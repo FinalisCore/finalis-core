@@ -1,0 +1,38 @@
+{
+  "fixture_version": 1,
+  "name": "sticky_fallback_equal_min",
+  "protocol_params": {
+    "epoch_start_height": 33,
+    "committee_size": 3,
+    "min_eligible": 2,
+    "effective_min_bond": 23094000000,
+    "ticket_difficulty_bits": 8,
+    "ticket_bonus_cap_bps": 1000,
+    "max_effective_bond_multiple": 10,
+    "availability_min_bond": 5000000000,
+    "availability_eligibility_min_score": 0,
+    "epoch_seed": "af3e662fb391d4579790555254031f0e795ba643ce5be751a5e4d87c3a9678a0"
+  },
+  "previous_checkpoint": {
+    "derivation_mode": "FALLBACK",
+    "fallback_reason": "INSUFFICIENT_ELIGIBLE_OPERATORS",
+    "ticket_difficulty_bits": 8
+  },
+  "validators": [
+    {"validator_pubkey":"3131313131313131313131313131313131313131313131313131313131313131","operator_id":"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"3232323232323232323232323232323232323232323232323232323232323232","operator_id":"c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"3333333333333333333333333333333333333333333333333333333333333333","operator_id":"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true}
+  ],
+  "availability": [
+    {"operator_id":"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3","state":"WARMUP","bond":25000000000,"service_score":0,"retained_prefix_count":1}
+  ],
+  "expected": {
+    "eligible_operator_count": 0,
+    "derivation_mode": "FALLBACK",
+    "fallback_reason": "INSUFFICIENT_ELIGIBLE_OPERATORS",
+    "committee": ["3232323232323232323232323232323232323232323232323232323232323232","3333333333333333333333333333333333333333333333333333333333333333","3131313131313131313131313131313131313131313131313131313131313131"],
+    "proposer_schedule": ["3333333333333333333333333333333333333333333333333333333333333333","3131313131313131313131313131313131313131313131313131313131313131","3232323232323232323232323232323232323232323232323232323232323232"]
+  }
+}

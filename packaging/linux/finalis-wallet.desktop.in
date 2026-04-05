@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Finalis Wallet
+GenericName=Desktop Wallet
+Comment=Desktop wallet for finalized-state operations on Finalis
+Exec=finalis-wallet
+Icon=finalis-wallet
+Terminal=false
+Categories=Finance;
+StartupNotify=true

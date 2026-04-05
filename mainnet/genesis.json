@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "network_name": "mainnet",
+  "protocol_version": 1,
+  "network_id_hex": "a57ab83946712672c507b1bd312c5fb2",
+  "magic": 1396919630,
+  "genesis_time_unix": 1735689600,
+  "initial_height": 0,
+  "initial_validators": [
+    "cc9d1120bce87a9dca53e163d429ffbce7b3afc4ca3171ae1ea99cd3c9405863"
+  ],
+  "initial_active_set_size": 1,
+  "initial_committee_params": {
+    "min_committee": 1,
+    "max_committee": 128,
+    "sizing_rule": "min(MAX_COMMITTEE,ACTIVE_SIZE)",
+    "C": 1
+  },
+  "monetary_params_ref": "monetary-policy-7m-hard-cap",
+  "seeds": [],
+  "note": "Canonical Finalis mainnet genesis with bootstrap validator cc9d1120bce87a9dca53e163d429ffbce7b3afc4ca3171ae1ea99cd3c9405863"
+}

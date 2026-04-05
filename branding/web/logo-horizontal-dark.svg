@@ -1,0 +1,26 @@
+<svg width="980" height="220" viewBox="0 0 980 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Finalis Core horizontal logo on dark background">
+  <rect width="980" height="220" fill="black"/>
+  <g transform="translate(20,10)">
+    <g transform="translate(0,0)">
+      <g fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="45" y1="45" x2="100" y2="100"/>
+        <line x1="155" y1="45" x2="100" y2="100"/>
+        <line x1="45" y1="155" x2="100" y2="100"/>
+        <line x1="155" y1="155" x2="100" y2="100"/>
+      </g>
+      <circle cx="45" cy="45" r="10" fill="white"/>
+      <circle cx="155" cy="45" r="10" fill="white"/>
+      <circle cx="45" cy="155" r="10" fill="white"/>
+      <circle cx="155" cy="155" r="10" fill="white"/>
+      <circle cx="100" cy="100" r="16" fill="white"/>
+    </g>
+    <text x="235" y="122"
+          font-family="Inter, Arial, Helvetica, sans-serif"
+          font-size="58"
+          font-weight="500"
+          letter-spacing="-1.2"
+          fill="white">
+      Finalis Core
+    </text>
+  </g>
+</svg>

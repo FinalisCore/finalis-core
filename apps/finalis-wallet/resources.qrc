@@ -1,0 +1,8 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="branding/finalis-symbol.svg">../../branding/finalis-symbol.svg</file>
+    <file alias="branding/finalis-symbol-dark.svg">../../branding/finalis-symbol-dark.svg</file>
+    <file alias="branding/finalis-logo-horizontal.svg">../../branding/finalis-logo-horizontal.svg</file>
+    <file alias="branding/finalis-app-icon.svg">../../branding/finalis-app-icon.svg</file>
+  </qresource>
+</RCC>

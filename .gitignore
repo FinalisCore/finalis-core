@@ -1,0 +1,82 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# debug information files
+*.dwo
+
+# build and binary files
+build/
+build-*/
+data/
+Testing/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+*.snapshot
+sdk/selfcoin-wallet-js/node_modules/
+sdk/selfcoin-wallet-js/dist/
+key.json
+research_positioning.md
+
+build/
+node_modules/
+dist/
+*.log
+.env
+.env.*
+.codex
+formal/tlc_runs/
+
+# generated analysis artifacts
+analysis/parameter_recommendation/
+analysis/parameter_recommendation_depth/
+analysis/parameter_recommendation_replay_depth/
+analysis/parameter_recommendation_replay_expanded_depth/
+analysis/parameter_recommendation_threshold/
+
+# local finalis-mint runtime files
+services/finalis-mint/*.state.json
+services/finalis-mint/*.secrets.json
+services/finalis-mint/*.lock
+services/finalis-mint/email-spool/
+
+
+__pycache__/
+*.pyc

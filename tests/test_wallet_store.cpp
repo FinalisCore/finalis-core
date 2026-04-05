@@ -1,0 +1,103 @@
+#include "test_framework.hpp"
+
+#include <filesystem>
+
+#include "apps/finalis-wallet/wallet_store.hpp"
+
+using namespace finalis::wallet;
+using finalis::Hash32;
+using finalis::OutPoint;
+
+TEST(test_wallet_store_persists_sent_events_and_notes) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_test/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_test");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_test");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+  ASSERT_TRUE(store.add_sent_txid("abc123"));
+  Hash32 spend_txid{};
+  spend_txid.fill(0x42);
+  std::vector<OutPoint> pending_inputs{OutPoint{spend_txid, 7}};
+  ASSERT_TRUE(store.upsert_pending_spend("abc123", pending_inputs));
+  ASSERT_TRUE(store.replace_finalized_history({WalletStore::FinalizedHistoryRecord{
+      .txid_hex = "tx-final-1",
+      .height = 9,
+      .kind = "received",
+      .detail = "1.00000000 FLS",
+  }}));
+  ASSERT_TRUE(store.append_finalized_history({WalletStore::FinalizedHistoryRecord{
+      .txid_hex = "tx-final-2",
+      .height = 10,
+      .kind = "sent",
+      .detail = "0.50000000 FLS",
+  }}));
+  ASSERT_TRUE(store.set_history_cursor(10, std::string("tx-final-2")));
+    ASSERT_TRUE(store.append_local_event("event-one"));
+    ASSERT_TRUE(store.append_local_event("event-two"));
+    ASSERT_TRUE(store.upsert_mint_note("note-a", 250000000, true));
+    ASSERT_TRUE(store.upsert_mint_note("note-b", 50000000, false));
+    ASSERT_TRUE(store.set_mint_deposit_ref("dep-ref"));
+    ASSERT_TRUE(store.set_mint_last_deposit_txid("txid1"));
+    ASSERT_TRUE(store.set_mint_last_deposit_vout(3));
+    ASSERT_TRUE(store.set_mint_last_redemption_batch_id("batch-9"));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_EQ(state.sent_txids.size(), 1u);
+  ASSERT_EQ(state.sent_txids[0], "abc123");
+  ASSERT_EQ(state.pending_spends.size(), 1u);
+  ASSERT_EQ(state.pending_spends[0].txid_hex, "abc123");
+  ASSERT_EQ(state.pending_spends[0].inputs.size(), 1u);
+  ASSERT_EQ(state.pending_spends[0].inputs[0].index, 7u);
+  ASSERT_EQ(state.finalized_history.size(), 2u);
+  ASSERT_EQ(state.finalized_history[0].txid_hex, "tx-final-1");
+  ASSERT_EQ(state.finalized_history[1].txid_hex, "tx-final-2");
+  ASSERT_TRUE(state.history_cursor_height.has_value());
+  ASSERT_EQ(*state.history_cursor_height, 10u);
+  ASSERT_TRUE(state.history_cursor_txid.has_value());
+  ASSERT_EQ(*state.history_cursor_txid, "tx-final-2");
+  ASSERT_EQ(state.local_events.size(), 2u);
+  ASSERT_EQ(state.local_events[0], "event-one");
+  ASSERT_EQ(state.local_events[1], "event-two");
+  ASSERT_EQ(state.mint_notes.size(), 2u);
+  ASSERT_EQ(state.mint_deposit_ref, "dep-ref");
+  ASSERT_EQ(state.mint_last_deposit_txid, "txid1");
+  ASSERT_EQ(state.mint_last_deposit_vout, 3u);
+  ASSERT_EQ(state.mint_last_redemption_batch_id, "batch-9");
+  const auto reserved = WalletStore::reserved_pending_outpoints(state);
+  ASSERT_EQ(reserved.size(), 1u);
+  ASSERT_TRUE(reserved.find(state.pending_spends[0].inputs[0]) != reserved.end());
+}
+
+TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_remove_sent/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_remove_sent");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_remove_sent");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    ASSERT_TRUE(store.add_sent_txid("sent-a"));
+    ASSERT_TRUE(store.add_sent_txid("sent-b"));
+    Hash32 spend_txid{};
+    spend_txid.fill(0x21);
+    ASSERT_TRUE(store.upsert_pending_spend("sent-a", {OutPoint{spend_txid, 1}}));
+    ASSERT_TRUE(store.upsert_pending_spend("sent-b", {OutPoint{spend_txid, 2}}));
+    ASSERT_TRUE(store.remove_sent_txid("sent-a"));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_EQ(state.sent_txids.size(), 1u);
+  ASSERT_EQ(state.sent_txids[0], "sent-b");
+  ASSERT_EQ(state.pending_spends.size(), 2u);
+}

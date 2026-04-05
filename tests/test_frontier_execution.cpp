@@ -1,0 +1,187 @@
+#include "test_framework.hpp"
+
+#include <array>
+#include <stdexcept>
+#include <vector>
+
+#include "address/address.hpp"
+#include "consensus/frontier_execution.hpp"
+#include "crypto/ed25519.hpp"
+#include "crypto/hash.hpp"
+#include "utxo/signing.hpp"
+
+using namespace finalis;
+
+namespace {
+
+crypto::KeyPair key_from_byte(std::uint8_t base) {
+  std::array<std::uint8_t, 32> seed{};
+  seed.fill(base);
+  auto kp = crypto::keypair_from_seed32(seed);
+  if (!kp.has_value()) throw std::runtime_error("key derivation failed");
+  return *kp;
+}
+
+TxOut p2pkh_out_for_pub(const PubKey32& pub, std::uint64_t value) {
+  const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
+  return TxOut{value, address::p2pkh_script_pubkey(pkh)};
+}
+
+Bytes raw_signed_spend(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& from, const PubKey32& to_pub,
+                       std::uint64_t value_out) {
+  const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
+  std::vector<TxOut> outputs{TxOut{value_out, address::p2pkh_script_pubkey(to_pkh)}};
+  auto tx = build_signed_p2pkh_tx_single_input(op, prev, from.private_key, outputs);
+  if (!tx.has_value()) throw std::runtime_error("failed to build spend");
+  return tx->serialize();
+}
+
+}  // namespace
+
+TEST(test_frontier_execution_accepts_independent_valid_transactions) {
+  const auto from_a = key_from_byte(1);
+  const auto from_b = key_from_byte(2);
+  const auto to = key_from_byte(3);
+
+  OutPoint op_a{};
+  op_a.txid.fill(0x11);
+  op_a.index = 0;
+  OutPoint op_b{};
+  op_b.txid.fill(0x22);
+  op_b.index = 0;
+
+  UtxoSet parent;
+  parent[op_a] = UtxoEntry{p2pkh_out_for_pub(from_a.public_key, 10'000)};
+  parent[op_b] = UtxoEntry{p2pkh_out_for_pub(from_b.public_key, 12'000)};
+
+  std::vector<Bytes> ordered{
+      raw_signed_spend(op_a, parent[op_a].out, from_a, to.public_key, 9'700),
+      raw_signed_spend(op_b, parent[op_b].out, from_b, to.public_key, 11'500),
+  };
+
+  consensus::FrontierExecutionResult result;
+  std::string err;
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 7, ordered, nullptr, &result, &err));
+  ASSERT_EQ(result.transition.prev_frontier, 7u);
+  ASSERT_EQ(result.transition.next_frontier, 9u);
+  ASSERT_EQ(result.decisions.size(), 2u);
+  ASSERT_TRUE(result.decisions[0].accepted);
+  ASSERT_TRUE(result.decisions[1].accepted);
+  ASSERT_TRUE(result.transition.prev_state_root != result.transition.next_state_root);
+}
+
+TEST(test_frontier_execution_first_conflicting_valid_spend_wins) {
+  const auto from = key_from_byte(4);
+  const auto to = key_from_byte(5);
+
+  OutPoint op{};
+  op.txid.fill(0x33);
+  op.index = 0;
+
+  UtxoSet parent;
+  parent[op] = UtxoEntry{p2pkh_out_for_pub(from.public_key, 10'000)};
+
+  std::vector<Bytes> ordered{
+      raw_signed_spend(op, parent[op].out, from, to.public_key, 9'800),
+      raw_signed_spend(op, parent[op].out, from, to.public_key, 9'700),
+  };
+
+  consensus::FrontierExecutionResult result;
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, nullptr, &result));
+  ASSERT_EQ(result.decisions.size(), 2u);
+  ASSERT_TRUE(result.decisions[0].accepted);
+  ASSERT_TRUE(!result.decisions[1].accepted);
+  ASSERT_EQ(result.decisions[1].reject_reason, FrontierRejectReason::CONFLICT_DOMAIN_USED);
+}
+
+TEST(test_frontier_execution_invalid_then_later_valid_same_domain_can_accept) {
+  const auto from = key_from_byte(6);
+  const auto to = key_from_byte(7);
+
+  OutPoint op{};
+  op.txid.fill(0x44);
+  op.index = 0;
+
+  UtxoSet parent;
+  parent[op] = UtxoEntry{p2pkh_out_for_pub(from.public_key, 10'000)};
+
+  Tx invalid;
+  invalid.version = 1;
+  invalid.lock_time = 0;
+  invalid.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  invalid.outputs.push_back(TxOut{9'500, address::p2pkh_script_pubkey(crypto::h160(Bytes(to.public_key.begin(), to.public_key.end())))});
+
+  std::vector<Bytes> ordered{
+      invalid.serialize(),
+      raw_signed_spend(op, parent[op].out, from, to.public_key, 9'800),
+  };
+
+  consensus::FrontierExecutionResult result;
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 10, ordered, nullptr, &result));
+  ASSERT_EQ(result.decisions.size(), 2u);
+  ASSERT_TRUE(!result.decisions[0].accepted);
+  ASSERT_EQ(result.decisions[0].reject_reason, FrontierRejectReason::TX_INVALID);
+  ASSERT_TRUE(result.decisions[1].accepted);
+}
+
+TEST(test_frontier_execution_is_deterministic_for_same_parent_and_slice) {
+  const auto from_a = key_from_byte(8);
+  const auto from_b = key_from_byte(9);
+  const auto to = key_from_byte(10);
+
+  OutPoint op_a{};
+  op_a.txid.fill(0x55);
+  op_a.index = 0;
+  OutPoint op_b{};
+  op_b.txid.fill(0x66);
+  op_b.index = 0;
+
+  UtxoSet parent;
+  parent[op_a] = UtxoEntry{p2pkh_out_for_pub(from_a.public_key, 10'000)};
+  parent[op_b] = UtxoEntry{p2pkh_out_for_pub(from_b.public_key, 10'000)};
+
+  std::vector<Bytes> ordered{
+      raw_signed_spend(op_a, parent[op_a].out, from_a, to.public_key, 9'900),
+      raw_signed_spend(op_b, parent[op_b].out, from_b, to.public_key, 9'850),
+  };
+
+  consensus::FrontierExecutionResult a;
+  consensus::FrontierExecutionResult b;
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 3, ordered, nullptr, &a));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 3, ordered, nullptr, &b));
+  ASSERT_EQ(a.transition.serialize(), b.transition.serialize());
+  ASSERT_EQ(a.result_id(), b.result_id());
+  ASSERT_EQ(a.decisions.size(), b.decisions.size());
+  for (std::size_t i = 0; i < a.decisions.size(); ++i) {
+    ASSERT_EQ(a.decisions[i].serialize(), b.decisions[i].serialize());
+  }
+}
+
+TEST(test_frontier_transition_hash_is_stable_and_order_sensitive) {
+  const auto from_a = key_from_byte(11);
+  const auto from_b = key_from_byte(12);
+  const auto to = key_from_byte(13);
+
+  OutPoint op_a{};
+  op_a.txid.fill(0x77);
+  op_a.index = 0;
+  OutPoint op_b{};
+  op_b.txid.fill(0x88);
+  op_b.index = 0;
+
+  UtxoSet parent;
+  parent[op_a] = UtxoEntry{p2pkh_out_for_pub(from_a.public_key, 10'000)};
+  parent[op_b] = UtxoEntry{p2pkh_out_for_pub(from_b.public_key, 10'000)};
+
+  const Bytes tx_a = raw_signed_spend(op_a, parent[op_a].out, from_a, to.public_key, 9'900);
+  const Bytes tx_b = raw_signed_spend(op_b, parent[op_b].out, from_b, to.public_key, 9'900);
+
+  consensus::FrontierExecutionResult ab;
+  consensus::FrontierExecutionResult ba;
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, {tx_a, tx_b}, nullptr, &ab));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, {tx_b, tx_a}, nullptr, &ba));
+
+  ASSERT_EQ(ab.transition.transition_id(), ab.transition.transition_id());
+  ASSERT_TRUE(ab.transition.transition_id() != ba.transition.transition_id());
+  ASSERT_TRUE(ab.result_id() != ba.result_id());
+}

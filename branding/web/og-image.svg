@@ -1,0 +1,33 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Finalis Core open graph image">
+  <rect width="1200" height="630" fill="black"/>
+  <g transform="translate(110,145) scale(1.7)">
+    <g fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="45" y1="45" x2="100" y2="100"/>
+      <line x1="155" y1="45" x2="100" y2="100"/>
+      <line x1="45" y1="155" x2="100" y2="100"/>
+      <line x1="155" y1="155" x2="100" y2="100"/>
+    </g>
+    <circle cx="45" cy="45" r="10" fill="white"/>
+    <circle cx="155" cy="45" r="10" fill="white"/>
+    <circle cx="45" cy="155" r="10" fill="white"/>
+    <circle cx="155" cy="155" r="10" fill="white"/>
+    <circle cx="100" cy="100" r="16" fill="white"/>
+  </g>
+  <text x="500" y="286"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="78"
+        font-weight="500"
+        letter-spacing="-1.7"
+        fill="white">
+    Finalis Core
+  </text>
+  <text x="500" y="360"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="28"
+        font-weight="400"
+        letter-spacing="1.4"
+        fill="white"
+        opacity="0.72">
+    deterministic convergence
+  </text>
+</svg>

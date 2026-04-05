@@ -1,0 +1,601 @@
+#include "utxo/validate.hpp"
+
+#include <algorithm>
+#include <set>
+
+#include "codec/bytes.hpp"
+#include "common/chain_id.hpp"
+#include "consensus/monetary.hpp"
+#include "consensus/randomness.hpp"
+#include "crypto/ed25519.hpp"
+#include "crypto/hash.hpp"
+#include "address/address.hpp"
+#include "privacy/mint_scripts.hpp"
+
+namespace finalis {
+
+namespace {
+
+std::optional<Vote> read_vote_fixed(codec::ByteReader& r) {
+  Vote v;
+  auto h = r.u64le();
+  auto round = r.u32le();
+  auto bid = r.bytes_fixed<32>();
+  auto pub = r.bytes_fixed<32>();
+  auto sig = r.bytes_fixed<64>();
+  if (!h || !round || !bid || !pub || !sig) return std::nullopt;
+  v.height = *h;
+  v.round = *round;
+  v.frontier_transition_id = *bid;
+  v.validator_pubkey = *pub;
+  v.signature = *sig;
+  return v;
+}
+
+Bytes chain_id_bytes(const ChainId& chain_id) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'C', 'H', 'A', 'I', 'N', '_', 'I', 'D', '_', 'V', '1'});
+  w.varbytes(Bytes(chain_id.network_name.begin(), chain_id.network_name.end()));
+  w.u32le(chain_id.magic);
+  w.varbytes(Bytes(chain_id.network_id_hex.begin(), chain_id.network_id_hex.end()));
+  w.u32le(chain_id.protocol_version);
+  w.varbytes(Bytes(chain_id.genesis_hash_hex.begin(), chain_id.genesis_hash_hex.end()));
+  return w.take();
+}
+
+std::vector<OutPoint> tx_input_outpoints(const Tx& tx) {
+  std::vector<OutPoint> out;
+  out.reserve(tx.inputs.size());
+  for (const auto& in : tx.inputs) out.push_back(OutPoint{in.prev_txid, in.prev_index});
+  return out;
+}
+
+}  // namespace
+
+bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash) {
+  if (script_pubkey.size() != 25) return false;
+  if (script_pubkey[0] != 0x76 || script_pubkey[1] != 0xA9 || script_pubkey[2] != 0x14 ||
+      script_pubkey[23] != 0x88 || script_pubkey[24] != 0xAC) {
+    return false;
+  }
+  if (out_hash) {
+    std::copy(script_pubkey.begin() + 3, script_pubkey.begin() + 23, out_hash->begin());
+  }
+  return true;
+}
+
+bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_pub) {
+  if (script_sig.size() != 98) return false;
+  if (script_sig[0] != 0x40 || script_sig[65] != 0x20) return false;
+  if (out_sig) std::copy(script_sig.begin() + 1, script_sig.begin() + 65, out_sig->begin());
+  if (out_pub) std::copy(script_sig.begin() + 66, script_sig.end(), out_pub->begin());
+  return true;
+}
+
+bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
+  return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
+         is_validator_unbond_script(script_pubkey, nullptr) ||
+         is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
+         is_burn_script(script_pubkey, nullptr) || privacy::is_mint_deposit_script(script_pubkey, nullptr, nullptr);
+}
+
+std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index) {
+  if (input_index >= tx.inputs.size()) return std::nullopt;
+  Tx signing = tx;
+  for (auto& in : signing.inputs) {
+    in.script_sig.clear();
+  }
+  const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
+
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '0'});
+  w.u32le(input_index);
+  w.bytes_fixed(txh);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index) {
+  if (input_index >= tx.inputs.size()) return std::nullopt;
+  Tx signing = tx;
+  for (auto& in : signing.inputs) {
+    in.script_sig.clear();
+  }
+  const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
+
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '0'});
+  w.bytes_fixed(txh);
+  w.u32le(input_index);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
+  w.bytes_fixed(validator_pubkey);
+  w.bytes_fixed(payout_pubkey);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Hash32 admission_pow_chain_id_hash(const ChainId& chain_id) {
+  return crypto::sha256d(chain_id_bytes(chain_id));
+}
+
+Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs) {
+  codec::ByteWriter w;
+  w.bytes(
+      Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'J', 'O', 'I', 'N', '_', 'I', 'N', 'P', 'U', 'T', 'S', '_', 'V', '1'});
+  w.varint(inputs.size());
+  for (const auto& input : inputs) {
+    w.bytes_fixed(input.txid);
+    w.u32le(input.index);
+  }
+  return crypto::sha256d(w.data());
+}
+
+Hash32 bond_commitment_for_join_request(const PubKey32& operator_id, const PubKey32& payout_pubkey,
+                                        std::uint64_t bond_amount, const std::vector<OutPoint>& inputs) {
+  codec::ByteWriter w;
+  w.bytes(
+      Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'B', 'O', 'N', 'D', '_', 'C', 'O', 'M', 'M', 'I', 'T', '_', 'V', '1'});
+  w.bytes_fixed(operator_id);
+  w.bytes_fixed(payout_pubkey);
+  w.u64le(bond_amount);
+  w.bytes_fixed(join_request_input_commitment(inputs));
+  return crypto::sha256d(w.data());
+}
+
+std::uint64_t admission_pow_epoch_for_height(std::uint64_t height, std::uint64_t epoch_blocks) {
+  return consensus::committee_epoch_start(height, epoch_blocks);
+}
+
+std::optional<Hash32> admission_pow_epoch_anchor_hash(
+    std::uint64_t admission_pow_epoch, std::uint64_t epoch_blocks,
+    const std::function<std::optional<Hash32>(std::uint64_t)>& finalized_hash_at_height) {
+  if (admission_pow_epoch == 0 || epoch_blocks == 0) return std::nullopt;
+  if (consensus::committee_epoch_start(admission_pow_epoch, epoch_blocks) != admission_pow_epoch) return std::nullopt;
+  if (admission_pow_epoch <= 1) return zero_hash();
+  if (!finalized_hash_at_height) return std::nullopt;
+  return finalized_hash_at_height(admission_pow_epoch - 1);
+}
+
+Hash32 admission_pow_challenge(const Hash32& chain_id_hash, std::uint64_t admission_pow_epoch,
+                               const Hash32& finalized_epoch_anchor_hash, const PubKey32& operator_id,
+                               const Hash32& bond_commitment) {
+  codec::ByteWriter w;
+  w.bytes(
+      Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'A', 'D', 'M', 'I', 'S', 'S', 'I', 'O', 'N', '_', 'P', 'O', 'W', '_',
+            'V', '1'});
+  w.bytes_fixed(chain_id_hash);
+  w.u64le(admission_pow_epoch);
+  w.bytes_fixed(finalized_epoch_anchor_hash);
+  w.bytes_fixed(operator_id);
+  w.bytes_fixed(bond_commitment);
+  return crypto::sha256d(w.data());
+}
+
+Hash32 admission_pow_work_hash(const Hash32& challenge, std::uint64_t nonce) {
+  codec::ByteWriter w;
+  w.bytes_fixed(challenge);
+  w.u64le(nonce);
+  return crypto::sha256d(w.data());
+}
+
+std::uint32_t leading_zero_bits(const Hash32& hash) {
+  std::uint32_t count = 0;
+  for (std::uint8_t b : hash) {
+    if (b == 0) {
+      count += 8;
+      continue;
+    }
+    for (int bit = 7; bit >= 0; --bit) {
+      if (((b >> bit) & 1U) == 0U) {
+        ++count;
+      } else {
+        return count;
+      }
+    }
+  }
+  return count;
+}
+
+bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std::vector<OutPoint>& inputs,
+                            std::uint64_t bond_amount, const SpecialValidationContext& ctx, std::string* err) {
+  // Admission PoW is join-admission friction only. It must not influence
+  // committee weight, proposer schedule, finality, or reward weighting.
+  if (!ctx.network || !admission_pow_enabled(*ctx.network)) return true;
+  if (!ctx.chain_id) {
+    if (err) *err = "missing chain id context for admission pow";
+    return false;
+  }
+  if (!req.has_admission_pow) {
+    if (err) *err = "missing admission pow";
+    return false;
+  }
+  const auto current_epoch = admission_pow_epoch_for_height(ctx.current_height, ctx.network->committee_epoch_blocks);
+  const auto previous_epoch =
+      current_epoch > ctx.network->committee_epoch_blocks ? current_epoch - ctx.network->committee_epoch_blocks : 0;
+  if (req.admission_pow_epoch != current_epoch && req.admission_pow_epoch != previous_epoch) {
+    if (err) *err = "admission pow epoch expired";
+    return false;
+  }
+  const auto anchor = admission_pow_epoch_anchor_hash(req.admission_pow_epoch, ctx.network->committee_epoch_blocks,
+                                                      ctx.finalized_hash_at_height);
+  if (!anchor.has_value()) {
+    if (err) *err = "missing finalized epoch anchor for admission pow";
+    return false;
+  }
+  const auto operator_id = consensus::canonical_operator_id_from_join_request(req.payout_pubkey);
+  const auto bond_commitment = bond_commitment_for_join_request(operator_id, req.payout_pubkey, bond_amount, inputs);
+  const auto challenge =
+      admission_pow_challenge(admission_pow_chain_id_hash(*ctx.chain_id), req.admission_pow_epoch, *anchor, operator_id,
+                              bond_commitment);
+  const auto work_hash = admission_pow_work_hash(challenge, req.admission_pow_nonce);
+  if (leading_zero_bits(work_hash) < ctx.network->admission_pow_difficulty_bits) {
+    if (err) *err = "admission pow difficulty not met";
+    return false;
+  }
+  return true;
+}
+
+Bytes vote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'V', 'O', 'T', 'E', '-', 'V', '1'});
+  w.u64le(height);
+  w.u32le(round);
+  w.bytes_fixed(transition_id);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'O', 'U', 'T', '-', 'V', '1'});
+  w.u64le(height);
+  w.u32le(round);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
+  static const Bytes marker{'S', 'C', 'S', 'L', 'A', 'S', 'H'};
+  if (script_sig.size() < marker.size()) return false;
+  if (!std::equal(marker.begin(), marker.end(), script_sig.begin())) return false;
+
+  Bytes tail(script_sig.begin() + static_cast<long>(marker.size()), script_sig.end());
+  Bytes blob;
+  if (!codec::parse_exact(tail, [&](codec::ByteReader& r) {
+        auto b = r.varbytes();
+        if (!b) return false;
+        blob = *b;
+        return true;
+      })) {
+    return false;
+  }
+
+  Vote a;
+  Vote b;
+  if (!codec::parse_exact(blob, [&](codec::ByteReader& r) {
+        auto v1 = read_vote_fixed(r);
+        auto v2 = read_vote_fixed(r);
+        if (!v1 || !v2) return false;
+        a = *v1;
+        b = *v2;
+        return true;
+      })) {
+    return false;
+  }
+
+  if (out) {
+    out->a = a;
+    out->b = b;
+    out->raw_blob = blob;
+  }
+  return true;
+}
+
+TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
+                               const SpecialValidationContext* ctx) {
+  if (tx.version != 1) return {false, "unsupported tx version", 0};
+  if (tx.lock_time != 0) return {false, "lock_time must be 0 in v0", 0};
+  if (tx.inputs.empty() || tx.outputs.empty()) return {false, "tx inputs/outputs empty", 0};
+
+  if (tx_index_in_block == 0) {
+    if (tx.inputs.size() != 1) return {false, "coinbase must have one input", 0};
+    const auto& in = tx.inputs[0];
+    if (in.prev_txid != zero_hash()) return {false, "coinbase prev_txid invalid", 0};
+    if (in.prev_index != 0xFFFFFFFF) return {false, "coinbase prev_index invalid", 0};
+    if (in.sequence != 0xFFFFFFFF) return {false, "coinbase sequence invalid", 0};
+    if (in.script_sig.size() > 100) return {false, "coinbase script_sig > 100", 0};
+    return {true, "", 0};
+  }
+
+  for (const auto& out : tx.outputs) {
+    if (!is_supported_base_layer_output_script(out.script_pubkey)) {
+      return {false, "unsupported script_pubkey", 0};
+    }
+    PubKey32 pub{};
+    if (is_validator_register_script(out.script_pubkey, &pub)) {
+      (void)pub;
+      if (ctx && ctx->enforce_variable_bond_range) {
+        const std::uint64_t min_bond_amount = ctx->min_bond_amount;
+        const std::uint64_t max_bond_amount = std::max<std::uint64_t>(ctx->max_bond_amount, min_bond_amount);
+        if (out.value < min_bond_amount || out.value > max_bond_amount) {
+          return {false, "SCVALREG output out of v7 bond range", 0};
+        }
+      } else if (out.value != BOND_AMOUNT) {
+        return {false, "SCVALREG output must equal BOND_AMOUNT", 0};
+      }
+    }
+    ValidatorJoinRequestScriptData join_req{};
+    if (parse_validator_join_request_script(out.script_pubkey, &join_req)) {
+      if (out.value != 0) return {false, "SCVALJRQ output must have zero value", 0};
+      if (!crypto::ed25519_verify(
+              validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey), join_req.pop,
+              join_req.validator_pubkey)) {
+        return {false, "validator join request proof invalid", 0};
+      }
+      if (ctx && ctx->network && admission_pow_enabled(*ctx->network) && !join_req.has_admission_pow) {
+        return {false, "missing admission pow", 0};
+      }
+    }
+  }
+
+  std::set<PubKey32> reg_outputs;
+  std::set<PubKey32> join_req_outputs;
+  for (const auto& out : tx.outputs) {
+    PubKey32 pub{};
+    if (is_validator_register_script(out.script_pubkey, &pub)) reg_outputs.insert(pub);
+    if (is_validator_join_request_script(out.script_pubkey, &pub, nullptr, nullptr)) join_req_outputs.insert(pub);
+  }
+  for (const auto& pub : join_req_outputs) {
+    if (reg_outputs.find(pub) == reg_outputs.end()) return {false, "join request missing matching SCVALREG output", 0};
+  }
+  for (const auto& pub : reg_outputs) {
+    if (join_req_outputs.find(pub) == join_req_outputs.end()) {
+      return {false, "SCVALREG output missing matching SCVALJRQ output", 0};
+    }
+  }
+
+  if (ctx && ctx->network && admission_pow_enabled(*ctx->network)) {
+    const auto inputs = tx_input_outpoints(tx);
+    for (const auto& out : tx.outputs) {
+      ValidatorJoinRequestScriptData join_req{};
+      if (!parse_validator_join_request_script(out.script_pubkey, &join_req)) continue;
+      const auto bond_it = std::find_if(tx.outputs.begin(), tx.outputs.end(), [&](const TxOut& candidate) {
+        PubKey32 reg_pub{};
+        return is_validator_register_script(candidate.script_pubkey, &reg_pub) && reg_pub == join_req.validator_pubkey;
+      });
+      if (bond_it == tx.outputs.end()) return {false, "join request missing matching SCVALREG output", 0};
+      std::string pow_error;
+      if (!validate_admission_pow(join_req, inputs, bond_it->value, *ctx, &pow_error)) {
+        return {false, pow_error.empty() ? "validator join request admission pow invalid" : pow_error, 0};
+      }
+    }
+  }
+
+  std::uint64_t in_sum = 0;
+  std::uint64_t out_sum = 0;
+  std::set<OutPoint> seen_inputs;
+  for (const auto& out : tx.outputs) out_sum += out.value;
+
+  for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
+    const auto& in = tx.inputs[i];
+    if (in.sequence != 0xFFFFFFFF) return {false, "sequence must be FFFFFFFF", 0};
+    OutPoint op{in.prev_txid, in.prev_index};
+    if (!seen_inputs.insert(op).second) return {false, "duplicate input outpoint", 0};
+    auto it = utxos.find(op);
+    if (it == utxos.end()) return {false, "missing utxo", 0};
+
+    const TxOut& prev_out = it->second.out;
+
+    std::array<std::uint8_t, 20> pkh{};
+    if (is_p2pkh_script_pubkey(prev_out.script_pubkey, &pkh)) {
+      Sig64 sig{};
+      PubKey32 pub{};
+      if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad script_sig", 0};
+      const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
+      if (!std::equal(derived.begin(), derived.end(), pkh.begin())) {
+        return {false, "pubkey hash mismatch", 0};
+      }
+
+      const auto msg = signing_message_for_input(tx, i);
+      if (!msg.has_value()) return {false, "sighash failed", 0};
+      if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
+      in_sum += prev_out.value;
+      continue;
+    }
+
+    PubKey32 bond_pub{};
+    if (is_validator_register_script(prev_out.script_pubkey, &bond_pub)) {
+      if (!ctx || !ctx->validators) return {false, "bond spend requires validator context", 0};
+
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+        if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
+        Hash32 burn_hash{};
+        if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return {false, "slash output must be SCBURN", 0};
+        const Hash32 evh = crypto::sha256d(evidence.raw_blob);
+        if (burn_hash != evh) return {false, "slash evidence hash mismatch", 0};
+
+        if (evidence.a.height != evidence.b.height || evidence.a.round != evidence.b.round) {
+          return {false, "invalid equivocation evidence height/round", 0};
+        }
+        if (evidence.a.frontier_transition_id == evidence.b.frontier_transition_id) {
+          return {false, "invalid equivocation evidence transition_id", 0};
+        }
+        if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
+        if (evidence.a.validator_pubkey != bond_pub) return {false, "evidence pubkey must match bond", 0};
+
+        const auto a_msg =
+            vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
+        const auto b_msg =
+            vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
+          return {false, "invalid evidence signature a", 0};
+        }
+        if (!crypto::ed25519_verify(b_msg, evidence.b.signature, evidence.b.validator_pubkey)) {
+          return {false, "invalid evidence signature b", 0};
+        }
+        if (!ctx->is_committee_member) return {false, "slash spend requires committee context", 0};
+        if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
+          return {false, "slash evidence validator not in committee", 0};
+        }
+      } else {
+        // UNBOND path
+        if (tx.outputs.size() != 1) return {false, "unbond tx must have exactly one output", 0};
+        auto info = ctx->validators->get(bond_pub);
+        if (!info.has_value()) return {false, "unknown validator for bond output", 0};
+        if (info->status == consensus::ValidatorStatus::BANNED) {
+          return {false, "banned validator bond must be slashed, not unbonded", 0};
+        }
+        PubKey32 out_pub{};
+        if (!is_validator_unbond_script(tx.outputs[0].script_pubkey, &out_pub)) {
+          return {false, "unbond tx must output SCVALUNB", 0};
+        }
+        if (out_pub != bond_pub) return {false, "unbond pubkey mismatch", 0};
+
+        Sig64 sig{};
+        PubKey32 pub{};
+        if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond auth script_sig", 0};
+        if (pub != bond_pub) return {false, "unbond auth pubkey mismatch", 0};
+        const auto msg = unbond_message_for_input(tx, i);
+        if (!msg.has_value()) return {false, "unbond sighash failed", 0};
+        if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond signature invalid", 0};
+      }
+
+      in_sum += prev_out.value;
+      continue;
+    }
+
+    PubKey32 unbond_pub{};
+    if (is_validator_unbond_script(prev_out.script_pubkey, &unbond_pub)) {
+      if (!ctx || !ctx->validators) return {false, "unbond spend requires validator context", 0};
+      auto info = ctx->validators->get(unbond_pub);
+      if (!info.has_value()) return {false, "unknown validator for unbond output", 0};
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+        if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
+        Hash32 burn_hash{};
+        if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return {false, "slash output must be SCBURN", 0};
+        const Hash32 evh = crypto::sha256d(evidence.raw_blob);
+        if (burn_hash != evh) return {false, "slash evidence hash mismatch", 0};
+        if (evidence.a.height != evidence.b.height || evidence.a.round != evidence.b.round) {
+          return {false, "invalid equivocation evidence height/round", 0};
+        }
+        if (evidence.a.frontier_transition_id == evidence.b.frontier_transition_id) {
+          return {false, "invalid equivocation evidence transition_id", 0};
+        }
+        if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
+        if (evidence.a.validator_pubkey != unbond_pub) return {false, "evidence pubkey must match unbond output", 0};
+        const auto a_msg =
+            vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
+        const auto b_msg =
+            vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
+          return {false, "invalid evidence signature a", 0};
+        }
+        if (!crypto::ed25519_verify(b_msg, evidence.b.signature, evidence.b.validator_pubkey)) {
+          return {false, "invalid evidence signature b", 0};
+        }
+        if (!ctx->is_committee_member) return {false, "slash spend requires committee context", 0};
+        if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
+          return {false, "slash evidence validator not in committee", 0};
+        }
+        in_sum += prev_out.value;
+        continue;
+      }
+      if (!ctx->validators->can_withdraw_bond(unbond_pub, ctx->current_height, ctx->unbond_delay_blocks)) {
+        return {false, "unbond delay not reached", 0};
+      }
+
+      Sig64 sig{};
+      PubKey32 pub{};
+      if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond-spend script_sig", 0};
+      if (pub != unbond_pub) return {false, "unbond-spend pubkey mismatch", 0};
+      const auto msg = signing_message_for_input(tx, i);
+      if (!msg.has_value()) return {false, "unbond-spend sighash failed", 0};
+      if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond-spend signature invalid", 0};
+
+      for (const auto& o : tx.outputs) {
+        if (!is_p2pkh_script_pubkey(o.script_pubkey, nullptr)) {
+          return {false, "unbond output spend must go to P2PKH", 0};
+        }
+      }
+
+      in_sum += prev_out.value;
+      continue;
+    }
+
+    return {false, "unsupported prev script_pubkey", 0};
+  }
+
+  if (in_sum < out_sum) return {false, "negative fee", 0};
+  return {true, "", in_sum - out_sum};
+}
+
+BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
+                                         const SpecialValidationContext* ctx,
+                                         const ExpectedCoinbaseOutputsBuilder* expected_coinbase_outputs) {
+  if (block.txs.empty()) return {false, "block has no tx", 0};
+  UtxoSet work = base_utxos;
+
+  std::uint64_t fees = 0;
+  for (size_t i = 0; i < block.txs.size(); ++i) {
+    auto r = validate_tx(block.txs[i], i, work, ctx);
+    if (!r.ok) return {false, "tx invalid at index " + std::to_string(i) + ": " + r.error, 0};
+    fees += r.fee;
+
+    if (i > 0) {
+      for (const auto& in : block.txs[i].inputs) {
+        work.erase(OutPoint{in.prev_txid, in.prev_index});
+      }
+    }
+    const Hash32 txid = block.txs[i].txid();
+    for (std::uint32_t out_i = 0; out_i < block.txs[i].outputs.size(); ++out_i) {
+      work[OutPoint{txid, out_i}] = UtxoEntry{block.txs[i].outputs[out_i]};
+    }
+  }
+
+  (void)block_reward;
+  std::uint64_t coinbase_sum = 0;
+  for (const auto& out : block.txs[0].outputs) coinbase_sum += out.value;
+  if (expected_coinbase_outputs) {
+    const auto expected = (*expected_coinbase_outputs)(fees);
+    std::uint64_t expected_sum = 0;
+    for (const auto& out : expected) expected_sum += out.value;
+    if (coinbase_sum != expected_sum) {
+      return {false, "coinbase sum mismatch", 0};
+    }
+    if (block.txs[0].outputs.size() != expected.size()) return {false, "coinbase payout distribution mismatch", 0};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      if (block.txs[0].outputs[i].value != expected[i].value ||
+          block.txs[0].outputs[i].script_pubkey != expected[i].script_pubkey) {
+        return {false, "coinbase payout distribution mismatch", 0};
+      }
+    }
+  } else if (coinbase_sum != fees) {
+    return {false, "coinbase sum mismatch", 0};
+  }
+
+  return {true, "", fees};
+}
+
+void apply_block_to_utxo(const Block& block, UtxoSet& utxos) {
+  for (size_t i = 0; i < block.txs.size(); ++i) {
+    if (i > 0) {
+      for (const auto& in : block.txs[i].inputs) {
+        utxos.erase(OutPoint{in.prev_txid, in.prev_index});
+      }
+    }
+    const Hash32 txid = block.txs[i].txid();
+    for (std::uint32_t out_i = 0; out_i < block.txs[i].outputs.size(); ++out_i) {
+      utxos[OutPoint{txid, out_i}] = UtxoEntry{block.txs[i].outputs[out_i]};
+    }
+  }
+}
+
+}  // namespace finalis

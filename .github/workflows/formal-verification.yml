@@ -1,0 +1,50 @@
+name: formal-verification
+
+on:
+  push:
+    paths:
+      - "formal/**"
+      - "scripts/run_tlc.sh"
+      - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
+      - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
+      - "docs/LIVE_PROTOCOL.md"
+      - "README.md"
+      - ".github/workflows/formal-verification.yml"
+  pull_request:
+    paths:
+      - "formal/**"
+      - "scripts/run_tlc.sh"
+      - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
+      - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
+      - "docs/LIVE_PROTOCOL.md"
+      - "README.md"
+      - ".github/workflows/formal-verification.yml"
+
+jobs:
+  tlc-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Java and curl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jre curl
+
+      - name: Install tla2tools.jar
+        run: |
+          mkdir -p "$HOME/tools/tla"
+          curl -L -o "$HOME/tools/tla/tla2tools.jar" \
+            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+
+      - name: Run TLC suite
+        run: |
+          chmod +x scripts/run_tlc.sh
+          ./scripts/run_tlc.sh
+
+      - name: Upload TLC artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal-tlc-runs
+          path: formal/tlc_runs/**

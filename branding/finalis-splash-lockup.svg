@@ -1,0 +1,35 @@
+<svg width="1080" height="1920" viewBox="0 0 1080 1920" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Finalis Core splash lockup">
+  <rect width="1080" height="1920" fill="black"/>
+  <g transform="translate(290,620)">
+    <g fill="none" stroke="white" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="120" y1="120" x2="250" y2="250"/>
+      <line x1="380" y1="120" x2="250" y2="250"/>
+      <line x1="120" y1="380" x2="250" y2="250"/>
+      <line x1="380" y1="380" x2="250" y2="250"/>
+    </g>
+    <circle cx="120" cy="120" r="24" fill="white"/>
+    <circle cx="380" cy="120" r="24" fill="white"/>
+    <circle cx="120" cy="380" r="24" fill="white"/>
+    <circle cx="380" cy="380" r="24" fill="white"/>
+    <circle cx="250" cy="250" r="38" fill="white"/>
+  </g>
+  <text x="540" y="1260"
+        text-anchor="middle"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="92"
+        font-weight="500"
+        letter-spacing="-2"
+        fill="white">
+    Finalis Core
+  </text>
+  <text x="540" y="1340"
+        text-anchor="middle"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="34"
+        font-weight="400"
+        letter-spacing="2"
+        fill="white"
+        opacity="0.72">
+    deterministic convergence
+  </text>
+</svg>

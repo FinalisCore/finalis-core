@@ -1,0 +1,67 @@
+name: finalis-wallet-packaging
+
+on:
+  push:
+    paths:
+      - "apps/finalis-wallet/**"
+      - "docs/REFERENCE_WALLET_SPEC.md"
+      - "docs/REFERENCE_WALLET_INSTALL.md"
+      - "docs/SELFCOIN_CORE_CURRENT_BEHAVIOR.md"
+      - "packaging/linux/**"
+      - "scripts/package_reference_wallet.sh"
+      - "scripts/verify_wallet_release.sh"
+      - "CMakeLists.txt"
+      - ".github/workflows/finalis-wallet-packaging.yml"
+  pull_request:
+    paths:
+      - "apps/finalis-wallet/**"
+      - "docs/REFERENCE_WALLET_SPEC.md"
+      - "docs/REFERENCE_WALLET_INSTALL.md"
+      - "docs/SELFCOIN_CORE_CURRENT_BEHAVIOR.md"
+      - "packaging/linux/**"
+      - "scripts/package_reference_wallet.sh"
+      - "scripts/verify_wallet_release.sh"
+      - "CMakeLists.txt"
+      - ".github/workflows/finalis-wallet-packaging.yml"
+
+jobs:
+  package-wallet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            qtbase5-dev \
+            libssl-dev \
+            libsodium-dev \
+            librocksdb-dev
+
+      - name: Package reference wallet
+        run: |
+          chmod +x scripts/package_reference_wallet.sh
+          ./scripts/package_reference_wallet.sh
+
+      - name: Verify release artifacts
+        run: |
+          test -f build/release/SHA256SUMS.txt
+          test -f build/release/manifest.txt
+          test -f build/release/RELEASE_NOTES.md
+          test -f build/release/finalis-wallet-0.1.0-Linux.tar.gz
+          test -f build/release/finalis-wallet-0.1.0-Linux.zip
+
+      - name: Verify release manifest and checksums
+        run: |
+          chmod +x scripts/verify_wallet_release.sh
+          ./scripts/verify_wallet_release.sh build/release
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: finalis-wallet-release
+          path: build/release/*

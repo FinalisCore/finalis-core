@@ -1,0 +1,15 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Finalis Core token badge">
+  <circle cx="256" cy="256" r="224" fill="none" stroke="currentColor" stroke-width="20"/>
+  <circle cx="256" cy="256" r="184" fill="none" stroke="currentColor" stroke-width="8" opacity="0.35"/>
+  <g fill="none" stroke="currentColor" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="154" y1="154" x2="256" y2="256"/>
+    <line x1="358" y1="154" x2="256" y2="256"/>
+    <line x1="154" y1="358" x2="256" y2="256"/>
+    <line x1="358" y1="358" x2="256" y2="256"/>
+  </g>
+  <circle cx="154" cy="154" r="18" fill="currentColor"/>
+  <circle cx="358" cy="154" r="18" fill="currentColor"/>
+  <circle cx="154" cy="358" r="18" fill="currentColor"/>
+  <circle cx="358" cy="358" r="18" fill="currentColor"/>
+  <circle cx="256" cy="256" r="28" fill="currentColor"/>
+</svg>

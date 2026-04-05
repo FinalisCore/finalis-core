@@ -1,0 +1,40 @@
+{
+  "fixture_version": 1,
+  "name": "shuffled_small_candidate_set",
+  "protocol_params": {
+    "epoch_start_height": 33,
+    "committee_size": 4,
+    "min_eligible": 2,
+    "effective_min_bond": 28284000000,
+    "ticket_difficulty_bits": 8,
+    "ticket_bonus_cap_bps": 1000,
+    "max_effective_bond_multiple": 10,
+    "availability_min_bond": 5000000000,
+    "availability_eligibility_min_score": 0,
+    "epoch_seed": "af3e662fb391d4579790555254031f0e795ba643ce5be751a5e4d87c3a9678a0"
+  },
+  "previous_checkpoint": {
+    "derivation_mode": "NORMAL",
+    "fallback_reason": "NONE",
+    "ticket_difficulty_bits": 8
+  },
+  "validators": [
+    {"validator_pubkey":"7373737373737373737373737373737373737373737373737373737373737373","operator_id":"7373737373737373737373737373737373737373737373737373737373737373","join_source":"POST_GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":false},
+    {"validator_pubkey":"7171717171717171717171717171717171717171717171717171717171717171","operator_id":"7171717171717171717171717171717171717171717171717171717171717171","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"7474747474747474747474747474747474747474747474747474747474747474","operator_id":"7474747474747474747474747474747474747474747474747474747474747474","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":false,"lifecycle_active":false},
+    {"validator_pubkey":"7272727272727272727272727272727272727272727272727272727272727272","operator_id":"7272727272727272727272727272727272727272727272727272727272727272","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true}
+  ],
+  "availability": [
+    {"operator_id":"7171717171717171717171717171717171717171717171717171717171717171","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"7272727272727272727272727272727272727272727272727272727272727272","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"7373737373737373737373737373737373737373737373737373737373737373","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"7474747474747474747474747474747474747474747474747474747474747474","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1}
+  ],
+  "expected": {
+    "eligible_operator_count": 0,
+    "derivation_mode": "FALLBACK",
+    "fallback_reason": "INSUFFICIENT_ELIGIBLE_OPERATORS",
+    "committee": ["7171717171717171717171717171717171717171717171717171717171717171","7272727272727272727272727272727272727272727272727272727272727272"],
+    "proposer_schedule": ["7272727272727272727272727272727272727272727272727272727272727272","7171717171717171717171717171717171717171717171717171717171717171"]
+  }
+}

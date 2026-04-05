@@ -1,0 +1,698 @@
+#include "test_framework.hpp"
+
+#include <array>
+#include <functional>
+#include <optional>
+#include <sstream>
+#include <string>
+
+#include "address/address.hpp"
+#include "crypto/hash.hpp"
+#include "utxo/tx.hpp"
+
+#define main finalis_explorer_program_main
+#include "../apps/finalis-explorer/main.cpp"
+#undef main
+
+using namespace finalis;
+
+namespace {
+
+std::string make_http_get(const std::string& path) {
+  return "GET " + path + " HTTP/1.1\r\nHost: explorer.test\r\nConnection: close\r\n\r\n";
+}
+
+std::string rpc_result(const std::string& result_json) {
+  return std::string("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":") + result_json + "}";
+}
+
+std::string rpc_error(int code, const std::string& message) {
+  return std::string("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":") + std::to_string(code) +
+         ",\"message\":\"" + message + "\"}}";
+}
+
+std::string make_address(std::uint8_t seed) {
+  std::array<std::uint8_t, 20> pkh{};
+  for (std::size_t i = 0; i < pkh.size(); ++i) pkh[i] = static_cast<std::uint8_t>(seed + i);
+  const auto addr = address::encode_p2pkh("sc", pkh);
+  ASSERT_TRUE(addr.has_value());
+  return *addr;
+}
+
+Hash32 scripthash_for_address(const std::string& addr) {
+  const auto decoded = address::decode(addr);
+  ASSERT_TRUE(decoded.has_value());
+  return crypto::sha256(address::p2pkh_script_pubkey(decoded->pubkey_hash));
+}
+
+Tx make_test_tx(const std::string& addr) {
+  const auto decoded = address::decode(addr);
+  ASSERT_TRUE(decoded.has_value());
+  Tx tx;
+  tx.version = 1;
+  tx.inputs.push_back(TxIn{zero_hash(), 0xFFFFFFFFu, Bytes{0x01, 0x02, 0x03}, 0xFFFFFFFFu});
+  tx.outputs.push_back(TxOut{123456789u, address::p2pkh_script_pubkey(decoded->pubkey_hash)});
+  tx.lock_time = 0;
+  return tx;
+}
+
+Block make_test_transition(const Tx& tx, std::uint64_t height, std::uint64_t timestamp) {
+  Block block;
+  block.header.prev_finalized_hash = zero_hash();
+  block.header.height = height;
+  block.header.timestamp = timestamp;
+  block.header.merkle_root = tx.txid();
+  block.header.leader_pubkey.fill(0x11);
+  block.header.leader_signature.fill(0x22);
+  block.header.round = 0;
+  block.txs.push_back(tx);
+  return block;
+}
+
+class ScopedRpcHook {
+ public:
+  using Handler = std::function<std::string(const std::string&)>;
+
+  explicit ScopedRpcHook(Handler handler) : prev_(g_http_post_json_raw) {
+    g_http_post_json_raw = [handler = std::move(handler)](const std::string&, const std::string& body, std::string*) {
+      return std::optional<std::string>(handler(body));
+    };
+  }
+
+  ~ScopedRpcHook() { g_http_post_json_raw = prev_; }
+
+ private:
+  HttpPostJsonRawFn prev_;
+};
+
+class ScopedUtxoHook {
+ public:
+  using Handler =
+      std::function<std::optional<std::vector<finalis::lightserver::UtxoView>>(const Hash32&, std::string*)>;
+
+  explicit ScopedUtxoHook(Handler handler) : prev_(g_rpc_get_utxos) {
+    g_rpc_get_utxos = [handler = std::move(handler)](const std::string&, const Hash32& scripthash, std::string* err) {
+      return handler(scripthash, err);
+    };
+  }
+
+  ~ScopedUtxoHook() { g_rpc_get_utxos = prev_; }
+
+ private:
+  RpcGetUtxosFn prev_;
+};
+
+struct ExplorerFixture {
+  std::string known_address = make_address(0x10);
+  std::string empty_address = make_address(0x40);
+  Hash32 known_scripthash = scripthash_for_address(known_address);
+  Hash32 empty_scripthash = scripthash_for_address(empty_address);
+  Tx tx = make_test_tx(known_address);
+  Block transition = make_test_transition(tx, 7, 1700000000ULL);
+  std::string txid = hex_encode32(tx.txid());
+  std::string transition_hash = hex_encode32(transition.header.block_id());
+  std::string known_scripthash_hex = hex_encode32(known_scripthash);
+  std::string empty_scripthash_hex = hex_encode32(empty_scripthash);
+  std::string unknown_txid = std::string(63, '0') + "1";
+  std::string unknown_transition_hash = std::string(63, 'a') + "b";
+};
+
+Config test_config() {
+  Config cfg;
+  cfg.rpc_url = "http://test.invalid/rpc";
+  return cfg;
+}
+
+std::string default_rpc_handler(const ExplorerFixture& fx, const std::string& body) {
+  if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+    return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":10,\"finalized_transition_hash\":\"") +
+                      fx.transition_hash + "\",\"version\":\"fake-lightserver\",\"availability\":{\"epoch\":9,"
+                      "\"retained_prefix_count\":5,\"tracked_operator_count\":28,\"eligible_operator_count\":26,"
+                      "\"below_min_eligible\":true,\"checkpoint_derivation_mode\":\"fallback\","
+                      "\"checkpoint_fallback_reason\":\"hysteresis_recovery_pending\",\"fallback_sticky\":true,"
+                      "\"adaptive_regime\":{\"qualified_depth\":26,\"adaptive_target_committee_size\":24,"
+                      "\"adaptive_min_eligible\":27,\"adaptive_min_bond\":15000000000,\"slack\":-1,"
+                      "\"target_expand_streak\":3,\"target_contract_streak\":0,\"fallback_rate_bps\":2500,"
+                      "\"sticky_fallback_rate_bps\":1250,\"fallback_rate_window_epochs\":8,"
+                      "\"near_threshold_operation\":true,\"prolonged_expand_buildup\":true,"
+                      "\"prolonged_contract_buildup\":false,\"repeated_sticky_fallback\":true,"
+                      "\"depth_collapse_after_bond_increase\":false},"
+                      "\"adaptive_telemetry_summary\":{\"window_epochs\":8,\"sample_count\":8,"
+                      "\"fallback_epochs\":2,\"sticky_fallback_epochs\":1},"
+                      "\"local_operator\":{\"known\":true,"
+                      "\"pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                      "\"status\":\"ACTIVE\",\"seat_budget\":1}},\"ticket_pow\":{\"difficulty\":10,"
+                      "\"difficulty_min\":8,\"difficulty_max\":12,\"epoch_health\":\"healthy\","
+                      "\"streak_up\":1,\"streak_down\":0,\"nonce_search_limit\":4096,\"bonus_cap_bps\":1000}}");
+  }
+  if (body.find("\"method\":\"get_committee\"") != std::string::npos) {
+    return rpc_result(std::string("{\"height\":10,\"epoch_start_height\":1,")
+                      + "\"checkpoint_derivation_mode\":\"fallback\",\"checkpoint_fallback_reason\":\"hysteresis_recovery_pending\","
+                        "\"fallback_sticky\":true,\"availability_eligible_operator_count\":26,"
+                        "\"availability_min_eligible_operators\":27,\"adaptive_target_committee_size\":24,"
+                        "\"adaptive_min_eligible\":27,\"adaptive_min_bond\":15000000000,\"qualified_depth\":26,"
+                        "\"slack\":-1,\"target_expand_streak\":3,\"target_contract_streak\":0,"
+                      + "\"ticket_pow\":{\"difficulty\":10,\"difficulty_min\":8,"
+                        "\"difficulty_max\":12,\"epoch_health\":\"healthy\",\"streak_up\":1,\"streak_down\":0,"
+                        "\"nonce_search_limit\":4096,\"bonus_cap_bps\":1000},"
+                        "\"members\":[{\"operator_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                        "\"representative_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+                        "\"base_weight\":100,\"ticket_bonus_bps\":1000,\"final_weight\":1010000,"
+                        "\"ticket_hash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+                        "\"ticket_nonce\":12}]}");
+  }
+  if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) {
+    if (body.find(fx.txid) != std::string::npos) {
+      return rpc_result(std::string("{\"status\":\"finalized\",\"finalized\":true,\"height\":7,\"finalized_depth\":4,") +
+                        "\"credit_safe\":true,\"transition_hash\":\"" + fx.transition_hash + "\"}");
+    }
+    return rpc_result(R"({"status":"not_found","finalized":false,"credit_safe":false})");
+  }
+  if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+    if (body.find(fx.txid) != std::string::npos) {
+      return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(fx.tx.serialize()) + "\"}");
+    }
+    return rpc_error(-32001, "tx not found");
+  }
+  if (body.find("\"method\":\"get_transition_by_height\"") != std::string::npos) {
+    if (body.find("\"height\":7") != std::string::npos) {
+      return rpc_result(std::string("{\"height\":7,\"hash\":\"") + fx.transition_hash + "\",\"transition_hash\":\"" +
+                        fx.transition_hash + "\",\"transition_hex\":\"" + hex_encode(fx.transition.serialize()) + "\"}");
+    }
+    return rpc_error(-32001, "transition not found");
+  }
+  if (body.find("\"method\":\"get_transition\"") != std::string::npos) {
+    if (body.find(fx.transition_hash) != std::string::npos) {
+      return rpc_result(std::string("{\"hash\":\"") + fx.transition_hash + "\",\"transition_hash\":\"" + fx.transition_hash +
+                        "\",\"transition_hex\":\"" + hex_encode(fx.transition.serialize()) + "\"}");
+    }
+    return rpc_error(-32001, "transition not found");
+  }
+  if (body.find("\"method\":\"get_utxos\"") != std::string::npos) {
+    if (body.find(fx.known_scripthash_hex) != std::string::npos) {
+      return rpc_result(std::string("[{\"txid\":\"") + fx.txid + "\",\"vout\":0,\"value\":123456789,\"height\":7}]");
+    }
+    return rpc_result("[]");
+  }
+  if (body.find("\"method\":\"get_history_page\"") != std::string::npos) {
+    if (body.find(fx.known_scripthash_hex) != std::string::npos) {
+      return rpc_result(std::string("{\"items\":[{\"txid\":\"") + fx.txid + "\",\"height\":7}],\"has_more\":false,"
+                        "\"next_start_after\":{\"height\":99,\"txid\":\"" + fx.txid + "\"}}");
+    }
+    return rpc_result("{\"items\":[],\"has_more\":false,\"next_start_after\":{\"height\":99,\"txid\":\"deadbeef\"}}");
+  }
+  return rpc_error(-32601, "unknown method");
+}
+
+std::string future_policy_rpc_handler(const ExplorerFixture& fx, const std::string& body) {
+  if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+    return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":240001,\"finalized_transition_hash\":\"") +
+                      fx.transition_hash + "\",\"version\":\"fake-lightserver\",\"availability\":{\"epoch\":7500,"
+                      "\"retained_prefix_count\":7,\"tracked_operator_count\":31,\"eligible_operator_count\":30,"
+                      "\"below_min_eligible\":false,\"checkpoint_derivation_mode\":\"normal\","
+                      "\"checkpoint_fallback_reason\":\"none\",\"fallback_sticky\":false,"
+                      "\"adaptive_regime\":{\"qualified_depth\":30,\"adaptive_target_committee_size\":24,"
+                      "\"adaptive_min_eligible\":27,\"adaptive_min_bond\":15000000000,\"slack\":3,"
+                      "\"target_expand_streak\":4,\"target_contract_streak\":0,\"fallback_rate_bps\":0,"
+                      "\"sticky_fallback_rate_bps\":0,\"fallback_rate_window_epochs\":8,"
+                      "\"near_threshold_operation\":false,\"prolonged_expand_buildup\":false,"
+                      "\"prolonged_contract_buildup\":false,\"repeated_sticky_fallback\":false,"
+                      "\"depth_collapse_after_bond_increase\":false},"
+                      "\"adaptive_telemetry_summary\":{\"window_epochs\":8,\"sample_count\":8,"
+                      "\"fallback_epochs\":0,\"sticky_fallback_epochs\":0},"
+                      "\"local_operator\":{\"known\":true,"
+                      "\"pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                      "\"status\":\"ACTIVE\",\"seat_budget\":1}},\"ticket_pow\":{\"difficulty\":10,"
+                      "\"difficulty_min\":8,\"difficulty_max\":12,\"epoch_health\":\"healthy\","
+                      "\"streak_up\":2,\"streak_down\":0,\"nonce_search_limit\":4096,\"bonus_cap_bps\":500}}");
+  }
+  if (body.find("\"method\":\"get_committee\"") != std::string::npos) {
+    return rpc_result(std::string("{\"height\":240001,\"epoch_start_height\":240001,")
+                      + "\"checkpoint_derivation_mode\":\"normal\",\"checkpoint_fallback_reason\":\"none\","
+                        "\"fallback_sticky\":false,\"availability_eligible_operator_count\":30,"
+                        "\"availability_min_eligible_operators\":27,\"adaptive_target_committee_size\":24,"
+                        "\"adaptive_min_eligible\":27,\"adaptive_min_bond\":15000000000,\"qualified_depth\":30,"
+                        "\"slack\":3,\"target_expand_streak\":4,\"target_contract_streak\":0,"
+                      + "\"ticket_pow\":{\"difficulty\":10,\"difficulty_min\":8,"
+                        "\"difficulty_max\":12,\"epoch_health\":\"healthy\",\"streak_up\":2,\"streak_down\":0,"
+                        "\"nonce_search_limit\":4096,\"bonus_cap_bps\":500},"
+                        "\"members\":[{\"operator_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                        "\"representative_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+                        "\"base_weight\":100,\"ticket_bonus_bps\":500,\"final_weight\":1005000,"
+                        "\"ticket_hash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+                        "\"ticket_nonce\":12}]}");
+  }
+  return default_rpc_handler(fx, body);
+}
+
+std::string no_recent_tx_rpc_handler(const ExplorerFixture& fx, const std::string& body) {
+  if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+    return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":10,\"finalized_transition_hash\":\"") +
+                      fx.transition_hash + "\",\"version\":\"fake-lightserver\",\"ticket_pow\":{\"difficulty\":10,"
+                      "\"difficulty_min\":8,\"difficulty_max\":12,\"epoch_health\":\"healthy\","
+                      "\"streak_up\":1,\"streak_down\":0,\"nonce_search_limit\":4096,\"bonus_cap_bps\":1000}}");
+  }
+  if (body.find("\"method\":\"get_transition_by_height\"") != std::string::npos) {
+    return rpc_error(-32001, "transition not found");
+  }
+  return default_rpc_handler(fx, body);
+}
+
+std::string empty_committee_rpc_handler(const ExplorerFixture& fx, const std::string& body) {
+  if (body.find("\"method\":\"get_committee\"") != std::string::npos) {
+    return rpc_result(std::string("{\"height\":10,\"epoch_start_height\":1,")
+                      + "\"ticket_pow\":{\"difficulty\":10,\"difficulty_min\":8,"
+                        "\"difficulty_max\":12,\"epoch_health\":\"healthy\",\"streak_up\":1,\"streak_down\":0,"
+                        "\"nonce_search_limit\":4096,\"bonus_cap_bps\":1000},"
+                        "\"members\":[]}");
+  }
+  return default_rpc_handler(fx, body);
+}
+
+TEST(test_explorer_api_status_and_tx_contract) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto status = handle_request(cfg, make_http_get("/api/status"));
+  ASSERT_EQ(status.status, 200);
+  ASSERT_TRUE(status.body.find("\"finalized_only\":true") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"committee_snapshot\"") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"finalized_height\":10") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"finalized_transition_hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
+
+  const auto tx_ok = handle_request(cfg, make_http_get("/api/tx/" + fx.txid));
+  ASSERT_EQ(tx_ok.status, 200);
+  ASSERT_TRUE(tx_ok.body.find("\"txid\":\"" + fx.txid + "\"") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"finalized\":true") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"credit_safe\":true") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"height\":7") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"transition_hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"input_count\":1") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"output_count\":1") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"decoded_output_count\":1") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"finalized_only\":true") != std::string::npos);
+
+  const auto tx_bad = handle_request(cfg, make_http_get("/api/tx/not-a-txid"));
+  ASSERT_EQ(tx_bad.status, 400);
+  ASSERT_TRUE(tx_bad.body.find("\"code\":\"invalid_txid\"") != std::string::npos);
+
+  const auto tx_missing = handle_request(cfg, make_http_get("/api/tx/" + fx.unknown_txid));
+  ASSERT_EQ(tx_missing.status, 404);
+  ASSERT_TRUE(tx_missing.body.find("\"code\":\"not_found\"") != std::string::npos);
+}
+
+TEST(test_explorer_tx_page_makes_credit_decision_explicit) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto tx_page = handle_request(cfg, make_http_get("/tx/" + fx.txid));
+  ASSERT_EQ(tx_page.status, 200);
+  ASSERT_TRUE(tx_page.body.find("FINALIZED") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("CREDIT SAFE") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("Safe to credit") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("FINALIZED (CREDIT SAFE)") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("Credit Safe</div><div>YES") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("confirm") == std::string::npos);
+}
+
+TEST(test_explorer_status_and_committee_surface_show_bounded_ticket_pow) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto status = handle_request(cfg, make_http_get("/api/status"));
+  ASSERT_EQ(status.status, 200);
+  ASSERT_TRUE(status.body.find("\"ticket_pow\"") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"difficulty\":10") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"operator_native\":") == std::string::npos);
+  ASSERT_TRUE(status.body.find("\"economics_version\":") == std::string::npos);
+  ASSERT_TRUE(status.body.find("\"adaptive_target_committee_size\":24") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"qualified_depth\":26") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"slack\":-1") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"fallback_rate_bps\":2500") != std::string::npos);
+
+  const auto committee = handle_request(cfg, make_http_get("/api/committee"));
+  ASSERT_EQ(committee.status, 200);
+  ASSERT_TRUE(committee.body.find("\"members\"") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"member_count\":1") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"resolved_operator_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") !=
+              std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"operator_id_source\":\"operator_id\"") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"base_weight\":100") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"ticket_bonus_bps\":1000") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"final_weight\":1010000") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"checkpoint_derivation_mode\":\"fallback\"") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"adaptive_min_eligible\":27") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("\"target_expand_streak\":3") != std::string::npos);
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded)") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded, Operator-Native)") == std::string::npos);
+  ASSERT_TRUE(home.body.find("Current Committee Operators") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Operator-Native") == std::string::npos);
+  ASSERT_TRUE(home.body.find("ID Source") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Adaptive Committee Target") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Qualified Operator Depth") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Telemetry Sample Count") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Telemetry Fallback Epochs") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Telemetry Sticky Fallback Epochs") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Adaptive Alert Flags") != std::string::npos);
+  ASSERT_TRUE(home.body.find("near-threshold") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Current finalized committee operator detail is unavailable from the backend view.") == std::string::npos);
+  ASSERT_TRUE(home.body.find("aaaaaaaa") != std::string::npos);
+  ASSERT_TRUE(home.body.find("1010000") != std::string::npos);
+
+  const auto committee_page = handle_request(cfg, make_http_get("/committee"));
+  ASSERT_EQ(committee_page.status, 200);
+  ASSERT_TRUE(committee_page.body.find("Selected Operators") != std::string::npos);
+  ASSERT_TRUE(committee_page.body.find("ID Source") != std::string::npos);
+  ASSERT_TRUE(committee_page.body.find("nonce 12") != std::string::npos);
+  ASSERT_TRUE(committee_page.body.find("Checkpoint Mode") != std::string::npos);
+  ASSERT_TRUE(committee_page.body.find("Qualified Operator Depth") != std::string::npos);
+}
+
+TEST(test_explorer_api_recent_tx_summary_contract) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto recent = handle_request(cfg, make_http_get("/api/recent-tx"));
+  ASSERT_EQ(recent.status, 200);
+  ASSERT_TRUE(recent.body.find("\"snapshot_kind\":\"recent_finalized_transactions\"") != std::string::npos);
+  ASSERT_TRUE(recent.body.find("\"items\"") != std::string::npos);
+  ASSERT_TRUE(recent.body.find("\"txid\":\"" + fx.txid + "\"") != std::string::npos);
+  ASSERT_TRUE(recent.body.find("\"status_label\":\"FINALIZED (CREDIT SAFE)\"") != std::string::npos);
+}
+
+TEST(test_explorer_api_recent_tx_empty_state_contract) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return no_recent_tx_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto recent = handle_request(cfg, make_http_get("/api/recent-tx"));
+  ASSERT_EQ(recent.status, 200);
+  ASSERT_TRUE(recent.body.find("\"snapshot_kind\":\"recent_finalized_transactions\"") != std::string::npos);
+  ASSERT_TRUE(recent.body.find("\"items\":[]") != std::string::npos);
+}
+
+TEST(test_explorer_root_page_recent_tx_empty_state_is_explicit) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return no_recent_tx_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Finalized Transactions") != std::string::npos);
+  ASSERT_TRUE(home.body.find("No recent finalized transactions available from the current backend view.") != std::string::npos);
+}
+
+TEST(test_explorer_root_page_committee_empty_state_is_explicit) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return empty_committee_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Current Committee Operators") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Current finalized committee operator detail is unavailable from the backend. Check the finalized committee checkpoint and lightserver verbose committee view.") != std::string::npos);
+
+  const auto committee = handle_request(cfg, make_http_get("/committee"));
+  ASSERT_EQ(committee.status, 200);
+  ASSERT_TRUE(committee.body.find("No finalized committee members available.") != std::string::npos);
+}
+
+TEST(test_explorer_root_page_availability_enforcement_empty_state_is_explicit) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Availability Enforcement") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Finalized-history-derived BPoAR eligibility now gates future committee checkpoints.") !=
+              std::string::npos);
+  ASSERT_TRUE(home.body.find("Epoch</div><div>9") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Retained Prefixes</div><div>5") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Tracked Operators</div><div>28") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Eligible Operators</div><div>26") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Below Min Eligible</div><div>YES") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Local Operator</div><div>ACTIVE") != std::string::npos);
+}
+
+TEST(test_explorer_root_page_surfaces_summary_sections_consistently) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Finalized Transactions") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Availability Enforcement") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Current Committee Operators") != std::string::npos);
+  ASSERT_TRUE(home.body.find("ID Source") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Finality Committee") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Network ID") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Genesis Hash") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Wallet API") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Copy Status API Path") != std::string::npos);
+}
+
+TEST(test_explorer_status_surface_remains_truthful_for_single_live_ticket_policy) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return future_policy_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto status = handle_request(cfg, make_http_get("/api/status"));
+  ASSERT_EQ(status.status, 200);
+  ASSERT_TRUE(status.body.find("\"economics_version\":") == std::string::npos);
+  ASSERT_TRUE(status.body.find("\"operator_native\":") == std::string::npos);
+  ASSERT_TRUE(status.body.find("\"bonus_cap_bps\":500") != std::string::npos);
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded)") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded, Operator-Native)") == std::string::npos);
+  ASSERT_TRUE(home.body.find("Legacy adjustment policy") == std::string::npos);
+  ASSERT_TRUE(home.body.find("Current finalized committee operator detail is unavailable from the backend view.") == std::string::npos);
+}
+
+TEST(test_explorer_api_transition_contract) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto by_height = handle_request(cfg, make_http_get("/api/transition/7"));
+  ASSERT_EQ(by_height.status, 200);
+  ASSERT_TRUE(by_height.body.find("\"height\":7") != std::string::npos);
+
+  const auto missing_height = handle_request(cfg, make_http_get("/api/transition/999"));
+  ASSERT_EQ(missing_height.status, 404);
+  ASSERT_TRUE(missing_height.body.find("\"code\":\"not_found\"") != std::string::npos);
+
+  const auto by_hash = handle_request(cfg, make_http_get("/api/transition/" + fx.transition_hash));
+  ASSERT_EQ(by_hash.status, 200);
+  ASSERT_TRUE(by_hash.body.find("\"hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
+
+  const auto malformed = handle_request(cfg, make_http_get("/api/transition/not-hex!"));
+  ASSERT_EQ(malformed.status, 400);
+  ASSERT_TRUE(malformed.body.find("\"code\":\"invalid_transition_id\"") != std::string::npos);
+
+  const auto missing_hash = handle_request(cfg, make_http_get("/api/transition/" + fx.unknown_transition_hash));
+  ASSERT_EQ(missing_hash.status, 404);
+  ASSERT_TRUE(missing_hash.body.find("\"code\":\"not_found\"") != std::string::npos);
+}
+
+TEST(test_explorer_api_address_contract_and_empty_state) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  ScopedUtxoHook utxo_hook([&](const Hash32& scripthash, std::string*) -> std::optional<std::vector<finalis::lightserver::UtxoView>> {
+    if (scripthash == fx.known_scripthash) {
+      finalis::lightserver::UtxoView utxo;
+      utxo.txid = fx.tx.txid();
+      utxo.vout = 0;
+      utxo.value = 123456789u;
+      utxo.height = 7;
+      utxo.script_pubkey = fx.tx.outputs[0].script_pubkey;
+      return std::vector<finalis::lightserver::UtxoView>{utxo};
+    }
+    return std::vector<finalis::lightserver::UtxoView>{};
+  });
+  const Config cfg = test_config();
+
+  const auto known = handle_request(cfg, make_http_get("/api/address/" + fx.known_address));
+  ASSERT_EQ(known.status, 200);
+  ASSERT_TRUE(known.body.find("\"address\":\"" + fx.known_address + "\"") != std::string::npos);
+  ASSERT_TRUE(known.body.find("\"found\":true") != std::string::npos);
+
+  const auto empty = handle_request(cfg, make_http_get("/api/address/" + fx.empty_address));
+  ASSERT_EQ(empty.status, 200);
+  ASSERT_TRUE(empty.body.find("\"found\":false") != std::string::npos);
+  ASSERT_TRUE(empty.body.find("\"utxos\":[]") != std::string::npos);
+  ASSERT_TRUE(empty.body.find("\"items\":[]") != std::string::npos);
+  ASSERT_TRUE(empty.body.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(empty.body.find("\"next_cursor\":null") != std::string::npos);
+
+  const auto invalid = handle_request(cfg, make_http_get("/api/address/not-an-address"));
+  ASSERT_EQ(invalid.status, 400);
+  ASSERT_TRUE(invalid.body.find("\"code\":\"invalid_address\"") != std::string::npos);
+}
+
+TEST(test_explorer_api_search_contract) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  ScopedUtxoHook utxo_hook([&](const Hash32& scripthash, std::string*) -> std::optional<std::vector<finalis::lightserver::UtxoView>> {
+    if (scripthash == fx.known_scripthash) {
+      finalis::lightserver::UtxoView utxo;
+      utxo.txid = fx.tx.txid();
+      utxo.vout = 0;
+      utxo.value = 123456789u;
+      utxo.height = 7;
+      utxo.script_pubkey = fx.tx.outputs[0].script_pubkey;
+      return std::vector<finalis::lightserver::UtxoView>{utxo};
+    }
+    return std::vector<finalis::lightserver::UtxoView>{};
+  });
+  const Config cfg = test_config();
+
+  const auto numeric = handle_request(cfg, make_http_get("/api/search?q=7"));
+  ASSERT_EQ(numeric.status, 200);
+  ASSERT_TRUE(numeric.body.find("\"classification\":\"transition_height\"") != std::string::npos);
+  ASSERT_TRUE(numeric.body.find("\"target\":\"/transition/7\"") != std::string::npos);
+
+  const auto tx = handle_request(cfg, make_http_get("/api/search?q=" + fx.txid));
+  ASSERT_EQ(tx.status, 200);
+  ASSERT_TRUE(tx.body.find("\"classification\":\"txid\"") != std::string::npos);
+  ASSERT_TRUE(tx.body.find("\"target\":\"/tx/" + fx.txid + "\"") != std::string::npos);
+
+  const auto transition = handle_request(cfg, make_http_get("/api/search?q=" + fx.transition_hash));
+  ASSERT_EQ(transition.status, 200);
+  ASSERT_TRUE(transition.body.find("\"classification\":\"transition_hash\"") != std::string::npos);
+  ASSERT_TRUE(transition.body.find("\"target\":\"/transition/" + fx.transition_hash + "\"") != std::string::npos);
+
+  const auto unknown_hex = handle_request(cfg, make_http_get("/api/search?q=" + fx.unknown_transition_hash));
+  ASSERT_EQ(unknown_hex.status, 200);
+  ASSERT_TRUE(unknown_hex.body.find("\"classification\":\"not_found\"") != std::string::npos);
+  ASSERT_TRUE(unknown_hex.body.find("\"found\":false") != std::string::npos);
+  ASSERT_TRUE(unknown_hex.body.find("\"target\":null") != std::string::npos);
+
+  const auto active_addr = handle_request(cfg, make_http_get("/api/search?q=" + fx.known_address));
+  ASSERT_EQ(active_addr.status, 200);
+  ASSERT_TRUE(active_addr.body.find("\"classification\":\"address\"") != std::string::npos);
+  ASSERT_TRUE(active_addr.body.find("\"target\":\"/address/" + fx.known_address + "\"") != std::string::npos);
+
+  const auto empty_addr = handle_request(cfg, make_http_get("/api/search?q=" + fx.empty_address));
+  ASSERT_EQ(empty_addr.status, 200);
+  ASSERT_TRUE(empty_addr.body.find("\"classification\":\"address\"") != std::string::npos);
+  ASSERT_TRUE(empty_addr.body.find("\"found\":false") != std::string::npos);
+  ASSERT_TRUE(empty_addr.body.find("\"target\":null") != std::string::npos);
+
+  const auto invalid = handle_request(cfg, make_http_get("/api/search?q=hello"));
+  ASSERT_EQ(invalid.status, 400);
+  ASSERT_TRUE(invalid.body.find("\"code\":\"invalid_query\"") != std::string::npos);
+}
+
+TEST(test_explorer_address_pagination_contract) {
+  ExplorerFixture fx;
+
+  ScopedRpcHook last_page_hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+      return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":10,\"finalized_transition_hash\":\"") +
+                        fx.transition_hash + "\",\"version\":\"fake-lightserver\"}");
+    }
+    if (body.find("\"method\":\"get_utxos\"") != std::string::npos) return rpc_result("[]");
+    if (body.find("\"method\":\"get_history_page\"") != std::string::npos) {
+      return rpc_result("{\"items\":[],\"has_more\":false,\"next_start_after\":{\"height\":123,\"txid\":\"abcd\"}}");
+    }
+    return rpc_error(-32601, "unknown method");
+  });
+  ScopedUtxoHook last_page_utxo_hook([&](const Hash32&, std::string*) -> std::optional<std::vector<finalis::lightserver::UtxoView>> {
+    return std::vector<finalis::lightserver::UtxoView>{};
+  });
+  auto last_page = handle_request(test_config(), make_http_get("/api/address/" + fx.empty_address));
+  ASSERT_EQ(last_page.status, 200);
+  ASSERT_TRUE(last_page.body.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(last_page.body.find("\"next_cursor\":null") != std::string::npos);
+
+  int page_calls = 0;
+  ScopedRpcHook more_pages_hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+      return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":10,\"finalized_transition_hash\":\"") +
+                        fx.transition_hash + "\",\"version\":\"fake-lightserver\"}");
+    }
+    if (body.find("\"method\":\"get_utxos\"") != std::string::npos) return rpc_result("[]");
+    if (body.find("\"method\":\"get_history_page\"") != std::string::npos) {
+      ++page_calls;
+      return rpc_result(std::string("{\"items\":[{\"txid\":\"") + fx.txid + "\",\"height\":7}],\"has_more\":true,"
+                        "\"next_start_after\":{\"height\":" + std::to_string(100 + page_calls) + ",\"txid\":\"" + fx.txid + "\"}}");
+    }
+    return rpc_error(-32601, "unknown method");
+  });
+  ScopedUtxoHook more_pages_utxo_hook([&](const Hash32&, std::string*) -> std::optional<std::vector<finalis::lightserver::UtxoView>> {
+    return std::vector<finalis::lightserver::UtxoView>{};
+  });
+  auto paged = handle_request(test_config(), make_http_get("/api/address/" + fx.empty_address));
+  ASSERT_EQ(paged.status, 200);
+  ASSERT_TRUE(paged.body.find("\"has_more\":true") != std::string::npos);
+  ASSERT_TRUE(paged.body.find("\"next_cursor\":\"") != std::string::npos);
+
+  ScopedRpcHook malformed_cursor_hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+      return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":10,\"finalized_transition_hash\":\"") +
+                        fx.transition_hash + "\",\"version\":\"fake-lightserver\"}");
+    }
+    if (body.find("\"method\":\"get_utxos\"") != std::string::npos) return rpc_result("[]");
+    if (body.find("\"method\":\"get_history_page\"") != std::string::npos) {
+      return rpc_result("{\"items\":[],\"has_more\":true}");
+    }
+    return rpc_error(-32601, "unknown method");
+  });
+  ScopedUtxoHook malformed_cursor_utxo_hook([&](const Hash32&, std::string*) -> std::optional<std::vector<finalis::lightserver::UtxoView>> {
+    return std::vector<finalis::lightserver::UtxoView>{};
+  });
+  auto malformed = handle_request(test_config(), make_http_get("/api/address/" + fx.empty_address));
+  ASSERT_EQ(malformed.status, 502);
+  ASSERT_TRUE(malformed.body.find("\"code\":\"upstream_error\"") != std::string::npos);
+}
+
+TEST(test_explorer_upstream_failure_returns_consistent_json_error) {
+  ScopedRpcHook hook([&](const std::string& body) -> std::string {
+    if (body.find("\"method\":\"get_status\"") != std::string::npos) return "not-json";
+    return rpc_error(-32601, "unknown method");
+  });
+  const auto resp = handle_request(test_config(), make_http_get("/api/status"));
+  ASSERT_EQ(resp.status, 502);
+  ASSERT_TRUE(resp.body.find("\"error\":{\"code\":\"upstream_error\"") != std::string::npos);
+  ASSERT_TRUE(resp.body.find("\"message\":\"invalid rpc response\"") != std::string::npos);
+}
+
+TEST(test_explorer_healthz_reports_upstream_health) {
+  ExplorerFixture fx;
+  ScopedRpcHook ok_hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+      return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":10,\"finalized_transition_hash\":\"") +
+                        fx.transition_hash + "\",\"version\":\"fake-lightserver\"}");
+    }
+    return rpc_error(-32601, "unknown method");
+  });
+  const auto ok = handle_request(test_config(), make_http_get("/healthz"));
+  ASSERT_EQ(ok.status, 200);
+  ASSERT_TRUE(ok.body.find("\"ok\":true") != std::string::npos);
+  ASSERT_TRUE(ok.body.find("\"finalized_only\":true") != std::string::npos);
+  ASSERT_TRUE(ok.body.find("\"upstream_ok\":true") != std::string::npos);
+
+  ScopedRpcHook fail_hook([&](const std::string& body) -> std::string {
+    if (body.find("\"method\":\"get_status\"") != std::string::npos) return "not-json";
+    return rpc_error(-32601, "unknown method");
+  });
+  const auto failed = handle_request(test_config(), make_http_get("/healthz"));
+  ASSERT_EQ(failed.status, 502);
+  ASSERT_TRUE(failed.body.find("\"ok\":false") != std::string::npos);
+  ASSERT_TRUE(failed.body.find("\"finalized_only\":true") != std::string::npos);
+  ASSERT_TRUE(failed.body.find("\"upstream_ok\":false") != std::string::npos);
+  ASSERT_TRUE(failed.body.find("\"error\":{\"code\":\"upstream_error\"") != std::string::npos);
+}
+
+}  // namespace

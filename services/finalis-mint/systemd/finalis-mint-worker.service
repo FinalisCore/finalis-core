@@ -1,0 +1,40 @@
+[Unit]
+Description=finalis-mint queue worker
+After=network-online.target finalis-mint-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/finalis-core
+EnvironmentFile=-/etc/finalis-mint/finalis-mint.env
+ExecStart=/usr/bin/python3 /opt/finalis-core/services/finalis-mint/server.py \
+  --mode worker \
+  --state-file ${FINALIS_MINT_STATE_FILE} \
+  --mint-id ${FINALIS_MINT_MINT_ID} \
+  --signing-seed ${FINALIS_MINT_SIGNING_SEED} \
+  --operator-key ${FINALIS_MINT_OPERATOR_KEY} \
+  --lightserver-url ${FINALIS_MINT_LIGHTSERVER_URL} \
+  --reserve-privkey ${FINALIS_MINT_RESERVE_PRIVKEY} \
+  --reserve-address ${FINALIS_MINT_RESERVE_ADDRESS} \
+  --reserve-fee ${FINALIS_MINT_RESERVE_FEE} \
+  --cli-path ${FINALIS_MINT_CLI_PATH} \
+  --notifier-retry-interval-seconds ${FINALIS_MINT_NOTIFIER_RETRY_INTERVAL_SECONDS} \
+  --notifier-secret-backend ${FINALIS_MINT_SECRET_BACKEND} \
+  --notifier-secrets-file ${FINALIS_MINT_NOTIFIER_SECRETS_FILE} \
+  --notifier-secret-dir ${FINALIS_MINT_NOTIFIER_SECRET_DIR} \
+  --notifier-secret-env-prefix ${FINALIS_MINT_NOTIFIER_SECRET_ENV_PREFIX} \
+  --notifier-secret-helper-cmd ${FINALIS_MINT_NOTIFIER_SECRET_HELPER_CMD} \
+  --worker-lock-file ${FINALIS_MINT_WORKER_LOCK_FILE} \
+  --worker-stale-timeout-seconds ${FINALIS_MINT_WORKER_STALE_TIMEOUT_SECONDS}
+Restart=on-failure
+RestartSec=5
+User=finalis
+Group=finalis
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/finalis-mint /run/finalis-mint
+
+[Install]
+WantedBy=multi-user.target

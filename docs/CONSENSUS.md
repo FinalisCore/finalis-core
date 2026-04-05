@@ -1,0 +1,204 @@
+# Consensus
+
+This document describes the live finalized-tip BFT path at a high level.
+
+It is not the normative source for checkpoint derivation. For that, use:
+
+- [spec/CHECKPOINT_DERIVATION_SPEC.md](spec/CHECKPOINT_DERIVATION_SPEC.md)
+- [spec/AVAILABILITY_STATE_COMPLETENESS.md](spec/AVAILABILITY_STATE_COMPLETENESS.md)
+
+## Active Height Rule
+
+The live consensus path only accepts work for:
+
+`height = finalized_height + 1`
+
+That means:
+
+- there is no live longest-chain competition
+- there is no non-finalized fork-choice rule
+- proposals, votes, and QCs are only meaningful for the next finalized height
+
+Relevant implementation:
+
+- [src/node/node.cpp](/home/greendragon/Desktop/selfcoin-core-clean/src/node/node.cpp)
+
+## Committee Source
+
+The active committee for a height is taken from the finalized checkpoint for the
+epoch containing that height.
+
+That checkpoint is derived only from finalized state at the prior epoch
+boundary. It already incorporates:
+
+- finalized validator lifecycle
+- availability eligibility
+- explicit `normal` / `fallback` checkpoint mode
+- adaptive checkpoint target committee size
+- adaptive checkpoint minimum eligible threshold
+- adaptive checkpoint minimum bond
+
+Consensus does not recompute those policy decisions in the live proposal/vote
+path. It consumes the finalized checkpoint output.
+
+## Proposal
+
+A proposal consists of:
+
+- `height`
+- `round`
+- `prev_finalized_hash`
+- serialized block bytes
+- optional `justify_qc`
+
+The node accepts a proposal only if:
+
+- `height == finalized_height + 1`
+- `round == current_round`
+- `prev_finalized_hash` matches the current finalized tip hash
+- the proposer matches the deterministic proposer for `(height, round)`
+- the proposer signature is valid
+- block transaction validation succeeds
+- if a QC is present, it is valid for the proposal
+
+Important boundary:
+
+- proposer selection is deterministic from the finalized checkpoint
+- if the checkpoint was derived in `fallback` mode, the live consensus path
+  still uses that already-finalized committee output directly
+
+## Vote
+
+A vote is over:
+
+`(height, round, block_id)`
+
+The signed message is the canonical vote-signing message for that exact tuple.
+
+Vote acceptance requires:
+
+- `height == finalized_height + 1`
+- validator is in the committee for `(height, round)`
+- signature verifies over the canonical vote-signing message
+- the vote tracker accepts it under the lock / relock rules
+
+Votes are not over a generic height-only or block-only object. They are bound
+to the exact round and block identifier.
+
+## Quorum Certificate
+
+A QC contains:
+
+- `height`
+- `round`
+- `block_id`
+- quorum signatures
+
+QC validation requires:
+
+- committee lookup for `(height, round)`
+- deduplication by signer pubkey
+- all signatures verify over `(height, round, block_id)`
+- signer count after filtering is at least quorum
+
+Finality threshold remains:
+
+`floor(2N/3) + 1`
+
+where `N` is the committee size for that height.
+
+## Lock Rules
+
+Each node keeps:
+
+- a local vote lock per height
+- a highest known QC for that height
+
+The node may vote for block `B` at height `H` only if one of the following
+holds:
+
+1. no local lock exists at `H`
+2. the local lock already points to the same consensus payload as `B`
+3. a valid QC is supplied and:
+   - `QC.height == H`
+   - `QC.round < proposal.round`
+   - `QC` resolves to the same payload as `B`
+   - `QC.round >= locked_round`
+
+The lock is updated when the node votes.
+
+This preserves the live safety property that a QC cannot unlock a conflicting
+payload.
+
+## Finalization
+
+A block finalizes when the node has:
+
+- the block body
+- the committee for `(height, round)`
+- at least quorum valid signatures for the same `(height, round, block_id)`
+
+The finality proof is canonicalized before persistence:
+
+- signatures sorted by signer pubkey
+- duplicates removed
+- truncated to exactly quorum
+
+The finalized transition then drives:
+
+- finalized tip advancement
+- deterministic state transition
+- reward / settlement progression
+- validator lifecycle replay state
+- availability replay state
+- checkpoint rebuild at epoch boundaries when required
+
+## `PROPOSE` And Finalized Transition Delivery
+
+`PROPOSE` is the live current-round proposal path.
+
+Finalized artifact delivery on the live path is frontier-transition based.
+
+Both converge through the same finalized application path.
+
+That unified path:
+
+- canonicalizes signatures
+- persists the finalized frontier transition and the height-indexed finality
+  certificate
+- updates finalized tip and randomness
+- applies deterministic state transition
+- updates validator and availability state
+- rebuilds the next epoch checkpoint when the epoch boundary is crossed
+
+## Checkpoint Boundary
+
+The most important live consensus boundary is:
+
+- consensus for height `H` consumes the finalized checkpoint already derived for
+  `epoch_of_height(H)`
+- checkpoint derivation for the next epoch is itself a deterministic function of
+  finalized state at the prior epoch boundary
+
+So the protocol is split cleanly:
+
+- finalized-tip BFT decides the next transition
+- finalized epoch-boundary derivation decides the next epoch committee and
+  proposer schedule
+
+The second part is still consensus-critical, but it is not recomputed from
+local heuristics during proposal/vote handling.
+
+## Invariants
+
+- only `finalized_height + 1` is processed in the live path
+- votes are bound to `(height, round, block_id)`
+- the committee for a height comes from the finalized checkpoint for that
+  height's epoch
+- checkpoint output is deterministic from finalized state only
+- a QC cannot unlock a conflicting payload
+- finalized transition delivery and local quorum finalization use the same
+  state transition
+- finalized transitions are applied deterministically
+- restart and replay must reconstruct the same validator state, availability
+  state, checkpoints, committees, and proposer schedule

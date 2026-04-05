@@ -1,0 +1,62 @@
+name: simulator-conformance
+
+on:
+  push:
+    paths:
+      - "src/consensus/finalized_committee.cpp"
+      - "src/consensus/finalized_committee.hpp"
+      - "src/consensus/canonical_derivation.cpp"
+      - "src/consensus/canonical_derivation.hpp"
+      - "src/availability/retention.cpp"
+      - "src/availability/retention.hpp"
+      - "tools/checkpoint_fixture_export.cpp"
+      - "scripts/generate_checkpoint_fixtures.sh"
+      - "scripts/check_checkpoint_fixtures.sh"
+      - "scripts/protocol_attack_sim.py"
+      - "scripts/tests/test_protocol_attack_sim.py"
+      - "scripts/tests/test_cpp_fixture_conformance.py"
+      - "tests/fixtures/**"
+      - "docs/PROTOCOL_ATTACK_SIMULATOR.md"
+      - "README.md"
+      - "CMakeLists.txt"
+      - ".github/workflows/simulator-conformance.yml"
+  pull_request:
+    paths:
+      - "src/consensus/finalized_committee.cpp"
+      - "src/consensus/finalized_committee.hpp"
+      - "src/consensus/canonical_derivation.cpp"
+      - "src/consensus/canonical_derivation.hpp"
+      - "src/availability/retention.cpp"
+      - "src/availability/retention.hpp"
+      - "tools/checkpoint_fixture_export.cpp"
+      - "scripts/generate_checkpoint_fixtures.sh"
+      - "scripts/check_checkpoint_fixtures.sh"
+      - "scripts/protocol_attack_sim.py"
+      - "scripts/tests/test_protocol_attack_sim.py"
+      - "scripts/tests/test_cpp_fixture_conformance.py"
+      - "tests/fixtures/**"
+      - "docs/PROTOCOL_ATTACK_SIMULATOR.md"
+      - "README.md"
+      - "CMakeLists.txt"
+      - ".github/workflows/simulator-conformance.yml"
+
+jobs:
+  simulator-fixture-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libsodium-dev librocksdb-dev python3
+
+      - name: Verify committed fixture corpus matches C++ exporter
+        run: |
+          chmod +x scripts/generate_checkpoint_fixtures.sh scripts/check_checkpoint_fixtures.sh
+          ./scripts/check_checkpoint_fixtures.sh
+
+      - name: Run Python simulator conformance tests
+        run: |
+          python3 -m unittest scripts.tests.test_cpp_fixture_conformance
+          python3 -m unittest scripts.tests.test_protocol_attack_sim

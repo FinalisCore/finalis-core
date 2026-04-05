@@ -1,0 +1,104 @@
+# Operator Model
+
+## Definition
+
+The live protocol aggregates committee economics by `operator_id`.
+
+In finalized validator state:
+
+- `ValidatorInfo::operator_id` is persisted in the validator registry
+- validators may share one operator
+- committee economics, availability qualification, and qualified-depth counting
+  are operator-based on the live path
+
+## Source Of `operator_id`
+
+For finalized join approvals:
+
+- `operator_id` is derived from the join request payout pubkey
+
+For bootstrap or legacy validators:
+
+- `operator_id` falls back to the validator pubkey itself
+
+That means the operator layer is a deterministic on-chain grouping rule, not a
+local label.
+
+## Why The Operator Layer Exists
+
+Without operator aggregation, splitting one bond across many validator pubkeys
+can increase influence under square-root weighting.
+
+The live protocol avoids that by aggregating bond at operator level first:
+
+`W_op = sqrt(sum bond_i under one operator)`
+
+instead of summing per-validator transformed weights.
+
+## What Uses Operator Aggregation
+
+Operator aggregation affects:
+
+- effective bond / primary weight
+- qualified-depth counting
+- checkpoint eligibility grouping
+- bounded ticket search in the live protocol
+- committee candidate construction
+
+It does not remove validator pubkeys from runtime finality.
+
+Consensus still uses validator pubkeys for:
+
+- proposer signatures
+- vote signatures
+- committee membership entries
+- finality certificates
+
+The operator layer is an economics and committee-formation layer, not a
+replacement for validator keys.
+
+## Representative Selection
+
+When an operator contributes a committee candidate, the implementation selects a
+deterministic representative validator pubkey for that operator-level entry.
+
+Important boundary:
+
+- the representative is chosen by canonical live rules
+- it is not a free local choice
+- it is not a separate identity concept from `operator_id`
+
+The exact representative/tie-break behavior is implementation-defined by the
+canonical candidate construction and ordering logic. Do not re-specify it
+loosely in integrations; consume the finalized checkpoint output.
+
+## Qualified Depth
+
+Adaptive checkpoint control uses:
+
+`qualified_depth = count(distinct operator_id)` such that the operator is:
+
+- lifecycle-active
+- checkpoint-bond-qualified
+- availability-eligible
+
+This is the only operator-count signal that now drives adaptive checkpoint
+target expansion/contraction.
+
+## Limitations
+
+The operator model does not solve real-world identity.
+
+It protects against:
+
+- splitting many validators under one `operator_id`
+- additive same-operator ticket gain
+- changing qualified depth by validator-count inflation alone inside one
+  operator
+
+It does not protect against:
+
+- one actor controlling many genuinely distinct `operator_id` values
+- off-chain identity duplication outside the protocol’s operator abstraction
+
+That remains outside the protocol’s identity model.

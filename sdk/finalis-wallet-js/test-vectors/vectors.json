@@ -1,0 +1,25 @@
+{
+  "address": {
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "pubkey_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "hrp": "tsc",
+    "address": "tsc1adrqzotqb6xl76opjawtlcn5ds6msa6sqdtecmte"
+  },
+  "script": {
+    "address": "tsc1adrqzotqb6xl76opjawtlcn5ds6msa6sqdtecmte",
+    "script_pubkey_hex": "76a914e30cba700faebff9cf482d3589bd1cbcc903d28088ac",
+    "scripthash_hex": "c50912493a0c1ae0f35b691d19918b7eb9b5ea69c4f24629ff23e190828fd78e"
+  },
+  "tx_signing": {
+    "prev_txid_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "prev_index": 1,
+    "prev_value_units": "1000000",
+    "from_privkey_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "from_pubkey_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "to_address": "tsc1addeqodb2u6nmz67nuqtedky4nmtdahbwprg5dsg",
+    "amount_units": "250000",
+    "fee_units": "1000",
+    "expected_txid": "a8e2567f937a31429e50311bfb0c1b539c45a985f473b1bf8aedbfb7b635e9b6",
+    "expected_tx_hex": "01000000011111111111111111111111111111111111111111111111111111111111111111010000006240aa34462252e03624e736ed838d89ff31bc2fe48dbfe0f357d1b887e1f025f13549816dc2c4228e79595ecdb81e9d5ee0a904d1dc93b95ca9586f7d1a3f86ea0d2003a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8ffffffff0290d00300000000001976a914c6483861d53cd667df6d21320d58e3593180e1b388acc86d0b00000000001976a914e30cba700faebff9cf482d3589bd1cbcc903d28088ac00000000"
+  }
+}
