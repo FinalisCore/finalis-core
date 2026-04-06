@@ -31,10 +31,10 @@
     {"operator_id":"ecececececececececececececececececececececececececececececececec","state":"WARMUP","bond":25000000000,"service_score":0,"retained_prefix_count":1}
   ],
   "expected": {
-    "eligible_operator_count": 0,
-    "derivation_mode": "FALLBACK",
-    "fallback_reason": "INSUFFICIENT_ELIGIBLE_OPERATORS",
-    "committee": ["6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a","6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b","6969696969696969696969696969696969696969696969696969696969696969"],
-    "proposer_schedule": ["6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b","6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a","6969696969696969696969696969696969696969696969696969696969696969"]
+    "eligible_operator_count": 2,
+    "derivation_mode": "NORMAL",
+    "fallback_reason": "NONE",
+    "committee": ["6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a","6969696969696969696969696969696969696969696969696969696969696969"],
+    "proposer_schedule": ["6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a","6969696969696969696969696969696969696969696969696969696969696969"]
   }
 }

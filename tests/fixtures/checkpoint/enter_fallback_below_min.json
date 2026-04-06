@@ -29,7 +29,7 @@
     {"operator_id":"b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3","state":"PROBATION","bond":25000000000,"service_score":0,"retained_prefix_count":1}
   ],
   "expected": {
-    "eligible_operator_count": 0,
+    "eligible_operator_count": 1,
     "derivation_mode": "FALLBACK",
     "fallback_reason": "INSUFFICIENT_ELIGIBLE_OPERATORS",
     "committee": ["2222222222222222222222222222222222222222222222222222222222222222","2323232323232323232323232323232323232323232323232323232323232323","2121212121212121212121212121212121212121212121212121212121212121"],
