@@ -4258,6 +4258,203 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   ASSERT_EQ(loc->height, 34u);
 }
 
+TEST(test_tx_status_reports_certified_ingress_before_finalization) {
+  const std::string base = "/tmp/finalis_it_tx_status_certified_ingress";
+
+  node::NodeConfig cfg;
+  cfg.disable_p2p = true;
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 33; }, std::chrono::seconds(60)));
+  ASSERT_TRUE(node->pause_proposals_for_test(true));
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  auto spendable = node->find_utxos_by_pubkey_hash_for_test(own_pkh);
+  ASSERT_TRUE(!spendable.empty());
+  const auto prev = spendable.front();
+
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x44);
+  constexpr std::uint64_t kAmount = 5'000'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+  ASSERT_TRUE(prev.second.value > kAmount + kFee);
+
+  std::vector<TxOut> outputs;
+  outputs.push_back(TxOut{kAmount, address::p2pkh_script_pubkey(recipient_pkh)});
+  outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
+
+  std::string build_err;
+  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
+                                               &build_err);
+  ASSERT_TRUE(tx.has_value());
+  ASSERT_TRUE(node->inject_tx_for_test(*tx, true));
+  node->stop();
+  node.reset();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = cfg.db_path;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":302,"method":"get_tx_status","params":{"txid":")") +
+                           hex_encode32(tx->txid()) + R"("}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  ASSERT_TRUE(resp.find("\"status\":\"certified_ingress\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"finalized\":false") != std::string::npos);
+}
+
+TEST(test_ingress_record_propagates_to_follower_before_finalization) {
+  const std::string base = unique_test_base("/tmp/finalis_it_ingress_record_propagates");
+  auto cluster = make_cluster(base, 2, 2, 2);
+  auto& n0 = *cluster.nodes[0];
+  auto& n1 = *cluster.nodes[1];
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    return s0.height >= 33 && s1.height >= 33 &&
+           s0.transition_hash == s1.transition_hash;
+  }, std::chrono::seconds(90)));
+  ASSERT_TRUE(n0.pause_proposals_for_test(true));
+  ASSERT_TRUE(n1.pause_proposals_for_test(true));
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  int sender_idx = -1;
+  std::pair<OutPoint, TxOut> prev;
+  std::array<std::uint8_t, 20> sender_pkh{};
+  for (int i = 0; i < 2; ++i) {
+    const auto kp = node::Node::deterministic_test_keypairs()[static_cast<std::size_t>(i)];
+    const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+    auto utxos = cluster.nodes[static_cast<std::size_t>(i)]->find_utxos_by_pubkey_hash_for_test(pkh);
+    if (utxos.empty()) continue;
+    sender_idx = i;
+    prev = utxos.front();
+    sender_pkh = pkh;
+    break;
+  }
+  ASSERT_TRUE(sender_idx >= 0);
+
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x66);
+  constexpr std::uint64_t kAmount = 5'000'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+  ASSERT_TRUE(prev.second.value > kAmount + kFee);
+
+  std::vector<TxOut> outputs;
+  outputs.push_back(TxOut{kAmount, address::p2pkh_script_pubkey(recipient_pkh)});
+  outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(sender_pkh)});
+
+  const auto kp = node::Node::deterministic_test_keypairs()[static_cast<std::size_t>(sender_idx)];
+  std::string build_err;
+  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(kp.private_key.begin(), kp.private_key.end()),
+                                               outputs, &build_err);
+  ASSERT_TRUE(tx.has_value());
+  ASSERT_TRUE(cluster.nodes[static_cast<std::size_t>(sender_idx)]->inject_tx_for_test(*tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db0;
+    storage::DB db1;
+    if (!db0.open_readonly(cluster.configs[0].db_path)) return false;
+    if (!db1.open_readonly(cluster.configs[1].db_path)) return false;
+    return db0.get_ingress_bytes(tx->txid()).has_value() && db1.get_ingress_bytes(tx->txid()).has_value();
+  }, std::chrono::seconds(10)));
+
+  n0.stop();
+  n1.stop();
+}
+
+TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
+  const std::string base = unique_test_base("/tmp/finalis_it_follower_materializes_transfer_utxos");
+  auto cluster = make_cluster(base, 1, 2, 1);
+  auto& leader = *cluster.nodes[0];
+  auto& follower = *cluster.nodes[1];
+
+  ASSERT_TRUE(wait_for([&]() {
+    return leader.status().height >= 33 && follower.status().height >= 33;
+  }, std::chrono::seconds(120)));
+
+  const auto leader_keypair = node::Node::deterministic_test_keypairs()[0];
+  const auto own_pkh = crypto::h160(Bytes(leader_keypair.public_key.begin(), leader_keypair.public_key.end()));
+  auto spendable = leader.find_utxos_by_pubkey_hash_for_test(own_pkh);
+  ASSERT_TRUE(!spendable.empty());
+  const auto prev = spendable.front();
+
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x55);
+  constexpr std::uint64_t kAmount = 10'000'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+  ASSERT_TRUE(prev.second.value > kAmount + kFee);
+
+  std::vector<TxOut> outputs;
+  outputs.push_back(TxOut{kAmount, address::p2pkh_script_pubkey(recipient_pkh)});
+  outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
+
+  std::string build_err;
+  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
+                                               Bytes(leader_keypair.private_key.begin(), leader_keypair.private_key.end()),
+                                               outputs, &build_err);
+  ASSERT_TRUE(tx.has_value());
+  ASSERT_TRUE(leader.inject_tx_for_test(*tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto leader_status = leader.status();
+    const auto follower_status = follower.status();
+    return leader_status.height >= 34 && follower_status.height >= 34 &&
+           leader_status.transition_hash == follower_status.transition_hash;
+  }, std::chrono::seconds(90)));
+
+  const auto follower_utxos = follower.find_utxos_by_pubkey_hash_for_test(recipient_pkh);
+  ASSERT_TRUE(!follower_utxos.empty());
+  ASSERT_EQ(follower_utxos.front().second.value, kAmount);
+
+  follower.stop();
+  leader.stop();
+
+  storage::DB follower_db;
+  ASSERT_TRUE(follower_db.open(cluster.configs[1].db_path));
+  const auto persisted_utxos = follower_db.load_utxos();
+  bool found_recipient = false;
+  for (const auto& [op, entry] : persisted_utxos) {
+    (void)op;
+    if (entry.out.value == kAmount && entry.out.script_pubkey == address::p2pkh_script_pubkey(recipient_pkh)) {
+      found_recipient = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found_recipient);
+  follower_db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = cluster.configs[1].db_path;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto sh = crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh));
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":301,"method":"get_utxos","params":{"scripthash_hex":")") +
+                           hex_encode32(sh) + R"("}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  ASSERT_TRUE(resp.find("\"value\":10000000000") != std::string::npos);
+}
+
 TEST(test_restart_repairs_partial_settlement_state) {
   const std::string base = unique_test_base("/tmp/finalis_it_reward_restart_repair");
   {

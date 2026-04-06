@@ -228,6 +228,8 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "GET_EPOCH_TICKETS";
     case p2p::MsgType::EPOCH_TICKETS:
       return "EPOCH_TICKETS";
+    case p2p::MsgType::INGRESS_RECORD:
+      return "INGRESS_RECORD";
     case p2p::MsgType::GET_INGRESS_TIPS:
       return "GET_INGRESS_TIPS";
     case p2p::MsgType::INGRESS_TIPS:
@@ -4947,6 +4949,28 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       }
       break;
     }
+    case p2p::MsgType::INGRESS_RECORD: {
+      auto record = p2p::de_ingress_record(payload);
+      if (!record.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-ingress-record");
+        return;
+      }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " lane=" + std::to_string(record->certificate.lane) +
+               " seq=" + std::to_string(record->certificate.seq) +
+               " txid=" + short_hash_hex(record->certificate.txid));
+      std::lock_guard<std::mutex> lk(mu_);
+      std::string ingress_error;
+      bool appended = false;
+      if (!handle_ingress_record_locked(peer_id, *record, &appended, &ingress_error)) {
+        const auto reason = ingress_fault_reason_for(ingress_error);
+        const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
+        score_peer_locked(peer_id, reason, note);
+        return;
+      }
+      if (appended) broadcast_ingress_record(record->certificate, record->tx_bytes, peer_id);
+      break;
+    }
     case p2p::MsgType::GET_TRANSITION: {
       auto gb = p2p::de_get_transition(payload);
       if (!gb.has_value()) {
@@ -5916,10 +5940,61 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
     if (!maybe_certify_locally_accepted_tx_locked(tx, &ingress_error) && !ingress_error.empty()) {
       log_line("ingress-local-certify-skip txid=" + hex_encode32(txid) + " reason=" + ingress_error);
     }
+    maybe_forward_tx_to_designated_certifier_locked(tx, from_network ? from_peer_id : 0);
     log_line("mempool-accept txid=" + hex_encode32(txid) + " mempool_size=" + std::to_string(mempool_.size()));
   }
 
   if (from_network && !should_mute_peer(from_peer_id)) broadcast_tx(tx, from_peer_id);
+  return true;
+}
+
+bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended, std::string* error) {
+  if (appended) *appended = false;
+  if (msg.certificate.lane >= INGRESS_LANE_COUNT || msg.certificate.seq == 0) {
+    if (error) *error = "invalid-ingress-record";
+    return false;
+  }
+
+  if (auto existing_cert_bytes = db_.get_ingress_certificate(msg.certificate.lane, msg.certificate.seq);
+      existing_cert_bytes.has_value()) {
+    auto existing_cert = IngressCertificate::parse(*existing_cert_bytes);
+    if (!existing_cert.has_value()) {
+      if (error) *error = "stored-cert-invalid";
+      return false;
+    }
+    if (*existing_cert == msg.certificate) {
+      if (auto existing_tx = db_.get_ingress_bytes(msg.certificate.txid);
+          existing_tx.has_value() && *existing_tx == msg.tx_bytes) {
+        if (error) error->clear();
+        return true;
+      }
+      if (error) *error = "ingress-bytes-conflict";
+      return false;
+    }
+    std::string equivocation_error;
+    if (consensus::detect_ingress_equivocation(existing_cert, msg.certificate, &equivocation_error)) {
+      std::string persist_error;
+      if (!consensus::persist_ingress_equivocation_evidence(db_, *existing_cert, msg.certificate, &persist_error)) {
+        equivocation_error = persist_error;
+      }
+      if (error) *error = equivocation_error;
+      return false;
+    }
+  }
+
+  auto committee = ingress_committee_locked(0);
+  std::string append_error;
+  if (!consensus::append_validated_ingress_record(db_, msg.certificate, msg.tx_bytes, committee, &append_error)) {
+    if (error) *error = append_error;
+    return false;
+  }
+
+  if (appended) *appended = true;
+  if (error) error->clear();
+  log_line("ingress-record-accepted peer_id=" + std::to_string(peer_id) +
+           " lane=" + std::to_string(msg.certificate.lane) +
+           " seq=" + std::to_string(msg.certificate.seq) +
+           " txid=" + short_hash_hex(msg.certificate.txid));
   return true;
 }
 
@@ -5978,6 +6053,7 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const Tx& tx, std::string* e
   if (error) error->clear();
   log_line("ingress-local-certified txid=" + hex_encode32(txid) + " lane=" + std::to_string(lane) +
            " seq=" + std::to_string(cert.seq) + " epoch=" + std::to_string(cert.epoch));
+  broadcast_ingress_record(cert, tx_bytes);
   return true;
 }
 
@@ -6271,6 +6347,79 @@ void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
       if (id == skip_peer_id) continue;
       (void)p2p_.send_to(id, p2p::MsgType::TX, payload, true);
     }
+  }
+}
+
+void Node::broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id) {
+  if (cfg_.disable_p2p) {
+    if (!running_) return;
+    std::vector<Node*> peers;
+    {
+      std::lock_guard<std::mutex> lk(g_local_bus_mu);
+      peers = g_local_bus_nodes;
+    }
+    const p2p::IngressRecordMsg msg{cert, tx_bytes};
+    for (Node* peer : peers) {
+      if (peer == this) continue;
+      spawn_local_bus_task([peer, msg]() {
+        std::lock_guard<std::mutex> lk(peer->mu_);
+        bool appended = false;
+        std::string ingress_error;
+        if (!peer->handle_ingress_record_locked(0, msg, &appended, &ingress_error)) return;
+        if (appended) peer->broadcast_ingress_record(msg.certificate, msg.tx_bytes);
+      });
+    }
+  } else {
+    const auto payload = p2p::ser_ingress_record(p2p::IngressRecordMsg{cert, tx_bytes});
+    for (int id : p2p_.peer_ids()) {
+      if (id == skip_peer_id) continue;
+      (void)p2p_.send_to(id, p2p::MsgType::INGRESS_RECORD, payload, true);
+    }
+  }
+}
+
+void Node::maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int skip_peer_id) {
+  const std::uint64_t next_height = finalized_height_ + 1;
+  auto committee = ingress_committee_locked(next_height);
+  if (committee.empty()) return;
+
+  const std::uint32_t lane = consensus::assign_ingress_lane(tx);
+  const PubKey32& designated_certifier = committee[static_cast<std::size_t>(lane) % committee.size()];
+  if (designated_certifier == local_key_.public_key) return;
+
+  if (cfg_.disable_p2p) {
+    if (!running_) return;
+    std::vector<Node*> peers;
+    {
+      std::lock_guard<std::mutex> lk(g_local_bus_mu);
+      peers = g_local_bus_nodes;
+    }
+    for (Node* peer : peers) {
+      if (peer == this) continue;
+      if (peer->local_validator_pubkey_for_test() != designated_certifier) continue;
+      spawn_local_bus_task([peer, tx]() { (void)peer->handle_tx(tx, true); });
+      log_line("tx-forward-designated lane=" + std::to_string(lane) +
+               " designated=" + short_pub_hex(designated_certifier) + " transport=local-bus");
+      return;
+    }
+    return;
+  }
+
+  if (skip_peer_id != 0) {
+    auto it = peer_validator_pubkeys_.find(skip_peer_id);
+    if (it != peer_validator_pubkeys_.end() && it->second == designated_certifier) return;
+  }
+
+  const auto payload = p2p::ser_tx(p2p::TxMsg{tx.serialize()});
+  for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
+    if (peer_id == skip_peer_id) continue;
+    if (peer_pub != designated_certifier) continue;
+    const auto info = p2p_.get_peer_info(peer_id);
+    if (!info.established()) continue;
+    const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TX, payload, true);
+    log_line("tx-forward-designated peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(lane) +
+             " designated=" + short_pub_hex(designated_certifier) + " status=" + (ok ? "ok" : "failed"));
+    return;
   }
 }
 

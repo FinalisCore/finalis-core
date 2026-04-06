@@ -364,7 +364,11 @@ std::string tx_status_json(const Hash32& txid, const std::optional<storage::DB::
   std::ostringstream oss;
   oss << "{\"txid\":\"" << hex_encode32(txid) << "\"";
   if (!loc.has_value()) {
-    oss << ",\"status\":\"not_found\",\"finalized\":false,\"finalized_depth\":0,\"credit_safe\":false}";
+    if (db.get_ingress_bytes(txid).has_value()) {
+      oss << ",\"status\":\"certified_ingress\",\"finalized\":false,\"finalized_depth\":0,\"credit_safe\":false}";
+    } else {
+      oss << ",\"status\":\"not_found\",\"finalized\":false,\"finalized_depth\":0,\"credit_safe\":false}";
+    }
     return oss.str();
   }
 

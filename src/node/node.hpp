@@ -309,6 +309,8 @@ class Node {
                                     int from_peer_id, bool from_network);
   bool handle_tx(const Tx& tx, bool from_network, int from_peer_id = 0);
   bool maybe_certify_locally_accepted_tx_locked(const Tx& tx, std::string* error = nullptr);
+  bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
+                                    std::string* error = nullptr);
   bool finalize_if_quorum(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
   bool verify_quorum_certificate_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered = nullptr,
                                         std::string* error = nullptr) const;
@@ -344,6 +346,8 @@ class Node {
   void broadcast_timeout_vote(const TimeoutVote& vote);
   void broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate);
   void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
+  void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
+  void maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSet& prev_utxos);
   bool begin_finalized_write(const Block& block);
