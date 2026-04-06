@@ -43,6 +43,44 @@ namespace {
 
 constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
 constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
+
+std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage::DB& db, const Hash32& scripthash) {
+  const auto indexed_entries = db.get_script_utxos(scripthash);
+  const auto canonical_utxos = db.load_utxos();
+  std::map<OutPoint, TxOut> canonical_matches;
+  for (const auto& [op, entry] : canonical_utxos) {
+    if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+    canonical_matches.emplace(op, entry.out);
+  }
+
+  std::vector<storage::DB::ScriptUtxoEntry> out;
+  out.reserve(std::max(indexed_entries.size(), canonical_matches.size()));
+  std::set<OutPoint> seen;
+  for (const auto& entry : indexed_entries) {
+    const auto canonical_it = canonical_matches.find(entry.outpoint);
+    if (canonical_it == canonical_matches.end()) continue;
+    if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
+    storage::DB::ScriptUtxoEntry merged = entry;
+    if (auto loc = db.get_tx_index(entry.outpoint.txid); loc.has_value()) merged.height = loc->height;
+    out.push_back(std::move(merged));
+    seen.insert(entry.outpoint);
+  }
+  for (const auto& [op, prevout] : canonical_matches) {
+    if (seen.find(op) != seen.end()) continue;
+    storage::DB::ScriptUtxoEntry merged;
+    merged.outpoint = op;
+    merged.value = prevout.value;
+    merged.script_pubkey = prevout.script_pubkey;
+    if (auto loc = db.get_tx_index(op.txid); loc.has_value()) merged.height = loc->height;
+    out.push_back(std::move(merged));
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+    if (a.height != b.height) return a.height < b.height;
+    return std::tie(a.outpoint.txid, a.outpoint.index) < std::tie(b.outpoint.txid, b.outpoint.index);
+  });
+  return out;
+}
+
 std::string json_escape(const std::string& in) {
   std::string out;
   out.reserve(in.size() + 8);
@@ -1714,22 +1752,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     if (!sh_hex) return make_error(id, -32602, "missing scripthash_hex");
     auto sh = parse_hex32(*sh_hex);
     if (!sh) return make_error(id, -32602, "bad scripthash");
-    std::vector<storage::DB::ScriptUtxoEntry> utxos;
-    const auto all_utxos = db_.load_utxos();
-    utxos.reserve(all_utxos.size());
-    for (const auto& [op, entry] : all_utxos) {
-      if (crypto::sha256(entry.out.script_pubkey) != *sh) continue;
-      storage::DB::ScriptUtxoEntry indexed;
-      indexed.outpoint = op;
-      indexed.value = entry.out.value;
-      indexed.script_pubkey = entry.out.script_pubkey;
-      if (auto loc = db_.get_tx_index(op.txid); loc.has_value()) indexed.height = loc->height;
-      utxos.push_back(std::move(indexed));
-    }
-    std::sort(utxos.begin(), utxos.end(), [](const auto& a, const auto& b) {
-      if (a.height != b.height) return a.height < b.height;
-      return std::tie(a.outpoint.txid, a.outpoint.index) < std::tie(b.outpoint.txid, b.outpoint.index);
-    });
+    const auto utxos = reconciled_script_utxos(*view, *sh);
     std::ostringstream oss;
     oss << "[";
     for (size_t i = 0; i < utxos.size(); ++i) {

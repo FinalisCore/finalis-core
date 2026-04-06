@@ -29,6 +29,7 @@
 #include "storage/snapshot.hpp"
 #include "crypto/smt.hpp"
 #include "utxo/signing.hpp"
+#include "wallet/utxo_selection.hpp"
 
 using namespace finalis;
 
@@ -622,6 +623,46 @@ TEST(test_lightserver_get_utxos_ignores_stale_or_missing_script_index_entries) {
   ASSERT_TRUE(resp.find("\"value\":777777777") != std::string::npos);
   ASSERT_TRUE(resp.find("\"height\":12") != std::string::npos);
   ASSERT_TRUE(resp.find(hex_encode32(stale_op.txid)) == std::string::npos);
+}
+
+TEST(test_wallet_spendable_utxos_reconcile_script_index_with_canonical_set) {
+  const std::string base = "/tmp/finalis_wallet_spendable_reconcile";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const auto script_pubkey = address::p2pkh_script_pubkey(pkh);
+  const Hash32 sh = crypto::sha256(script_pubkey);
+
+  OutPoint canonical_only{};
+  canonical_only.txid[31] = 0x81;
+  canonical_only.index = 0;
+  ASSERT_TRUE(db.put_utxo(canonical_only, TxOut{123456789, script_pubkey}));
+
+  OutPoint indexed_and_canonical{};
+  indexed_and_canonical.txid[31] = 0x82;
+  indexed_and_canonical.index = 1;
+  ASSERT_TRUE(db.put_utxo(indexed_and_canonical, TxOut{222222222, script_pubkey}));
+  ASSERT_TRUE(db.put_script_utxo(sh, indexed_and_canonical, TxOut{222222222, script_pubkey}, 12));
+
+  OutPoint stale_indexed{};
+  stale_indexed.txid[31] = 0x83;
+  stale_indexed.index = 2;
+  ASSERT_TRUE(db.put_script_utxo(sh, stale_indexed, TxOut{999999999, script_pubkey}, 99));
+  ASSERT_TRUE(db.flush());
+
+  const auto spendable = wallet::spendable_p2pkh_utxos_for_pubkey_hash(db, pkh, nullptr);
+  ASSERT_EQ(spendable.size(), 2u);
+  ASSERT_EQ(spendable[0].prevout.value, 222222222u);
+  ASSERT_EQ(spendable[0].outpoint.txid, indexed_and_canonical.txid);
+  ASSERT_EQ(spendable[0].outpoint.index, indexed_and_canonical.index);
+  ASSERT_EQ(spendable[1].prevout.value, 123456789u);
+  ASSERT_EQ(spendable[1].outpoint.txid, canonical_only.txid);
+  ASSERT_EQ(spendable[1].outpoint.index, canonical_only.index);
 }
 
 TEST(test_lightserver_get_transition_by_height_direct) {

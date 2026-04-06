@@ -598,13 +598,9 @@ constexpr const char* kDefaultMainnetValidatorKeyPath = "~/.finalis/mainnet/keys
 std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> spendable_utxos_for_pubkey_hash(
     const finalis::storage::DB& db, const std::array<std::uint8_t, 20>& pkh) {
   std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> out;
-  const auto utxos = db.load_utxos();
-  for (const auto& [op, entry] : utxos) {
-    std::array<std::uint8_t, 20> got{};
-    if (!finalis::is_p2pkh_script_pubkey(entry.out.script_pubkey, &got)) continue;
-    if (got != pkh) continue;
-    out.push_back({op, entry.out});
-  }
+  const auto spendable = finalis::wallet::spendable_p2pkh_utxos_for_pubkey_hash(db, pkh, nullptr);
+  out.reserve(spendable.size());
+  for (const auto& utxo : spendable) out.push_back({utxo.outpoint, utxo.prevout});
   std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
     if (a.second.value != b.second.value) return a.second.value > b.second.value;
     if (a.first.txid != b.first.txid) return a.first.txid < b.first.txid;
