@@ -140,10 +140,19 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
                                                                                  *availability_state, qualified_cfg);
   }
   decision.adaptive = consensus::derive_adaptive_checkpoint_parameters(previous_checkpoint, decision.adaptive.qualified_depth);
+  if (consensus::bootstrap_availability_grace_active(validators, height)) {
+    decision.adaptive.target_committee_size = 1;
+    decision.adaptive.min_eligible_operators = 1;
+    decision.adaptive.min_bond = consensus::genesis_validator_bond_amount();
+    decision.adaptive.qualified_depth = std::max<std::uint64_t>(1, decision.adaptive.qualified_depth);
+    decision.adaptive.target_expand_streak = 0;
+    decision.adaptive.target_contract_streak = 0;
+  }
   decision.min_eligible_operators = decision.adaptive.min_eligible_operators;
   if (availability_state) {
-    decision.eligible_operator_count = availability::count_eligible_operators(
-        *availability_state, consensus::availability_config_with_min_bond(availability_cfg, decision.adaptive.min_bond));
+    decision.eligible_operator_count = consensus::count_eligible_operators_at_checkpoint(
+        validators, height, *availability_state,
+        consensus::availability_config_with_min_bond(availability_cfg, decision.adaptive.min_bond));
   }
   if (decision.min_eligible_operators == 0) return decision;
   if (decision.eligible_operator_count < decision.min_eligible_operators) {
@@ -559,7 +568,8 @@ std::vector<consensus::FinalizedCommitteeCandidate> finalized_committee_candidat
   decision.adaptive = adaptive;
   decision.min_eligible_operators = adaptive.min_eligible_operators;
   if (availability_state) {
-    decision.eligible_operator_count = availability::count_eligible_operators(*availability_state, adaptive_availability_cfg);
+    decision.eligible_operator_count =
+        consensus::count_eligible_operators_at_checkpoint(validators, height, *availability_state, adaptive_availability_cfg);
   }
   if (decision.min_eligible_operators != 0 && decision.eligible_operator_count < decision.min_eligible_operators) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
@@ -2325,11 +2335,14 @@ NodeStatus Node::status() const {
   auto status_availability_cfg = cfg_.availability;
   if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(finalized_height_ + 1); checkpoint.has_value()) {
     status_availability_cfg = consensus::availability_config_with_min_bond(cfg_.availability, checkpoint->adaptive_min_bond);
-    s.availability_eligible_operator_count = availability::count_eligible_operators(availability_state_, status_availability_cfg);
+    s.availability_eligible_operator_count = consensus::count_eligible_operators_at_checkpoint(
+        validators_, finalized_height_ + 1, availability_state_, status_availability_cfg);
     s.availability_below_min_eligible =
         s.adaptive_min_eligible != 0 && s.availability_eligible_operator_count < s.adaptive_min_eligible;
   } else {
-    s.availability_eligible_operator_count = availability::count_eligible_operators(availability_state_, status_availability_cfg);
+    s.availability_eligible_operator_count =
+        consensus::count_eligible_operators_at_checkpoint(validators_, finalized_height_ + 1, availability_state_,
+                                                          status_availability_cfg);
     s.availability_below_min_eligible = false;
   }
   s.availability_state_rebuild_triggered = availability_state_rebuild_triggered_;
@@ -2418,8 +2431,8 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
                               static_cast<std::int64_t>(checkpoint->adaptive_min_eligible);
     snapshot.target_expand_streak = checkpoint->target_expand_streak;
     snapshot.target_contract_streak = checkpoint->target_contract_streak;
-    snapshot.availability_eligible_operator_count =
-        availability::count_eligible_operators(availability_state_, adaptive_availability_cfg);
+    snapshot.availability_eligible_operator_count = consensus::count_eligible_operators_at_checkpoint(
+        validators_, finalized_height_ + 1, availability_state_, adaptive_availability_cfg);
     snapshot.availability_below_min_eligible =
         snapshot.availability_eligible_operator_count < checkpoint->adaptive_min_eligible;
     snapshot.availability_checkpoint_derivation_mode = static_cast<std::uint8_t>(checkpoint->derivation_mode);
@@ -2428,7 +2441,8 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
         checkpoint->fallback_reason == storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING;
   } else {
     snapshot.availability_eligible_operator_count =
-        availability::count_eligible_operators(availability_state_, cfg_.availability);
+        consensus::count_eligible_operators_at_checkpoint(validators_, finalized_height_ + 1, availability_state_,
+                                                          cfg_.availability);
     snapshot.availability_below_min_eligible = false;
   }
   const auto adaptive_summary =

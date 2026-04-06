@@ -158,6 +158,12 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
     const std::optional<storage::FinalizedCommitteeCheckpoint>& checkpoint);
 AdaptiveCheckpointParameters derive_adaptive_checkpoint_parameters(
     const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint, std::uint64_t qualified_depth);
+bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, std::uint64_t height);
+bool bootstrap_operator_grandfathered_for_availability(const ValidatorRegistry& validators, const PubKey32& operator_id,
+                                                       std::uint64_t height);
+std::uint64_t count_eligible_operators_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,
+                                                     const availability::AvailabilityPersistentState& availability_state,
+                                                     const availability::AvailabilityConfig& availability_cfg);
 availability::AvailabilityConfig availability_config_with_min_bond(const availability::AvailabilityConfig& base,
                                                                    std::uint64_t min_bond);
 bool canonical_checkpoints_equal(const storage::FinalizedCommitteeCheckpoint& a,

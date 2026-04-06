@@ -112,8 +112,16 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   decision.adaptive.qualified_depth = qualified_depth_at_checkpoint(state.validators, epoch_start_height, prior_adaptive.min_bond,
                                                                     availability_state, qualified_cfg);
   decision.adaptive = derive_adaptive_checkpoint_parameters(previous_checkpoint, decision.adaptive.qualified_depth);
+  if (bootstrap_availability_grace_active(state.validators, epoch_start_height)) {
+    decision.adaptive.target_committee_size = 1;
+    decision.adaptive.min_eligible_operators = 1;
+    decision.adaptive.min_bond = genesis_validator_bond_amount();
+    decision.adaptive.qualified_depth = std::max<std::uint64_t>(1, decision.adaptive.qualified_depth);
+    decision.adaptive.target_expand_streak = 0;
+    decision.adaptive.target_contract_streak = 0;
+  }
   decision.eligible_operator_count =
-      availability::count_eligible_operators(availability_state,
+      count_eligible_operators_at_checkpoint(state.validators, epoch_start_height, availability_state,
                                              availability_config_with_min_bond(cfg.availability, decision.adaptive.min_bond));
   decision.min_eligible_operators = decision.adaptive.min_eligible_operators;
   if (decision.min_eligible_operators == 0) return decision;
@@ -1660,6 +1668,55 @@ AdaptiveCheckpointParameters derive_adaptive_checkpoint_parameters(
   adaptive.min_eligible_operators = derive_adaptive_min_eligible(adaptive.target_committee_size);
   adaptive.min_bond = derive_adaptive_min_bond(adaptive.target_committee_size, qualified_depth);
   return adaptive;
+}
+
+bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, std::uint64_t height) {
+  const auto active = validators.active_sorted(height);
+  if (active.size() != 1) return false;
+  const auto info = validators.get(active.front());
+  if (!info.has_value()) return false;
+  const bool genesis_bond = info->bond_outpoint.txid == zero_hash() && info->bond_outpoint.index == 0;
+  return info->joined_height == 0 && genesis_bond &&
+         canonical_operator_id(active.front(), *info) == active.front();
+}
+
+bool bootstrap_operator_grandfathered_for_availability(const ValidatorRegistry& validators, const PubKey32& operator_id,
+                                                       std::uint64_t height) {
+  for (const auto& [validator_pubkey, info] : validators.all()) {
+    if (!validators.is_active_for_height(validator_pubkey, height)) continue;
+    if (canonical_operator_id(validator_pubkey, info) != operator_id) continue;
+    const bool genesis_bond = info.bond_outpoint.txid == zero_hash() && info.bond_outpoint.index == 0;
+    if (info.joined_height == 0 && genesis_bond) return true;
+  }
+  return false;
+}
+
+std::uint64_t count_eligible_operators_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,
+                                                     const availability::AvailabilityPersistentState& availability_state,
+                                                     const availability::AvailabilityConfig& availability_cfg) {
+  std::map<PubKey32, const availability::AvailabilityOperatorState*> availability_by_operator;
+  for (const auto& operator_state : availability_state.operators) {
+    availability_by_operator[operator_state.operator_pubkey] = &operator_state;
+  }
+
+  std::set<PubKey32> counted;
+  std::uint64_t out = 0;
+  for (const auto& validator_pubkey : validators.active_sorted(height)) {
+    const auto info = validators.get(validator_pubkey);
+    if (!info.has_value()) continue;
+    const auto operator_id = canonical_operator_id(validator_pubkey, *info);
+    if (!counted.insert(operator_id).second) continue;
+
+    if (bootstrap_operator_grandfathered_for_availability(validators, operator_id, height)) {
+      ++out;
+      continue;
+    }
+
+    const auto availability_it = availability_by_operator.find(operator_id);
+    if (availability_it == availability_by_operator.end()) continue;
+    if (availability::operator_is_eligible(*availability_it->second, availability_cfg)) ++out;
+  }
+  return out;
 }
 
 availability::AvailabilityConfig availability_config_with_min_bond(const availability::AvailabilityConfig& base,

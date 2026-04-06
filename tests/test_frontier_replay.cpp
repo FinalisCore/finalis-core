@@ -1919,10 +1919,41 @@ TEST(test_genesis_checkpoint_metadata_matches_later_checkpoint_semantics) {
   ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
   auto it = state.finalized_committee_checkpoints.find(1);
   ASSERT_TRUE(it != state.finalized_committee_checkpoints.end());
-  ASSERT_EQ(it->second.derivation_mode, storage::FinalizedCommitteeDerivationMode::FALLBACK);
-  ASSERT_EQ(it->second.fallback_reason, storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS);
-  ASSERT_EQ(it->second.availability_min_eligible_operators, consensus::derive_adaptive_min_eligible(16));
-  ASSERT_EQ(it->second.availability_eligible_operator_count, 0u);
+  ASSERT_EQ(it->second.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
+  ASSERT_EQ(it->second.fallback_reason, storage::FinalizedCommitteeFallbackReason::NONE);
+  ASSERT_EQ(it->second.availability_min_eligible_operators, 1u);
+  ASSERT_EQ(it->second.availability_eligible_operator_count, 1u);
+  ASSERT_EQ(it->second.adaptive_target_committee_size, 1u);
+  ASSERT_EQ(it->second.adaptive_min_eligible, 1u);
+  ASSERT_EQ(it->second.adaptive_min_bond, consensus::genesis_validator_bond_amount());
+}
+
+TEST(test_bootstrap_availability_grace_does_not_relax_post_genesis_joiner_requirements) {
+  auto cfg = live_activation_cfg();
+  const auto bootstrap = key_from_byte(141);
+  const auto joiner = key_from_byte(142);
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(bootstrap.public_key);
+
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+
+  state.validators.set_rules(
+      consensus::ValidatorRules{.min_bond = consensus::genesis_validator_bond_amount(), .warmup_blocks = 0, .cooldown_blocks = 0});
+  ASSERT_TRUE(state.validators.register_bond(joiner.public_key, OutPoint{Hash32{9}, 0}, 1,
+                                             consensus::genesis_validator_bond_amount(), &err, joiner.public_key));
+  state.validators.advance_height(1);
+  state.committee_epoch_randomness_cache[5] = state.finalized_randomness;
+
+  storage::FinalizedCommitteeCheckpoint checkpoint;
+  ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
+  ASSERT_EQ(checkpoint.derivation_mode, storage::FinalizedCommitteeDerivationMode::FALLBACK);
+  ASSERT_EQ(checkpoint.fallback_reason, storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS);
+  ASSERT_EQ(checkpoint.availability_eligible_operator_count, 1u);
+  ASSERT_EQ(checkpoint.availability_min_eligible_operators, consensus::derive_adaptive_min_eligible(16));
 }
 
 TEST(test_live_validator_exit_mid_epoch_is_removed_only_at_next_epoch_checkpoint) {
