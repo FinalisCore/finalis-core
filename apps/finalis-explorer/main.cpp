@@ -144,6 +144,7 @@ struct CommitteeResult {
 struct TxInputResult {
   std::string prev_txid;
   std::uint32_t vout{0};
+  std::optional<std::string> address;
 };
 
 struct TxOutputResult {
@@ -166,6 +167,11 @@ struct TxResult {
   std::vector<TxOutputResult> outputs;
   std::uint64_t total_out{0};
   std::optional<std::uint64_t> fee;
+  std::string flow_kind;
+  std::string flow_summary;
+  std::optional<std::string> primary_sender;
+  std::optional<std::string> primary_recipient;
+  std::optional<std::size_t> participant_count;
   bool finalized_only{true};
 };
 
@@ -241,6 +247,8 @@ struct RecentTxResult {
   std::optional<std::string> primary_sender;
   std::optional<std::string> primary_recipient;
   std::optional<std::size_t> recipient_count;
+  std::optional<std::string> flow_kind;
+  std::optional<std::string> flow_summary;
 };
 
 struct Response {
@@ -509,6 +517,62 @@ std::string display_identity(const std::optional<std::string>& value) {
     return "<code>" + html_escape(short_hex(*value)) + "</code>";
   }
   return "<code>" + html_escape(short_hex(*value)) + "</code>";
+}
+
+struct FlowClassification {
+  std::string kind;
+  std::string summary;
+  std::optional<std::string> primary_sender;
+  std::optional<std::string> primary_recipient;
+  std::optional<std::size_t> participant_count;
+};
+
+FlowClassification classify_tx_flow(const std::vector<TxInputResult>& inputs, const std::vector<TxOutputResult>& outputs) {
+  std::set<std::string> input_addresses;
+  std::set<std::string> output_addresses;
+  for (const auto& input : inputs) {
+    if (input.address.has_value() && !input.address->empty()) input_addresses.insert(*input.address);
+  }
+  for (const auto& output : outputs) {
+    if (output.address.has_value() && !output.address->empty()) output_addresses.insert(*output.address);
+  }
+
+  FlowClassification flow;
+  if (!input_addresses.empty()) flow.primary_sender = *input_addresses.begin();
+  if (!output_addresses.empty()) flow.primary_recipient = *output_addresses.begin();
+  flow.participant_count = input_addresses.size() + output_addresses.size();
+
+  const bool same_party = !input_addresses.empty() && !output_addresses.empty() && input_addresses == output_addresses;
+  const bool single_sender = input_addresses.size() == 1;
+  const bool single_recipient = output_addresses.size() == 1;
+  const bool has_change_like_overlap =
+      !input_addresses.empty() && !output_addresses.empty() &&
+      std::any_of(output_addresses.begin(), output_addresses.end(),
+                  [&](const std::string& address) { return input_addresses.count(address) != 0; });
+
+  if (inputs.empty()) {
+    flow.kind = "issuance";
+    flow.summary = outputs.size() <= 1 ? "Protocol or settlement issuance" : "Protocol or settlement issuance fanout";
+  } else if (same_party) {
+    flow.kind = "self-transfer";
+    flow.summary = "Inputs and outputs resolve to the same finalized address set";
+  } else if (single_sender && single_recipient && !has_change_like_overlap) {
+    flow.kind = "direct-transfer";
+    flow.summary = "Single-sender finalized transfer";
+  } else if (single_sender && has_change_like_overlap && output_addresses.size() == 2) {
+    flow.kind = "transfer-with-change";
+    flow.summary = "Likely payment with one external recipient and one change output";
+  } else if (input_addresses.size() > 1 && single_recipient) {
+    flow.kind = "consolidation";
+    flow.summary = "Many finalized inputs converging to one recipient";
+  } else if (single_sender && output_addresses.size() > 2) {
+    flow.kind = "fanout";
+    flow.summary = "One sender distributing finalized outputs to multiple recipients";
+  } else {
+    flow.kind = "multi-party";
+    flow.summary = "Multi-input or multi-recipient finalized transaction";
+  }
+  return flow;
 }
 
 std::string global_finalized_banner() {
@@ -986,14 +1050,21 @@ std::string render_root(const Config& cfg) {
   const auto recent = fetch_recent_tx_results(cfg, 8);
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
-    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Values are taken from finalized transaction data only.</div>";
-    body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>From</th><th>To</th><th>Total Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
+    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>";
+    body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>Flow</th><th>From</th><th>To</th><th>Total Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
     for (const auto& item : recent) {
       body << "<tr><td>" << link_tx(item.txid) << "</td><td>"
            << (item.height.has_value() ? link_transition_height(*item.height) : std::string("<span class=\"muted\">n/a</span>"))
            << "</td><td>"
            << (item.timestamp.has_value() ? html_escape(format_timestamp(*item.timestamp)) : std::string("<span class=\"muted\">n/a</span>"))
-           << "</td><td>" << display_identity(item.primary_sender) << "</td><td>";
+           << "</td><td>";
+      if (item.flow_kind.has_value()) {
+        body << "<strong>" << html_escape(*item.flow_kind) << "</strong>";
+        if (item.flow_summary.has_value()) body << "<div class=\"muted\">" << html_escape(*item.flow_summary) << "</div>";
+      } else {
+        body << "<span class=\"muted\">n/a</span>";
+      }
+      body << "</td><td>" << display_identity(item.primary_sender) << "</td><td>";
       if (item.primary_recipient.has_value()) {
         body << display_identity(item.primary_recipient);
         if (item.recipient_count.has_value() && *item.recipient_count > 1) {
@@ -1452,24 +1523,29 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   std::uint64_t total_in = 0;
   bool fee_known = true;
   for (const auto& in : tx->inputs) {
-    result.inputs.push_back(TxInputResult{finalis::hex_encode32(in.prev_txid), in.prev_index});
+    TxInputResult input_view{finalis::hex_encode32(in.prev_txid), in.prev_index, std::nullopt};
     auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + finalis::hex_encode32(in.prev_txid) + "\"}");
     if (!prev_call.result.has_value() || !prev_call.result->is_object()) {
+      result.inputs.push_back(std::move(input_view));
       fee_known = false;
       continue;
     }
     auto prev_hex = object_string(&*prev_call.result, "tx_hex");
     if (!prev_hex) {
+      result.inputs.push_back(std::move(input_view));
       fee_known = false;
       continue;
     }
     auto prev_bytes = finalis::hex_decode(*prev_hex);
     auto prev_tx = prev_bytes ? finalis::Tx::parse(*prev_bytes) : std::nullopt;
     if (!prev_tx.has_value() || in.prev_index >= prev_tx->outputs.size()) {
+      result.inputs.push_back(std::move(input_view));
       fee_known = false;
       continue;
     }
     total_in += prev_tx->outputs[in.prev_index].value;
+    input_view.address = script_to_address(prev_tx->outputs[in.prev_index].script_pubkey, hrp);
+    result.inputs.push_back(std::move(input_view));
   }
 
   for (const auto& tx_out : tx->outputs) {
@@ -1481,6 +1557,12 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     });
   }
   if (fee_known && total_in >= result.total_out) result.fee = total_in - result.total_out;
+  const auto flow = classify_tx_flow(result.inputs, result.outputs);
+  result.flow_kind = flow.kind;
+  result.flow_summary = flow.summary;
+  result.primary_sender = flow.primary_sender;
+  result.primary_recipient = flow.primary_recipient;
+  result.participant_count = flow.participant_count;
   out.value = std::move(result);
   return out;
 }
@@ -1683,6 +1765,8 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
             item.primary_sender = prev_lookup.value->outputs[first_input.vout].address;
           }
         }
+        item.flow_kind = tx_lookup.value->flow_kind;
+        item.flow_summary = tx_lookup.value->flow_summary;
       }
       out.push_back(std::move(item));
     }
@@ -1916,6 +2000,8 @@ std::string render_recent_tx_json(const std::vector<RecentTxResult>& items) {
         << ",\"total_out\":" << json_u64_or_null(item.total_out)
         << ",\"fee\":" << json_u64_or_null(item.fee)
         << ",\"status_label\":" << json_string_or_null(item.status_label)
+        << ",\"flow_kind\":" << json_string_or_null(item.flow_kind)
+        << ",\"flow_summary\":" << json_string_or_null(item.flow_summary)
         << ",\"primary_sender\":" << json_string_or_null(item.primary_sender)
         << ",\"primary_recipient\":" << json_string_or_null(item.primary_recipient)
         << ",\"recipient_count\":";
@@ -1966,6 +2052,8 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div class=\"note\">Transaction view is finalized-state only. Relay acceptance, mempool state, and pre-finality observations are intentionally not shown here.</div>"
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Txid</div><div class=\"value-cell\">" << mono_value(tx.txid) << "</div>"
+       << "<div>Flow Classification</div><div><strong>" << html_escape(tx.flow_kind) << "</strong><div class=\"muted\">"
+       << html_escape(tx.flow_summary) << "</div></div>"
        << "<div>Status</div><div>" << html_escape(tx.status_label) << "</div>"
        << "<div>Finalized</div><div>" << finalized_text(tx.finalized) << "</div>"
        << "<div>Credit Safe</div><div>" << credit_safe_text(tx.credit_safe) << "</div>"
@@ -1974,6 +2062,9 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   if (!tx.transition_hash.empty()) body << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(tx.transition_hash) << "</div>";
   if (tx.timestamp.has_value()) body << "<div>Timestamp</div><div>" << html_escape(format_timestamp(*tx.timestamp)) << "</div>";
   body << "<div>Finalized Depth</div><div>" << tx.finalized_depth << "</div>";
+  if (tx.primary_sender.has_value()) body << "<div>Primary Sender</div><div>" << display_identity(tx.primary_sender) << "</div>";
+  if (tx.primary_recipient.has_value()) body << "<div>Primary Recipient</div><div>" << display_identity(tx.primary_recipient) << "</div>";
+  if (tx.participant_count.has_value()) body << "<div>Distinct Participants</div><div>" << *tx.participant_count << "</div>";
   body << "<div>Input Count</div><div>" << tx.inputs.size() << "</div>";
   body << "<div>Output Count</div><div>" << tx.outputs.size() << "</div>";
   if (tx.fee.has_value()) body << "<div>Fee</div><div>" << html_escape(format_amount(*tx.fee)) << "</div>";
