@@ -198,6 +198,10 @@ struct AddressHistoryResult {
   std::vector<AddressHistoryItemResult> items;
   bool has_more{false};
   std::optional<std::string> next_cursor;
+  std::optional<std::uint64_t> next_cursor_height;
+  std::optional<std::string> next_cursor_txid;
+  std::optional<std::string> next_page_path;
+  std::size_t loaded_pages{0};
 };
 
 struct AddressResult {
@@ -231,6 +235,12 @@ struct RecentTxResult {
   std::optional<std::uint64_t> total_out;
   std::optional<std::string> status_label;
   std::optional<bool> credit_safe;
+  std::optional<std::size_t> input_count;
+  std::optional<std::size_t> output_count;
+  std::optional<std::uint64_t> fee;
+  std::optional<std::string> primary_sender;
+  std::optional<std::string> primary_recipient;
+  std::optional<std::size_t> recipient_count;
 };
 
 struct Response {
@@ -493,6 +503,14 @@ std::string amount_span(std::uint64_t value, const char* css_class) {
   return "<span class=\"" + std::string(css_class) + "\">" + html_escape(format_amount(value)) + "</span>";
 }
 
+std::string display_identity(const std::optional<std::string>& value) {
+  if (!value.has_value() || value->empty()) return "<span class=\"muted\">unknown</span>";
+  if (finalis::address::decode(*value).has_value()) {
+    return "<code>" + html_escape(short_hex(*value)) + "</code>";
+  }
+  return "<code>" + html_escape(short_hex(*value)) + "</code>";
+}
+
 std::string global_finalized_banner() {
   return "<div class=\"global-banner\">Explorer view is finalized-state only. Only finalized activity is shown.</div>";
 }
@@ -753,7 +771,9 @@ std::string link_transition_height(std::uint64_t height) {
 LookupResult<StatusResult> fetch_status_result(const Config& cfg);
 LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txid_hex);
 LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const std::string& ident);
-LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::string& addr);
+LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::string& addr,
+                                                 std::optional<std::uint64_t> start_after_height = std::nullopt,
+                                                 std::optional<std::string> start_after_txid = std::nullopt);
 LookupResult<SearchResult> fetch_search_result(const Config& cfg, const std::string& query);
 std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size_t max_items);
 LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uint64_t height);
@@ -966,22 +986,39 @@ std::string render_root(const Config& cfg) {
   const auto recent = fetch_recent_tx_results(cfg, 8);
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
-    body << "<div class=\"recent-list\">";
+    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Values are taken from finalized transaction data only.</div>";
+    body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>From</th><th>To</th><th>Total Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
     for (const auto& item : recent) {
-      const std::string tx_path = "/tx/" + item.txid;
-      const std::string api_path = "/api/tx/" + item.txid;
-      body << "<div class=\"recent-item\"><div class=\"recent-item-head\"><div>" << link_tx(item.txid)
-           << "</div><div class=\"copy-button-row\">" << copy_action("Copy Txid", item.txid)
-           << copy_action("Copy Page Path", tx_path) << copy_action("Copy API Path", api_path) << "</div></div>"
-           << "<div class=\"recent-meta\">";
-      if (item.height.has_value()) body << "<div>Height</div><div>" << link_transition_height(*item.height) << "</div>";
-      if (item.timestamp.has_value()) body << "<div>Timestamp</div><div>" << html_escape(format_timestamp(*item.timestamp)) << "</div>";
-      if (item.total_out.has_value()) body << "<div>Total Out</div><div>" << html_escape(format_amount(*item.total_out)) << "</div>";
-      if (item.status_label.has_value()) body << "<div>Status</div><div>" << html_escape(*item.status_label) << "</div>";
-      if (item.credit_safe.has_value()) body << "<div>Credit Safe</div><div>" << credit_safe_text(*item.credit_safe) << "</div>";
-      body << "</div></div>";
+      body << "<tr><td>" << link_tx(item.txid) << "</td><td>"
+           << (item.height.has_value() ? link_transition_height(*item.height) : std::string("<span class=\"muted\">n/a</span>"))
+           << "</td><td>"
+           << (item.timestamp.has_value() ? html_escape(format_timestamp(*item.timestamp)) : std::string("<span class=\"muted\">n/a</span>"))
+           << "</td><td>" << display_identity(item.primary_sender) << "</td><td>";
+      if (item.primary_recipient.has_value()) {
+        body << display_identity(item.primary_recipient);
+        if (item.recipient_count.has_value() && *item.recipient_count > 1) {
+          body << " <span class=\"muted\">+" << (*item.recipient_count - 1) << " more</span>";
+        }
+      } else {
+        body << "<span class=\"muted\">unknown</span>";
+      }
+      body << "</td><td class=\"num\">"
+           << (item.total_out.has_value() ? html_escape(format_amount(*item.total_out)) : std::string("<span class=\"muted\">n/a</span>"))
+           << "</td><td class=\"num\">"
+           << (item.fee.has_value() ? html_escape(format_amount(*item.fee)) : std::string("<span class=\"muted\">n/a</span>"))
+           << "</td><td>";
+      if (item.status_label.has_value()) body << html_escape(*item.status_label);
+      else body << "<span class=\"muted\">n/a</span>";
+      if (item.credit_safe.has_value()) body << "<div class=\"muted\">credit safe: " << credit_safe_text(*item.credit_safe) << "</div>";
+      body << "</td><td>";
+      if (item.input_count.has_value() && item.output_count.has_value()) {
+        body << *item.input_count << " in / " << *item.output_count << " out";
+      } else {
+        body << "<span class=\"muted\">n/a</span>";
+      }
+      body << "</td></tr>";
     }
-    body << "</div>";
+    body << "</tbody></table></div>";
   } else {
     body << "<div class=\"note\">No recent finalized transactions available from the current backend view.</div>";
   }
@@ -1448,7 +1485,9 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   return out;
 }
 
-LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::string& addr) {
+LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::string& addr,
+                                                 std::optional<std::uint64_t> start_after_height,
+                                                 std::optional<std::string> start_after_txid) {
   LookupResult<AddressResult> out;
   const auto decoded = finalis::address::decode(addr);
   if (!decoded.has_value()) {
@@ -1469,8 +1508,8 @@ LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::s
     result.utxos.push_back(AddressUtxoResult{finalis::hex_encode32(u.txid), u.vout, u.value, u.height});
   }
 
-  std::optional<std::uint64_t> cursor_height;
-  std::optional<std::string> cursor_txid;
+  std::optional<std::uint64_t> cursor_height = std::move(start_after_height);
+  std::optional<std::string> cursor_txid = std::move(start_after_txid);
   for (int page = 0; page < 5; ++page) {
     std::ostringstream params;
     params << "{\"scripthash_hex\":\"" << finalis::hex_encode32(scripthash) << "\",\"limit\":100";
@@ -1492,7 +1531,11 @@ LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::s
       result.history.items.push_back(AddressHistoryItemResult{*txid, *height});
     }
     result.history.has_more = object_bool(&*res.result, "has_more").value_or(false);
+    result.history.loaded_pages = static_cast<std::size_t>(page + 1);
     result.history.next_cursor.reset();
+    result.history.next_cursor_height.reset();
+    result.history.next_cursor_txid.reset();
+    result.history.next_page_path.reset();
     const auto* next = res.result->get("next_start_after");
     if (!result.history.has_more) break;
     if (!next || next->is_null() || !next->is_object()) {
@@ -1506,6 +1549,10 @@ LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::s
       return out;
     }
     result.history.next_cursor = std::to_string(*cursor_height) + ":" + *cursor_txid;
+    result.history.next_cursor_height = cursor_height;
+    result.history.next_cursor_txid = cursor_txid;
+    result.history.next_page_path =
+        "/address/" + addr + "?after_height=" + std::to_string(*cursor_height) + "&after_txid=" + *cursor_txid;
   }
 
   result.found = !result.utxos.empty() || !result.history.items.empty();
@@ -1597,7 +1644,8 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
   auto status = fetch_status_result(cfg);
   if (!status.value.has_value()) return out;
   const auto tip = status.value->finalized_height;
-  const std::uint64_t start_height = tip > 4 ? tip - 4 : 0;
+  const std::uint64_t depth_window = 32;
+  const std::uint64_t start_height = tip > depth_window ? tip - depth_window : 0;
   for (std::uint64_t h = tip + 1; h-- > start_height && out.size() < max_items;) {
     std::string err;
     std::string transition_hash_hex;
@@ -1615,6 +1663,26 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
         item.credit_safe = tx_lookup.value->credit_safe;
         item.timestamp = tx_lookup.value->timestamp;
         item.total_out = tx_lookup.value->total_out;
+        item.input_count = tx_lookup.value->inputs.size();
+        item.output_count = tx_lookup.value->outputs.size();
+        item.fee = tx_lookup.value->fee;
+        if (!tx_lookup.value->outputs.empty()) {
+          std::set<std::string> unique_recipients;
+          for (const auto& out_view : tx_lookup.value->outputs) {
+            if (out_view.address.has_value() && !out_view.address->empty()) unique_recipients.insert(*out_view.address);
+          }
+          if (!unique_recipients.empty()) {
+            item.primary_recipient = *unique_recipients.begin();
+            item.recipient_count = unique_recipients.size();
+          }
+        }
+        if (!tx_lookup.value->inputs.empty()) {
+          const auto& first_input = tx_lookup.value->inputs.front();
+          auto prev_lookup = fetch_tx_result(cfg, first_input.prev_txid);
+          if (prev_lookup.value.has_value() && first_input.vout < prev_lookup.value->outputs.size()) {
+            item.primary_sender = prev_lookup.value->outputs[first_input.vout].address;
+          }
+        }
       }
       out.push_back(std::move(item));
     }
@@ -1781,7 +1849,9 @@ std::string render_address_json(const AddressResult& result) {
         << result.history.items[i].height << "}";
   }
   oss << "],\"has_more\":" << json_bool(result.history.has_more) << ",\"next_cursor\":"
-      << json_string_or_null(result.history.next_cursor) << "},\"finalized_only\":true}";
+      << json_string_or_null(result.history.next_cursor)
+      << ",\"next_page_path\":" << json_string_or_null(result.history.next_page_path)
+      << ",\"loaded_pages\":" << result.history.loaded_pages << "},\"finalized_only\":true}";
   return oss.str();
 }
 
@@ -1844,8 +1914,20 @@ std::string render_recent_tx_json(const std::vector<RecentTxResult>& items) {
         << ",\"height\":" << json_u64_or_null(item.height)
         << ",\"timestamp\":" << json_u64_or_null(item.timestamp)
         << ",\"total_out\":" << json_u64_or_null(item.total_out)
+        << ",\"fee\":" << json_u64_or_null(item.fee)
         << ",\"status_label\":" << json_string_or_null(item.status_label)
-        << ",\"credit_safe\":";
+        << ",\"primary_sender\":" << json_string_or_null(item.primary_sender)
+        << ",\"primary_recipient\":" << json_string_or_null(item.primary_recipient)
+        << ",\"recipient_count\":";
+    if (item.recipient_count.has_value()) oss << *item.recipient_count;
+    else oss << "null";
+    oss << ",\"input_count\":";
+    if (item.input_count.has_value()) oss << *item.input_count;
+    else oss << "null";
+    oss << ",\"output_count\":";
+    if (item.output_count.has_value()) oss << *item.output_count;
+    else oss << "null";
+    oss << ",\"credit_safe\":";
     if (item.credit_safe.has_value()) oss << json_bool(*item.credit_safe);
     else oss << "null";
     oss << "}";
@@ -1967,10 +2049,21 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   return page_layout("Transition " + transition.hash, body.str());
 }
 
-std::string render_address(const Config& cfg, const std::string& addr) {
+std::string render_address(const Config& cfg, const std::string& addr, const std::map<std::string, std::string>& query) {
   std::ostringstream body;
   body << "<h1>Address</h1>";
-  auto lookup = fetch_address_result(cfg, addr);
+  std::optional<std::uint64_t> start_after_height;
+  std::optional<std::string> start_after_txid;
+  if (auto it = query.find("after_height"); it != query.end() && !it->second.empty() && is_digits(it->second)) {
+    try {
+      start_after_height = static_cast<std::uint64_t>(std::stoull(it->second));
+    } catch (...) {
+    }
+  }
+  if (auto it = query.find("after_txid"); it != query.end() && is_hex64(it->second)) {
+    start_after_txid = it->second;
+  }
+  auto lookup = fetch_address_result(cfg, addr, start_after_height, start_after_txid);
   if (!lookup.value.has_value()) {
     body << "<div class=\"card\"><div class=\"note\">Lookup failed: "
          << html_escape(lookup.error ? lookup.error->message : "unknown error") << "</div></div>";
@@ -1989,10 +2082,12 @@ std::string render_address(const Config& cfg, const std::string& addr) {
        << "<div>Finalized Activity</div><div>" << (address.found ? "yes" : "no") << "</div>"
        << "<div>Finalized UTXOs</div><div>" << address.utxos.size() << "</div>"
        << "<div>Finalized Balance</div><div>" << html_escape(format_amount(finalized_balance)) << "</div>"
-       << "<div>History Items (Page)</div><div>" << address.history.items.size() << "</div>"
+       << "<div>History Items (View)</div><div>" << address.history.items.size() << "</div>"
+       << "<div>History Pages Loaded</div><div>" << address.history.loaded_pages << "</div>"
        << "<div>History Slice Complete</div><div>" << (address.history.has_more ? "no" : "yes") << "</div>";
-  if (address.history.has_more && address.history.next_cursor.has_value()) {
-    body << "<div>Next Cursor</div><div class=\"value-cell\"><code>" << html_escape(*address.history.next_cursor) << "</code></div>";
+  if (start_after_height.has_value() && start_after_txid.has_value()) {
+    body << "<div>History Position</div><div>Showing older activity after height <code>" << *start_after_height
+         << "</code> and tx <code>" << html_escape(short_hex(*start_after_txid)) << "</code></div>";
   }
   body << "</div><div class=\"summary-actions\">"
        << copy_action("Copy Address", addr)
@@ -2022,9 +2117,18 @@ std::string render_address(const Config& cfg, const std::string& addr) {
   }
   body << "</tbody></table></div></div>";
   if (address.history.has_more) {
-    body << "<div class=\"card\"><div class=\"note\">Additional finalized history exists.";
-    if (address.history.next_cursor.has_value()) body << " Next cursor: <code>" << html_escape(*address.history.next_cursor) << "</code>";
-    body << "</div></div>";
+    body << "<div class=\"card\"><div class=\"note\">Additional finalized history exists. ";
+    if (address.history.next_page_path.has_value()) {
+      body << "<a href=\"" << html_escape(*address.history.next_page_path) << "\">Load older finalized activity</a>";
+    } else {
+      body << "Load another older page from the API.";
+    }
+    body << "</div>";
+    if (address.history.next_cursor.has_value()) {
+      body << "<div style=\"margin-top:10px;\" class=\"muted\">Machine cursor: <code>" << html_escape(*address.history.next_cursor)
+           << "</code></div>";
+    }
+    body << "</div>";
   }
 
   return page_layout("Address " + addr, body.str());
@@ -2188,7 +2292,16 @@ Response handle_request(const Config& cfg, const std::string& req) {
                                     : json_error_response(*result.error);
   }
   if (path.rfind(api_address_prefix, 0) == 0) {
-    auto result = fetch_address_result(cfg, path.substr(api_address_prefix.size()));
+    std::optional<std::uint64_t> start_after_height;
+    std::optional<std::string> start_after_txid;
+    if (auto it = query.find("after_height"); it != query.end() && !it->second.empty() && is_digits(it->second)) {
+      try {
+        start_after_height = static_cast<std::uint64_t>(std::stoull(it->second));
+      } catch (...) {
+      }
+    }
+    if (auto it = query.find("after_txid"); it != query.end() && is_hex64(it->second)) start_after_txid = it->second;
+    auto result = fetch_address_result(cfg, path.substr(api_address_prefix.size()), start_after_height, start_after_txid);
     return result.value.has_value() ? json_response(200, render_address_json(*result.value))
                                     : json_error_response(*result.error);
   }
@@ -2196,7 +2309,7 @@ Response handle_request(const Config& cfg, const std::string& req) {
     return html_response(200, render_transition(cfg, path.substr(transition_prefix.size())));
   }
   if (path.rfind(tx_prefix, 0) == 0) return html_response(200, render_tx(cfg, path.substr(tx_prefix.size())));
-  if (path.rfind(address_prefix, 0) == 0) return html_response(200, render_address(cfg, path.substr(address_prefix.size())));
+  if (path.rfind(address_prefix, 0) == 0) return html_response(200, render_address(cfg, path.substr(address_prefix.size()), query));
   return html_response(404, render_not_found());
 }
 
