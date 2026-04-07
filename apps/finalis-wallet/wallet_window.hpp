@@ -208,6 +208,7 @@ class WalletWindow final : public QMainWindow {
   void show_about();
   void save_connection_settings();
   void validate_send_form();
+  void populate_send_max_amount();
   void submit_send();
   void show_selected_history_detail();
   void show_selected_mint_detail();
@@ -287,6 +288,7 @@ class WalletWindow final : public QMainWindow {
   QLineEdit* send_address_edit_{nullptr};
   QLineEdit* send_amount_edit_{nullptr};
   QLineEdit* send_fee_edit_{nullptr};
+  QPushButton* send_max_button_{nullptr};
   QPushButton* send_review_button_{nullptr};
   QPushButton* send_button_{nullptr};
   QLabel* send_review_status_label_{nullptr};

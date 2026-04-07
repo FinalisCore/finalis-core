@@ -82,10 +82,13 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
 
   auto* actions = new QHBoxLayout();
   actions->setSpacing(8);
+  max_button_ = new QPushButton("Send Max", form_box);
   review_button_ = new QPushButton("Review Send", form_box);
   send_button_ = new QPushButton("Send", form_box);
+  max_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   review_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   send_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+  actions->addWidget(max_button_);
   actions->addWidget(review_button_);
   actions->addWidget(send_button_);
   actions->addStretch(1);

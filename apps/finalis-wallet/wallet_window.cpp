@@ -249,6 +249,15 @@ QString format_coin_amount(std::uint64_t units) {
   return QString("%1.%2 %3").arg(whole).arg(frac_str).arg(kDisplayTicker);
 }
 
+QString format_coin_input_amount(std::uint64_t units) {
+  const std::uint64_t whole = units / consensus::BASE_UNITS_PER_COIN;
+  const std::uint64_t frac = units % consensus::BASE_UNITS_PER_COIN;
+  if (frac == 0) return QString::number(whole);
+  QString frac_str = QString("%1").arg(frac, 8, 10, QChar('0'));
+  while (frac_str.endsWith('0')) frac_str.chop(1);
+  return QString("%1.%2").arg(whole).arg(frac_str);
+}
+
 HistoryFlowClassification classify_wallet_history_flow_impl(std::uint64_t credited, std::uint64_t debited) {
   if (credited > 0 && debited == 0) return {"received", format_coin_amount(credited)};
   if (debited > 0 && credited == 0) return {"sent", format_coin_amount(debited)};
@@ -913,6 +922,7 @@ void WalletWindow::build_ui() {
   send_address_edit_ = send_page_->address_edit();
   send_amount_edit_ = send_page_->amount_edit();
   send_fee_edit_ = send_page_->fee_edit();
+  send_max_button_ = send_page_->max_button();
   send_review_button_ = send_page_->review_button();
   send_button_ = send_page_->send_button();
   send_review_status_label_ = send_page_->review_status_label();
@@ -1019,6 +1029,7 @@ void WalletWindow::build_ui() {
   connect(overview_receive_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(receive_page_); });
   connect(overview_activity_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(activity_page_); });
   connect(overview_open_explorer_button_, &QPushButton::clicked, this, [this]() { open_explorer_home(); });
+  connect(send_max_button_, &QPushButton::clicked, this, [this]() { populate_send_max_amount(); });
   connect(send_review_button_, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button_, &QPushButton::clicked, this, [this]() { submit_send(); });
   connect(validator_action_button_, &QPushButton::clicked, this, [this]() { start_validator_onboarding_clicked(); });
@@ -1089,11 +1100,14 @@ void WalletWindow::build_ui() {
   install_table_copy_menu(mint_redemptions_view_, this);
   connect(quit_action, &QAction::triggered, this, [this]() { close(); });
 
+  send_max_button_->setEnabled(false);
   send_review_button_->setEnabled(false);
   send_button_->setEnabled(false);
   const auto update_send_state = [this]() {
+    const bool wallet_ready = wallet_.has_value();
     const bool ready =
-        wallet_.has_value() && !send_address_edit_->text().trimmed().isEmpty() && !send_amount_edit_->text().trimmed().isEmpty();
+        wallet_ready && !send_address_edit_->text().trimmed().isEmpty() && !send_amount_edit_->text().trimmed().isEmpty();
+    send_max_button_->setEnabled(wallet_ready);
     send_review_button_->setEnabled(ready);
     send_button_->setEnabled(ready);
   };
@@ -1476,8 +1490,9 @@ void WalletWindow::update_wallet_views() {
     header_tip_label_->setText(tip_height_ == 0 ? "Finalized tip: unavailable"
                                                  : QString("Finalized tip: %1").arg(tip_height_));
   }
-  if (send_review_button_ && send_button_) {
+  if (send_review_button_ && send_button_ && send_max_button_) {
     const bool ready = !send_address_edit_->text().trimmed().isEmpty() && !send_amount_edit_->text().trimmed().isEmpty();
+    send_max_button_->setEnabled(true);
     send_review_button_->setEnabled(ready);
     send_button_->setEnabled(ready);
   }
@@ -3262,6 +3277,43 @@ void WalletWindow::validate_send_form() {
   send_review_note_label_->setText(note);
   show_send_inline_status("Review ready");
   if (send_review_warning_label_) send_review_warning_label_->hide();
+}
+
+void WalletWindow::populate_send_max_amount() {
+  if (!ensure_wallet_loaded("Send Max")) return;
+  reset_send_review_panel();
+  std::size_t reserved_excluded = 0;
+  std::size_t pending_reserved_excluded = 0;
+  std::size_t onboarding_reserved_excluded = 0;
+  QString prev_err;
+  auto available_prevs =
+      send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+  if (!available_prevs) {
+    show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
+    show_send_inline_status("Send max unavailable");
+    return;
+  }
+
+  std::uint64_t total_units = 0;
+  for (const auto& [_, prevout] : *available_prevs) total_units += prevout.value;
+  if (total_units <= finalis::DEFAULT_WALLET_SEND_FEE_UNITS) {
+    show_send_inline_warning("Available finalized balance is too small to cover the fixed fee.");
+    show_send_inline_status("Send max unavailable");
+    return;
+  }
+
+  const std::uint64_t max_send_units = total_units - finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+  send_amount_edit_->setText(format_coin_input_amount(max_send_units));
+  QString note = QString("Max spendable amount loaded: %1 after fixed fee %2.")
+                     .arg(format_coin_amount(max_send_units))
+                     .arg(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS));
+  if (reserved_excluded > 0) {
+    note += QString("\nReserved finalized inputs excluded: %1.").arg(reserved_excluded);
+    const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
+    if (!reservation_breakdown.isEmpty()) note += "\n" + reservation_breakdown;
+  }
+  show_send_inline_status(note);
+  if (!send_address_edit_->text().trimmed().isEmpty()) validate_send_form();
 }
 
 void WalletWindow::submit_send() {

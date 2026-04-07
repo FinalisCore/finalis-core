@@ -216,6 +216,51 @@ std::string sha256_hex_string(const std::string& data) {
   return finalis::hex_encode(finalis::Bytes(h.begin(), h.end()));
 }
 
+std::optional<std::uint64_t> parse_coin_amount_text(const std::string& text) {
+  auto trim_local = [](const std::string& in) {
+    const auto first = in.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return std::string{};
+    const auto last = in.find_last_not_of(" \t\r\n");
+    return in.substr(first, last - first + 1);
+  };
+  const std::string trimmed = trim_local(text);
+  if (trimmed.empty()) return std::nullopt;
+  const auto dot = trimmed.find('.');
+  if (dot != std::string::npos && trimmed.find('.', dot + 1) != std::string::npos) return std::nullopt;
+
+  const std::string whole_part = dot == std::string::npos ? trimmed : trimmed.substr(0, dot);
+  const std::string frac_part = dot == std::string::npos ? std::string{} : trimmed.substr(dot + 1);
+  if (!whole_part.empty() &&
+      !std::all_of(whole_part.begin(), whole_part.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+    return std::nullopt;
+  }
+  if (!frac_part.empty() &&
+      !std::all_of(frac_part.begin(), frac_part.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+    return std::nullopt;
+  }
+  if (frac_part.size() > 8) return std::nullopt;
+
+  std::uint64_t units = 0;
+  if (!whole_part.empty()) {
+    try {
+      const std::uint64_t whole = std::stoull(whole_part);
+      units = whole * finalis::consensus::BASE_UNITS_PER_COIN;
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+  if (!frac_part.empty()) {
+    std::string padded = frac_part;
+    padded.append(8 - padded.size(), '0');
+    try {
+      units += std::stoull(padded);
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+  return units;
+}
+
 std::optional<std::string> hmac_sha256_hex(const finalis::Bytes& key, const std::string& data) {
   unsigned int out_len = 0;
   unsigned char out[EVP_MAX_MD_SIZE];
@@ -733,6 +778,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli getWallet [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getBalance [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
      << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--wait-for-sync] [--fee <u64>] [--watch] [--timeout-seconds <n>] [--json]\n"
@@ -2550,6 +2596,153 @@ int main(int argc, char** argv) {
       std::cout << "utxo[" << i << "].value=" << utxos[i].second.value << "\n";
     }
     std::cout << "balance=" << total << "\n";
+    return 0;
+  }
+
+  if (cmd == "send") {
+    std::string db_path = default_mainnet_db_path();
+    std::string file_path = default_mainnet_validator_key_path();
+    std::string passphrase;
+    std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    std::string to_addr;
+    std::string amount_text;
+    std::uint64_t amount_units = 0;
+    std::uint64_t fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    bool amount_units_set = false;
+    bool send_max = false;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--to" && i + 1 < argc) to_addr = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount_text = argv[++i];
+      else if (a == "--amount-units" && i + 1 < argc) {
+        amount_units = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+        amount_units_set = true;
+      } else if (a == "--fee" && i + 1 < argc) {
+        fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      } else if (a == "--max") {
+        send_max = true;
+      }
+    }
+
+    if (to_addr.empty()) {
+      std::cerr << "--to is required\n";
+      return 1;
+    }
+    if (!finalis::address::decode(to_addr).has_value()) {
+      std::cerr << "invalid --to address\n";
+      return 1;
+    }
+    const int amount_modes = (!amount_text.empty() ? 1 : 0) + (amount_units_set ? 1 : 0) + (send_max ? 1 : 0);
+    if (amount_modes != 1) {
+      std::cerr << "choose exactly one of --amount, --amount-units, or --max\n";
+      return 1;
+    }
+    if (!amount_text.empty()) {
+      auto parsed = parse_coin_amount_text(amount_text);
+      if (!parsed.has_value()) {
+        std::cerr << "invalid --amount (use whole coins or up to 8 decimals)\n";
+        return 1;
+      }
+      amount_units = *parsed;
+    }
+    if (!send_max && amount_units == 0) {
+      std::cerr << "amount must be positive\n";
+      return 1;
+    }
+
+    db_path = expand_user(db_path);
+    file_path = expand_user(file_path);
+    finalis::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+    finalis::keystore::ValidatorKey vk;
+    std::string err;
+    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
+      std::cerr << "send failed to load key: " << err << "\n";
+      return 1;
+    }
+
+    std::string utxo_err;
+    const auto available_prevs =
+        positive_value_utxos(spendable_utxos_for_wallet_address(db, vk.address, &utxo_err));
+    if (!utxo_err.empty()) {
+      std::cerr << "send failed to resolve wallet address: " << utxo_err << "\n";
+      return 1;
+    }
+    if (available_prevs.empty()) {
+      std::cerr << "send failed: no spendable finalized inputs are currently available\n";
+      return 1;
+    }
+
+    auto decoded_to = finalis::address::decode(to_addr);
+    auto own_decoded = finalis::address::decode(vk.address);
+    if (!decoded_to.has_value() || !own_decoded.has_value()) {
+      std::cerr << "send failed: invalid wallet or recipient address\n";
+      return 1;
+    }
+
+    std::uint64_t total_available = 0;
+    for (const auto& [_, prevout] : available_prevs) total_available += prevout.value;
+    if (send_max) {
+      if (total_available <= fee) {
+        std::cerr << "send failed: available finalized balance is too small to cover fee\n";
+        return 1;
+      }
+      amount_units = total_available - fee;
+    }
+
+    auto plan = finalis::plan_wallet_p2pkh_send(
+        available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
+        finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), amount_units, fee,
+        finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
+    if (!plan.has_value()) {
+      std::cerr << "send planning failed: " << err << "\n";
+      return 1;
+    }
+
+    auto tx = finalis::build_signed_p2pkh_tx_multi_input(
+        plan->selected_prevs, finalis::Bytes(vk.privkey.begin(), vk.privkey.end()), plan->outputs, &err);
+    if (!tx.has_value()) {
+      std::cerr << "send build failed: " << err << "\n";
+      return 1;
+    }
+
+    auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, tx->serialize(), &err);
+    std::cout << "db=" << db_path << "\n";
+    std::cout << "key_file=" << file_path << "\n";
+    std::cout << "address=" << vk.address << "\n";
+    std::cout << "recipient=" << to_addr << "\n";
+    std::cout << "amount=" << amount_units << "\n";
+    std::cout << "fee=" << plan->applied_fee_units << "\n";
+    std::cout << "change=" << plan->change_units << "\n";
+    std::cout << "inputs_selected=" << plan->selected_prevs.size() << "\n";
+    std::cout << "rpc_url=" << rpc_url << "\n";
+    std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
+
+    if (!err.empty() && result.outcome == finalis::lightserver::BroadcastOutcome::Ambiguous) {
+      std::cout << "accepted=unknown\n";
+      std::cout << "error_message=" << err << "\n";
+      return 1;
+    }
+    if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
+      std::cout << "accepted=no\n";
+      if (!result.error_code.empty()) std::cout << "error_code=" << result.error_code << "\n";
+      if (!result.error_message.empty()) std::cout << "error_message=" << result.error_message << "\n";
+      else if (!result.error.empty()) std::cout << "error_message=" << result.error << "\n";
+      std::cout << "retryable=" << (result.retryable ? "yes" : "no") << "\n";
+      std::cout << "retry_class=" << result.retry_class << "\n";
+      return 1;
+    }
+
+    std::cout << "accepted=yes\n";
+    std::cout << "status=accepted_for_relay\n";
     return 0;
   }
 
