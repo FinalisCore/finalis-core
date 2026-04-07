@@ -174,12 +174,27 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
 }
 
 std::size_t ingress_record_wire_size(const p2p::IngressRecordMsg& record) {
-  return record.certificate.serialize().size() + record.tx_bytes.size() + 24;
+  constexpr std::size_t kIngressRecordOverhead = 24;
+  const std::size_t cert_size = record.certificate.serialize().size();
+  if (cert_size > std::numeric_limits<std::size_t>::max() - record.tx_bytes.size()) {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  const std::size_t payload_size = cert_size + record.tx_bytes.size();
+  if (payload_size > std::numeric_limits<std::size_t>::max() - kIngressRecordOverhead) {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  return payload_size + kIngressRecordOverhead;
 }
 
 std::size_t ingress_range_wire_size(const p2p::IngressRangeMsg& msg) {
   std::size_t total = 32;
-  for (const auto& record : msg.records) total += ingress_record_wire_size(record);
+  for (const auto& record : msg.records) {
+    const std::size_t record_size = ingress_record_wire_size(record);
+    if (record_size > std::numeric_limits<std::size_t>::max() - total) {
+      return std::numeric_limits<std::size_t>::max();
+    }
+    total += record_size;
+  }
   return total;
 }
 
@@ -1183,10 +1198,14 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
   std::set<std::string> desired_utxos;
   desired_utxos.clear();
   for (const auto& [op, _] : state.utxos) desired_utxos.insert(storage::key_utxo(op));
+  std::vector<std::string> utxos_to_erase;
   for (const auto& [key, _] : db.scan_prefix(utxo_prefix)) {
     if (desired_utxos.find(key) == desired_utxos.end()) {
-      if (!db.erase(key)) return false;
+      utxos_to_erase.push_back(key);
     }
+  }
+  for (const auto& key : utxos_to_erase) {
+    if (!db.erase(key)) return false;
   }
   for (const auto& [op, entry] : state.utxos) {
     if (!db.put_utxo(op, entry.out)) return false;
@@ -1199,10 +1218,14 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
     const auto scripthash = crypto::sha256(entry.out.script_pubkey);
     desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
   }
+  std::vector<std::string> script_utxos_to_erase;
   for (const auto& [key, _] : db.scan_prefix(script_utxo_prefix)) {
     if (desired_script_utxos.find(key) == desired_script_utxos.end()) {
-      if (!db.erase(key)) return false;
+      script_utxos_to_erase.push_back(key);
     }
+  }
+  for (const auto& key : script_utxos_to_erase) {
+    if (!db.erase(key)) return false;
   }
   for (const auto& [op, entry] : state.utxos) {
     const auto scripthash = crypto::sha256(entry.out.script_pubkey);
@@ -2085,17 +2108,24 @@ bool Node::start_lightserver_child() {
     return true;
   }
 
-  if (lightserver_pid_ > 0) {
-    log_line("lightserver startup skipped reason=already-running pid=" + std::to_string(lightserver_pid_));
-    return true;
+  {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    if (lightserver_pid_ > 0) {
+      log_line("lightserver startup skipped reason=already-running pid=" + std::to_string(lightserver_pid_));
+      return true;
+    }
   }
 
   const std::string mode = lightserver_mode_name();
   const bool public_lightserver = lightserver_is_public();
   const std::string exposure = public_lightserver ? "public" : "local-only";
   bool sibling_found = false;
-  lightserver_exec_path_ = lightserver_binary_path(&sibling_found);
-  log_line("lightserver enabled mode=" + mode + " exec=" + lightserver_exec_path_ +
+  const std::string binary = lightserver_binary_path(&sibling_found);
+  {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    lightserver_exec_path_ = binary;
+  }
+  log_line("lightserver enabled mode=" + mode + " exec=" + binary +
            " exec_source=" + (sibling_found ? "sibling" : "PATH") + " bind=" + cfg_.lightserver_bind +
            " port=" + std::to_string(cfg_.lightserver_port) + " exposure=" + exposure);
 
@@ -2113,7 +2143,6 @@ bool Node::start_lightserver_child() {
     return false;
   }
 
-  const std::string binary = lightserver_exec_path_;
   std::vector<std::string> args{
       binary,
       "--db",
@@ -2146,11 +2175,15 @@ bool Node::start_lightserver_child() {
     _exit(127);
   }
 
-  lightserver_pid_ = static_cast<int>(pid);
+  {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    lightserver_pid_ = static_cast<int>(pid);
+  }
   ::usleep(200 * 1000);
   int status = 0;
   const pid_t waited = ::waitpid(pid, &status, WNOHANG);
   if (waited == pid) {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
     lightserver_pid_ = -1;
     std::ostringstream oss;
     oss << "lightserver startup failed mode=" << mode << " pid=" << pid;
@@ -2172,9 +2205,13 @@ bool Node::start_lightserver_child() {
 }
 
 void Node::stop_lightserver_child() {
-  if (lightserver_pid_ <= 0) return;
-  const pid_t pid = static_cast<pid_t>(lightserver_pid_);
-  lightserver_pid_ = -1;
+  pid_t pid = -1;
+  {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    if (lightserver_pid_ <= 0) return;
+    pid = static_cast<pid_t>(lightserver_pid_);
+    lightserver_pid_ = -1;
+  }
   int status = 0;
   const pid_t already = ::waitpid(pid, &status, WNOHANG);
   if (already == pid) {
@@ -2199,16 +2236,26 @@ void Node::stop_lightserver_child() {
 }
 
 bool Node::reap_lightserver_child(bool verbose) {
-  if (lightserver_pid_ <= 0) return false;
+  pid_t pid = -1;
+  {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    if (lightserver_pid_ <= 0) return false;
+    pid = static_cast<pid_t>(lightserver_pid_);
+  }
   int status = 0;
-  const pid_t pid = static_cast<pid_t>(lightserver_pid_);
   const pid_t waited = ::waitpid(pid, &status, WNOHANG);
   if (waited == 0) return false;
   if (waited < 0) {
-    if (errno == ECHILD) lightserver_pid_ = -1;
+    if (errno == ECHILD) {
+      std::lock_guard<std::mutex> lk(lightserver_mu_);
+      if (lightserver_pid_ == pid) lightserver_pid_ = -1;
+    }
     return false;
   }
-  lightserver_pid_ = -1;
+  {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    if (lightserver_pid_ == pid) lightserver_pid_ = -1;
+  }
   if (verbose) {
     std::ostringstream oss;
     oss << "lightserver exited pid=" << pid;
@@ -5865,6 +5912,16 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
 }
 
 bool Node::check_and_record_proposer_equivocation_locked(const FrontierTransition& transition) {
+  constexpr std::uint64_t kObservedProposalRetentionDepth = 512;
+  const std::uint64_t min_height_to_keep =
+      finalized_height_ > kObservedProposalRetentionDepth ? (finalized_height_ - kObservedProposalRetentionDepth) : 0;
+  for (auto it = observed_proposals_.begin(); it != observed_proposals_.end();) {
+    if (std::get<0>(it->first) < min_height_to_keep) {
+      it = observed_proposals_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   const auto key = std::make_tuple(transition.height, transition.round, transition.leader_pubkey);
   const auto new_transition_id = transition.transition_id();
   auto it = observed_proposals_.find(key);

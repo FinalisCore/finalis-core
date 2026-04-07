@@ -600,6 +600,7 @@ class Node {
   std::optional<FrontierProposal> last_broadcast_finalized_frontier_;
   std::optional<FinalityCertificate> last_broadcast_finality_certificate_;
   bool restart_debug_{false};
+  mutable std::mutex lightserver_mu_;
   int lightserver_pid_{-1};
   std::string lightserver_exec_path_;
 };
