@@ -10,6 +10,7 @@
 #include "codec/bytes.hpp"
 #include "consensus/committee_schedule.hpp"
 #include "consensus/finalized_committee.hpp"
+#include "consensus/ingress.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/randomness.hpp"
 #include "consensus/state_commitment.hpp"
@@ -1043,6 +1044,32 @@ std::uint64_t genesis_validator_bond_amount() { return kAdaptiveMinBondFloor; }
 bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                           const CanonicalFrontierRecord& record, FrontierExecutionResult* recomputed,
                                           std::string* error) {
+  const auto reconstruct_legacy_frontier_cursor =
+      [&](const std::vector<Bytes>& ordered_records, FrontierVector* next_vector, FrontierLaneRoots* next_lane_roots,
+          std::string* cursor_error) -> bool {
+    if (!next_vector || !next_lane_roots) {
+      if (cursor_error) *cursor_error = "missing-legacy-frontier-cursor-output";
+      return false;
+    }
+    *next_vector = prev.finalized_frontier_vector;
+    *next_lane_roots = prev.finalized_lane_roots;
+    for (const auto& raw : ordered_records) {
+      const auto tx = Tx::parse(raw);
+      if (!tx.has_value()) {
+        if (cursor_error) *cursor_error = "frontier-certified-ingress-parse-failed";
+        return false;
+      }
+      const auto lane = assign_ingress_lane(*tx);
+      if (lane >= finalis::INGRESS_LANE_COUNT) {
+        if (cursor_error) *cursor_error = "frontier-certified-ingress-lane-out-of-range";
+        return false;
+      }
+      ++next_vector->lane_max_seq[lane];
+      (*next_lane_roots)[lane] = compute_lane_root_append((*next_lane_roots)[lane], crypto::sha256d(raw));
+    }
+    return true;
+  };
+
   const auto build_validation_context = [&](std::uint64_t height) {
     const auto min_bond_amount = effective_validator_min_bond_for_height(cfg, prev, height);
     return SpecialValidationContext{
@@ -1131,6 +1158,17 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
       if (error && error->empty()) *error = "frontier-execution-failed";
       return false;
     }
+    FrontierVector reconstructed_next_vector{};
+    FrontierLaneRoots reconstructed_next_lane_roots{};
+    if (!reconstruct_legacy_frontier_cursor(record.ordered_records, &reconstructed_next_vector, &reconstructed_next_lane_roots,
+                                            error)) {
+      return false;
+    }
+    result.transition.prev_vector = prev.finalized_frontier_vector;
+    result.transition.next_vector = reconstructed_next_vector;
+    result.transition.ingress_commitment =
+        frontier_ingress_commitment(result.transition.prev_vector, result.transition.next_vector, reconstructed_next_lane_roots);
+    result.next_lane_roots = reconstructed_next_lane_roots;
     if (result.transition.prev_frontier != record.transition.prev_frontier) {
       if (error) *error = "frontier-prev-frontier-recompute-mismatch";
       return false;

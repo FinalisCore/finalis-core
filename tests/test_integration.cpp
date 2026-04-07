@@ -222,6 +222,9 @@ std::string epoch_db_key_suffix(std::uint64_t epoch) {
 
 std::string csafe_db_key(std::uint64_t height) { return "CSAFE:" + epoch_db_key_suffix(height); }
 
+std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id);
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
+
 Bytes serialize_test_finalized_write_marker(std::uint64_t height, const Hash32& block_id) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -266,7 +269,8 @@ consensus::CanonicalDerivationConfig test_canonical_cfg(const node::NodeConfig& 
 }
 
 bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::DB& db, const std::vector<Bytes>& ordered_records,
-                                          consensus::CanonicalDerivedState* derived_out = nullptr) {
+                                          consensus::CanonicalDerivedState* derived_out = nullptr,
+                                          bool store_legacy_zero_vectors = false) {
   const auto derivation_cfg = test_canonical_cfg(cfg, db);
   auto gj = db.get(storage::key_genesis_json());
   if (!gj.has_value()) return false;
@@ -327,15 +331,23 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
       if (!db.put_lane_state(state.lane, state)) return false;
     }
   }
-  if (!db.put_frontier_transition(exec_result.transition.transition_id(), exec_result.transition.serialize())) return false;
-  if (!db.map_height_to_frontier_transition(1, exec_result.transition.transition_id())) return false;
+  FrontierTransition stored_transition = exec_result.transition;
+  Hash32 stored_transition_id = stored_transition.transition_id();
+  if (store_legacy_zero_vectors) {
+    stored_transition.prev_vector = FrontierVector{};
+    stored_transition.next_vector = FrontierVector{};
+    stored_transition.ingress_commitment = zero_hash();
+    stored_transition_id = stored_transition.transition_id();
+  }
+  if (!db.put_frontier_transition(stored_transition_id, stored_transition.serialize())) return false;
+  if (!db.map_height_to_frontier_transition(1, stored_transition_id)) return false;
   const auto committee = consensus::canonical_committee_for_height_round(derivation_cfg, genesis_derived, 1, 0);
   const auto quorum = consensus::quorum_threshold(committee.size());
   if (committee.size() < quorum || quorum == 0) return false;
   FinalityCertificate cert;
   cert.height = 1;
   cert.round = 0;
-  cert.frontier_transition_id = exec_result.transition.transition_id();
+  cert.frontier_transition_id = stored_transition_id;
   cert.quorum_threshold = static_cast<std::uint32_t>(quorum);
   cert.committee_members = committee;
   const auto msg = vote_signing_message(cert.height, cert.round, cert.frontier_transition_id);
@@ -350,9 +362,9 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
     cert.signatures.push_back(FinalitySig{signer_pub, *sig});
   }
   if (!db.put_finality_certificate(cert)) return false;
-  if (!db.set_height_hash(1, exec_result.transition.transition_id())) return false;
+  if (!db.set_height_hash(1, stored_transition_id)) return false;
   if (!db.set_finalized_frontier_height(1)) return false;
-  db.set_tip(storage::TipState{1, exec_result.transition.transition_id()});
+  db.set_tip(storage::TipState{1, stored_transition_id});
   if (!db.put("REPLAY:MODE", Bytes{'f', 'r', 'o', 'n', 't', 'i', 'e', 'r'})) return false;
 
   if (derived_out) {
