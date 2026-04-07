@@ -800,5 +800,122 @@ https://github.com/finalis-core/finalis-core
 
 ---
 
+Here is a concise section for your whitepaper explaining the mint:
+
+---
+
+## Appendix D: Chaumian Mint Service (finalis-mint)
+
+### D.1 Overview
+
+`finalis-mint` is a standalone Chaumian eCash mint service that operates alongside the Finalis Core consensus node. It enables **privacy-preserving digital cash** by issuing blinded notes backed by on-chain FLS reserves.
+
+The service is **intentionally separate from consensus** — it uses the lightserver RPC to read finalized state and broadcast transactions, but does not participate in block production or validation.
+
+### D.2 How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MINT OPERATION FLOW                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   USER                                   MINT                               │
+│    │                                       │                                │
+│    │  1. Deposit FLS to reserve address    │                                │
+│    ├──────────────────────────────────────►│                                │
+│    │                                       │                                │
+│    │  2. Request blind signature           │                                │
+│    │     (send blinded message)            │                                │
+│    ├──────────────────────────────────────►│                                │
+│    │                                       │                                │
+│    │  3. Receive signed blinded message    │                                │
+│    │◄──────────────────────────────────────┤                                │
+│    │                                       │                                │
+│    │  4. Unblind to obtain note            │                                │
+│    │     (spendable digital cash)          │                                │
+│    │                                       │                                │
+│    │  ... off-chain transfers ...          │                                │
+│    │                                       │                                │
+│    │  5. Redeem note for FLS               │                                │
+│    ├──────────────────────────────────────►│                                │
+│    │                                       │                                │
+│    │  6. Receive FLS to address            │                                │
+│    │◄──────────────────────────────────────┤                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### D.3 Blind Signatures (Privacy Guarantee)
+
+The mint uses RSA blind signatures, first proposed by David Chaum in 1983. The protocol ensures:
+
+```
+User:   blinded = message × r^e mod n
+Mint:   signed_blinded = blinded^d mod n
+User:   signature = signed_blinded / r mod n
+
+Result: signature is a valid RSA signature on message
+Property: Mint never learns message
+```
+
+**Implication:** The mint cannot link issuance to redemption. Each note is anonymous.
+
+### D.4 Reserve Management
+
+The mint maintains an on-chain reserve wallet. Key policies:
+
+| Policy | Value | Purpose |
+|--------|-------|---------|
+| `RESERVE_MAX_INPUTS` | 8 | Limit per redemption transaction |
+| `RESERVE_CONSOLIDATE_UTXO_COUNT` | 12 | Trigger consolidation when fragmented |
+| `RESERVE_AUTO_PAUSE_LOW_RESERVE` | 10,000 FLS | Auto-pause redemptions when low |
+| `RESERVE_EXHAUSTION_BUFFER` | 10,000 FLS | Warn when reserve near exhaustion |
+
+Redemptions are processed only after the lightserver confirms finalization — no reorg risk.
+
+### D.5 Security Properties
+
+| Property | Implementation |
+|----------|----------------|
+| **Double-spend prevention** | Persistent note state (spent flags) |
+| **Auditability** | Signed reserve attestations via `/audit/export` |
+| **Operator authentication** | HMAC-signed requests |
+| **Secret management** | Pluggable backends (dir, env, command) |
+| **Retry resilience** | Persistent delivery job queue for notifiers |
+
+### D.6 Current Status
+
+`finalis-mint` is a **development and testing tool**, not a production system. The README explicitly states:
+
+> "It is a narrow scaffold, not a production mint: file-backed state, deterministic RSA blind-signing for development/testing, no federation, no multi-operator quorum custody."
+
+### D.7 Future Potential
+
+With additional work, the mint could become a production privacy layer:
+
+| Required Change | Purpose |
+|-----------------|---------|
+| HSM or secure key store | Replace seed-derived RSA |
+| Database replication | Replace single-file state |
+| Rate limiting | Prevent DoS attacks |
+| TLS for all endpoints | Secure communication |
+| N-of-M threshold signatures | Federation (multi-operator) |
+
+### D.8 Relationship to Consensus
+
+The mint **depends on** Finalis Core for:
+- Finalized state reads (deposit confirmation)
+- Transaction broadcast (redemptions)
+- Reserve wallet management
+
+The mint **does not affect** consensus:
+- No mint transactions enter the mempool (except redemptions)
+- The mint has no special privileges
+- The chain operates identically with or without the mint
+
+---
+
+**Summary:** `finalis-mint` is a Chaumian eCash service that demonstrates privacy-preserving digital cash on top of Finalis Core. It is currently a development tool, designed as a foundation for future production privacy layers.
+
 *This whitepaper is provided for informational purposes only. The Finalis Core project is in active development; specifications may change. Always refer to the latest code and documentation.*
 ```
