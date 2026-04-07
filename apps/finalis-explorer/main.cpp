@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -312,12 +313,25 @@ Response json_response(int status, std::string body) {
 
 Response json_error_response(const ApiError& err) { return json_response(err.http_status, error_json(err)); }
 
+std::string sanitize_redirect_location(const std::string& location) {
+  if (location.empty() || location.front() != '/') return "/";
+  std::string out;
+  out.reserve(location.size());
+  for (char c : location) {
+    if (c == '\r' || c == '\n') return "/";
+    const auto uc = static_cast<unsigned char>(c);
+    if (uc < 0x20 && c != '\t') return "/";
+    out.push_back(c);
+  }
+  return out;
+}
+
 Response redirect_response(const std::string& location) {
   Response out;
   out.status = 302;
   out.content_type = "text/plain; charset=utf-8";
   out.body = "Found";
-  out.location = location;
+  out.location = sanitize_redirect_location(location);
   return out;
 }
 
@@ -2026,6 +2040,14 @@ bool write_all(int fd, const std::string& data) {
   return true;
 }
 
+void apply_socket_timeouts(int fd) {
+  timeval tv{};
+  tv.tv_sec = 15;
+  tv.tv_usec = 0;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 std::optional<std::string> read_http_request(int fd) {
   std::string req;
   std::array<char, 4096> buf{};
@@ -2227,6 +2249,7 @@ int main(int argc, char** argv) {
       if (g_stop) break;
       continue;
     }
+    apply_socket_timeouts(fd);
     auto req = read_http_request(fd);
     const Response resp_obj =
         req.has_value() ? handle_request(*cfg, *req)

@@ -1442,6 +1442,156 @@ TEST(test_lightserver_history_page_is_deterministic) {
   ASSERT_TRUE(resp2.find(txid3_hex) != std::string::npos);
 }
 
+TEST(test_lightserver_get_utxos_supports_paged_response) {
+  const std::string base = "/tmp/finalis_light_utxos_paged";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-utxos-page";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
+
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const auto script_pubkey = address::p2pkh_script_pubkey(pkh);
+  const Hash32 sh = crypto::sha256(script_pubkey);
+
+  OutPoint op1{};
+  op1.txid[31] = 0x11;
+  op1.index = 0;
+  OutPoint op2{};
+  op2.txid[31] = 0x22;
+  op2.index = 1;
+  OutPoint op3{};
+  op3.txid[31] = 0x33;
+  op3.index = 0;
+  ASSERT_TRUE(db.put_utxo(op1, TxOut{11, script_pubkey}));
+  ASSERT_TRUE(db.put_utxo(op2, TxOut{22, script_pubkey}));
+  ASSERT_TRUE(db.put_utxo(op3, TxOut{33, script_pubkey}));
+  ASSERT_TRUE(db.put_tx_index(op1.txid, 7, 0, Bytes{0x01}));
+  ASSERT_TRUE(db.put_tx_index(op2.txid, 7, 0, Bytes{0x02}));
+  ASSERT_TRUE(db.put_tx_index(op3.txid, 8, 0, Bytes{0x03}));
+  ASSERT_TRUE(db.put_script_utxo(sh, op1, TxOut{11, script_pubkey}, 7));
+  ASSERT_TRUE(db.put_script_utxo(sh, op2, TxOut{22, script_pubkey}, 7));
+  ASSERT_TRUE(db.put_script_utxo(sh, op3, TxOut{33, script_pubkey}, 8));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const std::string page1 =
+      std::string(R"({"jsonrpc":"2.0","id":171,"method":"get_utxos","params":{"scripthash_hex":")") + hex_encode32(sh) +
+      R"(","limit":2}})";
+  const auto resp1 = ls.handle_rpc_for_test(page1);
+  ASSERT_TRUE(resp1.find("\"has_more\":true") != std::string::npos);
+  ASSERT_TRUE(resp1.find("\"ordering\":\"height_asc_txid_asc_vout_asc\"") != std::string::npos);
+  ASSERT_TRUE(resp1.find(hex_encode32(op1.txid)) != std::string::npos);
+  ASSERT_TRUE(resp1.find(hex_encode32(op2.txid)) != std::string::npos);
+  ASSERT_TRUE(resp1.find(hex_encode32(op3.txid)) == std::string::npos);
+  ASSERT_TRUE(resp1.find("\"next_start_after\":{\"height\":7,\"txid\":\"" + hex_encode32(op2.txid) + "\",\"vout\":1}") !=
+              std::string::npos);
+
+  const std::string page2 =
+      std::string(R"({"jsonrpc":"2.0","id":172,"method":"get_utxos","params":{"scripthash_hex":")") + hex_encode32(sh) +
+      R"(","limit":2,"start_after":{"height":7,"txid":")" + hex_encode32(op2.txid) + R"(","vout":1}}})";
+  const auto resp2 = ls.handle_rpc_for_test(page2);
+  ASSERT_TRUE(resp2.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(resp2.find(hex_encode32(op1.txid)) == std::string::npos);
+  ASSERT_TRUE(resp2.find(hex_encode32(op2.txid)) == std::string::npos);
+  ASSERT_TRUE(resp2.find(hex_encode32(op3.txid)) != std::string::npos);
+}
+
+TEST(test_lightserver_get_history_supports_paged_response) {
+  const std::string base = "/tmp/finalis_light_history_paged";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-history-page-support";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
+
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const Hash32 sh = crypto::sha256(address::p2pkh_script_pubkey(pkh));
+  Hash32 txid1{};
+  Hash32 txid2{};
+  Hash32 txid3{};
+  txid1[31] = 0x01;
+  txid2[31] = 0x02;
+  txid3[31] = 0x03;
+  ASSERT_TRUE(db.add_script_history(sh, 7, txid2));
+  ASSERT_TRUE(db.add_script_history(sh, 7, txid1));
+  ASSERT_TRUE(db.add_script_history(sh, 8, txid3));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const std::string page1 =
+      std::string(R"({"jsonrpc":"2.0","id":173,"method":"get_history","params":{"scripthash_hex":")") + hex_encode32(sh) +
+      R"(","limit":2}})";
+  const auto resp1 = ls.handle_rpc_for_test(page1);
+  const auto txid1_hex = hex_encode32(txid1);
+  const auto txid2_hex = hex_encode32(txid2);
+  const auto txid3_hex = hex_encode32(txid3);
+  ASSERT_TRUE(resp1.find("\"has_more\":true") != std::string::npos);
+  ASSERT_TRUE(resp1.find(txid1_hex) != std::string::npos);
+  ASSERT_TRUE(resp1.find(txid2_hex) != std::string::npos);
+  ASSERT_TRUE(resp1.find(txid3_hex) == std::string::npos);
+
+  const std::string page2 =
+      std::string(R"({"jsonrpc":"2.0","id":174,"method":"get_history","params":{"scripthash_hex":")") + hex_encode32(sh) +
+      R"(","limit":2,"start_after":{"height":7,"txid":")" + txid2_hex + R"("}}})";
+  const auto resp2 = ls.handle_rpc_for_test(page2);
+  ASSERT_TRUE(resp2.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(resp2.find(txid1_hex) == std::string::npos);
+  ASSERT_TRUE(resp2.find(txid2_hex) == std::string::npos);
+  ASSERT_TRUE(resp2.find(txid3_hex) != std::string::npos);
+}
+
 TEST(test_snapshot_export_import_bootstraps_imported_db) {
   const std::string base = unique_test_base("/tmp/finalis_light_snapshot");
   auto cluster = make_cluster(base);

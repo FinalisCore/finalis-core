@@ -612,6 +612,13 @@ TEST(test_explorer_api_search_contract) {
   ASSERT_TRUE(invalid.body.find("\"code\":\"invalid_query\"") != std::string::npos);
 }
 
+TEST(test_explorer_redirect_sanitizes_location_header) {
+  const auto resp = redirect_response("/tx/abc\r\nX-Evil: yes");
+  const auto wire = http_response(resp);
+  ASSERT_TRUE(wire.find("Location: /\r\n") != std::string::npos);
+  ASSERT_TRUE(wire.find("X-Evil: yes") == std::string::npos);
+}
+
 TEST(test_explorer_address_pagination_contract) {
   ExplorerFixture fx;
 

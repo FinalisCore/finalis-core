@@ -3,10 +3,12 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <array>
 #include <cctype>
+#include <limits>
 #include <sstream>
 
 #include "codec/bytes.hpp"
@@ -21,6 +23,26 @@ struct ParsedHttpUrl {
   std::string path;
 };
 
+struct UtxoCursor {
+  std::uint64_t height{0};
+  Hash32 txid{};
+  std::uint32_t vout{0};
+};
+
+struct UtxoPageView {
+  std::vector<UtxoView> items;
+  bool has_more{false};
+  std::optional<UtxoCursor> next_start_after;
+};
+
+void apply_socket_timeouts(int fd) {
+  timeval tv{};
+  tv.tv_sec = 15;
+  tv.tv_usec = 0;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 std::optional<int> connect_tcp(const std::string& host, std::uint16_t port) {
   addrinfo hints{};
   hints.ai_family = AF_INET;
@@ -31,6 +53,7 @@ std::optional<int> connect_tcp(const std::string& host, std::uint16_t port) {
   for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
     fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
     if (fd < 0) continue;
+    apply_socket_timeouts(fd);
     if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
     ::close(fd);
     fd = -1;
@@ -138,6 +161,62 @@ std::optional<std::string> object_string(const minijson::Value* obj, const char*
   const auto* value = obj->get(key);
   if (!value) return std::nullopt;
   return value->as_string();
+}
+
+std::optional<std::uint64_t> object_u64(const minijson::Value* obj, const char* key);
+std::optional<bool> object_bool(const minijson::Value* obj, const char* key);
+std::optional<Hash32> parse_hex32_field(const std::string& hex);
+
+std::optional<UtxoView> parse_utxo_entry(const minijson::Value& entry) {
+  auto txid_hex = object_string(&entry, "txid");
+  auto vout = object_u64(&entry, "vout");
+  auto value = object_u64(&entry, "value");
+  auto height = object_u64(&entry, "height");
+  auto spk_hex = object_string(&entry, "script_pubkey_hex");
+  if (!txid_hex || !vout || !value || !height || !spk_hex) return std::nullopt;
+  auto txid = parse_hex32_field(*txid_hex);
+  auto spk = hex_decode(*spk_hex);
+  if (!txid || !spk || *vout > std::numeric_limits<std::uint32_t>::max()) return std::nullopt;
+  return UtxoView{*txid, static_cast<std::uint32_t>(*vout), *value, *height, *spk};
+}
+
+std::optional<UtxoPageView> parse_utxo_page_result(const minijson::Value* result, std::string* err) {
+  if (!result) return std::nullopt;
+  UtxoPageView out;
+  if (result->is_array()) {
+    for (const auto& entry : result->array_value) {
+      auto utxo = parse_utxo_entry(entry);
+      if (utxo.has_value()) out.items.push_back(std::move(*utxo));
+    }
+    return out;
+  }
+  if (!result->is_object()) return std::nullopt;
+  out.has_more = object_bool(result, "has_more").value_or(false);
+  const auto* items = result->get("items");
+  if (!items || !items->is_array()) {
+    if (err) *err = "missing utxo page items";
+    return std::nullopt;
+  }
+  for (const auto& entry : items->array_value) {
+    auto utxo = parse_utxo_entry(entry);
+    if (utxo.has_value()) out.items.push_back(std::move(*utxo));
+  }
+  const auto* next = result->get("next_start_after");
+  if (!next || next->is_null()) return out;
+  auto next_height = object_u64(next, "height");
+  auto next_txid_hex = object_string(next, "txid");
+  auto next_vout = object_u64(next, "vout");
+  if (!next_height || !next_txid_hex || !next_vout || *next_vout > std::numeric_limits<std::uint32_t>::max()) {
+    if (err) *err = "malformed utxo page cursor";
+    return std::nullopt;
+  }
+  auto next_txid = parse_hex32_field(*next_txid_hex);
+  if (!next_txid) {
+    if (err) *err = "malformed utxo page cursor";
+    return std::nullopt;
+  }
+  out.next_start_after = UtxoCursor{*next_height, *next_txid, static_cast<std::uint32_t>(*next_vout)};
+  return out;
 }
 
 std::optional<std::uint64_t> object_u64(const minijson::Value* obj, const char* key) {
@@ -383,56 +462,99 @@ std::optional<AddressValidationView> rpc_validate_address(const std::string& rpc
 }
 
 std::optional<std::vector<UtxoView>> rpc_get_utxos(const std::string& rpc_url, const Hash32& scripthash, std::string* err) {
-  const std::string body_json = std::string(R"({"jsonrpc":"2.0","id":2,"method":"get_utxos","params":{"scripthash_hex":")") +
-                                hex_encode32(scripthash) + R"("}})";
-  auto body = http_post_json(rpc_url, body_json, err);
-  if (!body) return std::nullopt;
-  auto root = minijson::parse(*body);
-  if (!root.has_value()) {
-    if (err) *err = "invalid rpc response";
-    return std::nullopt;
-  }
-  const auto* result = result_value(*root, err);
-  if (!result || !result->is_array()) return std::nullopt;
-
   std::vector<UtxoView> out;
-  for (const auto& entry : result->array_value) {
-    auto txid_hex = object_string(&entry, "txid");
-    auto vout = object_u64(&entry, "vout");
-    auto value = object_u64(&entry, "value");
-    auto height = object_u64(&entry, "height");
-    auto spk_hex = object_string(&entry, "script_pubkey_hex");
-    if (!txid_hex || !vout || !value || !height || !spk_hex) continue;
-    auto txid = parse_hex32_field(*txid_hex);
-    auto spk = hex_decode(*spk_hex);
-    if (!txid || !spk) continue;
-    out.push_back(UtxoView{*txid, static_cast<std::uint32_t>(*vout), *value, *height, *spk});
+  std::optional<UtxoCursor> cursor;
+  constexpr std::uint64_t kPageLimit = 200;
+  while (true) {
+    std::ostringstream body_json;
+    body_json << R"({"jsonrpc":"2.0","id":2,"method":"get_utxos","params":{"scripthash_hex":")" << hex_encode32(scripthash)
+              << R"(","limit":)" << kPageLimit;
+    if (cursor.has_value()) {
+      body_json << R"(,"start_after":{"height":)" << cursor->height << R"(,"txid":")" << hex_encode32(cursor->txid)
+                << R"(","vout":)" << cursor->vout << "}";
+    }
+    body_json << "}}";
+    auto body = http_post_json(rpc_url, body_json.str(), err);
+    if (!body) return std::nullopt;
+    auto root = minijson::parse(*body);
+    if (!root.has_value()) {
+      if (err) *err = "invalid rpc response";
+      return std::nullopt;
+    }
+    const auto* result = result_value(*root, err);
+    auto page = parse_utxo_page_result(result, err);
+    if (!page) return std::nullopt;
+    out.insert(out.end(), page->items.begin(), page->items.end());
+    if (!page->has_more || !page->next_start_after.has_value()) break;
+    cursor = page->next_start_after;
   }
   return out;
 }
 
 std::optional<std::vector<HistoryEntry>> rpc_get_history(const std::string& rpc_url, const Hash32& scripthash,
                                                          std::string* err) {
-  const std::string body_json = std::string(R"({"jsonrpc":"2.0","id":3,"method":"get_history","params":{"scripthash_hex":")") +
-                                hex_encode32(scripthash) + R"("}})";
-  auto body = http_post_json(rpc_url, body_json, err);
-  if (!body) return std::nullopt;
-  auto root = minijson::parse(*body);
-  if (!root.has_value()) {
-    if (err) *err = "invalid rpc response";
-    return std::nullopt;
-  }
-  const auto* result = result_value(*root, err);
-  if (!result || !result->is_array()) return std::nullopt;
-
   std::vector<HistoryEntry> out;
-  for (const auto& entry : result->array_value) {
-    auto txid_hex = object_string(&entry, "txid");
-    auto height = object_u64(&entry, "height");
-    if (!txid_hex || !height) continue;
-    auto txid = parse_hex32_field(*txid_hex);
-    if (!txid) continue;
-    out.push_back(HistoryEntry{*txid, *height});
+  std::optional<HistoryCursor> cursor;
+  constexpr std::uint64_t kPageLimit = 200;
+  while (true) {
+    std::ostringstream body_json;
+    body_json << R"({"jsonrpc":"2.0","id":3,"method":"get_history","params":{"scripthash_hex":")" << hex_encode32(scripthash)
+              << R"(","limit":)" << kPageLimit;
+    if (cursor.has_value()) {
+      body_json << R"(,"start_after":{"height":)" << cursor->height << R"(,"txid":")" << hex_encode32(cursor->txid)
+                << R"("})";
+    }
+    body_json << "}}";
+    auto body = http_post_json(rpc_url, body_json.str(), err);
+    if (!body) return std::nullopt;
+    auto root = minijson::parse(*body);
+    if (!root.has_value()) {
+      if (err) *err = "invalid rpc response";
+      return std::nullopt;
+    }
+    const auto* result = result_value(*root, err);
+    if (!result) return std::nullopt;
+    if (result->is_array()) {
+      for (const auto& entry : result->array_value) {
+        auto txid_hex = object_string(&entry, "txid");
+        auto height = object_u64(&entry, "height");
+        if (!txid_hex || !height) continue;
+        auto txid = parse_hex32_field(*txid_hex);
+        if (!txid) continue;
+        out.push_back(HistoryEntry{*txid, *height});
+      }
+      break;
+    }
+    if (!result->is_object()) return std::nullopt;
+    const auto* items = result->get("items");
+    if (!items || !items->is_array()) {
+      if (err) *err = "missing history page items";
+      return std::nullopt;
+    }
+    for (const auto& entry : items->array_value) {
+      auto txid_hex = object_string(&entry, "txid");
+      auto height = object_u64(&entry, "height");
+      if (!txid_hex || !height) continue;
+      auto txid = parse_hex32_field(*txid_hex);
+      if (!txid) continue;
+      out.push_back(HistoryEntry{*txid, *height});
+    }
+    const bool has_more = object_bool(result, "has_more").value_or(false);
+    if (!has_more) break;
+    const auto* next = result->get("next_start_after");
+    if (!next || next->is_null()) break;
+    auto next_height = object_u64(next, "height");
+    auto next_txid_hex = object_string(next, "txid");
+    if (!next_height || !next_txid_hex) {
+      if (err) *err = "malformed history page cursor";
+      return std::nullopt;
+    }
+    auto next_txid = parse_hex32_field(*next_txid_hex);
+    if (!next_txid) {
+      if (err) *err = "malformed history page cursor";
+      return std::nullopt;
+    }
+    cursor = HistoryCursor{*next_height, *next_txid};
   }
   return out;
 }

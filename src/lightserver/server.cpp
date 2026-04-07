@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <ctime>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <regex>
 #include <set>
@@ -43,6 +45,8 @@ namespace {
 
 constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
 constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
+constexpr std::uint64_t kDefaultPageLimit = 200;
+constexpr std::uint64_t kMaxPageLimit = 1000;
 
 std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage::DB& db, const Hash32& scripthash) {
   const auto indexed_entries = db.get_script_utxos(scripthash);
@@ -79,6 +83,129 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     return std::tie(a.outpoint.txid, a.outpoint.index) < std::tie(b.outpoint.txid, b.outpoint.index);
   });
   return out;
+}
+
+struct UtxoCursor {
+  std::uint64_t height{0};
+  Hash32 txid{};
+  std::uint32_t vout{0};
+};
+
+struct ScriptHistoryCursor {
+  std::uint64_t height{0};
+  Hash32 txid{};
+};
+
+std::optional<Hash32> parse_hex32(const std::string& s);
+
+std::optional<UtxoCursor> field_utxo_cursor(const minijson::Value* obj, std::string* err = nullptr) {
+  if (!obj || obj->is_null()) return std::nullopt;
+  const auto* height_value = obj->get("height");
+  const auto* txid_value = obj->get("txid");
+  const auto* vout_value = obj->get("vout");
+  const auto height = (height_value && height_value->is_number()) ? height_value->as_u64() : std::optional<std::uint64_t>{};
+  const auto txid_hex = (txid_value && txid_value->is_string()) ? txid_value->as_string() : std::optional<std::string>{};
+  const auto vout = (vout_value && vout_value->is_number()) ? vout_value->as_u64() : std::optional<std::uint64_t>{};
+  if (!height && !txid_hex && !vout) return std::nullopt;
+  if (!height || !txid_hex || !vout) {
+    if (err) *err = "start_after requires height, txid, and vout";
+    return std::nullopt;
+  }
+  auto txid = parse_hex32(*txid_hex);
+  if (!txid.has_value()) {
+    if (err) *err = "bad start_after.txid";
+    return std::nullopt;
+  }
+  if (*vout > std::numeric_limits<std::uint32_t>::max()) {
+    if (err) *err = "bad start_after.vout";
+    return std::nullopt;
+  }
+  return UtxoCursor{*height, *txid, static_cast<std::uint32_t>(*vout)};
+}
+
+void apply_socket_timeouts(int fd) {
+  timeval tv{};
+  tv.tv_sec = 15;
+  tv.tv_usec = 0;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+std::string paged_utxos_json(const std::vector<storage::DB::ScriptUtxoEntry>& utxos, std::uint64_t limit,
+                             const std::optional<UtxoCursor>& start_after) {
+  std::vector<storage::DB::ScriptUtxoEntry> filtered;
+  filtered.reserve(utxos.size());
+  for (const auto& entry : utxos) {
+    if (start_after.has_value()) {
+      if (entry.height < start_after->height) continue;
+      if (entry.height == start_after->height) {
+        const auto entry_key = std::tie(entry.outpoint.txid, entry.outpoint.index);
+        const auto cursor_key = std::tie(start_after->txid, start_after->vout);
+        if (entry_key <= cursor_key) continue;
+      }
+    }
+    filtered.push_back(entry);
+  }
+
+  const std::size_t page_size = static_cast<std::size_t>(limit);
+  const bool has_more = filtered.size() > page_size;
+  const std::size_t emit = std::min(filtered.size(), page_size);
+
+  std::ostringstream oss;
+  oss << "{\"items\":[";
+  for (std::size_t i = 0; i < emit; ++i) {
+    if (i) oss << ",";
+    const auto& u = filtered[i];
+    oss << "{\"txid\":\"" << hex_encode32(u.outpoint.txid) << "\",\"vout\":" << u.outpoint.index
+        << ",\"value\":" << u.value << ",\"height\":" << u.height
+        << ",\"script_pubkey_hex\":\"" << hex_encode(u.script_pubkey) << "\"}";
+  }
+  oss << "],\"has_more\":" << (has_more ? "true" : "false")
+      << ",\"ordering\":\"height_asc_txid_asc_vout_asc\",\"next_start_after\":";
+  if (has_more && emit > 0) {
+    const auto& last = filtered[emit - 1];
+    oss << "{\"height\":" << last.height << ",\"txid\":\"" << hex_encode32(last.outpoint.txid)
+        << "\",\"vout\":" << last.outpoint.index << "}";
+  } else {
+    oss << "null";
+  }
+  oss << "}";
+  return oss.str();
+}
+
+std::string paged_history_json(const std::vector<storage::DB::ScriptHistoryEntry>& history, std::uint64_t limit,
+                               std::uint64_t from_height, const std::optional<ScriptHistoryCursor>& start_after) {
+  std::vector<storage::DB::ScriptHistoryEntry> filtered;
+  filtered.reserve(history.size());
+  for (const auto& entry : history) {
+    if (entry.height < from_height) continue;
+    if (start_after.has_value()) {
+      if (entry.height < start_after->height) continue;
+      if (entry.height == start_after->height && entry.txid <= start_after->txid) continue;
+    }
+    filtered.push_back(entry);
+  }
+
+  const std::size_t page_size = static_cast<std::size_t>(limit);
+  const bool has_more = filtered.size() > page_size;
+  const std::size_t emit = std::min(filtered.size(), page_size);
+
+  std::ostringstream oss;
+  oss << "{\"items\":[";
+  for (std::size_t i = 0; i < emit; ++i) {
+    if (i) oss << ",";
+    oss << "{\"txid\":\"" << hex_encode32(filtered[i].txid) << "\",\"height\":" << filtered[i].height << "}";
+  }
+  oss << "],\"has_more\":" << (has_more ? "true" : "false")
+      << ",\"ordering\":\"height_asc_txid_asc\",\"next_start_after\":";
+  if (has_more && emit > 0) {
+    const auto& last = filtered[emit - 1];
+    oss << "{\"height\":" << last.height << ",\"txid\":\"" << hex_encode32(last.txid) << "\"}";
+  } else {
+    oss << "null";
+  }
+  oss << "}";
+  return oss.str();
 }
 
 std::string json_escape(const std::string& in) {
@@ -817,6 +944,7 @@ void Server::accept_loop() {
       if (!running_) break;
       continue;
     }
+    apply_socket_timeouts(fd);
     handle_client(fd);
     ::shutdown(fd, SHUT_RDWR);
     ::close(fd);
@@ -1753,6 +1881,15 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto sh = parse_hex32(*sh_hex);
     if (!sh) return make_error(id, -32602, "bad scripthash");
     const auto utxos = reconciled_script_utxos(*view, *sh);
+    const auto limit = field_u64(params, "limit");
+    std::string cursor_err;
+    const auto start_after = field_utxo_cursor(field_object(params, "start_after"), &cursor_err);
+    if (!cursor_err.empty()) return make_error(id, -32602, cursor_err);
+    if (limit.has_value() || start_after.has_value()) {
+      const auto page_limit = limit.value_or(kDefaultPageLimit);
+      if (page_limit == 0 || page_limit > kMaxPageLimit) return make_error(id, -32602, "bad limit");
+      return make_result(id, paged_utxos_json(utxos, page_limit, start_after));
+    }
     std::ostringstream oss;
     oss << "[";
     for (size_t i = 0; i < utxos.size(); ++i) {
@@ -1772,6 +1909,25 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto sh = parse_hex32(*sh_hex);
     if (!sh) return make_error(id, -32602, "bad scripthash");
     auto history = view->get_script_history(*sh);
+    const auto limit = field_u64(params, "limit");
+    const auto from_height = field_u64(params, "from_height").value_or(0);
+    const auto start_after_obj = field_object(params, "start_after");
+    auto start_after_height = field_u64(start_after_obj, "height");
+    auto start_after_txid_hex = field_string(start_after_obj, "txid");
+    std::optional<ScriptHistoryCursor> start_after;
+    if (start_after_txid_hex.has_value()) {
+      auto start_after_txid = parse_hex32(*start_after_txid_hex);
+      if (!start_after_txid.has_value()) return make_error(id, -32602, "bad start_after.txid");
+      if (!start_after_height.has_value()) return make_error(id, -32602, "start_after requires height and txid");
+      start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
+    } else if (start_after_height.has_value()) {
+      return make_error(id, -32602, "start_after requires height and txid");
+    }
+    if (limit.has_value() || start_after.has_value() || from_height != 0) {
+      const auto page_limit = limit.value_or(kDefaultPageLimit);
+      if (page_limit == 0 || page_limit > kMaxPageLimit) return make_error(id, -32602, "bad limit");
+      return make_result(id, paged_history_json(history, page_limit, from_height, start_after));
+    }
     std::ostringstream oss;
     oss << "[";
     for (size_t i = 0; i < history.size(); ++i) {
@@ -1787,12 +1943,12 @@ std::string Server::handle_rpc_body(const std::string& body) {
     if (!sh_hex) return make_error(id, -32602, "missing scripthash_hex");
     auto sh = parse_hex32(*sh_hex);
     if (!sh) return make_error(id, -32602, "bad scripthash");
-    const auto limit = field_u64(params, "limit").value_or(100);
-    if (limit == 0 || limit > 1000) return make_error(id, -32602, "bad limit");
+    const auto limit = field_u64(params, "limit").value_or(kDefaultPageLimit);
+    if (limit == 0 || limit > kMaxPageLimit) return make_error(id, -32602, "bad limit");
     const auto from_height = field_u64(params, "from_height").value_or(0);
-    const auto start_after = field_object(params, "start_after");
-    auto start_after_height = field_u64(start_after, "height");
-    auto start_after_txid_hex = field_string(start_after, "txid");
+    const auto start_after_obj = field_object(params, "start_after");
+    auto start_after_height = field_u64(start_after_obj, "height");
+    auto start_after_txid_hex = field_string(start_after_obj, "txid");
     std::optional<Hash32> start_after_txid;
     if (start_after_txid_hex.has_value()) {
       start_after_txid = parse_hex32(*start_after_txid_hex);
@@ -1803,37 +1959,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
     }
 
     const auto history = view->get_script_history(*sh);
-    std::vector<storage::DB::ScriptHistoryEntry> filtered;
-    filtered.reserve(history.size());
-    for (const auto& entry : history) {
-      if (entry.height < from_height) continue;
-      if (start_after_height.has_value()) {
-        if (entry.height < *start_after_height) continue;
-        if (entry.height == *start_after_height && entry.txid <= *start_after_txid) continue;
-      }
-      filtered.push_back(entry);
-    }
-
-    const std::size_t page_size = static_cast<std::size_t>(limit);
-    const bool has_more = filtered.size() > page_size;
-    const std::size_t emit = std::min(filtered.size(), page_size);
-
-    std::ostringstream oss;
-    oss << "{\"items\":[";
-    for (std::size_t i = 0; i < emit; ++i) {
-      if (i) oss << ",";
-      oss << "{\"txid\":\"" << hex_encode32(filtered[i].txid) << "\",\"height\":" << filtered[i].height << "}";
-    }
-    oss << "],\"has_more\":" << (has_more ? "true" : "false")
-        << ",\"ordering\":\"height_asc_txid_asc\",\"next_start_after\":";
-    if (has_more && emit > 0) {
-      const auto& last = filtered[emit - 1];
-      oss << "{\"height\":" << last.height << ",\"txid\":\"" << hex_encode32(last.txid) << "\"}";
-    } else {
-      oss << "null";
-    }
-    oss << "}";
-    return make_result(id, oss.str());
+    std::optional<ScriptHistoryCursor> start_after;
+    if (start_after_height.has_value()) start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
+    return make_result(id, paged_history_json(history, limit, from_height, start_after));
   }
 
   if (*method == "get_committee") {
