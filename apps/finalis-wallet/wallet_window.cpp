@@ -1843,6 +1843,7 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
                                                                  : QString("validator key: %1").arg(key_error))
                                          : "Open your operator wallet first";
   if (wallet_loaded) {
+    readiness_text += "\nRegistration action is one-step: the wallet will wait for sync if needed, reserve finalized inputs, build the join transaction, broadcast it, and then track finalization/activation.";
     readiness_text += QString("\nMinimum required to register: %1 (bond %2 + fee %3)")
                           .arg(format_coin_amount(record.has_value() ? record->required_amount : required_total_units))
                           .arg(format_coin_amount(required_bond_units))
@@ -1899,7 +1900,39 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
        record->state == finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION ||
        record->state == finalis::onboarding::ValidatorOnboardingState::BROADCASTING_JOIN_TX);
   const bool can_start = wallet_loaded && key_loadable && rpc_reachable && !in_progress_or_done;
-  validator_action_button_->setText("Start Validator Onboarding");
+  QString action_text = "Register Validator";
+  if (!wallet_loaded) action_text = "Open Wallet First";
+  else if (!key_loadable) action_text = "Fix Validator Key";
+  else if (!rpc_reachable) action_text = "Fix RPC Endpoint";
+  else if (record.has_value()) {
+    switch (record->state) {
+      case finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_SYNC:
+        action_text = "Waiting For Sync";
+        break;
+      case finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_FUNDS:
+        action_text = "Waiting For Funds";
+        break;
+      case finalis::onboarding::ValidatorOnboardingState::SELECTING_UTXOS:
+      case finalis::onboarding::ValidatorOnboardingState::BUILDING_JOIN_TX:
+      case finalis::onboarding::ValidatorOnboardingState::BROADCASTING_JOIN_TX:
+      case finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION:
+      case finalis::onboarding::ValidatorOnboardingState::PENDING_ACTIVATION:
+        action_text = "Registration In Progress";
+        break;
+      case finalis::onboarding::ValidatorOnboardingState::ACTIVE:
+        action_text = "Validator Active";
+        break;
+      case finalis::onboarding::ValidatorOnboardingState::FAILED:
+        action_text = "Retry Validator Registration";
+        break;
+      case finalis::onboarding::ValidatorOnboardingState::CANCELLED:
+      case finalis::onboarding::ValidatorOnboardingState::IDLE:
+      case finalis::onboarding::ValidatorOnboardingState::CHECKING_PREREQS:
+        action_text = "Register Validator";
+        break;
+    }
+  }
+  validator_action_button_->setText(action_text);
   validator_action_button_->setEnabled(can_start);
   if (validator_refresh_button_) validator_refresh_button_->setEnabled(wallet_loaded || db_path_valid || key_exists);
   if (validator_cancel_button_) {

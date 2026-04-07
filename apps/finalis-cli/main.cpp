@@ -781,7 +781,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
-     << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--wait-for-sync] [--fee <u64>] [--watch] [--timeout-seconds <n>] [--json]\n"
+     << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync]\n"
      << "  finalis-cli validator-register-status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--json]\n"
      << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli wallet_create --out <path> [--pass <pass>] [--network mainnet] [--seed-hex <32b-hex>]\n"
@@ -2463,8 +2463,8 @@ int main(int argc, char** argv) {
     std::string passphrase;
     std::string rpc_url = "http://127.0.0.1:19444/rpc";
     std::uint64_t fee = 10'000;
-    bool wait_for_sync = false;
-    bool watch = false;
+    bool wait_for_sync = true;
+    bool watch = true;
     bool as_json = false;
     std::uint64_t timeout_seconds = 600;
     for (int i = 2; i < argc; ++i) {
@@ -2475,6 +2475,7 @@ int main(int argc, char** argv) {
       else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
       else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (a == "--wait-for-sync") wait_for_sync = true;
+      else if (a == "--no-wait-for-sync") wait_for_sync = false;
       else if (a == "--watch") watch = true;
       else if (a == "--no-watch") watch = false;
       else if (a == "--json") as_json = true;
