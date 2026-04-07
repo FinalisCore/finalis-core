@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -45,6 +46,45 @@ std::string frame_fail_detail(const FrameFailureInfo& fi) {
   if (fi.received_magic.has_value()) oss << " received_magic=" << u32_hex(*fi.received_magic);
   if (fi.payload_len.has_value()) oss << " payload_len=" << *fi.payload_len;
   return oss.str();
+}
+
+bool connect_with_timeout(int fd, const sockaddr* addr, socklen_t addrlen, std::uint32_t timeout_ms) {
+  const int current_flags = ::fcntl(fd, F_GETFL, 0);
+  if (current_flags < 0) return false;
+  if (::fcntl(fd, F_SETFL, current_flags | O_NONBLOCK) != 0) return false;
+
+  const int rc = ::connect(fd, addr, addrlen);
+  if (rc == 0) {
+    (void)::fcntl(fd, F_SETFL, current_flags);
+    return true;
+  }
+  if (errno != EINPROGRESS) {
+    (void)::fcntl(fd, F_SETFL, current_flags);
+    return false;
+  }
+
+  pollfd pfd{};
+  pfd.fd = fd;
+  pfd.events = POLLOUT;
+  const int poll_rc = ::poll(&pfd, 1, static_cast<int>(timeout_ms));
+  if (poll_rc <= 0) {
+    (void)::fcntl(fd, F_SETFL, current_flags);
+    if (poll_rc == 0) errno = ETIMEDOUT;
+    return false;
+  }
+
+  int so_error = 0;
+  socklen_t so_error_len = sizeof(so_error);
+  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) != 0) {
+    (void)::fcntl(fd, F_SETFL, current_flags);
+    return false;
+  }
+  (void)::fcntl(fd, F_SETFL, current_flags);
+  if (so_error != 0) {
+    errno = so_error;
+    return false;
+  }
+  return true;
 }
 
 std::string peer_state_detail(const PeerInfo& info) {
@@ -121,7 +161,7 @@ bool PeerManager::connect_to(const std::string& host, std::uint16_t port) {
     fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
     if (fd < 0) continue;
     set_close_on_exec(fd);
-    if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+    if (connect_with_timeout(fd, it->ai_addr, static_cast<socklen_t>(it->ai_addrlen), limits_.handshake_timeout_ms)) break;
     ::close(fd);
     fd = -1;
   }
@@ -205,7 +245,7 @@ bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
       p->queued_bytes.fetch_sub(payload.size());
       return false;
     }
-    ok = write_frame_fd(p->fd, Frame{msg_type, payload}, magic_, proto_version_);
+    ok = write_frame_fd_timed(p->fd, Frame{msg_type, payload}, limits_.frame_timeout_ms, magic_, proto_version_);
     if (!ok) send_errno = errno;
   }
   p->queued_msgs.fetch_sub(1);

@@ -45,6 +45,14 @@ Bytes burn_script(const Hash32& h) {
   return s;
 }
 
+Bytes join_request_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
+  Bytes s{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
+  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
+  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
+  s.insert(s.end(), pop.begin(), pop.end());
+  return s;
+}
+
 Tx make_spend_tx(const OutPoint& op, const TxOut& prev_out, const crypto::KeyPair& kp, const std::vector<TxOut>& outputs) {
   Tx tx;
   tx.version = 1;
@@ -136,6 +144,62 @@ TEST(test_protocol_scope_allows_mint_deposit_output_in_standard_tx) {
   auto tx = make_spend_tx(op, prev_out, kp, {TxOut{49'000, privacy::mint_deposit_script_pubkey(mint_id, pkh)}});
   auto r = validate_tx(tx, 1, view, nullptr);
   ASSERT_TRUE(r.ok);
+}
+
+TEST(test_protocol_scope_rejects_tx_with_too_many_inputs) {
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.reserve(kMaxTxInputs + 1);
+  for (std::size_t i = 0; i < kMaxTxInputs + 1; ++i) {
+    Hash32 prev{};
+    prev.fill(static_cast<std::uint8_t>(i & 0xFF));
+    tx.inputs.push_back(TxIn{prev, static_cast<std::uint32_t>(i), Bytes{}, 0xFFFFFFFF});
+  }
+
+  const auto kp = key_from_byte(25);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
+
+  auto r = validate_tx(tx, 1, {}, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_TRUE(r.error.find("too many inputs") != std::string::npos);
+}
+
+TEST(test_protocol_scope_rejects_tx_when_verify_budget_exceeded_by_join_request_outputs) {
+  const auto sponsor = key_from_byte(26);
+  const auto validator = key_from_byte(27);
+  const auto payout = key_from_byte(28);
+  const auto sponsor_pkh = crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0xD1);
+  op.index = 0;
+  TxOut prev_out{5'000'000, address::p2pkh_script_pubkey(sponsor_pkh)};
+  UtxoSet view;
+  view[op] = UtxoEntry{prev_out};
+
+  Tx tx = make_spend_tx(op, prev_out, sponsor,
+                        {TxOut{4'999'000, address::p2pkh_script_pubkey(sponsor_pkh)}});
+  tx.outputs.clear();
+  tx.outputs.push_back(TxOut{4'000'000, address::p2pkh_script_pubkey(sponsor_pkh)});
+
+  const auto pop =
+      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key), validator.private_key);
+  for (std::size_t i = 0; i < kMaxTxEd25519Verifies; ++i) {
+    tx.outputs.push_back(TxOut{BOND_AMOUNT, reg_script(validator.public_key)});
+    tx.outputs.push_back(TxOut{0, join_request_script(validator.public_key, payout.public_key, pop)});
+  }
+
+  auto msg = signing_message_for_input(tx, 0);
+  ASSERT_TRUE(msg.has_value());
+  auto sig = crypto::ed25519_sign(*msg, sponsor.private_key);
+  ASSERT_TRUE(sig.has_value());
+  tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, sponsor.public_key);
+
+  auto r = validate_tx(tx, 1, view, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_TRUE(r.error.find("verify budget exceeded") != std::string::npos);
 }
 
 TEST(test_protocol_scope_roundtrips_mint_deposit_script) {

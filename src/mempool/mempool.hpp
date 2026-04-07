@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <tuple>
 #include <optional>
 #include <set>
 #include <string>
@@ -51,12 +52,27 @@ class Mempool {
   void set_full_replacement_margin_bps(std::uint32_t margin_bps) { full_replacement_margin_bps_ = margin_bps; }
 
  private:
+  struct EvictionKey {
+    std::uint64_t fee{0};
+    std::size_t size_bytes{0};
+    Hash32 txid{};
+  };
+
+  struct EvictionKeyLess {
+    bool operator()(const EvictionKey& a, const EvictionKey& b) const;
+  };
+
   struct TxMeta {
     MempoolEntry entry;
     std::vector<OutPoint> spent;
+    EvictionKey eviction_key;
   };
 
+  void erase_entry(std::map<Hash32, TxMeta>::iterator it);
+  std::optional<EvictionKey> worst_entry_key() const;
+
   std::map<Hash32, TxMeta> by_txid_;
+  std::map<EvictionKey, Hash32, EvictionKeyLess> eviction_index_;
   std::map<OutPoint, Hash32> spent_outpoints_;
   std::size_t total_bytes_{0};
   std::optional<SpecialValidationContext> ctx_;

@@ -131,6 +131,15 @@ bool wait_readable(int fd, std::uint32_t timeout_ms) {
   return (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
+bool wait_writable(int fd, std::uint32_t timeout_ms) {
+  pollfd pfd{};
+  pfd.fd = fd;
+  pfd.events = POLLOUT;
+  const int r = ::poll(&pfd, 1, static_cast<int>(timeout_ms));
+  if (r <= 0) return false;
+  return (pfd.revents & (POLLOUT | POLLHUP | POLLERR | POLLNVAL)) != 0;
+}
+
 bool read_exact_timed(int fd, std::uint8_t* dst, std::size_t n, std::uint32_t timeout_ms, std::size_t* bytes_read,
                       bool* eof) {
   if (bytes_read) *bytes_read = 0;
@@ -158,6 +167,26 @@ bool read_exact_timed(int fd, std::uint8_t* dst, std::size_t n, std::uint32_t ti
     off += static_cast<std::size_t>(k);
   }
   if (bytes_read) *bytes_read = off;
+  return true;
+}
+
+bool write_exact_timed(int fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms) {
+  const auto start = std::chrono::steady_clock::now();
+  std::size_t off = 0;
+  while (off < n) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+    if (elapsed >= static_cast<long long>(timeout_ms)) return false;
+    const std::uint32_t remain = static_cast<std::uint32_t>(timeout_ms - elapsed);
+    if (!wait_writable(fd, remain)) return false;
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    const ssize_t k = ::send(fd, src + off, n - off, flags);
+    if (k <= 0) return false;
+    off += static_cast<std::size_t>(k);
+  }
   return true;
 }
 
@@ -265,6 +294,16 @@ std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, st
 bool write_frame_fd(int fd, const Frame& f, std::uint32_t magic, std::uint16_t proto_version) {
   const Bytes raw = encode_frame(f, magic, proto_version);
   return write_all(fd, raw.data(), raw.size());
+}
+
+bool write_all_timed(int fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms) {
+  return write_exact_timed(fd, src, n, timeout_ms);
+}
+
+bool write_frame_fd_timed(int fd, const Frame& f, std::uint32_t timeout_ms, std::uint32_t magic,
+                          std::uint16_t proto_version) {
+  const Bytes raw = encode_frame(f, magic, proto_version);
+  return write_exact_timed(fd, raw.data(), raw.size(), timeout_ms);
 }
 
 }  // namespace finalis::p2p

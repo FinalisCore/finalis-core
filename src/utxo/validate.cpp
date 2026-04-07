@@ -50,6 +50,16 @@ std::vector<OutPoint> tx_input_outpoints(const Tx& tx) {
   return out;
 }
 
+bool consume_verify_budget(std::size_t* remaining, std::size_t cost, std::string* err) {
+  if (!remaining) return true;
+  if (*remaining < cost) {
+    if (err) *err = "tx verify budget exceeded";
+    return false;
+  }
+  *remaining -= cost;
+  return true;
+}
+
 }  // namespace
 
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash) {
@@ -302,6 +312,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   if (tx.version != 1) return {false, "unsupported tx version", 0};
   if (tx.lock_time != 0) return {false, "lock_time must be 0 in v0", 0};
   if (tx.inputs.empty() || tx.outputs.empty()) return {false, "tx inputs/outputs empty", 0};
+  if (tx.inputs.size() > kMaxTxInputs) return {false, "tx has too many inputs", 0};
+
+  std::size_t verify_budget_remaining = kMaxTxEd25519Verifies;
 
   if (tx_index_in_block == 0) {
     if (tx.inputs.size() != 1) return {false, "coinbase must have one input", 0};
@@ -333,6 +346,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     ValidatorJoinRequestScriptData join_req{};
     if (parse_validator_join_request_script(out.script_pubkey, &join_req)) {
       if (out.value != 0) return {false, "SCVALJRQ output must have zero value", 0};
+      std::string budget_error;
+      if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
       if (!crypto::ed25519_verify(
               validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey), join_req.pop,
               join_req.validator_pubkey)) {
@@ -404,6 +419,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
 
       const auto msg = signing_message_for_input(tx, i);
       if (!msg.has_value()) return {false, "sighash failed", 0};
+      std::string budget_error;
+      if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
       if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
       in_sum += prev_out.value;
       continue;
@@ -434,6 +451,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
             vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
         const auto b_msg =
             vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        std::string budget_error;
+        if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
           return {false, "invalid evidence signature a", 0};
         }
@@ -464,6 +483,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (pub != bond_pub) return {false, "unbond auth pubkey mismatch", 0};
         const auto msg = unbond_message_for_input(tx, i);
         if (!msg.has_value()) return {false, "unbond sighash failed", 0};
+        std::string budget_error;
+        if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond signature invalid", 0};
       }
 
@@ -495,6 +516,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
             vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
         const auto b_msg =
             vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        std::string budget_error;
+        if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
           return {false, "invalid evidence signature a", 0};
         }
@@ -518,6 +541,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       if (pub != unbond_pub) return {false, "unbond-spend pubkey mismatch", 0};
       const auto msg = signing_message_for_input(tx, i);
       if (!msg.has_value()) return {false, "unbond-spend sighash failed", 0};
+      std::string budget_error;
+      if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
       if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond-spend signature invalid", 0};
 
       for (const auto& o : tx.outputs) {

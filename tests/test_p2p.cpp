@@ -229,6 +229,23 @@ TEST(test_tx_message_rejects_oversized_payload) {
   ASSERT_TRUE(!p2p::de_tx(w.take()).has_value());
 }
 
+TEST(test_write_frame_fd_timed_times_out_against_nonreading_peer) {
+  int fds[2]{-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+  int sndbuf = 4096;
+  (void)::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+  p2p::Frame frame;
+  frame.msg_type = p2p::MsgType::TX;
+  frame.payload.assign(4 * 1024 * 1024, 0xAB);
+
+  ASSERT_TRUE(!p2p::write_frame_fd_timed(fds[0], frame, 10));
+
+  ::close(fds[0]);
+  ::close(fds[1]);
+}
+
 TEST(test_peer_manager_send_to_closed_peer_returns_false_without_duplicate_disconnect) {
   const auto net = mainnet_network();
   const std::uint16_t port = reserve_test_port();

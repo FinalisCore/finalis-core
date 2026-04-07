@@ -42,6 +42,31 @@ bool meets_full_replacement_margin(const MempoolEntry& incoming, const MempoolEn
 
 }  // namespace
 
+bool Mempool::EvictionKeyLess::operator()(const EvictionKey& a, const EvictionKey& b) const {
+  if (const int fee_rate_cmp = compare_fee_rate(a.fee, a.size_bytes, b.fee, b.size_bytes); fee_rate_cmp != 0) {
+    return fee_rate_cmp < 0;
+  }
+  if (a.fee != b.fee) return a.fee < b.fee;
+  return a.txid > b.txid;
+}
+
+void Mempool::erase_entry(std::map<Hash32, TxMeta>::iterator it) {
+  for (const auto& op : it->second.spent) {
+    auto sit = spent_outpoints_.find(op);
+    if (sit != spent_outpoints_.end() && sit->second == it->first) {
+      spent_outpoints_.erase(sit);
+    }
+  }
+  eviction_index_.erase(it->second.eviction_key);
+  total_bytes_ -= it->second.entry.size_bytes;
+  by_txid_.erase(it);
+}
+
+std::optional<Mempool::EvictionKey> Mempool::worst_entry_key() const {
+  if (eviction_index_.empty()) return std::nullopt;
+  return eviction_index_.begin()->first;
+}
+
 bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee,
                         std::uint64_t* accepted_fee) {
   const Bytes raw = tx.serialize();
@@ -98,6 +123,7 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, st
 
   TxMeta meta;
   meta.entry = MempoolEntry{tx, txid, vr.fee, raw.size()};
+  meta.eviction_key = EvictionKey{meta.entry.fee, meta.entry.size_bytes, meta.entry.txid};
   meta.spent.reserve(tx.inputs.size());
   for (const auto& in : tx.inputs) {
     OutPoint op{in.prev_txid, in.prev_index};
@@ -108,14 +134,22 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, st
   const bool full_by_count = by_txid_.size() >= kMaxTxCount;
   const bool full_by_bytes = total_bytes_ + raw.size() > kMaxPoolBytes;
   if (full_by_count || full_by_bytes) {
-    auto worst_it = by_txid_.end();
-    for (auto it = by_txid_.begin(); it != by_txid_.end(); ++it) {
-      if (worst_it == by_txid_.end() || compare_entry_score(it->second.entry, worst_it->second.entry) < 0) {
-        worst_it = it;
-      }
-    }
-    if (worst_it == by_txid_.end()) {
+    const auto worst_key = worst_entry_key();
+    if (!worst_key.has_value()) {
       if (err) *err = full_by_count ? "mempool count limit reached" : "mempool bytes limit reached";
+      for (const auto& op : meta.spent) spent_outpoints_.erase(op);
+      return false;
+    }
+    auto worst_index_it = eviction_index_.find(*worst_key);
+    if (worst_index_it == eviction_index_.end()) {
+      if (err) *err = "mempool eviction index corrupted";
+      for (const auto& op : meta.spent) spent_outpoints_.erase(op);
+      return false;
+    }
+    auto worst_it = by_txid_.find(worst_index_it->second);
+    if (worst_it == by_txid_.end()) {
+      if (err) *err = "mempool entry missing for eviction key";
+      for (const auto& op : meta.spent) spent_outpoints_.erase(op);
       return false;
     }
     if (!meets_full_replacement_margin(meta.entry, worst_it->second.entry, full_replacement_margin_bps_)) {
@@ -135,19 +169,13 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, st
       for (const auto& op : meta.spent) spent_outpoints_.erase(op);
       return false;
     }
-    for (const auto& op : worst_it->second.spent) {
-      auto sit = spent_outpoints_.find(op);
-      if (sit != spent_outpoints_.end() && sit->second == worst_it->first) {
-        spent_outpoints_.erase(sit);
-      }
-    }
-    total_bytes_ -= worst_it->second.entry.size_bytes;
-    by_txid_.erase(worst_it);
+    erase_entry(worst_it);
     ++evicted_for_better_incoming_;
   }
 
   total_bytes_ += raw.size();
   by_txid_[txid] = std::move(meta);
+  eviction_index_[by_txid_[txid].eviction_key] = txid;
   if (accepted_fee) *accepted_fee = vr.fee;
   return true;
 }
@@ -209,15 +237,8 @@ void Mempool::remove_confirmed(const std::vector<Hash32>& txids) {
       ++it;
       continue;
     }
-
-    for (const auto& op : it->second.spent) {
-      auto sit = spent_outpoints_.find(op);
-      if (sit != spent_outpoints_.end() && sit->second == it->first) {
-        spent_outpoints_.erase(sit);
-      }
-    }
-    total_bytes_ -= it->second.entry.size_bytes;
-    it = by_txid_.erase(it);
+    auto erase_it = it++;
+    erase_entry(erase_it);
   }
 }
 
@@ -234,15 +255,8 @@ void Mempool::prune_against_utxo(const UtxoView& view) {
       ++it;
       continue;
     }
-
-    for (const auto& op : it->second.spent) {
-      auto sit = spent_outpoints_.find(op);
-      if (sit != spent_outpoints_.end() && sit->second == it->first) {
-        spent_outpoints_.erase(sit);
-      }
-    }
-    total_bytes_ -= it->second.entry.size_bytes;
-    it = by_txid_.erase(it);
+    auto erase_it = it++;
+    erase_entry(erase_it);
   }
 }
 
@@ -258,14 +272,11 @@ MempoolPolicyStats Mempool::policy_stats() const {
   out.evicted_for_better_incoming = evicted_for_better_incoming_;
   const bool full = by_txid_.size() >= kMaxTxCount || total_bytes_ >= kMaxPoolBytes;
   if (!full || by_txid_.empty()) return out;
-  const TxMeta* worst = nullptr;
-  for (const auto& [_, meta] : by_txid_) {
-    if (!worst || compare_entry_score(meta.entry, worst->entry) < 0) worst = &meta;
-  }
-  if (!worst || worst->entry.size_bytes == 0) return out;
+  const auto worst_key = worst_entry_key();
+  if (!worst_key.has_value() || worst_key->size_bytes == 0) return out;
   out.min_fee_rate_to_enter_when_full =
-      (static_cast<double>(worst->entry.fee) * static_cast<double>(10'000 + full_replacement_margin_bps_)) /
-      (static_cast<double>(10'000) * static_cast<double>(worst->entry.size_bytes));
+      (static_cast<double>(worst_key->fee) * static_cast<double>(10'000 + full_replacement_margin_bps_)) /
+      (static_cast<double>(10'000) * static_cast<double>(worst_key->size_bytes));
   return out;
 }
 

@@ -55,6 +55,7 @@ std::optional<Frame> decode_frame(const Bytes& b, std::size_t max_payload_len = 
 
 bool read_exact(int fd, std::uint8_t* dst, std::size_t n);
 bool write_all(int fd, const std::uint8_t* src, std::size_t n);
+bool write_all_timed(int fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms);
 std::optional<Frame> read_frame_fd(int fd, std::size_t max_payload_len = 8 * 1024 * 1024,
                                    std::uint32_t magic = MAGIC, std::uint16_t proto_version = PROTOCOL_VERSION);
 std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, std::uint32_t expected_magic,
@@ -62,5 +63,7 @@ std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, st
                                          std::uint32_t body_timeout_ms, FrameReadError* err,
                                          FrameFailureInfo* fail_info = nullptr);
 bool write_frame_fd(int fd, const Frame& f, std::uint32_t magic = MAGIC, std::uint16_t proto_version = PROTOCOL_VERSION);
+bool write_frame_fd_timed(int fd, const Frame& f, std::uint32_t timeout_ms, std::uint32_t magic = MAGIC,
+                          std::uint16_t proto_version = PROTOCOL_VERSION);
 
 }  // namespace finalis::p2p

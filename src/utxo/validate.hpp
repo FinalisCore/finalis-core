@@ -40,6 +40,9 @@ struct SlashEvidence {
   Bytes raw_blob;
 };
 
+inline constexpr std::size_t kMaxTxInputs = 512;
+inline constexpr std::size_t kMaxTxEd25519Verifies = 1024;
+
 TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
                                const SpecialValidationContext* ctx = nullptr);
 std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index);
