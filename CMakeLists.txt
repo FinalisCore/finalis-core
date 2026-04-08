@@ -107,6 +107,9 @@ if(FINALIS_SANITIZE)
   target_compile_options(finalis-node PRIVATE ${SC_SAN_FLAGS})
   target_link_options(finalis-node PRIVATE -fsanitize=address,undefined)
 endif()
+install(TARGETS finalis-node
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
 
 add_executable(finalis-cli apps/finalis-cli/main.cpp)
 target_link_libraries(finalis-cli PRIVATE finalis_core)
@@ -114,6 +117,9 @@ if(FINALIS_SANITIZE)
   target_compile_options(finalis-cli PRIVATE ${SC_SAN_FLAGS})
   target_link_options(finalis-cli PRIVATE -fsanitize=address,undefined)
 endif()
+install(TARGETS finalis-cli
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
 
 add_executable(finalis-lightserver apps/finalis-lightserver/main.cpp)
 target_link_libraries(finalis-lightserver PRIVATE finalis_core)
@@ -121,6 +127,9 @@ if(FINALIS_SANITIZE)
   target_compile_options(finalis-lightserver PRIVATE ${SC_SAN_FLAGS})
   target_link_options(finalis-lightserver PRIVATE -fsanitize=address,undefined)
 endif()
+install(TARGETS finalis-lightserver
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
 
 add_executable(checkpoint-fixture-export tools/checkpoint_fixture_export.cpp)
 target_link_libraries(checkpoint-fixture-export PRIVATE finalis_core)
@@ -135,6 +144,9 @@ if(FINALIS_SANITIZE)
   target_compile_options(finalis-explorer PRIVATE ${SC_SAN_FLAGS})
   target_link_options(finalis-explorer PRIVATE -fsanitize=address,undefined)
 endif()
+install(TARGETS finalis-explorer
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
 
 if(Qt5Widgets_FOUND)
   add_executable(finalis-wallet
@@ -207,6 +219,21 @@ if(Qt5Widgets_FOUND)
 else()
   message(STATUS "Qt5 Widgets not found; skipping finalis-wallet target")
 endif()
+
+set(FINALIS_INSTALL_DOC_DIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/finalis-core")
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/README.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/apps/finalis-explorer/README.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/apps/finalis-wallet/README.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/docs/LIVE_PROTOCOL.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/docs/ADDRESSES.md
+  DESTINATION ${FINALIS_INSTALL_DOC_DIR}
+)
+install(FILES
+  ${CMAKE_CURRENT_SOURCE_DIR}/branding/finalis-app-icon.png
+  ${CMAKE_CURRENT_SOURCE_DIR}/branding/finalis-logo-horizontal.png
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/finalis-core/branding
+)
 
 add_executable(finalis-tests
   apps/finalis-wallet/history_merge.cpp

@@ -1,0 +1,10 @@
+{
+  "name": "finalis-core",
+  "version-string": "0.7.0",
+  "description": "Finalized-state BFT node, lightserver, explorer, and wallet dependencies for native Windows builds.",
+  "dependencies": [
+    "openssl",
+    "libsodium",
+    "rocksdb"
+  ]
+}

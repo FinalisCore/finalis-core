@@ -1,0 +1,110 @@
+name: windows-release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - windows-installer-test
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    env:
+      BUILD_PRESET: windows-msvc-release
+      QT_VERSION: 5.15.2
+      QT_ARCH: win64_msvc2019_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache vcpkg downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg/downloads
+            vcpkg/packages
+            vcpkg/buildtrees
+            vcpkg/installed
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+
+      - name: Checkout vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          path: vcpkg
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: .\vcpkg\bootstrap-vcpkg.bat
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: ${{ env.QT_ARCH }}
+          dir: ${{ github.workspace }}\.qt
+          cache: true
+
+      - name: Set release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = "0.7.0-${{ github.run_number }}"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "FINALIS_QT_PREFIX=${{ github.workspace }}\.qt\${{ env.QT_VERSION }}\${{ env.QT_ARCH }}" >> $env:GITHUB_ENV
+          "VCPKG_ROOT=${{ github.workspace }}\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Configure
+        shell: pwsh
+        run: cmake --preset $env:BUILD_PRESET
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-wallet finalis-tests
+
+      - name: Run core tests
+        shell: pwsh
+        run: ctest --test-dir build/windows-release -C Release --output-on-failure -R "^finalis-tests$"
+
+      - name: Stage Windows payload
+        shell: pwsh
+        run: >
+          .\packaging\windows\Stage-WindowsRelease.ps1
+          -BuildDir "${{ github.workspace }}\build\windows-release"
+          -Configuration Release
+          -StageRoot "${{ github.workspace }}\dist\windows"
+          -QtRootDir "${{ env.FINALIS_QT_PREFIX }}"
+          -VcpkgInstalledDir "${{ github.workspace }}\vcpkg\installed\x64-windows"
+
+      - name: Build installer
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
+        with:
+          path: packaging/windows/finalis-core.iss
+          options: >
+            /DMyAppVersion=${{ steps.meta.outputs.version }}
+            /DSourceDir=${{ github.workspace }}\dist\windows\payload
+            /DOutputDir=${{ github.workspace }}\dist\installer
+
+      - name: Upload staged payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: finalis-core-windows-payload-${{ steps.meta.outputs.version }}
+          path: dist/windows/payload
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: finalis-core-installer-${{ steps.meta.outputs.version }}
+          path: dist/installer/finalis-core_installer.exe

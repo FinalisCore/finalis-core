@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-ninja-release",
+      "displayName": "Linux Ninja Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "windows-msvc-release",
+      "displayName": "Windows MSVC Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "FINALIS_BUILD_FUZZ": "OFF",
+        "FINALIS_SANITIZE": "OFF",
+        "FINALIS_STRICT_WARNINGS": "OFF",
+        "CMAKE_PREFIX_PATH": "$env{FINALIS_QT_PREFIX}"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-ninja-release",
+      "configurePreset": "linux-ninja-release",
+      "jobs": 4
+    },
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc-release",
+      "jobs": 4
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}
