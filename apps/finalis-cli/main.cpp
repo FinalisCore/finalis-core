@@ -27,6 +27,7 @@
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
+#include "common/wide_arith.hpp"
 #include "common/version.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/epoch_committee.hpp"
@@ -2249,9 +2250,8 @@ int main(int argc, char** argv) {
     const auto current_participation_bps =
         current_expected == 0
             ? 10'000U
-            : static_cast<std::uint32_t>((static_cast<unsigned __int128>(std::min(current_observed, current_expected)) *
-                                          10'000ULL) /
-                                         static_cast<unsigned __int128>(current_expected));
+            : static_cast<std::uint32_t>(finalis::wide::mul_div_u64(std::min(current_observed, current_expected),
+                                                                    10'000ULL, current_expected));
     const auto settlement_expected =
         settlement_epoch_state && settlement_epoch_state->expected_participation_units.count(vk.pubkey)
             ? settlement_epoch_state->expected_participation_units.at(vk.pubkey)
@@ -2267,10 +2267,8 @@ int main(int argc, char** argv) {
     const auto settlement_participation_bps =
         settlement_expected == 0
             ? 10'000U
-            : static_cast<std::uint32_t>((static_cast<unsigned __int128>(
-                                              std::min(settlement_observed, settlement_expected)) *
-                                          10'000ULL) /
-                                         static_cast<unsigned __int128>(settlement_expected));
+            : static_cast<std::uint32_t>(finalis::wide::mul_div_u64(std::min(settlement_observed, settlement_expected),
+                                                                    10'000ULL, settlement_expected));
     std::uint64_t settlement_reward_score_total = 0;
     if (settlement_epoch_state.has_value()) {
       for (const auto& [_, score] : settlement_epoch_state->reward_score_units) settlement_reward_score_total += score;
@@ -2278,10 +2276,9 @@ int main(int argc, char** argv) {
 
     std::uint64_t local_theoretical_reward_units = 0;
     if (settlement_epoch_state.has_value() && settlement_reward_score_total != 0 && settlement_reward_score != 0) {
-      local_theoretical_reward_units = static_cast<std::uint64_t>(
-          (static_cast<unsigned __int128>(settlement_epoch_state->total_reward_units) *
-           static_cast<unsigned __int128>(settlement_reward_score)) /
-          static_cast<unsigned __int128>(settlement_reward_score_total));
+      local_theoretical_reward_units = finalis::wide::mul_div_u64(settlement_epoch_state->total_reward_units,
+                                                                  settlement_reward_score,
+                                                                  settlement_reward_score_total);
     }
 
     bool finalized_settlement_block_present = false;

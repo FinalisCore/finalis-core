@@ -4,6 +4,7 @@
 #include <ctime>
 
 #include "codec/bytes.hpp"
+#include "common/wide_arith.hpp"
 #include "utxo/validate.hpp"
 
 namespace finalis::mempool {
@@ -15,11 +16,7 @@ bool outpoint_exists(const UtxoView& view, const OutPoint& op) {
 }
 
 int compare_fee_rate(std::uint64_t fee_a, std::size_t size_a, std::uint64_t fee_b, std::size_t size_b) {
-  const auto lhs = static_cast<unsigned __int128>(fee_a) * static_cast<unsigned __int128>(size_b);
-  const auto rhs = static_cast<unsigned __int128>(fee_b) * static_cast<unsigned __int128>(size_a);
-  if (lhs > rhs) return 1;
-  if (lhs < rhs) return -1;
-  return 0;
+  return wide::compare_mul_u64(fee_a, static_cast<std::uint64_t>(size_b), fee_b, static_cast<std::uint64_t>(size_a));
 }
 
 int compare_entry_score(const MempoolEntry& a, const MempoolEntry& b) {
@@ -33,11 +30,9 @@ int compare_entry_score(const MempoolEntry& a, const MempoolEntry& b) {
 }
 
 bool meets_full_replacement_margin(const MempoolEntry& incoming, const MempoolEntry& worst, std::uint32_t margin_bps) {
-  const auto lhs = static_cast<unsigned __int128>(incoming.fee) * static_cast<unsigned __int128>(10'000) *
-                   static_cast<unsigned __int128>(worst.size_bytes);
-  const auto rhs = static_cast<unsigned __int128>(worst.fee) * static_cast<unsigned __int128>(10'000 + margin_bps) *
-                   static_cast<unsigned __int128>(incoming.size_bytes);
-  return lhs >= rhs;
+  return wide::compare_mul3_u64(incoming.fee, 10'000ULL, static_cast<std::uint64_t>(worst.size_bytes),
+                                worst.fee, static_cast<std::uint64_t>(10'000U + margin_bps),
+                                static_cast<std::uint64_t>(incoming.size_bytes)) >= 0;
 }
 
 }  // namespace

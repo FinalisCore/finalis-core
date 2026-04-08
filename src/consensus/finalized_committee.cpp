@@ -5,6 +5,7 @@
 #include <set>
 
 #include "codec/bytes.hpp"
+#include "common/wide_arith.hpp"
 #include "crypto/hash.hpp"
 
 namespace finalis::consensus {
@@ -12,7 +13,6 @@ namespace finalis::consensus {
 namespace {
 
 static_assert(sizeof(std::uint64_t) == 8);
-static_assert(sizeof(unsigned __int128) >= 16);
 
 std::uint64_t hash64_prefix(const Hash32& hash) {
   std::uint64_t out = 0;
@@ -62,9 +62,9 @@ bool compare_ranked_candidates(const FinalizedCommitteeCandidate& a, const Final
   const auto b_strength = candidate_strength(b);
   // Spec §9.4 clause 1: compare selection_hash64 / strength with widened
   // cross-multiplication so ranking is architecture-stable and overflow-safe.
-  const auto lhs = static_cast<unsigned __int128>(a_hash64) * static_cast<unsigned __int128>(b_strength);
-  const auto rhs = static_cast<unsigned __int128>(b_hash64) * static_cast<unsigned __int128>(a_strength);
-  if (lhs != rhs) return lhs < rhs;
+  if (const int rank_cmp = wide::compare_mul_u64(a_hash64, b_strength, b_hash64, a_strength); rank_cmp != 0) {
+    return rank_cmp < 0;
+  }
   // Spec §9.4 clauses 2..11: exhaustive total-order tie-break chain.
   if (a_hash != b_hash) return a_hash < b_hash;
   if (a_selection_id != b_selection_id) return a_selection_id < b_selection_id;

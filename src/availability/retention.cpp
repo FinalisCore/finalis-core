@@ -1954,8 +1954,7 @@ std::uint64_t floor_sqrt_u64(std::uint64_t value) {
   std::uint64_t hi = (1ULL << 32);
   while (lo < hi) {
     const auto mid = lo + ((hi - lo + 1) / 2);
-    const auto sq = static_cast<unsigned __int128>(mid) * static_cast<unsigned __int128>(mid);
-    if (sq <= value) {
+    if (mid == 0 || mid <= (value / mid)) {
       lo = mid;
     } else {
       hi = mid - 1;

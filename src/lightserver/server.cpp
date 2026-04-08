@@ -20,6 +20,7 @@
 #include "address/address.hpp"
 #include "consensus/ingress.hpp"
 #include "codec/bytes.hpp"
+#include "common/wide_arith.hpp"
 #include "common/minijson.hpp"
 #include "common/paths.hpp"
 #include "common/version.hpp"
@@ -967,8 +968,7 @@ std::string retry_class_for_error_code(const std::string& error_code) {
 }
 
 bool fee_rate_below_threshold(std::uint64_t fee, std::size_t size_bytes, std::uint64_t threshold_milliunits_per_byte) {
-  return static_cast<unsigned __int128>(fee) * static_cast<unsigned __int128>(1000) <
-         static_cast<unsigned __int128>(threshold_milliunits_per_byte) * static_cast<unsigned __int128>(size_bytes);
+  return wide::compare_mul_u64(fee, 1000ULL, threshold_milliunits_per_byte, static_cast<std::uint64_t>(size_bytes)) < 0;
 }
 
 std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& record) {

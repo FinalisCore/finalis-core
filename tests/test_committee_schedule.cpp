@@ -6,6 +6,7 @@
 #include <map>
 
 #include "codec/bytes.hpp"
+#include "common/wide_arith.hpp"
 #include "consensus/committee_schedule.hpp"
 #include "consensus/epoch_tickets.hpp"
 #include "consensus/finalized_committee.hpp"
@@ -64,9 +65,9 @@ bool spec_candidate_outranks(const consensus::FinalizedCommitteeCandidate& a,
   const auto b_hash64 = schedule_hash64_prefix(b_hash);
   const auto a_strength = schedule_candidate_strength(a);
   const auto b_strength = schedule_candidate_strength(b);
-  const auto lhs = static_cast<unsigned __int128>(a_hash64) * static_cast<unsigned __int128>(b_strength);
-  const auto rhs = static_cast<unsigned __int128>(b_hash64) * static_cast<unsigned __int128>(a_strength);
-  if (lhs != rhs) return lhs < rhs;
+  if (const int rank_cmp = wide::compare_mul_u64(a_hash64, b_strength, b_hash64, a_strength); rank_cmp != 0) {
+    return rank_cmp < 0;
+  }
   if (a_hash != b_hash) return a_hash < b_hash;
   if (a_selection_id != b_selection_id) return a_selection_id < b_selection_id;
   if (a.pubkey != b.pubkey) return a.pubkey < b.pubkey;
@@ -375,11 +376,9 @@ TEST(test_committee_selection_matches_spec_comparator_under_shuffled_inputs) {
 }
 
 TEST(test_committee_selection_cross_multiplication_handles_extreme_hash64_values_deterministically) {
-  const auto lhs = static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max()) *
-                   static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max());
-  const auto rhs = static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max() - 1ULL) *
-                   static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max());
-  ASSERT_TRUE(lhs > rhs);
+  ASSERT_TRUE(wide::compare_mul_u64(std::numeric_limits<std::uint64_t>::max(), std::numeric_limits<std::uint64_t>::max(),
+                                    std::numeric_limits<std::uint64_t>::max() - 1ULL,
+                                    std::numeric_limits<std::uint64_t>::max()) > 0);
 }
 
 TEST(test_committee_eligibility_at_checkpoint_centralizes_lifecycle_bond_and_availability_gating) {

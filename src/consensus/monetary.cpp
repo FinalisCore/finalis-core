@@ -5,6 +5,8 @@
 #include <limits>
 #include <map>
 
+#include "common/wide_arith.hpp"
+
 namespace finalis::consensus {
 
 namespace {
@@ -30,9 +32,7 @@ std::uint64_t participant_score(const WeightedParticipant& participant, const Pu
 }
 
 std::uint64_t reserve_share_of_gross(std::uint64_t gross_units) {
-  return static_cast<std::uint64_t>((static_cast<unsigned __int128>(gross_units) *
-                                     static_cast<unsigned __int128>(RESERVE_ACCRUAL_BPS)) /
-                                    10'000ULL);
+  return wide::mul_div_u64(gross_units, static_cast<std::uint64_t>(RESERVE_ACCRUAL_BPS), 10'000ULL);
 }
 
 const std::array<std::uint64_t, EMISSION_YEARS>& emission_year_budgets() {
@@ -51,9 +51,7 @@ const std::array<std::uint64_t, EMISSION_YEARS>& emission_year_budgets() {
 
     std::uint64_t allocated = 0;
     for (std::uint64_t year = 0; year + 1 < EMISSION_YEARS; ++year) {
-      const auto budget = static_cast<std::uint64_t>(
-          (static_cast<unsigned __int128>(TOTAL_SUPPLY_UNITS) * static_cast<unsigned __int128>(weights[year])) /
-          static_cast<unsigned __int128>(total_weight));
+      const auto budget = wide::mul_div_u64(TOTAL_SUPPLY_UNITS, weights[year], total_weight);
       year_budgets[year] = budget;
       allocated += budget;
     }
@@ -144,8 +142,7 @@ std::uint64_t integer_sqrt(std::uint64_t value) {
   std::uint64_t hi = std::min<std::uint64_t>(value, 0xFFFFFFFFULL) + 1;
   while (lo + 1 < hi) {
     const std::uint64_t mid = lo + ((hi - lo) / 2);
-    const auto sq = static_cast<unsigned __int128>(mid) * static_cast<unsigned __int128>(mid);
-    if (sq <= value) {
+    if (mid == 0 || mid <= (value / mid)) {
       lo = mid;
     } else {
       hi = mid;
@@ -166,13 +163,9 @@ std::uint64_t validator_min_bond_units(const EconomicsConfig& cfg, std::size_t f
   const std::uint64_t active = std::max<std::uint64_t>(1, static_cast<std::uint64_t>(finalized_active_validators));
   constexpr std::uint64_t kScale = 100'000'000ULL;
   constexpr std::uint64_t kScaleSqrt = 10'000ULL;
-  const std::uint64_t scaled_ratio =
-      (static_cast<unsigned __int128>(cfg.target_validators) * static_cast<unsigned __int128>(kScale)) / active;
+  const std::uint64_t scaled_ratio = wide::mul_div_u64(cfg.target_validators, kScale, active);
   const std::uint64_t multiplier = integer_sqrt(scaled_ratio);
-  const std::uint64_t scaled =
-      static_cast<std::uint64_t>((static_cast<unsigned __int128>(cfg.base_min_bond) *
-                                  static_cast<unsigned __int128>(multiplier)) /
-                                 static_cast<unsigned __int128>(kScaleSqrt));
+  const std::uint64_t scaled = wide::mul_div_u64(cfg.base_min_bond, multiplier, kScaleSqrt);
   return clamp_u64(scaled, cfg.min_bond_floor, cfg.min_bond_ceiling);
 }
 
@@ -185,10 +178,8 @@ std::uint64_t validator_max_effective_bond_units(const NetworkConfig& network, s
 std::uint64_t validator_max_effective_bond_units(const EconomicsConfig& cfg, std::size_t finalized_active_validators) {
   const auto min_bond = validator_min_bond_units(cfg, finalized_active_validators);
   const auto multiple = cfg.max_effective_bond_multiple;
-  const auto widened = static_cast<unsigned __int128>(min_bond) * static_cast<unsigned __int128>(multiple);
-  return widened > static_cast<unsigned __int128>(std::numeric_limits<std::uint64_t>::max())
-             ? std::numeric_limits<std::uint64_t>::max()
-             : static_cast<std::uint64_t>(widened);
+  return wide::mul_u64_exceeds_u64(min_bond, multiple) ? std::numeric_limits<std::uint64_t>::max()
+                                                       : (min_bond * multiple);
 }
 
 std::uint64_t capped_effective_bond_units(const NetworkConfig& network, std::uint64_t height,
@@ -220,9 +211,8 @@ std::uint64_t apply_participation_penalty_bps(std::uint64_t reward_weight_units,
                                               std::uint32_t threshold_bps) {
   if (reward_weight_units == 0 || threshold_bps == 0) return reward_weight_units;
   if (participation_bps >= threshold_bps) return reward_weight_units;
-  return static_cast<std::uint64_t>(
-      (static_cast<unsigned __int128>(reward_weight_units) * static_cast<unsigned __int128>(participation_bps)) /
-      static_cast<unsigned __int128>(threshold_bps));
+  return wide::mul_div_u64(reward_weight_units, static_cast<std::uint64_t>(participation_bps),
+                           static_cast<std::uint64_t>(threshold_bps));
 }
 
 Payout compute_payout(std::uint64_t height, std::uint64_t fees_units, const PubKey32& leader_pubkey,
@@ -278,9 +268,7 @@ Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, c
 
   std::uint64_t distributed = 0;
   for (const auto& [pub, score] : scores) {
-    const auto share = static_cast<std::uint64_t>(
-        (static_cast<unsigned __int128>(out.total) * static_cast<unsigned __int128>(score)) /
-        static_cast<unsigned __int128>(total_score));
+    const auto share = wide::mul_div_u64(out.total, score, total_score);
     distributed += share;
     if (pub == leader_pubkey) {
       out.leader += share;
@@ -319,9 +307,7 @@ DeterministicCoinbasePayout compute_epoch_settlement_payout(
       std::optional<PubKey32> last_pub;
       for (const auto& [pub, score] : reward_score_units) {
         if (score == 0) continue;
-        const auto share = static_cast<std::uint64_t>(
-            (static_cast<unsigned __int128>(distributed_pool) * static_cast<unsigned __int128>(score)) /
-            static_cast<unsigned __int128>(total_score));
+        const auto share = wide::mul_div_u64(distributed_pool, score, total_score);
         merged[pub] += share;
         distributed += share;
         last_pub = pub;

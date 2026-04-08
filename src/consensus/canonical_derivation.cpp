@@ -8,6 +8,7 @@
 
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
+#include "common/wide_arith.hpp"
 #include "consensus/committee_schedule.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/ingress.hpp"
@@ -273,9 +274,7 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
         const std::uint32_t participation_bps =
             expected == 0
                 ? 10'000U
-                : static_cast<std::uint32_t>((static_cast<unsigned __int128>(std::min(observed, expected)) *
-                                              10'000ULL) /
-                                             static_cast<unsigned __int128>(expected));
+                : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
         score = apply_participation_penalty_bps(score, participation_bps, threshold_bps);
       }
     }
@@ -574,8 +573,7 @@ void mark_epoch_reward_settled_for_height(const CanonicalDerivationConfig& cfg, 
       const std::uint64_t observed = observed_it == reward_state.observed_participation_units.end() ? 0 : observed_it->second;
       const std::uint32_t participation_bps =
           expected == 0 ? 10'000U
-                        : static_cast<std::uint32_t>((static_cast<unsigned __int128>(std::min(observed, expected)) * 10'000ULL) /
-                                                     static_cast<unsigned __int128>(expected));
+                        : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
       const auto adjusted_score = apply_participation_penalty_bps(raw_score, participation_bps, econ.participation_threshold_bps);
       if (adjusted_score > 0) ++eligible_validator_count;
     }
@@ -601,8 +599,8 @@ void accrue_epoch_reward_state_for_block(const CanonicalDerivationConfig& cfg, C
   const auto gross_reward = reward_units(block.header.height);
   const auto prior_gross_reward = reward_state.total_reward_units + reward_state.reserve_accrual_units;
   const auto next_gross_reward = prior_gross_reward + gross_reward;
-  const auto next_reserve = static_cast<std::uint64_t>(
-      (static_cast<unsigned __int128>(next_gross_reward) * static_cast<unsigned __int128>(RESERVE_ACCRUAL_BPS)) / 10'000ULL);
+  const auto next_reserve =
+      wide::mul_div_u64(next_gross_reward, static_cast<std::uint64_t>(RESERVE_ACCRUAL_BPS), 10'000ULL);
   const auto reserve_delta = next_reserve - reward_state.reserve_accrual_units;
   reward_state.reserve_accrual_units = next_reserve;
   reward_state.total_reward_units += gross_reward - reserve_delta;
@@ -622,8 +620,8 @@ void accrue_epoch_reward_state_for_frontier(const CanonicalDerivationConfig& cfg
   const auto gross_reward = reward_units(transition.height);
   const auto prior_gross_reward = reward_state.total_reward_units + reward_state.reserve_accrual_units;
   const auto next_gross_reward = prior_gross_reward + gross_reward;
-  const auto next_reserve = static_cast<std::uint64_t>(
-      (static_cast<unsigned __int128>(next_gross_reward) * static_cast<unsigned __int128>(RESERVE_ACCRUAL_BPS)) / 10'000ULL);
+  const auto next_reserve =
+      wide::mul_div_u64(next_gross_reward, static_cast<std::uint64_t>(RESERVE_ACCRUAL_BPS), 10'000ULL);
   const auto reserve_delta = next_reserve - reward_state.reserve_accrual_units;
   reward_state.reserve_accrual_units = next_reserve;
   reward_state.total_reward_units += gross_reward - reserve_delta;
@@ -1645,13 +1643,9 @@ std::uint64_t derive_adaptive_min_bond(std::uint64_t target_committee_size, std:
   const std::uint64_t depth = std::max<std::uint64_t>(1, qualified_depth);
   constexpr std::uint64_t kScale = 100'000'000ULL;
   constexpr std::uint64_t kScaleSqrt = 10'000ULL;
-  const std::uint64_t scaled_ratio =
-      (static_cast<unsigned __int128>(target_committee_size) * static_cast<unsigned __int128>(kScale)) / depth;
+  const std::uint64_t scaled_ratio = wide::mul_div_u64(target_committee_size, kScale, depth);
   const std::uint64_t multiplier = integer_sqrt(scaled_ratio);
-  const std::uint64_t scaled =
-      static_cast<std::uint64_t>((static_cast<unsigned __int128>(kAdaptiveMinBondBase) *
-                                  static_cast<unsigned __int128>(multiplier)) /
-                                 static_cast<unsigned __int128>(kScaleSqrt));
+  const std::uint64_t scaled = wide::mul_div_u64(kAdaptiveMinBondBase, multiplier, kScaleSqrt);
   return std::min<std::uint64_t>(kAdaptiveMinBondCeiling, std::max<std::uint64_t>(kAdaptiveMinBondFloor, scaled));
 }
 

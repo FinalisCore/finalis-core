@@ -35,6 +35,7 @@
 #include "consensus/validator_registry.hpp"
 #include "consensus/monetary.hpp"
 #include "common/paths.hpp"
+#include "common/wide_arith.hpp"
 #include "common/version.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
@@ -962,8 +963,7 @@ void mark_epoch_reward_settled_for_height(const NetworkConfig& network, std::uin
       const std::uint64_t observed = observed_it == state.observed_participation_units.end() ? 0 : observed_it->second;
       const std::uint32_t participation_bps =
           expected == 0 ? 10'000U
-                        : static_cast<std::uint32_t>((static_cast<unsigned __int128>(std::min(observed, expected)) * 10'000ULL) /
-                                                     static_cast<unsigned __int128>(expected));
+                        : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
       const auto adjusted_score = consensus::apply_participation_penalty_bps(raw_score, participation_bps, threshold_bps);
       if (adjusted_score > 0) ++eligible_validator_count;
     }
@@ -994,9 +994,8 @@ void accrue_epoch_reward_state_for_block(
   state.epoch_start_height = epoch_start;
   const auto gross_reward = consensus::reward_units(block.header.height);
   const auto next_gross_reward = state.total_reward_units + state.reserve_accrual_units + gross_reward;
-  const auto next_reserve = static_cast<std::uint64_t>(
-      (static_cast<unsigned __int128>(next_gross_reward) * static_cast<unsigned __int128>(consensus::RESERVE_ACCRUAL_BPS)) /
-      10'000ULL);
+  const auto next_reserve = wide::mul_div_u64(next_gross_reward, static_cast<std::uint64_t>(consensus::RESERVE_ACCRUAL_BPS),
+                                              10'000ULL);
   const auto reserve_delta = next_reserve - state.reserve_accrual_units;
   state.reserve_accrual_units = next_reserve;
   state.total_reward_units += gross_reward - reserve_delta;
@@ -3109,9 +3108,7 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
         const std::uint64_t observed = observed_it == state.observed_participation_units.end() ? 0 : observed_it->second;
         const std::uint32_t participation_bps =
             expected == 0 ? 10'000U
-                          : static_cast<std::uint32_t>((static_cast<unsigned __int128>(std::min(observed, expected)) *
-                                                        10'000ULL) /
-                                                       static_cast<unsigned __int128>(expected));
+                          : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
         const auto raw_score = score;
         score = consensus::apply_participation_penalty_bps(score, participation_bps, threshold_bps);
         if (debug_economics_logs_enabled()) {
