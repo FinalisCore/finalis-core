@@ -1281,6 +1281,12 @@ bool DB::erase_utxo(const OutPoint& op) {
 #endif
 }
 
+std::optional<TxOut> DB::get_utxo(const OutPoint& op) const {
+  auto raw = get(key_utxo(op));
+  if (!raw.has_value()) return std::nullopt;
+  return parse_txout(*raw);
+}
+
 std::map<OutPoint, UtxoEntry> DB::load_utxos() const {
   std::map<OutPoint, UtxoEntry> out;
   for (const auto& [k, v] : scan_prefix(key_utxo_prefix())) {

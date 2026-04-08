@@ -1523,6 +1523,143 @@ TEST(test_lightserver_get_utxos_supports_paged_response) {
   ASSERT_TRUE(resp2.find(hex_encode32(op3.txid)) != std::string::npos);
 }
 
+TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow) {
+  const std::string base = "/tmp/finalis_light_history_page_detailed";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-history-detailed";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
+
+  const auto sender_kp = node::Node::deterministic_test_keypairs()[0];
+  const auto recipient_kp = node::Node::deterministic_test_keypairs()[1];
+  const auto sender_pkh = crypto::h160(Bytes(sender_kp.public_key.begin(), sender_kp.public_key.end()));
+  const auto recipient_pkh = crypto::h160(Bytes(recipient_kp.public_key.begin(), recipient_kp.public_key.end()));
+  const auto sender_spk = address::p2pkh_script_pubkey(sender_pkh);
+  const auto recipient_spk = address::p2pkh_script_pubkey(recipient_pkh);
+  const Hash32 recipient_sh = crypto::sha256(recipient_spk);
+
+  Tx prev;
+  prev.version = 1;
+  prev.outputs.push_back(TxOut{500, sender_spk});
+  const auto prev_bytes = prev.serialize();
+  const auto prev_txid = prev.txid();
+  ASSERT_TRUE(db.put_tx_index(prev_txid, 7, 0, prev_bytes));
+
+  Tx tx;
+  tx.version = 1;
+  tx.inputs.push_back(TxIn{prev_txid, 0, Bytes{}});
+  tx.outputs.push_back(TxOut{200, recipient_spk});
+  tx.outputs.push_back(TxOut{299, sender_spk});
+  const auto tx_bytes = tx.serialize();
+  const auto txid = tx.txid();
+  ASSERT_TRUE(db.put_tx_index(txid, 8, 0, tx_bytes));
+  ASSERT_TRUE(db.add_script_history(recipient_sh, 8, txid));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const std::string body =
+      std::string(R"({"jsonrpc":"2.0","id":173,"method":"get_history_page_detailed","params":{"scripthash_hex":")") +
+      hex_encode32(recipient_sh) + R"(","limit":10}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  ASSERT_TRUE(resp.find("\"direction\":\"received\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"net_amount\":200") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"detail\":\"Finalized credit to this address\"") != std::string::npos);
+}
+
+TEST(test_lightserver_get_tx_summaries_returns_batched_finalized_tx_view) {
+  const std::string base = "/tmp/finalis_light_tx_summaries";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-tx-summaries";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
+
+  const auto sender_kp = node::Node::deterministic_test_keypairs()[0];
+  const auto recipient_kp = node::Node::deterministic_test_keypairs()[1];
+  const auto sender_pkh = crypto::h160(Bytes(sender_kp.public_key.begin(), sender_kp.public_key.end()));
+  const auto recipient_pkh = crypto::h160(Bytes(recipient_kp.public_key.begin(), recipient_kp.public_key.end()));
+  const auto sender_spk = address::p2pkh_script_pubkey(sender_pkh);
+  const auto recipient_spk = address::p2pkh_script_pubkey(recipient_pkh);
+
+  Tx prev;
+  prev.version = 1;
+  prev.outputs.push_back(TxOut{500, sender_spk});
+  const auto prev_bytes = prev.serialize();
+  const auto prev_txid = prev.txid();
+  ASSERT_TRUE(db.put_tx_index(prev_txid, 7, 0, prev_bytes));
+
+  Tx tx;
+  tx.version = 1;
+  tx.inputs.push_back(TxIn{prev_txid, 0, Bytes{}});
+  tx.outputs.push_back(TxOut{200, recipient_spk});
+  tx.outputs.push_back(TxOut{299, sender_spk});
+  const auto tx_bytes = tx.serialize();
+  const auto txid = tx.txid();
+  ASSERT_TRUE(db.put_tx_index(txid, 8, 0, tx_bytes));
+  ASSERT_TRUE(db.set_tip(storage::TipState{8, txid}));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":174,"method":"get_tx_summaries","params":{"txids":[")") +
+                           hex_encode32(txid) + R"("]}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  ASSERT_TRUE(resp.find("\"txid\":\"" + hex_encode32(txid) + "\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"finalized_out\":499") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"fee\":1") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"flow_kind\":\"transfer-with-change\"") != std::string::npos);
+}
+
 TEST(test_lightserver_get_history_supports_paged_response) {
   const std::string base = "/tmp/finalis_light_history_paged";
   std::filesystem::remove_all(base);

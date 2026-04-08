@@ -19,16 +19,94 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
     const storage::DB& db, const std::array<std::uint8_t, 20>& pubkey_hash, const std::set<OutPoint>* excluded) {
   const Hash32 scripthash = crypto::sha256(address::p2pkh_script_pubkey(pubkey_hash));
   const auto entries = db.get_script_utxos(scripthash);
-  const auto canonical_utxos = db.load_utxos();
-  std::map<OutPoint, TxOut> canonical_matches;
-  for (const auto& [op, entry] : canonical_utxos) {
-    if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
-    canonical_matches.emplace(op, entry.out);
+  const auto history = db.get_script_history(scripthash);
+  std::vector<SpendableUtxo> out;
+  out.reserve(entries.size());
+  bool needs_canonical_fallback = entries.empty() || history.empty();
+  for (const auto& entry : entries) {
+    if (excluded && excluded->find(entry.outpoint) != excluded->end()) continue;
+    const auto canonical = db.get_utxo(entry.outpoint);
+    if (!canonical.has_value()) {
+      needs_canonical_fallback = true;
+      continue;
+    }
+    if (canonical->value != entry.value || canonical->script_pubkey != entry.script_pubkey) {
+      needs_canonical_fallback = true;
+      continue;
+    }
+    out.push_back(SpendableUtxo{entry.outpoint, *canonical});
+  }
+  if (!needs_canonical_fallback) {
+    std::sort(out.begin(), out.end(), [](const SpendableUtxo& a, const SpendableUtxo& b) {
+      if (a.prevout.value != b.prevout.value) return a.prevout.value > b.prevout.value;
+      return outpoint_less(a.outpoint, b.outpoint);
+    });
+    return out;
   }
 
-  std::vector<SpendableUtxo> out;
-  out.reserve(std::max(entries.size(), canonical_matches.size()));
+  if (history.empty()) {
+    const auto canonical_utxos = db.load_utxos();
+    out.clear();
+    out.reserve(std::max(entries.size(), canonical_utxos.size()));
+    std::set<OutPoint> seen;
+    std::map<OutPoint, TxOut> canonical_matches;
+    for (const auto& [op, entry] : canonical_utxos) {
+      if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+      canonical_matches.emplace(op, entry.out);
+    }
+    for (const auto& entry : entries) {
+      if (excluded && excluded->find(entry.outpoint) != excluded->end()) continue;
+      const auto canonical_it = canonical_matches.find(entry.outpoint);
+      if (canonical_it == canonical_matches.end()) continue;
+      if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
+      out.push_back(SpendableUtxo{entry.outpoint, canonical_it->second});
+      seen.insert(entry.outpoint);
+    }
+    for (const auto& [op, prevout] : canonical_matches) {
+      if (excluded && excluded->find(op) != excluded->end()) continue;
+      if (seen.find(op) != seen.end()) continue;
+      out.push_back(SpendableUtxo{op, prevout});
+    }
+    std::sort(out.begin(), out.end(), [](const SpendableUtxo& a, const SpendableUtxo& b) {
+      if (a.prevout.value != b.prevout.value) return a.prevout.value > b.prevout.value;
+      return outpoint_less(a.outpoint, b.outpoint);
+    });
+    return out;
+  }
+
+  std::map<Hash32, std::optional<Tx>> tx_cache;
+  const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
+    auto it = tx_cache.find(txid);
+    if (it != tx_cache.end()) return it->second;
+    std::optional<Tx> parsed;
+    if (auto loc = db.get_tx_index(txid); loc.has_value()) {
+      if (auto tx = Tx::parse(loc->tx_bytes); tx.has_value()) parsed = *tx;
+    }
+    tx_cache.emplace(txid, parsed);
+    return parsed;
+  };
+
+  out.clear();
+  out.reserve(std::max(entries.size(), history.size()));
   std::set<OutPoint> seen;
+  std::map<OutPoint, TxOut> canonical_matches;
+  for (const auto& item : history) {
+    const auto tx = load_tx(item.txid);
+    if (!tx.has_value()) continue;
+    for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
+      const auto& txout = tx->outputs[i];
+      if (crypto::sha256(txout.script_pubkey) != scripthash) continue;
+      canonical_matches.emplace(OutPoint{item.txid, static_cast<std::uint32_t>(i)}, txout);
+    }
+    for (const auto& input : tx->inputs) {
+      const auto prev_tx = load_tx(input.prev_txid);
+      if (!prev_tx.has_value()) continue;
+      if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
+      const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
+      if (crypto::sha256(prev_out.script_pubkey) != scripthash) continue;
+      canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
+    }
+  }
   for (const auto& entry : entries) {
     if (excluded && excluded->find(entry.outpoint) != excluded->end()) continue;
     const auto canonical_it = canonical_matches.find(entry.outpoint);

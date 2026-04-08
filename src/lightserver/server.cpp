@@ -48,15 +48,106 @@ constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
 constexpr std::uint64_t kDefaultPageLimit = 200;
 constexpr std::uint64_t kMaxPageLimit = 1000;
 
+std::string json_escape(const std::string& in);
+std::string server_hrp_for_network(const NetworkConfig& network);
+
+std::optional<std::string> p2pkh_script_to_address(const Bytes& script_pubkey, const std::string& hrp) {
+  if (script_pubkey.size() == 25 && script_pubkey[0] == 0x76 && script_pubkey[1] == 0xa9 && script_pubkey[2] == 0x14 &&
+      script_pubkey[23] == 0x88 && script_pubkey[24] == 0xac) {
+    std::array<std::uint8_t, 20> pkh{};
+    std::copy(script_pubkey.begin() + 3, script_pubkey.begin() + 23, pkh.begin());
+    return address::encode_p2pkh(hrp, pkh);
+  }
+  return std::nullopt;
+}
+
 std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage::DB& db, const Hash32& scripthash) {
   const auto indexed_entries = db.get_script_utxos(scripthash);
-  const auto canonical_utxos = db.load_utxos();
-  std::map<OutPoint, TxOut> canonical_matches;
-  for (const auto& [op, entry] : canonical_utxos) {
-    if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
-    canonical_matches.emplace(op, entry.out);
+  const auto history = db.get_script_history(scripthash);
+  std::vector<storage::DB::ScriptUtxoEntry> verified;
+  verified.reserve(indexed_entries.size());
+  bool needs_canonical_fallback = indexed_entries.empty() || history.empty();
+  for (const auto& entry : indexed_entries) {
+    const auto canonical = db.get_utxo(entry.outpoint);
+    if (!canonical.has_value()) {
+      needs_canonical_fallback = true;
+      continue;
+    }
+    if (canonical->value != entry.value || canonical->script_pubkey != entry.script_pubkey) {
+      needs_canonical_fallback = true;
+      continue;
+    }
+    storage::DB::ScriptUtxoEntry merged = entry;
+    if (auto loc = db.get_tx_index(entry.outpoint.txid); loc.has_value()) merged.height = loc->height;
+    verified.push_back(std::move(merged));
   }
+  if (!needs_canonical_fallback) return verified;
 
+  if (history.empty()) {
+    const auto canonical_utxos = db.load_utxos();
+    std::map<OutPoint, TxOut> canonical_matches;
+    for (const auto& [op, entry] : canonical_utxos) {
+      if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+      canonical_matches.emplace(op, entry.out);
+    }
+    std::vector<storage::DB::ScriptUtxoEntry> out;
+    out.reserve(std::max(indexed_entries.size(), canonical_matches.size()));
+    std::set<OutPoint> seen;
+    for (const auto& entry : indexed_entries) {
+      const auto canonical_it = canonical_matches.find(entry.outpoint);
+      if (canonical_it == canonical_matches.end()) continue;
+      if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
+      storage::DB::ScriptUtxoEntry merged = entry;
+      if (auto loc = db.get_tx_index(entry.outpoint.txid); loc.has_value()) merged.height = loc->height;
+      out.push_back(std::move(merged));
+      seen.insert(entry.outpoint);
+    }
+    for (const auto& [op, prevout] : canonical_matches) {
+      if (seen.find(op) != seen.end()) continue;
+      storage::DB::ScriptUtxoEntry merged;
+      merged.outpoint = op;
+      merged.value = prevout.value;
+      merged.script_pubkey = prevout.script_pubkey;
+      if (auto loc = db.get_tx_index(op.txid); loc.has_value()) merged.height = loc->height;
+      out.push_back(std::move(merged));
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+      if (a.height != b.height) return a.height < b.height;
+      return std::tie(a.outpoint.txid, a.outpoint.index) < std::tie(b.outpoint.txid, b.outpoint.index);
+    });
+    return out;
+  }
+  std::map<Hash32, std::optional<Tx>> tx_cache;
+  const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
+    auto it = tx_cache.find(txid);
+    if (it != tx_cache.end()) return it->second;
+    std::optional<Tx> parsed;
+    if (auto loc = db.get_tx_index(txid); loc.has_value()) {
+      if (auto tx = Tx::parse(loc->tx_bytes); tx.has_value()) parsed = *tx;
+    }
+    tx_cache.emplace(txid, parsed);
+    return parsed;
+  };
+
+  std::map<OutPoint, storage::DB::ScriptUtxoEntry> canonical_matches;
+  for (const auto& item : history) {
+    const auto tx = load_tx(item.txid);
+    if (!tx.has_value()) continue;
+    for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
+      const auto& out = tx->outputs[i];
+      if (crypto::sha256(out.script_pubkey) != scripthash) continue;
+      const OutPoint op{item.txid, static_cast<std::uint32_t>(i)};
+      canonical_matches[op] = storage::DB::ScriptUtxoEntry{op, out.value, out.script_pubkey, item.height};
+    }
+    for (const auto& input : tx->inputs) {
+      const auto prev_tx = load_tx(input.prev_txid);
+      if (!prev_tx.has_value()) continue;
+      if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
+      const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
+      if (crypto::sha256(prev_out.script_pubkey) != scripthash) continue;
+      canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
+    }
+  }
   std::vector<storage::DB::ScriptUtxoEntry> out;
   out.reserve(std::max(indexed_entries.size(), canonical_matches.size()));
   std::set<OutPoint> seen;
@@ -64,19 +155,12 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     const auto canonical_it = canonical_matches.find(entry.outpoint);
     if (canonical_it == canonical_matches.end()) continue;
     if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
-    storage::DB::ScriptUtxoEntry merged = entry;
-    if (auto loc = db.get_tx_index(entry.outpoint.txid); loc.has_value()) merged.height = loc->height;
-    out.push_back(std::move(merged));
+    out.push_back(canonical_it->second);
     seen.insert(entry.outpoint);
   }
   for (const auto& [op, prevout] : canonical_matches) {
     if (seen.find(op) != seen.end()) continue;
-    storage::DB::ScriptUtxoEntry merged;
-    merged.outpoint = op;
-    merged.value = prevout.value;
-    merged.script_pubkey = prevout.script_pubkey;
-    if (auto loc = db.get_tx_index(op.txid); loc.has_value()) merged.height = loc->height;
-    out.push_back(std::move(merged));
+    out.push_back(prevout);
   }
   std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
     if (a.height != b.height) return a.height < b.height;
@@ -203,6 +287,264 @@ std::string paged_history_json(const std::vector<storage::DB::ScriptHistoryEntry
     oss << "{\"height\":" << last.height << ",\"txid\":\"" << hex_encode32(last.txid) << "\"}";
   } else {
     oss << "null";
+  }
+  oss << "}";
+  return oss.str();
+}
+
+struct DetailedHistoryRow {
+  Hash32 txid{};
+  std::uint64_t height{0};
+  std::string direction;
+  std::int64_t net_amount{0};
+  std::string detail;
+};
+
+struct TxSummaryRow {
+  std::string txid;
+  std::uint64_t height{0};
+  bool credit_safe{true};
+  std::uint64_t finalized_depth{0};
+  std::uint64_t total_out{0};
+  std::optional<std::uint64_t> fee;
+  std::size_t input_count{0};
+  std::size_t output_count{0};
+  std::optional<std::string> primary_sender;
+  std::optional<std::string> primary_recipient;
+  std::size_t recipient_count{0};
+  std::vector<std::string> recipients;
+  std::string flow_kind{"multi-party"};
+  std::string flow_summary{"Multi-input or multi-recipient finalized transaction"};
+};
+
+std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const NetworkConfig& network,
+                                                const std::vector<Hash32>& txids) {
+  std::vector<TxSummaryRow> out;
+  out.reserve(txids.size());
+  std::map<Hash32, std::optional<Tx>> tx_cache;
+  const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
+    auto it = tx_cache.find(txid);
+    if (it != tx_cache.end()) return it->second;
+    std::optional<Tx> parsed;
+    if (auto loc = db.get_tx_index(txid); loc.has_value()) {
+      if (auto tx = Tx::parse(loc->tx_bytes); tx.has_value()) parsed = *tx;
+    }
+    tx_cache.emplace(txid, parsed);
+    return parsed;
+  };
+
+  const auto hrp = server_hrp_for_network(network);
+  const auto tip = db.get_tip();
+  for (const auto& txid : txids) {
+    auto loc = db.get_tx_index(txid);
+    if (!loc.has_value()) continue;
+    auto tx = load_tx(txid);
+    if (!tx.has_value()) continue;
+
+    TxSummaryRow row;
+    row.txid = hex_encode32(txid);
+    row.height = loc->height;
+    row.input_count = tx->inputs.size();
+    row.output_count = tx->outputs.size();
+    if (tip.has_value() && tip->height >= loc->height) row.finalized_depth = tip->height - loc->height + 1;
+
+    std::uint64_t total_in = 0;
+    bool fee_known = true;
+    std::set<std::string> input_addresses;
+    std::set<std::string> output_addresses;
+
+    for (const auto& input : tx->inputs) {
+      const auto prev_tx = load_tx(input.prev_txid);
+      if (!prev_tx.has_value() || static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) {
+        fee_known = false;
+        continue;
+      }
+      const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
+      total_in += prev_out.value;
+      if (auto addr = p2pkh_script_to_address(prev_out.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
+        input_addresses.insert(*addr);
+      }
+    }
+
+    for (const auto& output : tx->outputs) {
+      row.total_out += output.value;
+      if (auto addr = p2pkh_script_to_address(output.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
+        output_addresses.insert(*addr);
+        row.recipients.push_back(*addr);
+      }
+    }
+    if (fee_known && total_in >= row.total_out) row.fee = total_in - row.total_out;
+
+    if (!input_addresses.empty()) row.primary_sender = *input_addresses.begin();
+    if (!output_addresses.empty()) row.primary_recipient = *output_addresses.begin();
+    row.recipient_count = output_addresses.size();
+
+    const bool same_party = !input_addresses.empty() && !output_addresses.empty() && input_addresses == output_addresses;
+    const bool single_sender = input_addresses.size() == 1;
+    const bool single_recipient = output_addresses.size() == 1;
+    const bool has_change_like_overlap =
+        !input_addresses.empty() && !output_addresses.empty() &&
+        std::any_of(output_addresses.begin(), output_addresses.end(),
+                    [&](const std::string& address) { return input_addresses.count(address) != 0; });
+
+    if (tx->inputs.empty()) {
+      row.flow_kind = "issuance";
+      row.flow_summary = tx->outputs.size() <= 1 ? "Protocol or settlement issuance" : "Protocol or settlement issuance fanout";
+    } else if (same_party) {
+      row.flow_kind = "self-transfer";
+      row.flow_summary = "Inputs and outputs resolve to the same finalized address set";
+    } else if (single_sender && single_recipient && !has_change_like_overlap) {
+      row.flow_kind = "direct-transfer";
+      row.flow_summary = "Single-sender finalized transfer";
+    } else if (single_sender && has_change_like_overlap && output_addresses.size() == 2) {
+      row.flow_kind = "transfer-with-change";
+      row.flow_summary = "Likely payment with one external recipient and one change output";
+    } else if (input_addresses.size() > 1 && single_recipient) {
+      row.flow_kind = "consolidation";
+      row.flow_summary = "Many finalized inputs converging to one recipient";
+    } else if (single_sender && output_addresses.size() > 2) {
+      row.flow_kind = "fanout";
+      row.flow_summary = "One sender distributing finalized outputs to multiple recipients";
+    }
+
+    out.push_back(std::move(row));
+  }
+  return out;
+}
+
+std::string tx_summaries_json(const std::vector<TxSummaryRow>& rows) {
+  std::ostringstream oss;
+  oss << "{\"items\":[";
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    if (i) oss << ",";
+    const auto& row = rows[i];
+    oss << "{\"txid\":\"" << row.txid << "\",\"height\":" << row.height
+        << ",\"status_label\":\"FINALIZED" << (row.credit_safe ? " (CREDIT SAFE)" : "") << "\""
+        << ",\"credit_safe\":" << (row.credit_safe ? "true" : "false")
+        << ",\"finalized_depth\":" << row.finalized_depth
+        << ",\"finalized_out\":" << row.total_out
+        << ",\"total_out\":" << row.total_out
+        << ",\"fee\":";
+    if (row.fee.has_value()) oss << *row.fee; else oss << "null";
+    oss << ",\"input_count\":" << row.input_count
+        << ",\"output_count\":" << row.output_count
+        << ",\"primary_sender\":";
+    if (row.primary_sender.has_value()) oss << "\"" << json_escape(*row.primary_sender) << "\""; else oss << "null";
+    oss << ",\"primary_recipient\":";
+    if (row.primary_recipient.has_value()) oss << "\"" << json_escape(*row.primary_recipient) << "\""; else oss << "null";
+    oss << ",\"recipient_count\":" << row.recipient_count
+        << ",\"recipients\":[";
+    for (std::size_t j = 0; j < row.recipients.size(); ++j) {
+      if (j) oss << ",";
+      oss << "\"" << json_escape(row.recipients[j]) << "\"";
+    }
+    oss << "]"
+        << ",\"flow_kind\":\"" << json_escape(row.flow_kind) << "\""
+        << ",\"flow_summary\":\"" << json_escape(row.flow_summary) << "\"}";
+  }
+  oss << "]}";
+  return oss.str();
+}
+
+std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, const Hash32& scripthash,
+                                                      const std::vector<storage::DB::ScriptHistoryEntry>& page_items) {
+  std::vector<DetailedHistoryRow> out;
+  out.reserve(page_items.size());
+  std::map<Hash32, std::optional<Tx>> tx_cache;
+
+  const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
+    auto it = tx_cache.find(txid);
+    if (it != tx_cache.end()) return it->second;
+    std::optional<Tx> parsed;
+    if (auto loc = db.get_tx_index(txid); loc.has_value()) {
+      if (auto tx = Tx::parse(loc->tx_bytes); tx.has_value()) parsed = *tx;
+    }
+    tx_cache.emplace(txid, parsed);
+    return parsed;
+  };
+
+  for (const auto& item : page_items) {
+    DetailedHistoryRow row;
+    row.txid = item.txid;
+    row.height = item.height;
+
+    const auto tx = load_tx(item.txid);
+    if (!tx.has_value()) {
+      row.direction = "related";
+      row.detail = "Finalized history entry exists but transaction details could not be expanded";
+      out.push_back(std::move(row));
+      continue;
+    }
+
+    std::uint64_t credited = 0;
+    for (const auto& output : tx->outputs) {
+      if (crypto::sha256(output.script_pubkey) == scripthash) credited += output.value;
+    }
+
+    std::uint64_t debited = 0;
+    for (const auto& input : tx->inputs) {
+      const auto prev_tx = load_tx(input.prev_txid);
+      if (!prev_tx.has_value()) continue;
+      if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
+      const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
+      if (crypto::sha256(prev_out.script_pubkey) == scripthash) debited += prev_out.value;
+    }
+
+    if (debited == 0 && credited > 0) {
+      row.direction = "received";
+      row.net_amount = static_cast<std::int64_t>(credited);
+      row.detail = "Finalized credit to this address";
+    } else if (debited > 0 && credited == 0) {
+      row.direction = "sent";
+      row.net_amount = -static_cast<std::int64_t>(debited);
+      row.detail = "Finalized spend from this address with no decoded return output";
+    } else if (debited > 0 && credited > 0) {
+      row.direction = "self-transfer";
+      row.net_amount = static_cast<std::int64_t>(credited) - static_cast<std::int64_t>(debited);
+      row.detail = "This address appears on both finalized inputs and outputs";
+    } else {
+      row.direction = "related";
+      row.detail = "Address is present in finalized history but could not be classified precisely";
+    }
+    out.push_back(std::move(row));
+  }
+  return out;
+}
+
+std::string paged_detailed_history_json(const storage::DB& db, const Hash32& scripthash,
+                                        const std::vector<storage::DB::ScriptHistoryEntry>& history, std::uint64_t limit,
+                                        const std::optional<ScriptHistoryCursor>& start_after) {
+  std::vector<storage::DB::ScriptHistoryEntry> filtered;
+  filtered.reserve(history.size());
+  for (const auto& entry : history) {
+    if (start_after.has_value()) {
+      if (entry.height < start_after->height) continue;
+      if (entry.height == start_after->height && !(start_after->txid < entry.txid)) continue;
+    }
+    filtered.push_back(entry);
+  }
+
+  const std::size_t actual_limit = static_cast<std::size_t>(limit);
+  const bool has_more = filtered.size() > actual_limit;
+  if (has_more) filtered.resize(actual_limit);
+  const auto rows = detailed_history_rows(db, scripthash, filtered);
+
+  std::ostringstream oss;
+  oss << "{\"items\":[";
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    if (i) oss << ",";
+    const auto& row = rows[i];
+    oss << "{\"txid\":\"" << hex_encode32(row.txid) << "\",\"height\":" << row.height
+        << ",\"direction\":\"" << json_escape(row.direction) << "\",\"net_amount\":" << row.net_amount
+        << ",\"detail\":\"" << json_escape(row.detail) << "\"}";
+  }
+  oss << "],\"has_more\":" << (has_more ? "true" : "false")
+      << ",\"ordering\":\"height_asc_txid_asc\"";
+  if (has_more && !filtered.empty()) {
+    const auto& last = filtered.back();
+    oss << ",\"next_start_after\":{\"height\":" << last.height << ",\"txid\":\"" << hex_encode32(last.txid) << "\"}";
+  } else {
+    oss << ",\"next_start_after\":null";
   }
   oss << "}";
   return oss.str();
@@ -1736,6 +2078,20 @@ std::string Server::handle_rpc_body(const std::string& body) {
     return make_result(id, tx_status_json(*txid, loc, tip, *view));
   }
 
+  if (*method == "get_tx_summaries") {
+    const auto* txids_value = params ? params->get("txids") : nullptr;
+    if (!txids_value || !txids_value->is_array()) return make_error(id, -32602, "missing txids");
+    std::vector<Hash32> txids;
+    txids.reserve(txids_value->array_value.size());
+    for (const auto& item : txids_value->array_value) {
+      if (!item.is_string()) return make_error(id, -32602, "bad txids");
+      auto parsed = parse_hex32(item.string_value);
+      if (!parsed.has_value()) return make_error(id, -32602, "bad txids");
+      txids.push_back(*parsed);
+    }
+    return make_result(id, tx_summaries_json(build_tx_summary_rows(*view, cfg_.network, txids)));
+  }
+
   if (*method == "validator_onboarding_status") {
     auto key_file = field_string(params, "key_file");
     if (!key_file) return make_error(id, -32602, "missing key_file");
@@ -1962,6 +2318,31 @@ std::string Server::handle_rpc_body(const std::string& body) {
     std::optional<ScriptHistoryCursor> start_after;
     if (start_after_height.has_value()) start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
     return make_result(id, paged_history_json(history, limit, from_height, start_after));
+  }
+
+  if (*method == "get_history_page_detailed") {
+    auto sh_hex = field_string(params, "scripthash_hex");
+    if (!sh_hex) return make_error(id, -32602, "missing scripthash_hex");
+    auto sh = parse_hex32(*sh_hex);
+    if (!sh) return make_error(id, -32602, "bad scripthash");
+    const auto limit = field_u64(params, "limit").value_or(kDefaultPageLimit);
+    if (limit == 0 || limit > kMaxPageLimit) return make_error(id, -32602, "bad limit");
+    const auto start_after_obj = field_object(params, "start_after");
+    auto start_after_height = field_u64(start_after_obj, "height");
+    auto start_after_txid_hex = field_string(start_after_obj, "txid");
+    std::optional<Hash32> start_after_txid;
+    if (start_after_txid_hex.has_value()) {
+      start_after_txid = parse_hex32(*start_after_txid_hex);
+      if (!start_after_txid.has_value()) return make_error(id, -32602, "bad start_after.txid");
+    }
+    if (start_after_height.has_value() != start_after_txid.has_value()) {
+      return make_error(id, -32602, "start_after requires height and txid");
+    }
+
+    const auto history = view->get_script_history(*sh);
+    std::optional<ScriptHistoryCursor> start_after;
+    if (start_after_height.has_value()) start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
+    return make_result(id, paged_detailed_history_json(*view, *sh, history, limit, start_after));
   }
 
   if (*method == "get_committee") {

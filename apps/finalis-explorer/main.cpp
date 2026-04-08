@@ -41,9 +41,11 @@ struct Config {
 template <typename T>
 struct LookupResult;
 
+struct TxSummaryBatchItem;
 struct TxResult;
 struct TransitionResult;
 LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txid_hex);
+std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& cfg, const std::vector<std::string>& txids);
 
 struct ApiError {
   int http_status{500};
@@ -262,6 +264,23 @@ struct RecentTxResult {
   std::optional<std::string> flow_summary;
 };
 
+struct TxSummaryBatchItem {
+  std::string txid;
+  std::optional<std::uint64_t> height;
+  std::optional<std::uint64_t> total_out;
+  std::optional<std::uint64_t> fee;
+  std::optional<std::size_t> input_count;
+  std::optional<std::size_t> output_count;
+  std::optional<std::string> primary_sender;
+  std::optional<std::string> primary_recipient;
+  std::optional<std::size_t> recipient_count;
+  std::vector<std::string> recipients;
+  std::optional<std::string> flow_kind;
+  std::optional<std::string> flow_summary;
+  std::optional<std::string> status_label;
+  std::optional<bool> credit_safe;
+};
+
 struct Response {
   int status{200};
   std::string content_type{"text/html; charset=utf-8"};
@@ -401,7 +420,17 @@ struct TransitionSummary {
 TransitionSummary compute_transition_summary(const Config& cfg, const TransitionResult& transition) {
   TransitionSummary summary;
   std::set<std::string> distinct_recipients;
+  const auto summaries = fetch_tx_summary_batch(cfg, transition.txids);
   for (const auto& txid : transition.txids) {
+    auto it = summaries.find(txid);
+    if (it != summaries.end()) {
+      if (it->second.total_out.has_value()) summary.finalized_out += *it->second.total_out;
+      if (it->second.flow_kind.has_value()) ++summary.flow_mix[*it->second.flow_kind];
+      for (const auto& recipient : it->second.recipients) {
+        if (!recipient.empty()) distinct_recipients.insert(recipient);
+      }
+      continue;
+    }
     auto tx_lookup = fetch_tx_result(cfg, txid);
     if (!tx_lookup.value.has_value()) continue;
     summary.finalized_out += tx_lookup.value->total_out;
@@ -1016,6 +1045,7 @@ LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::s
 LookupResult<SearchResult> fetch_search_result(const Config& cfg, const std::string& query);
 std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size_t max_items);
 LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uint64_t height);
+std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& cfg, const std::vector<std::string>& txids);
 
 std::string render_status_json(const StatusResult& result);
 std::string render_tx_json(const TxResult& result);
@@ -1644,10 +1674,16 @@ LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::s
       params << ",\"start_after\":{\"height\":" << *cursor_height << ",\"txid\":\"" << *cursor_txid << "\"}";
     }
     params << "}";
-    auto res = rpc_call(cfg.rpc_url, "get_history_page", params.str());
+    auto res = rpc_call(cfg.rpc_url, "get_history_page_detailed", params.str());
+    bool used_legacy_history = false;
     if (!res.result.has_value() || !res.result->is_object()) {
-      out.error = upstream_error(res.error.empty() ? "history lookup failed" : res.error);
-      return out;
+      auto legacy = rpc_call(cfg.rpc_url, "get_history_page", params.str());
+      if (!legacy.result.has_value() || !legacy.result->is_object()) {
+        out.error = upstream_error(res.error.empty() ? "history lookup failed" : res.error);
+        return out;
+      }
+      res = std::move(legacy);
+      used_legacy_history = true;
     }
     const auto* items = res.result->get("items");
     if (!items || !items->is_array()) break;
@@ -1655,13 +1691,22 @@ LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::s
       auto txid = object_string(&item, "txid");
       auto height = object_u64(&item, "height");
       if (!txid || !height) continue;
-      auto tx_lookup = fetch_tx_result(cfg, *txid);
-      if (tx_lookup.value.has_value()) {
-        auto history_item = classify_address_history_item(addr, *tx_lookup.value);
-        history_item.height = *height;
-        result.history.items.push_back(std::move(history_item));
+      if (used_legacy_history) {
+        auto tx_lookup = fetch_tx_result(cfg, *txid);
+        if (tx_lookup.value.has_value()) {
+          auto history_item = classify_address_history_item(addr, *tx_lookup.value);
+          history_item.height = *height;
+          result.history.items.push_back(std::move(history_item));
+        } else {
+          result.history.items.push_back(AddressHistoryItemResult{*txid, *height, "related", 0,
+                                                                  "Explorer could not expand the finalized transaction details"});
+        }
       } else {
-        result.history.items.push_back(AddressHistoryItemResult{*txid, *height, "related", 0, "Explorer could not expand the finalized transaction details"});
+        auto direction = object_string(&item, "direction");
+        auto net_amount = object_i64(&item, "net_amount");
+        auto detail = object_string(&item, "detail");
+        if (!direction || !net_amount || !detail) continue;
+        result.history.items.push_back(AddressHistoryItemResult{*txid, *height, *direction, *net_amount, *detail});
       }
     }
     result.history.has_more = object_bool(&*res.result, "has_more").value_or(false);
@@ -1780,6 +1825,7 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
   const auto tip = status.value->finalized_height;
   const std::uint64_t depth_window = 32;
   const std::uint64_t start_height = tip > depth_window ? tip - depth_window : 0;
+  std::vector<std::pair<std::string, std::uint64_t>> tx_refs;
   for (std::uint64_t h = tip + 1; h-- > start_height && out.size() < max_items;) {
     std::string err;
     std::string transition_hash_hex;
@@ -1787,10 +1833,34 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
     if (!transition.has_value()) continue;
     const auto txids = fetch_transition_txids(cfg, *transition);
     for (const auto& txid : txids) {
-      if (out.size() >= max_items) break;
-      RecentTxResult item;
-      item.txid = txid;
-      item.height = h;
+      if (tx_refs.size() >= max_items) break;
+      tx_refs.push_back({txid, h});
+    }
+    if (h == 0) break;
+  }
+  std::vector<std::string> txids;
+  txids.reserve(tx_refs.size());
+  for (const auto& [txid, _] : tx_refs) txids.push_back(txid);
+  const auto summaries = fetch_tx_summary_batch(cfg, txids);
+  out.reserve(tx_refs.size());
+  for (const auto& [txid, height] : tx_refs) {
+    RecentTxResult item;
+    item.txid = txid;
+    item.height = height;
+    auto it = summaries.find(txid);
+    if (it != summaries.end()) {
+      item.status_label = it->second.status_label;
+      item.credit_safe = it->second.credit_safe;
+      item.total_out = it->second.total_out;
+      item.input_count = it->second.input_count;
+      item.output_count = it->second.output_count;
+      item.fee = it->second.fee;
+      item.primary_sender = it->second.primary_sender;
+      item.primary_recipient = it->second.primary_recipient;
+      item.recipient_count = it->second.recipient_count;
+      item.flow_kind = it->second.flow_kind;
+      item.flow_summary = it->second.flow_summary;
+    } else {
       auto tx_lookup = fetch_tx_result(cfg, txid);
       if (tx_lookup.value.has_value()) {
         item.status_label = tx_lookup.value->status_label;
@@ -1820,9 +1890,49 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
         item.flow_kind = tx_lookup.value->flow_kind;
         item.flow_summary = tx_lookup.value->flow_summary;
       }
-      out.push_back(std::move(item));
     }
-    if (h == 0) break;
+    out.push_back(std::move(item));
+  }
+  return out;
+}
+
+std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& cfg, const std::vector<std::string>& txids) {
+  std::map<std::string, TxSummaryBatchItem> out;
+  if (txids.empty()) return out;
+  std::ostringstream params;
+  params << "{\"txids\":[";
+  for (std::size_t i = 0; i < txids.size(); ++i) {
+    if (i) params << ",";
+    params << "\"" << json_escape(txids[i]) << "\"";
+  }
+  params << "]}";
+  auto res = rpc_call(cfg.rpc_url, "get_tx_summaries", params.str());
+  if (!res.result.has_value() || !res.result->is_object()) return out;
+  const auto* items = res.result->get("items");
+  if (!items || !items->is_array()) return out;
+  for (const auto& item : items->array_value) {
+    auto txid = object_string(&item, "txid");
+    if (!txid) continue;
+    TxSummaryBatchItem row;
+    row.txid = *txid;
+    row.height = object_u64(&item, "height");
+    row.total_out = object_u64(&item, "finalized_out");
+    row.fee = object_u64(&item, "fee");
+    if (auto count = object_u64(&item, "input_count"); count.has_value()) row.input_count = static_cast<std::size_t>(*count);
+    if (auto count = object_u64(&item, "output_count"); count.has_value()) row.output_count = static_cast<std::size_t>(*count);
+    row.primary_sender = object_string(&item, "primary_sender");
+    row.primary_recipient = object_string(&item, "primary_recipient");
+    if (auto count = object_u64(&item, "recipient_count"); count.has_value()) row.recipient_count = static_cast<std::size_t>(*count);
+    row.flow_kind = object_string(&item, "flow_kind");
+    row.flow_summary = object_string(&item, "flow_summary");
+    row.status_label = object_string(&item, "status_label");
+    row.credit_safe = object_bool(&item, "credit_safe");
+    if (const auto* recipients = item.get("recipients"); recipients && recipients->is_array()) {
+      for (const auto& recipient : recipients->array_value) {
+        if (recipient.is_string()) row.recipients.push_back(recipient.string_value);
+      }
+    }
+    out.emplace(*txid, std::move(row));
   }
   return out;
 }
@@ -2231,16 +2341,17 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   const auto& transition = *lookup.value;
   const std::string transition_path = "/transition/" + transition.hash;
   const std::string transition_api_path = "/api/transition/" + transition.hash;
+  const auto summaries = fetch_tx_summary_batch(cfg, transition.txids);
   std::uint64_t total_finalized_out = 0;
   std::set<std::string> distinct_recipients;
   std::map<std::string, std::size_t> flow_mix;
   for (const auto& txid : transition.txids) {
-    auto tx_lookup = fetch_tx_result(cfg, txid);
-    if (!tx_lookup.value.has_value()) continue;
-    total_finalized_out += tx_lookup.value->total_out;
-    ++flow_mix[tx_lookup.value->flow_kind];
-    for (const auto& out : tx_lookup.value->outputs) {
-      if (out.address.has_value() && !out.address->empty()) distinct_recipients.insert(*out.address);
+    auto it = summaries.find(txid);
+    if (it == summaries.end()) continue;
+    if (it->second.total_out.has_value()) total_finalized_out += *it->second.total_out;
+    if (it->second.flow_kind.has_value()) ++flow_mix[*it->second.flow_kind];
+    for (const auto& recipient : it->second.recipients) {
+      if (!recipient.empty()) distinct_recipients.insert(recipient);
     }
   }
   std::ostringstream flow_mix_text;

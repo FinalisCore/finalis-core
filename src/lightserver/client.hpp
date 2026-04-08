@@ -84,6 +84,20 @@ struct HistoryPageView {
   std::optional<HistoryCursor> next_start_after;
 };
 
+struct DetailedHistoryEntry {
+  Hash32 txid{};
+  std::uint64_t height{0};
+  std::string direction;
+  std::int64_t net_amount{0};
+  std::string detail;
+};
+
+struct DetailedHistoryPageView {
+  std::vector<DetailedHistoryEntry> items;
+  bool has_more{false};
+  std::optional<HistoryCursor> next_start_after;
+};
+
 struct TxView {
   std::uint64_t height{0};
   Bytes tx_bytes;
@@ -130,6 +144,10 @@ std::optional<std::vector<HistoryEntry>> rpc_get_history(const std::string& rpc_
                                                          std::string* err);
 std::optional<HistoryPageView> rpc_get_history_page(const std::string& rpc_url, const Hash32& scripthash, std::uint64_t limit,
                                                     const std::optional<HistoryCursor>& start_after, std::string* err);
+std::optional<DetailedHistoryPageView> rpc_get_history_page_detailed(const std::string& rpc_url, const Hash32& scripthash,
+                                                                     std::uint64_t limit,
+                                                                     const std::optional<HistoryCursor>& start_after,
+                                                                     std::string* err);
 std::optional<TxView> rpc_get_tx(const std::string& rpc_url, const Hash32& txid, std::string* err);
 std::optional<TxStatusView> rpc_get_tx_status(const std::string& rpc_url, const Hash32& txid, std::string* err);
 BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_bytes, std::string* err);

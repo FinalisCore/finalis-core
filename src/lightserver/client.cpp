@@ -614,6 +614,66 @@ std::optional<HistoryPageView> rpc_get_history_page(const std::string& rpc_url, 
   return out;
 }
 
+std::optional<DetailedHistoryPageView> rpc_get_history_page_detailed(const std::string& rpc_url, const Hash32& scripthash,
+                                                                     std::uint64_t limit,
+                                                                     const std::optional<HistoryCursor>& start_after,
+                                                                     std::string* err) {
+  std::ostringstream body_json;
+  body_json << R"({"jsonrpc":"2.0","id":35,"method":"get_history_page_detailed","params":{"scripthash_hex":")"
+            << hex_encode32(scripthash) << R"(","limit":)" << limit;
+  if (start_after.has_value()) {
+    body_json << R"(,"start_after":{"height":)" << start_after->height << R"(,"txid":")" << hex_encode32(start_after->txid)
+              << R"("})";
+  }
+  body_json << "}}";
+  auto body = http_post_json(rpc_url, body_json.str(), err);
+  if (!body) return std::nullopt;
+  auto root = minijson::parse(*body);
+  if (!root.has_value()) {
+    if (err) *err = "invalid rpc response";
+    return std::nullopt;
+  }
+  const auto* result = result_value(*root, err);
+  if (!result || !result->is_object()) return std::nullopt;
+
+  DetailedHistoryPageView out;
+  out.has_more = object_bool(result, "has_more").value_or(false);
+  const auto* items = result->get("items");
+  if (!items || !items->is_array()) {
+    if (err) *err = "missing detailed history page items";
+    return std::nullopt;
+  }
+  for (const auto& entry : items->array_value) {
+    auto txid_hex = object_string(&entry, "txid");
+    auto height = object_u64(&entry, "height");
+    auto direction = object_string(&entry, "direction");
+    auto net_amount = object_i64(&entry, "net_amount");
+    auto detail = object_string(&entry, "detail");
+    if (!txid_hex || !height || !direction || !net_amount || !detail) continue;
+    auto txid = parse_hex32_field(*txid_hex);
+    if (!txid) continue;
+    out.items.push_back(DetailedHistoryEntry{*txid, *height, *direction, *net_amount, *detail});
+  }
+  const auto* next = result->get("next_start_after");
+  if (!next || next->is_null()) {
+    out.next_start_after.reset();
+    return out;
+  }
+  auto next_height = object_u64(next, "height");
+  auto next_txid_hex = object_string(next, "txid");
+  if (!next_height || !next_txid_hex) {
+    if (err) *err = "malformed detailed history page cursor";
+    return std::nullopt;
+  }
+  auto next_txid = parse_hex32_field(*next_txid_hex);
+  if (!next_txid) {
+    if (err) *err = "malformed detailed history page cursor";
+    return std::nullopt;
+  }
+  out.next_start_after = HistoryCursor{*next_height, *next_txid};
+  return out;
+}
+
 std::optional<TxView> rpc_get_tx(const std::string& rpc_url, const Hash32& txid, std::string* err) {
   const std::string body_json = std::string(R"({"jsonrpc":"2.0","id":4,"method":"get_tx","params":{"txid":")") +
                                 hex_encode32(txid) + R"("}})";

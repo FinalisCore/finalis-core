@@ -364,21 +364,11 @@ TEST(test_explorer_status_and_committee_surface_show_bounded_ticket_pow) {
 
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
-  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded)") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded, Operator-Native)") == std::string::npos);
-  ASSERT_TRUE(home.body.find("Current Committee Operators") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Operator View") != std::string::npos);
   ASSERT_TRUE(home.body.find("Operator-Native") == std::string::npos);
-  ASSERT_TRUE(home.body.find("ID Source") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Adaptive Committee Target") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Qualified Operator Depth") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Telemetry Sample Count") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Telemetry Fallback Epochs") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Telemetry Sticky Fallback Epochs") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Adaptive Alert Flags") != std::string::npos);
-  ASSERT_TRUE(home.body.find("near-threshold") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Current finalized committee operator detail is unavailable from the backend view.") == std::string::npos);
-  ASSERT_TRUE(home.body.find("aaaaaaaa") != std::string::npos);
-  ASSERT_TRUE(home.body.find("1010000") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Open Committee View") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Protocol Reserve") != std::string::npos);
+  ASSERT_TRUE(home.body.find("42.00000000 FLS") != std::string::npos);
 
   const auto committee_page = handle_request(cfg, make_http_get("/committee"));
   ASSERT_EQ(committee_page.status, 200);
@@ -421,7 +411,7 @@ TEST(test_explorer_root_page_recent_tx_empty_state_is_explicit) {
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
   ASSERT_TRUE(home.body.find("Finalized Transactions") != std::string::npos);
-  ASSERT_TRUE(home.body.find("No recent finalized transactions available from the current backend view.") != std::string::npos);
+  ASSERT_TRUE(home.body.find("No finalized transactions were found in the recent finalized-height scan window.") != std::string::npos);
 }
 
 TEST(test_explorer_root_page_committee_empty_state_is_explicit) {
@@ -431,8 +421,8 @@ TEST(test_explorer_root_page_committee_empty_state_is_explicit) {
 
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
-  ASSERT_TRUE(home.body.find("Current Committee Operators") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Current finalized committee operator detail is unavailable from the backend. Check the finalized committee checkpoint and lightserver verbose committee view.") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Operator View") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Open Committee View") != std::string::npos);
 
   const auto committee = handle_request(cfg, make_http_get("/committee"));
   ASSERT_EQ(committee.status, 200);
@@ -446,15 +436,14 @@ TEST(test_explorer_root_page_availability_enforcement_empty_state_is_explicit) {
 
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
-  ASSERT_TRUE(home.body.find("Availability Enforcement") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Finalized-history-derived BPoAR eligibility now gates future committee checkpoints.") !=
+  ASSERT_TRUE(home.body.find("Operator View") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Committee composition, Ticket PoW, and availability mechanics live on the dedicated committee page.") !=
               std::string::npos);
-  ASSERT_TRUE(home.body.find("Epoch</div><div>9") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Retained Prefixes</div><div>5") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Tracked Operators</div><div>28") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Eligible Operators</div><div>26") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Below Min Eligible</div><div>YES") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Local Operator</div><div>ACTIVE") != std::string::npos);
+
+  const auto committee = handle_request(cfg, make_http_get("/committee"));
+  ASSERT_EQ(committee.status, 200);
+  ASSERT_TRUE(committee.body.find("Checkpoint Mode") != std::string::npos);
+  ASSERT_TRUE(committee.body.find("Adaptive Committee Target") != std::string::npos);
 }
 
 TEST(test_explorer_root_page_surfaces_summary_sections_consistently) {
@@ -465,16 +454,14 @@ TEST(test_explorer_root_page_surfaces_summary_sections_consistently) {
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
   ASSERT_TRUE(home.body.find("Finalized Transactions") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Availability Enforcement") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Current Committee Operators") != std::string::npos);
-  ASSERT_TRUE(home.body.find("ID Source") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Operator View") != std::string::npos);
   ASSERT_TRUE(home.body.find("Finality Committee") != std::string::npos);
   ASSERT_TRUE(home.body.find("Network ID") != std::string::npos);
   ASSERT_TRUE(home.body.find("Genesis Hash") != std::string::npos);
   ASSERT_TRUE(home.body.find("Wallet API") != std::string::npos);
   ASSERT_TRUE(home.body.find("Protocol Reserve") != std::string::npos);
   ASSERT_TRUE(home.body.find("42.00000000 FLS") != std::string::npos);
-  ASSERT_TRUE(home.body.find("used by core rules after year 12") != std::string::npos);
+  ASSERT_TRUE(home.body.find("Reserved by protocol issuance for long-horizon monetary rules.") != std::string::npos);
   ASSERT_TRUE(home.body.find("Copy Status API Path") != std::string::npos);
 }
 
@@ -491,10 +478,8 @@ TEST(test_explorer_status_surface_remains_truthful_for_single_live_ticket_policy
 
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
-  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded)") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Ticket PoW (Bounded, Operator-Native)") == std::string::npos);
+  ASSERT_TRUE(home.body.find("Operator View") != std::string::npos);
   ASSERT_TRUE(home.body.find("Legacy adjustment policy") == std::string::npos);
-  ASSERT_TRUE(home.body.find("Current finalized committee operator detail is unavailable from the backend view.") == std::string::npos);
 }
 
 TEST(test_explorer_api_transition_contract) {

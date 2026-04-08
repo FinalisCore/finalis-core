@@ -2757,8 +2757,6 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
       status->tip_height != request.previous_tip_height ||
       QString::fromStdString(status->transition_hash) != request.previous_transition_hash;
   std::set<std::string> sent_index(request.local_sent_txids.begin(), request.local_sent_txids.end());
-  const auto own_decoded = finalis::address::decode(request.wallet_address.toStdString());
-  const Bytes own_spk = own_decoded ? finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash) : Bytes{};
   std::vector<ChainRecord> finalized_records;
   std::set<std::string> finalized_seen;
   auto next_summary_cache = request.finalized_tx_summary_cache;
@@ -2775,7 +2773,7 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   }
 
   const auto append_history_record =
-      [&](const lightserver::HistoryEntry& entry, std::vector<WalletStore::FinalizedHistoryRecord>* persisted_out) {
+      [&](const lightserver::DetailedHistoryEntry& entry, std::vector<WalletStore::FinalizedHistoryRecord>* persisted_out) {
         const std::string txid_hex = hex_encode32(entry.txid);
         QString kind;
         QString detail;
@@ -2783,48 +2781,11 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
           kind = cached->second.first;
           detail = cached->second.second;
         } else {
-          std::map<std::string, std::optional<std::vector<TxOut>>> prev_outputs_cache;
-          std::string rpc_err;
-          auto txv = lightserver::rpc_get_tx(active_endpoint.toStdString(), entry.txid, &rpc_err);
-          if (txv) {
-            auto tx = Tx::parse(txv->tx_bytes);
-            if (tx) {
-              std::uint64_t credited = 0;
-              for (const auto& out : tx->outputs) {
-                if (out.script_pubkey == own_spk) credited += out.value;
-              }
-              std::uint64_t debited = 0;
-              for (const auto& input : tx->inputs) {
-                const std::string prev_txid_hex = hex_encode32(input.prev_txid);
-                auto cached_prev = prev_outputs_cache.find(prev_txid_hex);
-                if (cached_prev == prev_outputs_cache.end()) {
-                  std::string prev_err;
-                  std::optional<std::vector<TxOut>> outputs;
-                  auto prev_txv = lightserver::rpc_get_tx(active_endpoint.toStdString(), input.prev_txid, &prev_err);
-                  if (prev_txv) {
-                    auto prev_tx = Tx::parse(prev_txv->tx_bytes);
-                    if (prev_tx) outputs = prev_tx->outputs;
-                  }
-                  cached_prev = prev_outputs_cache.emplace(prev_txid_hex, std::move(outputs)).first;
-                }
-                if (!cached_prev->second.has_value()) continue;
-                if (static_cast<std::size_t>(input.prev_index) >= cached_prev->second->size()) continue;
-                const auto& prev_out = (*cached_prev->second)[static_cast<std::size_t>(input.prev_index)];
-                if (prev_out.script_pubkey == own_spk) debited += prev_out.value;
-              }
-              if (sent_index.count(txid_hex)) {
-                kind = "sent";
-                if (debited > credited) detail = QString("%1 net").arg(format_coin_amount(debited - credited));
-                else detail = format_coin_amount(debited > 0 ? debited : credited);
-              } else {
-                const auto flow = classify_wallet_history_flow_impl(credited, debited);
-                kind = flow.kind;
-                detail = flow.detail;
-              }
-              if (detail.isEmpty()) {
-                detail = QString("tx %1").arg(elide_middle(QString::fromStdString(txid_hex), 10));
-              }
-            }
+          kind = QString::fromStdString(entry.direction);
+          detail = QString::fromStdString(entry.detail);
+          if (sent_index.count(txid_hex) != 0) {
+            kind = "sent";
+            if (entry.net_amount < 0) detail = QString("%1 net").arg(format_coin_amount(static_cast<std::uint64_t>(-entry.net_amount)));
           }
           if (kind.isEmpty()) kind = sent_index.count(txid_hex) ? "sent" : "activity";
           if (detail.isEmpty()) detail = QString("tx %1").arg(elide_middle(QString::fromStdString(txid_hex), 10));
@@ -2859,8 +2820,8 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
     std::optional<lightserver::HistoryCursor> last_processed;
     while (true) {
       std::string rpc_err;
-      auto page =
-          lightserver::rpc_get_history_page(active_endpoint.toStdString(), validated_address->scripthash, 200, page_cursor, &rpc_err);
+      auto page = lightserver::rpc_get_history_page_detailed(active_endpoint.toStdString(), validated_address->scripthash, 200,
+                                                             page_cursor, &rpc_err);
       if (!page) {
         result.error = QString("Wallet history refresh failed.\n\nLast error: %1").arg(QString::fromStdString(rpc_err));
         result.success = false;
@@ -2901,8 +2862,8 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
     bool incremental_rebuilt = false;
     while (true) {
       std::string rpc_err;
-      auto page =
-          lightserver::rpc_get_history_page(active_endpoint.toStdString(), validated_address->scripthash, 200, page_cursor, &rpc_err);
+      auto page = lightserver::rpc_get_history_page_detailed(active_endpoint.toStdString(), validated_address->scripthash, 200,
+                                                             page_cursor, &rpc_err);
       if (!page) {
         result.finalized_history_cursor_height.reset();
         result.finalized_history_cursor_txid.reset();

@@ -240,6 +240,7 @@ class DB {
 
   bool put_utxo(const OutPoint& op, const TxOut& out);
   bool erase_utxo(const OutPoint& op);
+  std::optional<TxOut> get_utxo(const OutPoint& op) const;
   std::map<OutPoint, UtxoEntry> load_utxos() const;
 
   bool put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
