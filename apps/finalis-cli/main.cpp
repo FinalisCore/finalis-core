@@ -1,9 +1,5 @@
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <array>
 #include <chrono>
@@ -27,6 +23,7 @@
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
+#include "common/socket_compat.hpp"
 #include "common/wide_arith.hpp"
 #include "common/version.hpp"
 #include "consensus/monetary.hpp"
@@ -109,27 +106,29 @@ const char* epoch_ticket_origin_name(finalis::consensus::EpochTicketOrigin origi
   }
 }
 
-std::optional<int> connect_tcp(const std::string& host, std::uint16_t port) {
+std::optional<finalis::net::SocketHandle> connect_tcp(const std::string& host, std::uint16_t port) {
+  if (!finalis::net::ensure_sockets()) return std::nullopt;
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
-  if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return std::nullopt;
+  if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return std::nullopt;
 
-  int fd = -1;
+  auto fd = finalis::net::kInvalidSocket;
   for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
-    fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (fd < 0) continue;
-    if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
-    ::close(fd);
-    fd = -1;
+    fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (!finalis::net::valid_socket(fd)) continue;
+    (void)finalis::net::set_socket_timeouts(fd, 15'000);
+    if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+    finalis::net::close_socket(fd);
+    fd = finalis::net::kInvalidSocket;
   }
-  freeaddrinfo(res);
-  if (fd < 0) return std::nullopt;
+  ::freeaddrinfo(res);
+  if (!finalis::net::valid_socket(fd)) return std::nullopt;
   return fd;
 }
 
-bool do_handshake_v0(int fd) {
+bool do_handshake_v0(finalis::net::SocketHandle fd) {
   finalis::p2p::VersionMsg v;
   v.timestamp = static_cast<std::uint64_t>(std::time(nullptr));
   v.nonce = 0xC011CAFE;
@@ -316,7 +315,7 @@ std::optional<std::string> http_post_json_with_headers(const std::string& url, c
     if (err) *err = "connect failed";
     return std::nullopt;
   }
-  const int fd = *fd_opt;
+  const auto fd = *fd_opt;
   std::ostringstream req;
   req << "POST " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port
       << "\r\nContent-Type: application/json\r\n";
@@ -327,7 +326,7 @@ std::optional<std::string> http_post_json_with_headers(const std::string& url, c
       << "\r\nConnection: close\r\n\r\n" << body;
   const auto req_s = req.str();
   if (!finalis::p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req_s.data()), req_s.size())) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     if (err) *err = "send failed";
     return std::nullopt;
   }
@@ -338,7 +337,7 @@ std::optional<std::string> http_post_json_with_headers(const std::string& url, c
     if (n <= 0) break;
     resp.append(buf.data(), static_cast<std::size_t>(n));
   }
-  ::close(fd);
+  finalis::net::close_socket(fd);
   const auto pos = resp.find("\r\n\r\n");
   if (pos == std::string::npos) {
     if (err) *err = "bad http response";
@@ -370,7 +369,7 @@ std::optional<std::string> http_get_json_with_headers(const std::string& url, co
     if (err) *err = "connect failed";
     return std::nullopt;
   }
-  const int fd = *fd_opt;
+  const auto fd = *fd_opt;
   std::ostringstream req;
   req << "GET " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port << "\r\n";
   for (const auto& [k, v] : headers) {
@@ -379,7 +378,7 @@ std::optional<std::string> http_get_json_with_headers(const std::string& url, co
   req << "Connection: close\r\n\r\n";
   const auto req_s = req.str();
   if (!finalis::p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req_s.data()), req_s.size())) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     if (err) *err = "send failed";
     return std::nullopt;
   }
@@ -390,7 +389,7 @@ std::optional<std::string> http_get_json_with_headers(const std::string& url, co
     if (n <= 0) break;
     resp.append(buf.data(), static_cast<std::size_t>(n));
   }
-  ::close(fd);
+  finalis::net::close_socket(fd);
   const auto pos = resp.find("\r\n\r\n");
   if (pos == std::string::npos) {
     if (err) *err = "bad http response";

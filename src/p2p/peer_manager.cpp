@@ -1,12 +1,5 @@
 #include "p2p/peer_manager.hpp"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -16,13 +9,6 @@
 
 namespace finalis::p2p {
 namespace {
-
-void set_close_on_exec(int fd) {
-  if (fd < 0) return;
-  const int flags = ::fcntl(fd, F_GETFD);
-  if (flags < 0) return;
-  (void)::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-}
 
 std::string bytes_to_hex_prefix(const Bytes& in, std::size_t n = 16) {
   const std::size_t take = std::min(n, in.size());
@@ -48,43 +34,42 @@ std::string frame_fail_detail(const FrameFailureInfo& fi) {
   return oss.str();
 }
 
-bool connect_with_timeout(int fd, const sockaddr* addr, socklen_t addrlen, std::uint32_t timeout_ms) {
-  const int current_flags = ::fcntl(fd, F_GETFL, 0);
-  if (current_flags < 0) return false;
-  if (::fcntl(fd, F_SETFL, current_flags | O_NONBLOCK) != 0) return false;
+bool connect_with_timeout(net::SocketHandle fd, const sockaddr* addr, socklen_t addrlen, std::uint32_t timeout_ms) {
+  if (!net::set_nonblocking(fd, true)) return false;
 
   const int rc = ::connect(fd, addr, addrlen);
   if (rc == 0) {
-    (void)::fcntl(fd, F_SETFL, current_flags);
+    (void)net::set_nonblocking(fd, false);
     return true;
   }
-  if (errno != EINPROGRESS) {
-    (void)::fcntl(fd, F_SETFL, current_flags);
+  const int err = net::socket_last_error();
+#ifdef _WIN32
+  if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+#else
+  if (err != EINPROGRESS) {
+#endif
+    (void)net::set_nonblocking(fd, false);
     return false;
   }
-
-  pollfd pfd{};
-  pfd.fd = fd;
-  pfd.events = POLLOUT;
-  const int poll_rc = ::poll(&pfd, 1, static_cast<int>(timeout_ms));
-  if (poll_rc <= 0) {
-    (void)::fcntl(fd, F_SETFL, current_flags);
-    if (poll_rc == 0) errno = ETIMEDOUT;
+  if (!net::wait_writable(fd, timeout_ms)) {
+    (void)net::set_nonblocking(fd, false);
     return false;
   }
 
   int so_error = 0;
   socklen_t so_error_len = sizeof(so_error);
-  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) != 0) {
-    (void)::fcntl(fd, F_SETFL, current_flags);
+  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+#ifdef _WIN32
+                   reinterpret_cast<char*>(&so_error),
+#else
+                   &so_error,
+#endif
+                   &so_error_len) != 0) {
+    (void)net::set_nonblocking(fd, false);
     return false;
   }
-  (void)::fcntl(fd, F_SETFL, current_flags);
-  if (so_error != 0) {
-    errno = so_error;
-    return false;
-  }
-  return true;
+  (void)net::set_nonblocking(fd, false);
+  return so_error == 0;
 }
 
 std::string peer_state_detail(const PeerInfo& info) {
@@ -108,25 +93,24 @@ void PeerManager::configure_network(std::uint32_t magic, std::uint16_t proto_ver
 }
 
 bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port) {
+  if (!net::ensure_sockets()) return false;
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd_ < 0) return false;
-  set_close_on_exec(listen_fd_);
-
-  int one = 1;
-  setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (!net::valid_socket(listen_fd_)) return false;
+  net::set_close_on_exec(listen_fd_);
+  (void)net::set_reuseaddr(listen_fd_);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   if (inet_pton(AF_INET, bind_ip.c_str(), &addr.sin_addr) != 1) {
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+    net::close_socket(listen_fd_);
+    listen_fd_ = net::kInvalidSocket;
     return false;
   }
 
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+    net::close_socket(listen_fd_);
+    listen_fd_ = net::kInvalidSocket;
     return false;
   }
   sockaddr_in bound{};
@@ -137,8 +121,8 @@ bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port)
     listen_port_ = port;
   }
   if (listen(listen_fd_, 64) != 0) {
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+    net::close_socket(listen_fd_);
+    listen_fd_ = net::kInvalidSocket;
     return false;
   }
 
@@ -148,6 +132,7 @@ bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port)
 }
 
 bool PeerManager::connect_to(const std::string& host, std::uint16_t port) {
+  if (!net::ensure_sockets()) return false;
   if (!running_) running_ = true;
 
   addrinfo hints{};
@@ -156,17 +141,17 @@ bool PeerManager::connect_to(const std::string& host, std::uint16_t port) {
   addrinfo* res = nullptr;
   if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return false;
 
-  int fd = -1;
+  net::SocketHandle fd = net::kInvalidSocket;
   for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
     fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (fd < 0) continue;
-    set_close_on_exec(fd);
+    if (!net::valid_socket(fd)) continue;
+    net::set_close_on_exec(fd);
     if (connect_with_timeout(fd, it->ai_addr, static_cast<socklen_t>(it->ai_addrlen), limits_.handshake_timeout_ms)) break;
-    ::close(fd);
-    fd = -1;
+    net::close_socket(fd);
+    fd = net::kInvalidSocket;
   }
   freeaddrinfo(res);
-  if (fd < 0) return false;
+  if (!net::valid_socket(fd)) return false;
 
   start_peer(fd, host + ":" + std::to_string(port), host, false);
   return true;
@@ -175,10 +160,10 @@ bool PeerManager::connect_to(const std::string& host, std::uint16_t port) {
 void PeerManager::stop() {
   const bool was_running = running_.exchange(false);
 
-  if (listen_fd_ >= 0) {
-    ::shutdown(listen_fd_, SHUT_RDWR);
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+  if (net::valid_socket(listen_fd_)) {
+    net::shutdown_socket(listen_fd_);
+    net::close_socket(listen_fd_);
+    listen_fd_ = net::kInvalidSocket;
     listen_port_ = 0;
   }
 
@@ -192,10 +177,10 @@ void PeerManager::stop() {
   }
 
   for (auto& p : peers) {
-    if (p->fd >= 0) {
-      ::shutdown(p->fd, SHUT_RDWR);
-      ::close(p->fd);
-      p->fd = -1;
+    if (net::valid_socket(p->fd)) {
+      net::shutdown_socket(p->fd);
+      net::close_socket(p->fd);
+      p->fd = net::kInvalidSocket;
     }
   }
 
@@ -240,13 +225,13 @@ bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
   int send_errno = 0;
   {
     std::lock_guard<std::mutex> wl(p->write_mu);
-    if (p->fd < 0) {
+    if (!net::valid_socket(p->fd)) {
       p->queued_msgs.fetch_sub(1);
       p->queued_bytes.fetch_sub(payload.size());
       return false;
     }
     ok = write_frame_fd_timed(p->fd, Frame{msg_type, payload}, limits_.frame_timeout_ms, magic_, proto_version_);
-    if (!ok) send_errno = errno;
+    if (!ok) send_errno = net::socket_last_error();
   }
   p->queued_msgs.fetch_sub(1);
   p->queued_bytes.fetch_sub(payload.size());
@@ -254,7 +239,8 @@ bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
     if (!running_.load()) return false;
     const auto info = get_peer_info(peer_id);
     std::ostringstream oss;
-    oss << "send-failed errno=" << send_errno << " err=\"" << std::strerror(send_errno) << "\" " << peer_state_detail(info);
+    oss << "send-failed errno=" << send_errno << " err=\"" << net::socket_error_string(send_errno) << "\" "
+        << peer_state_detail(info);
     emit_event(peer_id, PeerEventType::DISCONNECTED, oss.str());
     disconnect_peer(peer_id);
   }
@@ -277,10 +263,10 @@ void PeerManager::disconnect_peer(int peer_id) {
     p = it->second;
   }
   std::lock_guard<std::mutex> wl(p->write_mu);
-  if (p->fd >= 0) {
-    ::shutdown(p->fd, SHUT_RDWR);
-    ::close(p->fd);
-    p->fd = -1;
+  if (net::valid_socket(p->fd)) {
+    net::shutdown_socket(p->fd);
+    net::close_socket(p->fd);
+    p->fd = net::kInvalidSocket;
   }
 }
 
@@ -349,12 +335,12 @@ void PeerManager::accept_loop() {
   while (running_) {
     sockaddr_in addr{};
     socklen_t len = sizeof(addr);
-    int fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
-    if (fd < 0) {
+    net::SocketHandle fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    if (!net::valid_socket(fd)) {
       if (!running_) break;
       continue;
     }
-    set_close_on_exec(fd);
+    net::set_close_on_exec(fd);
     char ipbuf[64]{};
     inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf));
     bool allowed = true;
@@ -367,15 +353,15 @@ void PeerManager::accept_loop() {
       if (inbound >= limits_.max_inbound) allowed = false;
     }
     if (!allowed) {
-      ::shutdown(fd, SHUT_RDWR);
-      ::close(fd);
+      net::shutdown_socket(fd);
+      net::close_socket(fd);
       continue;
     }
     start_peer(fd, std::string(ipbuf) + ":" + std::to_string(ntohs(addr.sin_port)), ipbuf, true);
   }
 }
 
-void PeerManager::start_peer(int fd, const std::string& endpoint, const std::string& ip, bool inbound) {
+void PeerManager::start_peer(net::SocketHandle fd, const std::string& endpoint, const std::string& ip, bool inbound) {
   auto p = std::make_shared<PeerConn>();
   p->fd = fd;
   p->inbound = inbound;
@@ -418,8 +404,8 @@ void PeerManager::read_loop(int peer_id) {
   }
 
   while (running_) {
-    const int fd = p->fd;
-    if (fd < 0) break;
+    const auto fd = p->fd;
+    if (!net::valid_socket(fd)) break;
     const auto info = get_peer_info(peer_id);
     std::uint32_t header_timeout = info.established() ? limits_.idle_timeout_ms : limits_.handshake_timeout_ms;
     if (info.established() && read_timeout_override_) {
@@ -447,9 +433,9 @@ void PeerManager::read_loop(int peer_id) {
     if (on_message_) on_message_(peer_id, frame->msg_type, frame->payload);
   }
 
-  ::shutdown(p->fd, SHUT_RDWR);
-  ::close(p->fd);
-  p->fd = -1;
+  net::shutdown_socket(p->fd);
+  net::close_socket(p->fd);
+  p->fd = net::kInvalidSocket;
   const std::string endpoint = p->info.endpoint;
   const std::string disconnect_detail = "endpoint=" + endpoint + " " + peer_state_detail(p->info);
   {

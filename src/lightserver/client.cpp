@@ -1,11 +1,5 @@
 #include "lightserver/client.hpp"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-
 #include <array>
 #include <cctype>
 #include <limits>
@@ -13,6 +7,7 @@
 
 #include "codec/bytes.hpp"
 #include "common/minijson.hpp"
+#include "common/socket_compat.hpp"
 
 namespace finalis::lightserver {
 namespace {
@@ -35,31 +30,24 @@ struct UtxoPageView {
   std::optional<UtxoCursor> next_start_after;
 };
 
-void apply_socket_timeouts(int fd) {
-  timeval tv{};
-  tv.tv_sec = 15;
-  tv.tv_usec = 0;
-  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-std::optional<int> connect_tcp(const std::string& host, std::uint16_t port) {
+std::optional<net::SocketHandle> connect_tcp(const std::string& host, std::uint16_t port) {
+  if (!net::ensure_sockets()) return std::nullopt;
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
   if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return std::nullopt;
-  int fd = -1;
+  net::SocketHandle fd = net::kInvalidSocket;
   for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
     fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (fd < 0) continue;
-    apply_socket_timeouts(fd);
+    if (!net::valid_socket(fd)) continue;
+    (void)net::set_socket_timeouts(fd, 15'000);
     if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
-    ::close(fd);
-    fd = -1;
+    net::close_socket(fd);
+    fd = net::kInvalidSocket;
   }
   ::freeaddrinfo(res);
-  if (fd < 0) return std::nullopt;
+  if (!net::valid_socket(fd)) return std::nullopt;
   return fd;
 }
 
@@ -79,7 +67,7 @@ std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
   return parsed;
 }
 
-bool write_all(int fd, const std::string& data) {
+bool write_all(net::SocketHandle fd, const std::string& data) {
   size_t off = 0;
   while (off < data.size()) {
     ssize_t n = ::send(fd, data.data() + off, data.size() - off, 0);
@@ -89,7 +77,7 @@ bool write_all(int fd, const std::string& data) {
   return true;
 }
 
-std::optional<std::string> read_all(int fd) {
+std::optional<std::string> read_all(net::SocketHandle fd) {
   std::string out;
   std::array<char, 4096> buf{};
   while (true) {
@@ -112,7 +100,7 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
     if (err) *err = "connect failed";
     return std::nullopt;
   }
-  const int fd = *fd_opt;
+  const auto fd = *fd_opt;
   std::ostringstream req;
   req << "POST " << parsed->path << " HTTP/1.1\r\n"
       << "Host: " << parsed->host << ":" << parsed->port << "\r\n"
@@ -121,12 +109,12 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
       << "Connection: close\r\n\r\n"
       << body;
   if (!write_all(fd, req.str())) {
-    ::close(fd);
+    net::close_socket(fd);
     if (err) *err = "send failed";
     return std::nullopt;
   }
   auto resp = read_all(fd);
-  ::close(fd);
+  net::close_socket(fd);
   if (!resp) {
     if (err) *err = "read failed";
     return std::nullopt;

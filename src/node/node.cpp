@@ -1,7 +1,6 @@
 #include "node.hpp"
 
 #include <algorithm>
-#include <arpa/inet.h>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
@@ -9,21 +8,22 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <ifaddrs.h>
 #include <iostream>
 #include <iterator>
 #include <limits>
-#include <netdb.h>
 #include <cerrno>
-#include <poll.h>
 #include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <cstdlib>
 #include <set>
 #include <sstream>
 #include <string_view>
+
+#ifndef _WIN32
+#include <ifaddrs.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
@@ -35,6 +35,7 @@
 #include "consensus/validator_registry.hpp"
 #include "consensus/monetary.hpp"
 #include "common/paths.hpp"
+#include "common/socket_compat.hpp"
 #include "common/wide_arith.hpp"
 #include "common/version.hpp"
 #include "crypto/ed25519.hpp"
@@ -354,6 +355,12 @@ std::vector<std::string> resolve_ipv4_addresses(const std::string& host) {
 
 std::set<std::string> local_ipv4_addresses() {
   std::set<std::string> ips;
+#ifdef _WIN32
+  char hostname[256] = {};
+  if (::gethostname(hostname, sizeof(hostname) - 1) == 0) {
+    for (const auto& ip : resolve_ipv4_addresses(hostname)) ips.insert(ip);
+  }
+#else
   ifaddrs* ifaddr = nullptr;
   if (::getifaddrs(&ifaddr) == 0 && ifaddr != nullptr) {
     for (ifaddrs* it = ifaddr; it != nullptr; it = it->ifa_next) {
@@ -364,6 +371,7 @@ std::set<std::string> local_ipv4_addresses() {
     }
     freeifaddrs(ifaddr);
   }
+#endif
   ips.insert("127.0.0.1");
   return ips;
 }
@@ -2142,6 +2150,11 @@ bool Node::start_lightserver_child() {
     return false;
   }
 
+#ifdef _WIN32
+  log_line("lightserver child launch unsupported on windows; start finalis-lightserver.exe separately");
+  return true;
+#else
+
   std::vector<std::string> args{
       binary,
       "--db",
@@ -2201,9 +2214,15 @@ bool Node::start_lightserver_child() {
     log_line("lightserver note: node listener is disabled; read RPC works, but tx relay to the node may fail");
   }
   return true;
+#endif
 }
 
 void Node::stop_lightserver_child() {
+#ifdef _WIN32
+  std::lock_guard<std::mutex> lk(lightserver_mu_);
+  lightserver_pid_ = -1;
+  return;
+#else
   pid_t pid = -1;
   {
     std::lock_guard<std::mutex> lk(lightserver_mu_);
@@ -2232,9 +2251,14 @@ void Node::stop_lightserver_child() {
     return;
   }
   (void)::waitpid(pid, &status, 0);
+#endif
 }
 
 bool Node::reap_lightserver_child(bool verbose) {
+#ifdef _WIN32
+  (void)verbose;
+  return false;
+#else
   pid_t pid = -1;
   {
     std::lock_guard<std::mutex> lk(lightserver_mu_);
@@ -2266,34 +2290,39 @@ bool Node::reap_lightserver_child(bool verbose) {
     log_line(oss.str());
   }
   return true;
+#endif
 }
 
 bool Node::preflight_lightserver_bind(std::string* err) const {
-  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
+  if (!net::ensure_sockets()) {
+    if (err) *err = "socket-init";
+    return false;
+  }
+  const auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!net::valid_socket(fd)) {
     if (err) *err = "socket-open";
     return false;
   }
-  int one = 1;
-  (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  (void)net::set_reuseaddr(fd);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(cfg_.lightserver_port);
   if (::inet_pton(AF_INET, cfg_.lightserver_bind.c_str(), &addr.sin_addr) != 1) {
     if (err) *err = "invalid-bind-address";
-    ::close(fd);
+    net::close_socket(fd);
     return false;
   }
   if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     if (err) {
       std::ostringstream oss;
-      oss << "bind-failed errno=" << errno << " (" << std::strerror(errno) << ")";
+      const int code = net::socket_last_error();
+      oss << "bind-failed errno=" << code << " (" << net::socket_error_string(code) << ")";
       *err = oss.str();
     }
-    ::close(fd);
+    net::close_socket(fd);
     return false;
   }
-  ::close(fd);
+  net::close_socket(fd);
   return true;
 }
 
@@ -2325,6 +2354,9 @@ std::string Node::lightserver_mode_name() const {
 
 std::string Node::lightserver_binary_path(bool* sibling_found) const {
   if (sibling_found) *sibling_found = false;
+#ifdef _WIN32
+  return "finalis-lightserver.exe";
+#else
   char exe_path[4096] = {};
   const ssize_t n = ::readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
   if (n > 0) {
@@ -2338,6 +2370,7 @@ std::string Node::lightserver_binary_path(bool* sibling_found) const {
     }
   }
   return "finalis-lightserver";
+#endif
 }
 
 bool Node::lightserver_is_public() const {
@@ -7844,28 +7877,26 @@ bool Node::seed_preflight_ok(const std::string& host, std::uint16_t port) {
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
   if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return true;
-  int fd = -1;
+  auto fd = net::kInvalidSocket;
   for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
     fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (fd < 0) continue;
+    if (!net::valid_socket(fd)) continue;
+    (void)net::set_socket_timeouts(fd, 1'000);
     if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
-    ::close(fd);
-    fd = -1;
+    net::close_socket(fd);
+    fd = net::kInvalidSocket;
   }
   freeaddrinfo(res);
-  if (fd < 0) return true;
+  if (!net::valid_socket(fd)) return true;
 
-  pollfd pfd{};
-  pfd.fd = fd;
-  pfd.events = POLLIN;
   Bytes prefix;
-  if (::poll(&pfd, 1, 200) > 0 && (pfd.revents & POLLIN)) {
+  if (net::wait_readable(fd, 200) > 0) {
     std::array<std::uint8_t, 16> tmp{};
-    const ssize_t n = ::recv(fd, tmp.data(), tmp.size(), MSG_DONTWAIT);
+    const ssize_t n = net::recv_nonblocking(fd, tmp.data(), tmp.size());
     if (n > 0) prefix.assign(tmp.begin(), tmp.begin() + n);
   }
-  ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  net::shutdown_socket(fd);
+  net::close_socket(fd);
 
   if (prefix.empty()) return true;
   const auto kind = p2p::classify_prefix(prefix);

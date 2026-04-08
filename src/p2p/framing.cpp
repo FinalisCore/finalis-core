@@ -1,9 +1,5 @@
 #include "p2p/framing.hpp"
 
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <chrono>
 
 #include "codec/bytes.hpp"
@@ -96,7 +92,8 @@ std::optional<Frame> decode_frame(const Bytes& b, std::size_t max_payload_len, s
   return f;
 }
 
-bool read_exact(int fd, std::uint8_t* dst, std::size_t n) {
+bool read_exact(net::SocketHandle fd, std::uint8_t* dst, std::size_t n) {
+  (void)net::ensure_sockets();
   size_t off = 0;
   while (off < n) {
     ssize_t k = ::recv(fd, dst + off, n - off, 0);
@@ -106,7 +103,8 @@ bool read_exact(int fd, std::uint8_t* dst, std::size_t n) {
   return true;
 }
 
-bool write_all(int fd, const std::uint8_t* src, std::size_t n) {
+bool write_all(net::SocketHandle fd, const std::uint8_t* src, std::size_t n) {
+  (void)net::ensure_sockets();
   size_t off = 0;
   while (off < n) {
     int flags = 0;
@@ -122,25 +120,15 @@ bool write_all(int fd, const std::uint8_t* src, std::size_t n) {
 
 namespace {
 
-bool wait_readable(int fd, std::uint32_t timeout_ms) {
-  pollfd pfd{};
-  pfd.fd = fd;
-  pfd.events = POLLIN;
-  const int r = ::poll(&pfd, 1, static_cast<int>(timeout_ms));
-  if (r <= 0) return false;
-  return (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
+bool wait_readable(net::SocketHandle fd, std::uint32_t timeout_ms) {
+  return net::wait_readable(fd, timeout_ms);
 }
 
-bool wait_writable(int fd, std::uint32_t timeout_ms) {
-  pollfd pfd{};
-  pfd.fd = fd;
-  pfd.events = POLLOUT;
-  const int r = ::poll(&pfd, 1, static_cast<int>(timeout_ms));
-  if (r <= 0) return false;
-  return (pfd.revents & (POLLOUT | POLLHUP | POLLERR | POLLNVAL)) != 0;
+bool wait_writable(net::SocketHandle fd, std::uint32_t timeout_ms) {
+  return net::wait_writable(fd, timeout_ms);
 }
 
-bool read_exact_timed(int fd, std::uint8_t* dst, std::size_t n, std::uint32_t timeout_ms, std::size_t* bytes_read,
+bool read_exact_timed(net::SocketHandle fd, std::uint8_t* dst, std::size_t n, std::uint32_t timeout_ms, std::size_t* bytes_read,
                       bool* eof) {
   if (bytes_read) *bytes_read = 0;
   if (eof) *eof = false;
@@ -170,7 +158,7 @@ bool read_exact_timed(int fd, std::uint8_t* dst, std::size_t n, std::uint32_t ti
   return true;
 }
 
-bool write_exact_timed(int fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms) {
+bool write_exact_timed(net::SocketHandle fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms) {
   const auto start = std::chrono::steady_clock::now();
   std::size_t off = 0;
   while (off < n) {
@@ -192,12 +180,12 @@ bool write_exact_timed(int fd, const std::uint8_t* src, std::size_t n, std::uint
 
 }  // namespace
 
-std::optional<Frame> read_frame_fd(int fd, std::size_t max_payload_len, std::uint32_t expected_magic,
+std::optional<Frame> read_frame_fd(net::SocketHandle fd, std::size_t max_payload_len, std::uint32_t expected_magic,
                                    std::uint16_t expected_proto_version) {
   return read_frame_fd_timed(fd, max_payload_len, expected_magic, expected_proto_version, 120000, 3000, nullptr, nullptr);
 }
 
-std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, std::uint32_t expected_magic,
+std::optional<Frame> read_frame_fd_timed(net::SocketHandle fd, std::size_t max_payload_len, std::uint32_t expected_magic,
                                          std::uint16_t expected_proto_version, std::uint32_t header_timeout_ms,
                                          std::uint32_t body_timeout_ms, FrameReadError* err, FrameFailureInfo* fail_info) {
   if (err) *err = FrameReadError::NONE;
@@ -291,16 +279,16 @@ std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, st
   return Frame{*msg, payload};
 }
 
-bool write_frame_fd(int fd, const Frame& f, std::uint32_t magic, std::uint16_t proto_version) {
+bool write_frame_fd(net::SocketHandle fd, const Frame& f, std::uint32_t magic, std::uint16_t proto_version) {
   const Bytes raw = encode_frame(f, magic, proto_version);
   return write_all(fd, raw.data(), raw.size());
 }
 
-bool write_all_timed(int fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms) {
+bool write_all_timed(net::SocketHandle fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms) {
   return write_exact_timed(fd, src, n, timeout_ms);
 }
 
-bool write_frame_fd_timed(int fd, const Frame& f, std::uint32_t timeout_ms, std::uint32_t magic,
+bool write_frame_fd_timed(net::SocketHandle fd, const Frame& f, std::uint32_t timeout_ms, std::uint32_t magic,
                           std::uint16_t proto_version) {
   const Bytes raw = encode_frame(f, magic, proto_version);
   return write_exact_timed(fd, raw.data(), raw.size(), timeout_ms);

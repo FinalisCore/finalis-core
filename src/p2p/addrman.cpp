@@ -1,7 +1,5 @@
 #include "p2p/addrman.hpp"
 
-#include <arpa/inet.h>
-
 #include <algorithm>
 #include <filesystem>
 #include <fstream>

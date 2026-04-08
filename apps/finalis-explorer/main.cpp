@@ -1,9 +1,3 @@
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -23,6 +17,7 @@
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
 #include "common/minijson.hpp"
+#include "common/socket_compat.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/client.hpp"
 #include "utxo/tx.hpp"
@@ -2506,7 +2501,7 @@ std::string render_address(const Config& cfg, const std::string& addr, const std
   return page_layout("Address " + addr, body.str(), "address");
 }
 
-bool write_all(int fd, const std::string& data) {
+bool write_all(finalis::net::SocketHandle fd, const std::string& data) {
   std::size_t off = 0;
   while (off < data.size()) {
     const ssize_t n = ::send(fd, data.data() + off, data.size() - off, 0);
@@ -2516,15 +2511,7 @@ bool write_all(int fd, const std::string& data) {
   return true;
 }
 
-void apply_socket_timeouts(int fd) {
-  timeval tv{};
-  tv.tv_sec = 15;
-  tv.tv_usec = 0;
-  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-std::optional<std::string> read_http_request(int fd) {
+std::optional<std::string> read_http_request(finalis::net::SocketHandle fd) {
   std::string req;
   std::array<char, 4096> buf{};
   while (req.find("\r\n\r\n") == std::string::npos) {
@@ -2694,30 +2681,33 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd < 0) {
+  if (!finalis::net::ensure_sockets()) {
+    std::cerr << "socket init failed\n";
+    return 1;
+  }
+  auto listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(listen_fd)) {
     std::cerr << "socket failed\n";
     return 1;
   }
-  int one = 1;
-  (void)::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  (void)finalis::net::set_reuseaddr(listen_fd);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(cfg->port);
   if (::inet_pton(AF_INET, cfg->bind_ip.c_str(), &addr.sin_addr) != 1) {
     std::cerr << "invalid bind address\n";
-    ::close(listen_fd);
+    finalis::net::close_socket(listen_fd);
     return 1;
   }
   if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     std::cerr << "bind failed\n";
-    ::close(listen_fd);
+    finalis::net::close_socket(listen_fd);
     return 1;
   }
   if (::listen(listen_fd, 32) != 0) {
     std::cerr << "listen failed\n";
-    ::close(listen_fd);
+    finalis::net::close_socket(listen_fd);
     return 1;
   }
 
@@ -2729,22 +2719,22 @@ int main(int argc, char** argv) {
   while (!g_stop) {
     sockaddr_in client{};
     socklen_t len = sizeof(client);
-    const int fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&client), &len);
-    if (fd < 0) {
+    const auto fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&client), &len);
+    if (!finalis::net::valid_socket(fd)) {
       if (g_stop) break;
       continue;
     }
-    apply_socket_timeouts(fd);
+    (void)finalis::net::set_socket_timeouts(fd, 15'000);
     auto req = read_http_request(fd);
     const Response resp_obj =
         req.has_value() ? handle_request(*cfg, *req)
                         : html_response(400, page_layout("Bad Request", "<h1>Bad Request</h1>"));
     const std::string resp = http_response(resp_obj);
     (void)write_all(fd, resp);
-    ::shutdown(fd, SHUT_RDWR);
-    ::close(fd);
+    finalis::net::shutdown_socket(fd);
+    finalis::net::close_socket(fd);
   }
 
-  ::close(listen_fd);
+  finalis::net::close_socket(listen_fd);
   return 0;
 }

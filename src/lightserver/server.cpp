@@ -1,11 +1,5 @@
 #include "lightserver/server.hpp"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cctype>
 #include <ctime>
@@ -23,6 +17,7 @@
 #include "common/wide_arith.hpp"
 #include "common/minijson.hpp"
 #include "common/paths.hpp"
+#include "common/socket_compat.hpp"
 #include "common/version.hpp"
 #include "consensus/epoch_tickets.hpp"
 #include "consensus/finalized_committee.hpp"
@@ -206,14 +201,6 @@ std::optional<UtxoCursor> field_utxo_cursor(const minijson::Value* obj, std::str
     return std::nullopt;
   }
   return UtxoCursor{*height, *txid, static_cast<std::uint32_t>(*vout)};
-}
-
-void apply_socket_timeouts(int fd) {
-  timeval tv{};
-  tv.tv_sec = 15;
-  tv.tv_usec = 0;
-  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 std::string paged_utxos_json(const std::vector<storage::DB::ScriptUtxoEntry>& utxos, std::uint64_t limit,
@@ -1185,7 +1172,7 @@ bool open_fresh_readonly_db(const std::string& db_path, storage::DB* db) {
   return db->open_readonly(db_path);
 }
 
-bool read_http_request(int fd, std::string* out_req) {
+bool read_http_request(net::SocketHandle fd, std::string* out_req) {
   std::string req;
   std::array<char, 4096> buf{};
   while (req.find("\r\n\r\n") == std::string::npos) {
@@ -1240,10 +1227,10 @@ bool Server::init() {
 }
 
 bool Server::start() {
+  if (!net::ensure_sockets()) return false;
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd_ < 0) return false;
-  int one = 1;
-  setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (!net::valid_socket(listen_fd_)) return false;
+  (void)net::set_reuseaddr(listen_fd_);
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -1266,10 +1253,10 @@ bool Server::start() {
 
 void Server::stop() {
   if (!running_.exchange(false)) return;
-  if (listen_fd_ >= 0) {
-    ::shutdown(listen_fd_, SHUT_RDWR);
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+  if (net::valid_socket(listen_fd_)) {
+    net::shutdown_socket(listen_fd_);
+    net::close_socket(listen_fd_);
+    listen_fd_ = net::kInvalidSocket;
     bound_port_ = 0;
   }
   if (accept_thread_.joinable()) accept_thread_.join();
@@ -1281,19 +1268,19 @@ void Server::accept_loop() {
   while (running_) {
     sockaddr_in addr{};
     socklen_t len = sizeof(addr);
-    int fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
-    if (fd < 0) {
+    auto fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    if (!net::valid_socket(fd)) {
       if (!running_) break;
       continue;
     }
-    apply_socket_timeouts(fd);
+    (void)net::set_socket_timeouts(fd, 15'000);
     handle_client(fd);
-    ::shutdown(fd, SHUT_RDWR);
-    ::close(fd);
+    net::shutdown_socket(fd);
+    net::close_socket(fd);
   }
 }
 
-void Server::handle_client(int fd) {
+void Server::handle_client(net::SocketHandle fd) {
   std::string req;
   if (!read_http_request(fd, &req)) return;
   const auto first_line_end = req.find("\r\n");
@@ -1350,16 +1337,16 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
     if (err) *err = "getaddrinfo failed";
     return false;
   }
-  int fd = -1;
+  net::SocketHandle fd = net::kInvalidSocket;
   for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
     fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (fd < 0) continue;
+    if (!net::valid_socket(fd)) continue;
     if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
-    ::close(fd);
-    fd = -1;
+    net::close_socket(fd);
+    fd = net::kInvalidSocket;
   }
   freeaddrinfo(res);
-  if (fd < 0) {
+  if (!net::valid_socket(fd)) {
     if (err) *err = "connect relay peer failed";
     return false;
   }
@@ -1376,7 +1363,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
   v.node_software_version = finalis::lightserver_software_version();
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
-    ::close(fd);
+    net::close_socket(fd);
     if (err) *err = "send VERSION failed";
     return false;
   }
@@ -1389,7 +1376,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
                                           cfg_.network.protocol_version, kRelayHandshakeTimeoutMs,
                                           kRelayHandshakeTimeoutMs, &read_err);
     if (!frame.has_value()) {
-      ::close(fd);
+      net::close_socket(fd);
       if (err) *err = "relay handshake failed: " + p2p::frame_read_error_string(read_err);
       return false;
     }
@@ -1397,7 +1384,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
       saw_version = true;
       if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}}, cfg_.network.magic,
                                cfg_.network.protocol_version)) {
-        ::close(fd);
+        net::close_socket(fd);
         if (err) *err = "send VERACK failed";
         return false;
       }
@@ -1411,7 +1398,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
 
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::TX, p2p::ser_tx(p2p::TxMsg{tx_bytes})}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
-    ::close(fd);
+    net::close_socket(fd);
     if (err) *err = "send TX failed";
     return false;
   }
@@ -1434,8 +1421,8 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
     }
   }
 
-  ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  net::shutdown_socket(fd);
+  net::close_socket(fd);
   return true;
 }
 

@@ -7,6 +7,8 @@
 #include <tuple>
 #include <vector>
 
+#include "common/socket_compat.hpp"
+
 namespace finalis::p2p {
 
 struct NetAddress {

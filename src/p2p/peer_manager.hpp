@@ -81,7 +81,7 @@ class PeerManager {
 
  private:
   struct PeerConn {
-    int fd{-1};
+    net::SocketHandle fd{net::kInvalidSocket};
     bool inbound{false};
     PeerInfo info;
     mutable std::mutex write_mu;
@@ -93,11 +93,11 @@ class PeerManager {
   };
 
   void accept_loop();
-  void start_peer(int fd, const std::string& endpoint, const std::string& ip, bool inbound);
+  void start_peer(net::SocketHandle fd, const std::string& endpoint, const std::string& ip, bool inbound);
   void read_loop(int peer_id);
   void emit_event(int peer_id, PeerEventType type, const std::string& detail) const;
 
-  int listen_fd_{-1};
+  net::SocketHandle listen_fd_{net::kInvalidSocket};
   std::uint16_t listen_port_{0};
   std::thread accept_thread_;
   std::atomic<bool> running_{false};
