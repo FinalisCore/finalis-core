@@ -1050,18 +1050,6 @@ std::string render_root(const Config& cfg) {
        << "style=\"width:min(100%,720px);padding:10px 12px;font:inherit;border:1px solid #cfcfc6;border-radius:8px;\"> "
        << "<button type=\"submit\" class=\"copy-button\">Search</button></form></div>";
   body << "<div class=\"card\"><div class=\"status-hero\"><div><h2>Backend</h2></div>";
-  if (status.value.has_value()) {
-    body << "<div style=\"max-width:340px;flex:0 1 340px;\">"
-         << "<div class=\"note\" style=\"margin:0;\">"
-         << "<strong>Protocol Reserve</strong><br>"
-         << "<span style=\"display:block;font-size:18px;font-weight:800;margin:6px 0 8px 0;\">"
-         << html_escape(status.value->protocol_reserve_balance.has_value()
-                            ? format_amount(*status.value->protocol_reserve_balance)
-                            : std::string("n/a"))
-         << "</span>"
-         << "<span class=\"muted\">Reserve accumulated by protocol issuance. It is retained for long-horizon monetary support and is intended to be used by core rules after year 12.</span>"
-         << "</div></div>";
-  }
   body << "</div><div class=\"grid\">";
   body << "<div>Lightserver RPC</div><div class=\"value-cell\">" << mono_value(cfg.rpc_url) << "</div>";
   if (status.value.has_value()) {
@@ -1088,152 +1076,13 @@ std::string render_root(const Config& cfg) {
   }
   body << "</div>";
   if (status.value.has_value()) {
-    body << "<div class=\"card\"><h2>" << html_escape(ticket_pow_title(*status.value))
-         << "</h2><div class=\"note\">" << html_escape(ticket_pow_note(*status.value)) << "</div>"
-         << "<div class=\"grid\" style=\"margin-top:14px;\">"
-         << "<div>Difficulty</div><div>" << status.value->ticket_pow_difficulty << " <span class=\"muted\">(range "
-         << status.value->ticket_pow_difficulty_min << "&ndash;" << status.value->ticket_pow_difficulty_max << ")</span></div>"
-         << "<div>Epoch Health</div><div>" << html_escape(title_case_health(status.value->ticket_pow_epoch_health)) << "</div>"
-         << "<div>Adjustment</div><div>" << html_escape(ticket_pow_adjustment_text(*status.value)) << "</div>"
-         << "<div>Streak</div><div>up=" << status.value->ticket_pow_streak_up << ", down=" << status.value->ticket_pow_streak_down << "</div>"
-         << "<div>Nonce Budget</div><div>" << status.value->ticket_pow_nonce_search_limit << "</div>"
-         << "<div>Bonus Cap</div><div>" << status.value->ticket_pow_bonus_cap_bps << " bps</div>"
-         << "</div><div class=\"summary-actions\">"
-         << copy_action("Copy Status API Path", "/api/status")
-         << "<a class=\"copy-button\" href=\"/committee\">Open Committee</a>"
+    body << "<div class=\"card\"><h2>Operator View</h2>"
+         << "<div class=\"note\">The homepage stays focused on finalized chain state and recent activity. Committee composition, Ticket PoW, and availability mechanics live on the dedicated committee page.</div>"
+         << "<div class=\"summary-actions\">"
+         << "<a class=\"copy-button\" href=\"/committee\">Open Committee View</a>"
          << "<a class=\"copy-button\" href=\"/api/committee\">Open Committee API</a>"
+         << copy_action("Copy Status API Path", "/api/status")
          << "</div></div>";
-    auto committee = fetch_committee_result(cfg, status.value->finalized_height);
-    body << "<div class=\"card\"><h2>Current Committee Operators</h2>";
-    if (committee.value.has_value() && !committee.value->members.empty()) {
-      body << "<div class=\"table-wrap\"><table><thead><tr><th>Operator</th><th>ID Source</th><th>Representative</th><th class=\"num\">Base Weight</th><th class=\"num\">Ticket Bonus</th><th class=\"num\">Bonus %</th><th class=\"num\">Final Weight</th><th>Weight Composition</th></tr></thead><tbody>";
-      for (const auto& member : committee.value->members) {
-        const std::string operator_value = member.resolved_operator_id;
-        body << "<tr><td><div class=\"inline-actions\"><code>" << html_escape(short_hex(operator_value))
-             << "</code>" << inline_copy_action("Copy", operator_value) << "</div></td><td><code>"
-             << html_escape(member.operator_id_source) << "</code></td><td><div class=\"inline-actions\"><code>"
-             << html_escape(short_hex(member.representative_pubkey)) << "</code>"
-             << inline_copy_action("Copy", member.representative_pubkey) << "</div></td><td class=\"num\">";
-        if (member.base_weight.has_value()) body << *member.base_weight;
-        else body << "<span class=\"muted\">n/a</span>";
-        body << "</td><td class=\"num\">";
-        if (member.ticket_bonus_bps.has_value()) body << *member.ticket_bonus_bps << " bps";
-        else body << "<span class=\"muted\">n/a</span>";
-        body << "</td><td class=\"num\">";
-        if (member.ticket_bonus_bps.has_value()) body << html_escape(format_bonus_percent(*member.ticket_bonus_bps));
-        else body << "<span class=\"muted\">n/a</span>";
-        body << "</td><td class=\"num\">";
-        if (member.final_weight.has_value()) body << *member.final_weight;
-        else body << "<span class=\"muted\">n/a</span>";
-        body << "</td><td>" << weight_composition(member.base_weight, member.ticket_bonus_bps, member.final_weight) << "</td></tr>";
-      }
-      body << "</tbody></table></div>";
-    } else {
-      body << "<div class=\"soft-empty\">Current finalized committee operator detail is unavailable from the backend. Check the finalized committee checkpoint and lightserver verbose committee view.</div>";
-    }
-    body << "</div>";
-    body << "<div class=\"card\"><h2>Availability Enforcement</h2><div class=\"note\">Finalized-history-derived BPoAR eligibility now gates future committee checkpoints. When eligible operator count is below the configured minimum, the node reports that fallback explicitly.</div>"
-         << "<div class=\"summary-actions\">" << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
-         << "<div class=\"grid\" style=\"margin-top:14px;\">"
-         << "<div>Epoch</div><div>" << (status.value->availability_epoch.has_value() ? std::to_string(*status.value->availability_epoch) : std::string("n/a")) << "</div>"
-         << "<div>Retained Prefixes</div><div>" << (status.value->availability_retained_prefix_count.has_value() ? std::to_string(*status.value->availability_retained_prefix_count) : std::string("n/a")) << "</div>"
-         << "<div>Tracked Operators</div><div>" << (status.value->availability_tracked_operator_count.has_value() ? std::to_string(*status.value->availability_tracked_operator_count) : std::string("n/a")) << "</div>"
-         << "<div>Eligible Operators</div><div>" << (status.value->availability_eligible_operator_count.has_value() ? std::to_string(*status.value->availability_eligible_operator_count) : std::string("n/a")) << "</div>"
-         << "<div>Below Min Eligible</div><div>" << (status.value->availability_below_min_eligible.has_value() ? yes_no(*status.value->availability_below_min_eligible) : std::string("n/a")) << "</div>"
-         << "<div>Qualified Operator Depth</div><div>"
-         << (status.value->qualified_depth.has_value() ? std::to_string(*status.value->qualified_depth) : std::string("n/a"))
-         << "</div>"
-         << "<div>Adaptive Committee Target</div><div>"
-         << (status.value->adaptive_target_committee_size.has_value()
-                 ? std::to_string(*status.value->adaptive_target_committee_size)
-                 : std::string("n/a"))
-         << "</div>"
-         << "<div>Adaptive Eligible Threshold</div><div>"
-         << (status.value->adaptive_min_eligible.has_value() ? std::to_string(*status.value->adaptive_min_eligible)
-                                                             : std::string("n/a"))
-         << "</div>"
-         << "<div>Adaptive Bond Floor</div><div>"
-         << (status.value->adaptive_min_bond.has_value() ? format_amount(*status.value->adaptive_min_bond) : std::string("n/a"))
-         << "</div>"
-         << "<div>Eligibility Slack</div><div>"
-         << (status.value->adaptive_slack.has_value() ? std::to_string(*status.value->adaptive_slack) : std::string("n/a"))
-         << "</div>"
-         << "<div>Target Expand Streak</div><div>"
-         << (status.value->target_expand_streak.has_value() ? std::to_string(*status.value->target_expand_streak)
-                                                            : std::string("n/a"))
-         << "</div>"
-         << "<div>Target Contract Streak</div><div>"
-         << (status.value->target_contract_streak.has_value() ? std::to_string(*status.value->target_contract_streak)
-                                                              : std::string("n/a"))
-         << "</div>"
-         << "<div>Fallback Rate</div><div>";
-    if (status.value->adaptive_fallback_rate_bps.has_value()) {
-      body << html_escape(format_bonus_percent(static_cast<std::uint32_t>(*status.value->adaptive_fallback_rate_bps)));
-      if (status.value->adaptive_fallback_window_epochs.has_value()) {
-        body << " <span class=\"muted\">(" << *status.value->adaptive_fallback_window_epochs << " epoch window)</span>";
-      }
-    } else {
-      body << "n/a";
-    }
-    body << "</div></div><details class=\"disclosure\"><summary>Show protocol internals</summary><div class=\"grid\">";
-    body << "<div>Checkpoint Mode</div><div>" << html_escape(status.value->availability_checkpoint_derivation_mode.value_or("n/a")) << "</div>"
-         << "<div>Checkpoint Fallback Reason</div><div>" << html_escape(status.value->availability_checkpoint_fallback_reason.value_or("n/a")) << "</div>"
-         << "<div>Sticky Fallback</div><div>"
-         << (status.value->availability_fallback_sticky.has_value() ? yes_no(*status.value->availability_fallback_sticky)
-                                                                   : std::string("n/a"))
-         << "</div>"
-         << "<div>Sticky Fallback Rate</div><div>";
-    if (status.value->adaptive_sticky_fallback_rate_bps.has_value()) {
-      body << html_escape(
-          format_bonus_percent(static_cast<std::uint32_t>(*status.value->adaptive_sticky_fallback_rate_bps)));
-    } else {
-      body << "n/a";
-    }
-    body << "</div><div>Telemetry Sample Count</div><div>"
-         << (status.value->adaptive_telemetry_sample_count.has_value()
-                 ? std::to_string(*status.value->adaptive_telemetry_sample_count)
-                 : std::string("n/a"))
-         << "</div>"
-         << "<div>Telemetry Fallback Epochs</div><div>"
-         << (status.value->adaptive_telemetry_fallback_epochs.has_value()
-                 ? std::to_string(*status.value->adaptive_telemetry_fallback_epochs)
-                 : std::string("n/a"))
-         << "</div>"
-         << "<div>Telemetry Sticky Fallback Epochs</div><div>"
-         << (status.value->adaptive_telemetry_sticky_fallback_epochs.has_value()
-                 ? std::to_string(*status.value->adaptive_telemetry_sticky_fallback_epochs)
-                 : std::string("n/a"))
-         << "</div>";
-    body << "<div>Adaptive Alert Flags</div><div>";
-    std::vector<std::string> adaptive_alerts;
-    if (status.value->adaptive_near_threshold_operation.value_or(false)) adaptive_alerts.push_back("near-threshold");
-    if (status.value->adaptive_prolonged_expand_buildup.value_or(false)) adaptive_alerts.push_back("expand-build");
-    if (status.value->adaptive_prolonged_contract_buildup.value_or(false)) adaptive_alerts.push_back("contract-build");
-    if (status.value->adaptive_repeated_sticky_fallback.value_or(false)) adaptive_alerts.push_back("sticky-repeat");
-    if (status.value->adaptive_depth_collapse_after_bond_increase.value_or(false)) {
-      adaptive_alerts.push_back("depth-drop-after-bond-rise");
-    }
-    if (adaptive_alerts.empty()) {
-      body << "<span class=\"muted\">none</span>";
-    } else {
-      for (std::size_t i = 0; i < adaptive_alerts.size(); ++i) {
-        if (i) body << ", ";
-        body << html_escape(adaptive_alerts[i]);
-      }
-    }
-    body << "</div><div>Local Operator</div><div>";
-    if (status.value->availability_local_operator_known.value_or(false)) {
-      body << html_escape(status.value->availability_local_operator_status.value_or("unknown"));
-      if (status.value->availability_local_operator_seat_budget.has_value()) {
-        body << " (seat budget " << *status.value->availability_local_operator_seat_budget << ")";
-      }
-      if (status.value->availability_local_operator_pubkey.has_value()) {
-        body << " <code>" << html_escape(short_hex(*status.value->availability_local_operator_pubkey)) << "</code>";
-      }
-    } else {
-      body << "n/a";
-    }
-    body << "</div></div></details></div>";
   }
   const auto recent = fetch_recent_tx_results(cfg, 8);
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
