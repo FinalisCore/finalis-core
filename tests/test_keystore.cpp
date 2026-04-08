@@ -76,7 +76,11 @@ TEST(test_keystore_create_and_load_without_passphrase) {
 }
 
 TEST(test_node_parse_args_validator_passphrase_env) {
+#ifdef _WIN32
+  _putenv_s("FINALIS_TEST_VALIDATOR_PASS", "env-secret");
+#else
   ::setenv("FINALIS_TEST_VALIDATOR_PASS", "env-secret", 1);
+#endif
   std::vector<std::string> args = {"finalis-node", "--node-id", "0",
                                    "--validator-passphrase-env", "FINALIS_TEST_VALIDATOR_PASS"};
   auto argv = make_argv(args);

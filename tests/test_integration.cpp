@@ -1,11 +1,5 @@
 #include "test_framework.hpp"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <chrono>
 #include <cstdlib>
 #include <cerrno>
@@ -18,6 +12,10 @@
 #include <atomic>
 #include <iostream>
 
+#ifdef _WIN32
+#include <process.h>
+#endif
+
 #include "address/address.hpp"
 #include "availability/retention.hpp"
 #include "codec/bytes.hpp"
@@ -26,6 +24,7 @@
 #include "consensus/ingress.hpp"
 #include "consensus/validator_registry.hpp"
 #include "consensus/state_commitment.hpp"
+#include "common/socket_compat.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
@@ -43,6 +42,14 @@
 using namespace finalis;
 
 namespace {
+
+long long current_process_id() {
+#ifdef _WIN32
+  return static_cast<long long>(::_getpid());
+#else
+  return static_cast<long long>(::getpid());
+#endif
+}
 
 bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeout) {
   const auto start = std::chrono::steady_clock::now();
@@ -140,8 +147,7 @@ std::string unique_test_base(const std::string& prefix) {
   static std::atomic<std::uint64_t> unique_counter{0};
   const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto seq = unique_counter.fetch_add(1, std::memory_order_relaxed);
-  return prefix + "_" + std::to_string(static_cast<long long>(::getpid())) + "_" + std::to_string(now) + "_" +
-         std::to_string(seq);
+  return prefix + "_" + std::to_string(current_process_id()) + "_" + std::to_string(now) + "_" + std::to_string(seq);
 }
 
 bool same_finality_sig_vector(const std::vector<FinalitySig>& a, const std::vector<FinalitySig>& b) {
@@ -529,16 +535,16 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
 
 std::uint16_t reserve_test_port() {
   for (int attempt = 0; attempt < 32; ++attempt) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
-    int one = 1;
-    (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (!finalis::net::ensure_sockets()) return 0;
+    auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!finalis::net::valid_socket(fd)) return 0;
+    (void)finalis::net::set_reuseaddr(fd);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(0);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-      ::close(fd);
+      finalis::net::close_socket(fd);
       continue;
     }
     sockaddr_in bound{};
@@ -547,7 +553,7 @@ std::uint16_t reserve_test_port() {
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
       port = ntohs(bound.sin_port);
     }
-    ::close(fd);
+    finalis::net::close_socket(fd);
     if (port != 0) return port;
   }
   return 0;
@@ -1033,16 +1039,16 @@ std::optional<FrontierProposal> build_cluster_frontier_proposal_from_records(
 }
 
 struct HttpStubServer {
-  int fd{-1};
+  finalis::net::SocketHandle fd{finalis::net::kInvalidSocket};
   std::uint16_t port{0};
   std::atomic<bool> running{false};
   std::thread th;
 
   bool start() {
+    if (!finalis::net::ensure_sockets()) return false;
     fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (!finalis::net::valid_socket(fd)) return false;
+    (void)finalis::net::set_reuseaddr(fd);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(0);
@@ -1058,12 +1064,12 @@ struct HttpStubServer {
       while (running) {
         sockaddr_in caddr{};
         socklen_t len = sizeof(caddr);
-        int cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
-        if (cfd < 0) continue;
+        auto cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+        if (!finalis::net::valid_socket(cfd)) continue;
         const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-        (void)::send(cfd, kResp, sizeof(kResp) - 1, 0);
-        ::shutdown(cfd, SHUT_RDWR);
-        ::close(cfd);
+        (void)::send(cfd, kResp, static_cast<int>(sizeof(kResp) - 1), 0);
+        finalis::net::shutdown_socket(cfd);
+        finalis::net::close_socket(cfd);
       }
     });
     return true;
@@ -1071,10 +1077,10 @@ struct HttpStubServer {
 
   void stop() {
     running = false;
-    if (fd >= 0) {
-      ::shutdown(fd, SHUT_RDWR);
-      ::close(fd);
-      fd = -1;
+    if (finalis::net::valid_socket(fd)) {
+      finalis::net::shutdown_socket(fd);
+      finalis::net::close_socket(fd);
+      fd = finalis::net::kInvalidSocket;
     }
     if (th.joinable()) th.join();
   }
@@ -1410,17 +1416,18 @@ bool restart_cluster_with_seeded_certified_ingress(Cluster* cluster, const std::
 }
 
 bool rpc_get_status_ok(const std::string& host, std::uint16_t port) {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return false;
+  if (!finalis::net::ensure_sockets()) return false;
+  auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(fd)) return false;
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return false;
   }
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return false;
   }
   const std::string body = R"({"jsonrpc":"2.0","id":1,"method":"get_status","params":{}})";
@@ -1432,8 +1439,8 @@ bool rpc_get_status_ok(const std::string& host, std::uint16_t port) {
       << "Connection: close\r\n\r\n"
       << body;
   const auto rs = req.str();
-  if (::send(fd, rs.data(), rs.size(), 0) != static_cast<ssize_t>(rs.size())) {
-    ::close(fd);
+  if (::send(fd, rs.data(), static_cast<int>(rs.size()), 0) != static_cast<int>(rs.size())) {
+    finalis::net::close_socket(fd);
     return false;
   }
   std::array<char, 4096> buf{};
@@ -1443,22 +1450,22 @@ bool rpc_get_status_ok(const std::string& host, std::uint16_t port) {
     if (n <= 0) break;
     resp.append(buf.data(), static_cast<std::size_t>(n));
   }
-  ::close(fd);
+  finalis::net::close_socket(fd);
   return resp.find("\"result\"") != std::string::npos && resp.find("\"get_status\"") == std::string::npos;
 }
 
 bool send_invalid_frame(const std::string& ip, std::uint16_t port, std::uint32_t magic) {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return false;
+  auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(fd)) return false;
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return false;
   }
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return false;
   }
   std::array<std::uint8_t, 12> hdr{};
@@ -1474,66 +1481,78 @@ bool send_invalid_frame(const std::string& ip, std::uint16_t port, std::uint32_t
   hdr[9] = 0xFF;
   hdr[10] = 0xFF;
   hdr[11] = 0x7F;
-  const bool ok = ::send(fd, hdr.data(), hdr.size(), 0) == static_cast<ssize_t>(hdr.size());
-  ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  const bool ok = ::send(fd, reinterpret_cast<const char*>(hdr.data()), static_cast<int>(hdr.size()), 0) ==
+                  static_cast<int>(hdr.size());
+  finalis::net::shutdown_socket(fd);
+  finalis::net::close_socket(fd);
   return ok;
 }
 
 bool connect_and_check_closed(const std::string& ip, std::uint16_t port, std::chrono::milliseconds wait) {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return true;
+  auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(fd)) return true;
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return true;
   }
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return true;
   }
   std::this_thread::sleep_for(wait);
   char c = 0;
-  const ssize_t n = ::recv(fd, &c, 1, MSG_DONTWAIT);
-  const bool closed = (n == 0) || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
-  ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  const ssize_t n = finalis::net::recv_nonblocking(fd, &c, 1);
+#ifdef _WIN32
+  const int err = finalis::net::socket_last_error();
+  const bool would_block = (err == WSAEWOULDBLOCK);
+#else
+  const bool would_block = (errno == EAGAIN || errno == EWOULDBLOCK);
+#endif
+  const bool closed = (n == 0) || (n < 0 && !would_block);
+  finalis::net::shutdown_socket(fd);
+  finalis::net::close_socket(fd);
   return closed;
 }
 
 bool send_version_and_expect_disconnect(const std::string& ip, std::uint16_t port, const p2p::VersionMsg& v,
                                         const NetworkConfig& net_cfg, std::chrono::milliseconds wait) {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return false;
+  auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(fd)) return false;
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return false;
   }
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return false;
   }
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, net_cfg.magic,
                            net_cfg.protocol_version)) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return false;
   }
   const auto deadline = std::chrono::steady_clock::now() + wait;
   bool disconnected = false;
   while (std::chrono::steady_clock::now() < deadline) {
     char buf[256];
-    const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+    const ssize_t n = finalis::net::recv_nonblocking(fd, buf, sizeof(buf));
     if (n == 0) {
       disconnected = true;
       break;
     }
     if (n < 0) {
+#ifdef _WIN32
+      const int err = finalis::net::socket_last_error();
+      if (err == WSAEWOULDBLOCK) {
+#else
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#endif
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       }
@@ -1541,39 +1560,41 @@ bool send_version_and_expect_disconnect(const std::string& ip, std::uint16_t por
       break;
     }
   }
-  ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  finalis::net::shutdown_socket(fd);
+  finalis::net::close_socket(fd);
   return disconnected;
 }
 
-int connect_bootstrap_joiner_without_sync(const std::string& ip, std::uint16_t port, const p2p::VersionMsg& v,
-                                          const NetworkConfig& net_cfg) {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
+finalis::net::SocketHandle connect_bootstrap_joiner_without_sync(const std::string& ip, std::uint16_t port,
+                                                                 const p2p::VersionMsg& v,
+                                                                 const NetworkConfig& net_cfg) {
+  auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(fd)) return finalis::net::kInvalidSocket;
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-    ::close(fd);
-    return -1;
+    finalis::net::close_socket(fd);
+    return finalis::net::kInvalidSocket;
   }
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(fd);
-    return -1;
+    finalis::net::close_socket(fd);
+    return finalis::net::kInvalidSocket;
   }
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, net_cfg.magic,
                            net_cfg.protocol_version)) {
-    ::close(fd);
-    return -1;
+    finalis::net::close_socket(fd);
+    return finalis::net::kInvalidSocket;
   }
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}}, net_cfg.magic, net_cfg.protocol_version)) {
-    ::close(fd);
-    return -1;
+    finalis::net::close_socket(fd);
+    return finalis::net::kInvalidSocket;
   }
   return fd;
 }
 
-bool request_finalized_tip_and_expect_response(int fd, const NetworkConfig& net_cfg, std::uint64_t min_height = 0) {
+bool request_finalized_tip_and_expect_response(finalis::net::SocketHandle fd, const NetworkConfig& net_cfg,
+                                               std::uint64_t min_height = 0) {
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::GET_FINALIZED_TIP, p2p::ser_finalized_tip(p2p::FinalizedTipMsg{})},
                            net_cfg.magic, net_cfg.protocol_version)) {
     return false;
@@ -1642,7 +1663,7 @@ std::optional<PubKey32> pubkey_from_hex32(const std::string& hex) {
 }
 
 struct OutOfOrderBlockSyncServer {
-  int fd{-1};
+  finalis::net::SocketHandle fd{finalis::net::kInvalidSocket};
   std::uint16_t port{0};
   std::atomic<bool> running{false};
   std::thread th;
@@ -1654,7 +1675,7 @@ struct OutOfOrderBlockSyncServer {
   std::map<Hash32, p2p::TransitionMsg> transitions;
   mutable std::mutex mu;
   mutable std::mutex client_mu;
-  std::set<int> client_fds;
+  std::set<finalis::net::SocketHandle> client_fds;
   std::vector<Hash32> requested_hashes;
   std::size_t disconnect_after_get_block_count{0};
   std::size_t total_get_block_count{0};
@@ -1689,10 +1710,10 @@ struct OutOfOrderBlockSyncServer {
     transitions = std::move(send_transitions);
     disconnect_after_get_block_count = disconnect_after;
     total_get_block_count = 0;
+    if (!finalis::net::ensure_sockets()) return false;
     fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (!finalis::net::valid_socket(fd)) return false;
+    (void)finalis::net::set_reuseaddr(fd);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(0);
@@ -1710,19 +1731,19 @@ struct OutOfOrderBlockSyncServer {
 
   void stop() {
     running = false;
-    if (fd >= 0) {
-      ::shutdown(fd, SHUT_RDWR);
-      ::close(fd);
-      fd = -1;
+    if (finalis::net::valid_socket(fd)) {
+      finalis::net::shutdown_socket(fd);
+      finalis::net::close_socket(fd);
+      fd = finalis::net::kInvalidSocket;
     }
-    std::vector<int> clients;
+    std::vector<finalis::net::SocketHandle> clients;
     {
       std::lock_guard<std::mutex> lk(client_mu);
       clients.assign(client_fds.begin(), client_fds.end());
     }
-    for (int cfd : clients) {
-      ::shutdown(cfd, SHUT_RDWR);
-      ::close(cfd);
+    for (auto cfd : clients) {
+      finalis::net::shutdown_socket(cfd);
+      finalis::net::close_socket(cfd);
     }
     if (th.joinable()) th.join();
   }
@@ -1736,8 +1757,8 @@ struct OutOfOrderBlockSyncServer {
     while (running) {
       sockaddr_in caddr{};
       socklen_t len = sizeof(caddr);
-      const int cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
-      if (cfd < 0) return;
+      const auto cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+      if (!finalis::net::valid_socket(cfd)) return;
       {
         std::lock_guard<std::mutex> lk(client_mu);
         client_fds.insert(cfd);
@@ -1843,8 +1864,8 @@ struct OutOfOrderBlockSyncServer {
         }
       }
 
-      ::shutdown(cfd, SHUT_RDWR);
-      ::close(cfd);
+      finalis::net::shutdown_socket(cfd);
+      finalis::net::close_socket(cfd);
       {
         std::lock_guard<std::mutex> lk(client_mu);
         client_fds.erase(cfd);
@@ -5574,16 +5595,16 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
 
   // Occupy the follower's inbound table with junk connections; outbound bootstrap
   // retry must still continue because it is based on outbound, not total peers.
-  std::vector<int> junk_fds;
+  std::vector<finalis::net::SocketHandle> junk_fds;
   for (int i = 0; i < 3; ++i) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) continue;
+    auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!finalis::net::valid_socket(fd)) continue;
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(follower_cfg.p2p_port);
     ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr), 1);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) junk_fds.push_back(fd);
-    else ::close(fd);
+    else finalis::net::close_socket(fd);
   }
 
   ASSERT_TRUE(wait_for([&]() {
@@ -5591,9 +5612,9 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
     return s.height >= 1 && s.established_peers >= 1;
   }, std::chrono::seconds(20)));
 
-  for (int fd : junk_fds) {
-    ::shutdown(fd, SHUT_RDWR);
-    ::close(fd);
+  for (auto fd : junk_fds) {
+    finalis::net::shutdown_socket(fd);
+    finalis::net::close_socket(fd);
   }
   follower.stop();
   bootstrap.stop();
@@ -7467,8 +7488,8 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
   bootstrap.stop();
 
   auto connect_client = [&](const NetworkConfig& net) {
-    const int cfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    ASSERT_TRUE(cfd >= 0);
+    const auto cfd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_TRUE(finalis::net::valid_socket(cfd));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(server.port);
@@ -7476,7 +7497,7 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
     ASSERT_EQ(::connect(cfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     return cfd;
   };
-  auto handshake = [&](int cfd, const NetworkConfig& net) {
+  auto handshake = [&](finalis::net::SocketHandle cfd, const NetworkConfig& net) {
     p2p::VersionMsg v;
     v.proto_version = static_cast<std::uint32_t>(net.protocol_version);
     v.network_id = net.network_id;
@@ -7502,7 +7523,7 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
       return saw_verack && saw_tip;
     }, std::chrono::seconds(5)));
   };
-  auto request_height_expect_transition = [&](int cfd, const NetworkConfig& net, std::uint64_t height,
+  auto request_height_expect_transition = [&](finalis::net::SocketHandle cfd, const NetworkConfig& net, std::uint64_t height,
                                               const Hash32& expected_hash) {
     ASSERT_TRUE(p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
                                                     p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{height})},
@@ -7521,7 +7542,7 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
   const auto a2_hash = frontier_proposal_id(a2->proposal);
   const auto a3_hash = frontier_proposal_id(a3->proposal);
 
-  const int first = connect_client(bootstrap_cfg.network);
+  const auto first = connect_client(bootstrap_cfg.network);
   handshake(first, bootstrap_cfg.network);
   request_height_expect_transition(first, bootstrap_cfg.network, 3, a3_hash);
   ASSERT_TRUE(p2p::write_frame_fd(first, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
@@ -7531,15 +7552,15 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
       p2p::read_frame_fd_timed(first, bootstrap_cfg.network.max_payload_len, bootstrap_cfg.network.magic,
                                bootstrap_cfg.network.protocol_version, 2000, 1000, nullptr, nullptr);
   ASSERT_TRUE(!dropped.has_value());
-  ::shutdown(first, SHUT_RDWR);
-  ::close(first);
+  finalis::net::shutdown_socket(first);
+  finalis::net::close_socket(first);
 
-  const int second = connect_client(bootstrap_cfg.network);
+  const auto second = connect_client(bootstrap_cfg.network);
   handshake(second, bootstrap_cfg.network);
   request_height_expect_transition(second, bootstrap_cfg.network, 2, a2_hash);
   request_height_expect_transition(second, bootstrap_cfg.network, 1, a1_hash);
-  ::shutdown(second, SHUT_RDWR);
-  ::close(second);
+  finalis::net::shutdown_socket(second);
+  finalis::net::close_socket(second);
   server.stop();
 
   const auto requested = server.requested_hashes_snapshot();

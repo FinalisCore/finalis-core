@@ -25,7 +25,11 @@ TEST(test_paths_default_db_dir_and_expand_home) {
   ASSERT_EQ(default_db_dir_for_network("mainnet"), "~/.finalis/mainnet");
 
   const std::string fake_home = "/tmp/finalis_test_home_paths";
+#ifdef _WIN32
+  _putenv_s("HOME", fake_home.c_str());
+#else
   ::setenv("HOME", fake_home.c_str(), 1);
+#endif
   ASSERT_EQ(expand_user_home("~/.finalis/mainnet"), fake_home + "/.finalis/mainnet");
 }
 
@@ -33,7 +37,11 @@ TEST(test_node_default_db_path_uses_home_by_network) {
   const std::string home = "/tmp/finalis_test_home_default_db";
   std::filesystem::remove_all(home);
   std::filesystem::create_directories(home);
+#ifdef _WIN32
+  _putenv_s("HOME", home.c_str());
+#else
   ::setenv("HOME", home.c_str(), 1);
+#endif
 
   std::vector<std::string> args = {"finalis-node", "--node-id", "0", "--disable-p2p", "--validator-passphrase",
                                    "test-passphrase"};

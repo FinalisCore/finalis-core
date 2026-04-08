@@ -1,10 +1,5 @@
 #include "test_framework.hpp"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -12,6 +7,7 @@
 #include <thread>
 
 #include "common/network.hpp"
+#include "common/socket_compat.hpp"
 #include "codec/bytes.hpp"
 #include "p2p/peer_manager.hpp"
 #include "p2p/framing.hpp"
@@ -22,16 +18,16 @@ using namespace finalis;
 namespace {
 
 std::uint16_t reserve_test_port() {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return 0;
-  int one = 1;
-  (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (!finalis::net::ensure_sockets()) return 0;
+  auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(fd)) return 0;
+  (void)finalis::net::set_reuseaddr(fd);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(0);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(fd);
+    finalis::net::close_socket(fd);
     return 0;
   }
   sockaddr_in bound{};
@@ -40,7 +36,7 @@ std::uint16_t reserve_test_port() {
   if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
     port = ntohs(bound.sin_port);
   }
-  ::close(fd);
+  finalis::net::close_socket(fd);
   return port;
 }
 
@@ -230,6 +226,9 @@ TEST(test_tx_message_rejects_oversized_payload) {
 }
 
 TEST(test_write_frame_fd_timed_times_out_against_nonreading_peer) {
+#ifdef _WIN32
+  return;
+#else
   int fds[2]{-1, -1};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 
@@ -244,6 +243,7 @@ TEST(test_write_frame_fd_timed_times_out_against_nonreading_peer) {
 
   ::close(fds[0]);
   ::close(fds[1]);
+#endif
 }
 
 TEST(test_peer_manager_send_to_closed_peer_returns_false_without_duplicate_disconnect) {
