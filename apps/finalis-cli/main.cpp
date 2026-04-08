@@ -748,11 +748,19 @@ std::size_t active_operator_count_for_cli(
 
 std::vector<std::string> run_command_lines(const std::string& cmd) {
   std::vector<std::string> out;
+#ifdef _WIN32
+  FILE* fp = ::_popen(cmd.c_str(), "r");
+#else
   FILE* fp = ::popen(cmd.c_str(), "r");
+#endif
   if (!fp) return out;
   char buf[4096];
   while (std::fgets(buf, sizeof(buf), fp)) out.push_back(trim_copy(buf));
+#ifdef _WIN32
+  (void)::_pclose(fp);
+#else
   (void)::pclose(fp);
+#endif
   return out;
 }
 

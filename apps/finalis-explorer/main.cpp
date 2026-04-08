@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -456,7 +457,11 @@ std::string summarize_flow_mix(const std::map<std::string, std::size_t>& flow_mi
 std::string format_timestamp(std::uint64_t ts) {
   std::time_t tt = static_cast<std::time_t>(ts);
   std::tm tm{};
+#ifdef _WIN32
+  if (::gmtime_s(&tm, &tt) != 0) return std::to_string(ts);
+#else
   if (::gmtime_r(&tt, &tm) == nullptr) return std::to_string(ts);
+#endif
   std::ostringstream oss;
   oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S UTC") << " (" << ts << ")";
   return oss.str();
