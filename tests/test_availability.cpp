@@ -1,5 +1,6 @@
 #include "test_framework.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <map>
