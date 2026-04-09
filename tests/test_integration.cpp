@@ -51,6 +51,46 @@ long long current_process_id() {
 #endif
 }
 
+std::chrono::seconds ci_timeout_seconds(int base_seconds) {
+#ifdef _WIN32
+  return std::chrono::seconds(base_seconds * 3);
+#else
+  return std::chrono::seconds(base_seconds);
+#endif
+}
+
+std::optional<std::filesystem::path> find_repo_fixture(const std::filesystem::path& relative) {
+  auto cur = std::filesystem::current_path();
+  for (int i = 0; i < 8; ++i) {
+    const auto candidate = cur / relative;
+    if (std::filesystem::exists(candidate)) return candidate;
+    if (!cur.has_parent_path()) break;
+    cur = cur.parent_path();
+  }
+  return std::nullopt;
+}
+
+std::string shell_quote_path(const std::filesystem::path& path) {
+  std::string s = path.string();
+  std::string out;
+  out.reserve(s.size() + 2);
+  out.push_back('"');
+  for (char ch : s) {
+    if (ch == '"') out += "\\\"";
+    else out.push_back(ch);
+  }
+  out.push_back('"');
+  return out;
+}
+
+std::string python_launcher() {
+#ifdef _WIN32
+  return "python";
+#else
+  return "python3";
+#endif
+}
+
 bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeout) {
   const auto start = std::chrono::steady_clock::now();
   while (std::chrono::steady_clock::now() - start < timeout) {
@@ -3710,15 +3750,13 @@ TEST(test_observer_reports_ok_on_two_lightservers) {
   ASSERT_TRUE(wait_for([&]() { return rpc_get_status_ok("127.0.0.1", p1); }, std::chrono::seconds(5)));
   ASSERT_TRUE(wait_for([&]() { return rpc_get_status_ok("127.0.0.1", p2); }, std::chrono::seconds(5)));
   const std::string out_file = base + "/observer.out";
-  std::filesystem::path observer_script = std::filesystem::current_path() / "scripts" / "observe.py";
-  if (!std::filesystem::exists(observer_script)) {
-    observer_script = std::filesystem::current_path().parent_path() / "scripts" / "observe.py";
-  }
-  ASSERT_TRUE(std::filesystem::exists(observer_script));
-  const std::string cmd = "python3 " + observer_script.string() +
+  auto observer_script = find_repo_fixture("scripts/observe.py");
+  ASSERT_TRUE(observer_script.has_value());
+  ASSERT_TRUE(std::filesystem::exists(*observer_script));
+  const std::string cmd = python_launcher() + " " + shell_quote_path(*observer_script) +
                           " --interval 0.2 --max-intervals 2 --mismatch-threshold 2 " +
                           std::string("http://127.0.0.1:") + std::to_string(p1) + "/rpc " +
-                          "http://127.0.0.1:" + std::to_string(p2) + "/rpc > " + out_file + " 2>&1";
+                          "http://127.0.0.1:" + std::to_string(p2) + "/rpc > " + shell_quote_path(out_file) + " 2>&1";
   const int rc = std::system(cmd.c_str());
   s2.stop();
   s1.stop();
@@ -3892,7 +3930,7 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
   {
     auto cluster = make_cluster(base, 1, 1, 1);
     const bool reached_225 =
-        wait_for([&]() { return cluster.nodes[0]->status().height >= 225; }, std::chrono::seconds(180));
+        wait_for([&]() { return cluster.nodes[0]->status().height >= 225; }, ci_timeout_seconds(180));
     if (!reached_225) {
       std::ostringstream oss;
       const auto st = cluster.nodes[0]->status();
@@ -6656,7 +6694,7 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
     n0.stop();
     return;
   }
-  ASSERT_TRUE(wait_for_tip(n0, 24, std::chrono::seconds(25)));
+  ASSERT_TRUE(wait_for_tip(n0, 24, ci_timeout_seconds(25)));
 
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
@@ -6684,7 +6722,7 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
     const auto s0 = n0.status();
     const auto s1 = n1.status();
     return s0.height >= 24 && s1.height >= 24 && s0.height == s1.height && s0.transition_hash == s1.transition_hash;
-  }, std::chrono::seconds(30)));
+  }, ci_timeout_seconds(30)));
 
   const auto synced = n0.status().height;
   ASSERT_TRUE(synced >= 24);
@@ -6692,7 +6730,7 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
     const auto s0 = n0.status();
     const auto s1 = n1.status();
     return s0.height >= synced + 4 && s1.height >= synced + 4 && s0.height == s1.height && s0.transition_hash == s1.transition_hash;
-  }, std::chrono::seconds(20)));
+  }, ci_timeout_seconds(20)));
 
   n1.stop();
   n0.stop();

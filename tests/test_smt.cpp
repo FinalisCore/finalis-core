@@ -19,6 +19,17 @@ Bytes v(std::uint8_t b, std::size_t n = 4) {
   return Bytes(n, b);
 }
 
+std::optional<std::filesystem::path> find_repo_fixture(const std::filesystem::path& relative) {
+  auto cur = std::filesystem::current_path();
+  for (int i = 0; i < 8; ++i) {
+    const auto candidate = cur / relative;
+    if (std::filesystem::exists(candidate)) return candidate;
+    if (!cur.has_parent_path()) break;
+    cur = cur.parent_path();
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 TEST(test_smt_insert_and_prove_membership) {
@@ -108,17 +119,9 @@ TEST(test_smt_determinism_across_replay) {
 }
 
 TEST(test_smt_shared_vectors_match_ts) {
-  const auto cwd = std::filesystem::current_path();
-  const std::vector<std::filesystem::path> candidates = {
-      cwd / "sdk/finalis-wallet-js/test-vectors/smt_vectors.json",
-      cwd.parent_path() / "sdk/finalis-wallet-js/test-vectors/smt_vectors.json",
-  };
   std::ifstream in;
-  for (const auto& p : candidates) {
-    in.open(p);
-    if (in.good()) break;
-    in.clear();
-  }
+  auto vectors_path = find_repo_fixture("sdk/finalis-wallet-js/test-vectors/smt_vectors.json");
+  if (vectors_path.has_value()) in.open(*vectors_path);
   ASSERT_TRUE(in.good());
   std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   ASSERT_TRUE(!s.empty());
