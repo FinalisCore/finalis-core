@@ -29,9 +29,9 @@
     {"operator_id":"f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1}
   ],
   "expected": {
-    "eligible_operator_count": 3,
-    "derivation_mode": "NORMAL",
-    "fallback_reason": "NONE",
+    "eligible_operator_count": 0,
+    "derivation_mode": "FALLBACK",
+    "fallback_reason": "INSUFFICIENT_ELIGIBLE_OPERATORS",
     "committee": ["6262626262626262626262626262626262626262626262626262626262626262","6363636363636363636363636363636363636363636363636363636363636363"],
     "proposer_schedule": ["6363636363636363636363636363636363636363636363636363636363636363","6262626262626262626262626262626262626262626262626262626262626262"]
   }

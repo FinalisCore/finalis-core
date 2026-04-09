@@ -33,7 +33,16 @@ sign_file() {
 }
 
 cmake -S "$ROOT" -B "$BUILD_DIR"
-cmake --build "$BUILD_DIR" --target finalis-wallet -j1
+build_targets=(
+  finalis-node
+  finalis-cli
+  finalis-lightserver
+  finalis-explorer
+)
+if cmake --build "$BUILD_DIR" --target help | grep -q '\<finalis-wallet\>'; then
+  build_targets+=(finalis-wallet)
+fi
+cmake --build "$BUILD_DIR" --target "${build_targets[@]}" -j1
 cmake --install "$BUILD_DIR" --prefix "$STAGE_DIR"
 
 (
