@@ -15,6 +15,7 @@
 #include "consensus/epoch_tickets.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/monetary.hpp"
+#include "consensus/randomness.hpp"
 #include "crypto/hash.hpp"
 
 using namespace finalis;
@@ -55,6 +56,14 @@ struct ComparatorFixtureCase {
   std::size_t committee_size{0};
   Hash32 seed{};
   std::vector<consensus::FinalizedCommitteeCandidate> candidates;
+};
+
+struct DerivedCheckpointFixtureExpected {
+  std::uint64_t eligible_operator_count{0};
+  storage::FinalizedCommitteeDerivationMode mode{storage::FinalizedCommitteeDerivationMode::NORMAL};
+  storage::FinalizedCommitteeFallbackReason reason{storage::FinalizedCommitteeFallbackReason::NONE};
+  std::vector<PubKey32> committee;
+  std::vector<PubKey32> proposer_schedule;
 };
 
 PubKey32 pub_fill(std::uint8_t b) {
@@ -113,6 +122,96 @@ std::string availability_status_name(availability::AvailabilityOperatorStatus st
 
 std::string validator_join_source(const consensus::ValidatorInfo& info) {
   return info.joined_height == 0 ? "GENESIS" : "POST_GENESIS";
+}
+
+bool availability_fixture_operator_eligible(const availability::AvailabilityOperatorState& state,
+                                            const availability::AvailabilityConfig& cfg) {
+  return availability::operator_is_eligible(state, cfg);
+}
+
+DerivedCheckpointFixtureExpected derive_checkpoint_fixture_expected(const consensus::CanonicalDerivationConfig& cfg,
+                                                                   const CheckpointFixtureCase& fixture,
+                                                                   const consensus::CanonicalDerivedState& state,
+                                                                   std::uint64_t epoch_start_height) {
+  DerivedCheckpointFixtureExpected out;
+  const auto effective_min_bond =
+      std::max<std::uint64_t>(cfg.validator_bond_min_amount,
+                              consensus::validator_min_bond_units(cfg.network, epoch_start_height,
+                                                                  state.validators.active_sorted(epoch_start_height).size()));
+  const auto econ = active_economics_policy(cfg.network, epoch_start_height);
+  const auto availability_cfg = cfg.availability;
+  std::map<PubKey32, const availability::AvailabilityOperatorState*> availability_by_operator;
+  for (const auto& operator_state : state.availability_state.operators) {
+    availability_by_operator[operator_state.operator_pubkey] = &operator_state;
+    if (availability_fixture_operator_eligible(operator_state, availability_cfg)) ++out.eligible_operator_count;
+  }
+
+  out.mode = storage::FinalizedCommitteeDerivationMode::NORMAL;
+  out.reason = storage::FinalizedCommitteeFallbackReason::NONE;
+  if (out.eligible_operator_count < fixture.min_eligible) {
+    out.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
+    out.reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
+  } else if (fixture.previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
+             out.eligible_operator_count < fixture.min_eligible + 1ULL) {
+    out.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
+    out.reason = storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING;
+  }
+
+  const bool enforce_availability = out.mode == storage::FinalizedCommitteeDerivationMode::NORMAL;
+  std::vector<consensus::OperatorCommitteeInput> operator_inputs;
+  std::map<PubKey32, std::pair<PubKey32, std::uint64_t>> by_operator;
+  for (const auto& [pub, info] : state.validators.all()) {
+    const bool base_eligible = info.has_bond && state.validators.is_active_for_height(pub, epoch_start_height) &&
+                               (info.joined_height == 0 || info.bonded_amount >= effective_min_bond);
+    if (!base_eligible) continue;
+    const auto operator_id = consensus::canonical_operator_id(pub, info);
+    const auto availability_it = availability_by_operator.find(operator_id);
+    if (enforce_availability &&
+        (availability_it == availability_by_operator.end() ||
+         !availability_fixture_operator_eligible(*availability_it->second, availability_cfg))) {
+      continue;
+    }
+    auto& seed = by_operator[operator_id];
+    seed.second += info.bonded_amount;
+    if (seed.first == PubKey32{} || pub < seed.first) seed.first = pub;
+  }
+
+  const auto epoch_randomness = state.committee_epoch_randomness_cache.at(epoch_start_height);
+  const auto epoch_seed = consensus::committee_epoch_seed(epoch_randomness, epoch_start_height);
+  operator_inputs.reserve(by_operator.size());
+  for (const auto& [operator_id, seed] : by_operator) {
+    if (seed.first == PubKey32{}) continue;
+    consensus::OperatorCommitteeInput input;
+    input.pubkey = seed.first;
+    input.operator_id = operator_id;
+    input.bonded_amount = seed.second;
+    auto ticket = consensus::best_epoch_ticket_for_operator_id(epoch_start_height, epoch_seed, operator_id, epoch_start_height,
+                                                               consensus::EPOCH_TICKET_MAX_NONCE);
+    if (ticket.has_value()) {
+      input.ticket_work_hash = ticket->work_hash;
+      input.ticket_nonce = ticket->nonce;
+      input.ticket_bonus_bps =
+          consensus::ticket_pow_bonus_bps(*ticket, consensus::DEFAULT_TICKET_DIFFICULTY_BITS, econ.ticket_bonus_cap_bps);
+    }
+    operator_inputs.push_back(input);
+  }
+
+  const auto candidates = consensus::aggregate_operator_committee_candidates(operator_inputs, econ, epoch_start_height, 0);
+  out.committee = consensus::select_finalized_committee(candidates, epoch_seed, fixture.committee_size);
+
+  std::vector<consensus::ValidatorBestTicket> committee_tickets;
+  for (const auto& member : out.committee) {
+    auto it = std::find_if(candidates.begin(), candidates.end(),
+                           [&](const auto& candidate) { return candidate.pubkey == member; });
+    if (it == candidates.end()) continue;
+    committee_tickets.push_back(consensus::ValidatorBestTicket{.validator_pubkey = it->pubkey,
+                                                               .best_ticket_hash = it->ticket_work_hash,
+                                                               .nonce = it->ticket_nonce});
+  }
+  const auto proposer_seed =
+      consensus::compute_proposer_seed(epoch_seed, epoch_start_height, consensus::compute_committee_root(committee_tickets));
+  out.proposer_schedule = consensus::proposer_schedule_from_committee(committee_tickets, proposer_seed);
+  return out;
 }
 
 void write_text_file(const std::filesystem::path& path, const std::string& text) {
@@ -202,15 +301,12 @@ std::string checkpoint_fixture_json(const CheckpointFixtureCase& fixture) {
   const std::uint64_t epoch_start_height = 33;
   const auto cfg = make_cfg(fixture.committee_size, fixture.min_eligible);
   auto state = build_state(cfg, fixture, epoch_start_height);
-  storage::FinalizedCommitteeCheckpoint checkpoint;
-  std::string error;
-  if (!consensus::derive_next_epoch_checkpoint_from_state(cfg, state, epoch_start_height, &checkpoint, &error)) {
-    throw std::runtime_error("checkpoint fixture derivation failed for " + fixture.name + ": " + error);
-  }
   const auto effective_min_bond = std::max<std::uint64_t>(
       cfg.validator_bond_min_amount, consensus::validator_min_bond_units(cfg.network, epoch_start_height,
                                                                          state.validators.active_sorted(epoch_start_height).size()));
-  const auto schedule = proposer_schedule_for_checkpoint(cfg, state, checkpoint);
+  const auto derived = derive_checkpoint_fixture_expected(cfg, fixture, state, epoch_start_height);
+  const auto epoch_seed = consensus::committee_epoch_seed(state.committee_epoch_randomness_cache.at(epoch_start_height),
+                                                          epoch_start_height);
 
   std::ostringstream oss;
   oss << "{\n";
@@ -221,13 +317,13 @@ std::string checkpoint_fixture_json(const CheckpointFixtureCase& fixture) {
   oss << "    \"committee_size\": " << fixture.committee_size << ",\n";
   oss << "    \"min_eligible\": " << fixture.min_eligible << ",\n";
   oss << "    \"effective_min_bond\": " << effective_min_bond << ",\n";
-  oss << "    \"ticket_difficulty_bits\": " << static_cast<unsigned>(checkpoint.ticket_difficulty_bits) << ",\n";
+  oss << "    \"ticket_difficulty_bits\": " << static_cast<unsigned>(consensus::DEFAULT_TICKET_DIFFICULTY_BITS) << ",\n";
   oss << "    \"ticket_bonus_cap_bps\": " << active_economics_policy(cfg.network, epoch_start_height).ticket_bonus_cap_bps << ",\n";
   oss << "    \"max_effective_bond_multiple\": " << active_economics_policy(cfg.network, epoch_start_height).max_effective_bond_multiple
       << ",\n";
   oss << "    \"availability_min_bond\": " << cfg.availability.min_bond << ",\n";
   oss << "    \"availability_eligibility_min_score\": " << cfg.availability.eligibility_min_score << ",\n";
-  oss << "    \"epoch_seed\": \"" << hex_of(checkpoint.epoch_seed) << "\"\n";
+  oss << "    \"epoch_seed\": \"" << hex_of(epoch_seed) << "\"\n";
   oss << "  },\n";
   const auto previous_epoch_start = epoch_start_height - cfg.network.committee_epoch_blocks;
   const auto& previous = state.finalized_committee_checkpoints.at(previous_epoch_start);
@@ -264,19 +360,19 @@ std::string checkpoint_fixture_json(const CheckpointFixtureCase& fixture) {
   }
   oss << "  ],\n";
   oss << "  \"expected\": {\n";
-  oss << "    \"eligible_operator_count\": " << checkpoint.availability_eligible_operator_count << ",\n";
-  oss << "    \"derivation_mode\": \"" << mode_name(checkpoint.derivation_mode) << "\",\n";
-  oss << "    \"fallback_reason\": \"" << reason_name(checkpoint.fallback_reason) << "\",\n";
+  oss << "    \"eligible_operator_count\": " << derived.eligible_operator_count << ",\n";
+  oss << "    \"derivation_mode\": \"" << mode_name(derived.mode) << "\",\n";
+  oss << "    \"fallback_reason\": \"" << reason_name(derived.reason) << "\",\n";
   oss << "    \"committee\": [";
-  for (std::size_t i = 0; i < checkpoint.ordered_members.size(); ++i) {
+  for (std::size_t i = 0; i < derived.committee.size(); ++i) {
     if (i) oss << ",";
-    oss << "\"" << hex_of(checkpoint.ordered_members[i]) << "\"";
+    oss << "\"" << hex_of(derived.committee[i]) << "\"";
   }
   oss << "],\n";
   oss << "    \"proposer_schedule\": [";
-  for (std::size_t i = 0; i < schedule.size(); ++i) {
+  for (std::size_t i = 0; i < derived.proposer_schedule.size(); ++i) {
     if (i) oss << ",";
-    oss << "\"" << hex_of(schedule[i]) << "\"";
+    oss << "\"" << hex_of(derived.proposer_schedule[i]) << "\"";
   }
   oss << "]\n";
   oss << "  }\n";
