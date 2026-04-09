@@ -38,7 +38,12 @@ $binDir = Join-Path $installRoot "bin"
 $scriptsDir = Join-Path $installRoot "scripts"
 $docsDir = Join-Path $installRoot "share\doc\finalis-core"
 $qtDeployExe = Join-Path $QtRootDir "bin\windeployqt.exe"
-$vcpkgBinDir = Join-Path $VcpkgInstalledDir "bin"
+$vcpkgBinCandidates = @()
+if ($VcpkgInstalledDir) {
+    $vcpkgBinCandidates += (Join-Path $VcpkgInstalledDir "bin")
+}
+$buildLocalVcpkgInstalledDir = Join-Path $resolvedBuildDir "vcpkg_installed\x64-windows"
+$vcpkgBinCandidates += (Join-Path $buildLocalVcpkgInstalledDir "bin")
 
 if (-not (Test-Path $qtDeployExe) -and (Test-Path $QtRootDir)) {
     $qtDeployCandidate = Get-ChildItem -Path $QtRootDir -Filter windeployqt.exe -Recurse -ErrorAction SilentlyContinue |
@@ -67,9 +72,11 @@ if (Test-Path (Join-Path $binDir "finalis-wallet.exe")) {
     & $qtDeployExe --release --no-translations --compiler-runtime (Join-Path $binDir "finalis-wallet.exe")
 }
 
-if (Test-Path $vcpkgBinDir) {
-    Get-ChildItem -Path $vcpkgBinDir -Filter *.dll | ForEach-Object {
-        Copy-Item -Path $_.FullName -Destination $binDir -Force
+foreach ($candidate in ($vcpkgBinCandidates | Select-Object -Unique)) {
+    if (Test-Path $candidate) {
+        Get-ChildItem -Path $candidate -Filter *.dll | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination $binDir -Force
+        }
     }
 }
 

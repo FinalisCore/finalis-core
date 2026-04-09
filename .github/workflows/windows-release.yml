@@ -107,7 +107,7 @@ jobs:
           -Configuration Release
           -StageRoot "${{ github.workspace }}\dist\windows"
           -QtRootDir "${{ env.FINALIS_QT_PREFIX }}"
-          -VcpkgInstalledDir "${{ github.workspace }}\vcpkg\installed\x64-windows"
+          -VcpkgInstalledDir "${{ github.workspace }}\build\windows-release\vcpkg_installed\x64-windows"
 
       - name: Build installer
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.5

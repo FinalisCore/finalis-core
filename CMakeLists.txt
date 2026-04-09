@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 project(finalis_core LANGUAGES CXX)
 
 include(GNUInstallDirs)
+if(WIN32)
+  set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ${CMAKE_INSTALL_BINDIR})
+  set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
+  include(InstallRequiredSystemLibraries)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -241,6 +246,11 @@ install(FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/branding/finalis-logo-horizontal.png
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/finalis-core/branding
 )
+if(WIN32 AND CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+  install(PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+endif()
 
 add_executable(finalis-tests
   apps/finalis-wallet/history_merge.cpp
