@@ -959,19 +959,38 @@ bool fee_rate_below_threshold(std::uint64_t fee, std::size_t size_bytes, std::ui
 }
 
 std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& record) {
+  const auto broadcast_outcome_name = [&]() -> const char* {
+    switch (record.broadcast_outcome) {
+      case onboarding::ValidatorOnboardingBroadcastOutcome::NONE:
+        return "none";
+      case onboarding::ValidatorOnboardingBroadcastOutcome::SENT:
+        return "sent";
+      case onboarding::ValidatorOnboardingBroadcastOutcome::REJECTED:
+        return "rejected";
+      case onboarding::ValidatorOnboardingBroadcastOutcome::AMBIGUOUS:
+        return "ambiguous";
+    }
+    return "unknown";
+  }();
   std::ostringstream oss;
   oss << "{\"validator_pubkey_hex\":\""
       << hex_encode(Bytes(record.validator_pubkey.begin(), record.validator_pubkey.end()))
+      << "\",\"onboarding_id\":\"" << json_escape(record.onboarding_id)
       << "\",\"wallet_address\":\"" << json_escape(record.wallet_address)
       << "\",\"wallet_pubkey_hex\":\"" << json_escape(record.wallet_pubkey_hex)
       << "\",\"state\":\"" << onboarding::validator_onboarding_state_name(record.state)
-      << "\",\"fee\":" << record.fee
+      << "\",\"wait_for_sync\":" << (record.wait_for_sync ? "true" : "false")
+      << ",\"fee\":" << record.fee
       << ",\"bond_amount\":" << record.bond_amount
       << ",\"eligibility_bond_amount\":" << record.eligibility_bond_amount
       << ",\"required_amount\":" << record.required_amount
       << ",\"last_spendable_balance\":" << record.last_spendable_balance
       << ",\"last_deficit\":" << record.last_deficit
+      << ",\"selected_input_count\":" << record.selected_inputs.size()
+      << ",\"selected_inputs_reserved\":" << (record.selected_inputs_reserved ? "true" : "false")
       << ",\"txid_hex\":\"" << json_escape(record.txid_hex)
+      << "\",\"broadcast_outcome\":\"" << broadcast_outcome_name
+      << "\",\"rpc_endpoint\":\"" << json_escape(record.rpc_endpoint)
       << "\",\"finalized_height\":" << record.finalized_height
       << ",\"validator_status\":\"" << json_escape(record.validator_status)
       << "\",\"activation_height\":" << record.activation_height
@@ -1087,12 +1106,14 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
     record.validator_status = validator_status_name_for_rpc(std::optional<consensus::ValidatorInfo>(it->second));
     if (it->second.status == consensus::ValidatorStatus::ACTIVE) {
       record.state = onboarding::ValidatorOnboardingState::ACTIVE;
+      record.broadcast_outcome = onboarding::ValidatorOnboardingBroadcastOutcome::SENT;
       record.activation_height = it->second.joined_height;
       record.finalized_height = tip ? tip->height : 0;
       return record;
     }
     if (it->second.status == consensus::ValidatorStatus::PENDING) {
       record.state = onboarding::ValidatorOnboardingState::PENDING_ACTIVATION;
+      record.broadcast_outcome = onboarding::ValidatorOnboardingBroadcastOutcome::SENT;
       record.activation_height = it->second.joined_height + network.validator_warmup_blocks;
       record.finalized_height = tip ? tip->height : 0;
       return record;
@@ -1116,12 +1137,14 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
   }
   if (join_request_present) {
     record.state = onboarding::ValidatorOnboardingState::PENDING_ACTIVATION;
+    record.broadcast_outcome = onboarding::ValidatorOnboardingBroadcastOutcome::SENT;
     record.finalized_height = tip ? tip->height : 0;
     return record;
   }
 
   if (!tracked_txid_hex.empty()) {
     record.txid_hex = tracked_txid_hex;
+    record.broadcast_outcome = onboarding::ValidatorOnboardingBroadcastOutcome::SENT;
     auto txid = parse_hex32(tracked_txid_hex);
     if (!txid) {
       if (err) *err = "bad txid";
@@ -2131,7 +2154,11 @@ std::string Server::handle_rpc_body(const std::string& body) {
     }
     std::vector<std::pair<OutPoint, TxOut>> prevs;
     prevs.reserve(selection->selected.size());
-    for (const auto& utxo : selection->selected) prevs.push_back({utxo.outpoint, utxo.prevout});
+    for (const auto& utxo : selection->selected) {
+      prevs.push_back({utxo.outpoint, utxo.prevout});
+      record->selected_inputs.push_back(onboarding::ReservedInput{utxo.outpoint, utxo.prevout.value});
+    }
+    record->selected_inputs_reserved = true;
     auto own_address = address::decode(key->address);
     if (!own_address.has_value()) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
@@ -2189,6 +2216,8 @@ std::string Server::handle_rpc_body(const std::string& body) {
     }
     record->state = onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION;
     record->txid_hex = hex_encode32(txid);
+    record->broadcast_outcome = onboarding::ValidatorOnboardingBroadcastOutcome::SENT;
+    record->rpc_endpoint = "lightserver";
     record->last_error_code.clear();
     record->last_error_message.clear();
     return make_result(id, onboarding_record_json(*record));

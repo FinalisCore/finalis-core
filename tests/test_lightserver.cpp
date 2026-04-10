@@ -1913,6 +1913,10 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
       R"(","passphrase":")" + passphrase + R"(","fee":10000,"wait_for_sync":true}})";
   const auto start_resp = ls.handle_rpc_for_test(start_body);
   ASSERT_TRUE(start_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
+  ASSERT_TRUE(start_resp.find("\"onboarding_id\":\"rpc\"") != std::string::npos);
+  ASSERT_TRUE(start_resp.find("\"wait_for_sync\":true") != std::string::npos);
+  ASSERT_TRUE(start_resp.find("\"broadcast_outcome\":\"sent\"") != std::string::npos);
+  ASSERT_TRUE(start_resp.find("\"selected_input_count\":1") != std::string::npos);
   const auto tracked_txid = json_string_field(start_resp, "txid_hex");
   ASSERT_TRUE(tracked_txid.has_value());
   ASSERT_TRUE(!tracked_txid->empty());
@@ -1924,6 +1928,7 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   const auto status_resp = ls.handle_rpc_for_test(status_body);
   ASSERT_TRUE(status_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find(std::string("\"txid_hex\":\"") + *tracked_txid + "\"") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"broadcast_outcome\":\"sent\"") != std::string::npos);
 }
 
 void register_lightserver_tests() {}
