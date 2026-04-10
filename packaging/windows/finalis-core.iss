@@ -38,7 +38,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 
 [Icons]
 Name: "{group}\Finalis Wallet"; Filename: "{app}\app\bin\finalis-wallet.exe"; Check: FileExists(ExpandConstant('{app}\app\bin\finalis-wallet.exe'))
-Name: "{group}\Finalis Explorer"; Filename: "{app}\app\bin\finalis-explorer.exe"; Parameters: "--bind 127.0.0.1 --port 18080 --rpc-url http://127.0.0.1:19444/rpc"; Check: FileExists(ExpandConstant('{app}\app\bin\finalis-explorer.exe'))
+Name: "{group}\Finalis Explorer"; Filename: "{app}\app\bin\finalis-explorer.exe"; Parameters: "--bind 0.0.0.0 --port 18080 --rpc-url http://127.0.0.1:19444/rpc"; Check: FileExists(ExpandConstant('{app}\app\bin\finalis-explorer.exe'))
 Name: "{group}\Start Finalis Stack"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\app\scripts\Start-Finalis.ps1"""; WorkingDir: "{app}\app"
 Name: "{group}\Finalis CLI"; Filename: "{app}\app\bin\finalis-cli.exe"; Check: FileExists(ExpandConstant('{app}\app\bin\finalis-cli.exe'))
 Name: "{group}\README"; Filename: "{app}\app\WINDOWS-RUN.txt"

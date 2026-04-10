@@ -115,17 +115,17 @@ Finalis Core for Windows
 Installed binaries live under:
   bin\
 
-To start a local node + lightserver + explorer:
+To start a network-listening node + lightserver + explorer:
   powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1
 
 Wallet:
   bin\finalis-wallet.exe
 
 Explorer:
-  http://127.0.0.1:18080
+  http://<this-machine-ip>:18080
 
 Lightserver RPC:
-  http://127.0.0.1:19444/rpc
+  http://<this-machine-ip>:19444/rpc
 "@
 
 Set-Content -Path (Join-Path $installRoot "WINDOWS-RUN.txt") -Value $launcherReadme -Encoding ASCII

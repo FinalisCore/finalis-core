@@ -5,10 +5,14 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 jobs:
   build-installer:
     runs-on: windows-latest
+    permissions:
+      contents: write
     env:
       BUILD_PRESET: windows-msvc-release
       QT_VERSION: 5.15.2
@@ -180,3 +184,12 @@ jobs:
         with:
           name: finalis-core-installer-${{ steps.meta.outputs.version }}
           path: dist/installer/finalis-core_installer.exe
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Finalis Core ${{ github.ref_name }}
+          files: dist/installer/finalis-core_installer.exe
+          generate_release_notes: true
