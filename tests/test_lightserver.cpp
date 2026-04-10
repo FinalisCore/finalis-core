@@ -1858,4 +1858,72 @@ TEST(test_lightserver_roots_endpoints_unavailable_away_from_finalized_tip) {
   }
 }
 
+TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_registration) {
+  const std::string base = "/tmp/finalis_light_onboarding_rpc";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  const auto seed = deterministic_seed_for_node_id(17);
+  const std::string key_file = base + "/keystore/validator.json";
+  const std::string passphrase = "test-pass";
+  keystore::ValidatorKey validator_key;
+  std::string key_err;
+  ASSERT_TRUE(keystore::create_validator_keystore(key_file, passphrase, "mainnet", "sc", seed, &validator_key, &key_err));
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0xA4;
+  ASSERT_TRUE(db.set_tip(storage::TipState{25, tip_hash}));
+  storage::NodeRuntimeStatusSnapshot snapshot;
+  snapshot.chain_id_ok = true;
+  snapshot.db_open = true;
+  snapshot.local_finalized_height = 25;
+  snapshot.observed_network_height_known = true;
+  snapshot.observed_network_finalized_height = 25;
+  snapshot.healthy_peer_count = 2;
+  snapshot.established_peer_count = 2;
+  snapshot.finalized_lag = 0;
+  snapshot.next_height_committee_available = true;
+  snapshot.next_height_proposer_available = true;
+  snapshot.registration_ready_preflight = true;
+  snapshot.readiness_stable_samples = 8;
+  snapshot.registration_ready = true;
+  snapshot.captured_at_unix_ms = static_cast<std::uint64_t>(std::time(nullptr)) * 1000ULL;
+  ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
+
+  OutPoint op{};
+  op.txid.fill(0x6A);
+  op.index = 0;
+  const auto own_pkh = crypto::h160(Bytes(validator_key.pubkey.begin(), validator_key.pubkey.end()));
+  const TxOut spendable{50'000'000'000, address::p2pkh_script_pubkey(own_pkh)};
+  ASSERT_TRUE(db.put_utxo(op, spendable));
+  ASSERT_TRUE(db.put_script_utxo(crypto::sha256(spendable.script_pubkey), op, spendable, 1));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config cfg;
+  cfg.db_path = base;
+  cfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
+  lightserver::Server ls(cfg);
+  ASSERT_TRUE(ls.init());
+
+  const std::string start_body =
+      std::string(R"({"jsonrpc":"2.0","id":501,"method":"validator_onboarding_start","params":{"key_file":")") + key_file +
+      R"(","passphrase":")" + passphrase + R"(","fee":10000,"wait_for_sync":true}})";
+  const auto start_resp = ls.handle_rpc_for_test(start_body);
+  ASSERT_TRUE(start_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
+  const auto tracked_txid = json_string_field(start_resp, "txid_hex");
+  ASSERT_TRUE(tracked_txid.has_value());
+  ASSERT_TRUE(!tracked_txid->empty());
+
+  const std::string status_body =
+      std::string(R"({"jsonrpc":"2.0","id":502,"method":"validator_onboarding_status","params":{"key_file":")") + key_file +
+      R"(","passphrase":")" + passphrase + R"(","fee":10000,"wait_for_sync":true,"txid_hex":")" + *tracked_txid +
+      R"("}})";
+  const auto status_resp = ls.handle_rpc_for_test(status_body);
+  ASSERT_TRUE(status_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
+  ASSERT_TRUE(status_resp.find(std::string("\"txid_hex\":\"") + *tracked_txid + "\"") != std::string::npos);
+}
+
 void register_lightserver_tests() {}

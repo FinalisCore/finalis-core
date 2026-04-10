@@ -2156,9 +2156,15 @@ std::string Server::handle_rpc_body(const std::string& body) {
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
     auto tip = db_.get_tip();
+    const std::uint64_t current_height = tip ? (tip->height + 1) : 1;
+    const auto min_bond_amount = record->bond_amount;
+    const auto max_bond_amount = std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, min_bond_amount);
     SpecialValidationContext ctx{
         .validators = &vr,
-        .current_height = tip ? (tip->height + 1) : 1,
+        .current_height = current_height,
+        .enforce_variable_bond_range = true,
+        .min_bond_amount = min_bond_amount,
+        .max_bond_amount = max_bond_amount,
         .is_committee_member =
             [this](const PubKey32& pk, std::uint64_t h, std::uint32_t /*round*/) {
               auto committee = committee_for_height(h);
