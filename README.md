@@ -102,30 +102,30 @@ The current code implements:
 - zero new issuance after the cap
 - post-cap epoch fee pooling with deterministic reserve subsidy support
 
-## Build
+## # Finalis Core – Run a Node | Deterministic finality. No forks.
 
-Minimum packages for Ubuntu / Debian:
+Do step-by-step | copy past | for Windows users see [Windows-installer]("https://github.com/finalis-core/finalis-core/releases")
 
 ```bash
-apt update
 apt install -y build-essential cmake ninja-build pkg-config libssl-dev \
   qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
   libsodium-dev librocksdb-dev curl jq
 ```
-
+```bash
+git clone https://github.com/finalis-core/finalis-core.git
+```
+```bash
+cd finalis-core
+```
 Build:
 
 ```bash
-cmake -S . -B build -G Ninja
-cmake --build build -j
+cmake -S . -B build -G Ninja && cmake --build build -j
 ```
 
 ## Run
-
-Run a node with lightserver:
-
 ```bash
-./build/finalis-node --db ~/.finalis/mainnet --with-lightserver
+./scripts/start.sh
 ```
 
 Default ports from the current mainnet config:
@@ -133,11 +133,6 @@ Default ports from the current mainnet config:
 - P2P: `19440`
 - lightserver: `19444`
 
-Helper script:
-
-```bash
-./scripts/start.sh
-```
 
 ## Testing
 

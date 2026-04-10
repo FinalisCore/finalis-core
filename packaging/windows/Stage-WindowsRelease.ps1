@@ -58,6 +58,7 @@ $installRoot = Join-Path $resolvedStageRoot "app"
 $binDir = Join-Path $installRoot "bin"
 $scriptsDir = Join-Path $installRoot "scripts"
 $docsDir = Join-Path $installRoot "share\doc\finalis-core"
+$mainnetDir = Join-Path $installRoot "mainnet"
 $installerAssetsDir = Join-Path $resolvedStageRoot "installer-assets"
 $qtDeployExe = Join-Path $QtRootDir "bin\windeployqt.exe"
 $vcpkgBinCandidates = @()
@@ -81,6 +82,7 @@ if (Test-Path $StageRoot) {
 
 New-Item -ItemType Directory -Force -Path $resolvedStageRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $mainnetDir | Out-Null
 New-Item -ItemType Directory -Force -Path $installerAssetsDir | Out-Null
 
 cmake --install $resolvedBuildDir --config $Configuration --prefix $installRoot
@@ -105,6 +107,7 @@ foreach ($candidate in ($vcpkgBinCandidates | Select-Object -Unique)) {
 
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-app-icon.png") -Destination (Join-Path $installRoot "finalis-app-icon.png")
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installRoot "finalis-logo-horizontal.png")
+Copy-OptionalFile -Source (Join-Path $repoRoot "mainnet\SEEDS.json") -Destination (Join-Path $mainnetDir "SEEDS.json")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-splash-lockup.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard.bmp")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard-small.bmp")
 
@@ -117,6 +120,9 @@ Installed binaries live under:
 
 To start a network-listening node + lightserver + explorer:
   powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1
+
+Windows joiner mode uses:
+  mainnet\SEEDS.json
 
 Wallet:
   bin\finalis-wallet.exe

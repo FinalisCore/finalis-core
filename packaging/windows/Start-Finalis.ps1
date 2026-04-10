@@ -134,11 +134,19 @@ $nodeArgs = @(
 $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0", "--outbound-target", "1")
 
 if (Test-Path $seedsJson) {
-    $seedList = Get-Content $seedsJson -Raw | ConvertFrom-Json
-    foreach ($seed in $seedList) {
-        if ($seed) {
-            $nodeArgs += @("--peers", [string]$seed)
+    $seedDoc = Get-Content $seedsJson -Raw | ConvertFrom-Json
+    $seedList = @()
+    if ($seedDoc -is [System.Collections.IEnumerable] -and -not ($seedDoc -is [string])) {
+        foreach ($entry in $seedDoc) {
+            if ($entry) { $seedList += [string]$entry }
         }
+    } elseif ($seedDoc.PSObject.Properties.Name -contains "seeds_p2p") {
+        foreach ($entry in $seedDoc.seeds_p2p) {
+            if ($entry) { $seedList += [string]$entry }
+        }
+    }
+    if ($seedList.Count -gt 0) {
+        $nodeArgs += @("--peers", ($seedList -join ","))
     }
 }
 
