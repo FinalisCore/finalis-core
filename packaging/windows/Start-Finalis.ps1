@@ -9,9 +9,7 @@ param(
     [bool]$WithExplorer = $true,
     [switch]$ConfigureFirewall,
     [switch]$NoStart,
-    [switch]$PublicNode,
-    [ValidateSet("auto", "bootstrap", "joiner")]
-    [string]$NodeRole = "auto"
+    [switch]$PublicNode
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,24 +131,9 @@ $nodeArgs = @(
     "--lightserver-bind", $LightserverBind,
     "--lightserver-port", $LightserverPort
 )
+$nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0", "--outbound-target", "1")
 
-switch ($NodeRole) {
-    "bootstrap" {
-        $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0", "--no-dns-seeds", "--outbound-target", "0")
-    }
-    "joiner" {
-        $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0", "--no-dns-seeds", "--outbound-target", "1")
-    }
-    default {
-        if (Test-Path $seedsJson) {
-            $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0", "--no-dns-seeds", "--outbound-target", "1")
-        } else {
-            $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0", "--no-dns-seeds", "--outbound-target", "0")
-        }
-    }
-}
-
-if ((Test-Path $seedsJson) -and $NodeRole -ne "bootstrap") {
+if (Test-Path $seedsJson) {
     $seedList = Get-Content $seedsJson -Raw | ConvertFrom-Json
     foreach ($seed in $seedList) {
         if ($seed) {

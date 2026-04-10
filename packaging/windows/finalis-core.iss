@@ -31,7 +31,7 @@ WizardSmallImageFile={#SourceDir}\installer-assets\finalis-wizard-small.bmp
 
 [Tasks]
 Name: "desktopicon"; Description: "Create desktop shortcuts"; GroupDescription: "Additional icons:"
-Name: "launchstack"; Description: "Start Finalis node and explorer after installation"; Flags: unchecked
+Name: "launchstack"; Description: "Start Finalis node, lightserver, and explorer after installation"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

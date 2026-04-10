@@ -273,6 +273,15 @@ std::optional<onboarding::ValidatorOnboardingState> parse_onboarding_state(const
   return std::nullopt;
 }
 
+std::optional<onboarding::ValidatorOnboardingBroadcastOutcome> parse_onboarding_broadcast_outcome(const std::string& outcome) {
+  using onboarding::ValidatorOnboardingBroadcastOutcome;
+  if (outcome == "none") return ValidatorOnboardingBroadcastOutcome::NONE;
+  if (outcome == "sent") return ValidatorOnboardingBroadcastOutcome::SENT;
+  if (outcome == "rejected") return ValidatorOnboardingBroadcastOutcome::REJECTED;
+  if (outcome == "ambiguous") return ValidatorOnboardingBroadcastOutcome::AMBIGUOUS;
+  return std::nullopt;
+}
+
 std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_result(const minijson::Value* result,
                                                                                     std::string* err) {
   if (!result || !result->is_object()) {
@@ -293,16 +302,26 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
     return std::nullopt;
   }
   record.validator_pubkey = *pubkey;
+  record.onboarding_id = object_string(result, "onboarding_id").value_or("");
   record.wallet_address = object_string(result, "wallet_address").value_or("");
   record.wallet_pubkey_hex = object_string(result, "wallet_pubkey_hex").value_or("");
   record.state = *state;
+  record.wait_for_sync = object_bool(result, "wait_for_sync").value_or(false);
   record.fee = object_u64(result, "fee").value_or(0);
   record.bond_amount = object_u64(result, "bond_amount").value_or(0);
   record.eligibility_bond_amount = object_u64(result, "eligibility_bond_amount").value_or(record.bond_amount);
   record.required_amount = object_u64(result, "required_amount").value_or(0);
   record.last_spendable_balance = object_u64(result, "last_spendable_balance").value_or(0);
   record.last_deficit = object_u64(result, "last_deficit").value_or(0);
+  if (auto selected_input_count = object_u64(result, "selected_input_count"); selected_input_count) {
+    record.selected_inputs.resize(static_cast<std::size_t>(*selected_input_count));
+  }
+  record.selected_inputs_reserved = object_bool(result, "selected_inputs_reserved").value_or(false);
   record.txid_hex = object_string(result, "txid_hex").value_or("");
+  if (auto outcome_name = object_string(result, "broadcast_outcome"); outcome_name) {
+    if (auto outcome = parse_onboarding_broadcast_outcome(*outcome_name); outcome) record.broadcast_outcome = *outcome;
+  }
+  record.rpc_endpoint = object_string(result, "rpc_endpoint").value_or("");
   record.finalized_height = object_u64(result, "finalized_height").value_or(0);
   record.validator_status = object_string(result, "validator_status").value_or("");
   record.activation_height = object_u64(result, "activation_height").value_or(0);
@@ -780,7 +799,9 @@ std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_st
     return std::nullopt;
   }
   const auto* result = result_value(*root, err);
-  return parse_onboarding_record_result(result, err);
+  auto record = parse_onboarding_record_result(result, err);
+  if (record) record->rpc_endpoint = rpc_url;
+  return record;
 }
 
 std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_start(
@@ -797,7 +818,9 @@ std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_st
     return std::nullopt;
   }
   const auto* result = result_value(*root, err);
-  return parse_onboarding_record_result(result, err);
+  auto record = parse_onboarding_record_result(result, err);
+  if (record) record->rpc_endpoint = rpc_url;
+  return record;
 }
 
 std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body, std::string* err) {
