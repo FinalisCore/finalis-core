@@ -814,7 +814,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli economics_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
      << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync]\n"
      << "  finalis-cli validator-register-status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--json]\n"
-     << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>]\n"
+     << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>]  # cancel attempt before broadcast; detach local tracking after broadcast\n"
      << "  finalis-cli wallet_create --out <path> [--pass <pass>] [--network mainnet] [--seed-hex <32b-hex>]\n"
      << "  finalis-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network mainnet]\n"
      << "  finalis-cli wallet_address --file <path> [--pass <pass>]\n"
@@ -2549,11 +2549,11 @@ int main(int argc, char** argv) {
                  local_status->broadcast_outcome == finalis::onboarding::ValidatorOnboardingBroadcastOutcome::NONE);
             if (pre_broadcast_cancel) {
               std::cerr
-                  << "validator-register-cancel requires exclusive local DB access to release reserved inputs or cancel a pre-broadcast attempt. "
+                  << "validator-register-cancel requires exclusive local DB access to release reserved inputs or cancel the pre-broadcast attempt. "
                   << "Stop finalis-node and rerun this command.\n";
             } else {
               std::cerr
-                  << "validator-register-cancel could not detach the local onboarding record while finalis-node owns the DB. "
+                  << "validator-register-cancel could not detach local tracking while finalis-node owns the DB. "
                   << "The join attempt is already post-broadcast or on-chain tracked; use validator-register-status to monitor it, or stop finalis-node and rerun this command if you explicitly want to detach local tracking.\n";
             }
             return 1;
@@ -2562,7 +2562,7 @@ int main(int argc, char** argv) {
           if (rpc_status) {
             print_onboarding_record(*rpc_status, as_json);
             std::cerr
-                << "validator-register-cancel could not update local onboarding tracking while finalis-node owns the DB. "
+                << "validator-register-cancel could not detach local tracking while finalis-node owns the DB. "
                 << "Stop finalis-node and rerun this command if you need to detach the local record.\n";
             return 1;
           }
@@ -2576,6 +2576,11 @@ int main(int argc, char** argv) {
         return 1;
       }
       print_onboarding_record(*record, as_json);
+      if (record->state == finalis::onboarding::ValidatorOnboardingState::CANCELLED) {
+        std::cerr << "validator-register-cancel: pre-broadcast attempt cancelled.\n";
+      } else if (record->tracking_detached) {
+        std::cerr << "validator-register-cancel: local tracking detached for a post-broadcast attempt.\n";
+      }
       return 0;
     }
 
