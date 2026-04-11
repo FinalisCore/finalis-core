@@ -1291,6 +1291,8 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
              record.transition.settlement.serialize() == expected.settlement.serialize() &&
              record.transition.next_state_root == expected.next_state_root;
     };
+    std::vector<PubKey32> effective_committee = canonical_committee_for_height_round(cfg, prev, record.transition.height,
+                                                                                     record.transition.round);
     if (!have_current_expected || !transition_metadata_matches(expected_transition)) {
       if (!have_legacy_expected || !transition_metadata_matches(legacy_expected_transition)) {
         if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
@@ -1311,8 +1313,11 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
         return false;
       }
       expected_transition = std::move(legacy_expected_transition);
+      effective_committee = legacy_canonical_committee_for_height_round(cfg, prev, record.transition.height,
+                                                                        record.transition.round);
     }
     result.transition = expected_transition;
+    result.effective_committee = std::move(effective_committee);
     apply_frontier_settlement_to_utxos(result.transition, &result.next_utxos);
     if (recomputed) *recomputed = std::move(result);
     return true;
@@ -1414,6 +1419,8 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
            record.transition.settlement.serialize() == expected.settlement.serialize() &&
            record.transition.next_state_root == expected.next_state_root;
   };
+  std::vector<PubKey32> effective_committee = canonical_committee_for_height_round(cfg, prev, record.transition.height,
+                                                                                   record.transition.round);
   if (!have_current_expected || !transition_metadata_matches(expected_transition)) {
     if (!have_legacy_expected || !transition_metadata_matches(legacy_expected_transition)) {
       if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
@@ -1432,8 +1439,11 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
       return false;
     }
     expected_transition = std::move(legacy_expected_transition);
+    effective_committee = legacy_canonical_committee_for_height_round(cfg, prev, record.transition.height,
+                                                                      record.transition.round);
   }
   result.transition = expected_transition;
+  result.effective_committee = std::move(effective_committee);
   apply_frontier_settlement_to_utxos(result.transition, &result.next_utxos);
   if (recomputed) *recomputed = std::move(result);
   return true;
@@ -1450,7 +1460,10 @@ bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const Canonical
 
   CanonicalDerivedState next = prev;
   mark_epoch_reward_settled_for_height(cfg, record.transition.height, &next);
-  const auto committee = canonical_committee_for_height_round(cfg, prev, record.transition.height, record.transition.round);
+  const auto committee = !recomputed.effective_committee.empty()
+                             ? recomputed.effective_committee
+                             : canonical_committee_for_height_round(cfg, prev, record.transition.height,
+                                                                    record.transition.round);
   accrue_epoch_reward_state_for_frontier(cfg, &next, record.transition, committee);
   update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, committee,
                                                        record.transition.observed_signers);

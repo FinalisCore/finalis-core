@@ -26,6 +26,7 @@ struct FrontierExecutionResult {
   UtxoSet next_utxos;
   FrontierLaneRoots next_lane_roots{};
   std::uint64_t accepted_fee_units{0};
+  std::vector<PubKey32> effective_committee;
 
   Hash32 result_id() const;
 };
