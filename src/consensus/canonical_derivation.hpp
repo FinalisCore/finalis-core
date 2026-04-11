@@ -111,8 +111,8 @@ struct CanonicalDerivedState {
 
 struct AdaptiveCheckpointParameters {
   std::uint64_t qualified_depth{0};
-  std::uint64_t target_committee_size{16};
-  std::uint64_t min_eligible_operators{19};
+  std::uint64_t target_committee_size{1};
+  std::uint64_t min_eligible_operators{1};
   std::uint64_t min_bond{150ULL * BASE_UNITS_PER_COIN};
   std::uint32_t target_expand_streak{0};
   std::uint32_t target_contract_streak{0};

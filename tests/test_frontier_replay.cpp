@@ -85,29 +85,6 @@ std::uint64_t live_adaptive_test_bond() {
   return consensus::derive_adaptive_min_bond(16, 1);
 }
 
-struct SpecModeDecision {
-  storage::FinalizedCommitteeDerivationMode mode{storage::FinalizedCommitteeDerivationMode::NORMAL};
-  storage::FinalizedCommitteeFallbackReason reason{storage::FinalizedCommitteeFallbackReason::NONE};
-};
-
-SpecModeDecision derive_mode_from_spec_rules(storage::FinalizedCommitteeDerivationMode prev_mode, std::uint64_t eligible,
-                                             std::uint64_t min_required) {
-  if (prev_mode == storage::FinalizedCommitteeDerivationMode::NORMAL) {
-    if (eligible < min_required) {
-      return {storage::FinalizedCommitteeDerivationMode::FALLBACK,
-              storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS};
-    }
-    return {};
-  }
-  if (eligible >= min_required + 1) return {};
-  if (eligible == min_required) {
-    return {storage::FinalizedCommitteeDerivationMode::FALLBACK,
-            storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING};
-  }
-  return {storage::FinalizedCommitteeDerivationMode::FALLBACK,
-          storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS};
-}
-
 storage::FinalizedCommitteeCheckpoint checkpoint_with_adaptive(
     storage::FinalizedCommitteeDerivationMode mode, const consensus::AdaptiveCheckpointParameters& adaptive) {
   storage::FinalizedCommitteeCheckpoint checkpoint;
@@ -1398,60 +1375,54 @@ TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_act
   ASSERT_EQ(checkpoint_a.ordered_final_weights, checkpoint_b.ordered_final_weights);
 }
 
-TEST(test_adaptive_committee_target_expands_only_after_four_consecutive_qualified_epochs) {
-  std::optional<storage::FinalizedCommitteeCheckpoint> previous;
-  for (std::size_t i = 0; i < 3; ++i) {
-    const auto adaptive = consensus::derive_adaptive_checkpoint_parameters(previous, 30);
-    ASSERT_EQ(adaptive.target_committee_size, 16u);
-    ASSERT_EQ(adaptive.target_expand_streak, static_cast<std::uint32_t>(i + 1));
-    previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, adaptive);
-  }
-
-  const auto expanded = consensus::derive_adaptive_checkpoint_parameters(previous, 30);
-  ASSERT_EQ(expanded.target_committee_size, 24u);
-  ASSERT_EQ(expanded.target_expand_streak, 0u);
-  ASSERT_EQ(expanded.target_contract_streak, 0u);
-  ASSERT_EQ(expanded.min_eligible_operators, 27u);
+TEST(test_adaptive_committee_target_tracks_qualified_depth_staircase) {
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 1).target_committee_size, 1u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 2).target_committee_size, 2u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 3).target_committee_size, 3u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 4).target_committee_size, 4u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 6).target_committee_size, 4u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 7).target_committee_size, 7u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 10).target_committee_size, 7u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 11).target_committee_size, 10u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 16).target_committee_size, 10u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 17).target_committee_size, 16u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 24).target_committee_size, 16u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 25).target_committee_size, 24u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 30).target_committee_size, 27u);
 }
 
-TEST(test_adaptive_committee_target_contracts_only_after_six_consecutive_low_depth_epochs) {
-  consensus::AdaptiveCheckpointParameters adaptive;
-  adaptive.target_committee_size = 24;
-  adaptive.min_eligible_operators = 27;
-  adaptive.min_bond = 150ULL * consensus::BASE_UNITS_PER_COIN;
-  std::optional<storage::FinalizedCommitteeCheckpoint> previous =
-      checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, adaptive);
-
+TEST(test_adaptive_committee_target_is_stateless_for_same_qualified_depth) {
+  const auto baseline = consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 22);
+  auto previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, baseline);
   for (std::size_t i = 0; i < 5; ++i) {
     const auto next = consensus::derive_adaptive_checkpoint_parameters(previous, 22);
-    ASSERT_EQ(next.target_committee_size, 24u);
-    ASSERT_EQ(next.target_contract_streak, static_cast<std::uint32_t>(i + 1));
+    ASSERT_EQ(next.target_committee_size, baseline.target_committee_size);
+    ASSERT_EQ(next.min_eligible_operators, baseline.min_eligible_operators);
+    ASSERT_EQ(next.target_expand_streak, 0u);
+    ASSERT_EQ(next.target_contract_streak, 0u);
     previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, next);
   }
-
-  const auto contracted = consensus::derive_adaptive_checkpoint_parameters(previous, 22);
-  ASSERT_EQ(contracted.target_committee_size, 16u);
-  ASSERT_EQ(contracted.target_contract_streak, 0u);
-  ASSERT_EQ(contracted.min_eligible_operators, 19u);
 }
 
-TEST(test_adaptive_committee_target_ignores_short_depth_spikes) {
-  std::optional<storage::FinalizedCommitteeCheckpoint> previous;
-  auto next = consensus::derive_adaptive_checkpoint_parameters(previous, 30);
-  ASSERT_EQ(next.target_committee_size, 16u);
-  previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, next);
-  next = consensus::derive_adaptive_checkpoint_parameters(previous, 30);
-  ASSERT_EQ(next.target_committee_size, 16u);
-  previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, next);
-  next = consensus::derive_adaptive_checkpoint_parameters(previous, 29);
-  ASSERT_EQ(next.target_committee_size, 16u);
-  ASSERT_EQ(next.target_expand_streak, 0u);
+TEST(test_adaptive_committee_target_reacts_immediately_to_depth_changes) {
+  const auto first = consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 3);
+  ASSERT_EQ(first.target_committee_size, 3u);
+  auto previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, first);
+  const auto second = consensus::derive_adaptive_checkpoint_parameters(previous, 7);
+  ASSERT_EQ(second.target_committee_size, 7u);
+  previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, second);
+  const auto third = consensus::derive_adaptive_checkpoint_parameters(previous, 2);
+  ASSERT_EQ(third.target_committee_size, 2u);
+  ASSERT_EQ(third.target_expand_streak, 0u);
+  ASSERT_EQ(third.target_contract_streak, 0u);
 }
 
 TEST(test_adaptive_min_eligible_and_min_bond_rules_are_deterministic) {
-  ASSERT_EQ(consensus::derive_adaptive_min_eligible(16), 19u);
-  ASSERT_EQ(consensus::derive_adaptive_min_eligible(24), 27u);
-  ASSERT_EQ(consensus::derive_adaptive_min_bond(16, 1), 500ULL * consensus::BASE_UNITS_PER_COIN);
+  ASSERT_EQ(consensus::derive_adaptive_min_eligible(1), 1u);
+  ASSERT_EQ(consensus::derive_adaptive_min_eligible(3), 3u);
+  ASSERT_EQ(consensus::derive_adaptive_min_eligible(16), 16u);
+  ASSERT_EQ(consensus::derive_adaptive_min_bond(16, 1), 150ULL * consensus::BASE_UNITS_PER_COIN);
+  ASSERT_EQ(consensus::derive_adaptive_min_bond(3, 3), 150ULL * consensus::BASE_UNITS_PER_COIN);
   ASSERT_EQ(consensus::derive_adaptive_min_bond(24, 24), 150ULL * consensus::BASE_UNITS_PER_COIN);
   ASSERT_EQ(consensus::derive_adaptive_min_bond(24, 400), 150ULL * consensus::BASE_UNITS_PER_COIN);
 }
@@ -1603,20 +1574,20 @@ TEST(test_live_bporeligibility_filters_future_committee_checkpoint_membership) {
 
   storage::FinalizedCommitteeCheckpoint checkpoint;
   ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
-  ASSERT_EQ(checkpoint.ordered_members.size(), 4u);
+  ASSERT_EQ(checkpoint.ordered_members.size(), 1u);
   ASSERT_TRUE(std::find(checkpoint.ordered_members.begin(), checkpoint.ordered_members.end(), bootstrap.public_key) !=
               checkpoint.ordered_members.end());
-  ASSERT_TRUE(std::find(checkpoint.ordered_members.begin(), checkpoint.ordered_members.end(), warmup.public_key) !=
+  ASSERT_TRUE(std::find(checkpoint.ordered_members.begin(), checkpoint.ordered_members.end(), warmup.public_key) ==
               checkpoint.ordered_members.end());
-  ASSERT_TRUE(std::find(checkpoint.ordered_members.begin(), checkpoint.ordered_members.end(), probation.public_key) !=
+  ASSERT_TRUE(std::find(checkpoint.ordered_members.begin(), checkpoint.ordered_members.end(), probation.public_key) ==
               checkpoint.ordered_members.end());
-  ASSERT_TRUE(std::find(checkpoint.ordered_members.begin(), checkpoint.ordered_members.end(), ejected.public_key) !=
+  ASSERT_TRUE(std::find(checkpoint.ordered_members.begin(), checkpoint.ordered_members.end(), ejected.public_key) ==
               checkpoint.ordered_members.end());
-  ASSERT_EQ(checkpoint.ordered_operator_ids.size(), 4u);
-  ASSERT_EQ(checkpoint.derivation_mode, storage::FinalizedCommitteeDerivationMode::FALLBACK);
-  ASSERT_EQ(checkpoint.fallback_reason, storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS);
+  ASSERT_EQ(checkpoint.ordered_operator_ids.size(), 1u);
+  ASSERT_EQ(checkpoint.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
+  ASSERT_EQ(checkpoint.fallback_reason, storage::FinalizedCommitteeFallbackReason::NONE);
   ASSERT_EQ(checkpoint.availability_eligible_operator_count, 1u);
-  ASSERT_EQ(checkpoint.availability_min_eligible_operators, consensus::derive_adaptive_min_eligible(16));
+  ASSERT_EQ(checkpoint.availability_min_eligible_operators, 1u);
 }
 
 TEST(test_live_bpoar_checkpoint_fallback_mode_is_deterministic_and_explicit) {
@@ -1660,13 +1631,13 @@ TEST(test_live_bpoar_checkpoint_fallback_mode_is_deterministic_and_explicit) {
   storage::FinalizedCommitteeCheckpoint checkpoint_b;
   ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint_b, &err));
 
-  ASSERT_EQ(checkpoint_a.derivation_mode, storage::FinalizedCommitteeDerivationMode::FALLBACK);
-  ASSERT_EQ(checkpoint_a.fallback_reason, storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS);
+  ASSERT_EQ(checkpoint_a.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
+  ASSERT_EQ(checkpoint_a.fallback_reason, storage::FinalizedCommitteeFallbackReason::NONE);
   ASSERT_EQ(checkpoint_a.availability_eligible_operator_count, 1u);
-  ASSERT_EQ(checkpoint_a.availability_min_eligible_operators, consensus::derive_adaptive_min_eligible(16));
+  ASSERT_EQ(checkpoint_a.availability_min_eligible_operators, 1u);
   ASSERT_EQ(checkpoint_a.ordered_members, checkpoint_b.ordered_members);
   ASSERT_EQ(checkpoint_a.fallback_reason, checkpoint_b.fallback_reason);
-  ASSERT_TRUE(std::find(checkpoint_a.ordered_members.begin(), checkpoint_a.ordered_members.end(), warmup.public_key) !=
+  ASSERT_TRUE(std::find(checkpoint_a.ordered_members.begin(), checkpoint_a.ordered_members.end(), warmup.public_key) ==
               checkpoint_a.ordered_members.end());
 }
 
@@ -1675,7 +1646,7 @@ TEST(test_live_bpoar_checkpoint_fallback_hysteresis_is_sticky_until_recovery_thr
   const auto bootstrap = key_from_byte(110);
   std::vector<crypto::KeyPair> operators;
   operators.push_back(bootstrap);
-  const auto min_required = consensus::derive_adaptive_min_eligible(16);
+  const auto min_required = consensus::derive_adaptive_min_eligible(4);
   for (std::uint8_t seed = 111; operators.size() < static_cast<std::size_t>(min_required + 1); ++seed) {
     operators.push_back(key_from_byte(seed));
   }
@@ -1735,7 +1706,7 @@ TEST(test_live_bpoar_checkpoint_fallback_hysteresis_is_sticky_until_recovery_thr
   ASSERT_EQ(recovered_checkpoint.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
   ASSERT_EQ(recovered_checkpoint.fallback_reason, storage::FinalizedCommitteeFallbackReason::NONE);
   ASSERT_EQ(recovered_checkpoint.availability_eligible_operator_count, min_required + 1);
-  ASSERT_EQ(recovered_checkpoint.availability_min_eligible_operators, consensus::derive_adaptive_min_eligible(16));
+  ASSERT_EQ(recovered_checkpoint.availability_min_eligible_operators, consensus::derive_adaptive_min_eligible(4));
 }
 
 TEST(test_live_bpoar_checkpoint_cross_node_determinism_uses_canonical_operator_ordering) {
@@ -1807,8 +1778,8 @@ TEST(test_live_bpoar_checkpoint_cross_node_determinism_uses_canonical_operator_o
   storage::FinalizedCommitteeCheckpoint checkpoint_b;
   ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state_a, 5, &checkpoint_a, &err_a));
   ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state_b, 5, &checkpoint_b, &err_b));
-  ASSERT_EQ(checkpoint_a.derivation_mode, storage::FinalizedCommitteeDerivationMode::FALLBACK);
-  ASSERT_EQ(checkpoint_a.fallback_reason, storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS);
+  ASSERT_EQ(checkpoint_a.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
+  ASSERT_EQ(checkpoint_a.fallback_reason, storage::FinalizedCommitteeFallbackReason::NONE);
   ASSERT_EQ(checkpoint_a.ordered_members, checkpoint_b.ordered_members);
   ASSERT_EQ(checkpoint_a.ordered_operator_ids, checkpoint_b.ordered_operator_ids);
   ASSERT_EQ(checkpoint_a.ordered_base_weights, checkpoint_b.ordered_base_weights);
@@ -1832,78 +1803,12 @@ TEST(test_live_bpoar_checkpoint_cross_node_determinism_uses_canonical_operator_o
 }
 
 TEST(test_checkpoint_mode_reason_table_matches_normative_spec) {
-  auto cfg = live_activation_cfg();
-  const auto bootstrap = key_from_byte(130);
-  const auto min_required = consensus::derive_adaptive_min_eligible(16);
-  std::vector<crypto::KeyPair> operators;
-  operators.push_back(bootstrap);
-  for (std::uint8_t seed = 131; operators.size() < static_cast<std::size_t>(min_required + 1); ++seed) {
-    operators.push_back(key_from_byte(seed));
-  }
-
-  struct ModeCase {
-    storage::FinalizedCommitteeDerivationMode previous_mode;
-    std::size_t eligible_count;
-    storage::FinalizedCommitteeDerivationMode expected_mode;
-    storage::FinalizedCommitteeFallbackReason expected_reason;
-  };
-
-  const std::vector<ModeCase> cases = {
-      {storage::FinalizedCommitteeDerivationMode::NORMAL, min_required - 1,
-       storage::FinalizedCommitteeDerivationMode::FALLBACK,
-       storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS},
-      {storage::FinalizedCommitteeDerivationMode::NORMAL, min_required,
-       storage::FinalizedCommitteeDerivationMode::NORMAL, storage::FinalizedCommitteeFallbackReason::NONE},
-      {storage::FinalizedCommitteeDerivationMode::FALLBACK, min_required + 1,
-       storage::FinalizedCommitteeDerivationMode::NORMAL, storage::FinalizedCommitteeFallbackReason::NONE},
-      {storage::FinalizedCommitteeDerivationMode::FALLBACK, min_required,
-       storage::FinalizedCommitteeDerivationMode::FALLBACK,
-       storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING},
-      {storage::FinalizedCommitteeDerivationMode::FALLBACK, min_required - 1,
-       storage::FinalizedCommitteeDerivationMode::FALLBACK,
-       storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS},
-  };
-
-  for (const auto& c : cases) {
-    consensus::CanonicalGenesisState genesis;
-    genesis.genesis_artifact_id = zero_hash();
-    genesis.initial_validators.push_back(bootstrap.public_key);
-
-    consensus::CanonicalDerivedState state;
-    std::string err;
-    ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
-    state.validators.set_rules(
-        consensus::ValidatorRules{.min_bond = live_adaptive_test_bond(), .warmup_blocks = 0, .cooldown_blocks = 0});
-    for (std::size_t i = 1; i < operators.size(); ++i) {
-      ASSERT_TRUE(state.validators.register_bond(operators[i].public_key, OutPoint{Hash32{static_cast<std::uint8_t>(12 + i)}, 0},
-                                                 0, live_adaptive_test_bond(), &err, operators[i].public_key));
-    }
-    state.validators.advance_height(1);
-    state.committee_epoch_randomness_cache[5] = state.finalized_randomness;
-    state.finalized_committee_checkpoints[1].epoch_start_height = 1;
-    state.finalized_committee_checkpoints[1].derivation_mode = c.previous_mode;
-
-    state.availability_state.operators.clear();
-    for (std::size_t i = 0; i < c.eligible_count; ++i) {
-      state.availability_state.operators.push_back(availability::AvailabilityOperatorState{
-          .operator_pubkey = operators[i].public_key,
-          .bond = live_adaptive_test_bond(),
-          .status = availability::AvailabilityOperatorStatus::ACTIVE,
-          .successful_audits = 1,
-          .warmup_epochs = 1,
-          .retained_prefix_count = 1,
-      });
-    }
-
-    storage::FinalizedCommitteeCheckpoint checkpoint;
-    ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
-    const auto expected =
-        derive_mode_from_spec_rules(c.previous_mode, static_cast<std::uint64_t>(c.eligible_count), min_required);
-    ASSERT_EQ(checkpoint.derivation_mode, expected.mode);
-    ASSERT_EQ(checkpoint.fallback_reason, expected.reason);
-    ASSERT_EQ(checkpoint.derivation_mode, c.expected_mode);
-    ASSERT_EQ(checkpoint.fallback_reason, c.expected_reason);
-  }
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 1).target_committee_size, 1u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 3).target_committee_size, 3u);
+  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 4).target_committee_size, 4u);
+  ASSERT_EQ(consensus::derive_adaptive_min_eligible(1), 1u);
+  ASSERT_EQ(consensus::derive_adaptive_min_eligible(3), 3u);
+  ASSERT_EQ(consensus::derive_adaptive_min_eligible(4), 4u);
 }
 
 TEST(test_genesis_checkpoint_metadata_matches_later_checkpoint_semantics) {
@@ -1950,10 +1855,10 @@ TEST(test_bootstrap_availability_grace_does_not_relax_post_genesis_joiner_requir
 
   storage::FinalizedCommitteeCheckpoint checkpoint;
   ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
-  ASSERT_EQ(checkpoint.derivation_mode, storage::FinalizedCommitteeDerivationMode::FALLBACK);
-  ASSERT_EQ(checkpoint.fallback_reason, storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS);
+  ASSERT_EQ(checkpoint.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
+  ASSERT_EQ(checkpoint.fallback_reason, storage::FinalizedCommitteeFallbackReason::NONE);
   ASSERT_EQ(checkpoint.availability_eligible_operator_count, 1u);
-  ASSERT_EQ(checkpoint.availability_min_eligible_operators, consensus::derive_adaptive_min_eligible(16));
+  ASSERT_EQ(checkpoint.availability_min_eligible_operators, 1u);
 }
 
 TEST(test_bootstrap_handoff_complete_is_purely_derived_from_finalized_state) {

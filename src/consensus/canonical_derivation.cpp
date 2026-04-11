@@ -25,13 +25,6 @@
 namespace finalis::consensus {
 namespace {
 
-constexpr std::uint64_t kAdaptiveInitialTargetCommitteeSize = 16;
-constexpr std::uint64_t kAdaptiveExpandedTargetCommitteeSize = 24;
-constexpr std::uint64_t kAdaptiveTargetMargin = 3;
-constexpr std::uint64_t kAdaptiveExpandThreshold = 30;
-constexpr std::uint64_t kAdaptiveContractThreshold = 22;
-constexpr std::uint32_t kAdaptiveExpandStreakRequired = 4;
-constexpr std::uint32_t kAdaptiveContractStreakRequired = 6;
 constexpr std::uint64_t kAdaptiveMinBondFloor = 150ULL * BASE_UNITS_PER_COIN;
 constexpr std::uint64_t kAdaptiveMinBondCeiling = 500ULL * BASE_UNITS_PER_COIN;
 constexpr std::uint64_t kAdaptiveMinBondBase = 150ULL * BASE_UNITS_PER_COIN;
@@ -91,8 +84,26 @@ struct AvailabilityCommitteeDecision {
   storage::FinalizedCommitteeFallbackReason fallback_reason{storage::FinalizedCommitteeFallbackReason::NONE};
   std::uint64_t eligible_operator_count{0};
   std::uint64_t min_eligible_operators{0};
+  std::uint64_t effective_committee_size{0};
   AdaptiveCheckpointParameters adaptive{};
 };
+
+std::uint64_t target_committee_size_for_qualified_depth(std::uint64_t qualified_depth) {
+  if (qualified_depth <= 1) return 1;
+  if (qualified_depth == 2) return 2;
+  if (qualified_depth == 3) return 3;
+  if (qualified_depth <= 6) return 4;
+  if (qualified_depth <= 10) return 7;
+  if (qualified_depth <= 16) return 10;
+  if (qualified_depth <= 24) return 16;
+  return 24 + ((qualified_depth - 24) / 2);
+}
+
+std::uint64_t fallback_recovery_threshold(std::uint64_t target_committee_size) {
+  if (target_committee_size <= 3) return target_committee_size;
+  if (target_committee_size <= 7) return target_committee_size + 1;
+  return target_committee_size + 2;
+}
 
 std::optional<storage::FinalizedCommitteeCheckpoint> previous_checkpoint_for_epoch(
     const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state, std::uint64_t epoch_start_height) {
@@ -126,6 +137,8 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
       count_eligible_operators_at_checkpoint(state.validators, epoch_start_height, availability_state,
                                              availability_config_with_min_bond(cfg.availability, decision.adaptive.min_bond));
   decision.min_eligible_operators = decision.adaptive.min_eligible_operators;
+  decision.effective_committee_size =
+      std::max<std::uint64_t>(1, std::min(decision.eligible_operator_count, decision.adaptive.target_committee_size));
   if (decision.min_eligible_operators == 0) return decision;
 
   if (decision.eligible_operator_count < decision.min_eligible_operators) {
@@ -137,8 +150,7 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   const auto previous_mode =
       previous_checkpoint.has_value() ? std::optional<storage::FinalizedCommitteeDerivationMode>(previous_checkpoint->derivation_mode)
                                       : std::nullopt;
-  const std::uint64_t recovery_threshold =
-      decision.min_eligible_operators + ((previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK) ? 1ULL : 0ULL);
+  const std::uint64_t recovery_threshold = fallback_recovery_threshold(decision.adaptive.target_committee_size);
   if (previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
       decision.eligible_operator_count < recovery_threshold) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
@@ -1094,7 +1106,7 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
   checkpoint.ordered_members = select_finalized_committee(genesis_active, checkpoint.epoch_seed,
                                                           std::min<std::size_t>(
                                                               {cfg.max_committee,
-                                                               static_cast<std::size_t>(checkpoint.adaptive_target_committee_size),
+                                                               static_cast<std::size_t>(genesis_decision.effective_committee_size),
                                                                genesis_active.size()}));
   checkpoint.ordered_operator_ids.reserve(checkpoint.ordered_members.size());
   checkpoint.ordered_base_weights.reserve(checkpoint.ordered_members.size());
@@ -1754,10 +1766,11 @@ std::uint64_t qualified_depth_at_checkpoint(const ValidatorRegistry& validators,
 }
 
 std::uint64_t derive_adaptive_min_eligible(std::uint64_t target_committee_size) {
-  return target_committee_size + kAdaptiveTargetMargin;
+  return std::max<std::uint64_t>(1, target_committee_size);
 }
 
 std::uint64_t derive_adaptive_min_bond(std::uint64_t target_committee_size, std::uint64_t qualified_depth) {
+  if (qualified_depth <= 3) return kAdaptiveMinBondFloor;
   const std::uint64_t depth = std::max<std::uint64_t>(1, qualified_depth);
   constexpr std::uint64_t kScale = 100'000'000ULL;
   constexpr std::uint64_t kScaleSqrt = 10'000ULL;
@@ -1771,8 +1784,7 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
     const std::optional<storage::FinalizedCommitteeCheckpoint>& checkpoint) {
   AdaptiveCheckpointParameters adaptive;
   if (!checkpoint.has_value()) return adaptive;
-  if (checkpoint->adaptive_target_committee_size == kAdaptiveInitialTargetCommitteeSize ||
-      checkpoint->adaptive_target_committee_size == kAdaptiveExpandedTargetCommitteeSize) {
+  if (checkpoint->adaptive_target_committee_size != 0) {
     adaptive.target_committee_size = checkpoint->adaptive_target_committee_size;
   }
   if (checkpoint->adaptive_min_eligible != 0) adaptive.min_eligible_operators = checkpoint->adaptive_min_eligible;
@@ -1786,26 +1798,10 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
 std::uint64_t derive_adaptive_committee_target(const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint,
                                                std::uint64_t qualified_depth, std::uint32_t* expand_streak,
                                                std::uint32_t* contract_streak) {
-  const auto previous = adaptive_checkpoint_parameters_from_metadata(previous_checkpoint);
-  std::uint64_t target = previous.target_committee_size;
-  std::uint32_t expand = 0;
-  std::uint32_t contract = 0;
-  if (target <= kAdaptiveInitialTargetCommitteeSize) {
-    expand = qualified_depth >= kAdaptiveExpandThreshold ? previous.target_expand_streak + 1U : 0U;
-    if (expand >= kAdaptiveExpandStreakRequired) {
-      target = kAdaptiveExpandedTargetCommitteeSize;
-      expand = 0;
-    }
-  } else {
-    contract = qualified_depth <= kAdaptiveContractThreshold ? previous.target_contract_streak + 1U : 0U;
-    if (contract >= kAdaptiveContractStreakRequired) {
-      target = kAdaptiveInitialTargetCommitteeSize;
-      contract = 0;
-    }
-  }
-  if (expand_streak) *expand_streak = expand;
-  if (contract_streak) *contract_streak = contract;
-  return target;
+  (void)previous_checkpoint;
+  if (expand_streak) *expand_streak = 0;
+  if (contract_streak) *contract_streak = 0;
+  return target_committee_size_for_qualified_depth(qualified_depth);
 }
 
 AdaptiveCheckpointParameters derive_adaptive_checkpoint_parameters(
@@ -1928,7 +1924,7 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
   checkpoint.ordered_members =
       select_finalized_committee(active, checkpoint.epoch_seed,
                                  std::min<std::size_t>({cfg.max_committee,
-                                                        static_cast<std::size_t>(checkpoint.adaptive_target_committee_size),
+                                                        static_cast<std::size_t>(decision.effective_committee_size),
                                                         active.size()}));
   checkpoint.ordered_operator_ids.reserve(checkpoint.ordered_members.size());
   checkpoint.ordered_base_weights.reserve(checkpoint.ordered_members.size());

@@ -116,6 +116,7 @@ struct AvailabilityCommitteeDecision {
   storage::FinalizedCommitteeFallbackReason fallback_reason{storage::FinalizedCommitteeFallbackReason::NONE};
   std::uint64_t eligible_operator_count{0};
   std::uint64_t min_eligible_operators{0};
+  std::uint64_t effective_committee_size{0};
   consensus::AdaptiveCheckpointParameters adaptive{};
 };
 
@@ -157,6 +158,8 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
         consensus::availability_config_with_min_bond(availability_cfg, decision.adaptive.min_bond));
   }
   if (decision.min_eligible_operators == 0) return decision;
+  decision.effective_committee_size =
+      std::max<std::uint64_t>(1, std::min(decision.eligible_operator_count, decision.adaptive.target_committee_size));
   if (decision.eligible_operator_count < decision.min_eligible_operators) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     decision.fallback_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
@@ -165,8 +168,11 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   const auto previous_mode =
       previous_checkpoint.has_value() ? std::optional<storage::FinalizedCommitteeDerivationMode>(previous_checkpoint->derivation_mode)
                                       : std::nullopt;
-  const std::uint64_t recovery_threshold =
-      decision.min_eligible_operators + ((previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK) ? 1ULL : 0ULL);
+  const std::uint64_t recovery_threshold = decision.adaptive.target_committee_size <= 3
+                                               ? decision.adaptive.target_committee_size
+                                               : (decision.adaptive.target_committee_size <= 7
+                                                      ? decision.adaptive.target_committee_size + 1ULL
+                                                      : decision.adaptive.target_committee_size + 2ULL);
   if (previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
       decision.eligible_operator_count < recovery_threshold) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
@@ -600,11 +606,16 @@ std::vector<consensus::FinalizedCommitteeCandidate> finalized_committee_candidat
     decision.eligible_operator_count =
         consensus::count_eligible_operators_at_checkpoint(validators, height, *availability_state, adaptive_availability_cfg);
   }
+  decision.effective_committee_size =
+      std::max<std::uint64_t>(1, std::min(decision.eligible_operator_count, adaptive.target_committee_size));
   if (decision.min_eligible_operators != 0 && decision.eligible_operator_count < decision.min_eligible_operators) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     decision.fallback_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
   } else if (previous_derivation_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
-             decision.eligible_operator_count < decision.min_eligible_operators + 1ULL) {
+             decision.eligible_operator_count < (adaptive.target_committee_size <= 3
+                                                     ? adaptive.target_committee_size
+                                                     : (adaptive.target_committee_size <= 7 ? adaptive.target_committee_size + 1ULL
+                                                                                            : adaptive.target_committee_size + 2ULL))) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     decision.fallback_reason = storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING;
   }
@@ -674,7 +685,8 @@ storage::FinalizedCommitteeCheckpoint build_finalized_committee_checkpoint_from_
     const std::vector<consensus::FinalizedCommitteeCandidate>& active, std::size_t max_committee,
     storage::FinalizedCommitteeDerivationMode derivation_mode,
     storage::FinalizedCommitteeFallbackReason fallback_reason, std::uint64_t eligible_operator_count,
-    std::uint64_t min_eligible_operators, const consensus::AdaptiveCheckpointParameters& adaptive) {
+    std::uint64_t min_eligible_operators, std::uint64_t effective_committee_size,
+    const consensus::AdaptiveCheckpointParameters& adaptive) {
   storage::FinalizedCommitteeCheckpoint checkpoint;
   checkpoint.epoch_start_height = epoch_start_height;
   checkpoint.epoch_seed = epoch_seed;
@@ -690,7 +702,7 @@ storage::FinalizedCommitteeCheckpoint build_finalized_committee_checkpoint_from_
   checkpoint.target_expand_streak = adaptive.target_expand_streak;
   checkpoint.target_contract_streak = adaptive.target_contract_streak;
   const auto take =
-      std::min<std::size_t>({max_committee, static_cast<std::size_t>(adaptive.target_committee_size), active.size()});
+      std::min<std::size_t>({max_committee, static_cast<std::size_t>(effective_committee_size), active.size()});
   checkpoint.ordered_members = consensus::select_finalized_committee(active, checkpoint.epoch_seed, take);
   checkpoint.ordered_operator_ids.reserve(checkpoint.ordered_members.size());
   checkpoint.ordered_base_weights.reserve(checkpoint.ordered_members.size());
@@ -2988,7 +3000,7 @@ storage::FinalizedCommitteeCheckpoint Node::build_finalized_committee_checkpoint
       epoch_start_height, consensus::committee_epoch_seed(epoch_randomness, epoch_start_height),
       ticket_difficulty_bits_for_epoch_locked(epoch_start_height, active_validator_count), active, cfg_.max_committee,
       decision.mode, decision.fallback_reason, decision.eligible_operator_count, decision.min_eligible_operators,
-      decision.adaptive);
+      decision.effective_committee_size, decision.adaptive);
 }
 
 void Node::persist_finalized_committee_checkpoint_locked(std::uint64_t epoch_start_height,
