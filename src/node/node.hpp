@@ -310,6 +310,9 @@ class Node {
   bool handle_timeout_vote(const TimeoutVote& vote, bool from_network, int from_peer_id = 0);
   bool handle_frontier_block_locked(const FrontierProposal& proposal, const std::optional<FinalityCertificate>& certificate,
                                     int from_peer_id, bool from_network);
+  bool maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
+                                         const std::optional<FinalityCertificate>& certificate, int from_peer_id);
+  bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
   bool handle_tx(const Tx& tx, bool from_network, int from_peer_id = 0);
   bool maybe_certify_locally_accepted_tx_locked(const Tx& tx, std::string* error = nullptr);
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
@@ -544,7 +547,13 @@ class Node {
   std::uint32_t validator_miss_rate_exit_threshold_percent_{60};
   std::uint64_t validator_suspend_duration_blocks_{1'000};
   std::size_t last_participation_eligible_signers_{0};
+  struct BufferedSyncFrontier {
+    FrontierProposal proposal;
+    std::optional<FinalityCertificate> certificate;
+    int from_peer_id{0};
+  };
   std::map<Hash32, FrontierProposal> candidate_frontier_proposals_;
+  std::map<std::uint64_t, BufferedSyncFrontier> buffered_sync_frontiers_;
   std::map<std::uint64_t, QuorumCertificate> highest_qc_by_height_;
   std::map<std::uint64_t, Hash32> highest_qc_payload_by_height_;
   std::map<std::uint64_t, TimeoutCertificate> highest_tc_by_height_;

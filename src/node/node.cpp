@@ -5244,7 +5244,15 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                short_hash_hex(proposal->transition.prev_finalized_hash));
       {
         std::lock_guard<std::mutex> lk(mu_);
-        if (handle_frontier_block_locked(*proposal, b->certificate, peer_id, true)) accepted_block_payloads_.insert(payload_id);
+        bool accepted = false;
+        if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
+          accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id);
+          if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
+        } else {
+          accepted = handle_frontier_block_locked(*proposal, b->certificate, peer_id, true);
+          if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
+        }
+        if (accepted) accepted_block_payloads_.insert(payload_id);
       }
       break;
     }
@@ -5900,6 +5908,55 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
 
   (void)finalize_if_quorum(transition_id, transition.height, transition.round);
   return true;
+}
+
+bool Node::maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
+                                             const std::optional<FinalityCertificate>& certificate, int from_peer_id) {
+  if (!certificate.has_value()) return false;
+  const auto& transition = proposal.transition;
+  const auto transition_id = transition.transition_id();
+  if (transition.height <= finalized_height_) {
+    return transition.height == finalized_height_ && transition_id == finalized_identity_.id;
+  }
+  if (transition.height == finalized_height_ + 1) return false;
+  if (auto existing = db_.get_height_hash(transition.height); existing.has_value()) return *existing == transition_id;
+
+  auto [it, inserted] = buffered_sync_frontiers_.try_emplace(
+      transition.height, BufferedSyncFrontier{proposal, certificate, from_peer_id});
+  if (!inserted) {
+    const auto existing_id = it->second.proposal.transition.transition_id();
+    if (existing_id != transition_id) {
+      log_line("buffer-sync-conflict height=" + std::to_string(transition.height) + " existing=" +
+               short_hash_hex(existing_id) + " incoming=" + short_hash_hex(transition_id));
+      return false;
+    }
+    if (it->second.from_peer_id == 0) it->second.from_peer_id = from_peer_id;
+    return true;
+  }
+
+  log_line("buffer-sync-transition peer_id=" + std::to_string(from_peer_id) + " height=" +
+           std::to_string(transition.height) + " hash=" + short_hash_hex(transition_id) + " prev=" +
+           short_hash_hex(transition.prev_finalized_hash));
+  return true;
+}
+
+bool Node::maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id) {
+  bool advanced = false;
+  while (true) {
+    auto it = buffered_sync_frontiers_.find(finalized_height_ + 1);
+    if (it == buffered_sync_frontiers_.end()) break;
+    BufferedSyncFrontier buffered = it->second;
+    buffered_sync_frontiers_.erase(it);
+    const auto expected_height = finalized_height_ + 1;
+    if (!handle_frontier_block_locked(buffered.proposal, buffered.certificate,
+                                      buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id, true)) {
+      log_line("buffer-sync-apply-failed height=" + std::to_string(expected_height) + " hash=" +
+               short_hash_hex(buffered.proposal.transition.transition_id()));
+      break;
+    }
+    advanced = true;
+  }
+  return advanced;
 }
 
 bool Node::verify_block_proposer_locked(const Block& block) const {
