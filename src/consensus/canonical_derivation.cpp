@@ -1265,6 +1265,18 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     result.transition.ingress_commitment =
         frontier_ingress_commitment(result.transition.prev_vector, result.transition.next_vector, reconstructed_next_lane_roots);
     result.next_lane_roots = reconstructed_next_lane_roots;
+    if (record.transition.prev_vector != result.transition.prev_vector) {
+      if (error) *error = "frontier-prev-vector-mismatch";
+      return false;
+    }
+    if (record.transition.next_vector != result.transition.next_vector) {
+      if (error) *error = "frontier-next-vector-mismatch";
+      return false;
+    }
+    if (record.transition.ingress_commitment != result.transition.ingress_commitment) {
+      if (error) *error = "frontier-ingress-commitment-mismatch";
+      return false;
+    }
     if (result.transition.prev_frontier != record.transition.prev_frontier) {
       if (error) *error = "frontier-prev-frontier-recompute-mismatch";
       return false;

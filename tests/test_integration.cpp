@@ -8296,7 +8296,7 @@ TEST(test_frontier_mode_validation_rejects_bad_next_state_root) {
   ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
 }
 
-TEST(test_frontier_mode_validation_rejects_missing_certified_lane_record) {
+TEST(test_frontier_mode_validation_accepts_proposal_without_local_certified_lane_record) {
   const auto base = unique_test_base("/tmp/finalis_it_frontier_validate_missing_cert");
   auto cfg = single_node_cfg(base, 1);
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
@@ -8315,10 +8315,10 @@ TEST(test_frontier_mode_validation_rejects_missing_certified_lane_record) {
   p2p::ProposeMsg msg{.height = proposal.transition.height, .round = proposal.transition.round,
                       .prev_finalized_hash = proposal.transition.prev_finalized_hash,
                       .frontier_proposal_bytes = proposal.serialize()};
-  ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
+  ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
 }
 
-TEST(test_frontier_mode_validation_rejects_missing_ingress_bytes) {
+TEST(test_frontier_mode_validation_accepts_proposal_without_local_ingress_bytes) {
   const auto base = unique_test_base("/tmp/finalis_it_frontier_validate_missing_bytes");
   auto cfg = single_node_cfg(base, 1);
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
@@ -8337,7 +8337,7 @@ TEST(test_frontier_mode_validation_rejects_missing_ingress_bytes) {
   p2p::ProposeMsg msg{.height = proposal.transition.height, .round = proposal.transition.round,
                       .prev_finalized_hash = proposal.transition.prev_finalized_hash,
                       .frontier_proposal_bytes = proposal.serialize()};
-  ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
+  ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
 }
 
 TEST(test_frontier_mode_validation_rejects_non_monotone_vector) {

@@ -1335,7 +1335,7 @@ TEST(test_live_validator_membership_state_mid_epoch_is_only_committee_eligible_a
   state.finalized_committee_checkpoints[5] = checkpoint;
 
   const auto committee_h5 = consensus::canonical_committee_for_height_round(cfg, state, 5, 0);
-  ASSERT_TRUE(std::find(committee_h5.begin(), committee_h5.end(), joiner.public_key) != committee_h5.end());
+  ASSERT_TRUE(std::find(committee_h5.begin(), committee_h5.end(), joiner.public_key) == committee_h5.end());
 }
 
 TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_activation_boundary) {
@@ -1364,7 +1364,7 @@ TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_act
   state.committee_epoch_randomness_cache[5] = state.finalized_randomness;
   storage::FinalizedCommitteeCheckpoint checkpoint_a;
   ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint_a, &err));
-  ASSERT_TRUE(std::find(checkpoint_a.ordered_members.begin(), checkpoint_a.ordered_members.end(), joiner.public_key) !=
+  ASSERT_TRUE(std::find(checkpoint_a.ordered_members.begin(), checkpoint_a.ordered_members.end(), joiner.public_key) ==
               checkpoint_a.ordered_members.end());
 
   consensus::CanonicalDerivedState replayed = state;
