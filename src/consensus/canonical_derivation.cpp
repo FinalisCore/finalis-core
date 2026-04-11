@@ -190,16 +190,20 @@ bool verify_frontier_finality_certificate_against_state(const CanonicalDerivatio
     if (error) *error = "missing-canonical-committee";
     return false;
   }
-  if (cert.committee_members != committee) {
+  const auto legacy_committee = legacy_canonical_committee_for_height_round(cfg, prev, transition.height, transition.round);
+  const bool committee_matches =
+      cert.committee_members == committee || (!legacy_committee.empty() && cert.committee_members == legacy_committee);
+  if (!committee_matches) {
     if (error) *error = "certificate-committee-mismatch";
     return false;
   }
-  std::set<PubKey32> committee_set(committee.begin(), committee.end());
-  if (committee_set.size() != committee.size()) {
+  const auto& effective_committee = (cert.committee_members == committee) ? committee : legacy_committee;
+  std::set<PubKey32> committee_set(effective_committee.begin(), effective_committee.end());
+  if (committee_set.size() != effective_committee.size()) {
     if (error) *error = "certificate-committee-duplicates";
     return false;
   }
-  const std::size_t quorum = quorum_threshold(committee.size());
+  const std::size_t quorum = quorum_threshold(effective_committee.size());
   const auto msg = vote_signing_message(cert.height, cert.round, cert.frontier_transition_id);
   std::set<PubKey32> seen;
   std::vector<FinalitySig> valid;
@@ -883,6 +887,61 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   return true;
 }
 
+bool populate_frontier_transition_metadata_legacy_for_replay(const CanonicalDerivationConfig& cfg,
+                                                             const CanonicalDerivedState& prev, std::uint64_t height,
+                                                             std::uint32_t round, const PubKey32& leader_pubkey,
+                                                             const std::vector<PubKey32>& observed_signers,
+                                                             std::uint64_t accepted_fee_units,
+                                                             const UtxoSet& post_execution_utxos,
+                                                             FrontierTransition* transition,
+                                                             std::string* error) {
+  if (!transition) {
+    if (error) *error = "missing-transition-output";
+    return false;
+  }
+  if (height != prev.finalized_height + 1) {
+    if (error) *error = "frontier-height-not-sequential";
+    return false;
+  }
+  const auto committee = legacy_canonical_committee_for_height_round(cfg, prev, height, round);
+  if (committee.empty()) {
+    if (error) *error = "missing-canonical-committee";
+    return false;
+  }
+  const auto leader = legacy_canonical_leader_for_height_round(cfg, prev, height, round);
+  if (!leader.has_value()) {
+    if (error) *error = "missing-canonical-leader";
+    return false;
+  }
+  if (*leader != leader_pubkey) {
+    if (error) *error = "frontier-leader-mismatch";
+    return false;
+  }
+  const auto quorum = static_cast<std::uint32_t>(quorum_threshold(committee.size()));
+  const auto canonical_signers = canonicalize_signer_pubkeys(observed_signers, quorum);
+  std::set<PubKey32> committee_set(committee.begin(), committee.end());
+  for (const auto& pub : canonical_signers) {
+    if (committee_set.find(pub) == committee_set.end()) {
+      if (error) *error = "frontier-non-committee-signer";
+      return false;
+    }
+  }
+
+  transition->prev_finalized_hash = prev.finalized_identity.id;
+  transition->prev_finality_link_hash = prev.last_finality_certificate_hash;
+  transition->height = height;
+  transition->round = round;
+  transition->leader_pubkey = leader_pubkey;
+  transition->quorum_threshold = quorum;
+  transition->observed_signers = canonical_signers;
+  transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
+  transition->settlement_commitment = transition->settlement.commitment();
+  UtxoSet settled_utxos = post_execution_utxos;
+  apply_frontier_settlement_to_utxos(*transition, &settled_utxos);
+  transition->next_state_root = frontier_utxo_state_root(settled_utxos);
+  return true;
+}
+
 bool load_certified_frontier_record_from_storage(const storage::DB& db, const FrontierTransition& transition,
                                                  CanonicalFrontierRecord* out, std::string* error) {
   if (!out) {
@@ -943,6 +1002,16 @@ std::vector<PubKey32> canonical_committee_for_height_round(const CanonicalDeriva
   return checkpoint_committee_for_round(it->second, round);
 }
 
+std::vector<PubKey32> legacy_canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
+                                                                  const CanonicalDerivedState& state,
+                                                                  std::uint64_t height, std::uint32_t round) {
+  if (height == 0) return {};
+  const auto epoch_start = committee_epoch_start(height, cfg.network.committee_epoch_blocks);
+  auto it = state.finalized_committee_checkpoints.find(epoch_start);
+  if (it == state.finalized_committee_checkpoints.end()) return {};
+  return legacy_checkpoint_committee_for_round(it->second, round);
+}
+
 std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
                                                           const CanonicalDerivedState& state, std::uint64_t height,
                                                           std::uint32_t round) {
@@ -951,6 +1020,21 @@ std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivat
   auto it = state.finalized_committee_checkpoints.find(epoch_start);
   if (it == state.finalized_committee_checkpoints.end()) return std::nullopt;
   if (auto fallback = checkpoint_ticket_pow_fallback_member_for_round(it->second, round); fallback.has_value()) {
+    return fallback;
+  }
+  const auto schedule = proposer_schedule_from_checkpoint(cfg, state, it->second, height);
+  if (schedule.empty()) return std::nullopt;
+  return schedule[static_cast<std::size_t>(round) % schedule.size()];
+}
+
+std::optional<PubKey32> legacy_canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
+                                                                 const CanonicalDerivedState& state,
+                                                                 std::uint64_t height, std::uint32_t round) {
+  if (height == 0) return std::nullopt;
+  const auto epoch_start = committee_epoch_start(height, cfg.network.committee_epoch_blocks);
+  auto it = state.finalized_committee_checkpoints.find(epoch_start);
+  if (it == state.finalized_committee_checkpoints.end()) return std::nullopt;
+  if (auto fallback = legacy_checkpoint_ticket_pow_fallback_member_for_round(it->second, round); fallback.has_value()) {
     return fallback;
   }
   const auto schedule = proposer_schedule_from_checkpoint(cfg, state, it->second, height);
@@ -1304,7 +1388,15 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   if (!populate_frontier_transition_metadata(cfg, prev, record.transition.height, record.transition.round,
                                              record.transition.leader_pubkey, record.transition.observed_signers,
                                              result.accepted_fee_units, result.next_utxos, &expected_transition, error)) {
-    return false;
+    FrontierTransition legacy_expected_transition = result.transition;
+    std::string legacy_error;
+    if (!populate_frontier_transition_metadata_legacy_for_replay(
+            cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
+            record.transition.observed_signers, result.accepted_fee_units, result.next_utxos,
+            &legacy_expected_transition, &legacy_error)) {
+      return false;
+    }
+    expected_transition = std::move(legacy_expected_transition);
   }
   if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
     if (error) *error = "frontier-quorum-threshold-mismatch";
@@ -1946,6 +2038,47 @@ std::optional<PubKey32> checkpoint_ticket_pow_fallback_member_for_round(const st
   const std::size_t selected =
       std::min<std::size_t>(static_cast<std::size_t>(round - committee_size), ranked.size() - 1);
   return checkpoint.ordered_members[ranked[selected]];
+}
+
+std::optional<PubKey32> legacy_checkpoint_ticket_pow_fallback_member_for_round(
+    const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round) {
+  if (checkpoint.ordered_members.empty() || round == 0) return std::nullopt;
+
+  std::vector<std::size_t> ranked(checkpoint.ordered_members.size());
+  for (std::size_t i = 0; i < ranked.size(); ++i) ranked[i] = i;
+
+  const auto ticket_hash_at = [&](std::size_t index) -> Hash32 {
+    if (index < checkpoint.ordered_ticket_hashes.size()) return checkpoint.ordered_ticket_hashes[index];
+    Hash32 worst{};
+    worst.fill(0xff);
+    return worst;
+  };
+  const auto ticket_nonce_at = [&](std::size_t index) -> std::uint64_t {
+    if (index < checkpoint.ordered_ticket_nonces.size()) return checkpoint.ordered_ticket_nonces[index];
+    return std::numeric_limits<std::uint64_t>::max();
+  };
+
+  std::sort(ranked.begin(), ranked.end(), [&](std::size_t a, std::size_t b) {
+    const auto ah = ticket_hash_at(a);
+    const auto bh = ticket_hash_at(b);
+    if (ah != bh) return ah < bh;
+    const auto an = ticket_nonce_at(a);
+    const auto bn = ticket_nonce_at(b);
+    if (an != bn) return an < bn;
+    return checkpoint.ordered_members[a] < checkpoint.ordered_members[b];
+  });
+
+  const std::size_t selected = std::min<std::size_t>(static_cast<std::size_t>(round - 1), ranked.size() - 1);
+  return checkpoint.ordered_members[ranked[selected]];
+}
+
+std::vector<PubKey32> legacy_checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
+                                                            std::uint32_t round) {
+  if (round == 0) return checkpoint.ordered_members;
+  if (auto fallback = legacy_checkpoint_ticket_pow_fallback_member_for_round(checkpoint, round); fallback.has_value()) {
+    return {*fallback};
+  }
+  return {};
 }
 
 std::vector<PubKey32> checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,

@@ -182,12 +182,22 @@ bool bootstrap_handoff_complete(const CanonicalDerivedState& state);
 std::optional<PubKey32> checkpoint_ticket_pow_fallback_member(const storage::FinalizedCommitteeCheckpoint& checkpoint);
 std::optional<PubKey32> checkpoint_ticket_pow_fallback_member_for_round(
     const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round);
+std::optional<PubKey32> legacy_checkpoint_ticket_pow_fallback_member_for_round(
+    const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round);
+std::vector<PubKey32> legacy_checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
+                                                            std::uint32_t round);
 std::vector<PubKey32> checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
                                                      std::uint32_t round);
+std::vector<PubKey32> legacy_canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
+                                                                  const CanonicalDerivedState& state,
+                                                                  std::uint64_t height, std::uint32_t round);
 
 std::vector<PubKey32> canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
                                                            const CanonicalDerivedState& state, std::uint64_t height,
                                                            std::uint32_t round);
+std::optional<PubKey32> legacy_canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
+                                                                 const CanonicalDerivedState& state,
+                                                                 std::uint64_t height, std::uint32_t round);
 std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
                                                           const CanonicalDerivedState& state, std::uint64_t height,
                                                           std::uint32_t round);

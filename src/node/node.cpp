@@ -1272,7 +1272,13 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
 
 bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
                                               const storage::FinalizedCommitteeCheckpoint& checkpoint) {
-  return cert.committee_members == consensus::checkpoint_committee_for_round(checkpoint, cert.round);
+  if (cert.committee_members == consensus::checkpoint_committee_for_round(checkpoint, cert.round)) return true;
+  if (cert.round == 0) return false;
+  if (auto legacy = consensus::legacy_checkpoint_ticket_pow_fallback_member_for_round(checkpoint, cert.round);
+      legacy.has_value()) {
+    return cert.committee_members.size() == 1 && cert.committee_members.front() == *legacy;
+  }
+  return false;
 }
 
 Bytes make_coinbase_script_sig(std::uint64_t height, std::uint32_t round) {
