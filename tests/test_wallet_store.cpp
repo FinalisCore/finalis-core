@@ -101,3 +101,82 @@ TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
   ASSERT_EQ(state.sent_txids[0], "sent-b");
   ASSERT_EQ(state.pending_spends.size(), 2u);
 }
+
+TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file, "secret-pass"));
+    ASSERT_TRUE(store.can_persist_confidential_secrets());
+    ASSERT_TRUE(store.upsert_confidential_account(WalletStore::ConfidentialAccountRecord{
+        .account_id = "acct-main",
+        .label = "Primary stealth",
+        .stealth_address = "sc_stealth1example",
+        .view_key_material_hex = "aa11",
+        .spend_key_material_hex = "bb22",
+        .active = true,
+    }));
+    ASSERT_TRUE(store.set_confidential_primary_account_id(std::string("acct-main")));
+    ASSERT_TRUE(store.upsert_confidential_coin(WalletStore::ConfidentialCoinRecord{
+        .txid_hex = "cc33",
+        .vout = 1,
+        .account_id = "acct-main",
+        .amount = 123456789ull,
+        .value_commitment_hex = "02cafe",
+        .one_time_pubkey_hex = "02beef",
+        .ephemeral_pubkey_hex = "03f00d",
+        .spend_secret_hex = "deadc0de",
+        .blinding_factor_hex = "b10b",
+        .spent = false,
+    }));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file, "secret-pass"));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.confidential_primary_account_id.has_value());
+  ASSERT_EQ(*state.confidential_primary_account_id, "acct-main");
+  ASSERT_EQ(state.confidential_accounts.size(), 1u);
+  ASSERT_EQ(state.confidential_accounts[0].stealth_address, "sc_stealth1example");
+  ASSERT_EQ(state.confidential_accounts[0].view_key_material_hex, "aa11");
+  ASSERT_EQ(state.confidential_coins.size(), 1u);
+  ASSERT_EQ(state.confidential_coins[0].account_id, "acct-main");
+  ASSERT_EQ(state.confidential_coins[0].amount, 123456789ull);
+  ASSERT_EQ(state.confidential_coins[0].spend_secret_hex, "deadc0de");
+  ASSERT_EQ(state.confidential_coins[0].blinding_factor_hex, "b10b");
+}
+
+TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_nopass");
+
+  WalletStore store;
+  ASSERT_TRUE(store.open(wallet_file));
+  ASSERT_TRUE(!store.can_persist_confidential_secrets());
+  ASSERT_TRUE(!store.upsert_confidential_account(WalletStore::ConfidentialAccountRecord{
+      .account_id = "acct-main",
+      .label = "Primary stealth",
+      .stealth_address = "sc_stealth1example",
+      .view_key_material_hex = "aa11",
+      .spend_key_material_hex = "bb22",
+      .active = true,
+  }));
+  ASSERT_TRUE(!store.upsert_confidential_coin(WalletStore::ConfidentialCoinRecord{
+      .txid_hex = "cc33",
+      .vout = 1,
+      .account_id = "acct-main",
+      .amount = 123456789ull,
+      .value_commitment_hex = "02cafe",
+      .one_time_pubkey_hex = "02beef",
+      .ephemeral_pubkey_hex = "03f00d",
+      .spend_secret_hex = "deadc0de",
+      .blinding_factor_hex = "b10b",
+      .spent = false,
+  }));
+}

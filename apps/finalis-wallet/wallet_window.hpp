@@ -255,10 +255,14 @@ class WalletWindow final : public QMainWindow {
   QLabel* header_crosscheck_label_{nullptr};
   QLabel* balance_label_{nullptr};
   QLabel* pending_balance_label_{nullptr};
+  QLabel* confidential_balance_label_{nullptr};
   QLabel* receive_address_home_label_{nullptr};
   QLabel* receive_address_label_{nullptr};
+  QLabel* overview_confidential_receive_label_{nullptr};
   QLabel* receive_copy_status_label_{nullptr};
   QLabel* receive_finalized_note_label_{nullptr};
+  QLabel* receive_confidential_address_label_{nullptr};
+  QLabel* receive_confidential_note_label_{nullptr};
   QComboBox* history_filter_combo_{nullptr};
   QTableWidget* history_view_{nullptr};
   QLabel* tip_status_label_{nullptr};
@@ -350,6 +354,10 @@ class WalletWindow final : public QMainWindow {
   QString mint_last_deposit_txid_;
   std::uint32_t mint_last_deposit_vout_{0};
   QString mint_last_redemption_batch_id_;
+  QString confidential_receive_address_;
+  std::uint64_t confidential_balance_units_{0};
+  std::size_t confidential_coin_count_{0};
+  bool confidential_storage_locked_{false};
   std::vector<MintNote> mint_notes_;
   std::vector<ChainRecord> chain_records_;
   std::vector<MintRecord> mint_records_;

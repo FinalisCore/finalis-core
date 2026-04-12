@@ -66,6 +66,8 @@ OverviewPage::OverviewPage(QWidget* parent) : QWidget(parent) {
   balance_label_->setFont(balance_font);
   pending_balance_label_ = new QLabel("Pending outgoing: 0 FLS", balance_box);
   pending_balance_label_->setProperty("role", QVariant(QStringLiteral("muted")));
+  confidential_balance_label_ = new QLabel("Confidential balance: unavailable", balance_box);
+  confidential_balance_label_->setProperty("role", QVariant(QStringLiteral("muted")));
   auto* action_row = new QHBoxLayout();
   action_row->setSpacing(8);
   send_button_ = new QPushButton("Send", balance_box);
@@ -84,6 +86,7 @@ OverviewPage::OverviewPage(QWidget* parent) : QWidget(parent) {
   balance_layout->addWidget(balance_caption);
   balance_layout->addWidget(balance_label_);
   balance_layout->addWidget(pending_balance_label_);
+  balance_layout->addWidget(confidential_balance_label_);
   balance_layout->addLayout(action_row);
   top_row->addWidget(balance_box);
 
@@ -128,6 +131,11 @@ OverviewPage::OverviewPage(QWidget* parent) : QWidget(parent) {
   receive_address_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
   receive_address_label_->setWordWrap(true);
   summary_grid->addWidget(receive_address_label_, 1, 1);
+  summary_grid->addWidget(new QLabel("Confidential receive:", identity_box), 2, 0);
+  confidential_receive_label_ = new QLabel("not configured", identity_box);
+  confidential_receive_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  confidential_receive_label_->setWordWrap(true);
+  summary_grid->addWidget(confidential_receive_label_, 2, 1);
   layout->addWidget(identity_box);
 
   auto* activity_box = new QGroupBox("Recent Activity", this);

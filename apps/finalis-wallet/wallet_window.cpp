@@ -927,7 +927,9 @@ void WalletWindow::build_ui() {
   network_label_ = overview_page_->network_label();
   balance_label_ = overview_page_->balance_label();
   pending_balance_label_ = overview_page_->pending_balance_label();
+  confidential_balance_label_ = overview_page_->confidential_balance_label();
   receive_address_home_label_ = overview_page_->receive_address_label();
+  overview_confidential_receive_label_ = overview_page_->confidential_receive_label();
   tip_status_label_ = overview_page_->tip_status_label();
   overview_connection_status_label_ = overview_page_->connection_status_label();
   overview_send_button_ = overview_page_->send_button();
@@ -952,8 +954,10 @@ void WalletWindow::build_ui() {
   send_review_note_label_ = send_page_->review_note_label();
 
   receive_address_label_ = receive_page_->address_label();
+  receive_confidential_address_label_ = receive_page_->confidential_address_label();
   receive_copy_status_label_ = receive_page_->copy_status_label();
   receive_finalized_note_label_ = receive_page_->finalized_note_label();
+  receive_confidential_note_label_ = receive_page_->confidential_note_label();
   auto* copy_address_button = receive_page_->copy_button();
 
   history_filter_combo_ = activity_page_->filter_combo();
@@ -1457,9 +1461,16 @@ void WalletWindow::update_wallet_views() {
     receive_address_home_label_->setToolTip({});
     receive_address_label_->setText("-");
     receive_address_label_->setToolTip({});
+    if (overview_confidential_receive_label_) overview_confidential_receive_label_->setText("not configured");
+    if (receive_confidential_address_label_) receive_confidential_address_label_->setText("not configured");
     if (receive_copy_status_label_) receive_copy_status_label_->setText("Open or create a wallet to get a receive address.");
     balance_label_->setText(QString("0 %1").arg(kDisplayTicker));
     pending_balance_label_->setText(QString("Pending outgoing: 0 %1").arg(kDisplayTicker));
+    if (confidential_balance_label_) confidential_balance_label_->setText("Confidential balance: unavailable");
+    if (receive_confidential_note_label_) {
+      receive_confidential_note_label_->setText(
+          "Confidential receive requires a configured stealth account and encrypted local recovery material.");
+    }
     current_chain_name_.clear();
     current_transition_hash_.clear();
     current_network_id_.clear();
@@ -1489,6 +1500,8 @@ void WalletWindow::update_wallet_views() {
   receive_address_home_label_->setToolTip(QString::fromStdString(wallet_->address));
   receive_address_label_->setText(QString::fromStdString(wallet_->address));
   receive_address_label_->setToolTip(QString::fromStdString(wallet_->address));
+  if (overview_confidential_receive_label_) overview_confidential_receive_label_->setText(confidential_receive_address_);
+  if (receive_confidential_address_label_) receive_confidential_address_label_->setText(confidential_receive_address_);
   if (receive_copy_status_label_) receive_copy_status_label_->setText("Address ready to share.");
   std::uint64_t total = 0;
   std::uint64_t pending_outgoing = 0;
@@ -1501,6 +1514,28 @@ void WalletWindow::update_wallet_views() {
   }
   balance_label_->setText(format_coin_amount(total));
   pending_balance_label_->setText(QString("Pending outgoing: %1").arg(format_coin_amount(pending_outgoing)));
+  if (confidential_balance_label_) {
+    if (confidential_storage_locked_) {
+      confidential_balance_label_->setText("Confidential balance: locked (wallet passphrase required)");
+    } else {
+      confidential_balance_label_->setText(
+          QString("Confidential balance: %1 across %2 coin(s)")
+              .arg(format_coin_amount(confidential_balance_units_))
+              .arg(static_cast<qulonglong>(confidential_coin_count_)));
+    }
+  }
+  if (receive_confidential_note_label_) {
+    if (confidential_storage_locked_) {
+      receive_confidential_note_label_->setText(
+          "Confidential recovery material is encrypted. Reopen the wallet with its passphrase to unlock confidential receive state.");
+    } else if (confidential_receive_address_ == "not configured") {
+      receive_confidential_note_label_->setText(
+          "No stealth account is configured locally yet. This wallet will not advertise a confidential address until encrypted recovery state exists.");
+    } else {
+      receive_confidential_note_label_->setText(
+          "Confidential receive is configured locally. The displayed stealth address depends on encrypted wallet recovery material.");
+    }
+  }
   tip_status_label_->setText(tip_height_ == 0 ? (refresh_in_flight_ ? "not refreshed · refreshing..." : "not refreshed")
                                               : QString("height %1%2").arg(tip_height_).arg(refresh_in_flight_ ? " · refreshing..." : ""));
   if (header_network_label_) {
@@ -2373,6 +2408,10 @@ void WalletWindow::load_wallet_local_state() {
   local_sent_txids_.clear();
   local_history_lines_.clear();
   mint_notes_.clear();
+  confidential_receive_address_ = "not configured";
+  confidential_balance_units_ = 0;
+  confidential_coin_count_ = 0;
+  confidential_storage_locked_ = false;
   pending_wallet_spends_.clear();
   finalized_tx_summary_cache_.clear();
   chain_records_.clear();
@@ -2402,6 +2441,23 @@ void WalletWindow::load_wallet_local_state() {
   mint_last_deposit_txid_ = QString::fromStdString(state.mint_last_deposit_txid);
   mint_last_deposit_vout_ = state.mint_last_deposit_vout;
   mint_last_redemption_batch_id_ = QString::fromStdString(state.mint_last_redemption_batch_id);
+  if (store_.can_persist_confidential_secrets()) {
+    const auto primary_account_id = state.confidential_primary_account_id.value_or("");
+    const auto account_it = std::find_if(state.confidential_accounts.begin(), state.confidential_accounts.end(),
+                                         [&](const auto& account) { return account.account_id == primary_account_id; });
+    if (account_it != state.confidential_accounts.end()) {
+      confidential_receive_address_ = QString::fromStdString(account_it->stealth_address);
+    } else if (!state.confidential_accounts.empty()) {
+      confidential_receive_address_ = QString::fromStdString(state.confidential_accounts.front().stealth_address);
+    }
+    for (const auto& coin : state.confidential_coins) {
+      if (coin.spent) continue;
+      confidential_balance_units_ += coin.amount;
+      ++confidential_coin_count_;
+    }
+  } else if (wallet_ && wallet_->passphrase.empty()) {
+    confidential_storage_locked_ = true;
+  }
   for (const auto& note : state.mint_notes) {
     if (note.active) mint_notes_.push_back(MintNote{QString::fromStdString(note.note_ref), note.amount});
   }
@@ -2411,7 +2467,7 @@ void WalletWindow::load_wallet_local_state() {
 
 bool WalletWindow::open_wallet_store() {
   if (!wallet_) return false;
-  return store_.open(wallet_->file_path);
+  return store_.open(wallet_->file_path, wallet_->passphrase);
 }
 
 void WalletWindow::append_local_event(const QString& line) {

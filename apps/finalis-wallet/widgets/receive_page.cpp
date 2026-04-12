@@ -77,6 +77,27 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
 
   layout->addWidget(box, 0, Qt::AlignLeft | Qt::AlignTop);
 
+  auto* confidential_box = new QGroupBox("Confidential Receive", this);
+  auto* confidential_layout = new QVBoxLayout(confidential_box);
+  confidential_layout->setSpacing(12);
+  confidential_address_label_ = new QLabel("not configured", confidential_box);
+  confidential_address_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  confidential_address_label_->setWordWrap(true);
+  QFont confidential_font = confidential_address_label_->font();
+  confidential_font.setPointSize(12);
+  confidential_font.setBold(true);
+  confidential_address_label_->setFont(confidential_font);
+  confidential_layout->addWidget(confidential_address_label_);
+
+  confidential_note_label_ = new QLabel(
+      "Confidential receive requires a configured stealth account and encrypted local recovery material. "
+      "This wallet will not advertise a confidential address until that state exists locally.",
+      confidential_box);
+  confidential_note_label_->setWordWrap(true);
+  confidential_note_label_->setProperty("role", QVariant(QStringLiteral("muted")));
+  confidential_layout->addWidget(confidential_note_label_);
+  layout->addWidget(confidential_box, 0, Qt::AlignLeft | Qt::AlignTop);
+
   auto* help_box = new QGroupBox("What This Screen Covers", this);
   auto* help_layout = new QVBoxLayout(help_box);
   help_layout->setSpacing(8);

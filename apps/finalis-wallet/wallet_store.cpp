@@ -4,10 +4,19 @@
 #include <algorithm>
 #include <filesystem>
 
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
 #include "codec/bytes.hpp"
 
 namespace finalis::wallet {
 namespace {
+
+constexpr std::uint32_t kConfidentialWalletRecordVersion = 1;
+constexpr std::uint32_t kConfidentialWalletPbkdf2Iterations = 200'000;
+constexpr std::size_t kWalletSaltLen = 16;
+constexpr std::size_t kWalletNonceLen = 12;
+constexpr std::size_t kWalletTagLen = 16;
 
 Bytes to_bytes(const std::string& value) { return Bytes(value.begin(), value.end()); }
 
@@ -29,6 +38,95 @@ std::string key_history(std::uint64_t seq) {
 }
 std::string key_note(const std::string& note_ref) { return "NOTE:" + note_ref; }
 std::string key_meta(const std::string& name) { return "META:" + name; }
+std::string key_confidential_account(const std::string& account_id) { return "CACCT:" + account_id; }
+std::string key_confidential_coin(const std::string& txid_hex, std::uint32_t vout) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%08x", vout);
+  return "CCOIN:" + txid_hex + ":" + buf;
+}
+
+bool derive_key_pbkdf2(const std::string& passphrase, const Bytes& salt, std::uint32_t iterations, Bytes* out32) {
+  out32->assign(32, 0);
+  return PKCS5_PBKDF2_HMAC(passphrase.c_str(), static_cast<int>(passphrase.size()), salt.data(),
+                           static_cast<int>(salt.size()), static_cast<int>(iterations), EVP_sha256(),
+                           static_cast<int>(out32->size()), out32->data()) == 1;
+}
+
+bool aes_gcm_encrypt(const Bytes& key32, const Bytes& nonce12, const Bytes& plaintext, Bytes* out_cipher_and_tag) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return false;
+  int ok = EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce12.size()), nullptr);
+  ok = ok && EVP_EncryptInit_ex(ctx, nullptr, nullptr, key32.data(), nonce12.data());
+  if (!ok) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  Bytes cipher(plaintext.size() + kWalletTagLen, 0);
+  int out_len = 0;
+  int total = 0;
+  if (EVP_EncryptUpdate(ctx, cipher.data(), &out_len, plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  if (EVP_EncryptFinal_ex(ctx, cipher.data() + total, &out_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kWalletTagLen), cipher.data() + total) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += static_cast<int>(kWalletTagLen);
+  cipher.resize(static_cast<std::size_t>(total));
+  EVP_CIPHER_CTX_free(ctx);
+  *out_cipher_and_tag = std::move(cipher);
+  return true;
+}
+
+bool aes_gcm_decrypt(const Bytes& key32, const Bytes& nonce12, const Bytes& cipher_and_tag, Bytes* out_plaintext) {
+  if (cipher_and_tag.size() < kWalletTagLen) return false;
+  const std::size_t clen = cipher_and_tag.size() - kWalletTagLen;
+  const std::uint8_t* tag = cipher_and_tag.data() + clen;
+
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return false;
+  int ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce12.size()), nullptr);
+  ok = ok && EVP_DecryptInit_ex(ctx, nullptr, nullptr, key32.data(), nonce12.data());
+  if (!ok) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  Bytes plain(clen, 0);
+  int out_len = 0;
+  int total = 0;
+  if (EVP_DecryptUpdate(ctx, plain.data(), &out_len, cipher_and_tag.data(), static_cast<int>(clen)) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kWalletTagLen), const_cast<std::uint8_t*>(tag)) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  if (EVP_DecryptFinal_ex(ctx, plain.data() + total, &out_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  plain.resize(static_cast<std::size_t>(total));
+  EVP_CIPHER_CTX_free(ctx);
+  *out_plaintext = std::move(plain);
+  return true;
+}
+
+bool random_bytes(Bytes* out) {
+  if (out->empty()) return true;
+  return RAND_bytes(out->data(), static_cast<int>(out->size())) == 1;
+}
 
 Bytes serialize_pending_spend(const std::vector<OutPoint>& inputs) {
   codec::ByteWriter w;
@@ -109,10 +207,140 @@ std::optional<std::pair<std::uint64_t, bool>> parse_note(const Bytes& value) {
   return out;
 }
 
+Bytes serialize_confidential_account_plain(const WalletStore::ConfidentialAccountRecord& record) {
+  codec::ByteWriter w;
+  w.u32le(kConfidentialWalletRecordVersion);
+  w.varbytes(to_bytes(record.account_id));
+  w.varbytes(to_bytes(record.label));
+  w.varbytes(to_bytes(record.stealth_address));
+  w.varbytes(to_bytes(record.view_key_material_hex));
+  w.varbytes(to_bytes(record.spend_key_material_hex));
+  w.u8(record.active ? 1 : 0);
+  return w.take();
+}
+
+std::optional<WalletStore::ConfidentialAccountRecord> parse_confidential_account_plain(const Bytes& value) {
+  WalletStore::ConfidentialAccountRecord out;
+  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
+        auto version = r.u32le();
+        auto account_id = r.varbytes();
+        auto label = r.varbytes();
+        auto stealth_address = r.varbytes();
+        auto view_key_material = r.varbytes();
+        auto spend_key_material = r.varbytes();
+        auto active = r.u8();
+        if (!version || !account_id || !label || !stealth_address || !view_key_material || !spend_key_material || !active) {
+          return false;
+        }
+        if (*version != kConfidentialWalletRecordVersion) return false;
+        out.account_id = from_bytes(*account_id);
+        out.label = from_bytes(*label);
+        out.stealth_address = from_bytes(*stealth_address);
+        out.view_key_material_hex = from_bytes(*view_key_material);
+        out.spend_key_material_hex = from_bytes(*spend_key_material);
+        out.active = (*active != 0);
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
+Bytes serialize_confidential_coin_plain(const WalletStore::ConfidentialCoinRecord& record) {
+  codec::ByteWriter w;
+  w.u32le(kConfidentialWalletRecordVersion);
+  w.varbytes(to_bytes(record.txid_hex));
+  w.u32le(record.vout);
+  w.varbytes(to_bytes(record.account_id));
+  w.u64le(record.amount);
+  w.varbytes(to_bytes(record.value_commitment_hex));
+  w.varbytes(to_bytes(record.one_time_pubkey_hex));
+  w.varbytes(to_bytes(record.ephemeral_pubkey_hex));
+  w.varbytes(to_bytes(record.spend_secret_hex));
+  w.varbytes(to_bytes(record.blinding_factor_hex));
+  w.u8(record.spent ? 1 : 0);
+  return w.take();
+}
+
+std::optional<WalletStore::ConfidentialCoinRecord> parse_confidential_coin_plain(const Bytes& value) {
+  WalletStore::ConfidentialCoinRecord out;
+  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
+        auto version = r.u32le();
+        auto txid_hex = r.varbytes();
+        auto vout = r.u32le();
+        auto account_id = r.varbytes();
+        auto amount = r.u64le();
+        auto commitment = r.varbytes();
+        auto one_time = r.varbytes();
+        auto ephemeral = r.varbytes();
+        auto spend_secret = r.varbytes();
+        auto blinding = r.varbytes();
+        auto spent = r.u8();
+        if (!version || !txid_hex || !vout || !account_id || !amount || !commitment || !one_time || !ephemeral ||
+            !spend_secret || !blinding || !spent) {
+          return false;
+        }
+        if (*version != kConfidentialWalletRecordVersion) return false;
+        out.txid_hex = from_bytes(*txid_hex);
+        out.vout = *vout;
+        out.account_id = from_bytes(*account_id);
+        out.amount = *amount;
+        out.value_commitment_hex = from_bytes(*commitment);
+        out.one_time_pubkey_hex = from_bytes(*one_time);
+        out.ephemeral_pubkey_hex = from_bytes(*ephemeral);
+        out.spend_secret_hex = from_bytes(*spend_secret);
+        out.blinding_factor_hex = from_bytes(*blinding);
+        out.spent = (*spent != 0);
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
+Bytes encrypt_secret_payload(const std::string& passphrase, const Bytes& plain) {
+  if (passphrase.empty()) return {};
+  Bytes salt(kWalletSaltLen, 0);
+  Bytes nonce(kWalletNonceLen, 0);
+  if (!random_bytes(&salt) || !random_bytes(&nonce)) return {};
+  Bytes key32;
+  if (!derive_key_pbkdf2(passphrase, salt, kConfidentialWalletPbkdf2Iterations, &key32)) return {};
+  Bytes cipher_and_tag;
+  if (!aes_gcm_encrypt(key32, nonce, plain, &cipher_and_tag)) return {};
+  codec::ByteWriter w;
+  w.u32le(kConfidentialWalletRecordVersion);
+  w.u32le(kConfidentialWalletPbkdf2Iterations);
+  w.varbytes(salt);
+  w.varbytes(nonce);
+  w.varbytes(cipher_and_tag);
+  return w.take();
+}
+
+std::optional<Bytes> decrypt_secret_payload(const std::string& passphrase, const Bytes& value) {
+  if (passphrase.empty()) return std::nullopt;
+  Bytes plain;
+  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
+        auto version = r.u32le();
+        auto iterations = r.u32le();
+        auto salt = r.varbytes();
+        auto nonce = r.varbytes();
+        auto cipher_and_tag = r.varbytes();
+        if (!version || !iterations || !salt || !nonce || !cipher_and_tag) return false;
+        if (*version != kConfidentialWalletRecordVersion) return false;
+        Bytes key32;
+        if (!derive_key_pbkdf2(passphrase, *salt, *iterations, &key32)) return false;
+        return aes_gcm_decrypt(key32, *nonce, *cipher_and_tag, &plain);
+      })) {
+    return std::nullopt;
+  }
+  return plain;
+}
+
 }  // namespace
 
-bool WalletStore::open(const std::string& wallet_file_path) {
+bool WalletStore::open(const std::string& wallet_file_path, const std::string& passphrase) {
   path_ = wallet_file_path + ".walletdb";
+  passphrase_ = passphrase;
   std::filesystem::create_directories(path_);
   return db_.open(path_);
 }
@@ -126,6 +354,9 @@ bool WalletStore::load(State* out) const {
   out->finalized_history.clear();
   out->history_cursor_height.reset();
   out->history_cursor_txid.reset();
+  out->confidential_accounts.clear();
+  out->confidential_coins.clear();
+  out->confidential_primary_account_id.reset();
 
   for (const auto& [key, _] : db_.scan_prefix("SENT:")) out->sent_txids.push_back(key.substr(5));
   std::sort(out->sent_txids.begin(), out->sent_txids.end());
@@ -164,6 +395,29 @@ bool WalletStore::load(State* out) const {
   out->mint_last_redemption_batch_id = get_string(key_meta("mint_last_redemption_batch_id")).value_or("");
   out->history_cursor_height = get_u64(key_meta("history_cursor_height"));
   out->history_cursor_txid = get_string(key_meta("history_cursor_txid"));
+  out->confidential_primary_account_id = get_string(key_meta("confidential_primary_account_id"));
+
+  for (const auto& [key, value] : db_.scan_prefix("CACCT:")) {
+    auto plain = decrypt_secret_payload(passphrase_, value);
+    if (!plain) continue;
+    auto parsed = parse_confidential_account_plain(*plain);
+    if (!parsed) continue;
+    out->confidential_accounts.push_back(*parsed);
+  }
+  std::sort(out->confidential_accounts.begin(), out->confidential_accounts.end(),
+            [](const auto& a, const auto& b) { return a.account_id < b.account_id; });
+
+  for (const auto& [key, value] : db_.scan_prefix("CCOIN:")) {
+    auto plain = decrypt_secret_payload(passphrase_, value);
+    if (!plain) continue;
+    auto parsed = parse_confidential_coin_plain(*plain);
+    if (!parsed) continue;
+    out->confidential_coins.push_back(*parsed);
+  }
+  std::sort(out->confidential_coins.begin(), out->confidential_coins.end(), [](const auto& a, const auto& b) {
+    if (a.txid_hex != b.txid_hex) return a.txid_hex < b.txid_hex;
+    return a.vout < b.vout;
+  });
   return true;
 }
 
@@ -228,6 +482,31 @@ bool WalletStore::set_mint_last_deposit_vout(std::uint32_t value) { return set_u
 bool WalletStore::set_mint_last_redemption_batch_id(const std::string& value) {
   return set_string(key_meta("mint_last_redemption_batch_id"), value);
 }
+
+bool WalletStore::upsert_confidential_account(const ConfidentialAccountRecord& record) {
+  if (!can_persist_confidential_secrets()) return false;
+  const auto encrypted = encrypt_secret_payload(passphrase_, serialize_confidential_account_plain(record));
+  if (encrypted.empty()) return false;
+  return db_.put(key_confidential_account(record.account_id), encrypted);
+}
+
+bool WalletStore::set_confidential_primary_account_id(const std::optional<std::string>& account_id) {
+  if (!account_id.has_value()) return db_.erase(key_meta("confidential_primary_account_id"));
+  return set_string(key_meta("confidential_primary_account_id"), *account_id);
+}
+
+bool WalletStore::upsert_confidential_coin(const ConfidentialCoinRecord& record) {
+  if (!can_persist_confidential_secrets()) return false;
+  const auto encrypted = encrypt_secret_payload(passphrase_, serialize_confidential_coin_plain(record));
+  if (encrypted.empty()) return false;
+  return db_.put(key_confidential_coin(record.txid_hex, record.vout), encrypted);
+}
+
+bool WalletStore::remove_confidential_coin(const std::string& txid_hex, std::uint32_t vout) {
+  return db_.erase(key_confidential_coin(txid_hex, vout));
+}
+
+bool WalletStore::can_persist_confidential_secrets() const { return !passphrase_.empty(); }
 
 bool WalletStore::set_string(const std::string& key, const std::string& value) { return db_.put(key, to_bytes(value)); }
 
