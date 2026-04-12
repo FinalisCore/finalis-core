@@ -1338,6 +1338,7 @@ void WalletWindow::build_ui() {
   receive_confidential_requests_table_ = receive_page_->confidential_requests_table();
   receive_confidential_coin_summary_label_ = receive_page_->confidential_coin_summary_label();
   receive_confidential_coins_table_ = receive_page_->confidential_coins_table();
+  receive_copy_confidential_pending_txid_button_ = receive_page_->copy_confidential_pending_txid_button();
   receive_copy_status_label_ = receive_page_->copy_status_label();
   receive_finalized_note_label_ = receive_page_->finalized_note_label();
   receive_confidential_note_label_ = receive_page_->confidential_note_label();
@@ -1347,6 +1348,7 @@ void WalletWindow::build_ui() {
   auto* generate_confidential_request_button = receive_page_->generate_confidential_request_button();
   auto* copy_confidential_request_button = receive_page_->copy_confidential_request_button();
   auto* import_confidential_tx_button = receive_page_->import_confidential_tx_button();
+  auto* copy_confidential_pending_txid_button = receive_page_->copy_confidential_pending_txid_button();
 
   history_filter_combo_ = activity_page_->filter_combo();
   history_detail_button_ = activity_page_->detail_button();
@@ -1453,6 +1455,27 @@ void WalletWindow::build_ui() {
     statusBar()->showMessage("Confidential request copied to clipboard.", 3000);
   });
   connect(import_confidential_tx_button, &QPushButton::clicked, this, [this]() { import_received_confidential_tx(); });
+  connect(copy_confidential_pending_txid_button, &QPushButton::clicked, this, [this]() {
+    if (!receive_confidential_coins_table_) return;
+    const int row = receive_confidential_coins_table_->currentRow();
+    if (row < 0) return;
+    auto* item = receive_confidential_coins_table_->item(row, 0);
+    if (!item) return;
+    const QString txid = item->data(Qt::UserRole).toString().trimmed();
+    if (txid.isEmpty()) return;
+    QApplication::clipboard()->setText(txid);
+    statusBar()->showMessage("Pending confidential send txid copied to clipboard.", 3000);
+  });
+  connect(receive_confidential_coins_table_, &QTableWidget::itemSelectionChanged, this, [this]() {
+    if (!receive_copy_confidential_pending_txid_button_ || !receive_confidential_coins_table_) return;
+    const int row = receive_confidential_coins_table_->currentRow();
+    bool enabled = false;
+    if (row >= 0) {
+      auto* item = receive_confidential_coins_table_->item(row, 0);
+      enabled = item && !item->data(Qt::UserRole).toString().trimmed().isEmpty();
+    }
+    receive_copy_confidential_pending_txid_button_->setEnabled(enabled);
+  });
   connect(overview_send_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(send_page_); });
   connect(overview_receive_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(receive_page_); });
   connect(overview_activity_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(activity_page_); });
@@ -2687,6 +2710,7 @@ void WalletWindow::render_confidential_receive_views() {
 
   receive_confidential_coins_table_->setSortingEnabled(false);
   receive_confidential_coins_table_->setRowCount(0);
+  if (receive_copy_confidential_pending_txid_button_) receive_copy_confidential_pending_txid_button_->setEnabled(false);
   int active_coins = 0;
   const std::uint64_t now_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
   for (const auto& coin : confidential_coin_views_) {
@@ -2697,8 +2721,9 @@ void WalletWindow::render_confidential_receive_views() {
         reserved ? pending_release_state_text(reservation_it->second, tip_height_, now_ms) : "Not reserved";
     const int row = receive_confidential_coins_table_->rowCount();
     receive_confidential_coins_table_->insertRow(row);
-    receive_confidential_coins_table_->setItem(row, 0,
-                                               new QTableWidgetItem(coin.spent ? "Spent" : (reserved ? "Reserved" : "Unspent")));
+    auto* status_item = new QTableWidgetItem(coin.spent ? "Spent" : (reserved ? "Reserved" : "Unspent"));
+    if (reserved) status_item->setData(Qt::UserRole, QString::fromStdString(reservation_it->second.txid_hex));
+    receive_confidential_coins_table_->setItem(row, 0, status_item);
     receive_confidential_coins_table_->setItem(row, 1, new QTableWidgetItem(format_coin_amount(coin.amount)));
     receive_confidential_coins_table_->setItem(
         row, 2, new QTableWidgetItem(QString("%1:%2").arg(elide_middle(coin.txid_hex, 10)).arg(coin.vout)));

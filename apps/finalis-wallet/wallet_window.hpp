@@ -296,6 +296,7 @@ class WalletWindow final : public QMainWindow {
   QTableWidget* receive_confidential_requests_table_{nullptr};
   QLabel* receive_confidential_coin_summary_label_{nullptr};
   QTableWidget* receive_confidential_coins_table_{nullptr};
+  QPushButton* receive_copy_confidential_pending_txid_button_{nullptr};
   QLabel* receive_confidential_note_label_{nullptr};
   QComboBox* history_filter_combo_{nullptr};
   QTableWidget* history_view_{nullptr};

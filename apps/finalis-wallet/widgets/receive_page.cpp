@@ -153,6 +153,14 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   configure_table(confidential_coins_table_, {"Status", "Amount", "Outpoint", "Account", "One-Time Key", "Reservation"});
   confidential_layout->addWidget(confidential_coins_table_);
 
+  auto* confidential_coin_actions = new QHBoxLayout();
+  confidential_coin_actions->setSpacing(8);
+  copy_confidential_pending_txid_button_ = new QPushButton("Copy Pending Txid", confidential_box);
+  copy_confidential_pending_txid_button_->setEnabled(false);
+  confidential_coin_actions->addWidget(copy_confidential_pending_txid_button_);
+  confidential_coin_actions->addStretch(1);
+  confidential_layout->addLayout(confidential_coin_actions);
+
   confidential_note_label_ = new QLabel(
       "Confidential receive requires a configured stealth account and encrypted local recovery material. "
       "This wallet will not advertise a confidential address until that state exists locally. Use Generate Request to produce a one-time shareable request URI for supported TxV2 sends.",

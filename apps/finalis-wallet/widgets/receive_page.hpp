@@ -20,6 +20,7 @@ class ReceivePage final : public QWidget {
   QTableWidget* confidential_requests_table() const { return confidential_requests_table_; }
   QLabel* confidential_coin_summary_label() const { return confidential_coin_summary_label_; }
   QTableWidget* confidential_coins_table() const { return confidential_coins_table_; }
+  QPushButton* copy_confidential_pending_txid_button() const { return copy_confidential_pending_txid_button_; }
   QPushButton* copy_button() const { return copy_button_; }
   QPushButton* create_confidential_account_button() const { return create_confidential_account_button_; }
   QPushButton* import_confidential_account_button() const { return import_confidential_account_button_; }
@@ -40,6 +41,7 @@ class ReceivePage final : public QWidget {
   QTableWidget* confidential_requests_table_{nullptr};
   QLabel* confidential_coin_summary_label_{nullptr};
   QTableWidget* confidential_coins_table_{nullptr};
+  QPushButton* copy_confidential_pending_txid_button_{nullptr};
   QPushButton* copy_button_{nullptr};
   QPushButton* create_confidential_account_button_{nullptr};
   QPushButton* import_confidential_account_button_{nullptr};
