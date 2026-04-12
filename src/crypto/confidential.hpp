@@ -47,10 +47,16 @@ bool confidential_crypto_init();
 const ConfidentialBackendStatus& confidential_backend_status();
 bool commitment_is_identity(const Commitment33& commitment);
 std::optional<PubKey33> secp256k1_pubkey_from_scalar(const Hash32& scalar32);
+bool xonly_pubkey32_is_canonical(const PubKey32& pubkey);
 bool compressed_pubkey33_is_canonical(const PubKey33& pubkey);
 bool commitment_is_canonical(const Commitment33& commitment);
 Commitment33 transparent_amount_commitment(std::uint64_t amount);
 std::optional<Commitment33> confidential_amount_commitment(std::uint64_t amount, const Blind32& blind);
+std::optional<PubKey32> excess_xonly_pubkey_from_scalar(const Blind32& blind);
+bool excess_pubkey_matches_commitment(const Commitment33& commitment, const PubKey32& excess_pubkey);
+std::optional<Sig64> sign_excess_authorization(const Hash32& msg32, const Blind32& excess_blind, const Hash32& aux32);
+bool verify_excess_authorization(const Hash32& msg32, const Commitment33& commitment, const PubKey32& excess_pubkey,
+                                 const Sig64& sig);
 std::optional<Blind32> combine_blinds(std::span<const Blind32> blinds, std::size_t npositive);
 std::optional<ProofBytes> sign_output_range_proof(const Commitment33& commitment, std::uint64_t amount,
                                                   const Blind32& blind, const Hash32& nonce32);

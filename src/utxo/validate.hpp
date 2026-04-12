@@ -50,6 +50,7 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
                                const SpecialValidationContext* ctx = nullptr);
 std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index);
 std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t input_index);
+std::optional<Hash32> balance_proof_message_v2(const TxV2& tx);
 std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index);
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id);

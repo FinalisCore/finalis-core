@@ -165,6 +165,22 @@ std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t 
   return Bytes(msg.begin(), msg.end());
 }
 
+std::optional<Hash32> balance_proof_message_v2(const TxV2& tx) {
+  TxV2 signing = tx;
+  for (auto& in : signing.inputs) {
+    if (in.kind == TxInputKind::TRANSPARENT) {
+      std::get<TransparentInputWitnessV2>(in.witness).script_sig.clear();
+    } else {
+      std::get<ConfidentialInputWitnessV2>(in.witness).spend_sig.fill(0);
+    }
+  }
+  signing.balance_proof.excess_sig.fill(0);
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'B', 'A', 'L', '-', 'V', '2'});
+  w.bytes(signing.serialize());
+  return crypto::sha256d(w.data());
+}
+
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
@@ -713,6 +729,12 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   std::size_t confidential_input_count = 0;
   std::size_t confidential_output_count = 0;
   std::size_t total_range_proof_bytes = 0;
+  const bool zero_excess_pubkey =
+      std::all_of(tx.balance_proof.excess_pubkey.begin(), tx.balance_proof.excess_pubkey.end(),
+                  [](std::uint8_t b) { return b == 0; });
+  const bool zero_excess_sig =
+      std::all_of(tx.balance_proof.excess_sig.begin(), tx.balance_proof.excess_sig.end(),
+                  [](std::uint8_t b) { return b == 0; });
   std::vector<crypto::Commitment33> proof_commitments;
   std::vector<crypto::ProofBytes> proofs;
   std::uint64_t in_sum = 0;
@@ -865,6 +887,32 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   if (!crypto::verify_commitment_tally(input_commitments, negative_commitments)) {
     out.error = "commitment balance mismatch";
     return out;
+  }
+
+  if (crypto::commitment_is_identity(tx.balance_proof.excess_commitment)) {
+    if (!zero_excess_pubkey || !zero_excess_sig) {
+      out.error = "identity excess must not carry authorization";
+      return out;
+    }
+  } else {
+    if (!crypto::confidential_backend_status().excess_authorization_available) {
+      out.error = "excess authorization unsupported by zkp backend";
+      return out;
+    }
+    if (!crypto::xonly_pubkey32_is_canonical(tx.balance_proof.excess_pubkey)) {
+      out.error = "invalid excess pubkey";
+      return out;
+    }
+    const auto msg = balance_proof_message_v2(tx);
+    if (!msg.has_value()) {
+      out.error = "balance proof sighash failed";
+      return out;
+    }
+    if (!crypto::verify_excess_authorization(*msg, tx.balance_proof.excess_commitment,
+                                             tx.balance_proof.excess_pubkey, tx.balance_proof.excess_sig)) {
+      out.error = "excess authorization invalid";
+      return out;
+    }
   }
 
   out.ok = true;

@@ -79,8 +79,9 @@ Bytes raw_signed_spend_v2(const OutPoint& op, const crypto::KeyPair& from, const
       .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
   });
   tx.fee = value_in - value_out;
-  tx.balance_proof.excess_commitment = commitment33(0x61);
-  tx.balance_proof.excess_sig.fill(0x62);
+  tx.balance_proof.excess_commitment = crypto::Commitment33{};
+  tx.balance_proof.excess_pubkey.fill(0);
+  tx.balance_proof.excess_sig.fill(0);
   auto msg = signing_message_for_input_v2(tx, 0);
   if (!msg.has_value()) throw std::runtime_error("failed to build v2 sighash");
   auto sig = crypto::ed25519_sign(*msg, from.private_key);

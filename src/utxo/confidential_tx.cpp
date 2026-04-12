@@ -117,6 +117,7 @@ Bytes TxV2::serialize() const {
   w.u32le(lock_time);
   w.u64le(fee);
   w.bytes_fixed(balance_proof.excess_commitment.bytes);
+  w.bytes_fixed(balance_proof.excess_pubkey);
   w.bytes_fixed(balance_proof.excess_sig);
   return w.take();
 }
@@ -152,11 +153,13 @@ std::optional<TxV2> TxV2::parse(const Bytes& b) {
           auto lock_time = r.u32le();
           auto fee = r.u64le();
           auto excess_commitment = r.bytes_fixed<33>();
+          auto excess_pubkey = r.bytes_fixed<32>();
           auto excess_sig = r.bytes_fixed<64>();
-          if (!lock_time || !fee || !excess_commitment || !excess_sig) return false;
+          if (!lock_time || !fee || !excess_commitment || !excess_pubkey || !excess_sig) return false;
           tx.lock_time = *lock_time;
           tx.fee = *fee;
           tx.balance_proof.excess_commitment = crypto::Commitment33{*excess_commitment};
+          tx.balance_proof.excess_pubkey = *excess_pubkey;
           tx.balance_proof.excess_sig = *excess_sig;
           return true;
         })) {

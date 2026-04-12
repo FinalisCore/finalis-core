@@ -70,6 +70,7 @@ struct TxOutV2 {
 
 struct TxBalanceProofV2 {
   crypto::Commitment33 excess_commitment{};
+  PubKey32 excess_pubkey{};
   Sig64 excess_sig{};
   bool operator==(const TxBalanceProofV2&) const = default;
 };

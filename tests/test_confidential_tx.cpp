@@ -63,6 +63,18 @@ void resign_input0(TxV2& tx, const crypto::KeyPair& from) {
   std::get<TransparentInputWitnessV2>(tx.inputs[0].witness).script_sig = make_p2pkh_script_sig(*sig, from.public_key);
 }
 
+void sign_balance_proof(TxV2& tx, const crypto::Blind32& excess_blind, std::uint8_t aux_seed) {
+  const auto pubkey = crypto::excess_xonly_pubkey_from_scalar(excess_blind);
+  if (!pubkey.has_value()) throw std::runtime_error("excess pubkey derivation failed");
+  tx.balance_proof.excess_pubkey = *pubkey;
+  tx.balance_proof.excess_sig.fill(0);
+  const auto msg = finalis::balance_proof_message_v2(tx);
+  if (!msg.has_value()) throw std::runtime_error("balance proof sighash failed");
+  const auto sig = crypto::sign_excess_authorization(*msg, excess_blind, nonce_from_byte(aux_seed));
+  if (!sig.has_value()) throw std::runtime_error("excess signature failed");
+  tx.balance_proof.excess_sig = *sig;
+}
+
 TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from, const PubKey32& to_pub,
                                  std::uint64_t value_in, std::uint64_t value_out) {
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
@@ -79,20 +91,9 @@ TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from
       .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
   });
   tx.fee = value_in - value_out;
-  if (crypto::confidential_backend_status().confidential_outputs_supported) {
-    tx.balance_proof.excess_commitment = crypto::Commitment33{};
-  } else {
-    const std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
-    const std::vector<crypto::Commitment33> outputs{crypto::transparent_amount_commitment(value_out),
-                                                    crypto::transparent_amount_commitment(tx.fee)};
-    const auto input_sum = crypto::add_commitments(inputs);
-    const auto output_sum = crypto::add_commitments(outputs);
-    if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
-    const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
-    if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
-    tx.balance_proof.excess_commitment = *excess;
-  }
-  tx.balance_proof.excess_sig.fill(0x42);
+  tx.balance_proof.excess_commitment = crypto::Commitment33{};
+  tx.balance_proof.excess_pubkey.fill(0);
+  tx.balance_proof.excess_sig.fill(0);
   resign_input0(tx, from);
   return tx;
 }
@@ -127,6 +128,7 @@ TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& f
                                                                *blind_excess);
     if (!excess.has_value()) throw std::runtime_error("excess commitment failed");
     tx.balance_proof.excess_commitment = *excess;
+    sign_balance_proof(tx, *blind_excess, 0x5A);
   } else {
     std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
     std::vector<crypto::Commitment33> outputs;
@@ -139,8 +141,9 @@ TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& f
     const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
     if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
     tx.balance_proof.excess_commitment = *excess;
+    tx.balance_proof.excess_pubkey.fill(0);
+    tx.balance_proof.excess_sig.fill(0x52);
   }
-  tx.balance_proof.excess_sig.fill(0x52);
 
   resign_input0(tx, from);
   return tx;
@@ -169,7 +172,7 @@ TEST(test_confidential_backend_status_reports_backend_capabilities_consistently)
   ASSERT_TRUE(status.secp256k1_available);
   ASSERT_TRUE(status.zkp_backend_available == status.rangeproof_backend_available);
   ASSERT_TRUE(status.confidential_outputs_supported == status.rangeproof_backend_available);
-  ASSERT_TRUE(!status.excess_authorization_available);
+  ASSERT_TRUE(status.excess_authorization_available == status.zkp_backend_available);
 }
 
 TEST(test_tx_v1_parser_rejects_v2_bytes) {
@@ -187,6 +190,7 @@ TEST(test_tx_v1_parser_rejects_v2_bytes) {
   });
   tx.fee = 5;
   tx.balance_proof.excess_commitment = commitment(0x31);
+  tx.balance_proof.excess_pubkey.fill(0x21);
   tx.balance_proof.excess_sig.fill(0x22);
 
   const auto ser = tx.serialize();
@@ -224,6 +228,7 @@ TEST(test_confidential_tx_v2_roundtrip_and_anytx_dispatch) {
   tx.lock_time = 17;
   tx.fee = 9;
   tx.balance_proof.excess_commitment = commitment(0x81);
+  tx.balance_proof.excess_pubkey.fill(0x54);
   tx.balance_proof.excess_sig.fill(0x55);
 
   const auto ser = tx.serialize();
@@ -523,6 +528,8 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
                                                };
   auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, 9'500, mismatch_blind, confidential_out, 500);
   tx.balance_proof.excess_commitment = commitment(0x55);
+  tx.balance_proof.excess_pubkey.fill(0);
+  tx.balance_proof.excess_sig.fill(0);
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
@@ -541,4 +548,35 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
     }
     ASSERT_TRUE(result.error.find("balance mismatch") != std::string::npos);
   }
+}
+
+TEST(test_validate_tx_v2_rejects_invalid_excess_authorization) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    return;
+  }
+
+  const auto from = key_from_byte(0x33);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0x5A);
+  op.index = 0;
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  const auto blind = blind_from_byte(0x6A);
+  const auto confidential_out = make_valid_confidential_output(0x69, 9'000);
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 500, 9'000, blind, confidential_out, 500);
+  tx.balance_proof.excess_sig[0] ^= 0x01;
+  resign_input0(tx, from);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 200;
+  SpecialValidationContext ctx;
+  ctx.current_height = 200;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_TRUE(result.error.find("excess authorization invalid") != std::string::npos);
 }
