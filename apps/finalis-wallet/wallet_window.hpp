@@ -113,6 +113,7 @@ class WalletWindow final : public QMainWindow {
   };
 
   struct ConfidentialCoinView {
+    OutPoint outpoint{};
     QString txid_hex;
     std::uint32_t vout{0};
     QString account_id;
@@ -383,6 +384,7 @@ class WalletWindow final : public QMainWindow {
   QStringList local_history_lines_;
   std::vector<std::string> local_sent_txids_;
   std::map<std::string, std::vector<OutPoint>> pending_wallet_spends_;
+  std::map<OutPoint, WalletStore::PendingSpend> pending_confidential_reservations_;
   std::optional<std::uint64_t> finalized_history_cursor_height_;
   std::optional<std::string> finalized_history_cursor_txid_;
   std::uint64_t tip_height_{0};

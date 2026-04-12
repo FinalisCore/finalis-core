@@ -870,6 +870,42 @@ QString local_history_state(const QString& line) {
   return "local event";
 }
 
+QString format_relative_duration_ms(std::uint64_t ms) {
+  const std::uint64_t seconds = ms / 1000;
+  if (seconds < 60) return QString("%1s").arg(seconds);
+  const std::uint64_t minutes = seconds / 60;
+  const std::uint64_t rem_seconds = seconds % 60;
+  if (minutes < 60) return rem_seconds == 0 ? QString("%1m").arg(minutes)
+                                             : QString("%1m %2s").arg(minutes).arg(rem_seconds);
+  const std::uint64_t hours = minutes / 60;
+  const std::uint64_t rem_minutes = minutes % 60;
+  return rem_minutes == 0 ? QString("%1h").arg(hours)
+                          : QString("%1h %2m").arg(hours).arg(rem_minutes);
+}
+
+QString pending_release_state_text(const WalletStore::PendingSpend& pending, std::uint64_t current_tip_height,
+                                   std::uint64_t now_ms) {
+  const std::uint64_t tip_delta =
+      current_tip_height >= pending.created_tip_height ? (current_tip_height - pending.created_tip_height) : 0;
+  const std::uint64_t age_ms = now_ms >= pending.created_unix_ms ? (now_ms - pending.created_unix_ms) : 0;
+  const std::uint64_t tip_remaining =
+      tip_delta >= kPendingSendReleaseMinTipDelta ? 0 : (kPendingSendReleaseMinTipDelta - tip_delta);
+  const std::uint64_t age_remaining =
+      age_ms >= kPendingSendReleaseMinAgeMs ? 0 : (kPendingSendReleaseMinAgeMs - age_ms);
+  if (tip_remaining == 0 && age_remaining == 0) {
+    return QString("Release-eligible after explicit not_found. Tip +%1/%2, age %3/%4")
+        .arg(tip_delta)
+        .arg(kPendingSendReleaseMinTipDelta)
+        .arg(format_relative_duration_ms(age_ms))
+        .arg(format_relative_duration_ms(kPendingSendReleaseMinAgeMs));
+  }
+  return QString("Reserved. Release gate: tip +%1/%2, age %3/%4")
+      .arg(tip_delta)
+      .arg(kPendingSendReleaseMinTipDelta)
+      .arg(format_relative_duration_ms(age_ms))
+      .arg(format_relative_duration_ms(kPendingSendReleaseMinAgeMs));
+}
+
 QString badge_text(const QString& status) {
   const QString upper = status.trimmed().toUpper();
   return upper.isEmpty() ? "[INFO]" : "[" + upper + "]";
@@ -2649,16 +2685,23 @@ void WalletWindow::render_confidential_receive_views() {
   receive_confidential_coins_table_->setSortingEnabled(false);
   receive_confidential_coins_table_->setRowCount(0);
   int active_coins = 0;
+  const std::uint64_t now_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
   for (const auto& coin : confidential_coin_views_) {
     if (!coin.spent) ++active_coins;
+    const auto reservation_it = pending_confidential_reservations_.find(coin.outpoint);
+    const bool reserved = reservation_it != pending_confidential_reservations_.end();
+    const QString reservation_text =
+        reserved ? pending_release_state_text(reservation_it->second, tip_height_, now_ms) : "Not reserved";
     const int row = receive_confidential_coins_table_->rowCount();
     receive_confidential_coins_table_->insertRow(row);
-    receive_confidential_coins_table_->setItem(row, 0, new QTableWidgetItem(coin.spent ? "Spent" : "Unspent"));
+    receive_confidential_coins_table_->setItem(row, 0,
+                                               new QTableWidgetItem(coin.spent ? "Spent" : (reserved ? "Reserved" : "Unspent")));
     receive_confidential_coins_table_->setItem(row, 1, new QTableWidgetItem(format_coin_amount(coin.amount)));
     receive_confidential_coins_table_->setItem(
         row, 2, new QTableWidgetItem(QString("%1:%2").arg(elide_middle(coin.txid_hex, 10)).arg(coin.vout)));
     receive_confidential_coins_table_->setItem(row, 3, new QTableWidgetItem(coin.account_id));
     receive_confidential_coins_table_->setItem(row, 4, new QTableWidgetItem(elide_middle(coin.one_time_pubkey_hex, 10)));
+    receive_confidential_coins_table_->setItem(row, 5, new QTableWidgetItem(reservation_text));
   }
   if (receive_confidential_coins_table_->rowCount() == 0) {
     receive_confidential_coins_table_->insertRow(0);
@@ -2857,6 +2900,7 @@ void WalletWindow::load_wallet_local_state() {
   confidential_coin_count_ = 0;
   confidential_storage_locked_ = false;
   pending_wallet_spends_.clear();
+  pending_confidential_reservations_.clear();
   finalized_tx_summary_cache_.clear();
   chain_records_.clear();
   finalized_history_cursor_height_.reset();
@@ -2865,7 +2909,10 @@ void WalletWindow::load_wallet_local_state() {
   WalletStore::State state;
   if (!store_.load(&state)) return;
   local_sent_txids_ = state.sent_txids;
-  for (const auto& pending : state.pending_spends) pending_wallet_spends_[pending.txid_hex] = pending.inputs;
+  for (const auto& pending : state.pending_spends) {
+    pending_wallet_spends_[pending.txid_hex] = pending.inputs;
+    for (const auto& input : pending.inputs) pending_confidential_reservations_[input] = pending;
+  }
   finalized_history_cursor_height_ = state.history_cursor_height;
   finalized_history_cursor_txid_ = state.history_cursor_txid;
   for (const auto& record : state.finalized_history) {
@@ -2905,7 +2952,10 @@ void WalletWindow::load_wallet_local_state() {
       });
     }
     for (const auto& coin : state.confidential_coins) {
+      auto txid = decode_hex32_string(coin.txid_hex);
+      if (!txid) continue;
       confidential_coin_views_.push_back(ConfidentialCoinView{
+          .outpoint = OutPoint{*txid, coin.vout},
           .txid_hex = QString::fromStdString(coin.txid_hex),
           .vout = coin.vout,
           .account_id = QString::fromStdString(coin.account_id),
@@ -4893,15 +4943,22 @@ void WalletWindow::update_selected_history_detail() {
   if (ref.source == HistoryRowRef::Source::Confidential) {
     if (static_cast<std::size_t>(ref.index) >= confidential_coin_views_.size()) return;
     const auto& coin = confidential_coin_views_[static_cast<std::size_t>(ref.index)];
-    activity_detail_title_label_->setText(QString("%1 · Confidential Coin").arg(coin.spent ? "Spent" : "Finalized"));
+    const auto reservation_it = pending_confidential_reservations_.find(coin.outpoint);
+    const bool reserved = reservation_it != pending_confidential_reservations_.end();
+    const std::uint64_t now_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
+    const QString reservation_text =
+        reserved ? pending_release_state_text(reservation_it->second, tip_height_, now_ms) : "No active reservation";
+    activity_detail_title_label_->setText(
+        QString("%1 · Confidential Coin").arg(coin.spent ? "Spent" : (reserved ? "Reserved" : "Finalized")));
     activity_detail_view_->setPlainText(
-        QString("Status: %1\nCategory: Confidential Coin\nAmount: %2\nOutpoint: %3:%4\nAccount: %5\nOne-time key: %6")
-            .arg(coin.spent ? "Spent" : "Unspent",
+        QString("Status: %1\nCategory: Confidential Coin\nAmount: %2\nOutpoint: %3:%4\nAccount: %5\nOne-time key: %6\nReservation: %7")
+            .arg(coin.spent ? "Spent" : (reserved ? "Reserved" : "Unspent"),
                  format_coin_amount(coin.amount),
                  coin.txid_hex,
                  QString::number(coin.vout),
                  coin.account_id.isEmpty() ? "-" : coin.account_id,
-                 coin.one_time_pubkey_hex));
+                 coin.one_time_pubkey_hex,
+                 reservation_text));
     return;
   }
   if (static_cast<std::size_t>(ref.index) >= mint_records_.size()) return;
@@ -4996,10 +5053,11 @@ void WalletWindow::refresh_history_table() {
   }
   for (std::size_t i = 0; i < confidential_coin_views_.size(); ++i) {
     const auto& rec = confidential_coin_views_[i];
-    push_row("Confidential Coin", "FINALIZED", format_coin_amount(rec.amount),
+    const bool reserved = pending_confidential_reservations_.find(rec.outpoint) != pending_confidential_reservations_.end();
+    push_row("Confidential Coin", rec.spent ? "FINALIZED" : (reserved ? "PENDING" : "FINALIZED"), format_coin_amount(rec.amount),
              QString("%1:%2").arg(elide_middle(rec.txid_hex, 10)).arg(rec.vout),
-             rec.spent ? "spent" : "unspent",
-             HistoryRowRef::Source::Confidential, static_cast<int>(i), rec.spent ? 4 : 3);
+             rec.spent ? "spent" : (reserved ? "reserved" : "unspent"),
+             HistoryRowRef::Source::Confidential, static_cast<int>(i), rec.spent ? 4 : (reserved ? 1 : 3));
   }
   std::stable_sort(rows.begin(), rows.end(), [](const HistoryDisplayRow& a, const HistoryDisplayRow& b) {
     if (a.bucket != b.bucket) return a.bucket < b.bucket;

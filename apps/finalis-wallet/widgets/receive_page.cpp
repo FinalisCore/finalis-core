@@ -150,7 +150,7 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
 
   confidential_coins_table_ = new QTableWidget(confidential_box);
   confidential_coins_table_->setMinimumHeight(160);
-  configure_table(confidential_coins_table_, {"Status", "Amount", "Outpoint", "Account", "One-Time Key"});
+  configure_table(confidential_coins_table_, {"Status", "Amount", "Outpoint", "Account", "One-Time Key", "Reservation"});
   confidential_layout->addWidget(confidential_coins_table_);
 
   confidential_note_label_ = new QLabel(
