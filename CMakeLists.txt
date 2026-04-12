@@ -117,6 +117,7 @@ add_library(finalis_core
   src/privacy/mint_client.cpp
   src/privacy/mint_scripts.cpp
   src/wallet/utxo_selection.cpp
+  src/wallet/confidential_builder.cpp
   src/utxo/tx.cpp
   src/utxo/confidential_tx.cpp
   src/utxo/validate.cpp
