@@ -178,6 +178,7 @@ class WalletWindow final : public QMainWindow {
     bool update_history_cursor{false};
     std::vector<std::string> remove_pending_txids;
     std::vector<std::string> remove_sent_txids;
+    std::vector<OutPoint> mark_spent_confidential_outpoints;
   };
 
   void build_ui();

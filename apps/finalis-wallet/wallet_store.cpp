@@ -560,6 +560,18 @@ bool WalletStore::upsert_confidential_coin(const ConfidentialCoinRecord& record)
   return db_.put(key_confidential_coin(record.txid_hex, record.vout), encrypted);
 }
 
+bool WalletStore::set_confidential_coin_spent(const std::string& txid_hex, std::uint32_t vout, bool spent) {
+  if (!can_persist_confidential_secrets()) return false;
+  const auto current = db_.get(key_confidential_coin(txid_hex, vout));
+  if (!current) return false;
+  const auto plain = decrypt_secret_payload(passphrase_, *current);
+  if (!plain) return false;
+  auto parsed = parse_confidential_coin_plain(*plain);
+  if (!parsed) return false;
+  parsed->spent = spent;
+  return upsert_confidential_coin(*parsed);
+}
+
 bool WalletStore::remove_confidential_coin(const std::string& txid_hex, std::uint32_t vout) {
   return db_.erase(key_confidential_coin(txid_hex, vout));
 }

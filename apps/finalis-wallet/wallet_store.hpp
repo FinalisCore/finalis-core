@@ -102,6 +102,7 @@ class WalletStore {
   bool upsert_confidential_account(const ConfidentialAccountRecord& record);
   bool set_confidential_primary_account_id(const std::optional<std::string>& account_id);
   bool upsert_confidential_coin(const ConfidentialCoinRecord& record);
+  bool set_confidential_coin_spent(const std::string& txid_hex, std::uint32_t vout, bool spent);
   bool remove_confidential_coin(const std::string& txid_hex, std::uint32_t vout);
   bool upsert_confidential_request(const ConfidentialRequestRecord& record);
   bool set_confidential_request_consumed(const std::string& request_id, bool consumed);

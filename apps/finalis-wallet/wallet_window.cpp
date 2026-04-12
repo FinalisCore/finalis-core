@@ -3475,6 +3475,7 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   std::vector<std::string> remaining_sent_txids;
   std::set<std::string> remove_pending;
   std::set<std::string> remove_sent;
+  std::vector<OutPoint> spent_confidential_outpoints;
   remaining_sent_txids.reserve(request.local_sent_txids.size());
   for (const auto& txid_hex : request.local_sent_txids) {
     bool finalized_direct = finalized_seen.count(txid_hex) != 0;
@@ -3487,6 +3488,10 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
       }
     }
     if (finalized_direct) {
+      const auto pending_it = pending_spends.find(txid_hex);
+      if (pending_it != pending_spends.end()) {
+        spent_confidential_outpoints.insert(spent_confidential_outpoints.end(), pending_it->second.begin(), pending_it->second.end());
+      }
       pending_spends.erase(txid_hex);
       remove_pending.insert(txid_hex);
       remove_sent.insert(txid_hex);
@@ -3526,6 +3531,7 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   result.local_sent_txids = std::move(remaining_sent_txids);
   result.remove_pending_txids.assign(remove_pending.begin(), remove_pending.end());
   result.remove_sent_txids.assign(remove_sent.begin(), remove_sent.end());
+  result.mark_spent_confidential_outpoints = std::move(spent_confidential_outpoints);
   return result;
 }
 
@@ -3584,11 +3590,15 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
     local_history_lines_.push_back(line);
     (void)store_.append_local_event(line.toStdString());
   }
+  for (const auto& outpoint : result.mark_spent_confidential_outpoints) {
+    (void)store_.set_confidential_coin_spent(hex_encode32(outpoint.txid), outpoint.index, true);
+  }
   for (const auto& txid : result.remove_pending_txids) (void)store_.remove_pending_spend(txid);
   for (const auto& txid : result.remove_sent_txids) (void)store_.remove_sent_txid(txid);
   refresh_in_flight_ = should_keep_refresh_indicator(generation, refresh_generation_);
   mark_refresh_state_changed();
 
+  load_wallet_local_state();
   update_wallet_views();
   render_history_view();
   update_connection_views();
