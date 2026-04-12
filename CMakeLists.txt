@@ -36,6 +36,20 @@ if(SECP256K1_LIB AND SECP256K1_INCLUDE_DIR)
   message(STATUS "Using libsecp256k1")
   add_compile_definitions(SC_HAS_SECP256K1=1)
 endif()
+find_path(SECP256K1_ZKP_INCLUDE_DIR
+  NAMES
+    secp256k1_rangeproof.h
+    secp256k1_commitment.h
+    secp256k1_generator.h
+  PATHS
+    ${SECP256K1_INCLUDE_DIR}
+    /usr/local/include
+    /usr/include
+)
+if(SECP256K1_LIB AND SECP256K1_ZKP_INCLUDE_DIR)
+  message(STATUS "Using secp256k1-zkp headers")
+  add_compile_definitions(SC_HAS_SECP256K1_ZKP=1)
+endif()
 
 find_library(ROCKSDB_LIB rocksdb)
 find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h)

@@ -796,7 +796,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     }
     ++confidential_output_count;
     if (!crypto::confidential_backend_status().confidential_outputs_supported) {
-      out.error = "confidential outputs unsupported by crypto backend";
+      out.error = "confidential outputs unsupported by zkp backend";
       return out;
     }
     const auto& confidential = std::get<ConfidentialTxOutV2>(output.body);

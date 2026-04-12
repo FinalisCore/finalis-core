@@ -117,6 +117,14 @@ TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& f
 
 }  // namespace
 
+TEST(test_confidential_backend_status_reports_plain_secp_without_zkp_support) {
+  const auto& status = crypto::confidential_backend_status();
+  ASSERT_TRUE(status.secp256k1_available);
+  ASSERT_TRUE(!status.confidential_outputs_supported);
+  ASSERT_TRUE(!status.rangeproof_backend_available);
+  ASSERT_TRUE(!status.excess_authorization_available);
+}
+
 TEST(test_tx_v1_parser_rejects_v2_bytes) {
   TxV2 tx;
   tx.inputs.push_back(TxInV2{
@@ -338,7 +346,7 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
     ASSERT_TRUE(!result.ok);
-    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+    ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
     ASSERT_TRUE(result.ok);
     ASSERT_EQ(result.cost.fee, 9'500u);
@@ -384,7 +392,7 @@ TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(!result.ok);
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
-    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+    ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
     ASSERT_TRUE(result.error.find("commitment") != std::string::npos);
   }
@@ -421,7 +429,7 @@ TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(!result.ok);
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
-    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+    ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
     ASSERT_TRUE(result.error.find("range proof too large") != std::string::npos ||
                 result.error.find("memo too large") != std::string::npos);
@@ -459,7 +467,7 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(!result.ok);
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
-    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+    ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
     ASSERT_TRUE(result.error.find("balance mismatch") != std::string::npos);
   }

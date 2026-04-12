@@ -8,9 +8,20 @@
 #if defined(SC_HAS_SECP256K1)
 #include <secp256k1.h>
 #endif
+#if defined(SC_HAS_SECP256K1_ZKP)
+#include <secp256k1_commitment.h>
+#include <secp256k1_generator.h>
+#include <secp256k1_rangeproof.h>
+#endif
 
 namespace finalis::crypto {
 namespace {
+
+#if defined(SC_HAS_SECP256K1_ZKP)
+inline constexpr bool kRangeproofVerificationImplemented = false;
+#else
+inline constexpr bool kRangeproofVerificationImplemented = false;
+#endif
 
 Commitment33 zero_commitment() {
   Commitment33 out;
@@ -68,8 +79,16 @@ bool confidential_crypto_init() {
     auto& state = backend();
     state.ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
     state.status.secp256k1_available = state.ctx != nullptr;
+#if defined(SC_HAS_SECP256K1_ZKP)
+    state.status.zkp_backend_available = state.ctx != nullptr;
+    state.status.rangeproof_backend_available = state.ctx != nullptr && kRangeproofVerificationImplemented;
+#else
     state.status.zkp_backend_available = false;
-    state.status.confidential_outputs_supported = false;
+    state.status.rangeproof_backend_available = false;
+#endif
+    state.status.excess_authorization_available = false;
+    state.status.confidential_outputs_supported =
+        state.status.secp256k1_available && state.status.rangeproof_backend_available;
     state.initialized = true;
   });
   return backend().status.secp256k1_available;

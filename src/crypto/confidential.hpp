@@ -38,6 +38,8 @@ struct ConfidentialOutputSecrets {
 struct ConfidentialBackendStatus {
   bool secp256k1_available{false};
   bool zkp_backend_available{false};
+  bool rangeproof_backend_available{false};
+  bool excess_authorization_available{false};
   bool confidential_outputs_supported{false};
 };
 
