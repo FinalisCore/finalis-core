@@ -81,7 +81,6 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      const auto& tx_v1 = std::get<Tx>(*tx);
       if (txid_any(*tx) != record.certificate.txid) {
         if (error) *error = "frontier-certified-ingress-txid-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
@@ -93,7 +92,7 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      if (assign_ingress_lane(tx_v1) != lane) {
+      if (!std::holds_alternative<Tx>(*tx) || assign_ingress_lane(std::get<Tx>(*tx)) != lane) {
         if (error) *error = "frontier-certified-ingress-lane-assignment-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
@@ -166,6 +165,15 @@ Hash32 frontier_utxo_state_root(const UtxoSet& utxos) {
   leaves.reserve(utxos.size());
   for (const auto& [op, entry] : utxos) {
     leaves.push_back({utxo_commitment_key(op), utxo_commitment_value(entry.out)});
+  }
+  return crypto::SparseMerkleTree::compute_root_from_leaves(leaves);
+}
+
+Hash32 frontier_utxo_state_root(const UtxoSetV2& utxos) {
+  std::vector<std::pair<Hash32, Bytes>> leaves;
+  leaves.reserve(utxos.size());
+  for (const auto& [op, entry] : utxos) {
+    leaves.push_back({utxo_commitment_key(op), utxo_commitment_value(entry)});
   }
   return crypto::SparseMerkleTree::compute_root_from_leaves(leaves);
 }

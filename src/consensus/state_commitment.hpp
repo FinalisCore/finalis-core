@@ -12,6 +12,7 @@ namespace finalis::consensus {
 
 Hash32 utxo_commitment_key(const OutPoint& op);
 Bytes utxo_commitment_value(const TxOut& out);
+Bytes utxo_commitment_value(const UtxoEntryV2& entry);
 
 Hash32 validator_commitment_key(const PubKey32& pub);
 Bytes validator_commitment_value_v3(const ValidatorInfo& info);

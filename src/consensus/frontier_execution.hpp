@@ -35,6 +35,7 @@ std::vector<OutPoint> frontier_conflict_domains_for_tx(const Tx& tx);
 Hash32 frontier_ordered_slice_commitment(const std::vector<Bytes>& ordered_records);
 Hash32 frontier_decisions_commitment(const std::vector<FrontierDecision>& decisions);
 Hash32 frontier_utxo_state_root(const UtxoSet& utxos);
+Hash32 frontier_utxo_state_root(const UtxoSetV2& utxos);
 Hash32 frontier_ingress_commitment(const FrontierVector& prev_vector, const FrontierVector& next_vector,
                                    const FrontierLaneRoots& lane_roots);
 bool frontier_merge_certified_ingress(const FrontierVector& prev_vector, const FrontierVector& next_vector,

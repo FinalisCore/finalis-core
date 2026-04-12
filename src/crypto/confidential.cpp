@@ -90,6 +90,19 @@ std::optional<PubKey32> serialize_xonly_pubkey(const secp256k1_xonly_pubkey& pub
   return std::nullopt;
 #endif
 }
+
+bool xonly_pubkey_from_pubkey(const PubKey33& pubkey_bytes, secp256k1_xonly_pubkey* xonly_out) {
+#if defined(SC_HAS_SECP256K1_ZKP)
+  if (!backend().ctx || !xonly_out) return false;
+  secp256k1_pubkey pubkey{};
+  if (!parse_pubkey(pubkey_bytes, &pubkey)) return false;
+  return secp256k1_xonly_pubkey_from_pubkey(backend().ctx, xonly_out, nullptr, &pubkey) == 1;
+#else
+  (void)pubkey_bytes;
+  (void)xonly_out;
+  return false;
+#endif
+}
 #endif
 
 #if defined(SC_HAS_SECP256K1_ZKP)
@@ -267,12 +280,13 @@ bool excess_pubkey_matches_commitment(const Commitment33& commitment, const PubK
   return std::equal(commitment.bytes.begin() + 1, commitment.bytes.end(), excess_pubkey.begin());
 }
 
-std::optional<Sig64> sign_excess_authorization(const Hash32& msg32, const Blind32& excess_blind, const Hash32& aux32) {
+std::optional<Sig64> sign_schnorr_authorization(const Hash32& msg32, const Blind32& secret_scalar,
+                                                const Hash32& aux32) {
 #if defined(SC_HAS_SECP256K1_ZKP)
   if (!confidential_crypto_init()) return std::nullopt;
   if (!backend().status.excess_authorization_available) return std::nullopt;
   secp256k1_keypair keypair{};
-  if (secp256k1_keypair_create(backend().ctx, &keypair, excess_blind.bytes.data()) != 1) return std::nullopt;
+  if (secp256k1_keypair_create(backend().ctx, &keypair, secret_scalar.bytes.data()) != 1) return std::nullopt;
   Sig64 sig{};
   if (secp256k1_schnorrsig_sign32(backend().ctx, sig.data(), msg32.data(), &keypair, aux32.data()) != 1) {
     return std::nullopt;
@@ -280,10 +294,29 @@ std::optional<Sig64> sign_excess_authorization(const Hash32& msg32, const Blind3
   return sig;
 #else
   (void)msg32;
-  (void)excess_blind;
+  (void)secret_scalar;
   (void)aux32;
   return std::nullopt;
 #endif
+}
+
+bool verify_schnorr_authorization(const Hash32& msg32, const PubKey33& pubkey, const Sig64& sig) {
+#if defined(SC_HAS_SECP256K1_ZKP)
+  if (!confidential_crypto_init()) return false;
+  if (!backend().status.excess_authorization_available) return false;
+  secp256k1_xonly_pubkey xonly{};
+  if (!xonly_pubkey_from_pubkey(pubkey, &xonly)) return false;
+  return secp256k1_schnorrsig_verify(backend().ctx, sig.data(), msg32.data(), msg32.size(), &xonly) == 1;
+#else
+  (void)msg32;
+  (void)pubkey;
+  (void)sig;
+  return false;
+#endif
+}
+
+std::optional<Sig64> sign_excess_authorization(const Hash32& msg32, const Blind32& excess_blind, const Hash32& aux32) {
+  return sign_schnorr_authorization(msg32, excess_blind, aux32);
 }
 
 bool verify_excess_authorization(const Hash32& msg32, const Commitment33& commitment, const PubKey32& excess_pubkey,

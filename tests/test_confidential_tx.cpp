@@ -75,6 +75,21 @@ void sign_balance_proof(TxV2& tx, const crypto::Blind32& excess_blind, std::uint
   tx.balance_proof.excess_sig = *sig;
 }
 
+void sign_confidential_input(TxV2& tx, std::size_t input_index, const crypto::Blind32& spend_secret, std::uint8_t aux_seed) {
+  const auto pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret.bytes);
+  if (!pubkey.has_value()) throw std::runtime_error("confidential input pubkey derivation failed");
+  auto& witness = std::get<ConfidentialInputWitnessV2>(tx.inputs.at(input_index).witness);
+  witness.one_time_pubkey = *pubkey;
+  witness.spend_sig.fill(0);
+  const auto msg = finalis::signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+  if (!msg.has_value()) throw std::runtime_error("confidential input sighash failed");
+  Hash32 msg32{};
+  std::copy(msg->begin(), msg->end(), msg32.begin());
+  const auto sig = crypto::sign_schnorr_authorization(msg32, spend_secret, nonce_from_byte(aux_seed));
+  if (!sig.has_value()) throw std::runtime_error("confidential input signature failed");
+  witness.spend_sig = *sig;
+}
+
 TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from, const PubKey32& to_pub,
                                  std::uint64_t value_in, std::uint64_t value_out) {
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
@@ -95,6 +110,34 @@ TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from
   tx.balance_proof.excess_pubkey.fill(0);
   tx.balance_proof.excess_sig.fill(0);
   resign_input0(tx, from);
+  return tx;
+}
+
+TxV2 make_confidential_input_v2_tx(const OutPoint& op, const crypto::Blind32& one_time_secret,
+                                   const crypto::Blind32& input_value_blind, const PubKey32& to_pub,
+                                   std::uint64_t value_in, std::uint64_t value_out) {
+  const auto one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(one_time_secret.bytes);
+  if (!one_time_pubkey.has_value()) throw std::runtime_error("one_time pubkey derivation failed");
+  const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
+
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op.txid,
+      .prev_index = op.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::CONFIDENTIAL,
+      .witness = ConfidentialInputWitnessV2{*one_time_pubkey, Sig64{}},
+  });
+  tx.outputs.push_back(TxOutV2{
+      .kind = TxOutputKind::TRANSPARENT,
+      .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
+  });
+  tx.fee = value_in - value_out;
+  const auto excess = crypto::confidential_amount_commitment(0, input_value_blind);
+  if (!excess.has_value()) throw std::runtime_error("confidential input excess commitment failed");
+  tx.balance_proof.excess_commitment = *excess;
+  sign_balance_proof(tx, input_value_blind, 0x83);
+  sign_confidential_input(tx, 0, one_time_secret, 0x84);
   return tx;
 }
 
@@ -415,6 +458,91 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
     ASSERT_TRUE(it != applied.end());
     ASSERT_EQ(it->second.kind, UtxoOutputKind::CONFIDENTIAL);
   }
+}
+
+TEST(test_validate_tx_v2_accepts_confidential_input_with_transparent_output) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    return;
+  }
+
+  const auto recipient = key_from_byte(0x34);
+  const auto spend_secret = blind_from_byte(0x35);
+  const auto input_blind = blind_from_byte(0x36);
+  const auto input_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret.bytes);
+  ASSERT_TRUE(input_pubkey.has_value());
+  const auto input_commitment = crypto::confidential_amount_commitment(10'000, input_blind);
+  ASSERT_TRUE(input_commitment.has_value());
+
+  OutPoint op{};
+  op.txid.fill(0x5B);
+  op.index = 0;
+  UtxoSetV2 view;
+  UtxoEntryV2 entry;
+  entry.kind = UtxoOutputKind::CONFIDENTIAL;
+  entry.body = UtxoConfidentialData{
+      .value_commitment = *input_commitment,
+      .one_time_pubkey = *input_pubkey,
+      .ephemeral_pubkey = compressed_key(0x37),
+      .scan_tag = crypto::ScanTag{0x38},
+      .memo = Bytes{0x01},
+  };
+  view[op] = entry;
+
+  auto tx = make_confidential_input_v2_tx(op, spend_secret, input_blind, recipient.public_key, 10'000, 9'500);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 300;
+  SpecialValidationContext ctx;
+  ctx.current_height = 300;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  if (!result.ok) throw std::runtime_error("accept confidential-input error: " + result.error);
+  ASSERT_TRUE(result.ok);
+  ASSERT_EQ(result.cost.fee, 500u);
+  ASSERT_EQ(result.cost.confidential_verify_weight, 0u);
+}
+
+TEST(test_validate_tx_v2_rejects_invalid_confidential_input_authorization) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    return;
+  }
+
+  const auto recipient = key_from_byte(0x39);
+  const auto spend_secret = blind_from_byte(0x3A);
+  const auto input_blind = blind_from_byte(0x3B);
+  const auto input_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret.bytes);
+  ASSERT_TRUE(input_pubkey.has_value());
+  const auto input_commitment = crypto::confidential_amount_commitment(10'000, input_blind);
+  ASSERT_TRUE(input_commitment.has_value());
+
+  OutPoint op{};
+  op.txid.fill(0x5C);
+  op.index = 0;
+  UtxoSetV2 view;
+  UtxoEntryV2 entry;
+  entry.kind = UtxoOutputKind::CONFIDENTIAL;
+  entry.body = UtxoConfidentialData{
+      .value_commitment = *input_commitment,
+      .one_time_pubkey = *input_pubkey,
+      .ephemeral_pubkey = compressed_key(0x3C),
+      .scan_tag = crypto::ScanTag{0x3D},
+      .memo = Bytes{},
+  };
+  view[op] = entry;
+
+  auto tx = make_confidential_input_v2_tx(op, spend_secret, input_blind, recipient.public_key, 10'000, 9'500);
+  std::get<ConfidentialInputWitnessV2>(tx.inputs[0].witness).spend_sig[0] ^= 0x01;
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 300;
+  SpecialValidationContext ctx;
+  ctx.current_height = 300;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_TRUE(result.error.find("confidential input authorization invalid") != std::string::npos);
 }
 
 TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {

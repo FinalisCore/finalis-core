@@ -54,6 +54,8 @@ Commitment33 transparent_amount_commitment(std::uint64_t amount);
 std::optional<Commitment33> confidential_amount_commitment(std::uint64_t amount, const Blind32& blind);
 std::optional<PubKey32> excess_xonly_pubkey_from_scalar(const Blind32& blind);
 bool excess_pubkey_matches_commitment(const Commitment33& commitment, const PubKey32& excess_pubkey);
+std::optional<Sig64> sign_schnorr_authorization(const Hash32& msg32, const Blind32& secret_scalar, const Hash32& aux32);
+bool verify_schnorr_authorization(const Hash32& msg32, const PubKey33& pubkey, const Sig64& sig);
 std::optional<Sig64> sign_excess_authorization(const Hash32& msg32, const Blind32& excess_blind, const Hash32& aux32);
 bool verify_excess_authorization(const Hash32& msg32, const Commitment33& commitment, const PubKey32& excess_pubkey,
                                  const Sig64& sig);

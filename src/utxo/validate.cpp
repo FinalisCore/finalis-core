@@ -763,8 +763,41 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     }
     if (input.kind == TxInputKind::CONFIDENTIAL) {
       ++confidential_input_count;
-      out.error = "confidential input witness validation not implemented";
-      return out;
+      if (!crypto::confidential_backend_status().excess_authorization_available) {
+        out.error = "confidential inputs unsupported by zkp backend";
+        return out;
+      }
+      if (input.sequence != 0xFFFFFFFF) {
+        out.error = "sequence must be FFFFFFFF";
+        return out;
+      }
+      if (it->second.kind != UtxoOutputKind::CONFIDENTIAL) {
+        out.error = "confidential input cannot spend transparent utxo";
+        return out;
+      }
+      const auto& prev_out = std::get<UtxoConfidentialData>(it->second.body);
+      const auto& witness = std::get<ConfidentialInputWitnessV2>(input.witness);
+      if (!crypto::compressed_pubkey33_is_canonical(witness.one_time_pubkey)) {
+        out.error = "invalid confidential input one_time_pubkey";
+        return out;
+      }
+      if (witness.one_time_pubkey != prev_out.one_time_pubkey) {
+        out.error = "confidential input one_time_pubkey mismatch";
+        return out;
+      }
+      const auto msg = signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+      if (!msg.has_value()) {
+        out.error = "sighash failed";
+        return out;
+      }
+      Hash32 msg32{};
+      std::copy(msg->begin(), msg->end(), msg32.begin());
+      if (!crypto::verify_schnorr_authorization(msg32, witness.one_time_pubkey, witness.spend_sig)) {
+        out.error = "confidential input authorization invalid";
+        return out;
+      }
+      input_commitments.push_back(prev_out.value_commitment);
+      continue;
     }
     if (it->second.kind != UtxoOutputKind::TRANSPARENT) {
       out.error = "transparent input cannot spend confidential utxo";
@@ -875,7 +908,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "fee mismatch";
       return out;
     }
-  } else if (in_sum < out_sum || in_sum - out_sum < tx.fee) {
+  } else if (confidential_input_count == 0 && (in_sum < out_sum || in_sum - out_sum < tx.fee)) {
     out.error = "insufficient transparent input value";
     return out;
   }
