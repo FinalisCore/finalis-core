@@ -3476,15 +3476,21 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   std::set<std::string> remove_pending;
   std::set<std::string> remove_sent;
   std::vector<OutPoint> spent_confidential_outpoints;
+  std::vector<std::string> released_pending_txids;
   remaining_sent_txids.reserve(request.local_sent_txids.size());
   for (const auto& txid_hex : request.local_sent_txids) {
     bool finalized_direct = finalized_seen.count(txid_hex) != 0;
+    bool dropped_from_runtime = false;
     if (!finalized_direct) {
       auto txid = decode_hex32_string(txid_hex);
       if (txid) {
         std::string rpc_err;
         auto tx_status = lightserver::rpc_get_tx_status(active_endpoint.toStdString(), *txid, &rpc_err);
-        finalized_direct = tx_status.has_value() && tx_status->finalized;
+        if (tx_status.has_value()) {
+          finalized_direct = tx_status->finalized;
+          dropped_from_runtime = tip_changed && !tx_status->finalized &&
+                                 QString::fromStdString(tx_status->status).trimmed().compare("not_found", Qt::CaseInsensitive) == 0;
+        }
       }
     }
     if (finalized_direct) {
@@ -3496,6 +3502,13 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
       remove_pending.insert(txid_hex);
       remove_sent.insert(txid_hex);
       finalized_seen.insert(txid_hex);
+      continue;
+    }
+    if (dropped_from_runtime) {
+      pending_spends.erase(txid_hex);
+      remove_pending.insert(txid_hex);
+      remove_sent.insert(txid_hex);
+      released_pending_txids.push_back(txid_hex);
       continue;
     }
     remaining_sent_txids.push_back(txid_hex);
@@ -3532,6 +3545,7 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   result.remove_pending_txids.assign(remove_pending.begin(), remove_pending.end());
   result.remove_sent_txids.assign(remove_sent.begin(), remove_sent.end());
   result.mark_spent_confidential_outpoints = std::move(spent_confidential_outpoints);
+  result.released_pending_txids = std::move(released_pending_txids);
   return result;
 }
 
@@ -3586,6 +3600,12 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
   }
   for (const auto& txid : result.remove_sent_txids) {
     const QString line = QString("[finalized] pending send finalized %1")
+                             .arg(elide_middle(QString::fromStdString(txid), 12));
+    local_history_lines_.push_back(line);
+    (void)store_.append_local_event(line.toStdString());
+  }
+  for (const auto& txid : result.released_pending_txids) {
+    const QString line = QString("[info] pending send released %1")
                              .arg(elide_middle(QString::fromStdString(txid), 12));
     local_history_lines_.push_back(line);
     (void)store_.append_local_event(line.toStdString());

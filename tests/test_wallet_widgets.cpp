@@ -33,12 +33,13 @@ void test_activity_page_local_filter_and_chips() {
   finalis::wallet::ActivityPage page;
   auto* filter = page.filter_combo();
   require(filter != nullptr, "activity filter combo missing");
-  require(filter->count() == 5, "activity filter count mismatch");
+  require(filter->count() == 6, "activity filter count mismatch");
   require(filter->itemText(0).toStdString() == "All", "activity filter missing All");
   require(filter->itemText(1).toStdString() == "On-Chain", "activity filter missing On-Chain");
   require(filter->itemText(2).toStdString() == "Local", "activity filter missing Local");
   require(filter->itemText(3).toStdString() == "Mint", "activity filter missing Mint");
-  require(filter->itemText(4).toStdString() == "Pending", "activity filter missing Pending");
+  require(filter->itemText(4).toStdString() == "Confidential", "activity filter missing Confidential");
+  require(filter->itemText(5).toStdString() == "Pending", "activity filter missing Pending");
 
   auto* local = page.local_count_label();
   require(local != nullptr, "local chip missing");
@@ -115,20 +116,23 @@ void test_wallet_window_local_filter_preserves_rendered_ordering() {
   });
   window.local_history_lines_.push_back("[pending] relay accepted (pending-ref-1)");
   window.local_history_lines_.push_back("[finalized] pending send finalized (final-ref-2)");
+  window.local_history_lines_.push_back("[info] pending send released (released-ref-3)");
   window.local_history_lines_.push_back("[onboarding] detached local tracking");
 
   window.history_filter_combo_->setCurrentText("Local");
   window.refresh_history_table();
 
   auto* table = window.history_view_;
-  require(table->rowCount() == 3, "local history filter row count mismatch");
+  require(table->rowCount() == 4, "local history filter row count mismatch");
   require(table->item(0, 0)->text().toStdString() == "Local Send (local)", "local pending row type mismatch");
   require(table->item(0, 1)->text().toStdString() == "Pending (local)", "local pending row status mismatch");
   require(table->item(1, 0)->text().toStdString() == "Local Send (local)", "local finalized row type mismatch");
   require(table->item(1, 1)->text().toStdString() == "Finalized", "local finalized row status mismatch");
-  require(table->item(2, 0)->text().toStdString() == "Onboarding (local)", "local onboarding row type mismatch");
-  require(table->item(2, 1)->text().toStdString() == "Info", "local onboarding row status mismatch");
-  require(window.activity_local_count_label_->text().toStdString() == "Local: 3", "local count chip mismatch");
+  require(table->item(2, 0)->text().toStdString() == "Local Event (local)", "local release row type mismatch");
+  require(table->item(2, 1)->text().toStdString() == "Info", "local release row status mismatch");
+  require(table->item(3, 0)->text().toStdString() == "Onboarding (local)", "local onboarding row type mismatch");
+  require(table->item(3, 1)->text().toStdString() == "Info", "local onboarding row status mismatch");
+  require(window.activity_local_count_label_->text().toStdString() == "Local: 4", "local count chip mismatch");
 }
 
 void test_advanced_page_onboarding_defaults() {

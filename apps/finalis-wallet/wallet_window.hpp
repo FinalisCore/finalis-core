@@ -179,6 +179,7 @@ class WalletWindow final : public QMainWindow {
     std::vector<std::string> remove_pending_txids;
     std::vector<std::string> remove_sent_txids;
     std::vector<OutPoint> mark_spent_confidential_outpoints;
+    std::vector<std::string> released_pending_txids;
   };
 
   void build_ui();
