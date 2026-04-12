@@ -721,7 +721,8 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   std::vector<crypto::Commitment33> input_commitments;
   std::vector<crypto::Commitment33> non_excess_output_commitments;
 
-  if (!crypto::commitment_is_canonical(tx.balance_proof.excess_commitment)) {
+  if (!crypto::commitment_is_identity(tx.balance_proof.excess_commitment) &&
+      !crypto::commitment_is_canonical(tx.balance_proof.excess_commitment)) {
     out.error = "invalid excess commitment";
     return out;
   }
@@ -794,6 +795,10 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       continue;
     }
     ++confidential_output_count;
+    if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+      out.error = "confidential outputs unsupported by crypto backend";
+      return out;
+    }
     const auto& confidential = std::get<ConfidentialTxOutV2>(output.body);
     if (!crypto::commitment_is_canonical(confidential.value_commitment)) {
       out.error = "invalid confidential value commitment";

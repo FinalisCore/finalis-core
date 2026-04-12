@@ -14,16 +14,11 @@ using namespace finalis;
 namespace {
 
 PubKey33 compressed_key(std::uint8_t seed) {
-  PubKey33 out{};
-  out[0] = 0x02 | (seed & 0x01);
-  for (std::size_t i = 1; i < out.size(); ++i) out[i] = static_cast<std::uint8_t>(seed + i);
-  return out;
+  return crypto::transparent_amount_commitment(static_cast<std::uint64_t>(seed) + 1).bytes;
 }
 
 crypto::Commitment33 commitment(std::uint8_t seed) {
-  crypto::Commitment33 out;
-  out.bytes = compressed_key(seed);
-  return out;
+  return crypto::transparent_amount_commitment(static_cast<std::uint64_t>(seed) + 1);
 }
 
 crypto::KeyPair key_from_byte(std::uint8_t seed) {
@@ -341,16 +336,21 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
   ctx.confidential_policy = &policy;
 
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
-  ASSERT_TRUE(result.ok);
-  ASSERT_EQ(result.cost.fee, 9'500u);
-  ASSERT_EQ(result.cost.confidential_verify_weight, confidential_out.range_proof.bytes.size());
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    ASSERT_TRUE(!result.ok);
+    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+  } else {
+    ASSERT_TRUE(result.ok);
+    ASSERT_EQ(result.cost.fee, 9'500u);
+    ASSERT_EQ(result.cost.confidential_verify_weight, confidential_out.range_proof.bytes.size());
 
-  UtxoSetV2 applied = view;
-  apply_any_tx_to_utxo(AnyTx{tx}, applied);
-  const auto txid = tx.txid();
-  const auto it = applied.find(OutPoint{txid, 1});
-  ASSERT_TRUE(it != applied.end());
-  ASSERT_EQ(it->second.kind, UtxoOutputKind::CONFIDENTIAL);
+    UtxoSetV2 applied = view;
+    apply_any_tx_to_utxo(AnyTx{tx}, applied);
+    const auto txid = tx.txid();
+    const auto it = applied.find(OutPoint{txid, 1});
+    ASSERT_TRUE(it != applied.end());
+    ASSERT_EQ(it->second.kind, UtxoOutputKind::CONFIDENTIAL);
+  }
 }
 
 TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
@@ -383,7 +383,11 @@ TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
 
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(!result.ok);
-  ASSERT_TRUE(result.error.find("commitment") != std::string::npos);
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+  } else {
+    ASSERT_TRUE(result.error.find("commitment") != std::string::npos);
+  }
 }
 
 TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
@@ -416,8 +420,12 @@ TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
 
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(!result.ok);
-  ASSERT_TRUE(result.error.find("range proof too large") != std::string::npos ||
-              result.error.find("memo too large") != std::string::npos);
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+  } else {
+    ASSERT_TRUE(result.error.find("range proof too large") != std::string::npos ||
+                result.error.find("memo too large") != std::string::npos);
+  }
 }
 
 TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
@@ -450,5 +458,9 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
 
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(!result.ok);
-  ASSERT_TRUE(result.error.find("balance mismatch") != std::string::npos);
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    ASSERT_TRUE(result.error.find("unsupported by crypto backend") != std::string::npos);
+  } else {
+    ASSERT_TRUE(result.error.find("balance mismatch") != std::string::npos);
+  }
 }
