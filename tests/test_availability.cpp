@@ -260,6 +260,73 @@ TEST(test_availability_operator_lifecycle_transitions_are_deterministic) {
   ASSERT_EQ(ejected.status, availability::AvailabilityOperatorStatus::EJECTED);
 }
 
+TEST(test_availability_probationary_returning_operator_recovers_in_one_epoch_for_small_network) {
+  availability::AvailabilityConfig cfg;
+  cfg.warmup_epochs = 2;
+  cfg.min_warmup_audits = 3;
+  cfg.min_warmup_success_rate_bps = 9000;
+  cfg.eligibility_min_score = 10;
+  cfg.probation_score = 0;
+  cfg.ejection_score = -20;
+
+  availability::AvailabilityOperatorState probation;
+  probation.operator_pubkey = key_from_byte(0x57).public_key;
+  probation.bond = BOND_AMOUNT;
+  probation.status = availability::AvailabilityOperatorStatus::PROBATION;
+  probation.service_score = 0;
+  probation.was_ever_active = true;
+
+  availability::apply_epoch_audit_outcomes(&probation, {availability::AvailabilityAuditOutcome::VALID_TIMELY}, 0, cfg, 1);
+  ASSERT_EQ(probation.status, availability::AvailabilityOperatorStatus::ACTIVE);
+  ASSERT_TRUE(probation.was_ever_active);
+  ASSERT_EQ(probation.service_score, cfg.eligibility_min_score);
+  ASSERT_EQ(probation.recovery_consecutive_success_epochs, 0u);
+}
+
+TEST(test_availability_probationary_recovery_requires_two_epochs_for_larger_network) {
+  availability::AvailabilityConfig cfg;
+  cfg.warmup_epochs = 2;
+  cfg.min_warmup_audits = 3;
+  cfg.min_warmup_success_rate_bps = 9000;
+  cfg.eligibility_min_score = 10;
+  cfg.probation_score = 0;
+  cfg.ejection_score = -20;
+
+  availability::AvailabilityOperatorState probation;
+  probation.operator_pubkey = key_from_byte(0x58).public_key;
+  probation.bond = BOND_AMOUNT;
+  probation.status = availability::AvailabilityOperatorStatus::PROBATION;
+  probation.service_score = 0;
+  probation.was_ever_active = true;
+
+  availability::apply_epoch_audit_outcomes(&probation, {availability::AvailabilityAuditOutcome::VALID_TIMELY}, 0, cfg, 2);
+  ASSERT_EQ(probation.status, availability::AvailabilityOperatorStatus::PROBATION);
+  ASSERT_EQ(probation.recovery_consecutive_success_epochs, 1u);
+
+  availability::apply_epoch_audit_outcomes(&probation, {availability::AvailabilityAuditOutcome::VALID_TIMELY}, 0, cfg, 2);
+  ASSERT_EQ(probation.status, availability::AvailabilityOperatorStatus::ACTIVE);
+  ASSERT_EQ(probation.recovery_consecutive_success_epochs, 0u);
+}
+
+TEST(test_availability_warmup_operator_does_not_get_probation_recovery_shortcut) {
+  availability::AvailabilityConfig cfg;
+  cfg.warmup_epochs = 10;
+  cfg.min_warmup_audits = 10;
+  cfg.min_warmup_success_rate_bps = 9900;
+  cfg.eligibility_min_score = 10;
+
+  availability::AvailabilityOperatorState warmup;
+  warmup.operator_pubkey = key_from_byte(0x59).public_key;
+  warmup.bond = BOND_AMOUNT;
+  warmup.status = availability::AvailabilityOperatorStatus::WARMUP;
+  warmup.service_score = 0;
+  warmup.was_ever_active = false;
+
+  availability::apply_epoch_audit_outcomes(&warmup, {availability::AvailabilityAuditOutcome::VALID_TIMELY}, 0, cfg, 1);
+  ASSERT_EQ(warmup.status, availability::AvailabilityOperatorStatus::WARMUP);
+  ASSERT_TRUE(!warmup.was_ever_active);
+}
+
 TEST(test_availability_seat_budget_is_concave_and_capped) {
   availability::AvailabilityConfig cfg;
   cfg.max_seats_per_operator = 4;
@@ -415,6 +482,7 @@ TEST(test_availability_lifecycle_persistence_across_restart_is_identical) {
   active.service_score = 20;
   active.successful_audits = 10;
   active.warmup_epochs = 20;
+  active.was_ever_active = true;
 
   availability::AvailabilityOperatorState probation = active;
   probation.operator_pubkey = key_from_byte(0x55).public_key;
@@ -441,6 +509,14 @@ TEST(test_availability_lifecycle_persistence_across_restart_is_identical) {
   ASSERT_EQ(find_status(active.operator_pubkey), availability::AvailabilityOperatorStatus::ACTIVE);
   ASSERT_EQ(find_status(probation.operator_pubkey), availability::AvailabilityOperatorStatus::PROBATION);
   ASSERT_EQ(find_status(ejected.operator_pubkey), availability::AvailabilityOperatorStatus::EJECTED);
+  auto find_operator = [&](const PubKey32& pub) -> availability::AvailabilityOperatorState {
+    for (const auto& op : parsed->operators) {
+      if (op.operator_pubkey == pub) return op;
+    }
+    throw std::runtime_error("missing restored operator");
+  };
+  ASSERT_TRUE(find_operator(active.operator_pubkey).was_ever_active);
+  ASSERT_TRUE(find_operator(probation.operator_pubkey).was_ever_active);
 
   availability::AvailabilityConfig cfg;
   cfg.warmup_epochs = 2;

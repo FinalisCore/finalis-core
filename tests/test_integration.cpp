@@ -7806,7 +7806,7 @@ TEST(test_startup_rejects_mismatching_persisted_consensus_state_commitment_cache
   ASSERT_TRUE(!restarted.init());
 }
 
-TEST(test_startup_rejects_mismatching_cached_checkpoint_material) {
+TEST(test_startup_repairs_mismatching_cached_checkpoint_material) {
   const auto base = unique_test_base("/tmp/finalis_it_checkpoint_cache_mismatch");
   auto cluster = make_cluster(base, 1, 1, 1);
   ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 2, std::chrono::seconds(15)));
@@ -7823,10 +7823,11 @@ TEST(test_startup_rejects_mismatching_cached_checkpoint_material) {
   db.close();
 
   node::Node restarted(single_node_cfg(base, 1));
-  ASSERT_TRUE(!restarted.init());
+  ASSERT_TRUE(restarted.init());
+  ASSERT_TRUE(restarted.status().height >= 2);
 }
 
-TEST(test_startup_rejects_schedule_relevant_checkpoint_drift) {
+TEST(test_startup_repairs_schedule_relevant_checkpoint_drift) {
   const auto base = unique_test_base("/tmp/finalis_it_checkpoint_schedule_drift");
   auto cluster = make_cluster(base, 1, 1, 1);
   ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 2, std::chrono::seconds(15)));
@@ -7843,7 +7844,8 @@ TEST(test_startup_rejects_schedule_relevant_checkpoint_drift) {
   db.close();
 
   node::Node restarted(single_node_cfg(base, 1));
-  ASSERT_TRUE(!restarted.init());
+  ASSERT_TRUE(restarted.init());
+  ASSERT_TRUE(restarted.status().height >= 2);
 }
 
 TEST(test_restart_replay_is_independent_of_validator_reward_and_checkpoint_caches) {

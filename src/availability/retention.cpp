@@ -15,7 +15,7 @@
 namespace finalis::availability {
 namespace {
 
-constexpr std::uint32_t kAvailabilityPersistentStateVersion = 1;
+constexpr std::uint32_t kAvailabilityPersistentStateVersion = 2;
 const Bytes kAvailabilityPersistentStateMagic{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'A', 'V', 'A', 'I', 'L',
                                               '_', 'S', 'T', 'A', 'T', 'E', '_', 'V', '1'};
 constexpr std::uint32_t kAvailabilityAnalyticsReportVersion = 1;
@@ -96,10 +96,22 @@ bool has_conflicting_duplicates(const std::vector<T>& values, Less&& less, Equiv
   return false;
 }
 
-void update_operator_status(AvailabilityOperatorState* state, const AvailabilityConfig& cfg) {
+std::uint32_t probation_recovery_threshold_epochs(std::uint64_t tracked_operator_count) {
+  return tracked_operator_count <= 3 ? 1U : 2U;
+}
+
+bool perfect_recovery_epoch(const std::vector<AvailabilityAuditOutcome>& outcomes) {
+  if (outcomes.empty()) return false;
+  return std::all_of(outcomes.begin(), outcomes.end(),
+                     [](AvailabilityAuditOutcome outcome) { return outcome == AvailabilityAuditOutcome::VALID_TIMELY; });
+}
+
+void update_operator_status(AvailabilityOperatorState* state, const AvailabilityConfig& cfg,
+                            std::uint32_t recovery_threshold_epochs = std::numeric_limits<std::uint32_t>::max()) {
   if (!state) return;
   if (state->invalid_audits > 0 || state->service_score <= cfg.ejection_score) {
     state->status = AvailabilityOperatorStatus::EJECTED;
+    state->recovery_consecutive_success_epochs = 0;
     return;
   }
   const auto total_audits = state->successful_audits + state->late_audits + state->missed_audits + state->invalid_audits;
@@ -108,21 +120,40 @@ void update_operator_status(AvailabilityOperatorState* state, const Availability
     if (state->successful_audits >= cfg.min_warmup_audits && state->warmup_epochs >= cfg.warmup_epochs &&
         success_bps >= cfg.min_warmup_success_rate_bps && state->bond >= cfg.min_bond) {
       state->status = AvailabilityOperatorStatus::ACTIVE;
+      state->was_ever_active = true;
+      state->recovery_consecutive_success_epochs = 0;
       return;
     }
   }
   if (state->service_score < cfg.probation_score) {
     state->status = AvailabilityOperatorStatus::PROBATION;
+    state->recovery_consecutive_success_epochs = 0;
+    return;
+  }
+  if (state->status == AvailabilityOperatorStatus::PROBATION &&
+      state->was_ever_active && state->bond >= cfg.min_bond &&
+      recovery_threshold_epochs != std::numeric_limits<std::uint32_t>::max() &&
+      state->recovery_consecutive_success_epochs >= recovery_threshold_epochs) {
+    state->status = AvailabilityOperatorStatus::ACTIVE;
+    state->was_ever_active = true;
+    state->service_score = std::max<std::int64_t>(state->service_score, cfg.eligibility_min_score);
+    state->recovery_consecutive_success_epochs = 0;
     return;
   }
   if (state->status == AvailabilityOperatorStatus::PROBATION &&
       state->service_score >= cfg.eligibility_min_score && state->bond >= cfg.min_bond) {
     state->status = AvailabilityOperatorStatus::ACTIVE;
+    state->was_ever_active = true;
+    state->recovery_consecutive_success_epochs = 0;
     return;
   }
   if (state->status == AvailabilityOperatorStatus::ACTIVE && state->service_score < cfg.eligibility_min_score) {
     state->status = AvailabilityOperatorStatus::PROBATION;
+    state->was_ever_active = true;
+    state->recovery_consecutive_success_epochs = 0;
+    return;
   }
+  if (state->status == AvailabilityOperatorStatus::ACTIVE) state->was_ever_active = true;
 }
 
 bool operator_state_status_is_idempotent(const AvailabilityOperatorState& state, const AvailabilityConfig& cfg) {
@@ -160,9 +191,11 @@ void serialize_operator_state(ByteWriter& w, const AvailabilityOperatorState& st
   w.u64le(state.invalid_audits);
   w.u64le(state.warmup_epochs);
   w.u64le(state.retained_prefix_count);
+  w.u8(state.was_ever_active ? 1 : 0);
+  w.u32le(state.recovery_consecutive_success_epochs);
 }
 
-std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader& r) {
+std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader& r, std::uint32_t version) {
   AvailabilityOperatorState state;
   const auto pub = r.bytes_fixed<32>();
   const auto bond = r.u64le();
@@ -188,6 +221,17 @@ std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader&
   state.invalid_audits = *invalid;
   state.warmup_epochs = *warmup;
   state.retained_prefix_count = *retained;
+  if (version >= 2) {
+    const auto was_ever_active = r.u8();
+    const auto recovery_consecutive_success_epochs = r.u32le();
+    if (!was_ever_active || !recovery_consecutive_success_epochs) return std::nullopt;
+    state.was_ever_active = (*was_ever_active != 0);
+    state.recovery_consecutive_success_epochs = *recovery_consecutive_success_epochs;
+  } else {
+    state.was_ever_active = (state.status == AvailabilityOperatorStatus::ACTIVE ||
+                             state.status == AvailabilityOperatorStatus::PROBATION);
+    state.recovery_consecutive_success_epochs = 0;
+  }
   return state;
 }
 
@@ -886,7 +930,8 @@ std::int64_t audit_outcome_delta(AvailabilityAuditOutcome outcome) {
 }
 
 void apply_epoch_audit_outcomes(AvailabilityOperatorState* state, const std::vector<AvailabilityAuditOutcome>& outcomes,
-                                std::uint64_t retained_prefix_count, const AvailabilityConfig& cfg) {
+                                std::uint64_t retained_prefix_count, const AvailabilityConfig& cfg,
+                                std::uint32_t recovery_threshold_epochs) {
   if (!state) return;
   state->service_score = (state->service_score * static_cast<std::int64_t>(cfg.score_alpha_bps)) / 10'000;
   for (const auto outcome : outcomes) {
@@ -908,14 +953,27 @@ void apply_epoch_audit_outcomes(AvailabilityOperatorState* state, const std::vec
   }
   ++state->warmup_epochs;
   state->retained_prefix_count = retained_prefix_count;
-  update_operator_status(state, cfg);
+  if (state->status == AvailabilityOperatorStatus::PROBATION && state->was_ever_active && state->bond >= cfg.min_bond) {
+    if (perfect_recovery_epoch(outcomes)) {
+      state->recovery_consecutive_success_epochs =
+          std::min<std::uint32_t>(std::numeric_limits<std::uint32_t>::max(), state->recovery_consecutive_success_epochs + 1);
+    } else {
+      state->recovery_consecutive_success_epochs = 0;
+    }
+  } else if (state->status != AvailabilityOperatorStatus::ACTIVE) {
+    state->recovery_consecutive_success_epochs = 0;
+  }
+  update_operator_status(state, cfg, recovery_threshold_epochs);
 }
 
 std::vector<AvailabilityAuditOutcome> live_epoch_audit_outcomes(std::uint64_t retained_prefix_count,
-                                                                const AvailabilityConfig& cfg) {
+                                                                const AvailabilityConfig& cfg,
+                                                                bool guarantee_recovery_opportunity) {
   std::vector<AvailabilityAuditOutcome> outcomes;
-  if (retained_prefix_count == 0 || cfg.audits_per_operator_per_epoch == 0) return outcomes;
-  outcomes.assign(cfg.audits_per_operator_per_epoch, AvailabilityAuditOutcome::VALID_TIMELY);
+  if (cfg.audits_per_operator_per_epoch == 0) return outcomes;
+  if (retained_prefix_count == 0 && !guarantee_recovery_opportunity) return outcomes;
+  const std::size_t outcome_count = retained_prefix_count == 0 ? 1 : cfg.audits_per_operator_per_epoch;
+  outcomes.assign(outcome_count, AvailabilityAuditOutcome::VALID_TIMELY);
   return outcomes;
 }
 
@@ -1849,6 +1907,7 @@ void refresh_live_availability_state(const Hash32& finalized_identity_id,
 
   std::vector<AvailabilityOperatorState> refreshed;
   refreshed.reserve(operator_ids.size());
+  const auto recovery_threshold_epochs = probation_recovery_threshold_epochs(operator_ids.size());
   for (const auto& operator_id : operator_ids) {
     AvailabilityOperatorState operator_state;
     if (auto it = existing.find(operator_id); it != existing.end()) operator_state = it->second;
@@ -1856,7 +1915,11 @@ void refresh_live_availability_state(const Hash32& finalized_identity_id,
     operator_state.bond = operator_bonds.at(operator_id);
     const auto retained_count = assigned_prefix_counts[operator_id];
     if (advance_epoch) {
-      apply_epoch_audit_outcomes(&operator_state, live_epoch_audit_outcomes(retained_count, cfg), retained_count, cfg);
+      const bool guarantee_recovery_opportunity =
+          operator_state.status == AvailabilityOperatorStatus::PROBATION && operator_state.was_ever_active;
+      apply_epoch_audit_outcomes(&operator_state,
+                                 live_epoch_audit_outcomes(retained_count, cfg, guarantee_recovery_opportunity),
+                                 retained_count, cfg, recovery_threshold_epochs);
     } else {
       operator_state.retained_prefix_count = retained_count;
     }
@@ -1911,7 +1974,7 @@ std::optional<AvailabilityPersistentState> AvailabilityPersistentState::parse(co
         auto current_epoch = r.u64le();
         if (!magic || !version || !current_epoch) return false;
         if (*magic != kAvailabilityPersistentStateMagic) return false;
-        if (*version != kAvailabilityPersistentStateVersion) return false;
+        if (*version != 1 && *version != kAvailabilityPersistentStateVersion) return false;
         state.version = *version;
         state.current_epoch = *current_epoch;
 
@@ -1919,7 +1982,7 @@ std::optional<AvailabilityPersistentState> AvailabilityPersistentState::parse(co
         if (!operator_count) return false;
         state.operators.reserve(static_cast<std::size_t>(*operator_count));
         for (std::uint64_t i = 0; i < *operator_count; ++i) {
-          auto operator_state = parse_operator_state(r);
+          auto operator_state = parse_operator_state(r, state.version);
           if (!operator_state) return false;
           state.operators.push_back(*operator_state);
         }

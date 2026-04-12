@@ -141,6 +141,8 @@ struct AvailabilityOperatorState {
   std::uint64_t invalid_audits{0};
   std::uint64_t warmup_epochs{0};
   std::uint64_t retained_prefix_count{0};
+  bool was_ever_active{false};
+  std::uint32_t recovery_consecutive_success_epochs{0};
 
   bool operator==(const AvailabilityOperatorState&) const = default;
 };
@@ -154,7 +156,7 @@ struct AvailabilitySeatTicket {
 };
 
 struct AvailabilityPersistentState {
-  std::uint32_t version{1};
+  std::uint32_t version{2};
   std::uint64_t current_epoch{0};
   std::vector<AvailabilityOperatorState> operators;
   std::vector<RetainedPrefix> retained_prefixes;
@@ -540,9 +542,11 @@ AvailabilityAuditOutcome verify_audit_response(const AvailabilityAuditChallenge&
 
 std::int64_t audit_outcome_delta(AvailabilityAuditOutcome outcome);
 void apply_epoch_audit_outcomes(AvailabilityOperatorState* state, const std::vector<AvailabilityAuditOutcome>& outcomes,
-                                std::uint64_t retained_prefix_count, const AvailabilityConfig& cfg = {});
+                                std::uint64_t retained_prefix_count, const AvailabilityConfig& cfg = {},
+                                std::uint32_t recovery_threshold_epochs = std::numeric_limits<std::uint32_t>::max());
 std::vector<AvailabilityAuditOutcome> live_epoch_audit_outcomes(std::uint64_t retained_prefix_count,
-                                                                const AvailabilityConfig& cfg = {});
+                                                                const AvailabilityConfig& cfg = {},
+                                                                bool guarantee_recovery_opportunity = false);
 std::int64_t operator_eligibility_score(const AvailabilityOperatorState& state, const AvailabilityConfig& cfg = {});
 bool operator_is_eligible(const AvailabilityOperatorState& state, const AvailabilityConfig& cfg = {});
 std::uint32_t operator_seat_budget(const AvailabilityOperatorState& state, const AvailabilityConfig& cfg = {});
