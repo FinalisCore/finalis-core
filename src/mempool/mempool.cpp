@@ -105,8 +105,7 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
     }
   }
 
-  const auto work_view = upgrade_utxo_set_v2(view);
-  const auto vr = validate_any_tx(tx, 1, work_view, ctx_ ? &*ctx_ : nullptr);
+  const auto vr = validate_any_tx(tx, 1, view, ctx_ ? &*ctx_ : nullptr);
   if (!vr.ok) {
     if (err) *err = "tx invalid: " + vr.error;
     return false;
@@ -210,7 +209,7 @@ std::vector<Tx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_b
   std::vector<Tx> out;
   out.reserve(std::min(max_txs, candidates.size()));
   std::size_t used_bytes = 0;
-  UtxoSetV2 work = upgrade_utxo_set_v2(view);
+  UtxoSetV2 work = view;
 
   for (const TxMeta* m : candidates) {
     if (out.size() >= max_txs) break;

@@ -92,7 +92,7 @@ struct CanonicalDerivedState {
   FrontierLaneRoots finalized_lane_roots{};
   FinalizedIdentity finalized_identity{};
   Hash32 last_finality_certificate_hash{};
-  UtxoSet utxos;
+  UtxoSetV2 utxos;
   ValidatorRegistry validators;
   std::map<Hash32, ValidatorJoinRequest> validator_join_requests;
   Hash32 finalized_randomness{};
@@ -126,7 +126,7 @@ Hash32 frontier_finality_link_hash(const FrontierTransition& transition);
 bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
                                            const std::vector<PubKey32>& observed_signers,
-                                           std::uint64_t accepted_fee_units, const UtxoSet& post_execution_utxos,
+                                           std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
                                            std::string* error);
 bool load_certified_frontier_record_from_storage(const storage::DB& db, const FrontierTransition& transition,

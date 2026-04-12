@@ -239,9 +239,12 @@ class DB {
   std::optional<Hash32> get_height_hash(std::uint64_t height) const;
 
   bool put_utxo(const OutPoint& op, const TxOut& out);
+  bool put_utxo_v2(const OutPoint& op, const UtxoEntryV2& entry);
   bool erase_utxo(const OutPoint& op);
   std::optional<TxOut> get_utxo(const OutPoint& op) const;
+  std::optional<UtxoEntryV2> get_utxo_v2(const OutPoint& op) const;
   std::map<OutPoint, UtxoEntry> load_utxos() const;
+  std::map<OutPoint, UtxoEntryV2> load_utxos_v2() const;
 
   bool put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
   std::map<PubKey32, consensus::ValidatorInfo> load_validators() const;

@@ -357,7 +357,7 @@ class Node {
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
   void maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int skip_peer_id = 0);
 
-  bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSet& prev_utxos);
+  bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos);
   bool begin_finalized_write(const Block& block);
   bool finish_finalized_write(const Block& block);
   bool check_no_incomplete_finalized_write() const;
@@ -508,7 +508,7 @@ class Node {
 
   consensus::ValidatorRegistry validators_;
   ConfidentialPolicy confidential_policy_{};
-  UtxoSet utxos_;
+  UtxoSetV2 utxos_;
   mempool::Mempool mempool_;
   consensus::VoteTracker votes_;
   consensus::TimeoutVoteTracker timeout_votes_;

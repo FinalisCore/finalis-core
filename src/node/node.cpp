@@ -840,13 +840,14 @@ bool same_tx_out(const TxOut& a, const TxOut& b) {
   return a.value == b.value && a.script_pubkey == b.script_pubkey;
 }
 
-bool same_utxos(const UtxoSet& a, const UtxoSet& b) {
+bool same_utxos(const UtxoSetV2& a, const UtxoSetV2& b) {
   if (a.size() != b.size()) return false;
   auto ita = a.begin();
   auto itb = b.begin();
   for (; ita != a.end(); ++ita, ++itb) {
-    if (ita->first.txid != itb->first.txid || ita->first.index != itb->first.index) return false;
-    if (!same_tx_out(ita->second.out, itb->second.out)) return false;
+    if (ita->first.txid != itb->first.txid || ita->first.index != itb->first.index || ita->second != itb->second) {
+      return false;
+    }
   }
   return true;
 }
@@ -1201,12 +1202,12 @@ FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_
   return cert;
 }
 
-StateRoots compute_roots_for_state(const UtxoSet& utxos, const consensus::ValidatorRegistry& validators,
+StateRoots compute_roots_for_state(const UtxoSetV2& utxos, const consensus::ValidatorRegistry& validators,
                                    std::uint32_t validation_rules_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(utxos.size());
   for (const auto& [op, ue] : utxos) {
-    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue)});
   }
 
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
@@ -1246,14 +1247,16 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
     if (!db.erase(key)) return false;
   }
   for (const auto& [op, entry] : state.utxos) {
-    if (!db.put_utxo(op, entry.out)) return false;
+    if (!db.put_utxo_v2(op, entry)) return false;
   }
 
   const std::string script_utxo_prefix = storage::key_script_utxo_prefix(Hash32{}).substr(0, 3);
   std::set<std::string> desired_script_utxos;
   desired_script_utxos.clear();
   for (const auto& [op, entry] : state.utxos) {
-    const auto scripthash = crypto::sha256(entry.out.script_pubkey);
+    const auto transparent = transparent_txout_from_utxo_entry(entry);
+    if (!transparent.has_value()) continue;
+    const auto scripthash = crypto::sha256(transparent->script_pubkey);
     desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
   }
   std::vector<std::string> script_utxos_to_erase;
@@ -1266,8 +1269,10 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
     if (!db.erase(key)) return false;
   }
   for (const auto& [op, entry] : state.utxos) {
-    const auto scripthash = crypto::sha256(entry.out.script_pubkey);
-    if (!db.put_script_utxo(scripthash, op, entry.out, state.finalized_height)) return false;
+    const auto transparent = transparent_txout_from_utxo_entry(entry);
+    if (!transparent.has_value()) continue;
+    const auto scripthash = crypto::sha256(transparent->script_pubkey);
+    if (!db.put_script_utxo(scripthash, op, *transparent, state.finalized_height)) return false;
   }
 
   for (const auto& [pub, info] : state.validators.all()) {
@@ -1552,12 +1557,12 @@ void sync_smt_tree(storage::DB& db, const std::string& tree_id, const std::vecto
   for (const auto& [k, v] : leaves) (void)db.put(storage::key_smt_leaf(tree_id, k), v);
 }
 
-StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSet& utxos,
+StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSetV2& utxos,
                                const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(utxos.size());
   for (const auto& [op, ue] : utxos) {
-    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue)});
   }
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
   validator_leaves.reserve(validators.all().size());
@@ -2010,7 +2015,7 @@ bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_val
   (void)db_.erase(storage::key_consensus_state_commitment_cache());
   if (!verify_and_persist_consensus_state_commitment_locked(rebound_state)) return false;
 
-  const UtxoSet empty_utxos;
+  const UtxoSetV2 empty_utxos;
   (void)persist_state_roots(db_, 0, empty_utxos, validators_, kFixedValidationRulesVersion);
   (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   if (!db_.flush()) return false;
@@ -3465,11 +3470,13 @@ std::optional<TxOut> Node::find_utxo_by_pubkey_hash_for_test(const std::array<st
                                                               OutPoint* outpoint) const {
   std::lock_guard<std::mutex> lk(mu_);
   for (const auto& [op, e] : utxos_) {
+    const auto txout = transparent_txout_from_utxo_entry(e);
+    if (!txout.has_value()) continue;
     std::array<std::uint8_t, 20> got{};
-    if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
+    if (!is_p2pkh_script_pubkey(txout->script_pubkey, &got)) continue;
     if (got != pkh) continue;
     if (outpoint) *outpoint = op;
-    return e.out;
+    return *txout;
   }
   return std::nullopt;
 }
@@ -3478,10 +3485,12 @@ std::vector<std::pair<OutPoint, TxOut>> Node::find_utxos_by_pubkey_hash_for_test
   std::vector<std::pair<OutPoint, TxOut>> out;
   std::lock_guard<std::mutex> lk(mu_);
   for (const auto& [op, e] : utxos_) {
+    const auto txout = transparent_txout_from_utxo_entry(e);
+    if (!txout.has_value()) continue;
     std::array<std::uint8_t, 20> got{};
-    if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
+    if (!is_p2pkh_script_pubkey(txout->script_pubkey, &got)) continue;
     if (got != pkh) continue;
-    out.push_back({op, e.out});
+    out.push_back({op, *txout});
   }
   return out;
 }
@@ -3489,7 +3498,9 @@ bool Node::has_utxo_for_test(const OutPoint& op, TxOut* out) const {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = utxos_.find(op);
   if (it == utxos_.end()) return false;
-  if (out) *out = it->second.out;
+  const auto txout = transparent_txout_from_utxo_entry(it->second);
+  if (!txout.has_value()) return false;
+  if (out) *out = *txout;
   return true;
 }
 std::string Node::proposer_path_for_next_height_for_test() const {
@@ -3576,10 +3587,10 @@ bool Node::seed_bonded_validator_for_test(const PubKey32& pub, const OutPoint& b
   if (!canonical_state_.has_value()) return false;
   auto updated = *canonical_state_;
   updated.validators.upsert(pub, *info);
-  updated.utxos[bond_outpoint] = UtxoEntry{bond_out};
+  updated.utxos[bond_outpoint] = UtxoEntryV2{bond_out};
   updated.state_commitment = consensus::consensus_state_commitment(canonical_derivation_config_locked(), updated);
 
-  if (!db_.put_utxo(bond_outpoint, bond_out)) return false;
+  if (!db_.put_utxo_v2(bond_outpoint, UtxoEntryV2{bond_out})) return false;
   if (!db_.put_validator(pub, *info)) return false;
   if (!persist_canonical_cache_rows(db_, updated)) return false;
   (void)db_.erase(storage::key_consensus_state_commitment_cache());
@@ -6789,7 +6800,7 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int ski
   }
 }
 
-bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSet& prev_utxos) {
+bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos) {
   if (record.transition.next_frontier !=
       record.transition.prev_frontier + static_cast<std::uint64_t>(record.ordered_records.size())) {
     log_line("finalized-state-invariant-violation source=runtime-write-frontier-continuity height=" +
@@ -6815,7 +6826,9 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       for (const auto& input : legacy.inputs) {
         const auto prev_it = prev_utxos.find(OutPoint{input.prev_txid, input.prev_index});
         if (prev_it == prev_utxos.end()) continue;
-        const auto spent_scripthash = crypto::sha256(prev_it->second.out.script_pubkey);
+        const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
+        if (!spent_out.has_value()) continue;
+        const auto spent_scripthash = crypto::sha256(spent_out->script_pubkey);
         if (!db_.add_script_history(spent_scripthash, record.transition.height, txid)) return false;
       }
       for (const auto& output : legacy.outputs) {
@@ -7039,7 +7052,7 @@ bool Node::init_mainnet_genesis() {
       vi.unbond_height = 0;
       vr.upsert(pub, vi);
     }
-    const UtxoSet empty_utxos;
+    const UtxoSetV2 empty_utxos;
     (void)persist_state_roots(db_, 0, empty_utxos, vr, kFixedValidationRulesVersion);
   }
   {
@@ -7181,7 +7194,7 @@ bool Node::load_state() {
       persisted_commitment->hash != expected_commitment.hash;
   bool canonical_cache_rewrite_needed = stale_canonical_cache_tip;
 
-  const auto persisted_utxos = db_.load_utxos();
+  const auto persisted_utxos = db_.load_utxos_v2();
   if (!persisted_utxos.empty() && !same_utxos(persisted_utxos, derived_state.utxos)) {
     if (using_frontier_replay) {
       log_line("canonical-cache-rewrite source=load-state-utxo-cache-mismatch");

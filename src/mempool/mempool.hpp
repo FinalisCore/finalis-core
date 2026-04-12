@@ -15,7 +15,7 @@
 
 namespace finalis::mempool {
 
-using UtxoView = UtxoSet;
+using UtxoView = UtxoSetV2;
 
 struct MempoolEntry {
   AnyTx tx;

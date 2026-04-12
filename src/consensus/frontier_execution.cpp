@@ -15,15 +15,9 @@ namespace {
 
 Hash32 record_id_for_raw_ingress_record(const Bytes& raw_record) { return crypto::sha256d(raw_record); }
 
-void apply_accepted_tx_to_utxos(const Tx& tx, UtxoSet* utxos) {
+void apply_accepted_tx_to_utxos(const AnyTx& tx, UtxoSetV2* utxos) {
   if (!utxos) return;
-  for (const auto& in : tx.inputs) {
-    utxos->erase(OutPoint{in.prev_txid, in.prev_index});
-  }
-  const Hash32 txid = tx.txid();
-  for (std::uint32_t out_index = 0; out_index < tx.outputs.size(); ++out_index) {
-    (*utxos)[OutPoint{txid, out_index}] = UtxoEntry{tx.outputs[out_index]};
-  }
+  apply_any_tx_to_utxo(tx, *utxos);
 }
 
 bool validate_certified_lane_records(const FrontierVector& prev_vector, const FrontierVector& next_vector,
@@ -135,11 +129,15 @@ Hash32 FrontierExecutionResult::result_id() const {
   return crypto::sha256d(pre);
 }
 
-std::vector<OutPoint> frontier_conflict_domains_for_tx(const Tx& tx) {
-  std::vector<OutPoint> out;
-  out.reserve(tx.inputs.size());
-  for (const auto& in : tx.inputs) out.push_back(OutPoint{in.prev_txid, in.prev_index});
-  return out;
+std::vector<OutPoint> frontier_conflict_domains_for_tx(const AnyTx& tx) {
+  return std::visit(
+      [](const auto& value) {
+        std::vector<OutPoint> out;
+        out.reserve(value.inputs.size());
+        for (const auto& in : value.inputs) out.push_back(OutPoint{in.prev_txid, in.prev_index});
+        return out;
+      },
+      tx);
 }
 
 Hash32 frontier_ordered_slice_commitment(const std::vector<Bytes>& ordered_records) {
@@ -197,7 +195,7 @@ bool frontier_merge_certified_ingress(const FrontierVector& prev_vector, const F
                                          ordered_records, error);
 }
 
-bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_frontier,
+bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
                             FrontierExecutionResult* out, std::string* error) {
   if (!out) {
@@ -205,11 +203,11 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
     return false;
   }
 
-  UtxoSet work = parent_utxos;
+  UtxoSetV2 work = parent_utxos;
   std::set<OutPoint> consumed_domains;
   std::vector<FrontierDecision> decisions;
   decisions.reserve(ordered_records.size());
-  std::vector<Tx> accepted_txs;
+  std::vector<AnyTx> accepted_txs;
   std::uint64_t accepted_fee_units = 0;
 
   for (const auto& raw_record : ordered_records) {
@@ -223,16 +221,7 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
       decisions.push_back(decision);
       continue;
     }
-    if (!std::holds_alternative<Tx>(*tx)) {
-      decision.record_id = txid_any(*tx);
-      decision.accepted = false;
-      decision.reject_reason = FrontierRejectReason::TX_INVALID;
-      decisions.push_back(decision);
-      continue;
-    }
-    const auto& tx_v1 = std::get<Tx>(*tx);
-
-    const auto domains = frontier_conflict_domains_for_tx(tx_v1);
+    const auto domains = frontier_conflict_domains_for_tx(*tx);
     bool conflict = false;
     for (const auto& domain : domains) {
       if (consumed_domains.find(domain) != consumed_domains.end()) {
@@ -248,7 +237,7 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
       continue;
     }
 
-    const auto validation = validate_tx(tx_v1, 1, work, ctx);
+    const auto validation = validate_any_tx(*tx, 1, work, ctx);
     decision.record_id = txid_any(*tx);
     if (!validation.ok) {
       decision.accepted = false;
@@ -258,9 +247,9 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
     }
 
     for (const auto& domain : domains) consumed_domains.insert(domain);
-    apply_accepted_tx_to_utxos(tx_v1, &work);
-    accepted_txs.push_back(tx_v1);
-    accepted_fee_units += validation.fee;
+    apply_accepted_tx_to_utxos(*tx, &work);
+    accepted_txs.push_back(*tx);
+    accepted_fee_units += validation.cost.fee;
     decision.accepted = true;
     decision.reject_reason = FrontierRejectReason::NONE;
     decisions.push_back(decision);
@@ -281,7 +270,13 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
   return true;
 }
 
-bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVector& prev_vector,
+bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_frontier,
+                            const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
+                            FrontierExecutionResult* out, std::string* error) {
+  return execute_frontier_slice(upgrade_utxo_set_v2(parent_utxos), prev_frontier, ordered_records, ctx, out, error);
+}
+
+bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, const FrontierVector& prev_vector,
                                   const FrontierVector& next_vector, const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
                                   FrontierExecutionResult* out, std::string* error) {
@@ -320,6 +315,14 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
   result.next_lane_roots = recomputed_lane_roots;
   if (out) *out = std::move(result);
   return true;
+}
+
+bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVector& prev_vector,
+                                  const FrontierVector& next_vector, const CertifiedIngressLaneRecords& lane_records,
+                                  const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
+                                  FrontierExecutionResult* out, std::string* error) {
+  return execute_frontier_lane_prefix(upgrade_utxo_set_v2(parent_utxos), prev_vector, next_vector, lane_records,
+                                      prev_lane_roots, ctx, out, error);
 }
 
 }  // namespace finalis::consensus

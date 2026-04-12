@@ -283,7 +283,9 @@ enum class UtxoOutputKind : std::uint8_t {
 
 struct UtxoTransparentData {
   TxOut out;
-  bool operator==(const UtxoTransparentData&) const = default;
+  bool operator==(const UtxoTransparentData& other) const {
+    return out.value == other.out.value && out.script_pubkey == other.out.script_pubkey;
+  }
 };
 
 struct UtxoConfidentialData {
@@ -301,12 +303,23 @@ struct UtxoEntryV2 {
   std::variant<UtxoTransparentData, UtxoConfidentialData> body{UtxoTransparentData{}};
 
   UtxoEntryV2() = default;
+  UtxoEntryV2(const UtxoEntry& entry) : kind(UtxoOutputKind::TRANSPARENT), body(UtxoTransparentData{entry.out}) {}
   UtxoEntryV2(const TxOut& out_in) : kind(UtxoOutputKind::TRANSPARENT), body(UtxoTransparentData{out_in}) {}
+  UtxoEntryV2& operator=(const UtxoEntry& entry) {
+    kind = UtxoOutputKind::TRANSPARENT;
+    body = UtxoTransparentData{entry.out};
+    return *this;
+  }
 
-  bool operator==(const UtxoEntryV2&) const = default;
+  bool operator==(const UtxoEntryV2& other) const { return kind == other.kind && body == other.body; }
 };
 
 using UtxoSetV2 = std::map<OutPoint, UtxoEntryV2>;
+
+Bytes serialize_utxo_entry_v2(const UtxoEntryV2& entry);
+std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b);
+std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry);
+UtxoSet downgrade_utxo_set_v1(const UtxoSetV2& utxos);
 
 struct ValidatorJoinRequestScriptData {
   PubKey32 validator_pubkey{};
