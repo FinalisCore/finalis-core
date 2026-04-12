@@ -54,6 +54,17 @@ class WalletStore {
     bool spent{false};
   };
 
+  struct ConfidentialRequestRecord {
+    std::string request_id;
+    std::string account_id;
+    std::string one_time_pubkey_hex;
+    std::string ephemeral_pubkey_hex;
+    std::uint8_t scan_tag{0};
+    std::string spend_secret_hex;
+    std::string memo_key_hex;
+    bool consumed{false};
+  };
+
   struct State {
     std::vector<std::string> sent_txids;
     std::vector<std::string> local_events;
@@ -68,6 +79,7 @@ class WalletStore {
     std::string mint_last_redemption_batch_id;
     std::vector<ConfidentialAccountRecord> confidential_accounts;
     std::vector<ConfidentialCoinRecord> confidential_coins;
+    std::vector<ConfidentialRequestRecord> confidential_requests;
     std::optional<std::string> confidential_primary_account_id;
   };
 
@@ -91,6 +103,9 @@ class WalletStore {
   bool set_confidential_primary_account_id(const std::optional<std::string>& account_id);
   bool upsert_confidential_coin(const ConfidentialCoinRecord& record);
   bool remove_confidential_coin(const std::string& txid_hex, std::uint32_t vout);
+  bool upsert_confidential_request(const ConfidentialRequestRecord& record);
+  bool set_confidential_request_consumed(const std::string& request_id, bool consumed);
+  bool remove_confidential_request(const std::string& request_id);
   bool can_persist_confidential_secrets() const;
 
   static std::set<OutPoint> reserved_pending_outpoints(const State& state);

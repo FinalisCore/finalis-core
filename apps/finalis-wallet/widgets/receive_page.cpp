@@ -1,11 +1,14 @@
 #include "receive_page.hpp"
 
+#include <QAbstractItemView>
 #include <QFont>
 #include <QHBoxLayout>
 #include <QGroupBox>
 #include <QLabel>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QTableWidget>
+#include <QHeaderView>
 #include <QVariant>
 #include <QVBoxLayout>
 
@@ -16,6 +19,19 @@ void configure_page_layout(QVBoxLayout* layout, int spacing = 12) {
   if (!layout) return;
   layout->setContentsMargins(14, 14, 14, 14);
   layout->setSpacing(spacing);
+}
+
+void configure_table(QTableWidget* table, const QStringList& headers) {
+  table->setColumnCount(headers.size());
+  table->setHorizontalHeaderLabels(headers);
+  table->setSelectionBehavior(QAbstractItemView::SelectRows);
+  table->setSelectionMode(QAbstractItemView::SingleSelection);
+  table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+  table->setAlternatingRowColors(true);
+  table->setSortingEnabled(false);
+  table->verticalHeader()->setVisible(false);
+  table->horizontalHeader()->setStretchLastSection(true);
+  table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
 }
 
 }  // namespace
@@ -89,6 +105,15 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   confidential_address_label_->setFont(confidential_font);
   confidential_layout->addWidget(confidential_address_label_);
 
+  auto* confidential_account_actions = new QHBoxLayout();
+  confidential_account_actions->setSpacing(8);
+  create_confidential_account_button_ = new QPushButton("New Confidential Account", confidential_box);
+  import_confidential_account_button_ = new QPushButton("Import Confidential Account", confidential_box);
+  confidential_account_actions->addWidget(create_confidential_account_button_);
+  confidential_account_actions->addWidget(import_confidential_account_button_);
+  confidential_account_actions->addStretch(1);
+  confidential_layout->addLayout(confidential_account_actions);
+
   auto* confidential_request_title = new QLabel("Shareable confidential request", confidential_box);
   confidential_request_title->setProperty("role", QVariant(QStringLiteral("muted")));
   confidential_layout->addWidget(confidential_request_title);
@@ -99,14 +124,34 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   confidential_request_label_->setFont(confidential_font);
   confidential_layout->addWidget(confidential_request_label_);
 
+  confidential_request_summary_label_ = new QLabel("Outstanding requests: 0 · Consumed: 0", confidential_box);
+  confidential_request_summary_label_->setProperty("role", QVariant(QStringLiteral("muted")));
+  confidential_layout->addWidget(confidential_request_summary_label_);
+
+  confidential_requests_table_ = new QTableWidget(confidential_box);
+  confidential_requests_table_->setMinimumHeight(140);
+  configure_table(confidential_requests_table_, {"Status", "Account", "Request ID", "Scan Tag", "One-Time Key"});
+  confidential_layout->addWidget(confidential_requests_table_);
+
   auto* confidential_actions = new QHBoxLayout();
   confidential_actions->setSpacing(8);
   generate_confidential_request_button_ = new QPushButton("Generate Request", confidential_box);
   copy_confidential_request_button_ = new QPushButton("Copy Request", confidential_box);
+  import_confidential_tx_button_ = new QPushButton("Import Received Tx", confidential_box);
   confidential_actions->addWidget(generate_confidential_request_button_);
   confidential_actions->addWidget(copy_confidential_request_button_);
+  confidential_actions->addWidget(import_confidential_tx_button_);
   confidential_actions->addStretch(1);
   confidential_layout->addLayout(confidential_actions);
+
+  confidential_coin_summary_label_ = new QLabel("Imported confidential coins: 0", confidential_box);
+  confidential_coin_summary_label_->setProperty("role", QVariant(QStringLiteral("muted")));
+  confidential_layout->addWidget(confidential_coin_summary_label_);
+
+  confidential_coins_table_ = new QTableWidget(confidential_box);
+  confidential_coins_table_->setMinimumHeight(160);
+  configure_table(confidential_coins_table_, {"Status", "Amount", "Outpoint", "Account", "One-Time Key"});
+  confidential_layout->addWidget(confidential_coins_table_);
 
   confidential_note_label_ = new QLabel(
       "Confidential receive requires a configured stealth account and encrypted local recovery material. "

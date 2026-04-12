@@ -54,7 +54,10 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <openssl/evp.h>
+
 #include "address/address.hpp"
+#include "codec/bytes.hpp"
 #include "history_merge.hpp"
 #include "refresh_gate.hpp"
 #include "common/network.hpp"
@@ -69,6 +72,7 @@
 #include "privacy/mint_client.hpp"
 #include "privacy/mint_scripts.hpp"
 #include "wallet/confidential_builder.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 
@@ -301,36 +305,179 @@ QString wallet_send_mode_recipient_label(WalletSendMode mode) {
   return "Recipient";
 }
 
-std::string encode_confidential_request_uri(const wallet::ConfidentialRecipient& recipient) {
+constexpr std::uint32_t kConfidentialRecoveryMemoVersion = 1;
+constexpr std::size_t kWalletMemoTagLen = 16;
+
+struct ParsedConfidentialRecipient {
+  wallet::ConfidentialRecipient recipient;
+  std::optional<Hash32> memo_key;
+};
+
+std::string encode_confidential_request_uri(const wallet::ConfidentialRecipient& recipient,
+                                            const std::optional<Hash32>& memo_key = std::nullopt) {
   Bytes payload;
   payload.insert(payload.end(), recipient.one_time_pubkey.begin(), recipient.one_time_pubkey.end());
   payload.insert(payload.end(), recipient.ephemeral_pubkey.begin(), recipient.ephemeral_pubkey.end());
   payload.push_back(recipient.scan_tag.value);
+  if (memo_key.has_value()) payload.insert(payload.end(), memo_key->begin(), memo_key->end());
   return "scconfreq1:" + finalis::hex_encode(payload);
 }
 
-std::optional<wallet::ConfidentialRecipient> parse_confidential_request_uri(const QString& text, QString* err) {
-  const QString trimmed = text.trimmed();
-  const QString prefix = "scconfreq1:";
-  if (!trimmed.startsWith(prefix, Qt::CaseInsensitive)) return std::nullopt;
-  auto payload = decode_hex_bytes_string(trimmed.mid(prefix.size()).trimmed().toStdString());
-  if (!payload || payload->size() != 67) {
-    if (err) *err = "Confidential request URI payload is malformed.";
+std::string encode_local_stealth_address(const PubKey33& view_pubkey, const PubKey33& spend_pubkey) {
+  Bytes payload;
+  payload.insert(payload.end(), view_pubkey.begin(), view_pubkey.end());
+  payload.insert(payload.end(), spend_pubkey.begin(), spend_pubkey.end());
+  return "scstealth1:" + finalis::hex_encode(payload);
+}
+
+Bytes confidential_memo_nonce(const PubKey33& ephemeral_pubkey) {
+  Bytes preimage(ephemeral_pubkey.begin(), ephemeral_pubkey.end());
+  preimage.push_back(0x6d);
+  preimage.push_back(0x65);
+  preimage.push_back(0x6d);
+  preimage.push_back(0x6f);
+  const auto digest = crypto::sha256d(preimage);
+  return Bytes(digest.begin(), digest.begin() + 12);
+}
+
+bool aes_gcm_encrypt_wallet_memo(const Bytes& key32, const Bytes& nonce12, const Bytes& plaintext, Bytes* out_cipher_and_tag) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return false;
+  int ok = EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce12.size()), nullptr);
+  ok = ok && EVP_EncryptInit_ex(ctx, nullptr, nullptr, key32.data(), nonce12.data());
+  if (!ok) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  Bytes cipher(plaintext.size() + kWalletMemoTagLen, 0);
+  int out_len = 0;
+  int total = 0;
+  if (EVP_EncryptUpdate(ctx, cipher.data(), &out_len, plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  if (EVP_EncryptFinal_ex(ctx, cipher.data() + total, &out_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kWalletMemoTagLen), cipher.data() + total) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += static_cast<int>(kWalletMemoTagLen);
+  cipher.resize(static_cast<std::size_t>(total));
+  EVP_CIPHER_CTX_free(ctx);
+  *out_cipher_and_tag = std::move(cipher);
+  return true;
+}
+
+bool aes_gcm_decrypt_wallet_memo(const Bytes& key32, const Bytes& nonce12, const Bytes& cipher_and_tag, Bytes* out_plaintext) {
+  if (cipher_and_tag.size() < kWalletMemoTagLen) return false;
+  const std::size_t clen = cipher_and_tag.size() - kWalletMemoTagLen;
+  const std::uint8_t* tag = cipher_and_tag.data() + clen;
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return false;
+  int ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce12.size()), nullptr);
+  ok = ok && EVP_DecryptInit_ex(ctx, nullptr, nullptr, key32.data(), nonce12.data());
+  if (!ok) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  Bytes plain(clen, 0);
+  int out_len = 0;
+  int total = 0;
+  if (EVP_DecryptUpdate(ctx, plain.data(), &out_len, cipher_and_tag.data(), static_cast<int>(clen)) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kWalletMemoTagLen), const_cast<std::uint8_t*>(tag)) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  if (EVP_DecryptFinal_ex(ctx, plain.data() + total, &out_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return false;
+  }
+  total += out_len;
+  plain.resize(static_cast<std::size_t>(total));
+  EVP_CIPHER_CTX_free(ctx);
+  *out_plaintext = std::move(plain);
+  return true;
+}
+
+std::optional<Bytes> encrypt_confidential_recovery_memo(std::uint64_t amount, const crypto::Blind32& blind,
+                                                        const Hash32& memo_key, const PubKey33& ephemeral_pubkey) {
+  codec::ByteWriter w;
+  w.u32le(kConfidentialRecoveryMemoVersion);
+  w.u64le(amount);
+  w.bytes_fixed(blind.bytes);
+  const Bytes plain = w.take();
+  Bytes cipher;
+  const Bytes key(memo_key.begin(), memo_key.end());
+  if (!aes_gcm_encrypt_wallet_memo(key, confidential_memo_nonce(ephemeral_pubkey), plain, &cipher)) return std::nullopt;
+  return cipher;
+}
+
+struct ConfidentialRecoveryPayload {
+  std::uint64_t amount{0};
+  crypto::Blind32 blind{};
+};
+
+std::optional<ConfidentialRecoveryPayload> decrypt_confidential_recovery_memo(const Bytes& cipher_and_tag, const Hash32& memo_key,
+                                                                              const PubKey33& ephemeral_pubkey) {
+  Bytes plain;
+  const Bytes key(memo_key.begin(), memo_key.end());
+  if (!aes_gcm_decrypt_wallet_memo(key, confidential_memo_nonce(ephemeral_pubkey), cipher_and_tag, &plain)) {
     return std::nullopt;
   }
-  wallet::ConfidentialRecipient out;
-  std::copy(payload->begin(), payload->begin() + 33, out.one_time_pubkey.begin());
-  std::copy(payload->begin() + 33, payload->begin() + 66, out.ephemeral_pubkey.begin());
-  out.scan_tag = crypto::ScanTag{(*payload)[66]};
-  if (!crypto::compressed_pubkey33_is_canonical(out.one_time_pubkey) ||
-      !crypto::compressed_pubkey33_is_canonical(out.ephemeral_pubkey)) {
-    if (err) *err = "Confidential request URI contains non-canonical pubkeys.";
+  ConfidentialRecoveryPayload out;
+  if (!codec::parse_exact(plain, [&](codec::ByteReader& r) {
+        auto version = r.u32le();
+        auto amount = r.u64le();
+        auto blind = r.bytes_fixed<32>();
+        if (!version || !amount || !blind) return false;
+        if (*version != kConfidentialRecoveryMemoVersion) return false;
+        out.amount = *amount;
+        std::copy(blind->begin(), blind->end(), out.blind.bytes.begin());
+        return true;
+      })) {
     return std::nullopt;
   }
   return out;
 }
 
-std::optional<wallet::ConfidentialRecipient> parse_confidential_recipient_descriptor(const QString& text, QString* err) {
+std::optional<ParsedConfidentialRecipient> parse_confidential_request_uri(const QString& text, QString* err) {
+  const QString trimmed = text.trimmed();
+  const QString prefix = "scconfreq1:";
+  if (!trimmed.startsWith(prefix, Qt::CaseInsensitive)) return std::nullopt;
+  auto payload = decode_hex_bytes_string(trimmed.mid(prefix.size()).trimmed().toStdString());
+  if (!payload || (payload->size() != 67 && payload->size() != 99)) {
+    if (err) *err = "Confidential request URI payload is malformed.";
+    return std::nullopt;
+  }
+  ParsedConfidentialRecipient out;
+  std::copy(payload->begin(), payload->begin() + 33, out.recipient.one_time_pubkey.begin());
+  std::copy(payload->begin() + 33, payload->begin() + 66, out.recipient.ephemeral_pubkey.begin());
+  out.recipient.scan_tag = crypto::ScanTag{(*payload)[66]};
+  if (!crypto::compressed_pubkey33_is_canonical(out.recipient.one_time_pubkey) ||
+      !crypto::compressed_pubkey33_is_canonical(out.recipient.ephemeral_pubkey)) {
+    if (err) *err = "Confidential request URI contains non-canonical pubkeys.";
+    return std::nullopt;
+  }
+  if (payload->size() == 99) {
+    Hash32 memo_key{};
+    std::copy(payload->begin() + 67, payload->begin() + 99, memo_key.begin());
+    out.memo_key = memo_key;
+  }
+  return out;
+}
+
+std::optional<ParsedConfidentialRecipient> parse_confidential_recipient_descriptor(const QString& text, QString* err) {
   if (auto uri = parse_confidential_request_uri(text, err); uri.has_value()) return uri;
   const QString trimmed = text.trimmed();
   const QString prefix = "ctxv2:";
@@ -367,11 +514,15 @@ std::optional<wallet::ConfidentialRecipient> parse_confidential_recipient_descri
     }
     memo = std::move(*memo_bytes);
   }
-  return wallet::ConfidentialRecipient{
-      .one_time_pubkey = *one_time_pubkey,
-      .ephemeral_pubkey = *ephemeral_pubkey,
-      .scan_tag = crypto::ScanTag{(*scan_tag_bytes)[0]},
-      .memo = std::move(memo),
+  return ParsedConfidentialRecipient{
+      .recipient =
+          wallet::ConfidentialRecipient{
+              .one_time_pubkey = *one_time_pubkey,
+              .ephemeral_pubkey = *ephemeral_pubkey,
+              .scan_tag = crypto::ScanTag{(*scan_tag_bytes)[0]},
+              .memo = std::move(memo),
+          },
+      .memo_key = std::nullopt,
   };
 }
 
@@ -1142,12 +1293,19 @@ void WalletWindow::build_ui() {
   receive_address_label_ = receive_page_->address_label();
   receive_confidential_address_label_ = receive_page_->confidential_address_label();
   receive_confidential_request_label_ = receive_page_->confidential_request_label();
+  receive_confidential_request_summary_label_ = receive_page_->confidential_request_summary_label();
+  receive_confidential_requests_table_ = receive_page_->confidential_requests_table();
+  receive_confidential_coin_summary_label_ = receive_page_->confidential_coin_summary_label();
+  receive_confidential_coins_table_ = receive_page_->confidential_coins_table();
   receive_copy_status_label_ = receive_page_->copy_status_label();
   receive_finalized_note_label_ = receive_page_->finalized_note_label();
   receive_confidential_note_label_ = receive_page_->confidential_note_label();
   auto* copy_address_button = receive_page_->copy_button();
+  auto* create_confidential_account_button = receive_page_->create_confidential_account_button();
+  auto* import_confidential_account_button = receive_page_->import_confidential_account_button();
   auto* generate_confidential_request_button = receive_page_->generate_confidential_request_button();
   auto* copy_confidential_request_button = receive_page_->copy_confidential_request_button();
+  auto* import_confidential_tx_button = receive_page_->import_confidential_tx_button();
 
   history_filter_combo_ = activity_page_->filter_combo();
   history_detail_button_ = activity_page_->detail_button();
@@ -1156,6 +1314,7 @@ void WalletWindow::build_ui() {
   activity_pending_count_label_ = activity_page_->pending_count_label();
   activity_local_count_label_ = activity_page_->local_count_label();
   activity_mint_count_label_ = activity_page_->mint_count_label();
+  activity_confidential_count_label_ = activity_page_->confidential_count_label();
   activity_detail_title_label_ = activity_page_->detail_title_label();
   activity_detail_view_ = activity_page_->detail_view();
 
@@ -1239,6 +1398,10 @@ void WalletWindow::build_ui() {
     if (receive_copy_status_label_) receive_copy_status_label_->setText("Address copied to clipboard.");
     statusBar()->showMessage("Receive address copied to clipboard.", 3000);
   });
+  connect(create_confidential_account_button, &QPushButton::clicked, this,
+          [this]() { create_confidential_account(); });
+  connect(import_confidential_account_button, &QPushButton::clicked, this,
+          [this]() { import_confidential_account(); });
   connect(generate_confidential_request_button, &QPushButton::clicked, this,
           [this]() { generate_confidential_request(); });
   connect(copy_confidential_request_button, &QPushButton::clicked, this, [this]() {
@@ -1248,6 +1411,7 @@ void WalletWindow::build_ui() {
     QApplication::clipboard()->setText(value);
     statusBar()->showMessage("Confidential request copied to clipboard.", 3000);
   });
+  connect(import_confidential_tx_button, &QPushButton::clicked, this, [this]() { import_received_confidential_tx(); });
   connect(overview_send_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(send_page_); });
   connect(overview_receive_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(receive_page_); });
   connect(overview_activity_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(activity_page_); });
@@ -1320,6 +1484,8 @@ void WalletWindow::build_ui() {
   install_copy_menu(mint_deposit_ref_label_, this);
   install_copy_menu(mint_redemption_label_, this);
   install_table_copy_menu(history_view_, this);
+  install_table_copy_menu(receive_confidential_requests_table_, this);
+  install_table_copy_menu(receive_confidential_coins_table_, this);
   install_table_copy_menu(mint_deposits_view_, this);
   install_table_copy_menu(mint_notes_view_, this);
   install_table_copy_menu(mint_redemptions_view_, this);
@@ -1698,6 +1864,7 @@ void WalletWindow::update_wallet_views() {
     if (header_tip_label_) header_tip_label_->setText("Finalized tip: unavailable");
     if (header_connection_label_) header_connection_label_->setText("Lightserver: unavailable");
     update_crosscheck_summary({});
+    render_confidential_receive_views();
     refresh_overview_activity_preview();
     update_validator_onboarding_view();
     return;
@@ -1765,6 +1932,7 @@ void WalletWindow::update_wallet_views() {
     send_review_button_->setEnabled(ready);
     send_button_->setEnabled(ready);
   }
+  render_confidential_receive_views();
   refresh_overview_activity_preview();
   update_validator_onboarding_view();
 }
@@ -2445,6 +2613,63 @@ void WalletWindow::render_history_view() {
   refresh_overview_activity_preview();
 }
 
+void WalletWindow::render_confidential_receive_views() {
+  if (!receive_confidential_requests_table_ || !receive_confidential_coins_table_) return;
+
+  receive_confidential_requests_table_->setSortingEnabled(false);
+  receive_confidential_requests_table_->setRowCount(0);
+  int outstanding_requests = 0;
+  int consumed_requests = 0;
+  for (const auto& request : confidential_request_views_) {
+    if (request.consumed) {
+      ++consumed_requests;
+    } else {
+      ++outstanding_requests;
+    }
+    const int row = receive_confidential_requests_table_->rowCount();
+    receive_confidential_requests_table_->insertRow(row);
+    receive_confidential_requests_table_->setItem(row, 0, new QTableWidgetItem(request.consumed ? "Consumed" : "Outstanding"));
+    receive_confidential_requests_table_->setItem(row, 1, new QTableWidgetItem(request.account_id));
+    receive_confidential_requests_table_->setItem(row, 2, new QTableWidgetItem(elide_middle(request.request_id, 10)));
+    receive_confidential_requests_table_->setItem(
+        row, 3, new QTableWidgetItem(QString("0x%1").arg(static_cast<unsigned int>(request.scan_tag), 2, 16, QChar('0'))));
+    receive_confidential_requests_table_->setItem(row, 4, new QTableWidgetItem(elide_middle(request.one_time_pubkey_hex, 10)));
+  }
+  if (receive_confidential_requests_table_->rowCount() == 0) {
+    receive_confidential_requests_table_->insertRow(0);
+    receive_confidential_requests_table_->setItem(0, 0, new QTableWidgetItem("No confidential requests"));
+  }
+  if (receive_confidential_request_summary_label_) {
+    receive_confidential_request_summary_label_->setText(
+        QString("Outstanding requests: %1 · Consumed: %2").arg(outstanding_requests).arg(consumed_requests));
+  }
+
+  receive_confidential_coins_table_->setSortingEnabled(false);
+  receive_confidential_coins_table_->setRowCount(0);
+  int active_coins = 0;
+  for (const auto& coin : confidential_coin_views_) {
+    if (!coin.spent) ++active_coins;
+    const int row = receive_confidential_coins_table_->rowCount();
+    receive_confidential_coins_table_->insertRow(row);
+    receive_confidential_coins_table_->setItem(row, 0, new QTableWidgetItem(coin.spent ? "Spent" : "Unspent"));
+    receive_confidential_coins_table_->setItem(row, 1, new QTableWidgetItem(format_coin_amount(coin.amount)));
+    receive_confidential_coins_table_->setItem(
+        row, 2, new QTableWidgetItem(QString("%1:%2").arg(elide_middle(coin.txid_hex, 10)).arg(coin.vout)));
+    receive_confidential_coins_table_->setItem(row, 3, new QTableWidgetItem(coin.account_id));
+    receive_confidential_coins_table_->setItem(row, 4, new QTableWidgetItem(elide_middle(coin.one_time_pubkey_hex, 10)));
+  }
+  if (receive_confidential_coins_table_->rowCount() == 0) {
+    receive_confidential_coins_table_->insertRow(0);
+    receive_confidential_coins_table_->setItem(0, 0, new QTableWidgetItem("No imported confidential coins"));
+  }
+  if (receive_confidential_coin_summary_label_) {
+    receive_confidential_coin_summary_label_->setText(
+        QString("Imported confidential coins: %1 · Unspent: %2")
+            .arg(static_cast<qulonglong>(confidential_coin_views_.size()))
+            .arg(active_coins));
+  }
+}
+
 void WalletWindow::refresh_overview_activity_preview() {
   auto* table = overview_page_ ? overview_page_->activity_preview_table() : nullptr;
   if (!table) return;
@@ -2622,6 +2847,8 @@ void WalletWindow::load_wallet_local_state() {
   local_sent_txids_.clear();
   local_history_lines_.clear();
   mint_notes_.clear();
+  confidential_request_views_.clear();
+  confidential_coin_views_.clear();
   confidential_receive_address_ = "not configured";
   if (receive_confidential_request_label_) receive_confidential_request_label_->setText("not generated");
   confidential_balance_units_ = 0;
@@ -2665,10 +2892,45 @@ void WalletWindow::load_wallet_local_state() {
     } else if (!state.confidential_accounts.empty()) {
       confidential_receive_address_ = QString::fromStdString(state.confidential_accounts.front().stealth_address);
     }
+    for (const auto& request : state.confidential_requests) {
+      confidential_request_views_.push_back(ConfidentialRequestView{
+          .request_id = QString::fromStdString(request.request_id),
+          .account_id = QString::fromStdString(request.account_id),
+          .one_time_pubkey_hex = QString::fromStdString(request.one_time_pubkey_hex),
+          .ephemeral_pubkey_hex = QString::fromStdString(request.ephemeral_pubkey_hex),
+          .scan_tag = request.scan_tag,
+          .consumed = request.consumed,
+      });
+    }
     for (const auto& coin : state.confidential_coins) {
+      confidential_coin_views_.push_back(ConfidentialCoinView{
+          .txid_hex = QString::fromStdString(coin.txid_hex),
+          .vout = coin.vout,
+          .account_id = QString::fromStdString(coin.account_id),
+          .amount = coin.amount,
+          .one_time_pubkey_hex = QString::fromStdString(coin.one_time_pubkey_hex),
+          .spent = coin.spent,
+      });
       if (coin.spent) continue;
       confidential_balance_units_ += coin.amount;
       ++confidential_coin_count_;
+    }
+    const auto request_it = std::find_if(state.confidential_requests.rbegin(), state.confidential_requests.rend(),
+                                         [](const auto& request) { return !request.consumed; });
+    if (request_it != state.confidential_requests.rend() && receive_confidential_request_label_) {
+      auto one_time_pubkey = decode_hex33_string(request_it->one_time_pubkey_hex);
+      auto ephemeral_pubkey = decode_hex33_string(request_it->ephemeral_pubkey_hex);
+      auto memo_key = decode_hex32_string(request_it->memo_key_hex);
+      if (one_time_pubkey && ephemeral_pubkey && memo_key) {
+        ConfidentialRecipient recipient{
+            .one_time_pubkey = *one_time_pubkey,
+            .ephemeral_pubkey = *ephemeral_pubkey,
+            .scan_tag = crypto::ScanTag{request_it->scan_tag},
+            .memo = {},
+        };
+        receive_confidential_request_label_->setText(
+            QString::fromStdString(encode_confidential_request_uri(recipient, *memo_key)));
+      }
     }
   } else if (wallet_ && wallet_->passphrase.empty()) {
     confidential_storage_locked_ = true;
@@ -2677,6 +2939,7 @@ void WalletWindow::load_wallet_local_state() {
     if (note.active) mint_notes_.push_back(MintNote{QString::fromStdString(note.note_ref), note.amount});
   }
   mark_refresh_state_changed();
+  render_confidential_receive_views();
   render_mint_state();
 }
 
@@ -3549,6 +3812,98 @@ void WalletWindow::unlock_confidential_state() {
   statusBar()->showMessage("Confidential local state unlocked.", 3000);
 }
 
+void WalletWindow::create_confidential_account() {
+  if (!ensure_wallet_loaded("Create Confidential Account")) return;
+  if (!store_.can_persist_confidential_secrets()) {
+    QMessageBox::warning(this, "Create Confidential Account",
+                         "Confidential accounts require an opened wallet with a non-empty passphrase.");
+    return;
+  }
+  bool ok = false;
+  const QString label = QInputDialog::getText(
+      this, "New Confidential Account", "Account label", QLineEdit::Normal, "Primary confidential account", &ok);
+  if (!ok) return;
+
+  const Hash32 view_secret = random_hash32();
+  const Hash32 spend_secret = random_hash32();
+  auto view_pubkey = crypto::secp256k1_pubkey_from_scalar(view_secret);
+  auto spend_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret);
+  if (!view_pubkey || !spend_pubkey) {
+    QMessageBox::warning(this, "Create Confidential Account", "Failed to derive confidential account pubkeys.");
+    return;
+  }
+
+  const Hash32 account_seed = random_hash32();
+  WalletStore::ConfidentialAccountRecord record{
+      .account_id = finalis::hex_encode32(account_seed),
+      .label = label.trimmed().isEmpty() ? "Confidential account" : label.trimmed().toStdString(),
+      .stealth_address = encode_local_stealth_address(*view_pubkey, *spend_pubkey),
+      .view_key_material_hex = finalis::hex_encode(Bytes(view_secret.begin(), view_secret.end())),
+      .spend_key_material_hex = finalis::hex_encode(Bytes(spend_secret.begin(), spend_secret.end())),
+      .active = true,
+  };
+  if (!store_.upsert_confidential_account(record) || !store_.set_confidential_primary_account_id(record.account_id)) {
+    QMessageBox::warning(this, "Create Confidential Account", "Failed to persist confidential account state.");
+    return;
+  }
+  load_wallet_local_state();
+  update_wallet_views();
+  append_local_event(QString("[confidential] created account %1")
+                         .arg(QString::fromStdString(record.label)));
+  statusBar()->showMessage("Confidential account created.", 3000);
+}
+
+void WalletWindow::import_confidential_account() {
+  if (!ensure_wallet_loaded("Import Confidential Account")) return;
+  if (!store_.can_persist_confidential_secrets()) {
+    QMessageBox::warning(this, "Import Confidential Account",
+                         "Confidential accounts require an opened wallet with a non-empty passphrase.");
+    return;
+  }
+  bool ok = false;
+  const QString label = QInputDialog::getText(
+      this, "Import Confidential Account", "Account label", QLineEdit::Normal, "Imported confidential account", &ok);
+  if (!ok) return;
+  const QString view_hex = QInputDialog::getText(
+      this, "Import Confidential Account", "View secret hex (32 bytes)", QLineEdit::Normal, {}, &ok);
+  if (!ok) return;
+  const QString spend_hex = QInputDialog::getText(
+      this, "Import Confidential Account", "Spend secret hex (32 bytes)", QLineEdit::Normal, {}, &ok);
+  if (!ok) return;
+
+  auto view_secret = decode_hex32_string(view_hex.trimmed().toStdString());
+  auto spend_secret = decode_hex32_string(spend_hex.trimmed().toStdString());
+  if (!view_secret || !spend_secret) {
+    QMessageBox::warning(this, "Import Confidential Account", "View and spend secrets must both be 32-byte hex values.");
+    return;
+  }
+  auto view_pubkey = crypto::secp256k1_pubkey_from_scalar(*view_secret);
+  auto spend_pubkey = crypto::secp256k1_pubkey_from_scalar(*spend_secret);
+  if (!view_pubkey || !spend_pubkey) {
+    QMessageBox::warning(this, "Import Confidential Account", "Failed to derive confidential account pubkeys.");
+    return;
+  }
+
+  Hash32 account_seed = random_hash32();
+  WalletStore::ConfidentialAccountRecord record{
+      .account_id = finalis::hex_encode32(account_seed),
+      .label = label.trimmed().isEmpty() ? "Imported confidential account" : label.trimmed().toStdString(),
+      .stealth_address = encode_local_stealth_address(*view_pubkey, *spend_pubkey),
+      .view_key_material_hex = view_hex.trimmed().toStdString(),
+      .spend_key_material_hex = spend_hex.trimmed().toStdString(),
+      .active = true,
+  };
+  if (!store_.upsert_confidential_account(record) || !store_.set_confidential_primary_account_id(record.account_id)) {
+    QMessageBox::warning(this, "Import Confidential Account", "Failed to persist confidential account state.");
+    return;
+  }
+  load_wallet_local_state();
+  update_wallet_views();
+  append_local_event(QString("[confidential] imported account %1")
+                         .arg(QString::fromStdString(record.label)));
+  statusBar()->showMessage("Confidential account imported.", 3000);
+}
+
 void WalletWindow::generate_confidential_request() {
   if (!ensure_wallet_loaded("Generate Confidential Request")) return;
   if (confidential_storage_locked_) {
@@ -3573,38 +3928,150 @@ void WalletWindow::generate_confidential_request() {
                          "No confidential account is configured locally yet.");
     return;
   }
-  auto view_key_material = decode_hex_bytes_string(account_it->view_key_material_hex);
-  if (!view_key_material || view_key_material->empty()) {
-    QMessageBox::warning(this, "Generate Confidential Request",
-                         "The primary confidential account is missing view key recovery material.");
+  const Hash32 spend_secret = random_hash32();
+  auto one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret);
+  if (!one_time_pubkey) {
+    QMessageBox::warning(this, "Generate Confidential Request", "Failed to derive a one-time confidential receive key.");
     return;
   }
+  const Hash32 memo_key = random_hash32();
   const Hash32 ephemeral_secret = random_hash32();
   auto ephemeral_pubkey = crypto::secp256k1_pubkey_from_scalar(ephemeral_secret);
   if (!ephemeral_pubkey) {
     QMessageBox::warning(this, "Generate Confidential Request", "Failed to derive an ephemeral request key.");
     return;
   }
-  Hash32 scan_tag_source = random_hash32();
-  const std::uint8_t scan_tag = scan_tag_source[0];
-  auto scanned = crypto::scan_stealth_output(*ephemeral_pubkey, scan_tag, *view_key_material);
-  if (!scanned || !scanned->mine) {
-    QMessageBox::warning(this, "Generate Confidential Request",
-                         "Failed to derive a local one-time confidential receive key.");
-    return;
-  }
+  const std::uint8_t scan_tag = random_hash32()[0];
   const ConfidentialRecipient recipient{
-      .one_time_pubkey = scanned->one_time_pubkey,
+      .one_time_pubkey = *one_time_pubkey,
       .ephemeral_pubkey = *ephemeral_pubkey,
       .scan_tag = crypto::ScanTag{scan_tag},
       .memo = {},
   };
-  const QString uri = QString::fromStdString(encode_confidential_request_uri(recipient));
+  const QString uri = QString::fromStdString(encode_confidential_request_uri(recipient, memo_key));
+  const QByteArray uri_utf8 = uri.toUtf8();
+  const Bytes uri_bytes(uri_utf8.begin(), uri_utf8.end());
+  WalletStore::ConfidentialRequestRecord request_record{
+      .request_id = finalis::hex_encode32(crypto::sha256d(uri_bytes)),
+      .account_id = account_it->account_id,
+      .one_time_pubkey_hex = finalis::hex_encode(Bytes(recipient.one_time_pubkey.begin(), recipient.one_time_pubkey.end())),
+      .ephemeral_pubkey_hex = finalis::hex_encode(Bytes(recipient.ephemeral_pubkey.begin(), recipient.ephemeral_pubkey.end())),
+      .scan_tag = recipient.scan_tag.value,
+      .spend_secret_hex = finalis::hex_encode(Bytes(spend_secret.begin(), spend_secret.end())),
+      .memo_key_hex = finalis::hex_encode(Bytes(memo_key.begin(), memo_key.end())),
+      .consumed = false,
+  };
+  if (!store_.upsert_confidential_request(request_record)) {
+    QMessageBox::warning(this, "Generate Confidential Request", "Failed to persist local confidential request state.");
+    return;
+  }
   if (receive_confidential_request_label_) receive_confidential_request_label_->setText(uri);
   QApplication::clipboard()->setText(uri);
   append_local_event(QString("[confidential] generated receive request for %1")
                          .arg(QString::fromStdString(account_it->label.empty() ? account_it->account_id : account_it->label)));
   statusBar()->showMessage("Confidential request generated and copied to clipboard.", 3000);
+}
+
+void WalletWindow::import_received_confidential_tx() {
+  if (!ensure_wallet_loaded("Import Received Confidential Tx")) return;
+  if (confidential_storage_locked_) {
+    QMessageBox::warning(this, "Import Received Confidential Tx", "Unlock confidential state first.");
+    return;
+  }
+  if (configured_lightserver_endpoints().isEmpty()) {
+    QMessageBox::warning(this, "Import Received Confidential Tx", "Configure at least one lightserver endpoint first.");
+    return;
+  }
+  WalletStore::State state;
+  if (!store_.load(&state)) {
+    QMessageBox::warning(this, "Import Received Confidential Tx", "Unable to load local confidential wallet state.");
+    return;
+  }
+  if (state.confidential_requests.empty()) {
+    QMessageBox::warning(this, "Import Received Confidential Tx",
+                         "No local confidential receive requests are available to match against.");
+    return;
+  }
+  bool ok = false;
+  const QString txid_text = QInputDialog::getText(this, "Import Received Confidential Tx", "Finalized txid hex",
+                                                  QLineEdit::Normal, {}, &ok);
+  if (!ok || txid_text.trimmed().isEmpty()) return;
+  auto txid = decode_hex32_string(txid_text.trimmed().toStdString());
+  if (!txid) {
+    QMessageBox::warning(this, "Import Received Confidential Tx", "Txid must be exactly 32 bytes in hex.");
+    return;
+  }
+
+  QString used_endpoint;
+  std::string rpc_err;
+  std::optional<lightserver::TxStatusView> tx_status;
+  std::optional<lightserver::TxView> tx_view;
+  for (const QString& endpoint : ordered_lightserver_endpoints()) {
+    tx_status = lightserver::rpc_get_tx_status(endpoint.toStdString(), *txid, &rpc_err);
+    if (!tx_status || !tx_status->finalized) continue;
+    tx_view = lightserver::rpc_get_tx(endpoint.toStdString(), *txid, &rpc_err);
+    if (!tx_view) continue;
+    used_endpoint = endpoint;
+    break;
+  }
+  if (!tx_status || !tx_status->finalized || !tx_view) {
+    QMessageBox::warning(this, "Import Received Confidential Tx",
+                         rpc_err.empty() ? "Unable to fetch a finalized transaction from the configured lightservers."
+                                         : QString::fromStdString(rpc_err));
+    return;
+  }
+  auto any_tx = parse_any_tx(tx_view->tx_bytes);
+  if (!any_tx || !std::holds_alternative<TxV2>(*any_tx)) {
+    QMessageBox::warning(this, "Import Received Confidential Tx", "Transaction is not a supported TxV2 record.");
+    return;
+  }
+  const auto& tx = std::get<TxV2>(*any_tx);
+  bool imported_any = false;
+  for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
+    const auto& output = tx.outputs[i];
+    if (output.kind != TxOutputKind::CONFIDENTIAL) continue;
+    const auto& confidential = std::get<ConfidentialTxOutV2>(output.body);
+    const std::string one_time_hex = finalis::hex_encode(Bytes(confidential.one_time_pubkey.begin(), confidential.one_time_pubkey.end()));
+    const std::string ephemeral_hex = finalis::hex_encode(Bytes(confidential.ephemeral_pubkey.begin(), confidential.ephemeral_pubkey.end()));
+    const auto request_it = std::find_if(
+        state.confidential_requests.begin(), state.confidential_requests.end(),
+        [&](const WalletStore::ConfidentialRequestRecord& req) {
+          return !req.consumed && req.one_time_pubkey_hex == one_time_hex &&
+                 req.ephemeral_pubkey_hex == ephemeral_hex && req.scan_tag == confidential.scan_tag.value;
+        });
+    if (request_it == state.confidential_requests.end()) continue;
+    auto memo_key = decode_hex32_string(request_it->memo_key_hex);
+    auto spend_secret = decode_hex32_string(request_it->spend_secret_hex);
+    if (!memo_key || !spend_secret) continue;
+    auto recovery = decrypt_confidential_recovery_memo(confidential.memo, *memo_key, confidential.ephemeral_pubkey);
+    if (!recovery) continue;
+    WalletStore::ConfidentialCoinRecord coin{
+        .txid_hex = hex_encode32(*txid),
+        .vout = static_cast<std::uint32_t>(i),
+        .account_id = request_it->account_id,
+        .amount = recovery->amount,
+        .value_commitment_hex = finalis::hex_encode(Bytes(confidential.value_commitment.bytes.begin(), confidential.value_commitment.bytes.end())),
+        .one_time_pubkey_hex = one_time_hex,
+        .ephemeral_pubkey_hex = ephemeral_hex,
+        .spend_secret_hex = request_it->spend_secret_hex,
+        .blinding_factor_hex = finalis::hex_encode(Bytes(recovery->blind.bytes.begin(), recovery->blind.bytes.end())),
+        .spent = false,
+    };
+    if (!store_.upsert_confidential_coin(coin)) continue;
+    (void)store_.set_confidential_request_consumed(request_it->request_id, true);
+    imported_any = true;
+  }
+  if (!imported_any) {
+    QMessageBox::warning(this, "Import Received Confidential Tx",
+                         "No matching confidential output for any local receive request was found in that finalized TxV2.");
+    return;
+  }
+  load_wallet_local_state();
+  update_wallet_views();
+  append_local_event(QString("[confidential] imported received output from %1 via %2")
+                         .arg(elide_middle(txid_text.trimmed(), 12))
+                         .arg(used_endpoint.isEmpty() ? "lightserver" : display_lightserver_endpoint(used_endpoint)));
+  statusBar()->showMessage("Confidential output imported.", 3000);
 }
 
 void WalletWindow::import_confidential_request() {
@@ -3626,7 +4093,7 @@ void WalletWindow::import_confidential_request() {
   }
   const QString normalized = input.trimmed().startsWith("scconfreq1:", Qt::CaseInsensitive)
                                  ? input.trimmed()
-                                 : QString::fromStdString(encode_confidential_request_uri(*recipient));
+                                 : QString::fromStdString(encode_confidential_request_uri(recipient->recipient, recipient->memo_key));
   send_address_edit_->setText(normalized);
   tabs_->setCurrentWidget(send_page_);
   show_send_inline_status("Confidential request imported. Review before sending.");
@@ -3828,7 +4295,6 @@ void WalletWindow::validate_send_form() {
     send_review_note_label_->setText(note);
     show_send_inline_status("Review ready");
     if (send_review_warning_label_) send_review_warning_label_->hide();
-    (void)recipient;
     return;
   }
 
@@ -4078,8 +4544,8 @@ void WalletWindow::submit_send() {
     for (const auto& [op, _] : plan->selected_prevs) reserved_inputs.push_back(op);
   } else if (mode == WalletSendMode::TransparentToConfidential) {
     QString recipient_err;
-    auto recipient = parse_confidential_recipient_descriptor(destination, &recipient_err);
-    if (!recipient) {
+    auto parsed_recipient = parse_confidential_recipient_descriptor(destination, &recipient_err);
+    if (!parsed_recipient) {
       QMessageBox::warning(this, "Send", recipient_err);
       return;
     }
@@ -4135,7 +4601,18 @@ void WalletWindow::submit_send() {
         .amount = *amount_units,
         .value_blind = crypto::Blind32{random_hash32()},
     };
-    auto confidential_out = build_confidential_output(*recipient, secrets, random_hash32(), &err);
+    auto recipient = parsed_recipient->recipient;
+    if (parsed_recipient->memo_key.has_value()) {
+      auto recovery_memo =
+          encrypt_confidential_recovery_memo(*amount_units, secrets.value_blind, *parsed_recipient->memo_key,
+                                             recipient.ephemeral_pubkey);
+      if (!recovery_memo) {
+        QMessageBox::warning(this, "Send", "Failed to encrypt confidential recovery memo.");
+        return;
+      }
+      recipient.memo = *recovery_memo;
+    }
+    auto confidential_out = build_confidential_output(recipient, secrets, random_hash32(), &err);
     if (!confidential_out) {
       QMessageBox::warning(this, "Send", QString::fromStdString(err));
       return;
@@ -4361,6 +4838,20 @@ void WalletWindow::update_selected_history_detail() {
                  line));
     return;
   }
+  if (ref.source == HistoryRowRef::Source::Confidential) {
+    if (static_cast<std::size_t>(ref.index) >= confidential_coin_views_.size()) return;
+    const auto& coin = confidential_coin_views_[static_cast<std::size_t>(ref.index)];
+    activity_detail_title_label_->setText(QString("%1 · Confidential Coin").arg(coin.spent ? "Spent" : "Finalized"));
+    activity_detail_view_->setPlainText(
+        QString("Status: %1\nCategory: Confidential Coin\nAmount: %2\nOutpoint: %3:%4\nAccount: %5\nOne-time key: %6")
+            .arg(coin.spent ? "Spent" : "Unspent",
+                 format_coin_amount(coin.amount),
+                 coin.txid_hex,
+                 QString::number(coin.vout),
+                 coin.account_id.isEmpty() ? "-" : coin.account_id,
+                 coin.one_time_pubkey_hex));
+    return;
+  }
   if (static_cast<std::size_t>(ref.index) >= mint_records_.size()) return;
   const auto& rec = mint_records_[static_cast<std::size_t>(ref.index)];
   activity_detail_title_label_->setText(QString("%1 · %2").arg(title_case_status(rec.status), display_mint_kind(rec.kind)));
@@ -4382,6 +4873,7 @@ void WalletWindow::refresh_history_table() {
   int pending_count = 0;
   int local_count = 0;
   int mint_count = 0;
+  int confidential_count = 0;
   struct HistoryDisplayRow {
     QString type;
     QString status;
@@ -4402,11 +4894,13 @@ void WalletWindow::refresh_history_table() {
     if (filter == "On-Chain" && source != HistoryRowRef::Source::Chain) return;
     if (filter == "Local" && source != HistoryRowRef::Source::Local) return;
     if (filter == "Mint" && source != HistoryRowRef::Source::Mint) return;
+    if (filter == "Confidential" && source != HistoryRowRef::Source::Confidential) return;
     if (filter == "Pending" && status.trimmed().toUpper() != "PENDING") return;
     if (status.trimmed().toUpper() == "FINALIZED") ++finalized_count;
     if (status.trimmed().toUpper() == "PENDING") ++pending_count;
     if (source == HistoryRowRef::Source::Local) ++local_count;
     if (source == HistoryRowRef::Source::Mint) ++mint_count;
+    if (source == HistoryRowRef::Source::Confidential) ++confidential_count;
     bool height_ok = false;
     const qulonglong numeric_height = height_or_state.toULongLong(&height_ok);
     rows.push_back(HistoryDisplayRow{
@@ -4448,6 +4942,13 @@ void WalletWindow::refresh_history_table() {
              elide_middle(rec.reference, 10), rec.height_or_state.isEmpty() ? "-" : rec.height_or_state,
              HistoryRowRef::Source::Mint, static_cast<int>(i), bucket);
   }
+  for (std::size_t i = 0; i < confidential_coin_views_.size(); ++i) {
+    const auto& rec = confidential_coin_views_[i];
+    push_row("Confidential Coin", "FINALIZED", format_coin_amount(rec.amount),
+             QString("%1:%2").arg(elide_middle(rec.txid_hex, 10)).arg(rec.vout),
+             rec.spent ? "spent" : "unspent",
+             HistoryRowRef::Source::Confidential, static_cast<int>(i), rec.spent ? 4 : 3);
+  }
   std::stable_sort(rows.begin(), rows.end(), [](const HistoryDisplayRow& a, const HistoryDisplayRow& b) {
     if (a.bucket != b.bucket) return a.bucket < b.bucket;
     if (a.numeric_height_ok != b.numeric_height_ok) return a.numeric_height_ok > b.numeric_height_ok;
@@ -4482,6 +4983,7 @@ void WalletWindow::refresh_history_table() {
     if (filter == "On-Chain") message = "No on-chain records yet";
     else if (filter == "Local") message = "No local activity records yet";
     else if (filter == "Mint") message = "No mint records yet";
+    else if (filter == "Confidential") message = "No confidential coin records yet";
     else if (filter == "Pending") message = "No pending records";
     auto* item = new QTableWidgetItem(message);
     item->setData(Qt::UserRole, -1);
@@ -4494,6 +4996,9 @@ void WalletWindow::refresh_history_table() {
   if (activity_pending_count_label_) activity_pending_count_label_->setText(QString("Pending: %1").arg(pending_count));
   if (activity_local_count_label_) activity_local_count_label_->setText(QString("Local: %1").arg(local_count));
   if (activity_mint_count_label_) activity_mint_count_label_->setText(QString("Mint: %1").arg(mint_count));
+  if (activity_confidential_count_label_) {
+    activity_confidential_count_label_->setText(QString("Confidential: %1").arg(confidential_count));
+  }
   update_selected_history_detail();
 }
 

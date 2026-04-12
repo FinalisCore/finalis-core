@@ -98,9 +98,27 @@ class WalletWindow final : public QMainWindow {
   };
 
   struct HistoryRowRef {
-    enum class Source { Chain, Mint, Local };
+    enum class Source { Chain, Mint, Local, Confidential };
     Source source{Source::Chain};
     int index{-1};
+  };
+
+  struct ConfidentialRequestView {
+    QString request_id;
+    QString account_id;
+    QString one_time_pubkey_hex;
+    QString ephemeral_pubkey_hex;
+    std::uint8_t scan_tag{0};
+    bool consumed{false};
+  };
+
+  struct ConfidentialCoinView {
+    QString txid_hex;
+    std::uint32_t vout{0};
+    QString account_id;
+    std::uint64_t amount{0};
+    QString one_time_pubkey_hex;
+    bool spent{false};
   };
 
   struct EndpointRuntimeState {
@@ -190,6 +208,7 @@ class WalletWindow final : public QMainWindow {
   std::optional<lightserver::BroadcastResult> broadcast_tx_with_failover(const Bytes& tx_bytes, std::string* err,
                                                                          QString* used_endpoint = nullptr);
   void render_history_view();
+  void render_confidential_receive_views();
   void refresh_overview_activity_preview();
   void update_selected_history_detail();
   void render_mint_state();
@@ -205,7 +224,10 @@ class WalletWindow final : public QMainWindow {
   void open_wallet();
   void import_wallet();
   void unlock_confidential_state();
+  void create_confidential_account();
+  void import_confidential_account();
   void generate_confidential_request();
+  void import_received_confidential_tx();
   void import_confidential_request();
   void export_wallet_secret();
   void show_about();
@@ -266,6 +288,10 @@ class WalletWindow final : public QMainWindow {
   QLabel* receive_finalized_note_label_{nullptr};
   QLabel* receive_confidential_address_label_{nullptr};
   QLabel* receive_confidential_request_label_{nullptr};
+  QLabel* receive_confidential_request_summary_label_{nullptr};
+  QTableWidget* receive_confidential_requests_table_{nullptr};
+  QLabel* receive_confidential_coin_summary_label_{nullptr};
+  QTableWidget* receive_confidential_coins_table_{nullptr};
   QLabel* receive_confidential_note_label_{nullptr};
   QComboBox* history_filter_combo_{nullptr};
   QTableWidget* history_view_{nullptr};
@@ -294,6 +320,7 @@ class WalletWindow final : public QMainWindow {
   QLabel* activity_pending_count_label_{nullptr};
   QLabel* activity_local_count_label_{nullptr};
   QLabel* activity_mint_count_label_{nullptr};
+  QLabel* activity_confidential_count_label_{nullptr};
   QLabel* activity_detail_title_label_{nullptr};
   QTextEdit* activity_detail_view_{nullptr};
 
@@ -367,6 +394,8 @@ class WalletWindow final : public QMainWindow {
   std::vector<MintNote> mint_notes_;
   std::vector<ChainRecord> chain_records_;
   std::vector<MintRecord> mint_records_;
+  std::vector<ConfidentialRequestView> confidential_request_views_;
+  std::vector<ConfidentialCoinView> confidential_coin_views_;
   std::vector<HistoryRowRef> history_row_refs_;
   QString current_chain_name_;
   QString current_transition_hash_;

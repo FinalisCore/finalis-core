@@ -44,6 +44,7 @@ std::string key_confidential_coin(const std::string& txid_hex, std::uint32_t vou
   std::snprintf(buf, sizeof(buf), "%08x", vout);
   return "CCOIN:" + txid_hex + ":" + buf;
 }
+std::string key_confidential_request(const std::string& request_id) { return "CREQ:" + request_id; }
 
 bool derive_key_pbkdf2(const std::string& passphrase, const Bytes& salt, std::uint32_t iterations, Bytes* out32) {
   out32->assign(32, 0);
@@ -298,6 +299,52 @@ std::optional<WalletStore::ConfidentialCoinRecord> parse_confidential_coin_plain
   return out;
 }
 
+Bytes serialize_confidential_request_plain(const WalletStore::ConfidentialRequestRecord& record) {
+  codec::ByteWriter w;
+  w.u32le(kConfidentialWalletRecordVersion);
+  w.varbytes(to_bytes(record.request_id));
+  w.varbytes(to_bytes(record.account_id));
+  w.varbytes(to_bytes(record.one_time_pubkey_hex));
+  w.varbytes(to_bytes(record.ephemeral_pubkey_hex));
+  w.u8(record.scan_tag);
+  w.varbytes(to_bytes(record.spend_secret_hex));
+  w.varbytes(to_bytes(record.memo_key_hex));
+  w.u8(record.consumed ? 1 : 0);
+  return w.take();
+}
+
+std::optional<WalletStore::ConfidentialRequestRecord> parse_confidential_request_plain(const Bytes& value) {
+  WalletStore::ConfidentialRequestRecord out;
+  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
+        auto version = r.u32le();
+        auto request_id = r.varbytes();
+        auto account_id = r.varbytes();
+        auto one_time_pubkey_hex = r.varbytes();
+        auto ephemeral_pubkey_hex = r.varbytes();
+        auto scan_tag = r.u8();
+        auto spend_secret_hex = r.varbytes();
+        auto memo_key_hex = r.varbytes();
+        auto consumed = r.u8();
+        if (!version || !request_id || !account_id || !one_time_pubkey_hex || !ephemeral_pubkey_hex || !scan_tag ||
+            !spend_secret_hex || !memo_key_hex || !consumed) {
+          return false;
+        }
+        if (*version != kConfidentialWalletRecordVersion) return false;
+        out.request_id = from_bytes(*request_id);
+        out.account_id = from_bytes(*account_id);
+        out.one_time_pubkey_hex = from_bytes(*one_time_pubkey_hex);
+        out.ephemeral_pubkey_hex = from_bytes(*ephemeral_pubkey_hex);
+        out.scan_tag = *scan_tag;
+        out.spend_secret_hex = from_bytes(*spend_secret_hex);
+        out.memo_key_hex = from_bytes(*memo_key_hex);
+        out.consumed = (*consumed != 0);
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
 Bytes encrypt_secret_payload(const std::string& passphrase, const Bytes& plain) {
   if (passphrase.empty()) return {};
   Bytes salt(kWalletSaltLen, 0);
@@ -356,6 +403,7 @@ bool WalletStore::load(State* out) const {
   out->history_cursor_txid.reset();
   out->confidential_accounts.clear();
   out->confidential_coins.clear();
+  out->confidential_requests.clear();
   out->confidential_primary_account_id.reset();
 
   for (const auto& [key, _] : db_.scan_prefix("SENT:")) out->sent_txids.push_back(key.substr(5));
@@ -418,6 +466,16 @@ bool WalletStore::load(State* out) const {
     if (a.txid_hex != b.txid_hex) return a.txid_hex < b.txid_hex;
     return a.vout < b.vout;
   });
+
+  for (const auto& [key, value] : db_.scan_prefix("CREQ:")) {
+    auto plain = decrypt_secret_payload(passphrase_, value);
+    if (!plain) continue;
+    auto parsed = parse_confidential_request_plain(*plain);
+    if (!parsed) continue;
+    out->confidential_requests.push_back(*parsed);
+  }
+  std::sort(out->confidential_requests.begin(), out->confidential_requests.end(),
+            [](const auto& a, const auto& b) { return a.request_id < b.request_id; });
   return true;
 }
 
@@ -504,6 +562,29 @@ bool WalletStore::upsert_confidential_coin(const ConfidentialCoinRecord& record)
 
 bool WalletStore::remove_confidential_coin(const std::string& txid_hex, std::uint32_t vout) {
   return db_.erase(key_confidential_coin(txid_hex, vout));
+}
+
+bool WalletStore::upsert_confidential_request(const ConfidentialRequestRecord& record) {
+  if (!can_persist_confidential_secrets()) return false;
+  const auto encrypted = encrypt_secret_payload(passphrase_, serialize_confidential_request_plain(record));
+  if (encrypted.empty()) return false;
+  return db_.put(key_confidential_request(record.request_id), encrypted);
+}
+
+bool WalletStore::set_confidential_request_consumed(const std::string& request_id, bool consumed) {
+  if (!can_persist_confidential_secrets()) return false;
+  const auto current = db_.get(key_confidential_request(request_id));
+  if (!current) return false;
+  const auto plain = decrypt_secret_payload(passphrase_, *current);
+  if (!plain) return false;
+  auto parsed = parse_confidential_request_plain(*plain);
+  if (!parsed) return false;
+  parsed->consumed = consumed;
+  return upsert_confidential_request(*parsed);
+}
+
+bool WalletStore::remove_confidential_request(const std::string& request_id) {
+  return db_.erase(key_confidential_request(request_id));
 }
 
 bool WalletStore::can_persist_confidential_secrets() const { return !passphrase_.empty(); }

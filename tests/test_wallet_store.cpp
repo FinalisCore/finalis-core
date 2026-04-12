@@ -151,6 +151,37 @@ TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {
   ASSERT_EQ(state.confidential_coins[0].blinding_factor_hex, "b10b");
 }
 
+TEST(test_wallet_store_marks_confidential_requests_consumed_without_deleting_them) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_requests/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_requests");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_requests");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file, "secret-pass"));
+    ASSERT_TRUE(store.upsert_confidential_request(WalletStore::ConfidentialRequestRecord{
+        .request_id = "req-1",
+        .account_id = "acct-main",
+        .one_time_pubkey_hex = "02aa",
+        .ephemeral_pubkey_hex = "03bb",
+        .scan_tag = 0x19,
+        .spend_secret_hex = "dead",
+        .memo_key_hex = "beef",
+        .consumed = false,
+    }));
+    ASSERT_TRUE(store.set_confidential_request_consumed("req-1", true));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file, "secret-pass"));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_EQ(state.confidential_requests.size(), 1u);
+  ASSERT_EQ(state.confidential_requests[0].request_id, "req-1");
+  ASSERT_TRUE(state.confidential_requests[0].consumed);
+}
+
 TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
   const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
   std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");
