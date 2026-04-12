@@ -43,6 +43,14 @@ Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
   return ss;
 }
 
+void resign_input0(TxV2& tx, const crypto::KeyPair& from) {
+  auto msg = finalis::signing_message_for_input_v2(tx, 0);
+  if (!msg.has_value()) throw std::runtime_error("sighash failed");
+  auto sig = crypto::ed25519_sign(*msg, from.private_key);
+  if (!sig.has_value()) throw std::runtime_error("sign failed");
+  std::get<TransparentInputWitnessV2>(tx.inputs[0].witness).script_sig = make_p2pkh_script_sig(*sig, from.public_key);
+}
+
 TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from, const PubKey32& to_pub,
                                  std::uint64_t value_in, std::uint64_t value_out) {
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
@@ -59,13 +67,56 @@ TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from
       .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
   });
   tx.fee = value_in - value_out;
-  tx.balance_proof.excess_commitment = commitment(0xA1);
+  const std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
+  const std::vector<crypto::Commitment33> outputs{crypto::transparent_amount_commitment(value_out),
+                                                  crypto::transparent_amount_commitment(tx.fee)};
+  const auto input_sum = crypto::add_commitments(inputs);
+  const auto output_sum = crypto::add_commitments(outputs);
+  if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
+  const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
+  if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
+  tx.balance_proof.excess_commitment = *excess;
   tx.balance_proof.excess_sig.fill(0x42);
-  auto msg = finalis::signing_message_for_input_v2(tx, 0);
-  if (!msg.has_value()) throw std::runtime_error("sighash failed");
-  auto sig = crypto::ed25519_sign(*msg, from.private_key);
-  if (!sig.has_value()) throw std::runtime_error("sign failed");
-  std::get<TransparentInputWitnessV2>(tx.inputs[0].witness).script_sig = make_p2pkh_script_sig(*sig, from.public_key);
+  resign_input0(tx, from);
+  return tx;
+}
+
+TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& from, std::uint64_t value_in,
+                                    std::uint64_t transparent_value_out, const ConfidentialTxOutV2& confidential_out,
+                                    std::uint64_t fee) {
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op.txid,
+      .prev_index = op.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::TRANSPARENT,
+      .witness = TransparentInputWitnessV2{},
+  });
+  if (transparent_value_out > 0) {
+    const auto to = key_from_byte(0x66);
+    tx.outputs.push_back(TxOutV2{
+        .kind = TxOutputKind::TRANSPARENT,
+        .body = TransparentTxOutV2{transparent_value_out,
+                                   address::p2pkh_script_pubkey(crypto::h160(Bytes(to.public_key.begin(), to.public_key.end())))},
+    });
+  }
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::CONFIDENTIAL, .body = confidential_out});
+  tx.fee = fee;
+
+  std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
+  std::vector<crypto::Commitment33> outputs;
+  if (transparent_value_out > 0) outputs.push_back(crypto::transparent_amount_commitment(transparent_value_out));
+  outputs.push_back(confidential_out.value_commitment);
+  outputs.push_back(crypto::transparent_amount_commitment(fee));
+  const auto input_sum = crypto::add_commitments(inputs);
+  const auto output_sum = crypto::add_commitments(outputs);
+  if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
+  const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
+  if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
+  tx.balance_proof.excess_commitment = *excess;
+  tx.balance_proof.excess_sig.fill(0x52);
+
+  resign_input0(tx, from);
   return tx;
 }
 
@@ -261,4 +312,143 @@ TEST(test_validate_tx_v2_accepts_transparent_only_post_activation) {
   ASSERT_TRUE(result.ok);
   ASSERT_EQ(result.cost.fee, 750u);
   ASSERT_EQ(result.cost.confidential_verify_weight, 0u);
+}
+
+TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
+  const auto from = key_from_byte(0x27);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0x47);
+  op.index = 0;
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  ConfidentialTxOutV2 confidential_out{
+      .value_commitment = commitment(0x70),
+      .one_time_pubkey = compressed_key(0x71),
+      .ephemeral_pubkey = compressed_key(0x72),
+      .scan_tag = crypto::ScanTag{0x73},
+      .range_proof = crypto::ProofBytes{Bytes{0xA1, 0xB2, 0xC3, 0xD4}},
+      .memo = Bytes{0x01, 0x02},
+  };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 500, confidential_out, 9'500);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 100;
+  SpecialValidationContext ctx;
+  ctx.current_height = 100;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(result.ok);
+  ASSERT_EQ(result.cost.fee, 9'500u);
+  ASSERT_EQ(result.cost.confidential_verify_weight, confidential_out.range_proof.bytes.size());
+
+  UtxoSetV2 applied = view;
+  apply_any_tx_to_utxo(AnyTx{tx}, applied);
+  const auto txid = tx.txid();
+  const auto it = applied.find(OutPoint{txid, 1});
+  ASSERT_TRUE(it != applied.end());
+  ASSERT_EQ(it->second.kind, UtxoOutputKind::CONFIDENTIAL);
+}
+
+TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
+  const auto from = key_from_byte(0x28);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0x48);
+  op.index = 0;
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  ConfidentialTxOutV2 confidential_out{
+      .value_commitment = commitment(0x74),
+      .one_time_pubkey = compressed_key(0x75),
+      .ephemeral_pubkey = compressed_key(0x76),
+      .scan_tag = crypto::ScanTag{0x77},
+      .range_proof = crypto::ProofBytes{Bytes{0x01}},
+      .memo = Bytes{},
+  };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, confidential_out, 10'000);
+  std::get<ConfidentialTxOutV2>(tx.outputs[0].body).value_commitment.bytes[0] = 0x04;
+  resign_input0(tx, from);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 100;
+  SpecialValidationContext ctx;
+  ctx.current_height = 100;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_TRUE(result.error.find("commitment") != std::string::npos);
+}
+
+TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
+  const auto from = key_from_byte(0x29);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0x49);
+  op.index = 0;
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  ConfidentialTxOutV2 confidential_out{
+      .value_commitment = commitment(0x78),
+      .one_time_pubkey = compressed_key(0x79),
+      .ephemeral_pubkey = compressed_key(0x7A),
+      .scan_tag = crypto::ScanTag{0x7B},
+      .range_proof = crypto::ProofBytes{Bytes{0x10, 0x11, 0x12}},
+      .memo = Bytes{0x01, 0x02, 0x03},
+  };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, confidential_out, 10'000);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 100;
+  policy.max_range_proof_bytes = 2;
+  policy.max_memo_bytes = 2;
+  SpecialValidationContext ctx;
+  ctx.current_height = 100;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_TRUE(result.error.find("range proof too large") != std::string::npos ||
+              result.error.find("memo too large") != std::string::npos);
+}
+
+TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
+  const auto from = key_from_byte(0x2A);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0x4A);
+  op.index = 0;
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  ConfidentialTxOutV2 confidential_out{
+      .value_commitment = commitment(0x7C),
+      .one_time_pubkey = compressed_key(0x7D),
+      .ephemeral_pubkey = compressed_key(0x7E),
+      .scan_tag = crypto::ScanTag{0x7F},
+      .range_proof = crypto::ProofBytes{Bytes{0x20, 0x21}},
+      .memo = Bytes{},
+  };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, confidential_out, 10'000);
+  tx.balance_proof.excess_commitment = commitment(0x55);
+  resign_input0(tx, from);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 100;
+  SpecialValidationContext ctx;
+  ctx.current_height = 100;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_TRUE(result.error.find("balance mismatch") != std::string::npos);
 }

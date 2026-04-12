@@ -718,6 +718,13 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   std::uint64_t in_sum = 0;
   std::uint64_t out_sum = 0;
   std::set<OutPoint> seen_inputs;
+  std::vector<crypto::Commitment33> input_commitments;
+  std::vector<crypto::Commitment33> non_excess_output_commitments;
+
+  if (!crypto::commitment_is_canonical(tx.balance_proof.excess_commitment)) {
+    out.error = "invalid excess commitment";
+    return out;
+  }
 
   for (std::size_t input_index = 0; input_index < tx.inputs.size(); ++input_index) {
     const auto& input = tx.inputs[input_index];
@@ -772,6 +779,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       return out;
     }
     in_sum += prev_out.value;
+    input_commitments.push_back(crypto::transparent_amount_commitment(prev_out.value));
   }
 
   for (const auto& output : tx.outputs) {
@@ -782,11 +790,40 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
         return out;
       }
       out_sum += transparent.value;
+      non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(transparent.value));
       continue;
     }
     ++confidential_output_count;
-    out.error = "confidential output balance validation not implemented";
-    return out;
+    const auto& confidential = std::get<ConfidentialTxOutV2>(output.body);
+    if (!crypto::commitment_is_canonical(confidential.value_commitment)) {
+      out.error = "invalid confidential value commitment";
+      return out;
+    }
+    if (!crypto::compressed_pubkey33_is_canonical(confidential.one_time_pubkey)) {
+      out.error = "invalid confidential one_time_pubkey";
+      return out;
+    }
+    if (!crypto::compressed_pubkey33_is_canonical(confidential.ephemeral_pubkey)) {
+      out.error = "invalid confidential ephemeral_pubkey";
+      return out;
+    }
+    if (confidential.memo.size() > policy.max_memo_bytes) {
+      out.error = "confidential memo too large";
+      return out;
+    }
+    if (confidential.range_proof.bytes.empty()) {
+      out.error = "missing confidential range proof";
+      return out;
+    }
+    if (confidential.range_proof.bytes.size() > policy.max_range_proof_bytes) {
+      out.error = "confidential range proof too large";
+      return out;
+    }
+    total_range_proof_bytes += confidential.range_proof.bytes.size();
+    proof_commitments.push_back(confidential.value_commitment);
+    proofs.push_back(confidential.range_proof);
+    non_excess_output_commitments.push_back(confidential.value_commitment);
+    out.cost.confidential_verify_weight += crypto::range_proof_verify_weight(confidential.range_proof);
   }
 
   if (confidential_input_count > policy.max_confidential_inputs_per_tx) {
@@ -811,9 +848,30 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     return out;
   }
 
+  non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(tx.fee));
+
+  const auto input_commitment_sum = crypto::add_commitments(input_commitments);
+  if (!input_commitment_sum.has_value()) {
+    out.error = "failed to accumulate input commitments";
+    return out;
+  }
+  const auto output_commitment_sum = crypto::add_commitments(non_excess_output_commitments);
+  if (!output_commitment_sum.has_value()) {
+    out.error = "failed to accumulate output commitments";
+    return out;
+  }
+  const auto expected_excess = crypto::subtract_commitments(*input_commitment_sum, *output_commitment_sum);
+  if (!expected_excess.has_value()) {
+    out.error = "failed to derive excess commitment";
+    return out;
+  }
+  if (*expected_excess != tx.balance_proof.excess_commitment) {
+    out.error = "commitment balance mismatch";
+    return out;
+  }
+
   out.ok = true;
   out.cost.fee = tx.fee;
-  out.cost.confidential_verify_weight = 0;
   return out;
 }
 
