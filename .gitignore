@@ -77,6 +77,8 @@ services/finalis-mint/*.secrets.json
 services/finalis-mint/*.lock
 services/finalis-mint/email-spool/
 
+third_party
+
 
 __pycache__/
 *.pyc
