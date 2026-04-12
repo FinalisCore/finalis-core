@@ -4364,7 +4364,7 @@ void Node::refresh_availability_operator_state_locked(bool advance_epoch) {
     operator_bonds[consensus::canonical_operator_id(validator_pubkey, info)] += info.bonded_amount;
   }
   availability::refresh_live_availability_state(finalized_identity_.id, operator_bonds, advance_epoch, &availability_state_,
-                                                cfg_.availability);
+                                                cfg_.availability, cfg_.network.availability_recovery_activation_height);
   (void)validate_availability_state_locked(advance_epoch ? "availability-advance-epoch" : "availability-refresh");
 }
 
@@ -4374,7 +4374,7 @@ void Node::advance_availability_epoch_locked(std::uint64_t epoch) {
     operator_bonds[consensus::canonical_operator_id(validator_pubkey, info)] += info.bonded_amount;
   }
   availability::advance_live_availability_epoch(finalized_identity_.id, operator_bonds, epoch, &availability_state_,
-                                                cfg_.availability);
+                                                cfg_.availability, cfg_.network.availability_recovery_activation_height);
   (void)validate_availability_state_locked("availability-advance-epoch");
 }
 

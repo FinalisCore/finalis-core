@@ -106,6 +106,10 @@ bool perfect_recovery_epoch(const std::vector<AvailabilityAuditOutcome>& outcome
                      [](AvailabilityAuditOutcome outcome) { return outcome == AvailabilityAuditOutcome::VALID_TIMELY; });
 }
 
+bool probation_recovery_rule_active(std::uint64_t current_epoch, std::uint64_t recovery_activation_height) {
+  return current_epoch >= recovery_activation_height;
+}
+
 void update_operator_status(AvailabilityOperatorState* state, const AvailabilityConfig& cfg,
                             std::uint32_t recovery_threshold_epochs = std::numeric_limits<std::uint32_t>::max()) {
   if (!state) return;
@@ -1888,7 +1892,8 @@ std::uint64_t count_eligible_operators(const AvailabilityPersistentState& state,
 
 void refresh_live_availability_state(const Hash32& finalized_identity_id,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, bool advance_epoch,
-                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg) {
+                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg,
+                                     std::uint64_t recovery_activation_height) {
   if (!state) return;
   std::vector<PubKey32> operator_ids;
   operator_ids.reserve(operator_bonds.size());
@@ -1907,7 +1912,11 @@ void refresh_live_availability_state(const Hash32& finalized_identity_id,
 
   std::vector<AvailabilityOperatorState> refreshed;
   refreshed.reserve(operator_ids.size());
-  const auto recovery_threshold_epochs = probation_recovery_threshold_epochs(operator_ids.size());
+  const bool recovery_rule_active =
+      probation_recovery_rule_active(state->current_epoch, recovery_activation_height);
+  const auto recovery_threshold_epochs =
+      recovery_rule_active ? probation_recovery_threshold_epochs(operator_ids.size())
+                           : std::numeric_limits<std::uint32_t>::max();
   for (const auto& operator_id : operator_ids) {
     AvailabilityOperatorState operator_state;
     if (auto it = existing.find(operator_id); it != existing.end()) operator_state = it->second;
@@ -1916,6 +1925,7 @@ void refresh_live_availability_state(const Hash32& finalized_identity_id,
     const auto retained_count = assigned_prefix_counts[operator_id];
     if (advance_epoch) {
       const bool guarantee_recovery_opportunity =
+          recovery_rule_active &&
           operator_state.status == AvailabilityOperatorStatus::PROBATION && operator_state.was_ever_active;
       apply_epoch_audit_outcomes(&operator_state,
                                  live_epoch_audit_outcomes(retained_count, cfg, guarantee_recovery_opportunity),
@@ -1931,18 +1941,19 @@ void refresh_live_availability_state(const Hash32& finalized_identity_id,
 
 void advance_live_availability_epoch(const Hash32& finalized_identity_id,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, std::uint64_t epoch,
-                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg) {
+                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg,
+                                     std::uint64_t recovery_activation_height) {
   if (!state) return;
   if (epoch < state->current_epoch) return;
   if (state->current_epoch == 0 && epoch == 0) {
-    refresh_live_availability_state(finalized_identity_id, operator_bonds, false, state, cfg);
+    refresh_live_availability_state(finalized_identity_id, operator_bonds, false, state, cfg, recovery_activation_height);
     return;
   }
   while (state->current_epoch < epoch) {
     ++state->current_epoch;
     state->retained_prefixes = expire_retained_prefixes(state->retained_prefixes, state->current_epoch,
                                                         cfg.retention_window_min_epochs);
-    refresh_live_availability_state(finalized_identity_id, operator_bonds, true, state, cfg);
+    refresh_live_availability_state(finalized_identity_id, operator_bonds, true, state, cfg, recovery_activation_height);
   }
 }
 

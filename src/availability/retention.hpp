@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -191,10 +192,12 @@ AvailabilityPersistentState consensus_relevant_availability_state(const Availabi
 std::uint64_t count_eligible_operators(const AvailabilityPersistentState& state, const AvailabilityConfig& cfg = {});
 void refresh_live_availability_state(const Hash32& finalized_identity_id,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, bool advance_epoch,
-                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg = {});
+                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg = {},
+                                     std::uint64_t recovery_activation_height = std::numeric_limits<std::uint64_t>::max());
 void advance_live_availability_epoch(const Hash32& finalized_identity_id,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, std::uint64_t epoch,
-                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg = {});
+                                     AvailabilityPersistentState* state, const AvailabilityConfig& cfg = {},
+                                     std::uint64_t recovery_activation_height = std::numeric_limits<std::uint64_t>::max());
 
 enum class AvailabilitySimulationBehavior : std::uint8_t {
   HONEST = 0,

@@ -53,7 +53,8 @@ void refresh_availability_operator_state(const CanonicalDerivationConfig& cfg, c
                                          availability::AvailabilityPersistentState* state) {
   if (!state) return;
   const auto operator_bonds = availability_operator_bonds(validators);
-  availability::refresh_live_availability_state(finalized_identity.id, operator_bonds, advance_epoch, state, cfg.availability);
+  availability::refresh_live_availability_state(finalized_identity.id, operator_bonds, advance_epoch, state, cfg.availability,
+                                                cfg.network.availability_recovery_activation_height);
 }
 
 void advance_availability_epoch(const CanonicalDerivationConfig& cfg, const FinalizedIdentity& finalized_identity,
@@ -61,7 +62,8 @@ void advance_availability_epoch(const CanonicalDerivationConfig& cfg, const Fina
                                 availability::AvailabilityPersistentState* state) {
   if (!state) return;
   const auto operator_bonds = availability_operator_bonds(validators);
-  availability::advance_live_availability_epoch(finalized_identity.id, operator_bonds, epoch, state, cfg.availability);
+  availability::advance_live_availability_epoch(finalized_identity.id, operator_bonds, epoch, state, cfg.availability,
+                                                cfg.network.availability_recovery_activation_height);
 }
 
 void update_availability_from_frontier(const CanonicalDerivationConfig& cfg, const CanonicalFrontierRecord& record,

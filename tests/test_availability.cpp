@@ -327,6 +327,53 @@ TEST(test_availability_warmup_operator_does_not_get_probation_recovery_shortcut)
   ASSERT_TRUE(!warmup.was_ever_active);
 }
 
+TEST(test_availability_probation_recovery_shortcut_respects_activation_height) {
+  availability::AvailabilityConfig cfg;
+  cfg.warmup_epochs = 2;
+  cfg.min_warmup_audits = 3;
+  cfg.min_warmup_success_rate_bps = 9000;
+  cfg.eligibility_min_score = 10;
+  cfg.probation_score = 0;
+  cfg.ejection_score = -20;
+
+  const auto kp = key_from_byte(0x5a);
+  std::map<PubKey32, std::uint64_t> operator_bonds;
+  operator_bonds[kp.public_key] = BOND_AMOUNT;
+  Hash32 finalized_identity_id{};
+  finalized_identity_id.fill(0x11);
+
+  availability::AvailabilityPersistentState before_activation;
+  before_activation.current_epoch = 64;
+  before_activation.operators.push_back(availability::AvailabilityOperatorState{
+      .operator_pubkey = kp.public_key,
+      .bond = BOND_AMOUNT,
+      .status = availability::AvailabilityOperatorStatus::PROBATION,
+      .service_score = 0,
+      .successful_audits = 0,
+      .late_audits = 0,
+      .missed_audits = 0,
+      .invalid_audits = 0,
+      .warmup_epochs = 0,
+      .retained_prefix_count = 0,
+      .was_ever_active = true,
+      .recovery_consecutive_success_epochs = 0,
+  });
+  availability::advance_live_availability_epoch(finalized_identity_id, operator_bonds, 65, &before_activation, cfg, 128);
+  ASSERT_EQ(before_activation.current_epoch, 65u);
+  ASSERT_EQ(before_activation.operators.size(), 1u);
+  ASSERT_EQ(before_activation.operators.front().status, availability::AvailabilityOperatorStatus::PROBATION);
+  ASSERT_EQ(before_activation.operators.front().recovery_consecutive_success_epochs, 0u);
+
+  availability::AvailabilityPersistentState after_activation = before_activation;
+  after_activation.current_epoch = 127;
+  after_activation.operators.front().recovery_consecutive_success_epochs = 0;
+  availability::advance_live_availability_epoch(finalized_identity_id, operator_bonds, 128, &after_activation, cfg, 128);
+  ASSERT_EQ(after_activation.current_epoch, 128u);
+  ASSERT_EQ(after_activation.operators.size(), 1u);
+  ASSERT_EQ(after_activation.operators.front().status, availability::AvailabilityOperatorStatus::ACTIVE);
+  ASSERT_EQ(after_activation.operators.front().service_score, cfg.eligibility_min_score);
+}
+
 TEST(test_availability_seat_budget_is_concave_and_capped) {
   availability::AvailabilityConfig cfg;
   cfg.max_seats_per_operator = 4;
