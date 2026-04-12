@@ -885,6 +885,7 @@ QString format_relative_duration_ms(std::uint64_t ms) {
 
 QString pending_release_state_text(const WalletStore::PendingSpend& pending, std::uint64_t current_tip_height,
                                    std::uint64_t now_ms) {
+  const QString txid_text = pending.txid_hex.empty() ? "-" : elide_middle(QString::fromStdString(pending.txid_hex), 10);
   const std::uint64_t tip_delta =
       current_tip_height >= pending.created_tip_height ? (current_tip_height - pending.created_tip_height) : 0;
   const std::uint64_t age_ms = now_ms >= pending.created_unix_ms ? (now_ms - pending.created_unix_ms) : 0;
@@ -893,13 +894,15 @@ QString pending_release_state_text(const WalletStore::PendingSpend& pending, std
   const std::uint64_t age_remaining =
       age_ms >= kPendingSendReleaseMinAgeMs ? 0 : (kPendingSendReleaseMinAgeMs - age_ms);
   if (tip_remaining == 0 && age_remaining == 0) {
-    return QString("Release-eligible after explicit not_found. Tip +%1/%2, age %3/%4")
+    return QString("Pending tx %1. Release-eligible after explicit not_found. Tip +%2/%3, age %4/%5")
+        .arg(txid_text)
         .arg(tip_delta)
         .arg(kPendingSendReleaseMinTipDelta)
         .arg(format_relative_duration_ms(age_ms))
         .arg(format_relative_duration_ms(kPendingSendReleaseMinAgeMs));
   }
-  return QString("Reserved. Release gate: tip +%1/%2, age %3/%4")
+  return QString("Pending tx %1. Reserved. Release gate: tip +%2/%3, age %4/%5")
+      .arg(txid_text)
       .arg(tip_delta)
       .arg(kPendingSendReleaseMinTipDelta)
       .arg(format_relative_duration_ms(age_ms))

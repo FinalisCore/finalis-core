@@ -148,7 +148,7 @@ void test_wallet_window_confidential_detail_shows_reservation_gate() {
   const std::string title = window.activity_detail_title_label_->text().toStdString();
   const std::string detail = window.activity_detail_view_->toPlainText().toStdString();
   require(title.find("Reserved") != std::string::npos, "confidential detail title missing reserved state");
-  require(detail.find("Reservation: Reserved. Release gate: tip +1/2") != std::string::npos,
+  require(detail.find("Reservation: Pending tx pending-send-1. Reserved. Release gate: tip +1/2") != std::string::npos,
           "confidential detail missing reservation gate");
 }
 
