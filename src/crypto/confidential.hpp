@@ -46,11 +46,17 @@ struct ConfidentialBackendStatus {
 bool confidential_crypto_init();
 const ConfidentialBackendStatus& confidential_backend_status();
 bool commitment_is_identity(const Commitment33& commitment);
+std::optional<PubKey33> secp256k1_pubkey_from_scalar(const Hash32& scalar32);
 bool compressed_pubkey33_is_canonical(const PubKey33& pubkey);
 bool commitment_is_canonical(const Commitment33& commitment);
 Commitment33 transparent_amount_commitment(std::uint64_t amount);
+std::optional<Commitment33> confidential_amount_commitment(std::uint64_t amount, const Blind32& blind);
+std::optional<Blind32> combine_blinds(std::span<const Blind32> blinds, std::size_t npositive);
+std::optional<ProofBytes> sign_output_range_proof(const Commitment33& commitment, std::uint64_t amount,
+                                                  const Blind32& blind, const Hash32& nonce32);
 std::optional<Commitment33> add_commitments(std::span<const Commitment33> commitments);
 std::optional<Commitment33> subtract_commitments(const Commitment33& lhs, const Commitment33& rhs);
+bool verify_commitment_tally(std::span<const Commitment33> positives, std::span<const Commitment33> negatives);
 
 bool verify_output_range_proof(const Commitment33& commitment, const ProofBytes& proof);
 bool verify_output_range_proofs_batch(std::span<const Commitment33> commitments, std::span<const ProofBytes> proofs);

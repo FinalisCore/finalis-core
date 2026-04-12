@@ -1,5 +1,6 @@
 #include "test_framework.hpp"
 
+#include <stdexcept>
 #include <variant>
 
 #include "address/address.hpp"
@@ -14,11 +15,27 @@ using namespace finalis;
 namespace {
 
 PubKey33 compressed_key(std::uint8_t seed) {
-  return crypto::transparent_amount_commitment(static_cast<std::uint64_t>(seed) + 1).bytes;
+  Hash32 scalar{};
+  scalar.fill(seed);
+  const auto pubkey = crypto::secp256k1_pubkey_from_scalar(scalar);
+  if (!pubkey.has_value()) throw std::runtime_error("secp pubkey derivation failed");
+  return *pubkey;
 }
 
 crypto::Commitment33 commitment(std::uint8_t seed) {
   return crypto::transparent_amount_commitment(static_cast<std::uint64_t>(seed) + 1);
+}
+
+crypto::Blind32 blind_from_byte(std::uint8_t seed) {
+  crypto::Blind32 out;
+  out.bytes.fill(seed);
+  return out;
+}
+
+Hash32 nonce_from_byte(std::uint8_t seed) {
+  Hash32 out{};
+  out.fill(seed);
+  return out;
 }
 
 crypto::KeyPair key_from_byte(std::uint8_t seed) {
@@ -62,22 +79,27 @@ TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from
       .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
   });
   tx.fee = value_in - value_out;
-  const std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
-  const std::vector<crypto::Commitment33> outputs{crypto::transparent_amount_commitment(value_out),
-                                                  crypto::transparent_amount_commitment(tx.fee)};
-  const auto input_sum = crypto::add_commitments(inputs);
-  const auto output_sum = crypto::add_commitments(outputs);
-  if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
-  const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
-  if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
-  tx.balance_proof.excess_commitment = *excess;
+  if (crypto::confidential_backend_status().confidential_outputs_supported) {
+    tx.balance_proof.excess_commitment = crypto::Commitment33{};
+  } else {
+    const std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
+    const std::vector<crypto::Commitment33> outputs{crypto::transparent_amount_commitment(value_out),
+                                                    crypto::transparent_amount_commitment(tx.fee)};
+    const auto input_sum = crypto::add_commitments(inputs);
+    const auto output_sum = crypto::add_commitments(outputs);
+    if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
+    const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
+    if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
+    tx.balance_proof.excess_commitment = *excess;
+  }
   tx.balance_proof.excess_sig.fill(0x42);
   resign_input0(tx, from);
   return tx;
 }
 
 TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& from, std::uint64_t value_in,
-                                    std::uint64_t transparent_value_out, const ConfidentialTxOutV2& confidential_out,
+                                    std::uint64_t transparent_value_out, std::uint64_t confidential_value,
+                                    const crypto::Blind32& confidential_blind, const ConfidentialTxOutV2& confidential_out,
                                     std::uint64_t fee) {
   TxV2 tx;
   tx.inputs.push_back(TxInV2{
@@ -98,30 +120,55 @@ TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& f
   tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::CONFIDENTIAL, .body = confidential_out});
   tx.fee = fee;
 
-  std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
-  std::vector<crypto::Commitment33> outputs;
-  if (transparent_value_out > 0) outputs.push_back(crypto::transparent_amount_commitment(transparent_value_out));
-  outputs.push_back(confidential_out.value_commitment);
-  outputs.push_back(crypto::transparent_amount_commitment(fee));
-  const auto input_sum = crypto::add_commitments(inputs);
-  const auto output_sum = crypto::add_commitments(outputs);
-  if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
-  const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
-  if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
-  tx.balance_proof.excess_commitment = *excess;
+  if (crypto::confidential_backend_status().confidential_outputs_supported) {
+    const auto blind_excess = crypto::combine_blinds(std::span<const crypto::Blind32>(&confidential_blind, 1), 0);
+    if (!blind_excess.has_value()) throw std::runtime_error("blind sum failed");
+    const auto excess = crypto::confidential_amount_commitment(value_in - transparent_value_out - confidential_value - fee,
+                                                               *blind_excess);
+    if (!excess.has_value()) throw std::runtime_error("excess commitment failed");
+    tx.balance_proof.excess_commitment = *excess;
+  } else {
+    std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
+    std::vector<crypto::Commitment33> outputs;
+    if (transparent_value_out > 0) outputs.push_back(crypto::transparent_amount_commitment(transparent_value_out));
+    outputs.push_back(confidential_out.value_commitment);
+    outputs.push_back(crypto::transparent_amount_commitment(fee));
+    const auto input_sum = crypto::add_commitments(inputs);
+    const auto output_sum = crypto::add_commitments(outputs);
+    if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
+    const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
+    if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
+    tx.balance_proof.excess_commitment = *excess;
+  }
   tx.balance_proof.excess_sig.fill(0x52);
 
   resign_input0(tx, from);
   return tx;
 }
 
+ConfidentialTxOutV2 make_valid_confidential_output(std::uint8_t seed, std::uint64_t value) {
+  const auto blind = blind_from_byte(static_cast<std::uint8_t>(seed + 1));
+  const auto commitment = crypto::confidential_amount_commitment(value, blind);
+  if (!commitment.has_value()) throw std::runtime_error("confidential commitment failed");
+  const auto proof = crypto::sign_output_range_proof(*commitment, value, blind, nonce_from_byte(static_cast<std::uint8_t>(seed + 2)));
+  if (!proof.has_value()) throw std::runtime_error("rangeproof sign failed");
+  return ConfidentialTxOutV2{
+      .value_commitment = *commitment,
+      .one_time_pubkey = compressed_key(static_cast<std::uint8_t>(seed + 3)),
+      .ephemeral_pubkey = compressed_key(static_cast<std::uint8_t>(seed + 4)),
+      .scan_tag = crypto::ScanTag{static_cast<std::uint8_t>(seed + 5)},
+      .range_proof = *proof,
+      .memo = Bytes{0x01, 0x02},
+  };
+}
+
 }  // namespace
 
-TEST(test_confidential_backend_status_reports_plain_secp_without_zkp_support) {
+TEST(test_confidential_backend_status_reports_backend_capabilities_consistently) {
   const auto& status = crypto::confidential_backend_status();
   ASSERT_TRUE(status.secp256k1_available);
-  ASSERT_TRUE(!status.confidential_outputs_supported);
-  ASSERT_TRUE(!status.rangeproof_backend_available);
+  ASSERT_TRUE(status.zkp_backend_available == status.rangeproof_backend_available);
+  ASSERT_TRUE(status.confidential_outputs_supported == status.rangeproof_backend_available);
   ASSERT_TRUE(!status.excess_authorization_available);
 }
 
@@ -327,15 +374,18 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
   UtxoSetV2 view;
   view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
 
-  ConfidentialTxOutV2 confidential_out{
-      .value_commitment = commitment(0x70),
-      .one_time_pubkey = compressed_key(0x71),
-      .ephemeral_pubkey = compressed_key(0x72),
-      .scan_tag = crypto::ScanTag{0x73},
-      .range_proof = crypto::ProofBytes{Bytes{0xA1, 0xB2, 0xC3, 0xD4}},
-      .memo = Bytes{0x01, 0x02},
-  };
-  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 500, confidential_out, 9'500);
+  const auto valid_blind = blind_from_byte(0x71);
+  ConfidentialTxOutV2 confidential_out = crypto::confidential_backend_status().confidential_outputs_supported
+                                             ? make_valid_confidential_output(0x70, 9'000)
+                                             : ConfidentialTxOutV2{
+                                                   .value_commitment = commitment(0x70),
+                                                   .one_time_pubkey = compressed_key(0x71),
+                                                   .ephemeral_pubkey = compressed_key(0x72),
+                                                   .scan_tag = crypto::ScanTag{0x73},
+                                                   .range_proof = crypto::ProofBytes{Bytes{0xA1, 0xB2, 0xC3, 0xD4}},
+                                                   .memo = Bytes{0x01, 0x02},
+                                               };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 500, 9'000, valid_blind, confidential_out, 500);
 
   ConfidentialPolicy policy;
   policy.activation_height = 100;
@@ -348,8 +398,9 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
     ASSERT_TRUE(!result.ok);
     ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
+    if (!result.ok) throw std::runtime_error("accept confidential error: " + result.error);
     ASSERT_TRUE(result.ok);
-    ASSERT_EQ(result.cost.fee, 9'500u);
+    ASSERT_EQ(result.cost.fee, 500u);
     ASSERT_EQ(result.cost.confidential_verify_weight, confidential_out.range_proof.bytes.size());
 
     UtxoSetV2 applied = view;
@@ -371,15 +422,18 @@ TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
   UtxoSetV2 view;
   view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
 
-  ConfidentialTxOutV2 confidential_out{
-      .value_commitment = commitment(0x74),
-      .one_time_pubkey = compressed_key(0x75),
-      .ephemeral_pubkey = compressed_key(0x76),
-      .scan_tag = crypto::ScanTag{0x77},
-      .range_proof = crypto::ProofBytes{Bytes{0x01}},
-      .memo = Bytes{},
-  };
-  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, confidential_out, 10'000);
+  const auto bad_blind = blind_from_byte(0x75);
+  ConfidentialTxOutV2 confidential_out = crypto::confidential_backend_status().confidential_outputs_supported
+                                             ? make_valid_confidential_output(0x74, 9'500)
+                                             : ConfidentialTxOutV2{
+                                                   .value_commitment = commitment(0x74),
+                                                   .one_time_pubkey = compressed_key(0x75),
+                                                   .ephemeral_pubkey = compressed_key(0x76),
+                                                   .scan_tag = crypto::ScanTag{0x77},
+                                                   .range_proof = crypto::ProofBytes{Bytes{0x01}},
+                                                   .memo = Bytes{},
+                                               };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, 9'500, bad_blind, confidential_out, 500);
   std::get<ConfidentialTxOutV2>(tx.outputs[0].body).value_commitment.bytes[0] = 0x04;
   resign_input0(tx, from);
 
@@ -394,6 +448,9 @@ TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
     ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
+    if (result.error.find("commitment") == std::string::npos) {
+      throw std::runtime_error("bad commitment error: " + result.error);
+    }
     ASSERT_TRUE(result.error.find("commitment") != std::string::npos);
   }
 }
@@ -408,15 +465,18 @@ TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
   UtxoSetV2 view;
   view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
 
-  ConfidentialTxOutV2 confidential_out{
-      .value_commitment = commitment(0x78),
-      .one_time_pubkey = compressed_key(0x79),
-      .ephemeral_pubkey = compressed_key(0x7A),
-      .scan_tag = crypto::ScanTag{0x7B},
-      .range_proof = crypto::ProofBytes{Bytes{0x10, 0x11, 0x12}},
-      .memo = Bytes{0x01, 0x02, 0x03},
-  };
-  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, confidential_out, 10'000);
+  const auto bounds_blind = blind_from_byte(0x79);
+  ConfidentialTxOutV2 confidential_out = crypto::confidential_backend_status().confidential_outputs_supported
+                                             ? make_valid_confidential_output(0x78, 9'500)
+                                             : ConfidentialTxOutV2{
+                                                   .value_commitment = commitment(0x78),
+                                                   .one_time_pubkey = compressed_key(0x79),
+                                                   .ephemeral_pubkey = compressed_key(0x7A),
+                                                   .scan_tag = crypto::ScanTag{0x7B},
+                                                   .range_proof = crypto::ProofBytes{Bytes{0x10, 0x11, 0x12}},
+                                                   .memo = Bytes{0x01, 0x02, 0x03},
+                                               };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, 9'500, bounds_blind, confidential_out, 500);
 
   ConfidentialPolicy policy;
   policy.activation_height = 100;
@@ -431,6 +491,10 @@ TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
     ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
+    if (!(result.error.find("range proof too large") != std::string::npos ||
+          result.error.find("memo too large") != std::string::npos)) {
+      throw std::runtime_error("bounds error: " + result.error);
+    }
     ASSERT_TRUE(result.error.find("range proof too large") != std::string::npos ||
                 result.error.find("memo too large") != std::string::npos);
   }
@@ -446,15 +510,18 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
   UtxoSetV2 view;
   view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
 
-  ConfidentialTxOutV2 confidential_out{
-      .value_commitment = commitment(0x7C),
-      .one_time_pubkey = compressed_key(0x7D),
-      .ephemeral_pubkey = compressed_key(0x7E),
-      .scan_tag = crypto::ScanTag{0x7F},
-      .range_proof = crypto::ProofBytes{Bytes{0x20, 0x21}},
-      .memo = Bytes{},
-  };
-  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, confidential_out, 10'000);
+  const auto mismatch_blind = blind_from_byte(0x7D);
+  ConfidentialTxOutV2 confidential_out = crypto::confidential_backend_status().confidential_outputs_supported
+                                             ? make_valid_confidential_output(0x7C, 9'500)
+                                             : ConfidentialTxOutV2{
+                                                   .value_commitment = commitment(0x7C),
+                                                   .one_time_pubkey = compressed_key(0x7D),
+                                                   .ephemeral_pubkey = compressed_key(0x7E),
+                                                   .scan_tag = crypto::ScanTag{0x7F},
+                                                   .range_proof = crypto::ProofBytes{Bytes{0x20, 0x21}},
+                                                   .memo = Bytes{},
+                                               };
+  auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, 9'500, mismatch_blind, confidential_out, 500);
   tx.balance_proof.excess_commitment = commitment(0x55);
   resign_input0(tx, from);
 
@@ -469,6 +536,9 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
     ASSERT_TRUE(result.error.find("unsupported by zkp backend") != std::string::npos);
   } else {
+    if (result.error.find("balance mismatch") == std::string::npos) {
+      throw std::runtime_error("mismatch error: " + result.error);
+    }
     ASSERT_TRUE(result.error.find("balance mismatch") != std::string::npos);
   }
 }

@@ -848,29 +848,21 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     return out;
   }
 
-  if (in_sum < out_sum || in_sum - out_sum != tx.fee) {
-    out.error = "fee mismatch";
+  if (confidential_output_count == 0 && confidential_input_count == 0) {
+    if (in_sum < out_sum || in_sum - out_sum != tx.fee) {
+      out.error = "fee mismatch";
+      return out;
+    }
+  } else if (in_sum < out_sum || in_sum - out_sum < tx.fee) {
+    out.error = "insufficient transparent input value";
     return out;
   }
 
   non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(tx.fee));
 
-  const auto input_commitment_sum = crypto::add_commitments(input_commitments);
-  if (!input_commitment_sum.has_value()) {
-    out.error = "failed to accumulate input commitments";
-    return out;
-  }
-  const auto output_commitment_sum = crypto::add_commitments(non_excess_output_commitments);
-  if (!output_commitment_sum.has_value()) {
-    out.error = "failed to accumulate output commitments";
-    return out;
-  }
-  const auto expected_excess = crypto::subtract_commitments(*input_commitment_sum, *output_commitment_sum);
-  if (!expected_excess.has_value()) {
-    out.error = "failed to derive excess commitment";
-    return out;
-  }
-  if (*expected_excess != tx.balance_proof.excess_commitment) {
+  std::vector<crypto::Commitment33> negative_commitments = non_excess_output_commitments;
+  negative_commitments.push_back(tx.balance_proof.excess_commitment);
+  if (!crypto::verify_commitment_tally(input_commitments, negative_commitments)) {
     out.error = "commitment balance mismatch";
     return out;
   }

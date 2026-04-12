@@ -87,8 +87,8 @@ struct ConfidentialPolicy {
   std::uint32_t max_confidential_inputs_per_tx{16};
   std::uint32_t max_confidential_outputs_per_tx{16};
   std::uint32_t max_memo_bytes{128};
-  std::uint32_t max_range_proof_bytes{1024};
-  std::uint32_t max_total_proof_bytes_per_tx{16384};
+  std::uint32_t max_range_proof_bytes{5134};
+  std::uint32_t max_total_proof_bytes_per_tx{65536};
   std::uint64_t max_fee{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t max_block_confidential_verify_weight{2'000'000};
 };
