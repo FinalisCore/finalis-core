@@ -240,7 +240,7 @@ TEST(test_frontier_transition_hash_is_stable_and_order_sensitive) {
   ASSERT_TRUE(ab.result_id() != ba.result_id());
 }
 
-TEST(test_frontier_execution_rejects_txv2_ordered_record_until_supported) {
+TEST(test_frontier_execution_accepts_supported_txv2_ordered_record_with_activation_policy) {
   const auto from = key_from_byte(14);
   const auto to = key_from_byte(15);
 
@@ -252,18 +252,24 @@ TEST(test_frontier_execution_rejects_txv2_ordered_record_until_supported) {
   parent[op] = UtxoEntry{p2pkh_out_for_pub(from.public_key, 10'000)};
 
   std::vector<Bytes> ordered{raw_signed_spend_v2(op, from, to.public_key, 10'000, 9'800)};
+  ConfidentialPolicy policy;
+  policy.activation_height = 0;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
 
   consensus::FrontierExecutionResult result;
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, nullptr, &result));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, &ctx, &result));
   ASSERT_EQ(result.decisions.size(), 1u);
-  ASSERT_TRUE(!result.decisions[0].accepted);
-  ASSERT_EQ(result.decisions[0].reject_reason, FrontierRejectReason::TX_INVALID);
-  ASSERT_TRUE(result.accepted_txs.empty());
+  ASSERT_TRUE(result.decisions[0].accepted);
+  ASSERT_EQ(result.accepted_txs.size(), 1u);
+  ASSERT_EQ(txid_any(result.accepted_txs[0]), txid_any(*parse_any_tx(ordered[0])));
 }
 
-TEST(test_ingress_append_rejects_txv2_payload_until_supported) {
+TEST(test_ingress_append_accepts_txv2_payload_when_lane_and_signature_match) {
   const auto from = key_from_byte(16);
   const auto to = key_from_byte(17);
+  const auto signer = key_from_byte(18);
 
   OutPoint op{};
   op.txid.fill(0x92);
@@ -275,11 +281,15 @@ TEST(test_ingress_append_rejects_txv2_payload_until_supported) {
 
   IngressCertificate cert;
   cert.epoch = 1;
-  cert.lane = 0;
+  cert.lane = consensus::assign_ingress_lane(*any);
   cert.seq = 1;
   cert.txid = txid_any(*any);
   cert.tx_hash = crypto::sha256d(raw);
   cert.prev_lane_root = zero_hash();
+  const auto signing_hash = cert.signing_hash();
+  auto sig = crypto::ed25519_sign(Bytes(signing_hash.begin(), signing_hash.end()), signer.private_key);
+  ASSERT_TRUE(sig.has_value());
+  cert.sigs = {FinalitySig{signer.public_key, *sig}};
 
   const auto base = unique_test_base("frontier_ingress_txv2");
   const auto db_path = std::filesystem::temp_directory_path() / base;
@@ -288,6 +298,7 @@ TEST(test_ingress_append_rejects_txv2_payload_until_supported) {
   ASSERT_TRUE(db.open(db_path.string()));
 
   std::string err;
-  ASSERT_TRUE(!consensus::append_validated_ingress_record(db, cert, raw, {}, &err));
-  ASSERT_EQ(err, "ingress-tx-version-not-yet-supported");
+  ASSERT_TRUE(consensus::append_validated_ingress_record(db, cert, raw, {signer.public_key}, &err));
+  ASSERT_TRUE(db.get_ingress_bytes(cert.txid).has_value());
+  ASSERT_TRUE(db.get_ingress_certificate(cert.lane, cert.seq).has_value());
 }

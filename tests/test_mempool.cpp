@@ -180,16 +180,16 @@ TEST(test_mempool_selection_order_fee_rate_then_absolute_fee_then_txid) {
   auto selected = mp.select_for_block(10, 1024 * 1024, view);
   ASSERT_EQ(selected.size(), 3u);
 
-  ASSERT_EQ(selected[0].txid(), tx2->txid());
+  ASSERT_EQ(txid_any(selected[0]), tx2->txid());
 
   const Hash32 t1 = tx1->txid();
   const Hash32 t3 = tx3->txid();
   if (t1 < t3) {
-    ASSERT_EQ(selected[1].txid(), t1);
-    ASSERT_EQ(selected[2].txid(), t3);
+    ASSERT_EQ(txid_any(selected[1]), t1);
+    ASSERT_EQ(txid_any(selected[2]), t3);
   } else {
-    ASSERT_EQ(selected[1].txid(), t3);
-    ASSERT_EQ(selected[2].txid(), t1);
+    ASSERT_EQ(txid_any(selected[1]), t3);
+    ASSERT_EQ(txid_any(selected[2]), t1);
   }
 }
 
@@ -284,12 +284,12 @@ TEST(test_mempool_block_selection_prefers_fee_rate_and_nonfitting_entries_remain
 
   auto selected = mp.select_for_block(10, 1024 * 1024, view);
   ASSERT_EQ(selected.size(), 2u);
-  ASSERT_EQ(selected[0].txid(), high_rate.txid());
-  ASSERT_EQ(selected[1].txid(), low_rate_high_fee.txid());
+  ASSERT_EQ(txid_any(selected[0]), high_rate.txid());
+  ASSERT_EQ(txid_any(selected[1]), low_rate_high_fee.txid());
 
   const auto fit_one = mp.select_for_block(10, high_rate.serialize().size() + 1, view);
   ASSERT_EQ(fit_one.size(), 1u);
-  ASSERT_EQ(fit_one[0].txid(), high_rate.txid());
+  ASSERT_EQ(txid_any(fit_one[0]), high_rate.txid());
   ASSERT_TRUE(mp.contains(high_rate.txid()));
   ASSERT_TRUE(mp.contains(low_rate_high_fee.txid()));
 }
@@ -413,7 +413,7 @@ TEST(test_mempool_rejects_txv2_before_activation_via_variant_validation) {
   ASSERT_TRUE(err.find("tx invalid: confidential tx not active") != std::string::npos);
 }
 
-TEST(test_mempool_rejects_txv2_after_activation_until_relay_enabled) {
+TEST(test_mempool_accepts_txv2_after_activation_when_variant_validation_succeeds) {
   mempool::Mempool mp;
   mempool::UtxoView view;
   const auto k1 = key_from_byte(72);
@@ -434,8 +434,8 @@ TEST(test_mempool_rejects_txv2_after_activation_until_relay_enabled) {
 
   const auto tx = make_transparent_only_v2_tx(op, k1, k2.public_key, 10'000, 9'800);
   std::string err;
-  ASSERT_TRUE(!mp.accept_tx(AnyTx{tx}, view, &err));
-  ASSERT_TRUE(err.find("tx version not yet relay-enabled") != std::string::npos);
+  ASSERT_TRUE(mp.accept_tx(AnyTx{tx}, view, &err));
+  ASSERT_TRUE(mp.contains(tx.txid()));
 }
 
 void register_mempool_tests() {}

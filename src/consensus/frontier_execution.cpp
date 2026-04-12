@@ -70,11 +70,6 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      if (!std::holds_alternative<Tx>(*tx)) {
-        if (error) *error = "frontier-certified-ingress-unsupported-tx-version lane=" + std::to_string(lane) +
-                            " seq=" + std::to_string(expected_seq);
-        return false;
-      }
       if (txid_any(*tx) != record.certificate.txid) {
         if (error) *error = "frontier-certified-ingress-txid-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
@@ -86,7 +81,7 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      if (!std::holds_alternative<Tx>(*tx) || assign_ingress_lane(std::get<Tx>(*tx)) != lane) {
+      if (assign_ingress_lane(*tx) != lane) {
         if (error) *error = "frontier-certified-ingress-lane-assignment-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;

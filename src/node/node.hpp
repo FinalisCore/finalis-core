@@ -221,7 +221,7 @@ class Node {
   void set_requested_ingress_range_for_test(int peer_id, const p2p::GetIngressRangeMsg& msg);
   bool observe_frontier_proposal_for_test(const FrontierProposal& proposal);
   bool inject_frontier_block_for_test(const FrontierProposal& proposal, const std::vector<FinalitySig>& finality_signatures);
-  bool inject_tx_for_test(const Tx& tx, bool relay);
+  bool inject_tx_for_test(const AnyTx& tx, bool relay);
   bool pause_proposals_for_test(bool pause);
   bool advance_round_for_test(std::uint64_t expected_height, std::uint32_t target_round);
   bool mempool_contains_for_test(const Hash32& txid) const;
@@ -313,8 +313,8 @@ class Node {
   bool maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
                                          const std::optional<FinalityCertificate>& certificate, int from_peer_id);
   bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
-  bool handle_tx(const Tx& tx, bool from_network, int from_peer_id = 0);
-  bool maybe_certify_locally_accepted_tx_locked(const Tx& tx, std::string* error = nullptr);
+  bool handle_tx(const AnyTx& tx, bool from_network, int from_peer_id = 0);
+  bool maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error = nullptr);
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
                                     std::string* error = nullptr);
   bool finalize_if_quorum(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
@@ -353,9 +353,9 @@ class Node {
   void broadcast_vote(const Vote& vote);
   void broadcast_timeout_vote(const TimeoutVote& vote);
   void broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate);
-  void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
+  void broadcast_tx(const AnyTx& tx, int skip_peer_id = 0);
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
-  void maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int skip_peer_id = 0);
+  void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos);
   bool begin_finalized_write(const Block& block);

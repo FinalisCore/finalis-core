@@ -115,26 +115,23 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
     return false;
   }
 
-  if (!std::holds_alternative<Tx>(tx)) {
-    if (err) *err = "tx version not yet relay-enabled";
-    return false;
-  }
-  const auto& v1 = std::get<Tx>(tx);
-
-  const auto required_bits = policy::required_hashcash_bits(hashcash_cfg_, v1, vr.cost.fee, by_txid_.size());
-  if (required_bits != 0) {
-    if (!v1.hashcash.has_value()) {
-      if (err) *err = "hashcash stamp required";
-      return false;
-    }
-    if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, required_bits,
-                                       static_cast<std::uint64_t>(std::time(nullptr)), err)) {
-      return false;
-    }
-  } else if (v1.hashcash.has_value()) {
-    if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, 0,
-                                       static_cast<std::uint64_t>(std::time(nullptr)), err)) {
-      return false;
+  if (std::holds_alternative<Tx>(tx)) {
+    const auto& v1 = std::get<Tx>(tx);
+    const auto required_bits = policy::required_hashcash_bits(hashcash_cfg_, v1, vr.cost.fee, by_txid_.size());
+    if (required_bits != 0) {
+      if (!v1.hashcash.has_value()) {
+        if (err) *err = "hashcash stamp required";
+        return false;
+      }
+      if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, required_bits,
+                                         static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+        return false;
+      }
+    } else if (v1.hashcash.has_value()) {
+      if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, 0,
+                                         static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+        return false;
+      }
     }
   }
 
@@ -194,8 +191,8 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
   return true;
 }
 
-std::vector<Tx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
-                                          std::vector<std::string>* diagnostics) const {
+std::vector<AnyTx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
+                                             std::vector<std::string>* diagnostics) const {
   std::vector<const TxMeta*> candidates;
   candidates.reserve(by_txid_.size());
   for (const auto& [_, meta] : by_txid_) {
@@ -206,7 +203,7 @@ std::vector<Tx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_b
     return compare_entry_score(a->entry, b->entry) > 0;
   });
 
-  std::vector<Tx> out;
+  std::vector<AnyTx> out;
   out.reserve(std::min(max_txs, candidates.size()));
   std::size_t used_bytes = 0;
   UtxoSetV2 work = view;
@@ -227,15 +224,8 @@ std::vector<Tx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_b
       }
       continue;
     }
-    if (!std::holds_alternative<Tx>(m->entry.tx)) {
-      if (diagnostics) {
-        diagnostics->push_back("skip txid=" + hex_encode32(m->entry.txid) + " reason=tx-version-not-yet-block-enabled");
-      }
-      continue;
-    }
-
     apply_any_tx_to_utxo(m->entry.tx, work);
-    out.push_back(std::get<Tx>(m->entry.tx));
+    out.push_back(m->entry.tx);
     used_bytes += m->entry.size_bytes;
   }
   return out;

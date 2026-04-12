@@ -1159,11 +1159,7 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
         if (cursor_error) *cursor_error = "frontier-certified-ingress-parse-failed";
         return false;
       }
-      if (!std::holds_alternative<Tx>(*tx)) {
-        if (cursor_error) *cursor_error = "frontier-certified-ingress-unsupported-tx-version";
-        return false;
-      }
-      const auto lane = assign_ingress_lane(std::get<Tx>(*tx));
+      const auto lane = assign_ingress_lane(*tx);
       if (lane >= finalis::INGRESS_LANE_COUNT) {
         if (cursor_error) *cursor_error = "frontier-certified-ingress-lane-out-of-range";
         return false;
@@ -1197,6 +1193,7 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
               if (h == prev.finalized_height) return prev.finalized_identity.id;
               return std::nullopt;
             },
+        .confidential_policy = &cfg.confidential_policy,
     };
   };
 

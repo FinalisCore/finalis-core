@@ -45,8 +45,8 @@ class Mempool {
                  std::uint64_t* accepted_fee = nullptr) {
     return accept_tx(AnyTx{tx}, view, err, min_fee, accepted_fee);
   }
-  std::vector<Tx> select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
-                                   std::vector<std::string>* diagnostics = nullptr) const;
+  std::vector<AnyTx> select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
+                                      std::vector<std::string>* diagnostics = nullptr) const;
   void remove_confirmed(const std::vector<Hash32>& txids);
   void prune_against_utxo(const UtxoView& view);
   std::size_t size() const;

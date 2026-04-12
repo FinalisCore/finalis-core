@@ -22,11 +22,6 @@ bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_by
     if (error) *error = "ingress-tx-parse-failed";
     return false;
   }
-  if (!std::holds_alternative<Tx>(*tx)) {
-    if (error) *error = "ingress-tx-version-not-yet-supported";
-    return false;
-  }
-  const auto& tx_v1 = std::get<Tx>(*tx);
 
   const auto expected_txid = txid_any(*tx);
   if (expected_txid != cert.txid) {
@@ -40,10 +35,7 @@ bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_by
     return false;
   }
 
-  // v1 lane assignment is anchored to the lexicographically smallest consumed
-  // outpoint commitment, or txid for inputless transactions. This keeps lane
-  // choice off sender-chosen fee or ordering fields.
-  if (assign_ingress_lane(tx_v1) != cert.lane) {
+  if (assign_ingress_lane(*tx) != cert.lane) {
     if (error) *error = "ingress-lane-mismatch";
     return false;
   }
@@ -63,6 +55,21 @@ Hash32 ingress_lane_anchor(const Tx& tx) {
   return best;
 }
 
+Hash32 ingress_lane_anchor(const TxV2& tx) {
+  if (tx.inputs.empty()) return tx.txid();
+
+  Hash32 best = outpoint_anchor_hash(TxIn{tx.inputs.front().prev_txid, tx.inputs.front().prev_index});
+  for (std::size_t i = 1; i < tx.inputs.size(); ++i) {
+    const auto candidate = outpoint_anchor_hash(TxIn{tx.inputs[i].prev_txid, tx.inputs[i].prev_index});
+    if (candidate < best) best = candidate;
+  }
+  return best;
+}
+
+Hash32 ingress_lane_anchor(const AnyTx& tx) {
+  return std::visit([](const auto& value) { return ingress_lane_anchor(value); }, tx);
+}
+
 std::uint32_t assign_ingress_lane(const Tx& tx) {
   const auto anchor = ingress_lane_anchor(tx);
   Bytes anchor_bytes(anchor.begin(), anchor.end());
@@ -71,6 +78,17 @@ std::uint32_t assign_ingress_lane(const Tx& tx) {
   if (!first8.has_value()) return 0;
   return static_cast<std::uint32_t>(*first8 % INGRESS_LANE_COUNT);
 }
+
+std::uint32_t assign_ingress_lane(const TxV2& tx) {
+  const auto anchor = ingress_lane_anchor(tx);
+  Bytes anchor_bytes(anchor.begin(), anchor.end());
+  codec::ByteReader r(anchor_bytes);
+  auto first8 = r.u64le();
+  if (!first8.has_value()) return 0;
+  return static_cast<std::uint32_t>(*first8 % INGRESS_LANE_COUNT);
+}
+
+std::uint32_t assign_ingress_lane(const AnyTx& tx) { return std::visit([](const auto& value) { return assign_ingress_lane(value); }, tx); }
 
 Hash32 compute_lane_root_append(const Hash32& prev_root, const Hash32& tx_hash) {
   codec::ByteWriter w;

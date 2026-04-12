@@ -11,6 +11,7 @@
 #include "crypto/hash.hpp"
 #include "p2p/messages.hpp"
 #include "storage/db.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 
@@ -71,13 +72,13 @@ Bytes signed_spend_tx_bytes(const OutPoint& op, const TxOut& prev, const crypto:
 
 IngressCertificate signed_ingress_certificate(const Bytes& tx_bytes, std::uint64_t epoch, std::uint64_t seq,
                                               const Hash32& prev_lane_root, const std::vector<crypto::KeyPair>& signers) {
-  auto tx = Tx::parse(tx_bytes);
+  auto tx = parse_any_tx(tx_bytes);
   if (!tx.has_value()) throw std::runtime_error("invalid tx bytes");
   IngressCertificate cert;
   cert.epoch = epoch;
   cert.lane = consensus::assign_ingress_lane(*tx);
   cert.seq = seq;
-  cert.txid = tx->txid();
+  cert.txid = txid_any(*tx);
   cert.tx_hash = crypto::sha256d(tx_bytes);
   cert.prev_lane_root = prev_lane_root;
   const auto signing_hash = cert.signing_hash();

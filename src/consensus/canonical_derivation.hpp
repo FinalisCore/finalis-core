@@ -13,6 +13,7 @@
 #include "consensus/frontier_execution.hpp"
 #include "consensus/validator_registry.hpp"
 #include "storage/db.hpp"
+#include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
 
 namespace finalis::consensus {
@@ -35,6 +36,7 @@ struct CanonicalDerivationConfig {
   availability::AvailabilityConfig availability{};
   std::uint64_t availability_min_eligible_operators{1};
   std::uint32_t validation_rules_version{6};
+  ConfidentialPolicy confidential_policy{};
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
 };
 

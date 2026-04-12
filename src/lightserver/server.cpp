@@ -2698,11 +2698,6 @@ std::string Server::handle_rpc_body(const std::string& body) {
       return make_result(id, broadcast_result_json(false, "", "rejected", "", std::string("tx_invalid"),
                                                    std::string("tx parse failed"), false, "none", false, std::nullopt));
     }
-    if (!std::holds_alternative<Tx>(*tx)) {
-      return make_result(id, broadcast_result_json(false, "", "rejected", "", std::string("tx_invalid"),
-                                                   std::string("tx version not yet relay-enabled"), false, "none", false,
-                                                   std::nullopt));
-    }
     const Hash32 txid = txid_any(*tx);
     const std::string txid_hex = hex_encode32(txid);
     if (view->get_tx_index(txid).has_value()) {
