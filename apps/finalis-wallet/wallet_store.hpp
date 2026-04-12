@@ -23,6 +23,8 @@ class WalletStore {
   struct PendingSpend {
     std::string txid_hex;
     std::vector<OutPoint> inputs;
+    std::uint64_t created_tip_height{0};
+    std::uint64_t created_unix_ms{0};
   };
 
   struct FinalizedHistoryRecord {
@@ -88,7 +90,8 @@ class WalletStore {
 
   bool add_sent_txid(const std::string& txid);
   bool remove_sent_txid(const std::string& txid);
-  bool upsert_pending_spend(const std::string& txid, const std::vector<OutPoint>& inputs);
+  bool upsert_pending_spend(const std::string& txid, const std::vector<OutPoint>& inputs,
+                            std::uint64_t created_tip_height = 0, std::uint64_t created_unix_ms = 0);
   bool remove_pending_spend(const std::string& txid);
   bool replace_finalized_history(const std::vector<FinalizedHistoryRecord>& records);
   bool append_finalized_history(const std::vector<FinalizedHistoryRecord>& records);

@@ -20,7 +20,7 @@ TEST(test_wallet_store_persists_sent_events_and_notes) {
   Hash32 spend_txid{};
   spend_txid.fill(0x42);
   std::vector<OutPoint> pending_inputs{OutPoint{spend_txid, 7}};
-  ASSERT_TRUE(store.upsert_pending_spend("abc123", pending_inputs));
+  ASSERT_TRUE(store.upsert_pending_spend("abc123", pending_inputs, 44, 123456789));
   ASSERT_TRUE(store.replace_finalized_history({WalletStore::FinalizedHistoryRecord{
       .txid_hex = "tx-final-1",
       .height = 9,
@@ -55,6 +55,8 @@ TEST(test_wallet_store_persists_sent_events_and_notes) {
   ASSERT_EQ(state.pending_spends[0].txid_hex, "abc123");
   ASSERT_EQ(state.pending_spends[0].inputs.size(), 1u);
   ASSERT_EQ(state.pending_spends[0].inputs[0].index, 7u);
+  ASSERT_EQ(state.pending_spends[0].created_tip_height, 44u);
+  ASSERT_EQ(state.pending_spends[0].created_unix_ms, 123456789u);
   ASSERT_EQ(state.finalized_history.size(), 2u);
   ASSERT_EQ(state.finalized_history[0].txid_hex, "tx-final-1");
   ASSERT_EQ(state.finalized_history[1].txid_hex, "tx-final-2");
@@ -87,8 +89,8 @@ TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
     ASSERT_TRUE(store.add_sent_txid("sent-b"));
     Hash32 spend_txid{};
     spend_txid.fill(0x21);
-    ASSERT_TRUE(store.upsert_pending_spend("sent-a", {OutPoint{spend_txid, 1}}));
-    ASSERT_TRUE(store.upsert_pending_spend("sent-b", {OutPoint{spend_txid, 2}}));
+    ASSERT_TRUE(store.upsert_pending_spend("sent-a", {OutPoint{spend_txid, 1}}, 10, 1000));
+    ASSERT_TRUE(store.upsert_pending_spend("sent-b", {OutPoint{spend_txid, 2}}, 11, 2000));
     ASSERT_TRUE(store.remove_sent_txid("sent-a"));
   }
 
@@ -100,6 +102,8 @@ TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
   ASSERT_EQ(state.sent_txids.size(), 1u);
   ASSERT_EQ(state.sent_txids[0], "sent-b");
   ASSERT_EQ(state.pending_spends.size(), 2u);
+  ASSERT_EQ(state.pending_spends[0].created_tip_height, 10u);
+  ASSERT_EQ(state.pending_spends[1].created_tip_height, 11u);
 }
 
 TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {

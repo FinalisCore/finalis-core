@@ -129,30 +129,38 @@ bool random_bytes(Bytes* out) {
   return RAND_bytes(out->data(), static_cast<int>(out->size())) == 1;
 }
 
-Bytes serialize_pending_spend(const std::vector<OutPoint>& inputs) {
+Bytes serialize_pending_spend(const WalletStore::PendingSpend& pending) {
   codec::ByteWriter w;
-  w.u32le(static_cast<std::uint32_t>(inputs.size()));
-  for (const auto& input : inputs) {
+  w.u32le(static_cast<std::uint32_t>(pending.inputs.size()));
+  for (const auto& input : pending.inputs) {
     w.bytes_fixed(input.txid);
     w.u32le(input.index);
   }
+  w.u64le(pending.created_tip_height);
+  w.u64le(pending.created_unix_ms);
   return w.take();
 }
 
-std::optional<std::vector<OutPoint>> parse_pending_spend(const Bytes& value) {
-  std::vector<OutPoint> out;
-  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
-        auto count = r.u32le();
-        if (!count) return false;
-        out.reserve(*count);
-        for (std::uint32_t i = 0; i < *count; ++i) {
-          auto txid = r.bytes_fixed<32>();
-          auto index = r.u32le();
-          if (!txid || !index) return false;
-          out.push_back(OutPoint{*txid, *index});
-        }
-        return true;
-      })) {
+std::optional<WalletStore::PendingSpend> parse_pending_spend(const std::string& txid_hex, const Bytes& value) {
+  WalletStore::PendingSpend out;
+  out.txid_hex = txid_hex;
+  codec::ByteReader r(value);
+  auto count = r.u32le();
+  if (!count) return std::nullopt;
+  out.inputs.reserve(*count);
+  for (std::uint32_t i = 0; i < *count; ++i) {
+    auto txid = r.bytes_fixed<32>();
+    auto index = r.u32le();
+    if (!txid || !index) return std::nullopt;
+    out.inputs.push_back(OutPoint{*txid, *index});
+  }
+  if (r.remaining() == 16) {
+    auto created_tip_height = r.u64le();
+    auto created_unix_ms = r.u64le();
+    if (!created_tip_height || !created_unix_ms) return std::nullopt;
+    out.created_tip_height = *created_tip_height;
+    out.created_unix_ms = *created_unix_ms;
+  } else if (!r.eof()) {
     return std::nullopt;
   }
   return out;
@@ -410,9 +418,9 @@ bool WalletStore::load(State* out) const {
   std::sort(out->sent_txids.begin(), out->sent_txids.end());
 
   for (const auto& [key, value] : db_.scan_prefix("PEND:")) {
-    auto parsed = parse_pending_spend(value);
+    auto parsed = parse_pending_spend(key.substr(5), value);
     if (!parsed) continue;
-    out->pending_spends.push_back(PendingSpend{key.substr(5), *parsed});
+    out->pending_spends.push_back(*parsed);
   }
   std::sort(out->pending_spends.begin(), out->pending_spends.end(),
             [](const auto& a, const auto& b) { return a.txid_hex < b.txid_hex; });
@@ -483,8 +491,14 @@ bool WalletStore::add_sent_txid(const std::string& txid) { return db_.put(key_se
 
 bool WalletStore::remove_sent_txid(const std::string& txid) { return db_.erase(key_sent(txid)); }
 
-bool WalletStore::upsert_pending_spend(const std::string& txid, const std::vector<OutPoint>& inputs) {
-  return db_.put(key_pending(txid), serialize_pending_spend(inputs));
+bool WalletStore::upsert_pending_spend(const std::string& txid, const std::vector<OutPoint>& inputs,
+                                       std::uint64_t created_tip_height, std::uint64_t created_unix_ms) {
+  return db_.put(key_pending(txid), serialize_pending_spend(PendingSpend{
+                                   .txid_hex = txid,
+                                   .inputs = inputs,
+                                   .created_tip_height = created_tip_height,
+                                   .created_unix_ms = created_unix_ms,
+                               }));
 }
 
 bool WalletStore::remove_pending_spend(const std::string& txid) { return db_.erase(key_pending(txid)); }

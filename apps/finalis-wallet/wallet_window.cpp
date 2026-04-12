@@ -82,6 +82,8 @@ namespace {
 constexpr const char* kSettingsOrg = "finalis";
 constexpr const char* kSettingsApp = "finalis-wallet";
 constexpr const char* kLegacySettingsApp = "reference-wallet";
+constexpr std::uint64_t kPendingSendReleaseMinTipDelta = 2;
+constexpr std::uint64_t kPendingSendReleaseMinAgeMs = 120000;
 constexpr const char* kDisplayTicker = "FLS";
 
 enum class ThemeMode { Light, Dark };
@@ -3472,12 +3474,17 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   }
 
   std::map<std::string, std::vector<OutPoint>> pending_spends = request.pending_wallet_spends;
+  std::map<std::string, WalletStore::PendingSpend> pending_spend_meta;
+  for (const auto& pending : request.pending_spend_records) {
+    pending_spend_meta.emplace(pending.txid_hex, pending);
+  }
   std::vector<std::string> remaining_sent_txids;
   std::set<std::string> remove_pending;
   std::set<std::string> remove_sent;
   std::vector<OutPoint> spent_confidential_outpoints;
   std::vector<std::string> released_pending_txids;
   remaining_sent_txids.reserve(request.local_sent_txids.size());
+  const std::uint64_t now_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
   for (const auto& txid_hex : request.local_sent_txids) {
     bool finalized_direct = finalized_seen.count(txid_hex) != 0;
     bool dropped_from_runtime = false;
@@ -3488,8 +3495,18 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
         auto tx_status = lightserver::rpc_get_tx_status(active_endpoint.toStdString(), *txid, &rpc_err);
         if (tx_status.has_value()) {
           finalized_direct = tx_status->finalized;
+          const auto meta_it = pending_spend_meta.find(txid_hex);
+          const std::uint64_t created_tip_height =
+              meta_it == pending_spend_meta.end() ? 0 : meta_it->second.created_tip_height;
+          const std::uint64_t created_unix_ms =
+              meta_it == pending_spend_meta.end() ? 0 : meta_it->second.created_unix_ms;
+          const bool release_height_ok =
+              status->tip_height >= created_tip_height + kPendingSendReleaseMinTipDelta;
+          const bool release_age_ok =
+              created_unix_ms == 0 || now_ms >= created_unix_ms + kPendingSendReleaseMinAgeMs;
           dropped_from_runtime = tip_changed && !tx_status->finalized &&
-                                 QString::fromStdString(tx_status->status).trimmed().compare("not_found", Qt::CaseInsensitive) == 0;
+                                 QString::fromStdString(tx_status->status).trimmed().compare("not_found", Qt::CaseInsensitive) == 0 &&
+                                 release_height_ok && release_age_ok;
         }
       }
     }
@@ -3659,6 +3676,10 @@ void WalletWindow::refresh_chain_state(bool interactive) {
   request.current_chain_records = chain_records_;
   request.local_sent_txids = local_sent_txids_;
   request.pending_wallet_spends = pending_wallet_spends_;
+  if (wallet_) {
+    WalletStore::State local_state;
+    if (store_.load(&local_state)) request.pending_spend_records = std::move(local_state.pending_spends);
+  }
   request.finalized_history_cursor_height = finalized_history_cursor_height_;
   request.finalized_history_cursor_txid = finalized_history_cursor_txid_;
   request.finalized_tx_summary_cache = finalized_tx_summary_cache_;
@@ -4772,7 +4793,8 @@ void WalletWindow::submit_send() {
   pending_wallet_spends_[result->txid_hex] = reserved_inputs;
   mark_refresh_state_changed();
   (void)store_.add_sent_txid(result->txid_hex);
-  (void)store_.upsert_pending_spend(result->txid_hex, reserved_inputs);
+  (void)store_.upsert_pending_spend(result->txid_hex, reserved_inputs, tip_height_,
+                                    static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch()));
   save_wallet_local_state();
   append_local_event(QString("[pending] sent %1 -> %2 (%3)")
                          .arg(format_coin_amount(*amount_units))

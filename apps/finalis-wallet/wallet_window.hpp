@@ -153,6 +153,7 @@ class WalletWindow final : public QMainWindow {
     std::vector<ChainRecord> current_chain_records;
     std::vector<std::string> local_sent_txids;
     std::map<std::string, std::vector<OutPoint>> pending_wallet_spends;
+    std::vector<WalletStore::PendingSpend> pending_spend_records;
     std::optional<std::uint64_t> finalized_history_cursor_height;
     std::optional<std::string> finalized_history_cursor_txid;
     std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache;
