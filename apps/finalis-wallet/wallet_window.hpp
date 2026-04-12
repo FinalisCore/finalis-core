@@ -204,6 +204,9 @@ class WalletWindow final : public QMainWindow {
   void create_wallet();
   void open_wallet();
   void import_wallet();
+  void unlock_confidential_state();
+  void generate_confidential_request();
+  void import_confidential_request();
   void export_wallet_secret();
   void show_about();
   void save_connection_settings();
@@ -262,6 +265,7 @@ class WalletWindow final : public QMainWindow {
   QLabel* receive_copy_status_label_{nullptr};
   QLabel* receive_finalized_note_label_{nullptr};
   QLabel* receive_confidential_address_label_{nullptr};
+  QLabel* receive_confidential_request_label_{nullptr};
   QLabel* receive_confidential_note_label_{nullptr};
   QComboBox* history_filter_combo_{nullptr};
   QTableWidget* history_view_{nullptr};
@@ -294,9 +298,11 @@ class WalletWindow final : public QMainWindow {
   QTextEdit* activity_detail_view_{nullptr};
 
   QLineEdit* send_address_edit_{nullptr};
+  QComboBox* send_mode_combo_{nullptr};
   QLineEdit* send_amount_edit_{nullptr};
   QLineEdit* send_fee_edit_{nullptr};
   QPushButton* send_max_button_{nullptr};
+  QPushButton* send_import_confidential_request_button_{nullptr};
   QPushButton* send_review_button_{nullptr};
   QPushButton* send_button_{nullptr};
   QLabel* send_review_status_label_{nullptr};

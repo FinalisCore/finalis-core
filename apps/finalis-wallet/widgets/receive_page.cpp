@@ -89,9 +89,28 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   confidential_address_label_->setFont(confidential_font);
   confidential_layout->addWidget(confidential_address_label_);
 
+  auto* confidential_request_title = new QLabel("Shareable confidential request", confidential_box);
+  confidential_request_title->setProperty("role", QVariant(QStringLiteral("muted")));
+  confidential_layout->addWidget(confidential_request_title);
+
+  confidential_request_label_ = new QLabel("not generated", confidential_box);
+  confidential_request_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  confidential_request_label_->setWordWrap(true);
+  confidential_request_label_->setFont(confidential_font);
+  confidential_layout->addWidget(confidential_request_label_);
+
+  auto* confidential_actions = new QHBoxLayout();
+  confidential_actions->setSpacing(8);
+  generate_confidential_request_button_ = new QPushButton("Generate Request", confidential_box);
+  copy_confidential_request_button_ = new QPushButton("Copy Request", confidential_box);
+  confidential_actions->addWidget(generate_confidential_request_button_);
+  confidential_actions->addWidget(copy_confidential_request_button_);
+  confidential_actions->addStretch(1);
+  confidential_layout->addLayout(confidential_actions);
+
   confidential_note_label_ = new QLabel(
       "Confidential receive requires a configured stealth account and encrypted local recovery material. "
-      "This wallet will not advertise a confidential address until that state exists locally.",
+      "This wallet will not advertise a confidential address until that state exists locally. Use Generate Request to produce a one-time shareable request URI for supported TxV2 sends.",
       confidential_box);
   confidential_note_label_->setWordWrap(true);
   confidential_note_label_->setProperty("role", QVariant(QStringLiteral("muted")));

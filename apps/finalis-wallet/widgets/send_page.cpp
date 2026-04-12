@@ -7,6 +7,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QComboBox>
 #include <QScrollArea>
 #include <QVariant>
 #include <QVBoxLayout>
@@ -44,7 +45,8 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   configure_page_layout(layout);
 
   auto* intro = new QLabel(
-      "Review the transaction inline before sending. The wallet signs locally and only observes finalized state through lightserver.",
+      "Review the transaction inline before sending. The wallet signs locally and only observes finalized state through lightserver. "
+      "Confidential TxV2 support is currently limited to transparent -> confidential and exact confidential -> transparent sends.",
       this);
   intro->setWordWrap(true);
   intro->setProperty("role", QVariant(QStringLiteral("muted")));
@@ -68,27 +70,36 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   configure_form_layout(form);
 
   address_edit_ = new QLineEdit(form_box);
+  mode_combo_ = new QComboBox(form_box);
   amount_edit_ = new QLineEdit(form_box);
   fee_edit_ = new QLineEdit(form_box);
   address_edit_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  mode_combo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
   amount_edit_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
   fee_edit_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
   fee_edit_->setReadOnly(true);
   address_edit_->setPlaceholderText("sc...");
+  mode_combo_->addItem("Transparent -> Transparent");
+  mode_combo_->addItem("Transparent -> Confidential");
+  mode_combo_->addItem("Confidential -> Transparent");
   amount_edit_->setPlaceholderText("0.00");
   form->addRow("Recipient address", address_edit_);
+  form->addRow("Send mode", mode_combo_);
   form->addRow("Amount (FLS)", amount_edit_);
   form->addRow("Fixed fee (FLS)", fee_edit_);
 
   auto* actions = new QHBoxLayout();
   actions->setSpacing(8);
   max_button_ = new QPushButton("Send Max", form_box);
+  import_confidential_request_button_ = new QPushButton("Import Request", form_box);
   review_button_ = new QPushButton("Review Send", form_box);
   send_button_ = new QPushButton("Send", form_box);
   max_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+  import_confidential_request_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   review_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   send_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   actions->addWidget(max_button_);
+  actions->addWidget(import_confidential_request_button_);
   actions->addWidget(review_button_);
   actions->addWidget(send_button_);
   actions->addStretch(1);

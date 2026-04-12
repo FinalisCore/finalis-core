@@ -5,6 +5,7 @@
 class QLineEdit;
 class QPushButton;
 class QLabel;
+class QComboBox;
 
 namespace finalis::wallet {
 
@@ -13,9 +14,11 @@ class SendPage final : public QWidget {
   explicit SendPage(QWidget* parent = nullptr);
 
   QLineEdit* address_edit() const { return address_edit_; }
+  QComboBox* mode_combo() const { return mode_combo_; }
   QLineEdit* amount_edit() const { return amount_edit_; }
   QLineEdit* fee_edit() const { return fee_edit_; }
   QPushButton* max_button() const { return max_button_; }
+  QPushButton* import_confidential_request_button() const { return import_confidential_request_button_; }
   QPushButton* review_button() const { return review_button_; }
   QPushButton* send_button() const { return send_button_; }
   QLabel* review_status_label() const { return review_status_label_; }
@@ -30,9 +33,11 @@ class SendPage final : public QWidget {
 
  private:
   QLineEdit* address_edit_{nullptr};
+  QComboBox* mode_combo_{nullptr};
   QLineEdit* amount_edit_{nullptr};
   QLineEdit* fee_edit_{nullptr};
   QPushButton* max_button_{nullptr};
+  QPushButton* import_confidential_request_button_{nullptr};
   QPushButton* review_button_{nullptr};
   QPushButton* send_button_{nullptr};
   QLabel* review_status_label_{nullptr};

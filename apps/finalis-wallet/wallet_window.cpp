@@ -61,12 +61,14 @@
 #include "common/types.hpp"
 #include "consensus/monetary.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/stealth_address.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "keystore/validator_keystore.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
 #include "privacy/mint_client.hpp"
 #include "privacy/mint_scripts.hpp"
+#include "wallet/confidential_builder.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 
@@ -228,6 +230,187 @@ std::optional<std::array<std::uint8_t, 32>> decode_hex32_string(const std::strin
   std::array<std::uint8_t, 32> out{};
   std::copy(bytes->begin(), bytes->end(), out.begin());
   return out;
+}
+
+std::optional<PubKey33> decode_hex33_string(const std::string& hex) {
+  auto bytes = finalis::hex_decode(hex);
+  if (!bytes || bytes->size() != 33) return std::nullopt;
+  PubKey33 out{};
+  std::copy(bytes->begin(), bytes->end(), out.begin());
+  return out;
+}
+
+std::optional<crypto::Blind32> decode_blind32_string(const std::string& hex) {
+  auto bytes = finalis::hex_decode(hex);
+  if (!bytes || bytes->size() != 32) return std::nullopt;
+  crypto::Blind32 out;
+  std::copy(bytes->begin(), bytes->end(), out.bytes.begin());
+  return out;
+}
+
+std::optional<Bytes> decode_hex_bytes_string(const std::string& hex) {
+  return finalis::hex_decode(hex);
+}
+
+Hash32 random_hash32() {
+  std::random_device rd;
+  Hash32 out{};
+  for (auto& b : out) b = static_cast<std::uint8_t>(rd());
+  return out;
+}
+
+enum class WalletSendMode : std::uint8_t {
+  TransparentToTransparent = 0,
+  TransparentToConfidential = 1,
+  ConfidentialToTransparent = 2,
+};
+
+WalletSendMode wallet_send_mode_from_combo(const QComboBox* combo) {
+  if (!combo) return WalletSendMode::TransparentToTransparent;
+  switch (combo->currentIndex()) {
+    case 1:
+      return WalletSendMode::TransparentToConfidential;
+    case 2:
+      return WalletSendMode::ConfidentialToTransparent;
+    default:
+      return WalletSendMode::TransparentToTransparent;
+  }
+}
+
+QString wallet_send_mode_default_placeholder(WalletSendMode mode) {
+  switch (mode) {
+    case WalletSendMode::TransparentToTransparent:
+      return "sc...";
+    case WalletSendMode::TransparentToConfidential:
+      return "ctxv2:<one_time_pubkey_hex>:<ephemeral_pubkey_hex>:<scan_tag_hex>[:memo_hex]";
+    case WalletSendMode::ConfidentialToTransparent:
+      return "sc...";
+  }
+  return "sc...";
+}
+
+QString wallet_send_mode_recipient_label(WalletSendMode mode) {
+  switch (mode) {
+    case WalletSendMode::TransparentToTransparent:
+      return "Recipient address";
+    case WalletSendMode::TransparentToConfidential:
+      return "Recipient descriptor";
+    case WalletSendMode::ConfidentialToTransparent:
+      return "Recipient address";
+  }
+  return "Recipient";
+}
+
+std::string encode_confidential_request_uri(const wallet::ConfidentialRecipient& recipient) {
+  Bytes payload;
+  payload.insert(payload.end(), recipient.one_time_pubkey.begin(), recipient.one_time_pubkey.end());
+  payload.insert(payload.end(), recipient.ephemeral_pubkey.begin(), recipient.ephemeral_pubkey.end());
+  payload.push_back(recipient.scan_tag.value);
+  return "scconfreq1:" + finalis::hex_encode(payload);
+}
+
+std::optional<wallet::ConfidentialRecipient> parse_confidential_request_uri(const QString& text, QString* err) {
+  const QString trimmed = text.trimmed();
+  const QString prefix = "scconfreq1:";
+  if (!trimmed.startsWith(prefix, Qt::CaseInsensitive)) return std::nullopt;
+  auto payload = decode_hex_bytes_string(trimmed.mid(prefix.size()).trimmed().toStdString());
+  if (!payload || payload->size() != 67) {
+    if (err) *err = "Confidential request URI payload is malformed.";
+    return std::nullopt;
+  }
+  wallet::ConfidentialRecipient out;
+  std::copy(payload->begin(), payload->begin() + 33, out.one_time_pubkey.begin());
+  std::copy(payload->begin() + 33, payload->begin() + 66, out.ephemeral_pubkey.begin());
+  out.scan_tag = crypto::ScanTag{(*payload)[66]};
+  if (!crypto::compressed_pubkey33_is_canonical(out.one_time_pubkey) ||
+      !crypto::compressed_pubkey33_is_canonical(out.ephemeral_pubkey)) {
+    if (err) *err = "Confidential request URI contains non-canonical pubkeys.";
+    return std::nullopt;
+  }
+  return out;
+}
+
+std::optional<wallet::ConfidentialRecipient> parse_confidential_recipient_descriptor(const QString& text, QString* err) {
+  if (auto uri = parse_confidential_request_uri(text, err); uri.has_value()) return uri;
+  const QString trimmed = text.trimmed();
+  const QString prefix = "ctxv2:";
+  if (!trimmed.startsWith(prefix, Qt::CaseInsensitive)) {
+    if (err) *err = "Confidential recipient must use the ctxv2 descriptor format.";
+    return std::nullopt;
+  }
+  const QStringList parts = trimmed.mid(prefix.size()).split(':');
+  if (parts.size() < 3 || parts.size() > 4) {
+    if (err) *err = "Confidential recipient format is ctxv2:<one_time_pubkey_hex>:<ephemeral_pubkey_hex>:<scan_tag_hex>[:memo_hex].";
+    return std::nullopt;
+  }
+  const auto one_time_pubkey = decode_hex33_string(parts[0].trimmed().toStdString());
+  if (!one_time_pubkey || !crypto::compressed_pubkey33_is_canonical(*one_time_pubkey)) {
+    if (err) *err = "Confidential recipient one-time pubkey must be a canonical 33-byte compressed secp256k1 key.";
+    return std::nullopt;
+  }
+  const auto ephemeral_pubkey = decode_hex33_string(parts[1].trimmed().toStdString());
+  if (!ephemeral_pubkey || !crypto::compressed_pubkey33_is_canonical(*ephemeral_pubkey)) {
+    if (err) *err = "Confidential recipient ephemeral pubkey must be a canonical 33-byte compressed secp256k1 key.";
+    return std::nullopt;
+  }
+  const auto scan_tag_bytes = decode_hex_bytes_string(parts[2].trimmed().toStdString());
+  if (!scan_tag_bytes || scan_tag_bytes->size() != 1) {
+    if (err) *err = "Confidential recipient scan tag must be a 1-byte hex value.";
+    return std::nullopt;
+  }
+  Bytes memo;
+  if (parts.size() == 4) {
+    auto memo_bytes = decode_hex_bytes_string(parts[3].trimmed().toStdString());
+    if (!memo_bytes) {
+      if (err) *err = "Confidential recipient memo must be valid hex.";
+      return std::nullopt;
+    }
+    memo = std::move(*memo_bytes);
+  }
+  return wallet::ConfidentialRecipient{
+      .one_time_pubkey = *one_time_pubkey,
+      .ephemeral_pubkey = *ephemeral_pubkey,
+      .scan_tag = crypto::ScanTag{(*scan_tag_bytes)[0]},
+      .memo = std::move(memo),
+  };
+}
+
+std::optional<std::pair<OutPoint, TxOut>> select_single_covering_prev(
+    const std::vector<std::pair<OutPoint, TxOut>>& available_prevs, std::uint64_t target_units) {
+  std::optional<std::pair<OutPoint, TxOut>> best;
+  for (const auto& prev : available_prevs) {
+    if (prev.second.value < target_units) continue;
+    if (!best || prev.second.value < best->second.value) best = prev;
+  }
+  return best;
+}
+
+std::optional<wallet::ConfidentialOwnedCoin> select_exact_confidential_coin(
+    const wallet::WalletStore::State& state, const std::set<OutPoint>& reserved, std::uint64_t total_units, QString* err) {
+  for (const auto& coin : state.confidential_coins) {
+    if (coin.spent || coin.amount != total_units) continue;
+    auto txid = decode_hex32_string(coin.txid_hex);
+    auto value_commitment = decode_hex33_string(coin.value_commitment_hex);
+    auto one_time_pubkey = decode_hex33_string(coin.one_time_pubkey_hex);
+    auto spend_secret = decode_blind32_string(coin.spend_secret_hex);
+    auto value_blind = decode_blind32_string(coin.blinding_factor_hex);
+    if (!txid || !value_commitment || !one_time_pubkey || !spend_secret || !value_blind) continue;
+    wallet::ConfidentialOwnedCoin out;
+    out.outpoint = OutPoint{*txid, coin.vout};
+    if (reserved.find(out.outpoint) != reserved.end()) continue;
+    out.amount = coin.amount;
+    out.spend_secret = *spend_secret;
+    out.value_blind = *value_blind;
+    out.value_commitment = crypto::Commitment33{*value_commitment};
+    out.one_time_pubkey = *one_time_pubkey;
+    return out;
+  }
+  if (err) {
+    *err =
+        QString("No unlocked confidential coin exactly matching %1 base units is available. Confidential sends currently support exact single-coin spends only.")
+            .arg(QString::number(total_units));
+  }
+  return std::nullopt;
 }
 
 QString elide_middle(const QString& value, int keep = 14) {
@@ -821,6 +1004,7 @@ void WalletWindow::build_ui() {
 
   auto* refresh_action = view_menu->addAction("Refresh");
   refresh_action->setShortcut(QKeySequence::Refresh);
+  auto* unlock_confidential_action = wallet_menu->addAction("Unlock Confidential State");
   auto* history_detail_action = view_menu->addAction("Selected Record Details");
   history_detail_action->setShortcut(QKeySequence("Ctrl+D"));
   auto* mint_detail_action = wallet_menu->addAction("Selected Mint Details");
@@ -938,9 +1122,11 @@ void WalletWindow::build_ui() {
   overview_open_explorer_button_ = overview_page_->open_explorer_button();
 
   send_address_edit_ = send_page_->address_edit();
+  send_mode_combo_ = send_page_->mode_combo();
   send_amount_edit_ = send_page_->amount_edit();
   send_fee_edit_ = send_page_->fee_edit();
   send_max_button_ = send_page_->max_button();
+  send_import_confidential_request_button_ = send_page_->import_confidential_request_button();
   send_review_button_ = send_page_->review_button();
   send_button_ = send_page_->send_button();
   send_review_status_label_ = send_page_->review_status_label();
@@ -955,10 +1141,13 @@ void WalletWindow::build_ui() {
 
   receive_address_label_ = receive_page_->address_label();
   receive_confidential_address_label_ = receive_page_->confidential_address_label();
+  receive_confidential_request_label_ = receive_page_->confidential_request_label();
   receive_copy_status_label_ = receive_page_->copy_status_label();
   receive_finalized_note_label_ = receive_page_->finalized_note_label();
   receive_confidential_note_label_ = receive_page_->confidential_note_label();
   auto* copy_address_button = receive_page_->copy_button();
+  auto* generate_confidential_request_button = receive_page_->generate_confidential_request_button();
+  auto* copy_confidential_request_button = receive_page_->copy_confidential_request_button();
 
   history_filter_combo_ = activity_page_->filter_combo();
   history_detail_button_ = activity_page_->detail_button();
@@ -1039,6 +1228,7 @@ void WalletWindow::build_ui() {
   connect(open_action, &QAction::triggered, this, [this]() { open_wallet(); });
   connect(import_button, &QPushButton::clicked, this, [this]() { import_wallet(); });
   connect(import_action, &QAction::triggered, this, [this]() { import_wallet(); });
+  connect(unlock_confidential_action, &QAction::triggered, this, [this]() { unlock_confidential_state(); });
   connect(export_button, &QPushButton::clicked, this, [this]() { export_wallet_secret(); });
   connect(export_action, &QAction::triggered, this, [this]() { export_wallet_secret(); });
   connect(refresh_button, &QPushButton::clicked, this, [this]() { refresh_chain_state(true); });
@@ -1049,11 +1239,22 @@ void WalletWindow::build_ui() {
     if (receive_copy_status_label_) receive_copy_status_label_->setText("Address copied to clipboard.");
     statusBar()->showMessage("Receive address copied to clipboard.", 3000);
   });
+  connect(generate_confidential_request_button, &QPushButton::clicked, this,
+          [this]() { generate_confidential_request(); });
+  connect(copy_confidential_request_button, &QPushButton::clicked, this, [this]() {
+    const QString value =
+        receive_confidential_request_label_ ? receive_confidential_request_label_->text().trimmed() : QString{};
+    if (value.isEmpty() || value == "not generated") return;
+    QApplication::clipboard()->setText(value);
+    statusBar()->showMessage("Confidential request copied to clipboard.", 3000);
+  });
   connect(overview_send_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(send_page_); });
   connect(overview_receive_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(receive_page_); });
   connect(overview_activity_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(activity_page_); });
   connect(overview_open_explorer_button_, &QPushButton::clicked, this, [this]() { open_explorer_home(); });
   connect(send_max_button_, &QPushButton::clicked, this, [this]() { populate_send_max_amount(); });
+  connect(send_import_confidential_request_button_, &QPushButton::clicked, this,
+          [this]() { import_confidential_request(); });
   connect(send_review_button_, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button_, &QPushButton::clicked, this, [this]() { submit_send(); });
   connect(validator_action_button_, &QPushButton::clicked, this, [this]() { start_validator_onboarding_clicked(); });
@@ -1127,6 +1328,10 @@ void WalletWindow::build_ui() {
   send_max_button_->setEnabled(false);
   send_review_button_->setEnabled(false);
   send_button_->setEnabled(false);
+  const auto update_send_mode_ui = [this]() {
+    const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
+    if (send_address_edit_) send_address_edit_->setPlaceholderText(wallet_send_mode_default_placeholder(mode));
+  };
   const auto update_send_state = [this]() {
     const bool wallet_ready = wallet_.has_value();
     const bool ready =
@@ -1139,6 +1344,11 @@ void WalletWindow::build_ui() {
   connect(send_amount_edit_, &QLineEdit::textChanged, this, [update_send_state](const QString&) { update_send_state(); });
   connect(send_address_edit_, &QLineEdit::textChanged, this, [this](const QString&) { reset_send_review_panel(); });
   connect(send_amount_edit_, &QLineEdit::textChanged, this, [this](const QString&) { reset_send_review_panel(); });
+  connect(send_mode_combo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, update_send_mode_ui](int) {
+    update_send_mode_ui();
+    reset_send_review_panel();
+  });
+  update_send_mode_ui();
   reset_send_review_panel();
 
   finalized_tip_poll_timer_ = new QTimer(this);
@@ -1463,6 +1673,7 @@ void WalletWindow::update_wallet_views() {
     receive_address_label_->setToolTip({});
     if (overview_confidential_receive_label_) overview_confidential_receive_label_->setText("not configured");
     if (receive_confidential_address_label_) receive_confidential_address_label_->setText("not configured");
+    if (receive_confidential_request_label_) receive_confidential_request_label_->setText("not generated");
     if (receive_copy_status_label_) receive_copy_status_label_->setText("Open or create a wallet to get a receive address.");
     balance_label_->setText(QString("0 %1").arg(kDisplayTicker));
     pending_balance_label_->setText(QString("Pending outgoing: 0 %1").arg(kDisplayTicker));
@@ -1502,6 +1713,9 @@ void WalletWindow::update_wallet_views() {
   receive_address_label_->setToolTip(QString::fromStdString(wallet_->address));
   if (overview_confidential_receive_label_) overview_confidential_receive_label_->setText(confidential_receive_address_);
   if (receive_confidential_address_label_) receive_confidential_address_label_->setText(confidential_receive_address_);
+  if (receive_confidential_request_label_ && receive_confidential_request_label_->text().trimmed().isEmpty()) {
+    receive_confidential_request_label_->setText("not generated");
+  }
   if (receive_copy_status_label_) receive_copy_status_label_->setText("Address ready to share.");
   std::uint64_t total = 0;
   std::uint64_t pending_outgoing = 0;
@@ -2409,6 +2623,7 @@ void WalletWindow::load_wallet_local_state() {
   local_history_lines_.clear();
   mint_notes_.clear();
   confidential_receive_address_ = "not configured";
+  if (receive_confidential_request_label_) receive_confidential_request_label_->setText("not generated");
   confidential_balance_units_ = 0;
   confidential_coin_count_ = 0;
   confidential_storage_locked_ = false;
@@ -3314,6 +3529,109 @@ void WalletWindow::import_wallet() {
   statusBar()->showMessage("Wallet imported.", 3000);
 }
 
+void WalletWindow::unlock_confidential_state() {
+  if (!ensure_wallet_loaded("Unlock Confidential State")) return;
+
+  const auto passphrase = prompt_passphrase("Unlock Confidential State", false);
+  if (!passphrase.has_value()) return;
+
+  auto loaded = load_wallet_file(QString::fromStdString(wallet_->file_path), *passphrase);
+  if (!loaded) return;
+
+  wallet_->passphrase = loaded->passphrase;
+  if (!open_wallet_store()) {
+    QMessageBox::warning(this, "Unlock Confidential State", "Failed to reopen wallet local state.");
+    return;
+  }
+  load_wallet_local_state();
+  update_wallet_views();
+  append_local_event("Unlocked confidential local state for " + QString::fromStdString(wallet_->file_path));
+  statusBar()->showMessage("Confidential local state unlocked.", 3000);
+}
+
+void WalletWindow::generate_confidential_request() {
+  if (!ensure_wallet_loaded("Generate Confidential Request")) return;
+  if (confidential_storage_locked_) {
+    QMessageBox::warning(this, "Generate Confidential Request",
+                         "Unlock confidential state first. Request generation needs local confidential recovery material.");
+    return;
+  }
+  WalletStore::State state;
+  if (!store_.load(&state)) {
+    QMessageBox::warning(this, "Generate Confidential Request", "Unable to load local confidential wallet state.");
+    return;
+  }
+  const std::string primary_account_id = state.confidential_primary_account_id.value_or("");
+  auto account_it = std::find_if(
+      state.confidential_accounts.begin(), state.confidential_accounts.end(),
+      [&](const WalletStore::ConfidentialAccountRecord& account) { return account.account_id == primary_account_id; });
+  if (account_it == state.confidential_accounts.end() && !state.confidential_accounts.empty()) {
+    account_it = state.confidential_accounts.begin();
+  }
+  if (account_it == state.confidential_accounts.end()) {
+    QMessageBox::warning(this, "Generate Confidential Request",
+                         "No confidential account is configured locally yet.");
+    return;
+  }
+  auto view_key_material = decode_hex_bytes_string(account_it->view_key_material_hex);
+  if (!view_key_material || view_key_material->empty()) {
+    QMessageBox::warning(this, "Generate Confidential Request",
+                         "The primary confidential account is missing view key recovery material.");
+    return;
+  }
+  const Hash32 ephemeral_secret = random_hash32();
+  auto ephemeral_pubkey = crypto::secp256k1_pubkey_from_scalar(ephemeral_secret);
+  if (!ephemeral_pubkey) {
+    QMessageBox::warning(this, "Generate Confidential Request", "Failed to derive an ephemeral request key.");
+    return;
+  }
+  Hash32 scan_tag_source = random_hash32();
+  const std::uint8_t scan_tag = scan_tag_source[0];
+  auto scanned = crypto::scan_stealth_output(*ephemeral_pubkey, scan_tag, *view_key_material);
+  if (!scanned || !scanned->mine) {
+    QMessageBox::warning(this, "Generate Confidential Request",
+                         "Failed to derive a local one-time confidential receive key.");
+    return;
+  }
+  const ConfidentialRecipient recipient{
+      .one_time_pubkey = scanned->one_time_pubkey,
+      .ephemeral_pubkey = *ephemeral_pubkey,
+      .scan_tag = crypto::ScanTag{scan_tag},
+      .memo = {},
+  };
+  const QString uri = QString::fromStdString(encode_confidential_request_uri(recipient));
+  if (receive_confidential_request_label_) receive_confidential_request_label_->setText(uri);
+  QApplication::clipboard()->setText(uri);
+  append_local_event(QString("[confidential] generated receive request for %1")
+                         .arg(QString::fromStdString(account_it->label.empty() ? account_it->account_id : account_it->label)));
+  statusBar()->showMessage("Confidential request generated and copied to clipboard.", 3000);
+}
+
+void WalletWindow::import_confidential_request() {
+  const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
+  if (mode != WalletSendMode::TransparentToConfidential) {
+    if (send_mode_combo_) send_mode_combo_->setCurrentIndex(static_cast<int>(WalletSendMode::TransparentToConfidential));
+  }
+  bool ok = false;
+  const QString current = QApplication::clipboard()->text().trimmed();
+  const QString input = QInputDialog::getMultiLineText(
+      this, "Import Confidential Request",
+      "Paste a confidential request URI or legacy ctxv2 descriptor.\n\nPreferred format: scconfreq1:...", current, &ok);
+  if (!ok) return;
+  QString parse_err;
+  auto recipient = parse_confidential_recipient_descriptor(input, &parse_err);
+  if (!recipient) {
+    QMessageBox::warning(this, "Import Confidential Request", parse_err.isEmpty() ? "Request is invalid." : parse_err);
+    return;
+  }
+  const QString normalized = input.trimmed().startsWith("scconfreq1:", Qt::CaseInsensitive)
+                                 ? input.trimmed()
+                                 : QString::fromStdString(encode_confidential_request_uri(*recipient));
+  send_address_edit_->setText(normalized);
+  tabs_->setCurrentWidget(send_page_);
+  show_send_inline_status("Confidential request imported. Review before sending.");
+}
+
 void WalletWindow::export_wallet_secret() {
   if (!ensure_wallet_loaded("Export Backup")) return;
 
@@ -3360,81 +3678,193 @@ void WalletWindow::show_about() {
 void WalletWindow::validate_send_form() {
   if (!ensure_wallet_loaded("Review Send")) return;
   reset_send_review_panel();
-  const QString address = send_address_edit_->text().trimmed();
-  const QString amount = send_amount_edit_->text().trimmed();
-  if (address.isEmpty() || amount.isEmpty()) {
+  const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
+  const QString recipient_text = send_address_edit_->text().trimmed();
+  const QString amount_text = send_amount_edit_->text().trimmed();
+  if (recipient_text.isEmpty() || amount_text.isEmpty()) {
     show_send_inline_warning("Recipient address and amount are required.");
     show_send_inline_status("Review unavailable");
     return;
   }
-  if (!finalis::address::decode(address.toStdString()).has_value()) {
-    show_send_inline_warning("Recipient address is invalid.");
-    show_send_inline_status("Review unavailable");
-    return;
-  }
   bool amount_ok = false;
-  const double amount_value = amount.toDouble(&amount_ok);
+  const double amount_value = amount_text.toDouble(&amount_ok);
   if (!amount_ok || amount_value <= 0.0) {
     show_send_inline_warning("Amount must be positive.");
     show_send_inline_status("Review unavailable");
     return;
   }
 
-  auto amount_units = parse_coin_amount(amount);
+  auto amount_units = parse_coin_amount(amount_text);
   if (!amount_units) {
     show_send_inline_warning("Amount must be a valid coin value with up to 8 decimals.");
     show_send_inline_status("Review unavailable");
     return;
   }
-  std::size_t reserved_excluded = 0;
-  std::size_t pending_reserved_excluded = 0;
-  std::size_t onboarding_reserved_excluded = 0;
-  QString prev_err;
-  auto available_prevs =
-      send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
-  if (!available_prevs) {
-    show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
-    show_send_inline_status("Review unavailable");
-    return;
-  }
-  auto decoded_to = finalis::address::decode(address.toStdString());
-  auto own_decoded = finalis::address::decode(wallet_->address);
-  if (!decoded_to || !own_decoded) {
-    show_send_inline_warning("Address data is invalid.");
-    show_send_inline_status("Review unavailable");
-    return;
-  }
-  std::string err;
-  auto plan = finalis::plan_wallet_p2pkh_send(
-      *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
-      finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), *amount_units, finalis::DEFAULT_WALLET_SEND_FEE_UNITS,
-      finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
-  if (!plan) {
-    show_send_inline_warning(QString::fromStdString(err));
-    show_send_inline_status("Review unavailable");
+  if (mode == WalletSendMode::TransparentToTransparent) {
+    if (!finalis::address::decode(recipient_text.toStdString()).has_value()) {
+      show_send_inline_warning("Recipient address is invalid.");
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    std::size_t reserved_excluded = 0;
+    std::size_t pending_reserved_excluded = 0;
+    std::size_t onboarding_reserved_excluded = 0;
+    QString prev_err;
+    auto available_prevs =
+        send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+    if (!available_prevs) {
+      show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    auto decoded_to = finalis::address::decode(recipient_text.toStdString());
+    auto own_decoded = finalis::address::decode(wallet_->address);
+    if (!decoded_to || !own_decoded) {
+      show_send_inline_warning("Address data is invalid.");
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    std::string err;
+    auto plan = finalis::plan_wallet_p2pkh_send(
+        *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
+        finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), *amount_units,
+        finalis::DEFAULT_WALLET_SEND_FEE_UNITS, finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
+    if (!plan) {
+      show_send_inline_warning(QString::fromStdString(err));
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+
+    const QString change_text =
+        plan->change_units > 0
+            ? QString("%1 back to %2")
+                  .arg(format_coin_amount(plan->change_units))
+                  .arg(elide_middle(QString::fromStdString(wallet_->address)))
+            : QString("Folded into fee (dust <= %1 units)").arg(finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS);
+    send_review_recipient_label_->setText(recipient_text);
+    send_review_amount_label_->setText(format_coin_amount(*amount_units));
+    send_review_fee_label_->setText(format_coin_amount(plan->applied_fee_units));
+    send_review_total_label_->setText(format_coin_amount(*amount_units + plan->applied_fee_units));
+    send_review_change_label_->setText(change_text);
+    send_review_inputs_label_->setText(QString::number(plan->selected_prevs.size()));
+    QString note =
+        "The review is based on finalized wallet state only. Pending local sends keep their inputs reserved until finalization.";
+    if (reserved_excluded > 0) {
+      note += QString("\nReserved finalized inputs excluded from this review: %1.").arg(reserved_excluded);
+      const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
+      if (!reservation_breakdown.isEmpty()) note += "\n" + reservation_breakdown;
+    }
+    send_review_note_label_->setText(note);
+    show_send_inline_status("Review ready");
+    if (send_review_warning_label_) send_review_warning_label_->hide();
     return;
   }
 
-  const QString change_text =
-      plan->change_units > 0
-          ? QString("%1 back to %2")
-                .arg(format_coin_amount(plan->change_units))
-                .arg(elide_middle(QString::fromStdString(wallet_->address)))
-          : QString("Folded into fee (dust <= %1 units)").arg(finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS);
-  send_review_recipient_label_->setText(address);
-  send_review_amount_label_->setText(format_coin_amount(*amount_units));
-  send_review_fee_label_->setText(format_coin_amount(plan->applied_fee_units));
-  send_review_total_label_->setText(format_coin_amount(*amount_units + plan->applied_fee_units));
-  send_review_change_label_->setText(change_text);
-  send_review_inputs_label_->setText(QString::number(plan->selected_prevs.size()));
-  QString note =
-      "The review is based on finalized wallet state only. Pending local sends keep their inputs reserved until finalization.";
-  if (reserved_excluded > 0) {
-    note += QString("\nReserved finalized inputs excluded from this review: %1.").arg(reserved_excluded);
-    const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
-    if (!reservation_breakdown.isEmpty()) note += "\n" + reservation_breakdown;
+  if (mode == WalletSendMode::TransparentToConfidential) {
+    QString recipient_err;
+    auto recipient = parse_confidential_recipient_descriptor(recipient_text, &recipient_err);
+    if (!recipient) {
+      show_send_inline_warning(recipient_err);
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    std::size_t reserved_excluded = 0;
+    std::size_t pending_reserved_excluded = 0;
+    std::size_t onboarding_reserved_excluded = 0;
+    QString prev_err;
+    auto available_prevs =
+        send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+    if (!available_prevs) {
+      show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    const std::uint64_t min_required = *amount_units + finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    auto selected_prev = select_single_covering_prev(*available_prevs, min_required);
+    if (!selected_prev) {
+      show_send_inline_warning(
+          QString("Transparent -> confidential currently requires one finalized UTXO covering at least %1.")
+              .arg(format_coin_amount(min_required)));
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    std::uint64_t applied_fee_units = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    const std::uint64_t leftover = selected_prev->second.value - min_required;
+    std::optional<TransparentTxOutV2> change_output;
+    QString change_text;
+    if (leftover == 0) {
+      change_text = "No transparent change output.";
+    } else if (leftover <= finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS) {
+      applied_fee_units += leftover;
+      change_text = QString("No change output. Dust %1 folded into fee.").arg(format_coin_amount(leftover));
+    } else {
+      auto own_decoded = finalis::address::decode(wallet_->address);
+      if (!own_decoded) {
+        show_send_inline_warning("Wallet change address is invalid.");
+        show_send_inline_status("Review unavailable");
+        return;
+      }
+      change_output = TransparentTxOutV2{
+          leftover,
+          finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash),
+      };
+      change_text = QString("%1 transparent change back to %2")
+                        .arg(format_coin_amount(leftover))
+                        .arg(elide_middle(QString::fromStdString(wallet_->address)));
+    }
+    send_review_recipient_label_->setText(elide_middle(recipient_text, 18));
+    send_review_amount_label_->setText(format_coin_amount(*amount_units));
+    send_review_fee_label_->setText(format_coin_amount(applied_fee_units));
+    send_review_total_label_->setText(format_coin_amount(selected_prev->second.value));
+    send_review_change_label_->setText(change_text);
+    send_review_inputs_label_->setText("1");
+    QString note =
+        "This builds a TxV2 transparent -> confidential transfer. Current wallet support requires a single transparent finalized UTXO.";
+    if (reserved_excluded > 0) {
+      note += QString("\nReserved finalized inputs excluded from this review: %1.").arg(reserved_excluded);
+      const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
+      if (!reservation_breakdown.isEmpty()) note += "\n" + reservation_breakdown;
+    }
+    send_review_note_label_->setText(note);
+    show_send_inline_status("Review ready");
+    if (send_review_warning_label_) send_review_warning_label_->hide();
+    (void)recipient;
+    return;
   }
-  send_review_note_label_->setText(note);
+
+  if (!finalis::address::decode(recipient_text.toStdString()).has_value()) {
+    show_send_inline_warning("Recipient address is invalid.");
+    show_send_inline_status("Review unavailable");
+    return;
+  }
+  if (confidential_storage_locked_) {
+    show_send_inline_warning("Unlock confidential state first. This flow needs locally stored confidential spend secrets.");
+    show_send_inline_status("Review unavailable");
+    return;
+  }
+  WalletStore::State state;
+  if (!store_.load(&state)) {
+    show_send_inline_warning("Unable to load local confidential wallet state.");
+    show_send_inline_status("Review unavailable");
+    return;
+  }
+  const auto reserved = pending_wallet_reserved_outpoints();
+  const std::uint64_t total_units = *amount_units + finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+  QString selection_err;
+  auto coin = select_exact_confidential_coin(state, reserved, total_units, &selection_err);
+  if (!coin) {
+    show_send_inline_warning(selection_err);
+    show_send_inline_status("Review unavailable");
+    return;
+  }
+  send_review_recipient_label_->setText(recipient_text);
+  send_review_amount_label_->setText(format_coin_amount(*amount_units));
+  send_review_fee_label_->setText(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS));
+  send_review_total_label_->setText(format_coin_amount(total_units));
+  send_review_change_label_->setText("No change. Exact confidential coin spend only.");
+  send_review_inputs_label_->setText("1");
+  send_review_note_label_->setText(
+      "This builds a TxV2 confidential -> transparent transfer. Current wallet support only allows exact single-coin full spends.");
   show_send_inline_status("Review ready");
   if (send_review_warning_label_) send_review_warning_label_->hide();
 }
@@ -3442,6 +3872,42 @@ void WalletWindow::validate_send_form() {
 void WalletWindow::populate_send_max_amount() {
   if (!ensure_wallet_loaded("Send Max")) return;
   reset_send_review_panel();
+  const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
+  if (mode == WalletSendMode::ConfidentialToTransparent) {
+    if (confidential_storage_locked_) {
+      show_send_inline_warning("Unlock confidential state first.");
+      show_send_inline_status("Send max unavailable");
+      return;
+    }
+    WalletStore::State state;
+    if (!store_.load(&state)) {
+      show_send_inline_warning("Unable to load local confidential wallet state.");
+      show_send_inline_status("Send max unavailable");
+      return;
+    }
+    const auto reserved = pending_wallet_reserved_outpoints();
+    std::uint64_t best_units = 0;
+    for (const auto& coin : state.confidential_coins) {
+      if (coin.spent || coin.amount <= finalis::DEFAULT_WALLET_SEND_FEE_UNITS) continue;
+      auto txid = decode_hex32_string(coin.txid_hex);
+      if (!txid) continue;
+      const OutPoint op{*txid, coin.vout};
+      if (reserved.find(op) != reserved.end()) continue;
+      best_units = std::max(best_units, coin.amount - finalis::DEFAULT_WALLET_SEND_FEE_UNITS);
+    }
+    if (best_units == 0) {
+      show_send_inline_warning("No unlocked confidential coin is available for an exact full-spend send.");
+      show_send_inline_status("Send max unavailable");
+      return;
+    }
+    send_amount_edit_->setText(format_coin_input_amount(best_units));
+    show_send_inline_status(QString("Max confidential spend loaded: %1 after fixed fee %2.")
+                                .arg(format_coin_amount(best_units))
+                                .arg(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS)));
+    if (!send_address_edit_->text().trimmed().isEmpty()) validate_send_form();
+    return;
+  }
+
   std::size_t reserved_excluded = 0;
   std::size_t pending_reserved_excluded = 0;
   std::size_t onboarding_reserved_excluded = 0;
@@ -3451,6 +3917,31 @@ void WalletWindow::populate_send_max_amount() {
   if (!available_prevs) {
     show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
     show_send_inline_status("Send max unavailable");
+    return;
+  }
+
+  if (mode == WalletSendMode::TransparentToConfidential) {
+    std::uint64_t best_units = 0;
+    for (const auto& [_, prevout] : *available_prevs) {
+      if (prevout.value <= finalis::DEFAULT_WALLET_SEND_FEE_UNITS) continue;
+      best_units = std::max(best_units, prevout.value - finalis::DEFAULT_WALLET_SEND_FEE_UNITS);
+    }
+    if (best_units == 0) {
+      show_send_inline_warning("No single finalized transparent UTXO can cover the fixed fee.");
+      show_send_inline_status("Send max unavailable");
+      return;
+    }
+    send_amount_edit_->setText(format_coin_input_amount(best_units));
+    QString note = QString("Max confidential-send amount loaded from the largest single finalized UTXO: %1 after fixed fee %2.")
+                       .arg(format_coin_amount(best_units))
+                       .arg(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS));
+    if (reserved_excluded > 0) {
+      note += QString("\nReserved finalized inputs excluded: %1.").arg(reserved_excluded);
+      const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
+      if (!reservation_breakdown.isEmpty()) note += "\n" + reservation_breakdown;
+    }
+    show_send_inline_status(note);
+    if (!send_address_edit_->text().trimmed().isEmpty()) validate_send_form();
     return;
   }
 
@@ -3484,100 +3975,261 @@ void WalletWindow::submit_send() {
     return;
   }
 
+  const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
   const QString destination = send_address_edit_->text().trimmed();
-  auto decoded_to = finalis::address::decode(destination.toStdString());
-  if (!decoded_to) {
-    QMessageBox::warning(this, "Send", "Destination address is invalid.");
-    return;
-  }
   auto amount_units = parse_coin_amount(send_amount_edit_->text());
   if (!amount_units || *amount_units == 0) {
     show_send_inline_warning("Amount must be positive.");
     show_send_inline_status("Send blocked");
     return;
   }
-  std::size_t reserved_excluded = 0;
-  std::size_t pending_reserved_excluded = 0;
-  std::size_t onboarding_reserved_excluded = 0;
-  QString prev_err;
-  auto available_prevs =
-      send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
-  if (!available_prevs) {
-    show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
-    show_send_inline_status("Send blocked");
-    return;
-  }
   std::string err;
-  auto key = load_wallet_key(&err);
-  if (!key) {
-    QMessageBox::warning(this, "Send", QString::fromStdString(err));
-    return;
-  }
-
-  auto own_decoded = finalis::address::decode(wallet_->address);
-  if (!own_decoded) {
-    QMessageBox::warning(this, "Send", "Wallet address is invalid.");
-    return;
-  }
-  auto plan = finalis::plan_wallet_p2pkh_send(
-      *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
-      finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), *amount_units, finalis::DEFAULT_WALLET_SEND_FEE_UNITS,
-      finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
-  if (!plan) {
-    QMessageBox::warning(this, "Send", QString::fromStdString(err));
-    return;
-  }
-
-  const QString change_text =
-      plan->change_units > 0
-          ? QString("%1 back to %2")
-                .arg(format_coin_amount(plan->change_units))
-                .arg(elide_middle(QString::fromStdString(wallet_->address)))
-          : QString("Folded into fee (dust <= %1 units)").arg(finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS);
-  send_review_recipient_label_->setText(destination);
-  send_review_amount_label_->setText(format_coin_amount(*amount_units));
-  send_review_fee_label_->setText(format_coin_amount(plan->applied_fee_units));
-  send_review_total_label_->setText(format_coin_amount(*amount_units + plan->applied_fee_units));
-  send_review_change_label_->setText(change_text);
-  send_review_inputs_label_->setText(QString::number(plan->selected_prevs.size()));
-  QString note =
-      "The wallet will broadcast through the configured lightserver list. Final settlement is finalized inclusion.";
-  if (reserved_excluded > 0) {
-    note += QString("\nReserved finalized inputs excluded: %1.").arg(reserved_excluded);
-    const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
-    if (!reservation_breakdown.isEmpty()) note += "\n" + reservation_breakdown;
-  }
-  send_review_note_label_->setText(note);
-  show_send_inline_status("Ready to confirm");
-  if (send_review_warning_label_) send_review_warning_label_->hide();
-
-  QString confirm = QString("Send to %1\n\nAmount: %2\nFee: %3\nTotal spend: %4\nChange: %5\nInputs selected: %6")
-                        .arg(elide_middle(destination))
-                        .arg(format_coin_amount(*amount_units))
-                        .arg(format_coin_amount(plan->applied_fee_units))
-                        .arg(format_coin_amount(*amount_units + plan->applied_fee_units))
-                        .arg(change_text)
-                        .arg(plan->selected_prevs.size());
-  if (reserved_excluded > 0) {
-    confirm += QString("\nReserved finalized inputs excluded: %1").arg(reserved_excluded);
-    const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
-    if (!reservation_breakdown.isEmpty()) confirm += "\n" + reservation_breakdown;
-  }
-  confirm += "\n\nAccepted for relay by lightserver is not finality.";
-  if (QMessageBox::question(this, "Confirm Send", confirm, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
-    show_send_inline_status("Send cancelled");
-    return;
-  }
-
-  auto tx = finalis::build_signed_p2pkh_tx_multi_input(
-      plan->selected_prevs, finalis::Bytes(key->privkey.begin(), key->privkey.end()), plan->outputs, &err);
-  if (!tx) {
-    QMessageBox::warning(this, "Send", QString::fromStdString(err));
-    return;
-  }
-
   QString used_endpoint;
-  auto result = broadcast_tx_with_failover(tx->serialize(), &err, &used_endpoint);
+  std::vector<OutPoint> reserved_inputs;
+  QString confirm;
+  Bytes tx_bytes;
+
+  if (mode == WalletSendMode::TransparentToTransparent) {
+    auto decoded_to = finalis::address::decode(destination.toStdString());
+    if (!decoded_to) {
+      QMessageBox::warning(this, "Send", "Destination address is invalid.");
+      return;
+    }
+    std::size_t reserved_excluded = 0;
+    std::size_t pending_reserved_excluded = 0;
+    std::size_t onboarding_reserved_excluded = 0;
+    QString prev_err;
+    auto available_prevs =
+        send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+    if (!available_prevs) {
+      show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
+      show_send_inline_status("Send blocked");
+      return;
+    }
+    auto key = load_wallet_key(&err);
+    if (!key) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    auto own_decoded = finalis::address::decode(wallet_->address);
+    if (!own_decoded) {
+      QMessageBox::warning(this, "Send", "Wallet address is invalid.");
+      return;
+    }
+    auto plan = finalis::plan_wallet_p2pkh_send(
+        *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
+        finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), *amount_units,
+        finalis::DEFAULT_WALLET_SEND_FEE_UNITS, finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
+    if (!plan) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+
+    const QString change_text =
+        plan->change_units > 0
+            ? QString("%1 back to %2")
+                  .arg(format_coin_amount(plan->change_units))
+                  .arg(elide_middle(QString::fromStdString(wallet_->address)))
+            : QString("Folded into fee (dust <= %1 units)").arg(finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS);
+    send_review_recipient_label_->setText(destination);
+    send_review_amount_label_->setText(format_coin_amount(*amount_units));
+    send_review_fee_label_->setText(format_coin_amount(plan->applied_fee_units));
+    send_review_total_label_->setText(format_coin_amount(*amount_units + plan->applied_fee_units));
+    send_review_change_label_->setText(change_text);
+    send_review_inputs_label_->setText(QString::number(plan->selected_prevs.size()));
+    QString note =
+        "The wallet will broadcast through the configured lightserver list. Final settlement is finalized inclusion.";
+    if (reserved_excluded > 0) {
+      note += QString("\nReserved finalized inputs excluded: %1.").arg(reserved_excluded);
+      const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
+      if (!reservation_breakdown.isEmpty()) note += "\n" + reservation_breakdown;
+    }
+    send_review_note_label_->setText(note);
+    show_send_inline_status("Ready to confirm");
+    if (send_review_warning_label_) send_review_warning_label_->hide();
+
+    confirm = QString("Send to %1\n\nAmount: %2\nFee: %3\nTotal spend: %4\nChange: %5\nInputs selected: %6")
+                  .arg(elide_middle(destination))
+                  .arg(format_coin_amount(*amount_units))
+                  .arg(format_coin_amount(plan->applied_fee_units))
+                  .arg(format_coin_amount(*amount_units + plan->applied_fee_units))
+                  .arg(change_text)
+                  .arg(plan->selected_prevs.size());
+    if (reserved_excluded > 0) {
+      confirm += QString("\nReserved finalized inputs excluded: %1").arg(reserved_excluded);
+      const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
+      if (!reservation_breakdown.isEmpty()) confirm += "\n" + reservation_breakdown;
+    }
+    confirm += "\n\nAccepted for relay by lightserver is not finality.";
+    if (QMessageBox::question(this, "Confirm Send", confirm, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) !=
+        QMessageBox::Yes) {
+      show_send_inline_status("Send cancelled");
+      return;
+    }
+
+    auto tx = finalis::build_signed_p2pkh_tx_multi_input(
+        plan->selected_prevs, finalis::Bytes(key->privkey.begin(), key->privkey.end()), plan->outputs, &err);
+    if (!tx) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    tx_bytes = tx->serialize();
+    reserved_inputs.reserve(plan->selected_prevs.size());
+    for (const auto& [op, _] : plan->selected_prevs) reserved_inputs.push_back(op);
+  } else if (mode == WalletSendMode::TransparentToConfidential) {
+    QString recipient_err;
+    auto recipient = parse_confidential_recipient_descriptor(destination, &recipient_err);
+    if (!recipient) {
+      QMessageBox::warning(this, "Send", recipient_err);
+      return;
+    }
+    std::size_t reserved_excluded = 0;
+    std::size_t pending_reserved_excluded = 0;
+    std::size_t onboarding_reserved_excluded = 0;
+    QString prev_err;
+    auto available_prevs =
+        send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+    if (!available_prevs) {
+      show_send_inline_warning(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
+      show_send_inline_status("Send blocked");
+      return;
+    }
+    auto key = load_wallet_key(&err);
+    if (!key) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    const std::uint64_t base_required = *amount_units + finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    auto selected_prev = select_single_covering_prev(*available_prevs, base_required);
+    if (!selected_prev) {
+      QMessageBox::warning(
+          this, "Send",
+          QString("Transparent -> confidential currently requires one finalized UTXO covering at least %1.")
+              .arg(format_coin_amount(base_required)));
+      return;
+    }
+    std::uint64_t applied_fee_units = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    std::optional<TransparentTxOutV2> change_output;
+    QString change_text = "No transparent change output.";
+    const std::uint64_t leftover = selected_prev->second.value - base_required;
+    if (leftover > 0) {
+      if (leftover <= finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS) {
+        applied_fee_units += leftover;
+        change_text = QString("No change output. Dust %1 folded into fee.").arg(format_coin_amount(leftover));
+      } else {
+        auto own_decoded = finalis::address::decode(wallet_->address);
+        if (!own_decoded) {
+          QMessageBox::warning(this, "Send", "Wallet change address is invalid.");
+          return;
+        }
+        change_output = TransparentTxOutV2{
+            leftover,
+            finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash),
+        };
+        change_text = QString("%1 transparent change back to %2")
+                          .arg(format_coin_amount(leftover))
+                          .arg(elide_middle(QString::fromStdString(wallet_->address)));
+      }
+    }
+    crypto::ConfidentialOutputSecrets secrets{
+        .amount = *amount_units,
+        .value_blind = crypto::Blind32{random_hash32()},
+    };
+    auto confidential_out = build_confidential_output(*recipient, secrets, random_hash32(), &err);
+    if (!confidential_out) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    auto tx = build_txv2_transparent_to_confidential(
+        selected_prev->first, selected_prev->second, Bytes(key->privkey.begin(), key->privkey.end()),
+        selected_prev->second.value, change_output, *confidential_out, secrets.value_blind, *amount_units,
+        applied_fee_units, &err);
+    if (!tx) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    send_review_recipient_label_->setText(elide_middle(destination, 18));
+    send_review_amount_label_->setText(format_coin_amount(*amount_units));
+    send_review_fee_label_->setText(format_coin_amount(applied_fee_units));
+    send_review_total_label_->setText(format_coin_amount(selected_prev->second.value));
+    send_review_change_label_->setText(change_text);
+    send_review_inputs_label_->setText("1");
+    send_review_note_label_->setText(
+        "The wallet will broadcast a TxV2 transparent -> confidential transfer through the configured lightserver list.");
+    show_send_inline_status("Ready to confirm");
+    if (send_review_warning_label_) send_review_warning_label_->hide();
+    confirm = QString("Send confidential TxV2\n\nDescriptor: %1\nAmount: %2\nFee: %3\nTotal spend: %4\nChange: %5\nInputs selected: 1")
+                  .arg(elide_middle(destination, 18))
+                  .arg(format_coin_amount(*amount_units))
+                  .arg(format_coin_amount(applied_fee_units))
+                  .arg(format_coin_amount(selected_prev->second.value))
+                  .arg(change_text);
+    if (QMessageBox::question(this, "Confirm Send", confirm, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) !=
+        QMessageBox::Yes) {
+      show_send_inline_status("Send cancelled");
+      return;
+    }
+    tx_bytes = tx->serialize();
+    reserved_inputs.push_back(selected_prev->first);
+  } else {
+    auto decoded_to = finalis::address::decode(destination.toStdString());
+    if (!decoded_to) {
+      QMessageBox::warning(this, "Send", "Destination address is invalid.");
+      return;
+    }
+    if (confidential_storage_locked_) {
+      QMessageBox::warning(this, "Send", "Unlock confidential state first.");
+      return;
+    }
+    WalletStore::State state;
+    if (!store_.load(&state)) {
+      QMessageBox::warning(this, "Send", "Unable to load local confidential wallet state.");
+      return;
+    }
+    const auto reserved = pending_wallet_reserved_outpoints();
+    const std::uint64_t total_units = *amount_units + finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    QString selection_err;
+    auto coin = select_exact_confidential_coin(state, reserved, total_units, &selection_err);
+    if (!coin) {
+      QMessageBox::warning(this, "Send", selection_err);
+      return;
+    }
+    auto tx = build_txv2_confidential_to_transparent(
+        *coin,
+        TransparentTxOutV2{
+            *amount_units,
+            finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
+        },
+        finalis::DEFAULT_WALLET_SEND_FEE_UNITS, random_hash32(), random_hash32(), &err);
+    if (!tx) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    send_review_recipient_label_->setText(destination);
+    send_review_amount_label_->setText(format_coin_amount(*amount_units));
+    send_review_fee_label_->setText(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS));
+    send_review_total_label_->setText(format_coin_amount(total_units));
+    send_review_change_label_->setText("No change. Exact confidential coin spend only.");
+    send_review_inputs_label_->setText("1");
+    send_review_note_label_->setText(
+        "The wallet will broadcast a TxV2 confidential -> transparent transfer. Current support is exact single-coin full-spend only.");
+    show_send_inline_status("Ready to confirm");
+    if (send_review_warning_label_) send_review_warning_label_->hide();
+    confirm = QString("Send confidential spend TxV2\n\nTo: %1\nAmount: %2\nFee: %3\nTotal spend: %4\nChange: none\nInputs selected: 1")
+                  .arg(elide_middle(destination))
+                  .arg(format_coin_amount(*amount_units))
+                  .arg(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS))
+                  .arg(format_coin_amount(total_units));
+    if (QMessageBox::question(this, "Confirm Send", confirm, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) !=
+        QMessageBox::Yes) {
+      show_send_inline_status("Send cancelled");
+      return;
+    }
+    tx_bytes = tx->serialize();
+    reserved_inputs.push_back(coin->outpoint);
+  }
+
+  auto result = broadcast_tx_with_failover(tx_bytes, &err, &used_endpoint);
   if (!result) {
     QMessageBox::warning(this, "Send", QString::fromStdString(err));
     return;
@@ -3610,9 +4262,6 @@ void WalletWindow::submit_send() {
   }
 
   local_sent_txids_.push_back(result->txid_hex);
-  std::vector<OutPoint> reserved_inputs;
-  reserved_inputs.reserve(plan->selected_prevs.size());
-  for (const auto& [op, _] : plan->selected_prevs) reserved_inputs.push_back(op);
   pending_wallet_spends_[result->txid_hex] = reserved_inputs;
   mark_refresh_state_changed();
   (void)store_.add_sent_txid(result->txid_hex);
