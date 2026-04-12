@@ -5,8 +5,10 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <variant>
 
 #include "common/types.hpp"
+#include "crypto/confidential.hpp"
 
 namespace finalis {
 
@@ -273,6 +275,38 @@ struct UtxoEntry {
 };
 
 using UtxoSet = std::map<OutPoint, UtxoEntry>;
+
+enum class UtxoOutputKind : std::uint8_t {
+  TRANSPARENT = 0,
+  CONFIDENTIAL = 1,
+};
+
+struct UtxoTransparentData {
+  TxOut out;
+  bool operator==(const UtxoTransparentData&) const = default;
+};
+
+struct UtxoConfidentialData {
+  crypto::Commitment33 value_commitment{};
+  PubKey33 one_time_pubkey{};
+  PubKey33 ephemeral_pubkey{};
+  crypto::ScanTag scan_tag{};
+  Bytes memo;
+
+  bool operator==(const UtxoConfidentialData&) const = default;
+};
+
+struct UtxoEntryV2 {
+  UtxoOutputKind kind{UtxoOutputKind::TRANSPARENT};
+  std::variant<UtxoTransparentData, UtxoConfidentialData> body{UtxoTransparentData{}};
+
+  UtxoEntryV2() = default;
+  UtxoEntryV2(const TxOut& out_in) : kind(UtxoOutputKind::TRANSPARENT), body(UtxoTransparentData{out_in}) {}
+
+  bool operator==(const UtxoEntryV2&) const = default;
+};
+
+using UtxoSetV2 = std::map<OutPoint, UtxoEntryV2>;
 
 struct ValidatorJoinRequestScriptData {
   PubKey32 validator_pubkey{};

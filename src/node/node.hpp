@@ -507,6 +507,7 @@ class Node {
   std::uint64_t last_repair_log_ms_{0};
 
   consensus::ValidatorRegistry validators_;
+  ConfidentialPolicy confidential_policy_{};
   UtxoSet utxos_;
   mempool::Mempool mempool_;
   consensus::VoteTracker votes_;

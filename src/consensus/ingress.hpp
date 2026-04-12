@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "storage/db.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/tx.hpp"
 
 namespace finalis::consensus {

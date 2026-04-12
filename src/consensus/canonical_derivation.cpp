@@ -1152,12 +1152,16 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     *next_vector = prev.finalized_frontier_vector;
     *next_lane_roots = prev.finalized_lane_roots;
     for (const auto& raw : ordered_records) {
-      const auto tx = Tx::parse(raw);
+      const auto tx = parse_any_tx(raw);
       if (!tx.has_value()) {
         if (cursor_error) *cursor_error = "frontier-certified-ingress-parse-failed";
         return false;
       }
-      const auto lane = assign_ingress_lane(*tx);
+      if (!std::holds_alternative<Tx>(*tx)) {
+        if (cursor_error) *cursor_error = "frontier-certified-ingress-unsupported-tx-version";
+        return false;
+      }
+      const auto lane = assign_ingress_lane(std::get<Tx>(*tx));
       if (lane >= finalis::INGRESS_LANE_COUNT) {
         if (cursor_error) *cursor_error = "frontier-certified-ingress-lane-out-of-range";
         return false;

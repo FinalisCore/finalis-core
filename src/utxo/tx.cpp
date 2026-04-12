@@ -53,6 +53,7 @@ std::optional<Tx> Tx::parse(const Bytes& b) {
           auto version = r.u32le();
           auto in_count = r.varint();
           if (!version || !in_count) return false;
+          if (*version != 1) return false;
           if (*in_count > kMaxTxInputs) return false;
           tx.version = *version;
 

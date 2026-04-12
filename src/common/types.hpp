@@ -11,6 +11,7 @@ namespace finalis {
 using Bytes = std::vector<std::uint8_t>;
 using Hash32 = std::array<std::uint8_t, 32>;
 using PubKey32 = std::array<std::uint8_t, 32>;
+using PubKey33 = std::array<std::uint8_t, 33>;
 using Sig64 = std::array<std::uint8_t, 64>;
 
 constexpr std::uint32_t MAGIC = 0x53434F49;

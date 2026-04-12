@@ -1659,11 +1659,12 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     return out;
   }
   auto tx_bytes = finalis::hex_decode(*tx_hex);
-  auto tx = tx_bytes ? finalis::Tx::parse(*tx_bytes) : std::nullopt;
-  if (!tx.has_value()) {
+  auto tx = tx_bytes ? finalis::parse_any_tx(*tx_bytes) : std::nullopt;
+  if (!tx.has_value() || !std::holds_alternative<finalis::Tx>(*tx)) {
     out.error = upstream_error("tx parse failed");
     return out;
   }
+  const auto& tx_v1 = std::get<finalis::Tx>(*tx);
 
   std::string network_name = "mainnet";
   if (auto st = fetch_status_result(cfg); st.value.has_value()) network_name = st.value->network;
@@ -1671,7 +1672,7 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
 
   std::uint64_t total_in = 0;
   bool fee_known = true;
-  for (const auto& in : tx->inputs) {
+  for (const auto& in : tx_v1.inputs) {
     TxInputResult input_view{finalis::hex_encode32(in.prev_txid), in.prev_index, std::nullopt, std::nullopt};
     auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + finalis::hex_encode32(in.prev_txid) + "\"}");
     if (!prev_call.result.has_value() || !prev_call.result->is_object()) {
@@ -1686,19 +1687,25 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
       continue;
     }
     auto prev_bytes = finalis::hex_decode(*prev_hex);
-    auto prev_tx = prev_bytes ? finalis::Tx::parse(*prev_bytes) : std::nullopt;
-    if (!prev_tx.has_value() || in.prev_index >= prev_tx->outputs.size()) {
+    auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
+    if (!prev_tx.has_value() || !std::holds_alternative<finalis::Tx>(*prev_tx)) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
       continue;
     }
-    total_in += prev_tx->outputs[in.prev_index].value;
-    input_view.address = script_to_address(prev_tx->outputs[in.prev_index].script_pubkey, hrp);
-    input_view.amount = prev_tx->outputs[in.prev_index].value;
+    const auto& prev_tx_v1 = std::get<finalis::Tx>(*prev_tx);
+    if (in.prev_index >= prev_tx_v1.outputs.size()) {
+      result.inputs.push_back(std::move(input_view));
+      fee_known = false;
+      continue;
+    }
+    total_in += prev_tx_v1.outputs[in.prev_index].value;
+    input_view.address = script_to_address(prev_tx_v1.outputs[in.prev_index].script_pubkey, hrp);
+    input_view.amount = prev_tx_v1.outputs[in.prev_index].value;
     result.inputs.push_back(std::move(input_view));
   }
 
-  for (const auto& tx_out : tx->outputs) {
+  for (const auto& tx_out : tx_v1.outputs) {
     result.total_out += tx_out.value;
     result.outputs.push_back(TxOutputResult{
         tx_out.value,

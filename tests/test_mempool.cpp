@@ -7,6 +7,7 @@
 #include "crypto/hash.hpp"
 #include "mempool/mempool.hpp"
 #include "policy/hashcash.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 
 using namespace finalis;
@@ -32,6 +33,48 @@ std::optional<Tx> spend_one(const OutPoint& op, const TxOut& prev, const crypto:
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
   outs.push_back(TxOut{value_out, address::p2pkh_script_pubkey(to_pkh)});
   return build_signed_p2pkh_tx_single_input(op, prev, from.private_key, outs);
+}
+
+Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
+  Bytes ss;
+  ss.push_back(0x40);
+  ss.insert(ss.end(), sig.begin(), sig.end());
+  ss.push_back(0x20);
+  ss.insert(ss.end(), pub.begin(), pub.end());
+  return ss;
+}
+
+crypto::Commitment33 commitment33(std::uint8_t seed) {
+  crypto::Commitment33 out;
+  out.bytes[0] = 0x02 | (seed & 0x01);
+  for (std::size_t i = 1; i < out.bytes.size(); ++i) out.bytes[i] = static_cast<std::uint8_t>(seed + i);
+  return out;
+}
+
+TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from, const PubKey32& to_pub,
+                                 std::uint64_t value_in, std::uint64_t value_out) {
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op.txid,
+      .prev_index = op.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::TRANSPARENT,
+      .witness = TransparentInputWitnessV2{},
+  });
+  const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
+  tx.outputs.push_back(TxOutV2{
+      .kind = TxOutputKind::TRANSPARENT,
+      .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
+  });
+  tx.fee = value_in - value_out;
+  tx.balance_proof.excess_commitment = commitment33(0x44);
+  tx.balance_proof.excess_sig.fill(0x55);
+  auto msg = signing_message_for_input_v2(tx, 0);
+  if (!msg.has_value()) throw std::runtime_error("v2 sighash failed");
+  auto sig = crypto::ed25519_sign(*msg, from.private_key);
+  if (!sig.has_value()) throw std::runtime_error("v2 sign failed");
+  std::get<TransparentInputWitnessV2>(tx.inputs[0].witness).script_sig = make_p2pkh_script_sig(*sig, from.public_key);
+  return tx;
 }
 
 std::vector<Tx> fill_pool_to_count_limit(mempool::Mempool& mp, mempool::UtxoView& view, const crypto::KeyPair& from,
@@ -342,6 +385,56 @@ TEST(test_mempool_hashcash_policy_requires_stamp_for_low_fee_txs) {
   ASSERT_TRUE(reparsed->hashcash.has_value());
   ASSERT_EQ(reparsed->hashcash->bits, 10u);
   ASSERT_TRUE(mp.accept_tx(*reparsed, view, &err));
+}
+
+TEST(test_mempool_rejects_txv2_before_activation_via_variant_validation) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+  const auto k1 = key_from_byte(70);
+  const auto k2 = key_from_byte(71);
+
+  OutPoint op{};
+  op.txid.fill(0x71);
+  op.index = 0;
+  TxOut prev = p2pkh_out_for_pub(k1.public_key, 10'000);
+  view[op] = UtxoEntry{prev};
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 500;
+  SpecialValidationContext ctx;
+  ctx.confidential_policy = &policy;
+  ctx.current_height = 100;
+  mp.set_validation_context(ctx);
+
+  const auto tx = make_transparent_only_v2_tx(op, k1, k2.public_key, 10'000, 9'800);
+  std::string err;
+  ASSERT_TRUE(!mp.accept_tx(AnyTx{tx}, view, &err));
+  ASSERT_TRUE(err.find("tx invalid: confidential tx not active") != std::string::npos);
+}
+
+TEST(test_mempool_rejects_txv2_after_activation_until_relay_enabled) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+  const auto k1 = key_from_byte(72);
+  const auto k2 = key_from_byte(73);
+
+  OutPoint op{};
+  op.txid.fill(0x72);
+  op.index = 0;
+  TxOut prev = p2pkh_out_for_pub(k1.public_key, 10'000);
+  view[op] = UtxoEntry{prev};
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 0;
+  SpecialValidationContext ctx;
+  ctx.confidential_policy = &policy;
+  ctx.current_height = 100;
+  mp.set_validation_context(ctx);
+
+  const auto tx = make_transparent_only_v2_tx(op, k1, k2.public_key, 10'000, 9'800);
+  std::string err;
+  ASSERT_TRUE(!mp.accept_tx(AnyTx{tx}, view, &err));
+  ASSERT_TRUE(err.find("tx version not yet relay-enabled") != std::string::npos);
 }
 
 void register_mempool_tests() {}

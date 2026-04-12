@@ -45,6 +45,7 @@
 #include "genesis/genesis.hpp"
 #include "keystore/validator_keystore.hpp"
 #include "merkle/merkle.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 
 namespace finalis::node {
@@ -307,6 +308,21 @@ bool load_certified_ingress_record_from_db(const storage::DB& db, std::uint32_t 
     return false;
   }
   *out = consensus::CertifiedIngressRecord{*cert, *tx_bytes};
+  return true;
+}
+
+bool inspect_frontier_ordered_record_v1_only(const Bytes& raw_record, std::size_t index, Hash32* txid_out,
+                                             std::string* error) {
+  const auto tx = parse_any_tx(raw_record);
+  if (!tx.has_value()) {
+    if (error) *error = "frontier-ordered-record-parse-failed index=" + std::to_string(index);
+    return false;
+  }
+  if (txid_out) *txid_out = txid_any(*tx);
+  if (!std::holds_alternative<Tx>(*tx)) {
+    if (error) *error = "frontier-ordered-record-unsupported-tx-version index=" + std::to_string(index);
+    return false;
+  }
   return true;
 }
 
@@ -1570,6 +1586,7 @@ StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const Utxo
 Node::Node(NodeConfig cfg) : cfg_(std::move(cfg)) {
   finalized_identity_ = finalized_identity_for_runtime_tip(0, zero_hash());
   finalized_randomness_ = zero_hash();
+  confidential_policy_.activation_height = cfg_.network.confidential_utxo_activation_height;
   restart_debug_ = restart_debug_enabled();
 }
 
@@ -3346,7 +3363,8 @@ bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
           .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
             if (anchor_height == 0) return zero_hash();
             return db_.get_height_hash(anchor_height);
-          }});
+          },
+          .confidential_policy = &confidential_policy_});
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }
@@ -3403,8 +3421,8 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
 
   std::vector<Hash32> confirmed_txids;
   for (const auto& raw : record.ordered_records) {
-    auto tx = Tx::parse(raw);
-    if (tx.has_value()) confirmed_txids.push_back(tx->txid());
+    auto tx = parse_any_tx(raw);
+    if (tx.has_value()) confirmed_txids.push_back(txid_any(*tx));
   }
   mempool_.remove_confirmed(confirmed_txids);
   hydrate_runtime_from_canonical_state_locked(next_state);
@@ -3947,7 +3965,8 @@ void Node::event_loop() {
               .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
                 if (anchor_height == 0) return zero_hash();
                 return db_.get_height_hash(anchor_height);
-              }});
+              },
+              .confidential_policy = &confidential_policy_});
       const std::uint64_t now_ms = this->now_ms();
       const std::uint64_t now_unix_ms = now_unix() * 1000;
       if (now_ms >= last_runtime_status_persist_ms_ + 1000) {
@@ -5410,14 +5429,20 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         std::lock_guard<std::mutex> lk(mu_);
         if (accepted_tx_payloads_.contains(payload_id)) return;
       }
-      auto tx = Tx::parse(m->tx_bytes);
+      auto tx = parse_any_tx(m->tx_bytes);
       if (!tx.has_value()) {
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
         score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-parse");
         return;
       }
-      if (!handle_tx(*tx, true, peer_id)) {
+      if (!std::holds_alternative<Tx>(*tx)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        invalid_message_payloads_.insert(payload_id);
+        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "unsupported-tx-version");
+        return;
+      }
+      if (!handle_tx(std::get<Tx>(*tx), true, peer_id)) {
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
         score_peer_locked(peer_id, p2p::MisbehaviorReason::DUPLICATE_SPAM, "tx-rejected");
@@ -6072,6 +6097,13 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
     if (error) *error = "frontier-prev-finalized-hash-mismatch";
     return false;
   }
+  for (std::size_t i = 0; i < proposal.ordered_records.size(); ++i) {
+    std::string ordered_record_error;
+    if (!inspect_frontier_ordered_record_v1_only(proposal.ordered_records[i], i, nullptr, &ordered_record_error)) {
+      if (error) *error = ordered_record_error;
+      return false;
+    }
+  }
   if (auto expected = leader_for_height_round(transition.height, transition.round); !expected.has_value() ||
                                                                       *expected != transition.leader_pubkey) {
     if (error) *error = "invalid-proposer";
@@ -6161,7 +6193,8 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
             .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
               if (anchor_height == 0) return zero_hash();
               return db_.get_height_hash(anchor_height);
-            }});
+            },
+            .confidential_policy = &confidential_policy_});
     std::string err;
     std::uint64_t fee = 0;
     const auto min_relay_fee = effective_min_relay_fee_for_height(next_height);
@@ -6445,6 +6478,15 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
         log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
                  " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
                  " reason=" + ingress_error);
+        return std::nullopt;
+      }
+      std::string ordered_record_error;
+      if (!inspect_frontier_ordered_record_v1_only(ingress.tx_bytes, selection.ordered_records.size(), nullptr,
+                                                   &ordered_record_error)) {
+        last_test_hook_error_ = "frontier-build-ordered-record-invalid:" + ordered_record_error;
+        log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
+                 " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
+                 " reason=" + ordered_record_error);
         return std::nullopt;
       }
       if (selection.ordered_records.size() >= kMaxBlockTxs ||
@@ -6760,22 +6802,26 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
   for (const auto& ordered_record : record.ordered_records) {
     ++seq;
     if (!db_.put_ingress_record(seq, ordered_record)) return false;
-    auto tx = Tx::parse(ordered_record);
+    auto tx = parse_any_tx(ordered_record);
     if (!tx.has_value()) {
       log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
                std::to_string(record.transition.height));
       return false;
     }
-    if (!db_.put_tx_index(tx->txid(), record.transition.height, tx_index++, ordered_record)) return false;
-    for (const auto& input : tx->inputs) {
-      const auto prev_it = prev_utxos.find(OutPoint{input.prev_txid, input.prev_index});
-      if (prev_it == prev_utxos.end()) continue;
-      const auto spent_scripthash = crypto::sha256(prev_it->second.out.script_pubkey);
-      if (!db_.add_script_history(spent_scripthash, record.transition.height, tx->txid())) return false;
-    }
-    for (const auto& output : tx->outputs) {
-      const auto received_scripthash = crypto::sha256(output.script_pubkey);
-      if (!db_.add_script_history(received_scripthash, record.transition.height, tx->txid())) return false;
+    const Hash32 txid = txid_any(*tx);
+    if (!db_.put_tx_index(txid, record.transition.height, tx_index++, ordered_record)) return false;
+    if (std::holds_alternative<Tx>(*tx)) {
+      const auto& legacy = std::get<Tx>(*tx);
+      for (const auto& input : legacy.inputs) {
+        const auto prev_it = prev_utxos.find(OutPoint{input.prev_txid, input.prev_index});
+        if (prev_it == prev_utxos.end()) continue;
+        const auto spent_scripthash = crypto::sha256(prev_it->second.out.script_pubkey);
+        if (!db_.add_script_history(spent_scripthash, record.transition.height, txid)) return false;
+      }
+      for (const auto& output : legacy.outputs) {
+        const auto received_scripthash = crypto::sha256(output.script_pubkey);
+        if (!db_.add_script_history(received_scripthash, record.transition.height, txid)) return false;
+      }
     }
   }
   if (!db_.set_finalized_ingress_tip(record.transition.next_frontier)) return false;

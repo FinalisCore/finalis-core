@@ -7,6 +7,7 @@
 #include "consensus/state_commitment.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/smt.hpp"
+#include "utxo/confidential_tx.hpp"
 
 namespace finalis::consensus {
 
@@ -69,13 +70,19 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " actual=" + std::to_string(record.certificate.seq);
         return false;
       }
-      const auto tx = Tx::parse(record.tx_bytes);
+      const auto tx = parse_any_tx(record.tx_bytes);
       if (!tx.has_value()) {
         if (error) *error = "frontier-certified-ingress-parse-failed lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      if (tx->txid() != record.certificate.txid) {
+      if (!std::holds_alternative<Tx>(*tx)) {
+        if (error) *error = "frontier-certified-ingress-unsupported-tx-version lane=" + std::to_string(lane) +
+                            " seq=" + std::to_string(expected_seq);
+        return false;
+      }
+      const auto& tx_v1 = std::get<Tx>(*tx);
+      if (txid_any(*tx) != record.certificate.txid) {
         if (error) *error = "frontier-certified-ingress-txid-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
@@ -86,7 +93,7 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      if (assign_ingress_lane(*tx) != lane) {
+      if (assign_ingress_lane(tx_v1) != lane) {
         if (error) *error = "frontier-certified-ingress-lane-assignment-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
@@ -201,15 +208,23 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
     FrontierDecision decision;
     decision.record_id = record_id_for_raw_ingress_record(raw_record);
 
-    auto tx = Tx::parse(raw_record);
+    auto tx = parse_any_tx(raw_record);
     if (!tx.has_value()) {
       decision.accepted = false;
       decision.reject_reason = FrontierRejectReason::TX_PARSE_FAILED;
       decisions.push_back(decision);
       continue;
     }
+    if (!std::holds_alternative<Tx>(*tx)) {
+      decision.record_id = txid_any(*tx);
+      decision.accepted = false;
+      decision.reject_reason = FrontierRejectReason::TX_INVALID;
+      decisions.push_back(decision);
+      continue;
+    }
+    const auto& tx_v1 = std::get<Tx>(*tx);
 
-    const auto domains = frontier_conflict_domains_for_tx(*tx);
+    const auto domains = frontier_conflict_domains_for_tx(tx_v1);
     bool conflict = false;
     for (const auto& domain : domains) {
       if (consumed_domains.find(domain) != consumed_domains.end()) {
@@ -218,15 +233,15 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
       }
     }
     if (conflict) {
-      decision.record_id = tx->txid();
+      decision.record_id = txid_any(*tx);
       decision.accepted = false;
       decision.reject_reason = FrontierRejectReason::CONFLICT_DOMAIN_USED;
       decisions.push_back(decision);
       continue;
     }
 
-    const auto validation = validate_tx(*tx, 1, work, ctx);
-    decision.record_id = tx->txid();
+    const auto validation = validate_tx(tx_v1, 1, work, ctx);
+    decision.record_id = txid_any(*tx);
     if (!validation.ok) {
       decision.accepted = false;
       decision.reject_reason = FrontierRejectReason::TX_INVALID;
@@ -235,8 +250,8 @@ bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_fron
     }
 
     for (const auto& domain : domains) consumed_domains.insert(domain);
-    apply_accepted_tx_to_utxos(*tx, &work);
-    accepted_txs.push_back(*tx);
+    apply_accepted_tx_to_utxos(tx_v1, &work);
+    accepted_txs.push_back(tx_v1);
     accepted_fee_units += validation.fee;
     decision.accepted = true;
     decision.reject_reason = FrontierRejectReason::NONE;

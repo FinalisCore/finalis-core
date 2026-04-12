@@ -47,6 +47,8 @@ add_library(finalis_core
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
   src/crypto/smt.cpp
+  src/crypto/confidential.cpp
+  src/crypto/stealth_address.cpp
   src/keystore/validator_keystore.cpp
   src/onboarding/validator_onboarding.cpp
   src/genesis/genesis.cpp
@@ -58,6 +60,7 @@ add_library(finalis_core
   src/privacy/mint_scripts.cpp
   src/wallet/utxo_selection.cpp
   src/utxo/tx.cpp
+  src/utxo/confidential_tx.cpp
   src/utxo/validate.cpp
   src/utxo/signing.cpp
   src/policy/hashcash.cpp
@@ -260,6 +263,7 @@ add_executable(finalis-tests
   tests/test_codec.cpp
   tests/test_chain_id.cpp
   tests/test_crypto.cpp
+  tests/test_confidential_tx.cpp
   tests/test_address.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp

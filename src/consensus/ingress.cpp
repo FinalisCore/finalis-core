@@ -17,13 +17,18 @@ Hash32 outpoint_anchor_hash(const TxIn& in) {
 }
 
 bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_bytes, std::string* error) {
-  const auto tx = Tx::parse(tx_bytes);
+  const auto tx = parse_any_tx(tx_bytes);
   if (!tx.has_value()) {
     if (error) *error = "ingress-tx-parse-failed";
     return false;
   }
+  if (!std::holds_alternative<Tx>(*tx)) {
+    if (error) *error = "ingress-tx-version-not-yet-supported";
+    return false;
+  }
+  const auto& tx_v1 = std::get<Tx>(*tx);
 
-  const auto expected_txid = tx->txid();
+  const auto expected_txid = txid_any(*tx);
   if (expected_txid != cert.txid) {
     if (error) *error = "ingress-txid-mismatch";
     return false;
@@ -38,7 +43,7 @@ bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_by
   // v1 lane assignment is anchored to the lexicographically smallest consumed
   // outpoint commitment, or txid for inputless transactions. This keeps lane
   // choice off sender-chosen fee or ordering fields.
-  if (assign_ingress_lane(*tx) != cert.lane) {
+  if (assign_ingress_lane(tx_v1) != cert.lane) {
     if (error) *error = "ingress-lane-mismatch";
     return false;
   }

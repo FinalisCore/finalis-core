@@ -9,6 +9,7 @@
 
 #include "common/network.hpp"
 #include "policy/hashcash.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
 
@@ -17,10 +18,12 @@ namespace finalis::mempool {
 using UtxoView = UtxoSet;
 
 struct MempoolEntry {
-  Tx tx;
+  AnyTx tx;
   Hash32 txid;
   std::uint64_t fee{0};
   std::size_t size_bytes{0};
+  std::uint64_t score_weight{0};
+  std::uint64_t confidential_verify_weight{0};
 };
 
 struct MempoolPolicyStats {
@@ -36,8 +39,12 @@ class Mempool {
   static constexpr std::size_t kMaxPoolBytes = 10 * 1024 * 1024;
   static constexpr std::uint32_t kDefaultFullReplacementMarginBps = 1'000;
 
-  bool accept_tx(const Tx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee = 0,
+  bool accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee = 0,
                  std::uint64_t* accepted_fee = nullptr);
+  bool accept_tx(const Tx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee = 0,
+                 std::uint64_t* accepted_fee = nullptr) {
+    return accept_tx(AnyTx{tx}, view, err, min_fee, accepted_fee);
+  }
   std::vector<Tx> select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
                                    std::vector<std::string>* diagnostics = nullptr) const;
   void remove_confirmed(const std::vector<Hash32>& txids);
@@ -54,7 +61,7 @@ class Mempool {
  private:
   struct EvictionKey {
     std::uint64_t fee{0};
-    std::size_t size_bytes{0};
+    std::uint64_t score_weight{0};
     Hash32 txid{};
   };
 
