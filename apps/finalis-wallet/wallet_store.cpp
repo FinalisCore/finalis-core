@@ -39,6 +39,7 @@ std::string key_history(std::uint64_t seq) {
 std::string key_note(const std::string& note_ref) { return "NOTE:" + note_ref; }
 std::string key_meta(const std::string& name) { return "META:" + name; }
 std::string key_snapshot() { return "SNAPSHOT:wallet"; }
+std::string key_view_snapshot() { return "SNAPSHOT:view"; }
 std::string key_confidential_account(const std::string& account_id) { return "CACCT:" + account_id; }
 std::string key_confidential_coin(const std::string& txid_hex, std::uint32_t vout) {
   char buf[32];
@@ -285,6 +286,93 @@ std::optional<WalletStore::WalletSnapshot> parse_wallet_snapshot(const Bytes& va
   return out;
 }
 
+Bytes serialize_wallet_view_snapshot(const WalletStore::WalletViewSnapshot& snapshot) {
+  codec::ByteWriter w;
+  w.u32le(kConfidentialWalletRecordVersion);
+  w.varbytes(to_bytes(snapshot.balance_text));
+  w.varbytes(to_bytes(snapshot.pending_balance_text));
+  w.varbytes(to_bytes(snapshot.confidential_balance_text));
+  w.varbytes(to_bytes(snapshot.confidential_request_summary_text));
+  w.varbytes(to_bytes(snapshot.confidential_coin_summary_text));
+  w.varbytes(to_bytes(snapshot.activity_finalized_count_text));
+  w.varbytes(to_bytes(snapshot.activity_pending_count_text));
+  w.varbytes(to_bytes(snapshot.activity_local_count_text));
+  w.varbytes(to_bytes(snapshot.activity_mint_count_text));
+  w.varbytes(to_bytes(snapshot.activity_confidential_count_text));
+  auto write_rows = [&](const std::vector<WalletStore::ViewSnapshotRow>& rows) {
+    w.u32le(static_cast<std::uint32_t>(rows.size()));
+    for (const auto& row : rows) {
+      w.varbytes(to_bytes(row.col0));
+      w.varbytes(to_bytes(row.col1));
+      w.varbytes(to_bytes(row.col2));
+      w.varbytes(to_bytes(row.col3));
+      w.varbytes(to_bytes(row.col4));
+    }
+  };
+  write_rows(snapshot.overview_activity_rows);
+  write_rows(snapshot.history_rows);
+  return w.take();
+}
+
+std::optional<WalletStore::WalletViewSnapshot> parse_wallet_view_snapshot(const Bytes& value) {
+  WalletStore::WalletViewSnapshot out;
+  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
+        auto version = r.u32le();
+        auto balance_text = r.varbytes();
+        auto pending_balance_text = r.varbytes();
+        auto confidential_balance_text = r.varbytes();
+        auto confidential_request_summary_text = r.varbytes();
+        auto confidential_coin_summary_text = r.varbytes();
+        auto activity_finalized_count_text = r.varbytes();
+        auto activity_pending_count_text = r.varbytes();
+        auto activity_local_count_text = r.varbytes();
+        auto activity_mint_count_text = r.varbytes();
+        auto activity_confidential_count_text = r.varbytes();
+        if (!version || !balance_text || !pending_balance_text || !confidential_balance_text ||
+            !confidential_request_summary_text || !confidential_coin_summary_text || !activity_finalized_count_text ||
+            !activity_pending_count_text || !activity_local_count_text || !activity_mint_count_text ||
+            !activity_confidential_count_text) {
+          return false;
+        }
+        if (*version != kConfidentialWalletRecordVersion) return false;
+        out.balance_text = from_bytes(*balance_text);
+        out.pending_balance_text = from_bytes(*pending_balance_text);
+        out.confidential_balance_text = from_bytes(*confidential_balance_text);
+        out.confidential_request_summary_text = from_bytes(*confidential_request_summary_text);
+        out.confidential_coin_summary_text = from_bytes(*confidential_coin_summary_text);
+        out.activity_finalized_count_text = from_bytes(*activity_finalized_count_text);
+        out.activity_pending_count_text = from_bytes(*activity_pending_count_text);
+        out.activity_local_count_text = from_bytes(*activity_local_count_text);
+        out.activity_mint_count_text = from_bytes(*activity_mint_count_text);
+        out.activity_confidential_count_text = from_bytes(*activity_confidential_count_text);
+        auto read_rows = [&](std::vector<WalletStore::ViewSnapshotRow>* rows) -> bool {
+          auto count = r.u32le();
+          if (!count) return false;
+          rows->reserve(*count);
+          for (std::uint32_t i = 0; i < *count; ++i) {
+            auto col0 = r.varbytes();
+            auto col1 = r.varbytes();
+            auto col2 = r.varbytes();
+            auto col3 = r.varbytes();
+            auto col4 = r.varbytes();
+            if (!col0 || !col1 || !col2 || !col3 || !col4) return false;
+            rows->push_back(WalletStore::ViewSnapshotRow{
+                .col0 = from_bytes(*col0),
+                .col1 = from_bytes(*col1),
+                .col2 = from_bytes(*col2),
+                .col3 = from_bytes(*col3),
+                .col4 = from_bytes(*col4),
+            });
+          }
+          return true;
+        };
+        return read_rows(&out.overview_activity_rows) && read_rows(&out.history_rows);
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
 Bytes serialize_note(std::uint64_t amount, bool active) {
   codec::ByteWriter w;
   w.u64le(amount);
@@ -505,6 +593,7 @@ bool WalletStore::load(State* out) const {
   out->confidential_requests.clear();
   out->confidential_primary_account_id.reset();
   out->wallet_snapshot.reset();
+  out->wallet_view_snapshot.reset();
 
   for (const auto& [key, _] : db_.scan_prefix("SENT:")) out->sent_txids.push_back(key.substr(5));
   std::sort(out->sent_txids.begin(), out->sent_txids.end());
@@ -546,6 +635,9 @@ bool WalletStore::load(State* out) const {
   out->confidential_primary_account_id = get_string(key_meta("confidential_primary_account_id"));
   if (const auto snapshot = db_.get(key_snapshot()); snapshot.has_value()) {
     out->wallet_snapshot = parse_wallet_snapshot(*snapshot);
+  }
+  if (const auto snapshot = db_.get(key_view_snapshot()); snapshot.has_value()) {
+    out->wallet_view_snapshot = parse_wallet_view_snapshot(*snapshot);
   }
 
   for (const auto& [key, value] : db_.scan_prefix("CACCT:")) {
@@ -631,6 +723,12 @@ bool WalletStore::set_wallet_snapshot(const WalletSnapshot& snapshot) {
 }
 
 bool WalletStore::clear_wallet_snapshot() { return db_.erase(key_snapshot()); }
+
+bool WalletStore::set_wallet_view_snapshot(const WalletViewSnapshot& snapshot) {
+  return db_.put(key_view_snapshot(), serialize_wallet_view_snapshot(snapshot));
+}
+
+bool WalletStore::clear_wallet_view_snapshot() { return db_.erase(key_view_snapshot()); }
 
 bool WalletStore::append_local_event(const std::string& line) {
   const std::uint64_t seq = next_event_seq() + 1;

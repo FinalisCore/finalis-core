@@ -2736,6 +2736,7 @@ void WalletWindow::cancel_validator_onboarding_clicked() {
 void WalletWindow::render_history_view() {
   refresh_history_table();
   refresh_overview_activity_preview();
+  persist_wallet_view_snapshot();
 }
 
 void WalletWindow::render_confidential_receive_views() {
@@ -2855,23 +2856,32 @@ void WalletWindow::update_selected_confidential_pending_tx_status_panel() {
     return;
   }
 
-  QString used_endpoint;
-  std::string rpc_err;
-  std::optional<lightserver::TxStatusView> tx_status;
-  for (const QString& endpoint : ordered_lightserver_endpoints()) {
-    tx_status = lightserver::rpc_get_tx_status(endpoint.toStdString(), *parsed_txid, &rpc_err);
-    if (tx_status) {
-      used_endpoint = endpoint;
-      pending_tx_status_cache_[txid] = CachedPendingTxStatus{
-          .status = *tx_status,
-          .endpoint = endpoint,
-          .cached_at = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss"),
-      };
-      break;
-    }
+  const auto now_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
+  if (const auto cache_it = pending_tx_status_cache_.find(txid); cache_it != pending_tx_status_cache_.end()) {
+    const auto& cached = cache_it->second;
+    receive_confidential_pending_status_view_->setPlainText(
+        QString("Txid: %1\nEndpoint: %2\nStatus: %3\nFinalized: %4\nHeight: %5\nFinalized depth: %6\nCredit safe: %7\nTransition: %8\nCached at: %9")
+            .arg(txid,
+                 cached.endpoint.isEmpty() ? "-" : display_lightserver_endpoint(cached.endpoint),
+                 QString::fromStdString(cached.status.status),
+                 cached.status.finalized ? "yes" : "no",
+                 QString::number(cached.status.height),
+                 QString::number(cached.status.finalized_depth),
+                 cached.status.credit_safe ? "yes" : "no",
+                 cached.status.transition_hash.empty() ? "-" : elide_middle(QString::fromStdString(cached.status.transition_hash), 10),
+                 cached.cached_at.isEmpty() ? "unknown" : cached.cached_at));
+    if (now_ms - cached.cached_at_ms <= 30000) return;
+  } else {
+    receive_confidential_pending_status_view_->setPlainText(
+        QString("Txid: %1\nStatus lookup: refreshing in background...").arg(txid));
   }
+  request_pending_tx_status_refresh(txid);
+}
 
-  if (!tx_status) {
+void WalletWindow::request_pending_tx_status_refresh(const QString& txid) {
+  if (txid.trimmed().isEmpty() || !receive_confidential_pending_status_view_) return;
+  const QStringList endpoints = ordered_lightserver_endpoints();
+  if (endpoints.isEmpty()) {
     const bool no_healthy_endpoint = last_successful_lightserver_endpoint_.trimmed().isEmpty();
     const QString stale_note =
         no_healthy_endpoint
@@ -2898,28 +2908,91 @@ void WalletWindow::update_selected_confidential_pending_tx_status_panel() {
             .arg(txid,
                  no_healthy_endpoint ? "yes" : "possible",
                  stale_note,
-                 rpc_err.empty() ? "Unable to query pending transaction status from configured lightservers."
-                                 : QString::fromStdString(rpc_err),
+                 "Unable to query pending transaction status from configured lightservers.",
                  last_known_text));
     return;
   }
-
-  receive_confidential_pending_status_view_->setPlainText(
-      QString("Txid: %1\nEndpoint: %2\nStatus: %3\nFinalized: %4\nHeight: %5\nFinalized depth: %6\nCredit safe: %7\nTransition: %8")
-          .arg(txid,
-               used_endpoint.isEmpty() ? "-" : display_lightserver_endpoint(used_endpoint),
-               QString::fromStdString(tx_status->status),
-               tx_status->finalized ? "yes" : "no",
-               QString::number(tx_status->height),
-               QString::number(tx_status->finalized_depth),
-               tx_status->credit_safe ? "yes" : "no",
-               tx_status->transition_hash.empty() ? "-" : elide_middle(QString::fromStdString(tx_status->transition_hash), 10)));
+  auto parsed_txid = decode_hex32_string(txid.toStdString());
+  if (!parsed_txid) return;
+  pending_tx_status_panel_txid_ = txid;
+  const std::uint64_t generation = ++pending_tx_status_generation_;
+  QPointer<WalletWindow> self(this);
+  std::thread([self, generation, txid, txid32 = *parsed_txid, endpoints]() mutable {
+    QString used_endpoint;
+    std::string rpc_err;
+    std::optional<lightserver::TxStatusView> tx_status;
+    for (const QString& endpoint : endpoints) {
+      tx_status = lightserver::rpc_get_tx_status(endpoint.toStdString(), txid32, &rpc_err);
+      if (tx_status) {
+        used_endpoint = endpoint;
+        break;
+      }
+    }
+    QMetaObject::invokeMethod(
+        self,
+        [self, generation, txid, used_endpoint, rpc_err = std::move(rpc_err), tx_status = std::move(tx_status)]() mutable {
+          if (!self || generation != self->pending_tx_status_generation_ || txid != self->pending_tx_status_panel_txid_) return;
+          if (tx_status) {
+            self->pending_tx_status_cache_[txid] = CachedPendingTxStatus{
+                .status = *tx_status,
+                .endpoint = used_endpoint,
+                .cached_at = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss"),
+                .cached_at_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch()),
+            };
+            self->update_selected_confidential_pending_tx_status_panel();
+            return;
+          }
+          const bool no_healthy_endpoint = self->last_successful_lightserver_endpoint_.trimmed().isEmpty();
+          const QString stale_note =
+              no_healthy_endpoint
+                  ? "Status is stale: no healthy lightserver endpoint is currently available. This is not a chain-level not_found result."
+                  : "Status lookup failed against configured lightservers. This is not a confirmed chain-level not_found result.";
+          QString last_known_text = "Last known status: unavailable";
+          if (const auto cache_it = self->pending_tx_status_cache_.find(txid); cache_it != self->pending_tx_status_cache_.end()) {
+            const auto& cached = cache_it->second;
+            last_known_text =
+                QString("Last known status (%1)\nEndpoint: %2\nStatus: %3\nFinalized: %4\nHeight: %5\nFinalized depth: %6\nCredit safe: %7\nTransition: %8")
+                    .arg(cached.cached_at.isEmpty() ? "unknown time" : cached.cached_at,
+                         cached.endpoint.isEmpty() ? "-" : display_lightserver_endpoint(cached.endpoint),
+                         QString::fromStdString(cached.status.status),
+                         cached.status.finalized ? "yes" : "no",
+                         QString::number(cached.status.height),
+                         QString::number(cached.status.finalized_depth),
+                         cached.status.credit_safe ? "yes" : "no",
+                         cached.status.transition_hash.empty() ? "-" : elide_middle(QString::fromStdString(cached.status.transition_hash), 10));
+          }
+          if (self->receive_confidential_pending_status_view_) {
+            self->receive_confidential_pending_status_view_->setPlainText(
+                QString("Txid: %1\nEndpoint: -\nStatus lookup: failed\nStale: %2\n\n%3\n\n%4\n\n%5")
+                    .arg(txid,
+                         no_healthy_endpoint ? "yes" : "possible",
+                         stale_note,
+                         rpc_err.empty() ? "Unable to query pending transaction status from configured lightservers."
+                                         : QString::fromStdString(rpc_err),
+                         last_known_text));
+          }
+        },
+        Qt::QueuedConnection);
+  }).detach();
 }
 
 void WalletWindow::refresh_overview_activity_preview() {
   auto* table = overview_page_ ? overview_page_->activity_preview_table() : nullptr;
   if (!table) return;
   table->setRowCount(0);
+  if (chain_records_.empty() && mint_records_.empty() && wallet_view_snapshot_.has_value() &&
+      !wallet_view_snapshot_->overview_activity_rows.empty()) {
+    for (const auto& row : wallet_view_snapshot_->overview_activity_rows) {
+      const int r = table->rowCount();
+      table->insertRow(r);
+      auto* status_item = new QTableWidgetItem(QString::fromStdString(row.col0));
+      apply_status_item_style(status_item);
+      table->setItem(r, 0, status_item);
+      table->setItem(r, 1, new QTableWidgetItem(QString::fromStdString(row.col1)));
+      table->setItem(r, 2, new QTableWidgetItem(QString::fromStdString(row.col2)));
+    }
+    return;
+  }
   int added = 0;
   const auto add_row = [&](const QString& status, const QString& activity, const QString& state) {
     const int row = table->rowCount();
@@ -3107,6 +3180,7 @@ void WalletWindow::load_wallet_local_state() {
   chain_records_.clear();
   finalized_history_cursor_height_.reset();
   finalized_history_cursor_txid_.reset();
+  wallet_view_snapshot_.reset();
   current_chain_name_.clear();
   current_transition_hash_.clear();
   current_network_id_.clear();
@@ -3158,6 +3232,7 @@ void WalletWindow::load_wallet_local_state() {
       });
     }
   }
+  wallet_view_snapshot_ = state.wallet_view_snapshot;
   local_sent_txids_ = state.sent_txids;
   for (const auto& pending : state.pending_spends) {
     pending_wallet_spends_[pending.txid_hex] = pending.inputs;
@@ -4101,6 +4176,7 @@ void WalletWindow::create_wallet() {
   (void)open_wallet_store();
   load_wallet_local_state();
   update_wallet_views();
+  render_history_view();
   append_local_event("Created wallet at " + path);
   refresh_chain_state(false);
   statusBar()->showMessage("Wallet created.", 3000);
@@ -4117,6 +4193,7 @@ void WalletWindow::open_wallet() {
   (void)open_wallet_store();
   load_wallet_local_state();
   update_wallet_views();
+  render_history_view();
   append_local_event("Opened wallet " + path);
   refresh_chain_state(false);
   statusBar()->showMessage("Wallet opened.", 3000);
@@ -4156,6 +4233,7 @@ void WalletWindow::import_wallet() {
   (void)open_wallet_store();
   load_wallet_local_state();
   update_wallet_views();
+  render_history_view();
   append_local_event("Imported wallet into " + path);
   refresh_chain_state(false);
   statusBar()->showMessage("Wallet imported.", 3000);
@@ -4177,6 +4255,7 @@ void WalletWindow::unlock_confidential_state() {
   }
   load_wallet_local_state();
   update_wallet_views();
+  render_history_view();
   append_local_event("Unlocked confidential local state for " + QString::fromStdString(wallet_->file_path));
   statusBar()->showMessage("Confidential local state unlocked.", 3000);
 }
@@ -5174,8 +5253,24 @@ void WalletWindow::update_selected_history_detail() {
   }
   const auto ref = history_row_refs_[static_cast<std::size_t>(row)];
   if (ref.index < 0) {
+    QString detail = "The selected row is only a cached summary and does not contain full wallet activity details yet.";
+    if (wallet_view_snapshot_.has_value() && row < static_cast<int>(wallet_view_snapshot_->history_rows.size())) {
+      const auto& cached = wallet_view_snapshot_->history_rows[static_cast<std::size_t>(row)];
+      activity_detail_title_label_->setText(QString("%1 · Cached Summary")
+                                                .arg(QString::fromStdString(cached.col1).isEmpty()
+                                                         ? "Cached"
+                                                         : QString::fromStdString(cached.col1)));
+      activity_detail_view_->setPlainText(
+          QString("Category: %1\nStatus: %2\nAmount: %3\nReference: %4\nState: %5\n\nCached view summary loaded from local wallet state. Full row detail will refresh after background sync.")
+              .arg(QString::fromStdString(cached.col0),
+                   QString::fromStdString(cached.col1),
+                   QString::fromStdString(cached.col2),
+                   QString::fromStdString(cached.col3),
+                   QString::fromStdString(cached.col4)));
+      return;
+    }
     activity_detail_title_label_->setText("No inspectable details");
-    activity_detail_view_->setPlainText("The selected row is only a placeholder and does not contain wallet activity details.");
+    activity_detail_view_->setPlainText(detail);
     return;
   }
   if (ref.source == HistoryRowRef::Source::Chain) {
@@ -5246,6 +5341,36 @@ void WalletWindow::refresh_history_table() {
   history_row_refs_.clear();
   const QString filter = history_filter_combo_ ? history_filter_combo_->currentText() : "All";
   history_view_->setSortingEnabled(false);
+  if (chain_records_.empty() && local_history_lines_.empty() && mint_records_.empty() && confidential_coin_views_.empty() &&
+      wallet_view_snapshot_.has_value()) {
+    const auto& snapshot = *wallet_view_snapshot_;
+    if (activity_finalized_count_label_) activity_finalized_count_label_->setText(QString::fromStdString(snapshot.activity_finalized_count_text));
+    if (activity_pending_count_label_) activity_pending_count_label_->setText(QString::fromStdString(snapshot.activity_pending_count_text));
+    if (activity_local_count_label_) activity_local_count_label_->setText(QString::fromStdString(snapshot.activity_local_count_text));
+    if (activity_mint_count_label_) activity_mint_count_label_->setText(QString::fromStdString(snapshot.activity_mint_count_text));
+    if (activity_confidential_count_label_) activity_confidential_count_label_->setText(QString::fromStdString(snapshot.activity_confidential_count_text));
+    for (const auto& row : snapshot.history_rows) {
+      if (filter == "Pending" && QString::fromStdString(row.col1).trimmed().toUpper() != "PENDING") continue;
+      const int r = history_view_->rowCount();
+      history_view_->insertRow(r);
+      auto* status_item = new QTableWidgetItem(QString::fromStdString(row.col1));
+      apply_status_item_style(status_item);
+      history_view_->setItem(r, 0, new QTableWidgetItem(QString::fromStdString(row.col0)));
+      history_view_->setItem(r, 1, status_item);
+      history_view_->setItem(r, 2, new QTableWidgetItem(QString::fromStdString(row.col2)));
+      history_view_->setItem(r, 3, new QTableWidgetItem(QString::fromStdString(row.col3)));
+      history_view_->setItem(r, 4, new QTableWidgetItem(QString::fromStdString(row.col4)));
+      history_row_refs_.push_back(HistoryRowRef{HistoryRowRef::Source::Local, -1});
+    }
+    if (history_row_refs_.empty()) {
+      history_view_->insertRow(0);
+      history_view_->setItem(0, 0, new QTableWidgetItem("No history cached"));
+      history_row_refs_.push_back(HistoryRowRef{HistoryRowRef::Source::Local, -1});
+    }
+    history_view_->setSortingEnabled(true);
+    update_selected_history_detail();
+    return;
+  }
   int finalized_count = 0;
   int pending_count = 0;
   int local_count = 0;
@@ -5378,6 +5503,48 @@ void WalletWindow::refresh_history_table() {
     activity_confidential_count_label_->setText(QString("Confidential: %1").arg(confidential_count));
   }
   update_selected_history_detail();
+}
+
+void WalletWindow::persist_wallet_view_snapshot() {
+  if (!wallet_ || !history_view_ || !overview_page_) return;
+  WalletStore::WalletViewSnapshot snapshot;
+  snapshot.balance_text = balance_label_ ? balance_label_->text().toStdString() : "";
+  snapshot.pending_balance_text = pending_balance_label_ ? pending_balance_label_->text().toStdString() : "";
+  snapshot.confidential_balance_text = confidential_balance_label_ ? confidential_balance_label_->text().toStdString() : "";
+  snapshot.confidential_request_summary_text =
+      receive_confidential_request_summary_label_ ? receive_confidential_request_summary_label_->text().toStdString() : "";
+  snapshot.confidential_coin_summary_text =
+      receive_confidential_coin_summary_label_ ? receive_confidential_coin_summary_label_->text().toStdString() : "";
+  snapshot.activity_finalized_count_text =
+      activity_finalized_count_label_ ? activity_finalized_count_label_->text().toStdString() : "";
+  snapshot.activity_pending_count_text =
+      activity_pending_count_label_ ? activity_pending_count_label_->text().toStdString() : "";
+  snapshot.activity_local_count_text =
+      activity_local_count_label_ ? activity_local_count_label_->text().toStdString() : "";
+  snapshot.activity_mint_count_text =
+      activity_mint_count_label_ ? activity_mint_count_label_->text().toStdString() : "";
+  snapshot.activity_confidential_count_text =
+      activity_confidential_count_label_ ? activity_confidential_count_label_->text().toStdString() : "";
+  if (auto* preview = overview_page_->activity_preview_table()) {
+    for (int row = 0; row < preview->rowCount(); ++row) {
+      snapshot.overview_activity_rows.push_back(WalletStore::ViewSnapshotRow{
+          .col0 = preview->item(row, 0) ? preview->item(row, 0)->text().toStdString() : "",
+          .col1 = preview->item(row, 1) ? preview->item(row, 1)->text().toStdString() : "",
+          .col2 = preview->item(row, 2) ? preview->item(row, 2)->text().toStdString() : "",
+      });
+    }
+  }
+  for (int row = 0; row < history_view_->rowCount(); ++row) {
+    snapshot.history_rows.push_back(WalletStore::ViewSnapshotRow{
+        .col0 = history_view_->item(row, 0) ? history_view_->item(row, 0)->text().toStdString() : "",
+        .col1 = history_view_->item(row, 1) ? history_view_->item(row, 1)->text().toStdString() : "",
+        .col2 = history_view_->item(row, 2) ? history_view_->item(row, 2)->text().toStdString() : "",
+        .col3 = history_view_->item(row, 3) ? history_view_->item(row, 3)->text().toStdString() : "",
+        .col4 = history_view_->item(row, 4) ? history_view_->item(row, 4)->text().toStdString() : "",
+    });
+  }
+  wallet_view_snapshot_ = snapshot;
+  (void)store_.set_wallet_view_snapshot(snapshot);
 }
 
 void WalletWindow::submit_mint_deposit() {

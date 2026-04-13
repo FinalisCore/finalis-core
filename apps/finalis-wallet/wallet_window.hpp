@@ -132,6 +132,7 @@ class WalletWindow final : public QMainWindow {
     lightserver::TxStatusView status;
     QString endpoint;
     QString cached_at;
+    std::uint64_t cached_at_ms{0};
   };
 
   struct EndpointObservation {
@@ -220,6 +221,8 @@ class WalletWindow final : public QMainWindow {
   void render_history_view();
   void render_confidential_receive_views();
   void update_selected_confidential_pending_tx_status_panel();
+  void persist_wallet_view_snapshot();
+  void request_pending_tx_status_refresh(const QString& txid);
   void refresh_overview_activity_preview();
   void update_selected_history_detail();
   void render_mint_state();
@@ -433,6 +436,9 @@ class WalletWindow final : public QMainWindow {
   QString crosscheck_detail_text_{"No endpoint cross-check yet."};
   std::map<QString, EndpointRuntimeState> endpoint_runtime_state_;
   std::map<QString, CachedPendingTxStatus> pending_tx_status_cache_;
+  std::optional<WalletStore::WalletViewSnapshot> wallet_view_snapshot_;
+  QString pending_tx_status_panel_txid_;
+  std::uint64_t pending_tx_status_generation_{0};
   std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache_;
   std::uint64_t refresh_generation_{0};
   std::uint64_t refresh_state_version_{0};

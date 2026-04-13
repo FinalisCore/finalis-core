@@ -268,6 +268,46 @@ TEST(test_wallet_store_persists_wallet_snapshot) {
   ASSERT_EQ(state.wallet_snapshot->utxos[0].value, 500000000ull);
 }
 
+TEST(test_wallet_store_persists_wallet_view_snapshot) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_view_snapshot/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_view_snapshot");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_view_snapshot");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    WalletStore::WalletViewSnapshot snapshot;
+    snapshot.balance_text = "12.5 FLS";
+    snapshot.pending_balance_text = "Pending outgoing: 1.0 FLS";
+    snapshot.confidential_balance_text = "Confidential balance: 3.0 FLS across 1 coin(s)";
+    snapshot.confidential_request_summary_text = "Outstanding requests: 1 · Consumed: 2";
+    snapshot.confidential_coin_summary_text = "Imported confidential coins: 4 · Unspent: 3";
+    snapshot.activity_finalized_count_text = "Finalized: 6";
+    snapshot.activity_pending_count_text = "Pending: 2";
+    snapshot.activity_local_count_text = "Local: 1";
+    snapshot.activity_mint_count_text = "Mint: 0";
+    snapshot.activity_confidential_count_text = "Confidential: 3";
+    snapshot.overview_activity_rows.push_back(
+        {.col0 = "Finalized", .col1 = "Received", .col2 = "Height 77"});
+    snapshot.history_rows.push_back(
+        {.col0 = "Sent", .col1 = "Finalized", .col2 = "1.0 FLS", .col3 = "tx-ref", .col4 = "Height 77"});
+    ASSERT_TRUE(store.set_wallet_view_snapshot(snapshot));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.wallet_view_snapshot.has_value());
+  ASSERT_EQ(state.wallet_view_snapshot->balance_text, "12.5 FLS");
+  ASSERT_EQ(state.wallet_view_snapshot->pending_balance_text, "Pending outgoing: 1.0 FLS");
+  ASSERT_EQ(state.wallet_view_snapshot->overview_activity_rows.size(), 1u);
+  ASSERT_EQ(state.wallet_view_snapshot->overview_activity_rows[0].col1, "Received");
+  ASSERT_EQ(state.wallet_view_snapshot->history_rows.size(), 1u);
+  ASSERT_EQ(state.wallet_view_snapshot->history_rows[0].col4, "Height 77");
+}
+
 TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
   const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
   std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");

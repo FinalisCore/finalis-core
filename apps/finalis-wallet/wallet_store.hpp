@@ -58,6 +58,29 @@ class WalletStore {
     std::vector<SnapshotUtxoRecord> utxos;
   };
 
+  struct ViewSnapshotRow {
+    std::string col0;
+    std::string col1;
+    std::string col2;
+    std::string col3;
+    std::string col4;
+  };
+
+  struct WalletViewSnapshot {
+    std::string balance_text;
+    std::string pending_balance_text;
+    std::string confidential_balance_text;
+    std::string confidential_request_summary_text;
+    std::string confidential_coin_summary_text;
+    std::string activity_finalized_count_text;
+    std::string activity_pending_count_text;
+    std::string activity_local_count_text;
+    std::string activity_mint_count_text;
+    std::string activity_confidential_count_text;
+    std::vector<ViewSnapshotRow> overview_activity_rows;
+    std::vector<ViewSnapshotRow> history_rows;
+  };
+
   struct ConfidentialAccountRecord {
     std::string account_id;
     std::string label;
@@ -108,6 +131,7 @@ class WalletStore {
     std::vector<ConfidentialRequestRecord> confidential_requests;
     std::optional<std::string> confidential_primary_account_id;
     std::optional<WalletSnapshot> wallet_snapshot;
+    std::optional<WalletViewSnapshot> wallet_view_snapshot;
   };
 
   bool open(const std::string& wallet_file_path, const std::string& passphrase = {});
@@ -123,6 +147,8 @@ class WalletStore {
   bool set_history_cursor(const std::optional<std::uint64_t>& height, const std::optional<std::string>& txid);
   bool set_wallet_snapshot(const WalletSnapshot& snapshot);
   bool clear_wallet_snapshot();
+  bool set_wallet_view_snapshot(const WalletViewSnapshot& snapshot);
+  bool clear_wallet_view_snapshot();
   bool append_local_event(const std::string& line);
   bool upsert_mint_note(const std::string& note_ref, std::uint64_t amount, bool active);
   bool set_mint_deposit_ref(const std::string& value);
