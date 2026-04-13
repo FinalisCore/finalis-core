@@ -152,6 +152,10 @@ published by the operator.
 
 For self-hosted exchange infrastructure:
 
+- CMake auto-fetches `secp256k1-zkp` if the vendored tree is missing (network required)
+- for offline builds, disable auto-fetch and provide the vendored tree:
+  `cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF`
+  `git submodule update --init --recursive`
 - run your own `finalis-node` with lightserver enabled
 - use persistent storage
 - expose the lightserver endpoint only through exchange-controlled network

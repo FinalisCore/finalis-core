@@ -151,6 +151,12 @@ Build:
 cmake -S . -B build -G Ninja && cmake --build build -j
 ```
 
+Dependency notes:
+- If `third_party/secp256k1-zkp` is missing, CMake will auto-fetch it (network required).
+- To force offline builds, disable auto-fetch and provide the vendored tree:
+  `cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF`
+  `git submodule update --init --recursive`
+
 ## Run
 
 Before first startup on the restarted mainnet:

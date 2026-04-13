@@ -19,6 +19,10 @@ Use it with:
 - different relay nodes may make different local admission decisions
 - confidential tx status may be visible publicly without exposing confidential
   output amounts or recipients
+- CMake auto-fetches `secp256k1-zkp` if the vendored tree is missing (network required)
+- for offline builds, disable auto-fetch and provide the vendored tree:
+  `cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF`
+  `git submodule update --init --recursive`
 
 ## Common incidents
 

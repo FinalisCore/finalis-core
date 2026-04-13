@@ -4,6 +4,13 @@
 
 The live protocol aggregates committee economics by `operator_id`.
 
+Build note:
+
+- CMake auto-fetches `secp256k1-zkp` if the vendored tree is missing (network required)
+- for offline builds, disable auto-fetch and provide the vendored tree:
+  `cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF`
+  `git submodule update --init --recursive`
+
 This model applies unchanged on the restarted mainnet with identity:
 
 - `network_id = 258038c123a1c9b08475216e5f53a503`

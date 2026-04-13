@@ -19,6 +19,7 @@ option(FINALIS_BUILD_FUZZ "Build fuzz harness executables" ON)
 option(FINALIS_STRICT_WARNINGS "Enable strict warning flags" OFF)
 option(FINALIS_USE_VENDORED_SECP256K1_ZKP "Prefer vendored secp256k1-zkp when available." ON)
 option(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND "Fail configure if secp256k1-zkp confidential backend is unavailable." ON)
+option(FINALIS_AUTO_FETCH_DEPS "Allow CMake to fetch missing third-party dependencies." ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(Qt5 COMPONENTS Widgets QUIET)
@@ -36,8 +37,23 @@ set(FINALIS_SECP256K1_TARGET "")
 set(FINALIS_SECP256K1_INCLUDE_DIR "")
 set(FINALIS_USE_SECP256K1_ZKP_BACKEND OFF)
 
+set(FINALIS_SECP256K1_ZKP_SOURCE "")
 if(FINALIS_USE_VENDORED_SECP256K1_ZKP AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/secp256k1-zkp/CMakeLists.txt")
+  set(FINALIS_SECP256K1_ZKP_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/secp256k1-zkp")
   message(STATUS "Using vendored secp256k1-zkp")
+elseif(FINALIS_AUTO_FETCH_DEPS)
+  include(FetchContent)
+  message(STATUS "Vendored secp256k1-zkp not found; fetching from upstream")
+  FetchContent_Declare(
+    secp256k1_zkp
+    GIT_REPOSITORY https://github.com/ElementsProject/secp256k1-zkp.git
+    GIT_TAG 08d1cd0c9c35a5a151ba80c226d49ea949e90374
+  )
+  FetchContent_Populate(secp256k1_zkp)
+  set(FINALIS_SECP256K1_ZKP_SOURCE "${secp256k1_zkp_SOURCE_DIR}")
+endif()
+
+if(FINALIS_SECP256K1_ZKP_SOURCE)
   set(SECP256K1_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
   set(SECP256K1_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(SECP256K1_BUILD_EXHAUSTIVE_TESTS OFF CACHE BOOL "" FORCE)
@@ -58,9 +74,9 @@ if(FINALIS_USE_VENDORED_SECP256K1_ZKP AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/th
   set(SECP256K1_ENABLE_MODULE_ECDSA_S2C OFF CACHE BOOL "" FORCE)
   set(SECP256K1_ENABLE_MODULE_BPPP OFF CACHE BOOL "" FORCE)
   set(SECP256K1_ENABLE_MODULE_SCHNORRSIG_HALFAGG OFF CACHE BOOL "" FORCE)
-  add_subdirectory(third_party/secp256k1-zkp EXCLUDE_FROM_ALL)
+  add_subdirectory(${FINALIS_SECP256K1_ZKP_SOURCE} ${CMAKE_BINARY_DIR}/secp256k1-zkp EXCLUDE_FROM_ALL)
   set(FINALIS_SECP256K1_TARGET secp256k1)
-  set(FINALIS_SECP256K1_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/secp256k1-zkp/include")
+  set(FINALIS_SECP256K1_INCLUDE_DIR "${FINALIS_SECP256K1_ZKP_SOURCE}/include")
   set(FINALIS_USE_SECP256K1_ZKP_BACKEND ON)
   add_compile_definitions(SC_HAS_SECP256K1=1 SC_HAS_SECP256K1_ZKP=1)
 else()
