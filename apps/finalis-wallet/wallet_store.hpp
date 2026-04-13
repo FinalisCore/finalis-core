@@ -34,6 +34,30 @@ class WalletStore {
     std::string detail;
   };
 
+  struct SnapshotUtxoRecord {
+    std::string txid_hex;
+    std::uint32_t vout{0};
+    std::uint64_t value{0};
+    std::uint64_t height{0};
+    Bytes script_pubkey;
+  };
+
+  struct WalletSnapshot {
+    std::string chain_network_name;
+    std::string transition_hash;
+    std::string network_id_hex;
+    std::string genesis_hash_hex;
+    std::string binary_version;
+    std::string wallet_api_version;
+    std::string last_refresh_text;
+    std::string last_successful_endpoint;
+    std::uint64_t tip_height{0};
+    std::optional<std::uint64_t> finalized_lag;
+    bool peer_height_disagreement{false};
+    bool bootstrap_sync_incomplete{false};
+    std::vector<SnapshotUtxoRecord> utxos;
+  };
+
   struct ConfidentialAccountRecord {
     std::string account_id;
     std::string label;
@@ -83,6 +107,7 @@ class WalletStore {
     std::vector<ConfidentialCoinRecord> confidential_coins;
     std::vector<ConfidentialRequestRecord> confidential_requests;
     std::optional<std::string> confidential_primary_account_id;
+    std::optional<WalletSnapshot> wallet_snapshot;
   };
 
   bool open(const std::string& wallet_file_path, const std::string& passphrase = {});
@@ -96,6 +121,8 @@ class WalletStore {
   bool replace_finalized_history(const std::vector<FinalizedHistoryRecord>& records);
   bool append_finalized_history(const std::vector<FinalizedHistoryRecord>& records);
   bool set_history_cursor(const std::optional<std::uint64_t>& height, const std::optional<std::string>& txid);
+  bool set_wallet_snapshot(const WalletSnapshot& snapshot);
+  bool clear_wallet_snapshot();
   bool append_local_event(const std::string& line);
   bool upsert_mint_note(const std::string& note_ref, std::uint64_t amount, bool active);
   bool set_mint_deposit_ref(const std::string& value);

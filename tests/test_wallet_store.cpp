@@ -220,6 +220,54 @@ TEST(test_wallet_store_marks_confidential_coin_spent_without_deleting_it) {
   ASSERT_TRUE(state.confidential_coins[0].spent);
 }
 
+TEST(test_wallet_store_persists_wallet_snapshot) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_snapshot/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_snapshot");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_snapshot");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    WalletStore::WalletSnapshot snapshot;
+    snapshot.chain_network_name = "mainnet";
+    snapshot.transition_hash = "abc123";
+    snapshot.network_id_hex = "deadbeef";
+    snapshot.genesis_hash_hex = "001122";
+    snapshot.binary_version = "1.2.3";
+    snapshot.wallet_api_version = "4";
+    snapshot.last_refresh_text = "2026-04-13 12:00:00";
+    snapshot.last_successful_endpoint = "http://127.0.0.1:19444/rpc";
+    snapshot.tip_height = 77;
+    snapshot.finalized_lag = 3;
+    snapshot.peer_height_disagreement = true;
+    snapshot.bootstrap_sync_incomplete = false;
+    snapshot.utxos.push_back(WalletStore::SnapshotUtxoRecord{
+        .txid_hex = "feedface",
+        .vout = 2,
+        .value = 500000000ull,
+        .height = 70,
+        .script_pubkey = finalis::Bytes{0x51, 0x21},
+    });
+    ASSERT_TRUE(store.set_wallet_snapshot(snapshot));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.wallet_snapshot.has_value());
+  ASSERT_EQ(state.wallet_snapshot->chain_network_name, "mainnet");
+  ASSERT_EQ(state.wallet_snapshot->tip_height, 77u);
+  ASSERT_TRUE(state.wallet_snapshot->finalized_lag.has_value());
+  ASSERT_EQ(*state.wallet_snapshot->finalized_lag, 3u);
+  ASSERT_EQ(state.wallet_snapshot->last_successful_endpoint, "http://127.0.0.1:19444/rpc");
+  ASSERT_EQ(state.wallet_snapshot->utxos.size(), 1u);
+  ASSERT_EQ(state.wallet_snapshot->utxos[0].txid_hex, "feedface");
+  ASSERT_EQ(state.wallet_snapshot->utxos[0].vout, 2u);
+  ASSERT_EQ(state.wallet_snapshot->utxos[0].value, 500000000ull);
+}
+
 TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
   const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
   std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");

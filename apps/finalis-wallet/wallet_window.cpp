@@ -1862,7 +1862,6 @@ void WalletWindow::clear_lightserver_runtime_status() {
   last_refresh_used_fallback_ = false;
   last_failed_lightserver_endpoint_.clear();
   last_lightserver_error_.clear();
-  current_lightserver_status_.reset();
 }
 
 void WalletWindow::update_crosscheck_summary(const std::vector<EndpointObservation>& observations) {
@@ -3091,6 +3090,7 @@ void WalletWindow::save_wallet_local_state() {
 }
 
 void WalletWindow::load_wallet_local_state() {
+  utxos_.clear();
   local_sent_txids_.clear();
   local_history_lines_.clear();
   mint_notes_.clear();
@@ -3107,9 +3107,57 @@ void WalletWindow::load_wallet_local_state() {
   chain_records_.clear();
   finalized_history_cursor_height_.reset();
   finalized_history_cursor_txid_.reset();
+  current_chain_name_.clear();
+  current_transition_hash_.clear();
+  current_network_id_.clear();
+  current_genesis_hash_.clear();
+  current_binary_version_.clear();
+  current_wallet_api_version_.clear();
+  current_lightserver_status_.reset();
+  current_finalized_lag_.reset();
+  current_peer_height_disagreement_ = false;
+  current_bootstrap_sync_incomplete_ = false;
+  last_refresh_text_.clear();
+  last_successful_lightserver_endpoint_.clear();
   if (!wallet_ || !open_wallet_store()) return;
   WalletStore::State state;
   if (!store_.load(&state)) return;
+  if (state.wallet_snapshot.has_value()) {
+    const auto& snapshot = *state.wallet_snapshot;
+    current_chain_name_ = QString::fromStdString(snapshot.chain_network_name);
+    current_transition_hash_ = QString::fromStdString(snapshot.transition_hash);
+    current_network_id_ = QString::fromStdString(snapshot.network_id_hex);
+    current_genesis_hash_ = QString::fromStdString(snapshot.genesis_hash_hex);
+    current_binary_version_ = QString::fromStdString(snapshot.binary_version);
+    current_wallet_api_version_ = QString::fromStdString(snapshot.wallet_api_version);
+    last_refresh_text_ = QString::fromStdString(snapshot.last_refresh_text);
+    last_successful_lightserver_endpoint_ = QString::fromStdString(snapshot.last_successful_endpoint);
+    tip_height_ = snapshot.tip_height;
+    current_finalized_lag_ =
+        snapshot.finalized_lag.has_value() ? std::optional<qulonglong>(*snapshot.finalized_lag) : std::nullopt;
+    current_peer_height_disagreement_ = snapshot.peer_height_disagreement;
+    current_bootstrap_sync_incomplete_ = snapshot.bootstrap_sync_incomplete;
+    current_lightserver_status_ = lightserver::RpcStatusView{};
+    current_lightserver_status_->chain.network_name = snapshot.chain_network_name;
+    current_lightserver_status_->chain.network_id_hex = snapshot.network_id_hex;
+    current_lightserver_status_->chain.genesis_hash_hex = snapshot.genesis_hash_hex;
+    current_lightserver_status_->tip_height = snapshot.tip_height;
+    current_lightserver_status_->transition_hash = snapshot.transition_hash;
+    current_lightserver_status_->binary_version = snapshot.binary_version;
+    current_lightserver_status_->wallet_api_version = snapshot.wallet_api_version;
+    current_lightserver_status_->finalized_lag = snapshot.finalized_lag;
+    current_lightserver_status_->peer_height_disagreement = snapshot.peer_height_disagreement;
+    current_lightserver_status_->bootstrap_sync_incomplete = snapshot.bootstrap_sync_incomplete;
+    for (const auto& utxo : snapshot.utxos) {
+      utxos_.push_back(WalletUtxo{
+          .txid_hex = utxo.txid_hex,
+          .vout = utxo.vout,
+          .value = utxo.value,
+          .height = utxo.height,
+          .script_pubkey = utxo.script_pubkey,
+      });
+    }
+  }
   local_sent_txids_ = state.sent_txids;
   for (const auto& pending : state.pending_spends) {
     pending_wallet_spends_[pending.txid_hex] = pending.inputs;
@@ -3858,6 +3906,30 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
   finalized_history_cursor_height_ = result.finalized_history_cursor_height;
   finalized_history_cursor_txid_ = result.finalized_history_cursor_txid;
   finalized_tx_summary_cache_ = std::move(result.finalized_tx_summary_cache);
+  WalletStore::WalletSnapshot snapshot;
+  snapshot.chain_network_name = result.status->chain.network_name;
+  snapshot.transition_hash = result.status->transition_hash;
+  snapshot.network_id_hex = result.status->chain.network_id_hex;
+  snapshot.genesis_hash_hex = result.status->chain.genesis_hash_hex;
+  snapshot.binary_version = result.status->binary_version;
+  snapshot.wallet_api_version = result.status->wallet_api_version;
+  snapshot.last_refresh_text = last_refresh_text_.toStdString();
+  snapshot.last_successful_endpoint = last_successful_lightserver_endpoint_.toStdString();
+  snapshot.tip_height = result.status->tip_height;
+  if (result.status->finalized_lag.has_value()) snapshot.finalized_lag = *result.status->finalized_lag;
+  snapshot.peer_height_disagreement = result.status->peer_height_disagreement;
+  snapshot.bootstrap_sync_incomplete = result.status->bootstrap_sync_incomplete;
+  snapshot.utxos.reserve(utxos_.size());
+  for (const auto& utxo : utxos_) {
+    snapshot.utxos.push_back(WalletStore::SnapshotUtxoRecord{
+        .txid_hex = utxo.txid_hex,
+        .vout = utxo.vout,
+        .value = utxo.value,
+        .height = utxo.height,
+        .script_pubkey = utxo.script_pubkey,
+    });
+  }
+  (void)store_.set_wallet_snapshot(snapshot);
 
   if (result.history_persist_mode == HistoryPersistMode::Replace) {
     (void)store_.replace_finalized_history(result.history_records);
@@ -4028,8 +4100,6 @@ void WalletWindow::create_wallet() {
   wallet_ = loaded;
   (void)open_wallet_store();
   load_wallet_local_state();
-  clear_lightserver_runtime_status();
-  utxos_.clear();
   update_wallet_views();
   append_local_event("Created wallet at " + path);
   refresh_chain_state(false);
@@ -4046,8 +4116,6 @@ void WalletWindow::open_wallet() {
   wallet_ = *loaded;
   (void)open_wallet_store();
   load_wallet_local_state();
-  clear_lightserver_runtime_status();
-  utxos_.clear();
   update_wallet_views();
   append_local_event("Opened wallet " + path);
   refresh_chain_state(false);
@@ -4087,8 +4155,6 @@ void WalletWindow::import_wallet() {
   wallet_ = loaded;
   (void)open_wallet_store();
   load_wallet_local_state();
-  clear_lightserver_runtime_status();
-  utxos_.clear();
   update_wallet_views();
   append_local_event("Imported wallet into " + path);
   refresh_chain_state(false);
