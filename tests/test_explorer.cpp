@@ -799,11 +799,13 @@ TEST(test_explorer_hydrates_tx_and_transition_index_from_disk_without_live_rpc) 
     ASSERT_TRUE(tx.value.has_value());
     ASSERT_EQ(tx.value->txid, fx.txid);
     ASSERT_EQ(tx.value->data_source, "cache_finalized_snapshot");
+    ASSERT_TRUE(tx.value->data_refreshed_unix_ms.has_value());
     auto transition = fetch_transition_result(cfg, fx.transition_hash);
     ASSERT_TRUE(transition.value.has_value());
     ASSERT_EQ(transition.value->hash, fx.transition_hash);
     ASSERT_TRUE(transition.value->summary_cached);
     ASSERT_EQ(transition.value->data_source, "cache_finalized_snapshot");
+    ASSERT_TRUE(transition.value->data_refreshed_unix_ms.has_value());
     ASSERT_EQ(rpc_calls, 0);
   }
 
@@ -830,12 +832,20 @@ TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
   {
     ScopedRpcHook rpc([&](const std::string&) { return rpc_error(-32000, "rpc should not be used"); });
     load_persisted_explorer_snapshot(cfg);
+    const auto tx_json = render_tx_json(*fetch_tx_result(cfg, fx.txid).value);
+    ASSERT_TRUE(tx_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
     const auto tx_page = render_tx(cfg, fx.txid);
     ASSERT_TRUE(tx_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
     ASSERT_TRUE(tx_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
+    ASSERT_TRUE(tx_page.find("Last refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(tx_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
+    const auto transition_json = render_transition_json(cfg, *fetch_transition_result(cfg, fx.transition_hash).value);
+    ASSERT_TRUE(transition_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
     const auto transition_page = render_transition(cfg, fx.transition_hash);
     ASSERT_TRUE(transition_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
     ASSERT_TRUE(transition_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
+    ASSERT_TRUE(transition_page.find("Last refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(transition_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
   }
 
   std::filesystem::remove(temp_path, ec);
