@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - Confindential-UTXO
+      - main
     tags:
       - "v*"
 
