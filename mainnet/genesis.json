@@ -7,7 +7,7 @@
   "genesis_time_unix": 1776708000,
   "initial_height": 0,
   "initial_validators": [
-    "cc9d1120bce87a9dca53e163d429ffbce7b3afc4ca3171ae1ea99cd3c9405863"
+    "577cb8a74175a4d96d1f9c94499f1f1ecfd03febcecf7cb7c05327958bb941cb"
   ],
   "initial_active_set_size": 1,
   "initial_committee_params": {
