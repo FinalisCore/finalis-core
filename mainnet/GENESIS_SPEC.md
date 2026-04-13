@@ -16,6 +16,15 @@ Fields:
 - `seeds` (array of `host:port`)
 - `note` (string)
 
+Runtime alignment rule:
+
+- `network_id_hex` must match the explicit `mainnet` runtime network id in
+  [src/common/network.cpp](../src/common/network.cpp)
+- `magic` must match the `mainnet` runtime magic in
+  [src/common/network.cpp](../src/common/network.cpp)
+- changing these fields requires regenerating `genesis.bin` and
+  `src/genesis/embedded_mainnet.cpp`, then rebuilding binaries
+
 ## Canonical binary (`genesis.bin`)
 Deterministic field order, LE integers, ULEB128 lengths:
 1. prefix bytes `"SCGENV1"` (7 bytes)
@@ -58,3 +67,15 @@ Deterministic field order, LE integers, ULEB128 lengths:
 ./build/finalis-cli genesis_hash --in mainnet/genesis.bin
 ./build/finalis-cli genesis_verify --json mainnet/genesis.json --bin mainnet/genesis.bin
 ```
+
+For embedded mainnet builds:
+
+```bash
+python3 scripts/genesis_to_cpp.py --in mainnet/genesis.bin --out src/genesis/embedded_mainnet.cpp
+./build/finalis-cli genesis_print_embedded
+```
+
+Pass condition:
+
+- `genesis_hash --in mainnet/genesis.bin` and `genesis_print_embedded` report
+  the same genesis hash

@@ -23,6 +23,8 @@ Default data dir:
 Transition note:
 - the restarted network is branded as `Finalis` with ticker `FLS`
 - binaries now use the `finalis-*` prefix
+- old-network peers will correctly fail handshake with
+  `genesis-fingerprint-mismatch` and must not be treated as healthy seeds
 
 Port sanity:
 - Seeds must be P2P endpoints (`19440`), not lightserver HTTP (`19444`).

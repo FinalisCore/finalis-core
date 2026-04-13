@@ -1,5 +1,11 @@
 # Consensus
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 This document describes the live finalized-tip BFT path at a high level.
 
 It is not the normative source for checkpoint derivation. For that, use:
@@ -21,7 +27,17 @@ That means:
 
 Relevant implementation:
 
-- [src/node/node.cpp](/home/greendragon/Desktop/selfcoin-core-clean/src/node/node.cpp)
+- [src/node/node.cpp](../src/node/node.cpp)
+
+After the fresh-genesis reset, consensus artifacts from the abandoned chain are
+not valid inputs to the current live path. Only the current genesis identity
+and current finalized history are authoritative.
+
+Consensus execution is version-aware:
+
+- legacy transparent transactions use `Tx`
+- confidential-capable transactions use `TxV2`
+- runtime dispatch uses `AnyTx`
 
 ## Committee Source
 
@@ -50,6 +66,9 @@ A proposal consists of:
 - `prev_finalized_hash`
 - serialized block bytes
 - optional `justify_qc`
+
+The serialized payload may contain either transparent-only transactions or the
+currently supported confidential-capable `TxV2` subset.
 
 The node accepts a proposal only if:
 
@@ -153,6 +172,10 @@ The finalized transition then drives:
 - availability replay state
 - checkpoint rebuild at epoch boundaries when required
 
+Finalized execution remains validator-signature-driven even when confidential
+transactions are present; `TxV2` does not change the validator-key consensus
+model.
+
 ## `PROPOSE` And Finalized Transition Delivery
 
 `PROPOSE` is the live current-round proposal path.
@@ -170,6 +193,7 @@ That unified path:
 - applies deterministic state transition
 - updates validator and availability state
 - rebuilds the next epoch checkpoint when the epoch boundary is crossed
+- applies version-aware transaction effects to version-aware UTXO state
 
 ## Checkpoint Boundary
 

@@ -2,6 +2,13 @@
 
 `finalis-core` is a finalized-state BFT chain.
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+- `magic = 0x9797412A`
+
 Normative checkpoint derivation semantics are defined in [docs/spec/CHECKPOINT_DERIVATION_SPEC.md](spec/CHECKPOINT_DERIVATION_SPEC.md).
 Normative availability state completeness and replay semantics are defined in [docs/spec/AVAILABILITY_STATE_COMPLETENESS.md](spec/AVAILABILITY_STATE_COMPLETENESS.md).
 A bounded formal verification artifact for checkpoint derivation and availability equivalence is provided in [formal/checkpoint_availability.tla](../formal/checkpoint_availability.tla), with a reproducible TLC suite runner at [scripts/run_tlc.sh](../scripts/run_tlc.sh).
@@ -88,6 +95,10 @@ Replay authority is:
 - one canonical finality certificate per finalized height
 - committed finalized ingress/state storage needed to verify those transitions
 
+After the deliberate genesis reset, old chain DB contents, frontier caches, and
+endpoint assumptions are outside this replay authority and must not be reused
+as if they belonged to the current network.
+
 ## Adaptive Observability
 
 - Adaptive observability is operational only. It does not feed checkpoint derivation.
@@ -114,5 +125,9 @@ Replay authority is:
 - External read surfaces remain finalized-only.
 - Lightserver and explorer expose finalized state, current finalized
   availability/committee status, and adaptive telemetry observability only.
-- The wallet exposes adaptive checkpoint diagnostics only under
-  `Advanced -> Diagnostics`; normal wallet send/receive flows remain unchanged.
+- The wallet remains finalized-state-driven for settlement decisions, but the
+  merged UI now includes confidential account creation/import, confidential
+  receive request generation, confidential coin import/tracking, pending
+  confidential reservation state, and cached-first pending tx inspection.
+- Explorer and wallet both use local-first caches and surface freshness /
+  provenance explicitly instead of assuming every view is a fresh RPC read.

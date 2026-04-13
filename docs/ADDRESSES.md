@@ -1,5 +1,12 @@
 # Addresses, Keys, And Script Identity
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `address_hrp = sc`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 This document describes the live `finalis-core` key and address model.
 
 It is intentionally practical:
@@ -17,8 +24,8 @@ In the live codebase, a wallet / validator private key is an Ed25519 raw
 
 Current implementation:
 
-- [src/crypto/ed25519.hpp](/home/greendragon/Desktop/selfcoin-core-clean/src/crypto/ed25519.hpp)
-- [src/crypto/ed25519.cpp](/home/greendragon/Desktop/selfcoin-core-clean/src/crypto/ed25519.cpp)
+- [src/crypto/ed25519.hpp](../src/crypto/ed25519.hpp)
+- [src/crypto/ed25519.cpp](../src/crypto/ed25519.cpp)
 
 Important detail:
 
@@ -90,8 +97,8 @@ HASH160(x) = RIPEMD160(SHA256(x))
 
 Current hash helpers:
 
-- [src/crypto/hash.hpp](/home/greendragon/Desktop/selfcoin-core-clean/src/crypto/hash.hpp)
-- [src/crypto/hash.cpp](/home/greendragon/Desktop/selfcoin-core-clean/src/crypto/hash.cpp)
+- [src/crypto/hash.hpp](../src/crypto/hash.hpp)
+- [src/crypto/hash.cpp](../src/crypto/hash.cpp)
 
 ## 5. Address Derivation
 
@@ -197,7 +204,7 @@ Byte form:
 
 Current helper:
 
-- [src/address/address.cpp](/home/greendragon/Desktop/selfcoin-core-clean/src/address/address.cpp)
+- [src/address/address.cpp](../src/address/address.cpp)
 
 ## 10. What Exchanges / Wallets Should Rely On
 
@@ -220,6 +227,9 @@ address string
   -> normalized_address + script_pubkey_hex + scripthash_hex
 ```
 
+This transparent address flow does not decode confidential request URIs or
+wallet-local confidential account state.
+
 ## 11. `scripthash_hex`
 
 The lightserver uses `scripthash_hex` for history and UTXO lookups.
@@ -238,6 +248,17 @@ This is what exchanges should use with:
 ## 12. What Is Not In The Live Address Model
 
 The current live model does not provide:
+
+- confidential receive request URI decoding through `validate_address`
+- confidential account import/export through the transparent address parser
+- transparent-style public address expansion for confidential outputs
+
+Confidential note:
+
+- the wallet may use local confidential request URI formats such as
+  `scconfreq1:...`
+- those are wallet/product surfaces, not part of the transparent address model
+  documented here
 
 - Base58 legacy addresses
 - secp256k1 account addresses

@@ -1,5 +1,12 @@
 # Devnet Testing Guide
 
+Current restarted mainnet identity reference for comparison against local test
+deployments:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 ## Purpose
 
 This guide is for validating current `finalis-core` runtime invariants on a
@@ -13,6 +20,11 @@ Use it to test:
 - adaptive checkpoint observability
 - reward settlement replay
 - QC and lock safety behavior
+- supported confidential `TxV2` execution on a fresh network
+- wallet / explorer local-first behavior across restart
+
+Do not mix abandoned-chain DBs or stale embedded-genesis binaries into these
+tests if the goal is to simulate the current restarted mainnet.
 
 ## Basic Commands
 
@@ -167,14 +179,59 @@ Expected invariant:
 - observability fields are replay-safe and derived from canonical checkpoint
   state or persisted telemetry only
 
+### 7. Confidential `TxV2` Fresh-Network Path
+
+Goal:
+
+- verify the supported confidential subset works from fresh genesis
+- verify replay / restart preserve versioned UTXO state
+
+Procedure:
+
+1. start a fresh network with wiped DBs
+2. activate confidential policy at the intended test height
+3. submit:
+   - transparent -> confidential `TxV2`
+   - confidential -> transparent `TxV2`
+4. restart one node
+5. compare finalized height, tx status, and resulting UTXO state after replay
+
+Expected invariant:
+
+- `TxV2` replay is deterministic
+- versioned UTXO state is restart-stable
+
+### 8. Wallet / Explorer Local-First Surfaces
+
+Goal:
+
+- verify UI startup remains usable without synchronous RPC dependence
+
+Procedure:
+
+1. start wallet and explorer once against a healthy lightserver
+2. confirm local snapshots / caches are written
+3. stop or firewall the lightserver
+4. restart wallet and explorer
+5. confirm:
+   - cached state renders immediately
+   - freshness / stale-state markers are visible
+   - cached finalized data is distinguished from fresh RPC data
+
+Expected invariant:
+
+- product startup is local-first
+- endpoint failure does not blank the surface
+- stale finalized cache is labeled explicitly
+
 ## Useful Existing Tests
 
 Targeted checks already exist in:
 
-- [tests/test_committee_schedule.cpp](/home/greendragon/Desktop/selfcoin-core-clean/tests/test_committee_schedule.cpp)
-- [tests/test_codec.cpp](/home/greendragon/Desktop/selfcoin-core-clean/tests/test_codec.cpp)
-- [tests/test_integration.cpp](/home/greendragon/Desktop/selfcoin-core-clean/tests/test_integration.cpp)
-- [tests/test_lightserver.cpp](/home/greendragon/Desktop/selfcoin-core-clean/tests/test_lightserver.cpp)
+- [tests/test_committee_schedule.cpp](../tests/test_committee_schedule.cpp)
+- [tests/test_codec.cpp](../tests/test_codec.cpp)
+- [tests/test_integration.cpp](../tests/test_integration.cpp)
+- [tests/test_lightserver.cpp](../tests/test_lightserver.cpp)
 
 Examples include:
 
@@ -182,6 +239,9 @@ Examples include:
 - operator aggregation invariance
 - canonical finalized transition behavior
 - adaptive observability surface checks
+- confidential transaction validation / execution
+- wallet local-first snapshot persistence
+- explorer startup cache hydration
 
 ## Core Invariants To Watch
 

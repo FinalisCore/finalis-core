@@ -11,6 +11,8 @@
     "http://212.58.103.170:19444/rpc"
   ],
   "notes": [
-    "Private bootstrap for this deployment."
+    "Private bootstrap for this deployment.",
+    "These endpoints are deployment-specific for the current fresh-genesis network identity.",
+    "Any endpoint serving the abandoned chain is invalid even if the host is reused."
   ]
 }

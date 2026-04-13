@@ -12,11 +12,11 @@ live checkpoint path, the normative documents are:
 
 Primary implementation paths:
 
-- [src/node/node.cpp](/src/node/node.cpp)
-- [src/consensus/finalized_committee.cpp](/src/consensus/finalized_committee.cpp)
-- [src/consensus/epoch_tickets.cpp](/src/consensus/epoch_tickets.cpp)
-- [src/consensus/monetary.cpp](/src/consensus/monetary.cpp)
-- [src/storage/db.cpp](/src/storage/db.cpp)
+- [src/node/node.cpp](../src/node/node.cpp)
+- [src/consensus/finalized_committee.cpp](../src/consensus/finalized_committee.cpp)
+- [src/consensus/epoch_tickets.cpp](../src/consensus/epoch_tickets.cpp)
+- [src/consensus/monetary.cpp](../src/consensus/monetary.cpp)
+- [src/storage/db.cpp](../src/storage/db.cpp)
 
 ## System Model
 
@@ -64,6 +64,38 @@ Important boundary:
 - obsolete block-era storage must fail closed rather than being interpreted as
   live frontier state
 
+## Transaction Model
+
+The current live codebase is version-aware:
+
+- legacy transparent transactions use `Tx`
+- confidential-capable transactions use `TxV2`
+- runtime dispatch uses `AnyTx`
+
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
+Version-aware paths are live in:
+
+- mempool admission
+- frontier execution
+- canonical replay
+- finalized read surfaces
+
+Current supported confidential subset:
+
+- transparent inputs -> confidential outputs
+- confidential inputs -> transparent outputs
+
+Not implemented as a live anonymity system:
+
+- no decoys
+- no hidden input set
+- no Monero-style sender anonymity
+
 ## Two Control Planes
 
 The live protocol now has two separate deterministic control planes.
@@ -83,8 +115,8 @@ It remains the source of truth for:
 
 The schedule is centralized in:
 
-- [src/common/network.hpp](/src/common/network.hpp)
-- [src/common/network.cpp](/src/common/network.cpp)
+- [src/common/network.hpp](../src/common/network.hpp)
+- [src/common/network.cpp](../src/common/network.cpp)
 
 The restarted mainnet currently has a single active economics policy from genesis.
 
@@ -218,6 +250,25 @@ Ticket PoW is secondary.
 
 - it does not define committee membership by itself
 - it contributes only a bounded modifier
+
+## Product / Read Surface Semantics
+
+Lightserver, explorer, and wallet remain finalized-state-driven for settlement
+decisions.
+
+Current implementation details:
+
+- lightserver serves version-aware transaction and finalized-status views
+- explorer uses local-first caches for startup, tx, and transition summaries
+- explorer exposes cached-vs-live provenance and freshness
+- wallet persists local snapshots, confidential account/request/coin state, and
+  cached pending-tx status so startup is not blocked on live RPC
+
+Confidential visibility boundary:
+
+- finalized transaction presence is public
+- confidential amounts and recipient semantics are intentionally not rendered as
+  transparent-style public fields
 - at most one PoW contribution is counted per operator
 - the active cap is always taken from
   `active_economics_policy(height).ticket_bonus_cap_bps`

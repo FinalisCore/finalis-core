@@ -19,6 +19,8 @@ The operating rule is:
 Pass condition:
 
 - the endpoint serves stable finalized-state data for repeated checks
+- the endpoint reports the intended fresh-network identity after the current
+  genesis reset
 
 ## 2. Verify finalized tip progression
 
@@ -30,6 +32,11 @@ Pass condition:
 Pass condition:
 
 - finalized identity progresses consistently with new finalized transitions
+
+Genesis-reset operational note:
+
+- if this is a restarted network from fresh genesis, old endpoints or old DBs
+  from the abandoned chain must not be reused for automated settlement
 
 ## 3. Verify endpoint agreement
 
@@ -59,6 +66,8 @@ Pass condition:
 Pass condition:
 
 - deposits are credited exactly once and only from finalized state
+- confidential transaction presence does not cause the exchange to invent
+  transparent-style amount/address interpretation
 
 ## 5. Verify withdrawal flow
 
@@ -73,6 +82,8 @@ Pass condition:
 
 - withdrawals remain pending after submission and complete only on finalized
   visibility
+- support tooling does not require explorer-style transparent output rendering
+  for confidential txs
 
 ## 6. Verify reconciliation
 

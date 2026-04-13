@@ -7,6 +7,15 @@ For exchanges, the model is narrow:
 - use finalized state only
 - do not use mempool state for accounting
 - do not implement confirmation-count settlement rules
+- treat a fresh-genesis relaunch as a new network identity, not an extension of
+  the abandoned chain
+
+Current mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+- `magic = 0x9797412A`
 
 ## What the exchange runs
 
@@ -27,6 +36,9 @@ Common ports:
 
 - P2P: `19440`
 - lightserver: `19444`
+
+Always confirm the live endpoint still reports that same identity through
+`get_status` before enabling settlement automation.
 
 ## Why integration is simple
 
@@ -56,6 +68,10 @@ Credit deposits only from finalized visibility.
 Mark withdrawals complete only from finalized visibility.
 
 Treat `broadcast_tx` as submission only.
+
+If confidential-capable transactions are present, public settlement tooling
+still uses finalized status only; it must not invent transparent-style
+amount/address interpretation for confidential outputs.
 
 Explorer REST is optional:
 

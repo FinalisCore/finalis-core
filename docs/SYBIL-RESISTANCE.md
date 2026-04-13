@@ -12,6 +12,12 @@ It is specifically about:
 
 It is not a claim of real-world identity uniqueness.
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 ## Same-Operator Split Resistance
 
 Consider an attacker with fixed total bond `B`.
@@ -103,8 +109,8 @@ entities because there is no stronger native identity layer.
 
 The repo now has two complementary analysis layers:
 
-- exploratory quantitative modeling in [scripts/attack_model.py](/home/greendragon/Desktop/selfcoin-core-clean/scripts/attack_model.py)
-- live-faithful adversarial simulation in [scripts/protocol_attack_sim.py](/home/greendragon/Desktop/selfcoin-core-clean/scripts/protocol_attack_sim.py)
+- exploratory quantitative modeling in [scripts/attack_model.py](../scripts/attack_model.py)
+- live-faithful adversarial simulation in [scripts/protocol_attack_sim.py](../scripts/protocol_attack_sim.py)
 
 The simulator is the more faithful current guide for:
 

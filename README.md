@@ -6,9 +6,18 @@
 
 `finalis-core` is a finalized-state BFT blockchain in which validator lifecycle, operator-native committee formation, adaptive checkpoint derivation, and future committee eligibility are all derived deterministically from finalized history..
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+- `magic = 0x9797412A`
+
 In the current codebase it consists of:
 
 - a UTXO ledger
+- versioned transaction handling through `Tx`, `TxV2`, and `AnyTx`
+- versioned UTXO state through `UtxoSetV2`
 - a validator committee
 - quorum finality
 - deterministic epoch-boundary checkpoint derivation
@@ -19,6 +28,9 @@ The live runtime processes only:
 `height = finalized_height + 1`
 
 There is no live longest-chain fork-choice path in the node runtime.
+
+After the deliberate genesis reset, old chain DBs, old endpoint assumptions,
+and abandoned-chain artifacts are not valid inputs to this live network.
 
 ## Repository Components
 
@@ -31,8 +43,13 @@ There is no live longest-chain fork-choice path in the node runtime.
   - finalized-state JSON-RPC service
 - `finalis-explorer`
   - HTTP UI and REST layer on top of lightserver
+  - local-first cached homepage / tx / transition views with freshness and
+    provenance markers
 - `finalis-wallet`
   - Qt desktop wallet
+  - local-first cached runtime/view state
+  - confidential account, receive-request, and imported-coin UX for the
+    supported confidential subset
 
 This repository also contains:
 
@@ -77,6 +94,15 @@ This repository also contains:
 `broadcast_tx` is a relay-submission surface. Finalized visibility still comes
 from finalized-state lookup.
 
+The current codebase also supports a bounded confidential transaction subset
+through `TxV2`:
+
+- transparent -> confidential
+- confidential -> transparent
+
+Public read surfaces stay finalized-only and do not expose confidential output
+amounts or recipients as if they were transparent fields.
+
 ## Addresses And Keys
 
 The current key / address model is:
@@ -102,9 +128,11 @@ The current code implements:
 - zero new issuance after the cap
 - post-cap epoch fee pooling with deterministic reserve subsidy support
 
-## # Finalis Core – Run a Node | Deterministic finality. No forks.
+## Run A Node
 
-Do step-by-step | copy past | for Windows users see [Windows-installer]("https://github.com/finalis-core/finalis-core/releases")
+For Windows builds/releases, use:
+
+- [finalis-core releases](https://github.com/finalis-core/finalis-core/releases)
 
 ```bash
 apt install -y build-essential cmake ninja-build pkg-config libssl-dev \
@@ -124,6 +152,14 @@ cmake -S . -B build -G Ninja && cmake --build build -j
 ```
 
 ## Run
+
+Before first startup on the restarted mainnet:
+
+- wipe old chain DBs
+- ensure your local validator key is actually present in the intended genesis
+  validator set
+- ensure your binaries embed the same canonical `genesis.bin` used for launch
+
 ```bash
 ./scripts/start.sh
 ```
@@ -132,6 +168,9 @@ Default ports from the current mainnet config:
 
 - P2P: `19440`
 - lightserver: `19444`
+
+Always verify live endpoint identity with `get_status` before relying on public
+infrastructure.
 
 
 ## Testing
@@ -146,6 +185,7 @@ ctest --test-dir build --output-on-failure
 - Exchange integration: [docs/EXCHANGE_INTEGRATION.md](docs/EXCHANGE_INTEGRATION.md)
 - Live protocol: [docs/LIVE_PROTOCOL.md](docs/LIVE_PROTOCOL.md)
 - Consensus overview: [docs/CONSENSUS.md](docs/CONSENSUS.md)
+- Confidential UTXO spec: [docs/spec/CONFIDENTIAL_UTXO_SPEC.md](docs/spec/CONFIDENTIAL_UTXO_SPEC.md)
 - Checkpoint derivation spec: [docs/spec/CHECKPOINT_DERIVATION_SPEC.md](docs/spec/CHECKPOINT_DERIVATION_SPEC.md)
 - Availability completeness spec: [docs/spec/AVAILABILITY_STATE_COMPLETENESS.md](docs/spec/AVAILABILITY_STATE_COMPLETENESS.md)
 

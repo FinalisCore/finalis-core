@@ -1,5 +1,11 @@
 # Node Execution Model
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 This document describes the live finalized application path in the node.
 
 It is the runtime complement to:
@@ -45,6 +51,7 @@ Important boundary:
   history
 - next-epoch checkpoint derivation is performed only when the finalized epoch
   boundary is crossed
+- finalized transaction application is version-aware and feeds `UtxoSetV2`
 
 ## Signature Canonicalization
 
@@ -77,8 +84,12 @@ Derived state rebuilt or validated on startup includes:
 - finalized committee checkpoints
 - adaptive checkpoint metadata
 - epoch settlement state
+
+After the fresh-genesis reset, persisted state from the abandoned chain must
+fail closed rather than being treated as replay input for this execution model.
 - consensus safety state for the current next height
 - adaptive epoch telemetry derived from finalized checkpoints
+- version-aware UTXO/state-root consistency for the live transaction mix
 
 The same finalized chain must reconstruct the same derived state.
 

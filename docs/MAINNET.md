@@ -13,6 +13,9 @@ It should be used together with:
 
 - network name: `mainnet`
 - address HRP: `sc`
+- network id: `258038c123a1c9b08475216e5f53a503`
+- genesis hash: `fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+- magic: `0x9797412A` (`2543272234`)
 - default p2p port: `19440`
 - default lightserver RPC port: `19444`
 
@@ -29,6 +32,13 @@ If multiple public endpoints are available, exchanges should compare them for
 agreement on finalized height and finalized transition hash before relying on a
 newly added endpoint.
 
+Fresh-genesis note:
+
+- if the network has been relaunched from a new genesis, all published RPC
+  endpoints must be revalidated against the new `network_id` and
+  `genesis_hash`; old-chain endpoints are irrelevant even if the hostname or IP
+  is reused
+
 ## 3. Expected RPC behavior
 
 Public lightserver RPC endpoints should expose the current lightserver / wallet
@@ -40,11 +50,20 @@ Exchange-relevant expectations:
 - `get_status` returns current adaptive checkpoint observability, including
   qualified depth, adaptive target, adaptive eligible threshold, adaptive bond
   floor, and rolling fallback metrics
-- `get_tx_status` returns finalized transaction status
+- `get_tx_status` returns finalized transaction status for both transparent and
+  confidential transactions
 - `get_history_page` returns finalized address history only
 - `get_utxos` returns finalized UTXO state only
 - `broadcast_tx` submits a transaction for relay but does not complete a
   withdrawal
+
+Confidential transaction interpretation:
+
+- confidential transaction presence can be finalized and credit-safe without
+  exposing confidential amounts or recipient semantics through public RPC
+- explorer / RPC surfaces should expose transaction type, finalized status, and
+  consensus identity, but must not invent transparent-style amount/address
+  fields for confidential outputs
 
 Settlement decisions must use finalized state only.
 
@@ -90,7 +109,8 @@ Safe interpretation:
 
 - same finalized transition hash at the same height -> healthy
 - lower finalized height on one endpoint -> endpoint is lagging
-- different finalized transition hashes at the same height -> investigate immediately
+- different finalized transition hashes at the same height -> investigate
+  immediately
 
 ## 7. Finalized-only interpretation
 

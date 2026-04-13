@@ -2,6 +2,12 @@
 
 Minimal standalone Chaumian mint boundary service for local development and integration work.
 
+Current restarted mainnet identity reference:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 This service is intentionally outside consensus. It consumes the JSON contracts described in:
 
 - the HTTP handlers implemented in [server.py](./server.py)
@@ -24,6 +30,13 @@ It is a narrow scaffold, not a production mint:
 - signed reserve attestations / audit exports
 - no federation
 - no multi-operator quorum custody
+
+Fresh-genesis boundary:
+
+- if the configured lightserver reports a different `network_id` or
+  `genesis_hash`, it is not the current restarted mainnet
+- old-chain reserve assumptions or txids from the abandoned chain must not be
+  reused as if they were current settlement facts
 
 ## Endpoints
 

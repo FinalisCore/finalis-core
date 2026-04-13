@@ -14,4 +14,11 @@
 1. Publish candidate validator list and hashes.
 2. Publish final `mainnet/genesis.json`.
 3. Publish canonical `mainnet/genesis.bin` and `genesis_hash`.
-4. Independent operators reproduce hash with CLI verification command.
+4. Regenerate `src/genesis/embedded_mainnet.cpp` from `mainnet/genesis.bin`.
+5. Independent operators reproduce hash with CLI verification command.
+
+Critical launch check:
+
+- each bootstrap validator must confirm its local `validator.json`
+  `pubkey_hex` is present in the published genesis validator set
+- if the local pubkey is absent, that node cannot produce block `1`

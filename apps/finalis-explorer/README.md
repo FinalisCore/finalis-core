@@ -2,13 +2,20 @@
 
 `Finalis Explorer` is a thin in-tree explorer for exchange and operator support.
 
+Current restarted mainnet identity reference:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 It is intentionally narrow:
 
 - backed by `finalis-lightserver`
 - finalized-state only
 - no consensus logic
-- no indexer of its own
+- no independent canonical index
 - no marketing UI
+- local-first cached startup / tx / transition views
 
 Supported routes:
 
@@ -57,6 +64,7 @@ What it shows:
 - recent finalized transaction activity on the homepage
 - copyable page/API paths for operator and support workflows
 - stable finalized-only JSON for exchange, wallet, and mobile consumers
+- cached-vs-live provenance and per-surface freshness markers
 - adaptive checkpoint regime observability:
   - qualified operator depth
   - adaptive committee target
@@ -74,6 +82,7 @@ What it does not show:
 - durable withdrawal tracking
 - state outside current lightserver capabilities
 - any non-finalized object as a creditable transaction
+- transparent-style confidential amount or recipient disclosure
 
 Transaction status semantics:
 
@@ -198,6 +207,12 @@ Ticket PoW observability:
 - explorer presents Ticket PoW as bounded, operator-based, and secondary to
   bond and BFT finality
 - the restarted mainnet begins directly on the live bounded-search policy
+
+Fresh-genesis boundary:
+
+- if an explorer endpoint reports a different `network_id` or `genesis_hash`,
+  treat it as a different network immediately
+- abandoned-chain explorer data must not be interpreted as current mainnet data
 
 ## Exchange Integration
 

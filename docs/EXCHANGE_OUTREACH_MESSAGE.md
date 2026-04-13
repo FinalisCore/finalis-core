@@ -11,11 +11,15 @@ designed around finalized-state lightserver APIs: deposits are credited from
 finalized visibility only, and withdrawals are completed from finalized
 visibility only. Relay admission is not treated as settlement.
 
+The current network identity should always be confirmed from live `get_status`
+fields (`network_id`, `genesis_hash`) before operational onboarding, especially
+after a fresh-genesis relaunch.
+
 The current exchange integration documents are:
 
-- [EXCHANGE_ONE_PAGER.md](/docs/EXCHANGE_ONE_PAGER.md)
-- [EXCHANGE_INTEGRATION.md](/docs/EXCHANGE_INTEGRATION.md)
-- [EXCHANGE_API_EXAMPLES.md](/docs/EXCHANGE_API_EXAMPLES.md)
+- [EXCHANGE_ONE_PAGER.md](EXCHANGE_ONE_PAGER.md)
+- [EXCHANGE_INTEGRATION.md](EXCHANGE_INTEGRATION.md)
+- [EXCHANGE_API_EXAMPLES.md](EXCHANGE_API_EXAMPLES.md)
 
 If useful, we can provide a direct technical review against the live repo
 implementation.
@@ -37,10 +41,10 @@ We are reaching out about `finalis-core` exchange integration.
 
 Current documentation:
 
-- [EXCHANGE_ONE_PAGER.md](/docs/EXCHANGE_ONE_PAGER.md)
-- [EXCHANGE_INTEGRATION.md](/docs/EXCHANGE_INTEGRATION.md)
-- [EXCHANGE_API_EXAMPLES.md](/docs/EXCHANGE_API_EXAMPLES.md)
-- [EXCHANGE_CHECKLIST.md](/docs/EXCHANGE_CHECKLIST.md)
+- [EXCHANGE_ONE_PAGER.md](EXCHANGE_ONE_PAGER.md)
+- [EXCHANGE_INTEGRATION.md](EXCHANGE_INTEGRATION.md)
+- [EXCHANGE_API_EXAMPLES.md](EXCHANGE_API_EXAMPLES.md)
+- [EXCHANGE_CHECKLIST.md](EXCHANGE_CHECKLIST.md)
 
 If your team is open to review, we can answer directly against the current RPC
 surface and provide integration support.
@@ -62,10 +66,14 @@ The practical path is:
 The intent is simple: exchange accounting runs from finalized state, not
 mempool state and not confirmation counts.
 
+If confidential-capable transactions are in use, that does not change the
+settlement rule: finalized status is the accounting truth; public APIs do not
+expand confidential outputs into transparent-style public fields.
+
 Docs:
 
-- [EXCHANGE_INTEGRATION.md](/docs/EXCHANGE_INTEGRATION.md)
-- [EXCHANGE_API_EXAMPLES.md](/docs/EXCHANGE_API_EXAMPLES.md)
+- [EXCHANGE_INTEGRATION.md](EXCHANGE_INTEGRATION.md)
+- [EXCHANGE_API_EXAMPLES.md](EXCHANGE_API_EXAMPLES.md)
 
 If your team wants a technical review pass, we can work directly from the live
 implementation and docs.

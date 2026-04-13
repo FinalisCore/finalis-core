@@ -17,6 +17,8 @@ Use it with:
 - mempool diagnostics are local operational hints only
 - mempool rejection is not proof of on-chain invalidity
 - different relay nodes may make different local admission decisions
+- confidential tx status may be visible publicly without exposing confidential
+  output amounts or recipients
 
 ## Common incidents
 
@@ -49,6 +51,11 @@ Action:
 2. keep polling finalized-state APIs by `txid`
 3. escalate only after your internal timeout is exceeded
 4. avoid duplicate operator actions until finalized reconciliation is complete
+
+If the transaction is confidential-capable:
+
+5. do not classify missing public amount/address expansion as tx failure
+6. reconcile by finalized status and locally known wallet intent only
 
 ### Mempool pressure rejection
 
@@ -138,6 +145,7 @@ Collect these before escalation:
 - current `finalized_height`
 - current `finalized_transition_hash`
 - internal withdrawal or deposit reference
+- whether the tx is transparent-only or confidential-capable
 
 ## Audit and reconciliation checklist
 
@@ -159,3 +167,9 @@ Terminology note:
 - if internal ops use the word `treasury`, treat it as shorthand for the
   exchange-controlled wallet inventory only
 - it is not the consensus reserve balance
+
+Genesis-reset note:
+
+- if the network was relaunched from a fresh genesis, any txids, heights, or
+  explorer links from the abandoned chain are irrelevant to current settlement
+  operations

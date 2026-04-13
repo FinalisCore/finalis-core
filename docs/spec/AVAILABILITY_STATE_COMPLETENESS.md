@@ -1,11 +1,21 @@
 # Availability State Completeness
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 ## Scope
 
 This document defines which live availability fields are consensus-relevant for checkpoint derivation, how they are reconstructed, and what replay/restart equivalence the implementation guarantees.
 
-It is normative for the live availability-gated checkpoint path together with [CHECKPOINT_DERIVATION_SPEC.md](/home/greendragon/Desktop/selfcoin-core-clean/docs/spec/CHECKPOINT_DERIVATION_SPEC.md).
+It is normative for the live availability-gated checkpoint path together with [CHECKPOINT_DERIVATION_SPEC.md](CHECKPOINT_DERIVATION_SPEC.md).
 A bounded formal model for replay-equivalent availability projection and evidence isolation is provided in [../../formal/checkpoint_availability.tla](../../formal/checkpoint_availability.tla), with reproducible TLC suite configurations under [../../formal/](../../formal/).
+
+Availability snapshots or retained-prefix state from the abandoned chain are
+not valid inputs to the restarted mainnet. Only availability state derived from
+the current genesis identity and current finalized history is admissible.
 
 ## Consensus-relevant availability fields
 

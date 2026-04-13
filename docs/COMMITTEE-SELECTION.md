@@ -1,11 +1,17 @@
 # Committee Selection
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 ## Source Of Truth
 
 The live committee comes from the finalized committee checkpoint:
 
-- [src/node/node.cpp](/src/node/node.cpp#L1567)
-- [src/storage/db.hpp](/src/storage/db.hpp)
+- [src/node/node.cpp](../src/node/node.cpp#L1567)
+- [src/storage/db.hpp](../src/storage/db.hpp)
 
 Checkpoint fields:
 
@@ -18,14 +24,18 @@ Checkpoint fields:
 
 `ordered_members` is the live committee member list for that epoch.
 
+After the fresh-genesis reset, committee checkpoints from the abandoned chain
+are irrelevant. Only checkpoints derived from the current finalized history and
+current genesis identity are valid inputs.
+
 ## Candidate Construction
 
 At epoch start, active validators are transformed into operator-level candidates.
 
 Runtime path:
 
-- [src/node/node.cpp](/src/node/node.cpp#L1635)
-- [src/consensus/finalized_committee.cpp](/src/consensus/finalized_committee.cpp#L40)
+- [src/node/node.cpp](../src/node/node.cpp#L1635)
+- [src/consensus/finalized_committee.cpp](../src/consensus/finalized_committee.cpp#L40)
 
 For each active validator:
 
@@ -73,7 +83,7 @@ The lottery hash is keyed by `selection_id`, which is the operator ID in the agg
 
 The weighted comparator is implemented in:
 
-- [src/consensus/finalized_committee.cpp](/src/consensus/finalized_committee.cpp#L145)
+- [src/consensus/finalized_committee.cpp](../src/consensus/finalized_committee.cpp#L145)
 
 The ordering rule is:
 

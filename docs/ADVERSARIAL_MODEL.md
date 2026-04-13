@@ -4,6 +4,12 @@
 
 This document defines the adversarial model for Finalis Core consensus as currently implemented.
 
+Current restarted mainnet identity:
+
+* `network_name = mainnet`
+* `network_id = 258038c123a1c9b08475216e5f53a503`
+* `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 It covers:
 
 * consensus safety
@@ -46,6 +52,10 @@ Authoritative replay input is strictly:
 * genesis and network configuration
 * the finalized frontier transition sequence
 * one canonical finality certificate per finalized height
+
+After the fresh-genesis reset, DB contents or endpoint assumptions from the
+abandoned chain are outside this authoritative replay input and must not be
+treated as valid inputs to the current network.
 
 Post-activation binding rule:
 

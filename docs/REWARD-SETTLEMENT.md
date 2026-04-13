@@ -1,5 +1,11 @@
 # Reward Settlement
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 `docs/ECONOMICS.md` is the source of truth for economics policy. This document
 describes how finalized transition accrual and epoch settlement consume the
 active economics policy.
@@ -11,9 +17,9 @@ All economics-sensitive settlement logic resolves through:
 
 Relevant code:
 
-- [src/common/network.cpp](/src/common/network.cpp)
-- [src/consensus/monetary.cpp](/src/consensus/monetary.cpp)
-- [src/node/node.cpp](/src/node/node.cpp)
+- [src/common/network.cpp](../src/common/network.cpp)
+- [src/consensus/monetary.cpp](../src/consensus/monetary.cpp)
+- [src/node/node.cpp](../src/node/node.cpp)
 
 ## Model
 
@@ -33,6 +39,10 @@ Fees and issuance are separated.
 
 This remains necessary because the final QC signer set is only known after the
 transition is finalized.
+
+After the fresh-genesis reset, settlement rows, reward accrual expectations,
+and reserve accounting from the abandoned chain are not valid inputs to the
+current restarted mainnet.
 
 ## Per-Transition Accrual
 
@@ -71,7 +81,7 @@ The rule is:
 
 Boundary lookup lives in:
 
-- [src/node/node.cpp](/src/node/node.cpp)
+- [src/node/node.cpp](../src/node/node.cpp)
 
 ## Persisted State
 
@@ -89,8 +99,8 @@ Settlement is persisted as `EpochRewardSettlementState` with:
 
 Persistence lives in:
 
-- [src/storage/db.hpp](/src/storage/db.hpp)
-- [src/storage/db.cpp](/src/storage/db.cpp)
+- [src/storage/db.hpp](../src/storage/db.hpp)
+- [src/storage/db.cpp](../src/storage/db.cpp)
 
 ## Participation Adjustment
 
@@ -139,7 +149,7 @@ settlement. There is no equal split and no validator-controlled treasury key.
 ## Exactly-Once Rule
 
 All finalized paths converge through the unified finalized transition in
-[src/node/node.cpp](/src/node/node.cpp).
+[src/node/node.cpp](../src/node/node.cpp).
 
 That path does both:
 

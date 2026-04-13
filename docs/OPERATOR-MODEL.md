@@ -4,6 +4,11 @@
 
 The live protocol aggregates committee economics by `operator_id`.
 
+This model applies unchanged on the restarted mainnet with identity:
+
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 In finalized validator state:
 
 - `ValidatorInfo::operator_id` is persisted in the validator registry
@@ -53,6 +58,9 @@ Consensus still uses validator pubkeys for:
 - vote signatures
 - committee membership entries
 - finality certificates
+
+This remains true even after `TxV2` / confidential-UTXO support. Confidential
+transaction support does not replace validator-key-based consensus identity.
 
 The operator layer is an economics and committee-formation layer, not a
 replacement for validator keys.

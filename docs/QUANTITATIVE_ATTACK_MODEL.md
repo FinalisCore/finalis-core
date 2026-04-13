@@ -7,9 +7,9 @@ This document describes the repository’s quantitative attack-analysis layer.
 There are now two distinct analysis tools:
 
 - exploratory attack/economics modeling:
-  - [scripts/attack_model.py](/home/greendragon/Desktop/selfcoin-core-clean/scripts/attack_model.py)
+  - [scripts/attack_model.py](../scripts/attack_model.py)
 - live-faithful adversarial checkpoint simulation:
-  - [scripts/protocol_attack_sim.py](/home/greendragon/Desktop/selfcoin-core-clean/scripts/protocol_attack_sim.py)
+  - [scripts/protocol_attack_sim.py](../scripts/protocol_attack_sim.py)
 
 The second tool is closer to the live protocol. This document is mainly about
 the exploratory quantitative model and its role.
@@ -53,7 +53,13 @@ That means the most live-faithful questions about:
 
 should be answered first with:
 
-- [scripts/protocol_attack_sim.py](/home/greendragon/Desktop/selfcoin-core-clean/scripts/protocol_attack_sim.py)
+- [scripts/protocol_attack_sim.py](../scripts/protocol_attack_sim.py)
+
+Current restarted mainnet identity for parameter-review context:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
 
 The simpler quantitative model remains useful for broad parameter-family
 comparison and sanity checks.

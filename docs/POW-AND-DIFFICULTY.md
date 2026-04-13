@@ -1,5 +1,11 @@
 # Ticket PoW And Difficulty
 
+Current restarted mainnet identity:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 `docs/ECONOMICS.md` is the economics source of truth. This document describes
 the live Ticket PoW behavior that remains consensus-adjacent but secondary.
 
@@ -15,6 +21,10 @@ Its role is:
 - bounded secondary modifier on committee ranking
 - deterministic tie pressure within the operator-weighted model
 
+Ticket PoW state must be interpreted relative to the current finalized history
+only. Old-chain difficulty or ticket observations from the abandoned network do
+not carry over after the genesis reset.
+
 ## Ticket Construction
 
 Ticket construction on the live network is operator-based:
@@ -23,7 +33,7 @@ Ticket construction on the live network is operator-based:
 
 Relevant code:
 
-- [src/consensus/epoch_tickets.cpp](/src/consensus/epoch_tickets.cpp)
+- [src/consensus/epoch_tickets.cpp](../src/consensus/epoch_tickets.cpp)
 
 ## Bounded Search
 
@@ -73,7 +83,7 @@ In the live protocol:
 
 Relevant code:
 
-- [src/consensus/finalized_committee.cpp](/src/consensus/finalized_committee.cpp)
+- [src/consensus/finalized_committee.cpp](../src/consensus/finalized_committee.cpp)
 
 ## Difficulty Update
 
@@ -87,7 +97,7 @@ The live node reads:
 
 Runtime path:
 
-- [src/node/node.cpp](/src/node/node.cpp)
+- [src/node/node.cpp](../src/node/node.cpp)
 
 The live protocol uses a conservative streak controller:
 

@@ -12,6 +12,12 @@ The simulator reflects the live protocol semantics documented in:
 - [docs/spec/AVAILABILITY_STATE_COMPLETENESS.md](spec/AVAILABILITY_STATE_COMPLETENESS.md)
 - [docs/LIVE_PROTOCOL.md](LIVE_PROTOCOL.md)
 
+The current live deployment context after the genesis reset is:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 ## Live Rules Modeled
 
 - finalized-history-driven validator lifecycle
@@ -48,6 +54,9 @@ The simulator is faithful at the checkpoint-policy layer, but it is still an ana
 - byte-level checkpoint serialization and state commitments
 
 The simulator does not prove the live implementation. It measures protocol behavior under bounded, reproducible adversarial scenarios.
+
+It must not be used as if it were replay input for the abandoned pre-reset
+chain; the current deployment context is the restarted mainnet identity above.
 
 The committed fixture bridge constrains simulator drift:
 

@@ -2,6 +2,12 @@
 
 `Finalis Wallet` is the Qt desktop wallet shipped in this repository. It manages a local keystore, reads finalized wallet state through lightserver, signs transactions locally, and exposes the wallet and mint flows already implemented by the backend.
 
+Current restarted mainnet identity reference:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 ## Build and run
 
 If Qt5 Widgets is available, the wallet target is built with the normal project build:
@@ -18,6 +24,13 @@ cmake --build build --target finalis-wallet -j"$(nproc)"
 - Mint endpoint: optional mint deposit, issuance, and redemption flows
 
 The wallet does not embed a node. It depends on the configured external endpoints.
+
+The wallet is local-first:
+
+- cached wallet/runtime snapshots are rendered immediately on startup
+- network refresh runs in the background
+- pending-tx inspection is cached-first
+- stale / freshness state is surfaced explicitly instead of blanking the UI
 
 ## UI structure
 
@@ -49,7 +62,15 @@ The wallet is now split into screen widgets under `apps/finalis-wallet/widgets/`
   - rolling fallback and sticky-fallback rates
   - observability-only alert flags
 
-This is a structural refactor only. Core wallet behavior, finalized-state assumptions, storage, validator onboarding logic, and mint protocol behavior are intentionally preserved.
+The wallet now also includes confidential-capable UX for the currently
+supported subset:
+
+- confidential account creation / import
+- one-time confidential receive request generation
+- request import in send flow
+- imported confidential coin tracking
+- reservation / pending-send visibility
+- cached pending-tx status and inline inspection surfaces
 
 ## Lightserver failover
 
@@ -90,6 +111,13 @@ This is an informational confidence signal only. It does not verify the chain, d
 Adaptive regime diagnostics are also informational only. They are rendered from
 canonical lightserver status and do not influence wallet behavior or consensus.
 
+Fresh-genesis boundary:
+
+- if a configured endpoint reports a different `network_id` or `genesis_hash`,
+  it is not the same network
+- abandoned-chain DBs or stale wallet assumptions must not be reused as if they
+  belonged to the restarted mainnet
+
 ## Branding assets
 
 The wallet uses resource-backed branding assets from:
@@ -101,12 +129,16 @@ The wallet uses resource-backed branding assets from:
 ## Current scope
 
 - keystore create, open, import, and export
-- receive and send flows
+- transparent receive and send flows
+- bounded confidential-capable send/receive flows:
+  - transparent -> confidential
+  - confidential -> transparent
 - finalized-state activity view
 - local connection settings with multi-endpoint lightserver failover under `Advanced`
 - persisted Light and Dark themes through `QSettings`
 - minimal About dialog and resource-backed branding
 - optional validator and mint interactions under `Advanced`
+- local-first cached status / activity / pending-tx surfaces
 
 The UI remains intentionally narrow. It does not expose backend capabilities that are not already present.
 

@@ -28,6 +28,7 @@ The current bootstrap threat surface is:
 
 - genesis mismatch between published artifacts and embedded mainnet bytes
 - node DB reuse across incompatible genesis histories
+- operator rollout with stale DBs from the abandoned pre-reset chain
 - seed / peer divergence at the same finalized height
 - stale client assumptions about finalized identity fields
 - wallet local-state drift after finalized transaction inclusion
@@ -43,6 +44,11 @@ The second is:
 - do not treat `broadcast_tx` acceptance, mempool presence, or submitted local
   state as settlement
 
+The third is:
+
+- after a deliberate genesis reset, every validator / wallet / explorer /
+  lightserver instance must start from wiped chain state
+
 ## 2. Genesis Integrity Gate
 
 Before launch, reproduce the canonical genesis artifacts:
@@ -57,6 +63,11 @@ Pass condition:
 
 - `genesis_verify` returns `verified=1`
 - the reported `genesis_hash` is the one you intend to launch
+
+Reset gate:
+
+- old mainnet DBs are wiped before first startup on the new genesis
+- no node attempts to reuse frontier / finalized state from the abandoned chain
 
 Then verify that embedded mainnet bytes match the canonical binary:
 
@@ -97,6 +108,7 @@ Launch blocker:
 
 - `chain_id_ok=false`
 - `availability.local_operator.known=false` on the intended bootstrap node
+- local validator pubkey is not present in the intended genesis validator set
 
 ## 4. Lightserver Settlement Gate
 
@@ -132,6 +144,12 @@ Pass condition:
   - `status = "finalized"`
   - `finalized = true`
   - `credit_safe = true`
+
+Confidential-surface rule:
+
+- tx/finalization surfaces may show confidential-capable transactions
+- public launch tooling must not assume confidential outputs expand into
+  transparent amount/address fields
 
 ## 5. Endpoint Agreement Gate
 
@@ -185,6 +203,7 @@ Pass condition:
   `get_utxos`
 - desktop Activity is explainable by finalized history from
   `get_history_page`
+- desktop stale/freshness markers are explainable after endpoint outages
 
 Important interpretation rule:
 
@@ -240,6 +259,8 @@ Pass condition:
 - explorer committee view reflects the current finalized checkpoint and verbose
   committee metadata
 - explorer does not rely on stale routes or stale field names
+- explorer cached-vs-live provenance and freshness surfaces are explainable
+- confidential tx pages do not invent transparent amount/address fields
 
 ## 9. Exchange Settlement Gate
 

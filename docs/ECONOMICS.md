@@ -15,8 +15,8 @@ Consensus code reads schedule-driven economics through:
 
 The canonical schedule lives in:
 
-- [src/common/network.hpp](/src/common/network.hpp)
-- [src/common/network.cpp](/src/common/network.cpp)
+- [src/common/network.hpp](../src/common/network.hpp)
+- [src/common/network.cpp](../src/common/network.cpp)
 
 Consensus activation is based on block height only. Wall clock time is not used
 for economics activation.
@@ -119,8 +119,8 @@ The canonical reward/admission helpers derive:
 
 These helpers are implemented in:
 
-- [src/consensus/monetary.hpp](/src/consensus/monetary.hpp)
-- [src/consensus/monetary.cpp](/src/consensus/monetary.cpp)
+- [src/consensus/monetary.hpp](../src/consensus/monetary.hpp)
+- [src/consensus/monetary.cpp](../src/consensus/monetary.cpp)
 
 Important boundary:
 
@@ -185,8 +185,8 @@ On the live path:
 
 Relevant code:
 
-- [src/node/node.cpp](/src/node/node.cpp)
-- [src/consensus/monetary.cpp](/src/consensus/monetary.cpp)
+- [src/node/node.cpp](../src/node/node.cpp)
+- [src/consensus/monetary.cpp](../src/consensus/monetary.cpp)
 
 ## 6. Ticket PoW
 
@@ -198,8 +198,8 @@ Its live cap remains schedule-driven:
 
 Relevant code:
 
-- [src/consensus/epoch_tickets.cpp](/src/consensus/epoch_tickets.cpp)
-- [src/consensus/finalized_committee.cpp](/src/consensus/finalized_committee.cpp)
+- [src/consensus/epoch_tickets.cpp](../src/consensus/epoch_tickets.cpp)
+- [src/consensus/finalized_committee.cpp](../src/consensus/finalized_committee.cpp)
 
 ## 7. Admission boundary
 

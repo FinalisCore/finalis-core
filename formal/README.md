@@ -1,5 +1,11 @@
 # Formal Models
 
+Current restarted mainnet identity context:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+
 ## Checkpoint / Availability Model
 
 - Spec: [checkpoint_availability.tla](checkpoint_availability.tla)
@@ -36,6 +42,10 @@ The abstraction preserves the properties that matter here:
 - hysteresis correctness
 - evidence isolation
 - ordering independence
+
+This formal layer is about the restarted live checkpoint regime, not the
+abandoned pre-reset chain. Old-chain DBs or old genesis assumptions are outside
+the model’s intended deployment context.
 
 ## Run TLC
 

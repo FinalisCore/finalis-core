@@ -12,8 +12,23 @@ The exchange rule is:
 - complete withdrawals only from finalized visibility
 - treat relay admission as submission only, not settlement
 
+Confidential transaction rule:
+
+- finalized confidential transaction presence may be visible through status and
+  tx lookup
+- confidential amounts and recipient semantics must not be interpreted as
+  transparent-style public fields unless your own wallet constructed or
+  decrypted them locally
+
 There is no exchange-side confirmation-count model after finalization and no
 ordinary reorg-rollback branch in accounting logic.
+
+Current mainnet identity for onboarding cross-checks:
+
+- `network_name = mainnet`
+- `network_id = 258038c123a1c9b08475216e5f53a503`
+- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+- `magic = 0x9797412A`
 
 Use this with:
 
@@ -73,6 +88,11 @@ Operationally useful:
 Exchange settlement does not require adaptive telemetry, but it may be useful
 for operator diagnostics.
 
+Current public transaction subset may include:
+
+- legacy transparent `Tx`
+- confidential-capable `TxV2`
+
 ## 4. Status and endpoint agreement
 
 Use `get_status` for:
@@ -122,6 +142,10 @@ Endpoint agreement rule:
 If two endpoints report the same finalized height but different
 `finalized_transition_hash`, stop automated settlement and investigate.
 
+If any endpoint reports a different `network_id` or `genesis_hash`, treat it
+as a different network immediately, even if hostnames or ports look familiar
+from the abandoned pre-reset chain.
+
 ## 5. Deposit model
 
 Recommended deposit flow:
@@ -150,6 +174,10 @@ Do not credit from:
 - explorer screenshots alone
 - `broadcast_tx` output
 - mempool admission
+
+For confidential deposits or withdrawals, the exchange must still apply the
+same finalized-only rule. Public RPC confirms finalized presence and tx
+identity, not confidential output amounts.
 
 ## 6. Withdrawal model
 
@@ -207,6 +235,10 @@ Do not build against non-existent or stale routes such as `/api/block/...`.
 
 Explorer field names are similar to lightserver but not identical. When the
 same integration is possible through lightserver, prefer lightserver.
+
+Explorer may mark data as cached finalized snapshot versus fresh RPC. That is a
+provenance signal, not a settlement distinction; finalized identity is still
+the accounting truth.
 
 ## 9. Failure handling
 

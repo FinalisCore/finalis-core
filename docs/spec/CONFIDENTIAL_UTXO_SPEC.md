@@ -98,19 +98,18 @@ Modify:
 
 ### 2.5 Wallet / Explorer
 
-Add:
-
-- [apps/finalis-wallet/confidential_wallet.hpp](../../apps/finalis-wallet/confidential_wallet.hpp)
-- [apps/finalis-wallet/confidential_wallet.cpp](../../apps/finalis-wallet/confidential_wallet.cpp)
-
 Modify:
 
 - [apps/finalis-wallet/wallet_store.hpp](../../apps/finalis-wallet/wallet_store.hpp)
 - [apps/finalis-wallet/wallet_store.cpp](../../apps/finalis-wallet/wallet_store.cpp)
+- [apps/finalis-wallet/wallet_window.hpp](../../apps/finalis-wallet/wallet_window.hpp)
+- [apps/finalis-wallet/wallet_window.cpp](../../apps/finalis-wallet/wallet_window.cpp)
 - [apps/finalis-wallet/widgets/send_page.hpp](../../apps/finalis-wallet/widgets/send_page.hpp)
 - [apps/finalis-wallet/widgets/send_page.cpp](../../apps/finalis-wallet/widgets/send_page.cpp)
 - [apps/finalis-wallet/widgets/receive_page.hpp](../../apps/finalis-wallet/widgets/receive_page.hpp)
 - [apps/finalis-wallet/widgets/receive_page.cpp](../../apps/finalis-wallet/widgets/receive_page.cpp)
+- [apps/finalis-wallet/widgets/activity_page.hpp](../../apps/finalis-wallet/widgets/activity_page.hpp)
+- [apps/finalis-wallet/widgets/activity_page.cpp](../../apps/finalis-wallet/widgets/activity_page.cpp)
 - [apps/finalis-explorer/main.cpp](../../apps/finalis-explorer/main.cpp)
 
 ### 2.6 Tests
@@ -118,13 +117,13 @@ Modify:
 Add:
 
 - [tests/test_confidential_tx.cpp](../../tests/test_confidential_tx.cpp)
-- [tests/test_confidential_validation.cpp](../../tests/test_confidential_validation.cpp)
 - [tests/test_stealth_address.cpp](../../tests/test_stealth_address.cpp)
-- [tests/test_mempool_confidential.cpp](../../tests/test_mempool_confidential.cpp)
+- [tests/test_wallet_send_policy.cpp](../../tests/test_wallet_send_policy.cpp)
+- [tests/test_wallet_store.cpp](../../tests/test_wallet_store.cpp)
+- [tests/test_wallet_widgets.cpp](../../tests/test_wallet_widgets.cpp)
 
 Modify:
 
-- [tests/test_codec.cpp](../../tests/test_codec.cpp)
 - [tests/test_protocol_scope.cpp](../../tests/test_protocol_scope.cpp)
 - [tests/test_frontier_replay.cpp](../../tests/test_frontier_replay.cpp)
 
@@ -312,12 +311,13 @@ struct TxOutV2 {
 
 struct TxBalanceProofV2 {
   crypto::Commitment33 excess_commitment{};
+  PubKey32 excess_pubkey{};
   Sig64 excess_sig{};
   bool operator==(const TxBalanceProofV2&) const = default;
 };
 
 struct TxV2 {
-  std::uint32_t version{2};
+  std::uint32_t version{static_cast<std::uint32_t>(TxVersionKind::CONFIDENTIAL_V2)};
   std::vector<TxInV2> inputs;
   std::vector<TxOutV2> outputs;
   std::uint32_t lock_time{0};
@@ -742,43 +742,53 @@ struct WalletConfidentialCoin {
 };
 ```
 
-Add:
+The merged implementation keeps confidential wallet state inside the main
+desktop wallet codebase. Confidential wallet state and local-first view caching
+live in:
 
-```cpp
-std::vector<WalletConfidentialCoin> confidential_coins_;
-Bytes view_key_material_;
-Bytes spend_key_material_;
-```
+- [apps/finalis-wallet/wallet_store.hpp](../../apps/finalis-wallet/wallet_store.hpp)
+- [apps/finalis-wallet/wallet_store.cpp](../../apps/finalis-wallet/wallet_store.cpp)
 
-### 10.2 New Wallet API
+Runtime UI orchestration and lightserver-backed refresh logic live in:
 
-In [apps/finalis-wallet/confidential_wallet.hpp](../../apps/finalis-wallet/confidential_wallet.hpp):
+- [apps/finalis-wallet/wallet_window.hpp](../../apps/finalis-wallet/wallet_window.hpp)
+- [apps/finalis-wallet/wallet_window.cpp](../../apps/finalis-wallet/wallet_window.cpp)
 
-```cpp
-class ConfidentialWallet {
- public:
-  bool init_from_seed(const Bytes& seed);
-  std::optional<crypto::StealthAddress> default_stealth_address() const;
-  bool scan_tx(const AnyTx& tx, const Hash32& txid);
-  std::optional<TxV2> build_private_send(const crypto::StealthAddress& to, std::uint64_t amount,
-                                         std::uint64_t fee);
-};
-```
+The wallet persists:
 
-This is intentionally separate from the existing transparent send path.
+- confidential accounts
+- confidential coins
+- confidential receive requests
+- pending spend reservations
+- cached wallet snapshots / view snapshots
+- cached pending-tx status records
+
+Wallet-side transaction construction lives in:
+
+- [src/wallet/confidential_builder.hpp](../../src/wallet/confidential_builder.hpp)
+- [src/wallet/confidential_builder.cpp](../../src/wallet/confidential_builder.cpp)
+
+Supported builder subset:
+
+- transparent -> confidential
+- confidential -> transparent
 
 ### 10.3 UI Changes
 
 Receive page:
 
-- show stealth receive address
-- add copy/export view key flow
+- create/import confidential account
+- generate one-time confidential receive request URIs
+- import received confidential txs into local coin state
+- show request lifecycle and imported confidential coin state
 
 Send page:
 
-- add output mode selector:
-  - transparent
-  - confidential
+- explicit mode selector:
+  - transparent -> transparent
+  - transparent -> confidential
+  - confidential -> transparent
+- import `scconfreq1:` request URIs and legacy `ctxv2:` descriptors
 
 Do not mix transparent and confidential send UX in one hidden checkbox.
 Make the privacy mode explicit.
@@ -788,6 +798,13 @@ Make the privacy mode explicit.
 In [apps/finalis-explorer/main.cpp](../../apps/finalis-explorer/main.cpp):
 
 Replace tx decoding with `parse_any_tx`.
+
+The merged implementation also adds:
+
+- local-first persisted explorer startup snapshot cache
+- bounded on-disk tx / transition summary index
+- per-surface freshness metadata
+- cached-vs-live provenance on tx / transition pages
 
 Display policy:
 

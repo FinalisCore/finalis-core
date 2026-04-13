@@ -9,6 +9,13 @@ There are two surfaces:
 
 Do not assume the same field names appear in both.
 
+Confidential transaction note:
+
+- finalized status and tx identity may be visible for confidential-capable
+  transactions
+- public APIs must not be interpreted as exposing confidential output amounts
+  or recipient semantics unless your own wallet built or decrypted that data
+
 Terminology note:
 
 - any exchange-side `treasury` or `withdrawal wallet` balance should be derived
@@ -42,18 +49,18 @@ Example response shape:
   "id": 1,
   "result": {
     "network_name": "mainnet",
-    "network_id": "...",
-    "genesis_hash": "...",
+    "network_id": "258038c123a1c9b08475216e5f53a503",
+    "genesis_hash": "fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211",
     "tip": {
-      "height": 225,
-      "transition_hash": "32a442db9ee0325a19b610f80aaa65d0795288364d63a6a10c805dbaacdf4197"
+      "height": 123,
+      "transition_hash": "<finalized_transition_hash>"
     },
     "finalized_tip": {
-      "height": 225,
-      "transition_hash": "32a442db9ee0325a19b610f80aaa65d0795288364d63a6a10c805dbaacdf4197"
+      "height": 123,
+      "transition_hash": "<finalized_transition_hash>"
     },
-    "finalized_height": 225,
-    "finalized_transition_hash": "32a442db9ee0325a19b610f80aaa65d0795288364d63a6a10c805dbaacdf4197",
+    "finalized_height": 123,
+    "finalized_transition_hash": "<finalized_transition_hash>",
     "version": "finalis-core/...",
     "binary_version": "finalis-lightserver/...",
     "wallet_api_version": "...",
@@ -61,8 +68,8 @@ Example response shape:
     "established_peer_count": 1,
     "sync": {
       "mode": "finalized_only",
-      "local_finalized_height": 225,
-      "observed_network_finalized_height": 225,
+      "local_finalized_height": 123,
+      "observed_network_finalized_height": 123,
       "finalized_lag": 0,
       "bootstrap_sync_incomplete": false,
       "peer_height_disagreement": false,
@@ -78,6 +85,7 @@ Exchange use:
 - finalized identity monitoring
 - endpoint agreement
 - sync health
+- confirming the fresh-genesis network identity after a relaunch
 
 ### 1.2 `get_tx_status`
 
@@ -99,10 +107,10 @@ Example finalized response:
     "txid": "<txid>",
     "status": "finalized",
     "finalized": true,
-    "height": 225,
+    "height": 123,
     "finalized_depth": 1,
     "credit_safe": true,
-    "transition_hash": "32a442db9ee0325a19b610f80aaa65d0795288364d63a6a10c805dbaacdf4197"
+    "transition_hash": "<finalized_transition_hash>"
   }
 }
 ```
@@ -140,11 +148,17 @@ Example response:
   "jsonrpc": "2.0",
   "id": 3,
   "result": {
-    "height": 225,
+    "height": 123,
     "tx_hex": "..."
   }
 }
 ```
+
+Interpretation:
+
+- `get_tx` is an identity / payload lookup surface
+- for confidential-capable transactions, callers must not assume the payload can
+  be expanded into transparent-style public amount/address semantics
 
 ### 1.4 `validate_address`
 
@@ -178,7 +192,18 @@ Example response shape:
 }
 ```
 
+Interpretation:
+
+- `network_id` and `genesis_hash` should match the current published mainnet
+  identity
+- example heights and transition hashes here remain illustrative placeholders,
+  not canonical live values
+
 Use `scripthash_hex` with `get_history_page` and `get_utxos`.
+
+This address validation flow remains for transparent address handling. It is
+not a decoder for confidential request URIs or confidential wallet-local
+account state.
 
 ### 1.5 `get_utxos`
 
@@ -201,7 +226,7 @@ Example response:
       "txid": "<txid>",
       "vout": 0,
       "value": 123456789,
-      "height": 225,
+      "height": 123,
       "script_pubkey_hex": "..."
     }
   ]
@@ -228,7 +253,7 @@ Example response:
     "items": [
       {
         "txid": "<txid>",
-        "height": 225
+        "height": 123
       }
     ],
     "has_more": false,
@@ -239,6 +264,11 @@ Example response:
 ```
 
 ### 1.7 `broadcast_tx`
+
+All numeric heights and hashes in this document are illustrative placeholders.
+For fresh-genesis deployments, always confirm the live `network_id`,
+`genesis_hash`, and finalized identity from `get_status` before operational
+use.
 
 Request:
 
@@ -336,10 +366,10 @@ Example response shape:
   "txid": "<txid>",
   "status": "finalized",
   "finalized": true,
-  "height": 225,
+  "height": 123,
   "finalized_depth": 1,
   "credit_safe": true,
-  "transition_hash": "32a442db9ee0325a19b610f80aaa65d0795288364d63a6a10c805dbaacdf4197"
+  "transition_hash": "<finalized_transition_hash>"
 }
 ```
 
@@ -348,13 +378,13 @@ Example response shape:
 Request by height:
 
 ```bash
-curl -s http://127.0.0.1:8080/api/transition/225
+curl -s http://127.0.0.1:8080/api/transition/123
 ```
 
 Request by transition hash:
 
 ```bash
-curl -s http://127.0.0.1:8080/api/transition/32a442db9ee0325a19b610f80aaa65d0795288364d63a6a10c805dbaacdf4197
+curl -s http://127.0.0.1:8080/api/transition/<finalized_transition_hash>
 ```
 
 Use `/api/transition/...`, not `/api/block/...`.
