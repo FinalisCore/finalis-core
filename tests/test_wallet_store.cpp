@@ -344,6 +344,55 @@ TEST(test_wallet_store_persists_pending_tx_status_cache) {
   ASSERT_EQ(state.pending_tx_statuses[0].transition_hash, "deadbeef");
 }
 
+TEST(test_wallet_store_bounds_pending_tx_status_cache_retention) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_pending_tx_status_retention/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_pending_tx_status_retention");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_pending_tx_status_retention");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    ASSERT_TRUE(store.upsert_pending_tx_status(WalletStore::PendingTxStatusRecord{
+        .txid_hex = "old-entry",
+        .endpoint = "http://127.0.0.1:19444/rpc",
+        .cached_at = "old",
+        .cached_at_ms = 1,
+        .status = "pending",
+        .finalized = false,
+        .height = 1,
+        .finalized_depth = 0,
+        .credit_safe = false,
+        .transition_hash = "old",
+    }));
+    for (int i = 0; i < 70; ++i) {
+      ASSERT_TRUE(store.upsert_pending_tx_status(WalletStore::PendingTxStatusRecord{
+          .txid_hex = "tx-" + std::to_string(i),
+          .endpoint = "http://127.0.0.1:19444/rpc",
+          .cached_at = "recent",
+          .cached_at_ms = 700000000ull + static_cast<std::uint64_t>(i),
+          .status = "pending",
+          .finalized = false,
+          .height = static_cast<std::uint64_t>(i),
+          .finalized_depth = 0,
+          .credit_safe = false,
+          .transition_hash = "recent",
+      }));
+    }
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.pending_tx_statuses.size() <= 64u);
+  bool found_old = false;
+  for (const auto& entry : state.pending_tx_statuses) {
+    if (entry.txid_hex == "old-entry") found_old = true;
+  }
+  ASSERT_TRUE(!found_old);
+}
+
 TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
   const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
   std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");

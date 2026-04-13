@@ -17,6 +17,8 @@ constexpr std::uint32_t kConfidentialWalletPbkdf2Iterations = 200'000;
 constexpr std::size_t kWalletSaltLen = 16;
 constexpr std::size_t kWalletNonceLen = 12;
 constexpr std::size_t kWalletTagLen = 16;
+constexpr std::size_t kMaxPendingTxStatusRecords = 64;
+constexpr std::uint64_t kPendingTxStatusRetentionMs = 7ull * 24ull * 60ull * 60ull * 1000ull;
 
 Bytes to_bytes(const std::string& value) { return Bytes(value.begin(), value.end()); }
 
@@ -793,11 +795,60 @@ bool WalletStore::set_wallet_view_snapshot(const WalletViewSnapshot& snapshot) {
 bool WalletStore::clear_wallet_view_snapshot() { return db_.erase(key_view_snapshot()); }
 
 bool WalletStore::upsert_pending_tx_status(const PendingTxStatusRecord& record) {
-  return db_.put(key_pending_tx_status(record.txid_hex), serialize_pending_tx_status_record(record));
+  if (!db_.put(key_pending_tx_status(record.txid_hex), serialize_pending_tx_status_record(record))) return false;
+  return prune_pending_tx_status_cache();
 }
 
 bool WalletStore::remove_pending_tx_status(const std::string& txid_hex) {
   return db_.erase(key_pending_tx_status(txid_hex));
+}
+
+bool WalletStore::prune_pending_tx_status_cache() {
+  struct Entry {
+    std::string key;
+    PendingTxStatusRecord record;
+  };
+  std::vector<Entry> entries;
+  entries.reserve(kMaxPendingTxStatusRecords + 8);
+  std::uint64_t newest_cached_at_ms = 0;
+  for (const auto& [key, value] : db_.scan_prefix("PENDINGTX:")) {
+    auto parsed = parse_pending_tx_status_record(value);
+    if (!parsed) {
+      (void)db_.erase(key);
+      continue;
+    }
+    newest_cached_at_ms = std::max(newest_cached_at_ms, parsed->cached_at_ms);
+    entries.push_back(Entry{key, *parsed});
+  }
+  if (entries.empty()) return true;
+
+  const std::uint64_t min_cached_at_ms =
+      newest_cached_at_ms > kPendingTxStatusRetentionMs ? (newest_cached_at_ms - kPendingTxStatusRetentionMs) : 0;
+  for (const auto& entry : entries) {
+    if (entry.record.cached_at_ms < min_cached_at_ms) {
+      if (!db_.erase(entry.key)) return false;
+    }
+  }
+
+  entries.clear();
+  for (const auto& [key, value] : db_.scan_prefix("PENDINGTX:")) {
+    auto parsed = parse_pending_tx_status_record(value);
+    if (!parsed) {
+      (void)db_.erase(key);
+      continue;
+    }
+    entries.push_back(Entry{key, *parsed});
+  }
+  if (entries.size() <= kMaxPendingTxStatusRecords) return true;
+
+  std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+    if (a.record.cached_at_ms != b.record.cached_at_ms) return a.record.cached_at_ms > b.record.cached_at_ms;
+    return a.record.txid_hex < b.record.txid_hex;
+  });
+  for (std::size_t i = kMaxPendingTxStatusRecords; i < entries.size(); ++i) {
+    if (!db_.erase(entries[i].key)) return false;
+  }
+  return true;
 }
 
 bool WalletStore::append_local_event(const std::string& line) {

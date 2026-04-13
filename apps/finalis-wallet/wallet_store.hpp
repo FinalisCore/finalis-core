@@ -184,6 +184,7 @@ class WalletStore {
   static std::set<OutPoint> reserved_pending_outpoints(const State& state);
 
  private:
+  bool prune_pending_tx_status_cache();
   bool set_string(const std::string& key, const std::string& value);
   bool set_u32(const std::string& key, std::uint32_t value);
   bool set_u64(const std::string& key, std::uint64_t value);
