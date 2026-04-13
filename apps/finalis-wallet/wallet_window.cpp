@@ -2939,6 +2939,18 @@ void WalletWindow::request_pending_tx_status_refresh(const QString& txid) {
                 .cached_at = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss"),
                 .cached_at_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch()),
             };
+            (void)self->store_.upsert_pending_tx_status(WalletStore::PendingTxStatusRecord{
+                .txid_hex = txid.toStdString(),
+                .endpoint = used_endpoint.toStdString(),
+                .cached_at = self->pending_tx_status_cache_[txid].cached_at.toStdString(),
+                .cached_at_ms = self->pending_tx_status_cache_[txid].cached_at_ms,
+                .status = tx_status->status,
+                .finalized = tx_status->finalized,
+                .height = tx_status->height,
+                .finalized_depth = tx_status->finalized_depth,
+                .credit_safe = tx_status->credit_safe,
+                .transition_hash = tx_status->transition_hash,
+            });
             self->update_selected_confidential_pending_tx_status_panel();
             return;
           }
@@ -3176,6 +3188,7 @@ void WalletWindow::load_wallet_local_state() {
   confidential_storage_locked_ = false;
   pending_wallet_spends_.clear();
   pending_confidential_reservations_.clear();
+  pending_tx_status_cache_.clear();
   finalized_tx_summary_cache_.clear();
   chain_records_.clear();
   finalized_history_cursor_height_.reset();
@@ -3233,6 +3246,22 @@ void WalletWindow::load_wallet_local_state() {
     }
   }
   wallet_view_snapshot_ = state.wallet_view_snapshot;
+  for (const auto& record : state.pending_tx_statuses) {
+    pending_tx_status_cache_[QString::fromStdString(record.txid_hex)] = CachedPendingTxStatus{
+        .status = lightserver::TxStatusView{
+            .txid_hex = record.txid_hex,
+            .status = record.status,
+            .finalized = record.finalized,
+            .height = record.height,
+            .finalized_depth = record.finalized_depth,
+            .credit_safe = record.credit_safe,
+            .transition_hash = record.transition_hash,
+        },
+        .endpoint = QString::fromStdString(record.endpoint),
+        .cached_at = QString::fromStdString(record.cached_at),
+        .cached_at_ms = record.cached_at_ms,
+    };
+  }
   local_sent_txids_ = state.sent_txids;
   for (const auto& pending : state.pending_spends) {
     pending_wallet_spends_[pending.txid_hex] = pending.inputs;
@@ -4029,8 +4058,16 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
   for (const auto& outpoint : result.mark_spent_confidential_outpoints) {
     (void)store_.set_confidential_coin_spent(hex_encode32(outpoint.txid), outpoint.index, true);
   }
-  for (const auto& txid : result.remove_pending_txids) (void)store_.remove_pending_spend(txid);
-  for (const auto& txid : result.remove_sent_txids) (void)store_.remove_sent_txid(txid);
+  for (const auto& txid : result.remove_pending_txids) {
+    (void)store_.remove_pending_spend(txid);
+    (void)store_.remove_pending_tx_status(txid);
+    pending_tx_status_cache_.erase(QString::fromStdString(txid));
+  }
+  for (const auto& txid : result.remove_sent_txids) {
+    (void)store_.remove_sent_txid(txid);
+    (void)store_.remove_pending_tx_status(txid);
+    pending_tx_status_cache_.erase(QString::fromStdString(txid));
+  }
   refresh_in_flight_ = should_keep_refresh_indicator(generation, refresh_generation_);
   mark_refresh_state_changed();
 

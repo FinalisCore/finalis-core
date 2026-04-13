@@ -308,6 +308,42 @@ TEST(test_wallet_store_persists_wallet_view_snapshot) {
   ASSERT_EQ(state.wallet_view_snapshot->history_rows[0].col4, "Height 77");
 }
 
+TEST(test_wallet_store_persists_pending_tx_status_cache) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_pending_tx_status/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_pending_tx_status");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_pending_tx_status");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    ASSERT_TRUE(store.upsert_pending_tx_status(WalletStore::PendingTxStatusRecord{
+        .txid_hex = "aa11",
+        .endpoint = "http://127.0.0.1:19444/rpc",
+        .cached_at = "2026-04-13 15:00:00",
+        .cached_at_ms = 123456789ull,
+        .status = "pending",
+        .finalized = false,
+        .height = 88,
+        .finalized_depth = 0,
+        .credit_safe = false,
+        .transition_hash = "deadbeef",
+    }));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_EQ(state.pending_tx_statuses.size(), 1u);
+  ASSERT_EQ(state.pending_tx_statuses[0].txid_hex, "aa11");
+  ASSERT_EQ(state.pending_tx_statuses[0].endpoint, "http://127.0.0.1:19444/rpc");
+  ASSERT_EQ(state.pending_tx_statuses[0].cached_at_ms, 123456789ull);
+  ASSERT_EQ(state.pending_tx_statuses[0].status, "pending");
+  ASSERT_EQ(state.pending_tx_statuses[0].height, 88u);
+  ASSERT_EQ(state.pending_tx_statuses[0].transition_hash, "deadbeef");
+}
+
 TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
   const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
   std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");

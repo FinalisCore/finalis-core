@@ -40,6 +40,7 @@ std::string key_note(const std::string& note_ref) { return "NOTE:" + note_ref; }
 std::string key_meta(const std::string& name) { return "META:" + name; }
 std::string key_snapshot() { return "SNAPSHOT:wallet"; }
 std::string key_view_snapshot() { return "SNAPSHOT:view"; }
+std::string key_pending_tx_status(const std::string& txid_hex) { return "PENDINGTX:" + txid_hex; }
 std::string key_confidential_account(const std::string& account_id) { return "CACCT:" + account_id; }
 std::string key_confidential_coin(const std::string& txid_hex, std::uint32_t vout) {
   char buf[32];
@@ -373,6 +374,58 @@ std::optional<WalletStore::WalletViewSnapshot> parse_wallet_view_snapshot(const 
   return out;
 }
 
+Bytes serialize_pending_tx_status_record(const WalletStore::PendingTxStatusRecord& record) {
+  codec::ByteWriter w;
+  w.u32le(kConfidentialWalletRecordVersion);
+  w.varbytes(to_bytes(record.txid_hex));
+  w.varbytes(to_bytes(record.endpoint));
+  w.varbytes(to_bytes(record.cached_at));
+  w.u64le(record.cached_at_ms);
+  w.varbytes(to_bytes(record.status));
+  w.u8(record.finalized ? 1 : 0);
+  w.u64le(record.height);
+  w.u64le(record.finalized_depth);
+  w.u8(record.credit_safe ? 1 : 0);
+  w.varbytes(to_bytes(record.transition_hash));
+  return w.take();
+}
+
+std::optional<WalletStore::PendingTxStatusRecord> parse_pending_tx_status_record(const Bytes& value) {
+  WalletStore::PendingTxStatusRecord out;
+  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
+        auto version = r.u32le();
+        auto txid_hex = r.varbytes();
+        auto endpoint = r.varbytes();
+        auto cached_at = r.varbytes();
+        auto cached_at_ms = r.u64le();
+        auto status = r.varbytes();
+        auto finalized = r.u8();
+        auto height = r.u64le();
+        auto finalized_depth = r.u64le();
+        auto credit_safe = r.u8();
+        auto transition_hash = r.varbytes();
+        if (!version || !txid_hex || !endpoint || !cached_at || !cached_at_ms || !status || !finalized || !height ||
+            !finalized_depth || !credit_safe || !transition_hash) {
+          return false;
+        }
+        if (*version != kConfidentialWalletRecordVersion) return false;
+        out.txid_hex = from_bytes(*txid_hex);
+        out.endpoint = from_bytes(*endpoint);
+        out.cached_at = from_bytes(*cached_at);
+        out.cached_at_ms = *cached_at_ms;
+        out.status = from_bytes(*status);
+        out.finalized = (*finalized != 0);
+        out.height = *height;
+        out.finalized_depth = *finalized_depth;
+        out.credit_safe = (*credit_safe != 0);
+        out.transition_hash = from_bytes(*transition_hash);
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
 Bytes serialize_note(std::uint64_t amount, bool active) {
   codec::ByteWriter w;
   w.u64le(amount);
@@ -594,6 +647,7 @@ bool WalletStore::load(State* out) const {
   out->confidential_primary_account_id.reset();
   out->wallet_snapshot.reset();
   out->wallet_view_snapshot.reset();
+  out->pending_tx_statuses.clear();
 
   for (const auto& [key, _] : db_.scan_prefix("SENT:")) out->sent_txids.push_back(key.substr(5));
   std::sort(out->sent_txids.begin(), out->sent_txids.end());
@@ -639,6 +693,14 @@ bool WalletStore::load(State* out) const {
   if (const auto snapshot = db_.get(key_view_snapshot()); snapshot.has_value()) {
     out->wallet_view_snapshot = parse_wallet_view_snapshot(*snapshot);
   }
+  for (const auto& [key, value] : db_.scan_prefix("PENDINGTX:")) {
+    auto parsed = parse_pending_tx_status_record(value);
+    if (!parsed) continue;
+    if (parsed->txid_hex.empty()) parsed->txid_hex = key.substr(10);
+    out->pending_tx_statuses.push_back(*parsed);
+  }
+  std::sort(out->pending_tx_statuses.begin(), out->pending_tx_statuses.end(),
+            [](const auto& a, const auto& b) { return a.txid_hex < b.txid_hex; });
 
   for (const auto& [key, value] : db_.scan_prefix("CACCT:")) {
     auto plain = decrypt_secret_payload(passphrase_, value);
@@ -729,6 +791,14 @@ bool WalletStore::set_wallet_view_snapshot(const WalletViewSnapshot& snapshot) {
 }
 
 bool WalletStore::clear_wallet_view_snapshot() { return db_.erase(key_view_snapshot()); }
+
+bool WalletStore::upsert_pending_tx_status(const PendingTxStatusRecord& record) {
+  return db_.put(key_pending_tx_status(record.txid_hex), serialize_pending_tx_status_record(record));
+}
+
+bool WalletStore::remove_pending_tx_status(const std::string& txid_hex) {
+  return db_.erase(key_pending_tx_status(txid_hex));
+}
 
 bool WalletStore::append_local_event(const std::string& line) {
   const std::uint64_t seq = next_event_seq() + 1;

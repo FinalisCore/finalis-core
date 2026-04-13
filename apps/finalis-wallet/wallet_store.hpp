@@ -81,6 +81,19 @@ class WalletStore {
     std::vector<ViewSnapshotRow> history_rows;
   };
 
+  struct PendingTxStatusRecord {
+    std::string txid_hex;
+    std::string endpoint;
+    std::string cached_at;
+    std::uint64_t cached_at_ms{0};
+    std::string status;
+    bool finalized{false};
+    std::uint64_t height{0};
+    std::uint64_t finalized_depth{0};
+    bool credit_safe{false};
+    std::string transition_hash;
+  };
+
   struct ConfidentialAccountRecord {
     std::string account_id;
     std::string label;
@@ -132,6 +145,7 @@ class WalletStore {
     std::optional<std::string> confidential_primary_account_id;
     std::optional<WalletSnapshot> wallet_snapshot;
     std::optional<WalletViewSnapshot> wallet_view_snapshot;
+    std::vector<PendingTxStatusRecord> pending_tx_statuses;
   };
 
   bool open(const std::string& wallet_file_path, const std::string& passphrase = {});
@@ -149,6 +163,8 @@ class WalletStore {
   bool clear_wallet_snapshot();
   bool set_wallet_view_snapshot(const WalletViewSnapshot& snapshot);
   bool clear_wallet_view_snapshot();
+  bool upsert_pending_tx_status(const PendingTxStatusRecord& record);
+  bool remove_pending_tx_status(const std::string& txid_hex);
   bool append_local_event(const std::string& line);
   bool upsert_mint_note(const std::string& note_ref, std::uint64_t amount, bool active);
   bool set_mint_deposit_ref(const std::string& value);
