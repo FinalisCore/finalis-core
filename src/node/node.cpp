@@ -1846,6 +1846,7 @@ bool Node::init() {
         requested_sync_heights_.clear();
         if (established_peer_count() == 0 && had_round_activity) {
           const auto current_height = finalized_height_ + 1;
+          current_round_ = 0;
           proposed_in_round_.clear();
           local_vote_reservations_.clear();
           local_timeout_vote_reservations_.clear();
@@ -3981,11 +3982,13 @@ void Node::event_loop() {
         (void)db_.put_node_runtime_status_snapshot(runtime);
         last_runtime_status_persist_ms_ = now_ms;
       }
+      const std::uint64_t min_block_interval_ms = static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
+      const std::uint64_t ticket_window_floor_ms = std::min<std::uint64_t>(1000, min_block_interval_ms);
       const std::uint64_t ticket_window_ms =
-          std::max<std::uint64_t>(1000, static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms) / 2);
+          std::max<std::uint64_t>(ticket_window_floor_ms, min_block_interval_ms / 2);
       const bool ticket_window_elapsed = now_ms >= last_finalized_progress_ms_ + ticket_window_ms;
       const bool block_interval_elapsed =
-          now_ms >= last_finalized_progress_ms_ + static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
+          now_ms >= last_finalized_progress_ms_ + min_block_interval_ms;
       if (current_round_ == 0 && ticket_window_elapsed) {
         const std::uint64_t round0_start = last_finalized_progress_ms_ + ticket_window_ms;
         if (round_started_ms_ < round0_start) round_started_ms_ = round0_start;

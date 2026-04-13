@@ -1330,8 +1330,15 @@ std::map<OutPoint, UtxoEntry> DB::load_utxos() const {
     auto op_b = hex_decode(op_hex);
     if (!op_b.has_value()) continue;
     auto op = parse_outpoint(*op_b);
+    if (!op.has_value()) continue;
+    if (auto entry_v2 = parse_utxo_entry_v2(v); entry_v2.has_value()) {
+      const auto transparent = transparent_txout_from_utxo_entry(*entry_v2);
+      if (!transparent.has_value()) continue;
+      out[*op] = UtxoEntry{*transparent};
+      continue;
+    }
     auto txout = parse_txout(v);
-    if (!op.has_value() || !txout.has_value()) continue;
+    if (!txout.has_value()) continue;
     out[*op] = UtxoEntry{*txout};
   }
   return out;
