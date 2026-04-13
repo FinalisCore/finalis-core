@@ -514,6 +514,28 @@ storage::SlashingRecord make_onchain_slash_record(const SlashEvidence& ev, const
 
 std::string finalized_write_marker_key() { return "FW:PENDING"; }
 
+std::string justify_summary(const std::optional<QuorumCertificate>& qc, const std::optional<TimeoutCertificate>& tc) {
+  if (qc.has_value()) {
+    return "qc(height=" + std::to_string(qc->height) + ",round=" + std::to_string(qc->round) +
+           ",transition=" + short_hash_hex(qc->frontier_transition_id) + ")";
+  }
+  if (tc.has_value()) {
+    return "tc(height=" + std::to_string(tc->height) + ",round=" + std::to_string(tc->round) + ")";
+  }
+  return "none";
+}
+
+std::string signer_set_summary(const std::vector<FinalitySig>& sigs) {
+  std::ostringstream oss;
+  bool first = true;
+  for (const auto& sig : sigs) {
+    if (!first) oss << ",";
+    first = false;
+    oss << short_pub_hex(sig.validator_pubkey);
+  }
+  return oss.str();
+}
+
 Bytes serialize_finalized_write_marker(std::uint64_t height, const Hash32& block_id) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -1844,8 +1866,11 @@ bool Node::init() {
         }
         requested_sync_artifacts_.clear();
         requested_sync_heights_.clear();
-        if (established_peer_count() == 0 && had_round_activity) {
-          const auto current_height = finalized_height_ + 1;
+        const auto current_height = finalized_height_ + 1;
+        const bool should_reset_round_state =
+            established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height) &&
+            (current_round_ > 0 || had_round_activity);
+        if (should_reset_round_state) {
           current_round_ = 0;
           proposed_in_round_.clear();
           local_vote_reservations_.clear();
@@ -5581,7 +5606,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     const bool allow_late_round0_after_first_timeout =
         from_network && msg.round == 0 && current_round_ == 1 && msg.height == finalized_height_ + 1;
     if (msg.round < current_round_ && !allow_late_round0_after_first_timeout) {
-      log_propose_soft_reject("stale-round", " local_round=" + std::to_string(current_round_));
+      log_propose_soft_reject("stale-round", " local_round=" + std::to_string(current_round_) +
+                                                 " justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
       return ProposeHandlingResult::SoftReject;
     }
     if (msg.prev_finalized_hash != finalized_identity_.id) {
@@ -5611,7 +5637,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       return ProposeHandlingResult::HardReject;
     }
     if (msg.round > 0 && !msg.justify_qc.has_value() && !msg.justify_tc.has_value()) {
-      log_propose_hard_reject("missing-justify");
+      log_propose_hard_reject("missing-justify", " local_round=" + std::to_string(current_round_) +
+                                                   " justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
       return ProposeHandlingResult::HardReject;
     }
     if (msg.justify_qc.has_value()) {
@@ -5658,7 +5685,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (msg.round > current_round_) {
       log_line("round-catchup height=" + std::to_string(msg.height) + " old_round=" + std::to_string(current_round_) +
                " new_round=" + std::to_string(msg.round) +
-               " reason=justified-propose");
+               " reason=justified-propose justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
       current_round_ = msg.round;
     }
 
@@ -5813,11 +5840,14 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
 
     if (!tr.accepted) {
       if (!tr.duplicate) {
-        log_vote_hard_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id));
+        log_vote_hard_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id) +
+                                                    " validator=" + short_pub_hex(vote.validator_pubkey));
         if (reject_reason) *reject_reason = "tracker-rejected";
         return VoteHandlingResult::HardReject;
       }
-      log_vote_soft_reject("duplicate", " transition=" + short_hash_hex(vote.frontier_transition_id));
+      log_vote_soft_reject("duplicate", " transition=" + short_hash_hex(vote.frontier_transition_id) +
+                                           " validator=" + short_pub_hex(vote.validator_pubkey) +
+                                           " peer_id=" + std::to_string(from_peer_id));
       if (reject_reason) *reject_reason = "duplicate";
       return VoteHandlingResult::SoftReject;
     }
@@ -5837,7 +5867,8 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
     finalize_ok = finalize_if_quorum(vote.frontier_transition_id, vote.height, vote.round);
     if (!finalize_ok) {
       log_line("vote-accepted-waiting height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
-               " transition=" + short_hash_hex(vote.frontier_transition_id));
+               " transition=" + short_hash_hex(vote.frontier_transition_id) +
+               " validator=" + short_pub_hex(vote.validator_pubkey));
     }
   }
 
@@ -6375,7 +6406,8 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   if (sigs.size() < quorum) {
     std::ostringstream oss;
     oss << "finalize-skip height=" << height << " round=" << round << " transition=" << short_hash_hex(block_id)
-        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << quorum;
+        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << quorum
+        << " signers=" << signer_set_summary(sigs);
     if (debug_finality_logs_enabled()) {
       oss << " committee_size=" << committee.size();
       if (auto proposer = leader_for_height_round(height, round); proposer.has_value()) {
