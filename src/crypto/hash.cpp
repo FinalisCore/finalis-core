@@ -1,6 +1,6 @@
 #include "crypto/hash.hpp"
 
-#include <openssl/evp.h>
+#include <openssl/ripemd.h>
 #include <openssl/sha.h>
 
 namespace finalis::crypto {
@@ -23,22 +23,12 @@ std::array<std::uint8_t, 20> h160(const Bytes& data) {
   unsigned char sha[SHA256_DIGEST_LENGTH];
   SHA256(data.data(), data.size(), sha);
   std::array<std::uint8_t, 20> out{};
-  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-  if (!ctx) return out;
 
-  const EVP_MD* ripemd = EVP_MD_fetch(nullptr, "RIPEMD160", nullptr);
-  if (!ripemd) ripemd = EVP_MD_fetch(nullptr, "RIPEMD-160", nullptr);
-  const bool fetched = (ripemd != nullptr);
-  if (!ripemd) ripemd = EVP_ripemd160();
-
-  unsigned int out_len = 0;
-  const bool ok = ripemd && EVP_DigestInit_ex(ctx, ripemd, nullptr) == 1 &&
-                  EVP_DigestUpdate(ctx, sha, SHA256_DIGEST_LENGTH) == 1 &&
-                  EVP_DigestFinal_ex(ctx, out.data(), &out_len) == 1 && out_len == out.size();
-
-  if (fetched) EVP_MD_free(const_cast<EVP_MD*>(ripemd));
-  EVP_MD_CTX_free(ctx);
-  if (!ok) out.fill(0);
+  // Address derivation must not depend on OpenSSL provider configuration.
+  // On some OpenSSL 3 installs, RIPEMD-160 is unavailable through EVP fetch and
+  // the old code silently returned all-zero hashes, collapsing every pubkey to
+  // the same address. Use the direct RIPEMD160 primitive instead.
+  if (!RIPEMD160(sha, SHA256_DIGEST_LENGTH, out.data())) out.fill(0);
   return out;
 }
 

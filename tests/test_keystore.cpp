@@ -75,6 +75,32 @@ TEST(test_keystore_create_and_load_without_passphrase) {
   ASSERT_EQ(created.address, loaded.address);
 }
 
+TEST(test_keystore_distinct_seeds_produce_distinct_addresses) {
+  const std::string root = "/tmp/finalis_test_keystore_distinct_addresses";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+
+  std::array<std::uint8_t, 32> seed_a{};
+  std::array<std::uint8_t, 32> seed_b{};
+  for (std::size_t i = 0; i < seed_a.size(); ++i) {
+    seed_a[i] = static_cast<std::uint8_t>(i + 1);
+    seed_b[i] = static_cast<std::uint8_t>(0x80 + i);
+  }
+
+  keystore::ValidatorKey key_a;
+  keystore::ValidatorKey key_b;
+  std::string err;
+  ASSERT_TRUE(
+      keystore::create_validator_keystore(root + "/a.json", "", "mainnet", "sc", seed_a, &key_a, &err));
+  ASSERT_TRUE(
+      keystore::create_validator_keystore(root + "/b.json", "", "mainnet", "sc", seed_b, &key_b, &err));
+
+  ASSERT_TRUE(key_a.pubkey != key_b.pubkey);
+  ASSERT_TRUE(key_a.address != key_b.address);
+  ASSERT_TRUE(key_a.address != "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy");
+  ASSERT_TRUE(key_b.address != "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy");
+}
+
 TEST(test_node_parse_args_validator_passphrase_env) {
 #ifdef _WIN32
   _putenv_s("FINALIS_TEST_VALIDATOR_PASS", "env-secret");
