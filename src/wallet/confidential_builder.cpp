@@ -138,13 +138,13 @@ std::optional<TxV2> build_txv2_transparent_to_confidential(
       .prev_txid = prev_outpoint.txid,
       .prev_index = prev_outpoint.index,
       .sequence = 0xFFFFFFFF,
-      .kind = TxInputKind::TRANSPARENT,
+      .kind = TxInputKind::Transparent,
       .witness = TransparentInputWitnessV2{},
   });
   if (transparent_output.has_value()) {
-    tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::TRANSPARENT, .body = *transparent_output});
+    tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent, .body = *transparent_output});
   }
-  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::CONFIDENTIAL, .body = confidential_output});
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential, .body = confidential_output});
   tx.fee = fee;
 
   const auto transparent_output_value = transparent_output.has_value() ? transparent_output->value : 0;
@@ -179,10 +179,10 @@ std::optional<TxV2> build_txv2_confidential_to_transparent(
       .prev_txid = coin.outpoint.txid,
       .prev_index = coin.outpoint.index,
       .sequence = 0xFFFFFFFF,
-      .kind = TxInputKind::CONFIDENTIAL,
+      .kind = TxInputKind::Confidential,
       .witness = ConfidentialInputWitnessV2{coin.one_time_pubkey, Sig64{}},
   });
-  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::TRANSPARENT, .body = transparent_output});
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent, .body = transparent_output});
   tx.fee = fee;
 
   const auto excess_commitment = crypto::confidential_amount_commitment(

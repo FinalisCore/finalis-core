@@ -98,11 +98,11 @@ TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from
       .prev_txid = op.txid,
       .prev_index = op.index,
       .sequence = 0xFFFFFFFF,
-      .kind = TxInputKind::TRANSPARENT,
+      .kind = TxInputKind::Transparent,
       .witness = TransparentInputWitnessV2{},
   });
   tx.outputs.push_back(TxOutV2{
-      .kind = TxOutputKind::TRANSPARENT,
+      .kind = TxOutputKind::Transparent,
       .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
   });
   tx.fee = value_in - value_out;
@@ -125,11 +125,11 @@ TxV2 make_confidential_input_v2_tx(const OutPoint& op, const crypto::Blind32& on
       .prev_txid = op.txid,
       .prev_index = op.index,
       .sequence = 0xFFFFFFFF,
-      .kind = TxInputKind::CONFIDENTIAL,
+      .kind = TxInputKind::Confidential,
       .witness = ConfidentialInputWitnessV2{*one_time_pubkey, Sig64{}},
   });
   tx.outputs.push_back(TxOutV2{
-      .kind = TxOutputKind::TRANSPARENT,
+      .kind = TxOutputKind::Transparent,
       .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
   });
   tx.fee = value_in - value_out;
@@ -150,18 +150,18 @@ TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& f
       .prev_txid = op.txid,
       .prev_index = op.index,
       .sequence = 0xFFFFFFFF,
-      .kind = TxInputKind::TRANSPARENT,
+      .kind = TxInputKind::Transparent,
       .witness = TransparentInputWitnessV2{},
   });
   if (transparent_value_out > 0) {
     const auto to = key_from_byte(0x66);
     tx.outputs.push_back(TxOutV2{
-        .kind = TxOutputKind::TRANSPARENT,
+        .kind = TxOutputKind::Transparent,
         .body = TransparentTxOutV2{transparent_value_out,
                                    address::p2pkh_script_pubkey(crypto::h160(Bytes(to.public_key.begin(), to.public_key.end())))},
     });
   }
-  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::CONFIDENTIAL, .body = confidential_out});
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential, .body = confidential_out});
   tx.fee = fee;
 
   if (crypto::confidential_backend_status().confidential_outputs_supported) {
@@ -224,11 +224,11 @@ TEST(test_tx_v1_parser_rejects_v2_bytes) {
       .prev_txid = zero_hash(),
       .prev_index = 7,
       .sequence = 0xFFFFFFFF,
-      .kind = TxInputKind::TRANSPARENT,
+      .kind = TxInputKind::Transparent,
       .witness = TransparentInputWitnessV2{Bytes{0x51}},
   });
   tx.outputs.push_back(TxOutV2{
-      .kind = TxOutputKind::TRANSPARENT,
+      .kind = TxOutputKind::Transparent,
       .body = TransparentTxOutV2{123, Bytes{0x51}},
   });
   tx.fee = 5;
@@ -248,17 +248,17 @@ TEST(test_confidential_tx_v2_roundtrip_and_anytx_dispatch) {
       .prev_txid = prev,
       .prev_index = 3,
       .sequence = 9,
-      .kind = TxInputKind::CONFIDENTIAL,
+      .kind = TxInputKind::Confidential,
       .witness = ConfidentialInputWitnessV2{compressed_key(0x41), Sig64{}},
   });
   std::get<ConfidentialInputWitnessV2>(tx.inputs.back().witness).spend_sig.fill(0x33);
 
   tx.outputs.push_back(TxOutV2{
-      .kind = TxOutputKind::TRANSPARENT,
+      .kind = TxOutputKind::Transparent,
       .body = TransparentTxOutV2{50, Bytes{0x51}},
   });
   tx.outputs.push_back(TxOutV2{
-      .kind = TxOutputKind::CONFIDENTIAL,
+      .kind = TxOutputKind::Confidential,
       .body = ConfidentialTxOutV2{
           .value_commitment = commitment(0x51),
           .one_time_pubkey = compressed_key(0x61),
@@ -456,7 +456,7 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
     const auto txid = tx.txid();
     const auto it = applied.find(OutPoint{txid, 1});
     ASSERT_TRUE(it != applied.end());
-    ASSERT_EQ(it->second.kind, UtxoOutputKind::CONFIDENTIAL);
+    ASSERT_EQ(it->second.kind, UtxoOutputKind::Confidential);
   }
 }
 
@@ -478,7 +478,7 @@ TEST(test_validate_tx_v2_accepts_confidential_input_with_transparent_output) {
   op.index = 0;
   UtxoSetV2 view;
   UtxoEntryV2 entry;
-  entry.kind = UtxoOutputKind::CONFIDENTIAL;
+  entry.kind = UtxoOutputKind::Confidential;
   entry.body = UtxoConfidentialData{
       .value_commitment = *input_commitment,
       .one_time_pubkey = *input_pubkey,
@@ -521,7 +521,7 @@ TEST(test_validate_tx_v2_rejects_invalid_confidential_input_authorization) {
   op.index = 0;
   UtxoSetV2 view;
   UtxoEntryV2 entry;
-  entry.kind = UtxoOutputKind::CONFIDENTIAL;
+  entry.kind = UtxoOutputKind::Confidential;
   entry.body = UtxoConfidentialData{
       .value_commitment = *input_commitment,
       .one_time_pubkey = *input_pubkey,

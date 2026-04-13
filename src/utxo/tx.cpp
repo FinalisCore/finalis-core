@@ -16,7 +16,7 @@ constexpr std::size_t kMaxMemoBytes = 64 * 1024;
 Bytes serialize_utxo_entry_v2(const UtxoEntryV2& entry) {
   codec::ByteWriter w;
   w.u8(static_cast<std::uint8_t>(entry.kind));
-  if (entry.kind == UtxoOutputKind::TRANSPARENT) {
+  if (entry.kind == UtxoOutputKind::Transparent) {
     const auto& transparent = std::get<UtxoTransparentData>(entry.body);
     w.u64le(transparent.out.value);
     w.varbytes(transparent.out.script_pubkey);
@@ -36,9 +36,9 @@ std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b) {
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
         auto kind = r.u8();
         if (!kind) return false;
-        if (*kind > static_cast<std::uint8_t>(UtxoOutputKind::CONFIDENTIAL)) return false;
+        if (*kind > static_cast<std::uint8_t>(UtxoOutputKind::Confidential)) return false;
         entry.kind = static_cast<UtxoOutputKind>(*kind);
-        if (entry.kind == UtxoOutputKind::TRANSPARENT) {
+        if (entry.kind == UtxoOutputKind::Transparent) {
           auto value = r.u64le();
           auto script = r.varbytes();
           if (!value || !script || script->size() > kMaxScriptBytes) return false;
@@ -67,7 +67,7 @@ std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b) {
 }
 
 std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry) {
-  if (entry.kind != UtxoOutputKind::TRANSPARENT) return std::nullopt;
+  if (entry.kind != UtxoOutputKind::Transparent) return std::nullopt;
   return std::get<UtxoTransparentData>(entry.body).out;
 }
 

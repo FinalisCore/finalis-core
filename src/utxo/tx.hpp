@@ -278,8 +278,8 @@ struct UtxoEntry {
 using UtxoSet = std::map<OutPoint, UtxoEntry>;
 
 enum class UtxoOutputKind : std::uint8_t {
-  TRANSPARENT = 0,
-  CONFIDENTIAL = 1,
+  Transparent = 0,
+  Confidential = 1,
 };
 
 struct UtxoTransparentData {
@@ -300,14 +300,14 @@ struct UtxoConfidentialData {
 };
 
 struct UtxoEntryV2 {
-  UtxoOutputKind kind{UtxoOutputKind::TRANSPARENT};
+  UtxoOutputKind kind{UtxoOutputKind::Transparent};
   std::variant<UtxoTransparentData, UtxoConfidentialData> body{UtxoTransparentData{}};
 
   UtxoEntryV2() = default;
-  UtxoEntryV2(const UtxoEntry& entry) : kind(UtxoOutputKind::TRANSPARENT), body(UtxoTransparentData{entry.out}) {}
-  UtxoEntryV2(const TxOut& out_in) : kind(UtxoOutputKind::TRANSPARENT), body(UtxoTransparentData{out_in}) {}
+  UtxoEntryV2(const UtxoEntry& entry) : kind(UtxoOutputKind::Transparent), body(UtxoTransparentData{entry.out}) {}
+  UtxoEntryV2(const TxOut& out_in) : kind(UtxoOutputKind::Transparent), body(UtxoTransparentData{out_in}) {}
   UtxoEntryV2& operator=(const UtxoEntry& entry) {
-    kind = UtxoOutputKind::TRANSPARENT;
+    kind = UtxoOutputKind::Transparent;
     body = UtxoTransparentData{entry.out};
     return *this;
   }

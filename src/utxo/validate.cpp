@@ -61,7 +61,7 @@ std::vector<OutPoint> txv2_input_outpoints(const TxV2& tx) {
 UtxoSet legacy_transparent_view(const UtxoSetV2& utxos) {
   UtxoSet out;
   for (const auto& [op, entry] : utxos) {
-    if (entry.kind != UtxoOutputKind::TRANSPARENT) continue;
+    if (entry.kind != UtxoOutputKind::Transparent) continue;
     out.emplace(op, UtxoEntry{std::get<UtxoTransparentData>(entry.body).out});
   }
   return out;
@@ -150,7 +150,7 @@ std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t 
   if (input_index >= tx.inputs.size()) return std::nullopt;
   TxV2 signing = tx;
   for (auto& in : signing.inputs) {
-    if (in.kind == TxInputKind::TRANSPARENT) {
+    if (in.kind == TxInputKind::Transparent) {
       std::get<TransparentInputWitnessV2>(in.witness).script_sig.clear();
     } else {
       std::get<ConfidentialInputWitnessV2>(in.witness).spend_sig.fill(0);
@@ -168,7 +168,7 @@ std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t 
 std::optional<Hash32> balance_proof_message_v2(const TxV2& tx) {
   TxV2 signing = tx;
   for (auto& in : signing.inputs) {
-    if (in.kind == TxInputKind::TRANSPARENT) {
+    if (in.kind == TxInputKind::Transparent) {
       std::get<TransparentInputWitnessV2>(in.witness).script_sig.clear();
     } else {
       std::get<ConfidentialInputWitnessV2>(in.witness).spend_sig.fill(0);
@@ -761,7 +761,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "missing utxo";
       return out;
     }
-    if (input.kind == TxInputKind::CONFIDENTIAL) {
+    if (input.kind == TxInputKind::Confidential) {
       ++confidential_input_count;
       if (!crypto::confidential_backend_status().excess_authorization_available) {
         out.error = "confidential inputs unsupported by zkp backend";
@@ -771,7 +771,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
         out.error = "sequence must be FFFFFFFF";
         return out;
       }
-      if (it->second.kind != UtxoOutputKind::CONFIDENTIAL) {
+      if (it->second.kind != UtxoOutputKind::Confidential) {
         out.error = "confidential input cannot spend transparent utxo";
         return out;
       }
@@ -799,7 +799,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       input_commitments.push_back(prev_out.value_commitment);
       continue;
     }
-    if (it->second.kind != UtxoOutputKind::TRANSPARENT) {
+    if (it->second.kind != UtxoOutputKind::Transparent) {
       out.error = "transparent input cannot spend confidential utxo";
       return out;
     }
@@ -839,7 +839,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   }
 
   for (const auto& output : tx.outputs) {
-    if (output.kind == TxOutputKind::TRANSPARENT) {
+    if (output.kind == TxOutputKind::Transparent) {
       const auto& transparent = std::get<TransparentTxOutV2>(output.body);
       if (!is_supported_base_layer_output_script(transparent.script_pubkey)) {
         out.error = "unsupported script_pubkey";
@@ -991,13 +991,13 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
           const Hash32 txid = value.txid();
           for (std::uint32_t out_i = 0; out_i < value.outputs.size(); ++out_i) {
             const auto& out = value.outputs[out_i];
-            if (out.kind == TxOutputKind::TRANSPARENT) {
+            if (out.kind == TxOutputKind::Transparent) {
               const auto& transparent = std::get<TransparentTxOutV2>(out.body);
               utxos[OutPoint{txid, out_i}] = UtxoEntryV2{TxOut{transparent.value, transparent.script_pubkey}};
             } else {
               const auto& confidential = std::get<ConfidentialTxOutV2>(out.body);
               UtxoEntryV2 entry;
-              entry.kind = UtxoOutputKind::CONFIDENTIAL;
+              entry.kind = UtxoOutputKind::Confidential;
               entry.body = UtxoConfidentialData{
                   .value_commitment = confidential.value_commitment,
                   .one_time_pubkey = confidential.one_time_pubkey,
