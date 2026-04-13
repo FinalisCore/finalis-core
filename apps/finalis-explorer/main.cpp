@@ -183,6 +183,7 @@ struct TxResult {
   std::optional<std::string> primary_sender;
   std::optional<std::string> primary_recipient;
   std::optional<std::size_t> participant_count;
+  std::string data_source{"rpc_live_finalized"};
   bool finalized_only{true};
 };
 
@@ -200,6 +201,7 @@ struct TransitionResult {
   std::uint64_t cached_summary_finalized_out{0};
   std::size_t cached_summary_distinct_recipient_count{0};
   std::map<std::string, std::size_t> cached_summary_flow_mix;
+  std::string data_source{"rpc_live_finalized"};
   bool finalized_only{true};
 };
 
@@ -533,6 +535,12 @@ std::string summarize_flow_mix(const std::map<std::string, std::size_t>& flow_mi
     }
   }
   return oss.str();
+}
+
+std::string explorer_data_source_label(const std::string& source) {
+  if (source == "cache_finalized_snapshot") return "cached finalized snapshot";
+  if (source == "rpc_live_finalized") return "fresh finalized RPC";
+  return source.empty() ? "unknown" : source;
 }
 
 std::string format_timestamp(std::uint64_t ts) {
@@ -1340,6 +1348,7 @@ finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
   json_put(obj, "flow_summary", result.flow_summary);
   json_put(obj, "primary_sender", result.primary_sender);
   json_put(obj, "primary_recipient", result.primary_recipient);
+  json_put(obj, "data_source", result.data_source);
   json_put(obj, "participant_count",
            result.participant_count.has_value() ? std::optional<std::uint64_t>(static_cast<std::uint64_t>(*result.participant_count))
                                                 : std::nullopt);
@@ -1385,6 +1394,7 @@ std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& o
   result.flow_summary = object_string(&obj, "flow_summary").value_or("");
   result.primary_sender = object_string(&obj, "primary_sender");
   result.primary_recipient = object_string(&obj, "primary_recipient");
+  result.data_source = object_string(&obj, "data_source").value_or("cache_finalized_snapshot");
   if (auto count = object_u64(&obj, "participant_count"); count.has_value()) result.participant_count = static_cast<std::size_t>(*count);
   if (const auto* inputs = obj.get("inputs"); inputs && inputs->is_array()) {
     for (const auto& input : inputs->array_value) {
@@ -1426,6 +1436,7 @@ finalis::minijson::Value serialize_transition_result_object(const TransitionResu
   json_put(obj, "summary_cached", result.summary_cached);
   json_put(obj, "cached_summary_finalized_out", result.cached_summary_finalized_out);
   json_put(obj, "cached_summary_distinct_recipient_count", static_cast<std::uint64_t>(result.cached_summary_distinct_recipient_count));
+  json_put(obj, "data_source", result.data_source);
   auto txids = json_array_value();
   for (const auto& txid : result.txids) txids.array_value.push_back(json_string_value(txid));
   obj.object_value["txids"] = std::move(txids);
@@ -1454,6 +1465,7 @@ std::optional<TransitionResult> parse_transition_result_object(const finalis::mi
   result.cached_summary_finalized_out = object_u64(&obj, "cached_summary_finalized_out").value_or(0);
   result.cached_summary_distinct_recipient_count =
       static_cast<std::size_t>(object_u64(&obj, "cached_summary_distinct_recipient_count").value_or(0));
+  result.data_source = object_string(&obj, "data_source").value_or("cache_finalized_snapshot");
   if (const auto* txids = obj.get("txids"); txids && txids->is_array()) {
     for (const auto& txid : txids->array_value) {
       if (txid.is_string()) result.txids.push_back(txid.string_value);
@@ -2075,6 +2087,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
     try {
       const auto height = static_cast<std::uint64_t>(std::stoull(ident));
       if (auto cached = find_persisted_transition_result_by_height(height); cached.has_value()) {
+        cached->data_source = "cache_finalized_snapshot";
         out.value = std::move(*cached);
         return out;
       }
@@ -2100,6 +2113,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
       result.cached_summary_finalized_out = summary.finalized_out;
       result.cached_summary_distinct_recipient_count = summary.distinct_recipient_count;
       result.cached_summary_flow_mix = summary.flow_mix;
+      result.data_source = "rpc_live_finalized";
       upsert_persisted_transition_result(cfg, result);
       out.value = std::move(result);
       return out;
@@ -2109,6 +2123,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
     }
   } else if (is_hex64(ident)) {
     if (auto cached = find_persisted_transition_result_by_hash(ident); cached.has_value()) {
+      cached->data_source = "cache_finalized_snapshot";
       out.value = std::move(*cached);
       return out;
     }
@@ -2138,6 +2153,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
     result.cached_summary_finalized_out = summary.finalized_out;
     result.cached_summary_distinct_recipient_count = summary.distinct_recipient_count;
     result.cached_summary_flow_mix = summary.flow_mix;
+    result.data_source = "rpc_live_finalized";
     upsert_persisted_transition_result(cfg, result);
     out.value = std::move(result);
     return out;
@@ -2154,6 +2170,7 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     return out;
   }
   if (auto cached = find_persisted_tx_result(txid_hex); cached.has_value()) {
+    cached->data_source = "cache_finalized_snapshot";
     out.value = std::move(*cached);
     return out;
   }
@@ -2253,6 +2270,7 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   result.primary_sender = flow.primary_sender;
   result.primary_recipient = flow.primary_recipient;
   result.participant_count = flow.participant_count;
+  result.data_source = "rpc_live_finalized";
   upsert_persisted_tx_result(cfg, result);
   out.value = std::move(result);
   return out;
@@ -2708,6 +2726,7 @@ std::string render_tx_json(const TxResult& result) {
       << "\"credit_safe\":" << json_bool(result.credit_safe) << ","
       << "\"status_label\":\"" << json_escape(result.status_label) << "\","
       << "\"transition_hash\":\"" << json_escape(result.transition_hash) << "\","
+      << "\"data_source\":\"" << json_escape(result.data_source) << "\","
       << "\"timestamp\":" << json_u64_or_null(result.timestamp) << ",\"inputs\":[";
   for (std::size_t i = 0; i < result.inputs.size(); ++i) {
     if (i) oss << ",";
@@ -2750,6 +2769,7 @@ std::string render_transition_json(const Config& cfg, const TransitionResult& re
   oss << "{\"found\":" << json_bool(result.found) << ",\"finalized\":true,"
       << "\"height\":" << result.height << ",\"hash\":\"" << json_escape(result.hash) << "\","
       << "\"prev_finalized_hash\":\"" << json_escape(result.prev_finalized_hash) << "\","
+      << "\"data_source\":\"" << json_escape(result.data_source) << "\","
       << "\"timestamp\":" << json_u64_or_null(result.timestamp) << ",\"round\":" << result.round
       << ",\"tx_count\":" << result.tx_count << ",\"txids\":[";
   for (std::size_t i = 0; i < result.txids.size(); ++i) {
@@ -2943,6 +2963,8 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>" << mono_value(tx.txid) << "</div><div>" << finalized_badge(tx.finalized) << " "
        << credit_safe_badge(tx.credit_safe) << "</div></div>"
        << "<div class=\"decision-line\">" << html_escape(credit_decision_text(tx.finalized, tx.credit_safe)) << "</div>"
+       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(tx.data_source))
+       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
        << "<div class=\"note\">Transaction view is finalized-state only. Relay acceptance, mempool state, and pre-finality observations are intentionally not shown here.</div>"
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Txid</div><div class=\"value-cell\">" << mono_value(tx.txid) << "</div>"
@@ -2951,6 +2973,7 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>Status</div><div>" << html_escape(tx.status_label) << "</div>"
        << "<div>Finalized</div><div>" << finalized_text(tx.finalized) << "</div>"
        << "<div>Credit Safe</div><div>" << credit_safe_text(tx.credit_safe) << "</div>"
+       << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(tx.data_source)) << "</div>"
        << "<div>Finalized Only</div><div>yes</div>";
   if (tx.finalized_height.has_value()) body << "<div>Finalized Height</div><div>" << link_transition_height(*tx.finalized_height) << "</div>";
   if (!tx.transition_hash.empty()) body << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(tx.transition_hash) << "</div>";
@@ -3012,40 +3035,20 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   const auto& transition = *lookup.value;
   const std::string transition_path = "/transition/" + transition.hash;
   const std::string transition_api_path = "/api/transition/" + transition.hash;
-  const auto summaries = fetch_tx_summary_batch(cfg, transition.txids);
-  std::uint64_t total_finalized_out = 0;
-  std::set<std::string> distinct_recipients;
-  std::map<std::string, std::size_t> flow_mix;
-  for (const auto& txid : transition.txids) {
-    auto it = summaries.find(txid);
-    if (it == summaries.end()) continue;
-    if (it->second.total_out.has_value()) total_finalized_out += *it->second.total_out;
-    if (it->second.flow_kind.has_value()) ++flow_mix[*it->second.flow_kind];
-    for (const auto& recipient : it->second.recipients) {
-      if (!recipient.empty()) distinct_recipients.insert(recipient);
-    }
-  }
-  std::ostringstream flow_mix_text;
-  if (flow_mix.empty()) {
-    flow_mix_text << "no classified finalized txs";
-  } else {
-    bool first = true;
-    for (const auto& [kind, count] : flow_mix) {
-      if (!first) flow_mix_text << ", ";
-      first = false;
-      flow_mix_text << kind << "=" << count;
-    }
-  }
+  const auto summary = compute_transition_summary(cfg, transition);
+  const auto flow_mix_text = summarize_flow_mix(summary.flow_mix);
 
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
        << render_summary_metric_card("Tx Count", std::to_string(transition.txids.size()), "finalized txids in this transition")
-       << render_summary_metric_card("Total Finalized Out", format_amount(total_finalized_out), "sum of finalized outputs in this transition")
-       << render_summary_metric_card("Distinct Recipients", std::to_string(distinct_recipients.size()), "decoded finalized output addresses")
-       << render_summary_metric_card("Activity Mix", flow_mix_text.str(), "flow-type counts inferred from finalized tx structure")
+       << render_summary_metric_card("Total Finalized Out", format_amount(summary.finalized_out), "sum of finalized outputs in this transition")
+       << render_summary_metric_card("Distinct Recipients", std::to_string(summary.distinct_recipient_count), "decoded finalized output addresses")
+       << render_summary_metric_card("Activity Mix", flow_mix_text, "flow-type counts inferred from finalized tx structure")
        << "</div></div>";
 
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(transition.hash) << "</div><div>" << finalized_badge(true) << "</div></div>"
+       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(transition.data_source))
+       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
        << "<div class=\"note\">Transition view is finalized-only. It shows the finalized checkpoint contents for one height, not proposal-stage or unfinalized round activity.</div>"
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Height</div><div>" << transition.height << "</div>"
@@ -3055,6 +3058,7 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
        << "<div>Timestamp</div><div>"
        << html_escape(transition.timestamp.has_value() ? format_timestamp(*transition.timestamp) : std::string("not carried in finalized transition record")) << "</div>"
        << "<div>Round</div><div>" << transition.round << "</div>"
+       << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(transition.data_source)) << "</div>"
        << "<div>Tx Count</div><div>" << transition.tx_count << "</div></div>"
        << "<div class=\"summary-actions\">"
        << copy_action("Copy Transition Hash", transition.hash)

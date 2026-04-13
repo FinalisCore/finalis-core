@@ -327,6 +327,7 @@ TEST(test_explorer_api_status_and_tx_contract) {
   ASSERT_TRUE(tx_ok.body.find("\"input_count\":1") != std::string::npos);
   ASSERT_TRUE(tx_ok.body.find("\"output_count\":1") != std::string::npos);
   ASSERT_TRUE(tx_ok.body.find("\"decoded_output_count\":1") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"data_source\":\"rpc_live_finalized\"") != std::string::npos);
   ASSERT_TRUE(tx_ok.body.find("\"finalized_only\":true") != std::string::npos);
 
   const auto tx_bad = handle_request(cfg, make_http_get("/api/tx/not-a-txid"));
@@ -350,6 +351,7 @@ TEST(test_explorer_tx_page_makes_credit_decision_explicit) {
   ASSERT_TRUE(tx_page.body.find("Safe to credit") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("FINALIZED (CREDIT SAFE)") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("Credit Safe</div><div>YES") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("Explorer data source: <strong>fresh finalized RPC</strong>") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("confirm") == std::string::npos);
 }
 
@@ -519,6 +521,7 @@ TEST(test_explorer_api_transition_contract) {
   const auto by_hash = handle_request(cfg, make_http_get("/api/transition/" + fx.transition_hash));
   ASSERT_EQ(by_hash.status, 200);
   ASSERT_TRUE(by_hash.body.find("\"hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
+  ASSERT_TRUE(by_hash.body.find("\"data_source\":\"rpc_live_finalized\"") != std::string::npos);
 
   const auto malformed = handle_request(cfg, make_http_get("/api/transition/not-hex!"));
   ASSERT_EQ(malformed.status, 400);
@@ -795,11 +798,44 @@ TEST(test_explorer_hydrates_tx_and_transition_index_from_disk_without_live_rpc) 
     auto tx = fetch_tx_result(cfg, fx.txid);
     ASSERT_TRUE(tx.value.has_value());
     ASSERT_EQ(tx.value->txid, fx.txid);
+    ASSERT_EQ(tx.value->data_source, "cache_finalized_snapshot");
     auto transition = fetch_transition_result(cfg, fx.transition_hash);
     ASSERT_TRUE(transition.value.has_value());
     ASSERT_EQ(transition.value->hash, fx.transition_hash);
     ASSERT_TRUE(transition.value->summary_cached);
+    ASSERT_EQ(transition.value->data_source, "cache_finalized_snapshot");
     ASSERT_EQ(rpc_calls, 0);
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
+TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-provenance-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    auto tx = fetch_tx_result(cfg, fx.txid);
+    ASSERT_TRUE(tx.value.has_value());
+    auto transition = fetch_transition_result(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition.value.has_value());
+  }
+
+  clear_runtime_caches();
+  {
+    ScopedRpcHook rpc([&](const std::string&) { return rpc_error(-32000, "rpc should not be used"); });
+    load_persisted_explorer_snapshot(cfg);
+    const auto tx_page = render_tx(cfg, fx.txid);
+    ASSERT_TRUE(tx_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
+    ASSERT_TRUE(tx_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
+    const auto transition_page = render_transition(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
+    ASSERT_TRUE(transition_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
   }
 
   std::filesystem::remove(temp_path, ec);
