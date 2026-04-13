@@ -52,7 +52,7 @@ ActivityPage::ActivityPage(QWidget* parent) : QWidget(parent) {
   auto* actions = new QHBoxLayout();
   actions->setSpacing(8);
   filter_combo_ = new QComboBox(this);
-  filter_combo_->addItems({"All", "On-Chain", "Local", "Mint", "Pending"});
+  filter_combo_->addItems({"All", "On-Chain", "Local", "Mint", "Confidential", "Pending"});
   detail_button_ = new QPushButton("Show Details", this);
   detail_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   actions->addWidget(new QLabel("Show:", this));
@@ -65,10 +65,13 @@ ActivityPage::ActivityPage(QWidget* parent) : QWidget(parent) {
   local_count_label_->setProperty("role", QVariant(QStringLiteral("chip")));
   mint_count_label_ = new QLabel("Mint: 0", this);
   mint_count_label_->setProperty("role", QVariant(QStringLiteral("chip")));
+  confidential_count_label_ = new QLabel("Confidential: 0", this);
+  confidential_count_label_->setProperty("role", QVariant(QStringLiteral("chip")));
   actions->addWidget(finalized_count_label_);
   actions->addWidget(pending_count_label_);
   actions->addWidget(local_count_label_);
   actions->addWidget(mint_count_label_);
+  actions->addWidget(confidential_count_label_);
   actions->addStretch(1);
   actions->addWidget(detail_button_);
   layout->addLayout(actions);

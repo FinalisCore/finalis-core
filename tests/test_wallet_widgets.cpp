@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QComboBox>
+#include <QDateTime>
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
@@ -33,12 +34,13 @@ void test_activity_page_local_filter_and_chips() {
   finalis::wallet::ActivityPage page;
   auto* filter = page.filter_combo();
   require(filter != nullptr, "activity filter combo missing");
-  require(filter->count() == 5, "activity filter count mismatch");
+  require(filter->count() == 6, "activity filter count mismatch");
   require(filter->itemText(0).toStdString() == "All", "activity filter missing All");
   require(filter->itemText(1).toStdString() == "On-Chain", "activity filter missing On-Chain");
   require(filter->itemText(2).toStdString() == "Local", "activity filter missing Local");
   require(filter->itemText(3).toStdString() == "Mint", "activity filter missing Mint");
-  require(filter->itemText(4).toStdString() == "Pending", "activity filter missing Pending");
+  require(filter->itemText(4).toStdString() == "Confidential", "activity filter missing Confidential");
+  require(filter->itemText(5).toStdString() == "Pending", "activity filter missing Pending");
 
   auto* local = page.local_count_label();
   require(local != nullptr, "local chip missing");
@@ -99,6 +101,57 @@ void test_wallet_window_history_selection_updates_detail_panel() {
           "wallet detail missing chain explanation");
 }
 
+void test_wallet_window_confidential_detail_shows_reservation_gate() {
+  finalis::wallet::WalletWindow window;
+  require(window.history_view_ != nullptr, "wallet history table missing");
+  require(window.activity_detail_title_label_ != nullptr, "wallet detail title missing");
+  require(window.activity_detail_view_ != nullptr, "wallet detail view missing");
+
+  finalis::Hash32 txid{};
+  txid.fill(0x44);
+  const finalis::OutPoint outpoint{txid, 2};
+  window.tip_height_ = 101;
+  window.confidential_coin_views_.clear();
+  window.history_row_refs_.clear();
+  window.pending_confidential_reservations_.clear();
+  window.confidential_coin_views_.push_back(finalis::wallet::WalletWindow::ConfidentialCoinView{
+      .outpoint = outpoint,
+      .txid_hex = "4444444444444444444444444444444444444444444444444444444444444444",
+      .vout = 2,
+      .account_id = "acct-main",
+      .amount = 500000000,
+      .one_time_pubkey_hex = "02abcdef",
+      .spent = false,
+  });
+  window.pending_confidential_reservations_[outpoint] = finalis::wallet::WalletStore::PendingSpend{
+      .txid_hex = "pending-send-1",
+      .inputs = {outpoint},
+      .created_tip_height = 100,
+      .created_unix_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch()),
+  };
+  window.history_row_refs_.push_back(
+      finalis::wallet::WalletWindow::HistoryRowRef{finalis::wallet::WalletWindow::HistoryRowRef::Source::Confidential, 0});
+
+  auto* table = window.history_view_;
+  table->clearContents();
+  table->setRowCount(1);
+  table->setItem(0, 0, new QTableWidgetItem("Confidential Coin"));
+  table->setItem(0, 1, new QTableWidgetItem("Pending (local)"));
+  table->setItem(0, 2, new QTableWidgetItem("5 FLS"));
+  table->setItem(0, 3, new QTableWidgetItem("coin-ref"));
+  table->setItem(0, 4, new QTableWidgetItem("reserved"));
+  table->setCurrentCell(0, 0);
+  table->selectRow(0);
+  QApplication::processEvents();
+  window.update_selected_history_detail();
+
+  const std::string title = window.activity_detail_title_label_->text().toStdString();
+  const std::string detail = window.activity_detail_view_->toPlainText().toStdString();
+  require(title.find("Reserved") != std::string::npos, "confidential detail title missing reserved state");
+  require(detail.find("Reservation: Pending tx pending-send-1. Reserved. Release gate: tip +1/2") != std::string::npos,
+          "confidential detail missing reservation gate");
+}
+
 void test_wallet_window_local_filter_preserves_rendered_ordering() {
   finalis::wallet::WalletWindow window;
   require(window.history_filter_combo_ != nullptr, "wallet history filter missing");
@@ -115,20 +168,23 @@ void test_wallet_window_local_filter_preserves_rendered_ordering() {
   });
   window.local_history_lines_.push_back("[pending] relay accepted (pending-ref-1)");
   window.local_history_lines_.push_back("[finalized] pending send finalized (final-ref-2)");
+  window.local_history_lines_.push_back("[info] pending send released (released-ref-3)");
   window.local_history_lines_.push_back("[onboarding] detached local tracking");
 
   window.history_filter_combo_->setCurrentText("Local");
   window.refresh_history_table();
 
   auto* table = window.history_view_;
-  require(table->rowCount() == 3, "local history filter row count mismatch");
+  require(table->rowCount() == 4, "local history filter row count mismatch");
   require(table->item(0, 0)->text().toStdString() == "Local Send (local)", "local pending row type mismatch");
   require(table->item(0, 1)->text().toStdString() == "Pending (local)", "local pending row status mismatch");
   require(table->item(1, 0)->text().toStdString() == "Local Send (local)", "local finalized row type mismatch");
   require(table->item(1, 1)->text().toStdString() == "Finalized", "local finalized row status mismatch");
-  require(table->item(2, 0)->text().toStdString() == "Onboarding (local)", "local onboarding row type mismatch");
-  require(table->item(2, 1)->text().toStdString() == "Info", "local onboarding row status mismatch");
-  require(window.activity_local_count_label_->text().toStdString() == "Local: 3", "local count chip mismatch");
+  require(table->item(2, 0)->text().toStdString() == "Local Event (local)", "local release row type mismatch");
+  require(table->item(2, 1)->text().toStdString() == "Info", "local release row status mismatch");
+  require(table->item(3, 0)->text().toStdString() == "Onboarding (local)", "local onboarding row type mismatch");
+  require(table->item(3, 1)->text().toStdString() == "Info", "local onboarding row status mismatch");
+  require(window.activity_local_count_label_->text().toStdString() == "Local: 4", "local count chip mismatch");
 }
 
 void test_advanced_page_onboarding_defaults() {
@@ -285,9 +341,10 @@ int main(int argc, char** argv) {
   qputenv("QT_QPA_PLATFORM", QByteArray("offscreen"));
   QApplication app(argc, argv);
   try {
-    test_activity_page_local_filter_and_chips();
-    test_wallet_window_history_selection_updates_detail_panel();
-    test_wallet_window_local_filter_preserves_rendered_ordering();
+  test_activity_page_local_filter_and_chips();
+  test_wallet_window_history_selection_updates_detail_panel();
+  test_wallet_window_confidential_detail_shows_reservation_gate();
+  test_wallet_window_local_filter_preserves_rendered_ordering();
     test_advanced_page_onboarding_defaults();
     test_wallet_window_adaptive_regime_diagnostics_render_current_status();
     test_wallet_window_onboarding_badge_states();

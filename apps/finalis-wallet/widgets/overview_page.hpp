@@ -17,7 +17,9 @@ class OverviewPage final : public QWidget {
   QLabel* network_label() const { return network_label_; }
   QLabel* balance_label() const { return balance_label_; }
   QLabel* pending_balance_label() const { return pending_balance_label_; }
+  QLabel* confidential_balance_label() const { return confidential_balance_label_; }
   QLabel* receive_address_label() const { return receive_address_label_; }
+  QLabel* confidential_receive_label() const { return confidential_receive_label_; }
   QLabel* tip_status_label() const { return tip_status_label_; }
   QLabel* connection_status_label() const { return connection_status_label_; }
   QPushButton* send_button() const { return send_button_; }
@@ -32,7 +34,9 @@ class OverviewPage final : public QWidget {
   QLabel* network_label_{nullptr};
   QLabel* balance_label_{nullptr};
   QLabel* pending_balance_label_{nullptr};
+  QLabel* confidential_balance_label_{nullptr};
   QLabel* receive_address_label_{nullptr};
+  QLabel* confidential_receive_label_{nullptr};
   QLabel* tip_status_label_{nullptr};
   QLabel* connection_status_label_{nullptr};
   QPushButton* send_button_{nullptr};

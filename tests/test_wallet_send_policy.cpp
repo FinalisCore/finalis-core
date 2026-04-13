@@ -7,9 +7,12 @@
 #include "apps/finalis-wallet/history_merge.hpp"
 #include "apps/finalis-wallet/refresh_gate.hpp"
 #include "consensus/monetary.hpp"
+#include "crypto/confidential.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "wallet/confidential_builder.hpp"
 #include "utxo/signing.hpp"
+#include "utxo/validate.hpp"
 
 using namespace finalis;
 
@@ -28,6 +31,26 @@ std::pair<OutPoint, TxOut> make_prev(std::uint8_t tag, std::uint32_t index, std:
   txid.fill(tag);
   const auto pkh = crypto::h160(Bytes(pubkey.begin(), pubkey.end()));
   return {OutPoint{txid, index}, TxOut{value, address::p2pkh_script_pubkey(pkh)}};
+}
+
+PubKey33 compressed_key(std::uint8_t seed) {
+  Hash32 scalar{};
+  scalar.fill(seed);
+  auto pub = crypto::secp256k1_pubkey_from_scalar(scalar);
+  if (!pub.has_value()) throw std::runtime_error("compressed key derivation failed");
+  return *pub;
+}
+
+crypto::Blind32 blind_from_byte(std::uint8_t seed) {
+  crypto::Blind32 out;
+  out.bytes.fill(seed);
+  return out;
+}
+
+Hash32 nonce_from_byte(std::uint8_t seed) {
+  Hash32 out{};
+  out.fill(seed);
+  return out;
 }
 
 }  // namespace
@@ -173,6 +196,91 @@ TEST(test_wallet_refresh_gate_rejects_stale_generation_or_state_version) {
   ASSERT_TRUE(!finalis::wallet::should_apply_refresh_result(7, 7, 2, 3));
   ASSERT_TRUE(!finalis::wallet::should_keep_refresh_indicator(7, 7));
   ASSERT_TRUE(finalis::wallet::should_keep_refresh_indicator(6, 7));
+}
+
+TEST(test_wallet_confidential_builder_creates_valid_transparent_to_confidential_txv2) {
+  const auto sender = key_from_byte(0x51);
+  const auto prev = make_prev(0x70, 0, 10'000, sender.public_key);
+  const auto recipient = finalis::wallet::ConfidentialRecipient{
+      .one_time_pubkey = compressed_key(0x61),
+      .ephemeral_pubkey = compressed_key(0x62),
+      .scan_tag = crypto::ScanTag{0x63},
+      .memo = Bytes{0xAA, 0xBB},
+  };
+  const auto secrets = crypto::ConfidentialOutputSecrets{
+      .amount = 9'000,
+      .value_blind = blind_from_byte(0x64),
+  };
+  std::string err;
+  auto confidential_out = finalis::wallet::build_confidential_output(recipient, secrets, nonce_from_byte(0x65), &err);
+  ASSERT_TRUE(confidential_out.has_value());
+
+  auto tx = finalis::wallet::build_txv2_transparent_to_confidential(
+      prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), prev.second.value, std::nullopt,
+      *confidential_out, secrets.value_blind, secrets.amount, 1'000, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  UtxoSetV2 view;
+  view[prev.first] = UtxoEntryV2{prev.second};
+  ConfidentialPolicy policy;
+  policy.activation_height = 0;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(*tx, 1, view, &ctx);
+  if (!result.ok) throw std::runtime_error("wallet transparent->confidential builder error: " + result.error);
+  ASSERT_TRUE(result.ok);
+}
+
+TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_txv2) {
+  const auto recipient = key_from_byte(0x71);
+  const auto spend_secret = blind_from_byte(0x72);
+  const auto value_blind = blind_from_byte(0x73);
+  const auto one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret.bytes);
+  ASSERT_TRUE(one_time_pubkey.has_value());
+  const auto commitment = crypto::confidential_amount_commitment(10'000, value_blind);
+  ASSERT_TRUE(commitment.has_value());
+
+  OutPoint op{};
+  op.txid.fill(0x74);
+  op.index = 0;
+  finalis::wallet::ConfidentialOwnedCoin coin{
+      .outpoint = op,
+      .amount = 10'000,
+      .spend_secret = spend_secret,
+      .value_blind = value_blind,
+      .value_commitment = *commitment,
+      .one_time_pubkey = *one_time_pubkey,
+  };
+  const auto recipient_spk =
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(recipient.public_key.begin(), recipient.public_key.end())));
+
+  std::string err;
+  auto tx = finalis::wallet::build_txv2_confidential_to_transparent(
+      coin, TransparentTxOutV2{9'000, recipient_spk}, 1'000, nonce_from_byte(0x75), nonce_from_byte(0x76), &err);
+  ASSERT_TRUE(tx.has_value());
+
+  UtxoSetV2 view;
+  UtxoEntryV2 confidential_entry;
+  confidential_entry.kind = UtxoOutputKind::CONFIDENTIAL;
+  confidential_entry.body = UtxoConfidentialData{
+      .value_commitment = *commitment,
+      .one_time_pubkey = *one_time_pubkey,
+      .ephemeral_pubkey = compressed_key(0x77),
+      .scan_tag = crypto::ScanTag{0x78},
+      .memo = {},
+  };
+  view[op] = confidential_entry;
+  ConfidentialPolicy policy;
+  policy.activation_height = 0;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(*tx, 1, view, &ctx);
+  if (!result.ok) throw std::runtime_error("wallet confidential->transparent builder error: " + result.error);
+  ASSERT_TRUE(result.ok);
 }
 
 void register_wallet_send_policy_tests() {}

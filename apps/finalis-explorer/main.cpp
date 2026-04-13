@@ -3,6 +3,8 @@
 #include <chrono>
 #include <csignal>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -19,6 +21,7 @@
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
 #include "common/minijson.hpp"
+#include "common/paths.hpp"
 #include "common/socket_compat.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/client.hpp"
@@ -33,6 +36,7 @@ struct Config {
   std::string bind_ip{"127.0.0.1"};
   std::uint16_t port{18080};
   std::string rpc_url{"http://127.0.0.1:19444/rpc"};
+  std::string cache_path;
 };
 
 template <typename T>
@@ -179,6 +183,8 @@ struct TxResult {
   std::optional<std::string> primary_sender;
   std::optional<std::string> primary_recipient;
   std::optional<std::size_t> participant_count;
+  std::string data_source{"rpc_live_finalized"};
+  std::optional<std::uint64_t> data_refreshed_unix_ms;
   bool finalized_only{true};
 };
 
@@ -192,6 +198,12 @@ struct TransitionResult {
   std::uint32_t round{0};
   std::size_t tx_count{0};
   std::vector<std::string> txids;
+  bool summary_cached{false};
+  std::uint64_t cached_summary_finalized_out{0};
+  std::size_t cached_summary_distinct_recipient_count{0};
+  std::map<std::string, std::size_t> cached_summary_flow_mix;
+  std::string data_source{"rpc_live_finalized"};
+  std::optional<std::uint64_t> data_refreshed_unix_ms;
   bool finalized_only{true};
 };
 
@@ -275,9 +287,41 @@ std::mutex g_recent_tx_cache_mu;
 TimedCacheEntry<std::vector<RecentTxResult>> g_recent_tx_cache;
 std::mutex g_committee_cache_mu;
 TimedCacheEntry<LookupResult<CommitteeResult>> g_committee_cache;
+std::mutex g_persisted_snapshot_mu;
 std::mutex g_log_mu;
 constexpr auto kSlowRpcThreshold = std::chrono::milliseconds(200);
 constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
+constexpr std::size_t kPersistedRecentLimit = 8;
+constexpr std::size_t kPersistedTxIndexLimit = 128;
+constexpr std::size_t kPersistedTransitionIndexLimit = 128;
+
+struct PersistedExplorerSnapshot {
+  std::uint64_t stored_unix_ms{0};
+  std::optional<std::uint64_t> status_refreshed_unix_ms;
+  std::optional<std::uint64_t> committee_refreshed_unix_ms;
+  std::optional<std::uint64_t> recent_refreshed_unix_ms;
+  std::optional<finalis::minijson::Value> status_result;
+  std::optional<finalis::minijson::Value> committee_result;
+  std::uint64_t committee_height{0};
+  std::vector<RecentTxResult> recent;
+  std::size_t recent_limit{kPersistedRecentLimit};
+  bool recent_present{false};
+  std::vector<finalis::minijson::Value> tx_index;
+  std::vector<finalis::minijson::Value> transition_index;
+};
+
+PersistedExplorerSnapshot g_persisted_snapshot;
+
+struct SurfaceRuntimeState {
+  std::optional<std::string> last_error;
+  bool used_cached_fallback{false};
+};
+
+std::mutex g_surface_state_mu;
+SurfaceRuntimeState g_status_surface_state;
+SurfaceRuntimeState g_committee_surface_state;
+SurfaceRuntimeState g_recent_surface_state;
+constexpr std::uint64_t kExplorerSurfaceStaleThresholdMs = 120000;
 
 void clear_runtime_caches() {
   {
@@ -292,7 +336,26 @@ void clear_runtime_caches() {
     std::lock_guard<std::mutex> guard(g_committee_cache_mu);
     g_committee_cache = {};
   }
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    g_persisted_snapshot = {};
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_surface_state_mu);
+    g_status_surface_state = {};
+    g_committee_surface_state = {};
+    g_recent_surface_state = {};
+  }
 }
+
+std::string default_explorer_cache_path(const std::string& rpc_url) {
+  const std::string root = finalis::expand_user_home("~/.finalis/explorer");
+  const auto hash = finalis::crypto::sha256(Bytes(rpc_url.begin(), rpc_url.end()));
+  return root + "/cache-" + finalis::hex_encode32(hash) + ".json";
+}
+
+std::string format_timestamp(std::uint64_t ts);
+std::uint64_t now_unix_ms();
 
 struct TxSummaryBatchItem {
   std::string txid;
@@ -319,6 +382,11 @@ struct Response {
 };
 
 Response handle_request(const Config& cfg, const std::string& req);
+ApiError upstream_error(const std::string& message);
+void persist_explorer_snapshot(const Config& cfg);
+LookupResult<StatusResult> parse_status_result_object(const finalis::minijson::Value& status_obj);
+LookupResult<CommitteeResult> parse_committee_result_object(const finalis::minijson::Value& committee_obj,
+                                                            std::uint64_t requested_height);
 
 volatile std::sig_atomic_t g_stop = 0;
 std::atomic<std::size_t> g_active_clients{0};
@@ -453,6 +521,12 @@ struct TransitionSummary {
 
 TransitionSummary compute_transition_summary(const Config& cfg, const TransitionResult& transition) {
   TransitionSummary summary;
+  if (transition.summary_cached) {
+    summary.finalized_out = transition.cached_summary_finalized_out;
+    summary.distinct_recipient_count = transition.cached_summary_distinct_recipient_count;
+    summary.flow_mix = transition.cached_summary_flow_mix;
+    return summary;
+  }
   std::set<std::string> distinct_recipients;
   const auto summaries = fetch_tx_summary_batch(cfg, transition.txids);
   for (const auto& txid : transition.txids) {
@@ -489,6 +563,103 @@ std::string summarize_flow_mix(const std::map<std::string, std::size_t>& flow_mi
       oss << kind << "=" << count;
     }
   }
+  return oss.str();
+}
+
+std::string explorer_data_source_label(const std::string& source) {
+  if (source == "cache_finalized_snapshot") return "cached finalized snapshot";
+  if (source == "rpc_live_finalized") return "fresh finalized RPC";
+  return source.empty() ? "unknown" : source;
+}
+
+std::string explorer_data_freshness_note(const std::string& source, const std::optional<std::uint64_t>& refreshed_unix_ms) {
+  if (source != "cache_finalized_snapshot") return {};
+  if (!refreshed_unix_ms.has_value()) return "Last refreshed from RPC: unknown";
+  return "Last refreshed from RPC: " + format_timestamp(*refreshed_unix_ms);
+}
+
+std::string explorer_snapshot_freshness_text(const std::optional<std::uint64_t>& refreshed_unix_ms) {
+  if (!refreshed_unix_ms.has_value()) return "unknown";
+  return format_timestamp(*refreshed_unix_ms);
+}
+
+std::optional<std::uint64_t> persisted_status_refreshed_unix_ms() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  return g_persisted_snapshot.status_refreshed_unix_ms;
+}
+
+std::optional<std::uint64_t> persisted_committee_refreshed_unix_ms() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  return g_persisted_snapshot.committee_refreshed_unix_ms;
+}
+
+std::optional<std::uint64_t> persisted_recent_refreshed_unix_ms() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  return g_persisted_snapshot.recent_refreshed_unix_ms;
+}
+
+std::optional<LookupResult<StatusResult>> persisted_status_result_lookup() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  if (!g_persisted_snapshot.status_result.has_value()) return std::nullopt;
+  return parse_status_result_object(*g_persisted_snapshot.status_result);
+}
+
+std::optional<LookupResult<CommitteeResult>> persisted_committee_result_lookup(std::uint64_t height) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  if (!g_persisted_snapshot.committee_result.has_value()) return std::nullopt;
+  if (g_persisted_snapshot.committee_height != height) return std::nullopt;
+  return parse_committee_result_object(*g_persisted_snapshot.committee_result, height);
+}
+
+std::optional<std::vector<RecentTxResult>> persisted_recent_results(std::size_t limit) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  if (!g_persisted_snapshot.recent_present) return std::nullopt;
+  if (g_persisted_snapshot.recent_limit != limit) return std::nullopt;
+  return g_persisted_snapshot.recent;
+}
+
+void set_surface_state(SurfaceRuntimeState& state, std::optional<std::string> error, bool used_cached_fallback) {
+  state.last_error = std::move(error);
+  state.used_cached_fallback = used_cached_fallback;
+}
+
+bool surface_is_stale(const std::optional<std::uint64_t>& refreshed_unix_ms) {
+  if (!refreshed_unix_ms.has_value()) return true;
+  const auto now_ms = now_unix_ms();
+  return now_ms > *refreshed_unix_ms && (now_ms - *refreshed_unix_ms) > kExplorerSurfaceStaleThresholdMs;
+}
+
+std::string build_surface_stale_banner() {
+  std::optional<std::uint64_t> status_ts = persisted_status_refreshed_unix_ms();
+  std::optional<std::uint64_t> committee_ts = persisted_committee_refreshed_unix_ms();
+  std::optional<std::uint64_t> recent_ts = persisted_recent_refreshed_unix_ms();
+  SurfaceRuntimeState status_state;
+  SurfaceRuntimeState committee_state;
+  SurfaceRuntimeState recent_state;
+  {
+    std::lock_guard<std::mutex> guard(g_surface_state_mu);
+    status_state = g_status_surface_state;
+    committee_state = g_committee_surface_state;
+    recent_state = g_recent_surface_state;
+  }
+  const bool any_stale = surface_is_stale(status_ts) || surface_is_stale(committee_ts) || surface_is_stale(recent_ts);
+  const bool any_failed = status_state.last_error.has_value() || committee_state.last_error.has_value() || recent_state.last_error.has_value();
+  if (!any_stale && !any_failed) return {};
+
+  std::ostringstream oss;
+  oss << "<div class=\"card\"><div class=\"note\"><strong>Snapshot Freshness Warning</strong>: ";
+  if (any_failed) {
+    oss << "one or more finalized explorer surfaces are being served from cached snapshot because live RPC refresh failed. ";
+  } else {
+    oss << "one or more finalized explorer surfaces are older than the freshness threshold. ";
+  }
+  oss << "Status=" << html_escape(explorer_snapshot_freshness_text(status_ts))
+      << ", Committee=" << html_escape(explorer_snapshot_freshness_text(committee_ts))
+      << ", Recent=" << html_escape(explorer_snapshot_freshness_text(recent_ts)) << ".";
+  if (status_state.last_error.has_value()) oss << " status error=" << html_escape(*status_state.last_error) << ".";
+  if (committee_state.last_error.has_value()) oss << " committee error=" << html_escape(*committee_state.last_error) << ".";
+  if (recent_state.last_error.has_value()) oss << " recent error=" << html_escape(*recent_state.last_error) << ".";
+  oss << "</div></div>";
   return oss.str();
 }
 
@@ -921,6 +1092,10 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next();
       if (!v) return std::nullopt;
       cfg.rpc_url = *v;
+    } else if (a == "--cache-path") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      cfg.cache_path = *v;
     } else {
       return std::nullopt;
     }
@@ -1025,6 +1200,594 @@ std::optional<std::int64_t> object_i64(const finalis::minijson::Value* obj, cons
   }
 }
 
+finalis::minijson::Value json_null() { return finalis::minijson::Value{}; }
+
+finalis::minijson::Value json_bool_value(bool v) {
+  finalis::minijson::Value out;
+  out.type = finalis::minijson::Value::Type::Bool;
+  out.bool_value = v;
+  return out;
+}
+
+finalis::minijson::Value json_number_value(std::uint64_t v) {
+  finalis::minijson::Value out;
+  out.type = finalis::minijson::Value::Type::Number;
+  out.string_value = std::to_string(v);
+  return out;
+}
+
+finalis::minijson::Value json_number_value_i64(std::int64_t v) {
+  finalis::minijson::Value out;
+  out.type = finalis::minijson::Value::Type::Number;
+  out.string_value = std::to_string(v);
+  return out;
+}
+
+finalis::minijson::Value json_string_value(const std::string& v) {
+  finalis::minijson::Value out;
+  out.type = finalis::minijson::Value::Type::String;
+  out.string_value = v;
+  return out;
+}
+
+finalis::minijson::Value json_array_value() {
+  finalis::minijson::Value out;
+  out.type = finalis::minijson::Value::Type::Array;
+  return out;
+}
+
+finalis::minijson::Value json_object_value() {
+  finalis::minijson::Value out;
+  out.type = finalis::minijson::Value::Type::Object;
+  return out;
+}
+
+void json_put(finalis::minijson::Value& obj, const char* key, const std::string& value) {
+  obj.object_value[std::string(key)] = json_string_value(value);
+}
+
+void json_put(finalis::minijson::Value& obj, const char* key, const std::optional<std::string>& value) {
+  obj.object_value[std::string(key)] = value.has_value() ? json_string_value(*value) : json_null();
+}
+
+void json_put(finalis::minijson::Value& obj, const char* key, std::uint64_t value) {
+  obj.object_value[std::string(key)] = json_number_value(value);
+}
+
+void json_put(finalis::minijson::Value& obj, const char* key, const std::optional<std::uint64_t>& value) {
+  obj.object_value[std::string(key)] = value.has_value() ? json_number_value(*value) : json_null();
+}
+
+void json_put(finalis::minijson::Value& obj, const char* key, const std::optional<std::int64_t>& value) {
+  obj.object_value[std::string(key)] = value.has_value() ? json_number_value_i64(*value) : json_null();
+}
+
+void json_put(finalis::minijson::Value& obj, const char* key, bool value) {
+  obj.object_value[std::string(key)] = json_bool_value(value);
+}
+
+void json_put(finalis::minijson::Value& obj, const char* key, const std::optional<bool>& value) {
+  obj.object_value[std::string(key)] = value.has_value() ? json_bool_value(*value) : json_null();
+}
+
+LookupResult<StatusResult> parse_status_result_object(const finalis::minijson::Value& status_obj) {
+  LookupResult<StatusResult> out;
+  if (!status_obj.is_object()) {
+    out.error = upstream_error("status unavailable");
+    return out;
+  }
+  StatusResult result;
+  result.network = object_string(&status_obj, "network_name").value_or("unknown");
+  result.network_id = object_string(&status_obj, "network_id").value_or("");
+  result.genesis_hash = object_string(&status_obj, "genesis_hash").value_or("");
+  result.finalized_height = object_u64(&status_obj, "finalized_height").value_or(0);
+  result.finalized_transition_hash =
+      object_string(&status_obj, "finalized_transition_hash").value_or(object_string(&status_obj, "transition_hash").value_or(""));
+  result.backend_version = object_string(&status_obj, "version").value_or("unknown");
+  result.wallet_api_version = object_string(&status_obj, "wallet_api_version").value_or("");
+  result.protocol_reserve_balance = object_u64(&status_obj, "protocol_reserve_balance");
+  result.healthy_peer_count = object_u64(&status_obj, "healthy_peer_count").value_or(0);
+  result.established_peer_count = object_u64(&status_obj, "established_peer_count").value_or(0);
+  result.latest_finality_committee_size =
+      static_cast<std::size_t>(object_u64(&status_obj, "latest_finality_committee_size").value_or(0));
+  result.latest_finality_quorum_threshold =
+      static_cast<std::size_t>(object_u64(&status_obj, "latest_finality_quorum_threshold").value_or(0));
+  if (const auto* sync = status_obj.get("sync"); sync && sync->is_object()) {
+    result.observed_network_height_known = object_bool(sync, "observed_network_height_known").value_or(false);
+    result.bootstrap_sync_incomplete = object_bool(sync, "bootstrap_sync_incomplete").value_or(false);
+    result.peer_height_disagreement = object_bool(sync, "peer_height_disagreement").value_or(false);
+    result.finalized_lag = object_u64(sync, "finalized_lag");
+    if (result.observed_network_height_known) result.observed_network_finalized_height = object_u64(sync, "observed_network_finalized_height");
+  }
+  if (const auto* availability = status_obj.get("availability"); availability && availability->is_object()) {
+    result.availability_epoch = object_u64(availability, "epoch");
+    result.availability_retained_prefix_count = object_u64(availability, "retained_prefix_count");
+    result.availability_tracked_operator_count = object_u64(availability, "tracked_operator_count");
+    result.availability_eligible_operator_count = object_u64(availability, "eligible_operator_count");
+    result.availability_below_min_eligible = object_bool(availability, "below_min_eligible");
+    result.availability_checkpoint_derivation_mode = object_string(availability, "checkpoint_derivation_mode");
+    result.availability_checkpoint_fallback_reason = object_string(availability, "checkpoint_fallback_reason");
+    result.availability_fallback_sticky = object_bool(availability, "fallback_sticky");
+    if (const auto* adaptive = availability->get("adaptive_regime"); adaptive && adaptive->is_object()) {
+      result.qualified_depth = object_u64(adaptive, "qualified_depth");
+      result.adaptive_target_committee_size = object_u64(adaptive, "adaptive_target_committee_size");
+      result.adaptive_min_eligible = object_u64(adaptive, "adaptive_min_eligible");
+      result.adaptive_min_bond = object_u64(adaptive, "adaptive_min_bond");
+      result.adaptive_slack = object_i64(adaptive, "slack");
+      result.target_expand_streak = object_u64(adaptive, "target_expand_streak");
+      result.target_contract_streak = object_u64(adaptive, "target_contract_streak");
+      result.adaptive_fallback_rate_bps = object_u64(adaptive, "fallback_rate_bps");
+      result.adaptive_sticky_fallback_rate_bps = object_u64(adaptive, "sticky_fallback_rate_bps");
+      result.adaptive_fallback_window_epochs = object_u64(adaptive, "fallback_rate_window_epochs");
+      result.adaptive_near_threshold_operation = object_bool(adaptive, "near_threshold_operation");
+      result.adaptive_prolonged_expand_buildup = object_bool(adaptive, "prolonged_expand_buildup");
+      result.adaptive_prolonged_contract_buildup = object_bool(adaptive, "prolonged_contract_buildup");
+      result.adaptive_repeated_sticky_fallback = object_bool(adaptive, "repeated_sticky_fallback");
+      result.adaptive_depth_collapse_after_bond_increase = object_bool(adaptive, "depth_collapse_after_bond_increase");
+    }
+    if (const auto* local = availability->get("local_operator"); local && local->is_object()) {
+      result.availability_local_operator_known = object_bool(local, "known");
+      result.availability_local_operator_pubkey = object_string(local, "pubkey");
+      result.availability_local_operator_status = object_string(local, "status");
+      result.availability_local_operator_seat_budget = object_u64(local, "seat_budget");
+    }
+  }
+  if (const auto* adaptive_summary = status_obj.get("adaptive_telemetry_summary"); adaptive_summary && adaptive_summary->is_object()) {
+    result.adaptive_telemetry_window_epochs = object_u64(adaptive_summary, "window_epochs");
+    result.adaptive_telemetry_sample_count = object_u64(adaptive_summary, "sample_count");
+    result.adaptive_telemetry_fallback_epochs = object_u64(adaptive_summary, "fallback_epochs");
+    result.adaptive_telemetry_sticky_fallback_epochs = object_u64(adaptive_summary, "sticky_fallback_epochs");
+  }
+  if (const auto* ticket_pow = status_obj.get("ticket_pow"); ticket_pow && ticket_pow->is_object()) {
+    result.ticket_pow_difficulty = static_cast<std::uint32_t>(object_u64(ticket_pow, "difficulty").value_or(0));
+    result.ticket_pow_difficulty_min = static_cast<std::uint32_t>(object_u64(ticket_pow, "difficulty_min").value_or(0));
+    result.ticket_pow_difficulty_max = static_cast<std::uint32_t>(object_u64(ticket_pow, "difficulty_max").value_or(0));
+    result.ticket_pow_epoch_health = object_string(ticket_pow, "epoch_health").value_or("unknown");
+    result.ticket_pow_streak_up = object_u64(ticket_pow, "streak_up").value_or(0);
+    result.ticket_pow_streak_down = object_u64(ticket_pow, "streak_down").value_or(0);
+    result.ticket_pow_nonce_search_limit = object_u64(ticket_pow, "nonce_search_limit").value_or(0);
+    result.ticket_pow_bonus_cap_bps = static_cast<std::uint32_t>(object_u64(ticket_pow, "bonus_cap_bps").value_or(0));
+  }
+  out.value = std::move(result);
+  return out;
+}
+
+LookupResult<CommitteeResult> parse_committee_result_object(const finalis::minijson::Value& committee_obj,
+                                                            std::uint64_t requested_height) {
+  LookupResult<CommitteeResult> out;
+  if (!committee_obj.is_object()) {
+    out.error = upstream_error("committee unavailable");
+    return out;
+  }
+  CommitteeResult result;
+  result.height = object_u64(&committee_obj, "height").value_or(requested_height);
+  result.epoch_start_height = object_u64(&committee_obj, "epoch_start_height").value_or(0);
+  result.checkpoint_derivation_mode = object_string(&committee_obj, "checkpoint_derivation_mode");
+  result.checkpoint_fallback_reason = object_string(&committee_obj, "checkpoint_fallback_reason");
+  result.fallback_sticky = object_bool(&committee_obj, "fallback_sticky");
+  result.availability_eligible_operator_count = object_u64(&committee_obj, "availability_eligible_operator_count");
+  result.availability_min_eligible_operators = object_u64(&committee_obj, "availability_min_eligible_operators");
+  result.adaptive_target_committee_size = object_u64(&committee_obj, "adaptive_target_committee_size");
+  result.adaptive_min_eligible = object_u64(&committee_obj, "adaptive_min_eligible");
+  result.adaptive_min_bond = object_u64(&committee_obj, "adaptive_min_bond");
+  result.qualified_depth = object_u64(&committee_obj, "qualified_depth");
+  result.adaptive_slack = object_i64(&committee_obj, "slack");
+  result.target_expand_streak = object_u64(&committee_obj, "target_expand_streak");
+  result.target_contract_streak = object_u64(&committee_obj, "target_contract_streak");
+  const auto* members = committee_obj.get("members");
+  if (!members || !members->is_array()) {
+    out.error = upstream_error("committee members missing");
+    return out;
+  }
+  for (const auto& member : members->array_value) {
+    if (!member.is_object()) continue;
+    CommitteeMemberResult item;
+    item.operator_id = object_string(&member, "operator_id");
+    item.representative_pubkey = object_string(&member, "representative_pubkey").value_or("");
+    item.resolved_operator_id = item.operator_id.value_or(item.representative_pubkey);
+    item.operator_id_source = item.operator_id.has_value() ? "operator_id" : "representative_pubkey";
+    item.base_weight = object_u64(&member, "base_weight");
+    item.ticket_bonus_bps = object_u64(&member, "ticket_bonus_bps");
+    item.final_weight = object_u64(&member, "final_weight");
+    item.ticket_hash = object_string(&member, "ticket_hash");
+    item.ticket_nonce = object_u64(&member, "ticket_nonce");
+    result.members.push_back(std::move(item));
+  }
+  out.value = std::move(result);
+  return out;
+}
+
+std::vector<RecentTxResult> parse_recent_tx_cache_array(const finalis::minijson::Value& recent_array) {
+  std::vector<RecentTxResult> out;
+  if (!recent_array.is_array()) return out;
+  out.reserve(recent_array.array_value.size());
+  for (const auto& item_value : recent_array.array_value) {
+    if (!item_value.is_object()) continue;
+    auto txid = object_string(&item_value, "txid");
+    if (!txid.has_value()) continue;
+    RecentTxResult item;
+    item.txid = *txid;
+    item.height = object_u64(&item_value, "height");
+    item.timestamp = object_u64(&item_value, "timestamp");
+    item.total_out = object_u64(&item_value, "total_out");
+    item.status_label = object_string(&item_value, "status_label");
+    item.credit_safe = object_bool(&item_value, "credit_safe");
+    if (auto count = object_u64(&item_value, "input_count"); count.has_value()) item.input_count = static_cast<std::size_t>(*count);
+    if (auto count = object_u64(&item_value, "output_count"); count.has_value()) item.output_count = static_cast<std::size_t>(*count);
+    item.fee = object_u64(&item_value, "fee");
+    item.primary_sender = object_string(&item_value, "primary_sender");
+    item.primary_recipient = object_string(&item_value, "primary_recipient");
+    if (auto count = object_u64(&item_value, "recipient_count"); count.has_value()) item.recipient_count = static_cast<std::size_t>(*count);
+    item.flow_kind = object_string(&item_value, "flow_kind");
+    item.flow_summary = object_string(&item_value, "flow_summary");
+    out.push_back(std::move(item));
+  }
+  return out;
+}
+
+finalis::minijson::Value serialize_recent_tx_cache_array(const std::vector<RecentTxResult>& rows) {
+  auto array = json_array_value();
+  for (const auto& row : rows) {
+    auto item = json_object_value();
+    json_put(item, "txid", row.txid);
+    json_put(item, "height", row.height);
+    json_put(item, "timestamp", row.timestamp);
+    json_put(item, "total_out", row.total_out);
+    json_put(item, "status_label", row.status_label);
+    json_put(item, "credit_safe", row.credit_safe);
+    json_put(item, "input_count",
+             row.input_count.has_value() ? std::optional<std::uint64_t>(static_cast<std::uint64_t>(*row.input_count)) : std::nullopt);
+    json_put(item, "output_count",
+             row.output_count.has_value() ? std::optional<std::uint64_t>(static_cast<std::uint64_t>(*row.output_count)) : std::nullopt);
+    json_put(item, "fee", row.fee);
+    json_put(item, "primary_sender", row.primary_sender);
+    json_put(item, "primary_recipient", row.primary_recipient);
+    json_put(item, "recipient_count",
+             row.recipient_count.has_value() ? std::optional<std::uint64_t>(static_cast<std::uint64_t>(*row.recipient_count)) : std::nullopt);
+    json_put(item, "flow_kind", row.flow_kind);
+    json_put(item, "flow_summary", row.flow_summary);
+    array.array_value.push_back(std::move(item));
+  }
+  return array;
+}
+
+finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
+  auto obj = json_object_value();
+  json_put(obj, "txid", result.txid);
+  json_put(obj, "found", result.found);
+  json_put(obj, "finalized", result.finalized);
+  json_put(obj, "finalized_height", result.finalized_height);
+  json_put(obj, "finalized_depth", result.finalized_depth);
+  json_put(obj, "credit_safe", result.credit_safe);
+  json_put(obj, "status_label", result.status_label);
+  json_put(obj, "transition_hash", result.transition_hash);
+  json_put(obj, "timestamp", result.timestamp);
+  json_put(obj, "total_out", result.total_out);
+  json_put(obj, "fee", result.fee);
+  json_put(obj, "flow_kind", result.flow_kind);
+  json_put(obj, "flow_summary", result.flow_summary);
+  json_put(obj, "primary_sender", result.primary_sender);
+  json_put(obj, "primary_recipient", result.primary_recipient);
+  json_put(obj, "data_source", result.data_source);
+  json_put(obj, "data_refreshed_unix_ms", result.data_refreshed_unix_ms);
+  json_put(obj, "participant_count",
+           result.participant_count.has_value() ? std::optional<std::uint64_t>(static_cast<std::uint64_t>(*result.participant_count))
+                                                : std::nullopt);
+  auto inputs = json_array_value();
+  for (const auto& in : result.inputs) {
+    auto item = json_object_value();
+    json_put(item, "prev_txid", in.prev_txid);
+    json_put(item, "vout", static_cast<std::uint64_t>(in.vout));
+    json_put(item, "address", in.address);
+    json_put(item, "amount", in.amount);
+    inputs.array_value.push_back(std::move(item));
+  }
+  auto outputs = json_array_value();
+  for (const auto& out : result.outputs) {
+    auto item = json_object_value();
+    json_put(item, "amount", out.amount);
+    json_put(item, "address", out.address);
+    json_put(item, "script_hex", out.script_hex);
+    outputs.array_value.push_back(std::move(item));
+  }
+  obj.object_value["inputs"] = std::move(inputs);
+  obj.object_value["outputs"] = std::move(outputs);
+  return obj;
+}
+
+std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& obj) {
+  if (!obj.is_object()) return std::nullopt;
+  auto txid = object_string(&obj, "txid");
+  if (!txid.has_value()) return std::nullopt;
+  TxResult result;
+  result.txid = *txid;
+  result.found = object_bool(&obj, "found").value_or(true);
+  result.finalized = object_bool(&obj, "finalized").value_or(true);
+  result.finalized_height = object_u64(&obj, "finalized_height");
+  result.finalized_depth = object_u64(&obj, "finalized_depth").value_or(0);
+  result.credit_safe = object_bool(&obj, "credit_safe").value_or(false);
+  result.status_label = object_string(&obj, "status_label").value_or("");
+  result.transition_hash = object_string(&obj, "transition_hash").value_or("");
+  result.timestamp = object_u64(&obj, "timestamp");
+  result.total_out = object_u64(&obj, "total_out").value_or(0);
+  result.fee = object_u64(&obj, "fee");
+  result.flow_kind = object_string(&obj, "flow_kind").value_or("");
+  result.flow_summary = object_string(&obj, "flow_summary").value_or("");
+  result.primary_sender = object_string(&obj, "primary_sender");
+  result.primary_recipient = object_string(&obj, "primary_recipient");
+  result.data_source = object_string(&obj, "data_source").value_or("cache_finalized_snapshot");
+  result.data_refreshed_unix_ms = object_u64(&obj, "data_refreshed_unix_ms");
+  if (auto count = object_u64(&obj, "participant_count"); count.has_value()) result.participant_count = static_cast<std::size_t>(*count);
+  if (const auto* inputs = obj.get("inputs"); inputs && inputs->is_array()) {
+    for (const auto& input : inputs->array_value) {
+      if (!input.is_object()) continue;
+      auto prev_txid = object_string(&input, "prev_txid");
+      auto vout = object_u64(&input, "vout");
+      if (!prev_txid.has_value() || !vout.has_value()) continue;
+      result.inputs.push_back(TxInputResult{
+          *prev_txid,
+          static_cast<std::uint32_t>(*vout),
+          object_string(&input, "address"),
+          object_u64(&input, "amount"),
+      });
+    }
+  }
+  if (const auto* outputs = obj.get("outputs"); outputs && outputs->is_array()) {
+    for (const auto& output : outputs->array_value) {
+      if (!output.is_object()) continue;
+      result.outputs.push_back(TxOutputResult{
+          object_u64(&output, "amount").value_or(0),
+          object_string(&output, "address"),
+          object_string(&output, "script_hex").value_or(""),
+      });
+    }
+  }
+  return result;
+}
+
+finalis::minijson::Value serialize_transition_result_object(const TransitionResult& result) {
+  auto obj = json_object_value();
+  json_put(obj, "found", result.found);
+  json_put(obj, "finalized", result.finalized);
+  json_put(obj, "height", result.height);
+  json_put(obj, "hash", result.hash);
+  json_put(obj, "prev_finalized_hash", result.prev_finalized_hash);
+  json_put(obj, "timestamp", result.timestamp);
+  json_put(obj, "round", static_cast<std::uint64_t>(result.round));
+  json_put(obj, "tx_count", static_cast<std::uint64_t>(result.tx_count));
+  json_put(obj, "summary_cached", result.summary_cached);
+  json_put(obj, "cached_summary_finalized_out", result.cached_summary_finalized_out);
+  json_put(obj, "cached_summary_distinct_recipient_count", static_cast<std::uint64_t>(result.cached_summary_distinct_recipient_count));
+  json_put(obj, "data_source", result.data_source);
+  json_put(obj, "data_refreshed_unix_ms", result.data_refreshed_unix_ms);
+  auto txids = json_array_value();
+  for (const auto& txid : result.txids) txids.array_value.push_back(json_string_value(txid));
+  obj.object_value["txids"] = std::move(txids);
+  auto flow_mix = json_object_value();
+  for (const auto& [kind, count] : result.cached_summary_flow_mix) {
+    json_put(flow_mix, kind.c_str(), static_cast<std::uint64_t>(count));
+  }
+  obj.object_value["cached_summary_flow_mix"] = std::move(flow_mix);
+  return obj;
+}
+
+std::optional<TransitionResult> parse_transition_result_object(const finalis::minijson::Value& obj) {
+  if (!obj.is_object()) return std::nullopt;
+  auto hash = object_string(&obj, "hash");
+  if (!hash.has_value()) return std::nullopt;
+  TransitionResult result;
+  result.found = object_bool(&obj, "found").value_or(true);
+  result.finalized = object_bool(&obj, "finalized").value_or(true);
+  result.height = object_u64(&obj, "height").value_or(0);
+  result.hash = *hash;
+  result.prev_finalized_hash = object_string(&obj, "prev_finalized_hash").value_or("");
+  result.timestamp = object_u64(&obj, "timestamp");
+  result.round = static_cast<std::uint32_t>(object_u64(&obj, "round").value_or(0));
+  result.tx_count = static_cast<std::size_t>(object_u64(&obj, "tx_count").value_or(0));
+  result.summary_cached = object_bool(&obj, "summary_cached").value_or(false);
+  result.cached_summary_finalized_out = object_u64(&obj, "cached_summary_finalized_out").value_or(0);
+  result.cached_summary_distinct_recipient_count =
+      static_cast<std::size_t>(object_u64(&obj, "cached_summary_distinct_recipient_count").value_or(0));
+  result.data_source = object_string(&obj, "data_source").value_or("cache_finalized_snapshot");
+  result.data_refreshed_unix_ms = object_u64(&obj, "data_refreshed_unix_ms");
+  if (const auto* txids = obj.get("txids"); txids && txids->is_array()) {
+    for (const auto& txid : txids->array_value) {
+      if (txid.is_string()) result.txids.push_back(txid.string_value);
+    }
+  }
+  if (const auto* flow_mix = obj.get("cached_summary_flow_mix"); flow_mix && flow_mix->is_object()) {
+    for (const auto& [kind, value] : flow_mix->object_value) {
+      if (auto count = value.as_u64(); count.has_value()) {
+        result.cached_summary_flow_mix[kind] = static_cast<std::size_t>(*count);
+      }
+    }
+  }
+  return result;
+}
+
+std::optional<TxResult> find_persisted_tx_result(const std::string& txid) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  for (const auto& entry : g_persisted_snapshot.tx_index) {
+    auto parsed = parse_tx_result_object(entry);
+    if (parsed.has_value() && parsed->txid == txid) {
+      parsed->data_refreshed_unix_ms = g_persisted_snapshot.stored_unix_ms ? std::optional<std::uint64_t>(g_persisted_snapshot.stored_unix_ms)
+                                                                           : parsed->data_refreshed_unix_ms;
+      return parsed;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<TransitionResult> find_persisted_transition_result_by_hash(const std::string& hash) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  for (const auto& entry : g_persisted_snapshot.transition_index) {
+    auto parsed = parse_transition_result_object(entry);
+    if (parsed.has_value() && parsed->hash == hash) {
+      parsed->data_refreshed_unix_ms = g_persisted_snapshot.stored_unix_ms ? std::optional<std::uint64_t>(g_persisted_snapshot.stored_unix_ms)
+                                                                           : parsed->data_refreshed_unix_ms;
+      return parsed;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<TransitionResult> find_persisted_transition_result_by_height(std::uint64_t height) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  for (const auto& entry : g_persisted_snapshot.transition_index) {
+    auto parsed = parse_transition_result_object(entry);
+    if (parsed.has_value() && parsed->height == height) {
+      parsed->data_refreshed_unix_ms = g_persisted_snapshot.stored_unix_ms ? std::optional<std::uint64_t>(g_persisted_snapshot.stored_unix_ms)
+                                                                           : parsed->data_refreshed_unix_ms;
+      return parsed;
+    }
+  }
+  return std::nullopt;
+}
+
+void upsert_persisted_tx_result(const Config& cfg, const TxResult& result) {
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    auto& entries = g_persisted_snapshot.tx_index;
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto& entry) {
+                    auto parsed = parse_tx_result_object(entry);
+                    return parsed.has_value() && parsed->txid == result.txid;
+                  }),
+                  entries.end());
+    entries.insert(entries.begin(), serialize_tx_result_object(result));
+    if (entries.size() > kPersistedTxIndexLimit) entries.resize(kPersistedTxIndexLimit);
+  }
+  persist_explorer_snapshot(cfg);
+}
+
+void upsert_persisted_transition_result(const Config& cfg, const TransitionResult& result) {
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    auto& entries = g_persisted_snapshot.transition_index;
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto& entry) {
+                    auto parsed = parse_transition_result_object(entry);
+                    return parsed.has_value() && (parsed->hash == result.hash || parsed->height == result.height);
+                  }),
+                  entries.end());
+    entries.insert(entries.begin(), serialize_transition_result_object(result));
+    if (entries.size() > kPersistedTransitionIndexLimit) entries.resize(kPersistedTransitionIndexLimit);
+  }
+  persist_explorer_snapshot(cfg);
+}
+
+std::uint64_t now_unix_ms() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+void persist_explorer_snapshot(const Config& cfg) {
+  if (cfg.cache_path.empty()) return;
+  PersistedExplorerSnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    snapshot = g_persisted_snapshot;
+  }
+  snapshot.stored_unix_ms = now_unix_ms();
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    g_persisted_snapshot.stored_unix_ms = snapshot.stored_unix_ms;
+  }
+  auto root = json_object_value();
+  json_put(root, "version", static_cast<std::uint64_t>(1));
+  json_put(root, "rpc_url", cfg.rpc_url);
+  json_put(root, "stored_unix_ms", snapshot.stored_unix_ms);
+  json_put(root, "status_refreshed_unix_ms", snapshot.status_refreshed_unix_ms);
+  json_put(root, "committee_refreshed_unix_ms", snapshot.committee_refreshed_unix_ms);
+  json_put(root, "recent_refreshed_unix_ms", snapshot.recent_refreshed_unix_ms);
+  json_put(root, "committee_height", snapshot.committee_height);
+  json_put(root, "recent_limit", static_cast<std::uint64_t>(snapshot.recent_limit));
+  json_put(root, "recent_present", snapshot.recent_present);
+  root.object_value["status_result"] = snapshot.status_result.has_value() ? *snapshot.status_result : json_null();
+  root.object_value["committee_result"] = snapshot.committee_result.has_value() ? *snapshot.committee_result : json_null();
+  root.object_value["recent_items"] = serialize_recent_tx_cache_array(snapshot.recent);
+  auto tx_index = json_array_value();
+  for (const auto& entry : snapshot.tx_index) tx_index.array_value.push_back(entry);
+  root.object_value["tx_index"] = std::move(tx_index);
+  auto transition_index = json_array_value();
+  for (const auto& entry : snapshot.transition_index) transition_index.array_value.push_back(entry);
+  root.object_value["transition_index"] = std::move(transition_index);
+
+  const auto path = std::filesystem::path(cfg.cache_path);
+  if (!path.parent_path().empty() && !finalis::ensure_private_dir(path.parent_path().string())) return;
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) return;
+  out << finalis::minijson::stringify(root);
+}
+
+void load_persisted_explorer_snapshot(const Config& cfg) {
+  if (cfg.cache_path.empty()) return;
+  std::ifstream in(cfg.cache_path, std::ios::binary);
+  if (!in) return;
+  std::stringstream buffer;
+  buffer << in.rdbuf();
+  const auto parsed = finalis::minijson::parse(buffer.str());
+  if (!parsed || !parsed->is_object()) return;
+  auto version = object_u64(&*parsed, "version");
+  if (!version.has_value() || *version != 1) return;
+  auto rpc_url = object_string(&*parsed, "rpc_url");
+  if (!rpc_url.has_value() || *rpc_url != cfg.rpc_url) return;
+
+  PersistedExplorerSnapshot loaded;
+  loaded.stored_unix_ms = object_u64(&*parsed, "stored_unix_ms").value_or(0);
+  loaded.status_refreshed_unix_ms = object_u64(&*parsed, "status_refreshed_unix_ms");
+  loaded.committee_refreshed_unix_ms = object_u64(&*parsed, "committee_refreshed_unix_ms");
+  loaded.recent_refreshed_unix_ms = object_u64(&*parsed, "recent_refreshed_unix_ms");
+  loaded.committee_height = object_u64(&*parsed, "committee_height").value_or(0);
+  if (auto recent_limit = object_u64(&*parsed, "recent_limit"); recent_limit.has_value()) {
+    loaded.recent_limit = static_cast<std::size_t>(*recent_limit);
+  }
+  loaded.recent_present = object_bool(&*parsed, "recent_present").value_or(false);
+  if (const auto* status = parsed->get("status_result"); status && status->is_object()) loaded.status_result = *status;
+  if (const auto* committee = parsed->get("committee_result"); committee && committee->is_object()) loaded.committee_result = *committee;
+  if (const auto* recent = parsed->get("recent_items"); recent && recent->is_array()) loaded.recent = parse_recent_tx_cache_array(*recent);
+  if (const auto* tx_index = parsed->get("tx_index"); tx_index && tx_index->is_array()) {
+    for (const auto& entry : tx_index->array_value) {
+      if (entry.is_object()) loaded.tx_index.push_back(entry);
+    }
+  }
+  if (const auto* transition_index = parsed->get("transition_index"); transition_index && transition_index->is_array()) {
+    for (const auto& entry : transition_index->array_value) {
+      if (entry.is_object()) loaded.transition_index.push_back(entry);
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    g_persisted_snapshot = loaded;
+  }
+  if (loaded.status_result.has_value()) {
+    auto parsed_status = parse_status_result_object(*loaded.status_result);
+    if (parsed_status.value.has_value()) {
+      std::lock_guard<std::mutex> guard(g_status_cache_mu);
+      g_status_cache = TimedCacheEntry<LookupResult<StatusResult>>{
+          .key = cfg.rpc_url, .stored_at = std::chrono::steady_clock::now(), .value = parsed_status, .valid = true};
+    }
+  }
+  if (loaded.committee_result.has_value()) {
+    auto parsed_committee = parse_committee_result_object(*loaded.committee_result, loaded.committee_height);
+    if (parsed_committee.value.has_value()) {
+      std::lock_guard<std::mutex> guard(g_committee_cache_mu);
+      g_committee_cache = TimedCacheEntry<LookupResult<CommitteeResult>>{
+          .key = cfg.rpc_url + "#committee#" + std::to_string(loaded.committee_height),
+          .stored_at = std::chrono::steady_clock::now(),
+          .value = parsed_committee,
+          .valid = true};
+    }
+  }
+  if (loaded.recent_present) {
+    std::lock_guard<std::mutex> guard(g_recent_tx_cache_mu);
+    g_recent_tx_cache = TimedCacheEntry<std::vector<RecentTxResult>>{
+        .key = cfg.rpc_url + "#recent#" + std::to_string(loaded.recent_limit),
+        .stored_at = std::chrono::steady_clock::now(),
+        .value = loaded.recent,
+        .valid = true};
+  }
+}
+
 bool rpc_not_found(const RpcCallResult& res) {
   return res.error_code.has_value() && *res.error_code == -32001;
 }
@@ -1094,19 +1857,23 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
 LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uint64_t height);
 std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& cfg, const std::vector<std::string>& txids);
 
-std::string render_status_json(const StatusResult& result);
+std::string render_status_json(const StatusResult& result, std::optional<std::uint64_t> refreshed_unix_ms = std::nullopt);
 std::string render_tx_json(const TxResult& result);
 std::string render_transition_json(const Config& cfg, const TransitionResult& result);
 std::string render_address_json(const AddressResult& result);
 std::string render_search_json(const SearchResult& result);
-std::string render_committee_json(const CommitteeResult& result);
-std::string render_recent_tx_json(const std::vector<RecentTxResult>& items);
+std::string render_committee_json(const CommitteeResult& result, std::optional<std::uint64_t> refreshed_unix_ms = std::nullopt);
+std::string render_recent_tx_json(const std::vector<RecentTxResult>& items, std::optional<std::uint64_t> refreshed_unix_ms = std::nullopt);
 
 std::string render_root(const Config& cfg) {
   std::ostringstream body;
+  auto status = fetch_status_result(cfg);
+  const auto status_refreshed_unix_ms = persisted_status_refreshed_unix_ms();
+  const auto recent = fetch_recent_tx_results(cfg, 8);
+  const auto recent_refreshed_unix_ms = persisted_recent_refreshed_unix_ms();
+  body << build_surface_stale_banner();
   body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>"
        << "<div class=\"note\">Finalized-state explorer for operators, wallets, and exchanges. It intentionally shows only finalized chain state and hides mempool ambiguity.</div>";
-  auto status = fetch_status_result(cfg);
   if (status.value.has_value()) {
     body << "<div class=\"hero-metrics\">"
          << "<div class=\"metric-card\"><span class=\"label\">Finalized Tip</span><span class=\"value\">" << status.value->finalized_height
@@ -1132,6 +1899,7 @@ std::string render_root(const Config& cfg) {
   if (status.value.has_value()) {
     body << "<div>Runtime Status</div><div>" << status_chip(sync_summary_text(*status.value), tone_for_sync(*status.value)) << " "
          << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
+         << "<div>Status Snapshot Refreshed</div><div>" << html_escape(explorer_snapshot_freshness_text(status_refreshed_unix_ms)) << "</div>"
          << "<div>Network</div><div>" << html_escape(status.value->network) << "</div>"
          << "<div>Finalized Tip</div><div class=\"value-cell\">" << link_transition_height(status.value->finalized_height) << " <code>" << html_escape(short_hex(status.value->finalized_transition_hash))
          << "</code> " << finalized_badge(true) << "</div>"
@@ -1161,10 +1929,11 @@ std::string render_root(const Config& cfg) {
          << copy_action("Copy Status API Path", "/api/status")
          << "</div></div>";
   }
-  const auto recent = fetch_recent_tx_results(cfg, 8);
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
-    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>";
+    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>"
+         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
+         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
     body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>Flow</th><th>From</th><th>To</th><th>Finalized Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
     for (const auto& item : recent) {
       body << "<tr><td>" << link_tx(item.txid) << "</td><td>"
@@ -1205,7 +1974,9 @@ std::string render_root(const Config& cfg) {
     }
     body << "</tbody></table></div>";
   } else {
-    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. This usually means the latest finalized transitions carried no user transactions, not that explorer indexing is broken.</div>";
+    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. This usually means the latest finalized transitions carried no user transactions, not that explorer indexing is broken.</div>"
+         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
+         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
   }
   body << "</div>";
   body << "<div class=\"card\"><h2>Routes</h2><ul>"
@@ -1227,6 +1998,7 @@ std::string render_committee(const Config& cfg) {
     return page_layout("Committee", body.str(), "committee");
   }
   auto committee = fetch_committee_result(cfg, status.value->finalized_height);
+  const auto committee_refreshed_unix_ms = persisted_committee_refreshed_unix_ms();
   if (!committee.value.has_value()) {
     body << "<div class=\"card\"><div class=\"note\">Committee unavailable: "
          << html_escape(committee.error ? committee.error->message : "unknown error") << "</div></div>";
@@ -1238,6 +2010,9 @@ std::string render_committee(const Config& cfg) {
        << render_summary_metric_card("Epoch Start", std::to_string(committee.value->epoch_start_height), "current finalized committee epoch")
        << render_summary_metric_card("Checkpoint Mode", committee.value->checkpoint_derivation_mode.value_or("n/a"),
                                      committee.value->checkpoint_fallback_reason.value_or("no fallback"))
+       << "</div></div>";
+  body << "<div class=\"card\"><div class=\"note\">Committee snapshot refreshed from RPC: "
+       << html_escape(explorer_snapshot_freshness_text(committee_refreshed_unix_ms))
        << "</div></div>";
   body << "<div class=\"card\"><h2>" << html_escape(ticket_pow_title(*status.value)) << "</h2><div class=\"grid\">"
        << "<div>Difficulty</div><div>" << status.value->ticket_pow_difficulty << " <span class=\"muted\">(range "
@@ -1411,84 +2186,35 @@ LookupResult<StatusResult> fetch_status_result(const Config& cfg) {
   LookupResult<StatusResult> out;
   auto status = rpc_call(cfg.rpc_url, "get_status", "{}");
   if (!status.result.has_value() || !status.result->is_object()) {
-    out.error = upstream_error(status.error.empty() ? "status unavailable" : status.error);
+    const auto err = upstream_error(status.error.empty() ? "status unavailable" : status.error);
+    if (auto cached = persisted_status_result_lookup(); cached.has_value() && cached->value.has_value()) {
+      out = *cached;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_status_surface_state, err.message, true);
+      }
+    } else {
+      out.error = err;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_status_surface_state, err.message, false);
+      }
+    }
   } else {
-    StatusResult result;
-    result.network = object_string(&*status.result, "network_name").value_or("unknown");
-    result.network_id = object_string(&*status.result, "network_id").value_or("");
-    result.genesis_hash = object_string(&*status.result, "genesis_hash").value_or("");
-    result.finalized_height = object_u64(&*status.result, "finalized_height").value_or(0);
-    result.finalized_transition_hash = object_string(&*status.result, "finalized_transition_hash")
-                                           .value_or(object_string(&*status.result, "transition_hash").value_or(""));
-    result.backend_version = object_string(&*status.result, "version").value_or("unknown");
-    result.wallet_api_version = object_string(&*status.result, "wallet_api_version").value_or("");
-    result.protocol_reserve_balance = object_u64(&*status.result, "protocol_reserve_balance");
-    result.healthy_peer_count = object_u64(&*status.result, "healthy_peer_count").value_or(0);
-    result.established_peer_count = object_u64(&*status.result, "established_peer_count").value_or(0);
-    result.latest_finality_committee_size =
-        static_cast<std::size_t>(object_u64(&*status.result, "latest_finality_committee_size").value_or(0));
-    result.latest_finality_quorum_threshold =
-        static_cast<std::size_t>(object_u64(&*status.result, "latest_finality_quorum_threshold").value_or(0));
-    if (const auto* sync = status.result->get("sync"); sync && sync->is_object()) {
-      result.observed_network_height_known = object_bool(sync, "observed_network_height_known").value_or(false);
-      result.bootstrap_sync_incomplete = object_bool(sync, "bootstrap_sync_incomplete").value_or(false);
-      result.peer_height_disagreement = object_bool(sync, "peer_height_disagreement").value_or(false);
-      result.finalized_lag = object_u64(sync, "finalized_lag");
-      if (result.observed_network_height_known) {
-        result.observed_network_finalized_height = object_u64(sync, "observed_network_finalized_height");
+    out = parse_status_result_object(*status.result);
+    if (out.value.has_value()) {
+      const auto refreshed_unix_ms = now_unix_ms();
+      {
+        std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+        g_persisted_snapshot.status_refreshed_unix_ms = refreshed_unix_ms;
+        g_persisted_snapshot.status_result = *status.result;
       }
+      persist_explorer_snapshot(cfg);
     }
-    if (const auto* availability = status.result->get("availability"); availability && availability->is_object()) {
-      result.availability_epoch = object_u64(availability, "epoch");
-      result.availability_retained_prefix_count = object_u64(availability, "retained_prefix_count");
-      result.availability_tracked_operator_count = object_u64(availability, "tracked_operator_count");
-      result.availability_eligible_operator_count = object_u64(availability, "eligible_operator_count");
-      result.availability_below_min_eligible = object_bool(availability, "below_min_eligible");
-      result.availability_checkpoint_derivation_mode = object_string(availability, "checkpoint_derivation_mode");
-      result.availability_checkpoint_fallback_reason = object_string(availability, "checkpoint_fallback_reason");
-      result.availability_fallback_sticky = object_bool(availability, "fallback_sticky");
-      if (const auto* adaptive = availability->get("adaptive_regime"); adaptive && adaptive->is_object()) {
-        result.qualified_depth = object_u64(adaptive, "qualified_depth");
-        result.adaptive_target_committee_size = object_u64(adaptive, "adaptive_target_committee_size");
-        result.adaptive_min_eligible = object_u64(adaptive, "adaptive_min_eligible");
-        result.adaptive_min_bond = object_u64(adaptive, "adaptive_min_bond");
-        result.adaptive_slack = object_i64(adaptive, "slack");
-        result.target_expand_streak = object_u64(adaptive, "target_expand_streak");
-        result.target_contract_streak = object_u64(adaptive, "target_contract_streak");
-        result.adaptive_fallback_rate_bps = object_u64(adaptive, "fallback_rate_bps");
-        result.adaptive_sticky_fallback_rate_bps = object_u64(adaptive, "sticky_fallback_rate_bps");
-        result.adaptive_fallback_window_epochs = object_u64(adaptive, "fallback_rate_window_epochs");
-        result.adaptive_near_threshold_operation = object_bool(adaptive, "near_threshold_operation");
-        result.adaptive_prolonged_expand_buildup = object_bool(adaptive, "prolonged_expand_buildup");
-        result.adaptive_prolonged_contract_buildup = object_bool(adaptive, "prolonged_contract_buildup");
-        result.adaptive_repeated_sticky_fallback = object_bool(adaptive, "repeated_sticky_fallback");
-        result.adaptive_depth_collapse_after_bond_increase = object_bool(adaptive, "depth_collapse_after_bond_increase");
-      }
-      if (const auto* local = availability->get("local_operator"); local && local->is_object()) {
-        result.availability_local_operator_known = object_bool(local, "known");
-        result.availability_local_operator_pubkey = object_string(local, "pubkey");
-        result.availability_local_operator_status = object_string(local, "status");
-        result.availability_local_operator_seat_budget = object_u64(local, "seat_budget");
-      }
+    {
+      std::lock_guard<std::mutex> guard(g_surface_state_mu);
+      set_surface_state(g_status_surface_state, std::nullopt, false);
     }
-    if (const auto* adaptive_summary = status.result->get("adaptive_telemetry_summary");
-        adaptive_summary && adaptive_summary->is_object()) {
-      result.adaptive_telemetry_window_epochs = object_u64(adaptive_summary, "window_epochs");
-      result.adaptive_telemetry_sample_count = object_u64(adaptive_summary, "sample_count");
-      result.adaptive_telemetry_fallback_epochs = object_u64(adaptive_summary, "fallback_epochs");
-      result.adaptive_telemetry_sticky_fallback_epochs = object_u64(adaptive_summary, "sticky_fallback_epochs");
-    }
-    if (const auto* ticket_pow = status.result->get("ticket_pow"); ticket_pow && ticket_pow->is_object()) {
-      result.ticket_pow_difficulty = static_cast<std::uint32_t>(object_u64(ticket_pow, "difficulty").value_or(0));
-      result.ticket_pow_difficulty_min = static_cast<std::uint32_t>(object_u64(ticket_pow, "difficulty_min").value_or(0));
-      result.ticket_pow_difficulty_max = static_cast<std::uint32_t>(object_u64(ticket_pow, "difficulty_max").value_or(0));
-      result.ticket_pow_epoch_health = object_string(ticket_pow, "epoch_health").value_or("unknown");
-      result.ticket_pow_streak_up = object_u64(ticket_pow, "streak_up").value_or(0);
-      result.ticket_pow_streak_down = object_u64(ticket_pow, "streak_down").value_or(0);
-      result.ticket_pow_nonce_search_limit = object_u64(ticket_pow, "nonce_search_limit").value_or(0);
-      result.ticket_pow_bonus_cap_bps = static_cast<std::uint32_t>(object_u64(ticket_pow, "bonus_cap_bps").value_or(0));
-    }
-    out.value = std::move(result);
   }
   {
     std::lock_guard<std::mutex> guard(g_status_cache_mu);
@@ -1512,43 +2238,36 @@ LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uin
   auto rpc = rpc_call(cfg.rpc_url, "get_committee",
                       std::string("{\"height\":") + std::to_string(height) + ",\"verbose\":true}");
   if (!rpc.result.has_value() || !rpc.result->is_object()) {
-    out.error = rpc_not_found(rpc) ? not_found_error("committee unavailable in finalized state")
-                                   : upstream_error(rpc.error.empty() ? "committee unavailable" : rpc.error);
-  } else {
-    CommitteeResult result;
-    result.height = object_u64(&*rpc.result, "height").value_or(height);
-    result.epoch_start_height = object_u64(&*rpc.result, "epoch_start_height").value_or(0);
-    result.checkpoint_derivation_mode = object_string(&*rpc.result, "checkpoint_derivation_mode");
-    result.checkpoint_fallback_reason = object_string(&*rpc.result, "checkpoint_fallback_reason");
-    result.fallback_sticky = object_bool(&*rpc.result, "fallback_sticky");
-    result.availability_eligible_operator_count = object_u64(&*rpc.result, "availability_eligible_operator_count");
-    result.availability_min_eligible_operators = object_u64(&*rpc.result, "availability_min_eligible_operators");
-    result.adaptive_target_committee_size = object_u64(&*rpc.result, "adaptive_target_committee_size");
-    result.adaptive_min_eligible = object_u64(&*rpc.result, "adaptive_min_eligible");
-    result.adaptive_min_bond = object_u64(&*rpc.result, "adaptive_min_bond");
-    result.qualified_depth = object_u64(&*rpc.result, "qualified_depth");
-    result.adaptive_slack = object_i64(&*rpc.result, "slack");
-    result.target_expand_streak = object_u64(&*rpc.result, "target_expand_streak");
-    result.target_contract_streak = object_u64(&*rpc.result, "target_contract_streak");
-    const auto* members = rpc.result->get("members");
-    if (!members || !members->is_array()) {
-      out.error = upstream_error("committee members missing");
-    } else {
-      for (const auto& member : members->array_value) {
-        if (!member.is_object()) continue;
-        CommitteeMemberResult item;
-        item.operator_id = object_string(&member, "operator_id");
-        item.representative_pubkey = object_string(&member, "representative_pubkey").value_or("");
-        item.resolved_operator_id = item.operator_id.value_or(item.representative_pubkey);
-        item.operator_id_source = item.operator_id.has_value() ? "operator_id" : "representative_pubkey";
-        item.base_weight = object_u64(&member, "base_weight");
-        item.ticket_bonus_bps = object_u64(&member, "ticket_bonus_bps");
-        item.final_weight = object_u64(&member, "final_weight");
-        item.ticket_hash = object_string(&member, "ticket_hash");
-        item.ticket_nonce = object_u64(&member, "ticket_nonce");
-        result.members.push_back(std::move(item));
+    const auto err = rpc_not_found(rpc) ? not_found_error("committee unavailable in finalized state")
+                                        : upstream_error(rpc.error.empty() ? "committee unavailable" : rpc.error);
+    if (auto cached = persisted_committee_result_lookup(height); cached.has_value() && cached->value.has_value()) {
+      out = *cached;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_committee_surface_state, err.message, true);
       }
-      out.value = std::move(result);
+    } else {
+      out.error = err;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_committee_surface_state, err.message, false);
+      }
+    }
+  } else {
+    out = parse_committee_result_object(*rpc.result, height);
+    if (out.value.has_value()) {
+      const auto refreshed_unix_ms = now_unix_ms();
+      {
+        std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+        g_persisted_snapshot.committee_refreshed_unix_ms = refreshed_unix_ms;
+        g_persisted_snapshot.committee_height = height;
+        g_persisted_snapshot.committee_result = *rpc.result;
+      }
+      persist_explorer_snapshot(cfg);
+    }
+    {
+      std::lock_guard<std::mutex> guard(g_surface_state_mu);
+      set_surface_state(g_committee_surface_state, std::nullopt, false);
     }
   }
 
@@ -1565,6 +2284,11 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
   if (is_digits(ident)) {
     try {
       const auto height = static_cast<std::uint64_t>(std::stoull(ident));
+      if (auto cached = find_persisted_transition_result_by_height(height); cached.has_value()) {
+        cached->data_source = "cache_finalized_snapshot";
+        out.value = std::move(*cached);
+        return out;
+      }
       std::string err;
       std::string transition_hash_hex;
       auto blk = fetch_transition_by_height(cfg, height, &transition_hash_hex, &err);
@@ -1582,6 +2306,13 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
                             ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                             : 0;
       result.txids = fetch_transition_txids(cfg, *blk);
+      const auto summary = compute_transition_summary(cfg, result);
+      result.summary_cached = true;
+      result.cached_summary_finalized_out = summary.finalized_out;
+      result.cached_summary_distinct_recipient_count = summary.distinct_recipient_count;
+      result.cached_summary_flow_mix = summary.flow_mix;
+      result.data_source = "rpc_live_finalized";
+      upsert_persisted_transition_result(cfg, result);
       out.value = std::move(result);
       return out;
     } catch (...) {
@@ -1589,6 +2320,11 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
       return out;
     }
   } else if (is_hex64(ident)) {
+    if (auto cached = find_persisted_transition_result_by_hash(ident); cached.has_value()) {
+      cached->data_source = "cache_finalized_snapshot";
+      out.value = std::move(*cached);
+      return out;
+    }
     auto rpc = rpc_call(cfg.rpc_url, "get_transition", std::string("{\"hash\":\"") + json_escape(ident) + "\"}");
     if (!rpc.result.has_value()) {
       out.error = rpc_not_found(rpc) ? not_found_error() : upstream_error(rpc.error);
@@ -1610,6 +2346,13 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
                           ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                           : 0;
     result.txids = fetch_transition_txids(cfg, *blk);
+    const auto summary = compute_transition_summary(cfg, result);
+    result.summary_cached = true;
+    result.cached_summary_finalized_out = summary.finalized_out;
+    result.cached_summary_distinct_recipient_count = summary.distinct_recipient_count;
+    result.cached_summary_flow_mix = summary.flow_mix;
+    result.data_source = "rpc_live_finalized";
+    upsert_persisted_transition_result(cfg, result);
     out.value = std::move(result);
     return out;
   } else {
@@ -1622,6 +2365,11 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   LookupResult<TxResult> out;
   if (!is_hex64(txid_hex)) {
     out.error = make_error(400, "invalid_txid", "malformed txid");
+    return out;
+  }
+  if (auto cached = find_persisted_tx_result(txid_hex); cached.has_value()) {
+    cached->data_source = "cache_finalized_snapshot";
+    out.value = std::move(*cached);
     return out;
   }
 
@@ -1659,11 +2407,12 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     return out;
   }
   auto tx_bytes = finalis::hex_decode(*tx_hex);
-  auto tx = tx_bytes ? finalis::Tx::parse(*tx_bytes) : std::nullopt;
-  if (!tx.has_value()) {
+  auto tx = tx_bytes ? finalis::parse_any_tx(*tx_bytes) : std::nullopt;
+  if (!tx.has_value() || !std::holds_alternative<finalis::Tx>(*tx)) {
     out.error = upstream_error("tx parse failed");
     return out;
   }
+  const auto& tx_v1 = std::get<finalis::Tx>(*tx);
 
   std::string network_name = "mainnet";
   if (auto st = fetch_status_result(cfg); st.value.has_value()) network_name = st.value->network;
@@ -1671,7 +2420,7 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
 
   std::uint64_t total_in = 0;
   bool fee_known = true;
-  for (const auto& in : tx->inputs) {
+  for (const auto& in : tx_v1.inputs) {
     TxInputResult input_view{finalis::hex_encode32(in.prev_txid), in.prev_index, std::nullopt, std::nullopt};
     auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + finalis::hex_encode32(in.prev_txid) + "\"}");
     if (!prev_call.result.has_value() || !prev_call.result->is_object()) {
@@ -1686,19 +2435,25 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
       continue;
     }
     auto prev_bytes = finalis::hex_decode(*prev_hex);
-    auto prev_tx = prev_bytes ? finalis::Tx::parse(*prev_bytes) : std::nullopt;
-    if (!prev_tx.has_value() || in.prev_index >= prev_tx->outputs.size()) {
+    auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
+    if (!prev_tx.has_value() || !std::holds_alternative<finalis::Tx>(*prev_tx)) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
       continue;
     }
-    total_in += prev_tx->outputs[in.prev_index].value;
-    input_view.address = script_to_address(prev_tx->outputs[in.prev_index].script_pubkey, hrp);
-    input_view.amount = prev_tx->outputs[in.prev_index].value;
+    const auto& prev_tx_v1 = std::get<finalis::Tx>(*prev_tx);
+    if (in.prev_index >= prev_tx_v1.outputs.size()) {
+      result.inputs.push_back(std::move(input_view));
+      fee_known = false;
+      continue;
+    }
+    total_in += prev_tx_v1.outputs[in.prev_index].value;
+    input_view.address = script_to_address(prev_tx_v1.outputs[in.prev_index].script_pubkey, hrp);
+    input_view.amount = prev_tx_v1.outputs[in.prev_index].value;
     result.inputs.push_back(std::move(input_view));
   }
 
-  for (const auto& tx_out : tx->outputs) {
+  for (const auto& tx_out : tx_v1.outputs) {
     result.total_out += tx_out.value;
     result.outputs.push_back(TxOutputResult{
         tx_out.value,
@@ -1713,6 +2468,8 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   result.primary_sender = flow.primary_sender;
   result.primary_recipient = flow.primary_recipient;
   result.participant_count = flow.participant_count;
+  result.data_source = "rpc_live_finalized";
+  upsert_persisted_tx_result(cfg, result);
   out.value = std::move(result);
   return out;
 }
@@ -1905,12 +2662,14 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
   std::vector<RecentTxResult> out;
   if (max_items == 0) return out;
   const std::uint64_t depth_window = 32;
+  bool live_recent_rpc_ok = false;
   {
     std::ostringstream params;
     params << "{\"limit\":" << max_items << ",\"depth_window\":" << depth_window << "}";
     auto res = rpc_call(cfg.rpc_url, "get_recent_tx_summaries", params.str());
     if (res.result.has_value() && res.result->is_object()) {
       if (const auto* items = res.result->get("items"); items && items->is_array()) {
+        live_recent_rpc_ok = true;
         out.reserve(items->array_value.size());
         for (const auto& item_value : items->array_value) {
           if (!item_value.is_object()) continue;
@@ -1937,7 +2696,16 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
   }
   if (out.empty()) {
     auto status = fetch_status_result(cfg);
-    if (!status.value.has_value()) return out;
+    if (!status.value.has_value()) {
+      if (auto cached = persisted_recent_results(max_items); cached.has_value()) {
+        {
+          std::lock_guard<std::mutex> guard(g_surface_state_mu);
+          set_surface_state(g_recent_surface_state, "recent tx refresh failed", true);
+        }
+        out = std::move(*cached);
+      }
+      return out;
+    }
     const auto tip = status.value->finalized_height;
     const std::uint64_t start_height = tip > depth_window ? tip - depth_window : 0;
     std::vector<std::pair<std::string, std::uint64_t>> tx_refs;
@@ -2014,6 +2782,26 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
     g_recent_tx_cache = TimedCacheEntry<std::vector<RecentTxResult>>{
         .key = cache_key, .stored_at = std::chrono::steady_clock::now(), .value = out, .valid = true};
   }
+  if (max_items == kPersistedRecentLimit) {
+    const auto refreshed_unix_ms = now_unix_ms();
+    {
+      std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+      g_persisted_snapshot.recent_refreshed_unix_ms = refreshed_unix_ms;
+      g_persisted_snapshot.recent_limit = max_items;
+      g_persisted_snapshot.recent_present = true;
+      g_persisted_snapshot.recent = out;
+    }
+    persist_explorer_snapshot(cfg);
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_surface_state_mu);
+    if (!out.empty() || live_recent_rpc_ok) {
+      set_surface_state(g_recent_surface_state, std::nullopt, false);
+    } else if (auto cached = persisted_recent_results(max_items); cached.has_value()) {
+      out = *cached;
+      set_surface_state(g_recent_surface_state, "recent tx refresh failed", true);
+    }
+  }
   return out;
 }
 
@@ -2058,7 +2846,7 @@ std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& c
   return out;
 }
 
-std::string render_status_json(const StatusResult& result) {
+std::string render_status_json(const StatusResult& result, std::optional<std::uint64_t> refreshed_unix_ms) {
   std::ostringstream oss;
   oss << "{\"network\":\"" << json_escape(result.network) << "\","
       << "\"network_id\":\"" << json_escape(result.network_id) << "\","
@@ -2143,6 +2931,7 @@ std::string render_status_json(const StatusResult& result) {
       << ",\"nonce_search_limit\":" << result.ticket_pow_nonce_search_limit
       << ",\"bonus_cap_bps\":" << result.ticket_pow_bonus_cap_bps
       << "},"
+      << "\"snapshot_refreshed_unix_ms\":" << json_u64_or_null(refreshed_unix_ms) << ","
       << "\"finalized_only\":true}";
   return oss.str();
 }
@@ -2158,6 +2947,8 @@ std::string render_tx_json(const TxResult& result) {
       << "\"credit_safe\":" << json_bool(result.credit_safe) << ","
       << "\"status_label\":\"" << json_escape(result.status_label) << "\","
       << "\"transition_hash\":\"" << json_escape(result.transition_hash) << "\","
+      << "\"data_source\":\"" << json_escape(result.data_source) << "\","
+      << "\"data_refreshed_unix_ms\":" << json_u64_or_null(result.data_refreshed_unix_ms) << ","
       << "\"timestamp\":" << json_u64_or_null(result.timestamp) << ",\"inputs\":[";
   for (std::size_t i = 0; i < result.inputs.size(); ++i) {
     if (i) oss << ",";
@@ -2200,6 +2991,8 @@ std::string render_transition_json(const Config& cfg, const TransitionResult& re
   oss << "{\"found\":" << json_bool(result.found) << ",\"finalized\":true,"
       << "\"height\":" << result.height << ",\"hash\":\"" << json_escape(result.hash) << "\","
       << "\"prev_finalized_hash\":\"" << json_escape(result.prev_finalized_hash) << "\","
+      << "\"data_source\":\"" << json_escape(result.data_source) << "\","
+      << "\"data_refreshed_unix_ms\":" << json_u64_or_null(result.data_refreshed_unix_ms) << ","
       << "\"timestamp\":" << json_u64_or_null(result.timestamp) << ",\"round\":" << result.round
       << ",\"tx_count\":" << result.tx_count << ",\"txids\":[";
   for (std::size_t i = 0; i < result.txids.size(); ++i) {
@@ -2271,7 +3064,7 @@ std::string render_search_json(const SearchResult& result) {
   return oss.str();
 }
 
-std::string render_committee_json(const CommitteeResult& result) {
+std::string render_committee_json(const CommitteeResult& result, std::optional<std::uint64_t> refreshed_unix_ms) {
   std::ostringstream oss;
   oss << "{\"height\":" << result.height
       << ",\"epoch_start_height\":" << result.epoch_start_height
@@ -2292,6 +3085,7 @@ std::string render_committee_json(const CommitteeResult& result) {
       << ",\"target_contract_streak\":" << json_u64_or_null(result.target_contract_streak)
       << ",\"member_count\":" << result.members.size()
       << ",\"snapshot_kind\":\"finalized_committee\""
+      << ",\"snapshot_refreshed_unix_ms\":" << json_u64_or_null(refreshed_unix_ms)
       << ",\"members\":[";
   for (std::size_t i = 0; i < result.members.size(); ++i) {
     if (i) oss << ",";
@@ -2311,7 +3105,7 @@ std::string render_committee_json(const CommitteeResult& result) {
   return oss.str();
 }
 
-std::string render_recent_tx_json(const std::vector<RecentTxResult>& items) {
+std::string render_recent_tx_json(const std::vector<RecentTxResult>& items, std::optional<std::uint64_t> refreshed_unix_ms) {
   std::ostringstream oss;
   std::uint64_t finalized_out_total = 0;
   oss << "{\"items\":[";
@@ -2345,7 +3139,8 @@ std::string render_recent_tx_json(const std::vector<RecentTxResult>& items) {
     oss << "}";
   }
   oss << "],\"summary\":{\"tx_count\":" << items.size() << ",\"finalized_out\":" << finalized_out_total
-      << "},\"finalized_only\":true,\"snapshot_kind\":\"recent_finalized_transactions\"}";
+      << "},\"snapshot_refreshed_unix_ms\":" << json_u64_or_null(refreshed_unix_ms)
+      << ",\"finalized_only\":true,\"snapshot_kind\":\"recent_finalized_transactions\"}";
   return oss.str();
 }
 
@@ -2393,6 +3188,11 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>" << mono_value(tx.txid) << "</div><div>" << finalized_badge(tx.finalized) << " "
        << credit_safe_badge(tx.credit_safe) << "</div></div>"
        << "<div class=\"decision-line\">" << html_escape(credit_decision_text(tx.finalized, tx.credit_safe)) << "</div>"
+       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(tx.data_source))
+       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
+       << (explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
+               ? std::string()
+               : "<div class=\"note\">" + html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms)) + "</div>")
        << "<div class=\"note\">Transaction view is finalized-state only. Relay acceptance, mempool state, and pre-finality observations are intentionally not shown here.</div>"
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Txid</div><div class=\"value-cell\">" << mono_value(tx.txid) << "</div>"
@@ -2401,6 +3201,12 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>Status</div><div>" << html_escape(tx.status_label) << "</div>"
        << "<div>Finalized</div><div>" << finalized_text(tx.finalized) << "</div>"
        << "<div>Credit Safe</div><div>" << credit_safe_text(tx.credit_safe) << "</div>"
+       << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(tx.data_source)) << "</div>"
+       << "<div>Snapshot Refreshed</div><div>"
+       << html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
+                          ? std::string("fresh live RPC")
+                          : format_timestamp(*tx.data_refreshed_unix_ms))
+       << "</div>"
        << "<div>Finalized Only</div><div>yes</div>";
   if (tx.finalized_height.has_value()) body << "<div>Finalized Height</div><div>" << link_transition_height(*tx.finalized_height) << "</div>";
   if (!tx.transition_hash.empty()) body << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(tx.transition_hash) << "</div>";
@@ -2462,40 +3268,24 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   const auto& transition = *lookup.value;
   const std::string transition_path = "/transition/" + transition.hash;
   const std::string transition_api_path = "/api/transition/" + transition.hash;
-  const auto summaries = fetch_tx_summary_batch(cfg, transition.txids);
-  std::uint64_t total_finalized_out = 0;
-  std::set<std::string> distinct_recipients;
-  std::map<std::string, std::size_t> flow_mix;
-  for (const auto& txid : transition.txids) {
-    auto it = summaries.find(txid);
-    if (it == summaries.end()) continue;
-    if (it->second.total_out.has_value()) total_finalized_out += *it->second.total_out;
-    if (it->second.flow_kind.has_value()) ++flow_mix[*it->second.flow_kind];
-    for (const auto& recipient : it->second.recipients) {
-      if (!recipient.empty()) distinct_recipients.insert(recipient);
-    }
-  }
-  std::ostringstream flow_mix_text;
-  if (flow_mix.empty()) {
-    flow_mix_text << "no classified finalized txs";
-  } else {
-    bool first = true;
-    for (const auto& [kind, count] : flow_mix) {
-      if (!first) flow_mix_text << ", ";
-      first = false;
-      flow_mix_text << kind << "=" << count;
-    }
-  }
+  const auto summary = compute_transition_summary(cfg, transition);
+  const auto flow_mix_text = summarize_flow_mix(summary.flow_mix);
 
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
        << render_summary_metric_card("Tx Count", std::to_string(transition.txids.size()), "finalized txids in this transition")
-       << render_summary_metric_card("Total Finalized Out", format_amount(total_finalized_out), "sum of finalized outputs in this transition")
-       << render_summary_metric_card("Distinct Recipients", std::to_string(distinct_recipients.size()), "decoded finalized output addresses")
-       << render_summary_metric_card("Activity Mix", flow_mix_text.str(), "flow-type counts inferred from finalized tx structure")
+       << render_summary_metric_card("Total Finalized Out", format_amount(summary.finalized_out), "sum of finalized outputs in this transition")
+       << render_summary_metric_card("Distinct Recipients", std::to_string(summary.distinct_recipient_count), "decoded finalized output addresses")
+       << render_summary_metric_card("Activity Mix", flow_mix_text, "flow-type counts inferred from finalized tx structure")
        << "</div></div>";
 
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(transition.hash) << "</div><div>" << finalized_badge(true) << "</div></div>"
+       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(transition.data_source))
+       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
+       << (explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms).empty()
+               ? std::string()
+               : "<div class=\"note\">" +
+                     html_escape(explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms)) + "</div>")
        << "<div class=\"note\">Transition view is finalized-only. It shows the finalized checkpoint contents for one height, not proposal-stage or unfinalized round activity.</div>"
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Height</div><div>" << transition.height << "</div>"
@@ -2505,6 +3295,12 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
        << "<div>Timestamp</div><div>"
        << html_escape(transition.timestamp.has_value() ? format_timestamp(*transition.timestamp) : std::string("not carried in finalized transition record")) << "</div>"
        << "<div>Round</div><div>" << transition.round << "</div>"
+       << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(transition.data_source)) << "</div>"
+       << "<div>Snapshot Refreshed</div><div>"
+       << html_escape(explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms).empty()
+                          ? std::string("fresh live RPC")
+                          : format_timestamp(*transition.data_refreshed_unix_ms))
+       << "</div>"
        << "<div>Tx Count</div><div>" << transition.tx_count << "</div></div>"
        << "<div class=\"summary-actions\">"
        << copy_action("Copy Transition Hash", transition.hash)
@@ -2776,18 +3572,18 @@ Response handle_request(const Config& cfg, const std::string& req) {
   }
   if (path == "/api/status") {
     auto result = fetch_status_result(cfg);
-    return result.value.has_value() ? json_response(200, render_status_json(*result.value))
+    return result.value.has_value() ? json_response(200, render_status_json(*result.value, persisted_status_refreshed_unix_ms()))
                                     : json_error_response(*result.error);
   }
   if (path == "/api/committee") {
     auto status = fetch_status_result(cfg);
     if (!status.value.has_value()) return json_error_response(*status.error);
     auto result = fetch_committee_result(cfg, status.value->finalized_height);
-    return result.value.has_value() ? json_response(200, render_committee_json(*result.value))
+    return result.value.has_value() ? json_response(200, render_committee_json(*result.value, persisted_committee_refreshed_unix_ms()))
                                     : json_error_response(*result.error);
   }
   if (path == "/api/recent-tx") {
-    return json_response(200, render_recent_tx_json(fetch_recent_tx_results(cfg, 8)));
+    return json_response(200, render_recent_tx_json(fetch_recent_tx_results(cfg, 8), persisted_recent_refreshed_unix_ms()));
   }
   const std::string tx_prefix = "/tx/";
   const std::string transition_prefix = "/transition/";
@@ -2839,9 +3635,11 @@ Response handle_request(const Config& cfg, const std::string& req) {
 int main(int argc, char** argv) {
   auto cfg = parse_args(argc, argv);
   if (!cfg.has_value()) {
-    std::cerr << "usage: finalis-explorer [--bind 127.0.0.1] [--port 18080] [--rpc-url http://127.0.0.1:19444/rpc]\n";
+    std::cerr << "usage: finalis-explorer [--bind 127.0.0.1] [--port 18080] [--rpc-url http://127.0.0.1:19444/rpc] [--cache-path /path/to/cache.json]\n";
     return 1;
   }
+  if (cfg->cache_path.empty()) cfg->cache_path = default_explorer_cache_path(cfg->rpc_url);
+  load_persisted_explorer_snapshot(*cfg);
 
   if (!finalis::net::ensure_sockets()) {
     std::cerr << "socket init failed\n";

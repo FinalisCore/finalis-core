@@ -5,8 +5,11 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <variant>
+#include <vector>
 
 #include "common/types.hpp"
+#include "crypto/confidential.hpp"
 
 namespace finalis {
 
@@ -273,6 +276,51 @@ struct UtxoEntry {
 };
 
 using UtxoSet = std::map<OutPoint, UtxoEntry>;
+
+enum class UtxoOutputKind : std::uint8_t {
+  TRANSPARENT = 0,
+  CONFIDENTIAL = 1,
+};
+
+struct UtxoTransparentData {
+  TxOut out;
+  bool operator==(const UtxoTransparentData& other) const {
+    return out.value == other.out.value && out.script_pubkey == other.out.script_pubkey;
+  }
+};
+
+struct UtxoConfidentialData {
+  crypto::Commitment33 value_commitment{};
+  PubKey33 one_time_pubkey{};
+  PubKey33 ephemeral_pubkey{};
+  crypto::ScanTag scan_tag{};
+  Bytes memo;
+
+  bool operator==(const UtxoConfidentialData&) const = default;
+};
+
+struct UtxoEntryV2 {
+  UtxoOutputKind kind{UtxoOutputKind::TRANSPARENT};
+  std::variant<UtxoTransparentData, UtxoConfidentialData> body{UtxoTransparentData{}};
+
+  UtxoEntryV2() = default;
+  UtxoEntryV2(const UtxoEntry& entry) : kind(UtxoOutputKind::TRANSPARENT), body(UtxoTransparentData{entry.out}) {}
+  UtxoEntryV2(const TxOut& out_in) : kind(UtxoOutputKind::TRANSPARENT), body(UtxoTransparentData{out_in}) {}
+  UtxoEntryV2& operator=(const UtxoEntry& entry) {
+    kind = UtxoOutputKind::TRANSPARENT;
+    body = UtxoTransparentData{entry.out};
+    return *this;
+  }
+
+  bool operator==(const UtxoEntryV2& other) const { return kind == other.kind && body == other.body; }
+};
+
+using UtxoSetV2 = std::map<OutPoint, UtxoEntryV2>;
+
+Bytes serialize_utxo_entry_v2(const UtxoEntryV2& entry);
+std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b);
+std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry);
+UtxoSet downgrade_utxo_set_v1(const UtxoSetV2& utxos);
 
 struct ValidatorJoinRequestScriptData {
   PubKey32 validator_pubkey{};

@@ -49,6 +49,7 @@ const NetworkConfig kMainnet{
     .admission_pow_difficulty_bits = 0,
     .finality_binding_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .availability_recovery_activation_height = std::numeric_limits<std::uint64_t>::max(),
+    .confidential_utxo_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .default_seeds = {},
     .economics_policies =
         {
@@ -89,6 +90,10 @@ bool finality_binding_active_at_height(const NetworkConfig& network, std::uint64
 
 bool availability_recovery_active_at_height(const NetworkConfig& network, std::uint64_t height) {
   return height >= network.availability_recovery_activation_height;
+}
+
+bool confidential_utxo_active_at_height(const NetworkConfig& network, std::uint64_t height) {
+  return height >= network.confidential_utxo_activation_height;
 }
 
 bool admission_pow_enabled(const NetworkConfig& network) {

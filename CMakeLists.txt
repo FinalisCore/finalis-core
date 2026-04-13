@@ -17,6 +17,7 @@ set(CMAKE_AUTORCC ON)
 option(FINALIS_SANITIZE "Enable ASan/UBSan instrumentation" OFF)
 option(FINALIS_BUILD_FUZZ "Build fuzz harness executables" ON)
 option(FINALIS_STRICT_WARNINGS "Enable strict warning flags" OFF)
+option(FINALIS_USE_VENDORED_SECP256K1_ZKP "Prefer vendored secp256k1-zkp when available." ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(Qt5 COMPONENTS Widgets QUIET)
@@ -28,6 +29,63 @@ find_path(SODIUM_INCLUDE_DIR sodium.h)
 if(SODIUM_LIB AND SODIUM_INCLUDE_DIR)
   message(STATUS "Using libsodium")
   add_compile_definitions(SC_HAS_LIBSODIUM=1)
+endif()
+
+set(FINALIS_SECP256K1_TARGET "")
+set(FINALIS_SECP256K1_INCLUDE_DIR "")
+set(FINALIS_USE_SECP256K1_ZKP_BACKEND OFF)
+
+if(FINALIS_USE_VENDORED_SECP256K1_ZKP AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/secp256k1-zkp/CMakeLists.txt")
+  message(STATUS "Using vendored secp256k1-zkp")
+  set(SECP256K1_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_BUILD_EXHAUSTIVE_TESTS OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_BUILD_CTIME_TESTS OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_INSTALL OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_ECDH OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_RECOVERY OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_EXTRAKEYS ON CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_SCHNORRSIG ON CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_MUSIG OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_ELLSWIFT OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_GENERATOR ON CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_RANGEPROOF ON CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_SURJECTIONPROOF OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_WHITELIST OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_ECDSA_ADAPTOR OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_ECDSA_S2C OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_BPPP OFF CACHE BOOL "" FORCE)
+  set(SECP256K1_ENABLE_MODULE_SCHNORRSIG_HALFAGG OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/secp256k1-zkp EXCLUDE_FROM_ALL)
+  set(FINALIS_SECP256K1_TARGET secp256k1)
+  set(FINALIS_SECP256K1_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/secp256k1-zkp/include")
+  set(FINALIS_USE_SECP256K1_ZKP_BACKEND ON)
+  add_compile_definitions(SC_HAS_SECP256K1=1 SC_HAS_SECP256K1_ZKP=1)
+else()
+  find_library(SECP256K1_LIB secp256k1)
+  find_path(SECP256K1_INCLUDE_DIR secp256k1.h)
+  if(SECP256K1_LIB AND SECP256K1_INCLUDE_DIR)
+    message(STATUS "Using libsecp256k1")
+    add_compile_definitions(SC_HAS_SECP256K1=1)
+    set(FINALIS_SECP256K1_INCLUDE_DIR "${SECP256K1_INCLUDE_DIR}")
+  endif()
+  find_path(SECP256K1_ZKP_INCLUDE_DIR
+    NAMES
+      secp256k1_rangeproof.h
+    PATHS
+      ${SECP256K1_INCLUDE_DIR}
+      /usr/local/include
+      /usr/include
+  )
+  if(SECP256K1_LIB AND SECP256K1_ZKP_INCLUDE_DIR
+     AND EXISTS "${SECP256K1_ZKP_INCLUDE_DIR}/secp256k1_generator.h"
+     AND EXISTS "${SECP256K1_ZKP_INCLUDE_DIR}/secp256k1_extrakeys.h"
+     AND EXISTS "${SECP256K1_ZKP_INCLUDE_DIR}/secp256k1_schnorrsig.h")
+    message(STATUS "Using system secp256k1-zkp headers")
+    add_compile_definitions(SC_HAS_SECP256K1_ZKP=1)
+    set(FINALIS_USE_SECP256K1_ZKP_BACKEND ON)
+  endif()
 endif()
 
 find_library(ROCKSDB_LIB rocksdb)
@@ -47,6 +105,8 @@ add_library(finalis_core
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
   src/crypto/smt.cpp
+  src/crypto/confidential.cpp
+  src/crypto/stealth_address.cpp
   src/keystore/validator_keystore.cpp
   src/onboarding/validator_onboarding.cpp
   src/genesis/genesis.cpp
@@ -57,7 +117,9 @@ add_library(finalis_core
   src/privacy/mint_client.cpp
   src/privacy/mint_scripts.cpp
   src/wallet/utxo_selection.cpp
+  src/wallet/confidential_builder.cpp
   src/utxo/tx.cpp
+  src/utxo/confidential_tx.cpp
   src/utxo/validate.cpp
   src/utxo/signing.cpp
   src/policy/hashcash.cpp
@@ -91,6 +153,14 @@ target_link_libraries(finalis_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 if(SODIUM_LIB AND SODIUM_INCLUDE_DIR)
   target_include_directories(finalis_core PUBLIC ${SODIUM_INCLUDE_DIR})
   target_link_libraries(finalis_core PUBLIC ${SODIUM_LIB})
+endif()
+if(FINALIS_SECP256K1_INCLUDE_DIR)
+  target_include_directories(finalis_core PUBLIC ${FINALIS_SECP256K1_INCLUDE_DIR})
+endif()
+if(FINALIS_SECP256K1_TARGET)
+  target_link_libraries(finalis_core PUBLIC ${FINALIS_SECP256K1_TARGET})
+elseif(SECP256K1_LIB AND SECP256K1_INCLUDE_DIR)
+  target_link_libraries(finalis_core PUBLIC ${SECP256K1_LIB})
 endif()
 if(ROCKSDB_LIB AND ROCKSDB_INCLUDE_DIR)
   target_include_directories(finalis_core PUBLIC ${ROCKSDB_INCLUDE_DIR})
@@ -260,6 +330,7 @@ add_executable(finalis-tests
   tests/test_codec.cpp
   tests/test_chain_id.cpp
   tests/test_crypto.cpp
+  tests/test_confidential_tx.cpp
   tests/test_address.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp

@@ -10,7 +10,76 @@ namespace {
 constexpr std::uint64_t kMaxTxInputs = 10'000;
 constexpr std::uint64_t kMaxTxOutputs = 10'000;
 constexpr std::size_t kMaxScriptBytes = 256 * 1024;
+constexpr std::size_t kMaxMemoBytes = 64 * 1024;
 }  // namespace
+
+Bytes serialize_utxo_entry_v2(const UtxoEntryV2& entry) {
+  codec::ByteWriter w;
+  w.u8(static_cast<std::uint8_t>(entry.kind));
+  if (entry.kind == UtxoOutputKind::TRANSPARENT) {
+    const auto& transparent = std::get<UtxoTransparentData>(entry.body);
+    w.u64le(transparent.out.value);
+    w.varbytes(transparent.out.script_pubkey);
+    return w.take();
+  }
+  const auto& confidential = std::get<UtxoConfidentialData>(entry.body);
+  w.bytes_fixed(confidential.value_commitment.bytes);
+  w.bytes_fixed(confidential.one_time_pubkey);
+  w.bytes_fixed(confidential.ephemeral_pubkey);
+  w.u8(confidential.scan_tag.value);
+  w.varbytes(confidential.memo);
+  return w.take();
+}
+
+std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b) {
+  UtxoEntryV2 entry;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto kind = r.u8();
+        if (!kind) return false;
+        if (*kind > static_cast<std::uint8_t>(UtxoOutputKind::CONFIDENTIAL)) return false;
+        entry.kind = static_cast<UtxoOutputKind>(*kind);
+        if (entry.kind == UtxoOutputKind::TRANSPARENT) {
+          auto value = r.u64le();
+          auto script = r.varbytes();
+          if (!value || !script || script->size() > kMaxScriptBytes) return false;
+          entry.body = UtxoTransparentData{TxOut{*value, *script}};
+          return true;
+        }
+        auto value_commitment = r.bytes_fixed<33>();
+        auto one_time_pubkey = r.bytes_fixed<33>();
+        auto ephemeral_pubkey = r.bytes_fixed<33>();
+        auto scan_tag = r.u8();
+        auto memo = r.varbytes();
+        if (!value_commitment || !one_time_pubkey || !ephemeral_pubkey || !scan_tag || !memo) return false;
+        if (memo->size() > kMaxMemoBytes) return false;
+        entry.body = UtxoConfidentialData{
+            .value_commitment = crypto::Commitment33{*value_commitment},
+            .one_time_pubkey = *one_time_pubkey,
+            .ephemeral_pubkey = *ephemeral_pubkey,
+            .scan_tag = crypto::ScanTag{*scan_tag},
+            .memo = *memo,
+        };
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return entry;
+}
+
+std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry) {
+  if (entry.kind != UtxoOutputKind::TRANSPARENT) return std::nullopt;
+  return std::get<UtxoTransparentData>(entry.body).out;
+}
+
+UtxoSet downgrade_utxo_set_v1(const UtxoSetV2& utxos) {
+  UtxoSet out;
+  for (const auto& [op, entry] : utxos) {
+    const auto transparent = transparent_txout_from_utxo_entry(entry);
+    if (!transparent.has_value()) continue;
+    out.emplace(op, UtxoEntry{*transparent});
+  }
+  return out;
+}
 
 Bytes Tx::serialize_without_hashcash() const {
   codec::ByteWriter w;
@@ -53,6 +122,7 @@ std::optional<Tx> Tx::parse(const Bytes& b) {
           auto version = r.u32le();
           auto in_count = r.varint();
           if (!version || !in_count) return false;
+          if (*version != 1) return false;
           if (*in_count > kMaxTxInputs) return false;
           tx.version = *version;
 

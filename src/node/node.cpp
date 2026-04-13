@@ -45,6 +45,7 @@
 #include "genesis/genesis.hpp"
 #include "keystore/validator_keystore.hpp"
 #include "merkle/merkle.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 
 namespace finalis::node {
@@ -310,6 +311,17 @@ bool load_certified_ingress_record_from_db(const storage::DB& db, std::uint32_t 
   return true;
 }
 
+bool inspect_frontier_ordered_record_supported(const Bytes& raw_record, std::size_t index, Hash32* txid_out,
+                                               std::string* error) {
+  const auto tx = parse_any_tx(raw_record);
+  if (!tx.has_value()) {
+    if (error) *error = "frontier-ordered-record-parse-failed index=" + std::to_string(index);
+    return false;
+  }
+  if (txid_out) *txid_out = txid_any(*tx);
+  return true;
+}
+
 std::vector<std::string> parse_endpoint_list(const std::string& raw) {
   std::vector<std::string> out;
   std::string current;
@@ -501,6 +513,28 @@ bool debug_checkpoint_logs_enabled() {
 storage::SlashingRecord make_onchain_slash_record(const SlashEvidence& ev, const Hash32& txid, std::uint64_t observed_height);
 
 std::string finalized_write_marker_key() { return "FW:PENDING"; }
+
+std::string justify_summary(const std::optional<QuorumCertificate>& qc, const std::optional<TimeoutCertificate>& tc) {
+  if (qc.has_value()) {
+    return "qc(height=" + std::to_string(qc->height) + ",round=" + std::to_string(qc->round) +
+           ",transition=" + short_hash_hex(qc->frontier_transition_id) + ")";
+  }
+  if (tc.has_value()) {
+    return "tc(height=" + std::to_string(tc->height) + ",round=" + std::to_string(tc->round) + ")";
+  }
+  return "none";
+}
+
+std::string signer_set_summary(const std::vector<FinalitySig>& sigs) {
+  std::ostringstream oss;
+  bool first = true;
+  for (const auto& sig : sigs) {
+    if (!first) oss << ",";
+    first = false;
+    oss << short_pub_hex(sig.validator_pubkey);
+  }
+  return oss.str();
+}
 
 Bytes serialize_finalized_write_marker(std::uint64_t height, const Hash32& block_id) {
   codec::ByteWriter w;
@@ -824,13 +858,14 @@ bool same_tx_out(const TxOut& a, const TxOut& b) {
   return a.value == b.value && a.script_pubkey == b.script_pubkey;
 }
 
-bool same_utxos(const UtxoSet& a, const UtxoSet& b) {
+bool same_utxos(const UtxoSetV2& a, const UtxoSetV2& b) {
   if (a.size() != b.size()) return false;
   auto ita = a.begin();
   auto itb = b.begin();
   for (; ita != a.end(); ++ita, ++itb) {
-    if (ita->first.txid != itb->first.txid || ita->first.index != itb->first.index) return false;
-    if (!same_tx_out(ita->second.out, itb->second.out)) return false;
+    if (ita->first.txid != itb->first.txid || ita->first.index != itb->first.index || ita->second != itb->second) {
+      return false;
+    }
   }
   return true;
 }
@@ -1185,12 +1220,12 @@ FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_
   return cert;
 }
 
-StateRoots compute_roots_for_state(const UtxoSet& utxos, const consensus::ValidatorRegistry& validators,
+StateRoots compute_roots_for_state(const UtxoSetV2& utxos, const consensus::ValidatorRegistry& validators,
                                    std::uint32_t validation_rules_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(utxos.size());
   for (const auto& [op, ue] : utxos) {
-    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue)});
   }
 
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
@@ -1230,14 +1265,16 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
     if (!db.erase(key)) return false;
   }
   for (const auto& [op, entry] : state.utxos) {
-    if (!db.put_utxo(op, entry.out)) return false;
+    if (!db.put_utxo_v2(op, entry)) return false;
   }
 
   const std::string script_utxo_prefix = storage::key_script_utxo_prefix(Hash32{}).substr(0, 3);
   std::set<std::string> desired_script_utxos;
   desired_script_utxos.clear();
   for (const auto& [op, entry] : state.utxos) {
-    const auto scripthash = crypto::sha256(entry.out.script_pubkey);
+    const auto transparent = transparent_txout_from_utxo_entry(entry);
+    if (!transparent.has_value()) continue;
+    const auto scripthash = crypto::sha256(transparent->script_pubkey);
     desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
   }
   std::vector<std::string> script_utxos_to_erase;
@@ -1250,8 +1287,10 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
     if (!db.erase(key)) return false;
   }
   for (const auto& [op, entry] : state.utxos) {
-    const auto scripthash = crypto::sha256(entry.out.script_pubkey);
-    if (!db.put_script_utxo(scripthash, op, entry.out, state.finalized_height)) return false;
+    const auto transparent = transparent_txout_from_utxo_entry(entry);
+    if (!transparent.has_value()) continue;
+    const auto scripthash = crypto::sha256(transparent->script_pubkey);
+    if (!db.put_script_utxo(scripthash, op, *transparent, state.finalized_height)) return false;
   }
 
   for (const auto& [pub, info] : state.validators.all()) {
@@ -1536,12 +1575,12 @@ void sync_smt_tree(storage::DB& db, const std::string& tree_id, const std::vecto
   for (const auto& [k, v] : leaves) (void)db.put(storage::key_smt_leaf(tree_id, k), v);
 }
 
-StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSet& utxos,
+StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSetV2& utxos,
                                const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(utxos.size());
   for (const auto& [op, ue] : utxos) {
-    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue)});
   }
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
   validator_leaves.reserve(validators.all().size());
@@ -1570,6 +1609,7 @@ StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const Utxo
 Node::Node(NodeConfig cfg) : cfg_(std::move(cfg)) {
   finalized_identity_ = finalized_identity_for_runtime_tip(0, zero_hash());
   finalized_randomness_ = zero_hash();
+  confidential_policy_.activation_height = cfg_.network.confidential_utxo_activation_height;
   restart_debug_ = restart_debug_enabled();
 }
 
@@ -1826,8 +1866,12 @@ bool Node::init() {
         }
         requested_sync_artifacts_.clear();
         requested_sync_heights_.clear();
-        if (established_peer_count() == 0 && had_round_activity) {
-          const auto current_height = finalized_height_ + 1;
+        const auto current_height = finalized_height_ + 1;
+        const bool should_reset_round_state =
+            established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height) &&
+            (current_round_ > 0 || had_round_activity);
+        if (should_reset_round_state) {
+          current_round_ = 0;
           proposed_in_round_.clear();
           local_vote_reservations_.clear();
           local_timeout_vote_reservations_.clear();
@@ -1993,7 +2037,7 @@ bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_val
   (void)db_.erase(storage::key_consensus_state_commitment_cache());
   if (!verify_and_persist_consensus_state_commitment_locked(rebound_state)) return false;
 
-  const UtxoSet empty_utxos;
+  const UtxoSetV2 empty_utxos;
   (void)persist_state_roots(db_, 0, empty_utxos, validators_, kFixedValidationRulesVersion);
   (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   if (!db_.flush()) return false;
@@ -3326,7 +3370,7 @@ std::vector<FinalitySig> Node::canonicalize_finality_signatures_locked(const std
   return out;
 }
 
-bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
+bool Node::inject_tx_for_test(const AnyTx& tx, bool relay) {
   if (relay) return handle_tx(tx, false);
   std::lock_guard<std::mutex> lk(mu_);
   const auto min_bond_amount = effective_validator_min_bond_for_height(finalized_height_ + 1);
@@ -3346,7 +3390,8 @@ bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
           .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
             if (anchor_height == 0) return zero_hash();
             return db_.get_height_hash(anchor_height);
-          }});
+          },
+          .confidential_policy = &confidential_policy_});
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }
@@ -3403,8 +3448,8 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
 
   std::vector<Hash32> confirmed_txids;
   for (const auto& raw : record.ordered_records) {
-    auto tx = Tx::parse(raw);
-    if (tx.has_value()) confirmed_txids.push_back(tx->txid());
+    auto tx = parse_any_tx(raw);
+    if (tx.has_value()) confirmed_txids.push_back(txid_any(*tx));
   }
   mempool_.remove_confirmed(confirmed_txids);
   hydrate_runtime_from_canonical_state_locked(next_state);
@@ -3447,11 +3492,13 @@ std::optional<TxOut> Node::find_utxo_by_pubkey_hash_for_test(const std::array<st
                                                               OutPoint* outpoint) const {
   std::lock_guard<std::mutex> lk(mu_);
   for (const auto& [op, e] : utxos_) {
+    const auto txout = transparent_txout_from_utxo_entry(e);
+    if (!txout.has_value()) continue;
     std::array<std::uint8_t, 20> got{};
-    if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
+    if (!is_p2pkh_script_pubkey(txout->script_pubkey, &got)) continue;
     if (got != pkh) continue;
     if (outpoint) *outpoint = op;
-    return e.out;
+    return *txout;
   }
   return std::nullopt;
 }
@@ -3460,10 +3507,12 @@ std::vector<std::pair<OutPoint, TxOut>> Node::find_utxos_by_pubkey_hash_for_test
   std::vector<std::pair<OutPoint, TxOut>> out;
   std::lock_guard<std::mutex> lk(mu_);
   for (const auto& [op, e] : utxos_) {
+    const auto txout = transparent_txout_from_utxo_entry(e);
+    if (!txout.has_value()) continue;
     std::array<std::uint8_t, 20> got{};
-    if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
+    if (!is_p2pkh_script_pubkey(txout->script_pubkey, &got)) continue;
     if (got != pkh) continue;
-    out.push_back({op, e.out});
+    out.push_back({op, *txout});
   }
   return out;
 }
@@ -3471,7 +3520,9 @@ bool Node::has_utxo_for_test(const OutPoint& op, TxOut* out) const {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = utxos_.find(op);
   if (it == utxos_.end()) return false;
-  if (out) *out = it->second.out;
+  const auto txout = transparent_txout_from_utxo_entry(it->second);
+  if (!txout.has_value()) return false;
+  if (out) *out = *txout;
   return true;
 }
 std::string Node::proposer_path_for_next_height_for_test() const {
@@ -3558,10 +3609,10 @@ bool Node::seed_bonded_validator_for_test(const PubKey32& pub, const OutPoint& b
   if (!canonical_state_.has_value()) return false;
   auto updated = *canonical_state_;
   updated.validators.upsert(pub, *info);
-  updated.utxos[bond_outpoint] = UtxoEntry{bond_out};
+  updated.utxos[bond_outpoint] = UtxoEntryV2{bond_out};
   updated.state_commitment = consensus::consensus_state_commitment(canonical_derivation_config_locked(), updated);
 
-  if (!db_.put_utxo(bond_outpoint, bond_out)) return false;
+  if (!db_.put_utxo_v2(bond_outpoint, UtxoEntryV2{bond_out})) return false;
   if (!db_.put_validator(pub, *info)) return false;
   if (!persist_canonical_cache_rows(db_, updated)) return false;
   (void)db_.erase(storage::key_consensus_state_commitment_cache());
@@ -3947,7 +3998,8 @@ void Node::event_loop() {
               .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
                 if (anchor_height == 0) return zero_hash();
                 return db_.get_height_hash(anchor_height);
-              }});
+              },
+              .confidential_policy = &confidential_policy_});
       const std::uint64_t now_ms = this->now_ms();
       const std::uint64_t now_unix_ms = now_unix() * 1000;
       if (now_ms >= last_runtime_status_persist_ms_ + 1000) {
@@ -3955,11 +4007,13 @@ void Node::event_loop() {
         (void)db_.put_node_runtime_status_snapshot(runtime);
         last_runtime_status_persist_ms_ = now_ms;
       }
+      const std::uint64_t min_block_interval_ms = static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
+      const std::uint64_t ticket_window_floor_ms = std::min<std::uint64_t>(1000, min_block_interval_ms);
       const std::uint64_t ticket_window_ms =
-          std::max<std::uint64_t>(1000, static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms) / 2);
+          std::max<std::uint64_t>(ticket_window_floor_ms, min_block_interval_ms / 2);
       const bool ticket_window_elapsed = now_ms >= last_finalized_progress_ms_ + ticket_window_ms;
       const bool block_interval_elapsed =
-          now_ms >= last_finalized_progress_ms_ + static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
+          now_ms >= last_finalized_progress_ms_ + min_block_interval_ms;
       if (current_round_ == 0 && ticket_window_elapsed) {
         const std::uint64_t round0_start = last_finalized_progress_ms_ + ticket_window_ms;
         if (round_started_ms_ < round0_start) round_started_ms_ = round0_start;
@@ -5410,7 +5464,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         std::lock_guard<std::mutex> lk(mu_);
         if (accepted_tx_payloads_.contains(payload_id)) return;
       }
-      auto tx = Tx::parse(m->tx_bytes);
+      auto tx = parse_any_tx(m->tx_bytes);
       if (!tx.has_value()) {
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
@@ -5552,7 +5606,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     const bool allow_late_round0_after_first_timeout =
         from_network && msg.round == 0 && current_round_ == 1 && msg.height == finalized_height_ + 1;
     if (msg.round < current_round_ && !allow_late_round0_after_first_timeout) {
-      log_propose_soft_reject("stale-round", " local_round=" + std::to_string(current_round_));
+      log_propose_soft_reject("stale-round", " local_round=" + std::to_string(current_round_) +
+                                                 " justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
       return ProposeHandlingResult::SoftReject;
     }
     if (msg.prev_finalized_hash != finalized_identity_.id) {
@@ -5582,7 +5637,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       return ProposeHandlingResult::HardReject;
     }
     if (msg.round > 0 && !msg.justify_qc.has_value() && !msg.justify_tc.has_value()) {
-      log_propose_hard_reject("missing-justify");
+      log_propose_hard_reject("missing-justify", " local_round=" + std::to_string(current_round_) +
+                                                   " justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
       return ProposeHandlingResult::HardReject;
     }
     if (msg.justify_qc.has_value()) {
@@ -5629,7 +5685,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (msg.round > current_round_) {
       log_line("round-catchup height=" + std::to_string(msg.height) + " old_round=" + std::to_string(current_round_) +
                " new_round=" + std::to_string(msg.round) +
-               " reason=justified-propose");
+               " reason=justified-propose justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
       current_round_ = msg.round;
     }
 
@@ -5784,11 +5840,14 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
 
     if (!tr.accepted) {
       if (!tr.duplicate) {
-        log_vote_hard_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id));
+        log_vote_hard_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id) +
+                                                    " validator=" + short_pub_hex(vote.validator_pubkey));
         if (reject_reason) *reject_reason = "tracker-rejected";
         return VoteHandlingResult::HardReject;
       }
-      log_vote_soft_reject("duplicate", " transition=" + short_hash_hex(vote.frontier_transition_id));
+      log_vote_soft_reject("duplicate", " transition=" + short_hash_hex(vote.frontier_transition_id) +
+                                           " validator=" + short_pub_hex(vote.validator_pubkey) +
+                                           " peer_id=" + std::to_string(from_peer_id));
       if (reject_reason) *reject_reason = "duplicate";
       return VoteHandlingResult::SoftReject;
     }
@@ -5808,7 +5867,8 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
     finalize_ok = finalize_if_quorum(vote.frontier_transition_id, vote.height, vote.round);
     if (!finalize_ok) {
       log_line("vote-accepted-waiting height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
-               " transition=" + short_hash_hex(vote.frontier_transition_id));
+               " transition=" + short_hash_hex(vote.frontier_transition_id) +
+               " validator=" + short_pub_hex(vote.validator_pubkey));
     }
   }
 
@@ -6072,6 +6132,13 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
     if (error) *error = "frontier-prev-finalized-hash-mismatch";
     return false;
   }
+  for (std::size_t i = 0; i < proposal.ordered_records.size(); ++i) {
+    std::string ordered_record_error;
+    if (!inspect_frontier_ordered_record_supported(proposal.ordered_records[i], i, nullptr, &ordered_record_error)) {
+      if (error) *error = ordered_record_error;
+      return false;
+    }
+  }
   if (auto expected = leader_for_height_round(transition.height, transition.round); !expected.has_value() ||
                                                                       *expected != transition.leader_pubkey) {
     if (error) *error = "invalid-proposer";
@@ -6132,7 +6199,7 @@ bool Node::check_and_record_proposer_equivocation_locked(const FrontierTransitio
   return true;
 }
 
-bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
+bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
   if (from_network && !running_) return false;
   Hash32 txid{};
   {
@@ -6140,7 +6207,8 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
     if (from_network && !running_) return false;
     auto& verify_bucket = tx_verify_buckets_[from_peer_id];
     verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
-    if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, tx.inputs.size())), now_ms())) {
+    const auto input_count = std::visit([](const auto& value) { return value.inputs.size(); }, tx);
+    if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, input_count)), now_ms())) {
       return false;
     }
     const auto next_height = finalized_height_ + 1;
@@ -6161,7 +6229,8 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
             .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
               if (anchor_height == 0) return zero_hash();
               return db_.get_height_hash(anchor_height);
-            }});
+            },
+            .confidential_policy = &confidential_policy_});
     std::string err;
     std::uint64_t fee = 0;
     const auto min_relay_fee = effective_min_relay_fee_for_height(next_height);
@@ -6169,10 +6238,12 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
       if (debug_economics_logs_enabled()) {
         PubKey32 reg_pub{};
         std::optional<std::uint64_t> offered_bond;
-        for (const auto& out : tx.outputs) {
-          if (!is_validator_register_script(out.script_pubkey, &reg_pub)) continue;
-          offered_bond = out.value;
-          break;
+        if (std::holds_alternative<Tx>(tx)) {
+          for (const auto& out : std::get<Tx>(tx).outputs) {
+            if (!is_validator_register_script(out.script_pubkey, &reg_pub)) continue;
+            offered_bond = out.value;
+            break;
+          }
         }
         if (offered_bond.has_value()) {
           std::ostringstream oss;
@@ -6189,7 +6260,7 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
       return false;
     }
     if (fee < min_relay_fee) return false;
-    txid = tx.txid();
+    txid = txid_any(tx);
     std::string ingress_error;
     if (!maybe_certify_locally_accepted_tx_locked(tx, &ingress_error) && !ingress_error.empty()) {
       log_line("ingress-local-certify-skip txid=" + hex_encode32(txid) + " reason=" + ingress_error);
@@ -6236,7 +6307,7 @@ bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg
     }
   }
 
-  auto committee = ingress_committee_locked(0);
+  auto committee = ingress_committee_locked(msg.certificate.epoch);
   std::string append_error;
   if (!consensus::append_validated_ingress_record(db_, msg.certificate, msg.tx_bytes, committee, &append_error)) {
     if (error) *error = append_error;
@@ -6252,7 +6323,7 @@ bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg
   return true;
 }
 
-bool Node::maybe_certify_locally_accepted_tx_locked(const Tx& tx, std::string* error) {
+bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error) {
   if (!is_validator_) {
     if (error) *error = "local-not-validator";
     return false;
@@ -6272,14 +6343,14 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const Tx& tx, std::string* e
     return false;
   }
 
-  const auto txid = tx.txid();
+  const auto txid = txid_any(tx);
   if (db_.get_ingress_bytes(txid).has_value()) {
     if (error) error->clear();
     return true;
   }
 
   const auto lane_state = db_.get_lane_state(lane);
-  const Bytes tx_bytes = tx.serialize();
+  const Bytes tx_bytes = serialize_any_tx(tx);
 
   IngressCertificate cert;
   cert.epoch = consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks);
@@ -6335,7 +6406,8 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   if (sigs.size() < quorum) {
     std::ostringstream oss;
     oss << "finalize-skip height=" << height << " round=" << round << " transition=" << short_hash_hex(block_id)
-        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << quorum;
+        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << quorum
+        << " signers=" << signer_set_summary(sigs);
     if (debug_finality_logs_enabled()) {
       oss << " committee_size=" << committee.size();
       if (auto proposer = leader_for_height_round(height, round); proposer.has_value()) {
@@ -6447,6 +6519,15 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                  " reason=" + ingress_error);
         return std::nullopt;
       }
+      std::string ordered_record_error;
+      if (!inspect_frontier_ordered_record_supported(ingress.tx_bytes, selection.ordered_records.size(), nullptr,
+                                                     &ordered_record_error)) {
+        last_test_hook_error_ = "frontier-build-ordered-record-invalid:" + ordered_record_error;
+        log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
+                 " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
+                 " reason=" + ordered_record_error);
+        return std::nullopt;
+      }
       if (selection.ordered_records.size() >= kMaxBlockTxs ||
           total_bytes + ingress.tx_bytes.size() > kMaxBlockBytes) {
         capped = true;
@@ -6474,7 +6555,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
         if (anchor_height == 0) return zero_hash();
         return db_.get_height_hash(anchor_height);
-      }};
+      },
+      .confidential_policy = &confidential_policy_};
 
   consensus::FrontierExecutionResult result;
   std::string validation_error;
@@ -6653,7 +6735,7 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
   }
 }
 
-void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
+void Node::broadcast_tx(const AnyTx& tx, int skip_peer_id) {
   if (cfg_.disable_p2p) {
     if (!running_) return;
     std::vector<Node*> peers;
@@ -6666,7 +6748,7 @@ void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
       spawn_local_bus_task([peer, tx]() { peer->handle_tx(tx, true); });
     }
   } else {
-    const auto payload = p2p::ser_tx(p2p::TxMsg{tx.serialize()});
+    const auto payload = p2p::ser_tx(p2p::TxMsg{serialize_any_tx(tx)});
     for (int id : p2p_.peer_ids()) {
       if (id == skip_peer_id) continue;
       (void)p2p_.send_to(id, p2p::MsgType::TX, payload, true);
@@ -6702,7 +6784,7 @@ void Node::broadcast_ingress_record(const IngressCertificate& cert, const Bytes&
   }
 }
 
-void Node::maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int skip_peer_id) {
+void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id) {
   const std::uint64_t next_height = finalized_height_ + 1;
   auto committee = ingress_committee_locked(next_height);
   if (committee.empty()) return;
@@ -6734,7 +6816,7 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int ski
     if (it != peer_validator_pubkeys_.end() && it->second == designated_certifier) return;
   }
 
-  const auto payload = p2p::ser_tx(p2p::TxMsg{tx.serialize()});
+  const auto payload = p2p::ser_tx(p2p::TxMsg{serialize_any_tx(tx)});
   for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
     if (peer_id == skip_peer_id) continue;
     if (peer_pub != designated_certifier) continue;
@@ -6747,7 +6829,7 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const Tx& tx, int ski
   }
 }
 
-bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSet& prev_utxos) {
+bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos) {
   if (record.transition.next_frontier !=
       record.transition.prev_frontier + static_cast<std::uint64_t>(record.ordered_records.size())) {
     log_line("finalized-state-invariant-violation source=runtime-write-frontier-continuity height=" +
@@ -6760,22 +6842,28 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
   for (const auto& ordered_record : record.ordered_records) {
     ++seq;
     if (!db_.put_ingress_record(seq, ordered_record)) return false;
-    auto tx = Tx::parse(ordered_record);
+    auto tx = parse_any_tx(ordered_record);
     if (!tx.has_value()) {
       log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
                std::to_string(record.transition.height));
       return false;
     }
-    if (!db_.put_tx_index(tx->txid(), record.transition.height, tx_index++, ordered_record)) return false;
-    for (const auto& input : tx->inputs) {
-      const auto prev_it = prev_utxos.find(OutPoint{input.prev_txid, input.prev_index});
-      if (prev_it == prev_utxos.end()) continue;
-      const auto spent_scripthash = crypto::sha256(prev_it->second.out.script_pubkey);
-      if (!db_.add_script_history(spent_scripthash, record.transition.height, tx->txid())) return false;
-    }
-    for (const auto& output : tx->outputs) {
-      const auto received_scripthash = crypto::sha256(output.script_pubkey);
-      if (!db_.add_script_history(received_scripthash, record.transition.height, tx->txid())) return false;
+    const Hash32 txid = txid_any(*tx);
+    if (!db_.put_tx_index(txid, record.transition.height, tx_index++, ordered_record)) return false;
+    if (std::holds_alternative<Tx>(*tx)) {
+      const auto& legacy = std::get<Tx>(*tx);
+      for (const auto& input : legacy.inputs) {
+        const auto prev_it = prev_utxos.find(OutPoint{input.prev_txid, input.prev_index});
+        if (prev_it == prev_utxos.end()) continue;
+        const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
+        if (!spent_out.has_value()) continue;
+        const auto spent_scripthash = crypto::sha256(spent_out->script_pubkey);
+        if (!db_.add_script_history(spent_scripthash, record.transition.height, txid)) return false;
+      }
+      for (const auto& output : legacy.outputs) {
+        const auto received_scripthash = crypto::sha256(output.script_pubkey);
+        if (!db_.add_script_history(received_scripthash, record.transition.height, txid)) return false;
+      }
     }
   }
   if (!db_.set_finalized_ingress_tip(record.transition.next_frontier)) return false;
@@ -6840,6 +6928,7 @@ consensus::CanonicalDerivationConfig Node::canonical_derivation_config_locked() 
   cfg.availability = cfg_.availability;
   cfg.availability_min_eligible_operators = cfg_.availability_min_eligible_operators;
   cfg.validation_rules_version = kFixedValidationRulesVersion;
+  cfg.confidential_policy = confidential_policy_;
   cfg.finalized_hash_at_height = [this](std::uint64_t height) -> std::optional<Hash32> {
     if (height == 0) return zero_hash();
     return db_.get_height_hash(height);
@@ -6993,7 +7082,7 @@ bool Node::init_mainnet_genesis() {
       vi.unbond_height = 0;
       vr.upsert(pub, vi);
     }
-    const UtxoSet empty_utxos;
+    const UtxoSetV2 empty_utxos;
     (void)persist_state_roots(db_, 0, empty_utxos, vr, kFixedValidationRulesVersion);
   }
   {
@@ -7135,7 +7224,7 @@ bool Node::load_state() {
       persisted_commitment->hash != expected_commitment.hash;
   bool canonical_cache_rewrite_needed = stale_canonical_cache_tip;
 
-  const auto persisted_utxos = db_.load_utxos();
+  const auto persisted_utxos = db_.load_utxos_v2();
   if (!persisted_utxos.empty() && !same_utxos(persisted_utxos, derived_state.utxos)) {
     if (using_frontier_replay) {
       log_line("canonical-cache-rewrite source=load-state-utxo-cache-mismatch");
@@ -7700,8 +7789,12 @@ void Node::maybe_request_getaddr(int peer_id) {
   (void)p2p_.send_to(peer_id, p2p::MsgType::GETADDR, p2p::ser_getaddr(p2p::GetAddrMsg{}), true);
 }
 
-std::vector<PubKey32> Node::ingress_committee_locked(std::uint64_t) const {
-  auto committee = validators_.active_sorted(finalized_height_ + 1);
+std::vector<PubKey32> Node::ingress_committee_locked(std::uint64_t height) const {
+  if (height == 0) return {};
+  if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(height); checkpoint.has_value()) {
+    return consensus::checkpoint_committee_for_round(*checkpoint, 0);
+  }
+  auto committee = validators_.active_sorted(height);
   if (committee.empty()) committee = validators_.active_sorted(1);
   return committee;
 }
@@ -7839,7 +7932,6 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
     return false;
   }
 
-  auto committee = ingress_committee_locked(0);
   auto simulated_state = db_.get_lane_state(msg.lane);
   std::string validation_error;
   std::size_t prevalidation_bytes = 0;
@@ -7888,6 +7980,7 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
       return false;
     }
     validation_error.clear();
+    const auto committee = ingress_committee_locked(record.certificate.epoch);
     if (!consensus::verify_ingress_certificate(record.certificate, committee, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
@@ -7911,6 +8004,7 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
 
   for (const auto& record : msg.records) {
     validation_error.clear();
+    const auto committee = ingress_committee_locked(record.certificate.epoch);
     if (!consensus::append_validated_ingress_record(db_, record.certificate, record.tx_bytes, committee, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-append-failed peer_id=" + std::to_string(peer_id) + " lane=" +

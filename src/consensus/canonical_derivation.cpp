@@ -324,14 +324,14 @@ Hash32 frontier_settlement_txid(const FrontierTransition& transition) {
   return crypto::sha256d(w.data());
 }
 
-void apply_frontier_settlement_to_utxos(const FrontierTransition& transition, UtxoSet* utxos) {
+void apply_frontier_settlement_to_utxos(const FrontierTransition& transition, UtxoSetV2* utxos) {
   if (!utxos) return;
   const auto settlement_txid = frontier_settlement_txid(transition);
   for (std::uint32_t out_index = 0; out_index < transition.settlement.outputs.size(); ++out_index) {
     const auto& [pub, units] = transition.settlement.outputs[out_index];
     const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
     (*utxos)[OutPoint{settlement_txid, out_index}] =
-        UtxoEntry{TxOut{units, address::p2pkh_script_pubkey(pkh)}};
+        UtxoEntryV2{TxOut{units, address::p2pkh_script_pubkey(pkh)}};
   }
 }
 
@@ -752,7 +752,7 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
 
 void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
                                             const std::vector<Tx>& txs, std::size_t input_start_index,
-                                            const UtxoSet& pre_utxos, std::uint64_t height) {
+                                            const UtxoSetV2& pre_utxos, std::uint64_t height) {
   state->validators.set_rules(ValidatorRules{
       .min_bond = effective_validator_min_bond_for_height(cfg, *state, height),
       .warmup_blocks = cfg.validator_warmup_blocks,
@@ -769,9 +769,11 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
       OutPoint op{in.prev_txid, in.prev_index};
       auto it = pre_utxos.find(op);
       if (it == pre_utxos.end()) continue;
+      const auto prev_out = transparent_txout_from_utxo_entry(it->second);
+      if (!prev_out.has_value()) continue;
       PubKey32 pub{};
       SlashEvidence evidence;
-      if (is_validator_register_script(it->second.out.script_pubkey, &pub)) {
+      if (is_validator_register_script(prev_out->script_pubkey, &pub)) {
         if (parse_slash_script_sig(in.script_sig, &evidence)) {
           state->validators.ban(pub, height);
           (void)state->validators.finalize_withdrawal(pub);
@@ -780,7 +782,7 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
         }
         continue;
       }
-      if (is_validator_unbond_script(it->second.out.script_pubkey, &pub)) {
+      if (is_validator_unbond_script(prev_out->script_pubkey, &pub)) {
         if (parse_slash_script_sig(in.script_sig, &evidence)) state->validators.ban(pub, height);
         (void)state->validators.finalize_withdrawal(pub);
       }
@@ -822,7 +824,7 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
 }
 
 void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state, const Block& block,
-                                   const UtxoSet& pre_utxos, std::uint64_t height) {
+                                   const UtxoSetV2& pre_utxos, std::uint64_t height) {
   apply_validator_state_changes_from_txs(cfg, state, block.txs, 1, pre_utxos, height);
 }
 
@@ -848,7 +850,7 @@ Hash32 frontier_finality_link_hash(const FrontierTransition& transition) {
 bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
                                            const std::vector<PubKey32>& observed_signers,
-                                           std::uint64_t accepted_fee_units, const UtxoSet& post_execution_utxos,
+                                           std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
                                            std::string* error) {
   if (!transition) {
@@ -895,7 +897,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   transition->observed_signers = canonical_signers;
   transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
   transition->settlement_commitment = transition->settlement.commitment();
-  UtxoSet settled_utxos = post_execution_utxos;
+  UtxoSetV2 settled_utxos = post_execution_utxos;
   apply_frontier_settlement_to_utxos(*transition, &settled_utxos);
   transition->next_state_root = frontier_utxo_state_root(settled_utxos);
   return true;
@@ -906,7 +908,7 @@ bool populate_frontier_transition_metadata_legacy_for_replay(const CanonicalDeri
                                                              std::uint32_t round, const PubKey32& leader_pubkey,
                                                              const std::vector<PubKey32>& observed_signers,
                                                              std::uint64_t accepted_fee_units,
-                                                             const UtxoSet& post_execution_utxos,
+                                                             const UtxoSetV2& post_execution_utxos,
                                                              FrontierTransition* transition,
                                                              std::string* error) {
   if (!transition) {
@@ -950,7 +952,7 @@ bool populate_frontier_transition_metadata_legacy_for_replay(const CanonicalDeri
   transition->observed_signers = canonical_signers;
   transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
   transition->settlement_commitment = transition->settlement.commitment();
-  UtxoSet settled_utxos = post_execution_utxos;
+  UtxoSetV2 settled_utxos = post_execution_utxos;
   apply_frontier_settlement_to_utxos(*transition, &settled_utxos);
   transition->next_state_root = frontier_utxo_state_root(settled_utxos);
   return true;
@@ -1152,7 +1154,7 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     *next_vector = prev.finalized_frontier_vector;
     *next_lane_roots = prev.finalized_lane_roots;
     for (const auto& raw : ordered_records) {
-      const auto tx = Tx::parse(raw);
+      const auto tx = parse_any_tx(raw);
       if (!tx.has_value()) {
         if (cursor_error) *cursor_error = "frontier-certified-ingress-parse-failed";
         return false;
@@ -1191,6 +1193,7 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
               if (h == prev.finalized_height) return prev.finalized_identity.id;
               return std::nullopt;
             },
+        .confidential_policy = &cfg.confidential_policy,
     };
   };
 
@@ -1494,8 +1497,13 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   accrue_epoch_reward_state_for_frontier(cfg, &next, record.transition, committee);
   update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, committee,
                                                        record.transition.observed_signers);
-  const UtxoSet pre_utxos = next.utxos;
-  apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos, record.transition.height);
+  const UtxoSetV2 pre_utxos = next.utxos;
+  std::vector<Tx> accepted_legacy_txs;
+  accepted_legacy_txs.reserve(recomputed.accepted_txs.size());
+  for (const auto& tx : recomputed.accepted_txs) {
+    if (std::holds_alternative<Tx>(tx)) accepted_legacy_txs.push_back(std::get<Tx>(tx));
+  }
+  apply_validator_state_changes_from_txs(cfg, &next, accepted_legacy_txs, 0, pre_utxos, record.transition.height);
   next.finalized_height = record.transition.height;
   next.finalized_frontier = recomputed.transition.next_frontier;
   next.finalized_frontier_vector = recomputed.transition.next_vector;
@@ -1614,7 +1622,7 @@ Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const Ca
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(state.utxos.size());
   for (const auto& [op, ue] : state.utxos) {
-    utxo_leaves.push_back({utxo_commitment_key(op), utxo_commitment_value(ue.out)});
+    utxo_leaves.push_back({utxo_commitment_key(op), utxo_commitment_value(ue)});
   }
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
   validator_leaves.reserve(state.validators.all().size());

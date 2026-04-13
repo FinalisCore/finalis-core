@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <set>
+#include <type_traits>
 
 #include "codec/bytes.hpp"
 #include "common/chain_id.hpp"
@@ -50,6 +51,22 @@ std::vector<OutPoint> tx_input_outpoints(const Tx& tx) {
   return out;
 }
 
+std::vector<OutPoint> txv2_input_outpoints(const TxV2& tx) {
+  std::vector<OutPoint> out;
+  out.reserve(tx.inputs.size());
+  for (const auto& in : tx.inputs) out.push_back(OutPoint{in.prev_txid, in.prev_index});
+  return out;
+}
+
+UtxoSet legacy_transparent_view(const UtxoSetV2& utxos) {
+  UtxoSet out;
+  for (const auto& [op, entry] : utxos) {
+    if (entry.kind != UtxoOutputKind::TRANSPARENT) continue;
+    out.emplace(op, UtxoEntry{std::get<UtxoTransparentData>(entry.body).out});
+  }
+  return out;
+}
+
 bool consume_verify_budget(std::size_t* remaining, std::size_t cost, std::string* err) {
   if (!remaining) return true;
   if (*remaining < cost) {
@@ -61,6 +78,14 @@ bool consume_verify_budget(std::size_t* remaining, std::size_t cost, std::string
 }
 
 }  // namespace
+
+UtxoSetV2 upgrade_utxo_set_v2(const UtxoSet& utxos) {
+  UtxoSetV2 out;
+  for (const auto& [op, entry] : utxos) {
+    out.emplace(op, UtxoEntryV2{entry.out});
+  }
+  return out;
+}
 
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash) {
   if (script_pubkey.size() != 25) return false;
@@ -119,6 +144,41 @@ std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_
   w.u32le(input_index);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
+}
+
+std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t input_index) {
+  if (input_index >= tx.inputs.size()) return std::nullopt;
+  TxV2 signing = tx;
+  for (auto& in : signing.inputs) {
+    if (in.kind == TxInputKind::TRANSPARENT) {
+      std::get<TransparentInputWitnessV2>(in.witness).script_sig.clear();
+    } else {
+      std::get<ConfidentialInputWitnessV2>(in.witness).spend_sig.fill(0);
+    }
+  }
+  const Hash32 txh = crypto::sha256d(signing.serialize());
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '2'});
+  w.u32le(input_index);
+  w.bytes_fixed(txh);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+std::optional<Hash32> balance_proof_message_v2(const TxV2& tx) {
+  TxV2 signing = tx;
+  for (auto& in : signing.inputs) {
+    if (in.kind == TxInputKind::TRANSPARENT) {
+      std::get<TransparentInputWitnessV2>(in.witness).script_sig.clear();
+    } else {
+      std::get<ConfidentialInputWitnessV2>(in.witness).spend_sig.fill(0);
+    }
+  }
+  signing.balance_proof.excess_sig.fill(0);
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'B', 'A', 'L', '-', 'V', '2'});
+  w.bytes(signing.serialize());
+  return crypto::sha256d(w.data());
 }
 
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
@@ -621,6 +681,336 @@ void apply_block_to_utxo(const Block& block, UtxoSet& utxos) {
       utxos[OutPoint{txid, out_i}] = UtxoEntry{block.txs[i].outputs[out_i]};
     }
   }
+}
+
+AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
+                                     const SpecialValidationContext* ctx) {
+  AnyTxValidationResult out;
+  out.cost.serialized_size = tx.serialize().size();
+
+  if (!ctx || !ctx->confidential_policy) {
+    out.error = "missing confidential policy context";
+    return out;
+  }
+  const auto& policy = *ctx->confidential_policy;
+  if (ctx->current_height < policy.activation_height) {
+    out.error = "confidential tx not active";
+    return out;
+  }
+  if (tx.version != static_cast<std::uint32_t>(TxVersionKind::CONFIDENTIAL_V2)) {
+    out.error = "unsupported tx version";
+    return out;
+  }
+  if (tx_index_in_block == 0) {
+    out.error = "confidential coinbase not supported";
+    return out;
+  }
+  if (tx.lock_time != 0) {
+    out.error = "lock_time must be 0 in v2";
+    return out;
+  }
+  if (tx.inputs.empty() || tx.outputs.empty()) {
+    out.error = "tx inputs/outputs empty";
+    return out;
+  }
+  if (tx.inputs.size() > policy.max_inputs_per_tx) {
+    out.error = "tx has too many inputs";
+    return out;
+  }
+  if (tx.outputs.size() > policy.max_outputs_per_tx) {
+    out.error = "tx has too many outputs";
+    return out;
+  }
+  if (tx.fee > policy.max_fee) {
+    out.error = "fee too large";
+    return out;
+  }
+
+  std::size_t confidential_input_count = 0;
+  std::size_t confidential_output_count = 0;
+  std::size_t total_range_proof_bytes = 0;
+  const bool zero_excess_pubkey =
+      std::all_of(tx.balance_proof.excess_pubkey.begin(), tx.balance_proof.excess_pubkey.end(),
+                  [](std::uint8_t b) { return b == 0; });
+  const bool zero_excess_sig =
+      std::all_of(tx.balance_proof.excess_sig.begin(), tx.balance_proof.excess_sig.end(),
+                  [](std::uint8_t b) { return b == 0; });
+  std::vector<crypto::Commitment33> proof_commitments;
+  std::vector<crypto::ProofBytes> proofs;
+  std::uint64_t in_sum = 0;
+  std::uint64_t out_sum = 0;
+  std::set<OutPoint> seen_inputs;
+  std::vector<crypto::Commitment33> input_commitments;
+  std::vector<crypto::Commitment33> non_excess_output_commitments;
+
+  if (!crypto::commitment_is_identity(tx.balance_proof.excess_commitment) &&
+      !crypto::commitment_is_canonical(tx.balance_proof.excess_commitment)) {
+    out.error = "invalid excess commitment";
+    return out;
+  }
+
+  for (std::size_t input_index = 0; input_index < tx.inputs.size(); ++input_index) {
+    const auto& input = tx.inputs[input_index];
+    const OutPoint op{input.prev_txid, input.prev_index};
+    if (!seen_inputs.insert(op).second) {
+      out.error = "duplicate input outpoint";
+      return out;
+    }
+    auto it = utxos.find(op);
+    if (it == utxos.end()) {
+      out.error = "missing utxo";
+      return out;
+    }
+    if (input.kind == TxInputKind::CONFIDENTIAL) {
+      ++confidential_input_count;
+      if (!crypto::confidential_backend_status().excess_authorization_available) {
+        out.error = "confidential inputs unsupported by zkp backend";
+        return out;
+      }
+      if (input.sequence != 0xFFFFFFFF) {
+        out.error = "sequence must be FFFFFFFF";
+        return out;
+      }
+      if (it->second.kind != UtxoOutputKind::CONFIDENTIAL) {
+        out.error = "confidential input cannot spend transparent utxo";
+        return out;
+      }
+      const auto& prev_out = std::get<UtxoConfidentialData>(it->second.body);
+      const auto& witness = std::get<ConfidentialInputWitnessV2>(input.witness);
+      if (!crypto::compressed_pubkey33_is_canonical(witness.one_time_pubkey)) {
+        out.error = "invalid confidential input one_time_pubkey";
+        return out;
+      }
+      if (witness.one_time_pubkey != prev_out.one_time_pubkey) {
+        out.error = "confidential input one_time_pubkey mismatch";
+        return out;
+      }
+      const auto msg = signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+      if (!msg.has_value()) {
+        out.error = "sighash failed";
+        return out;
+      }
+      Hash32 msg32{};
+      std::copy(msg->begin(), msg->end(), msg32.begin());
+      if (!crypto::verify_schnorr_authorization(msg32, witness.one_time_pubkey, witness.spend_sig)) {
+        out.error = "confidential input authorization invalid";
+        return out;
+      }
+      input_commitments.push_back(prev_out.value_commitment);
+      continue;
+    }
+    if (it->second.kind != UtxoOutputKind::TRANSPARENT) {
+      out.error = "transparent input cannot spend confidential utxo";
+      return out;
+    }
+    const auto& prev_out = std::get<UtxoTransparentData>(it->second.body).out;
+    if (input.sequence != 0xFFFFFFFF) {
+      out.error = "sequence must be FFFFFFFF";
+      return out;
+    }
+    std::array<std::uint8_t, 20> pkh{};
+    if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, &pkh)) {
+      out.error = "v2 transparent inputs currently support P2PKH only";
+      return out;
+    }
+    const auto& witness = std::get<TransparentInputWitnessV2>(input.witness);
+    Sig64 sig{};
+    PubKey32 pub{};
+    if (!is_p2pkh_script_sig(witness.script_sig, &sig, &pub)) {
+      out.error = "bad script_sig";
+      return out;
+    }
+    const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
+    if (!std::equal(derived.begin(), derived.end(), pkh.begin())) {
+      out.error = "pubkey hash mismatch";
+      return out;
+    }
+    const auto msg = signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+    if (!msg.has_value()) {
+      out.error = "sighash failed";
+      return out;
+    }
+    if (!crypto::ed25519_verify(*msg, sig, pub)) {
+      out.error = "signature invalid";
+      return out;
+    }
+    in_sum += prev_out.value;
+    input_commitments.push_back(crypto::transparent_amount_commitment(prev_out.value));
+  }
+
+  for (const auto& output : tx.outputs) {
+    if (output.kind == TxOutputKind::TRANSPARENT) {
+      const auto& transparent = std::get<TransparentTxOutV2>(output.body);
+      if (!is_supported_base_layer_output_script(transparent.script_pubkey)) {
+        out.error = "unsupported script_pubkey";
+        return out;
+      }
+      out_sum += transparent.value;
+      non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(transparent.value));
+      continue;
+    }
+    ++confidential_output_count;
+    if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+      out.error = "confidential outputs unsupported by zkp backend";
+      return out;
+    }
+    const auto& confidential = std::get<ConfidentialTxOutV2>(output.body);
+    if (!crypto::commitment_is_canonical(confidential.value_commitment)) {
+      out.error = "invalid confidential value commitment";
+      return out;
+    }
+    if (!crypto::compressed_pubkey33_is_canonical(confidential.one_time_pubkey)) {
+      out.error = "invalid confidential one_time_pubkey";
+      return out;
+    }
+    if (!crypto::compressed_pubkey33_is_canonical(confidential.ephemeral_pubkey)) {
+      out.error = "invalid confidential ephemeral_pubkey";
+      return out;
+    }
+    if (confidential.memo.size() > policy.max_memo_bytes) {
+      out.error = "confidential memo too large";
+      return out;
+    }
+    if (confidential.range_proof.bytes.empty()) {
+      out.error = "missing confidential range proof";
+      return out;
+    }
+    if (confidential.range_proof.bytes.size() > policy.max_range_proof_bytes) {
+      out.error = "confidential range proof too large";
+      return out;
+    }
+    total_range_proof_bytes += confidential.range_proof.bytes.size();
+    proof_commitments.push_back(confidential.value_commitment);
+    proofs.push_back(confidential.range_proof);
+    non_excess_output_commitments.push_back(confidential.value_commitment);
+    out.cost.confidential_verify_weight += crypto::range_proof_verify_weight(confidential.range_proof);
+  }
+
+  if (confidential_input_count > policy.max_confidential_inputs_per_tx) {
+    out.error = "too many confidential inputs";
+    return out;
+  }
+  if (confidential_output_count > policy.max_confidential_outputs_per_tx) {
+    out.error = "too many confidential outputs";
+    return out;
+  }
+  if (total_range_proof_bytes > policy.max_total_proof_bytes_per_tx) {
+    out.error = "too many proof bytes";
+    return out;
+  }
+  if (!proof_commitments.empty() && !crypto::verify_output_range_proofs_batch(proof_commitments, proofs)) {
+    out.error = "range proof invalid";
+    return out;
+  }
+
+  if (confidential_output_count == 0 && confidential_input_count == 0) {
+    if (in_sum < out_sum || in_sum - out_sum != tx.fee) {
+      out.error = "fee mismatch";
+      return out;
+    }
+  } else if (confidential_input_count == 0 && (in_sum < out_sum || in_sum - out_sum < tx.fee)) {
+    out.error = "insufficient transparent input value";
+    return out;
+  }
+
+  non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(tx.fee));
+
+  std::vector<crypto::Commitment33> negative_commitments = non_excess_output_commitments;
+  negative_commitments.push_back(tx.balance_proof.excess_commitment);
+  if (!crypto::verify_commitment_tally(input_commitments, negative_commitments)) {
+    out.error = "commitment balance mismatch";
+    return out;
+  }
+
+  if (crypto::commitment_is_identity(tx.balance_proof.excess_commitment)) {
+    if (!zero_excess_pubkey || !zero_excess_sig) {
+      out.error = "identity excess must not carry authorization";
+      return out;
+    }
+  } else {
+    if (!crypto::confidential_backend_status().excess_authorization_available) {
+      out.error = "excess authorization unsupported by zkp backend";
+      return out;
+    }
+    if (!crypto::xonly_pubkey32_is_canonical(tx.balance_proof.excess_pubkey)) {
+      out.error = "invalid excess pubkey";
+      return out;
+    }
+    const auto msg = balance_proof_message_v2(tx);
+    if (!msg.has_value()) {
+      out.error = "balance proof sighash failed";
+      return out;
+    }
+    if (!crypto::verify_excess_authorization(*msg, tx.balance_proof.excess_commitment,
+                                             tx.balance_proof.excess_pubkey, tx.balance_proof.excess_sig)) {
+      out.error = "excess authorization invalid";
+      return out;
+    }
+  }
+
+  out.ok = true;
+  out.cost.fee = tx.fee;
+  return out;
+}
+
+AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
+                                      const SpecialValidationContext* ctx) {
+  return std::visit(
+      [&](const auto& value) -> AnyTxValidationResult {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, Tx>) {
+          const auto vr = validate_tx(value, tx_index_in_block, legacy_transparent_view(utxos), ctx);
+          return AnyTxValidationResult{
+              .ok = vr.ok,
+              .error = vr.error,
+              .cost = TxValidationCost{.fee = vr.fee, .confidential_verify_weight = 0, .serialized_size = value.serialize().size()},
+          };
+        } else {
+          return validate_tx_v2(value, tx_index_in_block, utxos, ctx);
+        }
+      },
+      tx);
+}
+
+void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
+  std::visit(
+      [&](const auto& value) {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, Tx>) {
+          for (const auto& in : value.inputs) {
+            utxos.erase(OutPoint{in.prev_txid, in.prev_index});
+          }
+          const Hash32 txid = value.txid();
+          for (std::uint32_t out_i = 0; out_i < value.outputs.size(); ++out_i) {
+            utxos[OutPoint{txid, out_i}] = UtxoEntryV2{value.outputs[out_i]};
+          }
+        } else {
+          for (const auto& in : value.inputs) {
+            utxos.erase(OutPoint{in.prev_txid, in.prev_index});
+          }
+          const Hash32 txid = value.txid();
+          for (std::uint32_t out_i = 0; out_i < value.outputs.size(); ++out_i) {
+            const auto& out = value.outputs[out_i];
+            if (out.kind == TxOutputKind::TRANSPARENT) {
+              const auto& transparent = std::get<TransparentTxOutV2>(out.body);
+              utxos[OutPoint{txid, out_i}] = UtxoEntryV2{TxOut{transparent.value, transparent.script_pubkey}};
+            } else {
+              const auto& confidential = std::get<ConfidentialTxOutV2>(out.body);
+              UtxoEntryV2 entry;
+              entry.kind = UtxoOutputKind::CONFIDENTIAL;
+              entry.body = UtxoConfidentialData{
+                  .value_commitment = confidential.value_commitment,
+                  .one_time_pubkey = confidential.one_time_pubkey,
+                  .ephemeral_pubkey = confidential.ephemeral_pubkey,
+                  .scan_tag = confidential.scan_tag,
+                  .memo = confidential.memo,
+              };
+              utxos[OutPoint{txid, out_i}] = std::move(entry);
+            }
+          }
+        }
+      },
+      tx);
 }
 
 }  // namespace finalis

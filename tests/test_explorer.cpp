@@ -1,6 +1,7 @@
 #include "test_framework.hpp"
 
 #include <array>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <sstream>
@@ -315,6 +316,7 @@ TEST(test_explorer_api_status_and_tx_contract) {
   ASSERT_TRUE(status.body.find("\"finalized_height\":10") != std::string::npos);
   ASSERT_TRUE(status.body.find("\"finalized_transition_hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
   ASSERT_TRUE(status.body.find("\"protocol_reserve_balance\":4200000000") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"snapshot_refreshed_unix_ms\":") != std::string::npos);
 
   const auto tx_ok = handle_request(cfg, make_http_get("/api/tx/" + fx.txid));
   ASSERT_EQ(tx_ok.status, 200);
@@ -326,6 +328,7 @@ TEST(test_explorer_api_status_and_tx_contract) {
   ASSERT_TRUE(tx_ok.body.find("\"input_count\":1") != std::string::npos);
   ASSERT_TRUE(tx_ok.body.find("\"output_count\":1") != std::string::npos);
   ASSERT_TRUE(tx_ok.body.find("\"decoded_output_count\":1") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"data_source\":\"rpc_live_finalized\"") != std::string::npos);
   ASSERT_TRUE(tx_ok.body.find("\"finalized_only\":true") != std::string::npos);
 
   const auto tx_bad = handle_request(cfg, make_http_get("/api/tx/not-a-txid"));
@@ -349,6 +352,7 @@ TEST(test_explorer_tx_page_makes_credit_decision_explicit) {
   ASSERT_TRUE(tx_page.body.find("Safe to credit") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("FINALIZED (CREDIT SAFE)") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("Credit Safe</div><div>YES") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("Explorer data source: <strong>fresh finalized RPC</strong>") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("confirm") == std::string::npos);
 }
 
@@ -518,6 +522,7 @@ TEST(test_explorer_api_transition_contract) {
   const auto by_hash = handle_request(cfg, make_http_get("/api/transition/" + fx.transition_hash));
   ASSERT_EQ(by_hash.status, 200);
   ASSERT_TRUE(by_hash.body.find("\"hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
+  ASSERT_TRUE(by_hash.body.find("\"data_source\":\"") != std::string::npos);
 
   const auto malformed = handle_request(cfg, make_http_get("/api/transition/not-hex!"));
   ASSERT_EQ(malformed.status, 400);
@@ -526,6 +531,14 @@ TEST(test_explorer_api_transition_contract) {
   const auto missing_hash = handle_request(cfg, make_http_get("/api/transition/" + fx.unknown_transition_hash));
   ASSERT_EQ(missing_hash.status, 404);
   ASSERT_TRUE(missing_hash.body.find("\"code\":\"not_found\"") != std::string::npos);
+
+  const auto committee = handle_request(cfg, make_http_get("/api/committee"));
+  ASSERT_EQ(committee.status, 200);
+  ASSERT_TRUE(committee.body.find("\"snapshot_refreshed_unix_ms\":") != std::string::npos);
+
+  const auto recent = handle_request(cfg, make_http_get("/api/recent-tx"));
+  ASSERT_EQ(recent.status, 200);
+  ASSERT_TRUE(recent.body.find("\"snapshot_refreshed_unix_ms\":") != std::string::npos);
 }
 
 TEST(test_explorer_api_address_contract_and_empty_state) {
@@ -723,6 +736,202 @@ TEST(test_explorer_healthz_reports_upstream_health) {
   ASSERT_TRUE(failed.body.find("\"finalized_only\":true") != std::string::npos);
   ASSERT_TRUE(failed.body.find("\"upstream_ok\":false") != std::string::npos);
   ASSERT_TRUE(failed.body.find("\"error\":{\"code\":\"upstream_error\"") != std::string::npos);
+}
+
+TEST(test_explorer_hydrates_startup_cache_from_disk_without_live_rpc) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    auto status = fetch_status_result(cfg);
+    ASSERT_TRUE(status.value.has_value());
+    auto committee = fetch_committee_result(cfg, status.value->finalized_height);
+    ASSERT_TRUE(committee.value.has_value());
+    const auto recent = fetch_recent_tx_results(cfg, kPersistedRecentLimit);
+    ASSERT_TRUE(!recent.empty());
+  }
+
+  clear_runtime_caches();
+  int rpc_calls = 0;
+  {
+    ScopedRpcHook rpc([&](const std::string&) {
+      ++rpc_calls;
+      return rpc_error(-32000, "rpc should not be used");
+    });
+    load_persisted_explorer_snapshot(cfg);
+    auto status = fetch_status_result(cfg);
+    ASSERT_TRUE(status.value.has_value());
+    ASSERT_EQ(status.value->finalized_height, 10u);
+    auto committee = fetch_committee_result(cfg, status.value->finalized_height);
+    ASSERT_TRUE(committee.value.has_value());
+    ASSERT_EQ(committee.value->members.size(), 1u);
+    const auto recent = fetch_recent_tx_results(cfg, kPersistedRecentLimit);
+    ASSERT_TRUE(!recent.empty());
+    ASSERT_EQ(recent.front().txid, fx.txid);
+    ASSERT_EQ(rpc_calls, 0);
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
+TEST(test_explorer_hydrates_tx_and_transition_index_from_disk_without_live_rpc) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-index-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    auto tx = fetch_tx_result(cfg, fx.txid);
+    ASSERT_TRUE(tx.value.has_value());
+    auto transition = fetch_transition_result(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition.value.has_value());
+    ASSERT_TRUE(transition.value->summary_cached);
+  }
+
+  clear_runtime_caches();
+  int rpc_calls = 0;
+  {
+    ScopedRpcHook rpc([&](const std::string&) {
+      ++rpc_calls;
+      return rpc_error(-32000, "rpc should not be used");
+    });
+    load_persisted_explorer_snapshot(cfg);
+    auto tx = fetch_tx_result(cfg, fx.txid);
+    ASSERT_TRUE(tx.value.has_value());
+    ASSERT_EQ(tx.value->txid, fx.txid);
+    ASSERT_EQ(tx.value->data_source, "cache_finalized_snapshot");
+    ASSERT_TRUE(tx.value->data_refreshed_unix_ms.has_value());
+    auto transition = fetch_transition_result(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition.value.has_value());
+    ASSERT_EQ(transition.value->hash, fx.transition_hash);
+    ASSERT_TRUE(transition.value->summary_cached);
+    ASSERT_EQ(transition.value->data_source, "cache_finalized_snapshot");
+    ASSERT_TRUE(transition.value->data_refreshed_unix_ms.has_value());
+    ASSERT_EQ(rpc_calls, 0);
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
+TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-provenance-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    auto tx = fetch_tx_result(cfg, fx.txid);
+    ASSERT_TRUE(tx.value.has_value());
+    auto transition = fetch_transition_result(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition.value.has_value());
+  }
+
+  clear_runtime_caches();
+  {
+    ScopedRpcHook rpc([&](const std::string&) { return rpc_error(-32000, "rpc should not be used"); });
+    load_persisted_explorer_snapshot(cfg);
+    const auto tx_json = render_tx_json(*fetch_tx_result(cfg, fx.txid).value);
+    ASSERT_TRUE(tx_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
+    const auto tx_page = render_tx(cfg, fx.txid);
+    ASSERT_TRUE(tx_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
+    ASSERT_TRUE(tx_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
+    ASSERT_TRUE(tx_page.find("Last refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(tx_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
+    const auto transition_json = render_transition_json(cfg, *fetch_transition_result(cfg, fx.transition_hash).value);
+    ASSERT_TRUE(transition_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
+    const auto transition_page = render_transition(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
+    ASSERT_TRUE(transition_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
+    ASSERT_TRUE(transition_page.find("Last refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(transition_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
+TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-section-refresh-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    ASSERT_TRUE(fetch_status_result(cfg).value.has_value());
+    ASSERT_TRUE(fetch_committee_result(cfg, 10).value.has_value());
+    (void)fetch_recent_tx_results(cfg, 8);
+  }
+
+  clear_runtime_caches();
+  {
+    ScopedRpcHook rpc([&](const std::string&) { return rpc_error(-32000, "rpc should not be used"); });
+    load_persisted_explorer_snapshot(cfg);
+    const auto home = render_root(cfg);
+    ASSERT_TRUE(home.find("Status Snapshot Refreshed") != std::string::npos);
+    ASSERT_TRUE(home.find("Recent transactions snapshot refreshed from RPC: ") != std::string::npos);
+    const auto committee = render_committee(cfg);
+    ASSERT_TRUE(committee.find("Committee snapshot refreshed from RPC: ") != std::string::npos);
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
+TEST(test_explorer_homepage_shows_stale_banner_when_cached_surfaces_fallback_after_rpc_failure) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-stale-banner-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    ASSERT_TRUE(fetch_status_result(cfg).value.has_value());
+    ASSERT_TRUE(fetch_committee_result(cfg, 10).value.has_value());
+    (void)fetch_recent_tx_results(cfg, 8);
+  }
+
+  clear_runtime_caches();
+  load_persisted_explorer_snapshot(cfg);
+  {
+    std::lock_guard<std::mutex> guard(g_status_cache_mu);
+    g_status_cache.stored_at = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_recent_tx_cache_mu);
+    g_recent_tx_cache.stored_at = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_committee_cache_mu);
+    g_committee_cache.stored_at = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  }
+
+  {
+    const auto prev = g_http_post_json_raw;
+    g_http_post_json_raw = [&](const std::string&, const std::string&, std::string*) {
+      return std::optional<std::string>(rpc_error(-32000, "upstream down"));
+    };
+    const auto home = render_root(cfg);
+    ASSERT_TRUE(home.find("Snapshot Freshness Warning") != std::string::npos);
+    ASSERT_TRUE(home.find("because live RPC refresh failed") != std::string::npos);
+    ASSERT_TRUE(home.find("status error=") != std::string::npos);
+    g_http_post_json_raw = prev;
+  }
+
+  std::filesystem::remove(temp_path, ec);
 }
 
 }  // namespace

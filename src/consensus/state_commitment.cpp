@@ -22,6 +22,24 @@ Bytes utxo_commitment_value(const TxOut& out) {
   return w.take();
 }
 
+Bytes utxo_commitment_value(const UtxoEntryV2& entry) {
+  codec::ByteWriter w;
+  w.u8(static_cast<std::uint8_t>(entry.kind));
+  if (entry.kind == UtxoOutputKind::TRANSPARENT) {
+    const auto& transparent = std::get<UtxoTransparentData>(entry.body);
+    w.varbytes(utxo_commitment_value(transparent.out));
+    return w.take();
+  }
+
+  const auto& confidential = std::get<UtxoConfidentialData>(entry.body);
+  w.bytes_fixed(confidential.value_commitment.bytes);
+  w.bytes_fixed(confidential.one_time_pubkey);
+  w.bytes_fixed(confidential.ephemeral_pubkey);
+  w.u8(confidential.scan_tag.value);
+  w.varbytes(confidential.memo);
+  return w.take();
+}
+
 Hash32 validator_commitment_key(const PubKey32& pub) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', '-', 'K', 'E', 'Y', '-', 'V', '0'});

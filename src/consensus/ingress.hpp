@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "storage/db.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/tx.hpp"
 
 namespace finalis::consensus {
@@ -12,7 +13,11 @@ namespace finalis::consensus {
 constexpr std::uint32_t INGRESS_LANE_COUNT = static_cast<std::uint32_t>(finalis::INGRESS_LANE_COUNT);
 
 Hash32 ingress_lane_anchor(const Tx& tx);
+Hash32 ingress_lane_anchor(const TxV2& tx);
+Hash32 ingress_lane_anchor(const AnyTx& tx);
 std::uint32_t assign_ingress_lane(const Tx& tx);
+std::uint32_t assign_ingress_lane(const TxV2& tx);
+std::uint32_t assign_ingress_lane(const AnyTx& tx);
 Hash32 compute_lane_root_append(const Hash32& prev_root, const Hash32& tx_hash);
 
 bool verify_ingress_certificate(const IngressCertificate& cert, const std::vector<PubKey32>& committee,

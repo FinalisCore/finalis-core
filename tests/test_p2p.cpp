@@ -2,9 +2,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include "common/network.hpp"
 #include "common/socket_compat.hpp"
@@ -235,11 +241,29 @@ TEST(test_write_frame_fd_timed_times_out_against_nonreading_peer) {
   int sndbuf = 4096;
   (void)::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
+  const int flags = ::fcntl(fds[0], F_GETFL, 0);
+  ASSERT_TRUE(flags >= 0);
+  ASSERT_EQ(::fcntl(fds[0], F_SETFL, flags | O_NONBLOCK), 0);
+
+  Bytes fill(4096, 0xCD);
+  while (true) {
+    const ssize_t wrote = ::send(fds[0], reinterpret_cast<const char*>(fill.data()), static_cast<int>(fill.size()), 0);
+    if (wrote > 0) continue;
+    ASSERT_TRUE(wrote < 0);
+    ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+    break;
+  }
+
+  ASSERT_EQ(::fcntl(fds[0], F_SETFL, flags), 0);
+
   p2p::Frame frame;
   frame.msg_type = p2p::MsgType::TX;
-  frame.payload.assign(4 * 1024 * 1024, 0xAB);
+  frame.payload.assign(256, 0xAB);
 
-  ASSERT_TRUE(!p2p::write_frame_fd_timed(fds[0], frame, 10));
+  const auto start = std::chrono::steady_clock::now();
+  ASSERT_TRUE(!p2p::write_frame_fd_timed(fds[0], frame, 50));
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+  ASSERT_TRUE(elapsed.count() < 500);
 
   ::close(fds[0]);
   ::close(fds[1]);

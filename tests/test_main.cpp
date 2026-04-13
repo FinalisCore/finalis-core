@@ -37,9 +37,13 @@ void register_lightserver_tests();
 
 int main() {
 #ifdef _WIN32
-  _putenv_s("FINALIS_TEST_QUIET_LOGS", "1");
+  if (std::getenv("FINALIS_TEST_QUIET_LOGS") == nullptr) {
+    _putenv_s("FINALIS_TEST_QUIET_LOGS", "1");
+  }
 #else
-  setenv("FINALIS_TEST_QUIET_LOGS", "1", 1);
+  if (std::getenv("FINALIS_TEST_QUIET_LOGS") == nullptr) {
+    setenv("FINALIS_TEST_QUIET_LOGS", "1", 1);
+  }
 #endif
   // Default test runner: current live epoch-ticket runtime.
   register_codec_tests();

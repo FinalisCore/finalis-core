@@ -32,6 +32,7 @@
 #include "onboarding/validator_onboarding.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/signing.hpp"
 #include "wallet/utxo_selection.hpp"
@@ -119,7 +120,9 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = Tx::parse(loc->tx_bytes); tx.has_value()) parsed = *tx;
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
+        parsed = std::get<Tx>(*tx);
+      }
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -319,9 +322,9 @@ std::vector<Hash32> canonical_transition_txids(const storage::DB& db, std::uint6
   for (std::uint64_t seq = transition->prev_frontier + 1; seq <= transition->next_frontier; ++seq) {
     auto tx_bytes = db.get_ingress_record(seq);
     if (!tx_bytes.has_value()) continue;
-    auto tx = Tx::parse(*tx_bytes);
+    auto tx = parse_any_tx(*tx_bytes);
     if (!tx.has_value()) continue;
-    txids.push_back(tx->txid());
+    txids.push_back(txid_any(*tx));
   }
   return txids;
 }
@@ -336,7 +339,9 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = Tx::parse(loc->tx_bytes); tx.has_value()) parsed = *tx;
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
+        parsed = std::get<Tx>(*tx);
+      }
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -486,7 +491,9 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = Tx::parse(loc->tx_bytes); tx.has_value()) parsed = *tx;
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
+        parsed = std::get<Tx>(*tx);
+      }
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -792,8 +799,13 @@ std::string ingress_record_json(std::uint64_t seq, const std::optional<Bytes>& r
   }
   const auto record_hash = crypto::sha256d(*record);
   oss << ",\"hash\":\"" << hex_encode32(record_hash) << "\"";
-  if (auto tx = Tx::parse(*record); tx.has_value()) {
-    oss << ",\"txid\":\"" << hex_encode32(tx->txid()) << "\"";
+  if (auto tx = parse_any_tx(*record); tx.has_value()) {
+    oss << ",\"txid\":\"" << hex_encode32(txid_any(*tx)) << "\"";
+    if (std::holds_alternative<TxV2>(*tx)) {
+      oss << ",\"tx_version\":2";
+    } else {
+      oss << ",\"tx_version\":1";
+    }
   }
   oss << "}";
   return oss.str();
@@ -2235,7 +2247,10 @@ std::string Server::handle_rpc_body(const std::string& body) {
     const std::uint64_t current_height = tip ? (tip->height + 1) : 1;
     const auto min_bond_amount = record->bond_amount;
     const auto max_bond_amount = std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, min_bond_amount);
+    ConfidentialPolicy confidential_policy{};
+    confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
+        .network = &cfg_.network,
         .validators = &vr,
         .current_height = current_height,
         .enforce_variable_bond_range = true,
@@ -2247,8 +2262,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
               if (!committee.has_value()) return false;
               return std::find(committee->begin(), committee->end(), pk) != committee->end();
             },
+        .confidential_policy = &confidential_policy,
     };
-    auto vrx = validate_tx(*tx, 1, utxos, &ctx);
+    auto vrx = validate_any_tx(AnyTx{*tx}, 1, upgrade_utxo_set_v2(utxos), &ctx);
     if (!vrx.ok) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "tx_rejected";
@@ -2677,12 +2693,12 @@ std::string Server::handle_rpc_body(const std::string& body) {
       return make_result(id, broadcast_result_json(false, "", "rejected", "", std::string("tx_invalid"),
                                                    std::string("bad tx hex"), false, "none", false, std::nullopt));
     }
-    auto tx = Tx::parse(*tx_bytes);
+    auto tx = parse_any_tx(*tx_bytes);
     if (!tx.has_value()) {
       return make_result(id, broadcast_result_json(false, "", "rejected", "", std::string("tx_invalid"),
                                                    std::string("tx parse failed"), false, "none", false, std::nullopt));
     }
-    const Hash32 txid = tx->txid();
+    const Hash32 txid = txid_any(*tx);
     const std::string txid_hex = hex_encode32(txid);
     if (view->get_tx_index(txid).has_value()) {
       return make_result(id, broadcast_result_json(
@@ -2696,7 +2712,10 @@ std::string Server::handle_rpc_body(const std::string& body) {
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
     auto tip = db_.get_tip();
     const auto runtime = view->get_node_runtime_status_snapshot();
+    ConfidentialPolicy confidential_policy{};
+    confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
+        .network = &cfg_.network,
         .validators = &vr,
         .current_height = tip ? (tip->height + 1) : 1,
         .is_committee_member =
@@ -2705,8 +2724,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
               if (!committee.has_value()) return false;
               return std::find(committee->begin(), committee->end(), pk) != committee->end();
             },
+        .confidential_policy = &confidential_policy,
     };
-    auto vrx = validate_tx(*tx, 1, utxos, &ctx);
+    auto vrx = validate_any_tx(*tx, 1, upgrade_utxo_set_v2(utxos), &ctx);
     if (!vrx.ok) {
       const auto code = validation_error_code(vrx.error);
       const bool retryable = code == "tx_missing_or_unconfirmed_input";
@@ -2714,7 +2734,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
                                                    validation_error_message(vrx.error), retryable,
                                                    retry_class_for_error_code(code), false, std::nullopt));
     }
-    if (runtime.has_value() && runtime->min_relay_fee != 0 && vrx.fee < runtime->min_relay_fee) {
+    if (runtime.has_value() && runtime->min_relay_fee != 0 && vrx.cost.fee < runtime->min_relay_fee) {
       return make_result(id, broadcast_result_json(false, txid_hex, "rejected", "",
                                                    std::string("tx_fee_below_min_relay"),
                                                    std::string("Transaction fee is below the current minimum relay fee."),
@@ -2723,7 +2743,8 @@ std::string Server::handle_rpc_body(const std::string& body) {
     }
     if (runtime.has_value() && runtime->mempool_full &&
         runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte.has_value() &&
-        fee_rate_below_threshold(vrx.fee, tx_bytes->size(), *runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte)) {
+        fee_rate_below_threshold(vrx.cost.fee, tx_bytes->size(),
+                                 *runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte)) {
       return make_result(id, broadcast_result_json(
                                  false, txid_hex, "rejected", "", std::string("mempool_full_not_good_enough"),
                                  std::string("Network is busy. Transaction fee rate is too low for current mempool pressure."),

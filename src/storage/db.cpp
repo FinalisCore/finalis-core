@@ -1296,6 +1296,7 @@ std::optional<Hash32> DB::get_height_hash(std::uint64_t height) const {
 }
 
 bool DB::put_utxo(const OutPoint& op, const TxOut& out) { return put(key_utxo(op), serialize_txout(out)); }
+bool DB::put_utxo_v2(const OutPoint& op, const UtxoEntryV2& entry) { return put(key_utxo(op), serialize_utxo_entry_v2(entry)); }
 bool DB::erase_utxo(const OutPoint& op) {
   if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
@@ -1313,6 +1314,15 @@ std::optional<TxOut> DB::get_utxo(const OutPoint& op) const {
   return parse_txout(*raw);
 }
 
+std::optional<UtxoEntryV2> DB::get_utxo_v2(const OutPoint& op) const {
+  auto raw = get(key_utxo(op));
+  if (!raw.has_value()) return std::nullopt;
+  if (auto parsed = parse_utxo_entry_v2(*raw); parsed.has_value()) return parsed;
+  auto legacy = parse_txout(*raw);
+  if (!legacy.has_value()) return std::nullopt;
+  return UtxoEntryV2{*legacy};
+}
+
 std::map<OutPoint, UtxoEntry> DB::load_utxos() const {
   std::map<OutPoint, UtxoEntry> out;
   for (const auto& [k, v] : scan_prefix(key_utxo_prefix())) {
@@ -1320,9 +1330,36 @@ std::map<OutPoint, UtxoEntry> DB::load_utxos() const {
     auto op_b = hex_decode(op_hex);
     if (!op_b.has_value()) continue;
     auto op = parse_outpoint(*op_b);
+    if (!op.has_value()) continue;
+    if (auto entry_v2 = parse_utxo_entry_v2(v); entry_v2.has_value()) {
+      const auto transparent = transparent_txout_from_utxo_entry(*entry_v2);
+      if (!transparent.has_value()) continue;
+      out[*op] = UtxoEntry{*transparent};
+      continue;
+    }
     auto txout = parse_txout(v);
-    if (!op.has_value() || !txout.has_value()) continue;
+    if (!txout.has_value()) continue;
     out[*op] = UtxoEntry{*txout};
+  }
+  return out;
+}
+
+std::map<OutPoint, UtxoEntryV2> DB::load_utxos_v2() const {
+  std::map<OutPoint, UtxoEntryV2> out;
+  for (const auto& [k, v] : scan_prefix(key_utxo_prefix())) {
+    auto op_hex = k.substr(2);
+    auto op_b = hex_decode(op_hex);
+    if (!op_b.has_value()) continue;
+    auto op = parse_outpoint(*op_b);
+    if (!op.has_value()) continue;
+    auto entry = parse_utxo_entry_v2(v);
+    if (entry.has_value()) {
+      out[*op] = *entry;
+      continue;
+    }
+    auto txout = parse_txout(v);
+    if (!txout.has_value()) continue;
+    out[*op] = UtxoEntryV2{*txout};
   }
   return out;
 }

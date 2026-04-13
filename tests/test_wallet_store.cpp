@@ -20,7 +20,7 @@ TEST(test_wallet_store_persists_sent_events_and_notes) {
   Hash32 spend_txid{};
   spend_txid.fill(0x42);
   std::vector<OutPoint> pending_inputs{OutPoint{spend_txid, 7}};
-  ASSERT_TRUE(store.upsert_pending_spend("abc123", pending_inputs));
+  ASSERT_TRUE(store.upsert_pending_spend("abc123", pending_inputs, 44, 123456789));
   ASSERT_TRUE(store.replace_finalized_history({WalletStore::FinalizedHistoryRecord{
       .txid_hex = "tx-final-1",
       .height = 9,
@@ -55,6 +55,8 @@ TEST(test_wallet_store_persists_sent_events_and_notes) {
   ASSERT_EQ(state.pending_spends[0].txid_hex, "abc123");
   ASSERT_EQ(state.pending_spends[0].inputs.size(), 1u);
   ASSERT_EQ(state.pending_spends[0].inputs[0].index, 7u);
+  ASSERT_EQ(state.pending_spends[0].created_tip_height, 44u);
+  ASSERT_EQ(state.pending_spends[0].created_unix_ms, 123456789u);
   ASSERT_EQ(state.finalized_history.size(), 2u);
   ASSERT_EQ(state.finalized_history[0].txid_hex, "tx-final-1");
   ASSERT_EQ(state.finalized_history[1].txid_hex, "tx-final-2");
@@ -87,8 +89,8 @@ TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
     ASSERT_TRUE(store.add_sent_txid("sent-b"));
     Hash32 spend_txid{};
     spend_txid.fill(0x21);
-    ASSERT_TRUE(store.upsert_pending_spend("sent-a", {OutPoint{spend_txid, 1}}));
-    ASSERT_TRUE(store.upsert_pending_spend("sent-b", {OutPoint{spend_txid, 2}}));
+    ASSERT_TRUE(store.upsert_pending_spend("sent-a", {OutPoint{spend_txid, 1}}, 10, 1000));
+    ASSERT_TRUE(store.upsert_pending_spend("sent-b", {OutPoint{spend_txid, 2}}, 11, 2000));
     ASSERT_TRUE(store.remove_sent_txid("sent-a"));
   }
 
@@ -100,4 +102,323 @@ TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
   ASSERT_EQ(state.sent_txids.size(), 1u);
   ASSERT_EQ(state.sent_txids[0], "sent-b");
   ASSERT_EQ(state.pending_spends.size(), 2u);
+  ASSERT_EQ(state.pending_spends[0].created_tip_height, 10u);
+  ASSERT_EQ(state.pending_spends[1].created_tip_height, 11u);
+}
+
+TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file, "secret-pass"));
+    ASSERT_TRUE(store.can_persist_confidential_secrets());
+    ASSERT_TRUE(store.upsert_confidential_account(WalletStore::ConfidentialAccountRecord{
+        .account_id = "acct-main",
+        .label = "Primary stealth",
+        .stealth_address = "sc_stealth1example",
+        .view_key_material_hex = "aa11",
+        .spend_key_material_hex = "bb22",
+        .active = true,
+    }));
+    ASSERT_TRUE(store.set_confidential_primary_account_id(std::string("acct-main")));
+    ASSERT_TRUE(store.upsert_confidential_coin(WalletStore::ConfidentialCoinRecord{
+        .txid_hex = "cc33",
+        .vout = 1,
+        .account_id = "acct-main",
+        .amount = 123456789ull,
+        .value_commitment_hex = "02cafe",
+        .one_time_pubkey_hex = "02beef",
+        .ephemeral_pubkey_hex = "03f00d",
+        .spend_secret_hex = "deadc0de",
+        .blinding_factor_hex = "b10b",
+        .spent = false,
+    }));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file, "secret-pass"));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.confidential_primary_account_id.has_value());
+  ASSERT_EQ(*state.confidential_primary_account_id, "acct-main");
+  ASSERT_EQ(state.confidential_accounts.size(), 1u);
+  ASSERT_EQ(state.confidential_accounts[0].stealth_address, "sc_stealth1example");
+  ASSERT_EQ(state.confidential_accounts[0].view_key_material_hex, "aa11");
+  ASSERT_EQ(state.confidential_coins.size(), 1u);
+  ASSERT_EQ(state.confidential_coins[0].account_id, "acct-main");
+  ASSERT_EQ(state.confidential_coins[0].amount, 123456789ull);
+  ASSERT_EQ(state.confidential_coins[0].spend_secret_hex, "deadc0de");
+  ASSERT_EQ(state.confidential_coins[0].blinding_factor_hex, "b10b");
+}
+
+TEST(test_wallet_store_marks_confidential_requests_consumed_without_deleting_them) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_requests/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_requests");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_requests");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file, "secret-pass"));
+    ASSERT_TRUE(store.upsert_confidential_request(WalletStore::ConfidentialRequestRecord{
+        .request_id = "req-1",
+        .account_id = "acct-main",
+        .one_time_pubkey_hex = "02aa",
+        .ephemeral_pubkey_hex = "03bb",
+        .scan_tag = 0x19,
+        .spend_secret_hex = "dead",
+        .memo_key_hex = "beef",
+        .consumed = false,
+    }));
+    ASSERT_TRUE(store.set_confidential_request_consumed("req-1", true));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file, "secret-pass"));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_EQ(state.confidential_requests.size(), 1u);
+  ASSERT_EQ(state.confidential_requests[0].request_id, "req-1");
+  ASSERT_TRUE(state.confidential_requests[0].consumed);
+}
+
+TEST(test_wallet_store_marks_confidential_coin_spent_without_deleting_it) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_coin_spent/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_coin_spent");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_coin_spent");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file, "secret-pass"));
+    ASSERT_TRUE(store.upsert_confidential_coin(WalletStore::ConfidentialCoinRecord{
+        .txid_hex = "cc33",
+        .vout = 1,
+        .account_id = "acct-main",
+        .amount = 123456789ull,
+        .value_commitment_hex = "02cafe",
+        .one_time_pubkey_hex = "02beef",
+        .ephemeral_pubkey_hex = "03f00d",
+        .spend_secret_hex = "deadc0de",
+        .blinding_factor_hex = "b10b",
+        .spent = false,
+    }));
+    ASSERT_TRUE(store.set_confidential_coin_spent("cc33", 1, true));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file, "secret-pass"));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_EQ(state.confidential_coins.size(), 1u);
+  ASSERT_EQ(state.confidential_coins[0].txid_hex, "cc33");
+  ASSERT_EQ(state.confidential_coins[0].vout, 1u);
+  ASSERT_TRUE(state.confidential_coins[0].spent);
+}
+
+TEST(test_wallet_store_persists_wallet_snapshot) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_snapshot/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_snapshot");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_snapshot");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    WalletStore::WalletSnapshot snapshot;
+    snapshot.chain_network_name = "mainnet";
+    snapshot.transition_hash = "abc123";
+    snapshot.network_id_hex = "deadbeef";
+    snapshot.genesis_hash_hex = "001122";
+    snapshot.binary_version = "1.2.3";
+    snapshot.wallet_api_version = "4";
+    snapshot.last_refresh_text = "2026-04-13 12:00:00";
+    snapshot.last_successful_endpoint = "http://127.0.0.1:19444/rpc";
+    snapshot.tip_height = 77;
+    snapshot.finalized_lag = 3;
+    snapshot.peer_height_disagreement = true;
+    snapshot.bootstrap_sync_incomplete = false;
+    snapshot.utxos.push_back(WalletStore::SnapshotUtxoRecord{
+        .txid_hex = "feedface",
+        .vout = 2,
+        .value = 500000000ull,
+        .height = 70,
+        .script_pubkey = finalis::Bytes{0x51, 0x21},
+    });
+    ASSERT_TRUE(store.set_wallet_snapshot(snapshot));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.wallet_snapshot.has_value());
+  ASSERT_EQ(state.wallet_snapshot->chain_network_name, "mainnet");
+  ASSERT_EQ(state.wallet_snapshot->tip_height, 77u);
+  ASSERT_TRUE(state.wallet_snapshot->finalized_lag.has_value());
+  ASSERT_EQ(*state.wallet_snapshot->finalized_lag, 3u);
+  ASSERT_EQ(state.wallet_snapshot->last_successful_endpoint, "http://127.0.0.1:19444/rpc");
+  ASSERT_EQ(state.wallet_snapshot->utxos.size(), 1u);
+  ASSERT_EQ(state.wallet_snapshot->utxos[0].txid_hex, "feedface");
+  ASSERT_EQ(state.wallet_snapshot->utxos[0].vout, 2u);
+  ASSERT_EQ(state.wallet_snapshot->utxos[0].value, 500000000ull);
+}
+
+TEST(test_wallet_store_persists_wallet_view_snapshot) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_view_snapshot/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_view_snapshot");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_view_snapshot");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    WalletStore::WalletViewSnapshot snapshot;
+    snapshot.balance_text = "12.5 FLS";
+    snapshot.pending_balance_text = "Pending outgoing: 1.0 FLS";
+    snapshot.confidential_balance_text = "Confidential balance: 3.0 FLS across 1 coin(s)";
+    snapshot.confidential_request_summary_text = "Outstanding requests: 1 · Consumed: 2";
+    snapshot.confidential_coin_summary_text = "Imported confidential coins: 4 · Unspent: 3";
+    snapshot.activity_finalized_count_text = "Finalized: 6";
+    snapshot.activity_pending_count_text = "Pending: 2";
+    snapshot.activity_local_count_text = "Local: 1";
+    snapshot.activity_mint_count_text = "Mint: 0";
+    snapshot.activity_confidential_count_text = "Confidential: 3";
+    snapshot.overview_activity_rows.push_back(
+        {.col0 = "Finalized", .col1 = "Received", .col2 = "Height 77"});
+    snapshot.history_rows.push_back(
+        {.col0 = "Sent", .col1 = "Finalized", .col2 = "1.0 FLS", .col3 = "tx-ref", .col4 = "Height 77"});
+    ASSERT_TRUE(store.set_wallet_view_snapshot(snapshot));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.wallet_view_snapshot.has_value());
+  ASSERT_EQ(state.wallet_view_snapshot->balance_text, "12.5 FLS");
+  ASSERT_EQ(state.wallet_view_snapshot->pending_balance_text, "Pending outgoing: 1.0 FLS");
+  ASSERT_EQ(state.wallet_view_snapshot->overview_activity_rows.size(), 1u);
+  ASSERT_EQ(state.wallet_view_snapshot->overview_activity_rows[0].col1, "Received");
+  ASSERT_EQ(state.wallet_view_snapshot->history_rows.size(), 1u);
+  ASSERT_EQ(state.wallet_view_snapshot->history_rows[0].col4, "Height 77");
+}
+
+TEST(test_wallet_store_persists_pending_tx_status_cache) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_pending_tx_status/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_pending_tx_status");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_pending_tx_status");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    ASSERT_TRUE(store.upsert_pending_tx_status(WalletStore::PendingTxStatusRecord{
+        .txid_hex = "aa11",
+        .endpoint = "http://127.0.0.1:19444/rpc",
+        .cached_at = "2026-04-13 15:00:00",
+        .cached_at_ms = 123456789ull,
+        .status = "pending",
+        .finalized = false,
+        .height = 88,
+        .finalized_depth = 0,
+        .credit_safe = false,
+        .transition_hash = "deadbeef",
+    }));
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_EQ(state.pending_tx_statuses.size(), 1u);
+  ASSERT_EQ(state.pending_tx_statuses[0].txid_hex, "aa11");
+  ASSERT_EQ(state.pending_tx_statuses[0].endpoint, "http://127.0.0.1:19444/rpc");
+  ASSERT_EQ(state.pending_tx_statuses[0].cached_at_ms, 123456789ull);
+  ASSERT_EQ(state.pending_tx_statuses[0].status, "pending");
+  ASSERT_EQ(state.pending_tx_statuses[0].height, 88u);
+  ASSERT_EQ(state.pending_tx_statuses[0].transition_hash, "deadbeef");
+}
+
+TEST(test_wallet_store_bounds_pending_tx_status_cache_retention) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_pending_tx_status_retention/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_pending_tx_status_retention");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_pending_tx_status_retention");
+
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    ASSERT_TRUE(store.upsert_pending_tx_status(WalletStore::PendingTxStatusRecord{
+        .txid_hex = "old-entry",
+        .endpoint = "http://127.0.0.1:19444/rpc",
+        .cached_at = "old",
+        .cached_at_ms = 1,
+        .status = "pending",
+        .finalized = false,
+        .height = 1,
+        .finalized_depth = 0,
+        .credit_safe = false,
+        .transition_hash = "old",
+    }));
+    for (int i = 0; i < 70; ++i) {
+      ASSERT_TRUE(store.upsert_pending_tx_status(WalletStore::PendingTxStatusRecord{
+          .txid_hex = "tx-" + std::to_string(i),
+          .endpoint = "http://127.0.0.1:19444/rpc",
+          .cached_at = "recent",
+          .cached_at_ms = 700000000ull + static_cast<std::uint64_t>(i),
+          .status = "pending",
+          .finalized = false,
+          .height = static_cast<std::uint64_t>(i),
+          .finalized_depth = 0,
+          .credit_safe = false,
+          .transition_hash = "recent",
+      }));
+    }
+  }
+
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+
+  ASSERT_TRUE(state.pending_tx_statuses.size() <= 64u);
+  bool found_old = false;
+  for (const auto& entry : state.pending_tx_statuses) {
+    if (entry.txid_hex == "old-entry") found_old = true;
+  }
+  ASSERT_TRUE(!found_old);
+}
+
+TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
+  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
+  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");
+  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_nopass");
+
+  WalletStore store;
+  ASSERT_TRUE(store.open(wallet_file));
+  ASSERT_TRUE(!store.can_persist_confidential_secrets());
+  ASSERT_TRUE(!store.upsert_confidential_account(WalletStore::ConfidentialAccountRecord{
+      .account_id = "acct-main",
+      .label = "Primary stealth",
+      .stealth_address = "sc_stealth1example",
+      .view_key_material_hex = "aa11",
+      .spend_key_material_hex = "bb22",
+      .active = true,
+  }));
+  ASSERT_TRUE(!store.upsert_confidential_coin(WalletStore::ConfidentialCoinRecord{
+      .txid_hex = "cc33",
+      .vout = 1,
+      .account_id = "acct-main",
+      .amount = 123456789ull,
+      .value_commitment_hex = "02cafe",
+      .one_time_pubkey_hex = "02beef",
+      .ephemeral_pubkey_hex = "03f00d",
+      .spend_secret_hex = "deadc0de",
+      .blinding_factor_hex = "b10b",
+      .spent = false,
+  }));
 }

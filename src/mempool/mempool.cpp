@@ -15,12 +15,28 @@ bool outpoint_exists(const UtxoView& view, const OutPoint& op) {
   return view.find(op) != view.end();
 }
 
+std::vector<OutPoint> input_outpoints(const AnyTx& tx) {
+  return std::visit(
+      [](const auto& value) {
+        std::vector<OutPoint> out;
+        out.reserve(value.inputs.size());
+        for (const auto& in : value.inputs) out.push_back(OutPoint{in.prev_txid, in.prev_index});
+        return out;
+      },
+      tx);
+}
+
+std::uint64_t effective_score_weight(const TxValidationCost& cost) {
+  const auto base = std::max<std::uint64_t>(1, static_cast<std::uint64_t>(cost.serialized_size));
+  return base + (cost.confidential_verify_weight * 4);
+}
+
 int compare_fee_rate(std::uint64_t fee_a, std::size_t size_a, std::uint64_t fee_b, std::size_t size_b) {
   return wide::compare_mul_u64(fee_a, static_cast<std::uint64_t>(size_b), fee_b, static_cast<std::uint64_t>(size_a));
 }
 
 int compare_entry_score(const MempoolEntry& a, const MempoolEntry& b) {
-  if (const int fee_rate_cmp = compare_fee_rate(a.fee, a.size_bytes, b.fee, b.size_bytes); fee_rate_cmp != 0) {
+  if (const int fee_rate_cmp = compare_fee_rate(a.fee, a.score_weight, b.fee, b.score_weight); fee_rate_cmp != 0) {
     return fee_rate_cmp;
   }
   if (a.fee != b.fee) return a.fee > b.fee ? 1 : -1;
@@ -30,15 +46,15 @@ int compare_entry_score(const MempoolEntry& a, const MempoolEntry& b) {
 }
 
 bool meets_full_replacement_margin(const MempoolEntry& incoming, const MempoolEntry& worst, std::uint32_t margin_bps) {
-  return wide::compare_mul3_u64(incoming.fee, 10'000ULL, static_cast<std::uint64_t>(worst.size_bytes),
+  return wide::compare_mul3_u64(incoming.fee, 10'000ULL, worst.score_weight,
                                 worst.fee, static_cast<std::uint64_t>(10'000U + margin_bps),
-                                static_cast<std::uint64_t>(incoming.size_bytes)) >= 0;
+                                incoming.score_weight) >= 0;
 }
 
 }  // namespace
 
 bool Mempool::EvictionKeyLess::operator()(const EvictionKey& a, const EvictionKey& b) const {
-  if (const int fee_rate_cmp = compare_fee_rate(a.fee, a.size_bytes, b.fee, b.size_bytes); fee_rate_cmp != 0) {
+  if (const int fee_rate_cmp = compare_fee_rate(a.fee, a.score_weight, b.fee, b.score_weight); fee_rate_cmp != 0) {
     return fee_rate_cmp < 0;
   }
   if (a.fee != b.fee) return a.fee < b.fee;
@@ -62,23 +78,23 @@ std::optional<Mempool::EvictionKey> Mempool::worst_entry_key() const {
   return eviction_index_.begin()->first;
 }
 
-bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee,
+bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee,
                         std::uint64_t* accepted_fee) {
-  const Bytes raw = tx.serialize();
+  const Bytes raw = serialize_any_tx(tx);
   if (raw.size() > kMaxTxBytes) {
     if (err) *err = "tx too large";
     return false;
   }
 
-  const Hash32 txid = tx.txid();
+  const Hash32 txid = txid_any(tx);
   if (by_txid_.find(txid) != by_txid_.end()) {
     if (err) *err = "tx already exists";
     return false;
   }
 
   // v0: no unconfirmed parents. Every input must reference confirmed UTXO view.
-  for (const auto& in : tx.inputs) {
-    OutPoint op{in.prev_txid, in.prev_index};
+  const auto spent_inputs = input_outpoints(tx);
+  for (const auto& op : spent_inputs) {
     if (!outpoint_exists(view, op)) {
       if (err) *err = "input depends on unconfirmed or missing utxo";
       return false;
@@ -89,42 +105,42 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, st
     }
   }
 
-  const auto vr = validate_tx(tx, 1, view, ctx_ ? &*ctx_ : nullptr);
+  const auto vr = validate_any_tx(tx, 1, view, ctx_ ? &*ctx_ : nullptr);
   if (!vr.ok) {
     if (err) *err = "tx invalid: " + vr.error;
     return false;
   }
-  if (vr.fee < min_fee) {
+  if (vr.cost.fee < min_fee) {
     if (err) *err = "fee below min relay fee";
     return false;
   }
 
-  const auto required_bits = policy::required_hashcash_bits(hashcash_cfg_, tx, vr.fee, by_txid_.size());
-  if (required_bits != 0) {
-    if (!tx.hashcash.has_value()) {
-      if (err) *err = "hashcash stamp required";
-      return false;
-    }
-    if (!policy::verify_hashcash_stamp(tx, network_, *tx.hashcash, hashcash_cfg_, required_bits,
-                                       static_cast<std::uint64_t>(std::time(nullptr)), err)) {
-      return false;
-    }
-  } else if (tx.hashcash.has_value()) {
-    if (!policy::verify_hashcash_stamp(tx, network_, *tx.hashcash, hashcash_cfg_, 0,
-                                       static_cast<std::uint64_t>(std::time(nullptr)), err)) {
-      return false;
+  if (std::holds_alternative<Tx>(tx)) {
+    const auto& v1 = std::get<Tx>(tx);
+    const auto required_bits = policy::required_hashcash_bits(hashcash_cfg_, v1, vr.cost.fee, by_txid_.size());
+    if (required_bits != 0) {
+      if (!v1.hashcash.has_value()) {
+        if (err) *err = "hashcash stamp required";
+        return false;
+      }
+      if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, required_bits,
+                                         static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+        return false;
+      }
+    } else if (v1.hashcash.has_value()) {
+      if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, 0,
+                                         static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+        return false;
+      }
     }
   }
 
   TxMeta meta;
-  meta.entry = MempoolEntry{tx, txid, vr.fee, raw.size()};
-  meta.eviction_key = EvictionKey{meta.entry.fee, meta.entry.size_bytes, meta.entry.txid};
-  meta.spent.reserve(tx.inputs.size());
-  for (const auto& in : tx.inputs) {
-    OutPoint op{in.prev_txid, in.prev_index};
-    meta.spent.push_back(op);
-    spent_outpoints_[op] = txid;
-  }
+  meta.entry = MempoolEntry{tx, txid, vr.cost.fee, raw.size(), effective_score_weight(vr.cost),
+                            vr.cost.confidential_verify_weight};
+  meta.eviction_key = EvictionKey{meta.entry.fee, meta.entry.score_weight, meta.entry.txid};
+  meta.spent = spent_inputs;
+  for (const auto& op : meta.spent) spent_outpoints_[op] = txid;
 
   const bool full_by_count = by_txid_.size() >= kMaxTxCount;
   const bool full_by_bytes = total_bytes_ + raw.size() > kMaxPoolBytes;
@@ -171,12 +187,12 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, st
   total_bytes_ += raw.size();
   by_txid_[txid] = std::move(meta);
   eviction_index_[by_txid_[txid].eviction_key] = txid;
-  if (accepted_fee) *accepted_fee = vr.fee;
+  if (accepted_fee) *accepted_fee = vr.cost.fee;
   return true;
 }
 
-std::vector<Tx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
-                                          std::vector<std::string>* diagnostics) const {
+std::vector<AnyTx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
+                                             std::vector<std::string>* diagnostics) const {
   std::vector<const TxMeta*> candidates;
   candidates.reserve(by_txid_.size());
   for (const auto& [_, meta] : by_txid_) {
@@ -187,10 +203,10 @@ std::vector<Tx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_b
     return compare_entry_score(a->entry, b->entry) > 0;
   });
 
-  std::vector<Tx> out;
+  std::vector<AnyTx> out;
   out.reserve(std::min(max_txs, candidates.size()));
   std::size_t used_bytes = 0;
-  UtxoView work = view;
+  UtxoSetV2 work = view;
 
   for (const TxMeta* m : candidates) {
     if (out.size() >= max_txs) break;
@@ -201,22 +217,14 @@ std::vector<Tx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_b
       continue;
     }
 
-    const auto vr = validate_tx(m->entry.tx, 1, work, ctx_ ? &*ctx_ : nullptr);
+    const auto vr = validate_any_tx(m->entry.tx, 1, work, ctx_ ? &*ctx_ : nullptr);
     if (!vr.ok) {
       if (diagnostics) {
         diagnostics->push_back("skip txid=" + hex_encode32(m->entry.txid) + " reason=" + vr.error);
       }
       continue;
     }
-
-    for (const auto& in : m->entry.tx.inputs) {
-      work.erase(OutPoint{in.prev_txid, in.prev_index});
-    }
-    const Hash32 txid = m->entry.txid;
-    for (std::uint32_t i = 0; i < m->entry.tx.outputs.size(); ++i) {
-      work[OutPoint{txid, i}] = UtxoEntry{m->entry.tx.outputs[i]};
-    }
-
+    apply_any_tx_to_utxo(m->entry.tx, work);
     out.push_back(m->entry.tx);
     used_bytes += m->entry.size_bytes;
   }
@@ -240,8 +248,8 @@ void Mempool::remove_confirmed(const std::vector<Hash32>& txids) {
 void Mempool::prune_against_utxo(const UtxoView& view) {
   for (auto it = by_txid_.begin(); it != by_txid_.end();) {
     bool ok = true;
-    for (const auto& in : it->second.entry.tx.inputs) {
-      if (!outpoint_exists(view, OutPoint{in.prev_txid, in.prev_index})) {
+    for (const auto& op : input_outpoints(it->second.entry.tx)) {
+      if (!outpoint_exists(view, op)) {
         ok = false;
         break;
       }
@@ -268,10 +276,10 @@ MempoolPolicyStats Mempool::policy_stats() const {
   const bool full = by_txid_.size() >= kMaxTxCount || total_bytes_ >= kMaxPoolBytes;
   if (!full || by_txid_.empty()) return out;
   const auto worst_key = worst_entry_key();
-  if (!worst_key.has_value() || worst_key->size_bytes == 0) return out;
+  if (!worst_key.has_value() || worst_key->score_weight == 0) return out;
   out.min_fee_rate_to_enter_when_full =
       (static_cast<double>(worst_key->fee) * static_cast<double>(10'000 + full_replacement_margin_bps_)) /
-      (static_cast<double>(10'000) * static_cast<double>(worst_key->size_bytes));
+      (static_cast<double>(10'000) * static_cast<double>(worst_key->score_weight));
   return out;
 }
 

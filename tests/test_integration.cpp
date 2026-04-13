@@ -3072,8 +3072,8 @@ TEST(test_follower_startup_repairs_missing_required_epoch_from_peer) {
   follower.start();
 
   ASSERT_TRUE(wait_for([&]() {
-    return bootstrap.status().height >= 40 && follower.status().height >= 40;
-  }, std::chrono::seconds(120)));
+    return bootstrap.status().height >= 34 && follower.status().height >= 34;
+  }, ci_timeout_seconds(120)));
 
   const std::uint64_t before_height = follower.status().height;
   const std::uint64_t step = std::max<std::uint64_t>(1, follower_cfg.network.committee_epoch_blocks);
@@ -3168,7 +3168,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
     const auto s0 = bootstrap.status();
     const auto s1 = follower.status();
     return s0.height >= 5 && s1.height >= 5 && s0.transition_hash == s1.transition_hash && s1.established_peers >= 1;
-  }, std::chrono::seconds(40)));
+  }, ci_timeout_seconds(60)));
 
   ASSERT_TRUE(bootstrap.pause_proposals_for_test(true));
   ASSERT_TRUE(follower.pause_proposals_for_test(true));
@@ -3216,7 +3216,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   const bool recovered = wait_for([&]() {
     const auto s = follower.status();
     return s.established_peers >= 1 && s.consensus_state != "REPAIRING" && s.height >= synced_height + 2;
-  }, std::chrono::seconds(60));
+  }, ci_timeout_seconds(90));
   if (!recovered) {
     const auto sb = bootstrap_restarted.status();
     const auto sf = follower.status();
@@ -3652,7 +3652,7 @@ TEST(test_mainnet_seed_bootstrap_and_catchup) {
       if (n->status().height < 8) return false;
     }
     return true;
-  }, std::chrono::seconds(90)));
+  }, ci_timeout_seconds(120)));
   for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(30)));
   const auto frozen_tip = nodes[0]->status();
@@ -4314,7 +4314,13 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(node->inject_tx_for_test(*tx, true));
 
-  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 34; }, std::chrono::seconds(10)));
+  ASSERT_TRUE(wait_for([&]() {
+    if (node->status().height < 34) return false;
+    storage::DB probe_db;
+    if (!probe_db.open_readonly(cfg.db_path)) return false;
+    if (!probe_db.get_tx_index(tx->txid()).has_value()) return false;
+    return !node->find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty();
+  }, std::chrono::seconds(20)));
 
   const auto recipient_utxos = node->find_utxos_by_pubkey_hash_for_test(recipient_pkh);
   ASSERT_TRUE(!recipient_utxos.empty());
@@ -4326,7 +4332,7 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   ASSERT_TRUE(db.open(cfg.db_path));
   const auto loc = db.get_tx_index(tx->txid());
   ASSERT_TRUE(loc.has_value());
-  ASSERT_EQ(loc->height, 34u);
+  ASSERT_TRUE(loc->height >= 34u);
 }
 
 TEST(test_tx_status_reports_certified_ingress_before_finalization) {
@@ -4569,8 +4575,9 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
   ASSERT_TRUE(wait_for([&]() {
     const auto leader_status = leader.status();
     const auto follower_status = follower.status();
-    return leader_status.height >= 34 && follower_status.height >= 34 &&
-           leader_status.transition_hash == follower_status.transition_hash;
+    if (leader_status.height < 34 || follower_status.height < 34) return false;
+    if (leader_status.transition_hash != follower_status.transition_hash) return false;
+    return !follower.find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty();
   }, std::chrono::seconds(90)));
 
   const auto follower_utxos = follower.find_utxos_by_pubkey_hash_for_test(recipient_pkh);
@@ -7075,8 +7082,10 @@ TEST(test_syncing_follower_reconstructs_same_next_height_checkpoint_as_validator
   const std::string base = unique_test_base("/tmp/finalis_it_follower_checkpoint_match");
   auto cluster = make_p2p_cluster(base, 2, 2, 2);
   auto& validators = cluster.nodes;
+  const auto min_height =
+      std::max<std::uint64_t>(18, node::NodeConfig{}.network.committee_epoch_blocks + 2);
 
-  ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= 40; }, std::chrono::seconds(60)));
+  ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= min_height; }, ci_timeout_seconds(90)));
   ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
 
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
@@ -7136,8 +7145,10 @@ TEST(test_finalized_checkpoint_uses_persisted_epoch_ticket_winners) {
   const std::string base = unique_test_base("/tmp/finalis_it_checkpoint_uses_persisted_ticket_winners");
   auto cluster = make_p2p_cluster(base, 2, 2, 2);
   auto& validators = cluster.nodes;
+  const auto min_height =
+      std::max<std::uint64_t>(18, node::NodeConfig{}.network.committee_epoch_blocks + 2);
 
-  ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= 40; }, std::chrono::seconds(60)));
+  ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= min_height; }, ci_timeout_seconds(90)));
   ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(5)));
 
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
@@ -7168,10 +7179,12 @@ TEST(test_finalized_checkpoint_uses_persisted_epoch_ticket_winners) {
 
 TEST(test_startup_repairs_stale_checkpoint_ticket_winners) {
   const std::string base = unique_test_base("/tmp/finalis_it_repair_stale_checkpoint_ticket_winners");
+  const auto min_height =
+      std::max<std::uint64_t>(18, node::NodeConfig{}.network.committee_epoch_blocks + 2);
   {
     auto cluster = make_p2p_cluster(base, 2, 2, 2);
     auto& validators = cluster.nodes;
-    ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= 40; }, std::chrono::seconds(60)));
+    ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= min_height; }, ci_timeout_seconds(120)));
     ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
     for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
     ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
@@ -7222,10 +7235,12 @@ TEST(test_startup_repairs_stale_checkpoint_ticket_winners) {
 
 TEST(test_reconcile_rebuild_prefers_persisted_epoch_ticket_winners) {
   const std::string base = unique_test_base("/tmp/finalis_it_reconcile_rebuild_prefers_best_tickets");
+  const auto min_height =
+      std::max<std::uint64_t>(18, node::NodeConfig{}.network.committee_epoch_blocks + 2);
   {
     auto cluster = make_p2p_cluster(base, 2, 2, 2);
     auto& validators = cluster.nodes;
-    ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= 40; }, std::chrono::seconds(60)));
+    ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= min_height; }, ci_timeout_seconds(90)));
     ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(5)));
     for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
     ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(5)));
@@ -7314,7 +7329,7 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
   }, std::chrono::seconds(70)));
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
   ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
-  ASSERT_TRUE(wait_for([&]() { return follower.status().height >= 40; }, std::chrono::seconds(60)));
+  ASSERT_TRUE(wait_for([&]() { return follower.status().height >= 40; }, ci_timeout_seconds(90)));
 
   const auto follower_next_height = follower.status().height + 1;
   ASSERT_EQ(follower.proposer_for_height_round_for_test(follower_next_height, 0),

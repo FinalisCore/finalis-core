@@ -20,6 +20,7 @@ crypto::KeyPair key_from_byte(std::uint8_t b) {
 
 Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
   Bytes ss;
+  ss.reserve(1 + sig.size() + 1 + pub.size());
   ss.push_back(0x40);
   ss.insert(ss.end(), sig.begin(), sig.end());
   ss.push_back(0x20);
