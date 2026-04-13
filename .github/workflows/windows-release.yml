@@ -17,6 +17,7 @@ jobs:
       BUILD_PRESET: windows-msvc-release
       QT_VERSION: 5.15.2
       QT_ARCH: win64_msvc2019_64
+      VCPKG_FORCE_SYSTEM_BINARIES: "1"
       WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
       WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
       WINDOWS_SIGN_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGN_TIMESTAMP_URL }}
@@ -51,6 +52,12 @@ jobs:
       - name: Bootstrap vcpkg
         shell: pwsh
         run: .\vcpkg\bootstrap-vcpkg.bat
+
+      - name: Verify system build tools
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4

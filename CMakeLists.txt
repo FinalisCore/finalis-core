@@ -18,6 +18,7 @@ option(FINALIS_SANITIZE "Enable ASan/UBSan instrumentation" OFF)
 option(FINALIS_BUILD_FUZZ "Build fuzz harness executables" ON)
 option(FINALIS_STRICT_WARNINGS "Enable strict warning flags" OFF)
 option(FINALIS_USE_VENDORED_SECP256K1_ZKP "Prefer vendored secp256k1-zkp when available." ON)
+option(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND "Fail configure if secp256k1-zkp confidential backend is unavailable." ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(Qt5 COMPONENTS Widgets QUIET)
@@ -86,6 +87,12 @@ else()
     add_compile_definitions(SC_HAS_SECP256K1_ZKP=1)
     set(FINALIS_USE_SECP256K1_ZKP_BACKEND ON)
   endif()
+endif()
+
+if(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND AND NOT FINALIS_USE_SECP256K1_ZKP_BACKEND)
+  message(FATAL_ERROR
+    "Confidential backend unavailable: secp256k1-zkp support was not enabled. "
+    "Ensure third_party/secp256k1-zkp is present or provide a compatible system secp256k1-zkp installation.")
 endif()
 
 find_library(ROCKSDB_LIB rocksdb)
