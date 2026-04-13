@@ -4549,16 +4549,23 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
     return leader.status().height >= 33 && follower.status().height >= 33;
   }, std::chrono::seconds(120)));
 
-  const auto leader_keypair = node::Node::deterministic_test_keypairs()[0];
-  const auto own_pkh = crypto::h160(Bytes(leader_keypair.public_key.begin(), leader_keypair.public_key.end()));
-  auto spendable = leader.find_utxos_by_pubkey_hash_for_test(own_pkh);
-  ASSERT_TRUE(!spendable.empty());
-  const auto prev = spendable.front();
+  constexpr std::uint64_t kAmount = 10'000'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+
+  const auto keys = node::Node::deterministic_test_keypairs();
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(leader, keys, kAmount + kFee, 1);
+    if (!funded.has_value() || funded->utxos.empty()) return false;
+    return true;
+  }, std::chrono::seconds(60)));
+  ASSERT_TRUE(funded.has_value());
 
   std::array<std::uint8_t, 20> recipient_pkh{};
   recipient_pkh.fill(0x55);
-  constexpr std::uint64_t kAmount = 10'000'000'000ULL;
-  constexpr std::uint64_t kFee = 10'000ULL;
+  const auto sender_kp = keys[funded->key_index];
+  const auto own_pkh = crypto::h160(Bytes(sender_kp.public_key.begin(), sender_kp.public_key.end()));
+  const auto prev = funded->utxos.front();
   ASSERT_TRUE(prev.second.value > kAmount + kFee);
 
   std::vector<TxOut> outputs;
@@ -4567,7 +4574,7 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
 
   std::string build_err;
   auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
-                                               Bytes(leader_keypair.private_key.begin(), leader_keypair.private_key.end()),
+                                               Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()),
                                                outputs, &build_err);
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(leader.inject_tx_for_test(*tx, true));

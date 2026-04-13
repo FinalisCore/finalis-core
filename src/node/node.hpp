@@ -500,6 +500,7 @@ class Node {
   std::string last_test_hook_error_;
   std::uint32_t current_round_{0};
   std::uint64_t round_started_ms_{0};
+  bool reconnect_round_reset_pending_{false};
   bool repair_mode_{false};
   std::uint64_t repair_target_height_{0};
   std::string repair_reason_;

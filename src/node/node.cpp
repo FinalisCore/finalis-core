@@ -1867,6 +1867,9 @@ bool Node::init() {
         requested_sync_artifacts_.clear();
         requested_sync_heights_.clear();
         const auto current_height = finalized_height_ + 1;
+        if (established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height)) {
+          reconnect_round_reset_pending_ = true;
+        }
         const bool should_reset_round_state =
             established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height) &&
             (current_round_ > 0 || had_round_activity);
@@ -5003,6 +5006,21 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     request_finalized_tip(peer_id);
     send_ingress_tips(peer_id);
     request_ingress_tips(peer_id);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      const auto current_height = finalized_height_ + 1;
+      if (reconnect_round_reset_pending_ && !single_node_bootstrap_active_locked(current_height)) {
+        reconnect_round_reset_pending_ = false;
+        current_round_ = 0;
+        proposed_in_round_.clear();
+        local_vote_reservations_.clear();
+        local_timeout_vote_reservations_.clear();
+        votes_.clear_height(current_height);
+        timeout_votes_.clear_height(current_height);
+        round_started_ms_ = now_ms();
+        log_line("peer-reconnect-reset height=" + std::to_string(current_height) + " reason=peers-restored");
+      }
+    }
     auto pi = p2p_.get_peer_info(peer_id);
     auto na = addrman_address_for_peer(pi);
     if (na.has_value()) {
