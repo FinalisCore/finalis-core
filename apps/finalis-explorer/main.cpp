@@ -297,6 +297,9 @@ constexpr std::size_t kPersistedTransitionIndexLimit = 128;
 
 struct PersistedExplorerSnapshot {
   std::uint64_t stored_unix_ms{0};
+  std::optional<std::uint64_t> status_refreshed_unix_ms;
+  std::optional<std::uint64_t> committee_refreshed_unix_ms;
+  std::optional<std::uint64_t> recent_refreshed_unix_ms;
   std::optional<finalis::minijson::Value> status_result;
   std::optional<finalis::minijson::Value> committee_result;
   std::uint64_t committee_height{0};
@@ -552,6 +555,26 @@ std::string explorer_data_freshness_note(const std::string& source, const std::o
   if (source != "cache_finalized_snapshot") return {};
   if (!refreshed_unix_ms.has_value()) return "Last refreshed from RPC: unknown";
   return "Last refreshed from RPC: " + format_timestamp(*refreshed_unix_ms);
+}
+
+std::string explorer_snapshot_freshness_text(const std::optional<std::uint64_t>& refreshed_unix_ms) {
+  if (!refreshed_unix_ms.has_value()) return "unknown";
+  return format_timestamp(*refreshed_unix_ms);
+}
+
+std::optional<std::uint64_t> persisted_status_refreshed_unix_ms() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  return g_persisted_snapshot.status_refreshed_unix_ms;
+}
+
+std::optional<std::uint64_t> persisted_committee_refreshed_unix_ms() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  return g_persisted_snapshot.committee_refreshed_unix_ms;
+}
+
+std::optional<std::uint64_t> persisted_recent_refreshed_unix_ms() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  return g_persisted_snapshot.recent_refreshed_unix_ms;
 }
 
 std::string format_timestamp(std::uint64_t ts) {
@@ -1586,6 +1609,9 @@ void persist_explorer_snapshot(const Config& cfg) {
   json_put(root, "version", static_cast<std::uint64_t>(1));
   json_put(root, "rpc_url", cfg.rpc_url);
   json_put(root, "stored_unix_ms", snapshot.stored_unix_ms);
+  json_put(root, "status_refreshed_unix_ms", snapshot.status_refreshed_unix_ms);
+  json_put(root, "committee_refreshed_unix_ms", snapshot.committee_refreshed_unix_ms);
+  json_put(root, "recent_refreshed_unix_ms", snapshot.recent_refreshed_unix_ms);
   json_put(root, "committee_height", snapshot.committee_height);
   json_put(root, "recent_limit", static_cast<std::uint64_t>(snapshot.recent_limit));
   json_put(root, "recent_present", snapshot.recent_present);
@@ -1621,6 +1647,9 @@ void load_persisted_explorer_snapshot(const Config& cfg) {
 
   PersistedExplorerSnapshot loaded;
   loaded.stored_unix_ms = object_u64(&*parsed, "stored_unix_ms").value_or(0);
+  loaded.status_refreshed_unix_ms = object_u64(&*parsed, "status_refreshed_unix_ms");
+  loaded.committee_refreshed_unix_ms = object_u64(&*parsed, "committee_refreshed_unix_ms");
+  loaded.recent_refreshed_unix_ms = object_u64(&*parsed, "recent_refreshed_unix_ms");
   loaded.committee_height = object_u64(&*parsed, "committee_height").value_or(0);
   if (auto recent_limit = object_u64(&*parsed, "recent_limit"); recent_limit.has_value()) {
     loaded.recent_limit = static_cast<std::size_t>(*recent_limit);
@@ -1742,19 +1771,20 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
 LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uint64_t height);
 std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& cfg, const std::vector<std::string>& txids);
 
-std::string render_status_json(const StatusResult& result);
+std::string render_status_json(const StatusResult& result, std::optional<std::uint64_t> refreshed_unix_ms = std::nullopt);
 std::string render_tx_json(const TxResult& result);
 std::string render_transition_json(const Config& cfg, const TransitionResult& result);
 std::string render_address_json(const AddressResult& result);
 std::string render_search_json(const SearchResult& result);
-std::string render_committee_json(const CommitteeResult& result);
-std::string render_recent_tx_json(const std::vector<RecentTxResult>& items);
+std::string render_committee_json(const CommitteeResult& result, std::optional<std::uint64_t> refreshed_unix_ms = std::nullopt);
+std::string render_recent_tx_json(const std::vector<RecentTxResult>& items, std::optional<std::uint64_t> refreshed_unix_ms = std::nullopt);
 
 std::string render_root(const Config& cfg) {
   std::ostringstream body;
   body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>"
        << "<div class=\"note\">Finalized-state explorer for operators, wallets, and exchanges. It intentionally shows only finalized chain state and hides mempool ambiguity.</div>";
   auto status = fetch_status_result(cfg);
+  const auto status_refreshed_unix_ms = persisted_status_refreshed_unix_ms();
   if (status.value.has_value()) {
     body << "<div class=\"hero-metrics\">"
          << "<div class=\"metric-card\"><span class=\"label\">Finalized Tip</span><span class=\"value\">" << status.value->finalized_height
@@ -1780,6 +1810,7 @@ std::string render_root(const Config& cfg) {
   if (status.value.has_value()) {
     body << "<div>Runtime Status</div><div>" << status_chip(sync_summary_text(*status.value), tone_for_sync(*status.value)) << " "
          << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
+         << "<div>Status Snapshot Refreshed</div><div>" << html_escape(explorer_snapshot_freshness_text(status_refreshed_unix_ms)) << "</div>"
          << "<div>Network</div><div>" << html_escape(status.value->network) << "</div>"
          << "<div>Finalized Tip</div><div class=\"value-cell\">" << link_transition_height(status.value->finalized_height) << " <code>" << html_escape(short_hex(status.value->finalized_transition_hash))
          << "</code> " << finalized_badge(true) << "</div>"
@@ -1810,9 +1841,12 @@ std::string render_root(const Config& cfg) {
          << "</div></div>";
   }
   const auto recent = fetch_recent_tx_results(cfg, 8);
+  const auto recent_refreshed_unix_ms = persisted_recent_refreshed_unix_ms();
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
-    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>";
+    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>"
+         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
+         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
     body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>Flow</th><th>From</th><th>To</th><th>Finalized Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
     for (const auto& item : recent) {
       body << "<tr><td>" << link_tx(item.txid) << "</td><td>"
@@ -1853,7 +1887,9 @@ std::string render_root(const Config& cfg) {
     }
     body << "</tbody></table></div>";
   } else {
-    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. This usually means the latest finalized transitions carried no user transactions, not that explorer indexing is broken.</div>";
+    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. This usually means the latest finalized transitions carried no user transactions, not that explorer indexing is broken.</div>"
+         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
+         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
   }
   body << "</div>";
   body << "<div class=\"card\"><h2>Routes</h2><ul>"
@@ -1875,6 +1911,7 @@ std::string render_committee(const Config& cfg) {
     return page_layout("Committee", body.str(), "committee");
   }
   auto committee = fetch_committee_result(cfg, status.value->finalized_height);
+  const auto committee_refreshed_unix_ms = persisted_committee_refreshed_unix_ms();
   if (!committee.value.has_value()) {
     body << "<div class=\"card\"><div class=\"note\">Committee unavailable: "
          << html_escape(committee.error ? committee.error->message : "unknown error") << "</div></div>";
@@ -1886,6 +1923,9 @@ std::string render_committee(const Config& cfg) {
        << render_summary_metric_card("Epoch Start", std::to_string(committee.value->epoch_start_height), "current finalized committee epoch")
        << render_summary_metric_card("Checkpoint Mode", committee.value->checkpoint_derivation_mode.value_or("n/a"),
                                      committee.value->checkpoint_fallback_reason.value_or("no fallback"))
+       << "</div></div>";
+  body << "<div class=\"card\"><div class=\"note\">Committee snapshot refreshed from RPC: "
+       << html_escape(explorer_snapshot_freshness_text(committee_refreshed_unix_ms))
        << "</div></div>";
   body << "<div class=\"card\"><h2>" << html_escape(ticket_pow_title(*status.value)) << "</h2><div class=\"grid\">"
        << "<div>Difficulty</div><div>" << status.value->ticket_pow_difficulty << " <span class=\"muted\">(range "
@@ -2063,8 +2103,10 @@ LookupResult<StatusResult> fetch_status_result(const Config& cfg) {
   } else {
     out = parse_status_result_object(*status.result);
     if (out.value.has_value()) {
+      const auto refreshed_unix_ms = now_unix_ms();
       {
         std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+        g_persisted_snapshot.status_refreshed_unix_ms = refreshed_unix_ms;
         g_persisted_snapshot.status_result = *status.result;
       }
       persist_explorer_snapshot(cfg);
@@ -2097,8 +2139,10 @@ LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uin
   } else {
     out = parse_committee_result_object(*rpc.result, height);
     if (out.value.has_value()) {
+      const auto refreshed_unix_ms = now_unix_ms();
       {
         std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+        g_persisted_snapshot.committee_refreshed_unix_ms = refreshed_unix_ms;
         g_persisted_snapshot.committee_height = height;
         g_persisted_snapshot.committee_result = *rpc.result;
       }
@@ -2607,8 +2651,10 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
         .key = cache_key, .stored_at = std::chrono::steady_clock::now(), .value = out, .valid = true};
   }
   if (max_items == kPersistedRecentLimit) {
+    const auto refreshed_unix_ms = now_unix_ms();
     {
       std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+      g_persisted_snapshot.recent_refreshed_unix_ms = refreshed_unix_ms;
       g_persisted_snapshot.recent_limit = max_items;
       g_persisted_snapshot.recent_present = true;
       g_persisted_snapshot.recent = out;
@@ -2659,7 +2705,7 @@ std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& c
   return out;
 }
 
-std::string render_status_json(const StatusResult& result) {
+std::string render_status_json(const StatusResult& result, std::optional<std::uint64_t> refreshed_unix_ms) {
   std::ostringstream oss;
   oss << "{\"network\":\"" << json_escape(result.network) << "\","
       << "\"network_id\":\"" << json_escape(result.network_id) << "\","
@@ -2744,6 +2790,7 @@ std::string render_status_json(const StatusResult& result) {
       << ",\"nonce_search_limit\":" << result.ticket_pow_nonce_search_limit
       << ",\"bonus_cap_bps\":" << result.ticket_pow_bonus_cap_bps
       << "},"
+      << "\"snapshot_refreshed_unix_ms\":" << json_u64_or_null(refreshed_unix_ms) << ","
       << "\"finalized_only\":true}";
   return oss.str();
 }
@@ -2876,7 +2923,7 @@ std::string render_search_json(const SearchResult& result) {
   return oss.str();
 }
 
-std::string render_committee_json(const CommitteeResult& result) {
+std::string render_committee_json(const CommitteeResult& result, std::optional<std::uint64_t> refreshed_unix_ms) {
   std::ostringstream oss;
   oss << "{\"height\":" << result.height
       << ",\"epoch_start_height\":" << result.epoch_start_height
@@ -2897,6 +2944,7 @@ std::string render_committee_json(const CommitteeResult& result) {
       << ",\"target_contract_streak\":" << json_u64_or_null(result.target_contract_streak)
       << ",\"member_count\":" << result.members.size()
       << ",\"snapshot_kind\":\"finalized_committee\""
+      << ",\"snapshot_refreshed_unix_ms\":" << json_u64_or_null(refreshed_unix_ms)
       << ",\"members\":[";
   for (std::size_t i = 0; i < result.members.size(); ++i) {
     if (i) oss << ",";
@@ -2916,7 +2964,7 @@ std::string render_committee_json(const CommitteeResult& result) {
   return oss.str();
 }
 
-std::string render_recent_tx_json(const std::vector<RecentTxResult>& items) {
+std::string render_recent_tx_json(const std::vector<RecentTxResult>& items, std::optional<std::uint64_t> refreshed_unix_ms) {
   std::ostringstream oss;
   std::uint64_t finalized_out_total = 0;
   oss << "{\"items\":[";
@@ -2950,7 +2998,8 @@ std::string render_recent_tx_json(const std::vector<RecentTxResult>& items) {
     oss << "}";
   }
   oss << "],\"summary\":{\"tx_count\":" << items.size() << ",\"finalized_out\":" << finalized_out_total
-      << "},\"finalized_only\":true,\"snapshot_kind\":\"recent_finalized_transactions\"}";
+      << "},\"snapshot_refreshed_unix_ms\":" << json_u64_or_null(refreshed_unix_ms)
+      << ",\"finalized_only\":true,\"snapshot_kind\":\"recent_finalized_transactions\"}";
   return oss.str();
 }
 
@@ -3382,18 +3431,18 @@ Response handle_request(const Config& cfg, const std::string& req) {
   }
   if (path == "/api/status") {
     auto result = fetch_status_result(cfg);
-    return result.value.has_value() ? json_response(200, render_status_json(*result.value))
+    return result.value.has_value() ? json_response(200, render_status_json(*result.value, persisted_status_refreshed_unix_ms()))
                                     : json_error_response(*result.error);
   }
   if (path == "/api/committee") {
     auto status = fetch_status_result(cfg);
     if (!status.value.has_value()) return json_error_response(*status.error);
     auto result = fetch_committee_result(cfg, status.value->finalized_height);
-    return result.value.has_value() ? json_response(200, render_committee_json(*result.value))
+    return result.value.has_value() ? json_response(200, render_committee_json(*result.value, persisted_committee_refreshed_unix_ms()))
                                     : json_error_response(*result.error);
   }
   if (path == "/api/recent-tx") {
-    return json_response(200, render_recent_tx_json(fetch_recent_tx_results(cfg, 8)));
+    return json_response(200, render_recent_tx_json(fetch_recent_tx_results(cfg, 8), persisted_recent_refreshed_unix_ms()));
   }
   const std::string tx_prefix = "/tx/";
   const std::string transition_prefix = "/transition/";

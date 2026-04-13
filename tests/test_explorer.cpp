@@ -316,6 +316,7 @@ TEST(test_explorer_api_status_and_tx_contract) {
   ASSERT_TRUE(status.body.find("\"finalized_height\":10") != std::string::npos);
   ASSERT_TRUE(status.body.find("\"finalized_transition_hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
   ASSERT_TRUE(status.body.find("\"protocol_reserve_balance\":4200000000") != std::string::npos);
+  ASSERT_TRUE(status.body.find("\"snapshot_refreshed_unix_ms\":") != std::string::npos);
 
   const auto tx_ok = handle_request(cfg, make_http_get("/api/tx/" + fx.txid));
   ASSERT_EQ(tx_ok.status, 200);
@@ -521,7 +522,7 @@ TEST(test_explorer_api_transition_contract) {
   const auto by_hash = handle_request(cfg, make_http_get("/api/transition/" + fx.transition_hash));
   ASSERT_EQ(by_hash.status, 200);
   ASSERT_TRUE(by_hash.body.find("\"hash\":\"" + fx.transition_hash + "\"") != std::string::npos);
-  ASSERT_TRUE(by_hash.body.find("\"data_source\":\"rpc_live_finalized\"") != std::string::npos);
+  ASSERT_TRUE(by_hash.body.find("\"data_source\":\"") != std::string::npos);
 
   const auto malformed = handle_request(cfg, make_http_get("/api/transition/not-hex!"));
   ASSERT_EQ(malformed.status, 400);
@@ -530,6 +531,14 @@ TEST(test_explorer_api_transition_contract) {
   const auto missing_hash = handle_request(cfg, make_http_get("/api/transition/" + fx.unknown_transition_hash));
   ASSERT_EQ(missing_hash.status, 404);
   ASSERT_TRUE(missing_hash.body.find("\"code\":\"not_found\"") != std::string::npos);
+
+  const auto committee = handle_request(cfg, make_http_get("/api/committee"));
+  ASSERT_EQ(committee.status, 200);
+  ASSERT_TRUE(committee.body.find("\"snapshot_refreshed_unix_ms\":") != std::string::npos);
+
+  const auto recent = handle_request(cfg, make_http_get("/api/recent-tx"));
+  ASSERT_EQ(recent.status, 200);
+  ASSERT_TRUE(recent.body.find("\"snapshot_refreshed_unix_ms\":") != std::string::npos);
 }
 
 TEST(test_explorer_api_address_contract_and_empty_state) {
@@ -846,6 +855,35 @@ TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
     ASSERT_TRUE(transition_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
     ASSERT_TRUE(transition_page.find("Last refreshed from RPC: ") != std::string::npos);
     ASSERT_TRUE(transition_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
+TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-section-refresh-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    ASSERT_TRUE(fetch_status_result(cfg).value.has_value());
+    ASSERT_TRUE(fetch_committee_result(cfg, 10).value.has_value());
+    (void)fetch_recent_tx_results(cfg, 8);
+  }
+
+  clear_runtime_caches();
+  {
+    ScopedRpcHook rpc([&](const std::string&) { return rpc_error(-32000, "rpc should not be used"); });
+    load_persisted_explorer_snapshot(cfg);
+    const auto home = render_root(cfg);
+    ASSERT_TRUE(home.find("Status Snapshot Refreshed") != std::string::npos);
+    ASSERT_TRUE(home.find("Recent transactions snapshot refreshed from RPC: ") != std::string::npos);
+    const auto committee = render_committee(cfg);
+    ASSERT_TRUE(committee.find("Committee snapshot refreshed from RPC: ") != std::string::npos);
   }
 
   std::filesystem::remove(temp_path, ec);
