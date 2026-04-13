@@ -6,6 +6,7 @@
 #include <string>
 #include <tuple>
 #include <variant>
+#include <vector>
 
 #include "common/types.hpp"
 #include "crypto/confidential.hpp"
