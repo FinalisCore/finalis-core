@@ -196,6 +196,10 @@ struct TransitionResult {
   std::uint32_t round{0};
   std::size_t tx_count{0};
   std::vector<std::string> txids;
+  bool summary_cached{false};
+  std::uint64_t cached_summary_finalized_out{0};
+  std::size_t cached_summary_distinct_recipient_count{0};
+  std::map<std::string, std::size_t> cached_summary_flow_mix;
   bool finalized_only{true};
 };
 
@@ -284,6 +288,8 @@ std::mutex g_log_mu;
 constexpr auto kSlowRpcThreshold = std::chrono::milliseconds(200);
 constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
+constexpr std::size_t kPersistedTxIndexLimit = 128;
+constexpr std::size_t kPersistedTransitionIndexLimit = 128;
 
 struct PersistedExplorerSnapshot {
   std::optional<finalis::minijson::Value> status_result;
@@ -292,6 +298,8 @@ struct PersistedExplorerSnapshot {
   std::vector<RecentTxResult> recent;
   std::size_t recent_limit{kPersistedRecentLimit};
   bool recent_present{false};
+  std::vector<finalis::minijson::Value> tx_index;
+  std::vector<finalis::minijson::Value> transition_index;
 };
 
 PersistedExplorerSnapshot g_persisted_snapshot;
@@ -347,6 +355,7 @@ struct Response {
 
 Response handle_request(const Config& cfg, const std::string& req);
 ApiError upstream_error(const std::string& message);
+void persist_explorer_snapshot(const Config& cfg);
 
 volatile std::sig_atomic_t g_stop = 0;
 std::atomic<std::size_t> g_active_clients{0};
@@ -481,6 +490,12 @@ struct TransitionSummary {
 
 TransitionSummary compute_transition_summary(const Config& cfg, const TransitionResult& transition) {
   TransitionSummary summary;
+  if (transition.summary_cached) {
+    summary.finalized_out = transition.cached_summary_finalized_out;
+    summary.distinct_recipient_count = transition.cached_summary_distinct_recipient_count;
+    summary.flow_mix = transition.cached_summary_flow_mix;
+    return summary;
+  }
   std::set<std::string> distinct_recipients;
   const auto summaries = fetch_tx_summary_batch(cfg, transition.txids);
   for (const auto& txid : transition.txids) {
@@ -1308,6 +1323,209 @@ finalis::minijson::Value serialize_recent_tx_cache_array(const std::vector<Recen
   return array;
 }
 
+finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
+  auto obj = json_object_value();
+  json_put(obj, "txid", result.txid);
+  json_put(obj, "found", result.found);
+  json_put(obj, "finalized", result.finalized);
+  json_put(obj, "finalized_height", result.finalized_height);
+  json_put(obj, "finalized_depth", result.finalized_depth);
+  json_put(obj, "credit_safe", result.credit_safe);
+  json_put(obj, "status_label", result.status_label);
+  json_put(obj, "transition_hash", result.transition_hash);
+  json_put(obj, "timestamp", result.timestamp);
+  json_put(obj, "total_out", result.total_out);
+  json_put(obj, "fee", result.fee);
+  json_put(obj, "flow_kind", result.flow_kind);
+  json_put(obj, "flow_summary", result.flow_summary);
+  json_put(obj, "primary_sender", result.primary_sender);
+  json_put(obj, "primary_recipient", result.primary_recipient);
+  json_put(obj, "participant_count",
+           result.participant_count.has_value() ? std::optional<std::uint64_t>(static_cast<std::uint64_t>(*result.participant_count))
+                                                : std::nullopt);
+  auto inputs = json_array_value();
+  for (const auto& in : result.inputs) {
+    auto item = json_object_value();
+    json_put(item, "prev_txid", in.prev_txid);
+    json_put(item, "vout", static_cast<std::uint64_t>(in.vout));
+    json_put(item, "address", in.address);
+    json_put(item, "amount", in.amount);
+    inputs.array_value.push_back(std::move(item));
+  }
+  auto outputs = json_array_value();
+  for (const auto& out : result.outputs) {
+    auto item = json_object_value();
+    json_put(item, "amount", out.amount);
+    json_put(item, "address", out.address);
+    json_put(item, "script_hex", out.script_hex);
+    outputs.array_value.push_back(std::move(item));
+  }
+  obj.object_value["inputs"] = std::move(inputs);
+  obj.object_value["outputs"] = std::move(outputs);
+  return obj;
+}
+
+std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& obj) {
+  if (!obj.is_object()) return std::nullopt;
+  auto txid = object_string(&obj, "txid");
+  if (!txid.has_value()) return std::nullopt;
+  TxResult result;
+  result.txid = *txid;
+  result.found = object_bool(&obj, "found").value_or(true);
+  result.finalized = object_bool(&obj, "finalized").value_or(true);
+  result.finalized_height = object_u64(&obj, "finalized_height");
+  result.finalized_depth = object_u64(&obj, "finalized_depth").value_or(0);
+  result.credit_safe = object_bool(&obj, "credit_safe").value_or(false);
+  result.status_label = object_string(&obj, "status_label").value_or("");
+  result.transition_hash = object_string(&obj, "transition_hash").value_or("");
+  result.timestamp = object_u64(&obj, "timestamp");
+  result.total_out = object_u64(&obj, "total_out").value_or(0);
+  result.fee = object_u64(&obj, "fee");
+  result.flow_kind = object_string(&obj, "flow_kind").value_or("");
+  result.flow_summary = object_string(&obj, "flow_summary").value_or("");
+  result.primary_sender = object_string(&obj, "primary_sender");
+  result.primary_recipient = object_string(&obj, "primary_recipient");
+  if (auto count = object_u64(&obj, "participant_count"); count.has_value()) result.participant_count = static_cast<std::size_t>(*count);
+  if (const auto* inputs = obj.get("inputs"); inputs && inputs->is_array()) {
+    for (const auto& input : inputs->array_value) {
+      if (!input.is_object()) continue;
+      auto prev_txid = object_string(&input, "prev_txid");
+      auto vout = object_u64(&input, "vout");
+      if (!prev_txid.has_value() || !vout.has_value()) continue;
+      result.inputs.push_back(TxInputResult{
+          *prev_txid,
+          static_cast<std::uint32_t>(*vout),
+          object_string(&input, "address"),
+          object_u64(&input, "amount"),
+      });
+    }
+  }
+  if (const auto* outputs = obj.get("outputs"); outputs && outputs->is_array()) {
+    for (const auto& output : outputs->array_value) {
+      if (!output.is_object()) continue;
+      result.outputs.push_back(TxOutputResult{
+          object_u64(&output, "amount").value_or(0),
+          object_string(&output, "address"),
+          object_string(&output, "script_hex").value_or(""),
+      });
+    }
+  }
+  return result;
+}
+
+finalis::minijson::Value serialize_transition_result_object(const TransitionResult& result) {
+  auto obj = json_object_value();
+  json_put(obj, "found", result.found);
+  json_put(obj, "finalized", result.finalized);
+  json_put(obj, "height", result.height);
+  json_put(obj, "hash", result.hash);
+  json_put(obj, "prev_finalized_hash", result.prev_finalized_hash);
+  json_put(obj, "timestamp", result.timestamp);
+  json_put(obj, "round", static_cast<std::uint64_t>(result.round));
+  json_put(obj, "tx_count", static_cast<std::uint64_t>(result.tx_count));
+  json_put(obj, "summary_cached", result.summary_cached);
+  json_put(obj, "cached_summary_finalized_out", result.cached_summary_finalized_out);
+  json_put(obj, "cached_summary_distinct_recipient_count", static_cast<std::uint64_t>(result.cached_summary_distinct_recipient_count));
+  auto txids = json_array_value();
+  for (const auto& txid : result.txids) txids.array_value.push_back(json_string_value(txid));
+  obj.object_value["txids"] = std::move(txids);
+  auto flow_mix = json_object_value();
+  for (const auto& [kind, count] : result.cached_summary_flow_mix) {
+    json_put(flow_mix, kind.c_str(), static_cast<std::uint64_t>(count));
+  }
+  obj.object_value["cached_summary_flow_mix"] = std::move(flow_mix);
+  return obj;
+}
+
+std::optional<TransitionResult> parse_transition_result_object(const finalis::minijson::Value& obj) {
+  if (!obj.is_object()) return std::nullopt;
+  auto hash = object_string(&obj, "hash");
+  if (!hash.has_value()) return std::nullopt;
+  TransitionResult result;
+  result.found = object_bool(&obj, "found").value_or(true);
+  result.finalized = object_bool(&obj, "finalized").value_or(true);
+  result.height = object_u64(&obj, "height").value_or(0);
+  result.hash = *hash;
+  result.prev_finalized_hash = object_string(&obj, "prev_finalized_hash").value_or("");
+  result.timestamp = object_u64(&obj, "timestamp");
+  result.round = static_cast<std::uint32_t>(object_u64(&obj, "round").value_or(0));
+  result.tx_count = static_cast<std::size_t>(object_u64(&obj, "tx_count").value_or(0));
+  result.summary_cached = object_bool(&obj, "summary_cached").value_or(false);
+  result.cached_summary_finalized_out = object_u64(&obj, "cached_summary_finalized_out").value_or(0);
+  result.cached_summary_distinct_recipient_count =
+      static_cast<std::size_t>(object_u64(&obj, "cached_summary_distinct_recipient_count").value_or(0));
+  if (const auto* txids = obj.get("txids"); txids && txids->is_array()) {
+    for (const auto& txid : txids->array_value) {
+      if (txid.is_string()) result.txids.push_back(txid.string_value);
+    }
+  }
+  if (const auto* flow_mix = obj.get("cached_summary_flow_mix"); flow_mix && flow_mix->is_object()) {
+    for (const auto& [kind, value] : flow_mix->object_value) {
+      if (auto count = value.as_u64(); count.has_value()) {
+        result.cached_summary_flow_mix[kind] = static_cast<std::size_t>(*count);
+      }
+    }
+  }
+  return result;
+}
+
+std::optional<TxResult> find_persisted_tx_result(const std::string& txid) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  for (const auto& entry : g_persisted_snapshot.tx_index) {
+    auto parsed = parse_tx_result_object(entry);
+    if (parsed.has_value() && parsed->txid == txid) return parsed;
+  }
+  return std::nullopt;
+}
+
+std::optional<TransitionResult> find_persisted_transition_result_by_hash(const std::string& hash) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  for (const auto& entry : g_persisted_snapshot.transition_index) {
+    auto parsed = parse_transition_result_object(entry);
+    if (parsed.has_value() && parsed->hash == hash) return parsed;
+  }
+  return std::nullopt;
+}
+
+std::optional<TransitionResult> find_persisted_transition_result_by_height(std::uint64_t height) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  for (const auto& entry : g_persisted_snapshot.transition_index) {
+    auto parsed = parse_transition_result_object(entry);
+    if (parsed.has_value() && parsed->height == height) return parsed;
+  }
+  return std::nullopt;
+}
+
+void upsert_persisted_tx_result(const Config& cfg, const TxResult& result) {
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    auto& entries = g_persisted_snapshot.tx_index;
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto& entry) {
+                    auto parsed = parse_tx_result_object(entry);
+                    return parsed.has_value() && parsed->txid == result.txid;
+                  }),
+                  entries.end());
+    entries.insert(entries.begin(), serialize_tx_result_object(result));
+    if (entries.size() > kPersistedTxIndexLimit) entries.resize(kPersistedTxIndexLimit);
+  }
+  persist_explorer_snapshot(cfg);
+}
+
+void upsert_persisted_transition_result(const Config& cfg, const TransitionResult& result) {
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    auto& entries = g_persisted_snapshot.transition_index;
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto& entry) {
+                    auto parsed = parse_transition_result_object(entry);
+                    return parsed.has_value() && (parsed->hash == result.hash || parsed->height == result.height);
+                  }),
+                  entries.end());
+    entries.insert(entries.begin(), serialize_transition_result_object(result));
+    if (entries.size() > kPersistedTransitionIndexLimit) entries.resize(kPersistedTransitionIndexLimit);
+  }
+  persist_explorer_snapshot(cfg);
+}
+
 std::uint64_t now_unix_ms() {
   return static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -1330,6 +1548,12 @@ void persist_explorer_snapshot(const Config& cfg) {
   root.object_value["status_result"] = snapshot.status_result.has_value() ? *snapshot.status_result : json_null();
   root.object_value["committee_result"] = snapshot.committee_result.has_value() ? *snapshot.committee_result : json_null();
   root.object_value["recent_items"] = serialize_recent_tx_cache_array(snapshot.recent);
+  auto tx_index = json_array_value();
+  for (const auto& entry : snapshot.tx_index) tx_index.array_value.push_back(entry);
+  root.object_value["tx_index"] = std::move(tx_index);
+  auto transition_index = json_array_value();
+  for (const auto& entry : snapshot.transition_index) transition_index.array_value.push_back(entry);
+  root.object_value["transition_index"] = std::move(transition_index);
 
   const auto path = std::filesystem::path(cfg.cache_path);
   if (!path.parent_path().empty() && !finalis::ensure_private_dir(path.parent_path().string())) return;
@@ -1360,6 +1584,16 @@ void load_persisted_explorer_snapshot(const Config& cfg) {
   if (const auto* status = parsed->get("status_result"); status && status->is_object()) loaded.status_result = *status;
   if (const auto* committee = parsed->get("committee_result"); committee && committee->is_object()) loaded.committee_result = *committee;
   if (const auto* recent = parsed->get("recent_items"); recent && recent->is_array()) loaded.recent = parse_recent_tx_cache_array(*recent);
+  if (const auto* tx_index = parsed->get("tx_index"); tx_index && tx_index->is_array()) {
+    for (const auto& entry : tx_index->array_value) {
+      if (entry.is_object()) loaded.tx_index.push_back(entry);
+    }
+  }
+  if (const auto* transition_index = parsed->get("transition_index"); transition_index && transition_index->is_array()) {
+    for (const auto& entry : transition_index->array_value) {
+      if (entry.is_object()) loaded.transition_index.push_back(entry);
+    }
+  }
 
   {
     std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
@@ -1840,6 +2074,10 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
   if (is_digits(ident)) {
     try {
       const auto height = static_cast<std::uint64_t>(std::stoull(ident));
+      if (auto cached = find_persisted_transition_result_by_height(height); cached.has_value()) {
+        out.value = std::move(*cached);
+        return out;
+      }
       std::string err;
       std::string transition_hash_hex;
       auto blk = fetch_transition_by_height(cfg, height, &transition_hash_hex, &err);
@@ -1857,6 +2095,12 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
                             ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                             : 0;
       result.txids = fetch_transition_txids(cfg, *blk);
+      const auto summary = compute_transition_summary(cfg, result);
+      result.summary_cached = true;
+      result.cached_summary_finalized_out = summary.finalized_out;
+      result.cached_summary_distinct_recipient_count = summary.distinct_recipient_count;
+      result.cached_summary_flow_mix = summary.flow_mix;
+      upsert_persisted_transition_result(cfg, result);
       out.value = std::move(result);
       return out;
     } catch (...) {
@@ -1864,6 +2108,10 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
       return out;
     }
   } else if (is_hex64(ident)) {
+    if (auto cached = find_persisted_transition_result_by_hash(ident); cached.has_value()) {
+      out.value = std::move(*cached);
+      return out;
+    }
     auto rpc = rpc_call(cfg.rpc_url, "get_transition", std::string("{\"hash\":\"") + json_escape(ident) + "\"}");
     if (!rpc.result.has_value()) {
       out.error = rpc_not_found(rpc) ? not_found_error() : upstream_error(rpc.error);
@@ -1885,6 +2133,12 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
                           ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                           : 0;
     result.txids = fetch_transition_txids(cfg, *blk);
+    const auto summary = compute_transition_summary(cfg, result);
+    result.summary_cached = true;
+    result.cached_summary_finalized_out = summary.finalized_out;
+    result.cached_summary_distinct_recipient_count = summary.distinct_recipient_count;
+    result.cached_summary_flow_mix = summary.flow_mix;
+    upsert_persisted_transition_result(cfg, result);
     out.value = std::move(result);
     return out;
   } else {
@@ -1897,6 +2151,10 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   LookupResult<TxResult> out;
   if (!is_hex64(txid_hex)) {
     out.error = make_error(400, "invalid_txid", "malformed txid");
+    return out;
+  }
+  if (auto cached = find_persisted_tx_result(txid_hex); cached.has_value()) {
+    out.value = std::move(*cached);
     return out;
   }
 
@@ -1995,6 +2253,7 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   result.primary_sender = flow.primary_sender;
   result.primary_recipient = flow.primary_recipient;
   result.participant_count = flow.participant_count;
+  upsert_persisted_tx_result(cfg, result);
   out.value = std::move(result);
   return out;
 }

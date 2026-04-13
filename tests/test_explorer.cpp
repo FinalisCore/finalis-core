@@ -767,4 +767,42 @@ TEST(test_explorer_hydrates_startup_cache_from_disk_without_live_rpc) {
   std::filesystem::remove(temp_path, ec);
 }
 
+TEST(test_explorer_hydrates_tx_and_transition_index_from_disk_without_live_rpc) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-index-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    auto tx = fetch_tx_result(cfg, fx.txid);
+    ASSERT_TRUE(tx.value.has_value());
+    auto transition = fetch_transition_result(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition.value.has_value());
+    ASSERT_TRUE(transition.value->summary_cached);
+  }
+
+  clear_runtime_caches();
+  int rpc_calls = 0;
+  {
+    ScopedRpcHook rpc([&](const std::string&) {
+      ++rpc_calls;
+      return rpc_error(-32000, "rpc should not be used");
+    });
+    load_persisted_explorer_snapshot(cfg);
+    auto tx = fetch_tx_result(cfg, fx.txid);
+    ASSERT_TRUE(tx.value.has_value());
+    ASSERT_EQ(tx.value->txid, fx.txid);
+    auto transition = fetch_transition_result(cfg, fx.transition_hash);
+    ASSERT_TRUE(transition.value.has_value());
+    ASSERT_EQ(transition.value->hash, fx.transition_hash);
+    ASSERT_TRUE(transition.value->summary_cached);
+    ASSERT_EQ(rpc_calls, 0);
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
 }  // namespace
