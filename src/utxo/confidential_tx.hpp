@@ -14,13 +14,13 @@ enum class TxVersionKind : std::uint32_t {
 };
 
 enum class TxInputKind : std::uint8_t {
-  TRANSPARENT = 0,
-  CONFIDENTIAL = 1,
+  Transparent = 0,
+  Confidential = 1,
 };
 
 enum class TxOutputKind : std::uint8_t {
-  TRANSPARENT = 0,
-  CONFIDENTIAL = 1,
+  Transparent = 0,
+  Confidential = 1,
 };
 
 struct TransparentInputWitnessV2 {
@@ -38,7 +38,7 @@ struct TxInV2 {
   Hash32 prev_txid{};
   std::uint32_t prev_index{0};
   std::uint32_t sequence{0xFFFFFFFF};
-  TxInputKind kind{TxInputKind::TRANSPARENT};
+  TxInputKind kind{TxInputKind::Transparent};
   std::variant<TransparentInputWitnessV2, ConfidentialInputWitnessV2> witness{TransparentInputWitnessV2{}};
 
   bool operator==(const TxInV2&) const = default;
@@ -62,7 +62,7 @@ struct ConfidentialTxOutV2 {
 };
 
 struct TxOutV2 {
-  TxOutputKind kind{TxOutputKind::TRANSPARENT};
+  TxOutputKind kind{TxOutputKind::Transparent};
   std::variant<TransparentTxOutV2, ConfidentialTxOutV2> body{TransparentTxOutV2{}};
 
   bool operator==(const TxOutV2&) const = default;

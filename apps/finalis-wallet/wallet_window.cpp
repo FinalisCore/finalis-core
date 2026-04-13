@@ -4514,7 +4514,7 @@ void WalletWindow::import_received_confidential_tx() {
   bool imported_any = false;
   for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
     const auto& output = tx.outputs[i];
-    if (output.kind != TxOutputKind::CONFIDENTIAL) continue;
+    if (output.kind != TxOutputKind::Confidential) continue;
     const auto& confidential = std::get<ConfidentialTxOutV2>(output.body);
     const std::string one_time_hex = finalis::hex_encode(Bytes(confidential.one_time_pubkey.begin(), confidential.one_time_pubkey.end()));
     const std::string ephemeral_hex = finalis::hex_encode(Bytes(confidential.ephemeral_pubkey.begin(), confidential.ephemeral_pubkey.end()));

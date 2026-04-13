@@ -263,7 +263,7 @@ TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_
 
   UtxoSetV2 view;
   UtxoEntryV2 confidential_entry;
-  confidential_entry.kind = UtxoOutputKind::CONFIDENTIAL;
+  confidential_entry.kind = UtxoOutputKind::Confidential;
   confidential_entry.body = UtxoConfidentialData{
       .value_commitment = *commitment,
       .one_time_pubkey = *one_time_pubkey,

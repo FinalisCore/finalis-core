@@ -70,12 +70,12 @@ Bytes raw_signed_spend_v2(const OutPoint& op, const crypto::KeyPair& from, const
       .prev_txid = op.txid,
       .prev_index = op.index,
       .sequence = 0xFFFFFFFF,
-      .kind = TxInputKind::TRANSPARENT,
+      .kind = TxInputKind::Transparent,
       .witness = TransparentInputWitnessV2{},
   });
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
   tx.outputs.push_back(TxOutV2{
-      .kind = TxOutputKind::TRANSPARENT,
+      .kind = TxOutputKind::Transparent,
       .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
   });
   tx.fee = value_in - value_out;

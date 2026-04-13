@@ -25,7 +25,7 @@ Bytes utxo_commitment_value(const TxOut& out) {
 Bytes utxo_commitment_value(const UtxoEntryV2& entry) {
   codec::ByteWriter w;
   w.u8(static_cast<std::uint8_t>(entry.kind));
-  if (entry.kind == UtxoOutputKind::TRANSPARENT) {
+  if (entry.kind == UtxoOutputKind::Transparent) {
     const auto& transparent = std::get<UtxoTransparentData>(entry.body);
     w.varbytes(utxo_commitment_value(transparent.out));
     return w.take();

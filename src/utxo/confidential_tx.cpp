@@ -18,7 +18,7 @@ void serialize_txin_v2(codec::ByteWriter& w, const TxInV2& in) {
   w.u32le(in.prev_index);
   w.u32le(in.sequence);
   w.u8(static_cast<std::uint8_t>(in.kind));
-  if (in.kind == TxInputKind::TRANSPARENT) {
+  if (in.kind == TxInputKind::Transparent) {
     w.varbytes(std::get<TransparentInputWitnessV2>(in.witness).script_sig);
     return;
   }
@@ -35,12 +35,12 @@ bool parse_txin_v2(codec::ByteReader& r, TxInV2* out) {
   auto sequence = r.u32le();
   auto kind = r.u8();
   if (!prev_txid || !prev_index || !sequence || !kind) return false;
-  if (*kind > static_cast<std::uint8_t>(TxInputKind::CONFIDENTIAL)) return false;
+  if (*kind > static_cast<std::uint8_t>(TxInputKind::Confidential)) return false;
   in.prev_txid = *prev_txid;
   in.prev_index = *prev_index;
   in.sequence = *sequence;
   in.kind = static_cast<TxInputKind>(*kind);
-  if (in.kind == TxInputKind::TRANSPARENT) {
+  if (in.kind == TxInputKind::Transparent) {
     auto script_sig = r.varbytes();
     if (!script_sig || script_sig->size() > kMaxWitnessBytes) return false;
     in.witness = TransparentInputWitnessV2{*script_sig};
@@ -56,7 +56,7 @@ bool parse_txin_v2(codec::ByteReader& r, TxInV2* out) {
 
 void serialize_txout_v2(codec::ByteWriter& w, const TxOutV2& out) {
   w.u8(static_cast<std::uint8_t>(out.kind));
-  if (out.kind == TxOutputKind::TRANSPARENT) {
+  if (out.kind == TxOutputKind::Transparent) {
     const auto& transparent = std::get<TransparentTxOutV2>(out.body);
     w.u64le(transparent.value);
     w.varbytes(transparent.script_pubkey);
@@ -76,9 +76,9 @@ bool parse_txout_v2(codec::ByteReader& r, TxOutV2* out) {
   TxOutV2 result;
   auto kind = r.u8();
   if (!kind) return false;
-  if (*kind > static_cast<std::uint8_t>(TxOutputKind::CONFIDENTIAL)) return false;
+  if (*kind > static_cast<std::uint8_t>(TxOutputKind::Confidential)) return false;
   result.kind = static_cast<TxOutputKind>(*kind);
-  if (result.kind == TxOutputKind::TRANSPARENT) {
+  if (result.kind == TxOutputKind::Transparent) {
     auto value = r.u64le();
     auto script_pubkey = r.varbytes();
     if (!value || !script_pubkey || script_pubkey->size() > kMaxScriptBytes) return false;
