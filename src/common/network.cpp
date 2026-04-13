@@ -21,8 +21,10 @@ std::array<std::uint8_t, 16> network_id_for_name(const std::string& name) {
 
 const NetworkConfig kMainnet{
     .name = "mainnet",
-    .network_id = network_id_for_name("mainnet"),
-    .magic = 0x53434D4E,  // "SCMN"
+    .network_id =
+        std::array<std::uint8_t, 16>{0x25, 0x80, 0x38, 0xc1, 0x23, 0xa1, 0xc9, 0xb0,
+                                     0x84, 0x75, 0x21, 0x6e, 0x5f, 0x53, 0xa5, 0x03},
+    .magic = 0x9797412A,
     .protocol_version = PROTOCOL_VERSION,
     .feature_flags = 1ULL,  // bit0: strict-version-handshake-v0.7
     .p2p_default_port = 19440,

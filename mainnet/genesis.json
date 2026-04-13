@@ -2,9 +2,9 @@
   "version": 1,
   "network_name": "mainnet",
   "protocol_version": 1,
-  "network_id_hex": "a57ab83946712672c507b1bd312c5fb2",
-  "magic": 1396919630,
-  "genesis_time_unix": 1735689600,
+  "network_id_hex": "258038c123a1c9b08475216e5f53a503",
+  "magic": 2543272234,
+  "genesis_time_unix": 1776708000,
   "initial_height": 0,
   "initial_validators": [
     "cc9d1120bce87a9dca53e163d429ffbce7b3afc4ca3171ae1ea99cd3c9405863"
