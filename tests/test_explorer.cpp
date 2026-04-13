@@ -889,4 +889,49 @@ TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
   std::filesystem::remove(temp_path, ec);
 }
 
+TEST(test_explorer_homepage_shows_stale_banner_when_cached_surfaces_fallback_after_rpc_failure) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-stale-banner-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    ASSERT_TRUE(fetch_status_result(cfg).value.has_value());
+    ASSERT_TRUE(fetch_committee_result(cfg, 10).value.has_value());
+    (void)fetch_recent_tx_results(cfg, 8);
+  }
+
+  clear_runtime_caches();
+  load_persisted_explorer_snapshot(cfg);
+  {
+    std::lock_guard<std::mutex> guard(g_status_cache_mu);
+    g_status_cache.stored_at = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_recent_tx_cache_mu);
+    g_recent_tx_cache.stored_at = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_committee_cache_mu);
+    g_committee_cache.stored_at = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  }
+
+  {
+    const auto prev = g_http_post_json_raw;
+    g_http_post_json_raw = [&](const std::string&, const std::string&, std::string*) {
+      return std::optional<std::string>(rpc_error(-32000, "upstream down"));
+    };
+    const auto home = render_root(cfg);
+    ASSERT_TRUE(home.find("Snapshot Freshness Warning") != std::string::npos);
+    ASSERT_TRUE(home.find("because live RPC refresh failed") != std::string::npos);
+    ASSERT_TRUE(home.find("status error=") != std::string::npos);
+    g_http_post_json_raw = prev;
+  }
+
+  std::filesystem::remove(temp_path, ec);
+}
+
 }  // namespace

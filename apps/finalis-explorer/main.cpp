@@ -312,6 +312,17 @@ struct PersistedExplorerSnapshot {
 
 PersistedExplorerSnapshot g_persisted_snapshot;
 
+struct SurfaceRuntimeState {
+  std::optional<std::string> last_error;
+  bool used_cached_fallback{false};
+};
+
+std::mutex g_surface_state_mu;
+SurfaceRuntimeState g_status_surface_state;
+SurfaceRuntimeState g_committee_surface_state;
+SurfaceRuntimeState g_recent_surface_state;
+constexpr std::uint64_t kExplorerSurfaceStaleThresholdMs = 120000;
+
 void clear_runtime_caches() {
   {
     std::lock_guard<std::mutex> guard(g_status_cache_mu);
@@ -329,6 +340,12 @@ void clear_runtime_caches() {
     std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
     g_persisted_snapshot = {};
   }
+  {
+    std::lock_guard<std::mutex> guard(g_surface_state_mu);
+    g_status_surface_state = {};
+    g_committee_surface_state = {};
+    g_recent_surface_state = {};
+  }
 }
 
 std::string default_explorer_cache_path(const std::string& rpc_url) {
@@ -338,6 +355,7 @@ std::string default_explorer_cache_path(const std::string& rpc_url) {
 }
 
 std::string format_timestamp(std::uint64_t ts);
+std::uint64_t now_unix_ms();
 
 struct TxSummaryBatchItem {
   std::string txid;
@@ -366,6 +384,9 @@ struct Response {
 Response handle_request(const Config& cfg, const std::string& req);
 ApiError upstream_error(const std::string& message);
 void persist_explorer_snapshot(const Config& cfg);
+LookupResult<StatusResult> parse_status_result_object(const finalis::minijson::Value& status_obj);
+LookupResult<CommitteeResult> parse_committee_result_object(const finalis::minijson::Value& committee_obj,
+                                                            std::uint64_t requested_height);
 
 volatile std::sig_atomic_t g_stop = 0;
 std::atomic<std::size_t> g_active_clients{0};
@@ -575,6 +596,71 @@ std::optional<std::uint64_t> persisted_committee_refreshed_unix_ms() {
 std::optional<std::uint64_t> persisted_recent_refreshed_unix_ms() {
   std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
   return g_persisted_snapshot.recent_refreshed_unix_ms;
+}
+
+std::optional<LookupResult<StatusResult>> persisted_status_result_lookup() {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  if (!g_persisted_snapshot.status_result.has_value()) return std::nullopt;
+  return parse_status_result_object(*g_persisted_snapshot.status_result);
+}
+
+std::optional<LookupResult<CommitteeResult>> persisted_committee_result_lookup(std::uint64_t height) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  if (!g_persisted_snapshot.committee_result.has_value()) return std::nullopt;
+  if (g_persisted_snapshot.committee_height != height) return std::nullopt;
+  return parse_committee_result_object(*g_persisted_snapshot.committee_result, height);
+}
+
+std::optional<std::vector<RecentTxResult>> persisted_recent_results(std::size_t limit) {
+  std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+  if (!g_persisted_snapshot.recent_present) return std::nullopt;
+  if (g_persisted_snapshot.recent_limit != limit) return std::nullopt;
+  return g_persisted_snapshot.recent;
+}
+
+void set_surface_state(SurfaceRuntimeState& state, std::optional<std::string> error, bool used_cached_fallback) {
+  state.last_error = std::move(error);
+  state.used_cached_fallback = used_cached_fallback;
+}
+
+bool surface_is_stale(const std::optional<std::uint64_t>& refreshed_unix_ms) {
+  if (!refreshed_unix_ms.has_value()) return true;
+  const auto now_ms = now_unix_ms();
+  return now_ms > *refreshed_unix_ms && (now_ms - *refreshed_unix_ms) > kExplorerSurfaceStaleThresholdMs;
+}
+
+std::string build_surface_stale_banner() {
+  std::optional<std::uint64_t> status_ts = persisted_status_refreshed_unix_ms();
+  std::optional<std::uint64_t> committee_ts = persisted_committee_refreshed_unix_ms();
+  std::optional<std::uint64_t> recent_ts = persisted_recent_refreshed_unix_ms();
+  SurfaceRuntimeState status_state;
+  SurfaceRuntimeState committee_state;
+  SurfaceRuntimeState recent_state;
+  {
+    std::lock_guard<std::mutex> guard(g_surface_state_mu);
+    status_state = g_status_surface_state;
+    committee_state = g_committee_surface_state;
+    recent_state = g_recent_surface_state;
+  }
+  const bool any_stale = surface_is_stale(status_ts) || surface_is_stale(committee_ts) || surface_is_stale(recent_ts);
+  const bool any_failed = status_state.last_error.has_value() || committee_state.last_error.has_value() || recent_state.last_error.has_value();
+  if (!any_stale && !any_failed) return {};
+
+  std::ostringstream oss;
+  oss << "<div class=\"card\"><div class=\"note\"><strong>Snapshot Freshness Warning</strong>: ";
+  if (any_failed) {
+    oss << "one or more finalized explorer surfaces are being served from cached snapshot because live RPC refresh failed. ";
+  } else {
+    oss << "one or more finalized explorer surfaces are older than the freshness threshold. ";
+  }
+  oss << "Status=" << html_escape(explorer_snapshot_freshness_text(status_ts))
+      << ", Committee=" << html_escape(explorer_snapshot_freshness_text(committee_ts))
+      << ", Recent=" << html_escape(explorer_snapshot_freshness_text(recent_ts)) << ".";
+  if (status_state.last_error.has_value()) oss << " status error=" << html_escape(*status_state.last_error) << ".";
+  if (committee_state.last_error.has_value()) oss << " committee error=" << html_escape(*committee_state.last_error) << ".";
+  if (recent_state.last_error.has_value()) oss << " recent error=" << html_escape(*recent_state.last_error) << ".";
+  oss << "</div></div>";
+  return oss.str();
 }
 
 std::string format_timestamp(std::uint64_t ts) {
@@ -1781,10 +1867,13 @@ std::string render_recent_tx_json(const std::vector<RecentTxResult>& items, std:
 
 std::string render_root(const Config& cfg) {
   std::ostringstream body;
-  body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>"
-       << "<div class=\"note\">Finalized-state explorer for operators, wallets, and exchanges. It intentionally shows only finalized chain state and hides mempool ambiguity.</div>";
   auto status = fetch_status_result(cfg);
   const auto status_refreshed_unix_ms = persisted_status_refreshed_unix_ms();
+  const auto recent = fetch_recent_tx_results(cfg, 8);
+  const auto recent_refreshed_unix_ms = persisted_recent_refreshed_unix_ms();
+  body << build_surface_stale_banner();
+  body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>"
+       << "<div class=\"note\">Finalized-state explorer for operators, wallets, and exchanges. It intentionally shows only finalized chain state and hides mempool ambiguity.</div>";
   if (status.value.has_value()) {
     body << "<div class=\"hero-metrics\">"
          << "<div class=\"metric-card\"><span class=\"label\">Finalized Tip</span><span class=\"value\">" << status.value->finalized_height
@@ -1840,8 +1929,6 @@ std::string render_root(const Config& cfg) {
          << copy_action("Copy Status API Path", "/api/status")
          << "</div></div>";
   }
-  const auto recent = fetch_recent_tx_results(cfg, 8);
-  const auto recent_refreshed_unix_ms = persisted_recent_refreshed_unix_ms();
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
     body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>"
@@ -2099,7 +2186,20 @@ LookupResult<StatusResult> fetch_status_result(const Config& cfg) {
   LookupResult<StatusResult> out;
   auto status = rpc_call(cfg.rpc_url, "get_status", "{}");
   if (!status.result.has_value() || !status.result->is_object()) {
-    out.error = upstream_error(status.error.empty() ? "status unavailable" : status.error);
+    const auto err = upstream_error(status.error.empty() ? "status unavailable" : status.error);
+    if (auto cached = persisted_status_result_lookup(); cached.has_value() && cached->value.has_value()) {
+      out = *cached;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_status_surface_state, err.message, true);
+      }
+    } else {
+      out.error = err;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_status_surface_state, err.message, false);
+      }
+    }
   } else {
     out = parse_status_result_object(*status.result);
     if (out.value.has_value()) {
@@ -2110,6 +2210,10 @@ LookupResult<StatusResult> fetch_status_result(const Config& cfg) {
         g_persisted_snapshot.status_result = *status.result;
       }
       persist_explorer_snapshot(cfg);
+    }
+    {
+      std::lock_guard<std::mutex> guard(g_surface_state_mu);
+      set_surface_state(g_status_surface_state, std::nullopt, false);
     }
   }
   {
@@ -2134,8 +2238,21 @@ LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uin
   auto rpc = rpc_call(cfg.rpc_url, "get_committee",
                       std::string("{\"height\":") + std::to_string(height) + ",\"verbose\":true}");
   if (!rpc.result.has_value() || !rpc.result->is_object()) {
-    out.error = rpc_not_found(rpc) ? not_found_error("committee unavailable in finalized state")
-                                   : upstream_error(rpc.error.empty() ? "committee unavailable" : rpc.error);
+    const auto err = rpc_not_found(rpc) ? not_found_error("committee unavailable in finalized state")
+                                        : upstream_error(rpc.error.empty() ? "committee unavailable" : rpc.error);
+    if (auto cached = persisted_committee_result_lookup(height); cached.has_value() && cached->value.has_value()) {
+      out = *cached;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_committee_surface_state, err.message, true);
+      }
+    } else {
+      out.error = err;
+      {
+        std::lock_guard<std::mutex> guard(g_surface_state_mu);
+        set_surface_state(g_committee_surface_state, err.message, false);
+      }
+    }
   } else {
     out = parse_committee_result_object(*rpc.result, height);
     if (out.value.has_value()) {
@@ -2147,6 +2264,10 @@ LookupResult<CommitteeResult> fetch_committee_result(const Config& cfg, std::uin
         g_persisted_snapshot.committee_result = *rpc.result;
       }
       persist_explorer_snapshot(cfg);
+    }
+    {
+      std::lock_guard<std::mutex> guard(g_surface_state_mu);
+      set_surface_state(g_committee_surface_state, std::nullopt, false);
     }
   }
 
@@ -2541,12 +2662,14 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
   std::vector<RecentTxResult> out;
   if (max_items == 0) return out;
   const std::uint64_t depth_window = 32;
+  bool live_recent_rpc_ok = false;
   {
     std::ostringstream params;
     params << "{\"limit\":" << max_items << ",\"depth_window\":" << depth_window << "}";
     auto res = rpc_call(cfg.rpc_url, "get_recent_tx_summaries", params.str());
     if (res.result.has_value() && res.result->is_object()) {
       if (const auto* items = res.result->get("items"); items && items->is_array()) {
+        live_recent_rpc_ok = true;
         out.reserve(items->array_value.size());
         for (const auto& item_value : items->array_value) {
           if (!item_value.is_object()) continue;
@@ -2573,7 +2696,16 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
   }
   if (out.empty()) {
     auto status = fetch_status_result(cfg);
-    if (!status.value.has_value()) return out;
+    if (!status.value.has_value()) {
+      if (auto cached = persisted_recent_results(max_items); cached.has_value()) {
+        {
+          std::lock_guard<std::mutex> guard(g_surface_state_mu);
+          set_surface_state(g_recent_surface_state, "recent tx refresh failed", true);
+        }
+        out = std::move(*cached);
+      }
+      return out;
+    }
     const auto tip = status.value->finalized_height;
     const std::uint64_t start_height = tip > depth_window ? tip - depth_window : 0;
     std::vector<std::pair<std::string, std::uint64_t>> tx_refs;
@@ -2660,6 +2792,15 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
       g_persisted_snapshot.recent = out;
     }
     persist_explorer_snapshot(cfg);
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_surface_state_mu);
+    if (!out.empty() || live_recent_rpc_ok) {
+      set_surface_state(g_recent_surface_state, std::nullopt, false);
+    } else if (auto cached = persisted_recent_results(max_items); cached.has_value()) {
+      out = *cached;
+      set_surface_state(g_recent_surface_state, "recent tx refresh failed", true);
+    }
   }
   return out;
 }
