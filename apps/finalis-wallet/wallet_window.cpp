@@ -2863,6 +2863,11 @@ void WalletWindow::update_selected_confidential_pending_tx_status_panel() {
     tx_status = lightserver::rpc_get_tx_status(endpoint.toStdString(), *parsed_txid, &rpc_err);
     if (tx_status) {
       used_endpoint = endpoint;
+      pending_tx_status_cache_[txid] = CachedPendingTxStatus{
+          .status = *tx_status,
+          .endpoint = endpoint,
+          .cached_at = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss"),
+      };
       break;
     }
   }
@@ -2874,13 +2879,29 @@ void WalletWindow::update_selected_confidential_pending_tx_status_panel() {
             ? "Status is stale: no healthy lightserver endpoint is currently available. This is not a chain-level "
               "not_found result."
             : "Status lookup failed against configured lightservers. This is not a confirmed chain-level not_found result.";
+    QString last_known_text = "Last known status: unavailable";
+    if (const auto cache_it = pending_tx_status_cache_.find(txid); cache_it != pending_tx_status_cache_.end()) {
+      const auto& cached = cache_it->second;
+      last_known_text =
+          QString("Last known status (%1)\nEndpoint: %2\nStatus: %3\nFinalized: %4\nHeight: %5\nFinalized depth: %6\n"
+                  "Credit safe: %7\nTransition: %8")
+              .arg(cached.cached_at.isEmpty() ? "unknown time" : cached.cached_at,
+                   cached.endpoint.isEmpty() ? "-" : display_lightserver_endpoint(cached.endpoint),
+                   QString::fromStdString(cached.status.status),
+                   cached.status.finalized ? "yes" : "no",
+                   QString::number(cached.status.height),
+                   QString::number(cached.status.finalized_depth),
+                   cached.status.credit_safe ? "yes" : "no",
+                   cached.status.transition_hash.empty() ? "-" : elide_middle(QString::fromStdString(cached.status.transition_hash), 10));
+    }
     receive_confidential_pending_status_view_->setPlainText(
-        QString("Txid: %1\nEndpoint: -\nStatus lookup: failed\nStale: %2\n\n%3\n\n%4")
+        QString("Txid: %1\nEndpoint: -\nStatus lookup: failed\nStale: %2\n\n%3\n\n%4\n\n%5")
             .arg(txid,
                  no_healthy_endpoint ? "yes" : "possible",
                  stale_note,
                  rpc_err.empty() ? "Unable to query pending transaction status from configured lightservers."
-                                 : QString::fromStdString(rpc_err)));
+                                 : QString::fromStdString(rpc_err),
+                 last_known_text));
     return;
   }
 

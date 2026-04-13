@@ -128,6 +128,12 @@ class WalletWindow final : public QMainWindow {
     QString last_error;
   };
 
+  struct CachedPendingTxStatus {
+    lightserver::TxStatusView status;
+    QString endpoint;
+    QString cached_at;
+  };
+
   struct EndpointObservation {
     QString endpoint;
     QString network_name;
@@ -426,6 +432,7 @@ class WalletWindow final : public QMainWindow {
   QString crosscheck_summary_{"Cross-check: unavailable"};
   QString crosscheck_detail_text_{"No endpoint cross-check yet."};
   std::map<QString, EndpointRuntimeState> endpoint_runtime_state_;
+  std::map<QString, CachedPendingTxStatus> pending_tx_status_cache_;
   std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache_;
   std::uint64_t refresh_generation_{0};
   std::uint64_t refresh_state_version_{0};
