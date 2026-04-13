@@ -1,6 +1,7 @@
 #include "test_framework.hpp"
 
 #include <array>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <sstream>
@@ -723,6 +724,47 @@ TEST(test_explorer_healthz_reports_upstream_health) {
   ASSERT_TRUE(failed.body.find("\"finalized_only\":true") != std::string::npos);
   ASSERT_TRUE(failed.body.find("\"upstream_ok\":false") != std::string::npos);
   ASSERT_TRUE(failed.body.find("\"error\":{\"code\":\"upstream_error\"") != std::string::npos);
+}
+
+TEST(test_explorer_hydrates_startup_cache_from_disk_without_live_rpc) {
+  ExplorerFixture fx;
+  Config cfg = test_config();
+  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-cache-test.json";
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+
+  {
+    ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+    auto status = fetch_status_result(cfg);
+    ASSERT_TRUE(status.value.has_value());
+    auto committee = fetch_committee_result(cfg, status.value->finalized_height);
+    ASSERT_TRUE(committee.value.has_value());
+    const auto recent = fetch_recent_tx_results(cfg, kPersistedRecentLimit);
+    ASSERT_TRUE(!recent.empty());
+  }
+
+  clear_runtime_caches();
+  int rpc_calls = 0;
+  {
+    ScopedRpcHook rpc([&](const std::string&) {
+      ++rpc_calls;
+      return rpc_error(-32000, "rpc should not be used");
+    });
+    load_persisted_explorer_snapshot(cfg);
+    auto status = fetch_status_result(cfg);
+    ASSERT_TRUE(status.value.has_value());
+    ASSERT_EQ(status.value->finalized_height, 10u);
+    auto committee = fetch_committee_result(cfg, status.value->finalized_height);
+    ASSERT_TRUE(committee.value.has_value());
+    ASSERT_EQ(committee.value->members.size(), 1u);
+    const auto recent = fetch_recent_tx_results(cfg, kPersistedRecentLimit);
+    ASSERT_TRUE(!recent.empty());
+    ASSERT_EQ(recent.front().txid, fx.txid);
+    ASSERT_EQ(rpc_calls, 0);
+  }
+
+  std::filesystem::remove(temp_path, ec);
 }
 
 }  // namespace
