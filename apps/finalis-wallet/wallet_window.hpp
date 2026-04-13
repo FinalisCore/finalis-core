@@ -426,6 +426,7 @@ class WalletWindow final : public QMainWindow {
   bool current_peer_height_disagreement_{false};
   bool current_bootstrap_sync_incomplete_{false};
   QString last_refresh_text_;
+  QString last_refresh_endpoint_;
   QString last_polled_transition_hash_;
   std::uint64_t last_polled_tip_height_{0};
   QString last_successful_lightserver_endpoint_;

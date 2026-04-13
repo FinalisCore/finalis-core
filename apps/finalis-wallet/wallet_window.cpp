@@ -1929,10 +1929,14 @@ void WalletWindow::update_crosscheck_summary(const std::vector<EndpointObservati
 
 std::optional<lightserver::BroadcastResult> WalletWindow::broadcast_tx_with_failover(const Bytes& tx_bytes, std::string* err,
                                                                                       QString* used_endpoint) {
-  const QStringList endpoints = ordered_lightserver_endpoints();
+  QStringList endpoints = ordered_lightserver_endpoints();
   if (endpoints.isEmpty()) {
     if (err) *err = "configure at least one lightserver endpoint first";
     return std::nullopt;
+  }
+  if (!last_refresh_endpoint_.isEmpty()) {
+    const int idx = endpoints.indexOf(last_refresh_endpoint_);
+    if (idx > 0) endpoints.move(idx, 0);
   }
   clear_lightserver_runtime_status();
   for (int i = 0; i < endpoints.size(); ++i) {
@@ -3477,6 +3481,7 @@ bool WalletWindow::refresh_finalized_send_state(QString* err) {
     return false;
   }
   clear_lightserver_runtime_status();
+  last_refresh_endpoint_.clear();
   std::optional<lightserver::RpcStatusView> status;
   std::optional<lightserver::AddressValidationView> validated_address;
   std::optional<std::vector<lightserver::UtxoView>> utxos;
@@ -3532,6 +3537,7 @@ bool WalletWindow::refresh_finalized_send_state(QString* err) {
     status = endpoint_status;
     validated_address = endpoint_address;
     utxos = endpoint_utxos;
+    last_refresh_endpoint_ = endpoint;
     record_lightserver_success(endpoint, i > 0);
     break;
   }
