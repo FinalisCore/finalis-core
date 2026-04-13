@@ -1338,7 +1338,9 @@ void WalletWindow::build_ui() {
   receive_confidential_requests_table_ = receive_page_->confidential_requests_table();
   receive_confidential_coin_summary_label_ = receive_page_->confidential_coin_summary_label();
   receive_confidential_coins_table_ = receive_page_->confidential_coins_table();
+  receive_confidential_pending_status_view_ = receive_page_->confidential_pending_status_view();
   receive_copy_confidential_pending_txid_button_ = receive_page_->copy_confidential_pending_txid_button();
+  receive_inspect_confidential_pending_tx_button_ = receive_page_->inspect_confidential_pending_tx_button();
   receive_copy_status_label_ = receive_page_->copy_status_label();
   receive_finalized_note_label_ = receive_page_->finalized_note_label();
   receive_confidential_note_label_ = receive_page_->confidential_note_label();
@@ -1349,6 +1351,7 @@ void WalletWindow::build_ui() {
   auto* copy_confidential_request_button = receive_page_->copy_confidential_request_button();
   auto* import_confidential_tx_button = receive_page_->import_confidential_tx_button();
   auto* copy_confidential_pending_txid_button = receive_page_->copy_confidential_pending_txid_button();
+  auto* inspect_confidential_pending_tx_button = receive_page_->inspect_confidential_pending_tx_button();
 
   history_filter_combo_ = activity_page_->filter_combo();
   history_detail_button_ = activity_page_->detail_button();
@@ -1466,8 +1469,65 @@ void WalletWindow::build_ui() {
     QApplication::clipboard()->setText(txid);
     statusBar()->showMessage("Pending confidential send txid copied to clipboard.", 3000);
   });
+  connect(inspect_confidential_pending_tx_button, &QPushButton::clicked, this, [this]() {
+    if (!receive_confidential_coins_table_) return;
+    const int row = receive_confidential_coins_table_->currentRow();
+    if (row < 0) return;
+    auto* item = receive_confidential_coins_table_->item(row, 0);
+    const QString txid = item ? item->data(Qt::UserRole).toString().trimmed() : QString{};
+    if (txid.isEmpty()) return;
+
+    QUrl explorer = explorer_home_url();
+    bool opened = false;
+    if (explorer.isValid() && !explorer.scheme().isEmpty()) {
+      explorer.setPath("/tx/" + txid);
+      opened = QDesktopServices::openUrl(explorer);
+    }
+    if (opened) {
+      statusBar()->showMessage("Opened pending transaction in explorer.", 3000);
+      return;
+    }
+
+    update_selected_confidential_pending_tx_status_panel();
+
+    auto parsed_txid = decode_hex32_string(txid.toStdString());
+    if (!parsed_txid) {
+      QMessageBox::warning(this, "Inspect Pending Tx", "Pending txid is malformed.");
+      return;
+    }
+    QString used_endpoint;
+    std::string rpc_err;
+    std::optional<lightserver::TxStatusView> tx_status;
+    for (const QString& endpoint : ordered_lightserver_endpoints()) {
+      tx_status = lightserver::rpc_get_tx_status(endpoint.toStdString(), *parsed_txid, &rpc_err);
+      if (tx_status) {
+        used_endpoint = endpoint;
+        break;
+      }
+    }
+    if (!tx_status) {
+      QMessageBox::warning(this, "Inspect Pending Tx",
+                           rpc_err.empty() ? "Unable to query pending transaction status from configured lightservers."
+                                           : QString::fromStdString(rpc_err));
+      return;
+    }
+    QMessageBox::information(
+        this, "Inspect Pending Tx",
+        QString("Txid: %1\nEndpoint: %2\nStatus: %3\nFinalized: %4\nHeight: %5\nFinalized depth: %6\nCredit safe: %7\nTransition: %8")
+            .arg(txid,
+                 used_endpoint.isEmpty() ? "-" : display_lightserver_endpoint(used_endpoint),
+                 QString::fromStdString(tx_status->status),
+                 tx_status->finalized ? "yes" : "no",
+                 QString::number(tx_status->height),
+                 QString::number(tx_status->finalized_depth),
+                 tx_status->credit_safe ? "yes" : "no",
+                 tx_status->transition_hash.empty() ? "-" : elide_middle(QString::fromStdString(tx_status->transition_hash), 10)));
+  });
   connect(receive_confidential_coins_table_, &QTableWidget::itemSelectionChanged, this, [this]() {
-    if (!receive_copy_confidential_pending_txid_button_ || !receive_confidential_coins_table_) return;
+    if (!receive_copy_confidential_pending_txid_button_ || !receive_inspect_confidential_pending_tx_button_ ||
+        !receive_confidential_coins_table_) {
+      return;
+    }
     const int row = receive_confidential_coins_table_->currentRow();
     bool enabled = false;
     if (row >= 0) {
@@ -1475,6 +1535,8 @@ void WalletWindow::build_ui() {
       enabled = item && !item->data(Qt::UserRole).toString().trimmed().isEmpty();
     }
     receive_copy_confidential_pending_txid_button_->setEnabled(enabled);
+    receive_inspect_confidential_pending_tx_button_->setEnabled(enabled);
+    update_selected_confidential_pending_tx_status_panel();
   });
   connect(overview_send_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(send_page_); });
   connect(overview_receive_button_, &QPushButton::clicked, this, [this]() { tabs_->setCurrentWidget(receive_page_); });
@@ -2680,6 +2742,19 @@ void WalletWindow::render_history_view() {
 void WalletWindow::render_confidential_receive_views() {
   if (!receive_confidential_requests_table_ || !receive_confidential_coins_table_) return;
 
+  std::optional<OutPoint> selected_outpoint;
+  if (const int current_row = receive_confidential_coins_table_->currentRow(); current_row >= 0) {
+    if (auto* current_item = receive_confidential_coins_table_->item(current_row, 0)) {
+      const QString selected_txid = current_item->data(Qt::UserRole + 1).toString().trimmed();
+      bool vout_ok = false;
+      const auto selected_vout = current_item->data(Qt::UserRole + 2).toUInt(&vout_ok);
+      auto parsed_txid = decode_hex32_string(selected_txid.toStdString());
+      if (parsed_txid && vout_ok) {
+        selected_outpoint = OutPoint{*parsed_txid, selected_vout};
+      }
+    }
+  }
+
   receive_confidential_requests_table_->setSortingEnabled(false);
   receive_confidential_requests_table_->setRowCount(0);
   int outstanding_requests = 0;
@@ -2711,8 +2786,10 @@ void WalletWindow::render_confidential_receive_views() {
   receive_confidential_coins_table_->setSortingEnabled(false);
   receive_confidential_coins_table_->setRowCount(0);
   if (receive_copy_confidential_pending_txid_button_) receive_copy_confidential_pending_txid_button_->setEnabled(false);
+  if (receive_inspect_confidential_pending_tx_button_) receive_inspect_confidential_pending_tx_button_->setEnabled(false);
   int active_coins = 0;
   const std::uint64_t now_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
+  int restore_row = -1;
   for (const auto& coin : confidential_coin_views_) {
     if (!coin.spent) ++active_coins;
     const auto reservation_it = pending_confidential_reservations_.find(coin.outpoint);
@@ -2723,6 +2800,8 @@ void WalletWindow::render_confidential_receive_views() {
     receive_confidential_coins_table_->insertRow(row);
     auto* status_item = new QTableWidgetItem(coin.spent ? "Spent" : (reserved ? "Reserved" : "Unspent"));
     if (reserved) status_item->setData(Qt::UserRole, QString::fromStdString(reservation_it->second.txid_hex));
+    status_item->setData(Qt::UserRole + 1, coin.txid_hex);
+    status_item->setData(Qt::UserRole + 2, QVariant::fromValue(static_cast<qulonglong>(coin.vout)));
     receive_confidential_coins_table_->setItem(row, 0, status_item);
     receive_confidential_coins_table_->setItem(row, 1, new QTableWidgetItem(format_coin_amount(coin.amount)));
     receive_confidential_coins_table_->setItem(
@@ -2730,6 +2809,10 @@ void WalletWindow::render_confidential_receive_views() {
     receive_confidential_coins_table_->setItem(row, 3, new QTableWidgetItem(coin.account_id));
     receive_confidential_coins_table_->setItem(row, 4, new QTableWidgetItem(elide_middle(coin.one_time_pubkey_hex, 10)));
     receive_confidential_coins_table_->setItem(row, 5, new QTableWidgetItem(reservation_text));
+    if (selected_outpoint.has_value() && coin.outpoint.index == selected_outpoint->index &&
+        coin.outpoint.txid == selected_outpoint->txid) {
+      restore_row = row;
+    }
   }
   if (receive_confidential_coins_table_->rowCount() == 0) {
     receive_confidential_coins_table_->insertRow(0);
@@ -2741,6 +2824,76 @@ void WalletWindow::render_confidential_receive_views() {
             .arg(static_cast<qulonglong>(confidential_coin_views_.size()))
             .arg(active_coins));
   }
+  if (restore_row >= 0) {
+    receive_confidential_coins_table_->setCurrentCell(restore_row, 0);
+    receive_confidential_coins_table_->selectRow(restore_row);
+  }
+  update_selected_confidential_pending_tx_status_panel();
+}
+
+void WalletWindow::update_selected_confidential_pending_tx_status_panel() {
+  if (!receive_confidential_pending_status_view_ || !receive_confidential_coins_table_) return;
+
+  const int row = receive_confidential_coins_table_->currentRow();
+  if (row < 0) {
+    receive_confidential_pending_status_view_->setPlainText(
+        "Select a reserved confidential coin to inspect the current pending transaction status.");
+    return;
+  }
+
+  auto* status_item = receive_confidential_coins_table_->item(row, 0);
+  const QString txid = status_item ? status_item->data(Qt::UserRole).toString().trimmed() : QString{};
+  if (txid.isEmpty()) {
+    receive_confidential_pending_status_view_->setPlainText(
+        "The selected confidential coin does not have an active pending transaction reservation.");
+    return;
+  }
+
+  auto parsed_txid = decode_hex32_string(txid.toStdString());
+  if (!parsed_txid) {
+    receive_confidential_pending_status_view_->setPlainText(
+        QString("Pending txid is malformed.\n\nTxid: %1").arg(txid));
+    return;
+  }
+
+  QString used_endpoint;
+  std::string rpc_err;
+  std::optional<lightserver::TxStatusView> tx_status;
+  for (const QString& endpoint : ordered_lightserver_endpoints()) {
+    tx_status = lightserver::rpc_get_tx_status(endpoint.toStdString(), *parsed_txid, &rpc_err);
+    if (tx_status) {
+      used_endpoint = endpoint;
+      break;
+    }
+  }
+
+  if (!tx_status) {
+    const bool no_healthy_endpoint = last_successful_lightserver_endpoint_.trimmed().isEmpty();
+    const QString stale_note =
+        no_healthy_endpoint
+            ? "Status is stale: no healthy lightserver endpoint is currently available. This is not a chain-level "
+              "not_found result."
+            : "Status lookup failed against configured lightservers. This is not a confirmed chain-level not_found result.";
+    receive_confidential_pending_status_view_->setPlainText(
+        QString("Txid: %1\nEndpoint: -\nStatus lookup: failed\nStale: %2\n\n%3\n\n%4")
+            .arg(txid,
+                 no_healthy_endpoint ? "yes" : "possible",
+                 stale_note,
+                 rpc_err.empty() ? "Unable to query pending transaction status from configured lightservers."
+                                 : QString::fromStdString(rpc_err)));
+    return;
+  }
+
+  receive_confidential_pending_status_view_->setPlainText(
+      QString("Txid: %1\nEndpoint: %2\nStatus: %3\nFinalized: %4\nHeight: %5\nFinalized depth: %6\nCredit safe: %7\nTransition: %8")
+          .arg(txid,
+               used_endpoint.isEmpty() ? "-" : display_lightserver_endpoint(used_endpoint),
+               QString::fromStdString(tx_status->status),
+               tx_status->finalized ? "yes" : "no",
+               QString::number(tx_status->height),
+               QString::number(tx_status->finalized_depth),
+               tx_status->credit_safe ? "yes" : "no",
+               tx_status->transition_hash.empty() ? "-" : elide_middle(QString::fromStdString(tx_status->transition_hash), 10)));
 }
 
 void WalletWindow::refresh_overview_activity_preview() {

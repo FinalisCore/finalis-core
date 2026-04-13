@@ -8,6 +8,7 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QTableWidget>
+#include <QTextEdit>
 #include <QHeaderView>
 #include <QVariant>
 #include <QVBoxLayout>
@@ -157,9 +158,23 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   confidential_coin_actions->setSpacing(8);
   copy_confidential_pending_txid_button_ = new QPushButton("Copy Pending Txid", confidential_box);
   copy_confidential_pending_txid_button_->setEnabled(false);
+  inspect_confidential_pending_tx_button_ = new QPushButton("Inspect Pending Tx", confidential_box);
+  inspect_confidential_pending_tx_button_->setEnabled(false);
   confidential_coin_actions->addWidget(copy_confidential_pending_txid_button_);
+  confidential_coin_actions->addWidget(inspect_confidential_pending_tx_button_);
   confidential_coin_actions->addStretch(1);
   confidential_layout->addLayout(confidential_coin_actions);
+
+  auto* confidential_pending_status_title = new QLabel("Selected pending tx status", confidential_box);
+  confidential_pending_status_title->setProperty("role", QVariant(QStringLiteral("muted")));
+  confidential_layout->addWidget(confidential_pending_status_title);
+
+  confidential_pending_status_view_ = new QTextEdit(confidential_box);
+  confidential_pending_status_view_->setReadOnly(true);
+  confidential_pending_status_view_->setMinimumHeight(120);
+  confidential_pending_status_view_->setPlainText(
+      "Select a reserved confidential coin to inspect the current pending transaction status.");
+  confidential_layout->addWidget(confidential_pending_status_view_);
 
   confidential_note_label_ = new QLabel(
       "Confidential receive requires a configured stealth account and encrypted local recovery material. "

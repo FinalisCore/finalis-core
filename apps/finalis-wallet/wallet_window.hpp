@@ -213,6 +213,7 @@ class WalletWindow final : public QMainWindow {
                                                                          QString* used_endpoint = nullptr);
   void render_history_view();
   void render_confidential_receive_views();
+  void update_selected_confidential_pending_tx_status_panel();
   void refresh_overview_activity_preview();
   void update_selected_history_detail();
   void render_mint_state();
@@ -296,7 +297,9 @@ class WalletWindow final : public QMainWindow {
   QTableWidget* receive_confidential_requests_table_{nullptr};
   QLabel* receive_confidential_coin_summary_label_{nullptr};
   QTableWidget* receive_confidential_coins_table_{nullptr};
+  QTextEdit* receive_confidential_pending_status_view_{nullptr};
   QPushButton* receive_copy_confidential_pending_txid_button_{nullptr};
+  QPushButton* receive_inspect_confidential_pending_tx_button_{nullptr};
   QLabel* receive_confidential_note_label_{nullptr};
   QComboBox* history_filter_combo_{nullptr};
   QTableWidget* history_view_{nullptr};
