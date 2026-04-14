@@ -3635,7 +3635,7 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
       if (n->status().height < 10) return false;
     }
     return true;
-  }, std::chrono::seconds(120)));
+  }, ci_timeout_seconds(120)));
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(30)));
 
@@ -3677,7 +3677,7 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
       if (n->status().height < before + 2) return false;
     }
     return true;
-  }, std::chrono::seconds(120)));
+  }, ci_timeout_seconds(120)));
 }
 
 TEST(test_mainnet_seed_bootstrap_and_catchup) {

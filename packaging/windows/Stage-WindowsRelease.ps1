@@ -126,6 +126,9 @@ Installed binaries live under:
 To start a network-listening node + lightserver + explorer:
   powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1
 
+To keep the node local-only:
+  powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1 -PublicNode:`$false
+
 Windows joiner mode uses:
   mainnet\SEEDS.json
 
@@ -139,6 +142,8 @@ Lightserver RPC:
   http://<this-machine-ip>:19444/rpc
 
 Explorer will also open in your default browser when the stack starts.
+Windows firewall should allow inbound TCP on:
+  19440 (P2P), 19444 (Lightserver RPC), 18080 (Explorer)
 "@
 
 Set-Content -Path (Join-Path $installRoot "WINDOWS-RUN.txt") -Value $launcherReadme -Encoding ASCII

@@ -48,5 +48,5 @@ Name: "{autodesktop}\Start Finalis Stack"; Filename: "powershell.exe"; Parameter
 
 [Run]
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\app\scripts\Start-Finalis.ps1"" -ConfigureFirewall -NoStart"; Flags: runhidden
-Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\app\scripts\Start-Finalis.ps1"""; Flags: postinstall nowait skipifsilent
+Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\app\scripts\Start-Finalis.ps1"""; Flags: postinstall skipifsilent
 Filename: "{app}\app\bin\finalis-wallet.exe"; Description: "Launch Finalis Wallet"; Flags: postinstall nowait skipifsilent; Check: FileExists(ExpandConstant('{app}\app\bin\finalis-wallet.exe'))

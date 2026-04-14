@@ -8,9 +8,9 @@ param(
     [string]$ExplorerBind = "0.0.0.0",
     [bool]$WithExplorer = $true,
     [bool]$OpenExplorer = $true,
+    [bool]$PublicNode = $true,
     [switch]$ConfigureFirewall,
-    [switch]$NoStart,
-    [switch]$PublicNode
+    [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,23 +72,45 @@ function Ensure-FirewallRule {
 }
 
 function Ensure-FinalisFirewallRules {
+    param(
+        [bool]$Required = $false
+    )
+
     try {
         Ensure-FirewallRule -DisplayName "Finalis P2P ($P2PPort)" -Port $P2PPort -ProgramPath $nodeExe
         Ensure-FirewallRule -DisplayName "Finalis Lightserver RPC ($LightserverPort)" -Port $LightserverPort -ProgramPath $lightserverExe
         if ($WithExplorer -and (Test-Path $explorerExe)) {
             Ensure-FirewallRule -DisplayName "Finalis Explorer ($ExplorerPort)" -Port $ExplorerPort -ProgramPath $explorerExe
         }
+        return $true
     } catch {
+        if ($Required) {
+            throw "Firewall rule setup failed: $($_.Exception.Message)"
+        }
         Write-Warning "Firewall rule setup failed: $($_.Exception.Message)"
+        return $false
     }
 }
 
 function Stop-FinalisProcessIfRunning {
     param(
-        [string]$ProcessName
+        [string]$ProcessName,
+        [string]$ExpectedPath
     )
 
-    Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | ForEach-Object {
+        $matchesPath = $false
+        try {
+            if ($_.Path -and $ExpectedPath) {
+                $matchesPath = ([System.IO.Path]::GetFullPath($_.Path) -eq [System.IO.Path]::GetFullPath($ExpectedPath))
+            }
+        } catch {
+            $matchesPath = $false
+        }
+        if ($matchesPath) {
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Wait-ForTcpPort {
@@ -117,7 +139,7 @@ function Wait-ForTcpPort {
 }
 
 if ($ConfigureFirewall.IsPresent) {
-    Ensure-FinalisFirewallRules
+    [void](Ensure-FinalisFirewallRules -Required $true)
 }
 
 if ($NoStart.IsPresent) {
@@ -132,7 +154,12 @@ $nodeArgs = @(
     "--lightserver-bind", $LightserverBind,
     "--lightserver-port", $LightserverPort
 )
-$nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0", "--outbound-target", "1")
+if ($PublicNode) {
+    $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0")
+} else {
+    $nodeArgs += @("--listen", "--bind", "127.0.0.1")
+}
+$nodeArgs += @("--outbound-target", "1")
 
 if (Test-Path $seedsJson) {
     $seedDoc = Get-Content $seedsJson -Raw | ConvertFrom-Json
@@ -151,11 +178,11 @@ if (Test-Path $seedsJson) {
     }
 }
 
-Ensure-FinalisFirewallRules
+[void](Ensure-FinalisFirewallRules -Required $false)
 
-Stop-FinalisProcessIfRunning -ProcessName "finalis-explorer"
-Stop-FinalisProcessIfRunning -ProcessName "finalis-lightserver"
-Stop-FinalisProcessIfRunning -ProcessName "finalis-node"
+Stop-FinalisProcessIfRunning -ProcessName "finalis-explorer" -ExpectedPath $explorerExe
+Stop-FinalisProcessIfRunning -ProcessName "finalis-lightserver" -ExpectedPath $lightserverExe
+Stop-FinalisProcessIfRunning -ProcessName "finalis-node" -ExpectedPath $nodeExe
 
 $nodeLog = Join-Path $logDir "node.log"
 $nodeErr = Join-Path $logDir "node.err.log"
@@ -172,9 +199,17 @@ $lightserverLog = Join-Path $logDir "lightserver.log"
 $lightserverErr = Join-Path $logDir "lightserver.err.log"
 $lightserverProc = Start-Process -FilePath $lightserverExe -ArgumentList $lightserverArgs -WorkingDirectory $appRoot -RedirectStandardOutput $lightserverLog -RedirectStandardError $lightserverErr -PassThru
 
+Start-Sleep -Milliseconds 750
+if ($nodeProc.HasExited) {
+    throw "finalis-node.exe exited before lightserver startup completed. See $nodeErr"
+}
+
 if (-not (Wait-ForTcpPort -Host "127.0.0.1" -Port $LightserverPort -TimeoutSeconds 15)) {
     if ($lightserverProc.HasExited) {
         throw "finalis-lightserver.exe exited before listening on 127.0.0.1:$LightserverPort. See $lightserverErr"
+    }
+    if ($nodeProc.HasExited) {
+        throw "finalis-node.exe exited before lightserver became reachable. See $nodeErr"
     }
     throw "finalis-lightserver.exe did not start listening on 127.0.0.1:$LightserverPort. See $lightserverErr"
 }
@@ -192,6 +227,9 @@ if ($WithExplorer -and (Test-Path $explorerExe)) {
         if ($explorerProc.HasExited) {
             throw "finalis-explorer.exe exited before listening on 127.0.0.1:$ExplorerPort. See $explorerErr"
         }
+        if ($nodeProc.HasExited) {
+            throw "finalis-node.exe exited before explorer became reachable. See $nodeErr"
+        }
         throw "finalis-explorer.exe did not start listening on 127.0.0.1:$ExplorerPort. See $explorerErr"
     }
     if ($OpenExplorer) {
@@ -199,8 +237,14 @@ if ($WithExplorer -and (Test-Path $explorerExe)) {
     }
 }
 
+if ($nodeProc.HasExited) {
+    throw "finalis-node.exe exited during startup. See $nodeErr"
+}
+
 Write-Host "Finalis node started."
 Write-Host "Data dir: $DataDir"
+Write-Host "Public node: $PublicNode"
+Write-Host "Firewall ports: P2P $P2PPort, Lightserver $LightserverPort, Explorer $ExplorerPort"
 Write-Host "Lightserver RPC: http://127.0.0.1:$LightserverPort/rpc"
 if ($WithExplorer -and (Test-Path $explorerExe)) {
     Write-Host "Explorer: http://127.0.0.1:$ExplorerPort"
