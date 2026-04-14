@@ -130,6 +130,23 @@ The current code implements:
 
 ## Run A Node
 
+## Quick Start (Non-Developers)
+
+### Windows
+
+1. Download the latest Windows installer from the releases page.
+2. Install and launch `finalis-node` (and `finalis-lightserver` if you want wallet/explorer access).
+3. Verify identity with:
+   ```
+   curl -s http://127.0.0.1:19444/rpc -d '{"jsonrpc":"2.0","id":1,"method":"get_status","params":{}}'
+   ```
+   Confirm `network_id`, `magic`, and `genesis_hash` match the values above.
+
+### Linux
+
+If a Linux binary release is available, download and run it. Otherwise use the
+build steps below (requires a C++ toolchain).
+
 For Windows builds/releases, use:
 
 - [finalis-core releases](https://github.com/finalis-core/finalis-core/releases)
@@ -177,6 +194,12 @@ Default ports from the current mainnet config:
 
 Always verify live endpoint identity with `get_status` before relying on public
 infrastructure.
+
+## Community Help Wanted
+
+If you can make a clear, step-by-step installation and launch video (Linux and/or Windows),
+post it publicly and share the link. I can sponsor the best tutorials with enough FLS
+to cover validator registration requirements.
 
 
 ## Testing
