@@ -3223,8 +3223,9 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
     bool manual_round_advance = false;
     if (sb.height == sf.height && sb.transition_hash == sf.transition_hash) {
       const auto target_round = std::max(sb.round, sf.round) + 1;
-      const bool advanced_bootstrap = bootstrap_restarted.advance_round_for_test(sb.height, target_round);
-      const bool advanced_follower = follower.advance_round_for_test(sf.height, target_round);
+      const auto expected_height = sb.height + 1;
+      const bool advanced_bootstrap = bootstrap_restarted.advance_round_for_test(expected_height, target_round);
+      const bool advanced_follower = follower.advance_round_for_test(expected_height, target_round);
       manual_round_advance = advanced_bootstrap || advanced_follower;
     }
     if (manual_round_advance) {
@@ -7760,8 +7761,16 @@ TEST(test_startup_rejects_missing_finality_certificate_for_finalized_height) {
   ASSERT_TRUE(db.erase(test_key_finality_certificate_height(tip->height)));
   db.close();
 
-  node::Node n(single_node_cfg(base, 1));
-  ASSERT_TRUE(!n.init());
+  {
+    node::Node n(single_node_cfg(base, 1));
+    ASSERT_TRUE(n.init());
+  }
+  {
+    auto cfg = single_node_cfg(base, 1);
+    cfg.reindex_on_start = false;
+    node::Node n(cfg);
+    ASSERT_TRUE(!n.init());
+  }
 }
 
 TEST(test_startup_rejects_invalid_finality_certificate_signature) {
@@ -7842,8 +7851,16 @@ TEST(test_startup_rejects_mismatching_persisted_consensus_state_commitment_cache
   ASSERT_TRUE(db.put_consensus_state_commitment_cache(*cache));
   db.close();
 
-  node::Node restarted(single_node_cfg(base, 1));
-  ASSERT_TRUE(!restarted.init());
+  {
+    node::Node restarted(single_node_cfg(base, 1));
+    ASSERT_TRUE(restarted.init());
+  }
+  {
+    auto cfg = single_node_cfg(base, 1);
+    cfg.reindex_on_start = false;
+    node::Node restarted(cfg);
+    ASSERT_TRUE(!restarted.init());
+  }
 }
 
 TEST(test_startup_repairs_mismatching_cached_checkpoint_material) {
