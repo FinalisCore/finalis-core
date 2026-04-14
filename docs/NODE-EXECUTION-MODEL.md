@@ -76,6 +76,10 @@ next-height state from getting ahead of committed finalized state.
 On startup, the node restores persisted chain state and then rebuilds or
 validates derived finalized state from history.
 
+By default, startup clears the consensus state commitment cache to guarantee
+replay rebuilds a canonical view even if a previous cache was corrupted. Use
+`--no-reindex` to keep the cache when you are confident it is consistent.
+
 Derived state rebuilt or validated on startup includes:
 
 - finalized randomness

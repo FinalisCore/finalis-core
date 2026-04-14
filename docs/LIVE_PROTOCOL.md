@@ -87,6 +87,7 @@ Not live:
 
 - Validator state, availability state, finalized checkpoints, proposer schedule inputs, and the consensus state commitment are all reconstructed from finalized frontier history.
 - Restart and resync must reproduce the same validator registry, availability state, checkpoints, and proposer schedule.
+- On restart, the node clears the consensus state commitment cache by default so the rebuild is authoritative; use `--no-reindex` to keep the cache when intentionally preserving it.
 
 Replay authority is:
 
