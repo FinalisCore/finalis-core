@@ -7,6 +7,7 @@ param(
     [string]$LightserverBind = "0.0.0.0",
     [string]$ExplorerBind = "0.0.0.0",
     [bool]$WithExplorer = $true,
+    [bool]$OpenExplorer = $true,
     [switch]$ConfigureFirewall,
     [switch]$NoStart,
     [switch]$PublicNode
@@ -192,6 +193,9 @@ if ($WithExplorer -and (Test-Path $explorerExe)) {
             throw "finalis-explorer.exe exited before listening on 127.0.0.1:$ExplorerPort. See $explorerErr"
         }
         throw "finalis-explorer.exe did not start listening on 127.0.0.1:$ExplorerPort. See $explorerErr"
+    }
+    if ($OpenExplorer) {
+        Start-Process "http://127.0.0.1:$ExplorerPort"
     }
 }
 

@@ -106,10 +106,15 @@ foreach ($candidate in ($vcpkgBinCandidates | Select-Object -Unique)) {
 }
 
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-app-icon.png") -Destination (Join-Path $installRoot "finalis-app-icon.png")
+Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-gold-dark.ico") -Destination (Join-Path $installRoot "finalis-app-icon.ico")
+Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-gold-light.ico") -Destination (Join-Path $installRoot "finalis-app-icon-gold-light.ico")
+Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-silver-dark.ico") -Destination (Join-Path $installRoot "finalis-app-icon-silver-dark.ico")
+Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-silver-light.ico") -Destination (Join-Path $installRoot "finalis-app-icon-silver-light.ico")
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installRoot "finalis-logo-horizontal.png")
 Copy-OptionalFile -Source (Join-Path $repoRoot "mainnet\SEEDS.json") -Destination (Join-Path $mainnetDir "SEEDS.json")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-splash-lockup.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard.bmp")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard-small.bmp")
+Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-gold-dark.ico") -Destination (Join-Path $installerAssetsDir "finalis-app.ico")
 
 $launcherReadme = @"
 Finalis Core for Windows
@@ -132,6 +137,8 @@ Explorer:
 
 Lightserver RPC:
   http://<this-machine-ip>:19444/rpc
+
+Explorer will also open in your default browser when the stack starts.
 "@
 
 Set-Content -Path (Join-Path $installRoot "WINDOWS-RUN.txt") -Value $launcherReadme -Encoding ASCII
