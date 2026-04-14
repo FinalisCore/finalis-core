@@ -4945,6 +4945,10 @@ void WalletWindow::submit_send() {
   std::vector<OutPoint> reserved_inputs;
   QString confirm;
   Bytes tx_bytes;
+  bool auto_retry_allowed = false;
+  bool auto_retry_used = false;
+  std::optional<finalis::keystore::ValidatorKey> cached_key;
+  std::optional<finalis::address::DecodedAddress> cached_sender_address;
 
   if (mode == WalletSendMode::TransparentToTransparent) {
     auto decoded_to = finalis::address::decode(destination.toStdString());
@@ -5033,6 +5037,9 @@ void WalletWindow::submit_send() {
     tx_bytes = tx->serialize();
     reserved_inputs.reserve(plan->selected_prevs.size());
     for (const auto& [op, _] : plan->selected_prevs) reserved_inputs.push_back(op);
+    auto_retry_allowed = true;
+    cached_key = *key;
+    cached_sender_address = *own_decoded;
   } else if (mode == WalletSendMode::TransparentToConfidential) {
     QString recipient_err;
     auto parsed_recipient = parse_confidential_recipient_descriptor(destination, &recipient_err);
@@ -5139,6 +5146,8 @@ void WalletWindow::submit_send() {
     }
     tx_bytes = tx->serialize();
     reserved_inputs.push_back(selected_prev->first);
+    cached_key = *key;
+    cached_sender_address = finalis::address::decode(wallet_->address);
   } else {
     auto decoded_to = finalis::address::decode(destination.toStdString());
     if (!decoded_to) {
@@ -5215,6 +5224,58 @@ void WalletWindow::submit_send() {
     } else if (result->error == "missing utxo" || result->error_code == "tx_missing_or_unconfirmed_input") {
       QString refresh_err;
       (void)refresh_finalized_send_state(&refresh_err);
+      if (auto_retry_allowed && !auto_retry_used && cached_key.has_value() && cached_sender_address.has_value()) {
+        auto_retry_used = true;
+        std::size_t reserved_excluded = 0;
+        std::size_t pending_reserved_excluded = 0;
+        std::size_t onboarding_reserved_excluded = 0;
+        QString prev_err;
+        auto available_prevs =
+            send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+        if (available_prevs) {
+          auto decoded_to = finalis::address::decode(destination.toStdString());
+          if (decoded_to) {
+            auto retry_plan = finalis::plan_wallet_p2pkh_send(
+                *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
+                finalis::address::p2pkh_script_pubkey(cached_sender_address->pubkey_hash), *amount_units,
+                finalis::DEFAULT_WALLET_SEND_FEE_UNITS, finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
+            if (retry_plan) {
+              auto retry_tx = finalis::build_signed_p2pkh_tx_multi_input(
+                  retry_plan->selected_prevs,
+                  finalis::Bytes(cached_key->privkey.begin(), cached_key->privkey.end()),
+                  retry_plan->outputs, &err);
+              if (retry_tx) {
+                Bytes retry_bytes = retry_tx->serialize();
+                QString retry_endpoint;
+                auto retry_result = broadcast_tx_with_failover(retry_bytes, &err, &retry_endpoint);
+                if (retry_result && retry_result->outcome == lightserver::BroadcastOutcome::Sent) {
+                  local_sent_txids_.push_back(retry_result->txid_hex);
+                  reserved_inputs.clear();
+                  reserved_inputs.reserve(retry_plan->selected_prevs.size());
+                  for (const auto& [op, _] : retry_plan->selected_prevs) reserved_inputs.push_back(op);
+                  pending_wallet_spends_[retry_result->txid_hex] = reserved_inputs;
+                  mark_refresh_state_changed();
+                  (void)store_.add_sent_txid(retry_result->txid_hex);
+                  (void)store_.upsert_pending_spend(retry_result->txid_hex, reserved_inputs, tip_height_,
+                                                    static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch()));
+                  save_wallet_local_state();
+                  append_local_event(QString("[pending] sent %1 -> %2 (%3) [auto-refreshed]")
+                                         .arg(format_coin_amount(*amount_units))
+                                         .arg(elide_middle(destination))
+                                         .arg(elide_middle(QString::fromStdString(retry_result->txid_hex), 12)));
+                  refresh_chain_state(false);
+                  const QString retry_note = retry_endpoint.isEmpty()
+                                                 ? QString{}
+                                                 : QString(" via %1").arg(display_lightserver_endpoint(retry_endpoint));
+                  show_send_inline_status(QString("Accepted for relay%1 after auto-refresh.").arg(retry_note));
+                  statusBar()->showMessage(QString("Transaction accepted for relay%1.").arg(retry_note), 3000);
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
       QMessageBox::warning(
           this, "Send",
           "Broadcast rejected: missing utxo.\n\nThe finalized spendable set changed before broadcast. The wallet refreshed its finalized state. Review and send again.");
