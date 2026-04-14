@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
                  "[--validator-key-file <path>] [--validator-passphrase <pass>] [--validator-passphrase-env <ENV>] "
                  "[--public] [--listen] [--bind <ip>] [--with-lightserver] [--lightserver-bind <ip>] "
                  "[--lightserver-port <p>] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
-                 "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json] "
+                 "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--no-reindex] [--log-json] "
                  "[--handshake-timeout-ms <ms>] [--frame-timeout-ms <ms>] [--idle-timeout-ms <ms>] "
                  "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--max-inbound <n>] [--ban-seconds <s>] "
                  "[--invalid-frame-ban-threshold <n>] [--invalid-frame-window-seconds <s>] "

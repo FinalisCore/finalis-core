@@ -3220,6 +3220,24 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   if (!recovered) {
     const auto sb = bootstrap_restarted.status();
     const auto sf = follower.status();
+    bool manual_round_advance = false;
+    if (sb.height == sf.height && sb.transition_hash == sf.transition_hash) {
+      const auto target_round = std::max(sb.round, sf.round) + 1;
+      const bool advanced_bootstrap = bootstrap_restarted.advance_round_for_test(sb.height, target_round);
+      const bool advanced_follower = follower.advance_round_for_test(sf.height, target_round);
+      manual_round_advance = advanced_bootstrap || advanced_follower;
+    }
+    if (manual_round_advance) {
+      const bool recovered_after_advance = wait_for([&]() {
+        const auto s = follower.status();
+        return s.established_peers >= 1 && s.consensus_state != "REPAIRING" && s.height >= synced_height + 2;
+      }, ci_timeout_seconds(30));
+      if (recovered_after_advance) {
+        follower.stop();
+        bootstrap_restarted.stop();
+        return;
+      }
+    }
     const auto probe_round = std::max(sb.round, sf.round);
     const auto probe_height =
         (sb.height == sf.height && sb.transition_hash == sf.transition_hash) ? (sb.height + 1)

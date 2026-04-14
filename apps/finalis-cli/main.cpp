@@ -828,6 +828,7 @@ void print_user_cli_help(std::ostream& os) {
 void print_dev_cli_help(std::ostream& os) {
   os << "finalis-cli developer/protocol commands:\n"
      << "  finalis-cli tip --db <dir>\n"
+     << "  finalis-cli reindex [--db <dir>] [--file <path>]  # clear consensus cache so startup can rebuild\n"
      << "  finalis-cli --print-logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli print_logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
@@ -1091,6 +1092,24 @@ int main(int argc, char** argv) {
     } else {
       std::cout << "slashing_records=unknown\n";
     }
+    return 0;
+  }
+
+  if (cmd == "--reindex" || cmd == "reindex") {
+    std::string db_path = default_mainnet_db_path();
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--file" && i + 1 < argc) (void)argv[++i];
+    }
+    db_path = expand_user(db_path);
+    finalis::storage::DB db;
+    if (!db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+    const bool erased = db.erase(finalis::storage::key_consensus_state_commitment_cache());
+    std::cout << "reindex_erased=" << (erased ? "yes" : "no") << "\n";
     return 0;
   }
 

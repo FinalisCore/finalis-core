@@ -59,6 +59,7 @@ struct NodeConfig {
   std::string db_path{"~/.finalis/mainnet"};
   std::string genesis_path;
   bool disable_p2p{false};
+  bool reindex_on_start{true};
   bool log_json{false};
   std::size_t max_committee{MAX_COMMITTEE};
   std::uint32_t handshake_timeout_ms{10'000};
