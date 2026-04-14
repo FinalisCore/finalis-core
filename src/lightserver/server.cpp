@@ -147,6 +147,19 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
       canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
     }
   }
+  // History does not include frontier settlement credits. Merge canonical UTXOs
+  // so settlement outputs remain visible even when history is non-empty.
+  const auto canonical_utxos = db.load_utxos();
+  for (const auto& [op, entry] : canonical_utxos) {
+    if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+    if (canonical_matches.find(op) != canonical_matches.end()) continue;
+    storage::DB::ScriptUtxoEntry merged;
+    merged.outpoint = op;
+    merged.value = entry.out.value;
+    merged.script_pubkey = entry.out.script_pubkey;
+    if (auto loc = db.get_tx_index(op.txid); loc.has_value()) merged.height = loc->height;
+    canonical_matches.emplace(op, std::move(merged));
+  }
   std::vector<storage::DB::ScriptUtxoEntry> out;
   out.reserve(std::max(indexed_entries.size(), canonical_matches.size()));
   std::set<OutPoint> seen;
