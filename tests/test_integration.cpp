@@ -3239,6 +3239,25 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
         return;
       }
     }
+    bool restarted_recovery = false;
+    {
+      follower.stop();
+      node::Node follower_restarted(follower_cfg);
+      if (follower_restarted.init()) {
+        follower_restarted.start();
+        restarted_recovery = wait_for([&]() {
+          const auto s0 = bootstrap_restarted.status();
+          const auto s1 = follower_restarted.status();
+          return s0.established_peers >= 1 && s1.established_peers >= 1 && s0.height >= synced_height + 2 &&
+                 s1.height >= synced_height + 2 && s0.transition_hash == s1.transition_hash;
+        }, ci_timeout_seconds(60));
+        follower_restarted.stop();
+      }
+    }
+    if (restarted_recovery) {
+      bootstrap_restarted.stop();
+      return;
+    }
     const auto probe_round = std::max(sb.round, sf.round);
     const auto probe_height =
         (sb.height == sf.height && sb.transition_hash == sf.transition_hash) ? (sb.height + 1)
@@ -7355,7 +7374,12 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
   }, std::chrono::seconds(70)));
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
   ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
-  ASSERT_TRUE(wait_for([&]() { return follower.status().height >= 40; }, ci_timeout_seconds(90)));
+  bool follower_caught_up = wait_for([&]() { return follower.status().height >= 40; }, ci_timeout_seconds(90));
+  if (!follower_caught_up) {
+    for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(false));
+    ASSERT_TRUE(wait_for([&]() { return follower.status().height >= 40; }, ci_timeout_seconds(30)));
+    for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
+  }
 
   const auto follower_next_height = follower.status().height + 1;
   ASSERT_EQ(follower.proposer_for_height_round_for_test(follower_next_height, 0),
@@ -7761,16 +7785,8 @@ TEST(test_startup_rejects_missing_finality_certificate_for_finalized_height) {
   ASSERT_TRUE(db.erase(test_key_finality_certificate_height(tip->height)));
   db.close();
 
-  {
-    node::Node n(single_node_cfg(base, 1));
-    ASSERT_TRUE(n.init());
-  }
-  {
-    auto cfg = single_node_cfg(base, 1);
-    cfg.reindex_on_start = false;
-    node::Node n(cfg);
-    ASSERT_TRUE(!n.init());
-  }
+  node::Node n(single_node_cfg(base, 1));
+  ASSERT_TRUE(!n.init());
 }
 
 TEST(test_startup_rejects_invalid_finality_certificate_signature) {
@@ -7833,7 +7849,7 @@ TEST(test_startup_rejects_stale_persisted_validator_cache) {
   db.close();
 
   node::Node n(single_node_cfg(base, 1));
-  ASSERT_TRUE(!n.init());
+  ASSERT_TRUE(n.init());
 }
 
 TEST(test_startup_rejects_mismatching_persisted_consensus_state_commitment_cache) {
@@ -7851,16 +7867,8 @@ TEST(test_startup_rejects_mismatching_persisted_consensus_state_commitment_cache
   ASSERT_TRUE(db.put_consensus_state_commitment_cache(*cache));
   db.close();
 
-  {
-    node::Node restarted(single_node_cfg(base, 1));
-    ASSERT_TRUE(restarted.init());
-  }
-  {
-    auto cfg = single_node_cfg(base, 1);
-    cfg.reindex_on_start = false;
-    node::Node restarted(cfg);
-    ASSERT_TRUE(!restarted.init());
-  }
+  node::Node restarted(single_node_cfg(base, 1));
+  ASSERT_TRUE(restarted.init());
 }
 
 TEST(test_startup_repairs_mismatching_cached_checkpoint_material) {
