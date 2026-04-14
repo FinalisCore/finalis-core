@@ -1724,6 +1724,10 @@ bool Node::init() {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
   }
+  if (cfg_.reindex_on_start) {
+    const bool erased = db_.erase(storage::key_consensus_state_commitment_cache());
+    if (erased) log_line("startup-reindex cleared=consensus-state-commitment-cache");
+  }
   if (!init_mainnet_genesis()) {
     std::cerr << "mainnet genesis init failed\n";
     return false;
@@ -8500,6 +8504,8 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       for (const auto& item : parse_endpoint_list(*v)) cfg.peers.push_back(item);
     } else if (a == "--disable-p2p") {
       cfg.disable_p2p = true;
+    } else if (a == "--no-reindex") {
+      cfg.reindex_on_start = false;
     } else if (a == "--seeds") {
       auto v = next(a);
       if (!v) return std::nullopt;
