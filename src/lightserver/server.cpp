@@ -772,6 +772,69 @@ std::string ticket_pow_status_json(const TicketPowStatusView& status) {
   return oss.str();
 }
 
+std::string decoded_tx_output_json(const TxOut& out, const NetworkConfig& network) {
+  std::ostringstream oss;
+  oss << "{\"amount\":" << out.value
+      << ",\"script_hex\":\"" << hex_encode(out.script_pubkey) << "\"";
+  if (auto addr = p2pkh_script_to_address(out.script_pubkey, server_hrp_for_network(network)); addr.has_value()) {
+    oss << ",\"address\":\"" << json_escape(*addr) << "\"";
+  } else {
+    oss << ",\"address\":null";
+  }
+  OnboardingRegistrationScriptData onboarding{};
+  if (parse_onboarding_registration_script(out.script_pubkey, &onboarding)) {
+    oss << ",\"decoded_kind\":\"onboarding_registration\""
+        << ",\"validator_pubkey_hex\":\""
+        << hex_encode(Bytes(onboarding.validator_pubkey.begin(), onboarding.validator_pubkey.end()))
+        << "\",\"payout_pubkey_hex\":\""
+        << hex_encode(Bytes(onboarding.payout_pubkey.begin(), onboarding.payout_pubkey.end()))
+        << "\",\"has_admission_pow\":" << (onboarding.has_admission_pow ? "true" : "false")
+        << ",\"admission_pow_epoch\":";
+    if (onboarding.has_admission_pow) oss << onboarding.admission_pow_epoch;
+    else oss << "null";
+    oss << ",\"admission_pow_nonce\":";
+    if (onboarding.has_admission_pow) oss << onboarding.admission_pow_nonce;
+    else oss << "null";
+  } else {
+    oss << ",\"decoded_kind\":null";
+  }
+  oss << "}";
+  return oss.str();
+}
+
+std::optional<std::uint64_t> onboarding_score_units_for_pubkey(const storage::DB& db, const PubKey32& pub,
+                                                               std::uint64_t epoch_start_height) {
+  auto state = db.get_epoch_reward_settlement(epoch_start_height);
+  if (!state.has_value()) return std::nullopt;
+  auto it = state->onboarding_score_units.find(pub);
+  if (it == state->onboarding_score_units.end()) return std::nullopt;
+  return it->second;
+}
+
+std::string onboarding_visibility_json(const NetworkConfig& network, const storage::DB& db,
+                                       const onboarding::ValidatorOnboardingRecord& record,
+                                       std::optional<std::uint64_t> finalized_height) {
+  std::ostringstream oss;
+  oss << "\"onboarding_reward_pool_bps\":" << consensus::ONBOARDING_REWARD_BPS
+      << ",\"onboarding_admission_pow_difficulty_bits\":" << network.onboarding_admission_pow_difficulty_bits
+      << ",\"validator_join_admission_pow_difficulty_bits\":" << network.validator_join_admission_pow_difficulty_bits;
+  const auto epoch_start =
+      finalized_height.has_value() ? consensus::committee_epoch_start(*finalized_height, network.committee_epoch_blocks) : 0;
+  oss << ",\"onboarding_reward_epoch_start\":";
+  if (finalized_height.has_value()) oss << epoch_start;
+  else oss << "null";
+  const bool eligible = record.validator_status == "ONBOARDING";
+  oss << ",\"onboarding_reward_eligible\":" << (eligible ? "true" : "false")
+      << ",\"onboarding_reward_score_units\":";
+  if (eligible && finalized_height.has_value()) {
+    if (auto score = onboarding_score_units_for_pubkey(db, record.validator_pubkey, epoch_start); score.has_value()) oss << *score;
+    else oss << "null";
+  } else {
+    oss << "null";
+  }
+  return oss.str();
+}
+
 std::string finality_certificate_json(const FinalityCertificate& cert) {
   std::ostringstream oss;
   oss << "{\"height\":" << cert.height << ",\"round\":" << cert.round << ",\"transition_hash\":\""
@@ -1066,6 +1129,19 @@ std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& 
   return oss.str();
 }
 
+std::string onboarding_record_json_for_rpc(const NetworkConfig& network, const storage::DB& db,
+                                           const onboarding::ValidatorOnboardingRecord& record) {
+  auto base = onboarding_record_json(record);
+  if (base.size() < 2 || base.back() != '}') return base;
+  base.pop_back();
+  base += ",";
+  base += onboarding_visibility_json(network, db, record, record.finalized_height == 0
+                                                           ? std::optional<std::uint64_t>{}
+                                                           : std::optional<std::uint64_t>(record.finalized_height));
+  base += "}";
+  return base;
+}
+
 std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const std::string& key_file, const std::string& passphrase,
                                                                  std::string* err) {
   keystore::ValidatorKey key;
@@ -1076,6 +1152,8 @@ std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const std::stri
 std::string validator_status_name_for_rpc(const std::optional<consensus::ValidatorInfo>& info) {
   if (!info.has_value()) return "NOT_REGISTERED";
   switch (info->status) {
+    case consensus::ValidatorStatus::ONBOARDING:
+      return "ONBOARDING";
     case consensus::ValidatorStatus::PENDING:
       return "PENDING";
     case consensus::ValidatorStatus::ACTIVE:
@@ -1551,6 +1629,11 @@ std::string Server::handle_rpc_body(const std::string& body) {
       latest_committee_size = cert->committee_members.size();
       latest_quorum_threshold = cert->quorum_threshold;
     }
+    const auto validators = view->load_validators();
+    std::optional<PubKey32> local_registry_pubkey;
+    if (runtime.has_value() && runtime->availability_local_operator_known) {
+      local_registry_pubkey = runtime->availability_local_operator_pubkey;
+    }
     std::ostringstream oss;
     oss << "{\"network_name\":\"" << cfg_.network.name << "\",\"protocol_version\":"
         << cfg_.network.protocol_version << ",\"feature_flags\":" << cfg_.network.feature_flags
@@ -1775,6 +1858,32 @@ std::string Server::handle_rpc_body(const std::string& body) {
     oss << ",\"seat_budget\":";
     if (runtime.has_value() && runtime->availability_local_operator_known) oss << runtime->availability_local_seat_budget;
     else oss << "null";
+    oss << ",\"validator_registry_status\":";
+    if (local_registry_pubkey.has_value()) {
+      auto it = validators.find(*local_registry_pubkey);
+      if (it != validators.end()) {
+        oss << "\"" << json_escape(validator_status_name_for_rpc(std::optional<consensus::ValidatorInfo>(it->second))) << "\"";
+      } else {
+        oss << "\"NOT_REGISTERED\"";
+      }
+    } else {
+      oss << "null";
+    }
+    oss << ",\"onboarding_reward_eligible\":";
+    if (local_registry_pubkey.has_value()) {
+      auto it = validators.find(*local_registry_pubkey);
+      oss << ((it != validators.end() && it->second.status == consensus::ValidatorStatus::ONBOARDING) ? "true" : "false");
+    } else {
+      oss << "null";
+    }
+    oss << ",\"onboarding_reward_score_units\":";
+    if (local_registry_pubkey.has_value()) {
+      const auto epoch_start = consensus::committee_epoch_start(tip->height, cfg_.network.committee_epoch_blocks);
+      if (auto score = onboarding_score_units_for_pubkey(*view, *local_registry_pubkey, epoch_start); score.has_value()) oss << *score;
+      else oss << "null";
+    } else {
+      oss << "null";
+    }
     oss << "}},\"uptime_s\":" << (now - started_at_unix_)
         << ",\"version\":\"" << finalis::core_software_version() << "\""
         << ",\"binary\":\"finalis-lightserver\""
@@ -1782,6 +1891,10 @@ std::string Server::handle_rpc_body(const std::string& body) {
         << ",\"release\":\"" << finalis::kReleaseVersion << "\""
         << ",\"wallet_api_version\":\"" << finalis::kWalletApiVersion << "\""
         << ",\"consensus_model\":\"finalized-checkpoint-operator-committee-bft\""
+        << ",\"onboarding\":{\"reward_pool_bps\":" << consensus::ONBOARDING_REWARD_BPS
+        << ",\"admission_pow_difficulty_bits\":" << cfg_.network.onboarding_admission_pow_difficulty_bits
+        << ",\"validator_join_admission_pow_difficulty_bits\":" << cfg_.network.validator_join_admission_pow_difficulty_bits
+        << "}"
         << ",\"ticket_pow\":" << ticket_pow_status_json(ticket_pow)
         << ",\"latest_finality_committee_size\":" << latest_committee_size
         << ",\"latest_finality_quorum_threshold\":" << latest_quorum_threshold
@@ -2140,7 +2253,17 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto loc = view->get_tx_index(*txid);
     if (!loc.has_value()) return make_error(id, -32001, "not found");
     std::ostringstream oss;
-    oss << "{\"height\":" << loc->height << ",\"tx_hex\":\"" << hex_encode(loc->tx_bytes) << "\"}";
+    oss << "{\"height\":" << loc->height << ",\"tx_hex\":\"" << hex_encode(loc->tx_bytes) << "\"";
+    if (auto parsed = parse_any_tx(loc->tx_bytes); parsed.has_value() && std::holds_alternative<Tx>(*parsed)) {
+      const auto& tx = std::get<Tx>(*parsed);
+      oss << ",\"decoded_outputs\":[";
+      for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
+        if (i) oss << ",";
+        oss << decoded_tx_output_json(tx.outputs[i], cfg_.network);
+      }
+      oss << "]";
+    }
+    oss << "}";
     return make_result(id, oss.str());
   }
 
@@ -2194,7 +2317,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto record =
         onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, tracked_txid_hex, &err);
     if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
-    return make_result(id, onboarding_record_json(*record));
+    return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
   }
 
   if (*method == "validator_onboarding_start") {
@@ -2214,7 +2337,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto record = onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, "", &err);
     if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
     if (record->state != onboarding::ValidatorOnboardingState::CHECKING_PREREQS) {
-      return make_result(id, onboarding_record_json(*record));
+      return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
 
     const auto own_pkh = crypto::h160(Bytes(key->pubkey.begin(), key->pubkey.end()));
@@ -2224,7 +2347,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "selection_failed";
       record->last_error_message = err;
-      return make_result(id, onboarding_record_json(*record));
+      return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
     std::vector<std::pair<OutPoint, TxOut>> prevs;
     prevs.reserve(selection->selected.size());
@@ -2238,7 +2361,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "build_failed";
       record->last_error_message = "invalid wallet address";
-      return make_result(id, onboarding_record_json(*record));
+      return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
     auto tx = build_validator_join_request_tx(prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
                                               Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
@@ -2248,7 +2371,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "build_failed";
       record->last_error_message = err;
-      return make_result(id, onboarding_record_json(*record));
+      return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
     const Bytes tx_bytes = tx->serialize();
     const Hash32 txid = tx->txid();
@@ -2283,14 +2406,14 @@ std::string Server::handle_rpc_body(const std::string& body) {
       record->last_error_code = "tx_rejected";
       record->last_error_message = vrx.error;
       record->txid_hex = hex_encode32(txid);
-      return make_result(id, onboarding_record_json(*record));
+      return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
     if (!relay_tx_to_peer(tx_bytes, &err)) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "tx_rejected";
       record->last_error_message = err;
       record->txid_hex = hex_encode32(txid);
-      return make_result(id, onboarding_record_json(*record));
+      return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
     record->state = onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION;
     record->txid_hex = hex_encode32(txid);
@@ -2298,7 +2421,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     record->rpc_endpoint = "lightserver";
     record->last_error_code.clear();
     record->last_error_message.clear();
-    return make_result(id, onboarding_record_json(*record));
+    return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
   }
 
   if (*method == "validate_address") {

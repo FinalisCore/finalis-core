@@ -894,6 +894,7 @@ bool same_epoch_reward_state(const storage::EpochRewardSettlementState& a, const
          a.fee_pool_units == b.fee_pool_units && a.reserve_accrual_units == b.reserve_accrual_units &&
          a.reserve_subsidy_units == b.reserve_subsidy_units &&
          a.settled == b.settled && a.reward_score_units == b.reward_score_units &&
+         a.onboarding_score_units == b.onboarding_score_units &&
          a.expected_participation_units == b.expected_participation_units &&
          a.observed_participation_units == b.observed_participation_units;
 }
@@ -1170,6 +1171,16 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
     const Hash32 txid = tx.txid();
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
       const auto& out = tx.outputs[out_i];
+      PubKey32 onboarding_validator_pub{};
+      PubKey32 onboarding_payout_pub{};
+      Sig64 onboarding_pop{};
+      if (is_onboarding_registration_script(out.script_pubkey, &onboarding_validator_pub, &onboarding_payout_pub,
+                                            &onboarding_pop)) {
+        std::string err;
+        (void)validators.register_onboarding(onboarding_validator_pub, height, &err,
+                                             consensus::canonical_operator_id_from_join_request(onboarding_payout_pub));
+        continue;
+      }
       PubKey32 validator_pub{};
       PubKey32 payout_pub{};
       Sig64 pop{};
@@ -3241,6 +3252,7 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
                                                                                const PubKey32& leader_pubkey,
                                                                                std::uint64_t fees_units) const {
   std::map<PubKey32, std::uint64_t> settlement_scores;
+  std::map<PubKey32, std::uint64_t> onboarding_scores;
   std::uint64_t settlement_rewards = 0;
   std::uint64_t distributed_fee_units = height >= consensus::EMISSION_BLOCKS ? 0 : fees_units;
   std::uint64_t reserve_subsidy_units = 0;
@@ -3251,6 +3263,7 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
       distributed_fee_units = height >= consensus::EMISSION_BLOCKS ? state.fee_pool_units : fees_units;
       reserve_subsidy_units = height >= consensus::EMISSION_BLOCKS ? state.reserve_subsidy_units : 0;
       settlement_scores = state.reward_score_units;
+      onboarding_scores = state.onboarding_score_units;
       const auto& econ = active_economics_policy(cfg_.network, height);
       const auto threshold_bps = econ.participation_threshold_bps;
       for (auto& [pub, score] : settlement_scores) {
@@ -3280,7 +3293,22 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
     }
   }
   return consensus::compute_epoch_settlement_payout(settlement_rewards, distributed_fee_units, reserve_subsidy_units,
-                                                    leader_pubkey, settlement_scores);
+                                                    leader_pubkey, settlement_scores, onboarding_scores);
+}
+
+std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const {
+  std::map<PubKey32, std::uint64_t> out;
+  const auto tickets = db_.load_epoch_tickets(epoch_start_height);
+  const auto best_tickets = consensus::best_epoch_tickets_by_pubkey(tickets);
+  for (const auto& [pub, info] : validators_.all()) {
+    if (info.status != consensus::ValidatorStatus::ONBOARDING) continue;
+    auto it = best_tickets.find(pub);
+    if (it == best_tickets.end()) continue;
+    const auto score = static_cast<std::uint64_t>(
+        std::max<std::uint8_t>(1, consensus::leading_zero_bits(it->second.work_hash)));
+    out[pub] = score;
+  }
+  return out;
 }
 
 std::vector<TxOut> Node::coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
@@ -3358,6 +3386,15 @@ void Node::accrue_epoch_reward_for_finalized_block_locked(const Block& block, co
 }
 
 void Node::mark_epoch_reward_settled_if_needed_locked(std::uint64_t height) {
+  const auto epoch_start = consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks);
+  if (height == epoch_start && epoch_start > cfg_.network.committee_epoch_blocks && epoch_start > 1) {
+    const auto settlement_epoch = epoch_start - cfg_.network.committee_epoch_blocks;
+    auto& state = epoch_reward_states_[settlement_epoch];
+    state.epoch_start_height = settlement_epoch;
+    if (!state.settled) {
+      state.onboarding_score_units = compute_onboarding_score_units_for_epoch_locked(settlement_epoch);
+    }
+  }
   mark_epoch_reward_settled_for_height(cfg_.network, height, cfg_.network.committee_epoch_blocks, epoch_reward_states_,
                                        &protocol_reserve_balance_units_, &db_);
 }

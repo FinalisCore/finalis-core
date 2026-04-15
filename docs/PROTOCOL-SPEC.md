@@ -18,6 +18,10 @@ Primary implementation paths:
 - [src/consensus/monetary.cpp](../src/consensus/monetary.cpp)
 - [src/storage/db.cpp](../src/storage/db.cpp)
 
+Onboarding-specific admission and reward semantics are specified in:
+
+- [docs/ONBOARDING-PROTOCOL.md](ONBOARDING-PROTOCOL.md)
+
 ## System Model
 
 Finalis is a finalized-tip-only blockchain.
@@ -95,6 +99,12 @@ Not implemented as a live anonymity system:
 - no decoys
 - no hidden input set
 - no Monero-style sender anonymity
+
+The live transaction model also includes explicit validator-control outputs:
+
+- `SCONBREG` for onboarding admission
+- `SCVALJRQ` for bonded validator join request
+- `SCVALREG` for the bond-carrying validator registration output
 
 ## Two Control Planes
 

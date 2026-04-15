@@ -9,6 +9,8 @@
 
 #include "address/address.hpp"
 #include "crypto/hash.hpp"
+#include "node/node.hpp"
+#include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 
 #define main finalis_explorer_program_main
@@ -858,6 +860,73 @@ TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
   }
 
   std::filesystem::remove(temp_path, ec);
+}
+
+TEST(test_explorer_tx_page_and_json_surface_decoded_onboarding_registration_fields) {
+  Config cfg = test_config();
+  const auto funding = node::Node::deterministic_test_keypairs()[0];
+  const auto validator = node::Node::deterministic_test_keypairs()[1];
+  const auto payout = node::Node::deterministic_test_keypairs()[2];
+  const auto payout_addr = make_address(0x33);
+  const auto decoded = address::decode(payout_addr);
+  ASSERT_TRUE(decoded.has_value());
+  OutPoint prev{};
+  prev.txid[31] = 0x71;
+  prev.index = 0;
+  const auto funding_pkh = crypto::h160(Bytes(funding.public_key.begin(), funding.public_key.end()));
+  const TxOut prev_out{1'000'000, address::p2pkh_script_pubkey(funding_pkh)};
+  auto tx = build_onboarding_registration_tx(prev, prev_out, funding.private_key, validator.public_key, validator.private_key,
+                                             payout.public_key, 1'000, prev_out.script_pubkey);
+  ASSERT_TRUE(tx.has_value());
+  FrontierTransition transition = make_test_transition(7);
+  const auto txid = hex_encode32(tx->txid());
+  const auto transition_hash = hex_encode32(transition.transition_id());
+
+  ScopedRpcHook rpc([&](const std::string& body) {
+    if (body.find("\"method\":\"get_status\"") != std::string::npos) {
+      return rpc_result(std::string("{\"network_name\":\"mainnet\",\"finalized_height\":10,\"finalized_transition_hash\":\"") +
+                        transition_hash + "\",\"version\":\"fake-lightserver\",\"protocol_reserve_balance\":4200000000,"
+                        "\"availability\":{\"local_operator\":{\"known\":false,\"pubkey\":null,\"status\":null,\"seat_budget\":null,"
+                        "\"validator_registry_status\":null,\"onboarding_reward_eligible\":null,"
+                        "\"onboarding_reward_score_units\":null}},"
+                        "\"onboarding\":{\"reward_pool_bps\":300,\"admission_pow_difficulty_bits\":20,"
+                        "\"validator_join_admission_pow_difficulty_bits\":22},"
+                        "\"ticket_pow\":{\"difficulty\":10,\"difficulty_min\":8,\"difficulty_max\":12,"
+                        "\"epoch_health\":\"healthy\",\"streak_up\":1,\"streak_down\":0,"
+                        "\"nonce_search_limit\":4096,\"bonus_cap_bps\":1000}}");
+    }
+    if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) {
+      return rpc_result(std::string("{\"status\":\"finalized\",\"finalized\":true,\"height\":7,\"finalized_depth\":4,") +
+                        "\"credit_safe\":true,\"transition_hash\":\"" + transition_hash + "\"}");
+    }
+    if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+      return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(tx->serialize()) +
+                        "\",\"decoded_outputs\":[{\"amount\":0,\"address\":null,\"script_hex\":\"" +
+                        hex_encode(tx->outputs[0].script_pubkey) +
+                        "\",\"decoded_kind\":\"onboarding_registration\",\"validator_pubkey_hex\":\"" +
+                        hex_encode(Bytes(validator.public_key.begin(), validator.public_key.end())) +
+                        "\",\"payout_pubkey_hex\":\"" + hex_encode(Bytes(payout.public_key.begin(), payout.public_key.end())) +
+                        "\",\"has_admission_pow\":false,\"admission_pow_epoch\":null,\"admission_pow_nonce\":null},"
+                        "{\"amount\":999000,\"address\":\"" + payout_addr + "\",\"script_hex\":\"" +
+                        hex_encode(tx->outputs[1].script_pubkey) +
+                        "\",\"decoded_kind\":null,\"validator_pubkey_hex\":null,\"payout_pubkey_hex\":null,"
+                        "\"has_admission_pow\":false,\"admission_pow_epoch\":null,\"admission_pow_nonce\":null}]}");
+    }
+    if (body.find("\"method\":\"get_transition_by_height\"") != std::string::npos || body.find("\"method\":\"get_transition\"") != std::string::npos) {
+      return rpc_result(std::string("{\"height\":7,\"hash\":\"") + transition_hash + "\",\"transition_hash\":\"" + transition_hash +
+                        "\",\"transition_hex\":\"" + hex_encode(transition.serialize()) + "\"}");
+    }
+    return rpc_error(-32601, "unknown method");
+  });
+
+  const auto tx_json = render_tx_json(*fetch_tx_result(cfg, txid).value);
+  ASSERT_TRUE(tx_json.find("\"decoded_kind\":\"onboarding_registration\"") != std::string::npos);
+  ASSERT_TRUE(tx_json.find("\"validator_pubkey_hex\":\"" + hex_encode(Bytes(validator.public_key.begin(), validator.public_key.end())) + "\"") !=
+              std::string::npos);
+  const auto tx_page = render_tx(cfg, txid);
+  ASSERT_TRUE(tx_page.find("SCONBREG onboarding registration") != std::string::npos);
+  ASSERT_TRUE(tx_page.find("admission PoW") == std::string::npos);
+  ASSERT_TRUE(tx_page.find(short_hex(hex_encode(Bytes(validator.public_key.begin(), validator.public_key.end())))) != std::string::npos);
 }
 
 TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {

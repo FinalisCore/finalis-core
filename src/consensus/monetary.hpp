@@ -25,6 +25,7 @@ constexpr std::uint64_t POST_CAP_SUPPORT_UNITS_PER_ELIGIBLE_VALIDATOR_PER_EPOCH 
 constexpr std::uint64_t POST_CAP_MIN_RESERVE_RUNWAY_EPOCHS = 10ULL * EPOCHS_PER_YEAR_365;
 constexpr std::uint64_t POST_CAP_RESERVE_FLOOR_UNITS =
     ((TOTAL_SUPPLY_UNITS * RESERVE_ACCRUAL_BPS) / 10'000ULL) / 5ULL;
+constexpr std::uint64_t ONBOARDING_REWARD_BPS = 300ULL;
 // Fixed activation height for the validator economics fork. Historical validation
 // below this height must remain unchanged.
 constexpr std::uint64_t ECONOMICS_FORK_HEIGHT = 100'000ULL;
@@ -62,6 +63,7 @@ std::uint64_t emission_year_budget_units(std::uint64_t year_index);
 std::uint64_t post_cap_support_target_units(std::size_t eligible_validator_count);
 std::uint64_t post_cap_reserve_subsidy_units(std::size_t eligible_validator_count, std::uint64_t settled_epoch_fee_units,
                                              std::uint64_t reserve_balance_units);
+std::uint64_t onboarding_reward_units(std::uint64_t settlement_reward_units);
 bool economics_fork_active(std::uint64_t height);
 bool economics_fork_active(std::uint64_t height, std::uint64_t economics_fork_height);
 std::uint64_t validator_min_bond_units(std::uint64_t height);
@@ -98,6 +100,7 @@ Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, c
 DeterministicCoinbasePayout compute_epoch_settlement_payout(
     std::uint64_t settlement_reward_units, std::uint64_t settled_epoch_fee_units, std::uint64_t reserve_subsidy_units,
     const PubKey32& current_leader_pubkey,
-    const std::map<PubKey32, std::uint64_t>& reward_score_units);
+    const std::map<PubKey32, std::uint64_t>& reward_score_units,
+    const std::map<PubKey32, std::uint64_t>& onboarding_score_units);
 
 }  // namespace finalis::consensus

@@ -303,7 +303,8 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
   // therefore accounted but not paid into the transition settlement outputs.
   // This keeps the live payload independent of the round leader.
   const auto payout =
-      compute_epoch_settlement_payout(settlement_rewards, settled_epoch_fees, reserve_subsidy, leader_pubkey, settlement_scores);
+      compute_epoch_settlement_payout(settlement_rewards, settled_epoch_fees, reserve_subsidy, leader_pubkey,
+                                      settlement_scores, {});
   settlement.settled_epoch_fees = payout.settled_epoch_fees;
   settlement.settled_epoch_rewards = payout.settled_epoch_rewards;
   settlement.reserve_subsidy_units = payout.reserve_subsidy_units;
@@ -793,6 +794,17 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
     const Hash32 txid = tx.txid();
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
       const auto& out = tx.outputs[out_i];
+      PubKey32 onboarding_validator_pub{};
+      PubKey32 onboarding_payout_pub{};
+      Sig64 onboarding_pop{};
+      if (is_onboarding_registration_script(out.script_pubkey, &onboarding_validator_pub, &onboarding_payout_pub,
+                                            &onboarding_pop)) {
+        std::string err;
+        (void)state->validators.register_onboarding(
+            onboarding_validator_pub, height, &err,
+            canonical_operator_id_from_join_request(onboarding_payout_pub));
+        continue;
+      }
       PubKey32 validator_pub{};
       PubKey32 payout_pub{};
       Sig64 pop{};

@@ -272,7 +272,7 @@ std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<Ou
   req_spk.insert(req_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
   req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
   req_spk.insert(req_spk.end(), pop->begin(), pop->end());
-  if (pow_ctx && pow_ctx->network && admission_pow_enabled(*pow_ctx->network)) {
+  if (pow_ctx && pow_ctx->network && validator_join_admission_pow_enabled(*pow_ctx->network)) {
     // The admission PoW is epoch-scoped, expires quickly, and is only used to
     // make fresh operator admission attempts more expensive to mint.
     if (!pow_ctx->chain_id) {
@@ -293,7 +293,9 @@ std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<Ou
                                 bond_commitment);
     std::uint64_t nonce = 0;
     while (true) {
-      if (leading_zero_bits(admission_pow_work_hash(challenge, nonce)) >= pow_ctx->network->admission_pow_difficulty_bits) break;
+      if (leading_zero_bits(admission_pow_work_hash(challenge, nonce)) >=
+          pow_ctx->network->validator_join_admission_pow_difficulty_bits)
+        break;
       if (nonce == std::numeric_limits<std::uint64_t>::max()) {
         if (err) *err = "failed to find validator join admission pow nonce";
         return std::nullopt;
@@ -309,6 +311,79 @@ std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<Ou
 
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
   const std::uint64_t change = total_prev - bond_amount - fee;
+  if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
+  return build_signed_p2pkh_tx_multi_input(prevs, funding_privkey_32, outputs, err);
+}
+
+std::optional<Tx> build_onboarding_registration_tx(const OutPoint& prev_outpoint, const TxOut& prev_out,
+                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
+                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
+                                                   std::uint64_t fee, const Bytes& change_script_pubkey,
+                                                   std::string* err,
+                                                   const ValidatorJoinAdmissionPowBuildContext* pow_ctx) {
+  return build_onboarding_registration_tx(std::vector<std::pair<OutPoint, TxOut>>{{prev_outpoint, prev_out}},
+                                          funding_privkey_32, validator_pubkey, validator_privkey_32, payout_pubkey,
+                                          fee, change_script_pubkey, err, pow_ctx);
+}
+
+std::optional<Tx> build_onboarding_registration_tx(const std::vector<std::pair<OutPoint, TxOut>>& prevs,
+                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
+                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
+                                                   std::uint64_t fee, const Bytes& change_script_pubkey,
+                                                   std::string* err,
+                                                   const ValidatorJoinAdmissionPowBuildContext* pow_ctx) {
+  std::uint64_t total_prev = 0;
+  for (const auto& prev : prevs) total_prev += prev.second.value;
+  if (total_prev < fee) {
+    if (err) *err = "insufficient prev value for fee";
+    return std::nullopt;
+  }
+  auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator_pubkey, payout_pubkey),
+                                  validator_privkey_32);
+  if (!pop.has_value()) {
+    if (err) *err = "failed to sign onboarding registration proof";
+    return std::nullopt;
+  }
+
+  Bytes req_spk{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
+  req_spk.insert(req_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
+  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
+  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  if (pow_ctx && pow_ctx->network && onboarding_admission_pow_enabled(*pow_ctx->network)) {
+    if (!pow_ctx->chain_id) {
+      if (err) *err = "missing chain id for onboarding admission pow";
+      return std::nullopt;
+    }
+    const auto pow_epoch = admission_pow_epoch_for_height(pow_ctx->current_height, pow_ctx->network->committee_epoch_blocks);
+    const auto anchor = admission_pow_epoch_anchor_hash(pow_epoch, pow_ctx->network->committee_epoch_blocks,
+                                                        pow_ctx->finalized_hash_at_height);
+    if (!anchor.has_value()) {
+      if (err) *err = "missing finalized epoch anchor for onboarding admission pow";
+      return std::nullopt;
+    }
+    const auto challenge =
+        admission_pow_challenge(admission_pow_chain_id_hash(*pow_ctx->chain_id), pow_epoch, *anchor, validator_pubkey,
+                                onboarding_registration_commitment(validator_pubkey, payout_pubkey));
+    std::uint64_t nonce = 0;
+    while (true) {
+      if (leading_zero_bits(admission_pow_work_hash(challenge, nonce)) >=
+          pow_ctx->network->onboarding_admission_pow_difficulty_bits)
+        break;
+      if (nonce == std::numeric_limits<std::uint64_t>::max()) {
+        if (err) *err = "failed to find onboarding admission pow nonce";
+        return std::nullopt;
+      }
+      ++nonce;
+    }
+    codec::ByteWriter w;
+    w.u64le(pow_epoch);
+    w.u64le(nonce);
+    const auto suffix = w.take();
+    req_spk.insert(req_spk.end(), suffix.begin(), suffix.end());
+  }
+
+  std::vector<TxOut> outputs{TxOut{0, req_spk}};
+  const std::uint64_t change = total_prev - fee;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
   return build_signed_p2pkh_tx_multi_input(prevs, funding_privkey_32, outputs, err);
 }

@@ -63,7 +63,8 @@ consensus::CanonicalDerivationConfig test_cfg() {
 consensus::CanonicalDerivationConfig live_activation_cfg() {
   auto cfg = test_cfg();
   cfg.network.committee_epoch_blocks = 4;
-  cfg.network.admission_pow_difficulty_bits = 0;
+  cfg.network.onboarding_admission_pow_difficulty_bits = 0;
+  cfg.network.validator_join_admission_pow_difficulty_bits = 0;
   cfg.max_committee = 8;
   cfg.validator_min_bond_override = BOND_AMOUNT;
   cfg.validator_bond_min_amount = BOND_AMOUNT;

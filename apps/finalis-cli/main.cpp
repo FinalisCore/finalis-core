@@ -525,6 +525,8 @@ std::string slashing_kind_name(finalis::storage::SlashingRecordKind kind) {
 
 std::string validator_status_name(finalis::consensus::ValidatorStatus status) {
   switch (status) {
+    case finalis::consensus::ValidatorStatus::ONBOARDING:
+      return "ONBOARDING";
     case finalis::consensus::ValidatorStatus::PENDING:
       return "PENDING";
     case finalis::consensus::ValidatorStatus::ACTIVE:
@@ -810,6 +812,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli getBalance [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli onboarding-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
      << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync]\n"
@@ -2360,7 +2363,8 @@ int main(int argc, char** argv) {
           const auto payout = finalis::consensus::compute_epoch_settlement_payout(
               last_finalized_settlement_epoch_state->total_reward_units, finalized_settlement_fees_units,
               transition->settlement.reserve_subsidy_units, transition->leader_pubkey,
-              last_finalized_settlement_epoch_state->reward_score_units);
+              last_finalized_settlement_epoch_state->reward_score_units,
+              last_finalized_settlement_epoch_state->onboarding_score_units);
           for (const auto& [pub, units] : payout.outputs) {
             if (pub != vk.pubkey) continue;
             local_actual_reward_units = units;
@@ -2823,6 +2827,144 @@ int main(int argc, char** argv) {
     std::cout << "fee=" << plan->applied_fee_units << "\n";
     std::cout << "change=" << plan->change_units << "\n";
     std::cout << "inputs_selected=" << plan->selected_prevs.size() << "\n";
+    std::cout << "rpc_url=" << rpc_url << "\n";
+    std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
+
+    if (!err.empty() && result.outcome == finalis::lightserver::BroadcastOutcome::Ambiguous) {
+      std::cout << "accepted=unknown\n";
+      std::cout << "error_message=" << err << "\n";
+      return 1;
+    }
+    if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
+      std::cout << "accepted=no\n";
+      if (!result.error_code.empty()) std::cout << "error_code=" << result.error_code << "\n";
+      if (!result.error_message.empty()) std::cout << "error_message=" << result.error_message << "\n";
+      else if (!result.error.empty()) std::cout << "error_message=" << result.error << "\n";
+      std::cout << "retryable=" << (result.retryable ? "yes" : "no") << "\n";
+      std::cout << "retry_class=" << result.retry_class << "\n";
+      return 1;
+    }
+
+    std::cout << "accepted=yes\n";
+    std::cout << "status=accepted_for_relay\n";
+    return 0;
+  }
+
+  if (cmd == "onboarding-register") {
+    std::string db_path = default_mainnet_db_path();
+    std::string file_path = default_mainnet_validator_key_path();
+    std::string validator_file_path;
+    std::string passphrase;
+    std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    std::uint64_t fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--validator-file" && i + 1 < argc) validator_file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    db_path = expand_user(db_path);
+    file_path = expand_user(file_path);
+    if (validator_file_path.empty()) validator_file_path = file_path;
+    validator_file_path = expand_user(validator_file_path);
+
+    finalis::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+
+    finalis::keystore::ValidatorKey funding_key;
+    std::string err;
+    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &funding_key, &err)) {
+      std::cerr << "onboarding-register failed to load funding key: " << err << "\n";
+      return 1;
+    }
+
+    finalis::keystore::ValidatorKey validator_key;
+    if (!finalis::keystore::load_validator_keystore(validator_file_path, passphrase, &validator_key, &err)) {
+      std::cerr << "onboarding-register failed to load validator key: " << err << "\n";
+      return 1;
+    }
+    if (funding_key.network_name != validator_key.network_name) {
+      std::cerr << "onboarding-register failed: funding wallet targets " << funding_key.network_name
+                << " but validator key targets " << validator_key.network_name << "\n";
+      return 1;
+    }
+    const auto& network = finalis::network_by_name(funding_key.network_name);
+    const auto chain_id = finalis::ChainId::from_config_and_db(network, db);
+    std::string status_err;
+    const auto status = finalis::lightserver::rpc_get_status(rpc_url, &status_err);
+    if (!status.has_value()) {
+      std::cerr << "onboarding-register failed to load rpc status: "
+                << (status_err.empty() ? "rpc status unavailable" : status_err) << "\n";
+      return 1;
+    }
+    finalis::ValidatorJoinAdmissionPowBuildContext pow_ctx{
+        .network = &network,
+        .chain_id = &chain_id,
+        .current_height = status->tip_height + 1,
+        .finalized_hash_at_height = [&db](std::uint64_t anchor_height) -> std::optional<finalis::Hash32> {
+          return db.get_height_hash(anchor_height);
+        },
+    };
+
+    std::string utxo_err;
+    const auto available_prevs =
+        positive_value_utxos(spendable_utxos_for_wallet_address(db, funding_key.address, &utxo_err));
+    if (!utxo_err.empty()) {
+      std::cerr << "onboarding-register failed to resolve funding wallet address: " << utxo_err << "\n";
+      return 1;
+    }
+    if (available_prevs.empty()) {
+      std::cerr << "onboarding-register failed: no spendable finalized inputs are currently available\n";
+      return 1;
+    }
+
+    const auto ordered_prevs = finalis::deterministic_largest_first_prevs(available_prevs);
+    std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> selected_prevs;
+    std::uint64_t selected_units = 0;
+    for (const auto& prev : ordered_prevs) {
+      selected_prevs.push_back(prev);
+      selected_units += prev.second.value;
+      if (selected_units >= fee) break;
+    }
+    if (selected_units < fee) {
+      std::cerr << "onboarding-register failed: available finalized balance is too small to cover fee\n";
+      return 1;
+    }
+
+    auto own_decoded = finalis::address::decode(funding_key.address);
+    if (!own_decoded.has_value()) {
+      std::cerr << "onboarding-register failed: invalid funding wallet address\n";
+      return 1;
+    }
+
+    auto tx = finalis::build_onboarding_registration_tx(
+        selected_prevs, finalis::Bytes(funding_key.privkey.begin(), funding_key.privkey.end()),
+        validator_key.pubkey, finalis::Bytes(validator_key.privkey.begin(), validator_key.privkey.end()),
+        funding_key.pubkey, fee, finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), &err, &pow_ctx);
+    if (!tx.has_value()) {
+      std::cerr << "onboarding-register build failed: " << err << "\n";
+      return 1;
+    }
+
+    const std::uint64_t change_units = selected_units - fee;
+    auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, tx->serialize(), &err);
+    std::cout << "db=" << db_path << "\n";
+    std::cout << "funding_key_file=" << file_path << "\n";
+    std::cout << "validator_key_file=" << validator_file_path << "\n";
+    std::cout << "funding_address=" << funding_key.address << "\n";
+    std::cout << "validator_address=" << validator_key.address << "\n";
+    std::cout << "payout_address=" << funding_key.address << "\n";
+    std::cout << "fee=" << fee << "\n";
+    std::cout << "change=" << change_units << "\n";
+    std::cout << "inputs_selected=" << selected_prevs.size() << "\n";
     std::cout << "rpc_url=" << rpc_url << "\n";
     std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
 

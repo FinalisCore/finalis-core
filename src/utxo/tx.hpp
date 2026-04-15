@@ -331,8 +331,22 @@ struct ValidatorJoinRequestScriptData {
   std::uint64_t admission_pow_nonce{0};
 };
 
+struct OnboardingRegistrationScriptData {
+  PubKey32 validator_pubkey{};
+  PubKey32 payout_pubkey{};
+  Sig64 pop{};
+  bool has_admission_pow{false};
+  std::uint64_t admission_pow_epoch{0};
+  std::uint64_t admission_pow_nonce{0};
+};
+
 bool is_validator_register_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
 bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
+bool parse_onboarding_registration_script(const Bytes& script, OnboardingRegistrationScriptData* out = nullptr);
+bool is_onboarding_registration_script(const Bytes& script, PubKey32* out_validator_pubkey = nullptr,
+                                       PubKey32* out_payout_pubkey = nullptr, Sig64* out_pop = nullptr,
+                                       std::uint64_t* out_admission_pow_epoch = nullptr,
+                                       std::uint64_t* out_admission_pow_nonce = nullptr);
 bool parse_validator_join_request_script(const Bytes& script, ValidatorJoinRequestScriptData* out = nullptr);
 bool is_validator_join_request_script(const Bytes& script, PubKey32* out_validator_pubkey = nullptr,
                                       PubKey32* out_payout_pubkey = nullptr, Sig64* out_pop = nullptr,

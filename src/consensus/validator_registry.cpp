@@ -11,6 +11,32 @@ PubKey32 canonical_operator_id_from_join_request(const PubKey32& payout_pubkey) 
 
 void ValidatorRegistry::upsert(PubKey32 pub, ValidatorInfo info) { validators_[pub] = info; }
 
+bool ValidatorRegistry::register_onboarding(const PubKey32& pub, std::uint64_t joined_height, std::string* err,
+                                            const std::optional<PubKey32>& operator_id) {
+  const auto it = validators_.find(pub);
+  if (it != validators_.end()) {
+    const auto& v = it->second;
+    if (v.status == ValidatorStatus::BANNED) {
+      if (err) *err = "validator banned";
+      return false;
+    }
+    if (err) *err = "validator already registered";
+    return false;
+  }
+
+  auto& v = validators_[pub];
+  v.status = ValidatorStatus::ONBOARDING;
+  v.joined_height = joined_height;
+  v.operator_id = operator_id.value_or(pub);
+  v.has_bond = false;
+  v.bond_outpoint = OutPoint{};
+  v.bonded_amount = 0;
+  v.unbond_height = 0;
+  v.suspended_until_height = 0;
+  v.last_join_height = joined_height;
+  return true;
+}
+
 bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t height, std::uint64_t bond_amount,
                                           std::string* err) const {
   if (bond_amount < rules_.min_bond) {
@@ -115,7 +141,10 @@ void ValidatorRegistry::advance_height(std::uint64_t height) {
 
 bool ValidatorRegistry::is_effectively_active(const ValidatorInfo& info, std::uint64_t height) const {
   if (!info.has_bond) return false;
-  if (info.status == ValidatorStatus::BANNED || info.status == ValidatorStatus::EXITING) return false;
+  if (info.status == ValidatorStatus::BANNED || info.status == ValidatorStatus::EXITING ||
+      info.status == ValidatorStatus::ONBOARDING) {
+    return false;
+  }
   if (info.status == ValidatorStatus::SUSPENDED) return false;
   if (info.suspended_until_height > height) return false;
   if (info.status == ValidatorStatus::ACTIVE) return true;

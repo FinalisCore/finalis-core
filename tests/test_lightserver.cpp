@@ -498,6 +498,52 @@ TEST(test_lightserver_get_tx_status_direct) {
   ASSERT_TRUE(missing_resp.find("\"credit_safe\":false") != std::string::npos);
 }
 
+TEST(test_lightserver_get_tx_decodes_onboarding_registration_output_and_pow_fields) {
+  const std::string base = "/tmp/finalis_light_get_tx_onboarding_decode";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x91;
+  Hash32 block_hash{};
+  block_hash[31] = 0x51;
+  ASSERT_TRUE(db.set_tip(storage::TipState{9, tip_hash}));
+  ASSERT_TRUE(db.set_height_hash(5, block_hash));
+
+  const auto funding = node::Node::deterministic_test_keypairs()[0];
+  const auto validator = node::Node::deterministic_test_keypairs()[1];
+  const auto payout = node::Node::deterministic_test_keypairs()[2];
+  OutPoint prev{};
+  prev.txid[31] = 0x44;
+  prev.index = 0;
+  const auto funding_pkh = crypto::h160(Bytes(funding.public_key.begin(), funding.public_key.end()));
+  const TxOut prev_out{1'000'000, address::p2pkh_script_pubkey(funding_pkh)};
+  auto tx = build_onboarding_registration_tx(prev, prev_out, funding.private_key, validator.public_key, validator.private_key,
+                                             payout.public_key, 1'000, prev_out.script_pubkey);
+  ASSERT_TRUE(tx.has_value());
+  const Hash32 txid = tx->txid();
+  ASSERT_TRUE(db.put_tx_index(txid, 5, 0, tx->serialize()));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const std::string q = std::string(R"({"jsonrpc":"2.0","id":103,"method":"get_tx","params":{"txid":")") + hex_encode32(txid) + R"("}})";
+  const auto resp = ls.handle_rpc_for_test(q);
+  ASSERT_TRUE(resp.find("\"decoded_outputs\":[") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"decoded_kind\":\"onboarding_registration\"") != std::string::npos);
+  ASSERT_TRUE(resp.find(std::string("\"validator_pubkey_hex\":\"") +
+                        hex_encode(Bytes(validator.public_key.begin(), validator.public_key.end())) + "\"") != std::string::npos);
+  ASSERT_TRUE(resp.find(std::string("\"payout_pubkey_hex\":\"") +
+                        hex_encode(Bytes(payout.public_key.begin(), payout.public_key.end())) + "\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"has_admission_pow\":false") != std::string::npos);
+}
+
 TEST(test_lightserver_get_utxos_uses_canonical_utxo_set_even_with_incomplete_script_index) {
   const std::string base = "/tmp/finalis_light_utxos_canonical_only";
   std::filesystem::remove_all(base);
@@ -1904,6 +1950,8 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
 
   lightserver::Config cfg;
   cfg.db_path = base;
+  cfg.network.onboarding_admission_pow_difficulty_bits = 0;
+  cfg.network.validator_join_admission_pow_difficulty_bits = 0;
   cfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
   lightserver::Server ls(cfg);
   ASSERT_TRUE(ls.init());
@@ -1929,6 +1977,10 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   ASSERT_TRUE(status_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find(std::string("\"txid_hex\":\"") + *tracked_txid + "\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find("\"broadcast_outcome\":\"sent\"") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"onboarding_reward_pool_bps\":300") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"onboarding_admission_pow_difficulty_bits\":0") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"validator_join_admission_pow_difficulty_bits\":0") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"onboarding_reward_eligible\":false") != std::string::npos);
 }
 
 void register_lightserver_tests() {}

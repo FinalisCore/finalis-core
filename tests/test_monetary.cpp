@@ -138,7 +138,7 @@ TEST(test_epoch_settlement_pays_exact_accrued_scores) {
   std::map<PubKey32, std::uint64_t> scores;
   scores[pub(0x10)] = 1;
   scores[pub(0x20)] = 3;
-  const auto payout = compute_epoch_settlement_payout(400, 25, 7, leader, scores);
+  const auto payout = compute_epoch_settlement_payout(400, 25, 7, leader, scores, {});
   ASSERT_EQ(payout.total, 432ULL);
   ASSERT_EQ(payout.settled_epoch_fees, 25ULL);
   ASSERT_EQ(payout.settled_epoch_rewards, 400ULL);
@@ -156,6 +156,34 @@ TEST(test_epoch_settlement_pays_exact_accrued_scores) {
   ASSERT_EQ(sum, payout.total);
   ASSERT_TRUE(high_units > low_units);
   ASSERT_EQ(high_units + low_units, payout.total);
+}
+
+TEST(test_onboarding_reward_units_is_three_percent_of_settlement_rewards) {
+  using namespace finalis::consensus;
+  ASSERT_EQ(onboarding_reward_units(0), 0ULL);
+  ASSERT_EQ(onboarding_reward_units(100), 3ULL);
+  ASSERT_EQ(onboarding_reward_units(10'000), 300ULL);
+}
+
+TEST(test_epoch_settlement_keeps_onboarding_slice_in_validator_pool_when_no_onboarding_scores_exist) {
+  using namespace finalis::consensus;
+  const auto leader = pub(0x41);
+  std::map<PubKey32, std::uint64_t> scores;
+  scores[pub(0x10)] = 1;
+  scores[pub(0x20)] = 3;
+
+  const auto payout = compute_epoch_settlement_payout(10'000, 25, 7, leader, scores, {});
+  ASSERT_EQ(payout.total, 10'032ULL);
+
+  std::uint64_t sum = 0;
+  for (const auto& [_, units] : payout.outputs) sum += units;
+  ASSERT_EQ(sum, payout.total);
+
+  std::uint64_t validator_units = 0;
+  for (const auto& [pubkey, units] : payout.outputs) {
+    if (pubkey == pub(0x10) || pubkey == pub(0x20)) validator_units += units;
+  }
+  ASSERT_EQ(validator_units, payout.total);
 }
 
 TEST(test_post_cap_reserve_subsidy_respects_gap_floor_and_runway_caps) {

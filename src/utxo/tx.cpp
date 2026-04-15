@@ -764,6 +764,44 @@ bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey) {
   return true;
 }
 
+bool parse_onboarding_registration_script(const Bytes& script, OnboardingRegistrationScriptData* out) {
+  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
+  if (script.size() != 136 && script.size() != 152) return false;
+  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
+  if (out) {
+    std::copy(script.begin() + 8, script.begin() + 40, out->validator_pubkey.begin());
+    std::copy(script.begin() + 40, script.begin() + 72, out->payout_pubkey.begin());
+    std::copy(script.begin() + 72, script.begin() + 136, out->pop.begin());
+    out->has_admission_pow = (script.size() == 152);
+    out->admission_pow_epoch = 0;
+    out->admission_pow_nonce = 0;
+    if (out->has_admission_pow) {
+      Bytes suffix(script.begin() + 136, script.end());
+      codec::ByteReader r(suffix);
+      auto epoch = r.u64le();
+      auto nonce = r.u64le();
+      if (!epoch || !nonce || !r.eof()) return false;
+      out->admission_pow_epoch = *epoch;
+      out->admission_pow_nonce = *nonce;
+    }
+  }
+  return true;
+}
+
+bool is_onboarding_registration_script(const Bytes& script, PubKey32* out_validator_pubkey,
+                                       PubKey32* out_payout_pubkey, Sig64* out_pop,
+                                       std::uint64_t* out_admission_pow_epoch,
+                                       std::uint64_t* out_admission_pow_nonce) {
+  OnboardingRegistrationScriptData parsed;
+  if (!parse_onboarding_registration_script(script, &parsed)) return false;
+  if (out_validator_pubkey) *out_validator_pubkey = parsed.validator_pubkey;
+  if (out_payout_pubkey) *out_payout_pubkey = parsed.payout_pubkey;
+  if (out_pop) *out_pop = parsed.pop;
+  if (out_admission_pow_epoch) *out_admission_pow_epoch = parsed.has_admission_pow ? parsed.admission_pow_epoch : 0;
+  if (out_admission_pow_nonce) *out_admission_pow_nonce = parsed.has_admission_pow ? parsed.admission_pow_nonce : 0;
+  return true;
+}
+
 bool parse_validator_join_request_script(const Bytes& script, ValidatorJoinRequestScriptData* out) {
   static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
   if (script.size() != 136 && script.size() != 152) return false;

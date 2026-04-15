@@ -120,6 +120,10 @@ std::uint64_t post_cap_reserve_subsidy_units(std::size_t eligible_validator_coun
   return std::min({support_gap, spendable_reserve, runway_cap});
 }
 
+std::uint64_t onboarding_reward_units(std::uint64_t settlement_reward_units) {
+  return wide::mul_div_u64(settlement_reward_units, ONBOARDING_REWARD_BPS, 10'000ULL);
+}
+
 bool economics_fork_active(std::uint64_t height) {
   return economics_fork_active(height, ECONOMICS_FORK_HEIGHT);
 }
@@ -284,7 +288,8 @@ Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, c
 DeterministicCoinbasePayout compute_epoch_settlement_payout(
     std::uint64_t settlement_reward_units, std::uint64_t settled_epoch_fee_units, std::uint64_t reserve_subsidy_units,
     const PubKey32& current_leader_pubkey,
-    const std::map<PubKey32, std::uint64_t>& reward_score_units) {
+    const std::map<PubKey32, std::uint64_t>& reward_score_units,
+    const std::map<PubKey32, std::uint64_t>& onboarding_score_units) {
   DeterministicCoinbasePayout out;
   out.settled_epoch_fees = settled_epoch_fee_units;
   out.settled_epoch_rewards = settlement_reward_units;
@@ -292,36 +297,45 @@ DeterministicCoinbasePayout compute_epoch_settlement_payout(
   out.total = settlement_reward_units + settled_epoch_fee_units + reserve_subsidy_units;
 
   std::map<PubKey32, std::uint64_t> merged;
-
-  std::uint64_t total_score = 0;
-  for (const auto& [pub, score] : reward_score_units) {
-    if (score == 0) continue;
-    total_score += score;
-  }
-  const auto distributed_pool = settlement_reward_units + settled_epoch_fee_units + reserve_subsidy_units;
-  if (distributed_pool > 0) {
+  auto distribute_pool = [&](std::uint64_t pool, const std::map<PubKey32, std::uint64_t>& score_units,
+                             bool fallback_to_leader) {
+    if (pool == 0) return;
+    std::uint64_t total_score = 0;
+    for (const auto& [pub, score] : score_units) {
+      (void)pub;
+      if (score == 0) continue;
+      total_score += score;
+    }
     if (total_score == 0) {
-      merged[current_leader_pubkey] += distributed_pool;
-    } else {
-      std::uint64_t distributed = 0;
-      std::optional<PubKey32> last_pub;
-      for (const auto& [pub, score] : reward_score_units) {
-        if (score == 0) continue;
-        const auto share = wide::mul_div_u64(distributed_pool, score, total_score);
-        merged[pub] += share;
-        distributed += share;
-        last_pub = pub;
-      }
-      const auto remainder = distributed_pool - distributed;
-      if (remainder > 0) {
-        if (last_pub.has_value()) {
-          merged[*last_pub] += remainder;
-        } else {
-          merged[current_leader_pubkey] += remainder;
-        }
+      if (fallback_to_leader) merged[current_leader_pubkey] += pool;
+      return;
+    }
+
+    std::uint64_t distributed = 0;
+    std::optional<PubKey32> last_pub;
+    for (const auto& [pub, score] : score_units) {
+      if (score == 0) continue;
+      const auto share = wide::mul_div_u64(pool, score, total_score);
+      merged[pub] += share;
+      distributed += share;
+      last_pub = pub;
+    }
+    const auto remainder = pool - distributed;
+    if (remainder > 0) {
+      if (last_pub.has_value()) {
+        merged[*last_pub] += remainder;
+      } else if (fallback_to_leader) {
+        merged[current_leader_pubkey] += remainder;
       }
     }
-  }
+  };
+
+  const auto raw_onboarding_units = onboarding_reward_units(settlement_reward_units);
+  const auto onboarding_units = onboarding_score_units.empty() ? 0ULL : raw_onboarding_units;
+  const auto validator_units = settlement_reward_units - onboarding_units;
+
+  distribute_pool(validator_units + settled_epoch_fee_units + reserve_subsidy_units, reward_score_units, true);
+  distribute_pool(onboarding_units, onboarding_score_units, false);
 
   out.outputs.reserve(merged.size());
   for (const auto& [pub, units] : merged) {

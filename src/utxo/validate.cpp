@@ -110,6 +110,7 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
   return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
          is_validator_unbond_script(script_pubkey, nullptr) ||
+         is_onboarding_registration_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_burn_script(script_pubkey, nullptr) || privacy::is_mint_deposit_script(script_pubkey, nullptr, nullptr);
 }
@@ -181,6 +182,15 @@ std::optional<Hash32> balance_proof_message_v2(const TxV2& tx) {
   return crypto::sha256d(w.data());
 }
 
+Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '-', 'V', '1'});
+  w.bytes_fixed(validator_pubkey);
+  w.bytes_fixed(payout_pubkey);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
@@ -192,6 +202,15 @@ Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const
 
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id) {
   return crypto::sha256d(chain_id_bytes(chain_id));
+}
+
+Hash32 onboarding_registration_commitment(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '_', 'C', 'O', 'M', 'M',
+                'I', 'T', '_', 'V', '1'});
+  w.bytes_fixed(validator_pubkey);
+  w.bytes_fixed(payout_pubkey);
+  return crypto::sha256d(w.data());
 }
 
 Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs) {
@@ -276,7 +295,7 @@ bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std
                             std::uint64_t bond_amount, const SpecialValidationContext& ctx, std::string* err) {
   // Admission PoW is join-admission friction only. It must not influence
   // committee weight, proposer schedule, finality, or reward weighting.
-  if (!ctx.network || !admission_pow_enabled(*ctx.network)) return true;
+  if (!ctx.network || !validator_join_admission_pow_enabled(*ctx.network)) return true;
   if (!ctx.chain_id) {
     if (err) *err = "missing chain id context for admission pow";
     return false;
@@ -304,8 +323,43 @@ bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std
       admission_pow_challenge(admission_pow_chain_id_hash(*ctx.chain_id), req.admission_pow_epoch, *anchor, operator_id,
                               bond_commitment);
   const auto work_hash = admission_pow_work_hash(challenge, req.admission_pow_nonce);
-  if (leading_zero_bits(work_hash) < ctx.network->admission_pow_difficulty_bits) {
+  if (leading_zero_bits(work_hash) < ctx.network->validator_join_admission_pow_difficulty_bits) {
     if (err) *err = "admission pow difficulty not met";
+    return false;
+  }
+  return true;
+}
+
+bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& req, const SpecialValidationContext& ctx,
+                                       std::string* err) {
+  if (!ctx.network || !onboarding_admission_pow_enabled(*ctx.network)) return true;
+  if (!ctx.chain_id) {
+    if (err) *err = "missing chain id context for admission pow";
+    return false;
+  }
+  if (!req.has_admission_pow) {
+    if (err) *err = "missing onboarding admission pow";
+    return false;
+  }
+  const auto current_epoch = admission_pow_epoch_for_height(ctx.current_height, ctx.network->committee_epoch_blocks);
+  const auto previous_epoch =
+      current_epoch > ctx.network->committee_epoch_blocks ? current_epoch - ctx.network->committee_epoch_blocks : 0;
+  if (req.admission_pow_epoch != current_epoch && req.admission_pow_epoch != previous_epoch) {
+    if (err) *err = "onboarding admission pow epoch expired";
+    return false;
+  }
+  const auto anchor = admission_pow_epoch_anchor_hash(req.admission_pow_epoch, ctx.network->committee_epoch_blocks,
+                                                      ctx.finalized_hash_at_height);
+  if (!anchor.has_value()) {
+    if (err) *err = "missing finalized epoch anchor for onboarding admission pow";
+    return false;
+  }
+  const auto challenge =
+      admission_pow_challenge(admission_pow_chain_id_hash(*ctx.chain_id), req.admission_pow_epoch, *anchor,
+                              req.validator_pubkey, onboarding_registration_commitment(req.validator_pubkey, req.payout_pubkey));
+  const auto work_hash = admission_pow_work_hash(challenge, req.admission_pow_nonce);
+  if (leading_zero_bits(work_hash) < ctx.network->onboarding_admission_pow_difficulty_bits) {
+    if (err) *err = "onboarding admission pow difficulty not met";
     return false;
   }
   return true;
@@ -390,6 +444,29 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     if (!is_supported_base_layer_output_script(out.script_pubkey)) {
       return {false, "unsupported script_pubkey", 0};
     }
+    OnboardingRegistrationScriptData onboarding_req{};
+    if (parse_onboarding_registration_script(out.script_pubkey, &onboarding_req)) {
+      if (out.value != 0) return {false, "SCONBREG output must have zero value", 0};
+      std::string budget_error;
+      if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
+      if (!crypto::ed25519_verify(
+              onboarding_registration_pop_message(onboarding_req.validator_pubkey, onboarding_req.payout_pubkey),
+              onboarding_req.pop, onboarding_req.validator_pubkey)) {
+        return {false, "onboarding registration proof invalid", 0};
+      }
+      if (ctx && ctx->validators) {
+        auto existing = ctx->validators->get(onboarding_req.validator_pubkey);
+        if (existing.has_value()) {
+          return {false,
+                  existing->status == consensus::ValidatorStatus::BANNED ? "validator banned"
+                                                                          : "validator already registered",
+                  0};
+        }
+      }
+      if (ctx && ctx->network && onboarding_admission_pow_enabled(*ctx->network) && !onboarding_req.has_admission_pow) {
+        return {false, "missing onboarding admission pow", 0};
+      }
+    }
     PubKey32 pub{};
     if (is_validator_register_script(out.script_pubkey, &pub)) {
       (void)pub;
@@ -413,18 +490,24 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
               join_req.validator_pubkey)) {
         return {false, "validator join request proof invalid", 0};
       }
-      if (ctx && ctx->network && admission_pow_enabled(*ctx->network) && !join_req.has_admission_pow) {
+      if (ctx && ctx->network && validator_join_admission_pow_enabled(*ctx->network) && !join_req.has_admission_pow) {
         return {false, "missing admission pow", 0};
       }
     }
   }
 
   std::set<PubKey32> reg_outputs;
+  std::set<PubKey32> onboarding_outputs;
   std::set<PubKey32> join_req_outputs;
   for (const auto& out : tx.outputs) {
     PubKey32 pub{};
     if (is_validator_register_script(out.script_pubkey, &pub)) reg_outputs.insert(pub);
+    if (is_onboarding_registration_script(out.script_pubkey, &pub, nullptr, nullptr)) onboarding_outputs.insert(pub);
     if (is_validator_join_request_script(out.script_pubkey, &pub, nullptr, nullptr)) join_req_outputs.insert(pub);
+  }
+  if (onboarding_outputs.size() > 1) return {false, "multiple SCONBREG outputs not allowed", 0};
+  if (!onboarding_outputs.empty() && (!reg_outputs.empty() || !join_req_outputs.empty())) {
+    return {false, "SCONBREG may not appear with validator join outputs", 0};
   }
   for (const auto& pub : join_req_outputs) {
     if (reg_outputs.find(pub) == reg_outputs.end()) return {false, "join request missing matching SCVALREG output", 0};
@@ -435,7 +518,17 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     }
   }
 
-  if (ctx && ctx->network && admission_pow_enabled(*ctx->network)) {
+  if (ctx && ctx->network && onboarding_admission_pow_enabled(*ctx->network)) {
+    for (const auto& out : tx.outputs) {
+      OnboardingRegistrationScriptData onboarding_req{};
+      if (!parse_onboarding_registration_script(out.script_pubkey, &onboarding_req)) continue;
+      std::string pow_error;
+      if (!validate_onboarding_admission_pow(onboarding_req, *ctx, &pow_error)) {
+        return {false, pow_error.empty() ? "onboarding admission pow invalid" : pow_error, 0};
+      }
+    }
+  }
+  if (ctx && ctx->network && validator_join_admission_pow_enabled(*ctx->network)) {
     const auto inputs = tx_input_outpoints(tx);
     for (const auto& out : tx.outputs) {
       ValidatorJoinRequestScriptData join_req{};

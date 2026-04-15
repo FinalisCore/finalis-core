@@ -60,6 +60,7 @@
 #include "codec/bytes.hpp"
 #include "history_merge.hpp"
 #include "refresh_gate.hpp"
+#include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "common/types.hpp"
 #include "consensus/monetary.hpp"
@@ -706,6 +707,12 @@ QString onboarding_state_display_text(finalis::onboarding::ValidatorOnboardingSt
       return "Cancelled";
   }
   return "Unknown";
+}
+
+bool validator_requires_onboarding_registration(
+    const std::optional<finalis::onboarding::ValidatorOnboardingRecord>& record) {
+  if (!record.has_value()) return true;
+  return record->validator_status.empty() || record->validator_status == "NOT_REGISTERED";
 }
 
 QString send_reservation_note(std::size_t pending_reserved, std::size_t onboarding_reserved) {
@@ -2339,7 +2346,9 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
   const std::uint64_t eligibility_bond_units =
       record.has_value() && record->eligibility_bond_amount != 0 ? record->eligibility_bond_amount : required_bond_units;
   const std::uint64_t required_fee_units = record.has_value() ? record->fee : 10'000;
-  const std::uint64_t required_total_units = required_bond_units + required_fee_units;
+  const bool needs_onboarding_registration = validator_requires_onboarding_registration(record);
+  const std::uint64_t required_total_units =
+      needs_onboarding_registration ? required_fee_units : (required_bond_units + required_fee_units);
   std::uint64_t wallet_finalized_spendable_units = 0;
   for (const auto& utxo : utxos_) wallet_finalized_spendable_units += utxo.value;
   const std::uint64_t available_finalized_units =
@@ -2352,23 +2361,33 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
   bool tracked_checked_height_ok = false;
   const qulonglong persisted_checked_height = settings.value("validator/last_checked_height").toULongLong(&tracked_checked_height_ok);
   if (record.has_value()) {
-    enough_balance = record->last_spendable_balance >= record->required_amount;
+    enough_balance = record->last_spendable_balance >= (needs_onboarding_registration ? record->fee : record->required_amount);
     if (enough_balance) {
-      funding_text = QString("%1 available, %2 required to register (bond %3 + fee %4)")
+      funding_text = needs_onboarding_registration
+                         ? QString("%1 available, %2 required to register as onboarding operator (fee only)")
+                               .arg(format_coin_amount(record->last_spendable_balance))
+                               .arg(format_coin_amount(record->fee))
+                         : QString("%1 available, %2 required to register validator (bond %3 + fee %4)")
                          .arg(format_coin_amount(record->last_spendable_balance))
                          .arg(format_coin_amount(record->required_amount))
                          .arg(format_coin_amount(record->bond_amount))
                          .arg(format_coin_amount(record->fee));
     } else {
-      funding_text = QString("Need %1 more. Minimum required to register: %2 (bond %3 + fee %4)")
-                         .arg(format_coin_amount(record->last_deficit == 0
-                                                     ? (record->required_amount - record->last_spendable_balance)
-                                                     : record->last_deficit))
-                         .arg(format_coin_amount(record->required_amount))
-                         .arg(format_coin_amount(record->bond_amount))
-                         .arg(format_coin_amount(record->fee));
+      funding_text = needs_onboarding_registration
+                         ? QString("Need %1 more. Minimum required to register as onboarding operator: %2 fee")
+                               .arg(format_coin_amount(record->last_spendable_balance >= record->fee
+                                                           ? 0
+                                                           : (record->fee - record->last_spendable_balance)))
+                               .arg(format_coin_amount(record->fee))
+                         : QString("Need %1 more. Minimum required to register validator: %2 (bond %3 + fee %4)")
+                               .arg(format_coin_amount(record->last_deficit == 0
+                                                           ? (record->required_amount - record->last_spendable_balance)
+                                                           : record->last_deficit))
+                               .arg(format_coin_amount(record->required_amount))
+                               .arg(format_coin_amount(record->bond_amount))
+                               .arg(format_coin_amount(record->fee));
     }
-    if (record->eligibility_bond_amount > record->bond_amount) {
+    if (!needs_onboarding_registration && record->eligibility_bond_amount > record->bond_amount) {
       funding_text += QString("\nCurrent eligibility floor: %1 bond").arg(format_coin_amount(record->eligibility_bond_amount));
     }
     registration_status = onboarding_state_display_text(record->state);
@@ -2388,11 +2407,14 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
     funding_text = "Unable to refresh onboarding status";
     registration_status = "Status unavailable";
   } else {
-    funding_text = QString("Minimum required to register: %1 (bond %2 + fee %3)")
-                       .arg(format_coin_amount(required_total_units))
-                       .arg(format_coin_amount(required_bond_units))
-                       .arg(format_coin_amount(required_fee_units));
-    if (eligibility_bond_units > required_bond_units) {
+    funding_text = needs_onboarding_registration
+                       ? QString("Minimum required to register as onboarding operator: %1 fee")
+                             .arg(format_coin_amount(required_fee_units))
+                       : QString("Minimum required to register validator: %1 (bond %2 + fee %3)")
+                             .arg(format_coin_amount(required_total_units))
+                             .arg(format_coin_amount(required_bond_units))
+                             .arg(format_coin_amount(required_fee_units));
+    if (!needs_onboarding_registration && eligibility_bond_units > required_bond_units) {
       funding_text += QString("\nCurrent eligibility floor: %1 bond").arg(format_coin_amount(eligibility_bond_units));
     }
   }
@@ -2403,10 +2425,10 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
 
   QStringList blockers;
   if (!wallet_loaded) blockers << "Open the operator wallet";
-  if (!db_path_valid) blockers << "Select the local node data folder";
+  if (!needs_onboarding_registration && !db_path_valid) blockers << "Select the local node data folder";
   if (!key_loadable) blockers << QString("Fix validator key: %1").arg(key_error);
   if (!rpc_reachable) blockers << QString("Fix RPC endpoint: %1").arg(rpc_error);
-  if (wallet_loaded && key_loadable && rpc_reachable && !node_synced) {
+  if (!needs_onboarding_registration && wallet_loaded && key_loadable && rpc_reachable && !node_synced) {
     if (record.has_value() && record->readiness.captured_at_unix_ms != 0 &&
         !record->readiness.readiness_blockers_csv.empty()) {
       blockers << QString::fromStdString(record->readiness.readiness_blockers_csv);
@@ -2418,11 +2440,15 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
   }
   if ((record.has_value() || wallet_loaded) && !enough_balance) {
     blockers << QString("Need %1 more finalized balance")
-                    .arg(format_coin_amount((record.has_value() && record->last_deficit != 0)
-                                                ? record->last_deficit
-                                                : (available_finalized_units >= required_total_units
+                    .arg(format_coin_amount(needs_onboarding_registration
+                                                ? (available_finalized_units >= required_fee_units
                                                        ? 0
-                                                       : (required_total_units - available_finalized_units))));
+                                                       : (required_fee_units - available_finalized_units))
+                                                : ((record.has_value() && record->last_deficit != 0)
+                                                       ? record->last_deficit
+                                                       : (available_finalized_units >= required_total_units
+                                                              ? 0
+                                                              : (required_total_units - available_finalized_units)))));
   }
   if (detached_local) blockers << "Local tracking is detached; refresh or retry to resume tracking";
   if (record.has_value() && record->state == finalis::onboarding::ValidatorOnboardingState::FAILED && !onboarding_error.isEmpty()) {
@@ -2433,21 +2459,28 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
   QStringList checklist;
   checklist << QString("%1 Wallet loaded").arg(wallet_loaded ? "OK" : "Missing")
             << QString("%1 RPC reachable").arg(rpc_reachable ? "OK" : "Missing")
-            << QString("%1 Node synced").arg(node_synced ? "OK" : "Waiting")
-            << QString("%1 DB path valid").arg(db_path_valid ? "OK" : "Missing")
+            << QString("%1 Node synced").arg(needs_onboarding_registration ? "N/A" : (node_synced ? "OK" : "Waiting"))
+            << QString("%1 DB path valid").arg(needs_onboarding_registration ? "N/A" : (db_path_valid ? "OK" : "Missing"))
             << QString("%1 Validator key ready").arg(key_loadable ? "OK" : "Missing")
-            << QString("%1 Balance >= %2").arg(enough_balance ? "OK" : "Waiting", format_coin_amount(record.has_value() ? record->required_amount : required_total_units));
-  if (eligibility_bond_units > required_bond_units) {
+            << QString("%1 Balance >= %2")
+                   .arg(enough_balance ? "OK" : "Waiting",
+                        format_coin_amount(needs_onboarding_registration
+                                               ? required_fee_units
+                                               : (record.has_value() ? record->required_amount : required_total_units)));
+  if (!needs_onboarding_registration && eligibility_bond_units > required_bond_units) {
     checklist << QString("Info Eligibility floor = %1 bond").arg(format_coin_amount(eligibility_bond_units));
   }
   if (validator_summary_label_) validator_summary_label_->setText(checklist.join("\n"));
 
   if (validator_required_bond_label_) {
-    QString bond_text = QString("%1 required now (%2 bond + %3 fee)")
-                            .arg(format_coin_amount(record.has_value() ? record->required_amount : required_total_units))
-                            .arg(format_coin_amount(required_bond_units))
-                            .arg(format_coin_amount(required_fee_units));
-    if (eligibility_bond_units > required_bond_units) {
+    QString bond_text = needs_onboarding_registration
+                            ? QString("%1 required now for onboarding operator registration (fee only)")
+                                  .arg(format_coin_amount(required_fee_units))
+                            : QString("%1 required now (%2 bond + %3 fee)")
+                                  .arg(format_coin_amount(record.has_value() ? record->required_amount : required_total_units))
+                                  .arg(format_coin_amount(required_bond_units))
+                                  .arg(format_coin_amount(required_fee_units));
+    if (!needs_onboarding_registration && eligibility_bond_units > required_bond_units) {
       bond_text += QString("\nEligibility floor currently %1 bond").arg(format_coin_amount(eligibility_bond_units));
     }
     validator_required_bond_label_->setText(bond_text);
@@ -2495,12 +2528,19 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
                                                                  : QString("validator key: %1").arg(key_error))
                                          : "Open your operator wallet first";
   if (wallet_loaded) {
-    readiness_text += "\nRegistration action is one-step: the wallet will wait for sync if needed, reserve finalized inputs, build the join transaction, broadcast it, and then track finalization/activation.";
-    readiness_text += QString("\nMinimum required to register: %1 (bond %2 + fee %3)")
-                          .arg(format_coin_amount(record.has_value() ? record->required_amount : required_total_units))
-                          .arg(format_coin_amount(required_bond_units))
-                          .arg(format_coin_amount(required_fee_units));
-    if (eligibility_bond_units > required_bond_units) {
+    if (needs_onboarding_registration) {
+      readiness_text +=
+          "\nFirst step: register as an onboarding operator. The wallet will build and broadcast an SCONBREG transaction that binds the selected validator key to this funding wallet as the payout key.";
+      readiness_text += QString("\nMinimum required now: %1 fee").arg(format_coin_amount(required_fee_units));
+      readiness_text += QString("\nAfter finalization, validator registration remains a separate step that requires the full bond.");
+    } else {
+      readiness_text += "\nRegistration action is one-step: the wallet will wait for sync if needed, reserve finalized inputs, build the join transaction, broadcast it, and then track finalization/activation.";
+      readiness_text += QString("\nMinimum required to register: %1 (bond %2 + fee %3)")
+                            .arg(format_coin_amount(record.has_value() ? record->required_amount : required_total_units))
+                            .arg(format_coin_amount(required_bond_units))
+                            .arg(format_coin_amount(required_fee_units));
+    }
+    if (!needs_onboarding_registration && eligibility_bond_units > required_bond_units) {
       readiness_text += QString("\nCurrent eligibility floor: %1 bond").arg(format_coin_amount(eligibility_bond_units));
     }
     readiness_text += QString("\nTracked txid: %1").arg(tracked_txid.isEmpty() ? "none" : elide_middle(tracked_txid, 12));
@@ -2528,8 +2568,10 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
           .arg(db_path.isEmpty() ? "-" : db_path)
           .arg(key_path.isEmpty() ? "-" : key_path)
           .arg(rpc_url.isEmpty() ? "-" : rpc_url);
-  details += QString("\nMinimum required to register: %1").arg(format_coin_amount(record.has_value() ? record->required_amount : required_total_units));
-  details += QString("\nCurrent eligibility floor: %1 bond").arg(format_coin_amount(eligibility_bond_units));
+  details += QString("\nMinimum required right now: %1").arg(format_coin_amount(required_total_units));
+  if (!needs_onboarding_registration) {
+    details += QString("\nCurrent eligibility floor: %1 bond").arg(format_coin_amount(eligibility_bond_units));
+  }
   if (record.has_value()) {
     details += QString("\nRaw status: %1\nLast txid: %2\nLast checked height: %3")
                    .arg(QString::fromStdString(finalis::onboarding::validator_onboarding_state_name(record->state)))
@@ -2546,17 +2588,19 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
   if (validator_details_view_) validator_details_view_->setPlainText(details);
 
   const bool in_progress_or_done =
-      record.has_value() &&
+      !needs_onboarding_registration && record.has_value() &&
       (record->state == finalis::onboarding::ValidatorOnboardingState::ACTIVE ||
        record->state == finalis::onboarding::ValidatorOnboardingState::PENDING_ACTIVATION ||
        record->state == finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION ||
        record->state == finalis::onboarding::ValidatorOnboardingState::BROADCASTING_JOIN_TX);
-  const bool can_start = wallet_loaded && key_loadable && rpc_reachable && !in_progress_or_done;
-  QString action_text = "Register Validator";
+  const bool can_start = wallet_loaded && key_loadable && rpc_reachable && enough_balance && !in_progress_or_done;
+  QString action_text = needs_onboarding_registration ? "Register Onboarding Operator" : "Register Validator";
   if (!wallet_loaded) action_text = "Open Wallet First";
   else if (!key_loadable) action_text = "Fix Validator Key";
   else if (!rpc_reachable) action_text = "Fix RPC Endpoint";
-  else if (record.has_value()) {
+  else if (needs_onboarding_registration) {
+    if (!enough_balance) action_text = "Waiting For Fee";
+  } else if (record.has_value()) {
     switch (record->state) {
       case finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_SYNC:
         action_text = "Waiting For Sync";
@@ -2631,6 +2675,171 @@ void WalletWindow::toggle_validator_details() {
   validator_toggle_details_button_->setText(show ? "Hide Details" : "Show Details");
 }
 
+void WalletWindow::start_onboarding_registration_clicked() {
+  if (!ensure_wallet_loaded("Register Onboarding Operator")) return;
+  refresh_validator_readiness_panel(false);
+
+  const QString key_path = validator_key_path_edit_ ? validator_key_path_edit_->text().trimmed() : QString{};
+  const QString rpc_url = validator_rpc_url_edit_ ? validator_rpc_url_edit_->text().trimmed() : QString{};
+  if (key_path.isEmpty() || !QFileInfo::exists(key_path)) {
+    QMessageBox::warning(this, "Register Onboarding Operator", "Select your validator key file.");
+    return;
+  }
+  if (rpc_url.isEmpty()) {
+    QMessageBox::warning(this, "Register Onboarding Operator", "Set local RPC endpoint.");
+    return;
+  }
+
+  std::string err;
+  auto funding_key = load_wallet_key(&err);
+  if (!funding_key) {
+    QMessageBox::warning(this, "Register Onboarding Operator", QString::fromStdString(err));
+    return;
+  }
+
+  finalis::keystore::ValidatorKey validator_key;
+  std::string validator_err;
+  if (!finalis::keystore::load_validator_keystore(key_path.toStdString(), wallet_->passphrase, &validator_key, &validator_err)) {
+    QMessageBox::warning(
+        this, "Register Onboarding Operator",
+        QString("The selected validator key cannot be opened with the current wallet passphrase.\n\n%1")
+            .arg(validator_err.empty() ? "Load failed." : QString::fromStdString(validator_err)));
+    return;
+  }
+  if (validator_key.network_name != wallet_->network_name) {
+    QMessageBox::warning(this, "Register Onboarding Operator",
+                         QString("The selected validator key targets %1, but the wallet is on %2.")
+                             .arg(QString::fromStdString(validator_key.network_name),
+                                  QString::fromStdString(wallet_->network_name)));
+    return;
+  }
+
+  finalis::onboarding::ValidatorOnboardingOptions options;
+  options.key_file = key_path.toStdString();
+  options.passphrase = wallet_->passphrase;
+  options.rpc_url = rpc_url.toStdString();
+  options.fee = 10'000;
+
+  std::string status_err;
+  const auto rpc_status = lightserver::rpc_get_status(rpc_url.toStdString(), &status_err);
+  if (!rpc_status.has_value()) {
+    QMessageBox::warning(this, "Register Onboarding Operator",
+                         QString("Unable to load RPC status.\n\n%1")
+                             .arg(status_err.empty() ? "RPC status unavailable." : QString::fromStdString(status_err)));
+    return;
+  }
+
+  auto preview = finalis::lightserver::rpc_validator_onboarding_status(rpc_url.toStdString(), options, "", &err);
+  if (!preview && !err.empty()) {
+    QMessageBox::warning(this, "Register Onboarding Operator", QString::fromStdString(err));
+    persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));
+    return;
+  }
+  if (preview.has_value() && !validator_requires_onboarding_registration(preview)) {
+    QMessageBox::information(this, "Register Onboarding Operator",
+                             "This validator key is already registered as an onboarding operator or validator.");
+    refresh_validator_readiness_panel(false);
+    return;
+  }
+
+  std::size_t reserved_excluded = 0;
+  std::size_t pending_reserved_excluded = 0;
+  std::size_t onboarding_reserved_excluded = 0;
+  QString prev_err;
+  auto available_prevs = send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+  if (!available_prevs.has_value()) {
+    QMessageBox::warning(this, "Register Onboarding Operator", prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
+    return;
+  }
+  const auto ordered_prevs = finalis::deterministic_largest_first_prevs(*available_prevs);
+  std::vector<std::pair<OutPoint, TxOut>> selected_prevs;
+  std::uint64_t selected_units = 0;
+  for (const auto& prev : ordered_prevs) {
+    selected_prevs.push_back(prev);
+    selected_units += prev.second.value;
+    if (selected_units >= options.fee) break;
+  }
+  if (selected_units < options.fee) {
+    QMessageBox::warning(this, "Register Onboarding Operator",
+                         QString("Insufficient finalized balance for the %1 registration fee.")
+                             .arg(format_coin_amount(options.fee)));
+    return;
+  }
+
+  auto own_decoded = finalis::address::decode(wallet_->address);
+  if (!own_decoded.has_value()) {
+    QMessageBox::warning(this, "Register Onboarding Operator", "Wallet address is invalid.");
+    return;
+  }
+  auto db_path = inferred_local_db_path();
+  if (!db_path.has_value()) {
+    QMessageBox::warning(this, "Register Onboarding Operator", "Unable to infer the local node data folder for finalized anchor lookup.");
+    return;
+  }
+  finalis::storage::DB db;
+  if (!db.open_readonly(*db_path) && !db.open(*db_path)) {
+    QMessageBox::warning(this, "Register Onboarding Operator", "Failed to open the local node database for finalized anchor lookup.");
+    return;
+  }
+  const auto& network = finalis::network_by_name(wallet_->network_name);
+  const auto chain_id = finalis::ChainId::from_config_and_db(network, db);
+  finalis::ValidatorJoinAdmissionPowBuildContext pow_ctx{
+      .network = &network,
+      .chain_id = &chain_id,
+      .current_height = rpc_status->tip_height + 1,
+      .finalized_hash_at_height = [&db](std::uint64_t anchor_height) -> std::optional<finalis::Hash32> {
+        return db.get_height_hash(anchor_height);
+      },
+  };
+
+  const QString confirm_text =
+      QString("Confirm onboarding operator registration.\n\nFee: %1\nValidator pubkey: %2\nValidator address: %3\nPayout address: %4\nRPC endpoint: %5")
+          .arg(format_coin_amount(options.fee))
+          .arg(elide_middle(QString::fromStdString(finalis::hex_encode(finalis::Bytes(validator_key.pubkey.begin(), validator_key.pubkey.end()))), 16))
+          .arg(QString::fromStdString(validator_key.address))
+          .arg(QString::fromStdString(funding_key->address))
+          .arg(rpc_url);
+  if (QMessageBox::question(this, "Confirm Onboarding Registration", confirm_text,
+                            QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Ok) {
+    return;
+  }
+
+  auto tx = finalis::build_onboarding_registration_tx(
+      selected_prevs, finalis::Bytes(funding_key->privkey.begin(), funding_key->privkey.end()), validator_key.pubkey,
+      finalis::Bytes(validator_key.privkey.begin(), validator_key.privkey.end()), funding_key->pubkey, options.fee,
+      finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), &err, &pow_ctx);
+  if (!tx.has_value()) {
+    QMessageBox::warning(this, "Register Onboarding Operator", QString::fromStdString(err));
+    return;
+  }
+
+  QString used_endpoint;
+  auto broadcast = broadcast_tx_with_failover(tx->serialize(), &err, &used_endpoint);
+  if (!broadcast || broadcast->outcome != lightserver::BroadcastOutcome::Sent) {
+    const QString reason = broadcast
+                               ? (!broadcast->error_message.empty()
+                                      ? QString::fromStdString(broadcast->error_message)
+                                      : (!broadcast->error.empty() ? QString::fromStdString(broadcast->error)
+                                                                   : QString::fromStdString(err)))
+                               : QString::fromStdString(err);
+    QMessageBox::warning(this, "Register Onboarding Operator", "Broadcast failed: " + reason);
+    return;
+  }
+
+  append_local_event(QString("[onboarding] submitted SCONBREG txid=%1 validator=%2 payout=%3 endpoint=%4")
+                         .arg(QString::fromStdString(finalis::hex_encode32(tx->txid())))
+                         .arg(elide_middle(QString::fromStdString(finalis::hex_encode(finalis::Bytes(
+                                  validator_key.pubkey.begin(), validator_key.pubkey.end()))), 12))
+                         .arg(QString::fromStdString(funding_key->address))
+                         .arg(used_endpoint.isEmpty() ? rpc_url : used_endpoint));
+  statusBar()->showMessage("Onboarding registration submitted for relay.", 4000);
+  refresh_chain_state(false);
+  refresh_validator_readiness_panel(false);
+  QMessageBox::information(this, "Register Onboarding Operator",
+                           QString("Onboarding registration accepted for relay.\n\nTxid: %1")
+                               .arg(QString::fromStdString(finalis::hex_encode32(tx->txid()))));
+}
+
 void WalletWindow::start_validator_onboarding_clicked() {
   if (!ensure_wallet_loaded("Start Validator Onboarding")) return;
   refresh_validator_readiness_panel(false);
@@ -2679,6 +2888,10 @@ void WalletWindow::start_validator_onboarding_clicked() {
   if (!preview && !err.empty()) {
     QMessageBox::warning(this, "Start Validator Onboarding", QString::fromStdString(err));
     persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));
+    return;
+  }
+  if (validator_requires_onboarding_registration(preview)) {
+    start_onboarding_registration_clicked();
     return;
   }
 

@@ -510,6 +510,11 @@ Bytes serialize_epoch_reward_settlement(const EpochRewardSettlementState& state)
   w.u64le(state.fee_pool_units);
   w.u64le(state.reserve_accrual_units);
   w.u64le(state.reserve_subsidy_units);
+  w.varint(state.onboarding_score_units.size());
+  for (const auto& [pub, score] : state.onboarding_score_units) {
+    w.bytes_fixed(pub);
+    w.u64le(score);
+  }
   return w.take();
 }
 
@@ -536,6 +541,7 @@ std::optional<EpochRewardSettlementState> parse_epoch_reward_settlement(const By
         }
         state.expected_participation_units.clear();
         state.observed_participation_units.clear();
+        state.onboarding_score_units.clear();
         if (!r.remaining()) return true;
         auto expected_count = r.varint();
         if (!expected_count) return false;
@@ -564,8 +570,18 @@ std::optional<EpochRewardSettlementState> parse_epoch_reward_settlement(const By
         state.reserve_accrual_units = *reserve_accrual;
         if (!r.remaining()) return true;
         auto reserve_subsidy = r.u64le();
-        if (!reserve_subsidy || !r.eof()) return false;
+        if (!reserve_subsidy) return false;
         state.reserve_subsidy_units = *reserve_subsidy;
+        if (!r.remaining()) return true;
+        auto onboarding_count = r.varint();
+        if (!onboarding_count) return false;
+        for (std::uint64_t i = 0; i < *onboarding_count; ++i) {
+          auto pub = r.bytes_fixed<32>();
+          auto score = r.u64le();
+          if (!pub || !score) return false;
+          state.onboarding_score_units[*pub] = *score;
+        }
+        if (!r.eof()) return false;
         return true;
       })) {
     return std::nullopt;

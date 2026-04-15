@@ -203,6 +203,7 @@ class WalletWindow final : public QMainWindow {
   void update_validator_onboarding_view();
   void refresh_validator_readiness_panel(bool interactive = false);
   void start_validator_onboarding_clicked();
+  void start_onboarding_registration_clicked();
   void cancel_validator_onboarding_clicked();
   void browse_validator_db_path();
   void browse_validator_key_path();

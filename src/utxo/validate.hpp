@@ -52,8 +52,10 @@ std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input
 std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t input_index);
 std::optional<Hash32> balance_proof_message_v2(const TxV2& tx);
 std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index);
+Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id);
+Hash32 onboarding_registration_commitment(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs);
 Hash32 bond_commitment_for_join_request(const PubKey32& operator_id, const PubKey32& payout_pubkey,
                                         std::uint64_t bond_amount, const std::vector<OutPoint>& inputs);
@@ -68,6 +70,8 @@ Hash32 admission_pow_work_hash(const Hash32& challenge, std::uint64_t nonce);
 std::uint32_t leading_zero_bits(const Hash32& hash);
 bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std::vector<OutPoint>& inputs,
                             std::uint64_t bond_amount, const SpecialValidationContext& ctx, std::string* err = nullptr);
+bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& req, const SpecialValidationContext& ctx,
+                                       std::string* err = nullptr);
 Bytes vote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
 Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);

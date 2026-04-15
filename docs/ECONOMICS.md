@@ -135,13 +135,29 @@ For each finalized transition:
 - before the emission cap:
   - gross issuance accrues deterministically by height
   - `10%` of gross issuance is accrued into protocol reserve
-  - `90%` of gross issuance is accrued into validator epoch rewards
+  - the remaining `90%` enters epoch settlement rewards
+  - within epoch settlement rewards, `3%` is carved into the onboarding bucket
+    when eligible onboarding recipients exist
 - after the emission cap:
   - new issuance is zero
   - finalized transaction fees are pooled into the closed epoch instead of being
     paid immediately
 - settlement at the next epoch boundary applies finalized participation
   adjustment using the live policy and distributes the closed epoch pool
+
+So the live restarted mainnet settlement split is:
+
+- `10%` reserve accrual from gross issuance
+- `87.3%` validator settlement rewards from gross issuance when onboarding is
+  populated
+- `2.7%` onboarding rewards from gross issuance when onboarding is populated
+
+Important boundary:
+
+- the `3%` onboarding carve-out is taken from settlement rewards, not from
+  reserve accrual
+- if the onboarding score set is empty, that `3%` remains in the validator
+  settlement pool
 
 Primary emission constants:
 
@@ -182,11 +198,19 @@ On the live path:
 - capped bond is used for reward scoring
 - the participation penalty threshold is taken from
   `active_economics_policy(height).participation_threshold_bps`
+- `ONBOARDING` recipients are excluded from validator participation accounting
+  and validator reward scoring
+- onboarding rewards are derived from a separate finalized score map based on
+  best finalized epoch ticket only
 
 Relevant code:
 
 - [src/node/node.cpp](../src/node/node.cpp)
 - [src/consensus/monetary.cpp](../src/consensus/monetary.cpp)
+
+Onboarding-specific rules are specified in:
+
+- [docs/ONBOARDING-PROTOCOL.md](ONBOARDING-PROTOCOL.md)
 
 ## 6. Ticket PoW
 

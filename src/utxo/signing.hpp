@@ -62,6 +62,18 @@ std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<Ou
                                                   std::uint64_t bond_amount, std::uint64_t fee,
                                                   const Bytes& change_script_pubkey, std::string* err = nullptr,
                                                   const ValidatorJoinAdmissionPowBuildContext* pow_ctx = nullptr);
+std::optional<Tx> build_onboarding_registration_tx(const OutPoint& prev_outpoint, const TxOut& prev_out,
+                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
+                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
+                                                   std::uint64_t fee, const Bytes& change_script_pubkey,
+                                                   std::string* err = nullptr,
+                                                   const ValidatorJoinAdmissionPowBuildContext* pow_ctx = nullptr);
+std::optional<Tx> build_onboarding_registration_tx(const std::vector<std::pair<OutPoint, TxOut>>& prevs,
+                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
+                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
+                                                   std::uint64_t fee, const Bytes& change_script_pubkey,
+                                                   std::string* err = nullptr,
+                                                   const ValidatorJoinAdmissionPowBuildContext* pow_ctx = nullptr);
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
                                  const Vote& vote_b, std::uint64_t fee = 0, std::string* err = nullptr);
 
