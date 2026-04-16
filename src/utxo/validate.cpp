@@ -581,6 +581,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
       if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
       in_sum += prev_out.value;
       continue;
     }
@@ -646,7 +649,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond signature invalid", 0};
       }
-
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
       in_sum += prev_out.value;
       continue;
     }
@@ -687,6 +692,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
           return {false, "slash evidence validator not in committee", 0};
         }
+        if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+          return {false, "input sum overflow", 0};
+        }
         in_sum += prev_out.value;
         continue;
       }
@@ -709,7 +717,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
           return {false, "unbond output spend must go to P2PKH", 0};
         }
       }
-
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
       in_sum += prev_out.value;
       continue;
     }
@@ -938,6 +948,10 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "signature invalid";
       return out;
     }
+    if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+      out.error = "input sum overflow";
+      return out;
+    }
     in_sum += prev_out.value;
     input_commitments.push_back(crypto::transparent_amount_commitment(prev_out.value));
   }
@@ -1012,16 +1026,26 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     return out;
   }
 
-  // Consistent fee validation: all transparent inputs must exactly match outputs + fee
+  // Consistent fee validation for all cases:
+  // 1. All transparent inputs/outputs: transparent inputs must EXACTLY match transparent outputs + fee
+  // 2. Transparent inputs with confidential outputs: same as case 1 - no hidden value allowed
+  // 3. Both confidential inputs/outputs: transparent inputs must AT LEAST cover transparent outputs + fee
   if (confidential_input_count == 0) {
+    // Cases 1 & 2: No confidential inputs - strict fee validation
     if (in_sum < out_sum || in_sum - out_sum != tx.fee) {
-      out.error = confidential_output_count > 0 ? "fee mismatch with confidential outputs" : "fee mismatch";
+      if (confidential_output_count > 0) {
+        out.error = "fee mismatch: transparent inputs cannot cover hidden output value";
+      } else {
+        out.error = "fee mismatch";
+      }
       return out;
     }
-  } else if (in_sum < out_sum || in_sum - out_sum < tx.fee) {
-    // With confidential inputs, transparent inputs must at least cover outputs + fee
-    out.error = "insufficient transparent input value";
-    return out;
+  } else if (confidential_input_count > 0) {
+    // Case 3: Confidential inputs exist - loose check for transparent side
+    if (in_sum < out_sum || in_sum - out_sum < tx.fee) {
+      out.error = "insufficient transparent input value";
+      return out;
+    }
   }
 
   non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(tx.fee));

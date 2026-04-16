@@ -1,6 +1,7 @@
 #include "consensus/validator_registry.hpp"
 
 #include <algorithm>
+#include <limits>
 namespace finalis::consensus {
 
 PubKey32 canonical_operator_id(const PubKey32& validator_pubkey, const ValidatorInfo& info) {
@@ -54,9 +55,19 @@ bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t hei
     if (err) *err = "validator already registered";
     return false;
   }
-  if (rules_.cooldown_blocks > 0 && v.last_exit_height > 0 && height < v.last_exit_height + rules_.cooldown_blocks) {
-    if (err) *err = "validator cooldown";
+  if (v.has_bond) {
+    if (err) *err = "validator bond already active";
     return false;
+  }
+  if (rules_.cooldown_blocks > 0 && v.last_exit_height > 0) {
+    if (v.last_exit_height > std::numeric_limits<std::uint64_t>::max() - rules_.cooldown_blocks) {
+      if (err) *err = "validator cooldown overflow";
+      return false;
+    }
+    if (height < v.last_exit_height + rules_.cooldown_blocks) {
+      if (err) *err = "validator cooldown";
+      return false;
+    }
   }
   return true;
 }
@@ -124,6 +135,9 @@ bool ValidatorRegistry::can_withdraw_bond(const PubKey32& pub, std::uint64_t hei
   const auto& info = it->second;
   if (!info.has_bond) return false;
   if (info.status == ValidatorStatus::BANNED) return false;
+  if (info.status != ValidatorStatus::EXITING) return false;
+  if (info.unbond_height == 0) return false;
+  if (info.unbond_height > std::numeric_limits<std::uint64_t>::max() - delay_blocks) return false;
   return height >= info.unbond_height + delay_blocks;
 }
 

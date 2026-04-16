@@ -820,12 +820,16 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
         req.bond_outpoint = OutPoint{txid, bond_i};
         req.bond_amount = tx.outputs[bond_i].value;
         req.requested_height = height;
-        req.status = ValidatorJoinRequestStatus::APPROVED;
-        req.approved_height = height;
-        state->validator_join_requests[txid] = req;
+        if (cfg.validator_join_limit_window_blocks > 0 && cfg.validator_join_limit_max_new > 0 &&
+            state->validator_join_count_in_window >= cfg.validator_join_limit_max_new) {
+          break;
+        }
         std::string err;
         if (state->validators.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err,
                                             canonical_operator_id_from_join_request(req.payout_pubkey))) {
+          req.status = ValidatorJoinRequestStatus::APPROVED;
+          req.approved_height = height;
+          state->validator_join_requests[txid] = req;
           if (cfg.validator_join_limit_window_blocks > 0) ++state->validator_join_count_in_window;
         }
         break;

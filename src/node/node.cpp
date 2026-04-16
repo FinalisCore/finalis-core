@@ -1128,6 +1128,7 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
                                         const Block& block, const UtxoSet& pre_utxos, std::uint64_t height,
                                         std::uint64_t min_bond, std::uint64_t warmup_blocks,
                                         std::uint64_t cooldown_blocks, std::uint64_t join_limit_window_blocks,
+                                        std::uint32_t join_limit_max_new,
                                         std::uint64_t* join_window_start_height, std::uint32_t* join_count_in_window,
                                         storage::DB* db) {
   validators.set_rules(consensus::ValidatorRules{
@@ -1196,13 +1197,17 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
         req.bond_outpoint = OutPoint{txid, bond_i};
         req.bond_amount = tx.outputs[bond_i].value;
         req.requested_height = height;
-        req.status = ValidatorJoinRequestStatus::APPROVED;
-        req.approved_height = height;
-        validator_join_requests[txid] = req;
-        if (db) (void)db->put_validator_join_request(txid, req);
+        if (join_count_in_window && join_limit_window_blocks > 0 && join_limit_max_new > 0 &&
+            *join_count_in_window >= join_limit_max_new) {
+          break;
+        }
         std::string err;
         if (validators.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err,
                                      consensus::canonical_operator_id_from_join_request(req.payout_pubkey))) {
+          req.status = ValidatorJoinRequestStatus::APPROVED;
+          req.approved_height = height;
+          validator_join_requests[txid] = req;
+          if (db) (void)db->put_validator_join_request(txid, req);
           if (join_count_in_window && join_limit_window_blocks > 0) ++(*join_count_in_window);
         }
         break;
@@ -7670,6 +7675,7 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
   apply_validator_state_changes_impl(validators_, validator_join_requests_, block, pre_utxos, height,
                                      effective_validator_min_bond_for_height(height), validator_warmup_blocks_,
                                      validator_cooldown_blocks_, validator_join_limit_window_blocks_,
+                                     validator_join_limit_max_new_,
                                      &validator_join_window_start_height_, &validator_join_count_in_window_, &db_);
   validators_.advance_height(height + 1);
   codec::ByteWriter w_start;
