@@ -548,7 +548,13 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   std::uint64_t in_sum = 0;
   std::uint64_t out_sum = 0;
   std::set<OutPoint> seen_inputs;
-  for (const auto& out : tx.outputs) out_sum += out.value;
+  for (const auto& out : tx.outputs) {
+    // Prevent uint64_t overflow when accumulating output values
+    if (out_sum > std::numeric_limits<std::uint64_t>::max() - out.value) {
+      return {false, "output sum overflow", 0};
+    }
+    out_sum += out.value;
+  }
 
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
     const auto& in = tx.inputs[i];
@@ -712,7 +718,12 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   }
 
   if (in_sum < out_sum) return {false, "negative fee", 0};
-  return {true, "", in_sum - out_sum};
+  std::uint64_t fee = in_sum - out_sum;
+  // Validate max_fee policy for V1 transactions (consistent with V2)
+  if (ctx && ctx->confidential_policy && fee > ctx->confidential_policy->max_fee) {
+    return {false, "fee too large", 0};
+  }
+  return {true, "", fee};
 }
 
 BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
@@ -938,6 +949,11 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
         out.error = "unsupported script_pubkey";
         return out;
       }
+      // Prevent uint64_t overflow when accumulating transparent output values
+      if (out_sum > std::numeric_limits<std::uint64_t>::max() - transparent.value) {
+        out.error = "output sum overflow";
+        return out;
+      }
       out_sum += transparent.value;
       non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(transparent.value));
       continue;
@@ -996,12 +1012,14 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     return out;
   }
 
-  if (confidential_output_count == 0 && confidential_input_count == 0) {
+  // Consistent fee validation: all transparent inputs must exactly match outputs + fee
+  if (confidential_input_count == 0) {
     if (in_sum < out_sum || in_sum - out_sum != tx.fee) {
-      out.error = "fee mismatch";
+      out.error = confidential_output_count > 0 ? "fee mismatch with confidential outputs" : "fee mismatch";
       return out;
     }
-  } else if (confidential_input_count == 0 && (in_sum < out_sum || in_sum - out_sum < tx.fee)) {
+  } else if (in_sum < out_sum || in_sum - out_sum < tx.fee) {
+    // With confidential inputs, transparent inputs must at least cover outputs + fee
     out.error = "insufficient transparent input value";
     return out;
   }
