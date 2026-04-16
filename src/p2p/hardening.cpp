@@ -121,13 +121,22 @@ bool PeerDiscipline::is_banned(const std::string& ip, std::uint64_t now_unix) co
 }
 
 void PeerDiscipline::decay(std::uint64_t now_unix) {
-  for (auto& [_, e] : entries_) {
-    if (e.last_update == 0 || now_unix <= e.last_update) continue;
-    const std::uint64_t elapsed = now_unix - e.last_update;
-    const int decay = static_cast<int>(elapsed / 30);
-    if (decay > 0) {
-      e.score = std::max(0, e.score - decay);
-      e.last_update = now_unix;
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    auto& e = it->second;
+    if (e.last_update != 0 && now_unix > e.last_update) {
+      const std::uint64_t elapsed = now_unix - e.last_update;
+      const int d = static_cast<int>(elapsed / 30);
+      if (d > 0) {
+        e.score = std::max(0, e.score - d);
+        e.last_update = now_unix;
+      }
+    }
+    // Prune entries that are fully decayed and no longer under a ban; prevents
+    // unbounded map growth when attackers rotate source IPs.
+    if (e.score == 0 && now_unix >= e.ban_until) {
+      it = entries_.erase(it);
+    } else {
+      ++it;
     }
   }
 }

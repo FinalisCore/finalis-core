@@ -1820,6 +1820,9 @@ bool Node::init() {
     p2p_.set_on_message([this](int peer_id, std::uint16_t msg_type, const Bytes& payload) {
       handle_message(peer_id, msg_type, payload);
     });
+    p2p_.set_accept_filter([this](const std::string& ip) {
+      return !discipline_.is_banned(ip, now_unix());
+    });
     p2p_.set_read_timeout_override([this](int peer_id, const p2p::PeerInfo& info) -> std::optional<std::uint32_t> {
       if (!info.established()) return std::nullopt;
       std::lock_guard<std::mutex> lk(mu_);
@@ -8465,6 +8468,16 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);
     case p2p::MsgType::PONG:
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);
+    case p2p::MsgType::INGRESS_RECORD:
+      return get(msg_type, 20.0, 10.0).consume(1.0, nms);
+    case p2p::MsgType::EPOCH_TICKET:
+      return get(msg_type, 20.0, 10.0).consume(1.0, nms);
+    case p2p::MsgType::GET_TRANSITION_BY_HEIGHT:
+      return get(msg_type, 30.0, 15.0).consume(1.0, nms);
+    case p2p::MsgType::GET_EPOCH_TICKETS:
+      return get(msg_type, 10.0, 5.0).consume(1.0, nms);
+    case p2p::MsgType::EPOCH_TICKETS:
+      return get(msg_type, 10.0, 5.0).consume(1.0, nms);
     default:
       return true;
   }

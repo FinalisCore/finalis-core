@@ -65,6 +65,8 @@ class PeerManager {
   void set_on_message(MessageHandler fn) { on_message_ = std::move(fn); }
   void set_on_event(PeerEventHandler fn) { on_event_ = std::move(fn); }
   void set_read_timeout_override(ReadTimeoutOverride fn) { read_timeout_override_ = std::move(fn); }
+  using AcceptFilter = std::function<bool(const std::string& ip)>;
+  void set_accept_filter(AcceptFilter fn) { accept_filter_ = std::move(fn); }
   bool send_to(int peer_id, std::uint16_t msg_type, const Bytes& payload, bool low_priority = false);
   void broadcast(std::uint16_t msg_type, const Bytes& payload);
   void disconnect_peer(int peer_id);
@@ -109,6 +111,7 @@ class PeerManager {
   MessageHandler on_message_;
   PeerEventHandler on_event_;
   ReadTimeoutOverride read_timeout_override_;
+  AcceptFilter accept_filter_;
   std::uint32_t magic_{MAGIC};
   std::uint16_t proto_version_{PROTOCOL_VERSION};
   std::size_t max_payload_len_{8 * 1024 * 1024};

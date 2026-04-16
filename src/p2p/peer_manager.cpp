@@ -357,6 +357,11 @@ void PeerManager::accept_loop() {
       net::close_socket(fd);
       continue;
     }
+    if (accept_filter_ && !accept_filter_(std::string(ipbuf))) {
+      net::shutdown_socket(fd);
+      net::close_socket(fd);
+      continue;
+    }
     start_peer(fd, std::string(ipbuf) + ":" + std::to_string(ntohs(addr.sin_port)), ipbuf, true);
   }
 }
