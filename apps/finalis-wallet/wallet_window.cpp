@@ -16,6 +16,10 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 #include <QApplication>
 #include <QAbstractItemView>
@@ -3699,66 +3703,126 @@ bool WalletWindow::refresh_finalized_send_state(QString* err) {
   std::optional<lightserver::AddressValidationView> validated_address;
   std::optional<std::vector<lightserver::UtxoView>> utxos;
   std::vector<EndpointObservation> observations;
-  for (int i = 0; i < endpoints.size(); ++i) {
-    const QString endpoint = endpoints[i];
-    std::string rpc_err;
-    auto endpoint_status = lightserver::rpc_get_status(endpoint.toStdString(), &rpc_err);
-    if (!endpoint_status) {
-      record_lightserver_failure(endpoint, QString::fromStdString(rpc_err));
-      if (observations.size() < 3) {
-        observations.push_back(EndpointObservation{endpoint, {}, {}, {}, 0, {}, {}, {}, true, false, false,
-                                                   QString::fromStdString(rpc_err)});
+
+  const auto now = std::chrono::steady_clock::now();
+  const bool can_reuse_probes = (now - last_probe_time_) < std::chrono::seconds(30) &&
+                                last_endpoint_probe_results_.size() == static_cast<std::size_t>(endpoints.size()) &&
+                                std::equal(endpoints.begin(), endpoints.end(), last_endpoint_probe_results_.begin(),
+                                           [](const QString& ep, const WalletWindow::EndpointProbeResult& probe) { return ep == probe.endpoint; });
+
+  if (can_reuse_probes) {
+    for (const auto& probe : last_endpoint_probe_results_) {
+      if (!probe.healthy) {
+        record_lightserver_failure(probe.endpoint, probe.error);
+        if (observations.size() < 3) {
+          observations.push_back(EndpointObservation{probe.endpoint, {}, {}, {}, 0, {}, {}, {}, true, false, false, probe.error});
+        }
+        continue;
       }
-      continue;
+      if (observations.size() < 3 && probe.status.has_value()) {
+        const auto& endpoint_status = *probe.status;
+        observations.push_back(EndpointObservation{probe.endpoint,
+                                                   QString::fromStdString(endpoint_status.chain.network_name),
+                                                   QString::fromStdString(endpoint_status.chain.network_id_hex),
+                                                   QString::fromStdString(endpoint_status.chain.genesis_hash_hex),
+                                                   endpoint_status.tip_height,
+                                                   QString::fromStdString(endpoint_status.transition_hash),
+                                                   QString::fromStdString(endpoint_status.binary_version),
+                                                   QString::fromStdString(endpoint_status.wallet_api_version),
+                                                   endpoint_status.chain_id_ok,
+                                                   endpoint_status.bootstrap_sync_incomplete,
+                                                   endpoint_status.peer_height_disagreement,
+                                                   {}});
+      }
+      status = probe.status;
+      validated_address = probe.validated_address;
+      utxos = probe.utxos;
+      last_refresh_endpoint_ = probe.endpoint;
+      record_lightserver_success(probe.endpoint, false);  // assume not fallback for send
+      break;
     }
-    if (observations.size() < 3) {
-      observations.push_back(EndpointObservation{endpoint,
-                                                 QString::fromStdString(endpoint_status->chain.network_name),
-                                                 QString::fromStdString(endpoint_status->chain.network_id_hex),
-                                                 QString::fromStdString(endpoint_status->chain.genesis_hash_hex),
-                                                 endpoint_status->tip_height,
-                                                 QString::fromStdString(endpoint_status->transition_hash),
-                                                 QString::fromStdString(endpoint_status->binary_version),
-                                                 QString::fromStdString(endpoint_status->wallet_api_version),
-                                                 endpoint_status->chain_id_ok,
-                                                 endpoint_status->bootstrap_sync_incomplete,
-                                                 endpoint_status->peer_height_disagreement,
-                                                 {}});
+  } else {
+    for (int i = 0; i < endpoints.size(); ++i) {
+      const QString endpoint = endpoints[i];
+      std::string rpc_err;
+      auto endpoint_status = lightserver::rpc_get_status(endpoint.toStdString(), &rpc_err);
+      if (!endpoint_status) {
+        record_lightserver_failure(endpoint, QString::fromStdString(rpc_err));
+        if (observations.size() < 3) {
+          observations.push_back(EndpointObservation{endpoint, {}, {}, {}, 0, {}, {}, {}, true, false, false,
+                                                     QString::fromStdString(rpc_err)});
+        }
+        continue;
+      }
+      if (observations.size() < 3) {
+        observations.push_back(EndpointObservation{endpoint,
+                                                   QString::fromStdString(endpoint_status->chain.network_name),
+                                                   QString::fromStdString(endpoint_status->chain.network_id_hex),
+                                                   QString::fromStdString(endpoint_status->chain.genesis_hash_hex),
+                                                   endpoint_status->tip_height,
+                                                   QString::fromStdString(endpoint_status->transition_hash),
+                                                   QString::fromStdString(endpoint_status->binary_version),
+                                                   QString::fromStdString(endpoint_status->wallet_api_version),
+                                                   endpoint_status->chain_id_ok,
+                                                   endpoint_status->bootstrap_sync_incomplete,
+                                                   endpoint_status->peer_height_disagreement,
+                                                   {}});
+      }
+      if (auto mismatch = endpoint_chain_mismatch_reason(*endpoint_status, QString::fromStdString(wallet_->network_name))) {
+        record_lightserver_failure(endpoint, *mismatch);
+        continue;
+      }
+      auto endpoint_address = lightserver::rpc_validate_address(endpoint.toStdString(), wallet_->address, &rpc_err);
+      if (!endpoint_address) {
+        record_lightserver_failure(endpoint, QString::fromStdString(rpc_err));
+        continue;
+      }
+      if (!endpoint_address->valid) {
+        record_lightserver_failure(endpoint, QString("wallet address invalid: %1").arg(QString::fromStdString(endpoint_address->error)));
+        continue;
+      }
+      if (!endpoint_address->server_network_match || !endpoint_address->has_scripthash) {
+        record_lightserver_failure(endpoint, "wallet address does not match backend network");
+        continue;
+      }
+      auto endpoint_utxos = lightserver::rpc_get_utxos(endpoint.toStdString(), endpoint_address->scripthash, &rpc_err);
+      if (!endpoint_utxos) {
+        record_lightserver_failure(endpoint, QString::fromStdString(rpc_err));
+        continue;
+      }
+      status = endpoint_status;
+      validated_address = endpoint_address;
+      utxos = endpoint_utxos;
+      last_refresh_endpoint_ = endpoint;
+      record_lightserver_success(endpoint, i > 0);
+      break;
     }
-    if (auto mismatch = endpoint_chain_mismatch_reason(*endpoint_status, QString::fromStdString(wallet_->network_name))) {
-      record_lightserver_failure(endpoint, *mismatch);
-      continue;
-    }
-    auto endpoint_address = lightserver::rpc_validate_address(endpoint.toStdString(), wallet_->address, &rpc_err);
-    if (!endpoint_address) {
-      record_lightserver_failure(endpoint, QString::fromStdString(rpc_err));
-      continue;
-    }
-    if (!endpoint_address->valid) {
-      record_lightserver_failure(endpoint, QString("wallet address invalid: %1").arg(QString::fromStdString(endpoint_address->error)));
-      continue;
-    }
-    if (!endpoint_address->server_network_match || !endpoint_address->has_scripthash) {
-      record_lightserver_failure(endpoint, "wallet address does not match backend network");
-      continue;
-    }
-    auto endpoint_utxos = lightserver::rpc_get_utxos(endpoint.toStdString(), endpoint_address->scripthash, &rpc_err);
-    if (!endpoint_utxos) {
-      record_lightserver_failure(endpoint, QString::fromStdString(rpc_err));
-      continue;
-    }
-    status = endpoint_status;
-    validated_address = endpoint_address;
-    utxos = endpoint_utxos;
-    last_refresh_endpoint_ = endpoint;
-    record_lightserver_success(endpoint, i > 0);
-    break;
   }
   const QStringList crosscheck_endpoints = endpoints.mid(0, std::min(3, endpoints.size()));
   for (const QString& endpoint : crosscheck_endpoints) {
     const auto already = std::find_if(observations.begin(), observations.end(),
                                       [&](const EndpointObservation& obs) { return obs.endpoint == endpoint; });
     if (already != observations.end()) continue;
+    if (can_reuse_probes) {
+      const auto probe_it = std::find_if(last_endpoint_probe_results_.begin(), last_endpoint_probe_results_.end(),
+                                         [&](const WalletWindow::EndpointProbeResult& probe) { return probe.endpoint == endpoint; });
+      if (probe_it != last_endpoint_probe_results_.end() && probe_it->status.has_value()) {
+        const auto& endpoint_status = *probe_it->status;
+        observations.push_back(EndpointObservation{endpoint,
+                                                   QString::fromStdString(endpoint_status.chain.network_name),
+                                                   QString::fromStdString(endpoint_status.chain.network_id_hex),
+                                                   QString::fromStdString(endpoint_status.chain.genesis_hash_hex),
+                                                   endpoint_status.tip_height,
+                                                   QString::fromStdString(endpoint_status.transition_hash),
+                                                   QString::fromStdString(endpoint_status.binary_version),
+                                                   QString::fromStdString(endpoint_status.wallet_api_version),
+                                                   endpoint_status.chain_id_ok,
+                                                   endpoint_status.bootstrap_sync_incomplete,
+                                                   endpoint_status.peer_height_disagreement,
+                                                   {}});
+        continue;
+      }
+    }
     std::string rpc_err;
     auto endpoint_status = lightserver::rpc_get_status(endpoint.toStdString(), &rpc_err);
     if (!endpoint_status) {
@@ -3823,78 +3887,150 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   std::optional<std::vector<lightserver::UtxoView>> utxos;
   QString active_endpoint;
   QString last_error;
-  for (int i = 0; i < request.endpoints.size(); ++i) {
-    const QString endpoint = request.endpoints[i];
+
+  const QString wallet_address = request.wallet_address;
+  const QString wallet_network_name = request.wallet_network_name;
+
+  const auto probe_endpoint = [wallet_address, wallet_network_name](const QString& endpoint) {
+    WalletWindow::EndpointProbeResult probe;
+    probe.endpoint = endpoint;
     std::string err;
     auto endpoint_status = lightserver::rpc_get_status(endpoint.toStdString(), &err);
     if (!endpoint_status) {
-      const QString qerr = QString::fromStdString(err);
-      result.endpoint_failures.push_back({endpoint, qerr});
+      probe.error = QString::fromStdString(err);
+      return probe;
+    }
+    probe.status = endpoint_status;
+    if (auto mismatch = endpoint_chain_mismatch_reason(*endpoint_status, wallet_network_name)) {
+      probe.error = *mismatch;
+      return probe;
+    }
+    auto endpoint_address = lightserver::rpc_validate_address(endpoint.toStdString(), wallet_address.toStdString(), &err);
+    if (!endpoint_address) {
+      probe.error = QString::fromStdString(err);
+      return probe;
+    }
+    if (!endpoint_address->valid) {
+      probe.error = QString("wallet address invalid: %1").arg(QString::fromStdString(endpoint_address->error));
+      return probe;
+    }
+    if (!endpoint_address->server_network_match || !endpoint_address->has_scripthash) {
+      probe.error = "wallet address does not match backend network";
+      return probe;
+    }
+    auto endpoint_utxos = lightserver::rpc_get_utxos(endpoint.toStdString(), endpoint_address->scripthash, &err);
+    if (!endpoint_utxos) {
+      probe.error = QString::fromStdString(err);
+      return probe;
+    }
+    probe.validated_address = endpoint_address;
+    probe.utxos = endpoint_utxos;
+    probe.healthy = true;
+    return probe;
+  };
+
+  struct ProbeSharedState {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::size_t done_count = 0;
+    bool healthy_found = false;
+    std::vector<WalletWindow::EndpointProbeResult> results;
+  };
+
+  auto state = std::make_shared<ProbeSharedState>();
+  state->results.resize(request.endpoints.size());
+
+  if (request.endpoints.empty()) {
+    result.error = "No healthy lightserver endpoint was available.";
+    return result;
+  }
+
+  for (int i = 0; i < request.endpoints.size(); ++i) {
+    const QString endpoint = request.endpoints[i];
+    std::thread([state, i, endpoint, probe_endpoint]() mutable {
+      auto probe = probe_endpoint(endpoint);
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->results[i] = std::move(probe);
+        if (state->results[i].healthy) state->healthy_found = true;
+        state->done_count += 1;
+      }
+      state->cv.notify_one();
+    }).detach();
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(state->mu);
+    state->cv.wait(lock, [&] { return state->healthy_found || state->done_count == request.endpoints.size(); });
+  }
+
+  for (int i = 0; i < static_cast<int>(state->results.size()); ++i) {
+    const auto& probe = state->results[i];
+    if (probe.endpoint.isEmpty()) continue;
+    if (!probe.healthy) {
+      const QString qerr = probe.error.isEmpty() ? "probe failed" : probe.error;
+      result.endpoint_failures.push_back({probe.endpoint, qerr});
       if (result.observations.size() < 3) {
-        result.observations.push_back(EndpointObservation{endpoint, {}, {}, {}, 0, {}, {}, {}, true, false, false, qerr});
+        result.observations.push_back(EndpointObservation{probe.endpoint, {}, {}, {}, 0, {}, {}, {}, true, false, false, qerr});
       }
       last_error = qerr;
       continue;
     }
-    if (result.observations.size() < 3) {
-      result.observations.push_back(EndpointObservation{
-          endpoint,
-          QString::fromStdString(endpoint_status->chain.network_name),
-          QString::fromStdString(endpoint_status->chain.network_id_hex),
-          QString::fromStdString(endpoint_status->chain.genesis_hash_hex),
-          endpoint_status->tip_height,
-          QString::fromStdString(endpoint_status->transition_hash),
-          QString::fromStdString(endpoint_status->binary_version),
-          QString::fromStdString(endpoint_status->wallet_api_version),
-          endpoint_status->chain_id_ok,
-          endpoint_status->bootstrap_sync_incomplete,
-          endpoint_status->peer_height_disagreement,
-          {}});
+    if (!status.has_value()) {
+      if (result.observations.size() < 3) {
+        const auto& endpoint_status = *probe.status;
+        result.observations.push_back(EndpointObservation{
+            probe.endpoint,
+            QString::fromStdString(endpoint_status.chain.network_name),
+            QString::fromStdString(endpoint_status.chain.network_id_hex),
+            QString::fromStdString(endpoint_status.chain.genesis_hash_hex),
+            endpoint_status.tip_height,
+            QString::fromStdString(endpoint_status.transition_hash),
+            QString::fromStdString(endpoint_status.binary_version),
+            QString::fromStdString(endpoint_status.wallet_api_version),
+            endpoint_status.chain_id_ok,
+            endpoint_status.bootstrap_sync_incomplete,
+            endpoint_status.peer_height_disagreement,
+            {}});
+      }
+      status = probe.status;
+      validated_address = probe.validated_address;
+      utxos = probe.utxos;
+      active_endpoint = probe.endpoint;
+      result.endpoint_success = std::make_pair(probe.endpoint, i > 0);
     }
-    if (auto mismatch = endpoint_chain_mismatch_reason(*endpoint_status, request.wallet_network_name)) {
-      const QString qerr = *mismatch;
-      result.endpoint_failures.push_back({endpoint, qerr});
-      last_error = qerr;
-      continue;
-    }
-    auto endpoint_address = lightserver::rpc_validate_address(endpoint.toStdString(), request.wallet_address.toStdString(), &err);
-    if (!endpoint_address) {
-      const QString qerr = QString::fromStdString(err);
-      result.endpoint_failures.push_back({endpoint, qerr});
-      last_error = qerr;
-      continue;
-    }
-    if (!endpoint_address->valid) {
-      const QString qerr = QString("wallet address invalid: %1").arg(QString::fromStdString(endpoint_address->error));
-      result.endpoint_failures.push_back({endpoint, qerr});
-      last_error = qerr;
-      continue;
-    }
-    if (!endpoint_address->server_network_match || !endpoint_address->has_scripthash) {
-      const QString qerr = "wallet address does not match backend network";
-      result.endpoint_failures.push_back({endpoint, qerr});
-      last_error = qerr;
-      continue;
-    }
-    auto endpoint_utxos = lightserver::rpc_get_utxos(endpoint.toStdString(), endpoint_address->scripthash, &err);
-    if (!endpoint_utxos) {
-      const QString qerr = QString::fromStdString(err);
-      result.endpoint_failures.push_back({endpoint, qerr});
-      last_error = qerr;
-      continue;
-    }
-    status = endpoint_status;
-    validated_address = endpoint_address;
-    utxos = endpoint_utxos;
-    active_endpoint = endpoint;
-    result.endpoint_success = std::make_pair(endpoint, i > 0);
-    break;
   }
   const QStringList crosscheck_endpoints = request.endpoints.mid(0, std::min(3, request.endpoints.size()));
   for (const QString& endpoint : crosscheck_endpoints) {
     const auto already = std::find_if(result.observations.begin(), result.observations.end(),
                                       [&](const EndpointObservation& obs) { return obs.endpoint == endpoint; });
     if (already != result.observations.end()) continue;
+
+    const auto probe_it = std::find_if(state->results.begin(), state->results.end(),
+                                       [&](const EndpointProbeResult& probe) { return probe.endpoint == endpoint; });
+    if (probe_it != state->results.end()) {
+      if (probe_it->status.has_value()) {
+        const auto& endpoint_status = *probe_it->status;
+        result.observations.push_back(EndpointObservation{
+            endpoint,
+            QString::fromStdString(endpoint_status.chain.network_name),
+            QString::fromStdString(endpoint_status.chain.network_id_hex),
+            QString::fromStdString(endpoint_status.chain.genesis_hash_hex),
+            endpoint_status.tip_height,
+            QString::fromStdString(endpoint_status.transition_hash),
+            QString::fromStdString(endpoint_status.binary_version),
+            QString::fromStdString(endpoint_status.wallet_api_version),
+            endpoint_status.chain_id_ok,
+            endpoint_status.bootstrap_sync_incomplete,
+            endpoint_status.peer_height_disagreement,
+            {}});
+      } else {
+        const QString qerr = probe_it->error.isEmpty() ? "probe failed" : probe_it->error;
+        result.observations.push_back(EndpointObservation{endpoint, {}, {}, {}, 0, {}, {}, {}, true, false, false, qerr});
+      }
+      continue;
+    }
+
     std::string err;
     auto endpoint_status = lightserver::rpc_get_status(endpoint.toStdString(), &err);
     if (!endpoint_status) {
@@ -4186,12 +4322,16 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   result.remove_sent_txids.assign(remove_sent.begin(), remove_sent.end());
   result.mark_spent_confidential_outpoints = std::move(spent_confidential_outpoints);
   result.released_pending_txids = std::move(released_pending_txids);
+  result.probe_results = state->results;
   return result;
 }
 
 void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t base_state_version, bool interactive,
                                         RefreshResult result) {
   if (!should_apply_refresh_result(generation, refresh_generation_, base_state_version, refresh_state_version_)) return;
+
+  last_endpoint_probe_results_ = result.probe_results;
+  last_probe_time_ = std::chrono::steady_clock::now();
 
   clear_lightserver_runtime_status();
   for (const auto& [endpoint, error] : result.endpoint_failures) record_lightserver_failure(endpoint, error);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <map>
 #include <optional>
 #include <set>
@@ -167,6 +168,15 @@ class WalletWindow final : public QMainWindow {
     std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache;
   };
 
+  struct EndpointProbeResult {
+    QString endpoint;
+    bool healthy{false};
+    QString error;
+    std::optional<lightserver::RpcStatusView> status;
+    std::optional<lightserver::AddressValidationView> validated_address;
+    std::optional<std::vector<lightserver::UtxoView>> utxos;
+  };
+
   struct RefreshResult {
     bool success{false};
     QString error;
@@ -189,6 +199,7 @@ class WalletWindow final : public QMainWindow {
     std::vector<std::string> remove_sent_txids;
     std::vector<OutPoint> mark_spent_confidential_outpoints;
     std::vector<std::string> released_pending_txids;
+    std::vector<EndpointProbeResult> probe_results;
   };
 
   void build_ui();
@@ -445,6 +456,8 @@ class WalletWindow final : public QMainWindow {
   std::uint64_t refresh_generation_{0};
   std::uint64_t refresh_state_version_{0};
   bool refresh_in_flight_{false};
+  std::vector<EndpointProbeResult> last_endpoint_probe_results_;
+  std::chrono::steady_clock::time_point last_probe_time_;
   WalletStore store_;
 };
 

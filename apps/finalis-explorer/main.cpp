@@ -2447,6 +2447,22 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     return out;
   }
   const auto& tx_v1 = std::get<finalis::Tx>(*tx);
+  std::map<std::string, finalis::Tx> prev_tx_cache;
+  auto fetch_prev_tx = [&](const Hash32& prev_txid) -> std::optional<std::reference_wrapper<const finalis::Tx>> {
+    const std::string prev_txid_hex = finalis::hex_encode32(prev_txid);
+    auto it = prev_tx_cache.find(prev_txid_hex);
+    if (it != prev_tx_cache.end()) return std::cref(it->second);
+
+    auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + prev_txid_hex + "\"}");
+    if (!prev_call.result.has_value() || !prev_call.result->is_object()) return std::nullopt;
+    auto prev_hex = object_string(&*prev_call.result, "tx_hex");
+    if (!prev_hex) return std::nullopt;
+    auto prev_bytes = finalis::hex_decode(*prev_hex);
+    auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
+    if (!prev_tx.has_value() || !std::holds_alternative<finalis::Tx>(*prev_tx)) return std::nullopt;
+    auto inserted = prev_tx_cache.emplace(prev_txid_hex, std::get<finalis::Tx>(*prev_tx));
+    return std::cref(inserted.first->second);
+  };
 
   std::string network_name = "mainnet";
   if (auto st = fetch_status_result(cfg); st.value.has_value()) network_name = st.value->network;
@@ -2456,26 +2472,13 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   bool fee_known = true;
   for (const auto& in : tx_v1.inputs) {
     TxInputResult input_view{finalis::hex_encode32(in.prev_txid), in.prev_index, std::nullopt, std::nullopt};
-    auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + finalis::hex_encode32(in.prev_txid) + "\"}");
-    if (!prev_call.result.has_value() || !prev_call.result->is_object()) {
+    auto prev_tx_opt = fetch_prev_tx(in.prev_txid);
+    if (!prev_tx_opt.has_value()) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
       continue;
     }
-    auto prev_hex = object_string(&*prev_call.result, "tx_hex");
-    if (!prev_hex) {
-      result.inputs.push_back(std::move(input_view));
-      fee_known = false;
-      continue;
-    }
-    auto prev_bytes = finalis::hex_decode(*prev_hex);
-    auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
-    if (!prev_tx.has_value() || !std::holds_alternative<finalis::Tx>(*prev_tx)) {
-      result.inputs.push_back(std::move(input_view));
-      fee_known = false;
-      continue;
-    }
-    const auto& prev_tx_v1 = std::get<finalis::Tx>(*prev_tx);
+    const auto& prev_tx_v1 = prev_tx_opt->get();
     if (in.prev_index >= prev_tx_v1.outputs.size()) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
