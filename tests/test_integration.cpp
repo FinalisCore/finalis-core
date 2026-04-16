@@ -3648,7 +3648,14 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
 }
 
 TEST(test_unbond_finalization_moves_validator_to_exiting) {
-  auto fixture = make_bonded_joined_validator_fixture(unique_test_base("/tmp/finalis_it_unbond_exit"), 66);
+  // auto fixture = make_bonded_joined_validator_fixture(unique_test_base("/tmp/finalis_it_unbond_exit"), 66);
+  #ifdef _WIN32
+    auto temp_base = std::string(std::getenv("USERPROFILE")) + "\\AppData\\Local\\Temp\\finalis_it_unbond_exit";
+  #else
+      auto temp_base = "/tmp/finalis_it_unbond_exit";
+  #endif
+  auto fixture = make_bonded_joined_validator_fixture(
+      unique_test_base(temp_base), 66);
   auto& cluster = fixture.cluster;
   auto& nodes = cluster.nodes;
 
