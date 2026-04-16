@@ -1381,6 +1381,34 @@ TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_act
   ASSERT_EQ(checkpoint_a.ordered_final_weights, checkpoint_b.ordered_final_weights);
 }
 
+TEST(test_frontier_lane_prefix_rejects_stale_ingress_epoch_with_context) {
+  auto cfg = test_cfg();
+  cfg.network.committee_epoch_blocks = 4;
+
+  const auto from = key_from_byte(110);
+  const auto to = key_from_byte(111);
+  OutPoint op{};
+  op.txid.fill(0xA1);
+  op.index = 0;
+  auto parent_state = build_parent_state_with_utxo(cfg, 0, op, p2pkh_out_for_pub(from.public_key, 10'000));
+  parent_state.finalized_height = 4;
+
+  const auto raw = raw_signed_spend(op, p2pkh_out_for_pub(from.public_key, 10'000), from, to.public_key, 9'800);
+  FrontierVector next_vector;
+  auto lane_records = make_lane_records(parent_state, {raw}, &next_vector);
+
+  SpecialValidationContext ctx;
+  ctx.network = &cfg.network;
+  ctx.current_height = 5;
+
+  consensus::FrontierExecutionResult result;
+  std::string err;
+  ASSERT_TRUE(!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.finalized_frontier_vector,
+                                                       next_vector, lane_records, parent_state.finalized_lane_roots,
+                                                       &ctx, &result, &err));
+  ASSERT_TRUE(err.find("frontier-certified-ingress-epoch-mismatch") != std::string::npos);
+}
+
 TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
   auto cfg = live_activation_cfg();
   cfg.max_committee = 5;

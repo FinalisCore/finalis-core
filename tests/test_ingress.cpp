@@ -397,6 +397,24 @@ TEST(test_append_validated_ingress_record_rejects_bad_prev_lane_root) {
   ASSERT_EQ(err, "ingress-prev-lane-root-mismatch");
 }
 
+TEST(test_append_validated_ingress_record_rejects_epoch_mismatch_when_expected_epoch_provided) {
+  storage::DB db;
+  ASSERT_TRUE(db.open(unique_test_base("/tmp/finalis_test_ingress_epoch_mismatch")));
+
+  const auto from = key_from_byte(30);
+  const auto to = key_from_byte(31);
+  OutPoint op{};
+  op.txid.fill(0x72);
+  op.index = 0;
+  const auto tx_bytes = signed_spend_tx_bytes(op, p2pkh_out_for_pub(from.public_key, 10'000), from, to.public_key, 9'800);
+  const auto signer = key_from_byte(32);
+  auto cert = signed_ingress_certificate(tx_bytes, 1, 1, zero_hash(), {signer});
+
+  std::string err;
+  ASSERT_TRUE(!consensus::append_validated_ingress_record(db, cert, tx_bytes, {signer.public_key}, 5, &err));
+  ASSERT_EQ(err, "ingress-epoch-mismatch");
+}
+
 TEST(test_append_validated_ingress_record_rejects_equivocation_without_partial_persist) {
   const std::string path = unique_test_base("/tmp/finalis_test_ingress_equivocation");
   std::filesystem::remove_all(path);

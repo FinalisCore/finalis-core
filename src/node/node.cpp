@@ -6372,9 +6372,11 @@ bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg
     }
   }
 
-  auto committee = ingress_committee_locked(msg.certificate.epoch);
+  const auto expected_ingress_epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  auto committee = ingress_committee_locked(expected_ingress_epoch);
   std::string append_error;
-  if (!consensus::append_validated_ingress_record(db_, msg.certificate, msg.tx_bytes, committee, &append_error)) {
+  if (!consensus::append_validated_ingress_record(db_, msg.certificate, msg.tx_bytes, committee,
+                                                  expected_ingress_epoch, &append_error)) {
     if (error) *error = append_error;
     return false;
   }
@@ -6435,7 +6437,7 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
   cert.sigs.push_back(FinalitySig{local_key_.public_key, *sig});
 
   std::string append_error;
-  if (!consensus::append_validated_ingress_record(db_, cert, tx_bytes, committee, &append_error)) {
+  if (!consensus::append_validated_ingress_record(db_, cert, tx_bytes, committee, cert.epoch, &append_error)) {
     if (error) *error = append_error;
     return false;
   }
@@ -7998,6 +8000,7 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
     return false;
   }
 
+  const auto expected_ingress_epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
   auto simulated_state = db_.get_lane_state(msg.lane);
   std::string validation_error;
   std::size_t prevalidation_bytes = 0;
@@ -8039,14 +8042,15 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
       }
     }
     validation_error.clear();
-    if (!consensus::validate_ingress_append(simulated_state, record.certificate, record.tx_bytes, &validation_error)) {
+    if (!consensus::validate_ingress_append(simulated_state, record.certificate, record.tx_bytes,
+                                            expected_ingress_epoch, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
                " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
       return false;
     }
     validation_error.clear();
-    const auto committee = ingress_committee_locked(record.certificate.epoch);
+    const auto committee = ingress_committee_locked(expected_ingress_epoch);
     if (!consensus::verify_ingress_certificate(record.certificate, committee, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
@@ -8070,8 +8074,9 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
 
   for (const auto& record : msg.records) {
     validation_error.clear();
-    const auto committee = ingress_committee_locked(record.certificate.epoch);
-    if (!consensus::append_validated_ingress_record(db_, record.certificate, record.tx_bytes, committee, &validation_error)) {
+    const auto committee = ingress_committee_locked(expected_ingress_epoch);
+    if (!consensus::append_validated_ingress_record(db_, record.certificate, record.tx_bytes, committee,
+                                                    expected_ingress_epoch, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-append-failed peer_id=" + std::to_string(peer_id) + " lane=" +
                std::to_string(msg.lane) + " seq=" + std::to_string(record.certificate.seq) + " reason=" + validation_error);

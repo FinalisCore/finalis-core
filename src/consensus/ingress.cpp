@@ -99,6 +99,14 @@ Hash32 compute_lane_root_append(const Hash32& prev_root, const Hash32& tx_hash) 
   return crypto::sha256d(w.take());
 }
 
+bool validate_ingress_certificate_epoch(const IngressCertificate& cert, std::uint64_t expected_epoch, std::string* error) {
+  if (expected_epoch != 0 && cert.epoch != expected_epoch) {
+    if (error) *error = "ingress-epoch-mismatch";
+    return false;
+  }
+  return true;
+}
+
 bool verify_ingress_certificate(const IngressCertificate& cert, const std::vector<PubKey32>& committee, std::string* error) {
   if (cert.sigs.empty()) {
     if (error) *error = "ingress-cert-missing-signatures";
@@ -127,7 +135,8 @@ bool verify_ingress_certificate(const IngressCertificate& cert, const std::vecto
 }
 
 bool validate_ingress_append(const std::optional<LaneState>& lane_state, const IngressCertificate& cert, const Bytes& tx_bytes,
-                             std::string* error) {
+                             std::uint64_t expected_epoch, std::string* error) {
+  if (!validate_ingress_certificate_epoch(cert, expected_epoch, error)) return false;
   if (!validate_ingress_payload(cert, tx_bytes, error)) return false;
 
   if (lane_state.has_value()) {
@@ -145,6 +154,11 @@ bool validate_ingress_append(const std::optional<LaneState>& lane_state, const I
   }
 
   return true;
+}
+
+bool validate_ingress_append(const std::optional<LaneState>& lane_state, const IngressCertificate& cert, const Bytes& tx_bytes,
+                             std::string* error) {
+  return validate_ingress_append(lane_state, cert, tx_bytes, 0, error);
 }
 
 bool detect_ingress_equivocation(const std::optional<IngressCertificate>& existing, const IngressCertificate& incoming,
@@ -203,8 +217,10 @@ bool persist_ingress_equivocation_evidence(storage::DB& db, const IngressCertifi
 }
 
 bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& cert, const Bytes& tx_bytes,
-                                     const std::vector<PubKey32>& committee, std::string* error) {
+                                     const std::vector<PubKey32>& committee, std::uint64_t expected_epoch,
+                                     std::string* error) {
   const auto lane_state = db.get_lane_state(cert.lane);
+  if (!validate_ingress_certificate_epoch(cert, expected_epoch, error)) return false;
   if (lane_state.has_value()) {
     if (cert.seq != lane_state->max_seq + 1) {
       if (error) *error = "ingress-seq-discontinuity";
@@ -264,6 +280,11 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
     return false;
   }
   return true;
+}
+
+bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& cert, const Bytes& tx_bytes,
+                                     const std::vector<PubKey32>& committee, std::string* error) {
+  return append_validated_ingress_record(db, cert, tx_bytes, committee, 0, error);
 }
 
 }  // namespace finalis::consensus

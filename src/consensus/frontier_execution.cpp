@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include "consensus/ingress.hpp"
+#include "consensus/randomness.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/state_commitment.hpp"
 #include "crypto/hash.hpp"
@@ -33,6 +34,10 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
 
   FrontierLaneRoots lane_roots{};
   std::uint64_t max_delta = 0;
+  const auto expected_ingress_epoch =
+      (ctx && ctx->network && ctx->current_height != 0)
+          ? committee_epoch_start(ctx->current_height, ctx->network->committee_epoch_blocks)
+          : 0;
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     if (next_vector.lane_max_seq[lane] < prev_vector.lane_max_seq[lane]) {
       if (error) *error = "frontier-vector-rewind lane=" + std::to_string(lane);
@@ -83,6 +88,13 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
         return false;
       }
       std::string cert_error;
+      if (!validate_ingress_certificate_epoch(record.certificate, expected_ingress_epoch, &cert_error)) {
+        if (error) {
+          *error = "frontier-certified-ingress-epoch-mismatch lane=" + std::to_string(lane) +
+                   " seq=" + std::to_string(expected_seq) + " reason=" + cert_error;
+        }
+        return false;
+      }
       if (!verify_ingress_certificate(record.certificate, {}, &cert_error)) {
         if (error) {
           *error = "frontier-certified-ingress-cert-invalid lane=" + std::to_string(lane) +
@@ -91,8 +103,9 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
         return false;
       }
       if (ctx && ctx->is_committee_member) {
+        const auto committee_epoch = expected_ingress_epoch != 0 ? expected_ingress_epoch : record.certificate.epoch;
         for (const auto& sig : record.certificate.sigs) {
-          if (!ctx->is_committee_member(sig.validator_pubkey, record.certificate.epoch, 0)) {
+          if (!ctx->is_committee_member(sig.validator_pubkey, committee_epoch, 0)) {
             if (error) {
               *error = "frontier-certified-ingress-signer-not-in-committee lane=" + std::to_string(lane) +
                        " seq=" + std::to_string(expected_seq);
