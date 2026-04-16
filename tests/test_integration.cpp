@@ -1382,6 +1382,10 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
     if (error) *error = "open-db-failed";
     return false;
   }
+  const auto tip = db.get_tip();
+  const std::uint64_t tip_height = tip.has_value() ? tip->height : 0;
+  const std::uint64_t expected_ingress_epoch =
+      consensus::committee_epoch_start(tip_height + 1, node::NodeConfig{}.network.committee_epoch_blocks);
 
   for (const auto& raw : raw_records) {
     auto parsed = Tx::parse(raw);
@@ -1398,7 +1402,7 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
       prev_root = state.has_value() ? state->lane_root : zero_hash();
     }
 
-    auto rec = make_signed_ingress_record_msg(raw, 1, seq, prev_root, signer_override);
+    auto rec = make_signed_ingress_record_msg(raw, expected_ingress_epoch, seq, prev_root, signer_override);
     prev_root = consensus::compute_lane_root_append(prev_root, rec.certificate.tx_hash);
 
     auto& range = ranges[lane];
