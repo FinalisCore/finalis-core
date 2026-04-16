@@ -436,12 +436,10 @@ ValidatorBestTicket checkpoint_best_ticket_for_member(const CanonicalDerivationC
   }
   auto ticket = best_epoch_ticket_for_operator_id(checkpoint.epoch_start_height, checkpoint.epoch_seed, operator_id,
                                                   checkpoint.epoch_start_height, EPOCH_TICKET_MAX_NONCE);
-  if (ticket.has_value()) return ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
-  return ValidatorBestTicket{
-      pub,
-      make_epoch_ticket_work_hash(checkpoint.epoch_start_height, checkpoint.epoch_seed, operator_id, 0),
-      0,
-  };
+  if (ticket.has_value() && epoch_ticket_meets_difficulty(*ticket, checkpoint.ticket_difficulty_bits)) {
+    return ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
+  }
+  return ValidatorBestTicket{pub, Hash32{}, 0};
 }
 
 std::vector<ValidatorBestTicket> checkpoint_winners(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
@@ -509,7 +507,7 @@ std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_heig
     input.operator_id = operator_id;
     input.bonded_amount = seed.bonded_amount;
     auto ticket = best_epoch_ticket_for_operator_id(epoch_start, epoch_seed, operator_id, epoch_start, EPOCH_TICKET_MAX_NONCE);
-    if (ticket.has_value()) {
+    if (ticket.has_value() && epoch_ticket_meets_difficulty(*ticket, ticket_difficulty_bits)) {
       input.ticket_work_hash = ticket->work_hash;
       input.ticket_nonce = ticket->nonce;
       input.ticket_bonus_bps = ticket_pow_bonus_bps(*ticket, ticket_difficulty_bits, econ.ticket_bonus_cap_bps);

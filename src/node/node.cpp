@@ -573,12 +573,10 @@ consensus::ValidatorBestTicket checkpoint_best_ticket_for_member(
   auto ticket =
       consensus::best_epoch_ticket_for_operator_id(epoch, checkpoint.epoch_seed, operator_id, epoch,
                                                    consensus::EPOCH_TICKET_MAX_NONCE);
-  if (ticket.has_value()) return consensus::ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
-  return consensus::ValidatorBestTicket{
-      pub,
-      consensus::make_epoch_ticket_work_hash(epoch, checkpoint.epoch_seed, operator_id, 0),
-      0,
-  };
+  if (ticket.has_value() && consensus::epoch_ticket_meets_difficulty(*ticket, checkpoint.ticket_difficulty_bits)) {
+    return consensus::ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
+  }
+  return consensus::ValidatorBestTicket{pub, Hash32{}, 0};
 }
 
 std::vector<consensus::ValidatorBestTicket> checkpoint_winners(

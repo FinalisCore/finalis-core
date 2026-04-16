@@ -1381,6 +1381,54 @@ TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_act
   ASSERT_EQ(checkpoint_a.ordered_final_weights, checkpoint_b.ordered_final_weights);
 }
 
+TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
+  auto cfg = live_activation_cfg();
+  cfg.max_committee = 5;
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  const auto v0 = key_from_byte(101);
+  const auto v1 = key_from_byte(102);
+  const auto v2 = key_from_byte(103);
+  const auto v3 = key_from_byte(104);
+  const auto v4 = key_from_byte(105);
+  genesis.initial_validators = {v0.public_key, v1.public_key, v2.public_key, v3.public_key, v4.public_key};
+
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  state.finalized_height = 4;
+  state.finalized_committee_checkpoints[1].ticket_difficulty_bits = 12;
+
+  bool found_nonqualifying_selected_member = false;
+  for (std::uint8_t seed_b = 1; seed_b < 64 && !found_nonqualifying_selected_member; ++seed_b) {
+    Hash32 epoch_randomness{};
+    epoch_randomness.fill(seed_b);
+    state.committee_epoch_randomness_cache[5] = epoch_randomness;
+
+    storage::FinalizedCommitteeCheckpoint checkpoint;
+    ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
+    ASSERT_EQ(checkpoint.ticket_difficulty_bits, 12u);
+
+    for (std::size_t i = 0; i < checkpoint.ordered_members.size(); ++i) {
+      const auto operator_id = i < checkpoint.ordered_operator_ids.size() ? checkpoint.ordered_operator_ids[i]
+                                                                          : checkpoint.ordered_members[i];
+      const auto ticket = consensus::best_epoch_ticket_for_operator_id(5, checkpoint.epoch_seed, operator_id, 5,
+                                                                       consensus::EPOCH_TICKET_MAX_NONCE);
+      ASSERT_TRUE(ticket.has_value());
+      if (consensus::epoch_ticket_meets_difficulty(*ticket, checkpoint.ticket_difficulty_bits)) continue;
+
+      ASSERT_EQ(checkpoint.ordered_ticket_bonus_bps[i], 0u);
+      ASSERT_EQ(checkpoint.ordered_ticket_hashes[i], Hash32{});
+      ASSERT_EQ(checkpoint.ordered_ticket_nonces[i], 0u);
+      found_nonqualifying_selected_member = true;
+      break;
+    }
+  }
+
+  ASSERT_TRUE(found_nonqualifying_selected_member);
+}
+
 TEST(test_adaptive_committee_target_tracks_qualified_depth_staircase) {
   ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 1).target_committee_size, 1u);
   ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 2).target_committee_size, 2u);
