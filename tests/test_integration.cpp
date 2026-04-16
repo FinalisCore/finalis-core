@@ -331,6 +331,8 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   std::string error;
   if (!consensus::build_genesis_canonical_state(derivation_cfg, genesis_state, &genesis_derived, &error)) return false;
   consensus::CertifiedIngressLaneRecords lane_records;
+  const auto signers = node::Node::deterministic_test_keypairs();
+  const auto& signer = signers.front();
   FrontierVector next_vector = genesis_derived.finalized_frontier_vector;
   auto lane_roots = genesis_derived.finalized_lane_roots;
   for (const auto& raw : ordered_records) {
@@ -344,6 +346,11 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
     cert.txid = parsed->txid();
     cert.tx_hash = crypto::sha256d(raw);
     cert.prev_lane_root = lane_roots[lane];
+    const auto signing_hash = cert.signing_hash();
+    const Bytes msg(signing_hash.begin(), signing_hash.end());
+    auto sig = crypto::ed25519_sign(msg, signer.private_key);
+    if (!sig.has_value()) return false;
+    cert.sigs = {FinalitySig{signer.public_key, *sig}};
     lane_roots[lane] = consensus::compute_lane_root_append(lane_roots[lane], cert.tx_hash);
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
   }
@@ -477,6 +484,8 @@ bool persist_certified_ingress_fixture(const node::NodeConfig& cfg, storage::DB&
 
   FrontierVector next_vector = genesis_derived.finalized_frontier_vector;
   auto lane_roots = genesis_derived.finalized_lane_roots;
+  const auto signers = node::Node::deterministic_test_keypairs();
+  const auto& signer = signers.front();
   consensus::CertifiedIngressLaneRecords lane_records;
   for (const auto& raw : raw_records) {
     auto parsed = Tx::parse(raw);
@@ -489,6 +498,11 @@ bool persist_certified_ingress_fixture(const node::NodeConfig& cfg, storage::DB&
     cert.txid = parsed->txid();
     cert.tx_hash = crypto::sha256d(raw);
     cert.prev_lane_root = lane_roots[lane];
+    const auto signing_hash = cert.signing_hash();
+    const Bytes msg(signing_hash.begin(), signing_hash.end());
+    auto sig = crypto::ed25519_sign(msg, signer.private_key);
+    if (!sig.has_value()) return false;
+    cert.sigs = {FinalitySig{signer.public_key, *sig}};
     lane_roots[lane] = consensus::compute_lane_root_append(lane_roots[lane], cert.tx_hash);
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
 

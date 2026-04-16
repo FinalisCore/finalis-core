@@ -160,6 +160,7 @@ consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::Canoni
                                                          const std::vector<Bytes>& ordered_records,
                                                          FrontierVector* next_vector_out = nullptr) {
   consensus::CertifiedIngressLaneRecords lane_records;
+  const auto signer = key_from_byte(90);
   FrontierVector next_vector = parent_state.finalized_frontier_vector;
   auto lane_roots = parent_state.finalized_lane_roots;
   for (const auto& raw : ordered_records) {
@@ -173,6 +174,10 @@ consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::Canoni
     cert.txid = tx->txid();
     cert.tx_hash = crypto::sha256d(raw);
     cert.prev_lane_root = lane_roots[lane];
+    const auto signing_hash = cert.signing_hash();
+    const auto sig = crypto::ed25519_sign(Bytes(signing_hash.begin(), signing_hash.end()), signer.private_key);
+    if (!sig.has_value()) throw std::runtime_error("failed to sign ingress certificate");
+    cert.sigs = {FinalitySig{signer.public_key, *sig}};
     lane_roots[lane] = consensus::compute_lane_root_append(lane_roots[lane], cert.tx_hash);
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
   }

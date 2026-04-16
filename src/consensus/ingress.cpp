@@ -205,6 +205,20 @@ bool persist_ingress_equivocation_evidence(storage::DB& db, const IngressCertifi
 bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& cert, const Bytes& tx_bytes,
                                      const std::vector<PubKey32>& committee, std::string* error) {
   const auto lane_state = db.get_lane_state(cert.lane);
+  if (lane_state.has_value()) {
+    if (cert.seq != lane_state->max_seq + 1) {
+      if (error) *error = "ingress-seq-discontinuity";
+      return false;
+    }
+    if (cert.prev_lane_root != lane_state->lane_root) {
+      if (error) *error = "ingress-prev-lane-root-mismatch";
+      return false;
+    }
+  } else if (cert.seq != 1) {
+    if (error) *error = "ingress-first-seq-must-be-one";
+    return false;
+  }
+
   if (!validate_ingress_payload(cert, tx_bytes, error)) return false;
   if (!verify_ingress_certificate(cert, committee, error)) return false;
 
@@ -229,20 +243,6 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
       return false;
     }
     if (*existing_cert == cert) return true;
-  }
-
-  if (lane_state.has_value()) {
-    if (cert.seq != lane_state->max_seq + 1) {
-      if (error) *error = "ingress-seq-discontinuity";
-      return false;
-    }
-    if (cert.prev_lane_root != lane_state->lane_root) {
-      if (error) *error = "ingress-prev-lane-root-mismatch";
-      return false;
-    }
-  } else if (cert.seq != 1) {
-    if (error) *error = "ingress-first-seq-must-be-one";
-    return false;
   }
 
   if (!db.put_ingress_bytes(cert.txid, tx_bytes)) {
