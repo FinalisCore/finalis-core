@@ -750,7 +750,7 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
 }
 
 void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
-                                            const std::vector<Tx>& txs, std::size_t input_start_index,
+                                            const std::vector<AnyTx>& txs, std::size_t input_start_index,
                                             const UtxoSetV2& pre_utxos, std::uint64_t height) {
   state->validators.set_rules(ValidatorRules{
       .min_bond = effective_validator_min_bond_for_height(cfg, *state, height),
@@ -764,7 +764,9 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
 
   for (size_t txi = input_start_index; txi < txs.size(); ++txi) {
     const auto& tx = txs[txi];
-    for (const auto& in : tx.inputs) {
+    if (!std::holds_alternative<Tx>(tx)) continue;
+    const auto& legacy = std::get<Tx>(tx);
+    for (const auto& in : legacy.inputs) {
       OutPoint op{in.prev_txid, in.prev_index};
       auto it = pre_utxos.find(op);
       if (it == pre_utxos.end()) continue;
@@ -789,9 +791,31 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
   }
 
   for (const auto& tx : txs) {
-    const Hash32 txid = tx.txid();
-    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-      const auto& out = tx.outputs[out_i];
+    const Hash32 txid = txid_any(tx);
+    struct ScriptOutput {
+      std::uint32_t index{0};
+      std::uint64_t value{0};
+      Bytes script_pubkey;
+    };
+    std::vector<ScriptOutput> outputs;
+    if (std::holds_alternative<Tx>(tx)) {
+      const auto& legacy = std::get<Tx>(tx);
+      outputs.reserve(legacy.outputs.size());
+      for (std::uint32_t out_i = 0; out_i < legacy.outputs.size(); ++out_i) {
+        outputs.push_back(ScriptOutput{out_i, legacy.outputs[out_i].value, legacy.outputs[out_i].script_pubkey});
+      }
+    } else {
+      const auto& v2 = std::get<TxV2>(tx);
+      outputs.reserve(v2.outputs.size());
+      for (std::uint32_t out_i = 0; out_i < v2.outputs.size(); ++out_i) {
+        const auto& out = v2.outputs[out_i];
+        if (out.kind != TxOutputKind::Transparent) continue;
+        const auto& transparent = std::get<TransparentTxOutV2>(out.body);
+        outputs.push_back(ScriptOutput{out_i, transparent.value, transparent.script_pubkey});
+      }
+    }
+
+    for (const auto& out : outputs) {
       PubKey32 onboarding_validator_pub{};
       PubKey32 onboarding_payout_pub{};
       Sig64 onboarding_pop{};
@@ -808,15 +832,15 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
       Sig64 pop{};
       if (!is_validator_join_request_script(out.script_pubkey, &validator_pub, &payout_pub, &pop)) continue;
 
-      for (std::uint32_t bond_i = 0; bond_i < tx.outputs.size(); ++bond_i) {
+      for (const auto& bond_out : outputs) {
         PubKey32 bond_pub{};
-        if (!is_validator_register_script(tx.outputs[bond_i].script_pubkey, &bond_pub) || bond_pub != validator_pub) continue;
+        if (!is_validator_register_script(bond_out.script_pubkey, &bond_pub) || bond_pub != validator_pub) continue;
         ValidatorJoinRequest req;
         req.request_txid = txid;
         req.validator_pubkey = validator_pub;
         req.payout_pubkey = payout_pub;
-        req.bond_outpoint = OutPoint{txid, bond_i};
-        req.bond_amount = tx.outputs[bond_i].value;
+        req.bond_outpoint = OutPoint{txid, bond_out.index};
+        req.bond_amount = bond_out.value;
         req.requested_height = height;
         if (cfg.validator_join_limit_window_blocks > 0 && cfg.validator_join_limit_max_new > 0 &&
             state->validator_join_count_in_window >= cfg.validator_join_limit_max_new) {
@@ -839,7 +863,10 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
 
 void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state, const Block& block,
                                    const UtxoSetV2& pre_utxos, std::uint64_t height) {
-  apply_validator_state_changes_from_txs(cfg, state, block.txs, 1, pre_utxos, height);
+  std::vector<AnyTx> any_txs;
+  any_txs.reserve(block.txs.size());
+  for (const auto& tx : block.txs) any_txs.emplace_back(tx);
+  apply_validator_state_changes_from_txs(cfg, state, any_txs, 1, pre_utxos, height);
 }
 
 }  // namespace
@@ -1512,12 +1539,8 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, committee,
                                                        record.transition.observed_signers);
   const UtxoSetV2 pre_utxos = next.utxos;
-  std::vector<Tx> accepted_legacy_txs;
-  accepted_legacy_txs.reserve(recomputed.accepted_txs.size());
-  for (const auto& tx : recomputed.accepted_txs) {
-    if (std::holds_alternative<Tx>(tx)) accepted_legacy_txs.push_back(std::get<Tx>(tx));
-  }
-  apply_validator_state_changes_from_txs(cfg, &next, accepted_legacy_txs, 0, pre_utxos, record.transition.height);
+  apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos,
+                                         record.transition.height);
   next.finalized_height = record.transition.height;
   next.finalized_frontier = recomputed.transition.next_frontier;
   next.finalized_frontier_vector = recomputed.transition.next_vector;
