@@ -6460,23 +6460,51 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   }
   FrontierProposal finalized_proposal = proposal_it->second;
 
-  const auto committee = committee_for_height_round(height, round);
-  if (committee.empty()) {
+  std::string lock_error;
+  if (!can_accept_frontier_with_lock_locked(proposal_it->second.transition, &lock_error)) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=empty-committee");
+             " transition=" + short_hash_hex(block_id) + " reason=" + lock_error);
     return false;
   }
-  const std::size_t quorum = consensus::quorum_threshold(committee.size());
+  consensus::CanonicalFrontierRecord certified_record;
+  std::string frontier_record_error;
+  if (!consensus::load_certified_frontier_record_from_storage(db_, finalized_proposal.transition, &certified_record,
+                                                              &frontier_record_error)) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=" + frontier_record_error);
+    return false;
+  }
+  certified_record.ordered_records = finalized_proposal.ordered_records;
+
+  if (!canonical_state_.has_value()) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=missing-canonical-state");
+    return false;
+  }
+  consensus::FrontierExecutionResult recomputed;
+  std::string validation_error;
+  if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
+                                                       certified_record, &recomputed, &validation_error)) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=" + validation_error);
+    return false;
+  }
+  const auto expected_committee = recomputed.effective_committee;
+  if (expected_committee.empty()) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=empty-effective-committee");
+    return false;
+  }
+  const std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
   auto sigs = votes_.signatures_for(height, round, block_id);
-  std::set<PubKey32> committee_set;
-  committee_set.insert(committee.begin(), committee.end());
-  if (sigs.size() < quorum) {
+  std::set<PubKey32> committee_set(expected_committee.begin(), expected_committee.end());
+  if (sigs.size() < expected_quorum) {
     std::ostringstream oss;
     oss << "finalize-skip height=" << height << " round=" << round << " transition=" << short_hash_hex(block_id)
-        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << quorum
+        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << expected_quorum
         << " signers=" << signer_set_summary(sigs);
     if (debug_finality_logs_enabled()) {
-      oss << " committee_size=" << committee.size();
+      oss << " committee_size=" << expected_committee.size();
       if (auto proposer = leader_for_height_round(height, round); proposer.has_value()) {
         oss << " proposer=" << short_pub_hex(*proposer);
       }
@@ -6489,42 +6517,27 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::vector<FinalitySig> filtered;
   const auto vote_msg = vote_signing_message(height, round, block_id);
   for (const auto& s : sigs) {
-    if (!committee_set.empty() && committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
+    if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(s.validator_pubkey).second) continue;
     if (!crypto::ed25519_verify(vote_msg, s.signature, s.validator_pubkey)) continue;
     filtered.push_back(s);
   }
-  if (filtered.size() < quorum) {
+  if (filtered.size() < expected_quorum) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=insufficient-valid-signatures valid=" +
-             std::to_string(filtered.size()) + " quorum=" + std::to_string(quorum));
+             std::to_string(filtered.size()) + " quorum=" + std::to_string(expected_quorum));
     return false;
   }
+  const auto canonical_sigs = canonicalize_finality_signatures_locked(filtered, expected_quorum);
 
-  std::string lock_error;
-  if (!can_accept_frontier_with_lock_locked(proposal_it->second.transition, &lock_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=" + lock_error);
-    return false;
-  }
-  const auto canonical_sigs = canonicalize_finality_signatures_locked(filtered, quorum);
-  consensus::CanonicalFrontierRecord certified_record;
-  std::string frontier_record_error;
-  if (!consensus::load_certified_frontier_record_from_storage(db_, finalized_proposal.transition, &certified_record,
-                                                              &frontier_record_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=" + frontier_record_error);
-    return false;
-  }
-  certified_record.ordered_records = finalized_proposal.ordered_records;
-  if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs)) {
+  if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, false, &expected_committee)) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=apply-failed");
     return false;
   }
 
   const FinalityCertificate cert =
-      make_finality_certificate(height, round, block_id, quorum, committee, canonical_sigs);
+      make_finality_certificate(height, round, block_id, expected_quorum, expected_committee, canonical_sigs);
   broadcast_finalized_frontier(finalized_proposal, cert);
   broadcast_finalized_tip();
   return true;
