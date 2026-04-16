@@ -2092,6 +2092,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     cfg.max_committee = 3;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
+    cfg.network.validator_join_admission_pow_difficulty_bits = 0;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
@@ -2235,6 +2236,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     cfg.max_committee = 2;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
+    cfg.network.validator_join_admission_pow_difficulty_bits = 0;
     cfg.p2p_port = static_cast<std::uint16_t>(19140 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
