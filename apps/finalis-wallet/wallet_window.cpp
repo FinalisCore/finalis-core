@@ -1758,52 +1758,89 @@ void WalletWindow::poll_finalized_tip_status() {
   const QStringList endpoints = ordered_lightserver_endpoints();
   if (endpoints.isEmpty()) return;
 
-  for (int i = 0; i < endpoints.size(); ++i) {
-    const QString endpoint = endpoints[i];
-    std::string err;
-    auto status = lightserver::rpc_get_status(endpoint.toStdString(), &err);
-    if (!status) {
-      record_lightserver_failure(endpoint, QString::fromStdString(err));
-      continue;
-    }
-    if (wallet_) {
-      if (auto mismatch = endpoint_chain_mismatch_reason(*status, QString::fromStdString(wallet_->network_name))) {
-        record_lightserver_failure(endpoint, *mismatch);
+  if (tip_poll_in_flight_) return;
+  tip_poll_in_flight_ = true;
+
+  struct TipPollResult {
+    bool success{false};
+    QString endpoint;
+    bool fallback_used{false};
+    std::optional<lightserver::RpcStatusView> status;
+    std::vector<std::pair<QString, QString>> failures;
+  };
+
+  const QString wallet_network_name = wallet_ ? QString::fromStdString(wallet_->network_name) : QString{};
+  const std::uint64_t generation = ++tip_poll_generation_;
+  QPointer<WalletWindow> self(this);
+  std::thread([self, generation, endpoints, wallet_network_name]() mutable {
+    TipPollResult result;
+    for (int i = 0; i < endpoints.size(); ++i) {
+      const QString endpoint = endpoints[i];
+      std::string err;
+      auto status = lightserver::rpc_get_status(endpoint.toStdString(), &err);
+      if (!status) {
+        result.failures.push_back({endpoint, QString::fromStdString(err)});
         continue;
       }
+      if (!wallet_network_name.isEmpty()) {
+        if (auto mismatch = endpoint_chain_mismatch_reason(*status, wallet_network_name)) {
+          result.failures.push_back({endpoint, *mismatch});
+          continue;
+        }
+      }
+      result.success = true;
+      result.endpoint = endpoint;
+      result.fallback_used = i > 0;
+      result.status = std::move(status);
+      break;
     }
-    record_lightserver_success(endpoint, i > 0);
 
-    const QString network_name = QString::fromStdString(status->chain.network_name);
-    const QString transition_hash = QString::fromStdString(status->transition_hash);
-    const std::uint64_t tip_height = status->tip_height;
-    const bool tip_changed =
-        tip_height != last_polled_tip_height_ || transition_hash != last_polled_transition_hash_;
+    QMetaObject::invokeMethod(
+        self,
+        [self, generation, result = std::move(result)]() mutable {
+          if (!self) return;
+          if (generation != self->tip_poll_generation_) return;
 
-    current_chain_name_ = network_name;
-    current_transition_hash_ = transition_hash;
-    current_network_id_ = QString::fromStdString(status->chain.network_id_hex);
-    current_genesis_hash_ = QString::fromStdString(status->chain.genesis_hash_hex);
-    current_binary_version_ = QString::fromStdString(status->binary_version);
-    current_wallet_api_version_ = QString::fromStdString(status->wallet_api_version);
-    current_lightserver_status_ = *status;
-    current_peer_height_disagreement_ = status->peer_height_disagreement;
-    current_bootstrap_sync_incomplete_ = status->bootstrap_sync_incomplete;
-    current_finalized_lag_ = status->finalized_lag ? std::optional<qulonglong>(*status->finalized_lag) : std::nullopt;
-    tip_height_ = tip_height;
-    last_refresh_text_ = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
-    last_polled_tip_height_ = tip_height;
-    last_polled_transition_hash_ = transition_hash;
-    if (wallet_ && wallet_->network_name == status->chain.network_name && tip_changed) {
-      refresh_chain_state(false);
-    } else {
-      update_wallet_views();
-      update_connection_views();
-    }
-    return;
-  }
+          self->tip_poll_in_flight_ = false;
+          for (const auto& failure : result.failures) {
+            self->record_lightserver_failure(failure.first, failure.second);
+          }
+          if (!result.success || !result.status.has_value()) {
+            self->update_connection_views();
+            return;
+          }
 
-  update_connection_views();
+          self->record_lightserver_success(result.endpoint, result.fallback_used);
+
+          const QString transition_hash = QString::fromStdString(result.status->transition_hash);
+          const std::uint64_t tip_height = result.status->tip_height;
+          const bool tip_changed =
+              tip_height != self->last_polled_tip_height_ || transition_hash != self->last_polled_transition_hash_;
+
+          self->current_chain_name_ = QString::fromStdString(result.status->chain.network_name);
+          self->current_transition_hash_ = transition_hash;
+          self->current_network_id_ = QString::fromStdString(result.status->chain.network_id_hex);
+          self->current_genesis_hash_ = QString::fromStdString(result.status->chain.genesis_hash_hex);
+          self->current_binary_version_ = QString::fromStdString(result.status->binary_version);
+          self->current_wallet_api_version_ = QString::fromStdString(result.status->wallet_api_version);
+          self->current_lightserver_status_ = *result.status;
+          self->current_peer_height_disagreement_ = result.status->peer_height_disagreement;
+          self->current_bootstrap_sync_incomplete_ = result.status->bootstrap_sync_incomplete;
+          self->current_finalized_lag_ =
+              result.status->finalized_lag ? std::optional<qulonglong>(*result.status->finalized_lag) : std::nullopt;
+          self->tip_height_ = tip_height;
+          self->last_refresh_text_ = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+          self->last_polled_tip_height_ = tip_height;
+          self->last_polled_transition_hash_ = transition_hash;
+          if (self->wallet_ && self->wallet_->network_name == result.status->chain.network_name && tip_changed) {
+            self->refresh_chain_state(false);
+          } else {
+            self->update_wallet_views();
+            self->update_connection_views();
+          }
+        },
+        Qt::QueuedConnection);
+  }).detach();
 }
 
 void WalletWindow::apply_selected_theme() {
@@ -3603,44 +3640,49 @@ void WalletWindow::request_pending_tx_status_refresh(const QString& txid) {
 void WalletWindow::refresh_overview_activity_preview() {
   auto* table = overview_page_ ? overview_page_->activity_preview_table() : nullptr;
   if (!table) return;
+  table->setUpdatesEnabled(false);
   table->setRowCount(0);
   if (chain_records_.empty() && mint_records_.empty() && wallet_view_snapshot_.has_value() &&
       !wallet_view_snapshot_->overview_activity_rows.empty()) {
+    table->setRowCount(static_cast<int>(wallet_view_snapshot_->overview_activity_rows.size()));
+    int row_index = 0;
     for (const auto& row : wallet_view_snapshot_->overview_activity_rows) {
-      const int r = table->rowCount();
-      table->insertRow(r);
+      const int r = row_index++;
       auto* status_item = new QTableWidgetItem(QString::fromStdString(row.col0));
       apply_status_item_style(status_item);
       table->setItem(r, 0, status_item);
       table->setItem(r, 1, new QTableWidgetItem(QString::fromStdString(row.col1)));
       table->setItem(r, 2, new QTableWidgetItem(QString::fromStdString(row.col2)));
     }
+    table->setUpdatesEnabled(true);
     return;
   }
+  const int max_rows = 4;
+  table->setRowCount(max_rows);
   int added = 0;
   const auto add_row = [&](const QString& status, const QString& activity, const QString& state) {
-    const int row = table->rowCount();
-    table->insertRow(row);
+    const int row = added;
     auto* status_item = new QTableWidgetItem(status);
     apply_status_item_style(status_item);
     table->setItem(row, 0, status_item);
     table->setItem(row, 1, new QTableWidgetItem(activity));
     table->setItem(row, 2, new QTableWidgetItem(state));
+    ++added;
   };
   for (const auto& rec : chain_records_) {
     if (added >= 4) break;
     add_row(title_case_status(rec.status), display_chain_kind(rec.kind),
             rec.status.trimmed().toUpper() == "PENDING" ? rec.height : QString("Height %1").arg(rec.height));
-    ++added;
   }
   for (const auto& rec : mint_records_) {
     if (added >= 4) break;
     add_row(title_case_status(rec.status), display_mint_kind(rec.kind), rec.height_or_state.isEmpty() ? "-" : rec.height_or_state);
-    ++added;
   }
   if (added == 0) {
     add_row("Info", "No recent activity yet", "waiting for finalized activity");
   }
+  table->setRowCount(added);
+  table->setUpdatesEnabled(true);
 }
 
 void WalletWindow::render_mint_state() {
@@ -3696,14 +3738,17 @@ void WalletWindow::render_mint_state() {
     mint_notes_view_->setItem(0, 0, item);
   }
 
+  mint_deposits_view_->setRowCount(10);
+  mint_redemptions_view_->setRowCount(12);
+  int deposit_rows = 0;
+  int redemption_rows = 0;
   for (int i = local_history_lines_.size() - 1; i >= 0; --i) {
     const QString line = local_history_lines_[i];
-    if (line.startsWith("[mint-deposit]")) {
+    if (line.startsWith("[mint-deposit]") && deposit_rows < 10) {
       const QString details = trim_after_token(line, "[mint-deposit]");
       const QString amount = extract_amount_prefix(details);
       mint_records_.push_back(MintRecord{"PENDING", "deposit", mint_deposit_ref_, amount, "registered", details});
-      const int row = mint_deposits_view_->rowCount();
-      mint_deposits_view_->insertRow(row);
+      const int row = deposit_rows++;
       auto* status_item = new QTableWidgetItem("PENDING");
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
       apply_status_item_style(status_item);
@@ -3711,14 +3756,13 @@ void WalletWindow::render_mint_state() {
       mint_deposits_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
       mint_deposits_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(mint_deposit_ref_, 10)));
       mint_deposits_view_->setItem(row, 3, new QTableWidgetItem(elide_middle(mint_last_deposit_txid_, 10)));
-    } else if (line.startsWith("[mint-redeem]")) {
+    } else if (line.startsWith("[mint-redeem]") && redemption_rows < 12) {
       const QString batch = extract_field_value(line, "batch");
       const QString amount = extract_field_value(line, "amount");
       const QString notes = extract_field_value(line, "notes");
       const QString details = QString("batch=%1  amount=%2  notes=%3").arg(batch, amount, notes);
       mint_records_.push_back(MintRecord{"PENDING", "redemption", batch, amount, "pending", details});
-      const int row = mint_redemptions_view_->rowCount();
-      mint_redemptions_view_->insertRow(row);
+      const int row = redemption_rows++;
       auto* status_item = new QTableWidgetItem("PENDING");
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
       apply_status_item_style(status_item);
@@ -3726,15 +3770,14 @@ void WalletWindow::render_mint_state() {
       mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
       mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(batch, 10)));
       mint_redemptions_view_->setItem(row, 3, new QTableWidgetItem("pending"));
-    } else if (line.startsWith("[mint-status]")) {
+    } else if (line.startsWith("[mint-status]") && redemption_rows < 12) {
       const QString batch = extract_field_value(line, "batch");
       const QString state = extract_field_value(line, "state");
       const QString txid = extract_field_value(line, "l1_txid");
       const QString details = QString("batch=%1  state=%2  tx=%3")
                                   .arg(batch, state, txid.isEmpty() ? "-" : elide_middle(txid, 8));
       mint_records_.push_back(MintRecord{mint_state_badge(state), "status", batch, {}, state, details});
-      const int row = mint_redemptions_view_->rowCount();
-      mint_redemptions_view_->insertRow(row);
+      const int row = redemption_rows++;
       auto* status_item = new QTableWidgetItem(mint_state_badge(state));
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
       apply_status_item_style(status_item);
@@ -3742,14 +3785,13 @@ void WalletWindow::render_mint_state() {
       mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem("-"));
       mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(batch, 10)));
       mint_redemptions_view_->setItem(row, 3, new QTableWidgetItem(state.isEmpty() ? "-" : state));
-    } else if (line.startsWith("[mint-issue]")) {
+    } else if (line.startsWith("[mint-issue]") && redemption_rows < 12) {
       const QString issuance = extract_field_value(line, "issuance");
       const QString amount = extract_field_value(line, "amount");
       const QString notes = extract_field_value(line, "notes");
       const QString details = QString("issuance=%1  amount=%2  notes=%3").arg(issuance, amount, notes);
       mint_records_.push_back(MintRecord{"FINALIZED", "issue", issuance, amount, "issued", details});
-      const int row = mint_redemptions_view_->rowCount();
-      mint_redemptions_view_->insertRow(row);
+      const int row = redemption_rows++;
       auto* status_item = new QTableWidgetItem("FINALIZED");
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
       apply_status_item_style(status_item);
@@ -3758,8 +3800,10 @@ void WalletWindow::render_mint_state() {
       mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(issuance, 10)));
       mint_redemptions_view_->setItem(row, 3, new QTableWidgetItem("issued"));
     }
-    if (mint_deposits_view_->rowCount() >= 10 && mint_redemptions_view_->rowCount() >= 12) break;
+    if (deposit_rows >= 10 && redemption_rows >= 12) break;
   }
+  mint_deposits_view_->setRowCount(deposit_rows);
+  mint_redemptions_view_->setRowCount(redemption_rows);
   if (mint_deposits_view_->rowCount() == 0) {
     mint_deposits_view_->setRowCount(1);
     auto* item = new QTableWidgetItem("No mint deposits recorded yet");

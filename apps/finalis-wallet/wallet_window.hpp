@@ -455,8 +455,10 @@ class WalletWindow final : public QMainWindow {
   std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache_;
   std::uint64_t refresh_generation_{0};
   std::uint64_t refresh_state_version_{0};
+  std::uint64_t tip_poll_generation_{0};
   std::uint64_t last_validator_auto_refresh_ms_{0};
   std::uint64_t validator_refresh_generation_{0};
+  bool tip_poll_in_flight_{false};
   bool validator_refresh_in_flight_{false};
   bool refresh_in_flight_{false};
   std::vector<EndpointProbeResult> last_endpoint_probe_results_;
