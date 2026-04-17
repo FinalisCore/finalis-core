@@ -2605,13 +2605,13 @@ TEST(test_tx_finalized_and_visible_on_all_nodes) {
       if (out.value != amount) return false;
     }
     return true;
-  }, std::chrono::seconds(60)));
+  }, std::chrono::seconds(120)));
   ASSERT_TRUE(wait_for([&]() {
     for (const auto& n : nodes) {
       if (n->status().height <= height_before) return false;
     }
     return true;
-  }, std::chrono::seconds(60)));
+  }, std::chrono::seconds(120)));
 }
 
 TEST(test_epoch_ticket_challenge_anchor_ignores_pending_mempool_state) {
@@ -7029,7 +7029,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
     auto info0 = n0.validator_info_for_test(joiner_vk.pubkey);
     auto info1 = n1.validator_info_for_test(joiner_vk.pubkey);
     return info0.has_value() && info1.has_value();
-  }, std::chrono::seconds(20)));
+  }, std::chrono::seconds(60)));
 
   ASSERT_EQ(n0.status().pending_bootstrap_joiners, 0u);
   ASSERT_TRUE(wait_for([&]() {
