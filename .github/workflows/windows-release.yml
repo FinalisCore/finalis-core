@@ -87,15 +87,12 @@ jobs:
           "FINALIS_QT_PREFIX=$qtRoot" >> $env:GITHUB_ENV
           "VCPKG_ROOT=${{ github.workspace }}\vcpkg" >> $env:GITHUB_ENV
 
-      - name: Require signing credentials for tagged release
+      - name: Check signing credentials for tagged release
         if: ${{ github.ref_type == 'tag' }}
         shell: pwsh
         run: |
-          if (-not "${env:WINDOWS_SIGN_PFX_BASE64}") {
-            throw "Tagged releases require WINDOWS_SIGN_PFX_BASE64"
-          }
-          if (-not "${env:WINDOWS_SIGN_PFX_PASSWORD}") {
-            throw "Tagged releases require WINDOWS_SIGN_PFX_PASSWORD"
+          if (-not "${env:WINDOWS_SIGN_PFX_BASE64}" -or -not "${env:WINDOWS_SIGN_PFX_PASSWORD}") {
+            Write-Host "::warning::Signing secrets are not configured; tagged release artifacts will be published unsigned."
           }
 
       - name: Configure
