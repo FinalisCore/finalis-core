@@ -93,10 +93,13 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
         // Replay compatibility for legacy databases:
         // - some historical builds persisted certificate.epoch as block height
         // - earliest lane records may carry legacy epoch encodings at seq=1
+        // Only apply legacy bypasses when we lack proper validation context (expected_ingress_epoch == 0)
         const bool legacy_epoch_equals_height =
-            ctx && ctx->current_height != 0 && record.certificate.epoch == ctx->current_height;
+            expected_ingress_epoch == 0 && ctx && ctx->current_height != 0 &&
+            record.certificate.epoch == ctx->current_height;
         const bool legacy_first_record_epoch =
-            expected_seq == 1 && record.certificate.prev_lane_root == zero_hash();
+            expected_ingress_epoch == 0 && expected_seq == 1 &&
+            record.certificate.prev_lane_root == zero_hash();
         if (legacy_epoch_equals_height || legacy_first_record_epoch) {
           use_certificate_epoch_for_committee = legacy_epoch_equals_height;
           cert_error.clear();
