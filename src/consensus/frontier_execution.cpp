@@ -89,11 +89,19 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
       }
       std::string cert_error;
       if (!validate_ingress_certificate_epoch(record.certificate, expected_ingress_epoch, &cert_error)) {
-        if (error) {
-          *error = "frontier-certified-ingress-epoch-mismatch lane=" + std::to_string(lane) +
-                   " seq=" + std::to_string(expected_seq) + " reason=" + cert_error;
+        // Legacy compatibility: older databases may store epoch=0 for the first
+        // lane record. Keep strict checks for all other records.
+        const bool legacy_first_record_epoch =
+            expected_seq == 1 && record.certificate.epoch == 0 && record.certificate.prev_lane_root == zero_hash();
+        if (legacy_first_record_epoch) {
+          cert_error.clear();
+        } else {
+          if (error) {
+            *error = "frontier-certified-ingress-epoch-mismatch lane=" + std::to_string(lane) +
+                     " seq=" + std::to_string(expected_seq) + " reason=" + cert_error;
+          }
+          return false;
         }
-        return false;
       }
       if (!verify_ingress_certificate(record.certificate, {}, &cert_error)) {
         if (error) {
