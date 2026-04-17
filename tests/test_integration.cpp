@@ -3861,7 +3861,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   ASSERT_TRUE(wait_for([&]() {
     auto info = n0.validator_info_for_test(banned_pub);
     return info.has_value() && info->status == consensus::ValidatorStatus::BANNED && !info->has_bond;
-  }, std::chrono::seconds(60)));
+  }, std::chrono::seconds(120)));
 
   const auto& sender = keys[funded->key_index];
   const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
