@@ -8057,10 +8057,26 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
     validation_error.clear();
     if (!consensus::validate_ingress_append(simulated_state, record.certificate, record.tx_bytes,
                                             expected_ingress_epoch, &validation_error)) {
-      if (error) *error = validation_error;
-      log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
-               " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
-      return false;
+      // Legacy compatibility for historical ingress lanes that started with
+      // pre-epoch-normalized certificates (seq=1 with zero prev root).
+      bool legacy_epoch_fallback_ok = false;
+      if (validation_error == "ingress-epoch-mismatch") {
+        const bool legacy_first_record_epoch =
+            expected_seq == 1 && record.certificate.prev_lane_root == zero_hash();
+        if (legacy_first_record_epoch) {
+          std::string legacy_validation_error;
+          legacy_epoch_fallback_ok = consensus::validate_ingress_append(
+              simulated_state, record.certificate, record.tx_bytes,
+              0, &legacy_validation_error);
+          if (!legacy_epoch_fallback_ok && error) *error = legacy_validation_error;
+        }
+      }
+      if (!legacy_epoch_fallback_ok) {
+        if (error && error->empty()) *error = validation_error;
+        log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
+                 " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
+        return false;
+      }
     }
     validation_error.clear();
     const auto committee = ingress_committee_locked(expected_ingress_epoch);
