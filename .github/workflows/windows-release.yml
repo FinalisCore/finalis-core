@@ -11,8 +11,10 @@ on:
 jobs:
   build-installer:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
     permissions:
-      contents: write
+      contents: read
     env:
       BUILD_PRESET: windows-msvc-release
       QT_VERSION: 5.15.2
@@ -84,6 +86,17 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "FINALIS_QT_PREFIX=$qtRoot" >> $env:GITHUB_ENV
           "VCPKG_ROOT=${{ github.workspace }}\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Require signing credentials for tagged release
+        if: ${{ github.ref_type == 'tag' }}
+        shell: pwsh
+        run: |
+          if (-not "${env:WINDOWS_SIGN_PFX_BASE64}") {
+            throw "Tagged releases require WINDOWS_SIGN_PFX_BASE64"
+          }
+          if (-not "${env:WINDOWS_SIGN_PFX_PASSWORD}") {
+            throw "Tagged releases require WINDOWS_SIGN_PFX_PASSWORD"
+          }
 
       - name: Configure
         shell: pwsh
@@ -192,8 +205,20 @@ jobs:
           name: finalis-core-installer-${{ steps.meta.outputs.version }}
           path: dist/installer/finalis-core_installer.exe
 
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: finalis-core-installer-${{ needs.build-installer.outputs.version }}
+          path: dist/installer
+
       - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
