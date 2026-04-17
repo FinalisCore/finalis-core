@@ -6457,6 +6457,10 @@ void WalletWindow::persist_wallet_view_snapshot() {
 
 void WalletWindow::submit_mint_deposit() {
   if (!ensure_wallet_loaded("Mint Deposit")) return;
+  if (mint_deposit_submit_in_flight_) {
+    statusBar()->showMessage("Mint deposit submission already in progress.", 2000);
+    return;
+  }
   const QString mint_url = mint_url_edit_->text().trimmed();
   const QString mint_id_hex = mint_id_edit_->text().trimmed();
   if (configured_lightserver_endpoints().isEmpty() || mint_url.isEmpty() || mint_id_hex.isEmpty()) {
@@ -6471,6 +6475,12 @@ void WalletWindow::submit_mint_deposit() {
   auto amount_units = parse_coin_amount(mint_deposit_amount_edit_->text());
   if (!amount_units || *amount_units == 0) {
     QMessageBox::warning(this, "Mint Deposit", "Enter a valid deposit amount.");
+    return;
+  }
+
+  const QStringList endpoints = ordered_lightserver_endpoints();
+  if (endpoints.isEmpty()) {
+    QMessageBox::warning(this, "Mint Deposit", "Configure at least one lightserver endpoint first.");
     return;
   }
 
@@ -6512,45 +6522,119 @@ void WalletWindow::submit_mint_deposit() {
     QMessageBox::warning(this, "Mint Deposit", QString::fromStdString(err));
     return;
   }
-  QString used_endpoint;
-  auto broadcast = broadcast_tx_with_failover(tx->serialize(), &err, &used_endpoint);
-  if (!broadcast || broadcast->outcome != lightserver::BroadcastOutcome::Sent) {
-    const QString reason = broadcast ? QString::fromStdString(broadcast->error) : QString::fromStdString(err);
-    QMessageBox::warning(this, "Mint Deposit", "Broadcast failed: " + reason);
-    return;
-  }
 
-  finalis::privacy::MintDepositRegistrationRequest req;
-  req.chain = "mainnet";
-  req.deposit_txid = tx->txid();
-  req.deposit_vout = 0;
-  req.mint_id = *mint_id;
-  req.recipient_pubkey_hash = own_decoded->pubkey_hash;
-  req.amount = *amount_units;
-  auto reg_body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/deposits/register").toStdString(),
-                                                  finalis::privacy::to_json(req), &err);
-  if (!reg_body) {
-    QMessageBox::warning(this, "Mint Deposit", "Mint registration failed: " + QString::fromStdString(err));
-    return;
-  }
-  auto reg = finalis::privacy::parse_mint_deposit_registration_response(*reg_body);
-  if (!reg || !reg->accepted) {
-    QMessageBox::warning(this, "Mint Deposit", "Mint registration was rejected.");
-    return;
-  }
+  struct MintDepositResult {
+    bool success{false};
+    QString error;
+    QString used_endpoint;
+    QString deposit_txid_hex;
+    QString mint_deposit_ref;
+  };
 
-  mint_deposit_ref_ = QString::fromStdString(reg->mint_deposit_ref);
-  mint_last_deposit_txid_ = QString::fromStdString(hex_encode32(tx->txid()));
-  mint_last_deposit_vout_ = 0;
-  save_wallet_local_state();
-  render_mint_state();
-  append_local_event(QString("[mint-deposit] %1 %2 ref=%3")
-                         .arg(format_coin_amount(*amount_units))
-                         .arg(elide_middle(mint_last_deposit_txid_, 12))
-                         .arg(mint_deposit_ref_));
-  refresh_chain_state(false);
-  const QString endpoint_note = used_endpoint.isEmpty() ? QString{} : QString(" via %1").arg(display_lightserver_endpoint(used_endpoint));
-  statusBar()->showMessage(QString("Mint deposit accepted for relay and registered%1.").arg(endpoint_note), 3000);
+  const Bytes tx_bytes = tx->serialize();
+  const Hash32 deposit_txid = tx->txid();
+  const auto recipient_pubkey_hash = own_decoded->pubkey_hash;
+  const auto mint_id_copy = *mint_id;
+  const std::uint64_t amount_units_copy = *amount_units;
+  const QString amount_text = format_coin_amount(*amount_units);
+
+  mint_deposit_submit_in_flight_ = true;
+  if (mint_deposit_button_) mint_deposit_button_->setEnabled(false);
+  statusBar()->showMessage("Submitting mint deposit...", 2000);
+
+  const std::uint64_t generation = ++mint_deposit_submit_generation_;
+  QPointer<WalletWindow> self(this);
+  std::thread([self, generation, tx_bytes, deposit_txid, mint_url, endpoints, mint_id_copy, recipient_pubkey_hash,
+               amount_units_copy]() mutable {
+    MintDepositResult result;
+
+    std::string last_broadcast_err;
+    bool sent = false;
+    for (int i = 0; i < endpoints.size(); ++i) {
+      const QString endpoint = endpoints[i];
+      std::string call_err;
+      auto broadcast = lightserver::rpc_broadcast_tx(endpoint.toStdString(), tx_bytes, &call_err);
+      if (broadcast.outcome == lightserver::BroadcastOutcome::Ambiguous) {
+        if (!call_err.empty()) last_broadcast_err = call_err;
+        continue;
+      }
+      if (broadcast.outcome != lightserver::BroadcastOutcome::Sent) {
+        last_broadcast_err = !broadcast.error.empty() ? broadcast.error : call_err;
+        continue;
+      }
+      result.used_endpoint = endpoint;
+      sent = true;
+      break;
+    }
+    if (!sent) {
+      result.error = QString("Broadcast failed: %1")
+                         .arg(last_broadcast_err.empty() ? "unable to submit transaction" : QString::fromStdString(last_broadcast_err));
+      QMetaObject::invokeMethod(
+          self,
+          [self, generation, result = std::move(result)]() mutable {
+            if (!self) return;
+            if (generation != self->mint_deposit_submit_generation_) return;
+            self->mint_deposit_submit_in_flight_ = false;
+            if (self->mint_deposit_button_) self->mint_deposit_button_->setEnabled(true);
+            QMessageBox::warning(self, "Mint Deposit", result.error);
+          },
+          Qt::QueuedConnection);
+      return;
+    }
+
+    std::string err;
+    finalis::privacy::MintDepositRegistrationRequest req;
+    req.chain = "mainnet";
+    req.deposit_txid = deposit_txid;
+    req.deposit_vout = 0;
+    req.mint_id = mint_id_copy;
+    req.recipient_pubkey_hash = recipient_pubkey_hash;
+    req.amount = amount_units_copy;
+    auto reg_body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/deposits/register").toStdString(),
+                                                    finalis::privacy::to_json(req), &err);
+    if (!reg_body) {
+      result.error = "Mint registration failed: " + QString::fromStdString(err);
+    } else {
+      auto reg = finalis::privacy::parse_mint_deposit_registration_response(*reg_body);
+      if (!reg || !reg->accepted) {
+        result.error = "Mint registration was rejected.";
+      } else {
+        result.success = true;
+        result.deposit_txid_hex = QString::fromStdString(hex_encode32(deposit_txid));
+        result.mint_deposit_ref = QString::fromStdString(reg->mint_deposit_ref);
+      }
+    }
+
+    QMetaObject::invokeMethod(
+        self,
+        [self, generation, amount_text, result = std::move(result)]() mutable {
+          if (!self) return;
+          if (generation != self->mint_deposit_submit_generation_) return;
+
+          self->mint_deposit_submit_in_flight_ = false;
+          if (self->mint_deposit_button_) self->mint_deposit_button_->setEnabled(true);
+
+          if (!result.success) {
+            QMessageBox::warning(self, "Mint Deposit", result.error);
+            return;
+          }
+
+          self->mint_deposit_ref_ = result.mint_deposit_ref;
+          self->mint_last_deposit_txid_ = result.deposit_txid_hex;
+          self->mint_last_deposit_vout_ = 0;
+          self->save_wallet_local_state();
+          self->render_mint_state();
+          self->append_local_event(QString("[mint-deposit] %1 %2 ref=%3")
+                                       .arg(amount_text)
+                                       .arg(elide_middle(self->mint_last_deposit_txid_, 12))
+                                       .arg(self->mint_deposit_ref_));
+          self->refresh_chain_state(false);
+          const QString endpoint_note =
+              result.used_endpoint.isEmpty() ? QString{} : QString(" via %1").arg(display_lightserver_endpoint(result.used_endpoint));
+          self->statusBar()->showMessage(QString("Mint deposit accepted for relay and registered%1.").arg(endpoint_note), 3000);
+        },
+        Qt::QueuedConnection);
+  }).detach();
 }
 
 void WalletWindow::issue_mint_note() {
@@ -6607,6 +6691,10 @@ void WalletWindow::issue_mint_note() {
 
 void WalletWindow::submit_mint_redemption() {
   if (!ensure_wallet_loaded("Redeem")) return;
+  if (mint_redeem_submit_in_flight_) {
+    statusBar()->showMessage("Mint redemption submission already in progress.", 2000);
+    return;
+  }
   const QString mint_url = mint_url_edit_->text().trimmed();
   if (mint_url.isEmpty()) {
     QMessageBox::warning(this, "Redeem", "Configure a mint URL first.");
@@ -6631,39 +6719,75 @@ void WalletWindow::submit_mint_redemption() {
   std::vector<std::string> selected_notes;
   for (auto idx : *selected_indexes) selected_notes.push_back(mint_notes_[idx].note_ref.toStdString());
 
-  finalis::privacy::MintRedemptionRequest req;
-  req.notes = selected_notes;
-  req.redeem_address = redeem_address.toStdString();
-  req.amount = *amount_units;
-  std::string err;
-  auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/redemptions/create").toStdString(),
-                                              finalis::privacy::to_json(req), &err);
-  if (!body) {
-    QMessageBox::warning(this, "Redeem", "Mint redemption failed: " + QString::fromStdString(err));
-    return;
-  }
-  auto resp = finalis::privacy::parse_mint_redemption_response(*body);
-  if (!resp || !resp->accepted) {
-    QMessageBox::warning(this, "Redeem", "Mint redemption was rejected.");
-    return;
-  }
+  struct MintRedeemResult {
+    bool success{false};
+    QString error;
+    QString batch_id;
+  };
 
-  mint_last_redemption_batch_id_ = QString::fromStdString(resp->redemption_batch_id);
-  for (const auto& note_ref : selected_notes) {
-    auto it = std::find_if(mint_notes_.begin(), mint_notes_.end(),
-                           [&](const MintNote& note) { return note.note_ref.toStdString() == note_ref; });
-    if (it != mint_notes_.end()) (void)store_.upsert_mint_note(note_ref, it->amount, false);
-    mint_notes_.erase(std::remove_if(mint_notes_.begin(), mint_notes_.end(),
-                                     [&](const MintNote& note) { return note.note_ref.toStdString() == note_ref; }),
-                      mint_notes_.end());
-  }
-  save_wallet_local_state();
-  render_mint_state();
-  append_local_event(QString("[mint-redeem] batch=%1 amount=%2 notes=%3")
-                         .arg(mint_last_redemption_batch_id_)
-                         .arg(format_coin_amount(*amount_units))
-                         .arg(selected_notes.size()));
-  statusBar()->showMessage("Mint redemption created.", 3000);
+  const std::uint64_t amount_units_copy = *amount_units;
+  const QString amount_text = format_coin_amount(*amount_units);
+
+  mint_redeem_submit_in_flight_ = true;
+  if (mint_redeem_button_) mint_redeem_button_->setEnabled(false);
+  statusBar()->showMessage("Submitting mint redemption...", 2000);
+
+  const std::uint64_t generation = ++mint_redeem_submit_generation_;
+  QPointer<WalletWindow> self(this);
+  std::thread([self, generation, mint_url, redeem_address, selected_notes, amount_units_copy]() mutable {
+    MintRedeemResult result;
+    finalis::privacy::MintRedemptionRequest req;
+    req.notes = selected_notes;
+    req.redeem_address = redeem_address.toStdString();
+    req.amount = amount_units_copy;
+    std::string err;
+    auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/redemptions/create").toStdString(),
+                                                finalis::privacy::to_json(req), &err);
+    if (!body) {
+      result.error = "Mint redemption failed: " + QString::fromStdString(err);
+    } else {
+      auto resp = finalis::privacy::parse_mint_redemption_response(*body);
+      if (!resp || !resp->accepted) {
+        result.error = "Mint redemption was rejected.";
+      } else {
+        result.success = true;
+        result.batch_id = QString::fromStdString(resp->redemption_batch_id);
+      }
+    }
+
+    QMetaObject::invokeMethod(
+        self,
+        [self, generation, selected_notes, amount_text, result = std::move(result)]() mutable {
+          if (!self) return;
+          if (generation != self->mint_redeem_submit_generation_) return;
+
+          self->mint_redeem_submit_in_flight_ = false;
+          if (self->mint_redeem_button_) self->mint_redeem_button_->setEnabled(true);
+
+          if (!result.success) {
+            QMessageBox::warning(self, "Redeem", result.error);
+            return;
+          }
+
+          self->mint_last_redemption_batch_id_ = result.batch_id;
+          for (const auto& note_ref : selected_notes) {
+            auto it = std::find_if(self->mint_notes_.begin(), self->mint_notes_.end(),
+                                   [&](const MintNote& note) { return note.note_ref.toStdString() == note_ref; });
+            if (it != self->mint_notes_.end()) (void)self->store_.upsert_mint_note(note_ref, it->amount, false);
+            self->mint_notes_.erase(std::remove_if(self->mint_notes_.begin(), self->mint_notes_.end(),
+                                                   [&](const MintNote& note) { return note.note_ref.toStdString() == note_ref; }),
+                                    self->mint_notes_.end());
+          }
+          self->save_wallet_local_state();
+          self->render_mint_state();
+          self->append_local_event(QString("[mint-redeem] batch=%1 amount=%2 notes=%3")
+                                       .arg(self->mint_last_redemption_batch_id_)
+                                       .arg(amount_text)
+                                       .arg(selected_notes.size()));
+          self->statusBar()->showMessage("Mint redemption created.", 3000);
+        },
+        Qt::QueuedConnection);
+  }).detach();
 }
 
 void WalletWindow::refresh_mint_redemption_status() {
