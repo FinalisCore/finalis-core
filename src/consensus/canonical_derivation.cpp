@@ -2002,29 +2002,36 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
   checkpoint.qualified_depth = decision.adaptive.qualified_depth;
   checkpoint.target_expand_streak = decision.adaptive.target_expand_streak;
   checkpoint.target_contract_streak = decision.adaptive.target_contract_streak;
-  checkpoint.ordered_members =
-      select_finalized_committee(active, checkpoint.epoch_seed,
-                                 std::min<std::size_t>({cfg.max_committee,
-                                                        static_cast<std::size_t>(decision.effective_committee_size),
-                                                        active.size()}));
-  checkpoint.ordered_operator_ids.reserve(checkpoint.ordered_members.size());
-  checkpoint.ordered_base_weights.reserve(checkpoint.ordered_members.size());
-  checkpoint.ordered_ticket_bonus_bps.reserve(checkpoint.ordered_members.size());
-  checkpoint.ordered_final_weights.reserve(checkpoint.ordered_members.size());
-  checkpoint.ordered_ticket_hashes.reserve(checkpoint.ordered_members.size());
-  checkpoint.ordered_ticket_nonces.reserve(checkpoint.ordered_members.size());
-  for (const auto& pub : checkpoint.ordered_members) {
-    auto it = std::find_if(active.begin(), active.end(), [&](const auto& candidate) { return candidate.pubkey == pub; });
-    if (it == active.end()) {
-      if (error) *error = "checkpoint-member-missing-from-candidates";
-      return false;
-    }
-    checkpoint.ordered_operator_ids.push_back(it->selection_id == PubKey32{} ? it->pubkey : it->selection_id);
-    checkpoint.ordered_base_weights.push_back(it->effective_weight);
-    checkpoint.ordered_ticket_bonus_bps.push_back(it->ticket_bonus_bps);
-    checkpoint.ordered_final_weights.push_back(finalized_committee_candidate_strength(*it));
-    checkpoint.ordered_ticket_hashes.push_back(it->ticket_work_hash);
-    checkpoint.ordered_ticket_nonces.push_back(it->ticket_nonce);
+  std::vector<FinalizedCommitteeCandidate> ticket_ranked;
+  ticket_ranked.reserve(active.size());
+  for (const auto& candidate : active) {
+    if (candidate.ticket_work_hash == Hash32{}) continue;
+    ticket_ranked.push_back(candidate);
+  }
+  std::sort(ticket_ranked.begin(), ticket_ranked.end(), [](const auto& a, const auto& b) {
+    if (a.ticket_work_hash != b.ticket_work_hash) return a.ticket_work_hash < b.ticket_work_hash;
+    if (a.ticket_nonce != b.ticket_nonce) return a.ticket_nonce < b.ticket_nonce;
+    return a.pubkey < b.pubkey;
+  });
+  const auto take = std::min<std::size_t>({cfg.max_committee,
+                                           static_cast<std::size_t>(decision.effective_committee_size),
+                                           ticket_ranked.size()});
+  checkpoint.ordered_members.reserve(take);
+  checkpoint.ordered_operator_ids.reserve(take);
+  checkpoint.ordered_base_weights.reserve(take);
+  checkpoint.ordered_ticket_bonus_bps.reserve(take);
+  checkpoint.ordered_final_weights.reserve(take);
+  checkpoint.ordered_ticket_hashes.reserve(take);
+  checkpoint.ordered_ticket_nonces.reserve(take);
+  for (std::size_t i = 0; i < take; ++i) {
+    const auto& candidate = ticket_ranked[i];
+    checkpoint.ordered_members.push_back(candidate.pubkey);
+    checkpoint.ordered_operator_ids.push_back(candidate.selection_id == PubKey32{} ? candidate.pubkey : candidate.selection_id);
+    checkpoint.ordered_base_weights.push_back(candidate.effective_weight);
+    checkpoint.ordered_ticket_bonus_bps.push_back(candidate.ticket_bonus_bps);
+    checkpoint.ordered_final_weights.push_back(finalized_committee_candidate_strength(candidate));
+    checkpoint.ordered_ticket_hashes.push_back(candidate.ticket_work_hash);
+    checkpoint.ordered_ticket_nonces.push_back(candidate.ticket_nonce);
   }
   *out = std::move(checkpoint);
   return true;

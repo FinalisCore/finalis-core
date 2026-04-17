@@ -7403,15 +7403,23 @@ bool Node::load_state() {
     if (!finalized_checkpoint_matches_epoch_snapshot(checkpoint, *snapshot)) {
       log_line("canonical-cache-rewrite source=load-state-checkpoint-snapshot-mismatch epoch=" +
                std::to_string(epoch_start));
-      const auto rewritten_snapshot = epoch_committee_snapshot_from_checkpoint(checkpoint);
-      if (!db_.put_epoch_committee_snapshot(rewritten_snapshot)) {
-        log_line("finalized-state-invariant-violation source=load-state-checkpoint-snapshot-rewrite-failed epoch=" +
+      checkpoint.ordered_members = snapshot->ordered_members;
+      checkpoint.ordered_ticket_hashes.clear();
+      checkpoint.ordered_ticket_nonces.clear();
+      checkpoint.ordered_ticket_hashes.reserve(snapshot->selected_winners.size());
+      checkpoint.ordered_ticket_nonces.reserve(snapshot->selected_winners.size());
+      for (const auto& winner : snapshot->selected_winners) {
+        checkpoint.ordered_ticket_hashes.push_back(winner.work_hash);
+        checkpoint.ordered_ticket_nonces.push_back(winner.nonce);
+      }
+      if (!db_.put_finalized_committee_checkpoint(checkpoint)) {
+        log_line("finalized-state-invariant-violation source=load-state-checkpoint-repair-failed epoch=" +
                  std::to_string(epoch_start));
-        std::cerr << "load_state: checkpoint snapshot rewrite failed epoch=" << epoch_start << "\n";
+        std::cerr << "load_state: checkpoint repair failed epoch=" << epoch_start << "\n";
         return false;
       }
       if (epoch_committee_closed_locked(epoch_start)) {
-        const auto marker = make_epoch_committee_freeze_marker_locked(rewritten_snapshot);
+        const auto marker = make_epoch_committee_freeze_marker_locked(*snapshot);
         if (!db_.put_epoch_committee_freeze_marker(marker)) {
           log_line("finalized-state-invariant-violation source=load-state-checkpoint-freeze-marker-rewrite-failed epoch=" +
                    std::to_string(epoch_start));

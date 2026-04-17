@@ -294,6 +294,7 @@ TEST(test_sconbreg_admission_pow_valid_nonce_is_accepted_and_disabled_mode_prese
 TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_anchor_and_wrong_payout_binding) {
   auto net = mainnet_network();
   net.onboarding_admission_pow_difficulty_bits = 4;
+  net.committee_epoch_blocks = 16;
   const auto chain_id = sample_chain_id(net);
   Hash32 anchor{};
   anchor.fill(0x77);
@@ -327,18 +328,37 @@ TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_ancho
   OnboardingRegistrationScriptData parsed{};
   ASSERT_TRUE(parse_onboarding_registration_script(valid_tx->outputs[0].script_pubkey, &parsed));
 
+  const auto pow_anchor = admission_pow_epoch_anchor_hash(
+      parsed.admission_pow_epoch, net.committee_epoch_blocks, valid_ctx.finalized_hash_at_height);
+  ASSERT_TRUE(pow_anchor.has_value());
+  const auto pow_challenge = admission_pow_challenge(
+      admission_pow_chain_id_hash(chain_id), parsed.admission_pow_epoch, *pow_anchor, validator.public_key,
+      onboarding_registration_commitment(validator.public_key, payout.public_key));
+  std::uint64_t bad_nonce = parsed.admission_pow_nonce + 1;
+  while (leading_zero_bits(admission_pow_work_hash(pow_challenge, bad_nonce)) >=
+         net.onboarding_admission_pow_difficulty_bits) {
+    ++bad_nonce;
+  }
   auto bad_nonce_script = onboarding_registration_script_with_pow(
-      validator.public_key, payout.public_key, parsed.pop, parsed.admission_pow_epoch, parsed.admission_pow_nonce + 1);
+      validator.public_key, payout.public_key, parsed.pop, parsed.admission_pow_epoch, bad_nonce);
   auto bad_nonce_tx = build_signed_p2pkh_tx_single_input(
       spend_op, prev_out, sponsor.private_key,
       std::vector<TxOut>{TxOut{0, bad_nonce_script}, TxOut{prev_out.value - 1000, prev_out.script_pubkey}});
   ASSERT_TRUE(bad_nonce_tx.has_value());
   ASSERT_TRUE(!validate_tx(*bad_nonce_tx, 1, view, &valid_ctx).ok);
 
-  Hash32 wrong_anchor{};
-  wrong_anchor.fill(0x78);
-  auto wrong_anchor_ctx = join_pow_ctx(net, chain_id, 33, wrong_anchor);
-  ASSERT_TRUE(!validate_tx(*valid_tx, 1, view, &wrong_anchor_ctx).ok);
+  bool wrong_anchor_rejected = false;
+  for (std::uint32_t i = 0; i < 256; ++i) {
+    Hash32 wrong_anchor{};
+    wrong_anchor.fill(static_cast<std::uint8_t>(0x78 + i));
+    if (wrong_anchor == anchor) continue;
+    auto wrong_anchor_ctx = join_pow_ctx(net, chain_id, 33, wrong_anchor);
+    if (!validate_tx(*valid_tx, 1, view, &wrong_anchor_ctx).ok) {
+      wrong_anchor_rejected = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(wrong_anchor_rejected);
 
   auto expired_ctx = join_pow_ctx(net, chain_id, 97, anchor);
   ASSERT_TRUE(!validate_tx(*valid_tx, 1, view, &expired_ctx).ok);
