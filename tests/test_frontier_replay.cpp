@@ -12,9 +12,11 @@
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/ingress.hpp"
+#include "consensus/randomness.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "storage/db.hpp"
+#include "utxo/validate.hpp"
 #include "utxo/signing.hpp"
 
 using namespace finalis;
@@ -48,6 +50,46 @@ Bytes raw_signed_spend(const OutPoint& op, const TxOut& prev, const crypto::KeyP
   return tx->serialize();
 }
 
+Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
+  Bytes ss;
+  ss.push_back(0x40);
+  ss.insert(ss.end(), sig.begin(), sig.end());
+  ss.push_back(0x20);
+  ss.insert(ss.end(), pub.begin(), pub.end());
+  return ss;
+}
+
+Bytes onboarding_registration_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
+  Bytes s{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
+  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
+  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
+  s.insert(s.end(), pop.begin(), pop.end());
+  return s;
+}
+
+Bytes raw_signed_spend_v2_with_outputs(const OutPoint& op, const crypto::KeyPair& from,
+                                       const std::vector<TxOutV2>& outputs, std::uint64_t fee) {
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op.txid,
+      .prev_index = op.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::Transparent,
+      .witness = TransparentInputWitnessV2{},
+  });
+  tx.outputs = outputs;
+  tx.fee = fee;
+  tx.balance_proof.excess_commitment = crypto::Commitment33{};
+  tx.balance_proof.excess_pubkey.fill(0);
+  tx.balance_proof.excess_sig.fill(0);
+  auto msg = signing_message_for_input_v2(tx, 0);
+  if (!msg.has_value()) throw std::runtime_error("failed to build v2 sighash");
+  auto sig = crypto::ed25519_sign(*msg, from.private_key);
+  if (!sig.has_value()) throw std::runtime_error("failed to sign v2 spend");
+  std::get<TransparentInputWitnessV2>(tx.inputs[0].witness).script_sig = make_p2pkh_script_sig(*sig, from.public_key);
+  return tx.serialize();
+}
+
 consensus::CanonicalDerivationConfig test_cfg() {
   consensus::CanonicalDerivationConfig cfg;
   cfg.network = mainnet_network();
@@ -63,7 +105,8 @@ consensus::CanonicalDerivationConfig test_cfg() {
 consensus::CanonicalDerivationConfig live_activation_cfg() {
   auto cfg = test_cfg();
   cfg.network.committee_epoch_blocks = 4;
-  cfg.network.admission_pow_difficulty_bits = 0;
+  cfg.network.onboarding_admission_pow_difficulty_bits = 0;
+  cfg.network.validator_join_admission_pow_difficulty_bits = 0;
   cfg.max_committee = 8;
   cfg.validator_min_bond_override = BOND_AMOUNT;
   cfg.validator_bond_min_amount = BOND_AMOUNT;
@@ -157,21 +200,31 @@ consensus::CanonicalDerivedState build_parent_state_with_utxo(const consensus::C
 
 consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::CanonicalDerivedState& parent_state,
                                                          const std::vector<Bytes>& ordered_records,
-                                                         FrontierVector* next_vector_out = nullptr) {
+                                                         FrontierVector* next_vector_out = nullptr,
+                                                         std::uint64_t epoch_blocks = 0) {
   consensus::CertifiedIngressLaneRecords lane_records;
+  const auto signer = key_from_byte(90);
   FrontierVector next_vector = parent_state.finalized_frontier_vector;
   auto lane_roots = parent_state.finalized_lane_roots;
+  const auto next_height = parent_state.finalized_height + 1;
+  const std::uint64_t cert_epoch = (epoch_blocks > 0)
+      ? consensus::committee_epoch_start(next_height, epoch_blocks)
+      : 1;
   for (const auto& raw : ordered_records) {
-    auto tx = Tx::parse(raw);
+    auto tx = parse_any_tx(raw);
     if (!tx.has_value()) throw std::runtime_error("failed to parse ordered test tx");
     const auto lane = consensus::assign_ingress_lane(*tx);
     IngressCertificate cert;
-    cert.epoch = 1;
+    cert.epoch = cert_epoch;
     cert.lane = lane;
     cert.seq = ++next_vector.lane_max_seq[lane];
-    cert.txid = tx->txid();
+    cert.txid = txid_any(*tx);
     cert.tx_hash = crypto::sha256d(raw);
     cert.prev_lane_root = lane_roots[lane];
+    const auto signing_hash = cert.signing_hash();
+    const auto sig = crypto::ed25519_sign(Bytes(signing_hash.begin(), signing_hash.end()), signer.private_key);
+    if (!sig.has_value()) throw std::runtime_error("failed to sign ingress certificate");
+    cert.sigs = {FinalitySig{signer.public_key, *sig}};
     lane_roots[lane] = consensus::compute_lane_root_append(lane_roots[lane], cert.tx_hash);
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
   }
@@ -183,13 +236,14 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
                                                         const std::vector<Bytes>& ordered_records,
                                                         const consensus::CanonicalDerivationConfig& cfg = test_cfg(),
                                                         std::uint32_t round = 0,
-                                                        const std::vector<PubKey32>& observed_signers = {}) {
+                                                        const std::vector<PubKey32>& observed_signers = {},
+                                                        const SpecialValidationContext* vctx = nullptr) {
   FrontierVector next_vector;
-  auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector);
+  auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector, cfg.network.committee_epoch_blocks);
   consensus::FrontierExecutionResult result;
   std::string err;
   if (!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.finalized_frontier_vector, next_vector,
-                                               lane_records, parent_state.finalized_lane_roots, nullptr, &result, &err)) {
+                                               lane_records, parent_state.finalized_lane_roots, vctx, &result, &err)) {
     throw std::runtime_error("frontier execution failed: " + err);
   }
   const auto height = parent_state.finalized_height + 1;
@@ -1373,6 +1427,123 @@ TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_act
   ASSERT_EQ(checkpoint_a.ordered_members, checkpoint_b.ordered_members);
   ASSERT_EQ(checkpoint_a.ordered_operator_ids, checkpoint_b.ordered_operator_ids);
   ASSERT_EQ(checkpoint_a.ordered_final_weights, checkpoint_b.ordered_final_weights);
+}
+
+TEST(test_frontier_lane_prefix_rejects_stale_ingress_epoch_with_context) {
+  auto cfg = test_cfg();
+  cfg.network.committee_epoch_blocks = 4;
+
+  const auto from = key_from_byte(110);
+  const auto to = key_from_byte(111);
+  OutPoint op{};
+  op.txid.fill(0xA1);
+  op.index = 0;
+  auto parent_state = build_parent_state_with_utxo(cfg, 0, op, p2pkh_out_for_pub(from.public_key, 10'000));
+  parent_state.finalized_height = 4;
+
+  const auto raw = raw_signed_spend(op, p2pkh_out_for_pub(from.public_key, 10'000), from, to.public_key, 9'800);
+  FrontierVector next_vector;
+  auto lane_records = make_lane_records(parent_state, {raw}, &next_vector);
+
+  SpecialValidationContext ctx;
+  ctx.network = &cfg.network;
+  ctx.current_height = 5;
+
+  consensus::FrontierExecutionResult result;
+  std::string err;
+  ASSERT_TRUE(!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.finalized_frontier_vector,
+                                                       next_vector, lane_records, parent_state.finalized_lane_roots,
+                                                       &ctx, &result, &err));
+  ASSERT_TRUE(err.find("frontier-certified-ingress-epoch-mismatch") != std::string::npos);
+}
+
+TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
+  auto cfg = live_activation_cfg();
+  cfg.confidential_policy.activation_height = 0;
+
+  const auto from = key_from_byte(0xA2);
+  const auto validator = key_from_byte(0xA3);
+  const auto payout = key_from_byte(0xA4);
+
+  OutPoint op{};
+  op.txid.fill(0xB1);
+  op.index = 0;
+  auto parent_state = build_parent_state_with_utxo(cfg, 0, op, p2pkh_out_for_pub(from.public_key, 10'000));
+
+  const auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+                                        validator.private_key);
+  ASSERT_TRUE(pop.has_value());
+
+  std::vector<TxOutV2> outputs;
+  outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
+                            .body = TransparentTxOutV2{0,
+                                                       onboarding_registration_script(validator.public_key,
+                                                                                      payout.public_key, *pop)}});
+  outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
+                            .body = TransparentTxOutV2{9'500, p2pkh_script_for_pub(payout.public_key)}});
+  const auto raw = raw_signed_spend_v2_with_outputs(op, from, outputs, 500);
+
+  SpecialValidationContext vctx;
+  vctx.network = &cfg.network;
+  vctx.current_height = 1;
+  vctx.confidential_policy = &cfg.confidential_policy;
+
+  const auto record = make_frontier_record(parent_state, {raw}, cfg, 0, {}, &vctx);
+
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(cfg, parent_state, record, &out, &err));
+  const auto info = out.validators.get(validator.public_key);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_EQ(info->status, consensus::ValidatorStatus::ONBOARDING);
+}
+
+TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
+  auto cfg = live_activation_cfg();
+  cfg.max_committee = 5;
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  const auto v0 = key_from_byte(101);
+  const auto v1 = key_from_byte(102);
+  const auto v2 = key_from_byte(103);
+  const auto v3 = key_from_byte(104);
+  const auto v4 = key_from_byte(105);
+  genesis.initial_validators = {v0.public_key, v1.public_key, v2.public_key, v3.public_key, v4.public_key};
+
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  state.finalized_height = 4;
+  state.finalized_committee_checkpoints[1].ticket_difficulty_bits = 12;
+
+  bool found_nonqualifying_selected_member = false;
+  for (std::uint8_t seed_b = 1; seed_b < 64 && !found_nonqualifying_selected_member; ++seed_b) {
+    Hash32 epoch_randomness{};
+    epoch_randomness.fill(seed_b);
+    state.committee_epoch_randomness_cache[5] = epoch_randomness;
+
+    storage::FinalizedCommitteeCheckpoint checkpoint;
+    ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
+    ASSERT_EQ(checkpoint.ticket_difficulty_bits, 12u);
+
+    for (std::size_t i = 0; i < checkpoint.ordered_members.size(); ++i) {
+      const auto operator_id = i < checkpoint.ordered_operator_ids.size() ? checkpoint.ordered_operator_ids[i]
+                                                                          : checkpoint.ordered_members[i];
+      const auto ticket = consensus::best_epoch_ticket_for_operator_id(5, checkpoint.epoch_seed, operator_id, 5,
+                                                                       consensus::EPOCH_TICKET_MAX_NONCE);
+      ASSERT_TRUE(ticket.has_value());
+      if (consensus::epoch_ticket_meets_difficulty(*ticket, checkpoint.ticket_difficulty_bits)) continue;
+
+      ASSERT_EQ(checkpoint.ordered_ticket_bonus_bps[i], 0u);
+      ASSERT_EQ(checkpoint.ordered_ticket_hashes[i], Hash32{});
+      ASSERT_EQ(checkpoint.ordered_ticket_nonces[i], 0u);
+      found_nonqualifying_selected_member = true;
+      break;
+    }
+  }
+
+  ASSERT_TRUE(found_nonqualifying_selected_member);
 }
 
 TEST(test_adaptive_committee_target_tracks_qualified_depth_staircase) {

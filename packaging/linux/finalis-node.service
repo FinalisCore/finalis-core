@@ -1,0 +1,42 @@
+[Unit]
+Description=Finalis Node
+Documentation=https://github.com/finalis-core/finalis-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=finalis
+Group=finalis
+WorkingDirectory=/opt/finalis-core
+Environment="FINALIS_HOME=/var/lib/finalis"
+
+# Paths - adjust to your deployment location
+ExecStart=/opt/finalis-core/bin/finalis-node \
+    --db ${FINALIS_HOME}/mainnet \
+    --genesis /opt/finalis-core/mainnet/genesis.bin \
+    --port 19440 \
+    --listen \
+    --bind 0.0.0.0 \
+    --public \
+    --with-lightserver \
+    --lightserver-bind 0.0.0.0 \
+    --lightserver-port 19444 \
+    --no-dns-seeds \
+    --outbound-target 8
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=finalis-node
+
+# Restart behavior
+Restart=on-failure
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

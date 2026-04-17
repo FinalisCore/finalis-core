@@ -303,7 +303,8 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
   // therefore accounted but not paid into the transition settlement outputs.
   // This keeps the live payload independent of the round leader.
   const auto payout =
-      compute_epoch_settlement_payout(settlement_rewards, settled_epoch_fees, reserve_subsidy, leader_pubkey, settlement_scores);
+      compute_epoch_settlement_payout(settlement_rewards, settled_epoch_fees, reserve_subsidy, leader_pubkey,
+                                      settlement_scores, {});
   settlement.settled_epoch_fees = payout.settled_epoch_fees;
   settlement.settled_epoch_rewards = payout.settled_epoch_rewards;
   settlement.reserve_subsidy_units = payout.reserve_subsidy_units;
@@ -435,12 +436,10 @@ ValidatorBestTicket checkpoint_best_ticket_for_member(const CanonicalDerivationC
   }
   auto ticket = best_epoch_ticket_for_operator_id(checkpoint.epoch_start_height, checkpoint.epoch_seed, operator_id,
                                                   checkpoint.epoch_start_height, EPOCH_TICKET_MAX_NONCE);
-  if (ticket.has_value()) return ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
-  return ValidatorBestTicket{
-      pub,
-      make_epoch_ticket_work_hash(checkpoint.epoch_start_height, checkpoint.epoch_seed, operator_id, 0),
-      0,
-  };
+  if (ticket.has_value() && epoch_ticket_meets_difficulty(*ticket, checkpoint.ticket_difficulty_bits)) {
+    return ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
+  }
+  return ValidatorBestTicket{pub, Hash32{}, 0};
 }
 
 std::vector<ValidatorBestTicket> checkpoint_winners(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
@@ -508,7 +507,7 @@ std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_heig
     input.operator_id = operator_id;
     input.bonded_amount = seed.bonded_amount;
     auto ticket = best_epoch_ticket_for_operator_id(epoch_start, epoch_seed, operator_id, epoch_start, EPOCH_TICKET_MAX_NONCE);
-    if (ticket.has_value()) {
+    if (ticket.has_value() && epoch_ticket_meets_difficulty(*ticket, ticket_difficulty_bits)) {
       input.ticket_work_hash = ticket->work_hash;
       input.ticket_nonce = ticket->nonce;
       input.ticket_bonus_bps = ticket_pow_bonus_bps(*ticket, ticket_difficulty_bits, econ.ticket_bonus_cap_bps);
@@ -751,7 +750,7 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
 }
 
 void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
-                                            const std::vector<Tx>& txs, std::size_t input_start_index,
+                                            const std::vector<AnyTx>& txs, std::size_t input_start_index,
                                             const UtxoSetV2& pre_utxos, std::uint64_t height) {
   state->validators.set_rules(ValidatorRules{
       .min_bond = effective_validator_min_bond_for_height(cfg, *state, height),
@@ -765,7 +764,9 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
 
   for (size_t txi = input_start_index; txi < txs.size(); ++txi) {
     const auto& tx = txs[txi];
-    for (const auto& in : tx.inputs) {
+    if (!std::holds_alternative<Tx>(tx)) continue;
+    const auto& legacy = std::get<Tx>(tx);
+    for (const auto& in : legacy.inputs) {
       OutPoint op{in.prev_txid, in.prev_index};
       auto it = pre_utxos.find(op);
       if (it == pre_utxos.end()) continue;
@@ -790,30 +791,67 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
   }
 
   for (const auto& tx : txs) {
-    const Hash32 txid = tx.txid();
-    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-      const auto& out = tx.outputs[out_i];
+    const Hash32 txid = txid_any(tx);
+    struct ScriptOutput {
+      std::uint32_t index{0};
+      std::uint64_t value{0};
+      Bytes script_pubkey;
+    };
+    std::vector<ScriptOutput> outputs;
+    if (std::holds_alternative<Tx>(tx)) {
+      const auto& legacy = std::get<Tx>(tx);
+      outputs.reserve(legacy.outputs.size());
+      for (std::uint32_t out_i = 0; out_i < legacy.outputs.size(); ++out_i) {
+        outputs.push_back(ScriptOutput{out_i, legacy.outputs[out_i].value, legacy.outputs[out_i].script_pubkey});
+      }
+    } else {
+      const auto& v2 = std::get<TxV2>(tx);
+      outputs.reserve(v2.outputs.size());
+      for (std::uint32_t out_i = 0; out_i < v2.outputs.size(); ++out_i) {
+        const auto& out = v2.outputs[out_i];
+        if (out.kind != TxOutputKind::Transparent) continue;
+        const auto& transparent = std::get<TransparentTxOutV2>(out.body);
+        outputs.push_back(ScriptOutput{out_i, transparent.value, transparent.script_pubkey});
+      }
+    }
+
+    for (const auto& out : outputs) {
+      PubKey32 onboarding_validator_pub{};
+      PubKey32 onboarding_payout_pub{};
+      Sig64 onboarding_pop{};
+      if (is_onboarding_registration_script(out.script_pubkey, &onboarding_validator_pub, &onboarding_payout_pub,
+                                            &onboarding_pop)) {
+        std::string err;
+        (void)state->validators.register_onboarding(
+            onboarding_validator_pub, height, &err,
+            canonical_operator_id_from_join_request(onboarding_payout_pub));
+        continue;
+      }
       PubKey32 validator_pub{};
       PubKey32 payout_pub{};
       Sig64 pop{};
       if (!is_validator_join_request_script(out.script_pubkey, &validator_pub, &payout_pub, &pop)) continue;
 
-      for (std::uint32_t bond_i = 0; bond_i < tx.outputs.size(); ++bond_i) {
+      for (const auto& bond_out : outputs) {
         PubKey32 bond_pub{};
-        if (!is_validator_register_script(tx.outputs[bond_i].script_pubkey, &bond_pub) || bond_pub != validator_pub) continue;
+        if (!is_validator_register_script(bond_out.script_pubkey, &bond_pub) || bond_pub != validator_pub) continue;
         ValidatorJoinRequest req;
         req.request_txid = txid;
         req.validator_pubkey = validator_pub;
         req.payout_pubkey = payout_pub;
-        req.bond_outpoint = OutPoint{txid, bond_i};
-        req.bond_amount = tx.outputs[bond_i].value;
+        req.bond_outpoint = OutPoint{txid, bond_out.index};
+        req.bond_amount = bond_out.value;
         req.requested_height = height;
-        req.status = ValidatorJoinRequestStatus::APPROVED;
-        req.approved_height = height;
-        state->validator_join_requests[txid] = req;
+        if (cfg.validator_join_limit_window_blocks > 0 && cfg.validator_join_limit_max_new > 0 &&
+            state->validator_join_count_in_window >= cfg.validator_join_limit_max_new) {
+          break;
+        }
         std::string err;
         if (state->validators.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err,
                                             canonical_operator_id_from_join_request(req.payout_pubkey))) {
+          req.status = ValidatorJoinRequestStatus::APPROVED;
+          req.approved_height = height;
+          state->validator_join_requests[txid] = req;
           if (cfg.validator_join_limit_window_blocks > 0) ++state->validator_join_count_in_window;
         }
         break;
@@ -825,7 +863,10 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
 
 void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state, const Block& block,
                                    const UtxoSetV2& pre_utxos, std::uint64_t height) {
-  apply_validator_state_changes_from_txs(cfg, state, block.txs, 1, pre_utxos, height);
+  std::vector<AnyTx> any_txs;
+  any_txs.reserve(block.txs.size());
+  for (const auto& tx : block.txs) any_txs.emplace_back(tx);
+  apply_validator_state_changes_from_txs(cfg, state, any_txs, 1, pre_utxos, height);
 }
 
 }  // namespace
@@ -1498,12 +1539,8 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, committee,
                                                        record.transition.observed_signers);
   const UtxoSetV2 pre_utxos = next.utxos;
-  std::vector<Tx> accepted_legacy_txs;
-  accepted_legacy_txs.reserve(recomputed.accepted_txs.size());
-  for (const auto& tx : recomputed.accepted_txs) {
-    if (std::holds_alternative<Tx>(tx)) accepted_legacy_txs.push_back(std::get<Tx>(tx));
-  }
-  apply_validator_state_changes_from_txs(cfg, &next, accepted_legacy_txs, 0, pre_utxos, record.transition.height);
+  apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos,
+                                         record.transition.height);
   next.finalized_height = record.transition.height;
   next.finalized_frontier = recomputed.transition.next_frontier;
   next.finalized_frontier_vector = recomputed.transition.next_vector;

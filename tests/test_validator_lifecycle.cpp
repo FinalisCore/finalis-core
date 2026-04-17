@@ -32,6 +32,57 @@ TEST(test_validator_min_bond_enforced) {
   ASSERT_TRUE(vr.can_register_bond(kp->public_key, 10, 1000, &err));
 }
 
+TEST(test_validator_onboarding_registers_without_bond_and_upgrades_only_via_register_bond) {
+  consensus::ValidatorRegistry vr;
+  vr.set_rules(consensus::ValidatorRules{.min_bond = 1000, .warmup_blocks = 5, .cooldown_blocks = 0});
+  auto kp = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{9});
+  ASSERT_TRUE(kp.has_value());
+  std::string err;
+  ASSERT_TRUE(vr.register_onboarding(kp->public_key, 10, &err));
+  auto info = vr.get(kp->public_key);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_EQ(info->status, consensus::ValidatorStatus::ONBOARDING);
+  ASSERT_TRUE(!info->has_bond);
+  ASSERT_EQ(info->bonded_amount, 0u);
+  ASSERT_TRUE(!vr.is_active_for_height(kp->public_key, 100));
+
+  ASSERT_TRUE(vr.can_register_bond(kp->public_key, 11, 1000, &err));
+  ASSERT_TRUE(vr.register_bond(kp->public_key, OutPoint{zero_hash(), 9}, 11, 1000, &err));
+  info = vr.get(kp->public_key);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_EQ(info->status, consensus::ValidatorStatus::PENDING);
+  ASSERT_TRUE(info->has_bond);
+}
+
+TEST(test_validator_onboarding_does_not_auto_activate_without_bond) {
+  consensus::ValidatorRegistry vr;
+  vr.set_rules(consensus::ValidatorRules{.min_bond = 1000, .warmup_blocks = 3, .cooldown_blocks = 0});
+  auto kp = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{10});
+  ASSERT_TRUE(kp.has_value());
+  std::string err;
+  ASSERT_TRUE(vr.register_onboarding(kp->public_key, 5, &err));
+
+  vr.advance_height(100);
+  const auto info = vr.get(kp->public_key);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_EQ(info->status, consensus::ValidatorStatus::ONBOARDING);
+  ASSERT_TRUE(!info->has_bond);
+  ASSERT_TRUE(!vr.is_active_for_height(kp->public_key, 100));
+  const auto active = vr.active_sorted(100);
+  ASSERT_TRUE(std::find(active.begin(), active.end(), kp->public_key) == active.end());
+}
+
+TEST(test_validator_onboarding_cannot_use_bonded_exit_path_before_register_bond) {
+  consensus::ValidatorRegistry vr;
+  vr.set_rules(consensus::ValidatorRules{.min_bond = 1000, .warmup_blocks = 3, .cooldown_blocks = 0});
+  auto kp = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{11});
+  ASSERT_TRUE(kp.has_value());
+  std::string err;
+  ASSERT_TRUE(vr.register_onboarding(kp->public_key, 5, &err));
+  ASSERT_TRUE(!vr.request_unbond(kp->public_key, 8));
+  ASSERT_TRUE(!vr.can_withdraw_bond(kp->public_key, 20, 5));
+}
+
 TEST(test_validator_cooldown_enforced_for_exit_rejoin) {
   consensus::ValidatorRegistry vr;
   vr.set_rules(consensus::ValidatorRules{.min_bond = BOND_AMOUNT, .warmup_blocks = 2, .cooldown_blocks = 10});
@@ -123,6 +174,48 @@ TEST(test_validator_liveness_participation_order_independent) {
   const auto p1 = consensus::committee_participants_from_finality(committee, sigs1);
   const auto p2 = consensus::committee_participants_from_finality(committee, sigs2);
   ASSERT_EQ(p1, p2);
+}
+
+TEST(test_validator_onboarding_duplicate_and_banned_reentry_rejected) {
+  consensus::ValidatorRegistry vr;
+  const auto kp = key_from_byte(0x21);
+  std::string err;
+  ASSERT_TRUE(vr.register_onboarding(kp.public_key, 10, &err));
+  err.clear();
+  ASSERT_TRUE(!vr.register_onboarding(kp.public_key, 11, &err));
+  ASSERT_EQ(err, std::string("validator already registered"));
+
+  vr.ban(kp.public_key, 12);
+  err.clear();
+  ASSERT_TRUE(!vr.register_onboarding(kp.public_key, 13, &err));
+  ASSERT_EQ(err, std::string("validator banned"));
+}
+
+TEST(test_validator_pending_and_active_reject_reentry_through_onboarding_and_bond) {
+  consensus::ValidatorRegistry vr;
+  vr.set_rules(consensus::ValidatorRules{.min_bond = BOND_AMOUNT, .warmup_blocks = 2, .cooldown_blocks = 0});
+  const auto kp = key_from_byte(0x31);
+  std::string err;
+
+  ASSERT_TRUE(vr.register_onboarding(kp.public_key, 10, &err));
+  ASSERT_TRUE(vr.register_bond(kp.public_key, OutPoint{zero_hash(), 4}, 11, BOND_AMOUNT, &err));
+
+  err.clear();
+  ASSERT_TRUE(!vr.register_onboarding(kp.public_key, 12, &err));
+  ASSERT_EQ(err, std::string("validator already registered"));
+
+  err.clear();
+  ASSERT_TRUE(!vr.can_register_bond(kp.public_key, 12, BOND_AMOUNT, &err));
+  ASSERT_EQ(err, std::string("validator already registered"));
+
+  vr.advance_height(13);
+  const auto info = vr.get(kp.public_key);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_EQ(info->status, consensus::ValidatorStatus::ACTIVE);
+
+  err.clear();
+  ASSERT_TRUE(!vr.register_onboarding(kp.public_key, 14, &err));
+  ASSERT_EQ(err, std::string("validator already registered"));
 }
 
 TEST(test_validator_liveness_participation_dedups_pubkeys) {

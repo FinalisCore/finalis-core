@@ -17,6 +17,7 @@ enum class ValidatorStatus : std::uint8_t {
   EXITING = 2,
   BANNED = 3,
   SUSPENDED = 4,
+  ONBOARDING = 5,
 };
 
 struct ValidatorInfo {
@@ -47,6 +48,8 @@ class ValidatorRegistry {
   void set_rules(ValidatorRules rules) { rules_ = rules; }
   const ValidatorRules& rules() const { return rules_; }
   void upsert(PubKey32 pub, ValidatorInfo info);
+  bool register_onboarding(const PubKey32& pub, std::uint64_t joined_height, std::string* err = nullptr,
+                           const std::optional<PubKey32>& operator_id = std::nullopt);
   bool can_register_bond(const PubKey32& pub, std::uint64_t height, std::uint64_t bond_amount, std::string* err = nullptr) const;
   bool register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height);
   bool register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height, std::uint64_t bond_amount,

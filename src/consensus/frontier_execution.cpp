@@ -1,8 +1,10 @@
 #include "consensus/frontier_execution.hpp"
 
 #include <set>
+#include <type_traits>
 
 #include "consensus/ingress.hpp"
+#include "consensus/randomness.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/state_commitment.hpp"
 #include "crypto/hash.hpp"
@@ -24,7 +26,7 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                                      const CertifiedIngressLaneRecords& lane_records,
                                      const FrontierLaneRoots& prev_lane_roots,
                                      FrontierLaneRoots* next_lane_roots, std::vector<Bytes>* ordered_records,
-                                     std::string* error) {
+                                     const SpecialValidationContext* ctx, std::string* error) {
   if (!next_lane_roots || !ordered_records) {
     if (error) *error = "missing-certified-ingress-output";
     return false;
@@ -32,6 +34,10 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
 
   FrontierLaneRoots lane_roots{};
   std::uint64_t max_delta = 0;
+  const auto expected_ingress_epoch =
+      (ctx && ctx->network && ctx->current_height != 0)
+          ? committee_epoch_start(ctx->current_height, ctx->network->committee_epoch_blocks)
+          : 0;
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     if (next_vector.lane_max_seq[lane] < prev_vector.lane_max_seq[lane]) {
       if (error) *error = "frontier-vector-rewind lane=" + std::to_string(lane);
@@ -80,6 +86,49 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
         if (error) *error = "frontier-certified-ingress-hash-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
+      }
+      bool use_certificate_epoch_for_committee = false;
+      std::string cert_error;
+      if (!validate_ingress_certificate_epoch(record.certificate, expected_ingress_epoch, &cert_error)) {
+        // Replay compatibility for legacy databases:
+        // - some historical builds persisted certificate.epoch as block height
+        // - earliest lane records may carry legacy epoch encodings at seq=1
+        const bool legacy_epoch_equals_height =
+            ctx && ctx->current_height != 0 && record.certificate.epoch == ctx->current_height;
+        const bool legacy_first_record_epoch =
+            expected_seq == 1 && record.certificate.prev_lane_root == zero_hash();
+        if (legacy_epoch_equals_height || legacy_first_record_epoch) {
+          use_certificate_epoch_for_committee = legacy_epoch_equals_height;
+          cert_error.clear();
+        } else {
+          if (error) {
+            *error = "frontier-certified-ingress-epoch-mismatch lane=" + std::to_string(lane) +
+                     " seq=" + std::to_string(expected_seq) + " reason=" + cert_error;
+          }
+          return false;
+        }
+      }
+      if (!verify_ingress_certificate(record.certificate, {}, &cert_error)) {
+        if (error) {
+          *error = "frontier-certified-ingress-cert-invalid lane=" + std::to_string(lane) +
+                   " seq=" + std::to_string(expected_seq) + " reason=" + cert_error;
+        }
+        return false;
+      }
+      if (ctx && ctx->is_committee_member) {
+        const auto committee_epoch =
+            use_certificate_epoch_for_committee
+                ? record.certificate.epoch
+                : (expected_ingress_epoch != 0 ? expected_ingress_epoch : record.certificate.epoch);
+        for (const auto& sig : record.certificate.sigs) {
+          if (!ctx->is_committee_member(sig.validator_pubkey, committee_epoch, 0)) {
+            if (error) {
+              *error = "frontier-certified-ingress-signer-not-in-committee lane=" + std::to_string(lane) +
+                       " seq=" + std::to_string(expected_seq);
+            }
+            return false;
+          }
+        }
       }
       if (assign_ingress_lane(*tx) != lane) {
         if (error) *error = "frontier-certified-ingress-lane-assignment-mismatch lane=" + std::to_string(lane) +
@@ -185,9 +234,35 @@ Hash32 frontier_ingress_commitment(const FrontierVector& prev_vector, const Fron
 bool frontier_merge_certified_ingress(const FrontierVector& prev_vector, const FrontierVector& next_vector,
                                       const CertifiedIngressLaneRecords& lane_records,
                                       const FrontierLaneRoots& prev_lane_roots, FrontierLaneRoots* next_lane_roots,
-                                      std::vector<Bytes>* ordered_records, std::string* error) {
+                                      std::vector<Bytes>* ordered_records, const SpecialValidationContext* ctx,
+                                      std::string* error) {
   return validate_certified_lane_records(prev_vector, next_vector, lane_records, prev_lane_roots, next_lane_roots,
-                                         ordered_records, error);
+                                         ordered_records, ctx, error);
+}
+
+bool frontier_merge_certified_ingress(const FrontierVector& prev_vector, const FrontierVector& next_vector,
+                                      const CertifiedIngressLaneRecords& lane_records,
+                                      const FrontierLaneRoots& prev_lane_roots, FrontierLaneRoots* next_lane_roots,
+                                      std::vector<Bytes>* ordered_records, std::string* error) {
+  return frontier_merge_certified_ingress(prev_vector, next_vector, lane_records, prev_lane_roots, next_lane_roots,
+                                          ordered_records, nullptr, error);
+}
+
+bool tx_uses_special_scripts(const AnyTx& tx) {
+  return std::visit(
+      [](const auto& value) {
+        for (const auto& out : value.outputs) {
+          if constexpr (std::is_same_v<std::decay_t<decltype(value)>, Tx>) {
+            if (!is_p2pkh_script_pubkey(out.script_pubkey, nullptr)) return true;
+          } else {
+            if (out.kind != TxOutputKind::Transparent) continue;
+            const auto& transparent = std::get<TransparentTxOutV2>(out.body);
+            if (!is_p2pkh_script_pubkey(transparent.script_pubkey, nullptr)) return true;
+          }
+        }
+        return false;
+      },
+      tx);
 }
 
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_frontier,
@@ -232,8 +307,14 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_fr
       continue;
     }
 
-    const auto validation = validate_any_tx(*tx, 1, work, ctx);
     decision.record_id = txid_any(*tx);
+    if (!ctx && tx_uses_special_scripts(*tx)) {
+      decision.accepted = false;
+      decision.reject_reason = FrontierRejectReason::TX_INVALID;
+      decisions.push_back(decision);
+      continue;
+    }
+    const auto validation = validate_any_tx(*tx, 1, work, ctx);
     if (!validation.ok) {
       decision.accepted = false;
       decision.reject_reason = FrontierRejectReason::TX_INVALID;
@@ -278,7 +359,7 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, const FrontierV
   FrontierLaneRoots recomputed_lane_roots{};
   std::vector<Bytes> ordered_records;
   if (!frontier_merge_certified_ingress(prev_vector, next_vector, lane_records, prev_lane_roots, &recomputed_lane_roots,
-                                        &ordered_records, error)) {
+                                        &ordered_records, ctx, error)) {
     return false;
   }
 

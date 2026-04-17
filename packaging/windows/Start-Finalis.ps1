@@ -159,7 +159,7 @@ if ($PublicNode) {
 } else {
     $nodeArgs += @("--listen", "--bind", "127.0.0.1")
 }
-$nodeArgs += @("--outbound-target", "1")
+$nodeArgs += @("--outbound-target", "8")
 
 if (Test-Path $seedsJson) {
     $seedDoc = Get-Content $seedsJson -Raw | ConvertFrom-Json

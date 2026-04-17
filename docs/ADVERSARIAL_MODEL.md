@@ -52,6 +52,7 @@ Authoritative replay input is strictly:
 * genesis and network configuration
 * the finalized frontier transition sequence
 * one canonical finality certificate per finalized height
+* finalized ingress certificates/bytes and lane state needed to verify frontier transitions
 
 After the fresh-genesis reset, DB contents or endpoint assumptions from the
 abandoned chain are outside this authoritative replay input and must not be
@@ -79,6 +80,7 @@ Definitions:
 
 * Finalized transition: a frontier transition accepted through valid finality certificate verification and canonical application.
 * Finality certificate: a quorum certificate over the exact `(height, round, block_id)` payload, including committee membership and canonicalized signer set.
+* Certified ingress record: `(certificate, tx_bytes)` pair where certificate epoch is pinned to the expected active epoch and lane/seq/root links validate.
 * Canonical derivation: the deterministic transition from prior derived state and a finalized record to the next derived state.
 * Committee checkpoint: the canonical epoch-level committee representation derived from finalized state.
 * Proposer schedule: deterministic proposer ordering derived from checkpoint inputs.
@@ -105,6 +107,7 @@ Canonical derived state includes:
 * committee checkpoints
 * proposer schedule inputs
 * consensus-state commitment
+* finalized frontier vector and lane roots
 
 Non-authoritative (cache only):
 
@@ -239,6 +242,27 @@ Residual risk:
 
 ---
 
+### 4.6 Ingress Relay / Replay Adversary
+
+Capabilities:
+
+* relaying stale certified ingress from prior epochs
+* replaying mismatched lane/sequence/root chains
+* submitting conflicting certificates at fixed `(epoch, lane, seq)`
+
+Protocol response:
+
+* ingress certificate epoch must match `committee_epoch_start(finalized_height + 1)`
+* lane assignment, sequence continuity, and `prev_lane_root` chaining are re-validated
+* signer validity and committee-membership checks are enforced in context
+* ingress equivocation is rejected and persisted as deterministic evidence
+
+Residual risk:
+
+* sustained network-level suppression can still delay ingress propagation and hurt liveness
+
+---
+
 ## 5. Assumptions
 
 ### 5.1 Cryptographic
@@ -352,6 +376,7 @@ Failures causing halt:
 * commitment mismatch
 * invalid binding hash
 * inconsistent carried certificate hash
+* missing/invalid certified ingress required to verify finalized transition execution
 
 The system enforces:
 
@@ -395,6 +420,8 @@ Economic risks:
 | Network partition            | stalled progress         | Liveness degradation |
 | Proposer failure             | stalled progress         | Liveness degradation |
 | Quorum equivocation          | conflicting finalization | Safety failure       |
+| Ingress equivocation         | ingress rejection/evidence | Safe halt          |
+| Stale ingress epoch replay   | ingress rejection         | Safe halt            |
 | Operator splitting           | influence skew           | Economic degradation |
 | Ticket optimization          | selection skew           | Economic degradation |
 | Binary mismatch              | network split            | Operational risk     |

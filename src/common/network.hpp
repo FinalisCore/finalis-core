@@ -51,7 +51,8 @@ struct NetworkConfig {
   std::uint32_t miss_rate_suspend_threshold_percent{30};
   std::uint32_t miss_rate_exit_threshold_percent{60};
   std::uint64_t suspend_duration_blocks{1'000};
-  std::uint32_t admission_pow_difficulty_bits{0};
+  std::uint32_t onboarding_admission_pow_difficulty_bits{0};
+  std::uint32_t validator_join_admission_pow_difficulty_bits{0};
   std::uint64_t finality_binding_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t availability_recovery_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t confidential_utxo_activation_height{std::numeric_limits<std::uint64_t>::max()};
@@ -66,6 +67,7 @@ const EconomicsConfig& active_economics_policy(const NetworkConfig& network, std
 bool finality_binding_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool availability_recovery_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool confidential_utxo_active_at_height(const NetworkConfig& network, std::uint64_t height);
-bool admission_pow_enabled(const NetworkConfig& network);
+bool onboarding_admission_pow_enabled(const NetworkConfig& network);
+bool validator_join_admission_pow_enabled(const NetworkConfig& network);
 
 }  // namespace finalis

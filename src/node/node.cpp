@@ -573,12 +573,10 @@ consensus::ValidatorBestTicket checkpoint_best_ticket_for_member(
   auto ticket =
       consensus::best_epoch_ticket_for_operator_id(epoch, checkpoint.epoch_seed, operator_id, epoch,
                                                    consensus::EPOCH_TICKET_MAX_NONCE);
-  if (ticket.has_value()) return consensus::ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
-  return consensus::ValidatorBestTicket{
-      pub,
-      consensus::make_epoch_ticket_work_hash(epoch, checkpoint.epoch_seed, operator_id, 0),
-      0,
-  };
+  if (ticket.has_value() && consensus::epoch_ticket_meets_difficulty(*ticket, checkpoint.ticket_difficulty_bits)) {
+    return consensus::ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
+  }
+  return consensus::ValidatorBestTicket{pub, Hash32{}, 0};
 }
 
 std::vector<consensus::ValidatorBestTicket> checkpoint_winners(
@@ -894,6 +892,7 @@ bool same_epoch_reward_state(const storage::EpochRewardSettlementState& a, const
          a.fee_pool_units == b.fee_pool_units && a.reserve_accrual_units == b.reserve_accrual_units &&
          a.reserve_subsidy_units == b.reserve_subsidy_units &&
          a.settled == b.settled && a.reward_score_units == b.reward_score_units &&
+         a.onboarding_score_units == b.onboarding_score_units &&
          a.expected_participation_units == b.expected_participation_units &&
          a.observed_participation_units == b.observed_participation_units;
 }
@@ -1127,6 +1126,7 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
                                         const Block& block, const UtxoSet& pre_utxos, std::uint64_t height,
                                         std::uint64_t min_bond, std::uint64_t warmup_blocks,
                                         std::uint64_t cooldown_blocks, std::uint64_t join_limit_window_blocks,
+                                        std::uint32_t join_limit_max_new,
                                         std::uint64_t* join_window_start_height, std::uint32_t* join_count_in_window,
                                         storage::DB* db) {
   validators.set_rules(consensus::ValidatorRules{
@@ -1170,6 +1170,16 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
     const Hash32 txid = tx.txid();
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
       const auto& out = tx.outputs[out_i];
+      PubKey32 onboarding_validator_pub{};
+      PubKey32 onboarding_payout_pub{};
+      Sig64 onboarding_pop{};
+      if (is_onboarding_registration_script(out.script_pubkey, &onboarding_validator_pub, &onboarding_payout_pub,
+                                            &onboarding_pop)) {
+        std::string err;
+        (void)validators.register_onboarding(onboarding_validator_pub, height, &err,
+                                             consensus::canonical_operator_id_from_join_request(onboarding_payout_pub));
+        continue;
+      }
       PubKey32 validator_pub{};
       PubKey32 payout_pub{};
       Sig64 pop{};
@@ -1185,13 +1195,17 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
         req.bond_outpoint = OutPoint{txid, bond_i};
         req.bond_amount = tx.outputs[bond_i].value;
         req.requested_height = height;
-        req.status = ValidatorJoinRequestStatus::APPROVED;
-        req.approved_height = height;
-        validator_join_requests[txid] = req;
-        if (db) (void)db->put_validator_join_request(txid, req);
+        if (join_count_in_window && join_limit_window_blocks > 0 && join_limit_max_new > 0 &&
+            *join_count_in_window >= join_limit_max_new) {
+          break;
+        }
         std::string err;
         if (validators.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err,
                                      consensus::canonical_operator_id_from_join_request(req.payout_pubkey))) {
+          req.status = ValidatorJoinRequestStatus::APPROVED;
+          req.approved_height = height;
+          validator_join_requests[txid] = req;
+          if (db) (void)db->put_validator_join_request(txid, req);
           if (join_count_in_window && join_limit_window_blocks > 0) ++(*join_count_in_window);
         }
         break;
@@ -1803,6 +1817,9 @@ bool Node::init() {
                                  cfg_.peer_queue_max_bytes, cfg_.peer_queue_max_msgs, cfg_.max_inbound});
     p2p_.set_on_message([this](int peer_id, std::uint16_t msg_type, const Bytes& payload) {
       handle_message(peer_id, msg_type, payload);
+    });
+    p2p_.set_accept_filter([this](const std::string& ip) {
+      return !discipline_.is_banned(ip, now_unix());
     });
     p2p_.set_read_timeout_override([this](int peer_id, const p2p::PeerInfo& info) -> std::optional<std::uint32_t> {
       if (!info.established()) return std::nullopt;
@@ -3241,6 +3258,7 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
                                                                                const PubKey32& leader_pubkey,
                                                                                std::uint64_t fees_units) const {
   std::map<PubKey32, std::uint64_t> settlement_scores;
+  std::map<PubKey32, std::uint64_t> onboarding_scores;
   std::uint64_t settlement_rewards = 0;
   std::uint64_t distributed_fee_units = height >= consensus::EMISSION_BLOCKS ? 0 : fees_units;
   std::uint64_t reserve_subsidy_units = 0;
@@ -3251,6 +3269,7 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
       distributed_fee_units = height >= consensus::EMISSION_BLOCKS ? state.fee_pool_units : fees_units;
       reserve_subsidy_units = height >= consensus::EMISSION_BLOCKS ? state.reserve_subsidy_units : 0;
       settlement_scores = state.reward_score_units;
+      onboarding_scores = state.onboarding_score_units;
       const auto& econ = active_economics_policy(cfg_.network, height);
       const auto threshold_bps = econ.participation_threshold_bps;
       for (auto& [pub, score] : settlement_scores) {
@@ -3280,7 +3299,22 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
     }
   }
   return consensus::compute_epoch_settlement_payout(settlement_rewards, distributed_fee_units, reserve_subsidy_units,
-                                                    leader_pubkey, settlement_scores);
+                                                    leader_pubkey, settlement_scores, onboarding_scores);
+}
+
+std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const {
+  std::map<PubKey32, std::uint64_t> out;
+  const auto tickets = db_.load_epoch_tickets(epoch_start_height);
+  const auto best_tickets = consensus::best_epoch_tickets_by_pubkey(tickets);
+  for (const auto& [pub, info] : validators_.all()) {
+    if (info.status != consensus::ValidatorStatus::ONBOARDING) continue;
+    auto it = best_tickets.find(pub);
+    if (it == best_tickets.end()) continue;
+    const auto score = static_cast<std::uint64_t>(
+        std::max<std::uint8_t>(1, consensus::leading_zero_bits(it->second.work_hash)));
+    out[pub] = score;
+  }
+  return out;
 }
 
 std::vector<TxOut> Node::coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
@@ -3358,6 +3392,15 @@ void Node::accrue_epoch_reward_for_finalized_block_locked(const Block& block, co
 }
 
 void Node::mark_epoch_reward_settled_if_needed_locked(std::uint64_t height) {
+  const auto epoch_start = consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks);
+  if (height == epoch_start && epoch_start > cfg_.network.committee_epoch_blocks && epoch_start > 1) {
+    const auto settlement_epoch = epoch_start - cfg_.network.committee_epoch_blocks;
+    auto& state = epoch_reward_states_[settlement_epoch];
+    state.epoch_start_height = settlement_epoch;
+    if (!state.settled) {
+      state.onboarding_score_units = compute_onboarding_score_units_for_epoch_locked(settlement_epoch);
+    }
+  }
   mark_epoch_reward_settled_for_height(cfg_.network, height, cfg_.network.committee_epoch_blocks, epoch_reward_states_,
                                        &protocol_reserve_balance_units_, &db_);
 }
@@ -6329,9 +6372,11 @@ bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg
     }
   }
 
-  auto committee = ingress_committee_locked(msg.certificate.epoch);
+  const auto expected_ingress_epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  auto committee = ingress_committee_locked(expected_ingress_epoch);
   std::string append_error;
-  if (!consensus::append_validated_ingress_record(db_, msg.certificate, msg.tx_bytes, committee, &append_error)) {
+  if (!consensus::append_validated_ingress_record(db_, msg.certificate, msg.tx_bytes, committee,
+                                                  expected_ingress_epoch, &append_error)) {
     if (error) *error = append_error;
     return false;
   }
@@ -6392,7 +6437,7 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
   cert.sigs.push_back(FinalitySig{local_key_.public_key, *sig});
 
   std::string append_error;
-  if (!consensus::append_validated_ingress_record(db_, cert, tx_bytes, committee, &append_error)) {
+  if (!consensus::append_validated_ingress_record(db_, cert, tx_bytes, committee, cert.epoch, &append_error)) {
     if (error) *error = append_error;
     return false;
   }
@@ -6415,23 +6460,51 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   }
   FrontierProposal finalized_proposal = proposal_it->second;
 
-  const auto committee = committee_for_height_round(height, round);
-  if (committee.empty()) {
+  std::string lock_error;
+  if (!can_accept_frontier_with_lock_locked(proposal_it->second.transition, &lock_error)) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=empty-committee");
+             " transition=" + short_hash_hex(block_id) + " reason=" + lock_error);
     return false;
   }
-  const std::size_t quorum = consensus::quorum_threshold(committee.size());
+  consensus::CanonicalFrontierRecord certified_record;
+  std::string frontier_record_error;
+  if (!consensus::load_certified_frontier_record_from_storage(db_, finalized_proposal.transition, &certified_record,
+                                                              &frontier_record_error)) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=" + frontier_record_error);
+    return false;
+  }
+  certified_record.ordered_records = finalized_proposal.ordered_records;
+
+  if (!canonical_state_.has_value()) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=missing-canonical-state");
+    return false;
+  }
+  consensus::FrontierExecutionResult recomputed;
+  std::string validation_error;
+  if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
+                                                       certified_record, &recomputed, &validation_error)) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=" + validation_error);
+    return false;
+  }
+  const auto expected_committee = recomputed.effective_committee;
+  if (expected_committee.empty()) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=empty-effective-committee");
+    return false;
+  }
+  const std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
   auto sigs = votes_.signatures_for(height, round, block_id);
-  std::set<PubKey32> committee_set;
-  committee_set.insert(committee.begin(), committee.end());
-  if (sigs.size() < quorum) {
+  std::set<PubKey32> committee_set(expected_committee.begin(), expected_committee.end());
+  if (sigs.size() < expected_quorum) {
     std::ostringstream oss;
     oss << "finalize-skip height=" << height << " round=" << round << " transition=" << short_hash_hex(block_id)
-        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << quorum
+        << " reason=insufficient-votes votes=" << sigs.size() << " quorum=" << expected_quorum
         << " signers=" << signer_set_summary(sigs);
     if (debug_finality_logs_enabled()) {
-      oss << " committee_size=" << committee.size();
+      oss << " committee_size=" << expected_committee.size();
       if (auto proposer = leader_for_height_round(height, round); proposer.has_value()) {
         oss << " proposer=" << short_pub_hex(*proposer);
       }
@@ -6444,42 +6517,27 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::vector<FinalitySig> filtered;
   const auto vote_msg = vote_signing_message(height, round, block_id);
   for (const auto& s : sigs) {
-    if (!committee_set.empty() && committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
+    if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(s.validator_pubkey).second) continue;
     if (!crypto::ed25519_verify(vote_msg, s.signature, s.validator_pubkey)) continue;
     filtered.push_back(s);
   }
-  if (filtered.size() < quorum) {
+  if (filtered.size() < expected_quorum) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=insufficient-valid-signatures valid=" +
-             std::to_string(filtered.size()) + " quorum=" + std::to_string(quorum));
+             std::to_string(filtered.size()) + " quorum=" + std::to_string(expected_quorum));
     return false;
   }
+  const auto canonical_sigs = canonicalize_finality_signatures_locked(filtered, expected_quorum);
 
-  std::string lock_error;
-  if (!can_accept_frontier_with_lock_locked(proposal_it->second.transition, &lock_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=" + lock_error);
-    return false;
-  }
-  const auto canonical_sigs = canonicalize_finality_signatures_locked(filtered, quorum);
-  consensus::CanonicalFrontierRecord certified_record;
-  std::string frontier_record_error;
-  if (!consensus::load_certified_frontier_record_from_storage(db_, finalized_proposal.transition, &certified_record,
-                                                              &frontier_record_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=" + frontier_record_error);
-    return false;
-  }
-  certified_record.ordered_records = finalized_proposal.ordered_records;
-  if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs)) {
+  if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, false, &expected_committee)) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=apply-failed");
     return false;
   }
 
   const FinalityCertificate cert =
-      make_finality_certificate(height, round, block_id, quorum, committee, canonical_sigs);
+      make_finality_certificate(height, round, block_id, expected_quorum, expected_committee, canonical_sigs);
   broadcast_finalized_frontier(finalized_proposal, cert);
   broadcast_finalized_tip();
   return true;
@@ -7633,6 +7691,7 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
   apply_validator_state_changes_impl(validators_, validator_join_requests_, block, pre_utxos, height,
                                      effective_validator_min_bond_for_height(height), validator_warmup_blocks_,
                                      validator_cooldown_blocks_, validator_join_limit_window_blocks_,
+                                     validator_join_limit_max_new_,
                                      &validator_join_window_start_height_, &validator_join_count_in_window_, &db_);
   validators_.advance_height(height + 1);
   codec::ByteWriter w_start;
@@ -7954,6 +8013,7 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
     return false;
   }
 
+  const auto expected_ingress_epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
   auto simulated_state = db_.get_lane_state(msg.lane);
   std::string validation_error;
   std::size_t prevalidation_bytes = 0;
@@ -7995,14 +8055,15 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
       }
     }
     validation_error.clear();
-    if (!consensus::validate_ingress_append(simulated_state, record.certificate, record.tx_bytes, &validation_error)) {
+    if (!consensus::validate_ingress_append(simulated_state, record.certificate, record.tx_bytes,
+                                            expected_ingress_epoch, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
                " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
       return false;
     }
     validation_error.clear();
-    const auto committee = ingress_committee_locked(record.certificate.epoch);
+    const auto committee = ingress_committee_locked(expected_ingress_epoch);
     if (!consensus::verify_ingress_certificate(record.certificate, committee, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
@@ -8026,8 +8087,9 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
 
   for (const auto& record : msg.records) {
     validation_error.clear();
-    const auto committee = ingress_committee_locked(record.certificate.epoch);
-    if (!consensus::append_validated_ingress_record(db_, record.certificate, record.tx_bytes, committee, &validation_error)) {
+    const auto committee = ingress_committee_locked(expected_ingress_epoch);
+    if (!consensus::append_validated_ingress_record(db_, record.certificate, record.tx_bytes, committee,
+                                                    expected_ingress_epoch, &validation_error)) {
       if (error) *error = validation_error;
       log_line("ingress-range-append-failed peer_id=" + std::to_string(peer_id) + " lane=" +
                std::to_string(msg.lane) + " seq=" + std::to_string(record.certificate.seq) + " reason=" + validation_error);
@@ -8422,6 +8484,16 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);
     case p2p::MsgType::PONG:
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);
+    case p2p::MsgType::INGRESS_RECORD:
+      return get(msg_type, 20.0, 10.0).consume(1.0, nms);
+    case p2p::MsgType::EPOCH_TICKET:
+      return get(msg_type, 20.0, 10.0).consume(1.0, nms);
+    case p2p::MsgType::GET_TRANSITION_BY_HEIGHT:
+      return get(msg_type, 30.0, 15.0).consume(1.0, nms);
+    case p2p::MsgType::GET_EPOCH_TICKETS:
+      return get(msg_type, 10.0, 5.0).consume(1.0, nms);
+    case p2p::MsgType::EPOCH_TICKETS:
+      return get(msg_type, 10.0, 5.0).consume(1.0, nms);
     default:
       return true;
   }

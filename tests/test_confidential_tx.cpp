@@ -55,6 +55,20 @@ Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
   return ss;
 }
 
+Bytes validator_register_script(const PubKey32& validator_pub) {
+  Bytes s{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
+  return s;
+}
+
+Bytes validator_join_request_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
+  Bytes s{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
+  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
+  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
+  s.insert(s.end(), pop.begin(), pop.end());
+  return s;
+}
+
 void resign_input0(TxV2& tx, const crypto::KeyPair& from) {
   auto msg = finalis::signing_message_for_input_v2(tx, 0);
   if (!msg.has_value()) throw std::runtime_error("sighash failed");
@@ -707,4 +721,104 @@ TEST(test_validate_tx_v2_rejects_invalid_excess_authorization) {
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(!result.ok);
   ASSERT_TRUE(result.error.find("excess authorization invalid") != std::string::npos);
+}
+
+TEST(test_validate_tx_v2_rejects_validator_join_request_without_matching_register_output) {
+  const auto from = key_from_byte(0x40);
+  const auto validator = key_from_byte(0x41);
+  const auto payout = key_from_byte(0x42);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0x6A);
+  op.index = 0;
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op.txid,
+      .prev_index = op.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::Transparent,
+      .witness = TransparentInputWitnessV2{},
+  });
+  const auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key),
+                                        validator.private_key);
+  ASSERT_TRUE(pop.has_value());
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
+                               .body = TransparentTxOutV2{0, validator_join_request_script(validator.public_key,
+                                                                                           payout.public_key, *pop)}});
+  tx.outputs.push_back(TxOutV2{
+      .kind = TxOutputKind::Transparent,
+      .body = TransparentTxOutV2{9'500,
+                                 address::p2pkh_script_pubkey(crypto::h160(Bytes(payout.public_key.begin(),
+                                                                                payout.public_key.end())))}
+  });
+  tx.fee = 500;
+  tx.balance_proof.excess_commitment = crypto::Commitment33{};
+  tx.balance_proof.excess_pubkey.fill(0);
+  tx.balance_proof.excess_sig.fill(0);
+  resign_input0(tx, from);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 1;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_TRUE(result.error.find("join request missing matching SCVALREG output") != std::string::npos);
+}
+
+TEST(test_validate_tx_v2_accepts_matching_validator_register_and_join_request_outputs) {
+  const auto from = key_from_byte(0x43);
+  const auto validator = key_from_byte(0x44);
+  const auto payout = key_from_byte(0x45);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+
+  OutPoint op{};
+  op.txid.fill(0x6B);
+  op.index = 0;
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{BOND_AMOUNT + 2'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op.txid,
+      .prev_index = op.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::Transparent,
+      .witness = TransparentInputWitnessV2{},
+  });
+  const auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key),
+                                        validator.private_key);
+  ASSERT_TRUE(pop.has_value());
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
+                               .body = TransparentTxOutV2{BOND_AMOUNT, validator_register_script(validator.public_key)}});
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
+                               .body = TransparentTxOutV2{0, validator_join_request_script(validator.public_key,
+                                                                                           payout.public_key, *pop)}});
+  tx.outputs.push_back(TxOutV2{
+      .kind = TxOutputKind::Transparent,
+      .body = TransparentTxOutV2{1'000,
+                                 address::p2pkh_script_pubkey(crypto::h160(Bytes(payout.public_key.begin(),
+                                                                                payout.public_key.end())))}
+  });
+  tx.fee = 1'000;
+  tx.balance_proof.excess_commitment = crypto::Commitment33{};
+  tx.balance_proof.excess_pubkey.fill(0);
+  tx.balance_proof.excess_sig.fill(0);
+  resign_input0(tx, from);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 1;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(result.ok);
+  ASSERT_EQ(result.cost.fee, 1'000u);
 }

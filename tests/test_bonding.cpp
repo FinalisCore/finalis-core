@@ -43,6 +43,25 @@ Bytes join_request_script(const PubKey32& validator_pub, const PubKey32& payout_
   return s;
 }
 
+Bytes onboarding_registration_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
+  Bytes s{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
+  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
+  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
+  s.insert(s.end(), pop.begin(), pop.end());
+  return s;
+}
+
+Bytes onboarding_registration_script_with_pow(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop,
+                                              std::uint64_t epoch, std::uint64_t nonce) {
+  Bytes s = onboarding_registration_script(validator_pub, payout_pub, pop);
+  codec::ByteWriter w;
+  w.u64le(epoch);
+  w.u64le(nonce);
+  const auto suffix = w.take();
+  s.insert(s.end(), suffix.begin(), suffix.end());
+  return s;
+}
+
 Bytes join_request_script_with_pow(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop,
                                    std::uint64_t epoch, std::uint64_t nonce) {
   Bytes s = join_request_script(validator_pub, payout_pub, pop);
@@ -81,6 +100,14 @@ SpecialValidationContext join_pow_ctx(const NetworkConfig& net, const ChainId& c
   };
 }
 
+SpecialValidationContext join_pow_ctx_with_validators(const NetworkConfig& net, const ChainId& chain_id,
+                                                      const consensus::ValidatorRegistry& vr,
+                                                      std::uint64_t current_height, const Hash32& anchor) {
+  auto ctx = join_pow_ctx(net, chain_id, current_height, anchor);
+  ctx.validators = &vr;
+  return ctx;
+}
+
 std::optional<Tx> build_manual_join_tx(const OutPoint& prev_outpoint, const TxOut& prev_out, const Bytes& funding_privkey,
                                        const PubKey32& validator_pubkey, std::uint64_t bond_amount, std::uint64_t fee,
                                        const Bytes& change_script_pubkey, const Bytes& req_script, std::string* err = nullptr) {
@@ -103,6 +130,230 @@ TEST(test_scval_scripts_detection) {
   ASSERT_EQ(out, kp.public_key);
   ASSERT_TRUE(is_validator_unbond_script(unb, &out));
   ASSERT_EQ(out, kp.public_key);
+}
+
+TEST(test_onboarding_registration_script_detection) {
+  const auto validator = key_from_byte(0x31);
+  const auto payout = key_from_byte(0x32);
+  const auto pop =
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+                            validator.private_key);
+  Bytes req = onboarding_registration_script(validator.public_key, payout.public_key, pop);
+  PubKey32 out_validator{};
+  PubKey32 out_payout{};
+  Sig64 out_pop{};
+  ASSERT_TRUE(is_onboarding_registration_script(req, &out_validator, &out_payout, &out_pop));
+  ASSERT_EQ(out_validator, validator.public_key);
+  ASSERT_EQ(out_payout, payout.public_key);
+  ASSERT_EQ(out_pop, pop);
+
+  OnboardingRegistrationScriptData parsed{};
+  ASSERT_TRUE(parse_onboarding_registration_script(req, &parsed));
+  ASSERT_TRUE(!parsed.has_admission_pow);
+}
+
+TEST(test_onboarding_registration_script_roundtrip_with_admission_pow_fields) {
+  const auto validator = key_from_byte(0x33);
+  const auto payout = key_from_byte(0x34);
+  const auto pop =
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+                            validator.private_key);
+  const auto script = onboarding_registration_script_with_pow(validator.public_key, payout.public_key, pop, 33, 9);
+  OnboardingRegistrationScriptData parsed{};
+  ASSERT_TRUE(parse_onboarding_registration_script(script, &parsed));
+  ASSERT_TRUE(parsed.has_admission_pow);
+  ASSERT_EQ(parsed.admission_pow_epoch, 33ULL);
+  ASSERT_EQ(parsed.admission_pow_nonce, 9ULL);
+}
+
+TEST(test_sconbreg_tx_validates_with_zero_value_output_and_valid_pop) {
+  const auto sponsor = key_from_byte(0x41);
+  const auto validator = key_from_byte(0x42);
+  const auto payout = key_from_byte(0x43);
+  const OutPoint spend_op{Hash32{0x41}, 0};
+  const TxOut prev_out{
+      1'000'000,
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  std::string err;
+  auto tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+                                             validator.private_key, payout.public_key, 1000,
+                                             prev_out.script_pubkey, &err);
+  ASSERT_TRUE(tx.has_value());
+  UtxoSet utxos;
+  utxos.emplace(spend_op, UtxoEntry{prev_out});
+  auto r = validate_tx(*tx, 1, utxos, nullptr);
+  ASSERT_TRUE(r.ok);
+}
+
+TEST(test_sconbreg_tx_rejects_join_request_mixing) {
+  const auto sponsor = key_from_byte(0x51);
+  const auto validator = key_from_byte(0x52);
+  const auto payout = key_from_byte(0x53);
+  const OutPoint spend_op{Hash32{0x51}, 0};
+  const TxOut prev_out{
+      BOND_AMOUNT + 1000,
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  auto join_pop =
+      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key),
+                            validator.private_key);
+  auto onboarding_pop =
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+                            validator.private_key);
+  std::vector<TxOut> outputs{
+      TxOut{BOND_AMOUNT, reg_script(validator.public_key)},
+      TxOut{0, join_request_script(validator.public_key, payout.public_key, join_pop)},
+      TxOut{0, onboarding_registration_script(validator.public_key, payout.public_key, onboarding_pop)},
+  };
+  const auto change = prev_out.value - BOND_AMOUNT - 1000;
+  if (change > 0) outputs.push_back(TxOut{change, prev_out.script_pubkey});
+  auto tx = build_signed_p2pkh_tx_single_input(spend_op, prev_out, sponsor.private_key, outputs);
+  ASSERT_TRUE(tx.has_value());
+  UtxoSet utxos;
+  utxos.emplace(spend_op, UtxoEntry{prev_out});
+  auto r = validate_tx(*tx, 1, utxos, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("SCONBREG may not appear with validator join outputs"));
+}
+
+TEST(test_sconbreg_rejects_duplicate_and_banned_validator_pubkey_when_registry_context_present) {
+  const auto sponsor = key_from_byte(0x58);
+  const auto validator = key_from_byte(0x59);
+  const auto payout = key_from_byte(0x5a);
+  const OutPoint spend_op{Hash32{0x58}, 0};
+  const TxOut prev_out{
+      1'000'000,
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  std::string err;
+  auto tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+                                             validator.private_key, payout.public_key, 1000, prev_out.script_pubkey);
+  ASSERT_TRUE(tx.has_value());
+  UtxoSet utxos;
+  utxos.emplace(spend_op, UtxoEntry{prev_out});
+
+  auto net = mainnet_network();
+  const auto chain_id = sample_chain_id(net);
+  Hash32 anchor{};
+  anchor.fill(0x31);
+  consensus::ValidatorRegistry vr;
+  ASSERT_TRUE(vr.register_onboarding(validator.public_key, 10, &err));
+  auto duplicate_ctx = join_pow_ctx_with_validators(net, chain_id, vr, 10, anchor);
+  auto duplicate = validate_tx(*tx, 1, utxos, &duplicate_ctx);
+  ASSERT_TRUE(!duplicate.ok);
+  ASSERT_EQ(duplicate.error, std::string("validator already registered"));
+
+  vr.ban(validator.public_key, 11);
+  auto banned_ctx = join_pow_ctx_with_validators(net, chain_id, vr, 11, anchor);
+  auto banned = validate_tx(*tx, 1, utxos, &banned_ctx);
+  ASSERT_TRUE(!banned.ok);
+  ASSERT_EQ(banned.error, std::string("validator banned"));
+}
+
+TEST(test_sconbreg_admission_pow_valid_nonce_is_accepted_and_disabled_mode_preserves_legacy) {
+  auto net = mainnet_network();
+  net.onboarding_admission_pow_difficulty_bits = 4;
+  const auto chain_id = sample_chain_id(net);
+  Hash32 anchor{};
+  anchor.fill(0x66);
+  const auto sponsor = key_from_byte(0x61);
+  const auto validator = key_from_byte(0x62);
+  const auto payout = key_from_byte(0x63);
+  const OutPoint spend_op{Hash32{0x61}, 0};
+  const TxOut prev_out{
+      1'000'000,
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  ValidatorJoinAdmissionPowBuildContext pow_ctx{
+      .network = &net,
+      .chain_id = &chain_id,
+      .current_height = 33,
+      .finalized_hash_at_height = [anchor](std::uint64_t height) -> std::optional<Hash32> {
+        if (height == 0) return zero_hash();
+        return anchor;
+      },
+  };
+  std::string err;
+  auto tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+                                             validator.private_key, payout.public_key, 1000, prev_out.script_pubkey,
+                                             &err, &pow_ctx);
+  ASSERT_TRUE(tx.has_value());
+  UtxoSet utxos;
+  utxos.emplace(spend_op, UtxoEntry{prev_out});
+  auto ctx = join_pow_ctx(net, chain_id, 33, anchor);
+  const auto accepted = validate_tx(*tx, 1, utxos, &ctx);
+  ASSERT_TRUE(accepted.ok);
+
+  auto disabled_net = net;
+  disabled_net.onboarding_admission_pow_difficulty_bits = 0;
+  auto disabled_ctx = join_pow_ctx(disabled_net, chain_id, 33, anchor);
+  auto legacy_tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+                                                    validator.private_key, payout.public_key, 1000,
+                                                    prev_out.script_pubkey, &err, nullptr);
+  ASSERT_TRUE(legacy_tx.has_value());
+  ASSERT_TRUE(validate_tx(*legacy_tx, 1, utxos, &disabled_ctx).ok);
+}
+
+TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_anchor_and_wrong_payout_binding) {
+  auto net = mainnet_network();
+  net.onboarding_admission_pow_difficulty_bits = 4;
+  const auto chain_id = sample_chain_id(net);
+  Hash32 anchor{};
+  anchor.fill(0x77);
+  const auto sponsor = key_from_byte(0x71);
+  const auto validator = key_from_byte(0x72);
+  const auto payout = key_from_byte(0x73);
+  const auto other_payout = key_from_byte(0x74);
+  const OutPoint spend_op{Hash32{0x71}, 0};
+  const TxOut prev_out{
+      1'000'000,
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  ValidatorJoinAdmissionPowBuildContext pow_ctx{
+      .network = &net,
+      .chain_id = &chain_id,
+      .current_height = 33,
+      .finalized_hash_at_height = [anchor](std::uint64_t height) -> std::optional<Hash32> {
+        if (height == 0) return zero_hash();
+        return anchor;
+      },
+  };
+  std::string err;
+  auto valid_tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+                                                   validator.private_key, payout.public_key, 1000,
+                                                   prev_out.script_pubkey, &err, &pow_ctx);
+  ASSERT_TRUE(valid_tx.has_value());
+  UtxoSet view;
+  view.emplace(spend_op, UtxoEntry{prev_out});
+  auto valid_ctx = join_pow_ctx(net, chain_id, 33, anchor);
+  ASSERT_TRUE(validate_tx(*valid_tx, 1, view, &valid_ctx).ok);
+
+  OnboardingRegistrationScriptData parsed{};
+  ASSERT_TRUE(parse_onboarding_registration_script(valid_tx->outputs[0].script_pubkey, &parsed));
+
+  auto bad_nonce_script = onboarding_registration_script_with_pow(
+      validator.public_key, payout.public_key, parsed.pop, parsed.admission_pow_epoch, parsed.admission_pow_nonce + 1);
+  auto bad_nonce_tx = build_signed_p2pkh_tx_single_input(
+      spend_op, prev_out, sponsor.private_key,
+      std::vector<TxOut>{TxOut{0, bad_nonce_script}, TxOut{prev_out.value - 1000, prev_out.script_pubkey}});
+  ASSERT_TRUE(bad_nonce_tx.has_value());
+  ASSERT_TRUE(!validate_tx(*bad_nonce_tx, 1, view, &valid_ctx).ok);
+
+  Hash32 wrong_anchor{};
+  wrong_anchor.fill(0x78);
+  auto wrong_anchor_ctx = join_pow_ctx(net, chain_id, 33, wrong_anchor);
+  ASSERT_TRUE(!validate_tx(*valid_tx, 1, view, &wrong_anchor_ctx).ok);
+
+  auto expired_ctx = join_pow_ctx(net, chain_id, 97, anchor);
+  ASSERT_TRUE(!validate_tx(*valid_tx, 1, view, &expired_ctx).ok);
+
+  auto wrong_payout_pop =
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, other_payout.public_key),
+                            validator.private_key);
+  auto wrong_payout_script = onboarding_registration_script_with_pow(
+      validator.public_key, other_payout.public_key, wrong_payout_pop, parsed.admission_pow_epoch,
+      parsed.admission_pow_nonce);
+  auto wrong_payout_tx = build_signed_p2pkh_tx_single_input(
+      spend_op, prev_out, sponsor.private_key,
+      std::vector<TxOut>{TxOut{0, wrong_payout_script}, TxOut{prev_out.value - 1000, prev_out.script_pubkey}});
+  ASSERT_TRUE(wrong_payout_tx.has_value());
+  ASSERT_TRUE(!validate_tx(*wrong_payout_tx, 1, view, &valid_ctx).ok);
 }
 
 TEST(test_admission_pow_challenge_is_deterministic_and_bound) {
@@ -158,7 +409,7 @@ TEST(test_validator_join_admission_pow_valid_nonce_is_accepted_and_disabled_mode
   view[spend_op] = UtxoEntry{prev_out};
 
   auto net = mainnet_network();
-  net.admission_pow_difficulty_bits = 4;
+  net.validator_join_admission_pow_difficulty_bits = 4;
   const auto chain_id = sample_chain_id(net);
   Hash32 anchor{};
   anchor.fill(0x77);
@@ -182,7 +433,7 @@ TEST(test_validator_join_admission_pow_valid_nonce_is_accepted_and_disabled_mode
   ASSERT_TRUE(accepted.ok);
 
   auto disabled_net = net;
-  disabled_net.admission_pow_difficulty_bits = 0;
+  disabled_net.validator_join_admission_pow_difficulty_bits = 0;
   auto legacy_tx = build_validator_join_request_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
                                                    validator.private_key, payout.public_key, BOND_AMOUNT, 1'000, change_spk,
                                                    &err, nullptr);
@@ -206,7 +457,7 @@ TEST(test_validator_join_admission_pow_rejects_invalid_nonce_expired_epoch_wrong
   view[spend_op] = UtxoEntry{prev_out};
 
   auto net = mainnet_network();
-  net.admission_pow_difficulty_bits = 4;
+  net.validator_join_admission_pow_difficulty_bits = 4;
   const auto chain_id = sample_chain_id(net);
   Hash32 anchor{};
   anchor.fill(0x88);

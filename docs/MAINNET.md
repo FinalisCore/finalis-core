@@ -132,6 +132,15 @@ Exchanges should not build credit logic around:
 - confirmation counting
 - reorg rollback workflows
 
+Ingress and admission safety boundary:
+
+- transaction relay or mempool acceptance is not a settlement signal
+- finalized execution consumes certified ingress that is epoch-pinned to the
+  current expected epoch
+- stale-epoch ingress certificates are rejected by consensus validation paths
+- validator-control scripts (`SCONBREG`, `SCVALJRQ`, `SCVALREG`) are validated
+  with consistent semantics across legacy `Tx` and transparent outputs in `TxV2`
+
 ## 8. Minimal transaction status example
 
 Request:

@@ -94,6 +94,7 @@ Settlement is persisted as `EpochRewardSettlementState` with:
 - `reserve_subsidy_units`
 - `settled`
 - `reward_score_units`
+- `onboarding_score_units`
 - `expected_participation_units`
 - `observed_participation_units`
 
@@ -124,6 +125,27 @@ Participation inputs are derived only from finalized committee data:
 
 This keeps settlement replay-safe. It does not depend on whichever valid quorum
 signature subset happened to arrive first on one node.
+
+## Onboarding Settlement Slice
+
+The live settlement path contains a separate onboarding reward slice.
+
+Current rule:
+
+- `3%` of settlement rewards are carved from the validator settlement reward
+  slice
+- the onboarding slice is distributed only over `onboarding_score_units`
+- only validators in `ONBOARDING` may appear in that score map
+- the onboarding score map is derived from finalized epoch tickets only
+- fees and reserve subsidy are not shared with the onboarding slice
+
+If `onboarding_score_units` is empty:
+
+- the onboarding carve-out is suppressed
+- the full settlement reward remains in the validator pool
+
+This keeps total payout exact while avoiding payment to nonexistent onboarding
+recipients.
 
 ## Post-Cap Subsidy
 

@@ -154,8 +154,14 @@ payload.
 A block finalizes when the node has:
 
 - the block body
-- the committee for `(height, round)`
+- the effective committee recomputed for the certified frontier transition at
+  `(height, round)`
 - at least quorum valid signatures for the same `(height, round, block_id)`
+
+Before applying finality effects, the node re-verifies the certified frontier
+record against current canonical state and derives the expected committee/quorum
+from that recomputation. Signature filtering and quorum counting are performed
+against this expected committee.
 
 The finality proof is canonicalized before persistence:
 
@@ -195,6 +201,13 @@ That unified path:
 - rebuilds the next epoch checkpoint when the epoch boundary is crossed
 - applies version-aware transaction effects to version-aware UTXO state
 
+Certified ingress that feeds the transition is validated as epoch-pinned input:
+
+- certificate epoch must match the active epoch start for
+  `finalized_height + 1`
+- signer set must be signature-valid and committee-valid
+- stale-epoch ingress certificates are rejected on receive and on replay
+
 ## Checkpoint Boundary
 
 The most important live consensus boundary is:
@@ -223,6 +236,7 @@ local heuristics during proposal/vote handling.
 - a QC cannot unlock a conflicting payload
 - finalized transition delivery and local quorum finalization use the same
   state transition
+- local finalization rechecks committee/quorum from recomputed transition state
 - finalized transitions are applied deterministically
 - restart and replay must reconstruct the same validator state, availability
   state, checkpoints, committees, and proposer schedule

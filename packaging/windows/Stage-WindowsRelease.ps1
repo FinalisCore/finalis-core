@@ -51,6 +51,26 @@ function Convert-PngToBmp {
     }
 }
 
+function Get-BinaryDependents {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BinaryPath
+    )
+
+    $dlls = @()
+    try {
+        $output = & dumpbin.exe /DEPENDENTS $BinaryPath 2>$null
+        foreach ($line in $output) {
+            $trimmed = $line.Trim()
+            if ($trimmed -match '^[A-Za-z0-9._-]+\.dll$') {
+                $dlls += $trimmed
+            }
+        }
+    } catch {
+    }
+    return $dlls
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $resolvedBuildDir = Resolve-Path $BuildDir
 $resolvedStageRoot = Join-Path $StageRoot "payload"
@@ -97,10 +117,54 @@ if (Test-Path (Join-Path $binDir "finalis-wallet.exe")) {
     & $qtDeployExe --release --no-translations --compiler-runtime (Join-Path $binDir "finalis-wallet.exe")
 }
 
+$vcpkgDllMap = @{}
 foreach ($candidate in ($vcpkgBinCandidates | Select-Object -Unique)) {
     if (Test-Path $candidate) {
         Get-ChildItem -Path $candidate -Filter *.dll | ForEach-Object {
-            Copy-Item -Path $_.FullName -Destination $binDir -Force
+            $key = $_.Name.ToLowerInvariant()
+            if (-not $vcpkgDllMap.ContainsKey($key)) {
+                $vcpkgDllMap[$key] = $_.FullName
+            }
+        }
+    }
+}
+
+$seedBinaries = @(
+    (Join-Path $binDir "finalis-node.exe"),
+    (Join-Path $binDir "finalis-lightserver.exe"),
+    (Join-Path $binDir "finalis-explorer.exe"),
+    (Join-Path $binDir "finalis-cli.exe"),
+    (Join-Path $binDir "finalis-wallet.exe")
+) | Where-Object { Test-Path $_ }
+
+$dumpbinAvailable = $null -ne (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)
+if ($dumpbinAvailable -and $seedBinaries.Count -gt 0 -and $vcpkgDllMap.Count -gt 0) {
+    $visited = New-Object 'System.Collections.Generic.HashSet[string]'
+    $queue = New-Object System.Collections.Queue
+    foreach ($binary in $seedBinaries) {
+        $queue.Enqueue($binary)
+    }
+
+    while ($queue.Count -gt 0) {
+        $current = [string]$queue.Dequeue()
+        foreach ($dll in (Get-BinaryDependents -BinaryPath $current)) {
+            $dllKey = $dll.ToLowerInvariant()
+            if (-not $visited.Add($dllKey)) {
+                continue
+            }
+            if ($vcpkgDllMap.ContainsKey($dllKey)) {
+                $sourcePath = $vcpkgDllMap[$dllKey]
+                Copy-Item -Path $sourcePath -Destination $binDir -Force
+                $queue.Enqueue((Join-Path $binDir $dll))
+            }
+        }
+    }
+} else {
+    foreach ($candidate in ($vcpkgBinCandidates | Select-Object -Unique)) {
+        if (Test-Path $candidate) {
+            Get-ChildItem -Path $candidate -Filter *.dll | ForEach-Object {
+                Copy-Item -Path $_.FullName -Destination $binDir -Force
+            }
         }
     }
 }

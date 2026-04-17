@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <map>
 #include <optional>
 #include <set>
@@ -167,6 +168,15 @@ class WalletWindow final : public QMainWindow {
     std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache;
   };
 
+  struct EndpointProbeResult {
+    QString endpoint;
+    bool healthy{false};
+    QString error;
+    std::optional<lightserver::RpcStatusView> status;
+    std::optional<lightserver::AddressValidationView> validated_address;
+    std::optional<std::vector<lightserver::UtxoView>> utxos;
+  };
+
   struct RefreshResult {
     bool success{false};
     QString error;
@@ -189,6 +199,7 @@ class WalletWindow final : public QMainWindow {
     std::vector<std::string> remove_sent_txids;
     std::vector<OutPoint> mark_spent_confidential_outpoints;
     std::vector<std::string> released_pending_txids;
+    std::vector<EndpointProbeResult> probe_results;
   };
 
   void build_ui();
@@ -203,6 +214,7 @@ class WalletWindow final : public QMainWindow {
   void update_validator_onboarding_view();
   void refresh_validator_readiness_panel(bool interactive = false);
   void start_validator_onboarding_clicked();
+  void start_onboarding_registration_clicked();
   void cancel_validator_onboarding_clicked();
   void browse_validator_db_path();
   void browse_validator_key_path();
@@ -443,7 +455,20 @@ class WalletWindow final : public QMainWindow {
   std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache_;
   std::uint64_t refresh_generation_{0};
   std::uint64_t refresh_state_version_{0};
+  std::uint64_t tip_poll_generation_{0};
+  std::uint64_t mint_status_refresh_generation_{0};
+  std::uint64_t mint_deposit_submit_generation_{0};
+  std::uint64_t mint_redeem_submit_generation_{0};
+  std::uint64_t last_validator_auto_refresh_ms_{0};
+  std::uint64_t validator_refresh_generation_{0};
+  bool tip_poll_in_flight_{false};
+  bool mint_status_refresh_in_flight_{false};
+  bool mint_deposit_submit_in_flight_{false};
+  bool mint_redeem_submit_in_flight_{false};
+  bool validator_refresh_in_flight_{false};
   bool refresh_in_flight_{false};
+  std::vector<EndpointProbeResult> last_endpoint_probe_results_;
+  std::chrono::steady_clock::time_point last_probe_time_;
   WalletStore store_;
 };
 

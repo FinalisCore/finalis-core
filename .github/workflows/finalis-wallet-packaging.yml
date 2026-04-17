@@ -53,11 +53,14 @@ jobs:
 
       - name: Verify release artifacts
         run: |
+          shopt -s nullglob
           test -f build/release/SHA256SUMS.txt
           test -f build/release/manifest.txt
           test -f build/release/RELEASE_NOTES.md
-          test -f build/release/finalis-wallet-0.1.0-Linux.tar.gz
-          test -f build/release/finalis-wallet-0.1.0-Linux.zip
+          tgz=(build/release/finalis-wallet-*-Linux.tar.gz)
+          zip=(build/release/finalis-wallet-*-Linux.zip)
+          [[ ${#tgz[@]} -ge 1 ]]
+          [[ ${#zip[@]} -ge 1 ]]
 
       - name: Verify release manifest and checksums
         run: |

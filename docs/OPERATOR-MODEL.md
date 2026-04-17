@@ -16,6 +16,10 @@ This model applies unchanged on the restarted mainnet with identity:
 - `network_id = 258038c123a1c9b08475216e5f53a503`
 - `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
 
+Onboarding lifecycle and admission rules are specified separately in:
+
+- [docs/ONBOARDING-PROTOCOL.md](ONBOARDING-PROTOCOL.md)
+
 In finalized validator state:
 
 - `ValidatorInfo::operator_id` is persisted in the validator registry
@@ -28,6 +32,10 @@ In finalized validator state:
 For finalized join approvals:
 
 - `operator_id` is derived from the join request payout pubkey
+
+For finalized onboarding admission:
+
+- `operator_id` is derived from the onboarding registration payout pubkey
 
 For bootstrap or legacy validators:
 

@@ -25,6 +25,13 @@ Ticket PoW state must be interpreted relative to the current finalized history
 only. Old-chain difficulty or ticket observations from the abandoned network do
 not carry over after the genesis reset.
 
+Boundary rule:
+
+- Ticket PoW is not ingress certification and does not authorize transaction
+  admission by itself
+- ingress/control-plane admission uses certificate validation and separate
+  admission-PoW rules where policy requires them
+
 ## Ticket Construction
 
 Ticket construction on the live network is operator-based:
@@ -164,6 +171,21 @@ It does not stop on the first qualifying nonce.
 - adaptive checkpoint target / minimum eligible / minimum bond are separate and
   are not controlled by Ticket PoW
 - the live protocol removes best-of-N validator ticket gain under one operator
+
+## Boundary With Admission PoW
+
+Ticket PoW and admission PoW are separate mechanisms.
+
+- Ticket PoW:
+  - operator-level bounded search for committee ranking pressure
+  - epoch difficulty controller in this document
+- Admission PoW:
+  - script-level anti-spam/sybil gate for `SCONBREG` and `SCVALJRQ`
+  - validated in transaction/script semantics, not in ticket scoring
+
+This separation is consensus-critical: improving ticket quality does not bypass
+onboarding/join admission rules, and admission-PoW success does not increase
+ticket ranking power.
 
 ## Bounded Ticket PoW
 

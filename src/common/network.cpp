@@ -48,7 +48,8 @@ const NetworkConfig kMainnet{
     .miss_rate_suspend_threshold_percent = 30,
     .miss_rate_exit_threshold_percent = 60,
     .suspend_duration_blocks = 1'000,
-    .admission_pow_difficulty_bits = 0,
+    .onboarding_admission_pow_difficulty_bits = 20,
+    .validator_join_admission_pow_difficulty_bits = 22,
     .finality_binding_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .availability_recovery_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .confidential_utxo_activation_height = std::numeric_limits<std::uint64_t>::max(),
@@ -98,8 +99,12 @@ bool confidential_utxo_active_at_height(const NetworkConfig& network, std::uint6
   return height >= network.confidential_utxo_activation_height;
 }
 
-bool admission_pow_enabled(const NetworkConfig& network) {
-  return network.admission_pow_difficulty_bits != 0;
+bool onboarding_admission_pow_enabled(const NetworkConfig& network) {
+  return network.onboarding_admission_pow_difficulty_bits != 0;
+}
+
+bool validator_join_admission_pow_enabled(const NetworkConfig& network) {
+  return network.validator_join_admission_pow_difficulty_bits != 0;
 }
 
 }  // namespace finalis

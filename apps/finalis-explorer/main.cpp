@@ -109,6 +109,12 @@ struct StatusResult {
   std::optional<std::string> availability_local_operator_pubkey;
   std::optional<std::string> availability_local_operator_status;
   std::optional<std::uint64_t> availability_local_operator_seat_budget;
+  std::optional<std::string> availability_local_operator_validator_status;
+  std::optional<bool> availability_local_operator_onboarding_reward_eligible;
+  std::optional<std::uint64_t> availability_local_operator_onboarding_reward_score_units;
+  std::uint32_t onboarding_reward_pool_bps{0};
+  std::uint32_t onboarding_admission_pow_difficulty_bits{0};
+  std::uint32_t validator_join_admission_pow_difficulty_bits{0};
   std::uint32_t ticket_pow_difficulty{0};
   std::uint32_t ticket_pow_difficulty_min{0};
   std::uint32_t ticket_pow_difficulty_max{0};
@@ -162,6 +168,12 @@ struct TxOutputResult {
   std::uint64_t amount{0};
   std::optional<std::string> address;
   std::string script_hex;
+  std::optional<std::string> decoded_kind;
+  std::optional<std::string> validator_pubkey_hex;
+  std::optional<std::string> payout_pubkey_hex;
+  bool has_admission_pow{false};
+  std::optional<std::uint64_t> admission_pow_epoch;
+  std::optional<std::uint64_t> admission_pow_nonce;
 };
 
 struct TxResult {
@@ -1330,6 +1342,9 @@ LookupResult<StatusResult> parse_status_result_object(const finalis::minijson::V
       result.availability_local_operator_pubkey = object_string(local, "pubkey");
       result.availability_local_operator_status = object_string(local, "status");
       result.availability_local_operator_seat_budget = object_u64(local, "seat_budget");
+      result.availability_local_operator_validator_status = object_string(local, "validator_registry_status");
+      result.availability_local_operator_onboarding_reward_eligible = object_bool(local, "onboarding_reward_eligible");
+      result.availability_local_operator_onboarding_reward_score_units = object_u64(local, "onboarding_reward_score_units");
     }
   }
   if (const auto* adaptive_summary = status_obj.get("adaptive_telemetry_summary"); adaptive_summary && adaptive_summary->is_object()) {
@@ -1337,6 +1352,13 @@ LookupResult<StatusResult> parse_status_result_object(const finalis::minijson::V
     result.adaptive_telemetry_sample_count = object_u64(adaptive_summary, "sample_count");
     result.adaptive_telemetry_fallback_epochs = object_u64(adaptive_summary, "fallback_epochs");
     result.adaptive_telemetry_sticky_fallback_epochs = object_u64(adaptive_summary, "sticky_fallback_epochs");
+  }
+  if (const auto* onboarding = status_obj.get("onboarding"); onboarding && onboarding->is_object()) {
+    result.onboarding_reward_pool_bps = static_cast<std::uint32_t>(object_u64(onboarding, "reward_pool_bps").value_or(0));
+    result.onboarding_admission_pow_difficulty_bits =
+        static_cast<std::uint32_t>(object_u64(onboarding, "admission_pow_difficulty_bits").value_or(0));
+    result.validator_join_admission_pow_difficulty_bits =
+        static_cast<std::uint32_t>(object_u64(onboarding, "validator_join_admission_pow_difficulty_bits").value_or(0));
   }
   if (const auto* ticket_pow = status_obj.get("ticket_pow"); ticket_pow && ticket_pow->is_object()) {
     result.ticket_pow_difficulty = static_cast<std::uint32_t>(object_u64(ticket_pow, "difficulty").value_or(0));
@@ -1488,6 +1510,12 @@ finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
     json_put(item, "amount", out.amount);
     json_put(item, "address", out.address);
     json_put(item, "script_hex", out.script_hex);
+    json_put(item, "decoded_kind", out.decoded_kind);
+    json_put(item, "validator_pubkey_hex", out.validator_pubkey_hex);
+    json_put(item, "payout_pubkey_hex", out.payout_pubkey_hex);
+    json_put(item, "has_admission_pow", out.has_admission_pow);
+    json_put(item, "admission_pow_epoch", out.admission_pow_epoch);
+    json_put(item, "admission_pow_nonce", out.admission_pow_nonce);
     outputs.array_value.push_back(std::move(item));
   }
   obj.object_value["inputs"] = std::move(inputs);
@@ -1539,6 +1567,12 @@ std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& o
           object_u64(&output, "amount").value_or(0),
           object_string(&output, "address"),
           object_string(&output, "script_hex").value_or(""),
+          object_string(&output, "decoded_kind"),
+          object_string(&output, "validator_pubkey_hex"),
+          object_string(&output, "payout_pubkey_hex"),
+          object_bool(&output, "has_admission_pow").value_or(false),
+          object_u64(&output, "admission_pow_epoch"),
+          object_u64(&output, "admission_pow_nonce"),
       });
     }
   }
@@ -2413,6 +2447,22 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     return out;
   }
   const auto& tx_v1 = std::get<finalis::Tx>(*tx);
+  std::map<std::string, finalis::Tx> prev_tx_cache;
+  auto fetch_prev_tx = [&](const Hash32& prev_txid) -> std::optional<std::reference_wrapper<const finalis::Tx>> {
+    const std::string prev_txid_hex = finalis::hex_encode32(prev_txid);
+    auto it = prev_tx_cache.find(prev_txid_hex);
+    if (it != prev_tx_cache.end()) return std::cref(it->second);
+
+    auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + prev_txid_hex + "\"}");
+    if (!prev_call.result.has_value() || !prev_call.result->is_object()) return std::nullopt;
+    auto prev_hex = object_string(&*prev_call.result, "tx_hex");
+    if (!prev_hex) return std::nullopt;
+    auto prev_bytes = finalis::hex_decode(*prev_hex);
+    auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
+    if (!prev_tx.has_value() || !std::holds_alternative<finalis::Tx>(*prev_tx)) return std::nullopt;
+    auto inserted = prev_tx_cache.emplace(prev_txid_hex, std::get<finalis::Tx>(*prev_tx));
+    return std::cref(inserted.first->second);
+  };
 
   std::string network_name = "mainnet";
   if (auto st = fetch_status_result(cfg); st.value.has_value()) network_name = st.value->network;
@@ -2422,26 +2472,13 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   bool fee_known = true;
   for (const auto& in : tx_v1.inputs) {
     TxInputResult input_view{finalis::hex_encode32(in.prev_txid), in.prev_index, std::nullopt, std::nullopt};
-    auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + finalis::hex_encode32(in.prev_txid) + "\"}");
-    if (!prev_call.result.has_value() || !prev_call.result->is_object()) {
+    auto prev_tx_opt = fetch_prev_tx(in.prev_txid);
+    if (!prev_tx_opt.has_value()) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
       continue;
     }
-    auto prev_hex = object_string(&*prev_call.result, "tx_hex");
-    if (!prev_hex) {
-      result.inputs.push_back(std::move(input_view));
-      fee_known = false;
-      continue;
-    }
-    auto prev_bytes = finalis::hex_decode(*prev_hex);
-    auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
-    if (!prev_tx.has_value() || !std::holds_alternative<finalis::Tx>(*prev_tx)) {
-      result.inputs.push_back(std::move(input_view));
-      fee_known = false;
-      continue;
-    }
-    const auto& prev_tx_v1 = std::get<finalis::Tx>(*prev_tx);
+    const auto& prev_tx_v1 = prev_tx_opt->get();
     if (in.prev_index >= prev_tx_v1.outputs.size()) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
@@ -2459,7 +2496,27 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
         tx_out.value,
         script_to_address(tx_out.script_pubkey, hrp),
         finalis::hex_encode(tx_out.script_pubkey),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        false,
+        std::nullopt,
+        std::nullopt,
     });
+  }
+  if (const auto* decoded_outputs = tx_call.result->get("decoded_outputs"); decoded_outputs && decoded_outputs->is_array()) {
+    const auto limit = std::min(decoded_outputs->array_value.size(), result.outputs.size());
+    for (std::size_t i = 0; i < limit; ++i) {
+      const auto& item = decoded_outputs->array_value[i];
+      if (!item.is_object()) continue;
+      result.outputs[i].decoded_kind = object_string(&item, "decoded_kind");
+      result.outputs[i].validator_pubkey_hex = object_string(&item, "validator_pubkey_hex");
+      result.outputs[i].payout_pubkey_hex = object_string(&item, "payout_pubkey_hex");
+      result.outputs[i].has_admission_pow = object_bool(&item, "has_admission_pow").value_or(false);
+      result.outputs[i].admission_pow_epoch = object_u64(&item, "admission_pow_epoch");
+      result.outputs[i].admission_pow_nonce = object_u64(&item, "admission_pow_nonce");
+      if (auto addr = object_string(&item, "address"); addr.has_value()) result.outputs[i].address = *addr;
+    }
   }
   if (fee_known && total_in >= result.total_out) result.fee = total_in - result.total_out;
   const auto flow = classify_tx_flow(result.inputs, result.outputs);
@@ -2921,7 +2978,18 @@ std::string render_status_json(const StatusResult& result, std::optional<std::ui
       << ",\"pubkey\":" << json_string_or_null(result.availability_local_operator_pubkey)
       << ",\"status\":" << json_string_or_null(result.availability_local_operator_status)
       << ",\"seat_budget\":" << json_u64_or_null(result.availability_local_operator_seat_budget)
+      << ",\"validator_registry_status\":" << json_string_or_null(result.availability_local_operator_validator_status)
+      << ",\"onboarding_reward_eligible\":"
+      << (result.availability_local_operator_onboarding_reward_eligible.has_value()
+              ? json_bool(*result.availability_local_operator_onboarding_reward_eligible)
+              : "null")
+      << ",\"onboarding_reward_score_units\":"
+      << json_u64_or_null(result.availability_local_operator_onboarding_reward_score_units)
       << "}},"
+      << "\"onboarding\":{\"reward_pool_bps\":" << result.onboarding_reward_pool_bps
+      << ",\"admission_pow_difficulty_bits\":" << result.onboarding_admission_pow_difficulty_bits
+      << ",\"validator_join_admission_pow_difficulty_bits\":" << result.validator_join_admission_pow_difficulty_bits
+      << "},"
       << "\"ticket_pow\":{\"difficulty\":" << result.ticket_pow_difficulty
       << ",\"difficulty_min\":" << result.ticket_pow_difficulty_min
       << ",\"difficulty_max\":" << result.ticket_pow_difficulty_max
@@ -2959,7 +3027,14 @@ std::string render_tx_json(const TxResult& result) {
     if (i) oss << ",";
     oss << "{\"amount\":" << result.outputs[i].amount << ",\"address\":"
         << json_string_or_null(result.outputs[i].address) << ",\"script_hex\":\""
-        << json_escape(result.outputs[i].script_hex) << "\"}";
+        << json_escape(result.outputs[i].script_hex) << "\",\"decoded_kind\":"
+        << json_string_or_null(result.outputs[i].decoded_kind)
+        << ",\"validator_pubkey_hex\":" << json_string_or_null(result.outputs[i].validator_pubkey_hex)
+        << ",\"payout_pubkey_hex\":" << json_string_or_null(result.outputs[i].payout_pubkey_hex)
+        << ",\"has_admission_pow\":" << json_bool(result.outputs[i].has_admission_pow)
+        << ",\"admission_pow_epoch\":" << json_u64_or_null(result.outputs[i].admission_pow_epoch)
+        << ",\"admission_pow_nonce\":" << json_u64_or_null(result.outputs[i].admission_pow_nonce)
+        << "}";
   }
   std::size_t decoded_output_count = 0;
   std::set<std::string> decoded_recipients;
@@ -3245,10 +3320,28 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
     const auto& out = tx.outputs[i];
     body << "<tr><td>" << i << "</td><td>" << html_escape(format_amount(out.amount)) << "</td><td>";
-    if (out.address.has_value()) body << "<a href=\"/address/" << html_escape(*out.address) << "\"><code>" << html_escape(*out.address) << "</code></a>";
-    else body << "<span class=\"muted\">not decoded by explorer</span>";
-    body << "</td><td>" << (out.address.has_value() ? "P2PKH address" : "Raw script only")
-         << "</td><td><code>" << html_escape(out.script_hex) << "</code></td></tr>";
+    if (out.decoded_kind == std::optional<std::string>{"onboarding_registration"}) {
+      body << "<div><strong>validator</strong> <code>" << html_escape(short_hex(out.validator_pubkey_hex.value_or(""))) << "</code></div>";
+      body << "<div><strong>payout</strong> <code>" << html_escape(short_hex(out.payout_pubkey_hex.value_or(""))) << "</code></div>";
+      if (out.has_admission_pow) {
+        body << "<div class=\"muted\">admission PoW epoch "
+             << html_escape(out.admission_pow_epoch.has_value() ? std::to_string(*out.admission_pow_epoch) : std::string("n/a"))
+             << ", nonce "
+             << html_escape(out.admission_pow_nonce.has_value() ? std::to_string(*out.admission_pow_nonce) : std::string("n/a"))
+             << "</div>";
+      }
+    } else if (out.address.has_value()) {
+      body << "<a href=\"/address/" << html_escape(*out.address) << "\"><code>" << html_escape(*out.address) << "</code></a>";
+    } else {
+      body << "<span class=\"muted\">not decoded by explorer</span>";
+    }
+    body << "</td><td>";
+    if (out.decoded_kind == std::optional<std::string>{"onboarding_registration"}) {
+      body << "SCONBREG onboarding registration";
+    } else {
+      body << (out.address.has_value() ? "P2PKH address" : "Raw script only");
+    }
+    body << "</td><td><code>" << html_escape(out.script_hex) << "</code></td></tr>";
   }
   if (tx.outputs.empty()) body << "<tr><td colspan=\"5\" class=\"muted\">No outputs</td></tr>";
   body << "</tbody></table></div></div>";

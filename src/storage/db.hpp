@@ -95,6 +95,7 @@ struct EpochRewardSettlementState {
   std::map<PubKey32, std::uint64_t> reward_score_units;
   std::map<PubKey32, std::uint64_t> expected_participation_units;
   std::map<PubKey32, std::uint64_t> observed_participation_units;
+  std::map<PubKey32, std::uint64_t> onboarding_score_units;
 };
 
 struct EpochCommitteeFreezeMarker {

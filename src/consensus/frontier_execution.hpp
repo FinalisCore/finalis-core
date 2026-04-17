@@ -41,7 +41,13 @@ Hash32 frontier_ingress_commitment(const FrontierVector& prev_vector, const Fron
 bool frontier_merge_certified_ingress(const FrontierVector& prev_vector, const FrontierVector& next_vector,
                                       const CertifiedIngressLaneRecords& lane_records,
                                       const FrontierLaneRoots& prev_lane_roots, FrontierLaneRoots* next_lane_roots,
-                                      std::vector<Bytes>* ordered_records, std::string* error = nullptr);
+                                      std::vector<Bytes>* ordered_records,
+                                      const SpecialValidationContext* ctx = nullptr,
+                                      std::string* error = nullptr);
+bool frontier_merge_certified_ingress(const FrontierVector& prev_vector, const FrontierVector& next_vector,
+                                      const CertifiedIngressLaneRecords& lane_records,
+                                      const FrontierLaneRoots& prev_lane_roots, FrontierLaneRoots* next_lane_roots,
+                                      std::vector<Bytes>* ordered_records, std::string* error);
 
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,

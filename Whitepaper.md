@@ -1,921 +1,282 @@
-# Finality Without Fork Choice: How Finalis Core Achieves Deterministic Settlement
+# Finalis: A Finalized-Tip Byzantine Settlement Protocol
 
-**Technical Whitepaper** | April 2026 | Version 1.0 | reikagitakashi@gmail.com
-
----
+**Technical Whitepaper**  
+April 2026 | reikagitakashi@gmail.com
 
 ## Abstract
 
-Finalis Core is a finalized-state BFT blockchain in which validator lifecycle, operator-native committee formation, adaptive checkpoint derivation, and future committee eligibility are all derived deterministically from finalized history. The node processes only `height = finalized_height + 1`. There is no live fork-choice path in the node runtime.
+Finalis is a blockchain protocol designed around deterministic finality rather than fork-choice competition. The live protocol advances only at `finalized_height + 1`. A transition is committed when a quorum certificate over `(height, round, transition_id)` is verified against the canonical committee for that context. The protocol removes non-finalized chain selection, derives committee checkpoints deterministically from finalized state, and replays state from authoritative finalized artifacts.
 
-This paper describes the consensus protocol, deterministic committee derivation, economic model, light client RPC interface, and security properties of the system.
-
----
+The design objective is strict settlement semantics with bounded validation cost, explicit replay authority, and auditable consensus behavior under standard Byzantine assumptions.
 
 ## 1. Introduction
 
-### 1.1 The Problem
+Classical proof-of-work chains expose probabilistic finality through depth and fork choice. Many BFT systems add explicit finality but still carry complex runtime branches around pending forks and speculative views.
 
-Most blockchains require a **live fork choice rule**:
+Finalis adopts a narrower model:
 
-| Chain | Fork Choice Rule |
-|-------|------------------|
-| Bitcoin | Longest chain (Nakamoto consensus) |
-| Ethereum | GHOST (heaviest subtree) |
-| Tendermint/Cosmos | Last finalized + vote extrapolation |
+- There is one authoritative finalized tip.
+- Consensus work is meaningful only for `height = finalized_height + 1`.
+- Deterministic replay from finalized artifacts reconstructs canonical state.
 
-These rules create complexity for:
-- Wallet developers (reorg handling, confirmation heuristics)
-- Exchange engineers (deposit finality, confirmation depth)
-- Light clients (trusted headers, fraud proofs)
-- Cross-chain bridges (finality gadgets, waiting periods)
+This model is intended for systems that prioritize unambiguous settlement over speculative throughput.
 
-### 1.2 The Alternative
-
-Finalis Core eliminates fork choice entirely.
-
-```
-The node processes only:
-    height = finalized_height + 1
-
-No live chain selection. No "best chain" computation. No reorgs.
-```
-
-### 1.3 State Transition
-
-The state transition is a pure function:
-
-```
-state(h+1) = Apply(finalized_block(h+1), state(h))
-```
-
-Where `finalized_block(h+1)` exists if and only if the network has produced a quorum certificate for that height.
-
-### 1.4 Key Insight
-
-In most chains, finality is an **emergent property** of fork choice + block depth. In Finalis Core, finality is **the only property** — fork choice is absent by design.
-
----
-
-## 2. BFT Quorum Finality
-
-### 2.1 Quorum Certificate (QC) Definition
+## 2. Model and Notation
 
 Let:
-- `N` = committee size at height `H`
-- `Q(H)` = floor(2N/3) + 1 (BFT quorum threshold)
-- `S(H,B)` = set of signatures from committee members for block `B` at height `H`
 
-A block `B` at height `H` is **finalized** if:
+- `H_f` be current finalized height.
+- `T_h` be the frontier transition proposed for height `h`.
+- `id(T_h)` be transition identifier.
+- `C(h, r)` be canonical committee for height `h`, round `r`.
+- `N = |C(h, r)|` and `Q = floor(2N/3) + 1`.
 
-```
-finalized(H, B) := |S(H,B)| >= Q(H) ∧ valid_signatures(S(H,B))
-```
-
-Where `valid_signatures()` verifies:
-- Each signature is from a distinct committee member
-- Each signature is over `(H, round, block_id)`
-- The signer was in the committee at height `H`
-
-### 2.2 Voting Flow
-
-```
-Leader                Validator 1          Validator 2          Validator N
-   │                       │                    │                    │
-   │   PROPOSE(H, B)       │                    │                    │
-   ├──────────────────────►│                    │                    │
-   │   PROPOSE(H, B)       │                    │                    │
-   ├───────────────────────┼───────────────────►│                    │
-   │   PROPOSE(H, B)       │                    │                    │
-   ├───────────────────────┼────────────────────┼───────────────────►│
-   │                       │                    │                    │
-   │                       │   VOTE(H, B)       │                    │
-   │◄──────────────────────┤                    │                    │
-   │                       │   VOTE(H, B)       │                    │
-   │◄──────────────────────┼─────────────────── ┤                    │
-   │                       │                    │                    │
-   │                       │                    │   VOTE(H, B)       │
-   │◄──────────────────────┼────────────────────┼─────────────────── ┤
-   │                       │                    │                    │
-   │   QC(H, B)            │                    │                    │
-   ├──────────────────────►│                    │                    │
-   │   QC(H, B)            │                    │                    │
-   ├───────────────────────┼───────────────────►│                    │
-   │   QC(H, B)            │                    │                    │
-   ├───────────────────────┼────────────────────┼───────────────────►│
-   │                       │                    │                    │
-   ▼                       ▼                    ▼                    ▼
-FINALIZED              FINALIZED              FINALIZED              FINALIZED
-```
-
-### 2.3 Safety Proof (No Forks)
-
-Assume two distinct blocks `B1` and `B2` are finalized at the same height `H`:
-
-```
-|S(H,B1)| >= Q(H)  and  |S(H,B2)| >= Q(H)
-```
-
-By the pigeonhole principle, the intersection `S(H,B1) ∩ S(H,B2)` has size:
-
-```
-|intersection| >= 2*Q(H) - N
-```
-
-Substituting `Q(H) = floor(2N/3) + 1`:
-
-```
-2*(floor(2N/3) + 1) - N >= 2*(2N/3) - N + 2 = (4N/3 - N) + 2 = N/3 + 2
-```
-
-For `N >= 1`, `N/3 + 2 > 0`. Therefore, at least one honest validator would have signed two different blocks at the same height — equivocation. Honest validators never equivocate, so `B1 = B2`.
-
-**Therefore, no two distinct blocks can be finalized at the same height.**
-
-### 2.4 Liveness
-
-If the network is synchronous and the leader is honest:
-1. Leader proposes block `B`
-2. `>= Q(H)` validators vote
-3. Leader collects votes into QC
-4. QC is broadcast, block is finalized
-
-If the leader is faulty, timeout certificate triggers round change. Liveness holds with standard BFT assumptions (2/3 honest, synchronous after GST).
-
-### 2.5 Restart Safety
-
-On restart, the node:
-1. Reads the last finalized height from disk
-2. Derives the full canonical state by replaying finalized transitions
-3. Begins consensus for `finalized_height + 1`
-
-No "last finality certificate" ambiguity. No "what if we finalized two different blocks" — the BFT quorum prevents equivocation.
-
----
-
-## 3. Deterministic Committee Formation
-
-### 3.1 The Challenge
-
-Most BFT chains have a live validator set that changes via external voting (on-chain governance, staking contract). Finalis Core derives committees **deterministically from finalized history** — no live votes for validator set changes.
-
-### 3.2 Core Data Structures
-
-```cpp
-struct FinalizedCommitteeCheckpoint {
-    uint64_t epoch_start_height;
-    Hash32 epoch_seed;
-    uint8_t ticket_difficulty_bits;
-    vector<PubKey32> ordered_members;
-    vector<uint64_t> ordered_base_weights;
-    vector<uint32_t> ordered_ticket_bonus_bps;
-    DerivationMode mode;  // NORMAL or FALLBACK
-    AdaptiveCheckpointParameters adaptive;
-}
-
-struct AdaptiveCheckpointParameters {
-    uint64_t qualified_depth;          // Operators meeting min_bond + availability
-    uint64_t target_committee_size;    // Derived from qualified_depth
-    uint64_t min_eligible_operators;   // target + 3 (BFT safety margin)
-    uint64_t min_bond;                 // Adjusts inversely with qualified_depth
-    uint32_t target_expand_streak;     // Consecutive expansions
-    uint32_t target_contract_streak;   // Consecutive contractions
-}
-```
-
-### 3.3 Committee Derivation Flow
-
-**Step 1: Compute qualified_depth**
-
-```
-qualified_depth = count_eligible_operators_at_checkpoint(
-    validators,
-    height,
-    availability_state,
-    availability_config_with_min_bond(availability_cfg, min_bond)
-)
-```
-
-An operator is eligible if:
-- Bonded amount >= min_bond
-- Availability status is ACTIVE (not WARMUP/PROBATION/EJECTED)
-- Passed liveness window checks
-
-**Step 2: Derive adaptive parameters**
-
-```
-if (qualified_depth > target * 1.5):
-    new_target = min(target * 2, qualified_depth)
-    expand_streak += 1, contract_streak = 0
-elif (qualified_depth < target * 0.75):
-    new_target = max(target / 2, 1)
-    contract_streak += 1, expand_streak = 0
-else:
-    new_target = target
-    expand_streak = 0, contract_streak = 0
-
-if (expand_streak > 3): new_target = min(new_target, qualified_depth)
-if (contract_streak > 2): new_target = max(new_target, qualified_depth / 2)
-```
-
-**Step 3: Compute min_bond and min_eligible**
-
-```
-min_eligible = target_committee_size + 3
-base_bond = BOND_AMOUNT * (target_committee_size / 16)
-depth_multiplier = max(1.0, qualified_depth / target_committee_size)
-min_bond = base_bond / depth_multiplier
-```
-
-**Step 4: Select committee members**
-
-```
-candidates = []
-for each eligible operator:
-    weight = bond_amount * (1 + ticket_bonus_bps/10000)
-    candidates.append(operator, weight)
-
-sort(candidates, by weight descending)
-committee = candidates[0:target]
-```
-
-### 3.4 Example Evolution
-
-| Epoch | Qualified Depth | Target | Min Bond | Mode |
-|-------|-----------------|--------|----------|------|
-| 0 (genesis) | 16 | 16 | 150 FLS | NORMAL |
-| 1 | 30 | 30 | 80 FLS | NORMAL |
-| 2 | 40 | 30 (stable) | 80 FLS | NORMAL |
-| 3 | 10 | 8 | 300 FLS | NORMAL |
-| 4 | 6 | 8 | 300 FLS | NORMAL |
-| 5 | 5 | 8 | 300 FLS | FALLBACK |
-
-### 3.5 Fallback Mode
-
-When `eligible_operator_count < min_eligible_operators`:
-- Committee derivation switches to FALLBACK mode
-- Availability enforcement is relaxed (`enforce_availability = false`)
-- Hysteresis: recovery requires `eligible >= min_eligible + 1`
-- Fallback mode is logged and exposed via RPC
-
-This ensures the chain remains live even if operator participation drops below safety threshold.
-
----
-
-## 4. Validator Lifecycle
-
-### 4.1 Validator Status State Machine
-
-```cpp
-enum class ValidatorStatus : uint8_t {
-    PENDING = 0,    // Joined but in warmup
-    ACTIVE = 1,     // Fully participating
-    EXITING = 2,    // Unbonding, can't participate
-    BANNED = 3,     // Slashed, permanently removed
-    SUSPENDED = 4,  // Temporarily removed (liveness failure)
-};
-```
-
-### 4.2 State Transitions
-
-```
-PENDING ──[warmup_blocks complete]──> ACTIVE
-ACTIVE  ──[unbond request]──────────> EXITING
-ACTIVE  ──[liveness failure]────────> SUSPENDED
-SUSPENDED ──[suspend_duration pass]─> ACTIVE
-ACTIVE/SUSPENDED ──[slashing]───────> BANNED
-EXITING ──[cooldown_blocks pass]────> (removed from registry)
-```
-
-### 4.3 Liveness Tracking
-
-Every block, validators in the committee are tracked:
-
-```
-info.eligible_count_window++      // Was in committee
-if (participated) 
-    info.participated_count_window++
-```
-
-At window rollover (every 10,000 blocks by default):
-
-```
-miss_rate = (eligible - participated) * 100 / eligible
-
-if (miss_rate >= 60%) → status = EXITING
-if (miss_rate >= 30%) → status = SUSPENDED
-// Reset counters for next window
-```
-
-### 4.4 Slashing
+A vote message is bound to `(h, r, id(T_h))`.
 
-Slashing occurs for:
-- Double signing (equivocation)
-- Other Byzantine behavior
+A finality certificate contains:
 
-When slash evidence is found:
-```
-validators.ban(pub, height);           // Status → BANNED
-validators.finalize_withdrawal(pub);   // Bond is forfeited
-```
-
-### 4.5 Operator Model
-
-One operator (entity) can run multiple validators. Availability is tracked per-operator, not per-validator:
-
-```
-Operator "StakingHub" (operator_id = 0xABC...)
-  ├── Validator Alice (pubkey 0x111...)
-  └── Validator Bob   (pubkey 0x222...)
-
-If Alice misses votes → Both Alice AND Bob are penalized
-```
-
-This prevents operators from running many unreliable validators.
-
----
-
-## 5. Economic Model
-
-### 5.1 Supply Cap
-
-```
-Total supply: 7,000,000 FLS (hard cap)
-Emission: 12 years, 20% annual decay
-Reserve accrual: 10% during emission era
-Post-cap: fee pooling + reserve subsidy
-```
-
-### 5.2 Emission Schedule
-
-```
-Year 1: 1,000,000 FLS (base)
-Year 2: 800,000 FLS (-20%)
-Year 3: 640,000 FLS
-Year 4: 512,000 FLS
-Year 5: 409,600 FLS
-Year 6: 327,680 FLS
-Year 7: 262,144 FLS
-Year 8: 209,715 FLS
-Year 9: 167,772 FLS
-Year 10: 134,218 FLS
-Year 11: 107,374 FLS
-Year 12: 85,899 FLS
-After year 12: 0 FLS new issuance
-```
-
-Per-block reward:
-```
-reward_units(height) = emission_rate(height) / blocks_per_year
-```
-
-### 5.3 Reward Flow
-
-```
-                    BLOCK PRODUCED at height H
-                              │
-                              ▼
-                    gross_reward = emission(H)
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        │                     │                     │
-        ▼                     ▼                     ▼
-  10% to Reserve        90% to Validators      Fees to Fee Pool
-        │                     │                     │
-        ▼                     ▼                     ▼
-   Reserve Balance      Validator Reward      Fee Pool (post-cap)
-   (post-cap subsidy)   = (90% * emission)/N   │
-                        * (participation_bps)  │
-                        + (fee_pool_share)     │
-                                               │
-                        ┌──────────────────────┘
-                        ▼
-                   Post-cap (after year 12):
-                   Fee Pool → Validators
-                   Reserve Subsidy → Fee Pool (if fees low)
-```
-
-### 5.4 Participation Penalty
-
-Validators earn rewards proportional to their participation:
-
-```
-adjusted_score = raw_score * participation_bps / 10000
-
-where participation_bps = min(observed_votes / expected_votes, 1) * 10000
-```
-
-**Example:**
-```
-expected_votes = 100 (validator in committee for 100 rounds)
-observed_votes = 85
-base_reward = 100 FLS
-
-actual_reward = 100 × (85/100) = 85 FLS
-```
-
-### 5.5 Thresholds
-
-| Threshold | Value | Consequence |
-|-----------|-------|-------------|
-| Miss rate ≥ 30% | Suspension | Temporarily removed from committee |
-| Miss rate ≥ 60% | Exit | Unbond and leave validator set |
-| Suspend duration | 1,000 blocks | ~2-3 hours (depending on block time) |
-
-### 5.6 Post-Cap Operation
-
-After year 12 (or when 7M FLS is reached):
-- No new coins are minted
-- Fee pools are distributed to validators
-- Reserve subsidy can supplement fee pools (drawn from accrued reserve)
-- Validators earn only transaction fees + reserve subsidy (if any)
-
----
+- `height`, `round`, `transition_id`
+- committee members used for verification
+- canonicalized valid signatures (deduplicated, sorted, quorum-truncated)
 
-## 6. Lightserver RPC
+## 3. Consensus Rule
 
-### 6.1 Design Principle
+A transition `T_h` is finalized iff:
 
-All RPC methods read **only finalized state**. There is no "pending" or "mempool" view. This eliminates reorg risk for clients.
+1. `h = H_f + 1`
+2. certificate payload matches `T_h`
+3. committee context is valid for `(h, r)`
+4. at least `Q` distinct committee signatures verify on the vote message
 
-### 6.2 Core Methods
+The runtime rejects work outside `H_f + 1` on the live path.
 
-| Method | Input | Output | Idempotent |
-|--------|-------|--------|------------|
-| `get_status` | `{}` | node status, tip height, availability | Yes |
-| `get_tx_status` | `{txid}` | finalized status, height, credit safety | Yes |
-| `get_tx` | `{txid}` | full transaction hex (if finalized) | Yes |
-| `get_utxos` | `{scripthash, limit, start_after}` | paged UTXO list | Yes |
-| `get_history_page` | `{scripthash, limit, start_after}` | paged transaction history | Yes |
-| `validate_address` | `{address}` | validity, network match, scripthash | Yes |
-| `broadcast_tx` | `{tx_hex}` | acceptance status (not finality) | No |
+### 3.1 Safety intuition
 
-### 6.3 Transaction Flow
+Two conflicting finalized transitions at the same `(h, r)` require two quorum signer sets over different payloads. Quorum intersection implies at least one overlapping honest signer would need to sign conflicting messages, violating Byzantine assumptions.
 
-```
-Wallet/Client              Lightserver              Node/Mempool
-     │                          │                        │
-     │   broadcast_tx(tx_hex)   │                        │
-     ├─────────────────────────►│                        │
-     │                          │   relay_tx(tx_hex)     │
-     │                          ├───────────────────────►│
-     │                          │                        │
-     │   {accepted: true}       │                        │
-     │◄─────────────────────────┤                        │
-     │                          │                        │
-     │   (polling)              │                        │
-     │   get_tx_status(txid)    │                        │
-     ├─────────────────────────►│                        │
-     │                          │   query DB             │
-     │                          │   (not yet finalized)  │
-     │   {finalized: false}     │                        │
-     │◄─────────────────────────┤                        │
-     │                          │                        │
-     │   ... later ...          │                        │
-     │                          │                        │
-     │   get_tx_status(txid)    │                        │
-     ├─────────────────────────►│                        │
-     │                          │   query DB             │
-     │                          │   (now finalized)      │
-     │   {finalized: true,      │                        │
-     │    height: 12345,        │                        │
-     │    credit_safe: true}    │                        │
-     │◄─────────────────────────┤                        │
-     │                          │                        │
-     ▼                          ▼                        ▼
-CREDIT SAFE                   (done)                   (done)
-```
-
-### 6.4 Credit Safety Rule
-
-A transaction is credit safe if:
-- It is finalized (`finalized = true`)
-- Its height is <= `finalized_height - 1` (not the tip itself, to allow for rollback of unconfirmed children — though reorgs cannot happen, this is conservative)
-
-### 6.5 Example RPC Responses
-
-**get_status response:**
-```json
-{
-    "network_name": "mainnet",
-    "finalized_height": 12345,
-    "finalized_transition_hash": "0x...",
-    "version": "0.1.0",
-    "healthy_peer_count": 8,
-    "latest_finality_committee_size": 16,
-    "latest_finality_quorum_threshold": 11,
-    "availability": {
-        "epoch": 5,
-        "eligible_operator_count": 12,
-        "checkpoint_derivation_mode": "normal",
-        "adaptive_regime": {
-            "qualified_depth": 14,
-            "adaptive_target_committee_size": 16,
-            "adaptive_min_bond": 15000000000
-        }
-    }
-}
-```
-
-**get_tx_status response:**
-```json
-{
-    "txid": "0x...",
-    "status": "finalized",
-    "finalized": true,
-    "height": 12340,
-    "finalized_depth": 6,
-    "credit_safe": true,
-    "transition_hash": "0x..."
-}
-```
-
-**get_utxos (paged) response:**
-```json
-{
-    "items": [
-        {"txid": "0x...", "vout": 0, "value": 100000000, "height": 12340}
-    ],
-    "has_more": true,
-    "next_start_after": {"txid": "0x...", "vout": 1}
-}
-```
-
-**broadcast_tx response:**
-```json
-{
-    "ok": true,
-    "accepted": true,
-    "txid": "0x...",
-    "status": "accepted_for_relay",
-    "retryable": false,
-    "mempool_full": false
-}
-```
+### 3.2 Liveness assumptions
 
-> **Important:** `accepted = true` means the transaction was accepted into the local mempool and will be relayed. It does **not** guarantee finalization. Clients must poll `get_tx_status` for settlement confirmation.
+Liveness remains conditional on:
 
----
+- eventual synchrony
+- quorum participation
+- valid proposal propagation
 
-## 7. Security Properties
+Failure of these conditions causes halt/degradation, not protocol-level ambiguous finalization.
 
-### 7.1 Safety Invariants
+### 3.3 Numbered propositions
 
-```
-∀ heights H1, H2: 
-    finalized(H1) ∧ finalized(H2) ∧ H1 ≠ H2 
-    → H1 and H2 are on same chain
-```
+**Proposition 1 (Single-Context Safety).**  
+Under quorum intersection and honest non-equivocation assumptions, two distinct
+transitions cannot both finalize at the same `(height, round)` context.
 
-(No forks by construction)
+*Proof sketch.* Distinct finalized transitions at one `(h, r)` imply two quorum
+signature sets over different payloads. Quorum intersection yields at least one
+common honest signer, contradicting non-equivocation.
 
-### 7.2 Liveness Invariant
+**Proposition 2 (Context Binding).**  
+A valid vote for `(h, r, id(T_h))` cannot be reused as a valid vote for a
+different `(h', r', id(T_{h'}))`.
 
-```
-If network is synchronous and >2/3 of validators are honest,
-then finalization eventually occurs for each height.
-```
+*Proof sketch.* Signature verification binds the exact message tuple
+`(height, round, transition_id)`. Any tuple change changes the verified
+message.
 
-### 7.3 Deterministic State
+## 4. Certified Ingress Layer
 
-```
-If two nodes have processed the same set of finalized blocks,
-they have identical state:
-    state1 == state2
-```
+Finalis executes ordered ingress records into transitions. Each certified ingress record binds a transaction payload to lane and sequence context.
 
-### 7.4 No Reorg Property
+Ingress validity requires:
 
-```
-Once a block is finalized, it is never unfinalized:
-    finalized(H, B) → ∀ future time t, finalized_t(H, B)
-```
+- certificate epoch equals `committee_epoch_start(finalized_height + 1)`
+- non-empty, signature-valid, deduplicated signer set
+- signer committee membership when committee context is available
+- payload parse success with exact `txid` and `tx_hash` match
+- lane assignment recomputes and matches certificate lane
+- strict sequence continuity and `prev_lane_root` chaining
 
-### 7.5 Attack Resilience
+Stale-epoch ingress is rejected. Equivocation at fixed `(epoch, lane, seq)` is rejected and persisted as deterministic evidence.
 
-| Attack | Mitigation |
-|--------|------------|
-| Equivocation | Slashing (bond forfeiture, banning) |
-| Long-range fork | Impossible (no fork choice, finalized history only) |
-| Sybil | Bond requirements, join window limiting |
-| DoS (P2P) | Per-peer queues, rate limiting, timeouts |
-| DoS (mempool) | Size limits (10MB, 10k txs), fee-based eviction |
-| Nothing-at-stake | Bonded validation, slashing |
+**Proposition 3 (Ingress Epoch Freshness).**  
+Certified ingress from a stale epoch cannot enter canonical execution.
 
----
+*Proof sketch.* Ingress validation enforces
+`certificate.epoch = committee_epoch_start(finalized_height + 1)`. Mismatch is
+rejected pre-execution.
 
-## 8. Comparison with Other Chains
+## 5. Deterministic State Transition
 
-| Feature | Bitcoin | Ethereum (post-merge) | Tendermint/Cosmos | Finalis Core |
-|---------|---------|----------------------|-------------------|--------------|
-| Fork choice | Longest chain | GHOST | Last finalized + extrapolation | None |
-| Finality | Probabilistic | Probabilistic + finality gadget | Instant (BFT) | Instant (BFT) |
-| Reorgs possible | Yes (deep) | Yes (shallow after finality) | No (under 1/3 faulty) | No (by construction) |
-| Light client safety | Checkpoints | Sync committee | Trusted validator set | Finalized-state queries |
-| Validator set changes | N/A | Live voting | Live staking | Deterministic from finalized history |
-| Script language | Bitcoin Script | EVM (Turing-complete) | CosmWasm | Fixed P2PKH only |
-| Supply cap | 21,000,000 BTC | No fixed cap | Variable | 7,000,000 FLS |
+Canonical replay is defined as:
 
----
+`S_h = ApplyFinalizedRecord(S_{h-1}, R_h)`
 
-## 9. Repository Structure
+where `R_h` is the finalized record at height `h`.
 
-```
-finalis-core/
-├── src/
-│   ├── consensus/        BFT, committees, checkpoints, TLA+ models
-│   ├── node/             Node runtime, event loop, state machine
-│   ├── lightserver/      JSON-RPC server, client library
-│   ├── p2p/              Peer management, framing, handshake
-│   ├── storage/          RocksDB interface, key prefixes
-│   ├── utxo/             UTXO validation, script handling
-│   ├── wallet/           Wallet logic, UTXO selection
-│   ├── crypto/           Ed25519, hashing, Sparse Merkle Trees
-│   └── mempool/          Transaction pool, fee policy
-├── apps/
-│   ├── finalis-node/       Node executable
-│   ├── finalis-lightserver/ Lightserver executable
-│   ├── finalis-explorer/   HTTP explorer (UI + API)
-│   ├── finalis-wallet/     Qt desktop wallet
-│   └── finalis-cli/        Command-line diagnostic tool
-├── tests/
-│   ├── test_consensus.cpp    Committee, finality, checkpoints
-│   ├── test_lightserver.cpp  RPC client/server
-│   ├── test_explorer.cpp     HTTP routes, pagination
-│   ├── test_integration.cpp  Full node + wallet + explorer
-│   └── test_utxo.cpp         UTXO validation, scripts
-├── formal/                TLA+ models for critical components
-└── scripts/               Attack simulations, helper scripts
-```
+### 5.1 Block and Frontier Append Path
 
-### 8.2 Building and Running
-
-```bash
-# Install dependencies (Ubuntu/Debian)
-apt update
-apt install -y build-essential cmake ninja-build pkg-config libssl-dev \
-  qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
-  libsodium-dev librocksdb-dev curl jq
-
-# Build
-cmake -S . -B build -G Ninja
-cmake --build build -j
-
-# Run a node with lightserver
-./build/finalis-node --db ~/.finalis/mainnet --with-lightserver
-
-# Default ports:
-# P2P: 19440
-# Lightserver: 19444
-# Explorer: 18080
 ```
-
-### 8.3 Testing
-
-```bash
-# Run all tests
-ctest --test-dir build --output-on-failure
-
-# Run specific test
-env FINALIS_TEST_FILTER=test_lightserver ./build/finalis-tests
+ tx admission (AnyTx)
+         |
+         v
+ certified ingress records (lane, seq, epoch-pinned cert)
+         |
+         v
+ per-lane chaining + round-robin merge
+         |
+         v
+ ordered frontier slice ---------> execute against parent UTXO/state
+         |                                      |
+         |                                      v
+         |                           frontier transition T_h
+         |                                      |
+         +-------------------------------> proposal + votes
+                                                |
+                                                v
+                                     QC(h, r, id(T_h)) verified
+                                                |
+                                                v
+                              finalized frontier height h appended
+                              (next starts at h+1 only)
 ```
-
----
-
-## 10. Current Status and Roadmap
-
-### 10.1 Current Status (April 2026)
-
-- ✅ Canonical mainnet genesis defined
-- ✅ Bootstrap testing active
-- ✅ Genesis validator can start chain alone
-- ✅ Chain finalizing under live test conditions
-- ✅ Block timing enforced on intended schedule
-- ✅ Node, wallet, explorer, lightserver, CLI consistent
-
-### 10.2 Testing Sequence
-
-The present test sequence is:
 
-1. Bootstrap finalization
-2. Reward settlement into spendable outputs
-3. Normal transfer of coins to another participant
-4. Standard post-genesis validator registration
+Authoritative replay inputs are:
 
-### 10.3 Future Work
+- genesis/network identity
+- finalized frontier transitions in height order
+- canonical finality certificate per finalized height
+- finalized ingress artifacts required for transition verification
 
-| Area | Description |
-|------|-------------|
-| Performance | Benchmark TPS, latency under load |
-| Security | Formal verification of TLA+ models |
-| Tooling | Improve wallet, explorer, RPC documentation |
-| Windows support | Packaging, installer, cross-platform builds |
-| Documentation | Exchange integration guide, operator manual |
+Non-authoritative caches may be rebuilt and cannot change canonical output.
 
----
+**Proposition 4 (Replay Uniqueness).**  
+For fixed authoritative finalized inputs, canonical derived state is unique.
 
-## 11. References
+*Proof sketch.* Replay applies a deterministic transition function in height
+order over canonical finalized records. No alternate fork-choice branch is in
+the live model.
 
-### 11.1 Code Repository
+## 6. Committee Checkpoints
 
-```
-https://github.com/finalis-core/finalis-core
-```
+Committee source is finalized-state-derived checkpoint metadata at epoch boundaries. Live proposal/vote handling consumes this output rather than recomputing policy heuristics locally.
 
-### 11.2 Key Documentation
+Adaptive checkpoint parameters are deterministic from finalized qualified operator depth:
 
-| Document | Location |
-|----------|----------|
-| Consensus overview | `docs/CONSENSUS.md` |
-| Live protocol spec | `docs/LIVE_PROTOCOL.md` |
-| Checkpoint derivation | `docs/spec/CHECKPOINT_DERIVATION_SPEC.md` |
-| Availability state completeness | `docs/spec/AVAILABILITY_STATE_COMPLETENESS.md` |
-| Exchange integration | `docs/EXCHANGE_INTEGRATION.md` |
-| Address format | `docs/ADDRESSES.md` |
+- target committee size
+- minimum eligible operators
+- checkpoint minimum bond
 
-### 11.3 Formal Models
+Fallback mode is explicit when eligibility falls below threshold; fallback metadata is part of deterministic checkpoint state.
 
-- TLA+ checkpoint models: `formal/`
-- Availability models: `formal/availability/`
-- Attack simulations: `scripts/protocol_attack_sim.py`
+## 7. Transaction and Script Semantics
 
----
+Finalis supports version-aware execution:
 
-## Appendix A: Quick Reference Card
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           FINALIS CORE REFERENCE                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   One line:                                                                 │
-│   "A BFT blockchain where the node only processes finalized_height + 1"     │
-│                                                                             │
-│   Finality rule:                                                            │
-│   |signatures| >= floor(2N/3) + 1                                           │
-│                                                                             │
-│   Committee formation:                                                      │
-│   Derived deterministically from qualified operator depth                   │
-│                                                                             │
-│   Light client:                                                             │
-│   Any query to lightserver reads only finalized state                       │
-│                                                                             │
-│   Supply:                                                                   │
-│   7,000,000 FLS, 12-year emission, 20% decay, 10% reserve                   │
-│                                                                             │
-│   Ports:                                                                    │
-│   P2P: 19440, Lightserver: 19444, Explorer: 18080                           │
-│                                                                             │
-│   Repository:                                                               │
-│   https://github.com/finalis-core/finalis-core                              │
-│                                                                             │
-│   License: MIT                                                              │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+- `Tx` (legacy transparent)
+- `TxV2` (confidential-capable)
+- runtime dispatch via `AnyTx`
 
----
+Validator-control scripts (`SCONBREG`, `SCVALJRQ`, `SCVALREG`) are enforced with aligned semantics across legacy `Tx` and transparent outputs in `TxV2`.
 
-## Appendix B: Glossary
+Validation hardening includes:
 
-| Term | Definition |
-|------|------------|
-| **BFT** | Byzantine Fault Tolerance — system continues operating correctly even if some nodes behave maliciously |
-| **QC** | Quorum Certificate — collection of signatures meeting the threshold `floor(2N/3) + 1` |
-| **Finalized state** | State derived exclusively from blocks that have achieved BFT quorum |
-| **Checkpoint** | Snapshot of committee composition at epoch boundaries |
-| **Epoch** | Fixed number of blocks after which committee may change |
-| **Qualified depth** | Number of operators meeting minimum bond and availability requirements |
-| **Fallback mode** | Committee derivation mode when eligible operators fall below safety threshold |
-| **Credit safe** | Transaction status indicating it is safe to credit (finalized and not at tip) |
-| **Lightserver** | JSON-RPC service exposing only finalized-state queries |
-| **Operator** | Entity that may run multiple validators; availability tracked per-operator |
+- explicit input/output sum overflow checks
+- max-fee policy enforcement on both V1 and V2 paths
+- V2 fee validation: transparent inputs must cover transparent outputs + fee; confidential value conservation is enforced via commitment balance checks
 
----
+**Proposition 5 (Script-Parity Invariant).**  
+Validator-control script semantics are consistent across legacy `Tx` and
+transparent outputs in `TxV2`.
 
-**Document version:** 1.0  
-**Last updated:** April 2026  
-**Authors:** Reikahi Takashi  
-**License:** MIT
+*Proof sketch.* Validation dispatch uses shared script-semantic checks for
+`SCONBREG`, `SCVALJRQ`, and `SCVALREG` invariants.
 
----
+## 8. Economics and Incentives
 
-Here is a concise section for your whitepaper explaining the mint:
+Economics is separated into two deterministic planes:
 
----
+1. Height-gated economics policy (`active_economics_policy(network, height)`) for reward/ticket parameters.
+2. Adaptive checkpoint control plane for committee target/eligibility/bond thresholds.
 
-## Appendix D: Chaumian Mint Service (finalis-mint)
+Emission is finite and deterministic in current implementation:
 
-### D.1 Overview
+- total primary emission: `7,000,000 FLS`
+- emission horizon: `2,102,400` blocks
+- reserve accrual during emission: `10%` of gross issuance
 
-`finalis-mint` is a standalone Chaumian eCash mint service that operates alongside the Finalis Core consensus node. It enables **privacy-preserving digital cash** by issuing blinded notes backed by on-chain FLS reserves.
+After cap, new issuance is zero; fees are epoch-pooled and settlement remains deterministic.
 
-The service is **intentionally separate from consensus** — it uses the lightserver RPC to read finalized state and broadcast transactions, but does not participate in block production or validation.
+## 9. Ticket PoW Boundary
 
-### D.2 How It Works
+Ticket PoW is secondary and bounded:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         MINT OPERATION FLOW                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   USER                                   MINT                               │
-│    │                                       │                                │
-│    │  1. Deposit FLS to reserve address    │                                │
-│    ├──────────────────────────────────────►│                                │
-│    │                                       │                                │
-│    │  2. Request blind signature           │                                │
-│    │     (send blinded message)            │                                │
-│    ├──────────────────────────────────────►│                                │
-│    │                                       │                                │
-│    │  3. Receive signed blinded message    │                                │
-│    │◄──────────────────────────────────────┤                                │
-│    │                                       │                                │
-│    │  4. Unblind to obtain note            │                                │
-│    │     (spendable digital cash)          │                                │
-│    │                                       │                                │
-│    │  ... off-chain transfers ...          │                                │
-│    │                                       │                                │
-│    │  5. Redeem note for FLS               │                                │
-│    ├──────────────────────────────────────►│                                │
-│    │                                       │                                │
-│    │  6. Receive FLS to address            │                                │
-│    │◄──────────────────────────────────────┤                                │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+- one bounded search per operator
+- fixed nonce budget
+- bounded bonus capped by active economics policy
 
-### D.3 Blind Signatures (Privacy Guarantee)
+Ticket PoW does not define finality and does not bypass admission controls. Admission PoW for onboarding/join scripts is a separate mechanism validated in script semantics.
 
-The mint uses RSA blind signatures, first proposed by David Chaum in 1983. The protocol ensures:
+## 10. Security Boundaries
 
-```
-User:   blinded = message × r^e mod n
-Mint:   signed_blinded = blinded^d mod n
-User:   signature = signed_blinded / r mod n
-
-Result: signature is a valid RSA signature on message
-Property: Mint never learns message
-```
+Finalis security requires:
 
-**Implication:** The mint cannot link issuance to redemption. Each note is anonymous.
+- signature unforgeability
+- deterministic serialization and hashing
+- quorum intersection assumptions
+- deterministic checkpoint and replay rules
 
-### D.4 Reserve Management
+The protocol intentionally prefers safe halt over speculative reconstruction when authoritative finalized artifacts are missing or inconsistent.
 
-The mint maintains an on-chain reserve wallet. Key policies:
+**Proposition 6 (Fail-Closed Recovery).**  
+Missing/inconsistent authoritative finalized artifacts lead to halt, not
+speculative canonical continuation.
 
-| Policy | Value | Purpose |
-|--------|-------|---------|
-| `RESERVE_MAX_INPUTS` | 8 | Limit per redemption transaction |
-| `RESERVE_CONSOLIDATE_UTXO_COUNT` | 12 | Trigger consolidation when fragmented |
-| `RESERVE_AUTO_PAUSE_LOW_RESERVE` | 10,000 FLS | Auto-pause redemptions when low |
-| `RESERVE_EXHAUSTION_BUFFER` | 10,000 FLS | Warn when reserve near exhaustion |
+*Proof sketch.* Startup/replay requires canonical finalized artifacts and
+consistency checks; violations are terminal in consensus-critical paths.
 
-Redemptions are processed only after the lightserver confirms finalization — no reorg risk.
+## 11. Operational Interpretation
 
-### D.5 Security Properties
+For integrators and exchanges:
 
-| Property | Implementation |
-|----------|----------------|
-| **Double-spend prevention** | Persistent note state (spent flags) |
-| **Auditability** | Signed reserve attestations via `/audit/export` |
-| **Operator authentication** | HMAC-signed requests |
-| **Secret management** | Pluggable backends (dir, env, command) |
-| **Retry resilience** | Persistent delivery job queue for notifiers |
+- settlement decisions must use finalized state only
+- relay/mempool acceptance is not a settlement signal
+- finalized inclusion is the credit-safe condition
 
-### D.6 Current Status
+No confirmation-depth heuristic is required by protocol semantics.
 
-`finalis-mint` is a **development and testing tool**, not a production system. The README explicitly states:
+## 12. Conclusion
 
-> "It is a narrow scaffold, not a production mint: file-backed state, deterministic RSA blind-signing for development/testing, no federation, no multi-operator quorum custody."
+Finalis frames blockchain consensus as deterministic finalized-state progression rather than fork-choice competition. By constraining live processing to `finalized_height + 1`, binding finality to quorum certificates over exact transition context, and deriving committee and replay state from finalized artifacts, the protocol aims to provide auditable, bounded, and unambiguous settlement behavior.
 
-### D.7 Future Potential
+## Appendix A. Threat Model (Short Form)
 
-With additional work, the mint could become a production privacy layer:
+Adversary classes considered:
 
-| Required Change | Purpose |
-|-----------------|---------|
-| HSM or secure key store | Replace seed-derived RSA |
-| Database replication | Replace single-file state |
-| Rate limiting | Prevent DoS attacks |
-| TLS for all endpoints | Secure communication |
-| N-of-M threshold signatures | Federation (multi-operator) |
+- Byzantine validators: equivocation, withholding, malformed votes/proposals.
+- Network adversary: delay, drop, partition, eclipse.
+- Storage adversary: cache corruption, partial persistence, artifact deletion.
+- Economic/Sybil adversary: operator fragmentation, capital concentration,
+  bounded ticket optimization.
 
-### D.8 Relationship to Consensus
+Out-of-scope guarantees:
 
-The mint **depends on** Finalis Core for:
-- Finalized state reads (deposit confirmation)
-- Transaction broadcast (redemptions)
-- Reserve wallet management
+- real-world identity uniqueness of `operator_id`
+- off-chain governance/social coordination guarantees
+- wallet/explorer UX correctness as a safety primitive
 
-The mint **does not affect** consensus:
-- No mint transactions enter the mempool (except redemptions)
-- The mint has no special privileges
-- The chain operates identically with or without the mint
+Security posture:
 
----
+- safety prioritized over availability during inconsistency
+- deterministic replay prioritized over speculative reconstruction
+- bounded validation and explicit artifact authority prioritized over heuristic
+  acceptance
 
-**Summary:** `finalis-mint` is a Chaumian eCash service that demonstrates privacy-preserving digital cash on top of Finalis Core. It is currently a development tool, designed as a foundation for future production privacy layers.
+## References
 
-*This whitepaper is provided for informational purposes only. The Finalis Core project is in active development; specifications may change. Always refer to the latest code and documentation.*
-```
+- `docs/PROTOCOL-SPEC.md`
+- `docs/CONSENSUS.md`
+- `docs/LIVE_PROTOCOL.md`
+- `docs/ECONOMICS.md`
+- `docs/ONBOARDING-PROTOCOL.md`
+- `docs/ADVERSARIAL_MODEL.md`
+- `docs/spec/CHECKPOINT_DERIVATION_SPEC.md`
+- `docs/spec/AVAILABILITY_STATE_COMPLETENESS.md`

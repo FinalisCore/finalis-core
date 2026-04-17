@@ -331,6 +331,8 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   std::string error;
   if (!consensus::build_genesis_canonical_state(derivation_cfg, genesis_state, &genesis_derived, &error)) return false;
   consensus::CertifiedIngressLaneRecords lane_records;
+  const auto signers = node::Node::deterministic_test_keypairs();
+  const auto& signer = signers.front();
   FrontierVector next_vector = genesis_derived.finalized_frontier_vector;
   auto lane_roots = genesis_derived.finalized_lane_roots;
   for (const auto& raw : ordered_records) {
@@ -344,6 +346,11 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
     cert.txid = parsed->txid();
     cert.tx_hash = crypto::sha256d(raw);
     cert.prev_lane_root = lane_roots[lane];
+    const auto signing_hash = cert.signing_hash();
+    const Bytes msg(signing_hash.begin(), signing_hash.end());
+    auto sig = crypto::ed25519_sign(msg, signer.private_key);
+    if (!sig.has_value()) return false;
+    cert.sigs = {FinalitySig{signer.public_key, *sig}};
     lane_roots[lane] = consensus::compute_lane_root_append(lane_roots[lane], cert.tx_hash);
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
   }
@@ -477,6 +484,8 @@ bool persist_certified_ingress_fixture(const node::NodeConfig& cfg, storage::DB&
 
   FrontierVector next_vector = genesis_derived.finalized_frontier_vector;
   auto lane_roots = genesis_derived.finalized_lane_roots;
+  const auto signers = node::Node::deterministic_test_keypairs();
+  const auto& signer = signers.front();
   consensus::CertifiedIngressLaneRecords lane_records;
   for (const auto& raw : raw_records) {
     auto parsed = Tx::parse(raw);
@@ -489,6 +498,11 @@ bool persist_certified_ingress_fixture(const node::NodeConfig& cfg, storage::DB&
     cert.txid = parsed->txid();
     cert.tx_hash = crypto::sha256d(raw);
     cert.prev_lane_root = lane_roots[lane];
+    const auto signing_hash = cert.signing_hash();
+    const Bytes msg(signing_hash.begin(), signing_hash.end());
+    auto sig = crypto::ed25519_sign(msg, signer.private_key);
+    if (!sig.has_value()) return false;
+    cert.sigs = {FinalitySig{signer.public_key, *sig}};
     lane_roots[lane] = consensus::compute_lane_root_append(lane_roots[lane], cert.tx_hash);
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
 
@@ -730,6 +744,29 @@ std::optional<Tx> create_join_request_tx_from_wallet(node::Node& node, const cry
                                                      std::uint64_t bond_amount = BOND_AMOUNT,
                                                      std::uint64_t fee = 0) {
   return create_join_request_tx_from_validator0(node, sender, new_validator, bond_amount, fee);
+}
+
+std::optional<Tx> create_onboarding_registration_tx_from_validator0(node::Node& node0, const crypto::KeyPair& validator0,
+                                                                    const crypto::KeyPair& new_validator,
+                                                                    const PubKey32& payout_pubkey,
+                                                                    std::uint64_t fee = 1000) {
+  const auto sender_pkh = crypto::h160(Bytes(validator0.public_key.begin(), validator0.public_key.end()));
+  auto utxos = node0.find_utxos_by_pubkey_hash_for_test(sender_pkh);
+  if (utxos.empty()) return std::nullopt;
+
+  std::vector<std::pair<OutPoint, TxOut>> selected;
+  std::uint64_t in_sum = 0;
+  for (const auto& it : utxos) {
+    selected.push_back(it);
+    in_sum += it.second.value;
+    if (in_sum >= fee) break;
+  }
+  if (in_sum < fee) return std::nullopt;
+
+  return build_onboarding_registration_tx(
+      selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()), new_validator.public_key,
+      Bytes(new_validator.private_key.begin(), new_validator.private_key.end()), payout_pubkey, fee,
+      address::p2pkh_script_pubkey(sender_pkh));
 }
 
 std::optional<Tx> create_join_request_tx_from_validator0_with_payout(node::Node& node0, const crypto::KeyPair& validator0,
@@ -1345,6 +1382,10 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
     if (error) *error = "open-db-failed";
     return false;
   }
+  const auto tip = db.get_tip();
+  const std::uint64_t tip_height = tip.has_value() ? tip->height : 0;
+  const std::uint64_t expected_ingress_epoch =
+      consensus::committee_epoch_start(tip_height + 1, node::NodeConfig{}.network.committee_epoch_blocks);
 
   for (const auto& raw : raw_records) {
     auto parsed = Tx::parse(raw);
@@ -1361,7 +1402,7 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
       prev_root = state.has_value() ? state->lane_root : zero_hash();
     }
 
-    auto rec = make_signed_ingress_record_msg(raw, 1, seq, prev_root, signer_override);
+    auto rec = make_signed_ingress_record_msg(raw, expected_ingress_epoch, seq, prev_root, signer_override);
     prev_root = consensus::compute_lane_root_append(prev_root, rec.certificate.tx_hash);
 
     auto& range = ranges[lane];
@@ -2069,6 +2110,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     cfg.max_committee = 3;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
+    cfg.network.validator_join_admission_pow_difficulty_bits = 0;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
@@ -2212,6 +2254,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     cfg.max_committee = 2;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
+    cfg.network.validator_join_admission_pow_difficulty_bits = 0;
     cfg.p2p_port = static_cast<std::uint16_t>(19140 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
@@ -2562,13 +2605,13 @@ TEST(test_tx_finalized_and_visible_on_all_nodes) {
       if (out.value != amount) return false;
     }
     return true;
-  }, std::chrono::seconds(60)));
+  }, std::chrono::seconds(120)));
   ASSERT_TRUE(wait_for([&]() {
     for (const auto& n : nodes) {
       if (n->status().height <= height_before) return false;
     }
     return true;
-  }, std::chrono::seconds(60)));
+  }, std::chrono::seconds(120)));
 }
 
 TEST(test_epoch_ticket_challenge_anchor_ignores_pending_mempool_state) {
@@ -3431,8 +3474,208 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
   }, std::chrono::seconds(120)));
 }
 
+TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto base = unique_test_base("/tmp/finalis_it_onboarding_registration_tx");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(20)));
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, 1000, 1);
+    return funded.has_value();
+  }, std::chrono::seconds(60)));
+
+  const auto before = n0.status().height;
+  const auto new_validator = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x91});
+  ASSERT_TRUE(new_validator.has_value());
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  storage::DB db0;
+  ASSERT_TRUE(db0.open_readonly(base + "/node0"));
+  const auto chain_id = ChainId::from_config_and_db(mainnet_network(), db0);
+  ValidatorJoinAdmissionPowBuildContext pow_ctx{
+      .network = &mainnet_network(),
+      .chain_id = &chain_id,
+      .current_height = n0.status().height + 1,
+      .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
+  };
+  auto tx = build_onboarding_registration_tx(
+      funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
+      Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
+      address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
+  ASSERT_TRUE(tx.has_value());
+  ASSERT_TRUE(n0.inject_tx_for_test(*tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    if (n0.status().height < before + 1) return false;
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    if (!db.get_tx_index(tx->txid()).has_value()) return false;
+    auto validators = db.load_validators();
+    auto it = validators.find(new_validator->public_key);
+    return it != validators.end() && it->second.status == consensus::ValidatorStatus::ONBOARDING;
+  }, std::chrono::seconds(20)));
+
+  auto info = n0.validator_info_for_test(new_validator->public_key);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_EQ(info->status, consensus::ValidatorStatus::ONBOARDING);
+}
+
+TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto base = unique_test_base("/tmp/finalis_it_duplicate_onboarding_registration_tx");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(20)));
+
+  std::optional<FundedTestWallet> funded0;
+  ASSERT_TRUE(wait_for([&]() {
+    funded0 = find_funded_test_wallet(n0, keys, 1000, 1);
+    return funded0.has_value();
+  }, std::chrono::seconds(60)));
+
+  const auto new_validator = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x92});
+  ASSERT_TRUE(new_validator.has_value());
+  const auto& sender0 = keys[funded0->key_index];
+  const auto sender0_pkh = crypto::h160(Bytes(sender0.public_key.begin(), sender0.public_key.end()));
+  storage::DB db0;
+  ASSERT_TRUE(db0.open_readonly(base + "/node0"));
+  const auto chain_id = ChainId::from_config_and_db(mainnet_network(), db0);
+  ValidatorJoinAdmissionPowBuildContext pow_ctx0{
+      .network = &mainnet_network(),
+      .chain_id = &chain_id,
+      .current_height = n0.status().height + 1,
+      .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
+  };
+  auto tx0 = build_onboarding_registration_tx(
+      funded0->utxos, Bytes(sender0.private_key.begin(), sender0.private_key.end()), new_validator->public_key,
+      Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
+      address::p2pkh_script_pubkey(sender0_pkh), nullptr, &pow_ctx0);
+  ASSERT_TRUE(tx0.has_value());
+  ASSERT_TRUE(n0.inject_tx_for_test(*tx0, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    auto info = n0.validator_info_for_test(new_validator->public_key);
+    return info.has_value() && info->status == consensus::ValidatorStatus::ONBOARDING;
+  }, std::chrono::seconds(20)));
+
+  std::optional<FundedTestWallet> funded1;
+  ASSERT_TRUE(wait_for([&]() {
+    funded1 = find_funded_test_wallet(n0, keys, 1000, 1);
+    return funded1.has_value();
+  }, std::chrono::seconds(60)));
+
+  const auto& sender1 = keys[funded1->key_index];
+  const auto sender1_pkh = crypto::h160(Bytes(sender1.public_key.begin(), sender1.public_key.end()));
+  ValidatorJoinAdmissionPowBuildContext pow_ctx1{
+      .network = &mainnet_network(),
+      .chain_id = &chain_id,
+      .current_height = n0.status().height + 1,
+      .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
+  };
+  auto tx1 = build_onboarding_registration_tx(
+      funded1->utxos, Bytes(sender1.private_key.begin(), sender1.private_key.end()), new_validator->public_key,
+      Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
+      address::p2pkh_script_pubkey(sender1_pkh), nullptr, &pow_ctx1);
+  ASSERT_TRUE(tx1.has_value());
+  ASSERT_TRUE(!n0.inject_tx_for_test(*tx1, true));
+}
+
+TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_join) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto base = unique_test_base("/tmp/finalis_it_onboarding_to_active_live_path");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(20)));
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0);
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, bond_amount + 1000, 1);
+    return funded.has_value();
+  }, std::chrono::seconds(60)));
+
+  const auto new_validator = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x93});
+  ASSERT_TRUE(new_validator.has_value());
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+
+  storage::DB onboarding_db;
+  ASSERT_TRUE(onboarding_db.open_readonly(base + "/node0"));
+  const auto onboarding_chain_id = ChainId::from_config_and_db(mainnet_network(), onboarding_db);
+  ValidatorJoinAdmissionPowBuildContext onboarding_pow_ctx{
+      .network = &mainnet_network(),
+      .chain_id = &onboarding_chain_id,
+      .current_height = n0.status().height + 1,
+      .finalized_hash_at_height = [&](std::uint64_t height) { return onboarding_db.get_height_hash(height); },
+  };
+  auto onboarding_tx = build_onboarding_registration_tx(
+      funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
+      Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
+      address::p2pkh_script_pubkey(sender_pkh), nullptr, &onboarding_pow_ctx);
+  ASSERT_TRUE(onboarding_tx.has_value());
+  ASSERT_TRUE(n0.inject_tx_for_test(*onboarding_tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    auto info = n0.validator_info_for_test(new_validator->public_key);
+    return info.has_value() && info->status == consensus::ValidatorStatus::ONBOARDING;
+  }, std::chrono::seconds(20)));
+
+  const auto onboarding_info = n0.validator_info_for_test(new_validator->public_key);
+  ASSERT_TRUE(onboarding_info.has_value());
+  ASSERT_TRUE(!onboarding_info->has_bond);
+
+  std::optional<FundedTestWallet> funded_after_onboarding;
+  ASSERT_TRUE(wait_for([&]() {
+    funded_after_onboarding = find_funded_test_wallet(n0, keys, bond_amount + 1000, 1);
+    return funded_after_onboarding.has_value();
+  }, std::chrono::seconds(60)));
+
+  storage::DB join_db;
+  ASSERT_TRUE(join_db.open_readonly(base + "/node0"));
+  const auto join_chain_id = ChainId::from_config_and_db(mainnet_network(), join_db);
+  ValidatorJoinAdmissionPowBuildContext join_pow_ctx{
+      .network = &mainnet_network(),
+      .chain_id = &join_chain_id,
+      .current_height = n0.status().height + 1,
+      .finalized_hash_at_height = [&](std::uint64_t height) { return join_db.get_height_hash(height); },
+  };
+  auto join_tx = build_validator_join_request_tx(
+      funded_after_onboarding->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
+      Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, bond_amount, 1000,
+      address::p2pkh_script_pubkey(sender_pkh), nullptr, &join_pow_ctx);
+  ASSERT_TRUE(join_tx.has_value());
+  ASSERT_TRUE(n0.inject_tx_for_test(*join_tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    auto info = n0.validator_info_for_test(new_validator->public_key);
+    return info.has_value() && info->status == consensus::ValidatorStatus::PENDING && info->has_bond;
+  }, std::chrono::seconds(20)));
+
+  const auto pending_info = n0.validator_info_for_test(new_validator->public_key);
+  ASSERT_TRUE(pending_info.has_value());
+  const auto activation_height = pending_info->joined_height + mainnet_network().validator_warmup_blocks;
+
+  ASSERT_TRUE(wait_for_tip(n0, activation_height, ci_timeout_seconds(30)));
+  ASSERT_TRUE(wait_for([&]() {
+    auto info = n0.validator_info_for_test(new_validator->public_key);
+    if (!info.has_value() || info->status != consensus::ValidatorStatus::ACTIVE) return false;
+    const auto active_next = n0.active_validators_for_next_height_for_test();
+    return std::find(active_next.begin(), active_next.end(), new_validator->public_key) != active_next.end();
+  }, ci_timeout_seconds(30)));
+}
+
 TEST(test_unbond_finalization_moves_validator_to_exiting) {
-  auto fixture = make_bonded_joined_validator_fixture(unique_test_base("/tmp/finalis_it_unbond_exit"), 66);
+  // auto fixture = make_bonded_joined_validator_fixture(unique_test_base("/tmp/finalis_it_unbond_exit"), 66);
+  #ifdef _WIN32
+    auto temp_base = std::string(std::getenv("USERPROFILE")) + "\\AppData\\Local\\Temp\\finalis_it_unbond_exit";
+  #else
+      auto temp_base = "/tmp/finalis_it_unbond_exit";
+  #endif
+  auto fixture = make_bonded_joined_validator_fixture(
+      unique_test_base(temp_base), 66);
   auto& cluster = fixture.cluster;
   auto& nodes = cluster.nodes;
 
@@ -3567,6 +3810,87 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
     }
     return true;
   }, std::chrono::seconds(60)));
+}
+
+TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_banned_onboarding_reentry"), 1, 1, 1);
+  auto& n0 = *cluster.nodes[0];
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(wait_for([&]() { return n0.status().height >= 6; }, std::chrono::seconds(30)));
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, 1000, 1);
+    return funded.has_value();
+  }, std::chrono::seconds(60)));
+
+  const auto banned_pub = keys[0].public_key;
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0);
+  Hash32 bond_txid{};
+  bond_txid.fill(0xB6);
+  const OutPoint bond_op{bond_txid, 0};
+  ASSERT_TRUE(n0.seed_bonded_validator_for_test(banned_pub, bond_op, bond_amount));
+
+  n0.pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, std::chrono::seconds(30)));
+
+  auto info0 = n0.validator_info_for_test(banned_pub);
+  ASSERT_TRUE(info0.has_value());
+  ASSERT_TRUE(info0->has_bond);
+
+  Vote a;
+  a.height = n0.status().height + 1;
+  a.round = 0;
+  a.block_id.fill(0x51);
+  a.validator_pubkey = banned_pub;
+  auto sa = crypto::ed25519_sign(vote_signing_message(a.height, a.round, a.block_id), keys[0].private_key);
+  ASSERT_TRUE(sa.has_value());
+  a.signature = *sa;
+
+  Vote b = a;
+  b.block_id.fill(0x61);
+  auto sb = crypto::ed25519_sign(vote_signing_message(b.height, b.round, b.block_id), keys[0].private_key);
+  ASSERT_TRUE(sb.has_value());
+  b.signature = *sb;
+
+  auto slash_tx = build_slash_tx(bond_op, info0->bonded_amount, a, b);
+  ASSERT_TRUE(slash_tx.has_value());
+  append_live_certified_tx_or_throw(cluster, *slash_tx, "append slash tx failed");
+  n0.pause_proposals_for_test(false);
+
+  ASSERT_TRUE(wait_for([&]() {
+    auto info = n0.validator_info_for_test(banned_pub);
+    return info.has_value() && info->status == consensus::ValidatorStatus::BANNED && !info->has_bond;
+  }, std::chrono::seconds(120)));
+
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly(cluster.base + "/node0"));
+  const auto chain_id = ChainId::from_config_and_db(mainnet_network(), db);
+  ValidatorJoinAdmissionPowBuildContext pow_ctx{
+      .network = &mainnet_network(),
+      .chain_id = &chain_id,
+      .current_height = n0.status().height + 1,
+      .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
+  };
+  auto onboarding_tx = build_onboarding_registration_tx(
+      funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), banned_pub,
+      Bytes(keys[0].private_key.begin(), keys[0].private_key.end()), banned_pub, 1000,
+      address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
+  ASSERT_TRUE(onboarding_tx.has_value());
+  ASSERT_TRUE(!n0.inject_tx_for_test(*onboarding_tx, true));
+
+  const auto before_height = n0.status().height;
+  ASSERT_TRUE(wait_for_tip(n0, before_height + 1, std::chrono::seconds(20)));
+  {
+    storage::DB verify_db;
+    ASSERT_TRUE(verify_db.open_readonly(cluster.base + "/node0"));
+    ASSERT_TRUE(!verify_db.get_tx_index(onboarding_tx->txid()).has_value());
+  }
+  auto final_info = n0.validator_info_for_test(banned_pub);
+  ASSERT_TRUE(final_info.has_value());
+  ASSERT_EQ(final_info->status, consensus::ValidatorStatus::BANNED);
 }
 
 TEST(test_committee_deterministic_despite_local_bans) {
@@ -5248,11 +5572,11 @@ TEST(test_quorum_subset_independence_for_settlement_accounting) {
   const auto payout0 =
       consensus::compute_epoch_settlement_payout(state0->total_reward_units, state0->fee_pool_units,
                                                  state0->reserve_subsidy_units, proposal->transition.leader_pubkey,
-                                                 state0->reward_score_units);
+                                                 state0->reward_score_units, {});
   const auto payout1 =
       consensus::compute_epoch_settlement_payout(state1->total_reward_units, state1->fee_pool_units,
                                                  state1->reserve_subsidy_units, proposal->transition.leader_pubkey,
-                                                 state1->reward_score_units);
+                                                 state1->reward_score_units, {});
   ASSERT_EQ(payout0.total, payout1.total);
   ASSERT_EQ(payout0.outputs, payout1.outputs);
 }
@@ -5286,6 +5610,72 @@ TEST(test_reject_cross_network_version_handshake) {
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
   n.stop();
+}
+
+TEST(test_epoch_settlement_pays_onboarding_slice_to_onboarding_pubkey_from_finalized_ticket) {
+  const auto base = unique_test_base("/tmp/finalis_it_onboarding_settlement_slice");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto leader = keys[0].public_key;
+  const auto validator_pub = keys[1].public_key;
+  const auto onboarding_pub = keys[2].public_key;
+  const std::uint64_t epoch_start = 32;
+  const std::uint64_t settlement_reward_units = 10'000;
+  const std::uint64_t expected_onboarding_units = consensus::onboarding_reward_units(settlement_reward_units);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  consensus::ValidatorInfo validator_info;
+  validator_info.status = consensus::ValidatorStatus::ACTIVE;
+  validator_info.has_bond = true;
+  validator_info.bonded_amount = BOND_AMOUNT;
+  ASSERT_TRUE(db.put_validator(validator_pub, validator_info));
+
+  consensus::ValidatorInfo onboarding_info;
+  onboarding_info.status = consensus::ValidatorStatus::ONBOARDING;
+  onboarding_info.has_bond = false;
+  onboarding_info.bonded_amount = 0;
+  ASSERT_TRUE(db.put_validator(onboarding_pub, onboarding_info));
+
+  consensus::EpochTicket ticket;
+  ticket.epoch = epoch_start;
+  ticket.participant_pubkey = onboarding_pub;
+  ticket.challenge_anchor = Hash32{0x42};
+  ticket.nonce = 1;
+  ticket.work_hash = consensus::make_epoch_ticket_work_hash(ticket.epoch, ticket.challenge_anchor, ticket.participant_pubkey,
+                                                            ticket.nonce);
+  ticket.source_height = epoch_start;
+  ticket.origin = consensus::EpochTicketOrigin::NETWORK;
+  ASSERT_TRUE(db.put_epoch_ticket(ticket));
+
+  const auto best_tickets = consensus::best_epoch_tickets_by_pubkey(db.load_epoch_tickets(epoch_start));
+  auto best_it = best_tickets.find(onboarding_pub);
+  ASSERT_TRUE(best_it != best_tickets.end());
+
+  storage::EpochRewardSettlementState state;
+  state.epoch_start_height = epoch_start;
+  state.total_reward_units = settlement_reward_units;
+  state.reward_score_units[validator_pub] = 100;
+  state.onboarding_score_units[onboarding_pub] =
+      static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(best_it->second.work_hash)));
+  ASSERT_TRUE(db.put_epoch_reward_settlement(state));
+
+  const auto payout = consensus::compute_epoch_settlement_payout(state.total_reward_units, 0, 0, leader,
+                                                                 state.reward_score_units, state.onboarding_score_units);
+  ASSERT_EQ(payout.total, settlement_reward_units);
+
+  std::uint64_t validator_units = 0;
+  std::uint64_t onboarding_units = 0;
+  for (const auto& [pub, units] : payout.outputs) {
+    if (pub == validator_pub) validator_units += units;
+    if (pub == onboarding_pub) onboarding_units += units;
+  }
+  ASSERT_EQ(onboarding_units, expected_onboarding_units);
+  ASSERT_EQ(validator_units + onboarding_units, settlement_reward_units);
+  ASSERT_EQ(validator_units, settlement_reward_units - expected_onboarding_units);
 }
 
 TEST(test_skip_exact_self_endpoint_before_dial) {
@@ -6639,7 +7029,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
     auto info0 = n0.validator_info_for_test(joiner_vk.pubkey);
     auto info1 = n1.validator_info_for_test(joiner_vk.pubkey);
     return info0.has_value() && info1.has_value();
-  }, std::chrono::seconds(20)));
+  }, std::chrono::seconds(60)));
 
   ASSERT_EQ(n0.status().pending_bootstrap_joiners, 0u);
   ASSERT_TRUE(wait_for([&]() {

@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "consensus/ingress.hpp"
+#include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/genesis.hpp"
 #include "keystore/validator_keystore.hpp"
@@ -107,6 +108,13 @@ bool persist_certified_ingress_record(const std::string& db_path, const Bytes& t
   cert.txid = tx->txid();
   cert.tx_hash = crypto::sha256d(tx_bytes);
   cert.prev_lane_root = zero_hash();
+  const auto signers = node::Node::deterministic_test_keypairs();
+  const auto& signer = signers.front();
+  const auto signing_hash = cert.signing_hash();
+  const Bytes msg(signing_hash.begin(), signing_hash.end());
+  auto sig = crypto::ed25519_sign(msg, signer.private_key);
+  if (!sig.has_value()) return false;
+  cert.sigs = {FinalitySig{signer.public_key, *sig}};
   if (!db.put_ingress_bytes(cert.txid, tx_bytes)) return false;
   if (!db.put_ingress_certificate(cert.lane, cert.seq, cert.serialize())) return false;
   LaneState state;

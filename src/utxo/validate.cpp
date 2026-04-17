@@ -77,6 +77,160 @@ bool consume_verify_budget(std::size_t* remaining, std::size_t cost, std::string
   return true;
 }
 
+struct ScriptAnnotatedOutput {
+  std::uint32_t index{0};
+  std::uint64_t value{0};
+  Bytes script_pubkey;
+};
+
+bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>& outputs,
+                                       const std::vector<OutPoint>& inputs,
+                                       const SpecialValidationContext* ctx,
+                                       std::size_t* verify_budget_remaining,
+                                       std::string* error) {
+  for (const auto& out : outputs) {
+    if (!is_supported_base_layer_output_script(out.script_pubkey)) {
+      if (error) *error = "unsupported script_pubkey";
+      return false;
+    }
+
+    OnboardingRegistrationScriptData onboarding_req{};
+    if (parse_onboarding_registration_script(out.script_pubkey, &onboarding_req)) {
+      if (out.value != 0) {
+        if (error) *error = "SCONBREG output must have zero value";
+        return false;
+      }
+      std::string budget_error;
+      if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
+        if (error) *error = budget_error;
+        return false;
+      }
+      if (!crypto::ed25519_verify(
+              onboarding_registration_pop_message(onboarding_req.validator_pubkey, onboarding_req.payout_pubkey),
+              onboarding_req.pop, onboarding_req.validator_pubkey)) {
+        if (error) *error = "onboarding registration proof invalid";
+        return false;
+      }
+      if (ctx && ctx->validators) {
+        auto existing = ctx->validators->get(onboarding_req.validator_pubkey);
+        if (existing.has_value()) {
+          if (error) {
+            *error = existing->status == consensus::ValidatorStatus::BANNED ? "validator banned"
+                                                                             : "validator already registered";
+          }
+          return false;
+        }
+      }
+      if (ctx && ctx->network && onboarding_admission_pow_enabled(*ctx->network) && !onboarding_req.has_admission_pow) {
+        if (error) *error = "missing onboarding admission pow";
+        return false;
+      }
+    }
+
+    PubKey32 pub{};
+    if (is_validator_register_script(out.script_pubkey, &pub)) {
+      (void)pub;
+      if (ctx && ctx->enforce_variable_bond_range) {
+        const std::uint64_t min_bond_amount = ctx->min_bond_amount;
+        const std::uint64_t max_bond_amount = std::max<std::uint64_t>(ctx->max_bond_amount, min_bond_amount);
+        if (out.value < min_bond_amount || out.value > max_bond_amount) {
+          if (error) *error = "SCVALREG output out of v7 bond range";
+          return false;
+        }
+      } else if (out.value != BOND_AMOUNT) {
+        if (error) *error = "SCVALREG output must equal BOND_AMOUNT";
+        return false;
+      }
+    }
+
+    ValidatorJoinRequestScriptData join_req{};
+    if (parse_validator_join_request_script(out.script_pubkey, &join_req)) {
+      if (out.value != 0) {
+        if (error) *error = "SCVALJRQ output must have zero value";
+        return false;
+      }
+      std::string budget_error;
+      if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
+        if (error) *error = budget_error;
+        return false;
+      }
+      if (!crypto::ed25519_verify(
+              validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey), join_req.pop,
+              join_req.validator_pubkey)) {
+        if (error) *error = "validator join request proof invalid";
+        return false;
+      }
+      if (ctx && ctx->network && validator_join_admission_pow_enabled(*ctx->network) && !join_req.has_admission_pow) {
+        if (error) *error = "missing admission pow";
+        return false;
+      }
+    }
+  }
+
+  std::set<PubKey32> reg_outputs;
+  std::set<PubKey32> onboarding_outputs;
+  std::set<PubKey32> join_req_outputs;
+  for (const auto& out : outputs) {
+    PubKey32 pub{};
+    if (is_validator_register_script(out.script_pubkey, &pub)) reg_outputs.insert(pub);
+    if (is_onboarding_registration_script(out.script_pubkey, &pub, nullptr, nullptr)) onboarding_outputs.insert(pub);
+    if (is_validator_join_request_script(out.script_pubkey, &pub, nullptr, nullptr)) join_req_outputs.insert(pub);
+  }
+  if (onboarding_outputs.size() > 1) {
+    if (error) *error = "multiple SCONBREG outputs not allowed";
+    return false;
+  }
+  if (!onboarding_outputs.empty() && (!reg_outputs.empty() || !join_req_outputs.empty())) {
+    if (error) *error = "SCONBREG may not appear with validator join outputs";
+    return false;
+  }
+  for (const auto& pub : join_req_outputs) {
+    if (reg_outputs.find(pub) == reg_outputs.end()) {
+      if (error) *error = "join request missing matching SCVALREG output";
+      return false;
+    }
+  }
+  for (const auto& pub : reg_outputs) {
+    if (join_req_outputs.find(pub) == join_req_outputs.end()) {
+      if (error) *error = "SCVALREG output missing matching SCVALJRQ output";
+      return false;
+    }
+  }
+
+  if (ctx && ctx->network && onboarding_admission_pow_enabled(*ctx->network)) {
+    for (const auto& out : outputs) {
+      OnboardingRegistrationScriptData onboarding_req{};
+      if (!parse_onboarding_registration_script(out.script_pubkey, &onboarding_req)) continue;
+      std::string pow_error;
+      if (!validate_onboarding_admission_pow(onboarding_req, *ctx, &pow_error)) {
+        if (error) *error = pow_error.empty() ? "onboarding admission pow invalid" : pow_error;
+        return false;
+      }
+    }
+  }
+  if (ctx && ctx->network && validator_join_admission_pow_enabled(*ctx->network)) {
+    for (const auto& out : outputs) {
+      ValidatorJoinRequestScriptData join_req{};
+      if (!parse_validator_join_request_script(out.script_pubkey, &join_req)) continue;
+      const auto bond_it = std::find_if(outputs.begin(), outputs.end(), [&](const ScriptAnnotatedOutput& candidate) {
+        PubKey32 reg_pub{};
+        return is_validator_register_script(candidate.script_pubkey, &reg_pub) && reg_pub == join_req.validator_pubkey;
+      });
+      if (bond_it == outputs.end()) {
+        if (error) *error = "join request missing matching SCVALREG output";
+        return false;
+      }
+      std::string pow_error;
+      if (!validate_admission_pow(join_req, inputs, bond_it->value, *ctx, &pow_error)) {
+        if (error) *error = pow_error.empty() ? "validator join request admission pow invalid" : pow_error;
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 }  // namespace
 
 UtxoSetV2 upgrade_utxo_set_v2(const UtxoSet& utxos) {
@@ -110,6 +264,7 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
   return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
          is_validator_unbond_script(script_pubkey, nullptr) ||
+         is_onboarding_registration_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_burn_script(script_pubkey, nullptr) || privacy::is_mint_deposit_script(script_pubkey, nullptr, nullptr);
 }
@@ -181,6 +336,15 @@ std::optional<Hash32> balance_proof_message_v2(const TxV2& tx) {
   return crypto::sha256d(w.data());
 }
 
+Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '-', 'V', '1'});
+  w.bytes_fixed(validator_pubkey);
+  w.bytes_fixed(payout_pubkey);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
@@ -192,6 +356,15 @@ Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const
 
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id) {
   return crypto::sha256d(chain_id_bytes(chain_id));
+}
+
+Hash32 onboarding_registration_commitment(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '_', 'C', 'O', 'M', 'M',
+                'I', 'T', '_', 'V', '1'});
+  w.bytes_fixed(validator_pubkey);
+  w.bytes_fixed(payout_pubkey);
+  return crypto::sha256d(w.data());
 }
 
 Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs) {
@@ -276,7 +449,7 @@ bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std
                             std::uint64_t bond_amount, const SpecialValidationContext& ctx, std::string* err) {
   // Admission PoW is join-admission friction only. It must not influence
   // committee weight, proposer schedule, finality, or reward weighting.
-  if (!ctx.network || !admission_pow_enabled(*ctx.network)) return true;
+  if (!ctx.network || !validator_join_admission_pow_enabled(*ctx.network)) return true;
   if (!ctx.chain_id) {
     if (err) *err = "missing chain id context for admission pow";
     return false;
@@ -304,8 +477,43 @@ bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std
       admission_pow_challenge(admission_pow_chain_id_hash(*ctx.chain_id), req.admission_pow_epoch, *anchor, operator_id,
                               bond_commitment);
   const auto work_hash = admission_pow_work_hash(challenge, req.admission_pow_nonce);
-  if (leading_zero_bits(work_hash) < ctx.network->admission_pow_difficulty_bits) {
+  if (leading_zero_bits(work_hash) < ctx.network->validator_join_admission_pow_difficulty_bits) {
     if (err) *err = "admission pow difficulty not met";
+    return false;
+  }
+  return true;
+}
+
+bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& req, const SpecialValidationContext& ctx,
+                                       std::string* err) {
+  if (!ctx.network || !onboarding_admission_pow_enabled(*ctx.network)) return true;
+  if (!ctx.chain_id) {
+    if (err) *err = "missing chain id context for admission pow";
+    return false;
+  }
+  if (!req.has_admission_pow) {
+    if (err) *err = "missing onboarding admission pow";
+    return false;
+  }
+  const auto current_epoch = admission_pow_epoch_for_height(ctx.current_height, ctx.network->committee_epoch_blocks);
+  const auto previous_epoch =
+      current_epoch > ctx.network->committee_epoch_blocks ? current_epoch - ctx.network->committee_epoch_blocks : 0;
+  if (req.admission_pow_epoch != current_epoch && req.admission_pow_epoch != previous_epoch) {
+    if (err) *err = "onboarding admission pow epoch expired";
+    return false;
+  }
+  const auto anchor = admission_pow_epoch_anchor_hash(req.admission_pow_epoch, ctx.network->committee_epoch_blocks,
+                                                      ctx.finalized_hash_at_height);
+  if (!anchor.has_value()) {
+    if (err) *err = "missing finalized epoch anchor for onboarding admission pow";
+    return false;
+  }
+  const auto challenge =
+      admission_pow_challenge(admission_pow_chain_id_hash(*ctx.chain_id), req.admission_pow_epoch, *anchor,
+                              req.validator_pubkey, onboarding_registration_commitment(req.validator_pubkey, req.payout_pubkey));
+  const auto work_hash = admission_pow_work_hash(challenge, req.admission_pow_nonce);
+  if (leading_zero_bits(work_hash) < ctx.network->onboarding_admission_pow_difficulty_bits) {
+    if (err) *err = "onboarding admission pow difficulty not met";
     return false;
   }
   return true;
@@ -386,76 +594,27 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     return {true, "", 0};
   }
 
-  for (const auto& out : tx.outputs) {
-    if (!is_supported_base_layer_output_script(out.script_pubkey)) {
-      return {false, "unsupported script_pubkey", 0};
-    }
-    PubKey32 pub{};
-    if (is_validator_register_script(out.script_pubkey, &pub)) {
-      (void)pub;
-      if (ctx && ctx->enforce_variable_bond_range) {
-        const std::uint64_t min_bond_amount = ctx->min_bond_amount;
-        const std::uint64_t max_bond_amount = std::max<std::uint64_t>(ctx->max_bond_amount, min_bond_amount);
-        if (out.value < min_bond_amount || out.value > max_bond_amount) {
-          return {false, "SCVALREG output out of v7 bond range", 0};
-        }
-      } else if (out.value != BOND_AMOUNT) {
-        return {false, "SCVALREG output must equal BOND_AMOUNT", 0};
-      }
-    }
-    ValidatorJoinRequestScriptData join_req{};
-    if (parse_validator_join_request_script(out.script_pubkey, &join_req)) {
-      if (out.value != 0) return {false, "SCVALJRQ output must have zero value", 0};
-      std::string budget_error;
-      if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
-      if (!crypto::ed25519_verify(
-              validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey), join_req.pop,
-              join_req.validator_pubkey)) {
-        return {false, "validator join request proof invalid", 0};
-      }
-      if (ctx && ctx->network && admission_pow_enabled(*ctx->network) && !join_req.has_admission_pow) {
-        return {false, "missing admission pow", 0};
-      }
-    }
+  std::vector<ScriptAnnotatedOutput> scripted_outputs;
+  scripted_outputs.reserve(tx.outputs.size());
+  for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+    scripted_outputs.push_back(ScriptAnnotatedOutput{out_i, tx.outputs[out_i].value, tx.outputs[out_i].script_pubkey});
   }
-
-  std::set<PubKey32> reg_outputs;
-  std::set<PubKey32> join_req_outputs;
-  for (const auto& out : tx.outputs) {
-    PubKey32 pub{};
-    if (is_validator_register_script(out.script_pubkey, &pub)) reg_outputs.insert(pub);
-    if (is_validator_join_request_script(out.script_pubkey, &pub, nullptr, nullptr)) join_req_outputs.insert(pub);
-  }
-  for (const auto& pub : join_req_outputs) {
-    if (reg_outputs.find(pub) == reg_outputs.end()) return {false, "join request missing matching SCVALREG output", 0};
-  }
-  for (const auto& pub : reg_outputs) {
-    if (join_req_outputs.find(pub) == join_req_outputs.end()) {
-      return {false, "SCVALREG output missing matching SCVALJRQ output", 0};
-    }
-  }
-
-  if (ctx && ctx->network && admission_pow_enabled(*ctx->network)) {
-    const auto inputs = tx_input_outpoints(tx);
-    for (const auto& out : tx.outputs) {
-      ValidatorJoinRequestScriptData join_req{};
-      if (!parse_validator_join_request_script(out.script_pubkey, &join_req)) continue;
-      const auto bond_it = std::find_if(tx.outputs.begin(), tx.outputs.end(), [&](const TxOut& candidate) {
-        PubKey32 reg_pub{};
-        return is_validator_register_script(candidate.script_pubkey, &reg_pub) && reg_pub == join_req.validator_pubkey;
-      });
-      if (bond_it == tx.outputs.end()) return {false, "join request missing matching SCVALREG output", 0};
-      std::string pow_error;
-      if (!validate_admission_pow(join_req, inputs, bond_it->value, *ctx, &pow_error)) {
-        return {false, pow_error.empty() ? "validator join request admission pow invalid" : pow_error, 0};
-      }
-    }
+  std::string script_error;
+  if (!validate_special_script_semantics(scripted_outputs, tx_input_outpoints(tx), ctx, &verify_budget_remaining,
+                                         &script_error)) {
+    return {false, script_error, 0};
   }
 
   std::uint64_t in_sum = 0;
   std::uint64_t out_sum = 0;
   std::set<OutPoint> seen_inputs;
-  for (const auto& out : tx.outputs) out_sum += out.value;
+  for (const auto& out : tx.outputs) {
+    // Prevent uint64_t overflow when accumulating output values
+    if (out_sum > std::numeric_limits<std::uint64_t>::max() - out.value) {
+      return {false, "output sum overflow", 0};
+    }
+    out_sum += out.value;
+  }
 
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
     const auto& in = tx.inputs[i];
@@ -482,6 +641,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
       if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
       in_sum += prev_out.value;
       continue;
     }
@@ -547,7 +709,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond signature invalid", 0};
       }
-
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
       in_sum += prev_out.value;
       continue;
     }
@@ -588,6 +752,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
           return {false, "slash evidence validator not in committee", 0};
         }
+        if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+          return {false, "input sum overflow", 0};
+        }
         in_sum += prev_out.value;
         continue;
       }
@@ -610,7 +777,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
           return {false, "unbond output spend must go to P2PKH", 0};
         }
       }
-
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
       in_sum += prev_out.value;
       continue;
     }
@@ -619,7 +788,12 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   }
 
   if (in_sum < out_sum) return {false, "negative fee", 0};
-  return {true, "", in_sum - out_sum};
+  std::uint64_t fee = in_sum - out_sum;
+  // Validate max_fee policy for V1 transactions (consistent with V2)
+  if (ctx && ctx->confidential_policy && fee > ctx->confidential_policy->max_fee) {
+    return {false, "fee too large", 0};
+  }
+  return {true, "", fee};
 }
 
 BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
@@ -687,6 +861,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
                                      const SpecialValidationContext* ctx) {
   AnyTxValidationResult out;
   out.cost.serialized_size = tx.serialize().size();
+  std::size_t verify_budget_remaining = kMaxTxEd25519Verifies;
 
   if (!ctx || !ctx->confidential_policy) {
     out.error = "missing confidential policy context";
@@ -742,6 +917,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   std::set<OutPoint> seen_inputs;
   std::vector<crypto::Commitment33> input_commitments;
   std::vector<crypto::Commitment33> non_excess_output_commitments;
+  std::vector<ScriptAnnotatedOutput> scripted_outputs;
 
   if (!crypto::commitment_is_identity(tx.balance_proof.excess_commitment) &&
       !crypto::commitment_is_canonical(tx.balance_proof.excess_commitment)) {
@@ -834,6 +1010,10 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "signature invalid";
       return out;
     }
+    if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+      out.error = "input sum overflow";
+      return out;
+    }
     in_sum += prev_out.value;
     input_commitments.push_back(crypto::transparent_amount_commitment(prev_out.value));
   }
@@ -841,11 +1021,14 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   for (const auto& output : tx.outputs) {
     if (output.kind == TxOutputKind::Transparent) {
       const auto& transparent = std::get<TransparentTxOutV2>(output.body);
-      if (!is_supported_base_layer_output_script(transparent.script_pubkey)) {
-        out.error = "unsupported script_pubkey";
+      // Prevent uint64_t overflow when accumulating transparent output values
+      if (out_sum > std::numeric_limits<std::uint64_t>::max() - transparent.value) {
+        out.error = "output sum overflow";
         return out;
       }
       out_sum += transparent.value;
+      scripted_outputs.push_back(ScriptAnnotatedOutput{static_cast<std::uint32_t>(scripted_outputs.size()),
+                                                       transparent.value, transparent.script_pubkey});
       non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(transparent.value));
       continue;
     }
@@ -898,20 +1081,35 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     out.error = "too many proof bytes";
     return out;
   }
+  if (!validate_special_script_semantics(scripted_outputs, txv2_input_outpoints(tx), ctx, &verify_budget_remaining,
+                                         &out.error)) {
+    return out;
+  }
   if (!proof_commitments.empty() && !crypto::verify_output_range_proofs_batch(proof_commitments, proofs)) {
     out.error = "range proof invalid";
     return out;
   }
 
-  if (confidential_output_count == 0 && confidential_input_count == 0) {
+  // Fee validation:
+  // 1. Pure transparent: transparent inputs must EXACTLY match transparent outputs + fee
+  // 2. Transparent inputs with confidential outputs: transparent inputs must cover transparent outputs + fee;
+  //    the remainder funds the confidential outputs (verified by commitment tally)
+  // 3. Confidential inputs exist: commitment tally handles the full balance; no transparent-side constraint needed
+  if (confidential_input_count == 0 && confidential_output_count == 0) {
+    // Case 1: Pure transparent - strict fee check
     if (in_sum < out_sum || in_sum - out_sum != tx.fee) {
       out.error = "fee mismatch";
       return out;
     }
-  } else if (confidential_input_count == 0 && (in_sum < out_sum || in_sum - out_sum < tx.fee)) {
-    out.error = "insufficient transparent input value";
-    return out;
+  } else if (confidential_input_count == 0) {
+    // Case 2: Transparent inputs with confidential outputs
+    // Transparent inputs must cover transparent outputs + fee; rest funds confidential outputs
+    if (in_sum < tx.fee || in_sum - tx.fee < out_sum) {
+      out.error = "fee mismatch: transparent inputs cannot cover hidden output value";
+      return out;
+    }
   }
+  // Case 3: Confidential inputs exist - commitment tally handles the full balance
 
   non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(tx.fee));
 

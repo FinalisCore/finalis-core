@@ -32,6 +32,12 @@ A live-protocol-faithful adversarial/economic simulator for committee concentrat
   finalized height.
 - Restart must fail closed if frontier transition storage or its matching
   finalized certificate is missing or inconsistent.
+- Ingress records are accepted and replayed only when certificate epoch matches
+  `committee_epoch_start(finalized_height + 1)`.
+- Ingress equivocation at fixed `(epoch, lane, seq)` is rejected and recorded
+  as persisted evidence.
+- Frontier ingress replay revalidates certificate signatures, lane assignment,
+  and lane-root chaining before transition execution.
 
 ## Validator Lifecycle
 

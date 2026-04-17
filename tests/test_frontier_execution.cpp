@@ -266,6 +266,32 @@ TEST(test_frontier_execution_accepts_supported_txv2_ordered_record_with_activati
   ASSERT_EQ(txid_any(result.accepted_txs[0]), txid_any(*parse_any_tx(ordered[0])));
 }
 
+TEST(test_frontier_execution_rejects_special_script_tx_without_context) {
+  const auto from = key_from_byte(31);
+  const auto validator = key_from_byte(32);
+
+  OutPoint op{};
+  op.txid.fill(0x93);
+  op.index = 0;
+
+  UtxoSet parent;
+  parent[op] = UtxoEntry{p2pkh_out_for_pub(from.public_key, 10'000)};
+
+  Bytes reg_script{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+  reg_script.insert(reg_script.end(), validator.public_key.begin(), validator.public_key.end());
+
+  auto tx = build_signed_p2pkh_tx_single_input(op, parent[op].out, from.private_key,
+                                               std::vector<TxOut>{TxOut{9'800, reg_script}});
+  ASSERT_TRUE(tx.has_value());
+
+  std::vector<Bytes> ordered{tx->serialize()};
+  consensus::FrontierExecutionResult result;
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, nullptr, &result));
+  ASSERT_EQ(result.decisions.size(), 1u);
+  ASSERT_TRUE(!result.decisions[0].accepted);
+  ASSERT_EQ(result.decisions[0].reject_reason, FrontierRejectReason::TX_INVALID);
+}
+
 TEST(test_ingress_append_accepts_txv2_payload_when_lane_and_signature_match) {
   const auto from = key_from_byte(16);
   const auto to = key_from_byte(17);
