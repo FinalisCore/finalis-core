@@ -12,6 +12,7 @@
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/ingress.hpp"
+#include "consensus/randomness.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "storage/db.hpp"
@@ -199,17 +200,22 @@ consensus::CanonicalDerivedState build_parent_state_with_utxo(const consensus::C
 
 consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::CanonicalDerivedState& parent_state,
                                                          const std::vector<Bytes>& ordered_records,
-                                                         FrontierVector* next_vector_out = nullptr) {
+                                                         FrontierVector* next_vector_out = nullptr,
+                                                         std::uint64_t epoch_blocks = 0) {
   consensus::CertifiedIngressLaneRecords lane_records;
   const auto signer = key_from_byte(90);
   FrontierVector next_vector = parent_state.finalized_frontier_vector;
   auto lane_roots = parent_state.finalized_lane_roots;
+  const auto next_height = parent_state.finalized_height + 1;
+  const std::uint64_t cert_epoch = (epoch_blocks > 0)
+      ? consensus::committee_epoch_start(next_height, epoch_blocks)
+      : 1;
   for (const auto& raw : ordered_records) {
     auto tx = parse_any_tx(raw);
     if (!tx.has_value()) throw std::runtime_error("failed to parse ordered test tx");
     const auto lane = consensus::assign_ingress_lane(*tx);
     IngressCertificate cert;
-    cert.epoch = 1;
+    cert.epoch = cert_epoch;
     cert.lane = lane;
     cert.seq = ++next_vector.lane_max_seq[lane];
     cert.txid = txid_any(*tx);
@@ -233,7 +239,7 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
                                                         const std::vector<PubKey32>& observed_signers = {},
                                                         const SpecialValidationContext* vctx = nullptr) {
   FrontierVector next_vector;
-  auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector);
+  auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector, cfg.network.committee_epoch_blocks);
   consensus::FrontierExecutionResult result;
   std::string err;
   if (!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.finalized_frontier_vector, next_vector,

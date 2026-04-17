@@ -221,6 +221,26 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
                                      std::string* error) {
   const auto lane_state = db.get_lane_state(cert.lane);
   if (!validate_ingress_certificate_epoch(cert, expected_epoch, error)) return false;
+
+  // Check for equivocation before sequence continuity: a certificate at the same lane/seq
+  // with different content is equivocation, not a seq-discontinuity error.
+  const auto existing_cert_bytes = db.get_ingress_certificate(cert.lane, cert.seq);
+  if (existing_cert_bytes.has_value()) {
+    const auto existing_cert = IngressCertificate::parse(*existing_cert_bytes);
+    if (!existing_cert.has_value()) {
+      if (error) *error = "stored-ingress-certificate-invalid";
+      return false;
+    }
+    if (detect_ingress_equivocation(existing_cert, cert, error)) {
+      std::string persist_error;
+      if (!persist_ingress_equivocation_evidence(db, *existing_cert, cert, &persist_error)) {
+        if (error) *error = persist_error;
+      }
+      return false;
+    }
+    if (*existing_cert == cert) return true;
+  }
+
   if (lane_state.has_value()) {
     if (cert.seq != lane_state->max_seq + 1) {
       if (error) *error = "ingress-seq-discontinuity";
@@ -242,23 +262,6 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
   if (existing_bytes.has_value() && *existing_bytes != tx_bytes) {
     if (error) *error = "ingress-bytes-conflict";
     return false;
-  }
-
-  const auto existing_cert_bytes = db.get_ingress_certificate(cert.lane, cert.seq);
-  if (existing_cert_bytes.has_value()) {
-    const auto existing_cert = IngressCertificate::parse(*existing_cert_bytes);
-    if (!existing_cert.has_value()) {
-      if (error) *error = "stored-ingress-certificate-invalid";
-      return false;
-    }
-    if (detect_ingress_equivocation(existing_cert, cert, error)) {
-      std::string persist_error;
-      if (!persist_ingress_equivocation_evidence(db, *existing_cert, cert, &persist_error)) {
-        if (error) *error = persist_error;
-      }
-      return false;
-    }
-    if (*existing_cert == cert) return true;
   }
 
   if (!db.put_ingress_bytes(cert.txid, tx_bytes)) {

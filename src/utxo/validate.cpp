@@ -1090,27 +1090,26 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     return out;
   }
 
-  // Consistent fee validation for all cases:
-  // 1. All transparent inputs/outputs: transparent inputs must EXACTLY match transparent outputs + fee
-  // 2. Transparent inputs with confidential outputs: same as case 1 - no hidden value allowed
-  // 3. Both confidential inputs/outputs: transparent inputs must AT LEAST cover transparent outputs + fee
-  if (confidential_input_count == 0) {
-    // Cases 1 & 2: No confidential inputs - strict fee validation
+  // Fee validation:
+  // 1. Pure transparent: transparent inputs must EXACTLY match transparent outputs + fee
+  // 2. Transparent inputs with confidential outputs: transparent inputs must cover transparent outputs + fee;
+  //    the remainder funds the confidential outputs (verified by commitment tally)
+  // 3. Confidential inputs exist: commitment tally handles the full balance; no transparent-side constraint needed
+  if (confidential_input_count == 0 && confidential_output_count == 0) {
+    // Case 1: Pure transparent - strict fee check
     if (in_sum < out_sum || in_sum - out_sum != tx.fee) {
-      if (confidential_output_count > 0) {
-        out.error = "fee mismatch: transparent inputs cannot cover hidden output value";
-      } else {
-        out.error = "fee mismatch";
-      }
+      out.error = "fee mismatch";
       return out;
     }
-  } else if (confidential_input_count > 0) {
-    // Case 3: Confidential inputs exist - loose check for transparent side
-    if (in_sum < out_sum || in_sum - out_sum < tx.fee) {
-      out.error = "insufficient transparent input value";
+  } else if (confidential_input_count == 0) {
+    // Case 2: Transparent inputs with confidential outputs
+    // Transparent inputs must cover transparent outputs + fee; rest funds confidential outputs
+    if (in_sum < tx.fee || in_sum - tx.fee < out_sum) {
+      out.error = "fee mismatch: transparent inputs cannot cover hidden output value";
       return out;
     }
   }
+  // Case 3: Confidential inputs exist - commitment tally handles the full balance
 
   non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(tx.fee));
 

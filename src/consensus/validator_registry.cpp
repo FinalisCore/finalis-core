@@ -55,7 +55,7 @@ bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t hei
     if (err) *err = "validator already registered";
     return false;
   }
-  if (v.has_bond) {
+  if (v.has_bond && v.status != ValidatorStatus::EXITING) {
     if (err) *err = "validator bond already active";
     return false;
   }
