@@ -149,7 +149,7 @@ build steps below (requires a C++ toolchain).
 
 For Windows builds/releases, use:
 
-- [finalis-core releases](https://github.com/finalis-core/finalis-core/releases)
+- [finalis-core releases](https://github.com/FinalisCore/finalis-core/releases)
 
 ```bash
 apt install -y build-essential cmake ninja-build pkg-config libssl-dev \
@@ -157,7 +157,7 @@ apt install -y build-essential cmake ninja-build pkg-config libssl-dev \
   libsodium-dev librocksdb-dev curl jq
 ```
 ```bash
-git clone https://github.com/finalis-core/finalis-core.git
+git clone https://github.com/FinalisCore/finalis-core.git
 ```
 ```bash
 cd finalis-core

@@ -205,7 +205,7 @@ If critical issues emerge:
 
 ## Support
 
-- **GitHub Issues:** https://github.com/finalis-core/finalis-core/issues
+- **GitHub Issues:** https://github.com/FinalisCore/finalis-core/issues
 - **Documentation:** `DEPLOYMENT.md` in repository
 - **Community:** Discord @finalis-core-dev
 
