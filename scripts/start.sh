@@ -34,6 +34,9 @@ GENESIS_BIN="${GENESIS_BIN:-}"
 GENESIS_PATH="${GENESIS_PATH:-${GENESIS_BIN}}"
 ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-1}"
 NODE_ROLE="${NODE_ROLE:-auto}"
+RECOVER_PEER_DISCOVERY="${RECOVER_PEER_DISCOVERY:-0}"
+TRUSTED_BOOTSTRAP_PEER="${TRUSTED_BOOTSTRAP_PEER:-}"
+FOLLOW_RECOVERY_LOGS="${FOLLOW_RECOVERY_LOGS:-1}"
 
 log() { printf '[start] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -291,6 +294,68 @@ try:
 except Exception:
     pass
 PY
+}
+
+set_single_seed_endpoint() {
+  local endpoint="$1"
+  local seeds_file="${ROOT_DIR}/mainnet/SEEDS.json"
+  if [[ -z "${endpoint}" ]]; then
+    log "TRUSTED_BOOTSTRAP_PEER is empty; cannot rewrite SEEDS.json"
+    return 1
+  fi
+  if [[ ! -f "${seeds_file}" ]]; then
+    log "SEEDS.json not found at ${seeds_file}; cannot pin bootstrap peer"
+    return 1
+  fi
+
+  python3 - "${seeds_file}" "${endpoint}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+endpoint = sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+data["seeds_p2p"] = [endpoint]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+  log "Pinned mainnet/SEEDS.json to trusted bootstrap peer: ${endpoint}"
+}
+
+recover_peer_discovery_state_if_requested() {
+  if [[ "${RECOVER_PEER_DISCOVERY}" != "1" ]]; then
+    return 0
+  fi
+
+  log "RECOVER_PEER_DISCOVERY=1: stopping finalis services, clearing peer cache, and restarting"
+  local s; s="$(need_sudo)"
+
+  if systemd_available; then
+    ${s} systemctl stop "${SERVICE_NAME}" "${SERVICE_NAME}-explorer" 2>/dev/null || true
+  fi
+
+  rm -f "${DB_DIR}/addrman.dat" "${DB_DIR}/peers.dat"
+  log "Cleared peer discovery cache: ${DB_DIR}/addrman.dat and ${DB_DIR}/peers.dat"
+
+  if [[ -n "${TRUSTED_BOOTSTRAP_PEER}" ]]; then
+    set_single_seed_endpoint "${TRUSTED_BOOTSTRAP_PEER}"
+  else
+    log "TRUSTED_BOOTSTRAP_PEER not set; leaving mainnet/SEEDS.json unchanged"
+  fi
+
+  if systemd_available; then
+    ${s} systemctl start "${SERVICE_NAME}"
+    log "Restarted ${SERVICE_NAME}.service"
+    if [[ "${FOLLOW_RECOVERY_LOGS}" == "1" ]]; then
+      log "Following ${SERVICE_NAME} logs (Ctrl+C to stop)..."
+      ${s} journalctl -u "${SERVICE_NAME}" -f
+      exit 0
+    fi
+  else
+    log "systemd not available; continuing with regular start flow"
+  fi
 }
 
 seed_count() {
@@ -696,6 +761,8 @@ start_explorer_background() {
 }
 
 main() {
+  recover_peer_discovery_state_if_requested
+
   log "Checking/installing build dependencies..."
   install_deps
   log "Running cmake -S . -B ${BUILD_DIR} -G ${GENERATOR:-Ninja if available} ..."
