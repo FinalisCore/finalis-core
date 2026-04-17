@@ -496,18 +496,51 @@ reset_chain_data_if_requested() {
     fi
   fi
 
-  log "RESET_CHAIN_DATA=1: resetting ${DB_DIR} (keeping validator key if present)."
-  local key="${DB_DIR}/keystore/validator.json"
-  local tmp_key="/tmp/finalis.validator.$$.json"
-  if [[ -f "${key}" ]]; then
-    cp -f "${key}" "${tmp_key}"
+  local data_root
+  data_root="$(dirname "${DB_DIR}")"
+  if [[ -z "${data_root}" || "${data_root}" == "/" ]]; then
+    log "RESET_CHAIN_DATA=1 refused: unsafe data root '${data_root}'"
+    exit 1
   fi
-  rm -rf "${DB_DIR}"
+
+  log "RESET_CHAIN_DATA=1: resetting ${data_root} (keeping validator.json files if present)."
+  mkdir -p "${data_root}"
+
+  local tmp_keep_root="/tmp/finalis.keep-keys.$$"
+  rm -rf "${tmp_keep_root}"
+  mkdir -p "${tmp_keep_root}"
+
+  local -a kept_keys=()
+  mapfile -t kept_keys < <(find "${data_root}" -type f -name "validator.json" 2>/dev/null || true)
+  if (( ${#kept_keys[@]} > 0 )); then
+    local key_path rel_path keep_path
+    for key_path in "${kept_keys[@]}"; do
+      rel_path="${key_path#${data_root}/}"
+      keep_path="${tmp_keep_root}/${rel_path}"
+      mkdir -p "$(dirname "${keep_path}")"
+      cp -f "${key_path}" "${keep_path}"
+    done
+    log "Preserved ${#kept_keys[@]} validator.json key file(s)"
+  fi
+
+  find "${data_root}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+  if (( ${#kept_keys[@]} > 0 )); then
+    local restored
+    restored=0
+    while IFS= read -r key_path; do
+      rel_path="${key_path#${tmp_keep_root}/}"
+      keep_path="${data_root}/${rel_path}"
+      mkdir -p "$(dirname "${keep_path}")"
+      cp -f "${key_path}" "${keep_path}"
+      chmod 600 "${keep_path}" || true
+      restored=$((restored + 1))
+    done < <(find "${tmp_keep_root}" -type f -name "validator.json" 2>/dev/null || true)
+    log "Restored ${restored} validator.json key file(s)"
+  fi
+
+  rm -rf "${tmp_keep_root}"
   mkdir -p "${DB_DIR}/keystore"
-  if [[ -f "${tmp_key}" ]]; then
-    mv -f "${tmp_key}" "${key}"
-    chmod 600 "${key}" || true
-  fi
   chmod 700 "${DB_DIR}/keystore" || true
 }
 
