@@ -86,3 +86,8 @@ __pycache__/
 *.pyc
 
 SEEDS-local.json
+
+# local release planning notes
+V1_0_0_NEXT_STEPS.md
+V1_0_0_BUILD_AND_RELEASE.md
+RELEASE_NOTES_V1_0_0.md
