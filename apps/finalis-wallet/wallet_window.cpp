@@ -6676,29 +6676,82 @@ void WalletWindow::refresh_mint_redemption_status() {
     QMessageBox::warning(this, "Redemption Status", "Configure a mint URL first.");
     return;
   }
-  std::ostringstream body_json;
-  body_json << "{\"redemption_batch_id\":\"" << mint_last_redemption_batch_id_.toStdString() << "\"}";
-  std::string err;
-  auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/redemptions/status").toStdString(),
-                                              body_json.str(), &err);
-  if (!body) {
-    QMessageBox::warning(this, "Redemption Status", "Status query failed: " + QString::fromStdString(err));
+
+  if (mint_status_refresh_in_flight_) {
+    statusBar()->showMessage("Mint redemption status refresh already in progress.", 2000);
     return;
   }
-  auto resp = finalis::privacy::parse_mint_redemption_status_response(*body);
-  if (!resp) {
-    QMessageBox::warning(this, "Redemption Status", "Status response was invalid.");
-    return;
+
+  struct MintStatusResult {
+    bool request_ok{false};
+    bool parse_ok{false};
+    QString error;
+    QString state;
+    QString l1_txid;
+    std::uint64_t amount{0};
+  };
+
+  const QString batch_id = mint_last_redemption_batch_id_;
+  mint_status_refresh_in_flight_ = true;
+  if (mint_redeem_status_button_) mint_redeem_status_button_->setEnabled(false);
+  if (mint_status_label_) {
+    mint_status_label_->setText(QString("Refreshing redemption %1...").arg(batch_id));
   }
-  mint_status_label_->setText(QString("Redemption %1: state=%2 l1_txid=%3 amount=%4")
-                                  .arg(mint_last_redemption_batch_id_)
-                                  .arg(QString::fromStdString(resp->state))
-                                  .arg(QString::fromStdString(resp->l1_txid))
-                                  .arg(format_coin_amount(resp->amount)));
-  append_local_event(QString("[mint-status] batch=%1 state=%2 l1_txid=%3")
-                         .arg(mint_last_redemption_batch_id_)
-                         .arg(QString::fromStdString(resp->state))
-                         .arg(elide_middle(QString::fromStdString(resp->l1_txid), 12)));
+
+  const std::uint64_t generation = ++mint_status_refresh_generation_;
+  QPointer<WalletWindow> self(this);
+  std::thread([self, generation, mint_url, batch_id]() mutable {
+    MintStatusResult result;
+    std::ostringstream body_json;
+    body_json << "{\"redemption_batch_id\":\"" << batch_id.toStdString() << "\"}";
+    std::string err;
+    auto body = lightserver::http_post_json_raw(
+        mint_endpoint(mint_url, "/redemptions/status").toStdString(), body_json.str(), &err);
+    if (!body) {
+      result.error = QString::fromStdString(err);
+    } else {
+      result.request_ok = true;
+      auto resp = finalis::privacy::parse_mint_redemption_status_response(*body);
+      if (resp) {
+        result.parse_ok = true;
+        result.state = QString::fromStdString(resp->state);
+        result.l1_txid = QString::fromStdString(resp->l1_txid);
+        result.amount = resp->amount;
+      }
+    }
+
+    QMetaObject::invokeMethod(
+        self,
+        [self, generation, batch_id, result = std::move(result)]() mutable {
+          if (!self) return;
+          if (generation != self->mint_status_refresh_generation_) return;
+
+          self->mint_status_refresh_in_flight_ = false;
+          if (self->mint_redeem_status_button_) self->mint_redeem_status_button_->setEnabled(true);
+
+          if (!result.request_ok) {
+            QMessageBox::warning(self, "Redemption Status", "Status query failed: " + result.error);
+            return;
+          }
+          if (!result.parse_ok) {
+            QMessageBox::warning(self, "Redemption Status", "Status response was invalid.");
+            return;
+          }
+          if (self->mint_status_label_) {
+            self->mint_status_label_->setText(QString("Redemption %1: state=%2 l1_txid=%3 amount=%4")
+                                                  .arg(batch_id)
+                                                  .arg(result.state)
+                                                  .arg(result.l1_txid)
+                                                  .arg(format_coin_amount(result.amount)));
+          }
+          self->append_local_event(QString("[mint-status] batch=%1 state=%2 l1_txid=%3")
+                                       .arg(batch_id)
+                                       .arg(result.state)
+                                       .arg(elide_middle(result.l1_txid, 12)));
+          self->statusBar()->showMessage("Mint redemption status refreshed.", 2500);
+        },
+        Qt::QueuedConnection);
+  }).detach();
 }
 
 }  // namespace finalis::wallet
