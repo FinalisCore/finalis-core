@@ -443,9 +443,6 @@ class WalletWindow final : public QMainWindow {
   std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache_;
   std::uint64_t refresh_generation_{0};
   std::uint64_t refresh_state_version_{0};
-  std::uint64_t last_validator_auto_refresh_ms_{0};
-  std::uint64_t validator_refresh_generation_{0};
-  bool validator_refresh_in_flight_{false};
   bool refresh_in_flight_{false};
   WalletStore store_;
 };
