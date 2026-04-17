@@ -2,9 +2,9 @@
   "version": 1,
   "network_name": "mainnet",
   "protocol_version": 1,
-  "network_id_hex": "258038c123a1c9b08475216e5f53a503",
-  "magic": 2543272234,
-  "genesis_time_unix": 1776708000,
+  "network_id_hex": "bb7048f8dbe7b7d753d62ab322813f1b",
+  "magic": 2038198198,
+  "genesis_time_unix": 1776445056,
   "initial_height": 0,
   "initial_validators": [
     "577cb8a74175a4d96d1f9c94499f1f1ecfd03febcecf7cb7c05327958bb941cb"
@@ -18,5 +18,5 @@
   },
   "monetary_params_ref": "monetary-policy-7m-hard-cap",
   "seeds": [],
-  "note": "Canonical Finalis mainnet genesis with bootstrap validator cc9d1120bce87a9dca53e163d429ffbce7b3afc4ca3171ae1ea99cd3c9405863"
+  "note": "Canonical Finalis mainnet genesis with bootstrap validator 577cb8a74175a4d96d1f9c94499f1f1ecfd03febcecf7cb7c05327958bb941cb"
 }
