@@ -22,9 +22,9 @@ std::array<std::uint8_t, 16> network_id_for_name(const std::string& name) {
 const NetworkConfig kMainnet{
     .name = "mainnet",
     .network_id =
-        std::array<std::uint8_t, 16>{0x25, 0x80, 0x38, 0xc1, 0x23, 0xa1, 0xc9, 0xb0,
-                                     0x84, 0x75, 0x21, 0x6e, 0x5f, 0x53, 0xa5, 0x03},
-    .magic = 0x9797412A,
+        std::array<std::uint8_t, 16>{0xbb, 0x70, 0x48, 0xf8, 0xdb, 0xe7, 0xb7, 0xd7,
+                                     0x53, 0xd6, 0x2a, 0xb3, 0x22, 0x81, 0x3f, 0x1b},
+    .magic = 2038198198,
     .protocol_version = PROTOCOL_VERSION,
     .feature_flags = 1ULL,  // bit0: strict-version-handshake-v0.7
     .p2p_default_port = 19440,
