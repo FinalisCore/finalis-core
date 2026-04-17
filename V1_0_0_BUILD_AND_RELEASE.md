@@ -9,7 +9,7 @@
 ## Step 1: Verify You're on Main with v1.0.0 Code
 
 ```bash
-cd /home/greendragon/Desktop/finalis-organization/finalis-core
+cd /path/to/finalis-core
 git branch -v  # Should show: main 0b8e0ad
 git log --oneline -1  # Should show: Merge pow branch...
 ```

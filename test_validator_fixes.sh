@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run targeted validator tests for unbond, withdraw, and join-window fixes
 
-cd /home/greendragon/Desktop/selfcoin-core-clean
+# Navigate to the finalis-core repository root
+cd "$(dirname "$0")"
 
 echo "Running targeted validator security tests..."
 echo "============================================"

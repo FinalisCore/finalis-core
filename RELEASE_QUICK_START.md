@@ -7,7 +7,7 @@
 
 ### Step 1: Build Linux Binaries
 ```bash
-cd /home/greendragon/Desktop/finalis-organization/finalis-core
+cd /path/to/finalis-core
 rm -rf build
 cmake --preset linux-ninja-release
 cmake --build build/linux-release -j$(nproc)
@@ -42,7 +42,7 @@ cat CHECKSUMS.txt
 
 ### Step 4: Create Git Tag
 ```bash
-cd /home/greendragon/Desktop/finalis-organization/finalis-core
+cd /path/to/finalis-core
 git tag -a v0.7.1-pow -m "Finalis Core v0.7.1 - Validator Onboarding & Enhanced Security"
 git push origin v0.7.1-pow
 ```
@@ -64,7 +64,7 @@ git push origin v0.7.1-pow
 
 ### Step 6: Build & Push Docker Image
 ```bash
-cd /home/greendragon/Desktop/finalis-organization/finalis-core
+cd /path/to/finalis-core
 docker build -t finalis/finalis-core:v0.7.1-pow -t finalis/finalis-core:pow-latest .
 docker login
 docker push finalis/finalis-core:v0.7.1-pow

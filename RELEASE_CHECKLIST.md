@@ -23,7 +23,7 @@
 
 ```bash
 # From repository root
-cd /home/greendragon/Desktop/finalis-organization/finalis-core
+cd /path/to/finalis-core
 
 # Clean build
 rm -rf build

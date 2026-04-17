@@ -19,7 +19,7 @@
 
 #### Step 1: Build Linux Binaries
 ```bash
-cd /home/greendragon/Desktop/finalis-organization/finalis-core
+cd /path/to/finalis-core
 rm -rf build
 cmake --preset linux-ninja-release
 cmake --build build/linux-release -j$(nproc)
