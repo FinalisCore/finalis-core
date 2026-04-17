@@ -87,13 +87,17 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
+      bool use_certificate_epoch_for_committee = false;
       std::string cert_error;
       if (!validate_ingress_certificate_epoch(record.certificate, expected_ingress_epoch, &cert_error)) {
-        // Legacy compatibility: older databases may store epoch=0 for the first
-        // lane record. Keep strict checks for all other records.
-        const bool legacy_first_record_epoch =
-            expected_seq == 1 && record.certificate.epoch == 0 && record.certificate.prev_lane_root == zero_hash();
-        if (legacy_first_record_epoch) {
+        // Replay compatibility for legacy databases:
+        // - some historical builds persisted certificate.epoch as block height
+        // - earliest lane records may have epoch=0 at seq=1
+        const bool legacy_epoch_equals_height =
+            ctx && ctx->current_height != 0 && record.certificate.epoch == ctx->current_height;
+        const bool legacy_first_record_epoch = expected_seq == 1 && record.certificate.epoch == 0;
+        if (legacy_epoch_equals_height || legacy_first_record_epoch) {
+          use_certificate_epoch_for_committee = legacy_epoch_equals_height;
           cert_error.clear();
         } else {
           if (error) {
@@ -111,7 +115,10 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
         return false;
       }
       if (ctx && ctx->is_committee_member) {
-        const auto committee_epoch = expected_ingress_epoch != 0 ? expected_ingress_epoch : record.certificate.epoch;
+        const auto committee_epoch =
+            use_certificate_epoch_for_committee
+                ? record.certificate.epoch
+                : (expected_ingress_epoch != 0 ? expected_ingress_epoch : record.certificate.epoch);
         for (const auto& sig : record.certificate.sigs) {
           if (!ctx->is_committee_member(sig.validator_pubkey, committee_epoch, 0)) {
             if (error) {
