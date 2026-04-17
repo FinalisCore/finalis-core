@@ -136,6 +136,11 @@ bool load_certified_frontier_record_from_storage(const storage::DB& db, const Fr
 bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                           const CanonicalFrontierRecord& record, FrontierExecutionResult* recomputed,
                                           std::string* error);
+bool verify_frontier_record_against_state_with_replay_options(
+                                          const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                          const CanonicalFrontierRecord& record,
+                                          bool allow_legacy_ingress_epoch_replay,
+                                          FrontierExecutionResult* recomputed, std::string* error);
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                            const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error);
 bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig& cfg,

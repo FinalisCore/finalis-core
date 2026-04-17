@@ -34,6 +34,8 @@ struct SpecialValidationContext {
   // Height-indexed finalized identity witness. This remains generic because the
   // anchor may come from legacy block history or frontier transition history.
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
+  // Enables replay-only compatibility for legacy ingress certificate epoch encodings.
+  bool allow_legacy_ingress_epoch_replay{false};
   const struct ConfidentialPolicy* confidential_policy{nullptr};
 };
 
