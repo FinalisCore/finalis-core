@@ -72,6 +72,15 @@ Adaptive checkpoint expansion/contraction is driven only by:
 So cheap or unavailable operator fragments do not contribute to the adaptive
 growth signal unless they satisfy the full finalized eligibility rule.
 
+Admission gates that raise cheap-fragment pressure:
+
+- onboarding admission (`SCONBREG`) and validator join admission (`SCVALJRQ`)
+  are separate policy-gated PoW checks
+- these checks are enforced in shared script validation semantics across legacy
+  `Tx` and transparent outputs in `TxV2`
+- therefore script-version choice does not create a bypass around onboarding or
+  join admission rules
+
 ## Adaptive Bond Floor
 
 The live checkpoint regime also derives a deterministic adaptive checkpoint
@@ -96,6 +105,8 @@ Protected:
 - same-operator qualified-depth inflation
 - future checkpoint participation by operators that fail finalized lifecycle,
   bond, or availability gates
+- stale-epoch ingress replay attempts to inject previously certified control
+  transactions into the wrong epoch context
 
 Not protected:
 

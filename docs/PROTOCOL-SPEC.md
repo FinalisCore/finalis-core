@@ -68,6 +68,33 @@ Important boundary:
 - obsolete block-era storage must fail closed rather than being interpreted as
   live frontier state
 
+## Certified Ingress Rules
+
+Ingress is consensus-critical input to frontier transitions and is now epoch
+pinned and replay-validated.
+
+Ingress acceptance on live nodes and during frontier replay requires:
+
+- certificate `epoch` equals `committee_epoch_start(finalized_height + 1)`
+- certificate signer set is non-empty, signature-valid, and deduplicated by
+  validator pubkey
+- each signer is in the ingress committee for the expected epoch when committee
+  context is available
+- lane assignment recomputes from transaction content and must match
+  `certificate.lane`
+- `(lane, seq)` continuity is strict and `prev_lane_root` must chain exactly
+- tx payload parse, `txid`, and `tx_hash` must match certificate fields
+
+Equivocation handling is fail-closed:
+
+- same `(epoch, lane, seq)` with different certificate body is treated as
+  ingress equivocation
+- deterministic equivocation evidence is persisted before rejection
+
+During frontier merge, certified ingress records are verified again against the
+current expected epoch and lane-root chain. Stale-epoch ingress certificates are
+rejected even if signatures are otherwise valid.
+
 ## Transaction Model
 
 The current live codebase is version-aware:
@@ -105,6 +132,26 @@ The live transaction model also includes explicit validator-control outputs:
 - `SCONBREG` for onboarding admission
 - `SCVALJRQ` for bonded validator join request
 - `SCVALREG` for the bond-carrying validator registration output
+
+Validator-control script semantics are unified across `Tx` and `TxV2`:
+
+- `SCONBREG` must be zero-value, PoP-valid, and cannot appear with
+  `SCVALREG`/`SCVALJRQ` in the same transaction
+- `SCVALJRQ` and `SCVALREG` must appear as a matched pair for the same
+  validator pubkey
+- admission PoW checks for onboarding/join requests are enforced from the same
+  policy context in both transaction versions
+- finalized replay applies lifecycle effects from accepted `AnyTx`, not
+  legacy-only transaction subsets
+
+Fee and overflow safety are also aligned:
+
+- V1 and V2 both enforce max-fee policy bounds through validation context
+- input/output accumulation performs explicit overflow checks before arithmetic
+- transparent-side fee constraints for `TxV2` are strict when no confidential
+  inputs exist
+- frontier execution rejects special-script transactions when validation context
+  is unavailable
 
 ## Two Control Planes
 
@@ -308,6 +355,8 @@ Liveness depends on:
 
 - only one finalized transition is valid for a given height
 - all finalized paths apply the same state transition
+- finalized ingress is epoch-pinned to the active committee epoch and rejected
+  on stale epoch mismatch
 - finalized committee checkpoints are deterministic from finalized state
 - adaptive checkpoint metadata is deterministic from finalized state
 - operator splitting does not linearly increase primary committee influence

@@ -98,6 +98,14 @@ Live implementation accepts:
   admission PoW is disabled by network policy
 - PoW-bearing `SCONBREG` when onboarding admission PoW is enabled
 
+`SCONBREG` script validation is version-consistent:
+
+- the same semantic checks are enforced when the output appears in legacy `Tx`
+  or in transparent outputs of `TxV2`
+- output value must be zero in both transaction versions
+- proof-of-possession and policy-gated admission-PoW checks are enforced through
+  the same validation context in both versions
+
 ## 4. Admission PoW
 
 On restarted mainnet, onboarding admission is PoW-gated.
@@ -149,6 +157,8 @@ The live protocol rejects `SCONBREG` if:
 - the validator pubkey is banned
 - the transaction mixes onboarding registration with validator join outputs
 - the admission PoW is invalid when required
+- ingress certification for the containing transaction is stale for the current
+  expected epoch
 
 This means:
 
@@ -230,6 +240,15 @@ That means:
 - reward eligibility is computed from finalized registry state and finalized
   epoch tickets only
 - explorer / lightserver visibility is observational and finalized-only
+
+Ingress boundary used by the live onboarding path:
+
+- onboarding transactions are admitted through certified ingress records that are
+  epoch-pinned to `committee_epoch_start(finalized_height + 1)`
+- stale-epoch ingress certificates are rejected before onboarding state changes
+  can be applied
+- replay re-validates certificate signatures, lane continuity, and lane-root
+  chaining before deterministic state transition
 
 ## 10. Safety Boundaries
 

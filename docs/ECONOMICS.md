@@ -237,6 +237,16 @@ outputs; it does not introduce a new forced-eviction rule for incumbents.
 Checkpoint minimum bond is separate and adaptive for future checkpoint
 eligibility only.
 
+Consensus boundary for economics-facing operators:
+
+- economic policy does not relax ingress validity rules
+- certified ingress remains epoch-pinned to
+  `committee_epoch_start(finalized_height + 1)`
+- stale-epoch ingress is rejected before any economics effects from contained
+  transactions can be applied
+- script-level admission rules (`SCONBREG`, `SCVALJRQ`, `SCVALREG`) are enforced
+  with aligned semantics across legacy `Tx` and transparent outputs in `TxV2`
+
 ## 8. Operator visibility
 
 `finalis-cli economics_status` reports the active policy fields, including:
