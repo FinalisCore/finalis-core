@@ -10,6 +10,7 @@
 #include "codec/bytes.hpp"
 #include "common/wide_arith.hpp"
 #include "consensus/committee_schedule.hpp"
+#include "consensus/epoch_tickets.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/ingress.hpp"
 #include "consensus/monetary.hpp"
@@ -259,6 +260,18 @@ std::optional<std::uint64_t> settlement_epoch_for_height(const CanonicalDerivati
   const auto epoch_start = committee_epoch_start(height, epoch_blocks);
   if (height != epoch_start || epoch_start <= 1 || epoch_start <= epoch_blocks) return std::nullopt;
   return epoch_start - epoch_blocks;
+}
+
+std::map<PubKey32, std::uint64_t> onboarding_score_units_from_epoch_tickets(const storage::DB& db,
+                                                                             std::uint64_t epoch_start) {
+  std::map<PubKey32, std::uint64_t> out;
+  const auto tickets = db.load_epoch_tickets(epoch_start);
+  const auto best_tickets = best_epoch_tickets_by_pubkey(tickets);
+  for (const auto& [pub, ticket] : best_tickets) {
+    const auto score = static_cast<std::uint64_t>(std::max<std::uint8_t>(1, leading_zero_bits(ticket.work_hash)));
+    out[pub] = score;
+  }
+  return out;
 }
 
 FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivationConfig& cfg,
@@ -1652,6 +1665,20 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
                           " actual=" + hex_encode32(transition->transition_id());
       return false;
     }
+
+    if (auto settlement_epoch = settlement_epoch_for_height(cfg, height); settlement_epoch.has_value()) {
+      auto& reward_state = state.epoch_reward_states[*settlement_epoch];
+      reward_state.epoch_start_height = *settlement_epoch;
+      if (reward_state.onboarding_score_units.empty()) {
+        const auto expected_with_empty =
+            derive_frontier_settlement_from_state(cfg, state, height, transition->leader_pubkey,
+                                                  transition->settlement.current_fees);
+        if (expected_with_empty.serialize() != transition->settlement.serialize()) {
+          reward_state.onboarding_score_units = onboarding_score_units_from_epoch_tickets(db, *settlement_epoch);
+        }
+      }
+    }
+
     const auto cert = db.get_finality_certificate_by_height(height);
     if (!cert.has_value()) {
       if (error) *error = "frontier-storage-missing-finality-certificate height=" + std::to_string(height);

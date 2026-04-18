@@ -7575,6 +7575,81 @@ TEST(test_unregistered_follower_ticket_is_network_accepted_and_paid_at_epoch_bou
   ASSERT_EQ(total_units, artifact->proposal.transition.settlement.total);
 }
 
+TEST(test_unregistered_follower_onboarding_payout_survives_restart_across_epoch_boundary) {
+  const std::string base = unique_test_base("/tmp/finalis_it_unknown_follower_restart_epoch_boundary_payout");
+  auto cluster = make_p2p_cluster(base, 1, 1, 1);
+  auto& validator = cluster.nodes[0];
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 9;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.listen = true;
+  follower_cfg.bind_ip = "127.0.0.1";
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = reserve_test_port();
+  ASSERT_TRUE(follower_cfg.p2p_port != 0);
+  follower_cfg.genesis_path = base + "/genesis.json";
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
+  follower_cfg.validator_passphrase = "test-pass";
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(validator->p2p_port_for_test())};
+  follower_cfg.network.min_block_interval_ms = 100;
+  follower_cfg.network.round_timeout_ms = 200;
+  follower_cfg.max_committee = 1;
+  ASSERT_TRUE(create_test_validator_keystore(follower_cfg, follower_cfg.node_id));
+
+  node::Node follower(follower_cfg);
+  ASSERT_TRUE(follower.init());
+  follower.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto sv = validator->status();
+    const auto sf = follower.status();
+    return sv.height >= 96 && sf.height == sv.height && sf.transition_hash == sv.transition_hash;
+  }, ci_timeout_seconds(120)));
+
+  const auto follower_pub = follower.local_validator_pubkey_for_test();
+  follower.stop();
+  validator->stop();
+
+  node::NodeConfig restart_cfg;
+  restart_cfg.disable_p2p = true;
+  restart_cfg.node_id = 0;
+  restart_cfg.max_committee = 1;
+  restart_cfg.network.min_block_interval_ms = 100;
+  restart_cfg.network.round_timeout_ms = 200;
+  restart_cfg.p2p_port = 0;
+  restart_cfg.db_path = base + "/node0";
+  restart_cfg.genesis_path = base + "/genesis.json";
+  restart_cfg.allow_unsafe_genesis_override = true;
+  restart_cfg.validator_key_file = restart_cfg.db_path + "/keystore/validator.json";
+  restart_cfg.validator_passphrase = "test-pass";
+
+  node::Node restarted(restart_cfg);
+  ASSERT_TRUE(restarted.init());
+  restarted.start();
+  ASSERT_TRUE(wait_for([&]() { return restarted.status().height >= 97; }, ci_timeout_seconds(90)));
+  restarted.stop();
+
+  storage::DB validator_db;
+  ASSERT_TRUE(validator_db.open_readonly(base + "/node0"));
+  const auto best = validator_db.load_best_epoch_tickets(65);
+  auto artifact = load_frontier_artifact_at_height(base + "/node0", 97);
+  validator_db.close();
+
+  ASSERT_TRUE(best.find(follower_pub) != best.end());
+  ASSERT_TRUE(artifact.has_value());
+
+  std::uint64_t follower_units = 0;
+  std::uint64_t total_units = 0;
+  for (const auto& [pub, units] : artifact->proposal.transition.settlement.outputs) {
+    total_units += units;
+    if (pub == follower_pub) follower_units += units;
+  }
+  ASSERT_TRUE(follower_units > 0);
+  ASSERT_EQ(total_units, artifact->proposal.transition.settlement.total);
+}
+
 TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticket) {
   const std::string base = unique_test_base("/tmp/finalis_it_non_active_follower_sync_past_epoch_boundary");
   auto cluster = make_p2p_cluster(base, 2, 2, 2);
