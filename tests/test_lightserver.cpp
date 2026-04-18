@@ -1935,8 +1935,22 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   snapshot.registration_ready_preflight = true;
   snapshot.readiness_stable_samples = 8;
   snapshot.registration_ready = true;
+  snapshot.availability_local_operator_known = true;
+  snapshot.availability_local_operator_pubkey = validator_key.pubkey;
   snapshot.captured_at_unix_ms = static_cast<std::uint64_t>(std::time(nullptr)) * 1000ULL;
   ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
+
+  lightserver::Config cfg;
+  cfg.db_path = base;
+  cfg.network.onboarding_admission_pow_difficulty_bits = 0;
+  cfg.network.validator_join_admission_pow_difficulty_bits = 0;
+  cfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
+
+  storage::EpochRewardSettlementState settlement;
+  settlement.epoch_start_height =
+      consensus::committee_epoch_start(snapshot.local_finalized_height, cfg.network.committee_epoch_blocks);
+  settlement.onboarding_score_units[validator_key.pubkey] = 7;
+  ASSERT_TRUE(db.put_epoch_reward_settlement(settlement));
 
   OutPoint op{};
   op.txid.fill(0x6A);
@@ -1948,11 +1962,6 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   ASSERT_TRUE(db.flush());
   db.close();
 
-  lightserver::Config cfg;
-  cfg.db_path = base;
-  cfg.network.onboarding_admission_pow_difficulty_bits = 0;
-  cfg.network.validator_join_admission_pow_difficulty_bits = 0;
-  cfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
   lightserver::Server ls(cfg);
   ASSERT_TRUE(ls.init());
 
@@ -1981,6 +1990,11 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   ASSERT_TRUE(status_resp.find("\"onboarding_admission_pow_difficulty_bits\":0") != std::string::npos);
   ASSERT_TRUE(status_resp.find("\"validator_join_admission_pow_difficulty_bits\":0") != std::string::npos);
   ASSERT_TRUE(status_resp.find("\"onboarding_reward_eligible\":false") != std::string::npos);
+
+  const auto get_status_resp = ls.handle_rpc_for_test(R"({"jsonrpc":"2.0","id":503,"method":"get_status","params":{}})");
+  ASSERT_TRUE(get_status_resp.find("\"validator_registry_status\":\"NOT_REGISTERED\"") != std::string::npos);
+  ASSERT_TRUE(get_status_resp.find("\"onboarding_reward_eligible\":true") != std::string::npos);
+  ASSERT_TRUE(get_status_resp.find("\"onboarding_reward_score_units\":7") != std::string::npos);
 }
 
 void register_lightserver_tests() {}
