@@ -4806,13 +4806,15 @@ std::optional<consensus::EpochTicket> Node::mine_local_epoch_ticket_locked(std::
   const auto epoch = consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks);
   const auto anchor = epoch_ticket_challenge_anchor_locked(height);
   auto local_info = validators_.get(local_key_.public_key);
-  if (!local_info.has_value()) return std::nullopt;
-  if (!validators_.is_active_for_height(local_key_.public_key, height) &&
-      local_info->status != consensus::ValidatorStatus::ONBOARDING) {
-    return std::nullopt;
+  PubKey32 participant = local_key_.public_key;
+  if (local_info.has_value()) {
+    if (!validators_.is_active_for_height(local_key_.public_key, height) &&
+        local_info->status != consensus::ValidatorStatus::ONBOARDING) {
+      return std::nullopt;
+    }
+    participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
   }
-  auto ticket = consensus::best_epoch_ticket_for_operator_id(
-      epoch, anchor, consensus::canonical_operator_id(local_key_.public_key, *local_info), height);
+  auto ticket = consensus::best_epoch_ticket_for_operator_id(epoch, anchor, participant, height);
   if (!ticket.has_value()) return std::nullopt;
   const auto difficulty_bits = ticket_difficulty_bits_for_epoch_locked(epoch, validators_.active_sorted(height).size());
   if (!consensus::epoch_ticket_meets_difficulty(*ticket, difficulty_bits)) return std::nullopt;
@@ -4826,18 +4828,19 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   const std::uint64_t current_epoch = current_epoch_ticket_epoch_locked();
   if (!from_network) {
     auto local_info = validators_.get(local_key_.public_key);
-    if (!local_info.has_value()) {
-      if (reject_reason) *reject_reason = "local-validator-missing";
-      return false;
-    }
-    const auto expected_participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
-    if (stored.participant_pubkey != expected_participant) {
+    if (local_info.has_value()) {
+      const auto expected_participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
+      if (stored.participant_pubkey != expected_participant) {
+        if (reject_reason) *reject_reason = "local-participant-mismatch";
+        return false;
+      }
+      if (!validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1) &&
+          local_info->status != consensus::ValidatorStatus::ONBOARDING) {
+        if (reject_reason) *reject_reason = "local-non-active";
+        return false;
+      }
+    } else if (stored.participant_pubkey != local_key_.public_key) {
       if (reject_reason) *reject_reason = "local-participant-mismatch";
-      return false;
-    }
-    if (!validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1) &&
-        local_info->status != consensus::ValidatorStatus::ONBOARDING) {
-      if (reject_reason) *reject_reason = "local-non-active";
       return false;
     }
   }
@@ -4892,6 +4895,18 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   (void)db_.put_epoch_ticket(stored);
   best[stored.participant_pubkey] = stored;
   (void)db_.put_best_epoch_ticket(stored);
+  const auto onboarding_score =
+      static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(stored.work_hash)));
+  auto& reward_state = epoch_reward_states_[stored.epoch];
+  reward_state.epoch_start_height = stored.epoch;
+  reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
+  if (canonical_state_.has_value()) {
+    auto& canonical_reward_state = canonical_state_->epoch_reward_states[stored.epoch];
+    canonical_reward_state.epoch_start_height = stored.epoch;
+    canonical_reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
+    canonical_state_->state_commitment =
+        consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+  }
   auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,
                                                              cfg_.max_committee, &validators_.all(), true);
   if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(stored.epoch); checkpoint.has_value() &&

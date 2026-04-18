@@ -269,6 +269,7 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
   settlement.current_fees = accepted_fee_units;
 
   std::map<PubKey32, std::uint64_t> settlement_scores;
+  std::map<PubKey32, std::uint64_t> onboarding_scores;
   std::uint64_t settlement_rewards = 0;
   std::uint64_t settled_epoch_fees = 0;
   std::uint64_t reserve_subsidy = 0;
@@ -280,6 +281,7 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
       settled_epoch_fees = height >= EMISSION_BLOCKS ? it->second.fee_pool_units : 0;
       reserve_subsidy = height >= EMISSION_BLOCKS ? it->second.reserve_subsidy_units : 0;
       settlement_scores = it->second.reward_score_units;
+      onboarding_scores = it->second.onboarding_score_units;
       const auto& econ = active_economics_policy(cfg.network, height);
       const auto threshold_bps = econ.participation_threshold_bps;
       for (auto& [pub, score] : settlement_scores) {
@@ -304,7 +306,7 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
   // This keeps the live payload independent of the round leader.
   const auto payout =
       compute_epoch_settlement_payout(settlement_rewards, settled_epoch_fees, reserve_subsidy, leader_pubkey,
-                                      settlement_scores, {});
+                      settlement_scores, onboarding_scores);
   settlement.settled_epoch_fees = payout.settled_epoch_fees;
   settlement.settled_epoch_rewards = payout.settled_epoch_rewards;
   settlement.reserve_subsidy_units = payout.reserve_subsidy_units;

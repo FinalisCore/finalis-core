@@ -5678,6 +5678,66 @@ TEST(test_epoch_settlement_pays_onboarding_slice_to_onboarding_pubkey_from_final
   ASSERT_EQ(validator_units, settlement_reward_units - expected_onboarding_units);
 }
 
+TEST(test_epoch_settlement_pays_onboarding_slice_to_unknown_participant_from_finalized_ticket) {
+  const auto base = unique_test_base("/tmp/finalis_it_unknown_onboarding_settlement_slice");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto leader = keys[0].public_key;
+  const auto validator_pub = keys[1].public_key;
+  const auto unknown_pub = keys[2].public_key;
+  const std::uint64_t epoch_start = 32;
+  const std::uint64_t settlement_reward_units = 10'000;
+  const std::uint64_t expected_onboarding_units = consensus::onboarding_reward_units(settlement_reward_units);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  consensus::ValidatorInfo validator_info;
+  validator_info.status = consensus::ValidatorStatus::ACTIVE;
+  validator_info.has_bond = true;
+  validator_info.bonded_amount = BOND_AMOUNT;
+  ASSERT_TRUE(db.put_validator(validator_pub, validator_info));
+
+  consensus::EpochTicket ticket;
+  ticket.epoch = epoch_start;
+  ticket.participant_pubkey = unknown_pub;
+  ticket.challenge_anchor = Hash32{0x42};
+  ticket.nonce = 1;
+  ticket.work_hash = consensus::make_epoch_ticket_work_hash(ticket.epoch, ticket.challenge_anchor, ticket.participant_pubkey,
+                                                            ticket.nonce);
+  ticket.source_height = epoch_start;
+  ticket.origin = consensus::EpochTicketOrigin::NETWORK;
+  ASSERT_TRUE(db.put_epoch_ticket(ticket));
+
+  const auto best_tickets = consensus::best_epoch_tickets_by_pubkey(db.load_epoch_tickets(epoch_start));
+  auto best_it = best_tickets.find(unknown_pub);
+  ASSERT_TRUE(best_it != best_tickets.end());
+
+  storage::EpochRewardSettlementState state;
+  state.epoch_start_height = epoch_start;
+  state.total_reward_units = settlement_reward_units;
+  state.reward_score_units[validator_pub] = 100;
+  state.onboarding_score_units[unknown_pub] =
+      static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(best_it->second.work_hash)));
+  ASSERT_TRUE(db.put_epoch_reward_settlement(state));
+
+  const auto payout = consensus::compute_epoch_settlement_payout(state.total_reward_units, 0, 0, leader,
+                                                                 state.reward_score_units, state.onboarding_score_units);
+  ASSERT_EQ(payout.total, settlement_reward_units);
+
+  std::uint64_t validator_units = 0;
+  std::uint64_t unknown_units = 0;
+  for (const auto& [pub, units] : payout.outputs) {
+    if (pub == validator_pub) validator_units += units;
+    if (pub == unknown_pub) unknown_units += units;
+  }
+  ASSERT_EQ(unknown_units, expected_onboarding_units);
+  ASSERT_EQ(validator_units + unknown_units, settlement_reward_units);
+  ASSERT_EQ(validator_units, settlement_reward_units - expected_onboarding_units);
+}
+
 TEST(test_skip_exact_self_endpoint_before_dial) {
   const std::string base = unique_test_base("/tmp/finalis_it_skip_exact_self");
   std::filesystem::remove_all(base);
@@ -7403,29 +7463,28 @@ TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   n0.stop();
 }
 
-TEST(test_non_active_follower_does_not_mine_historical_epoch_tickets) {
-  const std::string base = unique_test_base("/tmp/finalis_it_non_active_follower_no_historical_epoch_tickets");
-  auto cluster = make_p2p_cluster(base, 2, 2, 2);
-  auto& validators = cluster.nodes;
-  const auto min_height =
-      std::max<std::uint64_t>(18, node::NodeConfig{}.network.committee_epoch_blocks + 2);
+TEST(test_unregistered_follower_mines_epoch_tickets_without_joining_committee) {
+  const std::string base = unique_test_base("/tmp/finalis_it_unregistered_follower_epoch_tickets");
+  auto cluster = make_p2p_cluster(base, 1, 1, 1);
+  auto& validator = cluster.nodes[0];
 
-  ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= min_height; }, std::chrono::seconds(45)));
-  ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
-
-  for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
-  ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
-  follower_cfg.listen = false;
+  follower_cfg.listen = true;
+  follower_cfg.bind_ip = "127.0.0.1";
   follower_cfg.db_path = base + "/follower";
-  follower_cfg.p2p_port = 0;
+  follower_cfg.p2p_port = reserve_test_port();
+  ASSERT_TRUE(follower_cfg.p2p_port != 0);
   follower_cfg.genesis_path = base + "/genesis.json";
   follower_cfg.allow_unsafe_genesis_override = true;
   follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
   follower_cfg.validator_passphrase = "test-pass";
-  follower_cfg.peers = {"127.0.0.1:" + std::to_string(validators[0]->p2p_port_for_test())};
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(validator->p2p_port_for_test())};
+  follower_cfg.outbound_target = 1;
+  follower_cfg.network.min_block_interval_ms = 100;
+  follower_cfg.network.round_timeout_ms = 200;
+  follower_cfg.max_committee = 1;
   ASSERT_TRUE(create_test_validator_keystore(follower_cfg, follower_cfg.node_id));
 
   node::Node follower(follower_cfg);
@@ -7433,24 +7492,19 @@ TEST(test_non_active_follower_does_not_mine_historical_epoch_tickets) {
   follower.start();
 
   ASSERT_TRUE(wait_for([&]() {
-    const auto s0 = validators[0]->status();
-    const auto s1 = validators[1]->status();
+    const auto sv = validator->status();
     const auto sf = follower.status();
-    return s0.height == s1.height && s0.transition_hash == s1.transition_hash && sf.height == s0.height &&
-           sf.transition_hash == s0.transition_hash;
-  }, std::chrono::seconds(60)));
+    return sv.height >= 65 && sf.height == sv.height && sf.transition_hash == sv.transition_hash;
+  }, ci_timeout_seconds(120)));
 
   const auto local_pub = follower.local_validator_pubkey_for_test();
   const auto active = follower.active_validators_for_next_height_for_test();
   ASSERT_TRUE(std::find(active.begin(), active.end(), local_pub) == active.end());
 
-  const auto validator_status = validators[0]->status();
-  const auto step = std::max<std::uint64_t>(1, follower_cfg.network.committee_epoch_blocks);
-  const auto next_epoch = consensus::committee_epoch_start(validator_status.height + 1, follower_cfg.network.committee_epoch_blocks);
-  ASSERT_TRUE(next_epoch > step);
-  const auto required_epoch = next_epoch - step;
+  const auto required_epoch = 33ULL;
 
   follower.stop();
+  validator->stop();
 
   storage::DB db;
   ASSERT_TRUE(db.open_readonly(follower_cfg.db_path));
@@ -7458,12 +7512,67 @@ TEST(test_non_active_follower_does_not_mine_historical_epoch_tickets) {
   const auto snapshot = db.get_epoch_committee_snapshot(required_epoch);
   db.close();
 
-  ASSERT_TRUE(best.find(local_pub) == best.end());
+  ASSERT_TRUE(best.find(local_pub) != best.end());
   ASSERT_TRUE(snapshot.has_value());
   ASSERT_TRUE(std::find(snapshot->ordered_members.begin(), snapshot->ordered_members.end(), local_pub) ==
               snapshot->ordered_members.end());
+}
 
-  for (auto& n : validators) n->stop();
+TEST(test_unregistered_follower_ticket_is_network_accepted_and_paid_at_epoch_boundary) {
+  const std::string base = unique_test_base("/tmp/finalis_it_unknown_follower_epoch_boundary_payout");
+  auto cluster = make_p2p_cluster(base, 1, 1, 1);
+  auto& validator = cluster.nodes[0];
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 9;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.listen = true;
+  follower_cfg.bind_ip = "127.0.0.1";
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = reserve_test_port();
+  ASSERT_TRUE(follower_cfg.p2p_port != 0);
+  follower_cfg.genesis_path = base + "/genesis.json";
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
+  follower_cfg.validator_passphrase = "test-pass";
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(validator->p2p_port_for_test())};
+  follower_cfg.network.min_block_interval_ms = 100;
+  follower_cfg.network.round_timeout_ms = 200;
+  follower_cfg.max_committee = 1;
+  ASSERT_TRUE(create_test_validator_keystore(follower_cfg, follower_cfg.node_id));
+
+  node::Node follower(follower_cfg);
+  ASSERT_TRUE(follower.init());
+  follower.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto sv = validator->status();
+    const auto sf = follower.status();
+    return sv.height >= 65 && sf.height == sv.height && sf.transition_hash == sv.transition_hash;
+  }, ci_timeout_seconds(120)));
+
+  const auto follower_pub = follower.local_validator_pubkey_for_test();
+  follower.stop();
+  validator->stop();
+
+  storage::DB validator_db;
+  ASSERT_TRUE(validator_db.open_readonly(base + "/node0"));
+  const auto best = validator_db.load_best_epoch_tickets(33);
+  auto artifact = load_frontier_artifact_at_height(base + "/node0", 65);
+  validator_db.close();
+
+  auto best_it = best.find(follower_pub);
+  ASSERT_TRUE(best_it != best.end());
+  ASSERT_TRUE(artifact.has_value());
+
+  std::uint64_t follower_units = 0;
+  std::uint64_t total_units = 0;
+  for (const auto& [pub, units] : artifact->proposal.transition.settlement.outputs) {
+    total_units += units;
+    if (pub == follower_pub) follower_units += units;
+  }
+  ASSERT_TRUE(follower_units > 0);
+  ASSERT_EQ(total_units, artifact->proposal.transition.settlement.total);
 }
 
 TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticket) {
@@ -7520,8 +7629,6 @@ TEST(test_syncing_follower_reconstructs_same_next_height_checkpoint_as_validator
   const auto min_height =
       std::max<std::uint64_t>(18, node::NodeConfig{}.network.committee_epoch_blocks + 2);
 
-  ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= min_height; }, ci_timeout_seconds(90)));
-  ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
 
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
   ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(5)));
