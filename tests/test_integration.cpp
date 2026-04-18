@@ -7475,10 +7475,10 @@ TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticke
     const auto s0 = validators[0]->status();
     const auto s1 = validators[1]->status();
     return s0.height >= 18 && s1.height >= 18 && s0.height == s1.height && s0.transition_hash == s1.transition_hash;
-  }, std::chrono::seconds(35)));
+  }, ci_timeout_seconds(35)));
 
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
-  ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
+  ASSERT_TRUE(wait_for_same_tip(validators, ci_timeout_seconds(15)));
   const auto validator_status = validators[0]->status();
 
   node::NodeConfig follower_cfg;
@@ -7502,7 +7502,7 @@ TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticke
   ASSERT_TRUE(wait_for([&]() {
     const auto sf = follower.status();
     return sf.height == validator_status.height && sf.transition_hash == validator_status.transition_hash;
-  }, std::chrono::seconds(30)));
+  }, ci_timeout_seconds(30)));
 
   const auto local_pub = follower.local_validator_pubkey_for_test();
   const auto committee = follower.committee_for_next_height_for_test();
