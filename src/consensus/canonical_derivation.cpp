@@ -274,6 +274,15 @@ std::map<PubKey32, std::uint64_t> onboarding_score_units_from_epoch_tickets(cons
   return out;
 }
 
+std::map<PubKey32, std::uint64_t> onboarding_score_units_for_replay(const storage::DB& db,
+                                                                    std::uint64_t epoch_start) {
+  if (auto state = db.get_epoch_reward_settlement(epoch_start); state.has_value() &&
+      !state->onboarding_score_units.empty()) {
+    return state->onboarding_score_units;
+  }
+  return onboarding_score_units_from_epoch_tickets(db, epoch_start);
+}
+
 FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivationConfig& cfg,
                                                          const CanonicalDerivedState& prev, std::uint64_t height,
                                                          const PubKey32& leader_pubkey,
@@ -1674,7 +1683,7 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
             derive_frontier_settlement_from_state(cfg, state, height, transition->leader_pubkey,
                                                   transition->settlement.current_fees);
         if (expected_with_empty.serialize() != transition->settlement.serialize()) {
-          reward_state.onboarding_score_units = onboarding_score_units_from_epoch_tickets(db, *settlement_epoch);
+          reward_state.onboarding_score_units = onboarding_score_units_for_replay(db, *settlement_epoch);
         }
       }
     }
