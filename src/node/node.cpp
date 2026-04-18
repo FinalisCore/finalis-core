@@ -3309,12 +3309,9 @@ std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch
   std::map<PubKey32, std::uint64_t> out;
   const auto tickets = db_.load_epoch_tickets(epoch_start_height);
   const auto best_tickets = consensus::best_epoch_tickets_by_pubkey(tickets);
-  for (const auto& [pub, info] : validators_.all()) {
-    if (info.status != consensus::ValidatorStatus::ONBOARDING) continue;
-    auto it = best_tickets.find(pub);
-    if (it == best_tickets.end()) continue;
+  for (const auto& [pub, ticket] : best_tickets) {
     const auto score = static_cast<std::uint64_t>(
-        std::max<std::uint8_t>(1, consensus::leading_zero_bits(it->second.work_hash)));
+        std::max<std::uint8_t>(1, consensus::leading_zero_bits(ticket.work_hash)));
     out[pub] = score;
   }
   return out;
