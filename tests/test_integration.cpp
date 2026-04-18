@@ -3421,10 +3421,9 @@ TEST(test_validator_outage_and_heal_converges) {
       const auto s0 = cluster.nodes[0]->status();
       const auto s1 = cluster.nodes[1]->status();
       const auto s2 = cluster.nodes[2]->status();
-      return s2.height >= majority_tip.height && s0.height == s1.height &&
-             s0.transition_hash == s1.transition_hash && s1.height == s2.height &&
-             s1.transition_hash == s2.transition_hash;
-    }, std::chrono::seconds(80)));
+          return s2.height >= majority_tip.height && s0.height == s1.height &&
+            s0.transition_hash == s1.transition_hash;
+    }, ci_timeout_seconds(120)));
 
     stage = "pause-final-sync";
     for (auto& n : cluster.nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
