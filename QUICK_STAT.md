@@ -195,6 +195,57 @@ Behavior:
 - Confirm validator key can be decrypted with the provided passphrase.
 - Confirm the funding wallet address has received coins and that they are finalized, not just pending.
 
-## 8) One-line summary
+## 8) DB reset (wipe chain, keep identity and peers)
+
+Use this when you need a clean resync without losing your validator key or the peer address table. Preserving `peers.dat` means the node reconnects to known-good peers immediately instead of falling back to cold seed-only discovery.
+
+### Linux and macOS
+
+```bash
+sudo systemctl stop finalis finalis-lightserver 2>/dev/null; true
+
+# preserve key and peer table
+cp ~/.finalis/mainnet/keystore/validator.json /tmp/validator.json.bak
+cp ~/.finalis/mainnet/peers.dat /tmp/peers.dat.bak 2>/dev/null; true
+
+# wipe DB
+rm -rf ~/.finalis/mainnet
+
+# restore
+mkdir -p ~/.finalis/mainnet/keystore
+cp /tmp/validator.json.bak ~/.finalis/mainnet/keystore/validator.json
+chmod 600 ~/.finalis/mainnet/keystore/validator.json
+cp /tmp/peers.dat.bak ~/.finalis/mainnet/peers.dat 2>/dev/null; true
+
+sudo systemctl start finalis finalis-lightserver
+```
+
+### Windows (PowerShell)
+
+```powershell
+Stop-Service finalis, finalis-lightserver -ErrorAction SilentlyContinue
+
+# preserve key and peer table
+Copy-Item "$env:APPDATA\.finalis\mainnet\keystore\validator.json" "$env:TEMP\validator.json.bak"
+Copy-Item "$env:APPDATA\.finalis\mainnet\peers.dat" "$env:TEMP\peers.dat.bak" -ErrorAction SilentlyContinue
+
+# wipe DB
+Remove-Item -Recurse -Force "$env:APPDATA\.finalis\mainnet"
+
+# restore
+New-Item -ItemType Directory -Force "$env:APPDATA\.finalis\mainnet\keystore" | Out-Null
+Copy-Item "$env:TEMP\validator.json.bak" "$env:APPDATA\.finalis\mainnet\keystore\validator.json"
+Copy-Item "$env:TEMP\peers.dat.bak" "$env:APPDATA\.finalis\mainnet\peers.dat" -ErrorAction SilentlyContinue
+
+Start-Service finalis, finalis-lightserver
+```
+
+Notes:
+
+- The `peers.dat` copy is optional but recommended. If it does not exist yet (first run), the copy step is silently skipped.
+- After restart the node will resync from height 0. Watch for `state=SYNCED` in the logs.
+- Your validator identity (public key and rewards address) is preserved because `validator.json` is restored.
+
+## 9) One-line summary
 
 CLI and Wallet both support full install -> onboarding registration -> validator registration flows on Linux, macOS, and Windows, while ticket-based onboarding reward participation can begin before funded on-chain registration.
