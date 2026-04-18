@@ -5307,13 +5307,33 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
                " height=" + std::to_string(gbh->height));
       auto bh = db_.get_height_hash(gbh->height);
-      if (!bh.has_value()) return;
+      if (!bh.has_value()) {
+        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+                 " requested_height=" + std::to_string(gbh->height) + " status=not-found");
+        return;
+      }
       auto transition_bytes = db_.get_frontier_transition(*bh);
-      if (!transition_bytes.has_value()) return;
+      if (!transition_bytes.has_value()) {
+        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
+                 " status=missing-bytes");
+        return;
+      }
       auto transition = FrontierTransition::parse(*transition_bytes);
-      if (!transition.has_value()) return;
+      if (!transition.has_value()) {
+        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
+                 " status=parse-error");
+        return;
+      }
       auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
-      if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) return;
+      if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) {
+        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
+                 " status=ingress-slice-mismatch (expected=" + std::to_string(transition->next_frontier - transition->prev_frontier) +
+                 " got=" + std::to_string(ordered_records.size()) + ")");
+        return;
+      }
       p2p::TransitionMsg msg;
       msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
       msg.certificate = db_.get_finality_certificate_by_height(transition->height);
@@ -8138,9 +8158,24 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
 
 bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   const std::uint64_t next_height = finalized_height_ + 1;
-  const std::uint64_t retry_ms =
+  std::uint64_t retry_ms =
       std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
   const std::uint64_t tms = now_ms();
+
+  // If we have requested blocks but nothing has been finalized in a long time,
+  // become more aggressive about retrying to unstick sync
+  if (!requested_sync_heights_.empty()) {
+    auto oldest_it = std::min_element(requested_sync_heights_.begin(), requested_sync_heights_.end(),
+                                       [](const auto& a, const auto& b) { return a.second < b.second; });
+    if (oldest_it != requested_sync_heights_.end()) {
+      const std::uint64_t age_ms = tms - oldest_it->second;
+      if (age_ms > 10000) {  // If oldest request is > 10s old, use shorter retry window
+        retry_ms = 1000;
+      } else if (age_ms > 5000) {  // If > 5s old, moderate retry
+        retry_ms = std::min(retry_ms, static_cast<std::uint64_t>(2000));
+      }
+    }
+  }
 
   auto eligible_peer = [&](int peer_id) {
     const auto info = p2p_.get_peer_info(peer_id);
