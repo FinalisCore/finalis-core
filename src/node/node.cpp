@@ -4806,11 +4806,14 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
 }
 
 std::optional<consensus::EpochTicket> Node::mine_local_epoch_ticket_locked(std::uint64_t height) const {
-  if (!validators_.is_active_for_height(local_key_.public_key, height)) return std::nullopt;
   const auto epoch = consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks);
   const auto anchor = epoch_ticket_challenge_anchor_locked(height);
   auto local_info = validators_.get(local_key_.public_key);
   if (!local_info.has_value()) return std::nullopt;
+  if (!validators_.is_active_for_height(local_key_.public_key, height) &&
+      local_info->status != consensus::ValidatorStatus::ONBOARDING) {
+    return std::nullopt;
+  }
   auto ticket = consensus::best_epoch_ticket_for_operator_id(
       epoch, anchor, consensus::canonical_operator_id(local_key_.public_key, *local_info), height);
   if (!ticket.has_value()) return std::nullopt;
@@ -4835,7 +4838,8 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
       if (reject_reason) *reject_reason = "local-participant-mismatch";
       return false;
     }
-    if (!validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1)) {
+    if (!validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1) &&
+        local_info->status != consensus::ValidatorStatus::ONBOARDING) {
       if (reject_reason) *reject_reason = "local-non-active";
       return false;
     }
