@@ -823,7 +823,8 @@ std::string onboarding_visibility_json(const NetworkConfig& network, const stora
   oss << ",\"onboarding_reward_epoch_start\":";
   if (finalized_height.has_value()) oss << epoch_start;
   else oss << "null";
-  const bool eligible = record.validator_status == "ONBOARDING";
+  const bool eligible =
+      finalized_height.has_value() && onboarding_score_units_for_pubkey(db, record.validator_pubkey, epoch_start).has_value();
   oss << ",\"onboarding_reward_eligible\":" << (eligible ? "true" : "false")
       << ",\"onboarding_reward_score_units\":";
   if (eligible && finalized_height.has_value()) {
@@ -1871,8 +1872,8 @@ std::string Server::handle_rpc_body(const std::string& body) {
     }
     oss << ",\"onboarding_reward_eligible\":";
     if (local_registry_pubkey.has_value()) {
-      auto it = validators.find(*local_registry_pubkey);
-      oss << ((it != validators.end() && it->second.status == consensus::ValidatorStatus::ONBOARDING) ? "true" : "false");
+      const auto epoch_start = consensus::committee_epoch_start(tip->height, cfg_.network.committee_epoch_blocks);
+      oss << (onboarding_score_units_for_pubkey(*view, *local_registry_pubkey, epoch_start).has_value() ? "true" : "false");
     } else {
       oss << "null";
     }
