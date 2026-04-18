@@ -201,7 +201,7 @@ On the live path:
 - `ONBOARDING` recipients are excluded from validator participation accounting
   and validator reward scoring
 - onboarding rewards are derived from a separate finalized score map based on
-  best finalized epoch ticket only
+  best finalized epoch ticket only, independent of registry onboarding status
 
 Relevant code:
 

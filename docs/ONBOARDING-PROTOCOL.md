@@ -208,14 +208,17 @@ Current rule:
 - reserve accrual remains `10%` of gross issuance
 - fees and reserve subsidy are not shared with onboarding rewards
 
-The onboarding reward bucket is paid only to:
+The onboarding reward bucket is paid only to participants with at least one valid finalized epoch ticket.
 
-- validators in `ONBOARDING`
-- with at least one valid finalized epoch ticket
-
-Only the best finalized epoch ticket per onboarding validator counts.
+Only the best finalized epoch ticket per participant counts.
 
 The reward score is derived from that best ticket only.
+
+Important boundary:
+
+- `SCONBREG` still controls on-chain transition into registry status `ONBOARDING`
+- `SCONBREG` is not required for eligibility in the `3%` onboarding reward bucket
+- ticket-based reward eligibility is derived from finalized epoch tickets, not from registry status
 
 If the onboarding set is empty for a settlement epoch:
 
@@ -237,8 +240,7 @@ It must not depend on:
 That means:
 
 - unknown -> `ONBOARDING` is on-chain only
-- reward eligibility is computed from finalized registry state and finalized
-  epoch tickets only
+- reward eligibility is computed from finalized epoch tickets only
 - explorer / lightserver visibility is observational and finalized-only
 
 Ingress boundary used by the live onboarding path:

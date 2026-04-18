@@ -135,9 +135,13 @@ Current rule:
 - `3%` of settlement rewards are carved from the validator settlement reward
   slice
 - the onboarding slice is distributed only over `onboarding_score_units`
-- only validators in `ONBOARDING` may appear in that score map
 - the onboarding score map is derived from finalized epoch tickets only
 - fees and reserve subsidy are not shared with the onboarding slice
+
+Operational consequence:
+
+- a participant may appear in `onboarding_score_units` without first entering registry status `ONBOARDING`
+- registry onboarding and onboarding reward eligibility are separate concerns
 
 If `onboarding_score_units` is empty:
 

@@ -50,9 +50,31 @@ cmake --build build -j
 - DB: %APPDATA%\\.finalis\\mainnet
 - Validator key: %APPDATA%\\.finalis\\mainnet\\keystore\\validator.json
 
-## 4) CLI flow (install to validator registration)
+## 4) Reward participation vs registration
+
+These are now separate paths.
+
+- A zero-balance operator can participate in the `3%` onboarding reward bucket by producing valid finalized epoch tickets.
+- Wallet funding is required only for on-chain onboarding registration and later validator registration.
+
+Funding is required when you want to:
+
+- submit `onboarding-register` (`SCONBREG`)
+- submit `validator-register`
+- pay fees and post the validator bond
+
+If `validator_status` shows:
+
+- `spendable_utxos=0`
+- `spendable_balance=0`
+
+then on-chain registration will fail until coins are sent to that wallet address and become finalized.
+
+## 5) CLI flow (install to validator registration)
 
 Step 1: Onboarding registration (SCONBREG)
+
+This step is only needed if you want on-chain onboarding registration. It is not required just to compete for the `3%` onboarding reward bucket through valid finalized epoch tickets.
 
 ### Linux and macOS
 
@@ -124,7 +146,7 @@ Step 3: Check status
   --file "$env:APPDATA\.finalis\mainnet\keystore\validator.json"
 ```
 
-## 5) Wallet UI/UX flow
+## 6) Wallet UI/UX flow
 
 Step 1: Build wallet target
 
@@ -154,19 +176,25 @@ Step 2: In the wallet
   - RPC Endpoint (for example http://127.0.0.1:19444/rpc)
 - Click Register Validator.
 
+Important:
+
+- the wallet must already control finalized spendable funds for on-chain registration flows
+- zero-balance operators may still participate in the ticket-based onboarding reward path before registration
+
 Behavior:
 
 - If onboarding registration is still required, the wallet runs onboarding registration first.
 - Then it proceeds with validator registration and tracking.
 
-## 6) Quick checks if registration fails
+## 7) Quick checks if registration fails
 
 - Confirm RPC endpoint is reachable and synced.
 - Confirm DB path and validator key path point to mainnet data.
 - Confirm wallet/key network matches mainnet.
-- Confirm there are spendable finalized funds for fees/bond.
+- Confirm there are spendable finalized funds for registration fees/bond when using on-chain registration.
 - Confirm validator key can be decrypted with the provided passphrase.
+- Confirm the funding wallet address has received coins and that they are finalized, not just pending.
 
-## 7) One-line summary
+## 8) One-line summary
 
-CLI and Wallet both support full install -> onboarding registration -> validator registration flows on Linux, macOS, and Windows when local node/lightserver and key paths are configured correctly.
+CLI and Wallet both support full install -> onboarding registration -> validator registration flows on Linux, macOS, and Windows, while ticket-based onboarding reward participation can begin before funded on-chain registration.
