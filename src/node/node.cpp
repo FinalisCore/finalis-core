@@ -689,7 +689,7 @@ std::vector<consensus::FinalizedCommitteeCandidate> finalized_committee_candidat
     input.bonded_amount = seed.bonded_amount;
     auto ticket = consensus::best_epoch_ticket_for_operator_id(epoch_start, epoch_seed, operator_id, epoch_start,
                                                                consensus::EPOCH_TICKET_MAX_NONCE);
-    if (ticket.has_value()) {
+    if (ticket.has_value() && consensus::epoch_ticket_meets_difficulty(*ticket, ticket_difficulty_bits)) {
       input.ticket_work_hash = ticket->work_hash;
       input.ticket_nonce = ticket->nonce;
       input.ticket_bonus_bps =
@@ -3134,6 +3134,9 @@ void Node::persist_finalized_committee_checkpoint_locked(std::uint64_t epoch_sta
     log_line(oss.str());
   }
   (void)db_.put_finalized_committee_checkpoint(checkpoint);
+  // Keep epoch snapshot aligned with the finalized checkpoint winner ordering
+  // so startup/state validation compares equivalent committee views.
+  (void)db_.put_epoch_committee_snapshot(epoch_committee_snapshot_from_checkpoint(checkpoint));
   storage::AdaptiveEpochTelemetry telemetry;
   telemetry.epoch_start_height = checkpoint.epoch_start_height;
   telemetry.derivation_height = checkpoint.epoch_start_height > 0 ? (checkpoint.epoch_start_height - 1) : 0;
@@ -4888,8 +4891,12 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   (void)db_.put_epoch_ticket(stored);
   best[stored.participant_pubkey] = stored;
   (void)db_.put_best_epoch_ticket(stored);
-  const auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,
-                                                                   cfg_.max_committee, &validators_.all(), true);
+  auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,
+                                                             cfg_.max_committee, &validators_.all(), true);
+  if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(stored.epoch); checkpoint.has_value() &&
+      !checkpoint->ordered_members.empty()) {
+    snapshot = epoch_committee_snapshot_from_checkpoint(*checkpoint);
+  }
   (void)db_.put_epoch_committee_snapshot(snapshot);
 
   if (!from_network) {
