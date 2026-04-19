@@ -4951,8 +4951,7 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   auto it = best.find(stored.participant_pubkey);
   const bool improved = it == best.end() || consensus::epoch_ticket_better(stored, it->second);
   if (!improved) {
-    const bool allow_legacy_replay_override =
-        allow_closed_epoch_reconcile && stored.epoch != current_epoch && epoch_committee_closed_locked(stored.epoch);
+    const bool allow_legacy_replay_override = allow_closed_epoch_reconcile;
     if (!allow_legacy_replay_override) {
       if (reject_reason) *reject_reason = "not-best";
       return false;
