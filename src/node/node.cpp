@@ -5322,9 +5322,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       std::lock_guard<std::mutex> lk(mu_);
       std::string ingress_error;
       if (!handle_ingress_range_locked(peer_id, *range, &ingress_error)) {
-        const auto reason = ingress_fault_reason_for(ingress_error);
-        const std::string note = ingress_error.empty() ? "invalid-ingress-range" : ingress_error;
-        score_peer_locked(peer_id, reason, note);
+        // ingress-epoch-mismatch is not peer misbehavior: it occurs when the peer
+        // is in a different committee epoch (i.e., they are ahead of us in chain
+        // sync). Scoring them would cause them to be banned before we can catch up.
+        if (ingress_error != "ingress-epoch-mismatch") {
+          const auto reason = ingress_fault_reason_for(ingress_error);
+          const std::string note = ingress_error.empty() ? "invalid-ingress-range" : ingress_error;
+          score_peer_locked(peer_id, reason, note);
+        }
       }
       break;
     }
@@ -5342,9 +5347,13 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       std::string ingress_error;
       bool appended = false;
       if (!handle_ingress_record_locked(peer_id, *record, &appended, &ingress_error)) {
-        const auto reason = ingress_fault_reason_for(ingress_error);
-        const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
-        score_peer_locked(peer_id, reason, note);
+        // Same epoch-mismatch guard as INGRESS_RANGE: don't penalise a peer
+        // whose certificates belong to a later committee epoch.
+        if (ingress_error != "ingress-epoch-mismatch") {
+          const auto reason = ingress_fault_reason_for(ingress_error);
+          const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
+          score_peer_locked(peer_id, reason, note);
+        }
         return;
       }
       if (appended) broadcast_ingress_record(record->certificate, record->tx_bytes, peer_id);
@@ -8124,6 +8133,23 @@ void Node::broadcast_finalized_tip() {
 
 bool Node::handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& msg) {
   peer_ingress_tips_[peer_id] = msg;
+  // Do not request ingress from a peer that is in a different committee epoch.
+  // Their certificates carry an epoch we cannot validate against our local
+  // finalized state, which would cause spurious ingress-epoch-mismatch errors
+  // and incorrectly ban the peer before chain sync completes.
+  const auto local_epoch =
+      consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  if (const auto tip_it = peer_finalized_tips_.find(peer_id); tip_it != peer_finalized_tips_.end()) {
+    const auto peer_epoch = consensus::committee_epoch_start(tip_it->second.height + 1,
+                                                             cfg_.network.committee_epoch_blocks);
+    if (peer_epoch != local_epoch) {
+      log_line("ingress-tips-epoch-skipped peer_id=" + std::to_string(peer_id) +
+               " local_epoch=" + std::to_string(local_epoch) +
+               " peer_epoch=" + std::to_string(peer_epoch) +
+               " reason=epoch-mismatch-chain-sync-pending");
+      return true;
+    }
+  }
   const auto local_tips = local_ingress_lane_tips_locked();
   bool requested_any = false;
   std::size_t outstanding_for_peer = 0;
