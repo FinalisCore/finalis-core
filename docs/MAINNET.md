@@ -13,9 +13,9 @@ It should be used together with:
 
 - network name: `mainnet`
 - address HRP: `sc`
-- network id: `258038c123a1c9b08475216e5f53a503`
-- genesis hash: `fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
-- magic: `0x9797412A` (`2543272234`)
+- network id: `fe561911730912cced1e83bc273fab13`
+- genesis hash: `eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- magic: `0x499602D2` (`1234567890`)
 - default p2p port: `19440`
 - default lightserver RPC port: `19444`
 

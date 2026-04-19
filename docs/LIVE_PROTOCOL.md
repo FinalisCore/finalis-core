@@ -5,9 +5,9 @@
 Current restarted mainnet identity:
 
 - `network_name = mainnet`
-- `network_id = 258038c123a1c9b08475216e5f53a503`
-- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
-- `magic = 0x9797412A`
+- `network_id = fe561911730912cced1e83bc273fab13`
+- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `magic = 0x499602D2`
 
 Normative checkpoint derivation semantics are defined in [docs/spec/CHECKPOINT_DERIVATION_SPEC.md](spec/CHECKPOINT_DERIVATION_SPEC.md).
 Normative availability state completeness and replay semantics are defined in [docs/spec/AVAILABILITY_STATE_COMPLETENESS.md](spec/AVAILABILITY_STATE_COMPLETENESS.md).

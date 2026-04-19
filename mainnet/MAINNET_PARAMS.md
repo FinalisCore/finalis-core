@@ -2,9 +2,9 @@
 
 Current fixed-runtime mainnet defaults:
 - `network_name`: `mainnet`
-- `magic`: `0x9797412A` (`2543272234`)
+- `magic`: `0x499602D2` (`1234567890`)
 - `network_id`: explicit runtime constant
-- `network_id_hex`: `258038c123a1c9b08475216e5f53a503`
+- `network_id_hex`: `fe561911730912cced1e83bc273fab13`
 - `protocol_version`: `1`
 - `feature_flags`: `1` (strict version/network handshake)
 - `p2p_default_port`: `19440`
