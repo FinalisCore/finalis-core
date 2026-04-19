@@ -4908,9 +4908,13 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
     return false;
   }
   if (epoch_committee_closed_locked(stored.epoch)) {
-    if (allow_closed_epoch_reconcile && !epoch_committee_frozen_locked(stored.epoch)) {
-      // Explicit reconciliation may refill a missing closed epoch before the
-      // local node has reconstructed and frozen that epoch.
+    if (allow_closed_epoch_reconcile) {
+      // Explicit reconciliation may store tickets for a closed epoch, even a
+      // frozen one.  Frozen epochs still need onboarding_score_units populated
+      // so that settle-boundary blocks produced by older nodes can be replayed
+      // with the correct settlement_commitment.  The committee snapshot update
+      // below is harmless: for frozen epochs it is immediately overridden by
+      // the finalized checkpoint.
     } else {
       if (reject_reason) *reject_reason = "epoch-closed";
       return false;
