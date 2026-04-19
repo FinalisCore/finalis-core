@@ -6180,25 +6180,34 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       if (validation_error == "frontier-settlement-commitment-mismatch") {
         if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
             settlement_epoch.has_value()) {
-          auto fallback_state = *canonical_state_;
-          auto state_it = fallback_state.epoch_reward_states.find(*settlement_epoch);
-          if (state_it != fallback_state.epoch_reward_states.end() &&
-              !state_it->second.onboarding_score_units.empty()) {
-            state_it->second.onboarding_score_units.clear();
+          auto try_onboarding_state = [&](const std::map<PubKey32, std::uint64_t>& onboarding_scores) -> bool {
+            auto fallback_state = *canonical_state_;
+            auto& fallback_reward_state = fallback_state.epoch_reward_states[*settlement_epoch];
+            fallback_reward_state.epoch_start_height = *settlement_epoch;
+            fallback_reward_state.onboarding_score_units = onboarding_scores;
+
             consensus::FrontierExecutionResult fallback_recomputed;
             std::string fallback_error;
-            if (consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), fallback_state,
-                                                                certified_record, &fallback_recomputed,
-                                                                &fallback_error)) {
-              recomputed = std::move(fallback_recomputed);
-              auto& runtime_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
-              if (!runtime_reward_state.onboarding_score_units.empty()) {
-                runtime_reward_state.onboarding_score_units.clear();
-                canonical_state_->state_commitment =
-                    consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
-              }
-              accepted_with_settlement_fallback = true;
+            if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), fallback_state,
+                                                                 certified_record, &fallback_recomputed, &fallback_error)) {
+              return false;
             }
+            recomputed = std::move(fallback_recomputed);
+            auto& runtime_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
+            runtime_reward_state.epoch_start_height = *settlement_epoch;
+            if (runtime_reward_state.onboarding_score_units != onboarding_scores) {
+              runtime_reward_state.onboarding_score_units = onboarding_scores;
+              canonical_state_->state_commitment =
+                  consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+            }
+            return true;
+          };
+
+          if (auto persisted_state = db_.get_epoch_reward_settlement(*settlement_epoch); persisted_state.has_value()) {
+            accepted_with_settlement_fallback = try_onboarding_state(persisted_state->onboarding_score_units);
+          }
+          if (!accepted_with_settlement_fallback) {
+            accepted_with_settlement_fallback = try_onboarding_state({});
           }
         }
       }
