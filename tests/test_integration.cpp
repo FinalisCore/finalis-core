@@ -7002,7 +7002,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
     const auto s0 = n0.status();
     const auto s1 = n1.status();
     return s0.established_peers >= 1 && s1.established_peers >= 1 && s1.height >= 5;
-  }, std::chrono::seconds(30)));
+  }, ci_timeout_seconds(30)));
 
   const std::string leader_key_path = keystore::default_validator_keystore_path(cfg0.db_path);
   keystore::ValidatorKey leader_vk;
@@ -7033,7 +7033,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
         address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
     db.close();
     return request_tx.has_value();
-  }, std::chrono::seconds(180)));
+  }, ci_timeout_seconds(180)));
   const auto request_txid = request_tx->txid();
   {
     std::string ingress_error;
@@ -7047,7 +7047,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   bool finalized_request = wait_for([&]() {
     auto artifact = find_frontier_artifact_with_tx(base + "/node0", request_txid, n0.status().height);
     return artifact.has_value();
-  }, std::chrono::seconds(20));
+  }, ci_timeout_seconds(20));
   if (!finalized_request) {
     ASSERT_TRUE(n0.pause_proposals_for_test(true));
     ASSERT_TRUE(n1.pause_proposals_for_test(true));
@@ -7082,14 +7082,14 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
     finalized_request = wait_for([&]() {
       auto artifact = find_frontier_artifact_with_tx(base + "/node0", request_txid, n0.status().height);
       return artifact.has_value();
-    }, std::chrono::seconds(40));
+    }, ci_timeout_seconds(40));
   }
   ASSERT_TRUE(finalized_request);
   ASSERT_TRUE(wait_for([&]() {
     auto info0 = n0.validator_info_for_test(joiner_vk.pubkey);
     auto info1 = n1.validator_info_for_test(joiner_vk.pubkey);
     return info0.has_value() && info1.has_value();
-  }, std::chrono::seconds(60)));
+  }, ci_timeout_seconds(60)));
 
   ASSERT_EQ(n0.status().pending_bootstrap_joiners, 0u);
   ASSERT_TRUE(wait_for([&]() {
@@ -7098,7 +7098,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
     if (!info0.has_value() || !info1.has_value()) return false;
     return (info0->status == consensus::ValidatorStatus::PENDING || info0->status == consensus::ValidatorStatus::ACTIVE) &&
            (info1->status == consensus::ValidatorStatus::PENDING || info1->status == consensus::ValidatorStatus::ACTIVE);
-  }, std::chrono::seconds(30)));
+  }, ci_timeout_seconds(30)));
 
   n1.stop();
   n0.stop();
