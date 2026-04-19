@@ -1209,7 +1209,115 @@ std::uint64_t genesis_validator_bond_amount() { return kAdaptiveMinBondFloor; }
 bool verify_frontier_record_against_state_with_replay_options(
   const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
   const CanonicalFrontierRecord& record, bool allow_legacy_ingress_epoch_replay,
-  FrontierExecutionResult* recomputed, std::string* error) {
+  FrontierExecutionResult* recomputed, std::string* error,
+  std::string* validation_diagnostics) {
+  auto set_diag = [&](std::string msg) {
+    if (validation_diagnostics) *validation_diagnostics = std::move(msg);
+  };
+  auto set_error = [&](const std::string& code) {
+    if (error) *error = code;
+  };
+  auto fail_with = [&](const std::string& code, std::string diag) {
+    set_error(code);
+    set_diag(std::move(diag));
+    return false;
+  };
+  auto hash_of_bytes = [](const Bytes& b) -> std::string {
+    return hex_encode32(crypto::sha256d(b));
+  };
+  auto pub_list_fingerprint = [](const std::vector<PubKey32>& pubs) -> std::string {
+    codec::ByteWriter w;
+    for (const auto& pub : pubs) w.bytes_fixed(pub);
+    return hex_encode32(crypto::sha256d(w.data()));
+  };
+  auto pub_u64_map_fingerprint = [](const std::map<PubKey32, std::uint64_t>& values) -> std::string {
+    codec::ByteWriter w;
+    w.varint(values.size());
+    for (const auto& [pub, amount] : values) {
+      w.bytes_fixed(pub);
+      w.u64le(amount);
+    }
+    return hex_encode32(crypto::sha256d(w.data()));
+  };
+  auto settlement_outputs_fingerprint =
+      [](const std::vector<std::pair<PubKey32, std::uint64_t>>& outputs) -> std::string {
+    codec::ByteWriter w;
+    w.varint(outputs.size());
+    for (const auto& [pub, amount] : outputs) {
+      w.bytes_fixed(pub);
+      w.u64le(amount);
+    }
+    return hex_encode32(crypto::sha256d(w.data()));
+  };
+  auto append_h33_settlement_input_diagnostics = [&](std::string* diag, const FrontierTransition& received,
+                                                     const FrontierTransition& expected) {
+    if (!diag || received.height != 33) return;
+    std::ostringstream oss;
+    oss << *diag
+        << " h33_settlement received{epoch=" << received.settlement.settlement_epoch_start
+        << ",fees_current=" << received.settlement.current_fees
+        << ",fees_settled=" << received.settlement.settled_epoch_fees
+        << ",rewards_settled=" << received.settlement.settled_epoch_rewards
+        << ",reserve_subsidy=" << received.settlement.reserve_subsidy_units
+        << ",outputs_count=" << received.settlement.outputs.size()
+        << ",outputs_fp=" << settlement_outputs_fingerprint(received.settlement.outputs)
+        << ",payload_fp=" << hash_of_bytes(received.settlement.serialize())
+        << "} expected{epoch=" << expected.settlement.settlement_epoch_start
+        << ",fees_current=" << expected.settlement.current_fees
+        << ",fees_settled=" << expected.settlement.settled_epoch_fees
+        << ",rewards_settled=" << expected.settlement.settled_epoch_rewards
+        << ",reserve_subsidy=" << expected.settlement.reserve_subsidy_units
+        << ",outputs_count=" << expected.settlement.outputs.size()
+        << ",outputs_fp=" << settlement_outputs_fingerprint(expected.settlement.outputs)
+        << ",payload_fp=" << hash_of_bytes(expected.settlement.serialize())
+        << "}";
+    const auto settlement_epoch = settlement_epoch_for_height(cfg, received.height);
+    if (!settlement_epoch.has_value()) {
+      oss << " local_inputs{settlement_epoch=none}";
+      *diag = oss.str();
+      return;
+    }
+    oss << " local_inputs{settlement_epoch=" << *settlement_epoch;
+    auto state_it = prev.epoch_reward_states.find(*settlement_epoch);
+    if (state_it == prev.epoch_reward_states.end()) {
+      oss << ",state=missing}";
+      *diag = oss.str();
+      return;
+    }
+    const auto& state = state_it->second;
+    auto adjusted_reward_scores = state.reward_score_units;
+    const auto& econ = active_economics_policy(cfg.network, received.height);
+    for (auto& [pub, score] : adjusted_reward_scores) {
+      const auto expected_it = state.expected_participation_units.find(pub);
+      const auto observed_it = state.observed_participation_units.find(pub);
+      const std::uint64_t expected_units = expected_it == state.expected_participation_units.end() ? 0 : expected_it->second;
+      const std::uint64_t observed_units = observed_it == state.observed_participation_units.end() ? 0 : observed_it->second;
+      const std::uint32_t participation_bps =
+          expected_units == 0
+              ? 10'000U
+              : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed_units, expected_units), 10'000ULL,
+                                                             expected_units));
+      score = apply_participation_penalty_bps(score, participation_bps, econ.participation_threshold_bps);
+    }
+    const std::uint64_t effective_fee_pool = received.height >= EMISSION_BLOCKS ? state.fee_pool_units : 0;
+    const std::uint64_t effective_reserve_subsidy = received.height >= EMISSION_BLOCKS ? state.reserve_subsidy_units : 0;
+    oss << ",settled=" << (state.settled ? "true" : "false")
+        << ",total_reward_units=" << state.total_reward_units
+        << ",fee_pool_units_raw=" << state.fee_pool_units
+        << ",fee_pool_units_effective=" << effective_fee_pool
+        << ",reserve_subsidy_units_raw=" << state.reserve_subsidy_units
+        << ",reserve_subsidy_units_effective=" << effective_reserve_subsidy
+        << ",reward_scores_raw_count=" << state.reward_score_units.size()
+        << ",reward_scores_raw_fp=" << pub_u64_map_fingerprint(state.reward_score_units)
+        << ",reward_scores_adjusted_count=" << adjusted_reward_scores.size()
+        << ",reward_scores_adjusted_fp=" << pub_u64_map_fingerprint(adjusted_reward_scores)
+        << ",onboarding_scores_count=" << state.onboarding_score_units.size()
+        << ",onboarding_scores_fp=" << pub_u64_map_fingerprint(state.onboarding_score_units)
+        << ",expected_participation_fp=" << pub_u64_map_fingerprint(state.expected_participation_units)
+        << ",observed_participation_fp=" << pub_u64_map_fingerprint(state.observed_participation_units)
+        << "}";
+    *diag = oss.str();
+  };
   const auto reconstruct_legacy_frontier_cursor =
       [&](const std::vector<Bytes>& ordered_records, FrontierVector* next_vector, FrontierLaneRoots* next_lane_roots,
           std::string* cursor_error) -> bool {
@@ -1392,21 +1500,52 @@ bool verify_frontier_record_against_state_with_replay_options(
     if (!have_current_expected || !transition_metadata_matches(expected_transition)) {
       if (!have_legacy_expected || !transition_metadata_matches(legacy_expected_transition)) {
         if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
-          if (error) *error = "frontier-quorum-threshold-mismatch";
+          return fail_with("frontier-quorum-threshold-mismatch",
+                           "field=quorum_threshold height=" + std::to_string(record.transition.height) +
+                               " round=" + std::to_string(record.transition.round) +
+                               " actual=" + std::to_string(record.transition.quorum_threshold) +
+                               " expected=" + std::to_string(expected_transition.quorum_threshold));
         } else if (!have_current_expected && !legacy_error.empty()) {
-          if (error) *error = legacy_error;
+          return fail_with(legacy_error,
+                           "field=metadata-build height=" + std::to_string(record.transition.height) +
+                               " round=" + std::to_string(record.transition.round) + " legacy_error=" + legacy_error);
         } else if (record.transition.observed_signers != expected_transition.observed_signers) {
-          if (error) *error = "frontier-observed-signers-mismatch";
+          return fail_with("frontier-observed-signers-mismatch",
+                           "field=observed_signers height=" + std::to_string(record.transition.height) +
+                               " round=" + std::to_string(record.transition.round) +
+                               " actual_count=" + std::to_string(record.transition.observed_signers.size()) +
+                               " expected_count=" + std::to_string(expected_transition.observed_signers.size()) +
+                               " actual_fingerprint=" + pub_list_fingerprint(record.transition.observed_signers) +
+                               " expected_fingerprint=" + pub_list_fingerprint(expected_transition.observed_signers));
         } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
-          if (error) *error = "frontier-settlement-self-commitment-mismatch";
+          return fail_with("frontier-settlement-self-commitment-mismatch",
+                           "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
+                               " round=" + std::to_string(record.transition.round) +
+                               " advertised=" + hex_encode32(record.transition.settlement_commitment) +
+                               " computed_from_payload=" + hex_encode32(record.transition.settlement.commitment()));
         } else if (record.transition.settlement_commitment != expected_transition.settlement_commitment) {
-          if (error) *error = "frontier-settlement-commitment-mismatch";
+          std::string diag = "field=settlement_commitment height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual=" + hex_encode32(record.transition.settlement_commitment) +
+                             " expected=" + hex_encode32(expected_transition.settlement_commitment);
+          append_h33_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+          return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
         } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
-          if (error) *error = "frontier-settlement-mismatch";
+          return fail_with("frontier-settlement-mismatch",
+                           "field=settlement_payload height=" + std::to_string(record.transition.height) +
+                               " round=" + std::to_string(record.transition.round) +
+                               " actual_payload_hash=" + hash_of_bytes(record.transition.settlement.serialize()) +
+                               " expected_payload_hash=" + hash_of_bytes(expected_transition.settlement.serialize()));
         } else if (record.transition.next_state_root != expected_transition.next_state_root) {
-          if (error) *error = "frontier-next-state-root-mismatch";
+          return fail_with("frontier-next-state-root-mismatch",
+                           "field=next_state_root height=" + std::to_string(record.transition.height) +
+                               " round=" + std::to_string(record.transition.round) +
+                               " actual=" + hex_encode32(record.transition.next_state_root) +
+                               " expected=" + hex_encode32(expected_transition.next_state_root));
         }
-        return false;
+        return fail_with("frontier-metadata-mismatch",
+                         "field=unknown height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round));
       }
       expected_transition = std::move(legacy_expected_transition);
       effective_committee = legacy_canonical_committee_for_height_round(cfg, prev, record.transition.height,
@@ -1520,19 +1659,48 @@ bool verify_frontier_record_against_state_with_replay_options(
   if (!have_current_expected || !transition_metadata_matches(expected_transition)) {
     if (!have_legacy_expected || !transition_metadata_matches(legacy_expected_transition)) {
       if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
-        if (error) *error = "frontier-quorum-threshold-mismatch";
+        return fail_with("frontier-quorum-threshold-mismatch",
+                         "field=quorum_threshold height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual=" + std::to_string(record.transition.quorum_threshold) +
+                             " expected=" + std::to_string(expected_transition.quorum_threshold));
       } else if (record.transition.observed_signers != expected_transition.observed_signers) {
-        if (error) *error = "frontier-observed-signers-mismatch";
+        return fail_with("frontier-observed-signers-mismatch",
+                         "field=observed_signers height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual_count=" + std::to_string(record.transition.observed_signers.size()) +
+                             " expected_count=" + std::to_string(expected_transition.observed_signers.size()) +
+                             " actual_fingerprint=" + pub_list_fingerprint(record.transition.observed_signers) +
+                             " expected_fingerprint=" + pub_list_fingerprint(expected_transition.observed_signers));
       } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
-        if (error) *error = "frontier-settlement-self-commitment-mismatch";
+        return fail_with("frontier-settlement-self-commitment-mismatch",
+                         "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " advertised=" + hex_encode32(record.transition.settlement_commitment) +
+                             " computed_from_payload=" + hex_encode32(record.transition.settlement.commitment()));
       } else if (record.transition.settlement_commitment != expected_transition.settlement_commitment) {
-        if (error) *error = "frontier-settlement-commitment-mismatch";
+        std::string diag = "field=settlement_commitment height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round) +
+                           " actual=" + hex_encode32(record.transition.settlement_commitment) +
+                           " expected=" + hex_encode32(expected_transition.settlement_commitment);
+        append_h33_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+        return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
       } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
-        if (error) *error = "frontier-settlement-mismatch";
+        return fail_with("frontier-settlement-mismatch",
+                         "field=settlement_payload height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual_payload_hash=" + hash_of_bytes(record.transition.settlement.serialize()) +
+                             " expected_payload_hash=" + hash_of_bytes(expected_transition.settlement.serialize()));
       } else if (record.transition.next_state_root != expected_transition.next_state_root) {
-        if (error) *error = "frontier-next-state-root-mismatch";
+        return fail_with("frontier-next-state-root-mismatch",
+                         "field=next_state_root height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual=" + hex_encode32(record.transition.next_state_root) +
+                             " expected=" + hex_encode32(expected_transition.next_state_root));
       }
-      return false;
+      return fail_with("frontier-metadata-mismatch",
+                       "field=unknown height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round));
     }
     expected_transition = std::move(legacy_expected_transition);
     effective_committee = legacy_canonical_committee_for_height_round(cfg, prev, record.transition.height,
@@ -1547,9 +1715,10 @@ bool verify_frontier_record_against_state_with_replay_options(
 
 bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                           const CanonicalFrontierRecord& record,
-                                          FrontierExecutionResult* recomputed, std::string* error) {
+                                          FrontierExecutionResult* recomputed, std::string* error,
+                                          std::string* validation_diagnostics) {
   return verify_frontier_record_against_state_with_replay_options(cfg, prev, record,
-                                                                  false, recomputed, error);
+                                                                  false, recomputed, error, validation_diagnostics);
 }
 
 bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
@@ -1563,7 +1732,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   FrontierExecutionResult recomputed;
   if (!verify_frontier_record_against_state_with_replay_options(cfg, prev, record,
                                                                 allow_legacy_ingress_epoch_replay,
-                                                                &recomputed, error)) {
+                                                                &recomputed, error, nullptr)) {
     return false;
   }
 

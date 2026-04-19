@@ -266,6 +266,12 @@ std::size_t active_operator_count_for_onboarding(const NetworkConfig& network,
 
 std::uint64_t registration_bond_amount_for_onboarding(const NetworkConfig& network, storage::DB& db,
                                                       std::uint64_t planning_height) {
+  const auto epoch_start = consensus::committee_epoch_start(std::max<std::uint64_t>(1, planning_height),
+                                                            network.committee_epoch_blocks);
+  if (auto checkpoint = db.get_finalized_committee_checkpoint(epoch_start); checkpoint.has_value() &&
+      checkpoint->adaptive_min_bond != 0) {
+    return checkpoint->adaptive_min_bond;
+  }
   const auto validators = db.load_validators();
   const auto active_operator_count = active_operator_count_for_onboarding(network, validators, planning_height);
   return std::max<std::uint64_t>(network.validator_bond_min_amount,

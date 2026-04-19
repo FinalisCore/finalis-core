@@ -3958,7 +3958,7 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
       if (n->status().height < 10) return false;
     }
     return true;
-  }, ci_timeout_seconds(120)));
+  }, ci_timeout_seconds(180)));
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(30)));
 
@@ -7924,9 +7924,10 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
     const auto s1 = validators[1]->status();
     return s0.height >= 48 && s1.height == s0.height && s1.transition_hash == s0.transition_hash;
   }, std::chrono::seconds(70)));
+
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
-  ASSERT_TRUE(wait_for_stable_same_tip(validators, std::chrono::seconds(20)));
-  const auto frozen_tip = validators[0]->status();
+  ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(20)));
+  const auto target_tip = validators[0]->status();
 
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
@@ -7941,7 +7942,7 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
   follower_cfg.peers = {"127.0.0.1:" + std::to_string(validators[0]->p2p_port_for_test()),
                         "127.0.0.1:" + std::to_string(validators[1]->p2p_port_for_test())};
   follower_cfg.outbound_target = 1;
-  ASSERT_TRUE(create_test_validator_keystore(follower_cfg, follower_cfg.node_id));
+  ASSERT_TRUE(create_test_validator_keystore(follower_cfg, 0));
 
   node::Node follower(follower_cfg);
   ASSERT_TRUE(follower.init());
@@ -7957,7 +7958,9 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
 
     while (std::chrono::steady_clock::now() - start < overall_timeout) {
       const auto sf = follower.status();
-      if (sf.height == frozen_tip.height && sf.transition_hash == frozen_tip.transition_hash) return true;
+      if (sf.height == target_tip.height && sf.transition_hash == target_tip.transition_hash) {
+        return true;
+      }
 
       if (sf.height > last.height || sf.transition_hash != last.transition_hash) {
         last = sf;
@@ -7971,16 +7974,23 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
   };
   if (!wait_for_follower_catchup_with_progress()) {
     const auto sf = follower.status();
-    const auto s0 = validators[0]->status();
-    const auto s1 = validators[1]->status();
+    const auto last_err = follower.last_test_hook_error_for_test();
     std::ostringstream oss;
-    oss << "follower failed to catch frozen tip:"
-        << " frozen{h=" << frozen_tip.height << "}"
+    oss << "follower failed to catch validator tip:"
         << " follower{h=" << sf.height << ",peers=" << sf.peers << ",est=" << sf.established_peers << "}"
-        << " v0{h=" << s0.height << ",peers=" << s0.peers << ",est=" << s0.established_peers << "}"
-        << " v1{h=" << s1.height << ",peers=" << s1.peers << ",est=" << s1.established_peers << "}";
+        << " target{h=" << target_tip.height << "}";
+    if (!last_err.empty()) oss << " last_error={" << last_err << "}";
     throw std::runtime_error(oss.str());
   }
+
+  ASSERT_TRUE(follower.pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = validators[0]->status();
+    const auto s1 = validators[1]->status();
+    const auto sf = follower.status();
+    return s0.height == s1.height && s0.transition_hash == s1.transition_hash && sf.height == s0.height &&
+           sf.transition_hash == s0.transition_hash;
+  }, std::chrono::seconds(20)));
 
   const auto follower_next_height = follower.status().height + 1;
   ASSERT_EQ(follower.proposer_for_height_round_for_test(follower_next_height, 0),

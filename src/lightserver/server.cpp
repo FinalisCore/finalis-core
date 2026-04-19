@@ -2388,6 +2388,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
         .network = &cfg_.network,
+        .chain_id = &chain_id_,
         .validators = &vr,
         .current_height = current_height,
         .enforce_variable_bond_range = true,
@@ -2399,6 +2400,10 @@ std::string Server::handle_rpc_body(const std::string& body) {
               if (!committee.has_value()) return false;
               return std::find(committee->begin(), committee->end(), pk) != committee->end();
             },
+        .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
+          if (anchor_height == 0) return zero_hash();
+          return db_.get_height_hash(anchor_height);
+        },
         .confidential_policy = &confidential_policy,
     };
     auto vrx = validate_any_tx(AnyTx{*tx}, 1, upgrade_utxo_set_v2(utxos), &ctx);
@@ -2849,18 +2854,36 @@ std::string Server::handle_rpc_body(const std::string& body) {
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
     auto tip = db_.get_tip();
     const auto runtime = view->get_node_runtime_status_snapshot();
+    const std::uint64_t next_height = tip ? (tip->height + 1) : 1;
+    const auto epoch_start_for_broadcast =
+        consensus::committee_epoch_start(std::max<std::uint64_t>(1, next_height), cfg_.network.committee_epoch_blocks);
+    std::uint64_t broadcast_min_bond = cfg_.network.validator_bond_min_amount;
+    if (auto cp = db_.get_finalized_committee_checkpoint(epoch_start_for_broadcast);
+        cp.has_value() && cp->adaptive_min_bond != 0) {
+      broadcast_min_bond = cp->adaptive_min_bond;
+    }
+    const std::uint64_t broadcast_max_bond =
+        std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, broadcast_min_bond);
     ConfidentialPolicy confidential_policy{};
     confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
         .network = &cfg_.network,
+        .chain_id = &chain_id_,
         .validators = &vr,
-        .current_height = tip ? (tip->height + 1) : 1,
+        .current_height = next_height,
+        .enforce_variable_bond_range = true,
+        .min_bond_amount = broadcast_min_bond,
+        .max_bond_amount = broadcast_max_bond,
         .is_committee_member =
             [this](const PubKey32& pk, std::uint64_t h, std::uint32_t /*round*/) {
               auto committee = committee_for_height(h);
               if (!committee.has_value()) return false;
               return std::find(committee->begin(), committee->end(), pk) != committee->end();
             },
+        .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
+          if (anchor_height == 0) return zero_hash();
+          return db_.get_height_hash(anchor_height);
+        },
         .confidential_policy = &confidential_policy,
     };
     auto vrx = validate_any_tx(*tx, 1, upgrade_utxo_set_v2(utxos), &ctx);

@@ -15,11 +15,13 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
     permissions:
       contents: read
+      actions: write
     env:
       BUILD_PRESET: windows-msvc-release
       QT_VERSION: 5.15.2
       QT_ARCH: win64_msvc2019_64
       VCPKG_FORCE_SYSTEM_BINARIES: "1"
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
       WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
       WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
       WINDOWS_SIGN_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGN_TIMESTAMP_URL }}
@@ -35,21 +37,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache vcpkg downloads
-        uses: actions/cache@v4
-        with:
-          path: |
-            vcpkg/downloads
-            vcpkg/packages
-            vcpkg/buildtrees
-            vcpkg/installed
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
-
       - name: Checkout vcpkg
         uses: actions/checkout@v4
         with:
           repository: microsoft/vcpkg
           path: vcpkg
+
+      - name: Cache vcpkg downloads
+        uses: actions/cache@v4
+        with:
+          path: vcpkg/downloads
+          key: ${{ runner.os }}-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-downloads-
 
       - name: Bootstrap vcpkg
         shell: pwsh

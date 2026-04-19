@@ -2359,6 +2359,8 @@ void Node::stop_lightserver_child() {
   lightserver_pid_ = -1;
   return;
 #else
+  constexpr int kTermWaitIterations = 20;   // 2s total (20 * 100ms)
+  constexpr int kKillWaitIterations = 50;   // 5s total (50 * 100ms)
   pid_t pid = -1;
   {
     std::lock_guard<std::mutex> lk(lightserver_mu_);
@@ -2377,16 +2379,23 @@ void Node::stop_lightserver_child() {
     (void)::waitpid(pid, &status, WNOHANG);
     return;
   }
-  for (int i = 0; i < 20; ++i) {
+  for (int i = 0; i < kTermWaitIterations; ++i) {
     const pid_t waited = ::waitpid(pid, &status, WNOHANG);
     if (waited == pid) return;
     ::usleep(100 * 1000);
   }
+  log_line("lightserver stop escalation pid=" + std::to_string(pid) + " signal=SIGKILL");
   if (::kill(pid, SIGKILL) != 0 && errno == ESRCH) {
     (void)::waitpid(pid, &status, WNOHANG);
     return;
   }
-  (void)::waitpid(pid, &status, 0);
+  for (int i = 0; i < kKillWaitIterations; ++i) {
+    const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+    if (waited == pid) return;
+    ::usleep(100 * 1000);
+  }
+  // Avoid blocking shutdown indefinitely on a wedged child process.
+  log_line("lightserver stop timed out pid=" + std::to_string(pid) + " status=detached");
 #endif
 }
 
@@ -3320,52 +3329,13 @@ std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch
     auto it = out.find(pub);
     if (it == out.end() || score > it->second) out[pub] = score;
   }
+
   return out;
 }
 
-void Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height) {
+bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height) {
   const auto settlement_epoch = settlement_epoch_for_block_height_locked(height);
-  if (!settlement_epoch.has_value()) return;
-
-  std::set<PubKey32> required_participants;
-  auto collect_required_participants = [&](const storage::EpochRewardSettlementState& state) {
-    for (const auto& [pub, score] : state.reward_score_units) {
-      (void)score;
-      required_participants.insert(pub);
-    }
-  };
-
-  if (auto it = epoch_reward_states_.find(*settlement_epoch); it != epoch_reward_states_.end()) {
-    collect_required_participants(it->second);
-  }
-  if (canonical_state_.has_value()) {
-    if (auto it = canonical_state_->epoch_reward_states.find(*settlement_epoch);
-        it != canonical_state_->epoch_reward_states.end()) {
-      collect_required_participants(it->second);
-    }
-  }
-
-  bool needs_scores = false;
-  auto has_required_scores = [&](const std::map<PubKey32, std::uint64_t>& scores) {
-    for (const auto& pub : required_participants) {
-      if (scores.find(pub) == scores.end()) return false;
-    }
-    return true;
-  };
-
-  if (auto it = epoch_reward_states_.find(*settlement_epoch); it == epoch_reward_states_.end() ||
-      it->second.onboarding_score_units.empty() || !has_required_scores(it->second.onboarding_score_units)) {
-    needs_scores = true;
-  }
-  if (!needs_scores && canonical_state_.has_value()) {
-    if (auto it = canonical_state_->epoch_reward_states.find(*settlement_epoch);
-        it == canonical_state_->epoch_reward_states.end() || it->second.onboarding_score_units.empty() ||
-        !has_required_scores(it->second.onboarding_score_units)) {
-      needs_scores = true;
-    }
-  }
-  if (!needs_scores) return;
-
+  if (!settlement_epoch.has_value()) return true;
   const auto onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
   if (onboarding_scores.empty()) {
     for (int peer_id : p2p_.peer_ids()) {
@@ -3373,19 +3343,13 @@ void Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
       if (!info.established()) continue;
       request_epoch_tickets(peer_id, *settlement_epoch, 512);
     }
-    return;
+    return false;
   }
 
   auto& reward_state = epoch_reward_states_[*settlement_epoch];
   reward_state.epoch_start_height = *settlement_epoch;
-  bool runtime_updated = false;
-  for (const auto& [pub, score] : onboarding_scores) {
-    auto it = reward_state.onboarding_score_units.find(pub);
-    if (it == reward_state.onboarding_score_units.end() || score > it->second) {
-      reward_state.onboarding_score_units[pub] = score;
-      runtime_updated = true;
-    }
-  }
+  const bool runtime_updated = reward_state.onboarding_score_units != onboarding_scores;
+  if (runtime_updated) reward_state.onboarding_score_units = onboarding_scores;
   if (runtime_updated) {
     (void)db_.put_epoch_reward_settlement(reward_state);
   }
@@ -3393,19 +3357,14 @@ void Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
   if (canonical_state_.has_value()) {
     auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
     canonical_reward_state.epoch_start_height = *settlement_epoch;
-    bool canonical_updated = false;
-    for (const auto& [pub, score] : onboarding_scores) {
-      auto it = canonical_reward_state.onboarding_score_units.find(pub);
-      if (it == canonical_reward_state.onboarding_score_units.end() || score > it->second) {
-        canonical_reward_state.onboarding_score_units[pub] = score;
-        canonical_updated = true;
-      }
-    }
+    const bool canonical_updated = canonical_reward_state.onboarding_score_units != onboarding_scores;
+    if (canonical_updated) canonical_reward_state.onboarding_score_units = onboarding_scores;
     if (canonical_updated) {
       canonical_state_->state_commitment =
           consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
     }
   }
+  return true;
 }
 
 std::vector<TxOut> Node::coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
@@ -3483,7 +3442,7 @@ void Node::accrue_epoch_reward_for_finalized_block_locked(const Block& block, co
 }
 
 void Node::mark_epoch_reward_settled_if_needed_locked(std::uint64_t height) {
-  ensure_settlement_onboarding_scores_loaded_locked(height);
+  (void)ensure_settlement_onboarding_scores_loaded_locked(height);
   mark_epoch_reward_settled_for_height(cfg_.network, height, cfg_.network.committee_epoch_blocks, epoch_reward_states_,
                                        &protocol_reserve_balance_units_, &db_);
 }
@@ -5541,6 +5500,12 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       {
         std::lock_guard<std::mutex> lk(mu_);
         bool accepted = false;
+        if (proposal->transition.height > finalized_height_ + 1 && !b->certificate.has_value()) {
+          log_line("sync-stall reason=peer-served-uncertified-transition peer_id=" + std::to_string(peer_id) +
+                   " height=" + std::to_string(proposal->transition.height) + " next_needed=" +
+                   std::to_string(finalized_height_ + 1) + " transition=" +
+                   short_hash_hex(proposal->transition.transition_id()));
+        }
         if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
           accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id);
           if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
@@ -6165,6 +6130,9 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
   if (transition.height > finalized_height_ + 1 || transition.prev_finalized_hash != finalized_identity_.id) {
     return false;
   }
+  if (canonical_state_.has_value()) {
+    (void)ensure_settlement_onboarding_scores_loaded_locked(transition.height);
+  }
   if (certificate.has_value()) {
     if (!canonical_state_.has_value()) {
       log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
@@ -6172,24 +6140,67 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                " reason=missing-canonical-state");
       return false;
     }
-    ensure_settlement_onboarding_scores_loaded_locked(transition.height);
     std::vector<FinalitySig> canonical_sigs;
     std::string cert_error;
     if (!verify_finality_certificate_for_frontier_locked(*certificate, transition, &canonical_sigs, &cert_error)) {
       log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
                std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
                " reason=" + cert_error);
+      if (from_network) {
+        log_line("sync-stall reason=certificate-verification-failed peer_id=" + std::to_string(from_peer_id) +
+                 " height=" + std::to_string(transition.height) + " transition=" + short_hash_hex(transition_id) +
+                 " cert_reason=" + cert_error);
+      }
       return false;
     }
     consensus::CanonicalFrontierRecord certified_record{transition, proposal.ordered_records};
     consensus::FrontierExecutionResult recomputed;
     std::string validation_error;
+    std::string validation_diagnostics;
     if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
-                                                         certified_record, &recomputed, &validation_error)) {
+                                                         certified_record, &recomputed, &validation_error,
+                                                         &validation_diagnostics)) {
+      bool accepted_with_settlement_fallback = false;
+      if (validation_error == "frontier-settlement-commitment-mismatch") {
+        if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
+            settlement_epoch.has_value()) {
+          auto fallback_state = *canonical_state_;
+          auto state_it = fallback_state.epoch_reward_states.find(*settlement_epoch);
+          if (state_it != fallback_state.epoch_reward_states.end() &&
+              !state_it->second.onboarding_score_units.empty()) {
+            state_it->second.onboarding_score_units.clear();
+            consensus::FrontierExecutionResult fallback_recomputed;
+            std::string fallback_error;
+            if (consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), fallback_state,
+                                                                certified_record, &fallback_recomputed,
+                                                                &fallback_error)) {
+              recomputed = std::move(fallback_recomputed);
+              auto& runtime_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
+              if (!runtime_reward_state.onboarding_score_units.empty()) {
+                runtime_reward_state.onboarding_score_units.clear();
+                canonical_state_->state_commitment =
+                    consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+              }
+              accepted_with_settlement_fallback = true;
+            }
+          }
+        }
+      }
+      if (!accepted_with_settlement_fallback) {
+      last_test_hook_error_ = "frontier-verify-reject:" + validation_error;
+      if (!validation_diagnostics.empty()) {
+        last_test_hook_error_ += " details=" + validation_diagnostics;
+      }
       log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
                std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
                " reason=" + validation_error);
+      if (!validation_diagnostics.empty()) {
+        log_line("frontier-block-reject-diagnostics height=" + std::to_string(transition.height) +
+                 " round=" + std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
+                 " details=" + validation_diagnostics);
+      }
       return false;
+      }
     }
     const auto expected_committee = recomputed.effective_committee;
     const std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
@@ -6212,6 +6223,11 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
              std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
              " reason=" + validation_error);
+    if (from_network && !certificate.has_value()) {
+      log_line("sync-stall reason=uncertified-transition-invalid peer_id=" + std::to_string(from_peer_id) +
+               " height=" + std::to_string(transition.height) + " transition=" + short_hash_hex(transition_id) +
+               " validation_reason=" + validation_error);
+    }
     return false;
   }
   std::string lock_error;
@@ -6230,7 +6246,15 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
 
 bool Node::maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
                                              const std::optional<FinalityCertificate>& certificate, int from_peer_id) {
-  if (!certificate.has_value()) return false;
+  if (!certificate.has_value()) {
+    if (proposal.transition.height > finalized_height_ + 1) {
+      log_line("sync-stall reason=missing-certificate-for-future-height peer_id=" + std::to_string(from_peer_id) +
+               " height=" + std::to_string(proposal.transition.height) + " next_needed=" +
+               std::to_string(finalized_height_ + 1) + " transition=" +
+               short_hash_hex(proposal.transition.transition_id()));
+    }
+    return false;
+  }
   const auto& transition = proposal.transition;
   const auto transition_id = transition.transition_id();
   if (transition.height <= finalized_height_) {
@@ -6269,6 +6293,10 @@ bool Node::maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id) {
     if (!handle_frontier_block_locked(buffered.proposal, buffered.certificate,
                                       buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id, true)) {
       log_line("buffer-sync-apply-failed height=" + std::to_string(expected_height) + " hash=" +
+               short_hash_hex(buffered.proposal.transition.transition_id()));
+      log_line("sync-stall reason=buffered-transition-apply-failed peer_id=" +
+               std::to_string(buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id) +
+               " height=" + std::to_string(expected_height) + " transition=" +
                short_hash_hex(buffered.proposal.transition.transition_id()));
       break;
     }
@@ -6711,6 +6739,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
     last_test_hook_error_ = "frontier-parent-identity-kind-mismatch";
     return std::nullopt;
   }
+  ensure_settlement_onboarding_scores_loaded_locked(height);
+
   FrontierBuildSelection selection;
   selection.next_vector = canonical_state_->finalized_frontier_vector;
   std::array<std::uint64_t, finalis::INGRESS_LANE_COUNT> lane_tips{};
@@ -7766,6 +7796,10 @@ std::uint64_t Node::effective_validator_min_bond_for_height(std::uint64_t height
   if (cfg_.validator_min_bond_override.has_value() || cfg_.validator_bond_min_amount_override.has_value()) {
     return std::max(validator_min_bond_, validator_bond_min_amount_);
   }
+  if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(height);
+      checkpoint.has_value() && checkpoint->adaptive_min_bond != 0) {
+    return checkpoint->adaptive_min_bond;
+  }
   const auto active_operator_count = active_operator_count_for_height_locked(height);
   return std::max<std::uint64_t>(validator_bond_min_amount_,
                                  consensus::validator_min_bond_units(cfg_.network, height, active_operator_count));
@@ -8318,6 +8352,20 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
 
   const auto tip_it = peer_finalized_tips_.find(target_peer);
   if (tip_it == peer_finalized_tips_.end()) return false;
+
+  if (tip_it->second.height > finalized_height_ &&
+      !db_.get_finality_certificate_by_height(next_height).has_value()) {
+    const auto outstanding = requested_sync_heights_.find(next_height);
+    if (outstanding != requested_sync_heights_.end()) {
+      const std::uint64_t age_ms = tms >= outstanding->second ? (tms - outstanding->second) : 0;
+      if (age_ms > std::max<std::uint64_t>(3000, retry_ms * 2)) {
+        log_line("sync-stall reason=missing-certificate-for-next-height next_height=" + std::to_string(next_height) +
+                 " local_height=" + std::to_string(finalized_height_) + " target_peer_id=" +
+                 std::to_string(target_peer) + " target_peer_height=" + std::to_string(tip_it->second.height) +
+                 " request_age_ms=" + std::to_string(age_ms));
+      }
+    }
+  }
 
   const std::uint64_t window_end = std::min(tip_it->second.height, finalized_height_ + kForwardSyncWindow);
   bool requested_any = false;
