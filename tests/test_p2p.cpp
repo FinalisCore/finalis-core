@@ -156,7 +156,7 @@ TEST(test_version_message_rejects_oversized_software_string) {
 TEST(test_peer_manager_starts_reader_before_connected_event) {
   const auto net = mainnet_network();
   const std::uint16_t port = reserve_test_port();
-  if (port == 0) return;
+  ASSERT_TRUE(port != 0 && "Failed to reserve test port");
 
   p2p::PeerManager listener;
   p2p::PeerManager dialer;
@@ -273,7 +273,7 @@ TEST(test_write_frame_fd_timed_times_out_against_nonreading_peer) {
 TEST(test_peer_manager_send_to_closed_peer_returns_false_without_duplicate_disconnect) {
   const auto net = mainnet_network();
   const std::uint16_t port = reserve_test_port();
-  if (port == 0) return;
+  ASSERT_TRUE(port != 0 && "Failed to reserve test port");
 
   p2p::PeerManager listener;
   p2p::PeerManager dialer;

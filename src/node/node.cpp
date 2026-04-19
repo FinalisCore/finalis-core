@@ -3314,7 +3314,98 @@ std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch
         std::max<std::uint8_t>(1, consensus::leading_zero_bits(ticket.work_hash)));
     out[pub] = score;
   }
+  for (const auto& [pub, ticket] : db_.load_best_epoch_tickets(epoch_start_height)) {
+    const auto score = static_cast<std::uint64_t>(
+        std::max<std::uint8_t>(1, consensus::leading_zero_bits(ticket.work_hash)));
+    auto it = out.find(pub);
+    if (it == out.end() || score > it->second) out[pub] = score;
+  }
   return out;
+}
+
+void Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height) {
+  const auto settlement_epoch = settlement_epoch_for_block_height_locked(height);
+  if (!settlement_epoch.has_value()) return;
+
+  std::set<PubKey32> required_participants;
+  auto collect_required_participants = [&](const storage::EpochRewardSettlementState& state) {
+    for (const auto& [pub, score] : state.reward_score_units) {
+      (void)score;
+      required_participants.insert(pub);
+    }
+  };
+
+  if (auto it = epoch_reward_states_.find(*settlement_epoch); it != epoch_reward_states_.end()) {
+    collect_required_participants(it->second);
+  }
+  if (canonical_state_.has_value()) {
+    if (auto it = canonical_state_->epoch_reward_states.find(*settlement_epoch);
+        it != canonical_state_->epoch_reward_states.end()) {
+      collect_required_participants(it->second);
+    }
+  }
+
+  bool needs_scores = false;
+  auto has_required_scores = [&](const std::map<PubKey32, std::uint64_t>& scores) {
+    for (const auto& pub : required_participants) {
+      if (scores.find(pub) == scores.end()) return false;
+    }
+    return true;
+  };
+
+  if (auto it = epoch_reward_states_.find(*settlement_epoch); it == epoch_reward_states_.end() ||
+      it->second.onboarding_score_units.empty() || !has_required_scores(it->second.onboarding_score_units)) {
+    needs_scores = true;
+  }
+  if (!needs_scores && canonical_state_.has_value()) {
+    if (auto it = canonical_state_->epoch_reward_states.find(*settlement_epoch);
+        it == canonical_state_->epoch_reward_states.end() || it->second.onboarding_score_units.empty() ||
+        !has_required_scores(it->second.onboarding_score_units)) {
+      needs_scores = true;
+    }
+  }
+  if (!needs_scores) return;
+
+  const auto onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
+  if (onboarding_scores.empty()) {
+    for (int peer_id : p2p_.peer_ids()) {
+      const auto info = p2p_.get_peer_info(peer_id);
+      if (!info.established()) continue;
+      request_epoch_tickets(peer_id, *settlement_epoch, 512);
+    }
+    return;
+  }
+
+  auto& reward_state = epoch_reward_states_[*settlement_epoch];
+  reward_state.epoch_start_height = *settlement_epoch;
+  bool runtime_updated = false;
+  for (const auto& [pub, score] : onboarding_scores) {
+    auto it = reward_state.onboarding_score_units.find(pub);
+    if (it == reward_state.onboarding_score_units.end() || score > it->second) {
+      reward_state.onboarding_score_units[pub] = score;
+      runtime_updated = true;
+    }
+  }
+  if (runtime_updated) {
+    (void)db_.put_epoch_reward_settlement(reward_state);
+  }
+
+  if (canonical_state_.has_value()) {
+    auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
+    canonical_reward_state.epoch_start_height = *settlement_epoch;
+    bool canonical_updated = false;
+    for (const auto& [pub, score] : onboarding_scores) {
+      auto it = canonical_reward_state.onboarding_score_units.find(pub);
+      if (it == canonical_reward_state.onboarding_score_units.end() || score > it->second) {
+        canonical_reward_state.onboarding_score_units[pub] = score;
+        canonical_updated = true;
+      }
+    }
+    if (canonical_updated) {
+      canonical_state_->state_commitment =
+          consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+    }
+  }
 }
 
 std::vector<TxOut> Node::coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
@@ -3392,15 +3483,7 @@ void Node::accrue_epoch_reward_for_finalized_block_locked(const Block& block, co
 }
 
 void Node::mark_epoch_reward_settled_if_needed_locked(std::uint64_t height) {
-  const auto epoch_start = consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks);
-  if (height == epoch_start && epoch_start > cfg_.network.committee_epoch_blocks && epoch_start > 1) {
-    const auto settlement_epoch = epoch_start - cfg_.network.committee_epoch_blocks;
-    auto& state = epoch_reward_states_[settlement_epoch];
-    state.epoch_start_height = settlement_epoch;
-    if (!state.settled) {
-      state.onboarding_score_units = compute_onboarding_score_units_for_epoch_locked(settlement_epoch);
-    }
-  }
+  ensure_settlement_onboarding_scores_loaded_locked(height);
   mark_epoch_reward_settled_for_height(cfg_.network, height, cfg_.network.committee_epoch_blocks, epoch_reward_states_,
                                        &protocol_reserve_balance_units_, &db_);
 }
@@ -4777,6 +4860,7 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
   const std::uint64_t open_epoch = current_epoch_ticket_epoch_locked();
   const std::uint64_t step = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
   std::vector<std::uint64_t> epochs;
+  std::vector<std::uint64_t> settlement_epochs;
   if (auto required = epoch_committee_snapshot_epoch_for_height_locked(finalized_height_ + 1); required.has_value()) {
     for (std::uint64_t epoch = *required; epoch <= open_epoch; epoch += step) {
       epochs.push_back(epoch);
@@ -4784,12 +4868,28 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
     }
   }
   if (epochs.empty() || epochs.back() != open_epoch) epochs.push_back(open_epoch);
+  
+  // Add settlement epoch for current finalized height (settlement applies at next height)
+  // and for next finalized height if either is a settlement boundary
+  for (auto check_height : {finalized_height_, finalized_height_ + 1}) {
+    if (auto settlement_epoch = settlement_epoch_for_block_height_locked(check_height); settlement_epoch.has_value()) {
+      settlement_epochs.push_back(*settlement_epoch);
+      if (std::find(epochs.begin(), epochs.end(), *settlement_epoch) == epochs.end()) {
+        epochs.push_back(*settlement_epoch);
+      }
+    }
+  }
+  
   const std::uint64_t interval = std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
   for (int peer_id : p2p_.peer_ids()) {
     const auto info = p2p_.get_peer_info(peer_id);
     if (!info.established()) continue;
     for (const auto epoch : epochs) {
-      if (epoch != open_epoch && epoch_committee_frozen_locked(epoch) && db_.get_epoch_committee_snapshot(epoch).has_value()) {
+      const bool is_settlement_epoch =
+          std::find(settlement_epochs.begin(), settlement_epochs.end(), epoch) != settlement_epochs.end();
+      // Always request settlement epoch regardless of frozen status; skip other frozen epochs only if already synced
+      if (epoch != open_epoch && !is_settlement_epoch && epoch_committee_frozen_locked(epoch) && 
+          db_.get_epoch_committee_snapshot(epoch).has_value()) {
         auto snapshot = db_.get_epoch_committee_snapshot(epoch);
         if (snapshot.has_value() && !snapshot->ordered_members.empty()) continue;
       }
@@ -6072,6 +6172,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                " reason=missing-canonical-state");
       return false;
     }
+    ensure_settlement_onboarding_scores_loaded_locked(transition.height);
     std::vector<FinalitySig> canonical_sigs;
     std::string cert_error;
     if (!verify_finality_certificate_for_frontier_locked(*certificate, transition, &canonical_sigs, &cert_error)) {

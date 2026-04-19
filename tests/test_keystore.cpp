@@ -1,5 +1,15 @@
 #include "test_framework.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
+
+#include <atomic>
+#include <chrono>
+
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -12,6 +22,13 @@ using namespace finalis;
 
 namespace {
 
+std::string unique_test_base(const std::string& prefix) {
+  static std::atomic<std::uint64_t> seq{0};
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+}
+
 std::vector<char*> make_argv(std::vector<std::string>& args) {
   std::vector<char*> out;
   out.reserve(args.size());
@@ -22,7 +39,7 @@ std::vector<char*> make_argv(std::vector<std::string>& args) {
 }  // namespace
 
 TEST(test_keystore_create_and_load_roundtrip) {
-  const std::string root = "/tmp/finalis_test_keystore";
+  const std::string root = unique_test_base("/tmp/finalis_test_keystore");
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
   const std::string ks = root + "/validator.json";
@@ -45,7 +62,7 @@ TEST(test_keystore_create_and_load_roundtrip) {
 }
 
 TEST(test_keystore_rejects_wrong_passphrase) {
-  const std::string root = "/tmp/finalis_test_keystore_badpass";
+  const std::string root = unique_test_base("/tmp/finalis_test_keystore_badpass");
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
   const std::string ks = root + "/validator.json";
@@ -59,7 +76,7 @@ TEST(test_keystore_rejects_wrong_passphrase) {
 }
 
 TEST(test_keystore_create_and_load_without_passphrase) {
-  const std::string root = "/tmp/finalis_test_keystore_nopass";
+  const std::string root = unique_test_base("/tmp/finalis_test_keystore_nopass");
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
   const std::string ks = root + "/validator.json";
@@ -76,7 +93,7 @@ TEST(test_keystore_create_and_load_without_passphrase) {
 }
 
 TEST(test_keystore_distinct_seeds_produce_distinct_addresses) {
-  const std::string root = "/tmp/finalis_test_keystore_distinct_addresses";
+  const std::string root = unique_test_base("/tmp/finalis_test_keystore_distinct_addresses");
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
 

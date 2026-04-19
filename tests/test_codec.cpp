@@ -1,6 +1,14 @@
 #include "test_framework.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
+
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 
 #include "codec/bytes.hpp"
@@ -15,7 +23,9 @@ namespace {
 
 std::string unique_test_base(const std::string& prefix) {
   static std::atomic<std::uint64_t> seq{0};
-  return prefix + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
 }
 
 }  // namespace
@@ -102,7 +112,7 @@ TEST(test_blockheader_canonical_reserialization_always_includes_prev_finality_ce
 }
 
 TEST(test_slashing_record_db_roundtrip) {
-  const std::string path = "/tmp/finalis_test_slashing_record_db";
+  const std::string path = unique_test_base("/tmp/finalis_test_slashing_record_db");
   std::filesystem::remove_all(path);
 
   storage::DB db;
@@ -134,7 +144,7 @@ TEST(test_slashing_record_db_roundtrip) {
 }
 
 TEST(test_finalized_committee_checkpoint_db_roundtrip) {
-  const std::string path = "/tmp/finalis_test_finalized_committee_checkpoint_db";
+  const std::string path = unique_test_base("/tmp/finalis_test_finalized_committee_checkpoint_db");
   std::filesystem::remove_all(path);
 
   storage::DB db;
@@ -211,7 +221,7 @@ TEST(test_finalized_committee_checkpoint_db_roundtrip) {
 }
 
 TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback_observability) {
-  const std::string path = "/tmp/finalis_test_node_runtime_status_snapshot_db";
+  const std::string path = unique_test_base("/tmp/finalis_test_node_runtime_status_snapshot_db");
   std::filesystem::remove_all(path);
 
   storage::DB db;
@@ -275,7 +285,7 @@ TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback
 }
 
 TEST(test_adaptive_epoch_telemetry_db_roundtrip_and_summary) {
-  const std::string path = "/tmp/finalis_test_adaptive_epoch_telemetry_db";
+  const std::string path = unique_test_base("/tmp/finalis_test_adaptive_epoch_telemetry_db");
   std::filesystem::remove_all(path);
 
   storage::DB db;
@@ -324,7 +334,7 @@ TEST(test_adaptive_epoch_telemetry_db_roundtrip_and_summary) {
 }
 
 TEST(test_finalized_committee_checkpoint_rejects_unknown_enum_values) {
-  const std::string path = "/tmp/finalis_test_finalized_committee_checkpoint_bad_enum_db";
+  const std::string path = unique_test_base("/tmp/finalis_test_finalized_committee_checkpoint_bad_enum_db");
   std::filesystem::remove_all(path);
 
   storage::DB db;
@@ -350,7 +360,7 @@ TEST(test_finalized_committee_checkpoint_rejects_unknown_enum_values) {
 }
 
 TEST(test_epoch_reward_settlement_db_roundtrip) {
-  const std::string path = "/tmp/finalis_test_epoch_reward_settlement_db";
+  const std::string path = unique_test_base("/tmp/finalis_test_epoch_reward_settlement_db");
   std::filesystem::remove_all(path);
 
   storage::DB db;
@@ -393,7 +403,7 @@ TEST(test_epoch_reward_settlement_db_roundtrip) {
 }
 
 TEST(test_validator_db_roundtrip_preserves_operator_id) {
-  const std::string path = "/tmp/finalis_test_validator_db_operator";
+  const std::string path = unique_test_base("/tmp/finalis_test_validator_db_operator");
   std::filesystem::remove_all(path);
 
   storage::DB db;

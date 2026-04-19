@@ -394,6 +394,7 @@ class Node {
   std::optional<std::uint64_t> settlement_epoch_for_block_height_locked(std::uint64_t height) const;
   storage::EpochRewardSettlementState epoch_reward_state_for_epoch_locked(std::uint64_t epoch_start_height) const;
   std::map<PubKey32, std::uint64_t> compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const;
+  void ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height);
   consensus::DeterministicCoinbasePayout coinbase_payout_for_height_locked(std::uint64_t height,
                                                                            const PubKey32& leader_pubkey,
                                                                            std::uint64_t fees_units) const;

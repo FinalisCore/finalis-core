@@ -73,16 +73,24 @@ int main() {
   int failed = 0;
   std::vector<std::string> failed_names;
   const char* filter = std::getenv("FINALIS_TEST_FILTER");
+  const char* shard_index_env = std::getenv("FINALIS_TEST_SHARD_INDEX");
+  const char* shard_count_env = std::getenv("FINALIS_TEST_SHARD_COUNT");
+  const std::size_t shard_count = shard_count_env ? static_cast<std::size_t>(std::atoi(shard_count_env)) : 1;
+  const std::size_t shard_index = shard_index_env ? static_cast<std::size_t>(std::atoi(shard_index_env)) : 0;
+
   std::vector<std::pair<std::string, TestFn>> selected;
   selected.reserve(tests().size());
+  std::size_t shard_counter = 0;
   for (const auto& [name, fn] : tests()) {
     if (filter && std::string(name).find(filter) == std::string::npos) continue;
+    if (shard_count > 1 && (shard_counter++ % shard_count) != shard_index) continue;
     selected.push_back({name, fn});
   }
 
   const std::size_t total = selected.size();
   std::cout << "[tests] total=" << total;
   if (filter) std::cout << " filter=\"" << filter << "\"";
+  if (shard_count > 1) std::cout << " shard=" << shard_index << "/" << shard_count;
   std::cout << std::endl;
 
   std::size_t index = 0;

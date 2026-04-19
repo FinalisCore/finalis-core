@@ -1,6 +1,15 @@
 #include "test_framework.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
+
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
 
 #include "apps/finalis-wallet/wallet_store.hpp"
 
@@ -8,10 +17,21 @@ using namespace finalis::wallet;
 using finalis::Hash32;
 using finalis::OutPoint;
 
+namespace {
+std::string unique_test_dir(const char* prefix) {
+  static std::atomic<std::uint64_t> counter{0};
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto seq = counter.fetch_add(1, std::memory_order_relaxed);
+  const std::string dir = std::string(prefix) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq);
+  std::filesystem::create_directories(dir);
+  return dir;
+}
+}  // namespace
+
 TEST(test_wallet_store_persists_sent_events_and_notes) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_test/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_test");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_test");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_test");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -78,9 +98,8 @@ TEST(test_wallet_store_persists_sent_events_and_notes) {
 }
 
 TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_remove_sent/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_remove_sent");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_remove_sent");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_remove_sent");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -107,9 +126,8 @@ TEST(test_wallet_store_removes_sent_txid_without_touching_other_local_state) {
 }
 
 TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_confidential");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -156,9 +174,8 @@ TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {
 }
 
 TEST(test_wallet_store_marks_confidential_requests_consumed_without_deleting_them) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_requests/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_requests");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_requests");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_confidential_requests");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -187,9 +204,8 @@ TEST(test_wallet_store_marks_confidential_requests_consumed_without_deleting_the
 }
 
 TEST(test_wallet_store_marks_confidential_coin_spent_without_deleting_it) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_coin_spent/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_coin_spent");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_coin_spent");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_confidential_coin_spent");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -221,9 +237,8 @@ TEST(test_wallet_store_marks_confidential_coin_spent_without_deleting_it) {
 }
 
 TEST(test_wallet_store_persists_wallet_snapshot) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_snapshot/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_snapshot");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_snapshot");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_snapshot");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -269,9 +284,8 @@ TEST(test_wallet_store_persists_wallet_snapshot) {
 }
 
 TEST(test_wallet_store_persists_wallet_view_snapshot) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_view_snapshot/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_view_snapshot");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_view_snapshot");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_view_snapshot");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -309,9 +323,8 @@ TEST(test_wallet_store_persists_wallet_view_snapshot) {
 }
 
 TEST(test_wallet_store_persists_pending_tx_status_cache) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_pending_tx_status/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_pending_tx_status");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_pending_tx_status");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_pending_tx_status");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -345,9 +358,8 @@ TEST(test_wallet_store_persists_pending_tx_status_cache) {
 }
 
 TEST(test_wallet_store_bounds_pending_tx_status_cache_retention) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_pending_tx_status_retention/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_pending_tx_status_retention");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_pending_tx_status_retention");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_pending_tx_status_retention");
+  const std::string wallet_file = base + "/wallet.json";
 
   {
     WalletStore store;
@@ -394,9 +406,8 @@ TEST(test_wallet_store_bounds_pending_tx_status_cache_retention) {
 }
 
 TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphrase) {
-  const std::string wallet_file = "/tmp/finalis_wallet_store_confidential_nopass/wallet.json";
-  std::filesystem::remove_all("/tmp/finalis_wallet_store_confidential_nopass");
-  std::filesystem::create_directories("/tmp/finalis_wallet_store_confidential_nopass");
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_confidential_nopass");
+  const std::string wallet_file = base + "/wallet.json";
 
   WalletStore store;
   ASSERT_TRUE(store.open(wallet_file));

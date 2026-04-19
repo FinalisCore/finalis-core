@@ -1,5 +1,15 @@
 #include "test_framework.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
+
+#include <atomic>
+#include <chrono>
+
 #include <filesystem>
 
 #include "consensus/canonical_derivation.hpp"
@@ -7,6 +17,17 @@
 #include "utxo/tx.hpp"
 
 using namespace finalis;
+
+namespace {
+
+std::string unique_test_base(const std::string& prefix) {
+  static std::atomic<std::uint64_t> seq{0};
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+}
+
+}  // namespace
 
 TEST(test_finality_certificate_serialize_roundtrip) {
   FinalityCertificate cert;
@@ -41,7 +62,7 @@ TEST(test_finality_certificate_serialize_roundtrip) {
 }
 
 TEST(test_finality_certificate_db_roundtrip) {
-  const std::string path = "/tmp/finalis_test_finality_certificate_db";
+  const std::string path = unique_test_base("/tmp/finalis_test_finality_certificate_db");
   std::filesystem::remove_all(path);
 
   storage::DB db;

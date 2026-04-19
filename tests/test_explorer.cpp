@@ -1,6 +1,15 @@
 #include "test_framework.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
+
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -20,6 +29,14 @@
 using namespace finalis;
 
 namespace {
+
+std::filesystem::path unique_test_cache_path(const char* stem) {
+  static std::atomic<std::uint64_t> seq{0};
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto name = std::string(stem) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + ".json";
+  return std::filesystem::temp_directory_path() / name;
+}
 
 std::string make_http_get(const std::string& path) {
   return "GET " + path + " HTTP/1.1\r\nHost: explorer.test\r\nConnection: close\r\n\r\n";
@@ -743,7 +760,7 @@ TEST(test_explorer_healthz_reports_upstream_health) {
 TEST(test_explorer_hydrates_startup_cache_from_disk_without_live_rpc) {
   ExplorerFixture fx;
   Config cfg = test_config();
-  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-cache-test.json";
+  const auto temp_path = unique_test_cache_path("finalis-explorer-cache-test");
   cfg.cache_path = temp_path.string();
   std::error_code ec;
   std::filesystem::remove(temp_path, ec);
@@ -784,7 +801,7 @@ TEST(test_explorer_hydrates_startup_cache_from_disk_without_live_rpc) {
 TEST(test_explorer_hydrates_tx_and_transition_index_from_disk_without_live_rpc) {
   ExplorerFixture fx;
   Config cfg = test_config();
-  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-index-cache-test.json";
+  const auto temp_path = unique_test_cache_path("finalis-explorer-index-cache-test");
   cfg.cache_path = temp_path.string();
   std::error_code ec;
   std::filesystem::remove(temp_path, ec);
@@ -826,7 +843,7 @@ TEST(test_explorer_hydrates_tx_and_transition_index_from_disk_without_live_rpc) 
 TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
   ExplorerFixture fx;
   Config cfg = test_config();
-  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-provenance-cache-test.json";
+  const auto temp_path = unique_test_cache_path("finalis-explorer-provenance-cache-test");
   cfg.cache_path = temp_path.string();
   std::error_code ec;
   std::filesystem::remove(temp_path, ec);
@@ -932,7 +949,7 @@ TEST(test_explorer_tx_page_and_json_surface_decoded_onboarding_registration_fiel
 TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
   ExplorerFixture fx;
   Config cfg = test_config();
-  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-section-refresh-cache-test.json";
+  const auto temp_path = unique_test_cache_path("finalis-explorer-section-refresh-cache-test");
   cfg.cache_path = temp_path.string();
   std::error_code ec;
   std::filesystem::remove(temp_path, ec);
@@ -961,7 +978,7 @@ TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
 TEST(test_explorer_homepage_shows_stale_banner_when_cached_surfaces_fallback_after_rpc_failure) {
   ExplorerFixture fx;
   Config cfg = test_config();
-  const auto temp_path = std::filesystem::temp_directory_path() / "finalis-explorer-stale-banner-cache-test.json";
+  const auto temp_path = unique_test_cache_path("finalis-explorer-stale-banner-cache-test");
   cfg.cache_path = temp_path.string();
   std::error_code ec;
   std::filesystem::remove(temp_path, ec);

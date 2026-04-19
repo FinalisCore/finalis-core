@@ -204,12 +204,18 @@ Use this when you need a clean resync without losing your validator key or the p
 ```bash
 sudo systemctl stop finalis finalis-lightserver 2>/dev/null; true
 
+# pull release
+git pull origin main
+
 # preserve key and peer table
 cp ~/.finalis/mainnet/keystore/validator.json /tmp/validator.json.bak
 cp ~/.finalis/mainnet/peers.dat /tmp/peers.dat.bak 2>/dev/null; true
 
 # wipe DB
 rm -rf ~/.finalis/mainnet
+
+# re-install new binaries
+cmake -S . -B build -G Ninja && cmake --build build -j
 
 # restore
 mkdir -p ~/.finalis/mainnet/keystore

@@ -3067,7 +3067,7 @@ TEST(test_follower_startup_repairs_missing_required_epoch_from_peer) {
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap node");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.network.min_block_interval_ms = 100;
@@ -3165,7 +3165,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.network.min_block_interval_ms = 100;
@@ -3188,7 +3188,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
     bootstrap.stop();
-    return;
+    ASSERT_TRUE(false && "Failed to reserve test port for follower");
   }
   follower_cfg.genesis_path = gpath;
   follower_cfg.allow_unsafe_genesis_override = true;
@@ -4043,7 +4043,7 @@ TEST(test_mainnet_seed_bootstrap_and_catchup) {
   }
   join_cfg.seeds.push_back("127.0.0.1:" + std::to_string(seed_port));
   auto joiner = std::make_unique<node::Node>(join_cfg);
-  if (!joiner->init()) return;
+  ASSERT_TRUE(joiner->init() && "joiner->init() failed");
   joiner->start();
   if (!wait_for_peer_count(*joiner, 1, std::chrono::seconds(20))) {
     const auto st = joiner->status();
@@ -4093,7 +4093,7 @@ TEST(test_observer_reports_ok_on_two_lightservers) {
   l1.port = 0;  // ephemeral
   lightserver::Server s1(l1);
   ASSERT_TRUE(s1.init());
-  if (!s1.start()) return;
+  ASSERT_TRUE(s1.start() && "s1.start() failed");
   const std::uint16_t p1 = s1.bound_port();
   ASSERT_TRUE(p1 != 0);
 
@@ -4103,7 +4103,7 @@ TEST(test_observer_reports_ok_on_two_lightservers) {
   ASSERT_TRUE(s2.init());
   if (!s2.start()) {
     s1.stop();
-    return;
+    ASSERT_TRUE(false && "s2.start() failed");
   }
   const std::uint16_t p2 = s2.bound_port();
   ASSERT_TRUE(p2 != 0);
@@ -4145,7 +4145,7 @@ TEST(test_invalid_frame_spam_bans_peer_and_node_stays_alive) {
   cfg.idle_timeout_ms = 2000;
 
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   ASSERT_TRUE(port != 0);
@@ -4168,7 +4168,7 @@ TEST(test_seed_http_port_preflight_does_not_break_node_progress) {
   std::filesystem::create_directories(base);
 
   HttpStubServer http;
-  if (!http.start()) return;
+  ASSERT_TRUE(http.start() && "http.start() failed");
 
   node::NodeConfig cfg;
       cfg.node_id = 0;
@@ -4207,7 +4207,7 @@ TEST(test_invalid_frame_ban_threshold_applies_after_strikes) {
   cfg.handshake_timeout_ms = 5000;
 
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   ASSERT_TRUE(port != 0);
@@ -4387,8 +4387,8 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
 
 TEST(test_block_path_applies_settlement_same_as_quorum_path) {
   const auto keys = node::Node::deterministic_test_keypairs();
-  const std::string direct_base = "/tmp/finalis_it_reward_direct_path";
-  const std::string quorum_base = "/tmp/finalis_it_reward_quorum_path";
+  const std::string direct_base = unique_test_base("/tmp/finalis_it_reward_direct_path");
+  const std::string quorum_base = unique_test_base("/tmp/finalis_it_reward_quorum_path");
   Tx tx = make_fixture_ingress_tx(1, 0x90);
 
   node::NodeConfig direct_cfg;
@@ -4493,7 +4493,7 @@ TEST(test_block_path_applies_settlement_same_as_quorum_path) {
 }
 
 TEST(test_single_validator_respects_min_block_interval_after_finalization) {
-  const std::string base = "/tmp/finalis_it_min_block_interval_after_finalize";
+  const std::string base = unique_test_base("/tmp/finalis_it_min_block_interval_after_finalize");
 
   node::NodeConfig cfg;
   cfg.disable_p2p = true;
@@ -4532,7 +4532,7 @@ TEST(test_single_validator_respects_min_block_interval_after_finalization) {
 }
 
 TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
-  const std::string base = "/tmp/finalis_it_wallet_script_index_rewards";
+  const std::string base = unique_test_base("/tmp/finalis_it_wallet_script_index_rewards");
 
   node::NodeConfig cfg;
   cfg.disable_p2p = true;
@@ -4583,7 +4583,7 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
 }
 
 TEST(test_finalized_frontier_txs_are_indexed_for_explorer_queries) {
-  const std::string base = "/tmp/finalis_it_frontier_tx_indexing";
+  const std::string base = unique_test_base("/tmp/finalis_it_frontier_tx_indexing");
   Tx tx = make_fixture_ingress_tx(1, 0xA7);
 
   node::NodeConfig cfg;
@@ -4626,7 +4626,7 @@ TEST(test_finalized_frontier_txs_are_indexed_for_explorer_queries) {
 }
 
 TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
-  const std::string base = "/tmp/finalis_it_local_wallet_tx_finalizes";
+  const std::string base = unique_test_base("/tmp/finalis_it_local_wallet_tx_finalizes");
 
   node::NodeConfig cfg;
   cfg.disable_p2p = true;
@@ -4697,7 +4697,7 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
 }
 
 TEST(test_tx_status_reports_certified_ingress_before_finalization) {
-  const std::string base = "/tmp/finalis_it_tx_status_certified_ingress";
+  const std::string base = unique_test_base("/tmp/finalis_it_tx_status_certified_ingress");
 
   node::NodeConfig cfg;
   cfg.disable_p2p = true;
@@ -4762,7 +4762,7 @@ TEST(test_tx_status_reports_certified_ingress_before_finalization) {
 }
 
 TEST(test_next_height_runtime_schedule_uses_canonical_state_not_mutable_runtime_checkpoint_cache) {
-  const std::string base = "/tmp/finalis_it_next_height_schedule_uses_canonical";
+  const std::string base = unique_test_base("/tmp/finalis_it_next_height_schedule_uses_canonical");
 
   node::NodeConfig cfg;
   cfg.disable_p2p = true;
@@ -4814,7 +4814,7 @@ TEST(test_next_height_runtime_schedule_uses_canonical_state_not_mutable_runtime_
 }
 
 TEST(test_frontier_build_repairs_runtime_cursor_from_frontier_storage) {
-  const std::string base = "/tmp/finalis_it_frontier_build_repairs_runtime_cursor";
+  const std::string base = unique_test_base("/tmp/finalis_it_frontier_build_repairs_runtime_cursor");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -5590,12 +5590,12 @@ TEST(test_reject_cross_network_version_handshake) {
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   if (port == 0) {
     n.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
 
   p2p::VersionMsg v;
@@ -5755,7 +5755,7 @@ TEST(test_skip_exact_self_endpoint_before_dial) {
   cfg.peers.push_back("127.0.0.1:" + std::to_string(port));
 
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   ASSERT_TRUE(n.endpoint_is_obvious_self_for_test("127.0.0.1", port));
   n.start();
 
@@ -5784,7 +5784,7 @@ TEST(test_skip_resolved_localhost_self_endpoint_before_dial) {
   cfg.peers.push_back("localhost:" + std::to_string(port));
 
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   ASSERT_TRUE(n.endpoint_is_obvious_self_for_test("localhost", port));
   n.start();
 
@@ -5808,12 +5808,12 @@ TEST(test_reject_self_identity_in_version_handshake) {
   cfg.dns_seeds = false;
 
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   if (port == 0) {
     n.stop();
-    return;
+    ASSERT_TRUE(false && "n.p2p_port_for_test() returned 0");
   }
 
   p2p::VersionMsg v;
@@ -5851,7 +5851,7 @@ TEST(test_self_endpoint_retry_suppression_persists_for_process_lifetime) {
   cfg.peers.push_back("127.0.0.1:" + std::to_string(port));
 
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
 
   ASSERT_TRUE(wait_for([&]() { return n.self_endpoint_suppressed_for_test("127.0.0.1", port); },
@@ -5874,12 +5874,12 @@ TEST(test_reject_magic_mismatch_frame_before_handshake) {
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   if (port == 0) {
     n.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
 
   p2p::VersionMsg v;
@@ -5905,12 +5905,12 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   if (port == 0) {
     n.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
 
   p2p::VersionMsg v;
@@ -5953,7 +5953,8 @@ TEST(test_normal_peer_connection_unaffected_by_self_peer_filtering) {
 
   node::Node n0(cfg0);
   node::Node n1(cfg1);
-  if (!n0.init() || !n1.init()) return;
+  ASSERT_TRUE(n0.init() && "n0.init() failed");
+  ASSERT_TRUE(n1.init() && "n1.init() failed");
   n0.start();
   n1.start();
 
@@ -6098,14 +6099,14 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.network.min_block_interval_ms = 100;
   bootstrap_cfg.network.round_timeout_ms = 200;
 
   node::Node bootstrap(bootstrap_cfg);
-  if (!bootstrap.init()) return;
+  ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
   ASSERT_TRUE(wait_for_tip(bootstrap, 1, std::chrono::seconds(12)));
 
@@ -6116,7 +6117,7 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
     bootstrap.stop();
-    return;
+    ASSERT_TRUE(false && "Failed to reserve test port for follower");
   }
   follower_cfg.genesis_path = gpath;
   follower_cfg.allow_unsafe_genesis_override = true;
@@ -6171,7 +6172,7 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.network.min_block_interval_ms = 100;
@@ -6181,13 +6182,13 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
   bootstrap_cfg.outbound_target = 0;
 
   node::Node bootstrap(bootstrap_cfg);
-  if (!bootstrap.init()) return;
+  ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
   bootstrap.pause_proposals_for_test(true);
   const auto port0 = bootstrap.p2p_port_for_test();
   if (port0 == 0) {
     bootstrap.stop();
-    return;
+    ASSERT_TRUE(false && "bootstrap.p2p_port_for_test() returned 0");
   }
 
   node::NodeConfig follower_cfg;
@@ -6197,7 +6198,7 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
     bootstrap.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
   follower_cfg.genesis_path = gpath;
   follower_cfg.allow_unsafe_genesis_override = true;
@@ -6301,18 +6302,18 @@ TEST(test_adopted_bootstrap_identity_persists_across_restart_before_first_block)
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
 
   node::Node bootstrap(bootstrap_cfg);
-  if (!bootstrap.init()) return;
+  ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
   bootstrap.pause_proposals_for_test(true);
   const auto port0 = bootstrap.p2p_port_for_test();
   if (port0 == 0) {
     bootstrap.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
 
   node::NodeConfig follower_cfg;
@@ -6374,7 +6375,7 @@ TEST(test_height_zero_bootstrap_adoption_rejects_non_explicit_fallback_path) {
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.peers = {"127.0.0.1:1"};
@@ -6382,7 +6383,7 @@ TEST(test_height_zero_bootstrap_adoption_rejects_non_explicit_fallback_path) {
   bootstrap_cfg.network.round_timeout_ms = 200;
 
   node::Node bootstrap(bootstrap_cfg);
-  if (!bootstrap.init()) return;
+  ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
 
   node::NodeConfig follower_cfg;
@@ -6436,19 +6437,19 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  if (cfg0.p2p_port == 0) return;
+  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.network.min_block_interval_ms = 100;
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  if (!n0.init()) return;
+  ASSERT_TRUE(n0.init() && "n0.init() failed");
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
     n0.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
   ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(20)));
   ASSERT_TRUE(wait_for_tip(n0, 1, std::chrono::seconds(12)));
@@ -6952,7 +6953,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  if (cfg0.p2p_port == 0) return;
+  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.validator_min_bond_override = 1;
@@ -6963,12 +6964,12 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  if (!n0.init()) return;
+  ASSERT_TRUE(n0.init() && "n0.init() failed");
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
     n0.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
 
   node::NodeConfig cfg1;
@@ -7115,19 +7116,19 @@ TEST(test_late_joiner_requests_finalized_tip_and_catches_up) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  if (cfg0.p2p_port == 0) return;
+  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.network.min_block_interval_ms = 100;
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  if (!n0.init()) return;
+  ASSERT_TRUE(n0.init() && "n0.init() failed");
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
     n0.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
   ASSERT_TRUE(wait_for_tip(n0, 12, std::chrono::seconds(20)));
 
@@ -7181,19 +7182,19 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  if (cfg0.p2p_port == 0) return;
+  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.network.min_block_interval_ms = 100;
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  if (!n0.init()) return;
+  ASSERT_TRUE(n0.init() && "n0.init() failed");
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
     n0.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
   ASSERT_TRUE(wait_for_tip(n0, 24, ci_timeout_seconds(25)));
 
@@ -7328,14 +7329,14 @@ TEST(test_sync_peer_rejects_tampered_finalized_block_body) {
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.network.min_block_interval_ms = 100;
   bootstrap_cfg.network.round_timeout_ms = 200;
 
   node::Node bootstrap(bootstrap_cfg);
-  if (!bootstrap.init()) return;
+  ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
   ASSERT_TRUE(wait_for_tip(bootstrap, 3, std::chrono::seconds(15)));
 
@@ -7407,19 +7408,19 @@ TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  if (cfg0.p2p_port == 0) return;
+  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.network.min_block_interval_ms = 100;
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  if (!n0.init()) return;
+  ASSERT_TRUE(n0.init() && "n0.init() failed");
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
     n0.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
   ASSERT_TRUE(wait_for_tip(n0, 8, std::chrono::seconds(20)));
 
@@ -7667,9 +7668,10 @@ TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticke
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
-  follower_cfg.listen = false;
+  follower_cfg.listen = true;
   follower_cfg.db_path = base + "/follower";
-  follower_cfg.p2p_port = 0;
+  follower_cfg.p2p_port = reserve_test_port();
+  ASSERT_TRUE(follower_cfg.p2p_port != 0 && "Failed to reserve test port for follower");
   follower_cfg.genesis_path = base + "/genesis.json";
   follower_cfg.allow_unsafe_genesis_override = true;
   follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
@@ -7917,39 +7919,67 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
   ASSERT_TRUE(wait_for([&]() { return validators[0]->status().height >= 32; }, std::chrono::seconds(50)));
   ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(5)));
 
-  node::NodeConfig follower_cfg;
-  follower_cfg.node_id = 9;
-  follower_cfg.dns_seeds = false;
-  follower_cfg.db_path = base + "/follower";
-  follower_cfg.p2p_port = reserve_test_port();
-  if (follower_cfg.p2p_port == 0) {
-    for (auto& n : validators) n->stop();
-    return;
-  }
-  follower_cfg.genesis_path = base + "/genesis.json";
-  follower_cfg.allow_unsafe_genesis_override = true;
-  follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
-  follower_cfg.validator_passphrase = "test-pass";
-  follower_cfg.peers = {"127.0.0.1:" + std::to_string(validators[0]->p2p_port_for_test())};
-  follower_cfg.outbound_target = 1;
-  ASSERT_TRUE(create_test_validator_keystore(follower_cfg, follower_cfg.node_id));
-
-  node::Node follower(follower_cfg);
-  ASSERT_TRUE(follower.init());
-  follower.start();
-
   ASSERT_TRUE(wait_for([&]() {
     const auto s0 = validators[0]->status();
     const auto s1 = validators[1]->status();
     return s0.height >= 48 && s1.height == s0.height && s1.transition_hash == s0.transition_hash;
   }, std::chrono::seconds(70)));
   for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
-  ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(15)));
-  bool follower_caught_up = wait_for([&]() { return follower.status().height >= 40; }, ci_timeout_seconds(90));
-  if (!follower_caught_up) {
-    for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(false));
-    ASSERT_TRUE(wait_for([&]() { return follower.status().height >= 40; }, ci_timeout_seconds(30)));
-    for (auto& n : validators) ASSERT_TRUE(n->pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for_stable_same_tip(validators, std::chrono::seconds(20)));
+  const auto frozen_tip = validators[0]->status();
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 9;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.listen = false;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = 0;
+  follower_cfg.genesis_path = base + "/genesis.json";
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
+  follower_cfg.validator_passphrase = "test-pass";
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(validators[0]->p2p_port_for_test()),
+                        "127.0.0.1:" + std::to_string(validators[1]->p2p_port_for_test())};
+  follower_cfg.outbound_target = 1;
+  ASSERT_TRUE(create_test_validator_keystore(follower_cfg, follower_cfg.node_id));
+
+  node::Node follower(follower_cfg);
+  ASSERT_TRUE(follower.init());
+  follower.start();
+  ASSERT_TRUE(wait_for_peer_count(follower, 1, std::chrono::seconds(60)));
+
+  auto wait_for_follower_catchup_with_progress = [&]() {
+    const auto overall_timeout = ci_timeout_seconds(240);
+    const auto stall_timeout = std::chrono::seconds(90);
+    const auto start = std::chrono::steady_clock::now();
+    auto last_progress = start;
+    auto last = follower.status();
+
+    while (std::chrono::steady_clock::now() - start < overall_timeout) {
+      const auto sf = follower.status();
+      if (sf.height == frozen_tip.height && sf.transition_hash == frozen_tip.transition_hash) return true;
+
+      if (sf.height > last.height || sf.transition_hash != last.transition_hash) {
+        last = sf;
+        last_progress = std::chrono::steady_clock::now();
+      } else if (std::chrono::steady_clock::now() - last_progress > stall_timeout) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return false;
+  };
+  if (!wait_for_follower_catchup_with_progress()) {
+    const auto sf = follower.status();
+    const auto s0 = validators[0]->status();
+    const auto s1 = validators[1]->status();
+    std::ostringstream oss;
+    oss << "follower failed to catch frozen tip:"
+        << " frozen{h=" << frozen_tip.height << "}"
+        << " follower{h=" << sf.height << ",peers=" << sf.peers << ",est=" << sf.established_peers << "}"
+        << " v0{h=" << s0.height << ",peers=" << s0.peers << ",est=" << s0.established_peers << "}"
+        << " v1{h=" << s1.height << ",peers=" << s1.peers << ",est=" << s1.established_peers << "}";
+    throw std::runtime_error(oss.str());
   }
 
   const auto follower_next_height = follower.status().height + 1;
@@ -7972,7 +8002,7 @@ TEST(test_synced_joiner_keeps_outbound_peer_alive_with_short_idle_timeout) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  if (cfg0.p2p_port == 0) return;
+  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.idle_timeout_ms = 1200;
@@ -7980,12 +8010,12 @@ TEST(test_synced_joiner_keeps_outbound_peer_alive_with_short_idle_timeout) {
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  if (!n0.init()) return;
+  ASSERT_TRUE(n0.init() && "n0.init() failed");
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
     n0.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
   ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(15)));
 
@@ -8043,14 +8073,14 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.network.min_block_interval_ms = 100;
   bootstrap_cfg.network.round_timeout_ms = 200;
 
   node::Node bootstrap(bootstrap_cfg);
-  if (!bootstrap.init()) return;
+  ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
   ASSERT_TRUE(wait_for_tip(bootstrap, 3, std::chrono::seconds(15)));
 
@@ -8127,14 +8157,14 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
-  if (bootstrap_cfg.p2p_port == 0) return;
+  ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
   bootstrap_cfg.genesis_path = gpath;
   bootstrap_cfg.allow_unsafe_genesis_override = true;
   bootstrap_cfg.network.min_block_interval_ms = 100;
   bootstrap_cfg.network.round_timeout_ms = 200;
 
   node::Node bootstrap(bootstrap_cfg);
-  if (!bootstrap.init()) return;
+  ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
   ASSERT_TRUE(wait_for_tip(bootstrap, 3, std::chrono::seconds(15)));
 
@@ -8267,12 +8297,12 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
                                                     deterministic_seed_for_node_id(0), &vk, &kerr));
   }
   node::Node n(cfg);
-  if (!n.init()) return;
+  ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   if (port == 0) {
     n.stop();
-    return;
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
   }
 
   p2p::VersionMsg v;
@@ -8324,7 +8354,7 @@ TEST(test_single_validator_round0_uses_deterministic_proposer) {
   cfg.dns_seeds = false;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = reserve_test_port();
-  if (cfg.p2p_port == 0) return;
+  ASSERT_TRUE(cfg.p2p_port != 0 && "Failed to reserve test port for cfg");
   cfg.genesis_path = gpath;
   cfg.allow_unsafe_genesis_override = true;
   cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";

@@ -1,5 +1,15 @@
 #include "test_framework.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
+
+#include <atomic>
+#include <chrono>
+
 #include <filesystem>
 #include <fstream>
 
@@ -8,6 +18,13 @@
 using namespace finalis;
 
 namespace {
+
+std::string unique_test_base(const std::string& prefix) {
+  static std::atomic<std::uint64_t> seq{0};
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+}
 
 Hash32 h(std::uint8_t b) {
   Hash32 out{};
@@ -33,7 +50,7 @@ std::optional<std::filesystem::path> find_repo_fixture(const std::filesystem::pa
 }  // namespace
 
 TEST(test_smt_insert_and_prove_membership) {
-  const std::string dir = "/tmp/finalis_test_smt_insert";
+  const std::string dir = unique_test_base("/tmp/finalis_test_smt_insert");
   std::filesystem::remove_all(dir);
   storage::DB db;
   ASSERT_TRUE(db.open(dir));
@@ -50,7 +67,7 @@ TEST(test_smt_insert_and_prove_membership) {
 }
 
 TEST(test_smt_delete_and_prove_nonmembership) {
-  const std::string dir = "/tmp/finalis_test_smt_delete";
+  const std::string dir = unique_test_base("/tmp/finalis_test_smt_delete");
   std::filesystem::remove_all(dir);
   storage::DB db;
   ASSERT_TRUE(db.open(dir));
@@ -72,7 +89,7 @@ TEST(test_smt_delete_and_prove_nonmembership) {
 }
 
 TEST(test_smt_proof_verification_matches_root) {
-  const std::string dir = "/tmp/finalis_test_smt_verify";
+  const std::string dir = unique_test_base("/tmp/finalis_test_smt_verify");
   std::filesystem::remove_all(dir);
   storage::DB db;
   ASSERT_TRUE(db.open(dir));
@@ -91,8 +108,8 @@ TEST(test_smt_proof_verification_matches_root) {
 }
 
 TEST(test_smt_determinism_across_replay) {
-  const std::string d1 = "/tmp/finalis_test_smt_replay1";
-  const std::string d2 = "/tmp/finalis_test_smt_replay2";
+  const std::string d1 = unique_test_base("/tmp/finalis_test_smt_replay1");
+  const std::string d2 = unique_test_base("/tmp/finalis_test_smt_replay2");
   std::filesystem::remove_all(d1);
   std::filesystem::remove_all(d2);
 

@@ -1,7 +1,16 @@
 #include "test_framework.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <ctime>
 #include <filesystem>
+
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
 
 #include "address/address.hpp"
 #include "common/network.hpp"
@@ -21,10 +30,13 @@ std::uint64_t now_unix_ms() {
 }
 
 std::filesystem::path make_temp_dir(const char* name) {
+  static std::atomic<std::uint64_t> counter{0};
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto seq = counter.fetch_add(1, std::memory_order_relaxed);
   const auto base = std::filesystem::temp_directory_path() / "finalis-tests";
   std::filesystem::create_directories(base);
-  const auto path = base / name;
-  std::filesystem::remove_all(path);
+  const auto path = base / (std::string(name) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq));
   std::filesystem::create_directories(path);
   return path;
 }

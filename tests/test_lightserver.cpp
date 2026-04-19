@@ -1,5 +1,12 @@
 #include "test_framework.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -34,7 +41,9 @@ constexpr auto kClusterFinalizationTimeout = std::chrono::seconds(120);
 
 std::string unique_test_base(const std::string& prefix) {
   static std::atomic<std::uint64_t> seq{0};
-  return prefix + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+  const auto pid = static_cast<std::uint64_t>(::getpid());
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
 }
 
 std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id) {
@@ -277,7 +286,7 @@ TEST(test_lightserver_indexing_after_finalization) {
 }
 
 TEST(test_finality_certificate_persisted_separately) {
-  const std::string base = "/tmp/finalis_light_cert_db";
+  const std::string base = unique_test_base("/tmp/finalis_light_cert_db");
   auto cluster = make_cluster(base);
   auto& node = *cluster.nodes[0];
   ASSERT_TRUE(wait_for([&]() { return node.status().height >= 6; }, kClusterFinalizationTimeout));
@@ -367,7 +376,7 @@ TEST(test_lightserver_basic_live_rpc_surface) {
 }
 
 TEST(test_lightserver_exposes_finality_certificate_endpoint) {
-  const std::string base = "/tmp/finalis_light_cert_rpc";
+  const std::string base = unique_test_base("/tmp/finalis_light_cert_rpc");
   auto cluster = make_cluster(base);
   ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 6; }, kClusterFinalizationTimeout));
   const auto tip = cluster.nodes[0]->status();
@@ -405,7 +414,7 @@ TEST(test_lightserver_exposes_finality_certificate_endpoint) {
 }
 
 TEST(test_lightserver_exposes_script_history_endpoint_direct) {
-  const std::string base = "/tmp/finalis_light_history_direct";
+  const std::string base = unique_test_base("/tmp/finalis_light_history_direct");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -454,7 +463,7 @@ TEST(test_lightserver_exposes_script_history_endpoint_direct) {
 }
 
 TEST(test_lightserver_get_tx_status_direct) {
-  const std::string base = "/tmp/finalis_light_tx_status_direct";
+  const std::string base = unique_test_base("/tmp/finalis_light_tx_status_direct");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -499,7 +508,7 @@ TEST(test_lightserver_get_tx_status_direct) {
 }
 
 TEST(test_lightserver_get_tx_decodes_onboarding_registration_output_and_pow_fields) {
-  const std::string base = "/tmp/finalis_light_get_tx_onboarding_decode";
+  const std::string base = unique_test_base("/tmp/finalis_light_get_tx_onboarding_decode");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -545,7 +554,7 @@ TEST(test_lightserver_get_tx_decodes_onboarding_registration_output_and_pow_fiel
 }
 
 TEST(test_lightserver_get_utxos_uses_canonical_utxo_set_even_with_incomplete_script_index) {
-  const std::string base = "/tmp/finalis_light_utxos_canonical_only";
+  const std::string base = unique_test_base("/tmp/finalis_light_utxos_canonical_only");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -609,7 +618,7 @@ TEST(test_lightserver_get_utxos_uses_canonical_utxo_set_even_with_incomplete_scr
 }
 
 TEST(test_lightserver_get_utxos_ignores_stale_or_missing_script_index_entries) {
-  const std::string base = "/tmp/finalis_light_utxos_stale_or_missing_su";
+  const std::string base = unique_test_base("/tmp/finalis_light_utxos_stale_or_missing_su");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -709,7 +718,7 @@ TEST(test_wallet_spendable_utxos_reconcile_script_index_with_canonical_set) {
 }
 
 TEST(test_lightserver_get_transition_by_height_direct) {
-  const std::string base = "/tmp/finalis_light_block_by_height";
+  const std::string base = unique_test_base("/tmp/finalis_light_block_by_height");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -896,7 +905,7 @@ TEST(test_lightserver_exposes_lane_scoped_ingress_observability_endpoints) {
 }
 
 TEST(test_lightserver_get_status_exposes_runtime_sync_summary) {
-  const std::string base = "/tmp/finalis_light_status_direct";
+  const std::string base = unique_test_base("/tmp/finalis_light_status_direct");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1038,7 +1047,7 @@ TEST(test_lightserver_get_status_exposes_runtime_sync_summary) {
 }
 
 TEST(test_lightserver_get_adaptive_telemetry_exposes_persisted_snapshots) {
-  const std::string base = "/tmp/finalis_light_adaptive_telemetry";
+  const std::string base = unique_test_base("/tmp/finalis_light_adaptive_telemetry");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1079,7 +1088,7 @@ TEST(test_lightserver_get_adaptive_telemetry_exposes_persisted_snapshots) {
 }
 
 TEST(test_lightserver_broadcast_returns_structured_duplicate_code_for_finalized_tx) {
-  const std::string base = "/tmp/finalis_light_broadcast_duplicate";
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_duplicate");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1118,7 +1127,7 @@ TEST(test_lightserver_broadcast_returns_structured_duplicate_code_for_finalized_
 }
 
 TEST(test_lightserver_broadcast_returns_structured_invalid_code) {
-  const std::string base = "/tmp/finalis_light_broadcast_invalid";
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_invalid");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1150,7 +1159,7 @@ TEST(test_lightserver_broadcast_returns_structured_invalid_code) {
 }
 
 TEST(test_lightserver_broadcast_returns_mempool_pressure_rejection_from_runtime_snapshot) {
-  const std::string base = "/tmp/finalis_light_broadcast_pressure";
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_pressure");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1202,7 +1211,7 @@ TEST(test_lightserver_broadcast_returns_mempool_pressure_rejection_from_runtime_
 }
 
 TEST(test_lightserver_broadcast_returns_relay_unavailable_code_when_relay_path_fails) {
-  const std::string base = "/tmp/finalis_light_broadcast_relay_unavailable";
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_relay_unavailable");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1245,7 +1254,7 @@ TEST(test_lightserver_broadcast_returns_relay_unavailable_code_when_relay_path_f
 }
 
 TEST(test_lightserver_broadcast_returns_structured_success_when_relaying_to_live_node) {
-  const std::string base = "/tmp/finalis_light_broadcast_success";
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_success");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1286,7 +1295,7 @@ TEST(test_lightserver_broadcast_returns_structured_success_when_relaying_to_live
 }
 
 TEST(test_lightserver_verbose_committee_uses_checkpoint_operator_metadata_when_present) {
-  const std::string base = "/tmp/finalis_light_checkpoint_committee_verbose";
+  const std::string base = unique_test_base("/tmp/finalis_light_checkpoint_committee_verbose");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1342,7 +1351,7 @@ TEST(test_lightserver_verbose_committee_uses_checkpoint_operator_metadata_when_p
 }
 
 TEST(test_lightserver_validate_address_reports_network_and_error_reason) {
-  const std::string base = "/tmp/finalis_light_validate_address";
+  const std::string base = unique_test_base("/tmp/finalis_light_validate_address");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1414,7 +1423,7 @@ TEST(test_lightserver_validate_address_reports_network_and_error_reason) {
 }
 
 TEST(test_lightserver_history_page_is_deterministic) {
-  const std::string base = "/tmp/finalis_light_history_page";
+  const std::string base = unique_test_base("/tmp/finalis_light_history_page");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1486,7 +1495,7 @@ TEST(test_lightserver_history_page_is_deterministic) {
 }
 
 TEST(test_lightserver_get_utxos_supports_paged_response) {
-  const std::string base = "/tmp/finalis_light_utxos_paged";
+  const std::string base = unique_test_base("/tmp/finalis_light_utxos_paged");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1567,7 +1576,7 @@ TEST(test_lightserver_get_utxos_supports_paged_response) {
 }
 
 TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow) {
-  const std::string base = "/tmp/finalis_light_history_page_detailed";
+  const std::string base = unique_test_base("/tmp/finalis_light_history_page_detailed");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1636,7 +1645,7 @@ TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow
 }
 
 TEST(test_lightserver_get_tx_summaries_returns_batched_finalized_tx_view) {
-  const std::string base = "/tmp/finalis_light_tx_summaries";
+  const std::string base = unique_test_base("/tmp/finalis_light_tx_summaries");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1704,7 +1713,7 @@ TEST(test_lightserver_get_tx_summaries_returns_batched_finalized_tx_view) {
 }
 
 TEST(test_lightserver_get_history_supports_paged_response) {
-  const std::string base = "/tmp/finalis_light_history_paged";
+  const std::string base = unique_test_base("/tmp/finalis_light_history_paged");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -1827,7 +1836,7 @@ TEST(test_snapshot_export_import_bootstraps_imported_db) {
 }
 
 TEST(test_lightserver_rejects_oversized_request_body_for_test_api) {
-  const std::string base = "/tmp/finalis_light_oversized_body";
+  const std::string base = unique_test_base("/tmp/finalis_light_oversized_body");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   storage::DB db;
@@ -1850,7 +1859,7 @@ TEST(test_lightserver_rejects_oversized_request_body_for_test_api) {
 }
 
 TEST(test_lightserver_roots_endpoints_unavailable_away_from_finalized_tip) {
-  const std::string base = "/tmp/finalis_light_v3_proofs";
+  const std::string base = unique_test_base("/tmp/finalis_light_v3_proofs");
   auto cluster = make_cluster(base, 4);
   auto& node = *cluster.nodes[0];
 
@@ -1905,7 +1914,7 @@ TEST(test_lightserver_roots_endpoints_unavailable_away_from_finalized_tip) {
 }
 
 TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_registration) {
-  const std::string base = "/tmp/finalis_light_onboarding_rpc";
+  const std::string base = unique_test_base("/tmp/finalis_light_onboarding_rpc");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
