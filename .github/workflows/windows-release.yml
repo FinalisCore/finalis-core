@@ -149,12 +149,14 @@ jobs:
           Select-String -Path $logPath -Pattern '^\[fail ','^\[failed-summary\]' | ForEach-Object { $_.Line }
           if ($exitCode -ne 0) { exit $exitCode }
 
-      - name: Upload test logs
+      - name: Upload full test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: finalis-core-windows-test-logs-${{ steps.meta.outputs.version }}
-          path: dist/test-logs
+          path: dist/test-logs/**
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Stage Windows payload
         shell: pwsh

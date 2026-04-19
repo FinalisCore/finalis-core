@@ -6108,7 +6108,7 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   node::Node bootstrap(bootstrap_cfg);
   ASSERT_TRUE(bootstrap.init() && "bootstrap.init() failed");
   bootstrap.start();
-  ASSERT_TRUE(wait_for_tip(bootstrap, 1, std::chrono::seconds(12)));
+  ASSERT_TRUE(wait_for_tip(bootstrap, 1, ci_timeout_seconds(12)));
 
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
@@ -6150,7 +6150,7 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   ASSERT_TRUE(wait_for([&]() {
     const auto s = follower.status();
     return s.height >= 1 && s.established_peers >= 1;
-  }, std::chrono::seconds(20)));
+  }, ci_timeout_seconds(20)));
 
   for (auto fd : junk_fds) {
     finalis::net::shutdown_socket(fd);
