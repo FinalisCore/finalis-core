@@ -6236,6 +6236,28 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
 
   std::string validation_error;
   if (!validate_frontier_proposal_locked(proposal, &validation_error)) {
+    bool accepted_with_settlement_fallback = false;
+    if (validation_error == "frontier-settlement-commitment-mismatch") {
+      if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height); settlement_epoch.has_value()) {
+        auto state_it = epoch_reward_states_.find(*settlement_epoch);
+        if (state_it != epoch_reward_states_.end() && !state_it->second.onboarding_score_units.empty()) {
+          state_it->second.onboarding_score_units.clear();
+          (void)db_.put_epoch_reward_settlement(state_it->second);
+          if (canonical_state_.has_value()) {
+            auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
+            canonical_reward_state.epoch_start_height = *settlement_epoch;
+            canonical_reward_state.onboarding_score_units.clear();
+            canonical_state_->state_commitment =
+                consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+          }
+          validation_error.clear();
+          if (validate_frontier_proposal_locked(proposal, &validation_error)) {
+            accepted_with_settlement_fallback = true;
+          }
+        }
+      }
+    }
+    if (!accepted_with_settlement_fallback) {
     log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
              std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
              " reason=" + validation_error);
@@ -6245,6 +6267,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                " validation_reason=" + validation_error);
     }
     return false;
+    }
   }
   std::string lock_error;
   if (!can_accept_frontier_with_lock_locked(transition, &lock_error)) {
