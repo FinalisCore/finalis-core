@@ -6180,11 +6180,10 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       if (validation_error == "frontier-settlement-commitment-mismatch") {
         if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
             settlement_epoch.has_value()) {
-          auto try_onboarding_state = [&](const std::map<PubKey32, std::uint64_t>& onboarding_scores) -> bool {
+          auto try_reward_state = [&](storage::EpochRewardSettlementState candidate_state, const char* source) -> bool {
+            candidate_state.epoch_start_height = *settlement_epoch;
             auto fallback_state = *canonical_state_;
-            auto& fallback_reward_state = fallback_state.epoch_reward_states[*settlement_epoch];
-            fallback_reward_state.epoch_start_height = *settlement_epoch;
-            fallback_reward_state.onboarding_score_units = onboarding_scores;
+            fallback_state.epoch_reward_states[*settlement_epoch] = candidate_state;
 
             consensus::FrontierExecutionResult fallback_recomputed;
             std::string fallback_error;
@@ -6195,19 +6194,44 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
             recomputed = std::move(fallback_recomputed);
             auto& runtime_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
             runtime_reward_state.epoch_start_height = *settlement_epoch;
-            if (runtime_reward_state.onboarding_score_units != onboarding_scores) {
-              runtime_reward_state.onboarding_score_units = onboarding_scores;
+            if (!same_epoch_reward_state(runtime_reward_state, candidate_state)) {
+              runtime_reward_state = candidate_state;
               canonical_state_->state_commitment =
                   consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
             }
+            auto& mem_reward_state = epoch_reward_states_[*settlement_epoch];
+            mem_reward_state.epoch_start_height = *settlement_epoch;
+            if (!same_epoch_reward_state(mem_reward_state, candidate_state)) {
+              mem_reward_state = candidate_state;
+              (void)db_.put_epoch_reward_settlement(candidate_state);
+            }
+            log_line("frontier-settlement-fallback-accepted height=" + std::to_string(transition.height) +
+                     " epoch=" + std::to_string(*settlement_epoch) + " source=" + source);
             return true;
           };
 
+          const auto ticket_onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
+
           if (auto persisted_state = db_.get_epoch_reward_settlement(*settlement_epoch); persisted_state.has_value()) {
-            accepted_with_settlement_fallback = try_onboarding_state(persisted_state->onboarding_score_units);
+            accepted_with_settlement_fallback = try_reward_state(*persisted_state, "persisted-state");
+            if (!accepted_with_settlement_fallback &&
+                (!ticket_onboarding_scores.empty() || !persisted_state->onboarding_score_units.empty())) {
+              auto patched = *persisted_state;
+              patched.onboarding_score_units = ticket_onboarding_scores;
+              accepted_with_settlement_fallback = try_reward_state(std::move(patched), "persisted+ticket-onboarding");
+            }
           }
           if (!accepted_with_settlement_fallback) {
-            accepted_with_settlement_fallback = try_onboarding_state({});
+            auto runtime_state = epoch_reward_state_for_epoch_locked(*settlement_epoch);
+            runtime_state.onboarding_score_units = ticket_onboarding_scores;
+            accepted_with_settlement_fallback =
+                try_reward_state(std::move(runtime_state), "runtime+ticket-onboarding");
+          }
+          if (!accepted_with_settlement_fallback) {
+            auto empty_onboarding_state = epoch_reward_state_for_epoch_locked(*settlement_epoch);
+            empty_onboarding_state.onboarding_score_units.clear();
+            accepted_with_settlement_fallback =
+                try_reward_state(std::move(empty_onboarding_state), "runtime-empty-onboarding");
           }
         }
       }
@@ -6248,21 +6272,28 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     bool accepted_with_settlement_fallback = false;
     if (validation_error == "frontier-settlement-commitment-mismatch") {
       if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height); settlement_epoch.has_value()) {
-        auto state_it = epoch_reward_states_.find(*settlement_epoch);
-        if (state_it != epoch_reward_states_.end() && !state_it->second.onboarding_score_units.empty()) {
-          state_it->second.onboarding_score_units.clear();
-          (void)db_.put_epoch_reward_settlement(state_it->second);
+        auto apply_and_retry = [&](storage::EpochRewardSettlementState candidate_state) {
+          candidate_state.epoch_start_height = *settlement_epoch;
+          auto& runtime_state = epoch_reward_states_[*settlement_epoch];
+          runtime_state = candidate_state;
+          (void)db_.put_epoch_reward_settlement(runtime_state);
           if (canonical_state_.has_value()) {
             auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
-            canonical_reward_state.epoch_start_height = *settlement_epoch;
-            canonical_reward_state.onboarding_score_units.clear();
+            canonical_reward_state = candidate_state;
             canonical_state_->state_commitment =
                 consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
           }
           validation_error.clear();
-          if (validate_frontier_proposal_locked(proposal, &validation_error)) {
-            accepted_with_settlement_fallback = true;
-          }
+          accepted_with_settlement_fallback = validate_frontier_proposal_locked(proposal, &validation_error);
+        };
+
+        auto candidate_state = epoch_reward_state_for_epoch_locked(*settlement_epoch);
+        const auto ticket_onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
+        candidate_state.onboarding_score_units = ticket_onboarding_scores;
+        apply_and_retry(candidate_state);
+        if (!accepted_with_settlement_fallback) {
+          candidate_state.onboarding_score_units.clear();
+          apply_and_retry(candidate_state);
         }
       }
     }

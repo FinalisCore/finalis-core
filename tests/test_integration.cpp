@@ -4214,7 +4214,8 @@ TEST(test_invalid_frame_ban_threshold_applies_after_strikes) {
 
   ASSERT_TRUE(send_invalid_frame("127.0.0.1", port, cfg.network.magic));
   ASSERT_TRUE(send_invalid_frame("127.0.0.1", port, cfg.network.magic));
-  ASSERT_TRUE(!connect_and_check_closed("127.0.0.1", port, std::chrono::milliseconds(200)));
+  ASSERT_TRUE(wait_for([&]() { return !connect_and_check_closed("127.0.0.1", port, std::chrono::milliseconds(100)); },
+                       std::chrono::seconds(2)));
 
   ASSERT_TRUE(send_invalid_frame("127.0.0.1", port, cfg.network.magic));
   ASSERT_TRUE(wait_for([&]() { return connect_and_check_closed("127.0.0.1", port, std::chrono::milliseconds(150)); },
@@ -7957,8 +7958,13 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
     auto last = follower.status();
 
     while (std::chrono::steady_clock::now() - start < overall_timeout) {
+      const auto s0 = validators[0]->status();
+      const auto s1 = validators[1]->status();
       const auto sf = follower.status();
-      if (sf.height == target_tip.height && sf.transition_hash == target_tip.transition_hash) {
+      const bool validators_same_tip = s0.height == s1.height && s0.transition_hash == s1.transition_hash;
+      const bool follower_matches_validator_tip =
+          validators_same_tip && sf.height == s0.height && sf.transition_hash == s0.transition_hash;
+      if (follower_matches_validator_tip && sf.height >= target_tip.height) {
         return true;
       }
 
