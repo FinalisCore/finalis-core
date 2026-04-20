@@ -40,13 +40,6 @@ New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $DataDir "keystore") | Out-Null
 
-if ($ResetPeerDiscovery.IsPresent) {
-    $addrmanPath = Join-Path $DataDir "addrman.dat"
-    $peersPath = Join-Path $DataDir "peers.dat"
-    Remove-Item -Path $addrmanPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $peersPath -Force -ErrorAction SilentlyContinue
-}
-
 if (-not (Test-Path $nodeExe)) {
     throw "finalis-node.exe not found at $nodeExe"
 }
@@ -123,6 +116,65 @@ function Stop-FinalisProcessIfRunning {
     }
 }
 
+function Quote-CommandArgument {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+
+    $text = [string]$Value
+    if ($text.Length -eq 0) {
+        return '""'
+    }
+
+    # Escape embedded double-quotes for Windows command-line parsing.
+    $escaped = $text.Replace('"', '\"')
+    return '"' + $escaped + '"'
+}
+
+function Build-ArgumentString {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Args
+    )
+
+    return (($Args | ForEach-Object { Quote-CommandArgument -Value $_ }) -join ' ')
+}
+
+function Should-ResetPeerDiscoveryAutomatically {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDataDir
+    )
+
+    $addrmanPath = Join-Path $TargetDataDir "addrman.dat"
+    $peersPath = Join-Path $TargetDataDir "peers.dat"
+
+    if ((-not (Test-Path $addrmanPath)) -and (-not (Test-Path $peersPath))) {
+        return $false
+    }
+
+    # If either cache file exists but is effectively empty, force a reset.
+    foreach ($p in @($addrmanPath, $peersPath)) {
+        if (Test-Path $p) {
+            try {
+                $item = Get-Item $p -ErrorAction Stop
+                if ($item.Length -le 0) {
+                    return $true
+                }
+            } catch {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
 function Wait-ForTcpPort {
     param(
         [string]$Host,
@@ -156,6 +208,18 @@ if ($NoStart.IsPresent) {
     Write-Host "Finalis firewall configuration complete."
     Write-Host "Data dir: $DataDir"
     exit 0
+}
+
+if ((-not $ResetPeerDiscovery.IsPresent) -and (Should-ResetPeerDiscoveryAutomatically -TargetDataDir $DataDir)) {
+    Write-Warning "Detected stale/empty peer cache in $DataDir. Resetting addrman.dat and peers.dat automatically."
+    $ResetPeerDiscovery = $true
+}
+
+if ($ResetPeerDiscovery.IsPresent) {
+    $addrmanPath = Join-Path $DataDir "addrman.dat"
+    $peersPath = Join-Path $DataDir "peers.dat"
+    Remove-Item -Path $addrmanPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $peersPath -Force -ErrorAction SilentlyContinue
 }
 
 $nodeArgs = @(
@@ -204,7 +268,8 @@ Stop-FinalisProcessIfRunning -ProcessName "finalis-node" -ExpectedPath $nodeExe
 
 $nodeLog = Join-Path $logDir "node.log"
 $nodeErr = Join-Path $logDir "node.err.log"
-$nodeProc = Start-Process -FilePath $nodeExe -ArgumentList $nodeArgs -WorkingDirectory $appRoot -RedirectStandardOutput $nodeLog -RedirectStandardError $nodeErr -PassThru
+$nodeArgString = Build-ArgumentString -Args $nodeArgs
+$nodeProc = Start-Process -FilePath $nodeExe -ArgumentList $nodeArgString -WorkingDirectory $appRoot -RedirectStandardOutput $nodeLog -RedirectStandardError $nodeErr -PassThru
 
 $lightserverArgs = @(
     "--db", $DataDir,
@@ -215,7 +280,8 @@ $lightserverArgs = @(
 )
 $lightserverLog = Join-Path $logDir "lightserver.log"
 $lightserverErr = Join-Path $logDir "lightserver.err.log"
-$lightserverProc = Start-Process -FilePath $lightserverExe -ArgumentList $lightserverArgs -WorkingDirectory $appRoot -RedirectStandardOutput $lightserverLog -RedirectStandardError $lightserverErr -PassThru
+$lightserverArgString = Build-ArgumentString -Args $lightserverArgs
+$lightserverProc = Start-Process -FilePath $lightserverExe -ArgumentList $lightserverArgString -WorkingDirectory $appRoot -RedirectStandardOutput $lightserverLog -RedirectStandardError $lightserverErr -PassThru
 
 Start-Sleep -Milliseconds 750
 if ($nodeProc.HasExited) {
@@ -240,7 +306,8 @@ if ($WithExplorer -and (Test-Path $explorerExe)) {
     )
     $explorerLog = Join-Path $logDir "explorer.log"
     $explorerErr = Join-Path $logDir "explorer.err.log"
-    $explorerProc = Start-Process -FilePath $explorerExe -ArgumentList $explorerArgs -WorkingDirectory $appRoot -RedirectStandardOutput $explorerLog -RedirectStandardError $explorerErr -PassThru
+    $explorerArgString = Build-ArgumentString -Args $explorerArgs
+    $explorerProc = Start-Process -FilePath $explorerExe -ArgumentList $explorerArgString -WorkingDirectory $appRoot -RedirectStandardOutput $explorerLog -RedirectStandardError $explorerErr -PassThru
     if (-not (Wait-ForTcpPort -Host "127.0.0.1" -Port $ExplorerPort -TimeoutSeconds 20)) {
         if ($explorerProc.HasExited) {
             throw "finalis-explorer.exe exited before listening on 127.0.0.1:$ExplorerPort. See $explorerErr"
