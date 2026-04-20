@@ -320,7 +320,9 @@ TEST(test_lightserver_basic_live_rpc_surface) {
     }
     return true;
   }, kClusterFinalizationTimeout));
-  const auto blk_hash = nodes[0]->status().transition_hash;
+  const auto pinned_tip = nodes[0]->status();
+  const auto blk_height = pinned_tip.height;
+  const auto blk_hash = pinned_tip.transition_hash;
 
   lightserver::Config lcfg;
   lcfg.db_path = base + "/node0";
@@ -368,7 +370,7 @@ TEST(test_lightserver_basic_live_rpc_surface) {
 
   const std::string blk_by_height_q =
       std::string(R"({"jsonrpc":"2.0","id":71,"method":"get_transition_by_height","params":{"height":)") +
-      std::to_string(nodes[0]->status().height) + "}}";
+      std::to_string(blk_height) + "}}";
   const auto bresp2 = ls->handle_rpc_for_test(blk_by_height_q);
   ASSERT_TRUE(bresp2.find("\"hash\":\"" + hex_encode32(blk_hash) + "\"") != std::string::npos);
   ASSERT_TRUE(bresp2.find("\"transition_hash\":\"" + hex_encode32(blk_hash) + "\"") != std::string::npos);
