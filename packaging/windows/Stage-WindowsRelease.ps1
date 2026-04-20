@@ -176,6 +176,8 @@ Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-sil
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-silver-light.ico") -Destination (Join-Path $installRoot "finalis-app-icon-silver-light.ico")
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installRoot "finalis-logo-horizontal.png")
 Copy-OptionalFile -Source (Join-Path $repoRoot "mainnet\SEEDS.json") -Destination (Join-Path $mainnetDir "SEEDS.json")
+Copy-OptionalFile -Source (Join-Path $repoRoot "mainnet\genesis.bin") -Destination (Join-Path $mainnetDir "genesis.bin")
+Copy-OptionalFile -Source (Join-Path $repoRoot "mainnet\genesis.json") -Destination (Join-Path $mainnetDir "genesis.json")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-splash-lockup.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard.bmp")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard-small.bmp")
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-gold-dark.ico") -Destination (Join-Path $installerAssetsDir "finalis-app.ico")
@@ -192,6 +194,9 @@ To start a network-listening node + lightserver + explorer:
 
 To keep the node local-only:
   powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1 -PublicNode:`$false
+
+If sync appears stuck on an old height, clear peer discovery cache and restart:
+  powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1 -ResetPeerDiscovery
 
 Windows joiner mode uses:
   mainnet\SEEDS.json

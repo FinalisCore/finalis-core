@@ -9,6 +9,7 @@ param(
     [bool]$WithExplorer = $true,
     [bool]$OpenExplorer = $true,
     [bool]$PublicNode = $true,
+    [switch]$ResetPeerDiscovery,
     [switch]$ConfigureFirewall,
     [switch]$NoStart
 )
@@ -31,11 +32,20 @@ $nodeExe = Join-Path $binDir "finalis-node.exe"
 $lightserverExe = Join-Path $binDir "finalis-lightserver.exe"
 $explorerExe = Join-Path $binDir "finalis-explorer.exe"
 $seedsJson = Join-Path $appRoot "mainnet\SEEDS.json"
+$genesisBin = Join-Path $appRoot "mainnet\genesis.bin"
+$genesisJson = Join-Path $appRoot "mainnet\genesis.json"
 $logDir = Join-Path $DataDir "logs"
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $DataDir "keystore") | Out-Null
+
+if ($ResetPeerDiscovery.IsPresent) {
+    $addrmanPath = Join-Path $DataDir "addrman.dat"
+    $peersPath = Join-Path $DataDir "peers.dat"
+    Remove-Item -Path $addrmanPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $peersPath -Force -ErrorAction SilentlyContinue
+}
 
 if (-not (Test-Path $nodeExe)) {
     throw "finalis-node.exe not found at $nodeExe"
@@ -154,6 +164,11 @@ $nodeArgs = @(
     "--lightserver-bind", $LightserverBind,
     "--lightserver-port", $LightserverPort
 )
+if (Test-Path $genesisBin) {
+    $nodeArgs += @("--genesis", $genesisBin, "--allow-unsafe-genesis-override")
+} elseif (Test-Path $genesisJson) {
+    $nodeArgs += @("--genesis", $genesisJson, "--allow-unsafe-genesis-override")
+}
 if ($PublicNode) {
     $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0")
 } else {
@@ -174,7 +189,10 @@ if (Test-Path $seedsJson) {
         }
     }
     if ($seedList.Count -gt 0) {
-        $nodeArgs += @("--peers", ($seedList -join ","))
+        $nodeArgs += @("--no-dns-seeds")
+        foreach ($seed in ($seedList | Sort-Object -Unique)) {
+            $nodeArgs += @("--peers", $seed)
+        }
     }
 }
 
