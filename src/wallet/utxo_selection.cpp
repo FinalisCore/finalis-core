@@ -107,23 +107,25 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
       canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
     }
   }
-  // History may omit frontier settlement credits. Merge canonical UTXOs so
-  // settlement outputs remain spendable even when history is non-empty.
+  // History may be incomplete during index drift/rebuild windows.
+  // Canonical UTXOs remain the finalized source of truth for spendability.
   const auto canonical_utxos = db.load_utxos();
+  std::map<OutPoint, TxOut> canonical_current;
   for (const auto& [op, entry] : canonical_utxos) {
     if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+    canonical_current.emplace(op, entry.out);
     if (canonical_matches.find(op) != canonical_matches.end()) continue;
     canonical_matches.emplace(op, entry.out);
   }
   for (const auto& entry : entries) {
     if (excluded && excluded->find(entry.outpoint) != excluded->end()) continue;
-    const auto canonical_it = canonical_matches.find(entry.outpoint);
-    if (canonical_it == canonical_matches.end()) continue;
+    const auto canonical_it = canonical_current.find(entry.outpoint);
+    if (canonical_it == canonical_current.end()) continue;
     if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
     out.push_back(SpendableUtxo{entry.outpoint, canonical_it->second});
     seen.insert(entry.outpoint);
   }
-  for (const auto& [op, prevout] : canonical_matches) {
+  for (const auto& [op, prevout] : canonical_current) {
     if (excluded && excluded->find(op) != excluded->end()) continue;
     if (seen.find(op) != seen.end()) continue;
     out.push_back(SpendableUtxo{op, prevout});

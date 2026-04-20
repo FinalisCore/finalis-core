@@ -717,6 +717,42 @@ TEST(test_wallet_spendable_utxos_reconcile_script_index_with_canonical_set) {
   ASSERT_EQ(spendable[1].outpoint.index, canonical_only.index);
 }
 
+TEST(test_wallet_spendable_utxos_history_fallback_filters_noncanonical_outputs) {
+  const std::string base = unique_test_base("/tmp/finalis_wallet_spendable_history_fallback");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const auto script_pubkey = address::p2pkh_script_pubkey(pkh);
+  const Hash32 sh = crypto::sha256(script_pubkey);
+
+  Tx receive_tx;
+  receive_tx.inputs.push_back(TxIn{zero_hash(), 0, Bytes{}, 0xFFFFFFFF});
+  receive_tx.outputs.push_back(TxOut{111111111, script_pubkey});
+  const Hash32 receive_txid = receive_tx.txid();
+  ASSERT_TRUE(db.put_tx_index(receive_txid, 10, 0, receive_tx.serialize()));
+  ASSERT_TRUE(db.add_script_history(sh, 10, receive_txid));
+
+  OutPoint stale_indexed{receive_txid, 0};
+  ASSERT_TRUE(db.put_script_utxo(sh, stale_indexed, TxOut{111111111, script_pubkey}, 10));
+
+  OutPoint canonical_live{};
+  canonical_live.txid[31] = 0x91;
+  canonical_live.index = 1;
+  ASSERT_TRUE(db.put_utxo(canonical_live, TxOut{222222222, script_pubkey}));
+  ASSERT_TRUE(db.flush());
+
+  const auto spendable = wallet::spendable_p2pkh_utxos_for_pubkey_hash(db, pkh, nullptr);
+  ASSERT_EQ(spendable.size(), 1u);
+  ASSERT_EQ(spendable[0].outpoint.txid, canonical_live.txid);
+  ASSERT_EQ(spendable[0].outpoint.index, canonical_live.index);
+  ASSERT_EQ(spendable[0].prevout.value, 222222222u);
+}
+
 TEST(test_lightserver_get_transition_by_height_direct) {
   const std::string base = unique_test_base("/tmp/finalis_light_block_by_height");
   std::filesystem::remove_all(base);
