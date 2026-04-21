@@ -43,3 +43,28 @@ This document helps contributors quickly identify where to read and where to add
 - `docs/ARCHITECTURE_ORIENTATION.md`
 - `docs/PHYSICAL_DESIGN_GUIDELINES.md`
 - `CONTRIBUTING.md`
+
+## Documentation Coverage Status
+
+Current `src/` component README coverage is complete for all first-level
+components.
+
+- `src/address/README.md`
+- `src/availability/README.md`
+- `src/codec/README.md`
+- `src/common/README.md`
+- `src/consensus/README.md`
+- `src/crypto/README.md`
+- `src/genesis/README.md`
+- `src/keystore/README.md`
+- `src/lightserver/README.md`
+- `src/mempool/README.md`
+- `src/merkle/README.md`
+- `src/node/README.md`
+- `src/onboarding/README.md`
+- `src/p2p/README.md`
+- `src/policy/README.md`
+- `src/privacy/README.md`
+- `src/storage/README.md`
+- `src/utxo/README.md`
+- `src/wallet/README.md`

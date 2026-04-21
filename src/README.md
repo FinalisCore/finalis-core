@@ -4,25 +4,25 @@ This README explains the purpose of major source components under `src/`.
 
 ## Component Overview
 
-- `address/`: Address formatting and related primitives.
-- `availability/`: Availability and checkpoint-related runtime support.
-- `codec/`: Encoding and decoding infrastructure.
-- `common/`: Shared foundational types, constants, and helpers.
-- `consensus/`: Core consensus, committee, and finality logic.
-- `crypto/`: Cryptographic operations and wrappers.
-- `genesis/`: Genesis state and initialization data handling.
-- `keystore/`: Key management support.
-- `lightserver/`: Finalized-state RPC support components.
-- `mempool/`: Transaction admission and pending transaction management.
-- `merkle/`: Merkle structures and proofs.
-- `node/`: Node runtime orchestration and execution flow.
-- `onboarding/`: Validator/operator onboarding support.
-- `p2p/`: Peer networking and protocol transport.
-- `policy/`: Policy-level validation and gatekeeping logic.
-- `privacy/`: Confidential/privacy-oriented transaction support.
-- `storage/`: Persistent storage and state indexing.
-- `utxo/`: UTXO model and state transitions.
-- `wallet/`: Wallet-facing core logic.
+- [`address/`](address/README.md): Address formatting and related primitives.
+- [`availability/`](availability/README.md): Availability and checkpoint-related runtime support.
+- [`codec/`](codec/README.md): Encoding and decoding infrastructure.
+- [`common/`](common/README.md): Shared foundational types, constants, and helpers.
+- [`consensus/`](consensus/README.md): Core consensus, committee, and finality logic.
+- [`crypto/`](crypto/README.md): Cryptographic operations and wrappers.
+- [`genesis/`](genesis/README.md): Genesis state and initialization data handling.
+- [`keystore/`](keystore/README.md): Key management support.
+- [`lightserver/`](lightserver/README.md): Finalized-state RPC support components.
+- [`mempool/`](mempool/README.md): Transaction admission and pending transaction handling.
+- [`merkle/`](merkle/README.md): Merkle structures and proofs.
+- [`node/`](node/README.md): Node runtime orchestration and execution flow.
+- [`onboarding/`](onboarding/README.md): Validator/operator onboarding support.
+- [`p2p/`](p2p/README.md): Peer networking and protocol transport.
+- [`policy/`](policy/README.md): Policy-level validation and gatekeeping logic.
+- [`privacy/`](privacy/README.md): Confidential/privacy-oriented transaction support.
+- [`storage/`](storage/README.md): Persistent storage and state indexing.
+- [`utxo/`](utxo/README.md): UTXO model and state transitions.
+- [`wallet/`](wallet/README.md): Wallet-facing core logic.
 
 ## Placement Guidance
 
