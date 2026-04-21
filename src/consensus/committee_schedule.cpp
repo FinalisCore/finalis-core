@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/committee_schedule.hpp"
 
 #include <algorithm>

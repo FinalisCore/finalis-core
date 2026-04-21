@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "wallet/confidential_builder.hpp"
 
 #include <variant>

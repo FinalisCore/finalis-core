@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "privacy/mint_client.hpp"
 
 #include <regex>

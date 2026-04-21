@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "common/paths.hpp"
 
 #include <cstdlib>

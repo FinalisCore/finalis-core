@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "p2p/messages.hpp"
 
 #include "codec/bytes.hpp"

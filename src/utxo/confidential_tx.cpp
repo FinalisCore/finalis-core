@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "utxo/confidential_tx.hpp"
 
 #include "codec/bytes.hpp"

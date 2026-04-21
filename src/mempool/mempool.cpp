@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "mempool/mempool.hpp"
 
 #include <algorithm>

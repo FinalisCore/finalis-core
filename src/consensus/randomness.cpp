@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/randomness.hpp"
 
 #include "codec/bytes.hpp"

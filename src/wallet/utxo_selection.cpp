@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "wallet/utxo_selection.hpp"
 
 #include <algorithm>

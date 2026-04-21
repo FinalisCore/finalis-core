@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "crypto/stealth_address.hpp"
 
 #include <algorithm>

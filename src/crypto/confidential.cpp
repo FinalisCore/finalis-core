@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "crypto/confidential.hpp"
 
 #include <algorithm>

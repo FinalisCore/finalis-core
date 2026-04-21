@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "common/merkle.hpp"
 
 #include "crypto/hash.hpp"

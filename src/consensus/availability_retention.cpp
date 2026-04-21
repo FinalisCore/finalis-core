@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/availability_retention.hpp"
 
 #include <algorithm>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/canonical_derivation.hpp"
 
 #include <algorithm>
