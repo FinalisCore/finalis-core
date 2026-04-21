@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "wallet_window.hpp"
 
 #include "widgets/activity_page.hpp"

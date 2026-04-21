@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "receive_page.hpp"
 
 #include <QAbstractItemView>

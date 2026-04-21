@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+
 """
 Attack/economics model for the current operator-grouped finalized-committee path.
 

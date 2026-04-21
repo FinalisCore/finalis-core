@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "send_page.hpp"
 
 #include <QFormLayout>

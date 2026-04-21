@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+
 # Run targeted validator tests for unbond, withdraw, and join-window fixes
 
 # Navigate to the finalis-core repository root

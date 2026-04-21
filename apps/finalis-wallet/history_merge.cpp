@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "history_merge.hpp"
 
 #include <cctype>
