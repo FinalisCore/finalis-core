@@ -1,0 +1,48 @@
+name: spdx-header-check
+
+on:
+  push:
+    branches-ignore:
+      - "windows-installer-test"
+  pull_request:
+    branches-ignore:
+      - "windows-installer-test"
+
+jobs:
+  spdx-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed files
+        id: changed
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+
+          # Handle first push on a branch where before can be all zeros.
+          if [[ "$base" == "0000000000000000000000000000000000000000" ]]; then
+            base="$(git rev-list --max-parents=0 "$head" | tail -n 1)"
+          fi
+
+          git diff --name-only "$base" "$head" > changed_files.txt
+          count="$(wc -l < changed_files.txt | tr -d ' ')"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Run SPDX header check
+        if: steps.changed.outputs.count != '0'
+        run: |
+          chmod +x scripts/check_spdx_headers.sh
+          xargs -r scripts/check_spdx_headers.sh < changed_files.txt
+
+      - name: No changed files
+        if: steps.changed.outputs.count == '0'
+        run: echo "No changed files to check."

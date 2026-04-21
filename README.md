@@ -211,6 +211,11 @@ ctest --test-dir build --output-on-failure
 ## Documentation
 
 - General documentation: [docs/](docs/)
+- Codebase map: [docs/CODEBASE_MAP.md](docs/CODEBASE_MAP.md)
+- Architecture orientation: [docs/ARCHITECTURE_ORIENTATION.md](docs/ARCHITECTURE_ORIENTATION.md)
+- Physical design guidance: [docs/PHYSICAL_DESIGN_GUIDELINES.md](docs/PHYSICAL_DESIGN_GUIDELINES.md)
+- License policy: [docs/LICENSE_POLICY.md](docs/LICENSE_POLICY.md)
+- Contributing guide: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Exchange integration: [docs/EXCHANGE_INTEGRATION.md](docs/EXCHANGE_INTEGRATION.md)
 - Live protocol: [docs/LIVE_PROTOCOL.md](docs/LIVE_PROTOCOL.md)
 - Consensus overview: [docs/CONSENSUS.md](docs/CONSENSUS.md)
