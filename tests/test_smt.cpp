@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "test_framework.hpp"
 
 #ifndef _WIN32
