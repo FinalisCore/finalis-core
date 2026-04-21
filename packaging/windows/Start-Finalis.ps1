@@ -93,6 +93,51 @@ function Set-FinalisFirewallRules {
     }
 }
 
+function Test-IsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-FinalisFirewallElevation {
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or (-not (Test-Path $PSCommandPath))) {
+        Write-Warning "Unable to locate script path for elevated firewall setup."
+        return $false
+    }
+
+    $elevatedArgs = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $PSCommandPath,
+        "-ConfigureFirewall",
+        "-NoStart",
+        "-P2PPort", $P2PPort,
+        "-LightserverPort", $LightserverPort,
+        "-ExplorerPort", $ExplorerPort,
+        "-WithExplorer:$WithExplorer"
+    )
+
+    try {
+        $proc = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $elevatedArgs -Wait -PassThru
+        if ($proc.ExitCode -eq 0) {
+            return $true
+        }
+        Write-Warning "Elevated firewall setup exited with code $($proc.ExitCode)."
+        return $false
+    } catch {
+        if ($_.Exception.Message -match "cancel") {
+            Write-Warning "Firewall elevation was canceled by the user."
+        } else {
+            Write-Warning "Unable to request elevated firewall setup: $($_.Exception.Message)"
+        }
+        return $false
+    }
+}
+
 function Stop-FinalisProcessIfRunning {
     param(
         [string]$ProcessName,
@@ -253,7 +298,15 @@ if (Test-Path $seedsJson) {
     }
 }
 
-[void](Set-FinalisFirewallRules -Required $false)
+$firewallConfigured = Set-FinalisFirewallRules -Required $false
+if ((-not $firewallConfigured) -and (-not (Test-IsAdministrator))) {
+    Write-Host "Firewall rules require administrator approval. Prompting for elevation..."
+    if (Invoke-FinalisFirewallElevation) {
+        [void](Set-FinalisFirewallRules -Required $false)
+    } else {
+        Write-Warning "Continuing without automatic firewall rule configuration."
+    }
+}
 
 Stop-FinalisProcessIfRunning -ProcessName "finalis-explorer" -ExpectedPath $explorerExe
 Stop-FinalisProcessIfRunning -ProcessName "finalis-lightserver" -ExpectedPath $lightserverExe
