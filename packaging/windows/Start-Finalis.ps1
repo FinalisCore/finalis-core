@@ -45,7 +45,7 @@ if (-not (Test-Path $lightserverExe)) {
     throw "finalis-lightserver.exe not found at $lightserverExe"
 }
 
-function Ensure-FirewallRule {
+function Set-FinalisFirewallRule {
     param(
         [string]$DisplayName,
         [int]$Port,
@@ -72,16 +72,16 @@ function Ensure-FirewallRule {
     New-NetFirewallRule @params | Out-Null
 }
 
-function Ensure-FinalisFirewallRules {
+function Set-FinalisFirewallRules {
     param(
         [bool]$Required = $false
     )
 
     try {
-        Ensure-FirewallRule -DisplayName "Finalis P2P ($P2PPort)" -Port $P2PPort -ProgramPath $nodeExe
-        Ensure-FirewallRule -DisplayName "Finalis Lightserver RPC ($LightserverPort)" -Port $LightserverPort -ProgramPath $lightserverExe
+        Set-FinalisFirewallRule -DisplayName "Finalis P2P ($P2PPort)" -Port $P2PPort -ProgramPath $nodeExe
+        Set-FinalisFirewallRule -DisplayName "Finalis Lightserver RPC ($LightserverPort)" -Port $LightserverPort -ProgramPath $lightserverExe
         if ($WithExplorer -and (Test-Path $explorerExe)) {
-            Ensure-FirewallRule -DisplayName "Finalis Explorer ($ExplorerPort)" -Port $ExplorerPort -ProgramPath $explorerExe
+            Set-FinalisFirewallRule -DisplayName "Finalis Explorer ($ExplorerPort)" -Port $ExplorerPort -ProgramPath $explorerExe
         }
         return $true
     } catch {
@@ -114,7 +114,7 @@ function Stop-FinalisProcessIfRunning {
     }
 }
 
-function Quote-CommandArgument {
+function ConvertTo-QuotedCommandArgument {
     param(
         [AllowNull()]
         [object]$Value
@@ -140,10 +140,10 @@ function Build-ArgumentString {
         [object[]]$Args
     )
 
-    return (($Args | ForEach-Object { Quote-CommandArgument -Value $_ }) -join ' ')
+    return (($Args | ForEach-Object { ConvertTo-QuotedCommandArgument -Value $_ }) -join ' ')
 }
 
-function Should-ResetPeerDiscoveryAutomatically {
+function Test-ResetPeerDiscoveryAutomatically {
     param(
         [Parameter(Mandatory = $true)]
         [string]$TargetDataDir
@@ -175,7 +175,7 @@ function Should-ResetPeerDiscoveryAutomatically {
 
 function Wait-ForTcpPort {
     param(
-        [string]$Host,
+        [string]$TargetAddress,
         [int]$Port,
         [int]$TimeoutSeconds = 15
     )
@@ -184,7 +184,7 @@ function Wait-ForTcpPort {
     while ((Get-Date) -lt $deadline) {
         try {
             $client = New-Object System.Net.Sockets.TcpClient
-            $async = $client.BeginConnect($Host, $Port, $null, $null)
+            $async = $client.BeginConnect($TargetAddress, $Port, $null, $null)
             if ($async.AsyncWaitHandle.WaitOne(500)) {
                 $client.EndConnect($async)
                 $client.Close()
@@ -199,7 +199,7 @@ function Wait-ForTcpPort {
 }
 
 if ($ConfigureFirewall.IsPresent) {
-    [void](Ensure-FinalisFirewallRules -Required $true)
+    [void](Set-FinalisFirewallRules -Required $true)
 }
 
 if ($NoStart.IsPresent) {
@@ -208,7 +208,7 @@ if ($NoStart.IsPresent) {
     exit 0
 }
 
-if ((-not $ResetPeerDiscovery.IsPresent) -and (Should-ResetPeerDiscoveryAutomatically -TargetDataDir $DataDir)) {
+if ((-not $ResetPeerDiscovery.IsPresent) -and (Test-ResetPeerDiscoveryAutomatically -TargetDataDir $DataDir)) {
     Write-Warning "Detected stale/empty peer cache in $DataDir. Resetting addrman.dat and peers.dat automatically."
     $ResetPeerDiscovery = $true
 }
@@ -253,7 +253,7 @@ if (Test-Path $seedsJson) {
     }
 }
 
-[void](Ensure-FinalisFirewallRules -Required $false)
+[void](Set-FinalisFirewallRules -Required $false)
 
 Stop-FinalisProcessIfRunning -ProcessName "finalis-explorer" -ExpectedPath $explorerExe
 Stop-FinalisProcessIfRunning -ProcessName "finalis-lightserver" -ExpectedPath $lightserverExe
@@ -281,7 +281,7 @@ if ($nodeProc.HasExited) {
     throw "finalis-node.exe exited before lightserver startup completed. See $nodeErr"
 }
 
-if (-not (Wait-ForTcpPort -Host "127.0.0.1" -Port $LightserverPort -TimeoutSeconds 15)) {
+if (-not (Wait-ForTcpPort -TargetAddress "127.0.0.1" -Port $LightserverPort -TimeoutSeconds 15)) {
     if ($lightserverProc.HasExited) {
         throw "finalis-lightserver.exe exited before listening on 127.0.0.1:$LightserverPort. See $lightserverErr"
     }
@@ -301,7 +301,7 @@ if ($WithExplorer -and (Test-Path $explorerExe)) {
     $explorerErr = Join-Path $logDir "explorer.err.log"
     $explorerArgString = Build-ArgumentString -Args $explorerArgs
     $explorerProc = Start-Process -FilePath $explorerExe -ArgumentList $explorerArgString -WorkingDirectory $appRoot -RedirectStandardOutput $explorerLog -RedirectStandardError $explorerErr -PassThru
-    if (-not (Wait-ForTcpPort -Host "127.0.0.1" -Port $ExplorerPort -TimeoutSeconds 20)) {
+    if (-not (Wait-ForTcpPort -TargetAddress "127.0.0.1" -Port $ExplorerPort -TimeoutSeconds 20)) {
         if ($explorerProc.HasExited) {
             throw "finalis-explorer.exe exited before listening on 127.0.0.1:$ExplorerPort. See $explorerErr"
         }
