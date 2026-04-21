@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "p2p/framing.hpp"
 
 #include <chrono>

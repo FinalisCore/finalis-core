@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "genesis/embedded_mainnet.hpp"
 
 namespace finalis::genesis {

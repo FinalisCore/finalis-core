@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "common/keystore.hpp"
 
 #include <filesystem>

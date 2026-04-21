@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/votes.hpp"
 
 namespace finalis::consensus {

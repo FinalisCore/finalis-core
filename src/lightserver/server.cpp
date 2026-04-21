@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "lightserver/server.hpp"
 
 #include <algorithm>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "common/chain_id.hpp"
 
 #include <algorithm>

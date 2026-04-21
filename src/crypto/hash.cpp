@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "crypto/hash.hpp"
 
 #include <openssl/ripemd.h>

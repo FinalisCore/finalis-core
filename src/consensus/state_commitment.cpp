@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/state_commitment.hpp"
 
 #include <algorithm>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "onboarding/validator_onboarding.hpp"
 
 #include <ctime>

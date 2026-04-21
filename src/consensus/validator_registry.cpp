@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/validator_registry.hpp"
 
 #include <algorithm>

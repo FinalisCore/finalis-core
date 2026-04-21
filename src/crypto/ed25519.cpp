@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "crypto/ed25519.hpp"
 
 #include <openssl/evp.h>

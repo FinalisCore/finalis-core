@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "codec/varint.hpp"
 
 namespace finalis::codec {

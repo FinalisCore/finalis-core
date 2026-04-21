@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/epoch_committee.hpp"
 
 #include <algorithm>

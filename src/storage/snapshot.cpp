@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "storage/snapshot.hpp"
 
 #include <filesystem>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "utxo/validate.hpp"
 
 #include <algorithm>

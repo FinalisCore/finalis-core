@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "consensus/frontier_execution.hpp"
 
 #include <set>
