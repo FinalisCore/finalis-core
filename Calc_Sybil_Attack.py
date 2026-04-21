@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """
 Historical sybil/economics exploration script.
 

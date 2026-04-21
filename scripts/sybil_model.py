@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """
 Deterministic Monte Carlo model for finalized-committee sybil pressure.
 

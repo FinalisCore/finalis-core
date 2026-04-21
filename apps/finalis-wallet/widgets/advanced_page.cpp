@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "advanced_page.hpp"
 
 #include <QAbstractItemView>

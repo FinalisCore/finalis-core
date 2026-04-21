@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "wallet_store.hpp"
 
 #include <cstdio>

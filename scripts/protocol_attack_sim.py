@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+
 """
 Live-protocol-faithful adversarial simulator for the finalized checkpoint path.
 

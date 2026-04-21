@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "refresh_gate.hpp"
 
 namespace finalis::wallet {

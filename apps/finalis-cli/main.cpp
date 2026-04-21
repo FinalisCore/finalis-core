@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 

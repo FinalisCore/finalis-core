@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "settings_page.hpp"
 
 #include <QComboBox>

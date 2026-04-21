@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+
 # Bootstrap Finalis Node on Linux
 # This script installs finalis-node as a systemd service and configures it to use SEEDS.json
 
