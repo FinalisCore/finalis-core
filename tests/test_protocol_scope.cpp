@@ -1,6 +1,6 @@
 #include "test_framework.hpp"
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "privacy/mint_scripts.hpp"

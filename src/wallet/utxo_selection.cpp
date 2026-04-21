@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "crypto/hash.hpp"
 
 namespace finalis::wallet {

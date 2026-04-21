@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "availability/retention.hpp"
+#include "consensus/availability_retention.hpp"
 #include "common/network.hpp"
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/committee_schedule.hpp"

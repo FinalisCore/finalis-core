@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <set>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "apps/finalis-wallet/history_merge.hpp"
 #include "apps/finalis-wallet/refresh_gate.hpp"
 #include "consensus/monetary.hpp"

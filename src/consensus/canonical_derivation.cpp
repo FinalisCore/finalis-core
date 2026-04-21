@@ -6,7 +6,7 @@
 #include <set>
 #include <sstream>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "common/wide_arith.hpp"
 #include "consensus/committee_schedule.hpp"
@@ -20,7 +20,7 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/smt.hpp"
-#include "merkle/merkle.hpp"
+#include "common/merkle.hpp"
 #include "utxo/validate.hpp"
 
 namespace finalis::consensus {

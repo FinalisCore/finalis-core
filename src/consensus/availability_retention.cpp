@@ -1,4 +1,4 @@
-#include "availability/retention.hpp"
+#include "consensus/availability_retention.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -10,7 +10,7 @@
 #include "codec/bytes.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
-#include "merkle/merkle.hpp"
+#include "common/merkle.hpp"
 
 namespace finalis::availability {
 namespace {

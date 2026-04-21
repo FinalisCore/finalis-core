@@ -2,7 +2,7 @@
 
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
-#include "merkle/merkle.hpp"
+#include "common/merkle.hpp"
 
 using namespace finalis;
 

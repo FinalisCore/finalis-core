@@ -60,7 +60,7 @@
 
 #include <openssl/evp.h>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "history_merge.hpp"
 #include "refresh_gate.hpp"
@@ -71,7 +71,7 @@
 #include "crypto/hash.hpp"
 #include "crypto/stealth_address.hpp"
 #include "genesis/embedded_mainnet.hpp"
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
 #include "privacy/mint_client.hpp"

@@ -6,12 +6,12 @@
 #include <memory>
 #include <mutex>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/randomness.hpp"
 #include "crypto/hash.hpp"
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "lightserver/client.hpp"
 #include "utxo/signing.hpp"
 

@@ -9,7 +9,7 @@
 
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
-#include "availability/retention.hpp"
+#include "consensus/availability_retention.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/validator_registry.hpp"
 #include "storage/db.hpp"

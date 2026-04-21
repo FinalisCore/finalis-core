@@ -18,7 +18,7 @@
 #include <mutex>
 #include <vector>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "common/minijson.hpp"
 #include "common/paths.hpp"

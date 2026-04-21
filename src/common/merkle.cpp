@@ -1,4 +1,4 @@
-#include "merkle/merkle.hpp"
+#include "common/merkle.hpp"
 
 #include "crypto/hash.hpp"
 

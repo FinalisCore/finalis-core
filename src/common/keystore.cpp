@@ -1,4 +1,4 @@
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -7,7 +7,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "common/paths.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"

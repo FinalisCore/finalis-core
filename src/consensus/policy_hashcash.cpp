@@ -1,4 +1,4 @@
-#include "policy/hashcash.hpp"
+#include "consensus/policy_hashcash.hpp"
 
 #include <algorithm>
 #include <limits>

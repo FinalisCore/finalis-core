@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "node/node.hpp"
 
 using namespace finalis;

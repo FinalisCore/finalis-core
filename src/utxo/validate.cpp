@@ -10,7 +10,7 @@
 #include "consensus/randomness.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "privacy/mint_scripts.hpp"
 
 namespace finalis {

@@ -15,14 +15,14 @@
 #include <set>
 #include <thread>
 
-#include "address/address.hpp"
-#include "availability/retention.hpp"
+#include "common/address.hpp"
+#include "consensus/availability_retention.hpp"
 #include "consensus/ingress.hpp"
 #include "consensus/validator_registry.hpp"
 #include "common/socket_compat.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/genesis.hpp"
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "lightserver/server.hpp"
 #include "mempool/mempool.hpp"
 #include "node/node.hpp"

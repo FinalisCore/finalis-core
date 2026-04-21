@@ -7,7 +7,7 @@
 #include <set>
 #include <stdexcept>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/frontier_execution.hpp"

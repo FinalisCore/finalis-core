@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/ingress.hpp"
 #include "crypto/ed25519.hpp"
