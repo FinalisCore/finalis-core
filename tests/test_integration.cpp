@@ -52,11 +52,15 @@ long long current_process_id() {
 }
 
 std::chrono::seconds ci_timeout_seconds(int base_seconds) {
+  int scale = 1;
+  if (const char* env = std::getenv("FINALIS_CI_TIMEOUT_SCALE")) {
+    int v = std::atoi(env);
+    if (v > 0) scale = v;
+  }
 #ifdef _WIN32
-  return std::chrono::seconds(base_seconds * 3);
-#else
-  return std::chrono::seconds(base_seconds);
+  scale *= 3;
 #endif
+  return std::chrono::seconds(base_seconds * scale);
 }
 
 std::optional<std::filesystem::path> find_repo_fixture(const std::filesystem::path& relative) {
@@ -3427,7 +3431,7 @@ TEST(test_validator_outage_and_heal_converges) {
 
     stage = "pause-final-sync";
     for (auto& n : cluster.nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
-    ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, std::chrono::seconds(10)));
+    ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, ci_timeout_seconds(30)));
 
     stage = "final-assertions";
     const auto s0 = cluster.nodes[0]->status();

@@ -32,8 +32,6 @@ $nodeExe = Join-Path $binDir "finalis-node.exe"
 $lightserverExe = Join-Path $binDir "finalis-lightserver.exe"
 $explorerExe = Join-Path $binDir "finalis-explorer.exe"
 $seedsJson = Join-Path $appRoot "mainnet\SEEDS.json"
-$genesisBin = Join-Path $appRoot "mainnet\genesis.bin"
-$genesisJson = Join-Path $appRoot "mainnet\genesis.json"
 $logDir = Join-Path $DataDir "logs"
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -228,11 +226,6 @@ $nodeArgs = @(
     "--lightserver-bind", $LightserverBind,
     "--lightserver-port", $LightserverPort
 )
-if (Test-Path $genesisBin) {
-    $nodeArgs += @("--genesis", $genesisBin, "--allow-unsafe-genesis-override")
-} elseif (Test-Path $genesisJson) {
-    $nodeArgs += @("--genesis", $genesisJson, "--allow-unsafe-genesis-override")
-}
 if ($PublicNode) {
     $nodeArgs += @("--public", "--listen", "--bind", "0.0.0.0")
 } else {

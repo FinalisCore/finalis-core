@@ -1,4 +1,4 @@
-# Windows Installer Build Guide (v1.0.1)
+# Windows Installer Build Guide (v1.0.2)
 
 This guide walks you through rebuilding the Finalis Core Windows installer from current main branch on Windows 10/11.
 
@@ -41,8 +41,6 @@ git checkout main
 git pull origin main
 git rev-parse --short HEAD      # Verify you're at latest commit
 ```
-
-Expected: Should show `0c76372` or later
 
 ## Step 2: Clean Previous Build
 
@@ -106,7 +104,7 @@ $iscc = "C:\Program Files (x86)\Inno Setup 6\iscc.exe"
 cd C:\path\to\finalis-core\packaging\windows
 
 & $iscc finalis-core.iss `
-  /DMyAppVersion="1.0.1" `
+  /DMyAppVersion="1.0.2" `
   /DSourceDir="C:\path\to\dist\windows\payload" `
   /DOutputDir="C:\path\to\dist\installer"
 ```
@@ -151,12 +149,12 @@ Once tested:
 1. **Rename for release:**
    ```powershell
    Copy-Item C:\path\to\dist\installer\finalis-core_installer.exe `
-     -Destination C:\path\to\dist\installer\finalis-core-v1.0.1-windows-installer.exe
+     -Destination C:\path\to\dist\installer\finalis-core-v1.0.2-windows-installer.exe
    ```
 
 2. **Generate checksum:**
    ```powershell
-   $file = "C:\path\to\dist\installer\finalis-core-v1.0.1-windows-installer.exe"
+   $file = "C:\path\to\dist\installer\finalis-core-v1.0.2-windows-installer.exe"
    (Get-FileHash $file -Algorithm SHA256).Hash + " " + (Split-Path $file -Leaf) | Out-File checksum.txt
    ```
 
@@ -187,7 +185,7 @@ cmake --build build\windows-release -j $env:NUMBER_OF_PROCESSORS
 
 $iscc = "C:\Program Files (x86)\Inno Setup 6\iscc.exe"
 cd .\packaging\windows
-& $iscc finalis-core.iss /DMyAppVersion="1.0.1" /DSourceDir="C:\dist\windows\payload" /DOutputDir="C:\dist\installer"
+& $iscc finalis-core.iss /DMyAppVersion="1.0.2" /DSourceDir="C:\dist\windows\payload" /DOutputDir="C:\dist\installer"
 
 # Test
 C:\dist\installer\finalis-core_installer.exe
