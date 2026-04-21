@@ -68,3 +68,11 @@ components.
 - `src/storage/README.md`
 - `src/utxo/README.md`
 - `src/wallet/README.md`
+
+## Structure Consolidation Roadmap
+
+A proposed set of low-risk folder consolidations is documented in
+[STRUCTURE_CONSOLIDATION_PROPOSAL.md](STRUCTURE_CONSOLIDATION_PROPOSAL.md).
+This roadmap aims to reduce shallow folder fragmentation and improve codebase navigability.
+Expected outcome: from 19 src/ components to 14, while maintaining build stability and
+test coverage.

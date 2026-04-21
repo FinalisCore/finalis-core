@@ -42,3 +42,10 @@ We follow Lakos-inspired physical design principles:
 - Physical layout should help new contributors answer: "Where does this belong?"
 
 See `docs/PHYSICAL_DESIGN_GUIDELINES.md` for details.
+
+## Folder Structure Consolidation
+
+An ongoing proposal to consolidate low-entity and redundant folders is documented in
+`docs/STRUCTURE_CONSOLIDATION_PROPOSAL.md`. This is our roadmap for improving folder navigability
+and eliminating shallow directory fragmentation. Refer to this doc when creating new folders or
+evaluating refactors.
