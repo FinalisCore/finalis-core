@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "availability/retention.hpp"
+#include "consensus/availability_retention.hpp"
 #include "consensus/epoch_committee.hpp"
 #include "consensus/epoch_tickets.hpp"
 #include "consensus/validator_registry.hpp"

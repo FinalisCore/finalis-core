@@ -16,8 +16,8 @@
 #include <process.h>
 #endif
 
-#include "address/address.hpp"
-#include "availability/retention.hpp"
+#include "common/address.hpp"
+#include "consensus/availability_retention.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/frontier_execution.hpp"
@@ -28,8 +28,8 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
-#include "keystore/validator_keystore.hpp"
-#include "merkle/merkle.hpp"
+#include "common/keystore.hpp"
+#include "common/merkle.hpp"
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"

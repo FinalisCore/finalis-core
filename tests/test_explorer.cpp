@@ -16,7 +16,7 @@
 #include <sstream>
 #include <string>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "crypto/hash.hpp"
 #include "node/node.hpp"
 #include "utxo/signing.hpp"

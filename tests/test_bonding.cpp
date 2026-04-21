@@ -1,6 +1,6 @@
 #include "test_framework.hpp"
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "codec/bytes.hpp"

@@ -6,7 +6,7 @@
 #include <map>
 #include <stdexcept>
 
-#include "availability/retention.hpp"
+#include "consensus/availability_retention.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/validator_registry.hpp"
 #include "crypto/ed25519.hpp"

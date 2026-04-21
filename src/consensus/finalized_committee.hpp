@@ -5,7 +5,7 @@
 #include <optional>
 #include <vector>
 
-#include "availability/retention.hpp"
+#include "consensus/availability_retention.hpp"
 #include "common/network.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/validator_registry.hpp"

@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <stdexcept>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "consensus/ingress.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"

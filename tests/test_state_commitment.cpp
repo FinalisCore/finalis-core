@@ -2,7 +2,7 @@
 
 #include "consensus/state_commitment.hpp"
 #include "crypto/smt.hpp"
-#include "merkle/merkle.hpp"
+#include "common/merkle.hpp"
 #include "utxo/tx.hpp"
 
 using namespace finalis;

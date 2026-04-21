@@ -130,13 +130,13 @@ add_library(finalis_core
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
   src/crypto/stealth_address.cpp
-  src/keystore/validator_keystore.cpp
+  src/common/keystore.cpp
   src/onboarding/validator_onboarding.cpp
   src/genesis/genesis.cpp
   src/genesis/embedded_mainnet.cpp
-  src/merkle/merkle.cpp
-  src/address/address.cpp
-  src/availability/retention.cpp
+  src/common/merkle.cpp
+  src/common/address.cpp
+  src/consensus/availability_retention.cpp
   src/privacy/mint_client.cpp
   src/privacy/mint_scripts.cpp
   src/wallet/utxo_selection.cpp
@@ -145,7 +145,7 @@ add_library(finalis_core
   src/utxo/confidential_tx.cpp
   src/utxo/validate.cpp
   src/utxo/signing.cpp
-  src/policy/hashcash.cpp
+  src/consensus/policy_hashcash.cpp
   src/mempool/mempool.cpp
   src/consensus/monetary.cpp
   src/consensus/committee_schedule.cpp

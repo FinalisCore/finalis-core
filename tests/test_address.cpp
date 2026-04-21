@@ -1,6 +1,6 @@
 #include "test_framework.hpp"
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 
 using namespace finalis;
 

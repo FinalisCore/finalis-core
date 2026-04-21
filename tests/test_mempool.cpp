@@ -2,11 +2,11 @@
 
 #include <ctime>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "mempool/mempool.hpp"
-#include "policy/hashcash.hpp"
+#include "consensus/policy_hashcash.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 

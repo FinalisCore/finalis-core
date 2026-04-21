@@ -25,7 +25,7 @@
 #include <unistd.h>
 #endif
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/randomness.hpp"
@@ -43,8 +43,8 @@
 #include "crypto/smt.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
-#include "keystore/validator_keystore.hpp"
-#include "merkle/merkle.hpp"
+#include "common/keystore.hpp"
+#include "common/merkle.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 

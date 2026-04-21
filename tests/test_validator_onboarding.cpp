@@ -12,11 +12,11 @@
 #define getpid _getpid
 #endif
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "common/network.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "onboarding/validator_onboarding.hpp"
 #include "storage/db.hpp"
 #include "wallet/utxo_selection.hpp"

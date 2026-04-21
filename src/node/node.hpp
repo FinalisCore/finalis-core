@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-#include "availability/retention.hpp"
+#include "consensus/availability_retention.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/committee_schedule.hpp"

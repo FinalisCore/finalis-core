@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <variant>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"

@@ -19,7 +19,7 @@
 #include <filesystem>
 #include <cstdio>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
@@ -34,12 +34,12 @@
 #include "crypto/hash.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
-#include "policy/hashcash.hpp"
+#include "consensus/policy_hashcash.hpp"
 #include "privacy/mint_client.hpp"
 #include "privacy/mint_scripts.hpp"
 #include "storage/db.hpp"

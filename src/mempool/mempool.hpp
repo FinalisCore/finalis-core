@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "common/network.hpp"
-#include "policy/hashcash.hpp"
+#include "consensus/policy_hashcash.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/tx.hpp"

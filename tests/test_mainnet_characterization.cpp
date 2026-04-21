@@ -9,7 +9,7 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/genesis.hpp"
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "node/node.hpp"
 #include "storage/db.hpp"
 #include "utxo/validate.hpp"

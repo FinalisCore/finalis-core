@@ -11,7 +11,7 @@
 #include <set>
 #include <sstream>
 
-#include "address/address.hpp"
+#include "common/address.hpp"
 #include "consensus/ingress.hpp"
 #include "codec/bytes.hpp"
 #include "common/wide_arith.hpp"
@@ -28,7 +28,7 @@
 #include "crypto/hash.hpp"
 #include "crypto/smt.hpp"
 #include "genesis/genesis.hpp"
-#include "keystore/validator_keystore.hpp"
+#include "common/keystore.hpp"
 #include "onboarding/validator_onboarding.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
