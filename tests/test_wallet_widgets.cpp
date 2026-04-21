@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include <QApplication>
 #include <QByteArray>
 #include <QComboBox>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #include "test_framework.hpp"
 
 #include "crypto/ed25519.hpp"
