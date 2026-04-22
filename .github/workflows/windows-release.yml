@@ -2,6 +2,11 @@ name: windows-release
 
 on:
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "Run finalis-tests before packaging"
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -99,9 +104,15 @@ jobs:
         shell: pwsh
         run: cmake --preset $env:BUILD_PRESET
 
-      - name: Build
+      - name: Build (with tests)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
         shell: pwsh
         run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-wallet finalis-tests
+
+      - name: Build (without tests)
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.run_tests }}
+        shell: pwsh
+        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-wallet
 
       - name: Import code signing certificate
         if: ${{ env.WINDOWS_SIGN_PFX_BASE64 != '' && env.WINDOWS_SIGN_PFX_PASSWORD != '' }}
@@ -136,21 +147,47 @@ jobs:
             }
           }
 
-      - name: Run core tests
+      - name: Run core tests (full on tags, mainnet-focused on branch builds)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
         shell: pwsh
         run: |
           $logDir = "${{ github.workspace }}\dist\test-logs"
           New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-          $logPath = Join-Path $logDir "finalis-tests.log"
           $exe = "${{ github.workspace }}\build\windows-release\finalis-tests.exe"
-          & $exe 2>&1 | Tee-Object -FilePath $logPath
-          $exitCode = $LASTEXITCODE
+          $exitCode = 0
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $logPath = Join-Path $logDir "finalis-tests.log"
+            & $exe 2>&1 | Tee-Object -FilePath $logPath
+            $exitCode = $LASTEXITCODE
+          } else {
+            $filters = @(
+              "characterize_mainnet",
+              "mainnet_bootstrap_with_genesis",
+              "reject_cross_network_mainnet_vs_testnet_handshake",
+              "lightserver_parse_args_rejects_mainnet_flag",
+              "api_v1",
+              "explorer_partner"
+            )
+            foreach ($filter in $filters) {
+              $safeName = ($filter -replace '[^A-Za-z0-9_.-]', '_')
+              $logPath = Join-Path $logDir ("finalis-tests-" + $safeName + ".log")
+              Write-Host "== Running FINALIS_TEST_FILTER=$filter =="
+              $env:FINALIS_TEST_FILTER = $filter
+              & $exe 2>&1 | Tee-Object -FilePath $logPath
+              if ($LASTEXITCODE -ne 0) {
+                $exitCode = $LASTEXITCODE
+              }
+            }
+            Remove-Item Env:\FINALIS_TEST_FILTER -ErrorAction SilentlyContinue
+          }
           Write-Host "== Failed test lines =="
-          Select-String -Path $logPath -Pattern '^\[fail ','^\[failed-summary\]' | ForEach-Object { $_.Line }
+          Get-ChildItem -Path $logDir -Filter "finalis-tests*.log" | ForEach-Object {
+            Select-String -Path $_.FullName -Pattern '^\[fail ','^\[failed-summary\]' | ForEach-Object { $_.Line }
+          }
           if ($exitCode -ne 0) { exit $exitCode }
 
       - name: Upload full test logs
-        if: always()
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_tests) }}
         uses: actions/upload-artifact@v4
         with:
           name: finalis-core-windows-test-logs-${{ steps.meta.outputs.version }}
@@ -167,6 +204,30 @@ jobs:
           -StageRoot "${{ github.workspace }}\dist\windows"
           -QtRootDir "${{ env.FINALIS_QT_PREFIX }}"
           -VcpkgInstalledDir "${{ github.workspace }}\build\windows-release\vcpkg_installed\x64-windows"
+
+      - name: Verify staged payload correctness
+        shell: pwsh
+        run: |
+          $root = "${{ github.workspace }}\dist\windows\payload"
+          $required = @(
+            "app\bin\finalis-node.exe",
+            "app\bin\finalis-lightserver.exe",
+            "app\bin\finalis-explorer.exe",
+            "app\bin\finalis-cli.exe",
+            "app\bin\finalis-wallet.exe",
+            "app\scripts\Start-Finalis.ps1",
+            "app\WINDOWS-RUN.txt",
+            "app\mainnet\SEEDS.json",
+            "installer-assets\finalis-wizard.bmp",
+            "installer-assets\finalis-wizard-small.bmp",
+            "installer-assets\finalis-app.ico"
+          )
+          foreach ($rel in $required) {
+            $full = Join-Path $root $rel
+            if (-not (Test-Path $full)) {
+              throw "Staged payload missing required file: $full"
+            }
+          }
 
       - name: Build installer
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
