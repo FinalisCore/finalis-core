@@ -1,0 +1,42 @@
+name: partner-api-governance
+
+on:
+  push:
+    branches-ignore:
+      - "windows-installer-test"
+  pull_request:
+    branches-ignore:
+      - "windows-installer-test"
+
+jobs:
+  partner-api-governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve base/head refs
+        id: refs
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+
+          if [[ "$base" == "0000000000000000000000000000000000000000" ]]; then
+            base="$(git rev-list --max-parents=0 "$head" | tail -n 1)"
+          fi
+
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Partner API governance gate
+        run: |
+          python3 scripts/check_partner_api_governance.py \
+            --base-ref "${{ steps.refs.outputs.base }}" \
+            --head-ref "${{ steps.refs.outputs.head }}"
