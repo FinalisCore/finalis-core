@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+#
+# Partner API contract ownership.
+# Replace @FinalisCore with a specific maintainer user or team if needed.
+
+openapi/ @FinalisCore
+docs/PARTNER_API_* @FinalisCore

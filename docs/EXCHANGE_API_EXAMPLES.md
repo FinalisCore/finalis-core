@@ -399,3 +399,47 @@ curl -s http://127.0.0.1:8080/api/address/<address>
 
 Use this for support tooling and human reconciliation. Automated exchange
 accounting should still prefer lightserver JSON-RPC.
+
+## 3. Partner API v1 examples
+
+### 3.1 Batch tx status
+
+```bash
+curl -s http://127.0.0.1:8080/api/v1/transactions/status:batch \
+  -H 'Content-Type: application/json' \
+  -d '{"txids":["<txid1>","<txid2>"]}'
+```
+
+### 3.2 Idempotent withdrawal submission
+
+```bash
+curl -s http://127.0.0.1:8080/api/v1/withdrawals \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: withdrawal-123' \
+  -d '{"client_withdrawal_id":"withdrawal-123","tx_hex":"<serialized_tx_hex>"}'
+```
+
+### 3.3 Withdrawal lifecycle lookup
+
+```bash
+curl -s http://127.0.0.1:8080/api/v1/withdrawals/withdrawal-123
+```
+
+### 3.4 Finalized event replay
+
+```bash
+curl -s 'http://127.0.0.1:8080/api/v1/events/finalized?from_sequence=1'
+```
+
+### 3.5 Partner auth headers (HMAC)
+
+Protected partner endpoints expect:
+
+- `X-Finalis-Api-Key`
+- `X-Finalis-Timestamp`
+- `X-Finalis-Nonce`
+- `X-Finalis-Signature`
+
+Canonical signature string:
+
+`METHOD + "\\n" + PATH + "\\n" + TIMESTAMP + "\\n" + NONCE + "\\n" + SHA256_HEX(BODY)`

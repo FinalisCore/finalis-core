@@ -5,8 +5,8 @@
 Current restarted mainnet identity reference:
 
 - `network_name = mainnet`
-- `network_id = 258038c123a1c9b08475216e5f53a503`
-- `genesis_hash = fd5570810b163e43a90ef5e8203e8aef34c89072f5f261c4de74aa724a615211`
+- `network_id = fe561911730912cced1e83bc273fab13`
+- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
 
 It is intentionally narrow:
 
@@ -36,6 +36,19 @@ Supported API routes:
 - `/api/transition/<height_or_hash>`
 - `/api/address/<address>`
 - `/api/search?q=<query>`
+- `/api/v1/status`
+- `/api/v1/committee`
+- `/api/v1/recent-tx`
+- `/api/v1/tx/<txid>`
+- `/api/v1/transition/<height_or_hash>`
+- `/api/v1/address/<address>`
+- `/api/v1/search?q=<query>`
+- `/api/v1/transactions/status:batch` (POST)
+- `/api/v1/withdrawals` (POST)
+- `/api/v1/withdrawals/<client_withdrawal_id_or_txid>`
+- `/api/v1/events/finalized?from_sequence=<n>`
+- `/api/v1/fees/recommendation`
+- `/metrics`
 
 What it shows:
 
@@ -130,6 +143,78 @@ Transaction status semantics:
 All API responses are finalized-only and include:
 
 - `finalized_only: true`
+
+Partner API v1:
+
+- `GET /api/v1/...` mirrors stable finalized read surfaces with explicit
+  `api_version: "v1"` in responses
+- `POST /api/v1/withdrawals` provides idempotent withdrawal submission using
+  `Idempotency-Key`
+- `GET /api/v1/withdrawals/<client_withdrawal_id_or_txid>` provides one
+  canonical lifecycle shape
+- `GET /api/v1/events/finalized?from_sequence=<n>` provides a replayable
+  finalized event feed
+- `GET /api/v1/fees/recommendation` provides fee policy guidance for
+  withdrawal submitters
+- governance and compatibility policy:
+  - `docs/PARTNER_API_COMPATIBILITY_POLICY.md`
+  - `docs/PARTNER_API_CHANGELOG.md`
+  - `docs/PARTNER_API_DEPRECATIONS.md`
+  - CI gate: `.github/workflows/partner-api-governance.yml`
+
+Partner auth (when enabled):
+
+- configured by:
+  - `--partner-auth-required 1`
+  - `--partner-api-key <key>`
+  - `--partner-api-secret <secret>`
+- protected `v1` endpoints require:
+  - `X-Finalis-Api-Key`
+  - `X-Finalis-Timestamp` (unix seconds)
+  - `X-Finalis-Nonce`
+  - `X-Finalis-Signature` (hex HMAC-SHA256)
+- canonical signature payload:
+  - `METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256_HEX(BODY)`
+- replay protection:
+  - nonce reuse inside the allowed skew window is rejected
+- basic per-partner rate limit:
+  - configured by `--partner-rate-limit-per-minute`
+  - limit responses return `429` with `Retry-After`
+
+Multi-tenant partner registry:
+
+- configure with `--partner-registry /path/partners.json`
+- registry entries support:
+  - `partner_id`
+  - `api_key`
+  - `active_secret`
+  - optional `next_secret` (rotation window acceptance)
+  - optional `rate_limit_per_minute`
+  - optional `webhook_url`
+  - optional `webhook_secret`
+  - optional `enabled`
+- when a registry is loaded, partner auth is enabled for protected `/api/v1/*`
+  routes automatically
+
+Webhook delivery:
+
+- finalized withdrawal transitions enqueue signed webhook deliveries when
+  `webhook_url` and `webhook_secret` are configured for that partner
+- payload contains:
+  - `event`
+  - `signature` (`hmac_sha256` over event JSON)
+- delivery retries use exponential backoff:
+  - `--partner-webhook-max-attempts`
+  - `--partner-webhook-initial-backoff-ms`
+  - `--partner-webhook-max-backoff-ms`
+- persisted-state GC/TTL bounds:
+  - `--partner-idempotency-ttl-seconds` (default `604800`)
+  - `--partner-events-ttl-seconds` (default `2592000`)
+  - `--partner-webhook-queue-ttl-seconds` (default `604800`)
+- webhook crash-recovery semantics are at-least-once:
+  - queue entries are durable
+  - successful delivery removes an entry
+  - crash before snapshot flush may replay a webhook after restart
 
 Health behavior:
 

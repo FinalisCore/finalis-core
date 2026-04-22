@@ -1,0 +1,147 @@
+openapi: 3.1.0
+info:
+  title: Finalis Partner API
+  version: 1.0.0
+  summary: Exchange-facing finalized-state partner API.
+servers:
+  - url: https://partner.finalis.example
+security:
+  - FinalisHmac: []
+components:
+  securitySchemes:
+    FinalisHmac:
+      type: apiKey
+      in: header
+      name: X-Finalis-Signature
+      description: |
+        Use with X-Finalis-Api-Key, X-Finalis-Timestamp, and X-Finalis-Nonce.
+        Signature is HMAC-SHA256 over METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256_HEX(BODY).
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    Withdrawal:
+      type: object
+      required: [client_withdrawal_id, txid, state, retryable, retry_class, created_unix_ms, updated_unix_ms]
+      properties:
+        client_withdrawal_id:
+          type: string
+        txid:
+          type: string
+        state:
+          type: string
+          enum: [submitted, accepted_for_relay, finalized, rejected]
+        partner_id:
+          type: string
+        retryable:
+          type: boolean
+        retry_class:
+          type: string
+        error_code:
+          type: [string, 'null']
+        error_message:
+          type: [string, 'null']
+        finalized_height:
+          type: [integer, 'null']
+        transition_hash:
+          type: [string, 'null']
+        created_unix_ms:
+          type: integer
+        updated_unix_ms:
+          type: integer
+paths:
+  /api/v1/status:
+    get:
+      security: []
+      summary: Finalized status snapshot
+      responses:
+        '200':
+          description: OK
+  /api/v1/transactions/status:batch:
+    post:
+      summary: Batch transaction status lookup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                txids:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: OK
+        '400':
+          description: Invalid input
+  /api/v1/withdrawals:
+    post:
+      summary: Idempotent withdrawal submission
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_withdrawal_id, tx_hex]
+              properties:
+                client_withdrawal_id:
+                  type: string
+                tx_hex:
+                  type: string
+      responses:
+        '201':
+          description: Submitted
+        '200':
+          description: Idempotent replay or terminal rejection
+        '202':
+          description: Submitted but retryable relay state
+        '409':
+          description: Idempotency conflict
+  /api/v1/withdrawals/{id}:
+    get:
+      summary: Read canonical withdrawal lifecycle state
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+        '404':
+          description: Not found
+  /api/v1/events/finalized:
+    get:
+      summary: Replayable finalized event feed
+      parameters:
+        - in: query
+          name: from_sequence
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: OK
+  /api/v1/fees/recommendation:
+    get:
+      security: []
+      summary: Withdrawal fee policy guidance
+      responses:
+        '200':
+          description: OK
