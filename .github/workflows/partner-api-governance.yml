@@ -40,3 +40,7 @@ jobs:
           python3 scripts/check_partner_api_governance.py \
             --base-ref "${{ steps.refs.outputs.base }}" \
             --head-ref "${{ steps.refs.outputs.head }}"
+
+      - name: Partner API reference drift gate
+        run: |
+          python3 scripts/generate_partner_api_reference.py --check

@@ -20,6 +20,12 @@ From `/metrics`:
 - `finalis_partner_withdrawal_submissions_total`
 - `finalis_partner_webhook_deliveries_total`
 - `finalis_partner_webhook_failures_total`
+- `finalis_partner_webhook_dlq_total`
+- `finalis_partner_webhook_replays_total`
+- `finalis_partner_webhook_queue_depth`
+- `finalis_partner_webhook_dlq_depth`
+- `finalis_partner_webhook_oldest_age_seconds`
+- `finalis_http_request_duration_milliseconds_bucket`
 
 ## Minimum alerts
 

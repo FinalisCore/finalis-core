@@ -624,6 +624,190 @@ TEST(test_explorer_partner_webhook_retries_until_success) {
   std::filesystem::remove(registry_path, ec);
 }
 
+TEST(test_explorer_partner_scope_mtls_and_allowlist_enforced) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  cfg.partner_mtls_required = true;
+  cfg.partner_allowed_ipv4_cidrs_raw = {"10.0.0.0/8"};
+  const auto registry_path = unique_test_cache_path("finalis-partner-scope-registry");
+  {
+    std::ofstream out(registry_path);
+    out << "{"
+           "\"partners\":[{"
+           "\"partner_id\":\"psc\","
+           "\"api_key\":\"ksc\","
+           "\"active_secret\":\"ssc\","
+           "\"scopes\":[\"read\"],"
+           "\"enabled\":true"
+           "}]"
+           "}";
+  }
+  cfg.partner_registry_path = registry_path.string();
+  std::string reg_err;
+  ASSERT_TRUE(load_partner_registry(cfg, &reg_err));
+
+  const std::string body = std::string("{\"client_withdrawal_id\":\"w-scope-1\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const std::string nonce = "scope-n1";
+  const std::string canonical = std::string("POST\n/api/v1/withdrawals\n") + ts + "\n" + nonce + "\n" + sha256_hex_text(body);
+  const auto sig = hmac_sha256_hex("ssc", canonical);
+  ASSERT_TRUE(sig.has_value());
+  const auto missing_mtls = handle_request(
+      cfg, make_http_request("POST", "/api/v1/withdrawals",
+                             {{"Idempotency-Key", "idem-scope-1"},
+                              {"X-Finalis-Api-Key", "ksc"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", nonce},
+                              {"X-Finalis-Signature", *sig}},
+                             body));
+  ASSERT_EQ(missing_mtls.status, 401);
+  ASSERT_TRUE(missing_mtls.body.find("\"auth_mtls_required\"") != std::string::npos);
+
+  const auto sig2 = hmac_sha256_hex("ssc", std::string("POST\n/api/v1/withdrawals\n") + ts + "\nscope-n2\n" + sha256_hex_text(body));
+  ASSERT_TRUE(sig2.has_value());
+  const auto ip_forbidden = handle_request(
+      cfg, make_http_request("POST", "/api/v1/withdrawals",
+                             {{"Idempotency-Key", "idem-scope-1"},
+                              {"X-Finalis-Api-Key", "ksc"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "scope-n2"},
+                              {"X-Finalis-Signature", *sig2},
+                              {"X-Finalis-Mtls-Verified", "true"}},
+                             body));
+  ASSERT_EQ(ip_forbidden.status, 403);
+  ASSERT_TRUE(ip_forbidden.body.find("\"auth_ip_forbidden\"") != std::string::npos);
+
+  std::error_code ec;
+  std::filesystem::remove(registry_path, ec);
+}
+
+TEST(test_explorer_partner_webhook_dlq_and_replay_contract) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  cfg.partner_webhook_max_attempts = 1;
+  cfg.partner_webhook_initial_backoff_ms = 10;
+  cfg.partner_webhook_max_backoff_ms = 20;
+
+  const auto registry_path = unique_test_cache_path("finalis-partner-dlq-registry");
+  {
+    std::ofstream out(registry_path);
+    out << "{"
+           "\"partners\":[{"
+           "\"partner_id\":\"pdlq\","
+           "\"api_key\":\"kdlq\","
+           "\"active_secret\":\"sdlq\","
+           "\"scopes\":[\"read\",\"withdraw_submit\",\"events_read\",\"webhook_manage\"],"
+           "\"webhook_url\":\"http://webhook.invalid/dlq\","
+           "\"webhook_secret\":\"whdlq\","
+           "\"enabled\":true"
+           "}]"
+           "}";
+  }
+  cfg.partner_registry_path = registry_path.string();
+  std::string reg_err;
+  ASSERT_TRUE(load_partner_registry(cfg, &reg_err));
+
+  const auto prev_post = g_partner_webhook_post_json;
+  g_partner_webhook_post_json = [&](const std::string&, const std::string&, std::string* err) -> std::optional<std::string> {
+    if (err) *err = "forced_failure";
+    return std::nullopt;
+  };
+
+  g_partner_webhook_stop.store(false);
+  std::thread worker([cfg]() { partner_webhook_worker(cfg); });
+
+  const std::string body = std::string("{\"client_withdrawal_id\":\"w-dlq-1\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const auto sign = [&](const std::string& method, const std::string& path, const std::string& nonce, const std::string& req_body) {
+    const std::string canonical = method + "\n" + path + "\n" + ts + "\n" + nonce + "\n" + sha256_hex_text(req_body);
+    return hmac_sha256_hex("sdlq", canonical);
+  };
+
+  const auto sig_create = sign("POST", "/api/v1/withdrawals", "dlq-n1", body);
+  ASSERT_TRUE(sig_create.has_value());
+  const auto created = handle_request(
+      cfg, make_http_request("POST", "/api/v1/withdrawals",
+                             {{"Idempotency-Key", "idem-dlq-1"},
+                              {"X-Finalis-Api-Key", "kdlq"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "dlq-n1"},
+                              {"X-Finalis-Signature", *sig_create}},
+                             body));
+  ASSERT_TRUE(created.status == 200 || created.status == 201 || created.status == 202);
+
+  const auto sig_get = sign("GET", "/api/v1/withdrawals/w-dlq-1", "dlq-n2", "");
+  ASSERT_TRUE(sig_get.has_value());
+  const auto finalized = handle_request(
+      cfg, make_http_request("GET", "/api/v1/withdrawals/w-dlq-1",
+                             {{"X-Finalis-Api-Key", "kdlq"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "dlq-n2"},
+                              {"X-Finalis-Signature", *sig_get}},
+                             ""));
+  ASSERT_EQ(finalized.status, 200);
+  ASSERT_TRUE(finalized.body.find("\"state\":\"finalized\"") != std::string::npos);
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline) {
+    {
+      std::lock_guard<std::mutex> guard(g_partner_mu);
+      if (!g_partner_webhook_dlq.empty()) break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  const auto sig_dlq = sign("GET", "/api/v1/webhooks/dlq", "dlq-n3", "");
+  ASSERT_TRUE(sig_dlq.has_value());
+  const auto dlq = handle_request(
+      cfg, make_http_request("GET", "/api/v1/webhooks/dlq",
+                             {{"X-Finalis-Api-Key", "kdlq"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "dlq-n3"},
+                              {"X-Finalis-Signature", *sig_dlq}},
+                             ""));
+  ASSERT_EQ(dlq.status, 200);
+  ASSERT_TRUE(dlq.body.find("\"sequence\":") != std::string::npos);
+
+  const std::string replay_body = "{\"sequence\":2}";
+  const auto sig_replay = sign("POST", "/api/v1/webhooks/dlq/replay", "dlq-n4", replay_body);
+  ASSERT_TRUE(sig_replay.has_value());
+  const auto replay = handle_request(
+      cfg, make_http_request("POST", "/api/v1/webhooks/dlq/replay",
+                             {{"X-Finalis-Api-Key", "kdlq"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "dlq-n4"},
+                              {"X-Finalis-Signature", *sig_replay}},
+                             replay_body));
+  ASSERT_EQ(replay.status, 200);
+  ASSERT_TRUE(replay.body.find("\"replayed\":true") != std::string::npos);
+
+  g_partner_webhook_stop.store(true);
+  g_partner_webhook_cv.notify_all();
+  worker.join();
+  g_partner_webhook_post_json = prev_post;
+
+  std::error_code ec;
+  std::filesystem::remove(registry_path, ec);
+}
+
 TEST(test_explorer_partner_state_persists_across_restart) {
   ExplorerFixture fx;
   int broadcast_calls = 0;
