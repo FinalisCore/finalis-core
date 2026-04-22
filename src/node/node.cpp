@@ -3338,15 +3338,32 @@ std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch
 bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height) {
   const auto settlement_epoch = settlement_epoch_for_block_height_locked(height);
   if (!settlement_epoch.has_value()) return true;
-  const auto onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
-  if (onboarding_scores.empty()) {
+
+  auto request_epoch_reconcile = [&]() {
     for (int peer_id : p2p_.peer_ids()) {
       const auto info = p2p_.get_peer_info(peer_id);
       if (!info.established()) continue;
       request_epoch_tickets(peer_id, *settlement_epoch, 512);
     }
+  };
+
+  const auto onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
+  if (onboarding_scores.empty()) {
+    request_epoch_reconcile();
     return false;
   }
+
+#ifdef _WIN32
+  if (epoch_committee_closed_locked(*settlement_epoch)) {
+    const auto reconcile_it = windows_settlement_epoch_reconcile_ms_.find(*settlement_epoch);
+    const bool reconciled_this_runtime =
+        reconcile_it != windows_settlement_epoch_reconcile_ms_.end() && reconcile_it->second >= startup_ms_;
+    if (!reconciled_this_runtime) {
+      request_epoch_reconcile();
+      return false;
+    }
+  }
+#endif
 
   auto& reward_state = epoch_reward_states_[*settlement_epoch];
   reward_state.epoch_start_height = *settlement_epoch;
@@ -3444,7 +3461,11 @@ void Node::accrue_epoch_reward_for_finalized_block_locked(const Block& block, co
 }
 
 void Node::mark_epoch_reward_settled_if_needed_locked(std::uint64_t height) {
+#ifdef _WIN32
+  if (!ensure_settlement_onboarding_scores_loaded_locked(height)) return;
+#else
   (void)ensure_settlement_onboarding_scores_loaded_locked(height);
+#endif
   mark_epoch_reward_settled_for_height(cfg_.network, height, cfg_.network.committee_epoch_blocks, epoch_reward_states_,
                                        &protocol_reserve_balance_units_, &db_);
 }
@@ -4811,6 +4832,9 @@ bool Node::ensure_required_epoch_committee_state_startup() {
 }
 
 void Node::request_epoch_tickets(int peer_id, std::uint64_t epoch, std::uint32_t max_tickets) {
+#ifdef _WIN32
+  max_tickets = std::max<std::uint32_t>(max_tickets, 2048U);
+#endif
   const bool ok =
       p2p_.send_to(peer_id, p2p::MsgType::GET_EPOCH_TICKETS, p2p::ser_get_epoch_tickets(p2p::GetEpochTicketsMsg{epoch, max_tickets}));
   log_line("epoch-reconcile-request peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(epoch) +
@@ -4961,10 +4985,19 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   }
 
   (void)db_.put_epoch_ticket(stored);
+#ifdef _WIN32
+  if (improved) {
+    best[stored.participant_pubkey] = stored;
+    (void)db_.put_best_epoch_ticket(stored);
+  }
+  const auto score_work_hash = improved ? stored.work_hash : it->second.work_hash;
+#else
   best[stored.participant_pubkey] = stored;
   (void)db_.put_best_epoch_ticket(stored);
+  const auto score_work_hash = stored.work_hash;
+#endif
   const auto onboarding_score =
-      static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(stored.work_hash)));
+      static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(score_work_hash)));
   auto& reward_state = epoch_reward_states_[stored.epoch];
   reward_state.epoch_start_height = stored.epoch;
   reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
@@ -5485,6 +5518,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       }
       if (resp->epoch_closed) {
         std::lock_guard<std::mutex> lk(mu_);
+#ifdef _WIN32
+        windows_settlement_epoch_reconcile_ms_[resp->epoch] = now_ms();
+#endif
         rebuild_epoch_committee_state_locked(resp->epoch, "reconcile-closed", true);
       }
       log_line("epoch-reconcile-recv peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(resp->epoch) +
@@ -6149,7 +6185,15 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     return false;
   }
   if (canonical_state_.has_value()) {
+#ifdef _WIN32
+    if (!ensure_settlement_onboarding_scores_loaded_locked(transition.height)) {
+      log_line("frontier-settlement-sync-pending height=" + std::to_string(transition.height) +
+               " reason=windows-reconcile-pending");
+      return false;
+    }
+#else
     (void)ensure_settlement_onboarding_scores_loaded_locked(transition.height);
+#endif
   }
   if (certificate.has_value()) {
     if (!canonical_state_.has_value()) {
@@ -6820,7 +6864,14 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
     last_test_hook_error_ = "frontier-parent-identity-kind-mismatch";
     return std::nullopt;
   }
+#ifdef _WIN32
+  if (!ensure_settlement_onboarding_scores_loaded_locked(height)) {
+    last_test_hook_error_ = "settlement-onboarding-sync-pending";
+    return std::nullopt;
+  }
+#else
   ensure_settlement_onboarding_scores_loaded_locked(height);
+#endif
 
   FrontierBuildSelection selection;
   selection.next_vector = canonical_state_->finalized_frontier_vector;

@@ -10,7 +10,7 @@
 #endif
 
 [Setup]
-AppId={{EAA24893-1A6A-4E25-A528-33AB32D54C3B}
+AppId={{EAA24893-1A6A-4E25-A528-33AB32D54C3B}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=Finalis Core

@@ -576,6 +576,9 @@ class Node {
   std::optional<consensus::CanonicalDerivedState> canonical_state_;
   std::uint64_t last_open_epoch_ticket_epoch_{0};
   std::map<std::pair<int, std::uint64_t>, std::uint64_t> epoch_ticket_request_ms_;
+#ifdef _WIN32
+  std::map<std::uint64_t, std::uint64_t> windows_settlement_epoch_reconcile_ms_;
+#endif
   availability::AvailabilityPersistentState availability_state_;
   bool availability_state_rebuild_triggered_{false};
   std::string availability_state_rebuild_reason_;
