@@ -12,13 +12,21 @@
 #include <iostream>
 #include <optional>
 #include <map>
+#include <deque>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <unordered_map>
 #include <vector>
+#include <cctype>
+#include <cstdlib>
+#include <regex>
+
+#include <openssl/hmac.h>
 
 #include "common/address.hpp"
 #include "codec/bytes.hpp"
@@ -39,6 +47,15 @@ struct Config {
   std::uint16_t port{18080};
   std::string rpc_url{"http://127.0.0.1:19444/rpc"};
   std::string cache_path;
+  bool partner_auth_required{false};
+  std::string partner_api_key;
+  std::string partner_api_secret;
+  std::string partner_registry_path;
+  std::uint64_t partner_auth_max_skew_seconds{300};
+  std::uint64_t partner_rate_limit_per_minute{600};
+  std::uint64_t partner_webhook_max_attempts{5};
+  std::uint64_t partner_webhook_initial_backoff_ms{1000};
+  std::uint64_t partner_webhook_max_backoff_ms{60000};
 };
 
 template <typename T>
@@ -54,6 +71,64 @@ struct ApiError {
   int http_status{500};
   std::string code;
   std::string message;
+};
+
+struct HttpRequest {
+  std::string method;
+  std::string target;
+  std::map<std::string, std::string> headers;
+  std::string body;
+};
+
+struct PartnerEvent {
+  std::uint64_t sequence{0};
+  std::string partner_id;
+  std::string event_type;
+  std::string object_id;
+  std::string state;
+  std::uint64_t emitted_unix_ms{0};
+};
+
+struct PartnerAuthRecord {
+  std::string partner_id;
+  std::string api_key;
+  std::string active_secret;
+  std::optional<std::string> next_secret;
+  std::optional<std::uint64_t> rate_limit_per_minute;
+  std::optional<std::string> webhook_url;
+  std::optional<std::string> webhook_secret;
+  bool enabled{true};
+};
+
+struct PartnerPrincipal {
+  std::string partner_id;
+  std::string api_key;
+  std::uint64_t rate_limit_per_minute{0};
+  bool authenticated{false};
+};
+
+struct PartnerWebhookDelivery {
+  std::string partner_id;
+  std::uint64_t sequence{0};
+  std::string url;
+  std::string payload_json;
+  std::uint64_t attempt{0};
+  std::uint64_t next_attempt_unix_ms{0};
+};
+
+struct PartnerWithdrawal {
+  std::string partner_id;
+  std::string client_withdrawal_id;
+  std::string txid;
+  std::string state;
+  bool retryable{false};
+  std::string retry_class{"none"};
+  std::optional<std::string> error_code;
+  std::optional<std::string> error_message;
+  std::optional<std::uint64_t> finalized_height;
+  std::optional<std::string> transition_hash;
+  std::uint64_t created_unix_ms{0};
+  std::uint64_t updated_unix_ms{0};
 };
 
 template <typename T>
@@ -308,6 +383,32 @@ constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
 constexpr std::size_t kPersistedTxIndexLimit = 128;
 constexpr std::size_t kPersistedTransitionIndexLimit = 128;
+constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
+constexpr std::size_t kMaxHttpBodyBytes = 256 * 1024;
+
+std::mutex g_partner_mu;
+std::unordered_map<std::string, PartnerAuthRecord> g_partner_by_api_key;
+std::unordered_map<std::string, PartnerAuthRecord> g_partner_by_id;
+std::unordered_map<std::string, PartnerWithdrawal> g_partner_withdrawals_by_client_id;
+std::unordered_map<std::string, std::string> g_partner_client_id_by_txid;
+std::unordered_map<std::string, std::string> g_partner_idempotency_hash;
+std::unordered_map<std::string, std::string> g_partner_idempotency_client_id;
+std::vector<PartnerEvent> g_partner_events;
+std::uint64_t g_partner_next_sequence{1};
+std::unordered_map<std::string, std::uint64_t> g_seen_partner_nonce_unix_ms;
+std::unordered_map<std::string, std::deque<std::uint64_t>> g_partner_rate_windows_ms;
+std::deque<PartnerWebhookDelivery> g_partner_webhook_queue;
+std::condition_variable g_partner_webhook_cv;
+std::thread g_partner_webhook_thread;
+std::atomic<bool> g_partner_webhook_stop{false};
+
+std::mutex g_metrics_mu;
+std::unordered_map<std::string, std::uint64_t> g_metrics_http_requests_total;
+std::uint64_t g_metrics_partner_auth_failures_total{0};
+std::uint64_t g_metrics_partner_rate_limited_total{0};
+std::uint64_t g_metrics_partner_withdrawal_submissions_total{0};
+std::uint64_t g_metrics_partner_webhook_deliveries_total{0};
+std::uint64_t g_metrics_partner_webhook_failures_total{0};
 
 struct PersistedExplorerSnapshot {
   std::uint64_t stored_unix_ms{0};
@@ -360,6 +461,29 @@ void clear_runtime_caches() {
     g_committee_surface_state = {};
     g_recent_surface_state = {};
   }
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    g_partner_by_api_key.clear();
+    g_partner_by_id.clear();
+    g_partner_withdrawals_by_client_id.clear();
+    g_partner_client_id_by_txid.clear();
+    g_partner_idempotency_hash.clear();
+    g_partner_idempotency_client_id.clear();
+    g_partner_events.clear();
+    g_partner_next_sequence = 1;
+    g_seen_partner_nonce_unix_ms.clear();
+    g_partner_rate_windows_ms.clear();
+    g_partner_webhook_queue.clear();
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    g_metrics_http_requests_total.clear();
+    g_metrics_partner_auth_failures_total = 0;
+    g_metrics_partner_rate_limited_total = 0;
+    g_metrics_partner_withdrawal_submissions_total = 0;
+    g_metrics_partner_webhook_deliveries_total = 0;
+    g_metrics_partner_webhook_failures_total = 0;
+  }
 }
 
 std::string default_explorer_cache_path(const std::string& rpc_url) {
@@ -393,6 +517,7 @@ struct Response {
   std::string content_type{"text/html; charset=utf-8"};
   std::string body;
   std::optional<std::string> location;
+  std::vector<std::pair<std::string, std::string>> headers;
 };
 
 Response handle_request(const Config& cfg, const std::string& req);
@@ -468,14 +593,21 @@ std::string error_json(const ApiError& err) {
 }
 
 Response html_response(int status, std::string body) {
-  return Response{status, "text/html; charset=utf-8", std::move(body), std::nullopt};
+  return Response{status, "text/html; charset=utf-8", std::move(body), std::nullopt, {}};
 }
 
 Response json_response(int status, std::string body) {
-  return Response{status, "application/json; charset=utf-8", std::move(body), std::nullopt};
+  return Response{status, "application/json; charset=utf-8", std::move(body), std::nullopt, {}};
 }
 
 Response json_error_response(const ApiError& err) { return json_response(err.http_status, error_json(err)); }
+
+std::string append_api_v1(const std::string& json) {
+  if (!json.empty() && json.back() == '}') {
+    return json.substr(0, json.size() - 1) + ",\"api_version\":\"v1\"}";
+  }
+  return json;
+}
 
 std::string sanitize_redirect_location(const std::string& location) {
   if (location.empty() || location.front() != '/') return "/";
@@ -497,6 +629,136 @@ Response redirect_response(const std::string& location) {
   out.body = "Found";
   out.location = sanitize_redirect_location(location);
   return out;
+}
+
+std::string lowercase_ascii(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+std::optional<std::string> header_value(const HttpRequest& req, const std::string& key) {
+  const auto it = req.headers.find(lowercase_ascii(key));
+  if (it == req.headers.end()) return std::nullopt;
+  return it->second;
+}
+
+bool secure_equal(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  return diff == 0;
+}
+
+std::string sha256_hex_text(const std::string& text) {
+  const auto hash = finalis::crypto::sha256(Bytes(text.begin(), text.end()));
+  return finalis::hex_encode32(hash);
+}
+
+std::optional<std::string> hmac_sha256_hex(const std::string& key, const std::string& message) {
+  unsigned int len = EVP_MAX_MD_SIZE;
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  auto* out = HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+                   reinterpret_cast<const unsigned char*>(message.data()), message.size(), digest, &len);
+  if (!out) return std::nullopt;
+  return finalis::hex_encode(Bytes(digest, digest + len));
+}
+
+using HttpPostJsonRawFn = std::function<std::optional<std::string>(const std::string&, const std::string&, std::string*)>;
+HttpPostJsonRawFn g_partner_webhook_post_json = [](const std::string& url, const std::string& body, std::string* err) {
+  return finalis::lightserver::http_post_json_raw(url, body, err);
+};
+
+std::optional<std::uint64_t> parse_u64_strict(const std::string& s) {
+  if (s.empty()) return std::nullopt;
+  for (char c : s) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) return std::nullopt;
+  }
+  try {
+    return static_cast<std::uint64_t>(std::stoull(s));
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<HttpRequest> parse_http_request(const std::string& req, std::string* err) {
+  const auto line_end = req.find("\r\n");
+  if (line_end == std::string::npos) {
+    if (err) *err = "malformed request line";
+    return std::nullopt;
+  }
+  const std::string first = req.substr(0, line_end);
+  const auto sp1 = first.find(' ');
+  const auto sp2 = first.rfind(' ');
+  if (sp1 == std::string::npos || sp2 == std::string::npos || sp1 == sp2) {
+    if (err) *err = "malformed request line";
+    return std::nullopt;
+  }
+  HttpRequest out;
+  out.method = first.substr(0, sp1);
+  out.target = first.substr(sp1 + 1, sp2 - sp1 - 1);
+  const auto hdr_end = req.find("\r\n\r\n");
+  if (hdr_end == std::string::npos) {
+    if (err) *err = "missing headers terminator";
+    return std::nullopt;
+  }
+  std::size_t cursor = line_end + 2;
+  while (cursor < hdr_end) {
+    const auto next = req.find("\r\n", cursor);
+    if (next == std::string::npos || next > hdr_end) break;
+    const std::string line = req.substr(cursor, next - cursor);
+    cursor = next + 2;
+    const auto colon = line.find(':');
+    if (colon == std::string::npos) continue;
+    std::string key = lowercase_ascii(line.substr(0, colon));
+    std::string value = line.substr(colon + 1);
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+    out.headers[key] = value;
+  }
+  out.body = req.substr(hdr_end + 4);
+  return out;
+}
+
+void record_http_metric(const std::string& path, int status) {
+  std::lock_guard<std::mutex> guard(g_metrics_mu);
+  const std::string key = path + "|" + std::to_string(status);
+  ++g_metrics_http_requests_total[key];
+}
+
+void push_partner_event(const std::string& partner_id, const std::string& event_type, const std::string& object_id,
+                        const std::string& state) {
+  PartnerEvent evt;
+  evt.sequence = g_partner_next_sequence++;
+  evt.partner_id = partner_id;
+  evt.event_type = event_type;
+  evt.object_id = object_id;
+  evt.state = state;
+  evt.emitted_unix_ms = now_unix_ms();
+  g_partner_events.push_back(evt);
+}
+
+std::string partner_event_json(const PartnerEvent& evt) {
+  std::ostringstream oss;
+  oss << "{\"sequence\":" << evt.sequence << ",\"partner_id\":\"" << json_escape(evt.partner_id)
+      << "\",\"event_type\":\"" << json_escape(evt.event_type)
+      << "\",\"object_id\":\"" << json_escape(evt.object_id) << "\",\"state\":\"" << json_escape(evt.state)
+      << "\",\"emitted_unix_ms\":" << evt.emitted_unix_ms << "}";
+  return oss.str();
+}
+
+std::string partner_withdrawal_json(const PartnerWithdrawal& w) {
+  std::ostringstream oss;
+  oss << "{\"partner_id\":\"" << json_escape(w.partner_id) << "\",\"client_withdrawal_id\":\"" << json_escape(w.client_withdrawal_id)
+      << "\",\"txid\":\"" << json_escape(w.txid)
+      << "\",\"state\":\"" << json_escape(w.state) << "\",\"retryable\":" << json_bool(w.retryable)
+      << ",\"retry_class\":\"" << json_escape(w.retry_class) << "\""
+      << ",\"error_code\":" << json_string_or_null(w.error_code)
+      << ",\"error_message\":" << json_string_or_null(w.error_message)
+      << ",\"finalized_height\":" << json_u64_or_null(w.finalized_height)
+      << ",\"transition_hash\":" << json_string_or_null(w.transition_hash)
+      << ",\"created_unix_ms\":" << w.created_unix_ms
+      << ",\"updated_unix_ms\":" << w.updated_unix_ms << "}";
+  return oss.str();
 }
 
 std::string short_hex(const std::string& hex) {
@@ -1088,6 +1350,27 @@ std::string url_decode(std::string_view in) {
 
 std::optional<Config> parse_args(int argc, char** argv) {
   Config cfg;
+  if (const char* v = std::getenv("FINALIS_PARTNER_AUTH_REQUIRED")) {
+    cfg.partner_auth_required = std::string(v) == "1" || lowercase_ascii(std::string(v)) == "true";
+  }
+  if (const char* v = std::getenv("FINALIS_PARTNER_API_KEY")) cfg.partner_api_key = v;
+  if (const char* v = std::getenv("FINALIS_PARTNER_API_SECRET")) cfg.partner_api_secret = v;
+  if (const char* v = std::getenv("FINALIS_PARTNER_REGISTRY_PATH")) cfg.partner_registry_path = v;
+  if (const char* v = std::getenv("FINALIS_PARTNER_AUTH_MAX_SKEW_SECONDS")) {
+    if (auto parsed = parse_u64_strict(v); parsed.has_value()) cfg.partner_auth_max_skew_seconds = *parsed;
+  }
+  if (const char* v = std::getenv("FINALIS_PARTNER_RATE_LIMIT_PER_MINUTE")) {
+    if (auto parsed = parse_u64_strict(v); parsed.has_value() && *parsed != 0) cfg.partner_rate_limit_per_minute = *parsed;
+  }
+  if (const char* v = std::getenv("FINALIS_PARTNER_WEBHOOK_MAX_ATTEMPTS")) {
+    if (auto parsed = parse_u64_strict(v); parsed.has_value() && *parsed != 0) cfg.partner_webhook_max_attempts = *parsed;
+  }
+  if (const char* v = std::getenv("FINALIS_PARTNER_WEBHOOK_INITIAL_BACKOFF_MS")) {
+    if (auto parsed = parse_u64_strict(v); parsed.has_value() && *parsed != 0) cfg.partner_webhook_initial_backoff_ms = *parsed;
+  }
+  if (const char* v = std::getenv("FINALIS_PARTNER_WEBHOOK_MAX_BACKOFF_MS")) {
+    if (auto parsed = parse_u64_strict(v); parsed.has_value() && *parsed != 0) cfg.partner_webhook_max_backoff_ms = *parsed;
+  }
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> std::optional<std::string> {
@@ -1110,9 +1393,58 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next();
       if (!v) return std::nullopt;
       cfg.cache_path = *v;
+    } else if (a == "--partner-auth-required") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      cfg.partner_auth_required = (*v == "1" || lowercase_ascii(*v) == "true");
+    } else if (a == "--partner-api-key") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      cfg.partner_api_key = *v;
+    } else if (a == "--partner-api-secret") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      cfg.partner_api_secret = *v;
+    } else if (a == "--partner-registry") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      cfg.partner_registry_path = *v;
+    } else if (a == "--partner-auth-max-skew-seconds") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = parse_u64_strict(*v);
+      if (!parsed.has_value()) return std::nullopt;
+      cfg.partner_auth_max_skew_seconds = *parsed;
+    } else if (a == "--partner-rate-limit-per-minute") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = parse_u64_strict(*v);
+      if (!parsed.has_value() || *parsed == 0) return std::nullopt;
+      cfg.partner_rate_limit_per_minute = *parsed;
+    } else if (a == "--partner-webhook-max-attempts") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = parse_u64_strict(*v);
+      if (!parsed.has_value() || *parsed == 0) return std::nullopt;
+      cfg.partner_webhook_max_attempts = *parsed;
+    } else if (a == "--partner-webhook-initial-backoff-ms") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = parse_u64_strict(*v);
+      if (!parsed.has_value() || *parsed == 0) return std::nullopt;
+      cfg.partner_webhook_initial_backoff_ms = *parsed;
+    } else if (a == "--partner-webhook-max-backoff-ms") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = parse_u64_strict(*v);
+      if (!parsed.has_value() || *parsed == 0) return std::nullopt;
+      cfg.partner_webhook_max_backoff_ms = *parsed;
     } else {
       return std::nullopt;
     }
+  }
+  if (cfg.partner_auth_required && cfg.partner_registry_path.empty() && (cfg.partner_api_key.empty() || cfg.partner_api_secret.empty())) {
+    return std::nullopt;
   }
   return cfg;
 }
@@ -1123,7 +1455,6 @@ struct RpcCallResult {
   std::optional<std::int64_t> error_code;
 };
 
-using HttpPostJsonRawFn = std::function<std::optional<std::string>(const std::string&, const std::string&, std::string*)>;
 using RpcGetUtxosFn =
     std::function<std::optional<std::vector<finalis::lightserver::UtxoView>>(const std::string&, const Hash32&, std::string*)>;
 
@@ -3535,7 +3866,25 @@ std::optional<std::string> read_http_request(finalis::net::SocketHandle fd) {
     const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
     if (n <= 0) return std::nullopt;
     req.append(buf.data(), static_cast<std::size_t>(n));
-    if (req.size() > 16 * 1024) return std::nullopt;
+    if (req.size() > kMaxHttpHeaderBytes) return std::nullopt;
+  }
+  const auto hdr_end = req.find("\r\n\r\n");
+  const std::string headers = req.substr(0, hdr_end);
+  std::regex cl_re("Content-Length:\\s*([0-9]+)", std::regex_constants::icase);
+  std::smatch m;
+  std::size_t content_len = 0;
+  if (std::regex_search(headers, m, cl_re)) {
+    try {
+      content_len = static_cast<std::size_t>(std::stoull(m[1].str()));
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+  if (content_len > kMaxHttpBodyBytes) return std::nullopt;
+  while (req.size() < hdr_end + 4 + content_len) {
+    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    if (n <= 0) return std::nullopt;
+    req.append(buf.data(), static_cast<std::size_t>(n));
   }
   return req;
 }
@@ -3548,12 +3897,24 @@ std::string status_text_for_http(int status) {
       return "Found";
     case 400:
       return "Bad Request";
+    case 401:
+      return "Unauthorized";
+    case 403:
+      return "Forbidden";
+    case 409:
+      return "Conflict";
+    case 429:
+      return "Too Many Requests";
     case 404:
       return "Not Found";
     case 405:
       return "Method Not Allowed";
+    case 500:
+      return "Internal Server Error";
     case 502:
       return "Bad Gateway";
+    case 503:
+      return "Service Unavailable";
     default:
       return "Error";
   }
@@ -3565,6 +3926,7 @@ std::string http_response(const Response& resp) {
       << "Content-Type: " << resp.content_type << "\r\n"
       << "Content-Length: " << resp.body.size() << "\r\n";
   if (resp.location.has_value()) oss << "Location: " << *resp.location << "\r\n";
+  for (const auto& [k, v] : resp.headers) oss << k << ": " << v << "\r\n";
   oss << "Connection: close\r\n\r\n" << resp.body;
   return oss.str();
 }
@@ -3584,6 +3946,332 @@ std::string request_target_for_log(const std::optional<std::string>& req) {
   return first.substr(sp1 + 1, sp2 - sp1 - 1);
 }
 
+std::string path_from_target(const std::string& target) {
+  const auto q = target.find('?');
+  return url_decode(q == std::string::npos ? target : target.substr(0, q));
+}
+
+bool partner_auth_needed(const std::string& path) {
+  if (path.rfind("/api/v1/", 0) != 0) return false;
+  if (path == "/api/v1/status" || path == "/api/v1/fees/recommendation") return false;
+  return true;
+}
+
+std::string partner_scoped_id(const std::string& partner_id, const std::string& id) {
+  return partner_id + ":" + id;
+}
+
+std::optional<PartnerAuthRecord> resolve_partner_record_for_api_key(const Config& cfg, const std::string& api_key) {
+  std::lock_guard<std::mutex> guard(g_partner_mu);
+  auto it = g_partner_by_api_key.find(api_key);
+  if (it != g_partner_by_api_key.end()) return it->second;
+  if (!cfg.partner_api_key.empty() && secure_equal(api_key, cfg.partner_api_key)) {
+    PartnerAuthRecord single;
+    single.partner_id = "default";
+    single.api_key = cfg.partner_api_key;
+    single.active_secret = cfg.partner_api_secret;
+    single.enabled = true;
+    return single;
+  }
+  return std::nullopt;
+}
+
+std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest& req, const std::string& path,
+                                            PartnerPrincipal* out_principal) {
+  if (out_principal) {
+    out_principal->partner_id = "default";
+    out_principal->api_key.clear();
+    out_principal->rate_limit_per_minute = cfg.partner_rate_limit_per_minute;
+    out_principal->authenticated = false;
+  }
+  if (!cfg.partner_auth_required || !partner_auth_needed(path)) return std::nullopt;
+  const auto api_key = header_value(req, "x-finalis-api-key");
+  const auto timestamp = header_value(req, "x-finalis-timestamp");
+  const auto nonce = header_value(req, "x-finalis-nonce");
+  const auto signature = header_value(req, "x-finalis-signature");
+  if (!api_key.has_value() || !timestamp.has_value() || !nonce.has_value() || !signature.has_value()) {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    ++g_metrics_partner_auth_failures_total;
+    return make_error(401, "auth_missing", "missing partner auth headers");
+  }
+  const auto record = resolve_partner_record_for_api_key(cfg, *api_key);
+  if (!record.has_value() || !record->enabled) {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    ++g_metrics_partner_auth_failures_total;
+    return make_error(403, "auth_invalid_key", "invalid partner api key");
+  }
+  const auto ts = parse_u64_strict(*timestamp);
+  if (!ts.has_value()) {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    ++g_metrics_partner_auth_failures_total;
+    return make_error(401, "auth_bad_timestamp", "timestamp must be unix seconds");
+  }
+  const std::uint64_t now_sec = static_cast<std::uint64_t>(std::time(nullptr));
+  const std::uint64_t skew = now_sec > *ts ? (now_sec - *ts) : (*ts - now_sec);
+  if (skew > cfg.partner_auth_max_skew_seconds) {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    ++g_metrics_partner_auth_failures_total;
+    return make_error(401, "auth_timestamp_skew", "timestamp outside allowed window");
+  }
+  const std::string canonical = req.method + "\n" + path + "\n" + *timestamp + "\n" + *nonce + "\n" + sha256_hex_text(req.body);
+  const auto expected_active = hmac_sha256_hex(record->active_secret, canonical);
+  bool valid_sig = expected_active.has_value() &&
+                   secure_equal(lowercase_ascii(*signature), lowercase_ascii(*expected_active));
+  if (!valid_sig && record->next_secret.has_value()) {
+    const auto expected_next = hmac_sha256_hex(*record->next_secret, canonical);
+    valid_sig = expected_next.has_value() && secure_equal(lowercase_ascii(*signature), lowercase_ascii(*expected_next));
+  }
+  if (!valid_sig) {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    ++g_metrics_partner_auth_failures_total;
+    return make_error(403, "auth_bad_signature", "invalid partner signature");
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    auto it = g_seen_partner_nonce_unix_ms.find(*nonce);
+    if (it != g_seen_partner_nonce_unix_ms.end() && (now_sec > it->second ? now_sec - it->second : it->second - now_sec) <=
+            cfg.partner_auth_max_skew_seconds) {
+      std::lock_guard<std::mutex> metrics_guard(g_metrics_mu);
+      ++g_metrics_partner_auth_failures_total;
+      return make_error(409, "auth_replay", "nonce replay detected");
+    }
+    g_seen_partner_nonce_unix_ms[*nonce] = now_sec;
+    const std::uint64_t keep_after = now_sec > (cfg.partner_auth_max_skew_seconds * 2)
+                                         ? (now_sec - cfg.partner_auth_max_skew_seconds * 2)
+                                         : 0;
+    for (auto iter = g_seen_partner_nonce_unix_ms.begin(); iter != g_seen_partner_nonce_unix_ms.end();) {
+      if (iter->second < keep_after) iter = g_seen_partner_nonce_unix_ms.erase(iter);
+      else ++iter;
+    }
+  }
+  if (out_principal) {
+    out_principal->partner_id = record->partner_id;
+    out_principal->api_key = record->api_key;
+    out_principal->rate_limit_per_minute = record->rate_limit_per_minute.value_or(cfg.partner_rate_limit_per_minute);
+    out_principal->authenticated = true;
+  }
+  return std::nullopt;
+}
+
+std::optional<ApiError> enforce_partner_rate_limit(const Config& cfg, const HttpRequest& req, const PartnerPrincipal& principal,
+                                                   Response* out_response) {
+  if (!partner_auth_needed(path_from_target(req.target))) return std::nullopt;
+  const std::string bucket = principal.partner_id.empty() ? "default" : principal.partner_id;
+  const std::uint64_t now_ms = now_unix_ms();
+  std::uint64_t retry_after_s = 0;
+  const std::uint64_t limit = principal.rate_limit_per_minute == 0 ? cfg.partner_rate_limit_per_minute : principal.rate_limit_per_minute;
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    auto& window = g_partner_rate_windows_ms[bucket];
+    while (!window.empty() && window.front() + 60'000 <= now_ms) window.pop_front();
+    if (window.size() >= limit) {
+      retry_after_s = window.empty() ? 1 : std::max<std::uint64_t>(1, (window.front() + 60'000 - now_ms + 999) / 1000);
+    } else {
+      window.push_back(now_ms);
+    }
+  }
+  if (retry_after_s != 0) {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    ++g_metrics_partner_rate_limited_total;
+    if (out_response) out_response->headers.push_back({"Retry-After", std::to_string(retry_after_s)});
+    return make_error(429, "rate_limited", "partner rate limit exceeded");
+  }
+  return std::nullopt;
+}
+
+std::optional<PartnerWithdrawal> find_partner_withdrawal_by_any_id(const std::string& partner_id, const std::string& id) {
+  std::lock_guard<std::mutex> guard(g_partner_mu);
+  auto it = g_partner_withdrawals_by_client_id.find(partner_scoped_id(partner_id, id));
+  if (it != g_partner_withdrawals_by_client_id.end()) return it->second;
+  auto txit = g_partner_client_id_by_txid.find(partner_scoped_id(partner_id, id));
+  if (txit == g_partner_client_id_by_txid.end()) return std::nullopt;
+  auto wit = g_partner_withdrawals_by_client_id.find(txit->second);
+  if (wit == g_partner_withdrawals_by_client_id.end()) return std::nullopt;
+  return wit->second;
+}
+
+void upsert_partner_withdrawal(const Config& cfg, const PartnerWithdrawal& withdrawal) {
+  std::lock_guard<std::mutex> guard(g_partner_mu);
+  const auto scoped_client = partner_scoped_id(withdrawal.partner_id, withdrawal.client_withdrawal_id);
+  const auto scoped_txid = partner_scoped_id(withdrawal.partner_id, withdrawal.txid);
+  const auto prev = g_partner_withdrawals_by_client_id.find(scoped_client);
+  const bool state_changed = prev == g_partner_withdrawals_by_client_id.end() || prev->second.state != withdrawal.state;
+  g_partner_client_id_by_txid[scoped_txid] = scoped_client;
+  g_partner_withdrawals_by_client_id[scoped_client] = withdrawal;
+  if (state_changed) {
+    push_partner_event(withdrawal.partner_id, "withdrawal_state_changed", withdrawal.client_withdrawal_id, withdrawal.state);
+  }
+  if (state_changed && withdrawal.state == "finalized") {
+    auto pit = g_partner_by_id.find(withdrawal.partner_id);
+    if (pit != g_partner_by_id.end() && pit->second.webhook_url.has_value() && pit->second.webhook_secret.has_value()) {
+      const PartnerEvent& evt = g_partner_events.back();
+      const std::string evt_json = partner_event_json(evt);
+      const auto sig = hmac_sha256_hex(*pit->second.webhook_secret, evt_json);
+      if (sig.has_value()) {
+        std::ostringstream payload;
+        payload << "{\"event\":" << evt_json << ",\"signature\":\"" << json_escape(*sig) << "\",\"signature_algorithm\":\"hmac_sha256\"}";
+        PartnerWebhookDelivery d;
+        d.partner_id = withdrawal.partner_id;
+        d.sequence = evt.sequence;
+        d.url = *pit->second.webhook_url;
+        d.payload_json = payload.str();
+        d.attempt = 0;
+        d.next_attempt_unix_ms = now_unix_ms();
+        g_partner_webhook_queue.push_back(std::move(d));
+        g_partner_webhook_cv.notify_one();
+      }
+    }
+  }
+}
+
+PartnerWithdrawal refresh_partner_withdrawal_state(const Config& cfg, PartnerWithdrawal withdrawal) {
+  if (withdrawal.state == "finalized" || withdrawal.state == "rejected") return withdrawal;
+  auto tx = fetch_tx_result(cfg, withdrawal.txid);
+  if (tx.value.has_value() && tx.value->finalized && tx.value->credit_safe) {
+    withdrawal.state = "finalized";
+    withdrawal.finalized_height = tx.value->finalized_height;
+    withdrawal.transition_hash = tx.value->transition_hash;
+    withdrawal.retryable = false;
+    withdrawal.retry_class = "none";
+    withdrawal.updated_unix_ms = now_unix_ms();
+    upsert_partner_withdrawal(cfg, withdrawal);
+  }
+  return withdrawal;
+}
+
+Response render_metrics_response() {
+  std::ostringstream oss;
+  oss << "# HELP finalis_http_requests_total HTTP requests by route and status\n"
+      << "# TYPE finalis_http_requests_total counter\n";
+  {
+    std::lock_guard<std::mutex> guard(g_metrics_mu);
+    for (const auto& [key, count] : g_metrics_http_requests_total) {
+      const auto sep = key.rfind('|');
+      const std::string route = sep == std::string::npos ? key : key.substr(0, sep);
+      const std::string status = sep == std::string::npos ? "0" : key.substr(sep + 1);
+      oss << "finalis_http_requests_total{route=\"" << json_escape(route) << "\",status=\"" << json_escape(status) << "\"} "
+          << count << "\n";
+    }
+    oss << "finalis_partner_auth_failures_total " << g_metrics_partner_auth_failures_total << "\n";
+    oss << "finalis_partner_rate_limited_total " << g_metrics_partner_rate_limited_total << "\n";
+    oss << "finalis_partner_withdrawal_submissions_total " << g_metrics_partner_withdrawal_submissions_total << "\n";
+    oss << "finalis_partner_webhook_deliveries_total " << g_metrics_partner_webhook_deliveries_total << "\n";
+    oss << "finalis_partner_webhook_failures_total " << g_metrics_partner_webhook_failures_total << "\n";
+  }
+  Response resp;
+  resp.status = 200;
+  resp.content_type = "text/plain; version=0.0.4; charset=utf-8";
+  resp.body = oss.str();
+  return resp;
+}
+
+bool load_partner_registry(const Config& cfg, std::string* err) {
+  if (cfg.partner_registry_path.empty()) return true;
+  std::ifstream in(cfg.partner_registry_path);
+  if (!in) {
+    if (err) *err = "failed to open partner registry";
+    return false;
+  }
+  std::ostringstream oss;
+  oss << in.rdbuf();
+  auto root = finalis::minijson::parse(oss.str());
+  if (!root.has_value() || !root->is_object()) {
+    if (err) *err = "partner registry must be a JSON object";
+    return false;
+  }
+  const auto* partners = root->get("partners");
+  if (!partners || !partners->is_array()) {
+    if (err) *err = "partner registry must contain partners array";
+    return false;
+  }
+  std::unordered_map<std::string, PartnerAuthRecord> by_key;
+  std::unordered_map<std::string, PartnerAuthRecord> by_id;
+  for (const auto& p : partners->array_value) {
+    if (!p.is_object()) {
+      if (err) *err = "partner entry must be object";
+      return false;
+    }
+    const auto partner_id = object_string(&p, "partner_id");
+    const auto api_key = object_string(&p, "api_key");
+    const auto active_secret = object_string(&p, "active_secret");
+    if (!partner_id.has_value() || partner_id->empty() || !api_key.has_value() || api_key->empty() || !active_secret.has_value() ||
+        active_secret->empty()) {
+      if (err) *err = "partner entry missing partner_id/api_key/active_secret";
+      return false;
+    }
+    PartnerAuthRecord rec;
+    rec.partner_id = *partner_id;
+    rec.api_key = *api_key;
+    rec.active_secret = *active_secret;
+    rec.next_secret = object_string(&p, "next_secret");
+    rec.rate_limit_per_minute = object_u64(&p, "rate_limit_per_minute");
+    rec.webhook_url = object_string(&p, "webhook_url");
+    rec.webhook_secret = object_string(&p, "webhook_secret");
+    rec.enabled = object_bool(&p, "enabled").value_or(true);
+    if (by_key.count(rec.api_key) || by_id.count(rec.partner_id)) {
+      if (err) *err = "duplicate partner_id or api_key in registry";
+      return false;
+    }
+    by_key[rec.api_key] = rec;
+    by_id[rec.partner_id] = rec;
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    g_partner_by_api_key = std::move(by_key);
+    g_partner_by_id = std::move(by_id);
+  }
+  return true;
+}
+
+void partner_webhook_worker(const Config cfg) {
+  while (!g_partner_webhook_stop.load()) {
+    PartnerWebhookDelivery job;
+    bool have_job = false;
+    {
+      std::unique_lock<std::mutex> lock(g_partner_mu);
+      g_partner_webhook_cv.wait_for(lock, std::chrono::milliseconds(250), [] {
+        return g_partner_webhook_stop.load() || !g_partner_webhook_queue.empty();
+      });
+      if (g_partner_webhook_stop.load()) break;
+      const auto now = now_unix_ms();
+      std::size_t due_idx = static_cast<std::size_t>(-1);
+      for (std::size_t i = 0; i < g_partner_webhook_queue.size(); ++i) {
+        if (g_partner_webhook_queue[i].next_attempt_unix_ms <= now) {
+          due_idx = i;
+          break;
+        }
+      }
+      if (due_idx != static_cast<std::size_t>(-1)) {
+        job = g_partner_webhook_queue[due_idx];
+        g_partner_webhook_queue.erase(g_partner_webhook_queue.begin() + static_cast<std::ptrdiff_t>(due_idx));
+        have_job = true;
+      }
+    }
+    if (!have_job) continue;
+    std::string post_err;
+    auto res = g_partner_webhook_post_json(job.url, job.payload_json, &post_err);
+    if (res.has_value()) {
+      std::lock_guard<std::mutex> guard(g_metrics_mu);
+      ++g_metrics_partner_webhook_deliveries_total;
+      continue;
+    }
+    ++job.attempt;
+    {
+      std::lock_guard<std::mutex> guard(g_metrics_mu);
+      ++g_metrics_partner_webhook_failures_total;
+    }
+    if (job.attempt >= cfg.partner_webhook_max_attempts) continue;
+    const std::uint64_t shift = std::min<std::uint64_t>(job.attempt - 1, 16);
+    std::uint64_t backoff = cfg.partner_webhook_initial_backoff_ms * (1ULL << shift);
+    backoff = std::min<std::uint64_t>(backoff, cfg.partner_webhook_max_backoff_ms);
+    job.next_attempt_unix_ms = now_unix_ms() + backoff;
+    {
+      std::lock_guard<std::mutex> lock(g_partner_mu);
+      g_partner_webhook_queue.push_back(std::move(job));
+    }
+  }
+}
+
 void handle_client_session(Config cfg, finalis::net::SocketHandle fd) {
   struct ActiveGuard {
     ~ActiveGuard() { --g_active_clients; }
@@ -3595,6 +4283,7 @@ void handle_client_session(Config cfg, finalis::net::SocketHandle fd) {
   const Response resp_obj =
       req.has_value() ? handle_request(cfg, *req)
                       : html_response(400, page_layout("Bad Request", "<h1>Bad Request</h1>"));
+  record_http_metric(request_target_for_log(req), resp_obj.status);
   const std::string resp = http_response(resp_obj);
   (void)write_all(fd, resp);
   finalis::net::shutdown_socket(fd);
@@ -3610,21 +4299,16 @@ void handle_client_session(Config cfg, finalis::net::SocketHandle fd) {
 }
 
 Response handle_request(const Config& cfg, const std::string& req) {
-  const auto line_end = req.find("\r\n");
-  if (line_end == std::string::npos) {
+  std::string parse_err;
+  auto parsed_req = parse_http_request(req, &parse_err);
+  if (!parsed_req.has_value()) {
     return html_response(400, page_layout("Bad Request", "<h1>Bad Request</h1>"));
   }
-  const std::string first = req.substr(0, line_end);
-  const auto sp1 = first.find(' ');
-  const auto sp2 = first.rfind(' ');
-  if (sp1 == std::string::npos || sp2 == std::string::npos || sp1 == sp2) {
-    return html_response(400, page_layout("Bad Request", "<h1>Bad Request</h1>"));
-  }
-  const std::string method = first.substr(0, sp1);
-  if (method != "GET") {
+  const std::string method = parsed_req->method;
+  if (method != "GET" && method != "POST") {
     return html_response(405, page_layout("Method Not Allowed", "<h1>Method Not Allowed</h1>"));
   }
-  std::string raw_target = first.substr(sp1 + 1, sp2 - sp1 - 1);
+  std::string raw_target = parsed_req->target;
   std::string query_string;
   const auto query_pos = raw_target.find('?');
   if (query_pos != std::string::npos) {
@@ -3633,17 +4317,223 @@ Response handle_request(const Config& cfg, const std::string& req) {
   }
   std::string path = url_decode(raw_target);
   const auto query = parse_query_params(query_string);
+  const bool is_api_path = path.rfind("/api/", 0) == 0;
+  const bool post_allowed = (path == "/api/v1/withdrawals" || path == "/api/v1/transactions/status:batch");
+  if (method == "POST" && !post_allowed) {
+    if (is_api_path) return json_error_response(make_error(405, "method_not_allowed", "method not allowed"));
+    return html_response(405, page_layout("Method Not Allowed", "<h1>Method Not Allowed</h1>"));
+  }
+
+  if (path == "/metrics") return render_metrics_response();
+
+  PartnerPrincipal principal;
+  if (auto auth_err = verify_partner_auth(cfg, *parsed_req, path, &principal); auth_err.has_value()) {
+    return json_error_response(*auth_err);
+  }
+  Response rate_limited_response;
+  if (auto rl_err = enforce_partner_rate_limit(cfg, *parsed_req, principal, &rate_limited_response); rl_err.has_value()) {
+    rate_limited_response.status = rl_err->http_status;
+    rate_limited_response.content_type = "application/json; charset=utf-8";
+    rate_limited_response.body = error_json(*rl_err);
+    return rate_limited_response;
+  }
 
   if (path == "/" || path.empty()) return html_response(200, render_root(cfg));
   if (path == "/committee") return html_response(200, render_committee(cfg));
   if (path == "/favicon.ico") {
-    return Response{404, "text/plain; charset=utf-8", "", std::nullopt};
+    return Response{404, "text/plain; charset=utf-8", "", std::nullopt, {}};
   }
   if (path == "/healthz") {
     auto result = fetch_status_result(cfg);
     if (result.value.has_value()) return json_response(200, render_health_json(true));
     const auto err = result.error.value_or(upstream_error("status unavailable"));
     return json_response(502, render_health_json(false, err));
+  }
+  if (path == "/api/v1/status") {
+    auto result = fetch_status_result(cfg);
+    return result.value.has_value() ? json_response(200, append_api_v1(render_status_json(*result.value, persisted_status_refreshed_unix_ms())))
+                                    : json_error_response(*result.error);
+  }
+  if (path == "/api/v1/committee") {
+    auto status = fetch_status_result(cfg);
+    if (!status.value.has_value()) return json_error_response(*status.error);
+    auto result = fetch_committee_result(cfg, status.value->finalized_height);
+    return result.value.has_value()
+               ? json_response(200, append_api_v1(render_committee_json(*result.value, persisted_committee_refreshed_unix_ms())))
+               : json_error_response(*result.error);
+  }
+  if (path == "/api/v1/recent-tx") {
+    return json_response(200, append_api_v1(render_recent_tx_json(fetch_recent_tx_results(cfg, 8), persisted_recent_refreshed_unix_ms())));
+  }
+  if (path == "/api/v1/fees/recommendation") {
+    auto rpc = rpc_call(cfg.rpc_url, "get_status", "{}");
+    std::optional<std::uint64_t> min_fee_rate;
+    if (rpc.result.has_value() && rpc.result->is_object()) {
+      const auto* mempool = rpc.result->get("mempool");
+      if (mempool && mempool->is_object()) min_fee_rate = object_u64(mempool, "min_fee_rate_to_enter_when_full_milliunits_per_byte");
+    }
+    std::ostringstream oss;
+    oss << "{\"policy\":\"dynamic_mempool_min_fee\",\"recommended_milliunits_per_byte\":";
+    if (min_fee_rate.has_value()) oss << *min_fee_rate;
+    else oss << "10000";
+    oss << ",\"min_relay_milliunits_per_byte\":";
+    if (min_fee_rate.has_value()) oss << *min_fee_rate;
+    else oss << "10000";
+    oss << ",\"ttl_seconds\":30,\"finalized_only\":true,\"api_version\":\"v1\"}";
+    return json_response(200, oss.str());
+  }
+  if (path == "/api/v1/transactions/status:batch") {
+    if (method != "POST") return json_error_response(make_error(405, "method_not_allowed", "POST required"));
+    auto body_json = finalis::minijson::parse(parsed_req->body);
+    if (!body_json.has_value() || !body_json->is_object()) {
+      return json_error_response(make_error(400, "invalid_body", "expected JSON object body"));
+    }
+    const auto* txids = body_json->get("txids");
+    if (!txids || !txids->is_array()) return json_error_response(make_error(400, "invalid_txids", "missing txids array"));
+    std::ostringstream oss;
+    oss << "{\"items\":[";
+    bool first = true;
+    for (const auto& item : txids->array_value) {
+      if (!item.is_string() || !is_hex64(item.string_value)) {
+        return json_error_response(make_error(400, "invalid_txids", "txids must be 64-hex strings"));
+      }
+      auto tx_lookup = fetch_tx_result(cfg, item.string_value);
+      if (!first) oss << ",";
+      first = false;
+      if (!tx_lookup.value.has_value()) {
+        oss << "{\"txid\":\"" << json_escape(item.string_value)
+            << "\",\"status\":\"not_found\",\"finalized\":false,\"credit_safe\":false,\"finalized_depth\":0,"
+            << "\"height\":null,\"transition_hash\":null}";
+      } else {
+        const auto& tx = *tx_lookup.value;
+        oss << "{\"txid\":\"" << json_escape(tx.txid) << "\",\"status\":\"" << json_escape(tx.found ? "finalized" : "not_found")
+            << "\",\"finalized\":" << json_bool(tx.finalized)
+            << ",\"credit_safe\":" << json_bool(tx.credit_safe)
+            << ",\"finalized_depth\":" << tx.finalized_depth
+            << ",\"height\":" << json_u64_or_null(tx.finalized_height)
+            << ",\"transition_hash\":" << json_string_or_null(tx.transition_hash.empty() ? std::optional<std::string>{} : std::optional<std::string>{tx.transition_hash})
+            << "}";
+      }
+    }
+    oss << "],\"finalized_only\":true,\"api_version\":\"v1\"}";
+    return json_response(200, oss.str());
+  }
+  if (path == "/api/v1/withdrawals") {
+    if (method != "POST") return json_error_response(make_error(405, "method_not_allowed", "POST required"));
+    auto body_json = finalis::minijson::parse(parsed_req->body);
+    if (!body_json.has_value() || !body_json->is_object()) {
+      return json_error_response(make_error(400, "invalid_body", "expected JSON object body"));
+    }
+    const auto client_id = object_string(&*body_json, "client_withdrawal_id");
+    const auto tx_hex = object_string(&*body_json, "tx_hex");
+    if (!client_id.has_value() || client_id->empty()) {
+      return json_error_response(make_error(400, "missing_client_withdrawal_id", "client_withdrawal_id is required"));
+    }
+    if (!tx_hex.has_value() || tx_hex->empty()) {
+      return json_error_response(make_error(400, "missing_tx_hex", "tx_hex is required"));
+    }
+    const auto idem_key = header_value(*parsed_req, "idempotency-key");
+    if (!idem_key.has_value() || idem_key->empty()) {
+      return json_error_response(make_error(400, "missing_idempotency_key", "Idempotency-Key header is required"));
+    }
+    const std::string partner_id = principal.partner_id.empty() ? "default" : principal.partner_id;
+    const std::string scoped_idem = partner_scoped_id(partner_id, *idem_key);
+    const std::string scoped_client = partner_scoped_id(partner_id, *client_id);
+    const auto tx_bytes = finalis::hex_decode(*tx_hex);
+    if (!tx_bytes.has_value()) return json_error_response(make_error(400, "invalid_tx_hex", "tx_hex decode failed"));
+    const auto any_tx = finalis::parse_any_tx(*tx_bytes);
+    if (!any_tx.has_value()) return json_error_response(make_error(400, "invalid_tx_hex", "tx parse failed"));
+    const std::string txid = finalis::hex_encode32(finalis::txid_any(*any_tx));
+    const std::string body_hash = sha256_hex_text(parsed_req->body);
+    {
+      std::lock_guard<std::mutex> guard(g_partner_mu);
+      auto idh = g_partner_idempotency_hash.find(scoped_idem);
+      if (idh != g_partner_idempotency_hash.end() && idh->second != body_hash) {
+        return json_error_response(make_error(409, "idempotency_conflict", "idempotency key reused with different body"));
+      }
+      if (idh != g_partner_idempotency_hash.end()) {
+        auto cid_it = g_partner_idempotency_client_id.find(scoped_idem);
+        if (cid_it != g_partner_idempotency_client_id.end()) {
+          auto wit = g_partner_withdrawals_by_client_id.find(cid_it->second);
+          if (wit != g_partner_withdrawals_by_client_id.end()) {
+            return json_response(200, std::string("{\"withdrawal\":") + partner_withdrawal_json(wit->second) + ",\"api_version\":\"v1\"}");
+          }
+        }
+      }
+      auto existing = g_partner_withdrawals_by_client_id.find(scoped_client);
+      if (existing != g_partner_withdrawals_by_client_id.end()) {
+        g_partner_idempotency_hash[scoped_idem] = body_hash;
+        g_partner_idempotency_client_id[scoped_idem] = scoped_client;
+        return json_response(200, std::string("{\"withdrawal\":") + partner_withdrawal_json(existing->second) + ",\"api_version\":\"v1\"}");
+      }
+    }
+    auto broadcast = rpc_call(cfg.rpc_url, "broadcast_tx", std::string("{\"tx_hex\":\"") + json_escape(*tx_hex) + "\"}");
+    if (!broadcast.result.has_value() || !broadcast.result->is_object()) {
+      return json_error_response(upstream_error(broadcast.error.empty() ? "broadcast failed" : broadcast.error));
+    }
+    const bool accepted = object_bool(&*broadcast.result, "accepted").value_or(false);
+    const bool retryable = object_bool(&*broadcast.result, "retryable").value_or(false);
+    const std::string retry_class = object_string(&*broadcast.result, "retry_class").value_or("none");
+    const auto error_code = object_string(&*broadcast.result, "error_code");
+    const auto error_message = object_string(&*broadcast.result, "error_message");
+    PartnerWithdrawal w;
+    w.partner_id = partner_id;
+    w.client_withdrawal_id = *client_id;
+    w.txid = object_string(&*broadcast.result, "txid").value_or(txid);
+    w.state = accepted ? "accepted_for_relay" : (retryable ? "submitted" : "rejected");
+    w.retryable = retryable;
+    w.retry_class = retry_class;
+    w.error_code = error_code;
+    w.error_message = error_message;
+    w.created_unix_ms = now_unix_ms();
+    w.updated_unix_ms = w.created_unix_ms;
+    {
+      std::lock_guard<std::mutex> guard(g_partner_mu);
+      g_partner_idempotency_hash[scoped_idem] = body_hash;
+      g_partner_idempotency_client_id[scoped_idem] = scoped_client;
+    }
+    upsert_partner_withdrawal(cfg, w);
+    {
+      std::lock_guard<std::mutex> guard(g_metrics_mu);
+      ++g_metrics_partner_withdrawal_submissions_total;
+    }
+    const int status = accepted ? 201 : (retryable ? 202 : 200);
+    return json_response(status, std::string("{\"withdrawal\":") + partner_withdrawal_json(w) + ",\"api_version\":\"v1\"}");
+  }
+  const std::string api_v1_withdrawals_prefix = "/api/v1/withdrawals/";
+  if (path.rfind(api_v1_withdrawals_prefix, 0) == 0) {
+    if (method != "GET") return json_error_response(make_error(405, "method_not_allowed", "GET required"));
+    const std::string ident = path.substr(api_v1_withdrawals_prefix.size());
+    if (ident.empty()) return json_error_response(make_error(400, "invalid_withdrawal_id", "missing withdrawal id"));
+    auto lookup = find_partner_withdrawal_by_any_id(principal.partner_id.empty() ? "default" : principal.partner_id, ident);
+    if (!lookup.has_value()) return json_error_response(make_error(404, "not_found", "withdrawal not found"));
+    auto refreshed = refresh_partner_withdrawal_state(cfg, *lookup);
+    return json_response(200, std::string("{\"withdrawal\":") + partner_withdrawal_json(refreshed) + ",\"api_version\":\"v1\"}");
+  }
+  if (path == "/api/v1/events/finalized") {
+    if (method != "GET") return json_error_response(make_error(405, "method_not_allowed", "GET required"));
+    const auto from_seq = query.count("from_sequence") ? parse_u64_strict(query.at("from_sequence")) : std::optional<std::uint64_t>(1);
+    if (!from_seq.has_value()) return json_error_response(make_error(400, "invalid_from_sequence", "from_sequence must be numeric"));
+    std::vector<PartnerEvent> events;
+    std::uint64_t next_seq = 1;
+    {
+      std::lock_guard<std::mutex> guard(g_partner_mu);
+      next_seq = g_partner_next_sequence;
+      for (const auto& evt : g_partner_events) {
+        if (evt.sequence >= *from_seq && evt.state == "finalized" &&
+            evt.partner_id == (principal.partner_id.empty() ? "default" : principal.partner_id)) {
+          events.push_back(evt);
+        }
+      }
+    }
+    std::ostringstream oss;
+    oss << "{\"items\":[";
+    for (std::size_t i = 0; i < events.size(); ++i) {
+      if (i) oss << ",";
+      oss << partner_event_json(events[i]);
+    }
+    oss << "],\"next_sequence\":" << next_seq << ",\"api_version\":\"v1\"}";
+    return json_response(200, oss.str());
   }
   if (path == "/search") {
     auto it = query.find("q");
@@ -3686,24 +4576,34 @@ Response handle_request(const Config& cfg, const std::string& req) {
   const std::string api_tx_prefix = "/api/tx/";
   const std::string api_transition_prefix = "/api/transition/";
   const std::string api_address_prefix = "/api/address/";
-  if (path == "/api/search") {
+  const std::string api_v1_tx_prefix = "/api/v1/tx/";
+  const std::string api_v1_transition_prefix = "/api/v1/transition/";
+  const std::string api_v1_address_prefix = "/api/v1/address/";
+  if (path == "/api/search" || path == "/api/v1/search") {
     auto it = query.find("q");
     if (it == query.end() || it->second.empty()) return json_error_response(make_error(400, "invalid_query", "missing query"));
     auto result = fetch_search_result(cfg, it->second);
-    return result.value.has_value() ? json_response(200, render_search_json(*result.value))
+    return result.value.has_value()
+               ? json_response(200, path == "/api/v1/search" ? append_api_v1(render_search_json(*result.value))
+                                                             : render_search_json(*result.value))
+               : json_error_response(*result.error);
+  }
+  if (path.rfind(api_tx_prefix, 0) == 0 || path.rfind(api_v1_tx_prefix, 0) == 0) {
+    const bool v1 = path.rfind(api_v1_tx_prefix, 0) == 0;
+    auto result = fetch_tx_result(cfg, path.substr(v1 ? api_v1_tx_prefix.size() : api_tx_prefix.size()));
+    return result.value.has_value() ? json_response(200, v1 ? append_api_v1(render_tx_json(*result.value)) : render_tx_json(*result.value))
                                     : json_error_response(*result.error);
   }
-  if (path.rfind(api_tx_prefix, 0) == 0) {
-    auto result = fetch_tx_result(cfg, path.substr(api_tx_prefix.size()));
-    return result.value.has_value() ? json_response(200, render_tx_json(*result.value))
-                                    : json_error_response(*result.error);
+  if (path.rfind(api_transition_prefix, 0) == 0 || path.rfind(api_v1_transition_prefix, 0) == 0) {
+    const bool v1 = path.rfind(api_v1_transition_prefix, 0) == 0;
+    auto result = fetch_transition_result(cfg, path.substr(v1 ? api_v1_transition_prefix.size() : api_transition_prefix.size()));
+    return result.value.has_value()
+               ? json_response(200, v1 ? append_api_v1(render_transition_json(cfg, *result.value))
+                                       : render_transition_json(cfg, *result.value))
+               : json_error_response(*result.error);
   }
-  if (path.rfind(api_transition_prefix, 0) == 0) {
-    auto result = fetch_transition_result(cfg, path.substr(api_transition_prefix.size()));
-    return result.value.has_value() ? json_response(200, render_transition_json(cfg, *result.value))
-                                    : json_error_response(*result.error);
-  }
-  if (path.rfind(api_address_prefix, 0) == 0) {
+  if (path.rfind(api_address_prefix, 0) == 0 || path.rfind(api_v1_address_prefix, 0) == 0) {
+    const bool v1 = path.rfind(api_v1_address_prefix, 0) == 0;
     std::optional<std::uint64_t> start_after_height;
     std::optional<std::string> start_after_txid;
     if (auto it = query.find("after_height"); it != query.end() && !it->second.empty() && is_digits(it->second)) {
@@ -3713,9 +4613,11 @@ Response handle_request(const Config& cfg, const std::string& req) {
       }
     }
     if (auto it = query.find("after_txid"); it != query.end() && is_hex64(it->second)) start_after_txid = it->second;
-    auto result = fetch_address_result(cfg, path.substr(api_address_prefix.size()), start_after_height, start_after_txid);
-    return result.value.has_value() ? json_response(200, render_address_json(*result.value))
-                                    : json_error_response(*result.error);
+    auto result = fetch_address_result(cfg, path.substr(v1 ? api_v1_address_prefix.size() : api_address_prefix.size()), start_after_height,
+                                       start_after_txid);
+    return result.value.has_value()
+               ? json_response(200, v1 ? append_api_v1(render_address_json(*result.value)) : render_address_json(*result.value))
+               : json_error_response(*result.error);
   }
   if (path.rfind(transition_prefix, 0) == 0) {
     return html_response(200, render_transition(cfg, path.substr(transition_prefix.size())));
@@ -3730,10 +4632,24 @@ Response handle_request(const Config& cfg, const std::string& req) {
 int main(int argc, char** argv) {
   auto cfg = parse_args(argc, argv);
   if (!cfg.has_value()) {
-    std::cerr << "usage: finalis-explorer [--bind 127.0.0.1] [--port 18080] [--rpc-url http://127.0.0.1:19444/rpc] [--cache-path /path/to/cache.json]\n";
+    std::cerr << "usage: finalis-explorer [--bind 127.0.0.1] [--port 18080] [--rpc-url http://127.0.0.1:19444/rpc] "
+                 "[--cache-path /path/to/cache.json] [--partner-auth-required 0|1] [--partner-api-key KEY] "
+                 "[--partner-api-secret SECRET] [--partner-registry /path/partners.json] "
+                 "[--partner-auth-max-skew-seconds 300] [--partner-rate-limit-per-minute 600] "
+                 "[--partner-webhook-max-attempts 5] [--partner-webhook-initial-backoff-ms 1000] "
+                 "[--partner-webhook-max-backoff-ms 60000]\n";
     return 1;
   }
   if (cfg->cache_path.empty()) cfg->cache_path = default_explorer_cache_path(cfg->rpc_url);
+  std::string registry_err;
+  if (!load_partner_registry(*cfg, &registry_err)) {
+    std::cerr << "failed to load partner registry: " << registry_err << "\n";
+    return 1;
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    if (!g_partner_by_api_key.empty()) cfg->partner_auth_required = true;
+  }
   load_persisted_explorer_snapshot(*cfg);
 
   if (!finalis::net::ensure_sockets()) {
@@ -3768,8 +4684,14 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+  g_partner_webhook_stop.store(false);
+  g_partner_webhook_thread = std::thread([cfg = *cfg]() { partner_webhook_worker(cfg); });
   std::cout << "finalis-explorer listening on http://" << cfg->bind_ip << ":" << cfg->port
-            << " using lightserver " << cfg->rpc_url << "\n";
+            << " using lightserver " << cfg->rpc_url
+            << " partner_auth=" << (cfg->partner_auth_required ? "on" : "off")
+            << " partner_rate_limit_per_minute=" << cfg->partner_rate_limit_per_minute
+            << " partner_registry=" << (cfg->partner_registry_path.empty() ? "(none)" : cfg->partner_registry_path)
+            << " webhook_max_attempts=" << cfg->partner_webhook_max_attempts << "\n";
 
   while (!g_stop) {
     sockaddr_in client{};
@@ -3792,6 +4714,9 @@ int main(int argc, char** argv) {
     std::thread(handle_client_session, *cfg, fd).detach();
   }
 
+  g_partner_webhook_stop.store(true);
+  g_partner_webhook_cv.notify_all();
+  if (g_partner_webhook_thread.joinable()) g_partner_webhook_thread.join();
   finalis::net::close_socket(listen_fd);
   return 0;
 }
