@@ -244,40 +244,63 @@ def main() -> int:
 
     try:
         files = changed_files(args.base_ref, args.head_ref)
-        old_spec = read_file_at_ref(args.base_ref, OPENAPI_PATH)
         new_spec = read_file_at_ref(args.head_ref, OPENAPI_PATH)
-        old_contract = parse_openapi_contract(old_spec)
         new_contract = parse_openapi_contract(new_spec)
     except Exception as exc:
         print(f"partner-api-governance: failed to initialize check: {exc}", file=sys.stderr)
         return 2
 
+    # Detect whether the file existed at base. If not, this is a clean first
+    # introduction of the spec — no breaking-change analysis applies.
+    try:
+        old_spec = read_file_at_ref(args.base_ref, OPENAPI_PATH)
+        old_contract = parse_openapi_contract(old_spec)
+        openapi_is_new = False
+    except Exception:
+        old_spec = ""
+        old_contract = None
+        openapi_is_new = True
+
     openapi_changed = OPENAPI_PATH in files and old_spec != new_spec
-    if not openapi_changed:
+    if not openapi_changed and not openapi_is_new:
         print("partner-api-governance: OpenAPI unchanged; governance gate passed.")
         return 0
 
     errors: List[str] = []
-    breaking_reasons = classify_breaking(old_contract, new_contract)
-    is_breaking = len(breaking_reasons) > 0
+
+    if openapi_is_new:
+        # First introduction of the spec: no breaking-change analysis, no
+        # version-increment check (there is no old version to compare against).
+        # Changelog must still be present and reference the new version.
+        breaking_reasons = []
+        is_breaking = False
+        print(f"partner-api-governance: new OpenAPI spec introduced at v{new_contract.version}")
+    else:
+        breaking_reasons = classify_breaking(old_contract, new_contract)
+        is_breaking = len(breaking_reasons) > 0
+
+        if not semver_gt(new_contract.version, old_contract.version):
+            errors.append(
+                f"info.version must be incremented when OpenAPI changes (base={old_contract.version}, head={new_contract.version})."
+            )
+
+        if is_breaking:
+            old_major, _, _ = parse_semver(old_contract.version)
+            new_major, _, _ = parse_semver(new_contract.version)
+            if new_major <= old_major:
+                errors.append(
+                    f"breaking API changes require major version bump (base={old_contract.version}, head={new_contract.version})."
+                )
+            if DEPRECATIONS_PATH not in files:
+                errors.append(f"{DEPRECATIONS_PATH} must be updated for breaking API changes.")
+
+        print(f"partner-api-governance: base={old_contract.version} head={new_contract.version} breaking={is_breaking}")
+        if is_breaking:
+            for reason in breaking_reasons:
+                print(f"  - breaking: {reason}")
 
     if CHANGELOG_PATH not in files:
         errors.append(f"{CHANGELOG_PATH} must be updated whenever {OPENAPI_PATH} changes.")
-
-    if not semver_gt(new_contract.version, old_contract.version):
-        errors.append(
-            f"info.version must be incremented when OpenAPI changes (base={old_contract.version}, head={new_contract.version})."
-        )
-
-    if is_breaking:
-        old_major, _, _ = parse_semver(old_contract.version)
-        new_major, _, _ = parse_semver(new_contract.version)
-        if new_major <= old_major:
-            errors.append(
-                f"breaking API changes require major version bump (base={old_contract.version}, head={new_contract.version})."
-            )
-        if DEPRECATIONS_PATH not in files:
-            errors.append(f"{DEPRECATIONS_PATH} must be updated for breaking API changes.")
 
     if CHANGELOG_PATH in files:
         try:
@@ -298,11 +321,6 @@ def main() -> int:
                     errors.append(
                         f"top changelog entry for v{new_contract.version} must include 'BREAKING' for breaking changes."
                     )
-
-    print(f"partner-api-governance: base={old_contract.version} head={new_contract.version} breaking={is_breaking}")
-    if is_breaking:
-        for reason in breaking_reasons:
-            print(f"  - breaking: {reason}")
 
     if errors:
         print("partner-api-governance: FAILED", file=sys.stderr)
