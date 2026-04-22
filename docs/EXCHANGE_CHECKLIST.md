@@ -123,6 +123,9 @@ Before enabling user deposits and withdrawals, confirm:
 - incident handling is owned and documented
 - partner API v1 auth and idempotency are enabled and tested
 - partner metrics (`/metrics`) are scraped and alerting is active
+- partner API governance gate is active and green:
+  - `.github/workflows/partner-api-governance.yml`
+  - `docs/PARTNER_API_CHANGELOG.md`
 
 ## 9. Never build settlement around
 

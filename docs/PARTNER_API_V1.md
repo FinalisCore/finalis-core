@@ -6,6 +6,12 @@ Machine-readable OpenAPI contract:
 
 - `openapi/finalis-partner-v1.yaml`
 
+Governance artifacts:
+
+- `docs/PARTNER_API_COMPATIBILITY_POLICY.md`
+- `docs/PARTNER_API_CHANGELOG.md`
+- `docs/PARTNER_API_DEPRECATIONS.md`
+
 Base routes:
 
 - `GET /api/v1/status`

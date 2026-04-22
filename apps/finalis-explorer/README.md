@@ -156,6 +156,11 @@ Partner API v1:
   finalized event feed
 - `GET /api/v1/fees/recommendation` provides fee policy guidance for
   withdrawal submitters
+- governance and compatibility policy:
+  - `docs/PARTNER_API_COMPATIBILITY_POLICY.md`
+  - `docs/PARTNER_API_CHANGELOG.md`
+  - `docs/PARTNER_API_DEPRECATIONS.md`
+  - CI gate: `.github/workflows/partner-api-governance.yml`
 
 Partner auth (when enabled):
 
