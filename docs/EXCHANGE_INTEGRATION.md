@@ -35,6 +35,8 @@ Use this with:
 - [EXCHANGE_API_EXAMPLES.md](EXCHANGE_API_EXAMPLES.md)
 - [EXCHANGE_CHECKLIST.md](EXCHANGE_CHECKLIST.md)
 - [EXCHANGE_OPERATOR_RUNBOOK.md](EXCHANGE_OPERATOR_RUNBOOK.md)
+- [PARTNER_API_V1.md](PARTNER_API_V1.md)
+- [PARTNER_SLO.md](PARTNER_SLO.md)
 - [MAINNET.md](MAINNET.md)
 
 ## 1. Authoritative interfaces
@@ -230,6 +232,12 @@ Explorer is optional. Current relevant routes are:
 - `/api/transition/<height_or_hash>`
 - `/api/address/<address>`
 - `/api/search?q=<query>`
+- `/api/v1/status`
+- `/api/v1/transactions/status:batch`
+- `/api/v1/withdrawals`
+- `/api/v1/withdrawals/<id>`
+- `/api/v1/events/finalized`
+- `/api/v1/fees/recommendation`
 
 Do not build against non-existent or stale routes such as `/api/block/...`.
 
@@ -239,6 +247,16 @@ same integration is possible through lightserver, prefer lightserver.
 Explorer may mark data as cached finalized snapshot versus fresh RPC. That is a
 provenance signal, not a settlement distinction; finalized identity is still
 the accounting truth.
+
+Partner gateway notes:
+
+- `/api/v1` supports partner-scoped auth, idempotent withdrawal submission, and
+  replayable finalized events
+- multi-tenant auth can be configured via partner registry with per-partner
+  `api_key`, `active_secret`, optional `next_secret` (rotation), per-partner
+  rate limits, and optional webhook settings
+- finalized withdrawals can be consumed via pull (`/api/v1/events/finalized`)
+  and optional signed webhook delivery with retries
 
 ## 9. Failure handling
 
