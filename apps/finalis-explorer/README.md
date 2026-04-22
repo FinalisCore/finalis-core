@@ -48,6 +48,8 @@ Supported API routes:
 - `/api/v1/withdrawals/<client_withdrawal_id_or_txid>`
 - `/api/v1/events/finalized?from_sequence=<n>`
 - `/api/v1/fees/recommendation`
+- `/api/v1/webhooks/dlq`
+- `/api/v1/webhooks/dlq/replay` (POST)
 - `/metrics`
 
 What it shows:
@@ -180,6 +182,11 @@ Partner auth (when enabled):
 - basic per-partner rate limit:
   - configured by `--partner-rate-limit-per-minute`
   - limit responses return `429` with `Retry-After`
+- optional mTLS verification gate for protected partner endpoints:
+  - `--partner-mtls-required 1`
+  - requires header `X-Finalis-Mtls-Verified: true`
+- optional global source CIDR allowlist:
+  - `--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32`
 
 Multi-tenant partner registry:
 
@@ -192,6 +199,9 @@ Multi-tenant partner registry:
   - optional `rate_limit_per_minute`
   - optional `webhook_url`
   - optional `webhook_secret`
+  - optional `allowed_ipv4_cidrs`
+  - optional `scopes` (`read`, `withdraw_submit`, `events_read`,
+    `webhook_manage`)
   - optional `enabled`
 - when a registry is loaded, partner auth is enabled for protected `/api/v1/*`
   routes automatically
@@ -215,6 +225,10 @@ Webhook delivery:
   - queue entries are durable
   - successful delivery removes an entry
   - crash before snapshot flush may replay a webhook after restart
+- exhausted retries move deliveries to partner-scoped DLQ
+- replay DLQ entries with:
+  - `POST /api/v1/webhooks/dlq/replay`
+  - `{"sequence": <event_sequence>}`
 
 Health behavior:
 

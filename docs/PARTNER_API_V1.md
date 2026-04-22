@@ -5,6 +5,7 @@ This document defines the exchange-facing `v1` contract exposed by `finalis-expl
 Machine-readable OpenAPI contract:
 
 - `openapi/finalis-partner-v1.yaml`
+- `docs/PARTNER_API_REFERENCE.md` (generated)
 
 Governance artifacts:
 
@@ -26,6 +27,8 @@ Base routes:
 - `GET /api/v1/withdrawals/<client_withdrawal_id_or_txid>`
 - `GET /api/v1/events/finalized?from_sequence=<n>`
 - `GET /api/v1/fees/recommendation`
+- `GET /api/v1/webhooks/dlq`
+- `POST /api/v1/webhooks/dlq/replay`
 
 ## Withdrawal lifecycle
 
@@ -73,6 +76,14 @@ Multi-tenant behavior:
 - auth resolves partner identity by `api_key`
 - idempotency and withdrawal tracking are partner-scoped
 - optional `next_secret` allows key rotation windows without downtime
+- optional `allowed_ipv4_cidrs` enforces source CIDR allowlist per partner
+- optional `scopes` enforces per-partner permissions:
+  - `read`
+  - `withdraw_submit`
+  - `events_read`
+  - `webhook_manage`
+- optional deployment-wide mTLS gate via `X-Finalis-Mtls-Verified` when
+  `partner_mtls_required=true`
 
 ## Webhook delivery
 
@@ -93,6 +104,8 @@ Delivery policy:
 - exponential retry backoff
 - bounded by configured max attempts
 - consumers should deduplicate by `(partner_id, sequence)`
+- terminal failures are moved to partner DLQ
+- DLQ replay is available via `POST /api/v1/webhooks/dlq/replay`
 - persisted partner state is GC-bounded by TTL controls:
   - `partner_idempotency_ttl_seconds`
   - `partner_events_ttl_seconds`

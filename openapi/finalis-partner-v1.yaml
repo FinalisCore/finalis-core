@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Finalis Partner API
-  version: 1.0.0
+  version: 1.1.0
   summary: Exchange-facing finalized-state partner API.
 servers:
   - url: https://partner.finalis.example
@@ -145,3 +145,34 @@ paths:
       responses:
         '200':
           description: OK
+  /api/v1/webhooks/dlq:
+    get:
+      summary: List partner webhook dead-letter queue entries
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: OK
+        '403':
+          description: Missing webhook_manage scope
+  /api/v1/webhooks/dlq/replay:
+    post:
+      summary: Replay a dead-lettered webhook delivery by sequence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sequence]
+              properties:
+                sequence:
+                  type: integer
+      responses:
+        '200':
+          description: Replay accepted
+        '404':
+          description: Entry not found
