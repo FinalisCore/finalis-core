@@ -83,9 +83,14 @@ Payload shape:
 Delivery policy:
 
 - at-least-once delivery
+- crash before queue-snapshot flush can replay a delivered event after restart
 - exponential retry backoff
 - bounded by configured max attempts
 - consumers should deduplicate by `(partner_id, sequence)`
+- persisted partner state is GC-bounded by TTL controls:
+  - `partner_idempotency_ttl_seconds`
+  - `partner_events_ttl_seconds`
+  - `partner_webhook_queue_ttl_seconds`
 
 ## Retry model
 

@@ -202,6 +202,14 @@ Webhook delivery:
   - `--partner-webhook-max-attempts`
   - `--partner-webhook-initial-backoff-ms`
   - `--partner-webhook-max-backoff-ms`
+- persisted-state GC/TTL bounds:
+  - `--partner-idempotency-ttl-seconds` (default `604800`)
+  - `--partner-events-ttl-seconds` (default `2592000`)
+  - `--partner-webhook-queue-ttl-seconds` (default `604800`)
+- webhook crash-recovery semantics are at-least-once:
+  - queue entries are durable
+  - successful delivery removes an entry
+  - crash before snapshot flush may replay a webhook after restart
 
 Health behavior:
 

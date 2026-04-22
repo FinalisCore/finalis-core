@@ -624,6 +624,219 @@ TEST(test_explorer_partner_webhook_retries_until_success) {
   std::filesystem::remove(registry_path, ec);
 }
 
+TEST(test_explorer_partner_state_persists_across_restart) {
+  ExplorerFixture fx;
+  int broadcast_calls = 0;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      ++broadcast_calls;
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  const auto cache_path = unique_test_cache_path("finalis-partner-state-cache");
+  const auto registry_path = unique_test_cache_path("finalis-partner-state-registry");
+  cfg.cache_path = cache_path.string();
+  cfg.partner_registry_path = registry_path.string();
+  {
+    std::ofstream out(registry_path);
+    out << "{"
+           "\"partners\":[{"
+           "\"partner_id\":\"pdur\","
+           "\"api_key\":\"kdur\","
+           "\"active_secret\":\"sdur\","
+           "\"webhook_url\":\"http://webhook.invalid/pdur\","
+           "\"webhook_secret\":\"whdur\","
+           "\"enabled\":true"
+           "}]"
+           "}";
+  }
+  std::string reg_err;
+  ASSERT_TRUE(load_partner_registry(cfg, &reg_err));
+
+  const std::string body = std::string("{\"client_withdrawal_id\":\"w-dur-1\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const std::string nonce = "dur-n1";
+  const std::string canonical = std::string("POST\n/api/v1/withdrawals\n") + ts + "\n" + nonce + "\n" + sha256_hex_text(body);
+  const auto sig = hmac_sha256_hex("sdur", canonical);
+  ASSERT_TRUE(sig.has_value());
+  const auto created = handle_request(
+      cfg, make_http_request("POST", "/api/v1/withdrawals",
+                             {{"Idempotency-Key", "idem-dur-1"},
+                              {"X-Finalis-Api-Key", "kdur"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", nonce},
+                              {"X-Finalis-Signature", *sig}},
+                             body));
+  ASSERT_TRUE(created.status == 200 || created.status == 201 || created.status == 202);
+  ASSERT_EQ(broadcast_calls, 1);
+
+  const std::string nonce2 = "dur-n2";
+  const std::string canonical2 = std::string("GET\n/api/v1/withdrawals/w-dur-1\n") + ts + "\n" + nonce2 + "\n" + sha256_hex_text("");
+  const auto sig2 = hmac_sha256_hex("sdur", canonical2);
+  ASSERT_TRUE(sig2.has_value());
+  const auto finalized = handle_request(
+      cfg, make_http_request("GET", "/api/v1/withdrawals/w-dur-1",
+                             {{"X-Finalis-Api-Key", "kdur"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", nonce2},
+                              {"X-Finalis-Signature", *sig2}},
+                             ""));
+  ASSERT_EQ(finalized.status, 200);
+  ASSERT_TRUE(finalized.body.find("\"state\":\"finalized\"") != std::string::npos);
+
+  clear_runtime_caches();
+  ASSERT_TRUE(load_partner_registry(cfg, &reg_err));
+  load_persisted_explorer_snapshot(cfg);
+
+  const std::string ts3 = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const std::string nonce3 = "dur-n3";
+  const std::string canonical3 = std::string("POST\n/api/v1/withdrawals\n") + ts3 + "\n" + nonce3 + "\n" + sha256_hex_text(body);
+  const auto sig3 = hmac_sha256_hex("sdur", canonical3);
+  ASSERT_TRUE(sig3.has_value());
+  const auto replay = handle_request(
+      cfg, make_http_request("POST", "/api/v1/withdrawals",
+                             {{"Idempotency-Key", "idem-dur-1"},
+                              {"X-Finalis-Api-Key", "kdur"},
+                              {"X-Finalis-Timestamp", ts3},
+                              {"X-Finalis-Nonce", nonce3},
+                              {"X-Finalis-Signature", *sig3}},
+                             body));
+  ASSERT_EQ(replay.status, 200);
+  ASSERT_EQ(broadcast_calls, 1);
+  ASSERT_TRUE(replay.body.find("\"state\":\"finalized\"") != std::string::npos);
+
+  const std::string nonce4 = "dur-n4";
+  const std::string canonical4 = std::string("GET\n/api/v1/events/finalized\n") + ts3 + "\n" + nonce4 + "\n" + sha256_hex_text("");
+  const auto sig4 = hmac_sha256_hex("sdur", canonical4);
+  ASSERT_TRUE(sig4.has_value());
+  const auto events = handle_request(
+      cfg, make_http_request("GET", "/api/v1/events/finalized?from_sequence=1",
+                             {{"X-Finalis-Api-Key", "kdur"},
+                              {"X-Finalis-Timestamp", ts3},
+                              {"X-Finalis-Nonce", nonce4},
+                              {"X-Finalis-Signature", *sig4}},
+                             ""));
+  ASSERT_EQ(events.status, 200);
+  ASSERT_TRUE(events.body.find("\"object_id\":\"w-dur-1\"") != std::string::npos);
+  ASSERT_TRUE(events.body.find("\"state\":\"finalized\"") != std::string::npos);
+
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    ASSERT_TRUE(!g_partner_webhook_queue.empty());
+    ASSERT_EQ(g_partner_webhook_queue.front().partner_id, "pdur");
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(cache_path, ec);
+  std::filesystem::remove(registry_path, ec);
+}
+
+TEST(test_explorer_partner_state_gc_prunes_stale_entries_and_dedupes_queue) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  cfg.partner_auth_max_skew_seconds = 1;
+  cfg.partner_idempotency_ttl_seconds = 1;
+  cfg.partner_events_ttl_seconds = 1;
+  cfg.partner_webhook_queue_ttl_seconds = 1;
+  const auto cache_path = unique_test_cache_path("finalis-partner-gc-cache");
+  const auto registry_path = unique_test_cache_path("finalis-partner-gc-registry");
+  cfg.cache_path = cache_path.string();
+  cfg.partner_registry_path = registry_path.string();
+  {
+    std::ofstream out(registry_path);
+    out << "{"
+           "\"partners\":[{"
+           "\"partner_id\":\"pgc\","
+           "\"api_key\":\"kgc\","
+           "\"active_secret\":\"sgc\","
+           "\"webhook_url\":\"http://webhook.invalid/pgc\","
+           "\"webhook_secret\":\"whgc\","
+           "\"enabled\":true"
+           "}]"
+           "}";
+  }
+  std::string reg_err;
+  ASSERT_TRUE(load_partner_registry(cfg, &reg_err));
+
+  const std::string body = std::string("{\"client_withdrawal_id\":\"w-gc-1\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const std::string nonce = "gc-n1";
+  const std::string canonical = std::string("POST\n/api/v1/withdrawals\n") + ts + "\n" + nonce + "\n" + sha256_hex_text(body);
+  const auto sig = hmac_sha256_hex("sgc", canonical);
+  ASSERT_TRUE(sig.has_value());
+  const auto created = handle_request(
+      cfg, make_http_request("POST", "/api/v1/withdrawals",
+                             {{"Idempotency-Key", "idem-gc-1"},
+                              {"X-Finalis-Api-Key", "kgc"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", nonce},
+                              {"X-Finalis-Signature", *sig}},
+                             body));
+  ASSERT_TRUE(created.status == 200 || created.status == 201 || created.status == 202);
+
+  const std::string nonce2 = "gc-n2";
+  const std::string canonical2 = std::string("GET\n/api/v1/withdrawals/w-gc-1\n") + ts + "\n" + nonce2 + "\n" + sha256_hex_text("");
+  const auto sig2 = hmac_sha256_hex("sgc", canonical2);
+  ASSERT_TRUE(sig2.has_value());
+  const auto finalized = handle_request(
+      cfg, make_http_request("GET", "/api/v1/withdrawals/w-gc-1",
+                             {{"X-Finalis-Api-Key", "kgc"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", nonce2},
+                              {"X-Finalis-Signature", *sig2}},
+                             ""));
+  ASSERT_EQ(finalized.status, 200);
+  ASSERT_TRUE(finalized.body.find("\"state\":\"finalized\"") != std::string::npos);
+
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    ASSERT_TRUE(!g_partner_events.empty());
+    ASSERT_TRUE(!g_partner_webhook_queue.empty());
+    const auto stale_ms = now_unix_ms() - 120000;
+    for (auto& [_, ts_ms] : g_partner_idempotency_unix_ms) ts_ms = stale_ms;
+    for (auto& evt : g_partner_events) evt.emitted_unix_ms = stale_ms;
+    for (auto& q : g_partner_webhook_queue) {
+      q.enqueued_unix_ms = stale_ms;
+      q.next_attempt_unix_ms = stale_ms;
+    }
+    for (auto& [_, seen_sec] : g_seen_partner_nonce_unix_ms) seen_sec = (stale_ms / 1000) - 120;
+    PartnerWebhookDelivery dup = g_partner_webhook_queue.front();
+    dup.attempt += 1;
+    g_partner_webhook_queue.push_back(dup);
+  }
+
+  persist_explorer_snapshot(cfg);
+
+  {
+    std::lock_guard<std::mutex> guard(g_partner_mu);
+    ASSERT_TRUE(g_partner_idempotency_hash.empty());
+    ASSERT_TRUE(g_partner_idempotency_client_id.empty());
+    ASSERT_TRUE(g_partner_idempotency_unix_ms.empty());
+    ASSERT_TRUE(g_partner_events.empty());
+    ASSERT_TRUE(g_partner_webhook_queue.empty());
+    ASSERT_TRUE(g_seen_partner_nonce_unix_ms.empty());
+    ASSERT_TRUE(g_partner_next_sequence >= 1u);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(cache_path, ec);
+  std::filesystem::remove(registry_path, ec);
+}
+
 TEST(test_explorer_status_and_committee_surface_show_bounded_ticket_pow) {
   ExplorerFixture fx;
   ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
