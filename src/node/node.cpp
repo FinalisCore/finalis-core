@@ -1748,6 +1748,30 @@ bool Node::init() {
     std::cerr << "mainnet genesis init failed\n";
     return false;
   }
+  if (auto tip = db_.get_tip(); tip.has_value() && tip->height == 0) {
+    std::size_t erased_epoch_tickets = 0;
+    std::size_t erased_best_epoch_tickets = 0;
+    std::size_t erased_epoch_reward_settlements = 0;
+    auto purge_prefix = [this](const char* prefix, std::size_t* erased) {
+      const auto rows = db_.scan_prefix(prefix);
+      for (const auto& [key, _] : rows) {
+        if (!db_.erase(key)) return false;
+        ++(*erased);
+      }
+      return true;
+    };
+    if (!purge_prefix("ET:", &erased_epoch_tickets) || !purge_prefix("EB:", &erased_best_epoch_tickets) ||
+        !purge_prefix("ER:", &erased_epoch_reward_settlements)) {
+      std::cerr << "startup hardening purge failed at genesis tip\n";
+      return false;
+    }
+    if (erased_epoch_tickets != 0 || erased_best_epoch_tickets != 0 || erased_epoch_reward_settlements != 0) {
+      log_line("startup-hardening genesis-tip-purge height=0 erased_epoch_tickets=" +
+               std::to_string(erased_epoch_tickets) + " erased_best_epoch_tickets=" +
+               std::to_string(erased_best_epoch_tickets) + " erased_epoch_reward_settlements=" +
+               std::to_string(erased_epoch_reward_settlements));
+    }
+  }
   chain_id_ =
       ChainId::from_config_and_db(cfg_.network, db_, std::nullopt, genesis_source_hint_, expected_genesis_hash_);
   if (!load_state()) {
