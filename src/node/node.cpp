@@ -3342,14 +3342,23 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
 
 std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const {
   std::map<PubKey32, std::uint64_t> out;
+  const bool local_registered = validators_.get(local_key_.public_key).has_value();
+  const auto should_ignore_local_unregistered_participant = [&](const PubKey32& participant) {
+    // Startup on a fresh node may generate a local keystore that is not in the
+    // validator registry. Ignore historical local-only ticket residue so replay
+    // remains aligned with network-produced settlement payloads.
+    return !local_registered && participant == local_key_.public_key;
+  };
   const auto tickets = db_.load_epoch_tickets(epoch_start_height);
   const auto best_tickets = consensus::best_epoch_tickets_by_pubkey(tickets);
   for (const auto& [pub, ticket] : best_tickets) {
+    if (should_ignore_local_unregistered_participant(pub)) continue;
     const auto score = static_cast<std::uint64_t>(
         std::max<std::uint8_t>(1, consensus::leading_zero_bits(ticket.work_hash)));
     out[pub] = score;
   }
   for (const auto& [pub, ticket] : db_.load_best_epoch_tickets(epoch_start_height)) {
+    if (should_ignore_local_unregistered_participant(pub)) continue;
     const auto score = static_cast<std::uint64_t>(
         std::max<std::uint8_t>(1, consensus::leading_zero_bits(ticket.work_hash)));
     auto it = out.find(pub);
@@ -4918,14 +4927,13 @@ std::optional<consensus::EpochTicket> Node::mine_local_epoch_ticket_locked(std::
   const auto epoch = consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks);
   const auto anchor = epoch_ticket_challenge_anchor_locked(height);
   auto local_info = validators_.get(local_key_.public_key);
+  if (!local_info.has_value()) return std::nullopt;
   PubKey32 participant = local_key_.public_key;
-  if (local_info.has_value()) {
-    if (!validators_.is_active_for_height(local_key_.public_key, height) &&
-        local_info->status != consensus::ValidatorStatus::ONBOARDING) {
-      return std::nullopt;
-    }
-    participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
+  if (!validators_.is_active_for_height(local_key_.public_key, height) &&
+      local_info->status != consensus::ValidatorStatus::ONBOARDING) {
+    return std::nullopt;
   }
+  participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
   auto ticket = consensus::best_epoch_ticket_for_operator_id(epoch, anchor, participant, height);
   if (!ticket.has_value()) return std::nullopt;
   const auto difficulty_bits = ticket_difficulty_bits_for_epoch_locked(epoch, validators_.active_sorted(height).size());
@@ -4953,6 +4961,9 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
       }
     } else if (stored.participant_pubkey != local_key_.public_key) {
       if (reject_reason) *reject_reason = "local-participant-mismatch";
+      return false;
+    } else {
+      if (reject_reason) *reject_reason = "local-not-registered";
       return false;
     }
   }

@@ -434,6 +434,7 @@ std::atomic<bool> g_partner_webhook_stop{false};
 std::mutex g_metrics_mu;
 std::unordered_map<std::string, std::uint64_t> g_metrics_http_requests_total;
 std::uint64_t g_metrics_partner_auth_failures_total{0};
+std::unordered_map<std::string, std::uint64_t> g_metrics_partner_auth_failures_by_reason_total;
 std::uint64_t g_metrics_partner_rate_limited_total{0};
 std::uint64_t g_metrics_partner_withdrawal_submissions_total{0};
 std::uint64_t g_metrics_partner_webhook_deliveries_total{0};
@@ -443,6 +444,9 @@ std::uint64_t g_metrics_partner_webhook_replays_total{0};
 std::unordered_map<std::string, std::uint64_t> g_metrics_http_request_duration_bucket_ms;
 std::unordered_map<std::string, std::uint64_t> g_metrics_http_request_duration_sum_ms;
 std::unordered_map<std::string, std::uint64_t> g_metrics_http_request_duration_count;
+std::unordered_map<std::string, std::uint64_t> g_metrics_partner_webhook_delivery_latency_bucket_seconds;
+std::unordered_map<std::string, std::uint64_t> g_metrics_partner_webhook_delivery_latency_sum_seconds;
+std::unordered_map<std::string, std::uint64_t> g_metrics_partner_webhook_delivery_latency_count;
 
 struct PersistedExplorerSnapshot {
   std::uint64_t stored_unix_ms{0};
@@ -528,12 +532,16 @@ void clear_runtime_caches() {
     g_metrics_http_request_duration_sum_ms.clear();
     g_metrics_http_request_duration_count.clear();
     g_metrics_partner_auth_failures_total = 0;
+    g_metrics_partner_auth_failures_by_reason_total.clear();
     g_metrics_partner_rate_limited_total = 0;
     g_metrics_partner_withdrawal_submissions_total = 0;
     g_metrics_partner_webhook_deliveries_total = 0;
     g_metrics_partner_webhook_failures_total = 0;
     g_metrics_partner_webhook_dlq_total = 0;
     g_metrics_partner_webhook_replays_total = 0;
+    g_metrics_partner_webhook_delivery_latency_bucket_seconds.clear();
+    g_metrics_partner_webhook_delivery_latency_sum_seconds.clear();
+    g_metrics_partner_webhook_delivery_latency_count.clear();
   }
 }
 
@@ -787,6 +795,26 @@ void record_http_duration_metric(const std::string& path, std::uint64_t duration
     if (duration_ms <= bucket) {
       const std::string key = path + "|" + std::to_string(bucket);
       ++g_metrics_http_request_duration_bucket_ms[key];
+    }
+  }
+}
+
+void record_partner_auth_failure_metric(const std::string& reason) {
+  std::lock_guard<std::mutex> guard(g_metrics_mu);
+  ++g_metrics_partner_auth_failures_total;
+  ++g_metrics_partner_auth_failures_by_reason_total[reason.empty() ? "unknown" : reason];
+}
+
+void record_partner_webhook_delivery_latency_metric(const std::string& outcome, std::uint64_t latency_seconds) {
+  static const std::array<std::uint64_t, 10> buckets_seconds{1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600};
+  const std::string label = outcome.empty() ? "unknown" : outcome;
+  std::lock_guard<std::mutex> guard(g_metrics_mu);
+  g_metrics_partner_webhook_delivery_latency_sum_seconds[label] += latency_seconds;
+  g_metrics_partner_webhook_delivery_latency_count[label] += 1;
+  for (const auto bucket : buckets_seconds) {
+    if (latency_seconds <= bucket) {
+      const std::string key = label + "|" + std::to_string(bucket);
+      ++g_metrics_partner_webhook_delivery_latency_bucket_seconds[key];
     }
   }
 }
@@ -4604,8 +4632,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
   }
   if (!cfg.partner_auth_required || !partner_auth_needed(path)) return std::nullopt;
   if (cfg.partner_mtls_required && !mtls_verified(req)) {
-    std::lock_guard<std::mutex> guard(g_metrics_mu);
-    ++g_metrics_partner_auth_failures_total;
+    record_partner_auth_failure_metric("auth_mtls_required");
     return make_error(401, "auth_mtls_required", "mTLS verification header missing");
   }
   const auto api_key = header_value(req, "x-finalis-api-key");
@@ -4613,33 +4640,28 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
   const auto nonce = header_value(req, "x-finalis-nonce");
   const auto signature = header_value(req, "x-finalis-signature");
   if (!api_key.has_value() || !timestamp.has_value() || !nonce.has_value() || !signature.has_value()) {
-    std::lock_guard<std::mutex> guard(g_metrics_mu);
-    ++g_metrics_partner_auth_failures_total;
+    record_partner_auth_failure_metric("auth_missing");
     return make_error(401, "auth_missing", "missing partner auth headers");
   }
   const auto record = resolve_partner_record_for_api_key(cfg, *api_key);
   if (!record.has_value() || !record->enabled) {
-    std::lock_guard<std::mutex> guard(g_metrics_mu);
-    ++g_metrics_partner_auth_failures_total;
+    record_partner_auth_failure_metric("auth_invalid_key");
     return make_error(403, "auth_invalid_key", "invalid partner api key");
   }
   const auto& allowed_cidrs = record->allowed_ipv4_cidrs_raw.empty() ? cfg.partner_allowed_ipv4_cidrs_raw : record->allowed_ipv4_cidrs_raw;
   if (!ip_in_cidrs(client_ip, allowed_cidrs)) {
-    std::lock_guard<std::mutex> guard(g_metrics_mu);
-    ++g_metrics_partner_auth_failures_total;
+    record_partner_auth_failure_metric("auth_ip_forbidden");
     return make_error(403, "auth_ip_forbidden", "source IP not in partner allowlist");
   }
   const auto ts = parse_u64_strict(*timestamp);
   if (!ts.has_value()) {
-    std::lock_guard<std::mutex> guard(g_metrics_mu);
-    ++g_metrics_partner_auth_failures_total;
+    record_partner_auth_failure_metric("auth_bad_timestamp");
     return make_error(401, "auth_bad_timestamp", "timestamp must be unix seconds");
   }
   const std::uint64_t now_sec = static_cast<std::uint64_t>(std::time(nullptr));
   const std::uint64_t skew = now_sec > *ts ? (now_sec - *ts) : (*ts - now_sec);
   if (skew > cfg.partner_auth_max_skew_seconds) {
-    std::lock_guard<std::mutex> guard(g_metrics_mu);
-    ++g_metrics_partner_auth_failures_total;
+    record_partner_auth_failure_metric("auth_timestamp_skew");
     return make_error(401, "auth_timestamp_skew", "timestamp outside allowed window");
   }
   const std::string canonical = req.method + "\n" + path + "\n" + *timestamp + "\n" + *nonce + "\n" + sha256_hex_text(req.body);
@@ -4651,8 +4673,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
     valid_sig = expected_next.has_value() && secure_equal(lowercase_ascii(*signature), lowercase_ascii(*expected_next));
   }
   if (!valid_sig) {
-    std::lock_guard<std::mutex> guard(g_metrics_mu);
-    ++g_metrics_partner_auth_failures_total;
+    record_partner_auth_failure_metric("auth_bad_signature");
     return make_error(403, "auth_bad_signature", "invalid partner signature");
   }
   bool nonce_window_updated = false;
@@ -4662,8 +4683,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
     auto it = g_seen_partner_nonce_unix_ms.find(nonce_key);
     if (it != g_seen_partner_nonce_unix_ms.end() && (now_sec > it->second ? now_sec - it->second : it->second - now_sec) <=
             cfg.partner_auth_max_skew_seconds) {
-      std::lock_guard<std::mutex> metrics_guard(g_metrics_mu);
-      ++g_metrics_partner_auth_failures_total;
+      record_partner_auth_failure_metric("auth_replay");
       return make_error(409, "auth_replay", "nonce replay detected");
     }
     g_seen_partner_nonce_unix_ms[nonce_key] = now_sec;
@@ -4793,19 +4813,33 @@ Response render_metrics_response() {
   oss << "# HELP finalis_http_requests_total HTTP requests by route and status\n"
       << "# TYPE finalis_http_requests_total counter\n"
       << "# HELP finalis_http_request_duration_milliseconds Request duration histogram in milliseconds\n"
-      << "# TYPE finalis_http_request_duration_milliseconds histogram\n";
+      << "# TYPE finalis_http_request_duration_milliseconds histogram\n"
+      << "# HELP finalis_partner_auth_failures_total Partner auth failures\n"
+      << "# TYPE finalis_partner_auth_failures_total counter\n"
+      << "# HELP finalis_partner_auth_failures_by_reason_total Partner auth failures by reason code\n"
+      << "# TYPE finalis_partner_auth_failures_by_reason_total counter\n"
+      << "# HELP finalis_partner_webhook_delivery_latency_seconds End-to-end webhook delivery latency histogram by outcome\n"
+      << "# TYPE finalis_partner_webhook_delivery_latency_seconds histogram\n";
   std::uint64_t webhook_queue_depth = 0;
   std::uint64_t webhook_dlq_depth = 0;
   std::uint64_t webhook_oldest_age_seconds = 0;
+  std::unordered_map<std::string, std::uint64_t> webhook_queue_depth_by_partner;
+  std::unordered_map<std::string, std::uint64_t> webhook_dlq_depth_by_partner;
+  std::unordered_map<std::string, std::uint64_t> webhook_oldest_age_seconds_by_partner;
   {
     std::lock_guard<std::mutex> guard(g_partner_mu);
     webhook_queue_depth = static_cast<std::uint64_t>(g_partner_webhook_queue.size());
     webhook_dlq_depth = static_cast<std::uint64_t>(g_partner_webhook_dlq.size());
     const auto now = now_unix_ms();
     for (const auto& d : g_partner_webhook_queue) {
+      ++webhook_queue_depth_by_partner[d.partner_id];
       if (d.enqueued_unix_ms == 0 || now < d.enqueued_unix_ms) continue;
-      webhook_oldest_age_seconds = std::max<std::uint64_t>(webhook_oldest_age_seconds, (now - d.enqueued_unix_ms) / 1000);
+      const auto age = (now - d.enqueued_unix_ms) / 1000;
+      webhook_oldest_age_seconds = std::max<std::uint64_t>(webhook_oldest_age_seconds, age);
+      webhook_oldest_age_seconds_by_partner[d.partner_id] =
+          std::max<std::uint64_t>(webhook_oldest_age_seconds_by_partner[d.partner_id], age);
     }
+    for (const auto& d : g_partner_webhook_dlq) ++webhook_dlq_depth_by_partner[d.partner_id];
   }
   {
     std::lock_guard<std::mutex> guard(g_metrics_mu);
@@ -4830,16 +4864,45 @@ Response render_metrics_response() {
       oss << "finalis_http_request_duration_milliseconds_count{route=\"" << json_escape(route) << "\"} " << cnt << "\n";
     }
     oss << "finalis_partner_auth_failures_total " << g_metrics_partner_auth_failures_total << "\n";
+    for (const auto& [reason, count] : g_metrics_partner_auth_failures_by_reason_total) {
+      oss << "finalis_partner_auth_failures_by_reason_total{reason=\"" << json_escape(reason) << "\"} " << count << "\n";
+    }
     oss << "finalis_partner_rate_limited_total " << g_metrics_partner_rate_limited_total << "\n";
     oss << "finalis_partner_withdrawal_submissions_total " << g_metrics_partner_withdrawal_submissions_total << "\n";
     oss << "finalis_partner_webhook_deliveries_total " << g_metrics_partner_webhook_deliveries_total << "\n";
     oss << "finalis_partner_webhook_failures_total " << g_metrics_partner_webhook_failures_total << "\n";
     oss << "finalis_partner_webhook_dlq_total " << g_metrics_partner_webhook_dlq_total << "\n";
     oss << "finalis_partner_webhook_replays_total " << g_metrics_partner_webhook_replays_total << "\n";
+    for (const auto& [key, count] : g_metrics_partner_webhook_delivery_latency_bucket_seconds) {
+      const auto sep = key.rfind('|');
+      const std::string outcome = sep == std::string::npos ? key : key.substr(0, sep);
+      const std::string le = sep == std::string::npos ? "0" : key.substr(sep + 1);
+      oss << "finalis_partner_webhook_delivery_latency_seconds_bucket{outcome=\"" << json_escape(outcome)
+          << "\",le=\"" << json_escape(le) << "\"} " << count << "\n";
+    }
+    for (const auto& [outcome, count] : g_metrics_partner_webhook_delivery_latency_count) {
+      oss << "finalis_partner_webhook_delivery_latency_seconds_bucket{outcome=\"" << json_escape(outcome)
+          << "\",le=\"+Inf\"} " << count << "\n";
+    }
+    for (const auto& [outcome, sum] : g_metrics_partner_webhook_delivery_latency_sum_seconds) {
+      oss << "finalis_partner_webhook_delivery_latency_seconds_sum{outcome=\"" << json_escape(outcome) << "\"} " << sum << "\n";
+    }
+    for (const auto& [outcome, count] : g_metrics_partner_webhook_delivery_latency_count) {
+      oss << "finalis_partner_webhook_delivery_latency_seconds_count{outcome=\"" << json_escape(outcome) << "\"} " << count << "\n";
+    }
   }
   oss << "finalis_partner_webhook_queue_depth " << webhook_queue_depth << "\n";
   oss << "finalis_partner_webhook_dlq_depth " << webhook_dlq_depth << "\n";
   oss << "finalis_partner_webhook_oldest_age_seconds " << webhook_oldest_age_seconds << "\n";
+  for (const auto& [partner_id, depth] : webhook_queue_depth_by_partner) {
+    oss << "finalis_partner_webhook_queue_depth_by_partner{partner_id=\"" << json_escape(partner_id) << "\"} " << depth << "\n";
+  }
+  for (const auto& [partner_id, depth] : webhook_dlq_depth_by_partner) {
+    oss << "finalis_partner_webhook_dlq_depth_by_partner{partner_id=\"" << json_escape(partner_id) << "\"} " << depth << "\n";
+  }
+  for (const auto& [partner_id, age] : webhook_oldest_age_seconds_by_partner) {
+    oss << "finalis_partner_webhook_oldest_age_seconds_by_partner{partner_id=\"" << json_escape(partner_id) << "\"} " << age << "\n";
+  }
   Response resp;
   resp.status = 200;
   resp.content_type = "text/plain; version=0.0.4; charset=utf-8";
@@ -4982,12 +5045,20 @@ void partner_webhook_worker(const Config cfg) {
       }
     }
     if (res.has_value()) {
+      const auto delivery_now_ms = now_unix_ms();
+      if (delivery_now_ms >= job.enqueued_unix_ms) {
+        record_partner_webhook_delivery_latency_metric("success", (delivery_now_ms - job.enqueued_unix_ms) / 1000);
+      }
       {
         std::lock_guard<std::mutex> guard(g_metrics_mu);
         ++g_metrics_partner_webhook_deliveries_total;
       }
       append_webhook_audit_log(cfg, "webhook_delivery", job.partner_id, job.sequence, job.attempt + 1, true, "ok");
     } else {
+      const auto delivery_now_ms = now_unix_ms();
+      if (delivery_now_ms >= job.enqueued_unix_ms) {
+        record_partner_webhook_delivery_latency_metric("failure", (delivery_now_ms - job.enqueued_unix_ms) / 1000);
+      }
       {
         std::lock_guard<std::mutex> guard(g_metrics_mu);
         ++g_metrics_partner_webhook_failures_total;
