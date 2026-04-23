@@ -3363,6 +3363,12 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
   const auto settlement_epoch = settlement_epoch_for_block_height_locked(height);
   if (!settlement_epoch.has_value()) return true;
 
+  std::size_t established_peers = 0;
+  for (int peer_id : p2p_.peer_ids()) {
+    const auto info = p2p_.get_peer_info(peer_id);
+    if (!info.established()) continue;
+    ++established_peers;
+  }
   auto request_epoch_reconcile = [&]() {
     for (int peer_id : p2p_.peer_ids()) {
       const auto info = p2p_.get_peer_info(peer_id);
@@ -3372,13 +3378,10 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
   };
 
   const auto onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
-  if (onboarding_scores.empty()) {
-    request_epoch_reconcile();
-    return false;
-  }
+  if (onboarding_scores.empty()) request_epoch_reconcile();
 
 #ifdef _WIN32
-  if (epoch_committee_closed_locked(*settlement_epoch)) {
+  if (epoch_committee_closed_locked(*settlement_epoch) && established_peers != 0) {
     const auto reconcile_it = windows_settlement_epoch_reconcile_ms_.find(*settlement_epoch);
     const bool reconciled_this_runtime =
         reconcile_it != windows_settlement_epoch_reconcile_ms_.end() && reconcile_it->second >= startup_ms_;
