@@ -2378,11 +2378,11 @@ std::string Server::handle_rpc_body(const std::string& body) {
     }
     const Bytes tx_bytes = tx->serialize();
     const Hash32 txid = tx->txid();
-    const auto utxos = db_.load_utxos();
-    const auto validators = db_.load_validators();
+    const auto utxos = live_db.load_utxos();
+    const auto validators = live_db.load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
-    auto tip = db_.get_tip();
+    auto tip = live_db.get_tip();
     const std::uint64_t current_height = tip ? (tip->height + 1) : 1;
     const auto min_bond_amount = record->bond_amount;
     const auto max_bond_amount = std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, min_bond_amount);
@@ -2402,9 +2402,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
               if (!committee.has_value()) return false;
               return std::find(committee->begin(), committee->end(), pk) != committee->end();
             },
-        .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
+        .finalized_hash_at_height = [&live_db](std::uint64_t anchor_height) -> std::optional<Hash32> {
           if (anchor_height == 0) return zero_hash();
-          return db_.get_height_hash(anchor_height);
+          return live_db.get_height_hash(anchor_height);
         },
         .confidential_policy = &confidential_policy,
     };
@@ -2850,17 +2850,17 @@ std::string Server::handle_rpc_body(const std::string& body) {
                                  std::string("This transaction is already finalized or was previously submitted."),
                                  false, "none", false, std::nullopt));
     }
-    const auto utxos = db_.load_utxos();
-    const auto validators = db_.load_validators();
+    const auto utxos = view->load_utxos();
+    const auto validators = view->load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
-    auto tip = db_.get_tip();
+    auto tip = view->get_tip();
     const auto runtime = view->get_node_runtime_status_snapshot();
     const std::uint64_t next_height = tip ? (tip->height + 1) : 1;
     const auto epoch_start_for_broadcast =
         consensus::committee_epoch_start(std::max<std::uint64_t>(1, next_height), cfg_.network.committee_epoch_blocks);
     std::uint64_t broadcast_min_bond = cfg_.network.validator_bond_min_amount;
-    if (auto cp = db_.get_finalized_committee_checkpoint(epoch_start_for_broadcast);
+    if (auto cp = view->get_finalized_committee_checkpoint(epoch_start_for_broadcast);
         cp.has_value() && cp->adaptive_min_bond != 0) {
       broadcast_min_bond = cp->adaptive_min_bond;
     }
@@ -2882,9 +2882,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
               if (!committee.has_value()) return false;
               return std::find(committee->begin(), committee->end(), pk) != committee->end();
             },
-        .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
+        .finalized_hash_at_height = [view](std::uint64_t anchor_height) -> std::optional<Hash32> {
           if (anchor_height == 0) return zero_hash();
-          return db_.get_height_hash(anchor_height);
+          return view->get_height_hash(anchor_height);
         },
         .confidential_policy = &confidential_policy,
     };
