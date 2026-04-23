@@ -4985,17 +4985,11 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   }
 
   (void)db_.put_epoch_ticket(stored);
-#ifdef _WIN32
-  if (improved) {
-    best[stored.participant_pubkey] = stored;
-    (void)db_.put_best_epoch_ticket(stored);
-  }
-  const auto score_work_hash = improved ? stored.work_hash : it->second.work_hash;
-#else
+  // Consensus note: replayed closed-epoch ticket handling must not diverge by
+  // platform. Keep onboarding score derivation identical across OS targets.
   best[stored.participant_pubkey] = stored;
   (void)db_.put_best_epoch_ticket(stored);
   const auto score_work_hash = stored.work_hash;
-#endif
   const auto onboarding_score =
       static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(score_work_hash)));
   auto& reward_state = epoch_reward_states_[stored.epoch];

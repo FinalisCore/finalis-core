@@ -2080,6 +2080,7 @@ int main(int argc, char** argv) {
     const auto runtime = db.get_node_runtime_status_snapshot();
 
     std::cout << "db=" << db_path << "\n";
+    std::cout << "utxo_source=rpc_get_utxos\n";
     std::cout << "key_file=" << file_path << "\n";
     std::cout << "finalized_height=" << finalized_height << "\n";
     std::cout << "validator_pubkey=" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
@@ -2763,11 +2764,6 @@ int main(int argc, char** argv) {
 
     db_path = expand_user(db_path);
     file_path = expand_user(file_path);
-    finalis::storage::DB db;
-    if (!db.open_readonly(db_path) && !db.open(db_path)) {
-      std::cerr << "failed to open db\n";
-      return 1;
-    }
     finalis::keystore::ValidatorKey vk;
     std::string err;
     if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
@@ -2775,22 +2771,54 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    std::string utxo_err;
-    const auto available_prevs =
-        positive_value_utxos(spendable_utxos_for_wallet_address(db, vk.address, &utxo_err));
-    if (!utxo_err.empty()) {
-      std::cerr << "send failed to resolve wallet address: " << utxo_err << "\n";
+    auto own_decoded = finalis::address::decode(vk.address);
+    if (!own_decoded.has_value()) {
+      std::cerr << "send failed: invalid wallet address\n";
       return 1;
     }
+
+    auto validated = finalis::lightserver::rpc_validate_address(rpc_url, vk.address, &err);
+    if (!validated.has_value()) {
+      std::cerr << "send failed to validate wallet address on rpc endpoint: " << err << "\n";
+      return 1;
+    }
+    if (!validated->valid) {
+      std::cerr << "send failed: wallet address invalid for rpc endpoint";
+      if (!validated->error.empty()) std::cerr << " (" << validated->error << ")";
+      std::cerr << "\n";
+      return 1;
+    }
+    if (!validated->server_network_match || !validated->has_scripthash) {
+      std::cerr << "send failed: wallet address network does not match rpc endpoint\n";
+      return 1;
+    }
+
+    auto rpc_utxos = finalis::lightserver::rpc_get_utxos(rpc_url, validated->scripthash, &err);
+    if (!rpc_utxos.has_value()) {
+      std::cerr << "send failed to load finalized rpc utxos: " << err << "\n";
+      return 1;
+    }
+
+    std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> available_prevs;
+    available_prevs.reserve(rpc_utxos->size());
+    for (const auto& utxo : *rpc_utxos) {
+      if (utxo.value == 0) continue;
+      available_prevs.push_back({finalis::OutPoint{utxo.txid, utxo.vout}, finalis::TxOut{utxo.value, utxo.script_pubkey}});
+    }
+    std::sort(available_prevs.begin(), available_prevs.end(), [](const auto& a, const auto& b) {
+      if (a.second.value != b.second.value) return a.second.value > b.second.value;
+      if (a.first.txid != b.first.txid) return a.first.txid < b.first.txid;
+      return a.first.index < b.first.index;
+    });
+
     if (available_prevs.empty()) {
-      std::cerr << "send failed: no spendable finalized inputs are currently available\n";
+      std::cerr << "send failed: no spendable finalized inputs are currently available on rpc endpoint\n";
       return 1;
     }
 
     auto decoded_to = finalis::address::decode(to_addr);
-    auto own_decoded = finalis::address::decode(vk.address);
-    if (!decoded_to.has_value() || !own_decoded.has_value()) {
-      std::cerr << "send failed: invalid wallet or recipient address\n";
+    if (!decoded_to.has_value()) {
+      std::cerr << "send failed: invalid recipient address\n";
       return 1;
     }
 
