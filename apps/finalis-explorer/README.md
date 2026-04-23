@@ -228,7 +228,85 @@ Webhook delivery:
 - exhausted retries move deliveries to partner-scoped DLQ
 - replay DLQ entries with:
   - `POST /api/v1/webhooks/dlq/replay`
-  - `{"sequence": <event_sequence>}`
+
+Prometheus partner/SRE metrics (`GET /metrics`) include:
+
+- auth and abuse:
+  - `finalis_partner_auth_failures_total`
+  - `finalis_partner_auth_failures_by_reason_total{reason=...}`
+  - `finalis_partner_rate_limited_total`
+- webhook reliability:
+  - `finalis_partner_webhook_deliveries_total`
+  - `finalis_partner_webhook_failures_total`
+  - `finalis_partner_webhook_dlq_total`
+  - `finalis_partner_webhook_replays_total`
+  - `finalis_partner_webhook_delivery_latency_seconds_*{outcome=success|failure}`
+- backlog and lag:
+  - `finalis_partner_webhook_queue_depth`
+  - `finalis_partner_webhook_dlq_depth`
+  - `finalis_partner_webhook_oldest_age_seconds`
+  - `finalis_partner_webhook_queue_depth_by_partner{partner_id=...}`
+  - `finalis_partner_webhook_dlq_depth_by_partner{partner_id=...}`
+  - `finalis_partner_webhook_oldest_age_seconds_by_partner{partner_id=...}`
+
+Alert-friendly SLI/SLO profile (recommended):
+
+- evaluation windows:
+  - fast detection: `5m`
+  - paging: `15m`
+  - SLO tracking: `30d`
+- target SLOs:
+  - partner auth success ratio: `>= 99.90%` over `30d`
+  - webhook delivery success ratio: `>= 99.50%` over `30d`
+  - webhook p95 delivery latency: `<= 60s` over `30d`
+  - webhook p99 delivery latency: `<= 300s` over `30d`
+  - webhook queue oldest age: `<= 120s` steady-state
+  - DLQ depth: `0` steady-state, non-zero is operational debt
+
+SLI formulas (PromQL style):
+
+- auth success ratio:
+  - `1 - (increase(finalis_partner_auth_failures_total[30d]) / clamp_min(increase(finalis_http_requests_total{route=~"/api/v1/.*",status=~"2..|4..|5.."}[30d]), 1))`
+- webhook delivery success ratio:
+  - `increase(finalis_partner_webhook_deliveries_total[30d]) / clamp_min(increase(finalis_partner_webhook_deliveries_total[30d]) + increase(finalis_partner_webhook_failures_total[30d]), 1)`
+- webhook latency p95:
+  - `histogram_quantile(0.95, sum by (le) (rate(finalis_partner_webhook_delivery_latency_seconds_bucket{outcome="success"}[30d])))`
+- webhook latency p99:
+  - `histogram_quantile(0.99, sum by (le) (rate(finalis_partner_webhook_delivery_latency_seconds_bucket{outcome="success"}[30d])))`
+- queue age:
+  - `max(finalis_partner_webhook_oldest_age_seconds)`
+- DLQ depth:
+  - `sum(finalis_partner_webhook_dlq_depth)`
+
+Recommended alerts:
+
+- `SEV2 PartnerAuthFailureSpike`:
+  - trigger: auth failure ratio `> 2%` for `5m`
+  - escalation: if `> 5%` for `15m`
+- `SEV2 WebhookDeliveryDegraded`:
+  - trigger: webhook failure ratio `> 1%` for `15m`
+  - escalation: if `> 5%` for `15m`
+- `SEV2 WebhookLatencyHigh`:
+  - trigger: p95 latency `> 60s` for `15m`
+  - escalation: p99 latency `> 300s` for `15m`
+- `SEV1 WebhookBacklogGrowing`:
+  - trigger: `finalis_partner_webhook_oldest_age_seconds > 300` for `10m`
+- `SEV2 DlqNonZero`:
+  - trigger: `sum(finalis_partner_webhook_dlq_depth) > 0` for `15m`
+- `SEV2 PerPartnerBacklog`:
+  - trigger: any `finalis_partner_webhook_queue_depth_by_partner > 100` for `10m`
+
+Operator response order (recommended):
+
+- inspect auth failure reason mix:
+  - `sum by (reason) (increase(finalis_partner_auth_failures_by_reason_total[15m]))`
+- inspect per-partner backlog and age:
+  - `finalis_partner_webhook_queue_depth_by_partner`
+  - `finalis_partner_webhook_oldest_age_seconds_by_partner`
+- inspect DLQ entries:
+  - `GET /api/v1/webhooks/dlq`
+- replay fixed deliveries after root-cause mitigation:
+  - `POST /api/v1/webhooks/dlq/replay`
 
 Health behavior:
 
