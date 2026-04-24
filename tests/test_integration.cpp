@@ -3981,12 +3981,18 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_committee"), 12, 12, 5);
   auto& nodes = cluster.nodes;
 
-  ASSERT_TRUE(wait_for([&]() {
+  const auto all_nodes_reached_height_10 = [&]() {
     for (const auto& n : nodes) {
       if (n->status().height < 10) return false;
     }
     return true;
-  }, ci_timeout_seconds(180)));
+  };
+  if (!wait_for(all_nodes_reached_height_10, ci_timeout_seconds(300))) {
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      std::cerr << "committee-test-wait-timeout node=" << i << " height=" << nodes[i]->status().height << "\n";
+    }
+  }
+  ASSERT_TRUE(all_nodes_reached_height_10());
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(30)));
 
