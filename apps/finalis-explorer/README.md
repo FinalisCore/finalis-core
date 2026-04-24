@@ -152,6 +152,10 @@ Partner API v1:
   `api_version: "v1"` in responses
 - `POST /api/v1/withdrawals` provides idempotent withdrawal submission using
   `Idempotency-Key`
+  - response includes `idempotency` metadata:
+    - `status` (`created`, `replayed`, `bound_existing`)
+    - `first_seen_unix_ms`
+    - `request_hash` (SHA256 of request body)
 - `GET /api/v1/withdrawals/<client_withdrawal_id_or_txid>` provides one
   canonical lifecycle shape
 - `GET /api/v1/events/finalized?from_sequence=<n>` provides a replayable
@@ -159,10 +163,12 @@ Partner API v1:
 - `GET /api/v1/fees/recommendation` provides fee policy guidance for
   withdrawal submitters
 - governance and compatibility policy:
-  - `docs/PARTNER_API_COMPATIBILITY_POLICY.md`
-  - `docs/PARTNER_API_CHANGELOG.md`
-  - `docs/PARTNER_API_DEPRECATIONS.md`
-  - CI gate: `.github/workflows/partner-api-governance.yml`
+  - `apps/finalis-explorer/PARTNER_API_CHANGELOG.md`
+  - `apps/finalis-explorer/PARTNER_API_DEPRECATIONS.md`
+  - OpenAPI diff + changelog/deprecation gate:
+    - `apps/finalis-explorer/scripts/check_partner_api_governance.py`
+  - CI runner command:
+    - `apps/finalis-explorer/scripts/partner_api_governance_ci.sh <base-ref> <head-ref>`
 
 Partner auth (when enabled):
 
@@ -187,6 +193,8 @@ Partner auth (when enabled):
   - requires header `X-Finalis-Mtls-Verified: true`
 - optional global source CIDR allowlist:
   - `--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32`
+  - startup rejects malformed CIDRs (global or partner-level) with explicit
+    config error; invalid allowlists are never accepted silently
 
 Multi-tenant partner registry:
 
@@ -195,8 +203,14 @@ Multi-tenant partner registry:
   - `partner_id`
   - `api_key`
   - `active_secret`
+  - optional `lifecycle_state` (`active`, `draining`, `revoked`)
   - optional `next_secret` (rotation window acceptance)
   - optional `rate_limit_per_minute`
+  - optional `scope_rate_limit_per_minute` object:
+    - `read`
+    - `withdraw_submit`
+    - `events_read`
+    - `webhook_manage`
   - optional `webhook_url`
   - optional `webhook_secret`
   - optional `allowed_ipv4_cidrs`
@@ -205,16 +219,74 @@ Multi-tenant partner registry:
   - optional `enabled`
 - when a registry is loaded, partner auth is enabled for protected `/api/v1/*`
   routes automatically
+- lifecycle enforcement:
+  - `active`: normal authenticated behavior
+  - `draining`: read/event/webhook management remains available, new withdrawal
+    submission is rejected with `403 auth_partner_draining`
+  - `revoked`: all protected partner operations are rejected with
+    `403 auth_partner_revoked`
+- scope enforcement matrix on protected `/api/v1/*` routes:
+  - `read`: finalized read APIs (`/status` excepted as public, plus
+    `/committee`, `/recent-tx`, `/tx/*`, `/transition/*`, `/address/*`,
+    `/search`, `/withdrawals/{id}`)
+  - `withdraw_submit`: `POST /api/v1/withdrawals`
+  - `events_read`: `GET /api/v1/events/finalized`
+  - `webhook_manage`: `GET /api/v1/webhooks/dlq`,
+    `POST /api/v1/webhooks/dlq/replay`
+- rate-limit precedence:
+  - if `scope_rate_limit_per_minute.<scope>` is present, it overrides
+    `rate_limit_per_minute` for that scope
+  - otherwise `rate_limit_per_minute` is used
+
+Minimal `partners.json` lifecycle example:
+
+```json
+{
+  "partners": [
+    {
+      "partner_id": "exchange-a",
+      "api_key": "ex_a_key",
+      "active_secret": "ex_a_secret",
+      "lifecycle_state": "active",
+      "scope_rate_limit_per_minute": {
+        "read": 1200,
+        "withdraw_submit": 120,
+        "events_read": 600,
+        "webhook_manage": 120
+      },
+      "scopes": ["read", "withdraw_submit", "events_read", "webhook_manage"],
+      "webhook_url": "https://exchange-a.example/webhooks/finalis",
+      "webhook_secret": "ex_a_webhook_secret"
+    },
+    {
+      "partner_id": "exchange-b",
+      "api_key": "ex_b_key",
+      "active_secret": "ex_b_secret",
+      "lifecycle_state": "draining",
+      "scopes": ["read", "events_read", "webhook_manage"]
+    },
+    {
+      "partner_id": "exchange-c",
+      "api_key": "ex_c_key",
+      "active_secret": "ex_c_secret",
+      "lifecycle_state": "revoked",
+      "enabled": true
+    }
+  ]
+}
+```
 
 Webhook delivery:
 
 - finalized withdrawal transitions enqueue signed webhook deliveries when
   `webhook_url` and `webhook_secret` are configured for that partner
 - payload contains:
+  - `delivery_id` (stable deterministic identifier per partner+event sequence)
   - `event`
   - `signature` (`hmac_sha256` over event JSON)
 - delivery retries use exponential backoff:
   - `--partner-webhook-max-attempts`
+  - `--partner-webhook-max-replay-attempts`
   - `--partner-webhook-initial-backoff-ms`
   - `--partner-webhook-max-backoff-ms`
 - persisted-state GC/TTL bounds:
@@ -226,8 +298,21 @@ Webhook delivery:
   - successful delivery removes an entry
   - crash before snapshot flush may replay a webhook after restart
 - exhausted retries move deliveries to partner-scoped DLQ
+- DLQ records include replay controls:
+  - `delivery_id`
+  - `replay_attempts`
+  - `quarantined`
+  - `quarantine_reason`
 - replay DLQ entries with:
   - `POST /api/v1/webhooks/dlq/replay`
+  - accepts `sequence` or `delivery_id`
+  - once `replay_attempts` reaches `--partner-webhook-max-replay-attempts`, entry is quarantined and replay is rejected (`409`)
+- legacy route deprecation signaling:
+  - `/api/v1/*` emits `X-Finalis-Api-Version: v1`
+  - legacy `/api/*` partner routes emit:
+    - `Deprecation: true`
+    - `Sunset: Wed, 31 Dec 2026 23:59:59 GMT`
+    - `Link: </api/v1/...>; rel=\"successor-version\"`
 
 Prometheus partner/SRE metrics (`GET /metrics`) include:
 
@@ -235,11 +320,14 @@ Prometheus partner/SRE metrics (`GET /metrics`) include:
   - `finalis_partner_auth_failures_total`
   - `finalis_partner_auth_failures_by_reason_total{reason=...}`
   - `finalis_partner_rate_limited_total`
+  - `finalis_partner_rate_limited_by_scope_total{scope=...}`
+  - `finalis_partner_rate_limited_by_partner_scope_total{partner_id=...,scope=...}`
 - webhook reliability:
   - `finalis_partner_webhook_deliveries_total`
   - `finalis_partner_webhook_failures_total`
   - `finalis_partner_webhook_dlq_total`
   - `finalis_partner_webhook_replays_total`
+  - `finalis_partner_webhook_quarantined_total`
   - `finalis_partner_webhook_delivery_latency_seconds_*{outcome=success|failure}`
 - backlog and lag:
   - `finalis_partner_webhook_queue_depth`

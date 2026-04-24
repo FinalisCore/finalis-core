@@ -443,6 +443,9 @@ TEST(test_explorer_partner_auth_and_idempotent_withdrawal_contract) {
   const auto created = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", headers, body));
   ASSERT_TRUE(created.status == 201 || created.status == 200 || created.status == 202);
   ASSERT_TRUE(created.body.find("\"client_withdrawal_id\":\"w1\"") != std::string::npos);
+  ASSERT_TRUE(created.body.find("\"idempotency\":{") != std::string::npos);
+  ASSERT_TRUE(created.body.find("\"status\":\"created\"") != std::string::npos);
+  ASSERT_TRUE(created.body.find("\"request_hash\":\"" + sha256_hex_text(body) + "\"") != std::string::npos);
   ASSERT_TRUE(created.body.find("\"api_version\":\"v1\"") != std::string::npos);
 
   const std::string nonce2 = "n2";
@@ -459,6 +462,57 @@ TEST(test_explorer_partner_auth_and_idempotent_withdrawal_contract) {
   const auto replayed = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", headers2, body));
   ASSERT_EQ(replayed.status, 200);
   ASSERT_TRUE(replayed.body.find("\"client_withdrawal_id\":\"w1\"") != std::string::npos);
+  ASSERT_TRUE(replayed.body.find("\"status\":\"replayed\"") != std::string::npos);
+  ASSERT_TRUE(replayed.body.find("\"request_hash\":\"" + sha256_hex_text(body) + "\"") != std::string::npos);
+}
+
+TEST(test_explorer_partner_idempotency_conflict_and_ttl_reuse_contract) {
+  ExplorerFixture fx;
+  int broadcast_calls = 0;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      ++broadcast_calls;
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+
+  Config cfg = test_config();
+  cfg.partner_auth_required = false;
+  cfg.partner_idempotency_ttl_seconds = 1;
+  const auto cache_path = unique_test_cache_path("finalis-idem-ttl-cache");
+  cfg.cache_path = cache_path.string();
+
+  const std::string body_a =
+      std::string("{\"client_withdrawal_id\":\"idem-a\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  Tx tx_b = fx.tx;
+  tx_b.outputs[0].value += 1234;
+  const std::string body_b =
+      std::string("{\"client_withdrawal_id\":\"idem-b\",\"tx_hex\":\"") + finalis::hex_encode(tx_b.serialize()) + "\"}";
+
+  const auto first = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_a));
+  ASSERT_TRUE(first.status == 200 || first.status == 201 || first.status == 202);
+  ASSERT_TRUE(first.body.find("\"status\":\"created\"") != std::string::npos);
+  ASSERT_EQ(broadcast_calls, 1);
+
+  const auto conflict = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
+  ASSERT_EQ(conflict.status, 409);
+  ASSERT_TRUE(conflict.body.find("\"idempotency_conflict\"") != std::string::npos);
+  ASSERT_EQ(broadcast_calls, 1);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  clear_runtime_caches();
+  load_persisted_explorer_snapshot(cfg);
+
+  const auto reused = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
+  ASSERT_TRUE(reused.status == 200 || reused.status == 201 || reused.status == 202);
+  ASSERT_TRUE(reused.body.find("\"status\":\"created\"") != std::string::npos);
+  ASSERT_TRUE(reused.body.find("\"request_hash\":\"" + sha256_hex_text(body_b) + "\"") != std::string::npos);
+  ASSERT_EQ(broadcast_calls, 2);
+
+  std::error_code ec;
+  std::filesystem::remove(cache_path, ec);
 }
 
 TEST(test_explorer_partner_events_finalized_feed_contract) {
@@ -685,6 +739,126 @@ TEST(test_explorer_partner_scope_mtls_and_allowlist_enforced) {
                              body));
   ASSERT_EQ(ip_forbidden.status, 403);
   ASSERT_TRUE(ip_forbidden.body.find("\"auth_ip_forbidden\"") != std::string::npos);
+
+  std::error_code ec;
+  std::filesystem::remove(registry_path, ec);
+}
+
+TEST(test_explorer_partner_scope_matrix_enforced) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  const auto registry_path = unique_test_cache_path("finalis-partner-scope-matrix-registry");
+  {
+    std::ofstream out(registry_path);
+    out << "{"
+           "\"partners\":[{"
+           "\"partner_id\":\"pr\","
+           "\"api_key\":\"kr\","
+           "\"active_secret\":\"sr\","
+           "\"scopes\":[\"read\"],"
+           "\"enabled\":true"
+           "}]"
+           "}";
+  }
+  cfg.partner_registry_path = registry_path.string();
+  std::string reg_err;
+  ASSERT_TRUE(load_partner_registry(cfg, &reg_err));
+
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const auto sign = [&](const std::string& method, const std::string& path, const std::string& nonce, const std::string& req_body) {
+    const std::string canonical = method + "\n" + path + "\n" + ts + "\n" + nonce + "\n" + sha256_hex_text(req_body);
+    return hmac_sha256_hex("sr", canonical);
+  };
+
+  const auto sig_read = sign("GET", "/api/v1/tx/" + fx.txid, "scope-matrix-n1", "");
+  ASSERT_TRUE(sig_read.has_value());
+  const auto read_ok = handle_request(
+      cfg, make_http_request("GET", "/api/v1/tx/" + fx.txid,
+                             {{"X-Finalis-Api-Key", "kr"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "scope-matrix-n1"},
+                              {"X-Finalis-Signature", *sig_read}},
+                             ""));
+  ASSERT_EQ(read_ok.status, 200);
+
+  const auto sig_events = sign("GET", "/api/v1/events/finalized", "scope-matrix-n2", "");
+  ASSERT_TRUE(sig_events.has_value());
+  const auto events_denied = handle_request(
+      cfg, make_http_request("GET", "/api/v1/events/finalized?from_sequence=1",
+                             {{"X-Finalis-Api-Key", "kr"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "scope-matrix-n2"},
+                              {"X-Finalis-Signature", *sig_events}},
+                             ""));
+  ASSERT_EQ(events_denied.status, 403);
+  ASSERT_TRUE(events_denied.body.find("\"auth_scope_denied\"") != std::string::npos);
+
+  const auto sig_dlq = sign("GET", "/api/v1/webhooks/dlq", "scope-matrix-n3", "");
+  ASSERT_TRUE(sig_dlq.has_value());
+  const auto dlq_denied = handle_request(
+      cfg, make_http_request("GET", "/api/v1/webhooks/dlq",
+                             {{"X-Finalis-Api-Key", "kr"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "scope-matrix-n3"},
+                              {"X-Finalis-Signature", *sig_dlq}},
+                             ""));
+  ASSERT_EQ(dlq_denied.status, 403);
+  ASSERT_TRUE(dlq_denied.body.find("\"auth_scope_denied\"") != std::string::npos);
+
+  const std::string withdrawal_body =
+      std::string("{\"client_withdrawal_id\":\"w-scope-matrix-1\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  const auto sig_withdraw = sign("POST", "/api/v1/withdrawals", "scope-matrix-n4", withdrawal_body);
+  ASSERT_TRUE(sig_withdraw.has_value());
+  const auto withdraw_denied = handle_request(
+      cfg, make_http_request("POST", "/api/v1/withdrawals",
+                             {{"Idempotency-Key", "idem-scope-matrix-1"},
+                              {"X-Finalis-Api-Key", "kr"},
+                              {"X-Finalis-Timestamp", ts},
+                              {"X-Finalis-Nonce", "scope-matrix-n4"},
+                              {"X-Finalis-Signature", *sig_withdraw}},
+                             withdrawal_body));
+  ASSERT_EQ(withdraw_denied.status, 403);
+  ASSERT_TRUE(withdraw_denied.body.find("\"auth_scope_denied\"") != std::string::npos);
+
+  std::error_code ec;
+  std::filesystem::remove(registry_path, ec);
+}
+
+TEST(test_explorer_partner_allowlist_validation_rejects_invalid_cidrs) {
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  cfg.partner_allowed_ipv4_cidrs_raw = {"not-a-cidr"};
+  std::string err;
+  ASSERT_TRUE(!load_partner_registry(cfg, &err));
+  ASSERT_TRUE(err.find("global allowlist invalid IPv4 CIDR") != std::string::npos);
+
+  cfg.partner_allowed_ipv4_cidrs_raw.clear();
+  const auto registry_path = unique_test_cache_path("finalis-partner-invalid-cidr-registry");
+  {
+    std::ofstream out(registry_path);
+    out << "{"
+           "\"partners\":[{"
+           "\"partner_id\":\"pbadcidr\","
+           "\"api_key\":\"kbadcidr\","
+           "\"active_secret\":\"sbadcidr\","
+           "\"allowed_ipv4_cidrs\":[\"10.0.0.0/8\",\"bogus-cidr\"],"
+           "\"enabled\":true"
+           "}]"
+           "}";
+  }
+  cfg.partner_registry_path = registry_path.string();
+  err.clear();
+  ASSERT_TRUE(!load_partner_registry(cfg, &err));
+  ASSERT_TRUE(err.find("partner pbadcidr allowlist invalid IPv4 CIDR") != std::string::npos);
 
   std::error_code ec;
   std::filesystem::remove(registry_path, ec);

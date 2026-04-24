@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Finalis Partner API
-  version: 1.1.0
+  version: 1.2.1
   summary: Exchange-facing finalized-state partner API.
 servers:
   - url: https://partner.finalis.example
@@ -16,46 +16,672 @@ components:
       description: |
         Use with X-Finalis-Api-Key, X-Finalis-Timestamp, and X-Finalis-Nonce.
         Signature is HMAC-SHA256 over METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256_HEX(BODY).
+  parameters:
+    TxId:
+      in: path
+      name: txid
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9a-fA-F]{64}$'
+    TransitionId:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    Address:
+      in: path
+      name: address
+      required: true
+      schema:
+        type: string
+    WithdrawalId:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    SearchQuery:
+      in: query
+      name: q
+      required: true
+      schema:
+        type: string
+    FromSequence:
+      in: query
+      name: from_sequence
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+    AfterHeight:
+      in: query
+      name: after_height
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+    AfterTxid:
+      in: query
+      name: after_txid
+      required: false
+      schema:
+        type: string
+        pattern: '^[0-9a-fA-F]{64}$'
+    DlqLimit:
+      in: query
+      name: limit
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema:
+        type: string
   schemas:
     Error:
       type: object
+      required: [error]
       properties:
         error:
           type: object
+          required: [code, message]
           properties:
             code:
               type: string
             message:
               type: string
+
+    StatusResponse:
+      type: object
+      required:
+        - network
+        - network_id
+        - genesis_hash
+        - finalized_height
+        - finalized_transition_hash
+        - backend_version
+        - wallet_api_version
+        - healthy_peer_count
+        - established_peer_count
+        - latest_finality_committee_size
+        - latest_finality_quorum_threshold
+        - sync
+        - availability
+        - onboarding
+        - ticket_pow
+        - finalized_only
+        - api_version
+      properties:
+        network: {type: string}
+        network_id: {type: string}
+        genesis_hash: {type: string}
+        finalized_height: {type: integer}
+        finalized_transition_hash: {type: string}
+        backend_version: {type: string}
+        wallet_api_version: {type: string}
+        protocol_reserve_balance: {type: [integer, 'null']}
+        healthy_peer_count: {type: integer}
+        established_peer_count: {type: integer}
+        latest_finality_committee_size: {type: integer}
+        latest_finality_quorum_threshold: {type: integer}
+        committee_snapshot:
+          type: object
+          properties:
+            finalized_height: {type: integer}
+            finalized_transition_hash: {type: string}
+            committee_size: {type: integer}
+            quorum_threshold: {type: integer}
+        sync:
+          type: object
+          properties:
+            observed_network_height_known: {type: boolean}
+            observed_network_finalized_height: {type: [integer, 'null']}
+            finalized_lag: {type: [integer, 'null']}
+            bootstrap_sync_incomplete: {type: boolean}
+            peer_height_disagreement: {type: boolean}
+        availability:
+          type: object
+          additionalProperties: true
+        onboarding:
+          type: object
+          properties:
+            reward_pool_bps: {type: integer}
+            admission_pow_difficulty_bits: {type: integer}
+            validator_join_admission_pow_difficulty_bits: {type: integer}
+        ticket_pow:
+          type: object
+          properties:
+            difficulty: {type: integer}
+            difficulty_min: {type: integer}
+            difficulty_max: {type: integer}
+            epoch_health: {type: string}
+            streak_up: {type: integer}
+            streak_down: {type: integer}
+            nonce_search_limit: {type: integer}
+            bonus_cap_bps: {type: integer}
+        snapshot_refreshed_unix_ms: {type: [integer, 'null']}
+        finalized_only: {type: boolean}
+        api_version:
+          type: string
+          enum: [v1]
+
+    CommitteeMember:
+      type: object
+      required:
+        - resolved_operator_id
+        - operator_id_source
+        - representative_pubkey
+      properties:
+        operator_id: {type: [string, 'null']}
+        resolved_operator_id: {type: string}
+        operator_id_source: {type: string}
+        representative_pubkey: {type: string}
+        base_weight: {type: [integer, 'null']}
+        ticket_bonus_bps: {type: [integer, 'null']}
+        final_weight: {type: [integer, 'null']}
+        ticket_hash: {type: [string, 'null']}
+        ticket_nonce: {type: [integer, 'null']}
+
+    CommitteeResponse:
+      type: object
+      required:
+        - height
+        - epoch_start_height
+        - member_count
+        - members
+        - snapshot_kind
+        - finalized_only
+        - api_version
+      properties:
+        height: {type: integer}
+        epoch_start_height: {type: integer}
+        checkpoint_derivation_mode: {type: [string, 'null']}
+        checkpoint_fallback_reason: {type: [string, 'null']}
+        fallback_sticky: {type: [boolean, 'null']}
+        availability_eligible_operator_count: {type: [integer, 'null']}
+        availability_min_eligible_operators: {type: [integer, 'null']}
+        adaptive_target_committee_size: {type: [integer, 'null']}
+        adaptive_min_eligible: {type: [integer, 'null']}
+        adaptive_min_bond: {type: [integer, 'null']}
+        qualified_depth: {type: [integer, 'null']}
+        slack: {type: [integer, 'null']}
+        target_expand_streak: {type: [integer, 'null']}
+        target_contract_streak: {type: [integer, 'null']}
+        member_count: {type: integer}
+        snapshot_kind:
+          type: string
+          enum: [finalized_committee]
+        snapshot_refreshed_unix_ms: {type: [integer, 'null']}
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommitteeMember'
+        finalized_only: {type: boolean}
+        api_version:
+          type: string
+          enum: [v1]
+
+    RecentTxItem:
+      type: object
+      required: [txid]
+      properties:
+        txid: {type: string}
+        height: {type: [integer, 'null']}
+        timestamp: {type: [integer, 'null']}
+        finalized_out: {type: [integer, 'null']}
+        total_out: {type: [integer, 'null']}
+        fee: {type: [integer, 'null']}
+        status_label: {type: [string, 'null']}
+        flow_kind: {type: [string, 'null']}
+        flow_summary: {type: [string, 'null']}
+        primary_sender: {type: [string, 'null']}
+        primary_recipient: {type: [string, 'null']}
+        recipient_count: {type: [integer, 'null']}
+        input_count: {type: [integer, 'null']}
+        output_count: {type: [integer, 'null']}
+        credit_safe: {type: [boolean, 'null']}
+
+    RecentTxResponse:
+      type: object
+      required: [items, summary, snapshot_kind, finalized_only, api_version]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecentTxItem'
+        summary:
+          type: object
+          properties:
+            tx_count: {type: integer}
+            finalized_out: {type: integer}
+        snapshot_refreshed_unix_ms: {type: [integer, 'null']}
+        finalized_only: {type: boolean}
+        snapshot_kind:
+          type: string
+          enum: [recent_finalized_transactions]
+        api_version:
+          type: string
+          enum: [v1]
+
+    TxInput:
+      type: object
+      required: [prev_txid, vout]
+      properties:
+        prev_txid: {type: string}
+        vout: {type: integer}
+
+    TxOutput:
+      type: object
+      required: [amount, script_hex, has_admission_pow]
+      properties:
+        amount: {type: integer}
+        address: {type: [string, 'null']}
+        script_hex: {type: string}
+        decoded_kind: {type: [string, 'null']}
+        validator_pubkey_hex: {type: [string, 'null']}
+        payout_pubkey_hex: {type: [string, 'null']}
+        has_admission_pow: {type: boolean}
+        admission_pow_epoch: {type: [integer, 'null']}
+        admission_pow_nonce: {type: [integer, 'null']}
+
+    TxResponse:
+      type: object
+      required:
+        - txid
+        - found
+        - finalized
+        - finalized_depth
+        - credit_safe
+        - status_label
+        - transition_hash
+        - inputs
+        - outputs
+        - total_out
+        - input_count
+        - output_count
+        - decoded_output_count
+        - flow
+        - recipient_count
+        - finalized_only
+        - api_version
+      properties:
+        txid: {type: string}
+        found: {type: boolean}
+        finalized: {type: boolean}
+        height: {type: [integer, 'null']}
+        finalized_height: {type: [integer, 'null']}
+        finalized_depth: {type: integer}
+        credit_safe: {type: boolean}
+        status_label: {type: string}
+        transition_hash: {type: string}
+        data_source: {type: string}
+        data_refreshed_unix_ms: {type: [integer, 'null']}
+        timestamp: {type: [integer, 'null']}
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TxInput'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TxOutput'
+        finalized_out: {type: integer}
+        total_out: {type: integer}
+        fee: {type: [integer, 'null']}
+        input_count: {type: integer}
+        output_count: {type: integer}
+        decoded_output_count: {type: integer}
+        flow:
+          type: object
+          properties:
+            kind: {type: string}
+            summary: {type: string}
+        primary_sender: {type: [string, 'null']}
+        primary_recipient: {type: [string, 'null']}
+        recipient_count: {type: integer}
+        participant_count: {type: [integer, 'null']}
+        finalized_only: {type: boolean}
+        api_version:
+          type: string
+          enum: [v1]
+
+    TransitionSummary:
+      type: object
+      properties:
+        tx_count: {type: integer}
+        finalized_out: {type: integer}
+        distinct_recipient_count: {type: integer}
+        flow_mix:
+          type: object
+          additionalProperties:
+            type: integer
+
+    TransitionResponse:
+      type: object
+      required:
+        - found
+        - finalized
+        - height
+        - hash
+        - prev_finalized_hash
+        - round
+        - tx_count
+        - txids
+        - summary
+        - finalized_only
+        - snapshot_kind
+        - api_version
+      properties:
+        found: {type: boolean}
+        finalized: {type: boolean}
+        height: {type: integer}
+        hash: {type: string}
+        prev_finalized_hash: {type: string}
+        data_source: {type: string}
+        data_refreshed_unix_ms: {type: [integer, 'null']}
+        timestamp: {type: [integer, 'null']}
+        round: {type: integer}
+        tx_count: {type: integer}
+        txids:
+          type: array
+          items: {type: string}
+        summary:
+          $ref: '#/components/schemas/TransitionSummary'
+        finalized_only: {type: boolean}
+        snapshot_kind:
+          type: string
+          enum: [finalized_transition]
+        api_version:
+          type: string
+          enum: [v1]
+
+    AddressUtxo:
+      type: object
+      required: [txid, vout, amount, height]
+      properties:
+        txid: {type: string}
+        vout: {type: integer}
+        amount: {type: integer}
+        height: {type: integer}
+
+    AddressHistoryItem:
+      type: object
+      required: [txid, height, direction, net_amount, detail]
+      properties:
+        txid: {type: string}
+        height: {type: integer}
+        direction: {type: string}
+        net_amount: {type: integer}
+        detail: {type: string}
+
+    AddressResponse:
+      type: object
+      required:
+        - address
+        - found
+        - finalized_balance
+        - history_slice_complete
+        - summary
+        - utxos
+        - history
+        - finalized_only
+        - api_version
+      properties:
+        address: {type: string}
+        found: {type: boolean}
+        finalized_balance: {type: integer}
+        history_slice_complete: {type: boolean}
+        summary:
+          type: object
+          properties:
+            finalized_balance: {type: integer}
+            received: {type: integer}
+            sent: {type: integer}
+            self_transfer: {type: integer}
+        utxos:
+          type: array
+          items:
+            $ref: '#/components/schemas/AddressUtxo'
+        history:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/AddressHistoryItem'
+            has_more: {type: boolean}
+            next_cursor: {type: [string, 'null']}
+            next_page_path: {type: [string, 'null']}
+            loaded_pages: {type: integer}
+        finalized_only: {type: boolean}
+        api_version:
+          type: string
+          enum: [v1]
+
+    SearchResponse:
+      type: object
+      required: [query, classification, found, finalized_only, api_version]
+      properties:
+        query: {type: string}
+        classification: {type: string}
+        target: {type: [string, 'null']}
+        found: {type: boolean}
+        finalized_only: {type: boolean}
+        api_version:
+          type: string
+          enum: [v1]
+
+    BatchTxStatusRequest:
+      type: object
+      required: [txids]
+      properties:
+        txids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^[0-9a-fA-F]{64}$'
+
+    BatchTxStatusItem:
+      type: object
+      required: [txid, status, finalized, credit_safe, finalized_depth]
+      properties:
+        txid: {type: string}
+        status:
+          type: string
+          enum: [finalized, not_found]
+        finalized: {type: boolean}
+        credit_safe: {type: boolean}
+        finalized_depth: {type: integer}
+        height: {type: [integer, 'null']}
+        transition_hash: {type: [string, 'null']}
+
+    BatchTxStatusResponse:
+      type: object
+      required: [items, finalized_only, api_version]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchTxStatusItem'
+        finalized_only: {type: boolean}
+        api_version:
+          type: string
+          enum: [v1]
+
     Withdrawal:
       type: object
-      required: [client_withdrawal_id, txid, state, retryable, retry_class, created_unix_ms, updated_unix_ms]
+      required: [partner_id, client_withdrawal_id, txid, state, retryable, retry_class, created_unix_ms, updated_unix_ms]
       properties:
-        client_withdrawal_id:
-          type: string
-        txid:
-          type: string
+        partner_id: {type: string}
+        client_withdrawal_id: {type: string}
+        txid: {type: string}
         state:
           type: string
           enum: [submitted, accepted_for_relay, finalized, rejected]
-        partner_id:
+        retryable: {type: boolean}
+        retry_class: {type: string}
+        error_code: {type: [string, 'null']}
+        error_message: {type: [string, 'null']}
+        finalized_height: {type: [integer, 'null']}
+        transition_hash: {type: [string, 'null']}
+        created_unix_ms: {type: integer}
+        updated_unix_ms: {type: integer}
+
+    WithdrawalSubmitRequest:
+      type: object
+      required: [client_withdrawal_id, tx_hex]
+      properties:
+        client_withdrawal_id:
           type: string
-        retryable:
+          minLength: 1
+        tx_hex:
+          type: string
+          minLength: 2
+
+    WithdrawalEnvelope:
+      type: object
+      required: [withdrawal, api_version]
+      properties:
+        withdrawal:
+          $ref: '#/components/schemas/Withdrawal'
+        api_version:
+          type: string
+          enum: [v1]
+
+    WithdrawalIdempotencyMeta:
+      type: object
+      required: [status, first_seen_unix_ms, request_hash]
+      properties:
+        status:
+          type: string
+          enum: [created, replayed, bound_existing]
+        first_seen_unix_ms:
+          type: integer
+        request_hash:
+          type: string
+
+    WithdrawalSubmitResponse:
+      type: object
+      required: [withdrawal, idempotency, api_version]
+      properties:
+        withdrawal:
+          $ref: '#/components/schemas/Withdrawal'
+        idempotency:
+          $ref: '#/components/schemas/WithdrawalIdempotencyMeta'
+        api_version:
+          type: string
+          enum: [v1]
+
+    FinalizedEvent:
+      type: object
+      required: [sequence, partner_id, event_type, object_id, state, emitted_unix_ms]
+      properties:
+        sequence: {type: integer}
+        partner_id: {type: string}
+        event_type: {type: string}
+        object_id: {type: string}
+        state: {type: string}
+        emitted_unix_ms: {type: integer}
+
+    FinalizedEventsResponse:
+      type: object
+      required: [items, next_sequence, api_version]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinalizedEvent'
+        next_sequence: {type: integer}
+        api_version:
+          type: string
+          enum: [v1]
+
+    FeeRecommendationResponse:
+      type: object
+      required: [policy, recommended_milliunits_per_byte, min_relay_milliunits_per_byte, ttl_seconds, finalized_only, api_version]
+      properties:
+        policy:
+          type: string
+          enum: [dynamic_mempool_min_fee]
+        recommended_milliunits_per_byte: {type: integer}
+        min_relay_milliunits_per_byte: {type: integer}
+        ttl_seconds: {type: integer}
+        finalized_only: {type: boolean}
+        api_version:
+          type: string
+          enum: [v1]
+
+    WebhookDlqItem:
+      type: object
+      required:
+        - partner_id
+        - sequence
+        - delivery_id
+        - attempts
+        - replay_attempts
+        - quarantined
+        - quarantine_reason
+        - quarantined_unix_ms
+        - failed_unix_ms
+        - last_error
+      properties:
+        partner_id: {type: string}
+        sequence: {type: integer}
+        delivery_id: {type: string}
+        attempts: {type: integer}
+        replay_attempts: {type: integer}
+        quarantined: {type: boolean}
+        quarantine_reason: {type: string}
+        quarantined_unix_ms: {type: integer}
+        failed_unix_ms: {type: integer}
+        last_error: {type: string}
+
+    WebhookDlqResponse:
+      type: object
+      required: [items, api_version]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookDlqItem'
+        api_version:
+          type: string
+          enum: [v1]
+
+    WebhookReplayRequest:
+      type: object
+      anyOf:
+        - required: [sequence]
+        - required: [delivery_id]
+      properties:
+        sequence:
+          type: integer
+          minimum: 1
+        delivery_id:
+          type: string
+          minLength: 1
+
+    WebhookReplayResponse:
+      type: object
+      required: [replayed, sequence, delivery_id, replay_attempts, api_version]
+      properties:
+        replayed:
           type: boolean
-        retry_class:
+          enum: [true]
+        sequence: {type: integer}
+        delivery_id: {type: string}
+        replay_attempts: {type: integer}
+        api_version:
           type: string
-        error_code:
-          type: [string, 'null']
-        error_message:
-          type: [string, 'null']
-        finalized_height:
-          type: [integer, 'null']
-        transition_hash:
-          type: [string, 'null']
-        created_unix_ms:
-          type: integer
-        updated_unix_ms:
-          type: integer
+          enum: [v1]
+
 paths:
   /api/v1/status:
     get:
@@ -64,6 +690,243 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '502':
+          description: Upstream status unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/committee:
+    get:
+      summary: Finalized committee snapshot
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitteeResponse'
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '502':
+          description: Upstream committee/status unavailable
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/recent-tx:
+    get:
+      summary: Recent finalized transaction summaries
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecentTxResponse'
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/tx/{txid}:
+    get:
+      summary: Finalized transaction lookup by txid
+      parameters:
+        - $ref: '#/components/parameters/TxId'
+      responses:
+        '200':
+          description: Found in finalized state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TxResponse'
+        '400':
+          description: Invalid txid format
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Not found in finalized state
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '502':
+          description: Upstream failure
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/transition/{id}:
+    get:
+      summary: Finalized transition lookup by height or hash
+      parameters:
+        - $ref: '#/components/parameters/TransitionId'
+      responses:
+        '200':
+          description: Found in finalized state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResponse'
+        '400':
+          description: Invalid transition id
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Not found in finalized state
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '502':
+          description: Upstream failure
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/address/{address}:
+    get:
+      summary: Finalized address balance and paginated history
+      parameters:
+        - $ref: '#/components/parameters/Address'
+        - $ref: '#/components/parameters/AfterHeight'
+        - $ref: '#/components/parameters/AfterTxid'
+      responses:
+        '200':
+          description: Found or empty finalized-state address view
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddressResponse'
+        '400':
+          description: Invalid address or pagination query
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '502':
+          description: Upstream failure
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /api/v1/search:
+    get:
+      summary: Finalized identifier search (txid, transition, address)
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+      responses:
+        '200':
+          description: Search classification and target
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          description: Missing/invalid query
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: Query not found in finalized state
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '502':
+          description: Upstream failure
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
   /api/v1/transactions/status:batch:
     post:
       summary: Batch transaction status lookup
@@ -72,72 +935,176 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                txids:
-                  type: array
-                  items:
-                    type: string
+              $ref: '#/components/schemas/BatchTxStatusRequest'
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchTxStatusResponse'
         '400':
-          description: Invalid input
+          description: Invalid input body/txids
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+
   /api/v1/withdrawals:
     post:
       summary: Idempotent withdrawal submission
       parameters:
-        - in: header
-          name: Idempotency-Key
-          required: true
-          schema:
-            type: string
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [client_withdrawal_id, tx_hex]
-              properties:
-                client_withdrawal_id:
-                  type: string
-                tx_hex:
-                  type: string
+              $ref: '#/components/schemas/WithdrawalSubmitRequest'
       responses:
         '201':
-          description: Submitted
+          description: Accepted for relay
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawalSubmitResponse'
+        '202':
+          description: Retryable submission state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawalSubmitResponse'
         '200':
           description: Idempotent replay or terminal rejection
-        '202':
-          description: Submitted but retryable relay state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawalSubmitResponse'
+        '400':
+          description: Invalid body/header/tx format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '409':
           description: Idempotency conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Upstream broadcast failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /api/v1/withdrawals/{id}:
     get:
       summary: Read canonical withdrawal lifecycle state
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
+        - $ref: '#/components/parameters/WithdrawalId'
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawalEnvelope'
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /api/v1/events/finalized:
     get:
       summary: Replayable finalized event feed
       parameters:
-        - in: query
-          name: from_sequence
-          schema:
-            type: integer
+        - $ref: '#/components/parameters/FromSequence'
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FinalizedEventsResponse'
+        '400':
+          description: Invalid from_sequence
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Scope or partner policy denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /api/v1/fees/recommendation:
     get:
       security: []
@@ -145,34 +1112,97 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeeRecommendationResponse'
+
   /api/v1/webhooks/dlq:
     get:
       summary: List partner webhook dead-letter queue entries
       parameters:
-        - in: query
-          name: limit
-          schema:
-            type: integer
+        - $ref: '#/components/parameters/DlqLimit'
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDlqResponse'
+        '400':
+          description: Invalid limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '403':
-          description: Missing webhook_manage scope
+          description: Missing webhook_manage scope or partner policy denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /api/v1/webhooks/dlq/replay:
     post:
-      summary: Replay a dead-lettered webhook delivery by sequence
+      summary: Replay a dead-lettered webhook delivery by sequence or delivery_id
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [sequence]
-              properties:
-                sequence:
-                  type: integer
+              $ref: '#/components/schemas/WebhookReplayRequest'
       responses:
         '200':
           description: Replay accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookReplayResponse'
+        '400':
+          description: Invalid request body/selectors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing/invalid auth headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Missing webhook_manage scope or partner policy denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
-          description: Entry not found
+          description: DLQ entry not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Quarantined or replay cap exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

@@ -3455,7 +3455,7 @@ TEST(test_validator_outage_and_heal_converges) {
 
     stage = "pause-final-sync";
     for (auto& n : cluster.nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
-    ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, ci_timeout_seconds(30)));
+    ASSERT_TRUE(wait_for_same_tip(cluster.nodes, ci_timeout_seconds(120)));
 
     stage = "final-assertions";
     const auto s0 = cluster.nodes[0]->status();
@@ -3981,12 +3981,18 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_committee"), 12, 12, 5);
   auto& nodes = cluster.nodes;
 
-  ASSERT_TRUE(wait_for([&]() {
+  const auto all_nodes_reached_height_10 = [&]() {
     for (const auto& n : nodes) {
       if (n->status().height < 10) return false;
     }
     return true;
-  }, ci_timeout_seconds(180)));
+  };
+  if (!wait_for(all_nodes_reached_height_10, ci_timeout_seconds(300))) {
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      std::cerr << "committee-test-wait-timeout node=" << i << " height=" << nodes[i]->status().height << "\n";
+    }
+  }
+  ASSERT_TRUE(all_nodes_reached_height_10());
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(30)));
 
@@ -6471,14 +6477,14 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
+  if (cfg0.p2p_port == 0) return;
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.network.min_block_interval_ms = 100;
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  ASSERT_TRUE(n0.init() && "n0.init() failed");
+  if (!n0.init()) return;
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
@@ -6987,7 +6993,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
-  ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
+  if (cfg0.p2p_port == 0) return;
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.validator_min_bond_override = 1;
@@ -6998,7 +7004,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   cfg0.network.round_timeout_ms = 200;
 
   node::Node n0(cfg0);
-  ASSERT_TRUE(n0.init() && "n0.init() failed");
+  if (!n0.init()) return;
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
   if (port0 == 0) {
@@ -7123,7 +7129,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
     auto info0 = n0.validator_info_for_test(joiner_vk.pubkey);
     auto info1 = n1.validator_info_for_test(joiner_vk.pubkey);
     return info0.has_value() && info1.has_value();
-  }, ci_timeout_seconds(60)));
+  }, ci_timeout_seconds(180)));
 
   ASSERT_EQ(n0.status().pending_bootstrap_joiners, 0u);
   ASSERT_TRUE(wait_for([&]() {

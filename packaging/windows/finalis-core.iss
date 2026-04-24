@@ -29,6 +29,8 @@ UninstallDisplayIcon={app}\app\finalis-app-icon.ico
 SetupIconFile={#SourceDir}\installer-assets\finalis-app.ico
 WizardImageFile={#SourceDir}\installer-assets\finalis-wizard.bmp
 WizardSmallImageFile={#SourceDir}\installer-assets\finalis-wizard-small.bmp
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=none
 
 [Tasks]
 Name: "desktopicon"; Description: "Create desktop shortcuts"; GroupDescription: "Additional icons:"
@@ -50,3 +52,58 @@ Name: "{autodesktop}\Start Finalis Stack"; Filename: "powershell.exe"; Parameter
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\app\scripts\Start-Finalis.ps1"" -ConfigureFirewall -NoStart"; Flags: runhidden
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\app\scripts\Start-Finalis.ps1"""; Flags: postinstall skipifsilent
 Filename: "{app}\app\bin\finalis-wallet.exe"; Description: "Launch Finalis Wallet"; Flags: postinstall nowait skipifsilent; Check: FileExists(ExpandConstant('{app}\app\bin\finalis-wallet.exe'))
+
+[Code]
+function VerifyFinalisFirewallRules(): Boolean;
+var
+  ResultCode: Integer;
+  PsExe: string;
+  Script: string;
+begin
+  Result := False;
+  PsExe := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  if not FileExists(PsExe) then
+  begin
+    PsExe := 'powershell.exe';
+  end;
+
+  Script :=
+    '$names=@("Finalis P2P (19440)","Finalis Lightserver RPC (19444)","Finalis Explorer (18080)");' +
+    '$ok=$true;' +
+    'foreach($n in $names){ if(-not (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)){ $ok=$false; break } };' +
+    'if($ok){ exit 0 } else { exit 1 }';
+
+  if Exec(PsExe,
+          '-NoProfile -ExecutionPolicy Bypass -Command "' + Script + '"',
+          '',
+          SW_HIDE,
+          ewWaitUntilTerminated,
+          ResultCode) then
+  begin
+    Result := (ResultCode = 0);
+  end;
+end;
+
+procedure ShowFirewallVerificationMessage;
+begin
+  MsgBox(
+    'Finalis installed, but one or more firewall rules were not detected.' + #13#10 + #13#10 +
+    'To allow external network access, run PowerShell as Administrator and execute:' + #13#10 +
+    '  New-NetFirewallRule -DisplayName "Finalis P2P (19440)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 19440 -Profile Any' + #13#10 +
+    '  New-NetFirewallRule -DisplayName "Finalis Lightserver RPC (19444)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 19444 -Profile Any' + #13#10 +
+    '  New-NetFirewallRule -DisplayName "Finalis Explorer (18080)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 18080 -Profile Any',
+    mbInformation,
+    MB_OK
+  );
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if not VerifyFinalisFirewallRules() then
+    begin
+      ShowFirewallVerificationMessage();
+    end;
+  end;
+end;
