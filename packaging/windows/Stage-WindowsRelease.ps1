@@ -191,10 +191,14 @@ To start a network-listening node + lightserver + explorer:
   powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1
 
 To keep the node local-only:
-  powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1 -PublicNode:`$false
+  powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1 -PublicNode 0
+  (from PowerShell you can also use: -PublicNode:`$false)
 
 If sync appears stuck on an old height, clear peer discovery cache and restart:
   powershell -ExecutionPolicy Bypass -File .\scripts\Start-Finalis.ps1 -ResetPeerDiscovery
+
+If startup fails with frontier lane-tip corruption, Start-Finalis automatically
+resets local chain state once (keystore/logs preserved) and retries.
 
 Windows joiner mode uses:
   mainnet\SEEDS.json

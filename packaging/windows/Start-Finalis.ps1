@@ -8,7 +8,7 @@ param(
     [string]$ExplorerBind = "0.0.0.0",
     [bool]$WithExplorer = $true,
     [bool]$OpenExplorer = $true,
-    [bool]$PublicNode = $true,
+    [object]$PublicNode = $true,
     [switch]$ResetPeerDiscovery,
     [switch]$ConfigureFirewall,
     [switch]$NoStart
@@ -70,6 +70,39 @@ function Set-FinalisFirewallRule {
         $params["Program"] = $ProgramPath
     }
     New-NetFirewallRule @params | Out-Null
+}
+
+function ConvertTo-Boolean {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Value,
+        [bool]$Default = $true
+    )
+
+    if ($null -eq $Value) {
+        return $Default
+    }
+    if ($Value -is [bool]) {
+        return [bool]$Value
+    }
+    if ($Value -is [int] -or $Value -is [long]) {
+        return ([int64]$Value) -ne 0
+    }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $Default
+    }
+
+    switch -Regex ($text.ToLowerInvariant()) {
+        '^(1|true|t|yes|y|on)$' { return $true }
+        '^(0|false|f|no|n|off)$' { return $false }
+        '^\$(true|false)$' { return ($text.TrimStart('$').ToLowerInvariant() -eq 'true') }
+        default {
+            throw "Invalid boolean value '$Value'. Use true/false or 1/0 (for cmd.exe, prefer -PublicNode 0)."
+        }
+    }
 }
 
 function Set-FinalisFirewallRules {
@@ -218,6 +251,63 @@ function Test-ResetPeerDiscoveryAutomatically {
     return $false
 }
 
+function Reset-FinalisChainState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDataDir
+    )
+
+    if (-not (Test-Path $TargetDataDir)) {
+        return
+    }
+
+    $preserve = @("keystore", "logs")
+    Get-ChildItem -Path $TargetDataDir -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($preserve -contains $_.Name.ToLowerInvariant()) {
+            return
+        }
+        Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-NodeErrorContains {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NodeErrPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern
+    )
+
+    if (-not (Test-Path $NodeErrPath)) {
+        return $false
+    }
+    try {
+        $errText = Get-Content $NodeErrPath -Raw -ErrorAction Stop
+        return $errText -match $Pattern
+    } catch {
+        return $false
+    }
+}
+
+function Start-FinalisNodeProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExePath,
+        [Parameter(Mandatory = $true)]
+        [string]$WorkingDir,
+        [Parameter(Mandatory = $true)]
+        [object[]]$Arguments,
+        [Parameter(Mandatory = $true)]
+        [string]$StdOutPath,
+        [Parameter(Mandatory = $true)]
+        [string]$StdErrPath
+    )
+
+    $argString = Build-ArgumentString -Args $Arguments
+    return Start-Process -FilePath $ExePath -ArgumentList $argString -WorkingDirectory $WorkingDir `
+        -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath -PassThru
+}
+
 function Wait-ForTcpPort {
     param(
         [string]$TargetAddress,
@@ -257,6 +347,8 @@ if ((-not $ResetPeerDiscovery.IsPresent) -and (Test-ResetPeerDiscoveryAutomatica
     Write-Warning "Detected stale/empty peer cache in $DataDir. Resetting addrman.dat and peers.dat automatically."
     $ResetPeerDiscovery = $true
 }
+
+$PublicNode = ConvertTo-Boolean -Value $PublicNode -Default $true
 
 if ($ResetPeerDiscovery.IsPresent) {
     $addrmanPath = Join-Path $DataDir "addrman.dat"
@@ -314,8 +406,16 @@ Stop-FinalisProcessIfRunning -ProcessName "finalis-node" -ExpectedPath $nodeExe
 
 $nodeLog = Join-Path $logDir "node.log"
 $nodeErr = Join-Path $logDir "node.err.log"
-$nodeArgString = Build-ArgumentString -Args $nodeArgs
-$nodeProc = Start-Process -FilePath $nodeExe -ArgumentList $nodeArgString -WorkingDirectory $appRoot -RedirectStandardOutput $nodeLog -RedirectStandardError $nodeErr -PassThru
+$nodeProc = Start-FinalisNodeProcess -ExePath $nodeExe -WorkingDir $appRoot -Arguments $nodeArgs -StdOutPath $nodeLog -StdErrPath $nodeErr
+
+# Auto-recover one known startup corruption mode by rebuilding chain state from peers.
+Start-Sleep -Milliseconds 1200
+if ($nodeProc.HasExited -and (Test-NodeErrorContains -NodeErrPath $nodeErr -Pattern "frontier-storage-lane-tip-too-low")) {
+    Write-Warning "Detected frontier lane-tip corruption in persisted state. Resetting local chain state and retrying startup once."
+    Reset-FinalisChainState -TargetDataDir $DataDir
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $nodeProc = Start-FinalisNodeProcess -ExePath $nodeExe -WorkingDir $appRoot -Arguments $nodeArgs -StdOutPath $nodeLog -StdErrPath $nodeErr
+}
 
 $lightserverArgs = @(
     "--db", $DataDir,
@@ -370,6 +470,12 @@ if ($WithExplorer -and (Test-Path $explorerExe)) {
 
 if ($nodeProc.HasExited) {
     throw "finalis-node.exe exited during startup. See $nodeErr"
+}
+
+# Ensure node remains alive after dependent services are up.
+Start-Sleep -Milliseconds 1250
+if ($nodeProc.HasExited) {
+    throw "finalis-node.exe exited shortly after startup. See $nodeErr"
 }
 
 Write-Host "Finalis node started."
