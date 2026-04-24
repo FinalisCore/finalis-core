@@ -4439,6 +4439,54 @@ std::optional<std::string> partner_required_scope(const std::string& method, con
   return std::nullopt;
 }
 
+struct DeprecatedPartnerRoute {
+  std::string_view legacy_prefix;
+  std::string_view successor_prefix;
+  bool exact_match{false};
+};
+
+constexpr std::string_view kPartnerApiSunsetDate = "Wed, 31 Dec 2026 23:59:59 GMT";
+constexpr std::array<DeprecatedPartnerRoute, 7> kDeprecatedPartnerRoutes = {{
+    {"/api/status", "/api/v1/status", true},
+    {"/api/committee", "/api/v1/committee", true},
+    {"/api/recent-tx", "/api/v1/recent-tx", true},
+    {"/api/search", "/api/v1/search", true},
+    {"/api/tx/", "/api/v1/tx/", false},
+    {"/api/transition/", "/api/v1/transition/", false},
+    {"/api/address/", "/api/v1/address/", false},
+}};
+
+void set_or_replace_header(Response* resp, std::string_view key, std::string value) {
+  if (!resp) return;
+  const auto key_lower = lowercase_ascii(std::string(key));
+  for (auto& [k, v] : resp->headers) {
+    if (lowercase_ascii(k) == key_lower) {
+      v = std::move(value);
+      return;
+    }
+  }
+  resp->headers.emplace_back(std::string(key), std::move(value));
+}
+
+void apply_partner_api_governance_headers(const std::string& path, Response* resp) {
+  if (!resp) return;
+  if (path.rfind("/api/v1/", 0) == 0) {
+    set_or_replace_header(resp, "X-Finalis-Api-Version", "v1");
+    return;
+  }
+  if (path.rfind("/api/", 0) != 0) return;
+  for (const auto& entry : kDeprecatedPartnerRoutes) {
+    const bool matched = entry.exact_match ? (path == entry.legacy_prefix) : (path.rfind(entry.legacy_prefix, 0) == 0);
+    if (!matched) continue;
+    set_or_replace_header(resp, "Deprecation", "true");
+    set_or_replace_header(resp, "Sunset", std::string(kPartnerApiSunsetDate));
+    set_or_replace_header(resp, "Link", std::string("<") + std::string(entry.successor_prefix) + ">; rel=\"successor-version\"");
+    set_or_replace_header(resp, "X-Finalis-Api-Version", "legacy");
+    set_or_replace_header(resp, "X-Finalis-Api-Successor", std::string(entry.successor_prefix));
+    return;
+  }
+}
+
 std::string normalize_partner_lifecycle_state(const std::string& value) {
   const auto lowered = lowercase_ascii(value);
   if (lowered == "active" || lowered == "draining" || lowered == "revoked") return lowered;
@@ -5225,9 +5273,13 @@ void handle_client_session(Config cfg, finalis::net::SocketHandle fd, const std:
   const auto started = std::chrono::steady_clock::now();
   (void)finalis::net::set_socket_timeouts(fd, 15'000);
   auto req = read_http_request(fd);
-  const Response resp_obj =
+  Response resp_obj =
       req.has_value() ? handle_request(cfg, *req, client_ip)
                       : html_response(400, page_layout("Bad Request", "<h1>Bad Request</h1>"));
+  if (req.has_value()) {
+    const std::string target = request_target_for_log(req);
+    if (!target.empty() && target.front() == '/') apply_partner_api_governance_headers(path_from_target(target), &resp_obj);
+  }
   record_http_metric(request_target_for_log(req), resp_obj.status);
   const std::string resp = http_response(resp_obj);
   (void)write_all(fd, resp);

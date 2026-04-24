@@ -159,10 +159,12 @@ Partner API v1:
 - `GET /api/v1/fees/recommendation` provides fee policy guidance for
   withdrawal submitters
 - governance and compatibility policy:
-  - `docs/PARTNER_API_COMPATIBILITY_POLICY.md`
-  - `docs/PARTNER_API_CHANGELOG.md`
-  - `docs/PARTNER_API_DEPRECATIONS.md`
-  - CI gate: `.github/workflows/partner-api-governance.yml`
+  - `apps/finalis-explorer/PARTNER_API_CHANGELOG.md`
+  - `apps/finalis-explorer/PARTNER_API_DEPRECATIONS.md`
+  - OpenAPI diff + changelog/deprecation gate:
+    - `apps/finalis-explorer/scripts/check_partner_api_governance.py`
+  - CI runner command:
+    - `apps/finalis-explorer/scripts/partner_api_governance_ci.sh <base-ref> <head-ref>`
 
 Partner auth (when enabled):
 
@@ -291,6 +293,12 @@ Webhook delivery:
   - `POST /api/v1/webhooks/dlq/replay`
   - accepts `sequence` or `delivery_id`
   - once `replay_attempts` reaches `--partner-webhook-max-replay-attempts`, entry is quarantined and replay is rejected (`409`)
+- legacy route deprecation signaling:
+  - `/api/v1/*` emits `X-Finalis-Api-Version: v1`
+  - legacy `/api/*` partner routes emit:
+    - `Deprecation: true`
+    - `Sunset: Wed, 31 Dec 2026 23:59:59 GMT`
+    - `Link: </api/v1/...>; rel=\"successor-version\"`
 
 Prometheus partner/SRE metrics (`GET /metrics`) include:
 
