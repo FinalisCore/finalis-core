@@ -4517,6 +4517,15 @@ std::optional<ParsedIpv4Cidr> parse_ipv4_cidr(const std::string& raw) {
   return out;
 }
 
+bool validate_ipv4_cidrs(const std::vector<std::string>& cidrs_raw, std::string* err, const std::string& context) {
+  for (const auto& cidr : cidrs_raw) {
+    if (parse_ipv4_cidr(cidr).has_value()) continue;
+    if (err) *err = context + " invalid IPv4 CIDR: " + cidr;
+    return false;
+  }
+  return true;
+}
+
 bool ip_in_cidrs(const std::string& ip, const std::vector<std::string>& cidrs_raw) {
   if (cidrs_raw.empty()) return true;
   in_addr addr{};
@@ -5075,6 +5084,7 @@ Response render_metrics_response() {
 }
 
 bool load_partner_registry(const Config& cfg, std::string* err) {
+  if (!validate_ipv4_cidrs(cfg.partner_allowed_ipv4_cidrs_raw, err, "global allowlist")) return false;
   if (cfg.partner_registry_path.empty()) return true;
   std::ifstream in(cfg.partner_registry_path);
   if (!in) {
@@ -5152,6 +5162,7 @@ bool load_partner_registry(const Config& cfg, std::string* err) {
       for (const auto& c : cidrs->array_value) {
         if (c.is_string() && !c.string_value.empty()) rec.allowed_ipv4_cidrs_raw.push_back(c.string_value);
       }
+      if (!validate_ipv4_cidrs(rec.allowed_ipv4_cidrs_raw, err, "partner " + rec.partner_id + " allowlist")) return false;
     }
     rec.enabled = object_bool(&p, "enabled").value_or(true);
     if (by_key.count(rec.api_key) || by_id.count(rec.partner_id)) {

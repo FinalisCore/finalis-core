@@ -189,6 +189,8 @@ Partner auth (when enabled):
   - requires header `X-Finalis-Mtls-Verified: true`
 - optional global source CIDR allowlist:
   - `--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32`
+  - startup rejects malformed CIDRs (global or partner-level) with explicit
+    config error; invalid allowlists are never accepted silently
 
 Multi-tenant partner registry:
 
@@ -219,6 +221,14 @@ Multi-tenant partner registry:
     submission is rejected with `403 auth_partner_draining`
   - `revoked`: all protected partner operations are rejected with
     `403 auth_partner_revoked`
+- scope enforcement matrix on protected `/api/v1/*` routes:
+  - `read`: finalized read APIs (`/status` excepted as public, plus
+    `/committee`, `/recent-tx`, `/tx/*`, `/transition/*`, `/address/*`,
+    `/search`, `/withdrawals/{id}`)
+  - `withdraw_submit`: `POST /api/v1/withdrawals`
+  - `events_read`: `GET /api/v1/events/finalized`
+  - `webhook_manage`: `GET /api/v1/webhooks/dlq`,
+    `POST /api/v1/webhooks/dlq/replay`
 - rate-limit precedence:
   - if `scope_rate_limit_per_minute.<scope>` is present, it overrides
     `rate_limit_per_minute` for that scope
