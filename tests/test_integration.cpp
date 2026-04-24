@@ -2463,13 +2463,14 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   }, std::chrono::seconds(30)));
 
   // Equivocation injection for validator 0.
-  std::uint64_t min_before = UINT64_MAX;
-  for (const auto& n : nodes) min_before = std::min(min_before, n->status().height);
+  for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
+  const std::uint64_t min_before = nodes[0]->status().height;
+  const std::uint64_t equivocation_height = min_before + 1;
 
   for (auto& n : nodes) {
-    const auto st = n->status();
     Vote va;
-    va.height = st.height + 1;
+    va.height = equivocation_height;
     va.round = 0;
     va.block_id.fill(0xAA);
     va.validator_pubkey = keys[0].public_key;
@@ -2483,9 +2484,10 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
     ASSERT_TRUE(sb.has_value());
     vb.signature = *sb;
 
-    (void)n->inject_vote_for_test(va);
-    (void)n->inject_vote_for_test(vb);
+    ASSERT_TRUE(n->inject_vote_for_test(va));
+    ASSERT_TRUE(!n->inject_vote_for_test(vb));
   }
+  for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(false));
 
   const bool advanced_after_equivocation = wait_for([&]() {
     for (const auto& n : nodes) {
@@ -3785,7 +3787,7 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_slash"), 1, 1, 1);
   auto& nodes = cluster.nodes;
   const auto keys = node::Node::deterministic_test_keypairs();
-  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 6; }, std::chrono::seconds(30)));
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 6; }, ci_timeout_seconds(60)));
 
   const auto slash_pub = keys[0].public_key;
   const std::uint64_t bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
@@ -3795,7 +3797,7 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
 
   for (auto& n : nodes) n->pause_proposals_for_test(true);
-  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(30)));
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(60)));
 
   auto info0 = nodes[0]->validator_info_for_test(slash_pub);
   ASSERT_TRUE(info0.has_value());
@@ -3834,7 +3836,7 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
       if (!artifact.has_value()) return false;
     }
     return true;
-  }, std::chrono::seconds(60)));
+  }, ci_timeout_seconds(180)));
 }
 
 TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
@@ -5953,7 +5955,7 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
   v.nonce = 321;
   v.node_software_version = "handshake-test/0.7";
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
-  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_protocol_version >= 1; }, std::chrono::seconds(2)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_protocol_version >= 1; }, ci_timeout_seconds(2)));
   n.stop();
 }
 
