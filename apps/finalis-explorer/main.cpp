@@ -56,6 +56,7 @@ struct Config {
   std::uint64_t partner_auth_max_skew_seconds{300};
   std::uint64_t partner_rate_limit_per_minute{600};
   std::uint64_t partner_webhook_max_attempts{5};
+  std::uint64_t partner_webhook_max_replay_attempts{3};
   std::uint64_t partner_webhook_initial_backoff_ms{1000};
   std::uint64_t partner_webhook_max_backoff_ms{60000};
   std::uint64_t partner_idempotency_ttl_seconds{7 * 24 * 60 * 60};
@@ -125,9 +126,11 @@ struct PartnerPrincipal {
 struct PartnerWebhookDelivery {
   std::string partner_id;
   std::uint64_t sequence{0};
+  std::string delivery_id;
   std::string url;
   std::string payload_json;
   std::uint64_t attempt{0};
+  std::uint64_t replay_attempts{0};
   std::uint64_t enqueued_unix_ms{0};
   std::uint64_t next_attempt_unix_ms{0};
 };
@@ -135,11 +138,16 @@ struct PartnerWebhookDelivery {
 struct PartnerWebhookDlqEntry {
   std::string partner_id;
   std::uint64_t sequence{0};
+  std::string delivery_id;
   std::string url;
   std::string payload_json;
   std::uint64_t enqueued_unix_ms{0};
   std::uint64_t failed_unix_ms{0};
   std::uint64_t attempts{0};
+  std::uint64_t replay_attempts{0};
+  bool quarantined{false};
+  std::string quarantine_reason;
+  std::uint64_t quarantined_unix_ms{0};
   std::string last_error;
 };
 
@@ -446,6 +454,7 @@ std::uint64_t g_metrics_partner_webhook_deliveries_total{0};
 std::uint64_t g_metrics_partner_webhook_failures_total{0};
 std::uint64_t g_metrics_partner_webhook_dlq_total{0};
 std::uint64_t g_metrics_partner_webhook_replays_total{0};
+std::uint64_t g_metrics_partner_webhook_quarantined_total{0};
 std::unordered_map<std::string, std::uint64_t> g_metrics_http_request_duration_bucket_ms;
 std::unordered_map<std::string, std::uint64_t> g_metrics_http_request_duration_sum_ms;
 std::unordered_map<std::string, std::uint64_t> g_metrics_http_request_duration_count;
@@ -546,6 +555,7 @@ void clear_runtime_caches() {
     g_metrics_partner_webhook_failures_total = 0;
     g_metrics_partner_webhook_dlq_total = 0;
     g_metrics_partner_webhook_replays_total = 0;
+    g_metrics_partner_webhook_quarantined_total = 0;
     g_metrics_partner_webhook_delivery_latency_bucket_seconds.clear();
     g_metrics_partner_webhook_delivery_latency_sum_seconds.clear();
     g_metrics_partner_webhook_delivery_latency_count.clear();
@@ -1466,6 +1476,9 @@ std::optional<Config> parse_args(int argc, char** argv) {
   if (const char* v = std::getenv("FINALIS_PARTNER_WEBHOOK_MAX_ATTEMPTS")) {
     if (auto parsed = parse_u64_strict(v); parsed.has_value() && *parsed != 0) cfg.partner_webhook_max_attempts = *parsed;
   }
+  if (const char* v = std::getenv("FINALIS_PARTNER_WEBHOOK_MAX_REPLAY_ATTEMPTS")) {
+    if (auto parsed = parse_u64_strict(v); parsed.has_value() && *parsed != 0) cfg.partner_webhook_max_replay_attempts = *parsed;
+  }
   if (const char* v = std::getenv("FINALIS_PARTNER_WEBHOOK_INITIAL_BACKOFF_MS")) {
     if (auto parsed = parse_u64_strict(v); parsed.has_value() && *parsed != 0) cfg.partner_webhook_initial_backoff_ms = *parsed;
   }
@@ -1548,6 +1561,12 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto parsed = parse_u64_strict(*v);
       if (!parsed.has_value() || *parsed == 0) return std::nullopt;
       cfg.partner_webhook_max_attempts = *parsed;
+    } else if (a == "--partner-webhook-max-replay-attempts") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = parse_u64_strict(*v);
+      if (!parsed.has_value() || *parsed == 0) return std::nullopt;
+      cfg.partner_webhook_max_replay_attempts = *parsed;
     } else if (a == "--partner-webhook-initial-backoff-ms") {
       auto v = next();
       if (!v) return std::nullopt;
@@ -1834,9 +1853,11 @@ finalis::minijson::Value serialize_partner_webhook_delivery(const PartnerWebhook
   auto out = json_object_value();
   json_put(out, "partner_id", d.partner_id);
   json_put(out, "sequence", d.sequence);
+  json_put(out, "delivery_id", d.delivery_id);
   json_put(out, "url", d.url);
   json_put(out, "payload_json", d.payload_json);
   json_put(out, "attempt", d.attempt);
+  json_put(out, "replay_attempts", d.replay_attempts);
   json_put(out, "enqueued_unix_ms", d.enqueued_unix_ms);
   json_put(out, "next_attempt_unix_ms", d.next_attempt_unix_ms);
   return out;
@@ -1847,9 +1868,11 @@ std::optional<PartnerWebhookDelivery> parse_partner_webhook_delivery(const final
   PartnerWebhookDelivery d;
   d.partner_id = object_string(&v, "partner_id").value_or("");
   d.sequence = object_u64(&v, "sequence").value_or(0);
+  d.delivery_id = object_string(&v, "delivery_id").value_or("");
   d.url = object_string(&v, "url").value_or("");
   d.payload_json = object_string(&v, "payload_json").value_or("");
   d.attempt = object_u64(&v, "attempt").value_or(0);
+  d.replay_attempts = object_u64(&v, "replay_attempts").value_or(0);
   d.next_attempt_unix_ms = object_u64(&v, "next_attempt_unix_ms").value_or(0);
   d.enqueued_unix_ms = object_u64(&v, "enqueued_unix_ms").value_or(d.next_attempt_unix_ms);
   if (d.partner_id.empty() || d.sequence == 0 || d.url.empty() || d.payload_json.empty()) return std::nullopt;
@@ -1860,11 +1883,16 @@ finalis::minijson::Value serialize_partner_webhook_dlq_entry(const PartnerWebhoo
   auto out = json_object_value();
   json_put(out, "partner_id", d.partner_id);
   json_put(out, "sequence", d.sequence);
+  json_put(out, "delivery_id", d.delivery_id);
   json_put(out, "url", d.url);
   json_put(out, "payload_json", d.payload_json);
   json_put(out, "enqueued_unix_ms", d.enqueued_unix_ms);
   json_put(out, "failed_unix_ms", d.failed_unix_ms);
   json_put(out, "attempts", d.attempts);
+  json_put(out, "replay_attempts", d.replay_attempts);
+  json_put(out, "quarantined", d.quarantined);
+  json_put(out, "quarantine_reason", d.quarantine_reason);
+  json_put(out, "quarantined_unix_ms", d.quarantined_unix_ms);
   json_put(out, "last_error", d.last_error);
   return out;
 }
@@ -1874,11 +1902,16 @@ std::optional<PartnerWebhookDlqEntry> parse_partner_webhook_dlq_entry(const fina
   PartnerWebhookDlqEntry d;
   d.partner_id = object_string(&v, "partner_id").value_or("");
   d.sequence = object_u64(&v, "sequence").value_or(0);
+  d.delivery_id = object_string(&v, "delivery_id").value_or("");
   d.url = object_string(&v, "url").value_or("");
   d.payload_json = object_string(&v, "payload_json").value_or("");
   d.enqueued_unix_ms = object_u64(&v, "enqueued_unix_ms").value_or(0);
   d.failed_unix_ms = object_u64(&v, "failed_unix_ms").value_or(0);
   d.attempts = object_u64(&v, "attempts").value_or(0);
+  d.replay_attempts = object_u64(&v, "replay_attempts").value_or(0);
+  d.quarantined = object_bool(&v, "quarantined").value_or(false);
+  d.quarantine_reason = object_string(&v, "quarantine_reason").value_or("");
+  d.quarantined_unix_ms = object_u64(&v, "quarantined_unix_ms").value_or(0);
   d.last_error = object_string(&v, "last_error").value_or("");
   if (d.partner_id.empty() || d.sequence == 0 || d.url.empty() || d.payload_json.empty()) return std::nullopt;
   return d;
@@ -2372,14 +2405,15 @@ std::uint64_t now_unix_ms() {
 }
 
 void append_webhook_audit_log(const Config& cfg, const std::string& event, const std::string& partner_id, std::uint64_t sequence,
-                              std::uint64_t attempt, bool success, const std::string& detail) {
+                              const std::string& delivery_id, std::uint64_t attempt, bool success, const std::string& detail) {
   if (cfg.partner_webhook_audit_log_path.empty()) return;
   const auto path = std::filesystem::path(cfg.partner_webhook_audit_log_path);
   if (!path.parent_path().empty() && !finalis::ensure_private_dir(path.parent_path().string())) return;
   std::ofstream out(path, std::ios::binary | std::ios::app);
   if (!out) return;
   out << "{\"ts_unix_ms\":" << now_unix_ms() << ",\"event\":\"" << json_escape(event) << "\",\"partner_id\":\""
-      << json_escape(partner_id) << "\",\"sequence\":" << sequence << ",\"attempt\":" << attempt
+      << json_escape(partner_id) << "\",\"sequence\":" << sequence << ",\"delivery_id\":\"" << json_escape(delivery_id)
+      << "\",\"attempt\":" << attempt
       << ",\"success\":" << json_bool(success) << ",\"detail\":\"" << json_escape(detail) << "\"}\n";
 }
 
@@ -4464,6 +4498,11 @@ std::string partner_scoped_id(const std::string& partner_id, const std::string& 
   return partner_id + ":" + id;
 }
 
+std::string partner_webhook_delivery_id(const std::string& partner_id, std::uint64_t sequence) {
+  const auto digest = sha256_hex_text(partner_scoped_id(partner_id, "webhook:" + std::to_string(sequence)));
+  return std::string("wd_") + digest.substr(0, 24);
+}
+
 std::uint64_t ttl_ms_saturated(std::uint64_t ttl_seconds) {
   constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
   if (ttl_seconds == 0) return 0;
@@ -4574,6 +4613,10 @@ bool prune_partner_state_locked(const Config& cfg, std::uint64_t now_ms) {
   rebuilt_queue.clear();
   for (const auto& entry : g_partner_webhook_queue) {
     PartnerWebhookDelivery job = entry;
+    if (job.delivery_id.empty()) {
+      job.delivery_id = partner_webhook_delivery_id(job.partner_id, job.sequence);
+      changed = true;
+    }
     if (job.enqueued_unix_ms == 0) job.enqueued_unix_ms = job.next_attempt_unix_ms ? job.next_attempt_unix_ms : now_ms;
     const bool too_old = queue_ttl_ms != 0 && now_ms > job.enqueued_unix_ms && (now_ms - job.enqueued_unix_ms) > queue_ttl_ms;
     if (too_old || job.attempt >= cfg.partner_webhook_max_attempts) {
@@ -4601,13 +4644,24 @@ bool prune_partner_state_locked(const Config& cfg, std::uint64_t now_ms) {
   if (changed) g_partner_webhook_queue = std::move(rebuilt_queue);
   std::deque<PartnerWebhookDlqEntry> rebuilt_dlq;
   for (const auto& entry : g_partner_webhook_dlq) {
-    const std::uint64_t ref_ts = entry.failed_unix_ms ? entry.failed_unix_ms : entry.enqueued_unix_ms;
+    PartnerWebhookDlqEntry item = entry;
+    if (item.delivery_id.empty()) {
+      item.delivery_id = partner_webhook_delivery_id(item.partner_id, item.sequence);
+      changed = true;
+    }
+    if (!item.quarantined && item.replay_attempts >= cfg.partner_webhook_max_replay_attempts) {
+      item.quarantined = true;
+      item.quarantine_reason = "replay_cap_exceeded";
+      item.quarantined_unix_ms = now_ms;
+      changed = true;
+    }
+    const std::uint64_t ref_ts = item.failed_unix_ms ? item.failed_unix_ms : item.enqueued_unix_ms;
     const bool too_old = queue_ttl_ms != 0 && ref_ts != 0 && now_ms > ref_ts && (now_ms - ref_ts) > queue_ttl_ms;
     if (too_old) {
       changed = true;
       continue;
     }
-    rebuilt_dlq.push_back(entry);
+    rebuilt_dlq.push_back(std::move(item));
   }
   if (rebuilt_dlq.size() > kPersistedPartnerWebhookQueueLimit) {
     rebuilt_dlq.erase(rebuilt_dlq.begin(),
@@ -4808,14 +4862,18 @@ void upsert_partner_withdrawal(const Config& cfg, const PartnerWithdrawal& withd
       const std::string evt_json = partner_event_json(evt);
       const auto sig = hmac_sha256_hex(*pit->second.webhook_secret, evt_json);
       if (sig.has_value()) {
+        const std::string delivery_id = partner_webhook_delivery_id(withdrawal.partner_id, evt.sequence);
         std::ostringstream payload;
-        payload << "{\"event\":" << evt_json << ",\"signature\":\"" << json_escape(*sig) << "\",\"signature_algorithm\":\"hmac_sha256\"}";
+        payload << "{\"delivery_id\":\"" << json_escape(delivery_id) << "\",\"event\":" << evt_json << ",\"signature\":\""
+                << json_escape(*sig) << "\",\"signature_algorithm\":\"hmac_sha256\"}";
         PartnerWebhookDelivery d;
         d.partner_id = withdrawal.partner_id;
         d.sequence = evt.sequence;
+        d.delivery_id = delivery_id;
         d.url = *pit->second.webhook_url;
         d.payload_json = payload.str();
         d.attempt = 0;
+        d.replay_attempts = 0;
         d.enqueued_unix_ms = now_unix_ms();
         d.next_attempt_unix_ms = now_unix_ms();
         const auto duplicate = std::find_if(g_partner_webhook_queue.begin(), g_partner_webhook_queue.end(),
@@ -4864,7 +4922,9 @@ Response render_metrics_response() {
       << "# HELP finalis_partner_rate_limited_by_partner_scope_total Partner rate-limit rejections by partner and scope\n"
       << "# TYPE finalis_partner_rate_limited_by_partner_scope_total counter\n"
       << "# HELP finalis_partner_webhook_delivery_latency_seconds End-to-end webhook delivery latency histogram by outcome\n"
-      << "# TYPE finalis_partner_webhook_delivery_latency_seconds histogram\n";
+      << "# TYPE finalis_partner_webhook_delivery_latency_seconds histogram\n"
+      << "# HELP finalis_partner_webhook_quarantined_total Webhook DLQ entries quarantined after replay cap\n"
+      << "# TYPE finalis_partner_webhook_quarantined_total counter\n";
   std::uint64_t webhook_queue_depth = 0;
   std::uint64_t webhook_dlq_depth = 0;
   std::uint64_t webhook_oldest_age_seconds = 0;
@@ -4928,6 +4988,7 @@ Response render_metrics_response() {
     oss << "finalis_partner_webhook_failures_total " << g_metrics_partner_webhook_failures_total << "\n";
     oss << "finalis_partner_webhook_dlq_total " << g_metrics_partner_webhook_dlq_total << "\n";
     oss << "finalis_partner_webhook_replays_total " << g_metrics_partner_webhook_replays_total << "\n";
+    oss << "finalis_partner_webhook_quarantined_total " << g_metrics_partner_webhook_quarantined_total << "\n";
     for (const auto& [key, count] : g_metrics_partner_webhook_delivery_latency_bucket_seconds) {
       const auto sep = key.rfind('|');
       const std::string outcome = sep == std::string::npos ? key : key.substr(0, sep);
@@ -5113,6 +5174,8 @@ void partner_webhook_worker(const Config cfg) {
           dlq.enqueued_unix_ms = it->enqueued_unix_ms;
           dlq.failed_unix_ms = now_unix_ms();
           dlq.attempts = it->attempt;
+          dlq.delivery_id = it->delivery_id.empty() ? partner_webhook_delivery_id(it->partner_id, it->sequence) : it->delivery_id;
+          dlq.replay_attempts = it->replay_attempts;
           dlq.last_error = post_err.empty() ? "delivery_failed" : post_err;
           g_partner_webhook_dlq.push_back(std::move(dlq));
           moved_to_dlq = true;
@@ -5135,7 +5198,7 @@ void partner_webhook_worker(const Config cfg) {
         std::lock_guard<std::mutex> guard(g_metrics_mu);
         ++g_metrics_partner_webhook_deliveries_total;
       }
-      append_webhook_audit_log(cfg, "webhook_delivery", job.partner_id, job.sequence, job.attempt + 1, true, "ok");
+      append_webhook_audit_log(cfg, "webhook_delivery", job.partner_id, job.sequence, job.delivery_id, job.attempt + 1, true, "ok");
     } else {
       const auto delivery_now_ms = now_unix_ms();
       if (delivery_now_ms >= job.enqueued_unix_ms) {
@@ -5146,7 +5209,8 @@ void partner_webhook_worker(const Config cfg) {
         ++g_metrics_partner_webhook_failures_total;
         if (moved_to_dlq) ++g_metrics_partner_webhook_dlq_total;
       }
-      append_webhook_audit_log(cfg, moved_to_dlq ? "webhook_dlq" : "webhook_retry", job.partner_id, job.sequence, job.attempt + 1, false,
+      append_webhook_audit_log(cfg, moved_to_dlq ? "webhook_dlq" : "webhook_retry", job.partner_id, job.sequence, job.delivery_id,
+                               job.attempt + 1, false,
                                post_err.empty() ? "delivery_failed" : post_err);
     }
     if (persist_needed) persist_explorer_snapshot(cfg);
@@ -5476,8 +5540,11 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     for (std::size_t i = 0; i < items.size(); ++i) {
       if (i) oss << ",";
       const auto& item = items[i];
-      oss << "{\"partner_id\":\"" << json_escape(item.partner_id) << "\",\"sequence\":" << item.sequence << ",\"attempts\":"
-          << item.attempts << ",\"failed_unix_ms\":" << item.failed_unix_ms << ",\"last_error\":\"" << json_escape(item.last_error)
+      oss << "{\"partner_id\":\"" << json_escape(item.partner_id) << "\",\"sequence\":" << item.sequence << ",\"delivery_id\":\""
+          << json_escape(item.delivery_id) << "\",\"attempts\":" << item.attempts << ",\"replay_attempts\":" << item.replay_attempts
+          << ",\"quarantined\":" << json_bool(item.quarantined) << ",\"quarantine_reason\":\""
+          << json_escape(item.quarantine_reason) << "\",\"quarantined_unix_ms\":" << item.quarantined_unix_ms
+          << ",\"failed_unix_ms\":" << item.failed_unix_ms << ",\"last_error\":\"" << json_escape(item.last_error)
           << "\"}";
     }
     oss << "],\"api_version\":\"v1\"}";
@@ -5490,37 +5557,78 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
       return json_error_response(make_error(400, "invalid_body", "expected JSON object body"));
     }
     const auto seq = object_u64(&*body_json, "sequence");
-    if (!seq.has_value() || *seq == 0) return json_error_response(make_error(400, "invalid_sequence", "sequence is required"));
+    const auto delivery_id = object_string(&*body_json, "delivery_id");
+    if ((!seq.has_value() || *seq == 0) && (!delivery_id.has_value() || delivery_id->empty())) {
+      return json_error_response(make_error(400, "invalid_replay_selector", "sequence or delivery_id is required"));
+    }
     bool replayed = false;
+    bool persist_needed = false;
+    std::string replay_delivery_id;
+    std::uint64_t replay_sequence = seq.value_or(0);
+    std::uint64_t replay_attempts = 0;
+    std::optional<ApiError> replay_error;
     {
       std::lock_guard<std::mutex> guard(g_partner_mu);
       const std::string partner_id = principal.partner_id.empty() ? "default" : principal.partner_id;
       auto it = std::find_if(g_partner_webhook_dlq.begin(), g_partner_webhook_dlq.end(), [&](const PartnerWebhookDlqEntry& item) {
-        return item.partner_id == partner_id && item.sequence == *seq;
+        if (item.partner_id != partner_id) return false;
+        if (delivery_id.has_value() && !delivery_id->empty()) return item.delivery_id == *delivery_id;
+        return item.sequence == *seq;
       });
       if (it != g_partner_webhook_dlq.end()) {
-        PartnerWebhookDelivery d;
-        d.partner_id = it->partner_id;
-        d.sequence = it->sequence;
-        d.url = it->url;
-        d.payload_json = it->payload_json;
-        d.attempt = 0;
-        d.enqueued_unix_ms = now_unix_ms();
-        d.next_attempt_unix_ms = now_unix_ms();
-        g_partner_webhook_queue.push_back(std::move(d));
-        g_partner_webhook_dlq.erase(it);
-        replayed = true;
+        replay_sequence = it->sequence;
+        replay_delivery_id = it->delivery_id.empty() ? partner_webhook_delivery_id(it->partner_id, it->sequence) : it->delivery_id;
+        if (it->quarantined) {
+          replay_error = make_error(409, "replay_quarantined", "dlq entry is quarantined");
+        } else if (it->replay_attempts >= cfg.partner_webhook_max_replay_attempts) {
+          it->quarantined = true;
+          it->quarantine_reason = "replay_cap_exceeded";
+          it->quarantined_unix_ms = now_unix_ms();
+          replay_error = make_error(409, "replay_cap_exceeded", "replay cap exceeded for delivery");
+          persist_needed = true;
+          {
+            std::lock_guard<std::mutex> metric_guard(g_metrics_mu);
+            ++g_metrics_partner_webhook_quarantined_total;
+          }
+        } else {
+          PartnerWebhookDelivery d;
+          d.partner_id = it->partner_id;
+          d.sequence = it->sequence;
+          d.delivery_id = it->delivery_id.empty() ? partner_webhook_delivery_id(it->partner_id, it->sequence) : it->delivery_id;
+          d.url = it->url;
+          d.payload_json = it->payload_json;
+          d.attempt = 0;
+          d.replay_attempts = it->replay_attempts + 1;
+          d.enqueued_unix_ms = now_unix_ms();
+          d.next_attempt_unix_ms = now_unix_ms();
+          replay_delivery_id = d.delivery_id;
+          replay_sequence = it->sequence;
+          replay_attempts = d.replay_attempts;
+          g_partner_webhook_queue.push_back(std::move(d));
+          g_partner_webhook_dlq.erase(it);
+          replayed = true;
+          persist_needed = true;
+        }
       }
+    }
+    if (replay_error.has_value()) {
+      append_webhook_audit_log(cfg, "webhook_replay_rejected", principal.partner_id.empty() ? "default" : principal.partner_id,
+                               replay_sequence, replay_delivery_id, 0, false, replay_error->code);
+      if (persist_needed) persist_explorer_snapshot(cfg);
+      return json_error_response(*replay_error);
     }
     if (!replayed) return json_error_response(make_error(404, "not_found", "dlq entry not found"));
     {
       std::lock_guard<std::mutex> guard(g_metrics_mu);
       ++g_metrics_partner_webhook_replays_total;
     }
-    append_webhook_audit_log(cfg, "webhook_replay", principal.partner_id.empty() ? "default" : principal.partner_id, *seq, 0, true, "requeued");
+    append_webhook_audit_log(cfg, "webhook_replay", principal.partner_id.empty() ? "default" : principal.partner_id, replay_sequence,
+                             replay_delivery_id, 0, true, "requeued");
     g_partner_webhook_cv.notify_one();
-    persist_explorer_snapshot(cfg);
-    return json_response(200, std::string("{\"replayed\":true,\"sequence\":") + std::to_string(*seq) + ",\"api_version\":\"v1\"}");
+    if (persist_needed) persist_explorer_snapshot(cfg);
+    return json_response(200, std::string("{\"replayed\":true,\"sequence\":") + std::to_string(replay_sequence) +
+                                  ",\"delivery_id\":\"" + json_escape(replay_delivery_id) + "\",\"replay_attempts\":" +
+                                  std::to_string(replay_attempts) + ",\"api_version\":\"v1\"}");
   }
   if (path == "/search") {
     auto it = query.find("q");
@@ -5623,7 +5731,8 @@ int main(int argc, char** argv) {
                  "[--cache-path /path/to/cache.json] [--partner-auth-required 0|1] [--partner-api-key KEY] "
                  "[--partner-api-secret SECRET] [--partner-registry /path/partners.json] "
                  "[--partner-auth-max-skew-seconds 300] [--partner-rate-limit-per-minute 600] "
-                 "[--partner-webhook-max-attempts 5] [--partner-webhook-initial-backoff-ms 1000] "
+                 "[--partner-webhook-max-attempts 5] [--partner-webhook-max-replay-attempts 3] "
+                 "[--partner-webhook-initial-backoff-ms 1000] "
                  "[--partner-webhook-max-backoff-ms 60000] [--partner-idempotency-ttl-seconds 604800] "
                  "[--partner-events-ttl-seconds 2592000] [--partner-webhook-queue-ttl-seconds 604800] "
                  "[--partner-mtls-required 0|1] [--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32] "
@@ -5682,6 +5791,7 @@ int main(int argc, char** argv) {
             << " partner_rate_limit_per_minute=" << cfg->partner_rate_limit_per_minute
             << " partner_registry=" << (cfg->partner_registry_path.empty() ? "(none)" : cfg->partner_registry_path)
             << " webhook_max_attempts=" << cfg->partner_webhook_max_attempts
+            << " webhook_max_replay_attempts=" << cfg->partner_webhook_max_replay_attempts
             << " idempotency_ttl_s=" << cfg->partner_idempotency_ttl_seconds
             << " events_ttl_s=" << cfg->partner_events_ttl_seconds
             << " webhook_queue_ttl_s=" << cfg->partner_webhook_queue_ttl_seconds

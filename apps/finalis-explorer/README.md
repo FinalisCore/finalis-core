@@ -265,10 +265,12 @@ Webhook delivery:
 - finalized withdrawal transitions enqueue signed webhook deliveries when
   `webhook_url` and `webhook_secret` are configured for that partner
 - payload contains:
+  - `delivery_id` (stable deterministic identifier per partner+event sequence)
   - `event`
   - `signature` (`hmac_sha256` over event JSON)
 - delivery retries use exponential backoff:
   - `--partner-webhook-max-attempts`
+  - `--partner-webhook-max-replay-attempts`
   - `--partner-webhook-initial-backoff-ms`
   - `--partner-webhook-max-backoff-ms`
 - persisted-state GC/TTL bounds:
@@ -280,8 +282,15 @@ Webhook delivery:
   - successful delivery removes an entry
   - crash before snapshot flush may replay a webhook after restart
 - exhausted retries move deliveries to partner-scoped DLQ
+- DLQ records include replay controls:
+  - `delivery_id`
+  - `replay_attempts`
+  - `quarantined`
+  - `quarantine_reason`
 - replay DLQ entries with:
   - `POST /api/v1/webhooks/dlq/replay`
+  - accepts `sequence` or `delivery_id`
+  - once `replay_attempts` reaches `--partner-webhook-max-replay-attempts`, entry is quarantined and replay is rejected (`409`)
 
 Prometheus partner/SRE metrics (`GET /metrics`) include:
 
@@ -296,6 +305,7 @@ Prometheus partner/SRE metrics (`GET /metrics`) include:
   - `finalis_partner_webhook_failures_total`
   - `finalis_partner_webhook_dlq_total`
   - `finalis_partner_webhook_replays_total`
+  - `finalis_partner_webhook_quarantined_total`
   - `finalis_partner_webhook_delivery_latency_seconds_*{outcome=success|failure}`
 - backlog and lag:
   - `finalis_partner_webhook_queue_depth`
