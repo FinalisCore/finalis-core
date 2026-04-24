@@ -102,6 +102,7 @@ struct PartnerAuthRecord {
   std::string api_key;
   std::string active_secret;
   std::optional<std::string> next_secret;
+  std::string lifecycle_state{"active"};
   std::optional<std::uint64_t> rate_limit_per_minute;
   std::optional<std::string> webhook_url;
   std::optional<std::string> webhook_secret;
@@ -4398,6 +4399,12 @@ std::optional<std::string> partner_required_scope(const std::string& method, con
   return std::nullopt;
 }
 
+std::string normalize_partner_lifecycle_state(const std::string& value) {
+  const auto lowered = lowercase_ascii(value);
+  if (lowered == "active" || lowered == "draining" || lowered == "revoked") return lowered;
+  return {};
+}
+
 struct ParsedIpv4Cidr {
   std::uint32_t network{0};
   std::uint32_t mask{0};
@@ -4614,6 +4621,7 @@ std::optional<PartnerAuthRecord> resolve_partner_record_for_api_key(const Config
     single.partner_id = "default";
     single.api_key = cfg.partner_api_key;
     single.active_secret = cfg.partner_api_secret;
+    single.lifecycle_state = "active";
     single.scopes = {"read", "withdraw_submit", "events_read", "webhook_manage"};
     single.allowed_ipv4_cidrs_raw = cfg.partner_allowed_ipv4_cidrs_raw;
     single.enabled = true;
@@ -4647,6 +4655,17 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
   if (!record.has_value() || !record->enabled) {
     record_partner_auth_failure_metric("auth_invalid_key");
     return make_error(403, "auth_invalid_key", "invalid partner api key");
+  }
+  if (record->lifecycle_state == "revoked") {
+    record_partner_auth_failure_metric("auth_partner_revoked");
+    return make_error(403, "auth_partner_revoked", "partner credentials are revoked");
+  }
+  if (record->lifecycle_state == "draining") {
+    const auto needed_scope = partner_required_scope(req.method, path);
+    if (needed_scope.has_value() && *needed_scope == "withdraw_submit") {
+      record_partner_auth_failure_metric("auth_partner_draining");
+      return make_error(403, "auth_partner_draining", "partner is in draining state; withdrawal submission disabled");
+    }
   }
   const auto& allowed_cidrs = record->allowed_ipv4_cidrs_raw.empty() ? cfg.partner_allowed_ipv4_cidrs_raw : record->allowed_ipv4_cidrs_raw;
   if (!ip_in_cidrs(client_ip, allowed_cidrs)) {
@@ -4949,6 +4968,15 @@ bool load_partner_registry(const Config& cfg, std::string* err) {
     rec.api_key = *api_key;
     rec.active_secret = *active_secret;
     rec.next_secret = object_string(&p, "next_secret");
+    rec.lifecycle_state = "active";
+    if (const auto lifecycle = object_string(&p, "lifecycle_state"); lifecycle.has_value()) {
+      const auto normalized = normalize_partner_lifecycle_state(*lifecycle);
+      if (normalized.empty()) {
+        if (err) *err = "invalid lifecycle_state in registry (expected active|draining|revoked)";
+        return false;
+      }
+      rec.lifecycle_state = normalized;
+    }
     rec.rate_limit_per_minute = object_u64(&p, "rate_limit_per_minute");
     rec.webhook_url = object_string(&p, "webhook_url");
     rec.webhook_secret = object_string(&p, "webhook_secret");

@@ -195,6 +195,7 @@ Multi-tenant partner registry:
   - `partner_id`
   - `api_key`
   - `active_secret`
+  - optional `lifecycle_state` (`active`, `draining`, `revoked`)
   - optional `next_secret` (rotation window acceptance)
   - optional `rate_limit_per_minute`
   - optional `webhook_url`
@@ -205,6 +206,12 @@ Multi-tenant partner registry:
   - optional `enabled`
 - when a registry is loaded, partner auth is enabled for protected `/api/v1/*`
   routes automatically
+- lifecycle enforcement:
+  - `active`: normal authenticated behavior
+  - `draining`: read/event/webhook management remains available, new withdrawal
+    submission is rejected with `403 auth_partner_draining`
+  - `revoked`: all protected partner operations are rejected with
+    `403 auth_partner_revoked`
 
 Webhook delivery:
 
