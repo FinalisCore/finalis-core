@@ -152,6 +152,10 @@ Partner API v1:
   `api_version: "v1"` in responses
 - `POST /api/v1/withdrawals` provides idempotent withdrawal submission using
   `Idempotency-Key`
+  - response includes `idempotency` metadata:
+    - `status` (`created`, `replayed`, `bound_existing`)
+    - `first_seen_unix_ms`
+    - `request_hash` (SHA256 of request body)
 - `GET /api/v1/withdrawals/<client_withdrawal_id_or_txid>` provides one
   canonical lifecycle shape
 - `GET /api/v1/events/finalized?from_sequence=<n>` provides a replayable

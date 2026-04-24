@@ -1,5 +1,15 @@
 # Partner API Changelog (Explorer Scope)
 
+## v1.2.1 - 2026-04-24
+
+- Added explicit idempotency metadata to `POST /api/v1/withdrawals`
+  responses:
+  - `idempotency.status` (`created`, `replayed`, `bound_existing`)
+  - `idempotency.first_seen_unix_ms`
+  - `idempotency.request_hash`
+- Clarified deterministic idempotency TTL reuse behavior and added test coverage
+  for conflict-vs-expiry paths.
+
 ## v1.1.1 - 2026-04-24
 
 - Added governance-facing runtime headers for strict contract migration behavior:

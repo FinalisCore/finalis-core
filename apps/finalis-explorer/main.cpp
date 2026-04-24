@@ -872,6 +872,24 @@ std::string partner_withdrawal_json(const PartnerWithdrawal& w) {
   return oss.str();
 }
 
+std::string partner_idempotency_meta_json(const std::string& status, std::uint64_t first_seen_unix_ms, const std::string& request_hash) {
+  std::ostringstream oss;
+  oss << "{\"status\":\"" << json_escape(status) << "\",\"first_seen_unix_ms\":" << first_seen_unix_ms
+      << ",\"request_hash\":\"" << json_escape(request_hash) << "\"}";
+  return oss.str();
+}
+
+std::string partner_withdrawal_submit_response_json(const PartnerWithdrawal& w, const std::string& idempotency_status,
+                                                    std::uint64_t idempotency_first_seen_unix_ms,
+                                                    const std::string& idempotency_request_hash) {
+  std::ostringstream oss;
+  oss << "{\"withdrawal\":" << partner_withdrawal_json(w)
+      << ",\"idempotency\":"
+      << partner_idempotency_meta_json(idempotency_status, idempotency_first_seen_unix_ms, idempotency_request_hash)
+      << ",\"api_version\":\"v1\"}";
+  return oss.str();
+}
+
 std::string short_hex(const std::string& hex) {
   if (hex.size() <= 16) return hex;
   return hex.substr(0, 12) + "..." + hex.substr(hex.size() - 8);
@@ -5468,6 +5486,8 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     const std::uint64_t now_ms = now_unix_ms();
     bool partner_state_updated = false;
     std::optional<PartnerWithdrawal> existing_withdrawal;
+    std::string idempotency_status = "created";
+    std::uint64_t idempotency_first_seen_unix_ms = now_ms;
     {
       std::lock_guard<std::mutex> guard(g_partner_mu);
       if (prune_partner_state_locked(cfg, now_ms)) partner_state_updated = true;
@@ -5480,6 +5500,10 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
         if (cid_it != g_partner_idempotency_client_id.end()) {
           auto wit = g_partner_withdrawals_by_client_id.find(cid_it->second);
           if (wit != g_partner_withdrawals_by_client_id.end()) {
+            idempotency_status = "replayed";
+            idempotency_first_seen_unix_ms = g_partner_idempotency_unix_ms.count(scoped_idem)
+                                                 ? g_partner_idempotency_unix_ms[scoped_idem]
+                                                 : now_ms;
             if (!g_partner_idempotency_unix_ms.count(scoped_idem)) {
               g_partner_idempotency_unix_ms[scoped_idem] = now_ms;
               partner_state_updated = true;
@@ -5491,6 +5515,7 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
       if (!existing_withdrawal.has_value()) {
         auto existing = g_partner_withdrawals_by_client_id.find(scoped_client);
         if (existing != g_partner_withdrawals_by_client_id.end()) {
+          idempotency_status = "bound_existing";
           if (g_partner_idempotency_hash[scoped_idem] != body_hash) {
             g_partner_idempotency_hash[scoped_idem] = body_hash;
             partner_state_updated = true;
@@ -5503,13 +5528,15 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
             g_partner_idempotency_unix_ms[scoped_idem] = now_ms;
             partner_state_updated = true;
           }
+          idempotency_first_seen_unix_ms = g_partner_idempotency_unix_ms[scoped_idem];
           existing_withdrawal = existing->second;
         }
       }
     }
     if (partner_state_updated) persist_explorer_snapshot(cfg);
     if (existing_withdrawal.has_value()) {
-      return json_response(200, std::string("{\"withdrawal\":") + partner_withdrawal_json(*existing_withdrawal) + ",\"api_version\":\"v1\"}");
+      return json_response(200, partner_withdrawal_submit_response_json(*existing_withdrawal, idempotency_status,
+                                                                        idempotency_first_seen_unix_ms, body_hash));
     }
     auto broadcast = rpc_call(cfg.rpc_url, "broadcast_tx", std::string("{\"tx_hex\":\"") + json_escape(*tx_hex) + "\"}");
     if (!broadcast.result.has_value() || !broadcast.result->is_object()) {
@@ -5537,13 +5564,14 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
       g_partner_idempotency_client_id[scoped_idem] = scoped_client;
       g_partner_idempotency_unix_ms[scoped_idem] = now_ms;
     }
+    idempotency_first_seen_unix_ms = now_ms;
     upsert_partner_withdrawal(cfg, w);
     {
       std::lock_guard<std::mutex> guard(g_metrics_mu);
       ++g_metrics_partner_withdrawal_submissions_total;
     }
     const int status = accepted ? 201 : (retryable ? 202 : 200);
-    return json_response(status, std::string("{\"withdrawal\":") + partner_withdrawal_json(w) + ",\"api_version\":\"v1\"}");
+    return json_response(status, partner_withdrawal_submit_response_json(w, idempotency_status, idempotency_first_seen_unix_ms, body_hash));
   }
   const std::string api_v1_withdrawals_prefix = "/api/v1/withdrawals/";
   if (path.rfind(api_v1_withdrawals_prefix, 0) == 0) {

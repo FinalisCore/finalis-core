@@ -9,6 +9,16 @@ Entry format:
 - heading: `## YYYY-MM-DD - vX.Y.Z [NON-BREAKING|BREAKING]`
 - include changed endpoints/schemas and operational impact
 
+## 2026-04-24 - v1.2.1 [NON-BREAKING]
+
+- Added explicit idempotency replay metadata to `POST /api/v1/withdrawals`
+  responses:
+  - `idempotency.status` (`created`, `replayed`, `bound_existing`)
+  - `idempotency.first_seen_unix_ms`
+  - `idempotency.request_hash`
+- Clarified TTL-boundary behavior for idempotency keys and added test coverage
+  for stale-key reuse after expiry.
+
 ## 2026-04-24 - v1.2.0 [NON-BREAKING]
 
 - Brought OpenAPI into full parity with implemented explorer `v1` routes.

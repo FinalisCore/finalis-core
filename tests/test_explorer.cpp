@@ -443,6 +443,9 @@ TEST(test_explorer_partner_auth_and_idempotent_withdrawal_contract) {
   const auto created = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", headers, body));
   ASSERT_TRUE(created.status == 201 || created.status == 200 || created.status == 202);
   ASSERT_TRUE(created.body.find("\"client_withdrawal_id\":\"w1\"") != std::string::npos);
+  ASSERT_TRUE(created.body.find("\"idempotency\":{") != std::string::npos);
+  ASSERT_TRUE(created.body.find("\"status\":\"created\"") != std::string::npos);
+  ASSERT_TRUE(created.body.find("\"request_hash\":\"" + sha256_hex_text(body) + "\"") != std::string::npos);
   ASSERT_TRUE(created.body.find("\"api_version\":\"v1\"") != std::string::npos);
 
   const std::string nonce2 = "n2";
@@ -459,6 +462,57 @@ TEST(test_explorer_partner_auth_and_idempotent_withdrawal_contract) {
   const auto replayed = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", headers2, body));
   ASSERT_EQ(replayed.status, 200);
   ASSERT_TRUE(replayed.body.find("\"client_withdrawal_id\":\"w1\"") != std::string::npos);
+  ASSERT_TRUE(replayed.body.find("\"status\":\"replayed\"") != std::string::npos);
+  ASSERT_TRUE(replayed.body.find("\"request_hash\":\"" + sha256_hex_text(body) + "\"") != std::string::npos);
+}
+
+TEST(test_explorer_partner_idempotency_conflict_and_ttl_reuse_contract) {
+  ExplorerFixture fx;
+  int broadcast_calls = 0;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      ++broadcast_calls;
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+
+  Config cfg = test_config();
+  cfg.partner_auth_required = false;
+  cfg.partner_idempotency_ttl_seconds = 1;
+  const auto cache_path = unique_test_cache_path("finalis-idem-ttl-cache");
+  cfg.cache_path = cache_path.string();
+
+  const std::string body_a =
+      std::string("{\"client_withdrawal_id\":\"idem-a\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  Tx tx_b = fx.tx;
+  tx_b.outputs[0].value += 1234;
+  const std::string body_b =
+      std::string("{\"client_withdrawal_id\":\"idem-b\",\"tx_hex\":\"") + finalis::hex_encode(tx_b.serialize()) + "\"}";
+
+  const auto first = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_a));
+  ASSERT_TRUE(first.status == 200 || first.status == 201 || first.status == 202);
+  ASSERT_TRUE(first.body.find("\"status\":\"created\"") != std::string::npos);
+  ASSERT_EQ(broadcast_calls, 1);
+
+  const auto conflict = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
+  ASSERT_EQ(conflict.status, 409);
+  ASSERT_TRUE(conflict.body.find("\"idempotency_conflict\"") != std::string::npos);
+  ASSERT_EQ(broadcast_calls, 1);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  clear_runtime_caches();
+  load_persisted_explorer_snapshot(cfg);
+
+  const auto reused = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
+  ASSERT_TRUE(reused.status == 200 || reused.status == 201 || reused.status == 202);
+  ASSERT_TRUE(reused.body.find("\"status\":\"created\"") != std::string::npos);
+  ASSERT_TRUE(reused.body.find("\"request_hash\":\"" + sha256_hex_text(body_b) + "\"") != std::string::npos);
+  ASSERT_EQ(broadcast_calls, 2);
+
+  std::error_code ec;
+  std::filesystem::remove(cache_path, ec);
 }
 
 TEST(test_explorer_partner_events_finalized_feed_contract) {

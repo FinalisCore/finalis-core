@@ -55,6 +55,12 @@ Rules:
 
 - same key + same request body => returns the original withdrawal record
 - same key + different request body => `409 idempotency_conflict`
+- successful submission/replay responses include:
+  - `idempotency.status` (`created`, `replayed`, `bound_existing`)
+  - `idempotency.first_seen_unix_ms`
+  - `idempotency.request_hash` (SHA256 of canonical request body bytes)
+- when `partner_idempotency_ttl_seconds` expires, an old key is pruned and can
+  be reused as a fresh submission key.
 
 ## Partner auth
 

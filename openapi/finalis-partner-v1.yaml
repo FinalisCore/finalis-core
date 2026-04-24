@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Finalis Partner API
-  version: 1.2.0
+  version: 1.2.1
   summary: Exchange-facing finalized-state partner API.
 servers:
   - url: https://partner.finalis.example
@@ -555,6 +555,30 @@ components:
           type: string
           enum: [v1]
 
+    WithdrawalIdempotencyMeta:
+      type: object
+      required: [status, first_seen_unix_ms, request_hash]
+      properties:
+        status:
+          type: string
+          enum: [created, replayed, bound_existing]
+        first_seen_unix_ms:
+          type: integer
+        request_hash:
+          type: string
+
+    WithdrawalSubmitResponse:
+      type: object
+      required: [withdrawal, idempotency, api_version]
+      properties:
+        withdrawal:
+          $ref: '#/components/schemas/Withdrawal'
+        idempotency:
+          $ref: '#/components/schemas/WithdrawalIdempotencyMeta'
+        api_version:
+          type: string
+          enum: [v1]
+
     FinalizedEvent:
       type: object
       required: [sequence, partner_id, event_type, object_id, state, emitted_unix_ms]
@@ -957,19 +981,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WithdrawalEnvelope'
+                $ref: '#/components/schemas/WithdrawalSubmitResponse'
         '202':
           description: Retryable submission state
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WithdrawalEnvelope'
+                $ref: '#/components/schemas/WithdrawalSubmitResponse'
         '200':
           description: Idempotent replay or terminal rejection
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WithdrawalEnvelope'
+                $ref: '#/components/schemas/WithdrawalSubmitResponse'
         '400':
           description: Invalid body/header/tx format
           content:
