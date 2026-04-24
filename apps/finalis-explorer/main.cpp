@@ -104,6 +104,7 @@ struct PartnerAuthRecord {
   std::optional<std::string> next_secret;
   std::string lifecycle_state{"active"};
   std::optional<std::uint64_t> rate_limit_per_minute;
+  std::unordered_map<std::string, std::uint64_t> scope_rate_limit_per_minute;
   std::optional<std::string> webhook_url;
   std::optional<std::string> webhook_secret;
   std::set<std::string> scopes;
@@ -115,6 +116,7 @@ struct PartnerPrincipal {
   std::string partner_id;
   std::string api_key;
   std::uint64_t rate_limit_per_minute{0};
+  std::unordered_map<std::string, std::uint64_t> scope_rate_limit_per_minute;
   std::set<std::string> scopes;
   std::vector<std::string> allowed_ipv4_cidrs_raw;
   bool authenticated{false};
@@ -437,6 +439,8 @@ std::unordered_map<std::string, std::uint64_t> g_metrics_http_requests_total;
 std::uint64_t g_metrics_partner_auth_failures_total{0};
 std::unordered_map<std::string, std::uint64_t> g_metrics_partner_auth_failures_by_reason_total;
 std::uint64_t g_metrics_partner_rate_limited_total{0};
+std::unordered_map<std::string, std::uint64_t> g_metrics_partner_rate_limited_by_scope_total;
+std::unordered_map<std::string, std::uint64_t> g_metrics_partner_rate_limited_by_partner_scope_total;
 std::uint64_t g_metrics_partner_withdrawal_submissions_total{0};
 std::uint64_t g_metrics_partner_webhook_deliveries_total{0};
 std::uint64_t g_metrics_partner_webhook_failures_total{0};
@@ -535,6 +539,8 @@ void clear_runtime_caches() {
     g_metrics_partner_auth_failures_total = 0;
     g_metrics_partner_auth_failures_by_reason_total.clear();
     g_metrics_partner_rate_limited_total = 0;
+    g_metrics_partner_rate_limited_by_scope_total.clear();
+    g_metrics_partner_rate_limited_by_partner_scope_total.clear();
     g_metrics_partner_withdrawal_submissions_total = 0;
     g_metrics_partner_webhook_deliveries_total = 0;
     g_metrics_partner_webhook_failures_total = 0;
@@ -4622,6 +4628,10 @@ std::optional<PartnerAuthRecord> resolve_partner_record_for_api_key(const Config
     single.api_key = cfg.partner_api_key;
     single.active_secret = cfg.partner_api_secret;
     single.lifecycle_state = "active";
+    single.scope_rate_limit_per_minute["read"] = cfg.partner_rate_limit_per_minute;
+    single.scope_rate_limit_per_minute["withdraw_submit"] = cfg.partner_rate_limit_per_minute;
+    single.scope_rate_limit_per_minute["events_read"] = cfg.partner_rate_limit_per_minute;
+    single.scope_rate_limit_per_minute["webhook_manage"] = cfg.partner_rate_limit_per_minute;
     single.scopes = {"read", "withdraw_submit", "events_read", "webhook_manage"};
     single.allowed_ipv4_cidrs_raw = cfg.partner_allowed_ipv4_cidrs_raw;
     single.enabled = true;
@@ -4636,6 +4646,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
     out_principal->partner_id = "default";
     out_principal->api_key.clear();
     out_principal->rate_limit_per_minute = cfg.partner_rate_limit_per_minute;
+    out_principal->scope_rate_limit_per_minute.clear();
     out_principal->authenticated = false;
   }
   if (!cfg.partner_auth_required || !partner_auth_needed(path)) return std::nullopt;
@@ -4720,6 +4731,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
     out_principal->partner_id = record->partner_id;
     out_principal->api_key = record->api_key;
     out_principal->rate_limit_per_minute = record->rate_limit_per_minute.value_or(cfg.partner_rate_limit_per_minute);
+    out_principal->scope_rate_limit_per_minute = record->scope_rate_limit_per_minute;
     out_principal->scopes = record->scopes;
     out_principal->allowed_ipv4_cidrs_raw = allowed_cidrs;
     out_principal->authenticated = true;
@@ -4729,11 +4741,18 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
 
 std::optional<ApiError> enforce_partner_rate_limit(const Config& cfg, const HttpRequest& req, const PartnerPrincipal& principal,
                                                    Response* out_response) {
-  if (!partner_auth_needed(path_from_target(req.target))) return std::nullopt;
-  const std::string bucket = principal.partner_id.empty() ? "default" : principal.partner_id;
+  const std::string path = path_from_target(req.target);
+  if (!partner_auth_needed(path)) return std::nullopt;
+  const std::string scope = partner_required_scope(req.method, path).value_or("read");
+  const std::string partner_id = principal.partner_id.empty() ? "default" : principal.partner_id;
+  const std::string bucket = partner_id + "|" + scope;
   const std::uint64_t now_ms = now_unix_ms();
   std::uint64_t retry_after_s = 0;
-  const std::uint64_t limit = principal.rate_limit_per_minute == 0 ? cfg.partner_rate_limit_per_minute : principal.rate_limit_per_minute;
+  std::uint64_t limit = principal.rate_limit_per_minute == 0 ? cfg.partner_rate_limit_per_minute : principal.rate_limit_per_minute;
+  if (auto it = principal.scope_rate_limit_per_minute.find(scope); it != principal.scope_rate_limit_per_minute.end()) {
+    limit = it->second;
+  }
+  if (limit == 0) return std::nullopt;
   {
     std::lock_guard<std::mutex> guard(g_partner_mu);
     auto& window = g_partner_rate_windows_ms[bucket];
@@ -4747,7 +4766,10 @@ std::optional<ApiError> enforce_partner_rate_limit(const Config& cfg, const Http
   if (retry_after_s != 0) {
     std::lock_guard<std::mutex> guard(g_metrics_mu);
     ++g_metrics_partner_rate_limited_total;
+    ++g_metrics_partner_rate_limited_by_scope_total[scope];
+    ++g_metrics_partner_rate_limited_by_partner_scope_total[bucket];
     if (out_response) out_response->headers.push_back({"Retry-After", std::to_string(retry_after_s)});
+    if (out_response) out_response->headers.push_back({"X-Finalis-RateLimit-Scope", scope});
     return make_error(429, "rate_limited", "partner rate limit exceeded");
   }
   return std::nullopt;
@@ -4837,6 +4859,10 @@ Response render_metrics_response() {
       << "# TYPE finalis_partner_auth_failures_total counter\n"
       << "# HELP finalis_partner_auth_failures_by_reason_total Partner auth failures by reason code\n"
       << "# TYPE finalis_partner_auth_failures_by_reason_total counter\n"
+      << "# HELP finalis_partner_rate_limited_by_scope_total Partner rate-limit rejections by scope\n"
+      << "# TYPE finalis_partner_rate_limited_by_scope_total counter\n"
+      << "# HELP finalis_partner_rate_limited_by_partner_scope_total Partner rate-limit rejections by partner and scope\n"
+      << "# TYPE finalis_partner_rate_limited_by_partner_scope_total counter\n"
       << "# HELP finalis_partner_webhook_delivery_latency_seconds End-to-end webhook delivery latency histogram by outcome\n"
       << "# TYPE finalis_partner_webhook_delivery_latency_seconds histogram\n";
   std::uint64_t webhook_queue_depth = 0;
@@ -4887,6 +4913,16 @@ Response render_metrics_response() {
       oss << "finalis_partner_auth_failures_by_reason_total{reason=\"" << json_escape(reason) << "\"} " << count << "\n";
     }
     oss << "finalis_partner_rate_limited_total " << g_metrics_partner_rate_limited_total << "\n";
+    for (const auto& [scope, count] : g_metrics_partner_rate_limited_by_scope_total) {
+      oss << "finalis_partner_rate_limited_by_scope_total{scope=\"" << json_escape(scope) << "\"} " << count << "\n";
+    }
+    for (const auto& [key, count] : g_metrics_partner_rate_limited_by_partner_scope_total) {
+      const auto sep = key.rfind('|');
+      const std::string partner_id = sep == std::string::npos ? key : key.substr(0, sep);
+      const std::string scope = sep == std::string::npos ? "unknown" : key.substr(sep + 1);
+      oss << "finalis_partner_rate_limited_by_partner_scope_total{partner_id=\"" << json_escape(partner_id)
+          << "\",scope=\"" << json_escape(scope) << "\"} " << count << "\n";
+    }
     oss << "finalis_partner_withdrawal_submissions_total " << g_metrics_partner_withdrawal_submissions_total << "\n";
     oss << "finalis_partner_webhook_deliveries_total " << g_metrics_partner_webhook_deliveries_total << "\n";
     oss << "finalis_partner_webhook_failures_total " << g_metrics_partner_webhook_failures_total << "\n";
@@ -4980,6 +5016,24 @@ bool load_partner_registry(const Config& cfg, std::string* err) {
     rec.rate_limit_per_minute = object_u64(&p, "rate_limit_per_minute");
     rec.webhook_url = object_string(&p, "webhook_url");
     rec.webhook_secret = object_string(&p, "webhook_secret");
+    if (const auto* scope_limits = p.get("scope_rate_limit_per_minute"); scope_limits && scope_limits->is_object()) {
+      static const std::array<std::string, 4> kKnownScopes = {"read", "withdraw_submit", "events_read", "webhook_manage"};
+      for (const auto& [key, _] : scope_limits->object_value) {
+        if (std::find(kKnownScopes.begin(), kKnownScopes.end(), key) == kKnownScopes.end()) {
+          if (err) *err = "unknown scope_rate_limit_per_minute key: " + key;
+          return false;
+        }
+      }
+      for (const auto& scope : kKnownScopes) {
+        if (const auto limit = object_u64(scope_limits, scope.c_str()); limit.has_value()) {
+          if (*limit == 0) {
+            if (err) *err = "scope_rate_limit_per_minute values must be > 0";
+            return false;
+          }
+          rec.scope_rate_limit_per_minute[scope] = *limit;
+        }
+      }
+    }
     if (const auto* scopes = p.get("scopes"); scopes && scopes->is_array()) {
       for (const auto& s : scopes->array_value) {
         if (s.is_string() && !s.string_value.empty()) rec.scopes.insert(s.string_value);

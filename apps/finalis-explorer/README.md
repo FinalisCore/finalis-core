@@ -198,6 +198,11 @@ Multi-tenant partner registry:
   - optional `lifecycle_state` (`active`, `draining`, `revoked`)
   - optional `next_secret` (rotation window acceptance)
   - optional `rate_limit_per_minute`
+  - optional `scope_rate_limit_per_minute` object:
+    - `read`
+    - `withdraw_submit`
+    - `events_read`
+    - `webhook_manage`
   - optional `webhook_url`
   - optional `webhook_secret`
   - optional `allowed_ipv4_cidrs`
@@ -212,6 +217,10 @@ Multi-tenant partner registry:
     submission is rejected with `403 auth_partner_draining`
   - `revoked`: all protected partner operations are rejected with
     `403 auth_partner_revoked`
+- rate-limit precedence:
+  - if `scope_rate_limit_per_minute.<scope>` is present, it overrides
+    `rate_limit_per_minute` for that scope
+  - otherwise `rate_limit_per_minute` is used
 
 Minimal `partners.json` lifecycle example:
 
@@ -223,6 +232,12 @@ Minimal `partners.json` lifecycle example:
       "api_key": "ex_a_key",
       "active_secret": "ex_a_secret",
       "lifecycle_state": "active",
+      "scope_rate_limit_per_minute": {
+        "read": 1200,
+        "withdraw_submit": 120,
+        "events_read": 600,
+        "webhook_manage": 120
+      },
       "scopes": ["read", "withdraw_submit", "events_read", "webhook_manage"],
       "webhook_url": "https://exchange-a.example/webhooks/finalis",
       "webhook_secret": "ex_a_webhook_secret"
@@ -274,6 +289,8 @@ Prometheus partner/SRE metrics (`GET /metrics`) include:
   - `finalis_partner_auth_failures_total`
   - `finalis_partner_auth_failures_by_reason_total{reason=...}`
   - `finalis_partner_rate_limited_total`
+  - `finalis_partner_rate_limited_by_scope_total{scope=...}`
+  - `finalis_partner_rate_limited_by_partner_scope_total{partner_id=...,scope=...}`
 - webhook reliability:
   - `finalis_partner_webhook_deliveries_total`
   - `finalis_partner_webhook_failures_total`
