@@ -213,6 +213,38 @@ Multi-tenant partner registry:
   - `revoked`: all protected partner operations are rejected with
     `403 auth_partner_revoked`
 
+Minimal `partners.json` lifecycle example:
+
+```json
+{
+  "partners": [
+    {
+      "partner_id": "exchange-a",
+      "api_key": "ex_a_key",
+      "active_secret": "ex_a_secret",
+      "lifecycle_state": "active",
+      "scopes": ["read", "withdraw_submit", "events_read", "webhook_manage"],
+      "webhook_url": "https://exchange-a.example/webhooks/finalis",
+      "webhook_secret": "ex_a_webhook_secret"
+    },
+    {
+      "partner_id": "exchange-b",
+      "api_key": "ex_b_key",
+      "active_secret": "ex_b_secret",
+      "lifecycle_state": "draining",
+      "scopes": ["read", "events_read", "webhook_manage"]
+    },
+    {
+      "partner_id": "exchange-c",
+      "api_key": "ex_c_key",
+      "active_secret": "ex_c_secret",
+      "lifecycle_state": "revoked",
+      "enabled": true
+    }
+  ]
+}
+```
+
 Webhook delivery:
 
 - finalized withdrawal transitions enqueue signed webhook deliveries when
