@@ -30,7 +30,7 @@ SetupIconFile={#SourceDir}\installer-assets\finalis-app.ico
 WizardImageFile={#SourceDir}\installer-assets\finalis-wizard.bmp
 WizardSmallImageFile={#SourceDir}\installer-assets\finalis-wizard-small.bmp
 PrivilegesRequired=admin
-PrivilegesRequiredOverridesAllowed=none
+PrivilegesRequiredOverridesAllowed=dialog
 
 [Tasks]
 Name: "desktopicon"; Description: "Create desktop shortcuts"; GroupDescription: "Additional icons:"
