@@ -18,13 +18,13 @@ Base routes:
 - `GET /api/v1/status`
 - `GET /api/v1/committee`
 - `GET /api/v1/recent-tx`
-- `GET /api/v1/tx/<txid>`
-- `GET /api/v1/transition/<height_or_hash>`
-- `GET /api/v1/address/<address>`
+- `GET /api/v1/tx/{txid}`
+- `GET /api/v1/transition/{id}`
+- `GET /api/v1/address/{address}`
 - `GET /api/v1/search?q=<query>`
 - `POST /api/v1/transactions/status:batch`
 - `POST /api/v1/withdrawals`
-- `GET /api/v1/withdrawals/<client_withdrawal_id_or_txid>`
+- `GET /api/v1/withdrawals/{id}`
 - `GET /api/v1/events/finalized?from_sequence=<n>`
 - `GET /api/v1/fees/recommendation`
 - `GET /api/v1/webhooks/dlq`
@@ -94,6 +94,7 @@ Finalis delivers signed webhook notifications when a withdrawal transitions to
 Payload shape:
 
 - `event`: finalized event object
+- `delivery_id`: stable deterministic delivery identifier
 - `signature`: hex `HMAC-SHA256(webhook_secret, event_json)`
 - `signature_algorithm`: `hmac_sha256`
 
@@ -103,9 +104,10 @@ Delivery policy:
 - crash before queue-snapshot flush can replay a delivered event after restart
 - exponential retry backoff
 - bounded by configured max attempts
-- consumers should deduplicate by `(partner_id, sequence)`
+- consumers should deduplicate by `delivery_id` (or `(partner_id, sequence)`)
 - terminal failures are moved to partner DLQ
-- DLQ replay is available via `POST /api/v1/webhooks/dlq/replay`
+- DLQ replay is available via `POST /api/v1/webhooks/dlq/replay` using
+  `sequence` or `delivery_id`
 - persisted partner state is GC-bounded by TTL controls:
   - `partner_idempotency_ttl_seconds`
   - `partner_events_ttl_seconds`
