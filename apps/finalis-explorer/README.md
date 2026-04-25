@@ -48,6 +48,7 @@ Supported API routes:
 - `/api/v1/withdrawals/<client_withdrawal_id_or_txid>`
 - `/api/v1/events/finalized?from_sequence=<n>`
 - `/api/v1/fees/recommendation`
+- `/api/v1/audit/auth?limit=<n>&include_success=0|1`
 - `/api/v1/webhooks/dlq`
 - `/api/v1/webhooks/dlq/replay` (POST)
 - `/metrics`
@@ -162,6 +163,11 @@ Partner API v1:
   finalized event feed
 - `GET /api/v1/fees/recommendation` provides fee policy guidance for
   withdrawal submitters
+- `GET /api/v1/audit/auth` exposes partner-scoped auth decision logs for
+  exchange operations:
+  - default: denied decisions only
+  - set `include_success=1` to include successful auth decisions
+  - requires `--partner-auth-audit-log-path` to be configured
 - governance and compatibility policy:
   - `apps/finalis-explorer/PARTNER_API_CHANGELOG.md`
   - `apps/finalis-explorer/PARTNER_API_DEPRECATIONS.md`
@@ -216,6 +222,13 @@ Partner auth (when enabled):
   - `METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256_HEX(BODY)`
 - replay protection:
   - nonce reuse inside the allowed skew window is rejected
+- optional structured partner auth audit log (JSONL):
+  - `--partner-auth-audit-log-path /var/log/finalis/auth_audit.jsonl`
+  - env: `FINALIS_PARTNER_AUTH_AUDIT_LOG_PATH`
+  - each auth decision logs:
+    - `success` (`true|false`)
+    - `code` (deterministic auth reason, e.g. `auth_missing`, `auth_bad_signature`, `auth_replay`, `ok`)
+    - `http_status`, `method`, `path`, `client_ip`, `partner_id`
 - basic per-partner rate limit:
   - configured by `--partner-rate-limit-per-minute`
   - limit responses return `429` with `Retry-After`
@@ -263,7 +276,7 @@ Multi-tenant partner registry:
   - `withdraw_submit`: `POST /api/v1/withdrawals`
   - `events_read`: `GET /api/v1/events/finalized`
   - `webhook_manage`: `GET /api/v1/webhooks/dlq`,
-    `POST /api/v1/webhooks/dlq/replay`
+    `POST /api/v1/webhooks/dlq/replay`, `GET /api/v1/audit/auth`
 - rate-limit precedence:
   - if `scope_rate_limit_per_minute.<scope>` is present, it overrides
     `rate_limit_per_minute` for that scope

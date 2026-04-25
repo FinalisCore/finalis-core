@@ -14,6 +14,10 @@
   in `apps/finalis-explorer/main.cpp` in addition to OpenAPI/changelog checks.
 - Documented alert-friendly contract guarantees and compatibility rules directly
   in explorer README.
+- Added structured partner auth audit logging (`--partner-auth-audit-log-path`)
+  with deterministic reason/status fields for success and failure decisions.
+- Added `GET /api/v1/audit/auth` (partner-scoped) for exchange ops to inspect
+  recent auth denials (`include_success=1` optional).
 
 ## v1.2.1 - 2026-04-24
 
