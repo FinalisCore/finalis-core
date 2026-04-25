@@ -48,6 +48,7 @@ Supported API routes:
 - `/api/v1/withdrawals/<client_withdrawal_id_or_txid>`
 - `/api/v1/events/finalized?from_sequence=<n>`
 - `/api/v1/fees/recommendation`
+- `/api/v1/audit/auth?limit=<n>&include_success=0|1`
 - `/api/v1/webhooks/dlq`
 - `/api/v1/webhooks/dlq/replay` (POST)
 - `/metrics`
@@ -162,13 +163,49 @@ Partner API v1:
   finalized event feed
 - `GET /api/v1/fees/recommendation` provides fee policy guidance for
   withdrawal submitters
+- `GET /api/v1/audit/auth` exposes partner-scoped auth decision logs for
+  exchange operations:
+  - default: denied decisions only
+  - set `include_success=1` to include successful auth decisions
+  - requires `--partner-auth-audit-log-path` to be configured
 - governance and compatibility policy:
   - `apps/finalis-explorer/PARTNER_API_CHANGELOG.md`
   - `apps/finalis-explorer/PARTNER_API_DEPRECATIONS.md`
   - OpenAPI diff + changelog/deprecation gate:
-    - `apps/finalis-explorer/scripts/check_partner_api_governance.py`
+    - canonical checker: `scripts/check_partner_api_governance.py`
+    - compatibility wrapper: `apps/finalis-explorer/scripts/check_partner_api_governance.py`
   - CI runner command:
     - `apps/finalis-explorer/scripts/partner_api_governance_ci.sh <base-ref> <head-ref>`
+
+Contract guarantees:
+
+- response headers:
+  - every `/api/v1/*` response emits `X-Finalis-Api-Version: v1`
+  - legacy `/api/*` partner routes emit:
+    - `Deprecation: true`
+    - `Sunset: Wed, 31 Dec 2026 23:59:59 GMT`
+    - `Link: </api/v1/...>; rel="successor-version"`
+- stable error envelope:
+  - `{"error":{"code":"<stable_code>","message":"<human_message>"}}`
+- deterministic partner status classes:
+  - `400` malformed request/body/query
+  - `401` auth material/clock/mtls failures
+  - `403` auth denied (key/scope/lifecycle/ip/signature)
+  - `404` finalized object not found
+  - `405` method not allowed
+  - `409` idempotency/replay conflict
+  - `429` partner rate limit exceeded
+  - `502` upstream RPC unavailable/error
+
+Compatibility rules:
+
+- additive changes (new optional fields/endpoints) require OpenAPI + changelog
+  update with semver increase
+- breaking/deprecating changes require:
+  - OpenAPI semver increase
+  - changelog top entry with concrete deltas
+  - deprecations doc update with sunset window
+  - runtime legacy headers (`Deprecation`/`Sunset`/`Link`) in explorer
 
 Partner auth (when enabled):
 
@@ -185,6 +222,13 @@ Partner auth (when enabled):
   - `METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + SHA256_HEX(BODY)`
 - replay protection:
   - nonce reuse inside the allowed skew window is rejected
+- optional structured partner auth audit log (JSONL):
+  - `--partner-auth-audit-log-path /var/log/finalis/auth_audit.jsonl`
+  - env: `FINALIS_PARTNER_AUTH_AUDIT_LOG_PATH`
+  - each auth decision logs:
+    - `success` (`true|false`)
+    - `code` (deterministic auth reason, e.g. `auth_missing`, `auth_bad_signature`, `auth_replay`, `ok`)
+    - `http_status`, `method`, `path`, `client_ip`, `partner_id`
 - basic per-partner rate limit:
   - configured by `--partner-rate-limit-per-minute`
   - limit responses return `429` with `Retry-After`
@@ -232,7 +276,7 @@ Multi-tenant partner registry:
   - `withdraw_submit`: `POST /api/v1/withdrawals`
   - `events_read`: `GET /api/v1/events/finalized`
   - `webhook_manage`: `GET /api/v1/webhooks/dlq`,
-    `POST /api/v1/webhooks/dlq/replay`
+    `POST /api/v1/webhooks/dlq/replay`, `GET /api/v1/audit/auth`
 - rate-limit precedence:
   - if `scope_rate_limit_per_minute.<scope>` is present, it overrides
     `rate_limit_per_minute` for that scope

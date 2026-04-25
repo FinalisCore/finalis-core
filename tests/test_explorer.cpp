@@ -56,6 +56,41 @@ std::string make_http_request(const std::string& method, const std::string& path
   return oss.str();
 }
 
+std::string read_file_text(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return {};
+  std::ostringstream oss;
+  oss << in.rdbuf();
+  return oss.str();
+}
+
+std::string lowercase_copy(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+std::optional<std::string> response_header(const Response& resp, const std::string& key) {
+  const auto wanted = lowercase_copy(key);
+  for (const auto& [k, v] : resp.headers) {
+    if (lowercase_copy(k) == wanted) return v;
+  }
+  return std::nullopt;
+}
+
+void assert_json_error_envelope(const Response& resp, int expected_status, const std::string& expected_code) {
+  ASSERT_EQ(resp.status, expected_status);
+  auto parsed = finalis::minijson::parse(resp.body);
+  ASSERT_TRUE(parsed.has_value() && parsed->is_object());
+  const auto* error = parsed->get("error");
+  ASSERT_TRUE(error && error->is_object());
+  const auto code = object_string(error, "code");
+  const auto message = object_string(error, "message");
+  ASSERT_TRUE(code.has_value());
+  ASSERT_TRUE(message.has_value());
+  ASSERT_EQ(*code, expected_code);
+  ASSERT_TRUE(!message->empty());
+}
+
 std::string rpc_result(const std::string& result_json) {
   return std::string("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":") + result_json + "}";
 }
@@ -407,6 +442,55 @@ TEST(test_explorer_api_v1_alias_and_batch_status_contract) {
   ASSERT_TRUE(batch.body.find("\"finalized\":true") != std::string::npos);
 }
 
+TEST(test_explorer_api_contract_headers_for_v1_and_legacy_routes) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto v1_status = handle_request(cfg, make_http_get("/api/v1/status"));
+  ASSERT_EQ(v1_status.status, 200);
+  ASSERT_TRUE(response_header(v1_status, "X-Finalis-Api-Version").has_value());
+  ASSERT_EQ(*response_header(v1_status, "X-Finalis-Api-Version"), "v1");
+  ASSERT_TRUE(!response_header(v1_status, "Deprecation").has_value());
+
+  const auto legacy_status = handle_request(cfg, make_http_get("/api/status"));
+  ASSERT_EQ(legacy_status.status, 200);
+  ASSERT_TRUE(response_header(legacy_status, "X-Finalis-Api-Version").has_value());
+  ASSERT_EQ(*response_header(legacy_status, "X-Finalis-Api-Version"), "legacy");
+  ASSERT_TRUE(response_header(legacy_status, "Deprecation").has_value());
+  ASSERT_EQ(*response_header(legacy_status, "Deprecation"), "true");
+  ASSERT_TRUE(response_header(legacy_status, "Sunset").has_value());
+  ASSERT_EQ(*response_header(legacy_status, "Sunset"), "Wed, 31 Dec 2026 23:59:59 GMT");
+  ASSERT_TRUE(response_header(legacy_status, "Link").has_value());
+  ASSERT_EQ(*response_header(legacy_status, "Link"), "</api/v1/status>; rel=\"successor-version\"");
+}
+
+TEST(test_explorer_api_v1_method_policy_and_error_envelope_conformance) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+
+  const auto wrong_method_status = handle_request(cfg, make_http_request("POST", "/api/v1/status"));
+  assert_json_error_envelope(wrong_method_status, 405, "method_not_allowed");
+  ASSERT_TRUE(response_header(wrong_method_status, "X-Finalis-Api-Version").has_value());
+  ASSERT_EQ(*response_header(wrong_method_status, "X-Finalis-Api-Version"), "v1");
+
+  const auto wrong_method_batch = handle_request(cfg, make_http_get("/api/v1/transactions/status:batch"));
+  assert_json_error_envelope(wrong_method_batch, 405, "method_not_allowed");
+  ASSERT_TRUE(response_header(wrong_method_batch, "X-Finalis-Api-Version").has_value());
+  ASSERT_EQ(*response_header(wrong_method_batch, "X-Finalis-Api-Version"), "v1");
+
+  const auto invalid_body_batch = handle_request(cfg, make_http_request("POST", "/api/v1/transactions/status:batch", {}, "[]"));
+  assert_json_error_envelope(invalid_body_batch, 400, "invalid_body");
+  ASSERT_TRUE(response_header(invalid_body_batch, "X-Finalis-Api-Version").has_value());
+  ASSERT_EQ(*response_header(invalid_body_batch, "X-Finalis-Api-Version"), "v1");
+
+  const auto missing_txids = handle_request(cfg, make_http_request("POST", "/api/v1/transactions/status:batch", {}, "{}"));
+  assert_json_error_envelope(missing_txids, 400, "invalid_txids");
+  ASSERT_TRUE(response_header(missing_txids, "X-Finalis-Api-Version").has_value());
+  ASSERT_EQ(*response_header(missing_txids, "X-Finalis-Api-Version"), "v1");
+}
+
 TEST(test_explorer_partner_auth_and_idempotent_withdrawal_contract) {
   ExplorerFixture fx;
   ScopedRpcHook hook([&](const std::string& body) {
@@ -464,6 +548,154 @@ TEST(test_explorer_partner_auth_and_idempotent_withdrawal_contract) {
   ASSERT_TRUE(replayed.body.find("\"client_withdrawal_id\":\"w1\"") != std::string::npos);
   ASSERT_TRUE(replayed.body.find("\"status\":\"replayed\"") != std::string::npos);
   ASSERT_TRUE(replayed.body.find("\"request_hash\":\"" + sha256_hex_text(body) + "\"") != std::string::npos);
+}
+
+TEST(test_explorer_partner_auth_audit_log_records_failure_and_success) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  cfg.partner_api_key = "partner-key-audit";
+  cfg.partner_api_secret = "partner-secret-audit";
+  const auto audit_path = unique_test_cache_path("finalis-partner-auth-audit");
+  cfg.partner_auth_audit_log_path = audit_path.string();
+
+  const std::string body =
+      std::string("{\"client_withdrawal_id\":\"w-audit\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+
+  const auto missing_auth =
+      handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-audit-1"}}, body));
+  ASSERT_EQ(missing_auth.status, 401);
+  ASSERT_TRUE(missing_auth.body.find("\"code\":\"auth_missing\"") != std::string::npos);
+
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const std::string nonce = "audit-n1";
+  const std::string canonical = std::string("POST\n/api/v1/withdrawals\n") + ts + "\n" + nonce + "\n" + sha256_hex_text(body);
+  const auto sig = hmac_sha256_hex(cfg.partner_api_secret, canonical);
+  ASSERT_TRUE(sig.has_value());
+  const std::vector<std::pair<std::string, std::string>> headers{
+      {"Idempotency-Key", "idem-audit-1"},
+      {"X-Finalis-Api-Key", cfg.partner_api_key},
+      {"X-Finalis-Timestamp", ts},
+      {"X-Finalis-Nonce", nonce},
+      {"X-Finalis-Signature", *sig},
+  };
+  const auto ok = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", headers, body));
+  ASSERT_TRUE(ok.status == 200 || ok.status == 201 || ok.status == 202);
+
+  const auto log_text = read_file_text(audit_path);
+  ASSERT_TRUE(!log_text.empty());
+  ASSERT_TRUE(log_text.find("\"event\":\"partner_auth\"") != std::string::npos);
+  ASSERT_TRUE(log_text.find("\"code\":\"auth_missing\"") != std::string::npos);
+  ASSERT_TRUE(log_text.find("\"success\":false") != std::string::npos);
+  ASSERT_TRUE(log_text.find("\"code\":\"ok\"") != std::string::npos);
+  ASSERT_TRUE(log_text.find("\"success\":true") != std::string::npos);
+  ASSERT_TRUE(log_text.find("\"path\":\"/api/v1/withdrawals\"") != std::string::npos);
+  ASSERT_TRUE(log_text.find("\"method\":\"POST\"") != std::string::npos);
+
+  std::error_code ec;
+  std::filesystem::remove(audit_path, ec);
+}
+
+TEST(test_explorer_partner_auth_audit_read_api_contract) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) {
+      return rpc_result(std::string("{\"ok\":true,\"accepted\":true,\"status\":\"accepted_for_relay\",\"finalized\":false,")
+                        + "\"txid\":\"" + fx.txid + "\",\"message\":\"accepted_for_relay\",\"retryable\":false,\"retry_class\":\"none\"}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+  Config cfg = test_config();
+  cfg.partner_auth_required = true;
+  cfg.partner_api_key = "partner-key-audit-api";
+  cfg.partner_api_secret = "partner-secret-audit-api";
+  const auto audit_path = unique_test_cache_path("finalis-partner-auth-audit-api");
+  cfg.partner_auth_audit_log_path = audit_path.string();
+
+  const std::string body =
+      std::string("{\"client_withdrawal_id\":\"w-audit-api\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+
+  const std::vector<std::pair<std::string, std::string>> bad_headers{
+      {"Idempotency-Key", "idem-audit-api-1"},
+      {"X-Finalis-Api-Key", cfg.partner_api_key},
+      {"X-Finalis-Timestamp", ts},
+      {"X-Finalis-Nonce", "audit-api-n1"},
+      {"X-Finalis-Signature", "00"},
+  };
+  const auto denied = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", bad_headers, body));
+  ASSERT_EQ(denied.status, 403);
+  ASSERT_TRUE(denied.body.find("\"code\":\"auth_bad_signature\"") != std::string::npos);
+
+  const std::string canonical_ok =
+      std::string("POST\n/api/v1/withdrawals\n") + ts + "\naudit-api-n2\n" + sha256_hex_text(body);
+  const auto sig_ok = hmac_sha256_hex(cfg.partner_api_secret, canonical_ok);
+  ASSERT_TRUE(sig_ok.has_value());
+  const std::vector<std::pair<std::string, std::string>> ok_headers{
+      {"Idempotency-Key", "idem-audit-api-1"},
+      {"X-Finalis-Api-Key", cfg.partner_api_key},
+      {"X-Finalis-Timestamp", ts},
+      {"X-Finalis-Nonce", "audit-api-n2"},
+      {"X-Finalis-Signature", *sig_ok},
+  };
+  const auto accepted = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", ok_headers, body));
+  ASSERT_TRUE(accepted.status == 200 || accepted.status == 201 || accepted.status == 202);
+
+  const std::string canonical_audit =
+      std::string("GET\n/api/v1/audit/auth\n") + ts + "\naudit-api-n3\n" + sha256_hex_text("");
+  const auto sig_audit = hmac_sha256_hex(cfg.partner_api_secret, canonical_audit);
+  ASSERT_TRUE(sig_audit.has_value());
+  const std::vector<std::pair<std::string, std::string>> audit_headers{
+      {"X-Finalis-Api-Key", cfg.partner_api_key},
+      {"X-Finalis-Timestamp", ts},
+      {"X-Finalis-Nonce", "audit-api-n3"},
+      {"X-Finalis-Signature", *sig_audit},
+  };
+  const auto audit_denied_only = handle_request(cfg, make_http_request("GET", "/api/v1/audit/auth?limit=10", audit_headers));
+  ASSERT_EQ(audit_denied_only.status, 200);
+  ASSERT_TRUE(audit_denied_only.body.find("\"api_version\":\"v1\"") != std::string::npos);
+  ASSERT_TRUE(audit_denied_only.body.find("\"code\":\"auth_bad_signature\"") != std::string::npos);
+  ASSERT_TRUE(audit_denied_only.body.find("\"code\":\"ok\"") == std::string::npos);
+
+  const std::string canonical_audit_all =
+      std::string("GET\n/api/v1/audit/auth\n") + ts + "\naudit-api-n4\n" + sha256_hex_text("");
+  const auto sig_audit_all = hmac_sha256_hex(cfg.partner_api_secret, canonical_audit_all);
+  ASSERT_TRUE(sig_audit_all.has_value());
+  const std::vector<std::pair<std::string, std::string>> audit_headers_all{
+      {"X-Finalis-Api-Key", cfg.partner_api_key},
+      {"X-Finalis-Timestamp", ts},
+      {"X-Finalis-Nonce", "audit-api-n4"},
+      {"X-Finalis-Signature", *sig_audit_all},
+  };
+  const auto audit_with_success =
+      handle_request(cfg, make_http_request("GET", "/api/v1/audit/auth?limit=10&include_success=1", audit_headers_all));
+  ASSERT_EQ(audit_with_success.status, 200);
+  ASSERT_TRUE(audit_with_success.body.find("\"code\":\"ok\"") != std::string::npos);
+
+  const std::string canonical_bad_limit =
+      std::string("GET\n/api/v1/audit/auth\n") + ts + "\naudit-api-n5\n" + sha256_hex_text("");
+  const auto sig_bad_limit = hmac_sha256_hex(cfg.partner_api_secret, canonical_bad_limit);
+  ASSERT_TRUE(sig_bad_limit.has_value());
+  const std::vector<std::pair<std::string, std::string>> bad_limit_headers{
+      {"X-Finalis-Api-Key", cfg.partner_api_key},
+      {"X-Finalis-Timestamp", ts},
+      {"X-Finalis-Nonce", "audit-api-n5"},
+      {"X-Finalis-Signature", *sig_bad_limit},
+  };
+  const auto bad_limit =
+      handle_request(cfg, make_http_request("GET", "/api/v1/audit/auth?limit=oops", bad_limit_headers));
+  ASSERT_EQ(bad_limit.status, 400);
+  ASSERT_TRUE(bad_limit.body.find("\"code\":\"invalid_limit\"") != std::string::npos);
+
+  std::error_code ec;
+  std::filesystem::remove(audit_path, ec);
 }
 
 TEST(test_explorer_partner_idempotency_conflict_and_ttl_reuse_contract) {

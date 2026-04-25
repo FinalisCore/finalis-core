@@ -65,6 +65,7 @@ struct Config {
   bool partner_mtls_required{false};
   std::vector<std::string> partner_allowed_ipv4_cidrs_raw;
   std::string partner_webhook_audit_log_path;
+  std::string partner_auth_audit_log_path;
 };
 
 template <typename T>
@@ -413,6 +414,7 @@ std::mutex g_committee_cache_mu;
 TimedCacheEntry<LookupResult<CommitteeResult>> g_committee_cache;
 std::mutex g_persisted_snapshot_mu;
 std::mutex g_log_mu;
+std::mutex g_partner_audit_log_mu;
 constexpr auto kSlowRpcThreshold = std::chrono::milliseconds(200);
 constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
@@ -598,6 +600,7 @@ struct Response {
 
 Response handle_request(const Config& cfg, const std::string& req, const std::string& client_ip);
 Response handle_request(const Config& cfg, const std::string& req);
+void apply_partner_api_governance_headers(const std::string& path, Response* resp);
 ApiError upstream_error(const std::string& message);
 void persist_explorer_snapshot(const Config& cfg);
 bool prune_partner_state_locked(const Config& cfg, std::uint64_t now_ms);
@@ -608,6 +611,7 @@ LookupResult<CommitteeResult> parse_committee_result_object(const finalis::minij
 volatile std::sig_atomic_t g_stop = 0;
 std::atomic<std::size_t> g_active_clients{0};
 constexpr std::size_t kMaxConcurrentClients = 64;
+thread_local std::string g_current_request_path;
 
 void on_signal(int) { g_stop = 1; }
 
@@ -671,11 +675,15 @@ std::string error_json(const ApiError& err) {
 }
 
 Response html_response(int status, std::string body) {
-  return Response{status, "text/html; charset=utf-8", std::move(body), std::nullopt, {}};
+  Response out{status, "text/html; charset=utf-8", std::move(body), std::nullopt, {}};
+  if (!g_current_request_path.empty()) apply_partner_api_governance_headers(g_current_request_path, &out);
+  return out;
 }
 
 Response json_response(int status, std::string body) {
-  return Response{status, "application/json; charset=utf-8", std::move(body), std::nullopt, {}};
+  Response out{status, "application/json; charset=utf-8", std::move(body), std::nullopt, {}};
+  if (!g_current_request_path.empty()) apply_partner_api_governance_headers(g_current_request_path, &out);
+  return out;
 }
 
 Response json_error_response(const ApiError& err) { return json_response(err.http_status, error_json(err)); }
@@ -706,6 +714,7 @@ Response redirect_response(const std::string& location) {
   out.content_type = "text/plain; charset=utf-8";
   out.body = "Found";
   out.location = sanitize_redirect_location(location);
+  if (!g_current_request_path.empty()) apply_partner_api_governance_headers(g_current_request_path, &out);
   return out;
 }
 
@@ -1523,6 +1532,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
     }
   }
   if (const char* v = std::getenv("FINALIS_PARTNER_WEBHOOK_AUDIT_LOG_PATH")) cfg.partner_webhook_audit_log_path = v;
+  if (const char* v = std::getenv("FINALIS_PARTNER_AUTH_AUDIT_LOG_PATH")) cfg.partner_auth_audit_log_path = v;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> std::optional<std::string> {
@@ -1631,6 +1641,10 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next();
       if (!v) return std::nullopt;
       cfg.partner_webhook_audit_log_path = *v;
+    } else if (a == "--partner-auth-audit-log-path") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      cfg.partner_auth_audit_log_path = *v;
     } else {
       return std::nullopt;
     }
@@ -2425,6 +2439,7 @@ std::uint64_t now_unix_ms() {
 void append_webhook_audit_log(const Config& cfg, const std::string& event, const std::string& partner_id, std::uint64_t sequence,
                               const std::string& delivery_id, std::uint64_t attempt, bool success, const std::string& detail) {
   if (cfg.partner_webhook_audit_log_path.empty()) return;
+  std::lock_guard<std::mutex> guard(g_partner_audit_log_mu);
   const auto path = std::filesystem::path(cfg.partner_webhook_audit_log_path);
   if (!path.parent_path().empty() && !finalis::ensure_private_dir(path.parent_path().string())) return;
   std::ofstream out(path, std::ios::binary | std::ios::app);
@@ -2433,6 +2448,62 @@ void append_webhook_audit_log(const Config& cfg, const std::string& event, const
       << json_escape(partner_id) << "\",\"sequence\":" << sequence << ",\"delivery_id\":\"" << json_escape(delivery_id)
       << "\",\"attempt\":" << attempt
       << ",\"success\":" << json_bool(success) << ",\"detail\":\"" << json_escape(detail) << "\"}\n";
+}
+
+void append_partner_auth_audit_log(const Config& cfg, const HttpRequest& req, const std::string& path, const std::string& client_ip,
+                                   const std::string& partner_id, bool success, const std::string& code, int http_status) {
+  if (cfg.partner_auth_audit_log_path.empty()) return;
+  std::lock_guard<std::mutex> guard(g_partner_audit_log_mu);
+  const auto log_path = std::filesystem::path(cfg.partner_auth_audit_log_path);
+  if (!log_path.parent_path().empty() && !finalis::ensure_private_dir(log_path.parent_path().string())) return;
+  std::ofstream out(log_path, std::ios::binary | std::ios::app);
+  if (!out) return;
+  out << "{\"ts_unix_ms\":" << now_unix_ms() << ",\"event\":\"partner_auth\",\"success\":" << json_bool(success)
+      << ",\"code\":\"" << json_escape(code) << "\",\"http_status\":" << http_status
+      << ",\"method\":\"" << json_escape(req.method) << "\",\"path\":\"" << json_escape(path)
+      << "\",\"client_ip\":\"" << json_escape(client_ip) << "\",\"partner_id\":\""
+      << json_escape(partner_id.empty() ? "unknown" : partner_id) << "\"}\n";
+}
+
+struct PartnerAuthAuditEntry {
+  std::uint64_t ts_unix_ms{0};
+  bool success{false};
+  std::string code;
+  int http_status{0};
+  std::string method;
+  std::string path;
+  std::string client_ip;
+  std::string partner_id;
+};
+
+std::vector<PartnerAuthAuditEntry> load_partner_auth_audit_entries(const Config& cfg, const std::string& partner_id,
+                                                                   std::size_t limit, bool include_success) {
+  std::vector<PartnerAuthAuditEntry> out;
+  if (limit == 0 || cfg.partner_auth_audit_log_path.empty()) return out;
+  std::lock_guard<std::mutex> guard(g_partner_audit_log_mu);
+  std::ifstream in(cfg.partner_auth_audit_log_path, std::ios::binary);
+  if (!in) return out;
+  std::string line;
+  while (std::getline(in, line)) {
+    auto parsed = finalis::minijson::parse(line);
+    if (!parsed.has_value() || !parsed->is_object()) continue;
+    const auto event = object_string(&*parsed, "event");
+    if (!event.has_value() || *event != "partner_auth") continue;
+    PartnerAuthAuditEntry entry;
+    entry.success = object_bool(&*parsed, "success").value_or(false);
+    if (!include_success && entry.success) continue;
+    entry.partner_id = object_string(&*parsed, "partner_id").value_or("unknown");
+    if (entry.partner_id != partner_id) continue;
+    entry.ts_unix_ms = object_u64(&*parsed, "ts_unix_ms").value_or(0);
+    entry.code = object_string(&*parsed, "code").value_or("unknown");
+    entry.http_status = static_cast<int>(object_u64(&*parsed, "http_status").value_or(0));
+    entry.method = object_string(&*parsed, "method").value_or("");
+    entry.path = object_string(&*parsed, "path").value_or("");
+    entry.client_ip = object_string(&*parsed, "client_ip").value_or("");
+    out.push_back(std::move(entry));
+    if (out.size() > limit) out.erase(out.begin());
+  }
+  return out;
 }
 
 void persist_explorer_snapshot(const Config& cfg) {
@@ -4452,7 +4523,9 @@ bool partner_auth_needed(const std::string& path) {
 std::optional<std::string> partner_required_scope(const std::string& method, const std::string& path) {
   if (path == "/api/v1/withdrawals" && method == "POST") return std::string("withdraw_submit");
   if (path == "/api/v1/events/finalized") return std::string("events_read");
-  if (path == "/api/v1/webhooks/dlq" || path == "/api/v1/webhooks/dlq/replay") return std::string("webhook_manage");
+  if (path == "/api/v1/webhooks/dlq" || path == "/api/v1/webhooks/dlq/replay" || path == "/api/v1/audit/auth") {
+    return std::string("webhook_manage");
+  }
   if (partner_auth_needed(path)) return std::string("read");
   return std::nullopt;
 }
@@ -4463,7 +4536,30 @@ struct DeprecatedPartnerRoute {
   bool exact_match{false};
 };
 
+struct PartnerMethodRule {
+  std::string_view path_prefix;
+  bool exact_match{true};
+  std::string_view method;
+};
+
 constexpr std::string_view kPartnerApiSunsetDate = "Wed, 31 Dec 2026 23:59:59 GMT";
+constexpr std::array<PartnerMethodRule, 15> kPartnerMethodRules = {{
+    {"/api/v1/status", true, "GET"},
+    {"/api/v1/committee", true, "GET"},
+    {"/api/v1/recent-tx", true, "GET"},
+    {"/api/v1/fees/recommendation", true, "GET"},
+    {"/api/v1/transactions/status:batch", true, "POST"},
+    {"/api/v1/withdrawals", true, "POST"},
+    {"/api/v1/withdrawals/", false, "GET"},
+    {"/api/v1/events/finalized", true, "GET"},
+    {"/api/v1/webhooks/dlq", true, "GET"},
+    {"/api/v1/webhooks/dlq/replay", true, "POST"},
+    {"/api/v1/audit/auth", true, "GET"},
+    {"/api/v1/search", true, "GET"},
+    {"/api/v1/tx/", false, "GET"},
+    {"/api/v1/transition/", false, "GET"},
+    {"/api/v1/address/", false, "GET"},
+}};
 constexpr std::array<DeprecatedPartnerRoute, 7> kDeprecatedPartnerRoutes = {{
     {"/api/status", "/api/v1/status", true},
     {"/api/committee", "/api/v1/committee", true},
@@ -4473,6 +4569,14 @@ constexpr std::array<DeprecatedPartnerRoute, 7> kDeprecatedPartnerRoutes = {{
     {"/api/transition/", "/api/v1/transition/", false},
     {"/api/address/", "/api/v1/address/", false},
 }};
+
+std::optional<std::string_view> required_partner_method_for_path(const std::string& path) {
+  for (const auto& rule : kPartnerMethodRules) {
+    const bool matched = rule.exact_match ? (path == rule.path_prefix) : (path.rfind(rule.path_prefix, 0) == 0);
+    if (matched) return rule.method;
+  }
+  return std::nullopt;
+}
 
 void set_or_replace_header(Response* resp, std::string_view key, std::string value) {
   if (!resp) return;
@@ -4771,6 +4875,12 @@ std::optional<PartnerAuthRecord> resolve_partner_record_for_api_key(const Config
 
 std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest& req, const std::string& path,
                                             const std::string& client_ip, PartnerPrincipal* out_principal) {
+  auto fail = [&](int status, const std::string& code, const std::string& message, const std::string& partner_id = "unknown") {
+    record_partner_auth_failure_metric(code);
+    append_partner_auth_audit_log(cfg, req, path, client_ip, partner_id, false, code, status);
+    return make_error(status, code, message);
+  };
+
   if (out_principal) {
     out_principal->partner_id = "default";
     out_principal->api_key.clear();
@@ -4780,48 +4890,40 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
   }
   if (!cfg.partner_auth_required || !partner_auth_needed(path)) return std::nullopt;
   if (cfg.partner_mtls_required && !mtls_verified(req)) {
-    record_partner_auth_failure_metric("auth_mtls_required");
-    return make_error(401, "auth_mtls_required", "mTLS verification header missing");
+    return fail(401, "auth_mtls_required", "mTLS verification header missing");
   }
   const auto api_key = header_value(req, "x-finalis-api-key");
   const auto timestamp = header_value(req, "x-finalis-timestamp");
   const auto nonce = header_value(req, "x-finalis-nonce");
   const auto signature = header_value(req, "x-finalis-signature");
   if (!api_key.has_value() || !timestamp.has_value() || !nonce.has_value() || !signature.has_value()) {
-    record_partner_auth_failure_metric("auth_missing");
-    return make_error(401, "auth_missing", "missing partner auth headers");
+    return fail(401, "auth_missing", "missing partner auth headers");
   }
   const auto record = resolve_partner_record_for_api_key(cfg, *api_key);
   if (!record.has_value() || !record->enabled) {
-    record_partner_auth_failure_metric("auth_invalid_key");
-    return make_error(403, "auth_invalid_key", "invalid partner api key");
+    return fail(403, "auth_invalid_key", "invalid partner api key");
   }
   if (record->lifecycle_state == "revoked") {
-    record_partner_auth_failure_metric("auth_partner_revoked");
-    return make_error(403, "auth_partner_revoked", "partner credentials are revoked");
+    return fail(403, "auth_partner_revoked", "partner credentials are revoked", record->partner_id);
   }
   if (record->lifecycle_state == "draining") {
     const auto needed_scope = partner_required_scope(req.method, path);
     if (needed_scope.has_value() && *needed_scope == "withdraw_submit") {
-      record_partner_auth_failure_metric("auth_partner_draining");
-      return make_error(403, "auth_partner_draining", "partner is in draining state; withdrawal submission disabled");
+      return fail(403, "auth_partner_draining", "partner is in draining state; withdrawal submission disabled", record->partner_id);
     }
   }
   const auto& allowed_cidrs = record->allowed_ipv4_cidrs_raw.empty() ? cfg.partner_allowed_ipv4_cidrs_raw : record->allowed_ipv4_cidrs_raw;
   if (!ip_in_cidrs(client_ip, allowed_cidrs)) {
-    record_partner_auth_failure_metric("auth_ip_forbidden");
-    return make_error(403, "auth_ip_forbidden", "source IP not in partner allowlist");
+    return fail(403, "auth_ip_forbidden", "source IP not in partner allowlist", record->partner_id);
   }
   const auto ts = parse_u64_strict(*timestamp);
   if (!ts.has_value()) {
-    record_partner_auth_failure_metric("auth_bad_timestamp");
-    return make_error(401, "auth_bad_timestamp", "timestamp must be unix seconds");
+    return fail(401, "auth_bad_timestamp", "timestamp must be unix seconds", record->partner_id);
   }
   const std::uint64_t now_sec = static_cast<std::uint64_t>(std::time(nullptr));
   const std::uint64_t skew = now_sec > *ts ? (now_sec - *ts) : (*ts - now_sec);
   if (skew > cfg.partner_auth_max_skew_seconds) {
-    record_partner_auth_failure_metric("auth_timestamp_skew");
-    return make_error(401, "auth_timestamp_skew", "timestamp outside allowed window");
+    return fail(401, "auth_timestamp_skew", "timestamp outside allowed window", record->partner_id);
   }
   const std::string canonical = req.method + "\n" + path + "\n" + *timestamp + "\n" + *nonce + "\n" + sha256_hex_text(req.body);
   const auto expected_active = hmac_sha256_hex(record->active_secret, canonical);
@@ -4832,8 +4934,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
     valid_sig = expected_next.has_value() && secure_equal(lowercase_ascii(*signature), lowercase_ascii(*expected_next));
   }
   if (!valid_sig) {
-    record_partner_auth_failure_metric("auth_bad_signature");
-    return make_error(403, "auth_bad_signature", "invalid partner signature");
+    return fail(403, "auth_bad_signature", "invalid partner signature", record->partner_id);
   }
   bool nonce_window_updated = false;
   {
@@ -4843,6 +4944,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
     if (it != g_seen_partner_nonce_unix_ms.end() && (now_sec > it->second ? now_sec - it->second : it->second - now_sec) <=
             cfg.partner_auth_max_skew_seconds) {
       record_partner_auth_failure_metric("auth_replay");
+      append_partner_auth_audit_log(cfg, req, path, client_ip, record->partner_id, false, "auth_replay", 409);
       return make_error(409, "auth_replay", "nonce replay detected");
     }
     g_seen_partner_nonce_unix_ms[nonce_key] = now_sec;
@@ -4856,6 +4958,7 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
     nonce_window_updated = true;
   }
   if (nonce_window_updated) persist_explorer_snapshot(cfg);
+  append_partner_auth_audit_log(cfg, req, path, client_ip, record->partner_id, true, "ok", 200);
   if (out_principal) {
     out_principal->partner_id = record->partner_id;
     out_principal->api_key = record->api_key;
@@ -5347,8 +5450,22 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     raw_target = raw_target.substr(0, query_pos);
   }
   std::string path = url_decode(raw_target);
+  struct RequestPathScope {
+    std::string previous;
+    explicit RequestPathScope(std::string current) : previous(std::move(g_current_request_path)) {
+      g_current_request_path = std::move(current);
+    }
+    ~RequestPathScope() { g_current_request_path = std::move(previous); }
+  } request_path_scope(path);
   const auto query = parse_query_params(query_string);
   const bool is_api_path = path.rfind("/api/", 0) == 0;
+  if (const auto required_method = required_partner_method_for_path(path);
+      required_method.has_value() && method != *required_method) {
+    if (is_api_path) {
+      return json_error_response(make_error(405, "method_not_allowed", std::string(*required_method) + " required"));
+    }
+    return html_response(405, page_layout("Method Not Allowed", "<h1>Method Not Allowed</h1>"));
+  }
   const bool post_allowed =
       (path == "/api/v1/withdrawals" || path == "/api/v1/transactions/status:batch" || path == "/api/v1/webhooks/dlq/replay");
   if (method == "POST" && !post_allowed) {
@@ -5721,6 +5838,39 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
                                   ",\"delivery_id\":\"" + json_escape(replay_delivery_id) + "\",\"replay_attempts\":" +
                                   std::to_string(replay_attempts) + ",\"api_version\":\"v1\"}");
   }
+  if (path == "/api/v1/audit/auth") {
+    if (method != "GET") return json_error_response(make_error(405, "method_not_allowed", "GET required"));
+    if (cfg.partner_auth_audit_log_path.empty()) {
+      return json_error_response(make_error(503, "audit_not_enabled", "partner auth audit log is not configured"));
+    }
+    std::size_t limit = 100;
+    if (auto it = query.find("limit"); it != query.end() && !it->second.empty()) {
+      auto parsed = parse_u64_strict(it->second);
+      if (!parsed.has_value()) return json_error_response(make_error(400, "invalid_limit", "limit must be numeric"));
+      limit = static_cast<std::size_t>(std::min<std::uint64_t>(*parsed, 1000));
+    }
+    bool include_success = false;
+    if (auto it = query.find("include_success"); it != query.end() && !it->second.empty()) {
+      const auto normalized = lowercase_ascii(it->second);
+      if (normalized == "1" || normalized == "true") include_success = true;
+      else if (normalized == "0" || normalized == "false") include_success = false;
+      else return json_error_response(make_error(400, "invalid_include_success", "include_success must be 0|1|true|false"));
+    }
+    const std::string partner_id = principal.partner_id.empty() ? "default" : principal.partner_id;
+    const auto entries = load_partner_auth_audit_entries(cfg, partner_id, limit, include_success);
+    std::ostringstream oss;
+    oss << "{\"items\":[";
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      if (i) oss << ",";
+      const auto& e = entries[i];
+      oss << "{\"ts_unix_ms\":" << e.ts_unix_ms << ",\"success\":" << json_bool(e.success) << ",\"code\":\""
+          << json_escape(e.code) << "\",\"http_status\":" << e.http_status << ",\"method\":\"" << json_escape(e.method)
+          << "\",\"path\":\"" << json_escape(e.path) << "\",\"client_ip\":\"" << json_escape(e.client_ip)
+          << "\",\"partner_id\":\"" << json_escape(e.partner_id) << "\"}";
+    }
+    oss << "],\"api_version\":\"v1\"}";
+    return json_response(200, oss.str());
+  }
   if (path == "/search") {
     auto it = query.find("q");
     if (it == query.end() || it->second.empty()) {
@@ -5827,7 +5977,8 @@ int main(int argc, char** argv) {
                  "[--partner-webhook-max-backoff-ms 60000] [--partner-idempotency-ttl-seconds 604800] "
                  "[--partner-events-ttl-seconds 2592000] [--partner-webhook-queue-ttl-seconds 604800] "
                  "[--partner-mtls-required 0|1] [--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32] "
-                 "[--partner-webhook-audit-log-path /var/log/finalis/webhook_audit.jsonl]\n";
+                 "[--partner-webhook-audit-log-path /var/log/finalis/webhook_audit.jsonl] "
+                 "[--partner-auth-audit-log-path /var/log/finalis/auth_audit.jsonl]\n";
     return 1;
   }
   if (cfg->cache_path.empty()) cfg->cache_path = default_explorer_cache_path(cfg->rpc_url);
@@ -5889,6 +6040,7 @@ int main(int argc, char** argv) {
             << " mtls_required=" << (cfg->partner_mtls_required ? "on" : "off")
             << " allowed_ipv4_cidrs=" << cfg->partner_allowed_ipv4_cidrs_raw.size()
             << " webhook_audit_log=" << (cfg->partner_webhook_audit_log_path.empty() ? "(none)" : cfg->partner_webhook_audit_log_path)
+            << " auth_audit_log=" << (cfg->partner_auth_audit_log_path.empty() ? "(none)" : cfg->partner_auth_audit_log_path)
             << "\n";
 
   while (!g_stop) {
