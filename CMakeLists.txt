@@ -22,6 +22,8 @@ option(FINALIS_STRICT_WARNINGS "Enable strict warning flags" OFF)
 option(FINALIS_USE_VENDORED_SECP256K1_ZKP "Prefer vendored secp256k1-zkp when available." ON)
 option(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND "Fail configure if secp256k1-zkp confidential backend is unavailable." ON)
 option(FINALIS_AUTO_FETCH_DEPS "Allow CMake to fetch missing third-party dependencies." ON)
+option(FINALIS_GENERATE_NGINX_CONFIG "Generate Nginx reverse-proxy config in build output." ON)
+option(FINALIS_BUILD_NGINX "Build and install a local Nginx under build/third_party/nginx/install." ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(Qt5 COMPONENTS Widgets QUIET)
@@ -424,3 +426,90 @@ set(CPACK_PACKAGE_VERSION "0.1.0")
 set(CPACK_GENERATOR "TGZ;ZIP")
 set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}")
 include(CPack)
+
+if(FINALIS_GENERATE_NGINX_CONFIG)
+  set(FINALIS_NGINX_EXPLORER_SERVER_NAME "explorer.example.com" CACHE STRING "Public hostname for explorer HTTPS endpoint.")
+  set(FINALIS_NGINX_RPC_SERVER_NAME "rpc.example.com" CACHE STRING "Public hostname for lightserver HTTPS RPC endpoint.")
+  set(FINALIS_NGINX_EXPLORER_UPSTREAM "127.0.0.1:18080" CACHE STRING "Explorer upstream host:port.")
+  set(FINALIS_NGINX_RPC_UPSTREAM "127.0.0.1:19444" CACHE STRING "Lightserver RPC upstream host:port.")
+  set(FINALIS_NGINX_CORS_ORIGIN "https://finalis-core.github.io" CACHE STRING "Allowed CORS origin for explorer /api.")
+  set(FINALIS_NGINX_RPC_ALLOWLIST "127.0.0.1" CACHE STRING "Semicolon-delimited allowlist IPs for /rpc.")
+
+  string(REPLACE ";" "\n        allow " FINALIS_NGINX_RPC_ALLOW_RULES "${FINALIS_NGINX_RPC_ALLOWLIST}")
+  if(FINALIS_NGINX_RPC_ALLOW_RULES)
+    set(FINALIS_NGINX_RPC_ALLOW_RULES "allow ${FINALIS_NGINX_RPC_ALLOW_RULES};")
+  else()
+    set(FINALIS_NGINX_RPC_ALLOW_RULES "allow 127.0.0.1;")
+  endif()
+
+  set(FINALIS_NGINX_OUTPUT_DIR "${CMAKE_BINARY_DIR}/ops/nginx")
+  file(MAKE_DIRECTORY "${FINALIS_NGINX_OUTPUT_DIR}")
+  configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/packaging/nginx/finalis.conf.in
+    ${FINALIS_NGINX_OUTPUT_DIR}/finalis.conf
+    @ONLY
+  )
+
+  add_custom_target(finalis-nginx-config ALL
+    DEPENDS ${FINALIS_NGINX_OUTPUT_DIR}/finalis.conf
+  )
+
+  install(FILES
+    ${FINALIS_NGINX_OUTPUT_DIR}/finalis.conf
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/finalis-core/nginx
+  )
+endif()
+
+if(FINALIS_BUILD_NGINX)
+  if(WIN32)
+    message(FATAL_ERROR "FINALIS_BUILD_NGINX=ON is not supported on Windows in this CMake path.")
+  endif()
+  if(NOT FINALIS_GENERATE_NGINX_CONFIG)
+    message(FATAL_ERROR "FINALIS_BUILD_NGINX=ON requires FINALIS_GENERATE_NGINX_CONFIG=ON.")
+  endif()
+
+  include(ExternalProject)
+  set(FINALIS_NGINX_VERSION "1.28.0" CACHE STRING "Nginx version to build locally.")
+  set(FINALIS_NGINX_URL "https://nginx.org/download/nginx-${FINALIS_NGINX_VERSION}.tar.gz" CACHE STRING "Nginx source tarball URL.")
+  set(FINALIS_NGINX_PREFIX "${CMAKE_BINARY_DIR}/third_party/nginx/install" CACHE PATH "Local install prefix for built Nginx.")
+
+  ExternalProject_Add(finalis_nginx_build
+    URL ${FINALIS_NGINX_URL}
+    PREFIX ${CMAKE_BINARY_DIR}/third_party/nginx
+    CONFIGURE_COMMAND <SOURCE_DIR>/configure
+      --prefix=${FINALIS_NGINX_PREFIX}
+      --with-http_ssl_module
+      --with-http_v2_module
+      --with-http_realip_module
+      --with-http_stub_status_module
+      --without-http_rewrite_module
+      --without-http_gzip_module
+      --without-http_ssi_module
+      --without-http_userid_module
+      --without-http_autoindex_module
+      --without-http_geo_module
+      --without-http_split_clients_module
+      --without-http_memcached_module
+      --without-http_empty_gif_module
+      --without-http_browser_module
+      --without-http_fastcgi_module
+      --without-http_uwsgi_module
+      --without-http_scgi_module
+    BUILD_COMMAND $(MAKE)
+    INSTALL_COMMAND $(MAKE) install
+    BUILD_BYPRODUCTS ${FINALIS_NGINX_PREFIX}/sbin/nginx
+  )
+
+  add_custom_command(
+    OUTPUT ${FINALIS_NGINX_PREFIX}/conf/conf.d/finalis.conf
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${FINALIS_NGINX_PREFIX}/conf/conf.d
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${FINALIS_NGINX_OUTPUT_DIR}/finalis.conf
+      ${FINALIS_NGINX_PREFIX}/conf/conf.d/finalis.conf
+    DEPENDS finalis_nginx_build ${FINALIS_NGINX_OUTPUT_DIR}/finalis.conf
+  )
+
+  add_custom_target(finalis-nginx ALL
+    DEPENDS ${FINALIS_NGINX_PREFIX}/conf/conf.d/finalis.conf
+  )
+endif()
