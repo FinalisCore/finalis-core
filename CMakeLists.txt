@@ -479,7 +479,8 @@ if(FINALIS_BUILD_NGINX)
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     PREFIX ${CMAKE_BINARY_DIR}/third_party/nginx
     EXCLUDE_FROM_ALL TRUE
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure
+    BUILD_IN_SOURCE TRUE
+    CONFIGURE_COMMAND <SOURCE_DIR>/auto/configure
       --prefix=${FINALIS_NGINX_PREFIX}
       --with-http_ssl_module
       --with-http_v2_module
