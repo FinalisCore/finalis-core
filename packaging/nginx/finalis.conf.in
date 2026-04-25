@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MIT
+
+limit_req_zone $binary_remote_addr zone=explorer_api:10m rate=60r/s;
+limit_req_zone $binary_remote_addr zone=lightserver_rpc:10m rate=20r/s;
+
+upstream finalis_explorer_upstream {
+    server @FINALIS_NGINX_EXPLORER_UPSTREAM@;
+    keepalive 64;
+}
+
+upstream finalis_lightserver_upstream {
+    server @FINALIS_NGINX_RPC_UPSTREAM@;
+    keepalive 64;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @FINALIS_NGINX_EXPLORER_SERVER_NAME@ @FINALIS_NGINX_RPC_SERVER_NAME@;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @FINALIS_NGINX_EXPLORER_SERVER_NAME@;
+
+    ssl_certificate     /etc/letsencrypt/live/@FINALIS_NGINX_EXPLORER_SERVER_NAME@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@FINALIS_NGINX_EXPLORER_SERVER_NAME@/privkey.pem;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    set $cors_origin "";
+    if ($http_origin = "@FINALIS_NGINX_CORS_ORIGIN@") {
+        set $cors_origin $http_origin;
+    }
+
+    location /api/ {
+        limit_req zone=explorer_api burst=120 nodelay;
+
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin $cors_origin always;
+            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With" always;
+            add_header Access-Control-Max-Age 600 always;
+            return 204;
+        }
+
+        add_header Access-Control-Allow-Origin $cors_origin always;
+        add_header Vary Origin always;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://finalis_explorer_upstream;
+    }
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://finalis_explorer_upstream;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @FINALIS_NGINX_RPC_SERVER_NAME@;
+
+    ssl_certificate     /etc/letsencrypt/live/@FINALIS_NGINX_RPC_SERVER_NAME@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@FINALIS_NGINX_RPC_SERVER_NAME@/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    location /rpc {
+        @FINALIS_NGINX_RPC_ALLOW_RULES@
+        deny all;
+
+        limit_req zone=lightserver_rpc burst=60 nodelay;
+        client_max_body_size 2m;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://finalis_lightserver_upstream;
+    }
+}
