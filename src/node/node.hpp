@@ -441,6 +441,8 @@ class Node {
   void request_finalized_tip(int peer_id);
   void send_finalized_tip(int peer_id);
   void broadcast_finalized_tip();
+  bool peer_is_fresh_for_epoch_reconcile_locked(int peer_id, std::uint64_t* peer_height = nullptr,
+                                                std::uint64_t* max_peer_height = nullptr) const;
   std::vector<PubKey32> ingress_committee_locked(std::uint64_t epoch) const;
   std::array<std::uint64_t, INGRESS_LANE_COUNT> local_ingress_lane_tips_locked() const;
   bool handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& msg);

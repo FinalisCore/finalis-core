@@ -4889,6 +4889,7 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
   for (int peer_id : p2p_.peer_ids()) {
     const auto info = p2p_.get_peer_info(peer_id);
     if (!info.established()) continue;
+    if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id)) continue;
     for (const auto epoch : epochs) {
       const bool is_settlement_epoch =
           std::find(settlement_epochs.begin(), settlement_epochs.end(), epoch) != settlement_epochs.end();
@@ -5488,6 +5489,18 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-epoch-ticket");
         return;
       }
+      {
+        std::uint64_t peer_height = 0;
+        std::uint64_t max_peer_height = 0;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id, &peer_height, &max_peer_height)) {
+          log_line("epoch-ticket-drop peer_id=" + std::to_string(peer_id) +
+                   " epoch=" + std::to_string(t->ticket.epoch) +
+                   " reason=peer-tip-stale-for-reconcile peer_height=" + std::to_string(peer_height) +
+                   " max_peer_height=" + std::to_string(max_peer_height));
+          return;
+        }
+      }
       log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
                " epoch=" + std::to_string(t->ticket.epoch) + " participant=" + short_pub_hex(t->ticket.participant_pubkey));
       (void)handle_epoch_ticket(t->ticket, true, peer_id);
@@ -5520,6 +5533,18 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       if (!resp.has_value()) {
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-epoch-tickets");
         return;
+      }
+      {
+        std::uint64_t peer_height = 0;
+        std::uint64_t max_peer_height = 0;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id, &peer_height, &max_peer_height)) {
+          log_line("epoch-reconcile-drop peer_id=" + std::to_string(peer_id) +
+                   " epoch=" + std::to_string(resp->epoch) +
+                   " reason=peer-tip-stale-for-reconcile peer_height=" + std::to_string(peer_height) +
+                   " max_peer_height=" + std::to_string(max_peer_height));
+          return;
+        }
       }
       std::size_t accepted = 0;
       std::size_t rejected = 0;
@@ -8249,6 +8274,30 @@ void Node::broadcast_finalized_tip() {
     if (!p2p_.get_peer_info(peer_id).established()) continue;
     (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, payload, true);
   }
+}
+
+bool Node::peer_is_fresh_for_epoch_reconcile_locked(int peer_id, std::uint64_t* peer_height,
+                                                    std::uint64_t* max_peer_height) const {
+  const auto info = p2p_.get_peer_info(peer_id);
+  if (!info.established()) return false;
+  const auto it = peer_finalized_tips_.find(peer_id);
+  if (it == peer_finalized_tips_.end()) return false;
+  const std::uint64_t local_peer_height = it->second.height;
+  std::uint64_t observed_max_height = local_peer_height;
+  bool observed_any = false;
+  for (const auto& [id, tip] : peer_finalized_tips_) {
+    const auto peer_info = p2p_.get_peer_info(id);
+    if (!peer_info.established()) continue;
+    observed_any = true;
+    observed_max_height = std::max(observed_max_height, tip.height);
+  }
+  if (peer_height) *peer_height = local_peer_height;
+  if (max_peer_height) *max_peer_height = observed_max_height;
+  if (!observed_any) return false;
+  // Ignore stale peers for historical epoch-ticket reconciliation; these
+  // responses can diverge settlement replay inputs during bootstrap.
+  if (observed_max_height > local_peer_height && (observed_max_height - local_peer_height) > 2) return false;
+  return true;
 }
 
 bool Node::handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& msg) {
