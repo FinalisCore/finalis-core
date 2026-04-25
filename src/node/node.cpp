@@ -4915,13 +4915,14 @@ std::optional<consensus::EpochTicket> Node::mine_local_epoch_ticket_locked(std::
   const auto epoch = consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks);
   const auto anchor = epoch_ticket_challenge_anchor_locked(height);
   auto local_info = validators_.get(local_key_.public_key);
-  if (!local_info.has_value()) return std::nullopt;
   PubKey32 participant = local_key_.public_key;
-  if (!validators_.is_active_for_height(local_key_.public_key, height) &&
-      local_info->status != consensus::ValidatorStatus::ONBOARDING) {
-    return std::nullopt;
+  if (local_info.has_value()) {
+    if (!validators_.is_active_for_height(local_key_.public_key, height) &&
+        local_info->status != consensus::ValidatorStatus::ONBOARDING) {
+      return std::nullopt;
+    }
+    participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
   }
-  participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
   auto ticket = consensus::best_epoch_ticket_for_operator_id(epoch, anchor, participant, height);
   if (!ticket.has_value()) return std::nullopt;
   const auto difficulty_bits = ticket_difficulty_bits_for_epoch_locked(epoch, validators_.active_sorted(height).size());
@@ -4949,9 +4950,6 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
       }
     } else if (stored.participant_pubkey != local_key_.public_key) {
       if (reject_reason) *reject_reason = "local-participant-mismatch";
-      return false;
-    } else {
-      if (reject_reason) *reject_reason = "local-not-registered";
       return false;
     }
   }
