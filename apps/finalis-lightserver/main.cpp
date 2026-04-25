@@ -26,7 +26,9 @@ int main(int argc, char** argv) {
   if (!cfg.has_value()) {
     std::cerr
         << "usage: finalis-lightserver [--db <dir>] [--bind 127.0.0.1] [--port <network-default>] "
-           "[--relay-host 127.0.0.1] [--relay-port <node-p2p-default>] [--max-committee N]\n";
+           "[--relay-host 127.0.0.1] [--relay-port <node-p2p-default>] [--max-committee N]\n"
+        << "note: lightserver is the upstream finalized-state RPC surface; "
+           "the stable exchange/partner API contract is enforced by finalis-explorer /api/v1.\n";
     return 1;
   }
 

@@ -14,6 +14,7 @@ from typing import Dict, List, Set, Tuple
 OPENAPI_PATH = "openapi/finalis-partner-v1.yaml"
 CHANGELOG_PATH = "docs/PARTNER_API_CHANGELOG.md"
 DEPRECATIONS_PATH = "docs/PARTNER_API_DEPRECATIONS.md"
+EXPLORER_MAIN_PATH = "apps/finalis-explorer/main.cpp"
 
 
 @dataclass
@@ -236,6 +237,22 @@ def first_changelog_entry(changelog_text: str) -> Tuple[str, str]:
     return header, body
 
 
+def validate_runtime_contract_markers(explorer_main: str) -> List[str]:
+    errors: List[str] = []
+    required_snippets = [
+        "kPartnerMethodRules",
+        "required_partner_method_for_path",
+        "X-Finalis-Api-Version",
+        "Deprecation",
+        "Sunset",
+        "apply_partner_api_governance_headers(g_current_request_path, &out);",
+    ]
+    for snippet in required_snippets:
+        if snippet not in explorer_main:
+            errors.append(f"{EXPLORER_MAIN_PATH} missing required contract marker: '{snippet}'")
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Enforce Finalis partner API governance checks.")
     parser.add_argument("--base-ref", required=True, help="Base git ref/sha for comparison")
@@ -250,6 +267,13 @@ def main() -> int:
         print(f"partner-api-governance: failed to initialize check: {exc}", file=sys.stderr)
         return 2
 
+    errors: List[str] = []
+    try:
+        explorer_main = read_file_at_ref(args.head_ref, EXPLORER_MAIN_PATH)
+        errors.extend(validate_runtime_contract_markers(explorer_main))
+    except Exception as exc:
+        errors.append(f"unable to read {EXPLORER_MAIN_PATH} at {args.head_ref}: {exc}")
+
     # Detect whether the file existed at base. If not, this is a clean first
     # introduction of the spec — no breaking-change analysis applies.
     try:
@@ -263,10 +287,13 @@ def main() -> int:
 
     openapi_changed = OPENAPI_PATH in files and old_spec != new_spec
     if not openapi_changed and not openapi_is_new:
+        if errors:
+            print("partner-api-governance: FAILED", file=sys.stderr)
+            for err in errors:
+                print(f"  - {err}", file=sys.stderr)
+            return 1
         print("partner-api-governance: OpenAPI unchanged; governance gate passed.")
         return 0
-
-    errors: List[str] = []
 
     if openapi_is_new:
         # First introduction of the spec: no breaking-change analysis, no

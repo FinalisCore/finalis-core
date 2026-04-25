@@ -598,6 +598,7 @@ struct Response {
 
 Response handle_request(const Config& cfg, const std::string& req, const std::string& client_ip);
 Response handle_request(const Config& cfg, const std::string& req);
+void apply_partner_api_governance_headers(const std::string& path, Response* resp);
 ApiError upstream_error(const std::string& message);
 void persist_explorer_snapshot(const Config& cfg);
 bool prune_partner_state_locked(const Config& cfg, std::uint64_t now_ms);
@@ -608,6 +609,7 @@ LookupResult<CommitteeResult> parse_committee_result_object(const finalis::minij
 volatile std::sig_atomic_t g_stop = 0;
 std::atomic<std::size_t> g_active_clients{0};
 constexpr std::size_t kMaxConcurrentClients = 64;
+thread_local std::string g_current_request_path;
 
 void on_signal(int) { g_stop = 1; }
 
@@ -671,11 +673,15 @@ std::string error_json(const ApiError& err) {
 }
 
 Response html_response(int status, std::string body) {
-  return Response{status, "text/html; charset=utf-8", std::move(body), std::nullopt, {}};
+  Response out{status, "text/html; charset=utf-8", std::move(body), std::nullopt, {}};
+  if (!g_current_request_path.empty()) apply_partner_api_governance_headers(g_current_request_path, &out);
+  return out;
 }
 
 Response json_response(int status, std::string body) {
-  return Response{status, "application/json; charset=utf-8", std::move(body), std::nullopt, {}};
+  Response out{status, "application/json; charset=utf-8", std::move(body), std::nullopt, {}};
+  if (!g_current_request_path.empty()) apply_partner_api_governance_headers(g_current_request_path, &out);
+  return out;
 }
 
 Response json_error_response(const ApiError& err) { return json_response(err.http_status, error_json(err)); }
@@ -706,6 +712,7 @@ Response redirect_response(const std::string& location) {
   out.content_type = "text/plain; charset=utf-8";
   out.body = "Found";
   out.location = sanitize_redirect_location(location);
+  if (!g_current_request_path.empty()) apply_partner_api_governance_headers(g_current_request_path, &out);
   return out;
 }
 
@@ -4463,7 +4470,29 @@ struct DeprecatedPartnerRoute {
   bool exact_match{false};
 };
 
+struct PartnerMethodRule {
+  std::string_view path_prefix;
+  bool exact_match{true};
+  std::string_view method;
+};
+
 constexpr std::string_view kPartnerApiSunsetDate = "Wed, 31 Dec 2026 23:59:59 GMT";
+constexpr std::array<PartnerMethodRule, 14> kPartnerMethodRules = {{
+    {"/api/v1/status", true, "GET"},
+    {"/api/v1/committee", true, "GET"},
+    {"/api/v1/recent-tx", true, "GET"},
+    {"/api/v1/fees/recommendation", true, "GET"},
+    {"/api/v1/transactions/status:batch", true, "POST"},
+    {"/api/v1/withdrawals", true, "POST"},
+    {"/api/v1/withdrawals/", false, "GET"},
+    {"/api/v1/events/finalized", true, "GET"},
+    {"/api/v1/webhooks/dlq", true, "GET"},
+    {"/api/v1/webhooks/dlq/replay", true, "POST"},
+    {"/api/v1/search", true, "GET"},
+    {"/api/v1/tx/", false, "GET"},
+    {"/api/v1/transition/", false, "GET"},
+    {"/api/v1/address/", false, "GET"},
+}};
 constexpr std::array<DeprecatedPartnerRoute, 7> kDeprecatedPartnerRoutes = {{
     {"/api/status", "/api/v1/status", true},
     {"/api/committee", "/api/v1/committee", true},
@@ -4473,6 +4502,14 @@ constexpr std::array<DeprecatedPartnerRoute, 7> kDeprecatedPartnerRoutes = {{
     {"/api/transition/", "/api/v1/transition/", false},
     {"/api/address/", "/api/v1/address/", false},
 }};
+
+std::optional<std::string_view> required_partner_method_for_path(const std::string& path) {
+  for (const auto& rule : kPartnerMethodRules) {
+    const bool matched = rule.exact_match ? (path == rule.path_prefix) : (path.rfind(rule.path_prefix, 0) == 0);
+    if (matched) return rule.method;
+  }
+  return std::nullopt;
+}
 
 void set_or_replace_header(Response* resp, std::string_view key, std::string value) {
   if (!resp) return;
@@ -5347,8 +5384,22 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     raw_target = raw_target.substr(0, query_pos);
   }
   std::string path = url_decode(raw_target);
+  struct RequestPathScope {
+    std::string previous;
+    explicit RequestPathScope(std::string current) : previous(std::move(g_current_request_path)) {
+      g_current_request_path = std::move(current);
+    }
+    ~RequestPathScope() { g_current_request_path = std::move(previous); }
+  } request_path_scope(path);
   const auto query = parse_query_params(query_string);
   const bool is_api_path = path.rfind("/api/", 0) == 0;
+  if (const auto required_method = required_partner_method_for_path(path);
+      required_method.has_value() && method != *required_method) {
+    if (is_api_path) {
+      return json_error_response(make_error(405, "method_not_allowed", std::string(*required_method) + " required"));
+    }
+    return html_response(405, page_layout("Method Not Allowed", "<h1>Method Not Allowed</h1>"));
+  }
   const bool post_allowed =
       (path == "/api/v1/withdrawals" || path == "/api/v1/transactions/status:batch" || path == "/api/v1/webhooks/dlq/replay");
   if (method == "POST" && !post_allowed) {

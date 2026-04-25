@@ -166,9 +166,40 @@ Partner API v1:
   - `apps/finalis-explorer/PARTNER_API_CHANGELOG.md`
   - `apps/finalis-explorer/PARTNER_API_DEPRECATIONS.md`
   - OpenAPI diff + changelog/deprecation gate:
-    - `apps/finalis-explorer/scripts/check_partner_api_governance.py`
+    - canonical checker: `scripts/check_partner_api_governance.py`
+    - compatibility wrapper: `apps/finalis-explorer/scripts/check_partner_api_governance.py`
   - CI runner command:
     - `apps/finalis-explorer/scripts/partner_api_governance_ci.sh <base-ref> <head-ref>`
+
+Contract guarantees:
+
+- response headers:
+  - every `/api/v1/*` response emits `X-Finalis-Api-Version: v1`
+  - legacy `/api/*` partner routes emit:
+    - `Deprecation: true`
+    - `Sunset: Wed, 31 Dec 2026 23:59:59 GMT`
+    - `Link: </api/v1/...>; rel="successor-version"`
+- stable error envelope:
+  - `{"error":{"code":"<stable_code>","message":"<human_message>"}}`
+- deterministic partner status classes:
+  - `400` malformed request/body/query
+  - `401` auth material/clock/mtls failures
+  - `403` auth denied (key/scope/lifecycle/ip/signature)
+  - `404` finalized object not found
+  - `405` method not allowed
+  - `409` idempotency/replay conflict
+  - `429` partner rate limit exceeded
+  - `502` upstream RPC unavailable/error
+
+Compatibility rules:
+
+- additive changes (new optional fields/endpoints) require OpenAPI + changelog
+  update with semver increase
+- breaking/deprecating changes require:
+  - OpenAPI semver increase
+  - changelog top entry with concrete deltas
+  - deprecations doc update with sunset window
+  - runtime legacy headers (`Deprecation`/`Sunset`/`Link`) in explorer
 
 Partner auth (when enabled):
 
