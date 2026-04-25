@@ -479,25 +479,8 @@ if(FINALIS_BUILD_NGINX)
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     PREFIX ${CMAKE_BINARY_DIR}/third_party/nginx
     EXCLUDE_FROM_ALL TRUE
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure
-      --prefix=${FINALIS_NGINX_PREFIX}
-      --with-http_ssl_module
-      --with-http_v2_module
-      --with-http_realip_module
-      --with-http_stub_status_module
-      --without-http_rewrite_module
-      --without-http_gzip_module
-      --without-http_ssi_module
-      --without-http_userid_module
-      --without-http_autoindex_module
-      --without-http_geo_module
-      --without-http_split_clients_module
-      --without-http_memcached_module
-      --without-http_empty_gif_module
-      --without-http_browser_module
-      --without-http_fastcgi_module
-      --without-http_uwsgi_module
-      --without-http_scgi_module
+    BUILD_IN_SOURCE TRUE
+    CONFIGURE_COMMAND /bin/sh ${CMAKE_CURRENT_SOURCE_DIR}/packaging/nginx/configure_nginx.sh <SOURCE_DIR> ${FINALIS_NGINX_PREFIX}
     BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
     INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
     BUILD_BYPRODUCTS ${FINALIS_NGINX_PREFIX}/sbin/nginx
