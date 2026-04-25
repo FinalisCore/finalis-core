@@ -3343,22 +3343,24 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
 std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const {
   std::map<PubKey32, std::uint64_t> out;
   const bool local_registered = validators_.get(local_key_.public_key).has_value();
-  const auto should_ignore_local_unregistered_participant = [&](const PubKey32& participant) {
+  const auto should_ignore_local_unregistered_participant =
+      [&](const PubKey32& participant, consensus::EpochTicketOrigin origin) {
     // Startup on a fresh node may generate a local keystore that is not in the
     // validator registry. Ignore historical local-only ticket residue so replay
-    // remains aligned with network-produced settlement payloads.
-    return !local_registered && participant == local_key_.public_key;
+    // remains aligned with network-produced settlement payloads, but keep
+    // network-origin tickets (including for this pubkey) once reconciled.
+    return !local_registered && participant == local_key_.public_key && origin == consensus::EpochTicketOrigin::LOCAL;
   };
   const auto tickets = db_.load_epoch_tickets(epoch_start_height);
   const auto best_tickets = consensus::best_epoch_tickets_by_pubkey(tickets);
   for (const auto& [pub, ticket] : best_tickets) {
-    if (should_ignore_local_unregistered_participant(pub)) continue;
+    if (should_ignore_local_unregistered_participant(pub, ticket.origin)) continue;
     const auto score = static_cast<std::uint64_t>(
         std::max<std::uint8_t>(1, consensus::leading_zero_bits(ticket.work_hash)));
     out[pub] = score;
   }
   for (const auto& [pub, ticket] : db_.load_best_epoch_tickets(epoch_start_height)) {
-    if (should_ignore_local_unregistered_participant(pub)) continue;
+    if (should_ignore_local_unregistered_participant(pub, ticket.origin)) continue;
     const auto score = static_cast<std::uint64_t>(
         std::max<std::uint8_t>(1, consensus::leading_zero_bits(ticket.work_hash)));
     auto it = out.find(pub);
@@ -3388,6 +3390,7 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
 
   const auto onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
   if (onboarding_scores.empty()) request_epoch_reconcile();
+  if (epoch_committee_closed_locked(*settlement_epoch) && established_peers != 0) request_epoch_reconcile();
 
   auto& reward_state = epoch_reward_states_[*settlement_epoch];
   reward_state.epoch_start_height = *settlement_epoch;
