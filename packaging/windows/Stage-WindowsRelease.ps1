@@ -199,6 +199,8 @@ If sync appears stuck on an old height, clear peer discovery cache and restart:
 
 If startup fails with frontier lane-tip corruption, Start-Finalis automatically
 resets local chain state once (keystore/logs preserved) and retries.
+Manual one-shot repair command:
+  .\bin\finalis-cli.exe repair_state --db "$env:APPDATA\.finalis\mainnet" --force
 
 Windows joiner mode uses:
   mainnet\SEEDS.json

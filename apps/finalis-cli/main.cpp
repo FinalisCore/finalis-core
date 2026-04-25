@@ -10,6 +10,7 @@
 #include <regex>
 #include <fstream>
 #include <iostream>
+#include <cstdlib>
 #include <sstream>
 #include <iomanip>
 #include <optional>
@@ -17,6 +18,7 @@
 #include <set>
 #include <string>
 #include <algorithm>
+#include <cctype>
 #include <vector>
 #include <filesystem>
 #include <cstdio>
@@ -802,12 +804,127 @@ void print_section(const std::string& title) {
   std::cout << "\n== " << title << " ==\n";
 }
 
-std::string default_mainnet_db_path() { return expand_user(kDefaultMainnetDbPath); }
+std::string default_mainnet_db_path() {
+#ifdef _WIN32
+  if (const char* appdata = std::getenv("APPDATA")) {
+    const std::string root(appdata);
+    if (!root.empty()) return (std::filesystem::path(root) / ".finalis" / "mainnet").string();
+  }
+#endif
+  return expand_user(kDefaultMainnetDbPath);
+}
 
-std::string default_mainnet_validator_key_path() { return expand_user(kDefaultMainnetValidatorKeyPath); }
+std::string default_mainnet_validator_key_path() {
+#ifdef _WIN32
+  return (std::filesystem::path(default_mainnet_db_path()) / "keystore" / "validator.json").string();
+#else
+  return expand_user(kDefaultMainnetValidatorKeyPath);
+#endif
+}
+
+std::string platform_default_db_path_note() {
+#ifdef _WIN32
+  return "Windows default --db: %APPDATA%\\.finalis\\mainnet";
+#else
+  return "Linux default --db: ~/.finalis/mainnet";
+#endif
+}
+
+std::string lowercase_ascii(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return s;
+}
+
+bool is_dangerous_root_path(const std::filesystem::path& p) {
+  std::error_code ec;
+  const auto norm = std::filesystem::weakly_canonical(p, ec);
+  if (ec) return false;
+  if (norm.empty()) return true;
+  if (norm == norm.root_path()) return true;
+  return false;
+}
+
+int run_repair_state_command(const std::string& db_path, bool force, bool dry_run) {
+  const auto target = std::filesystem::path(expand_user(db_path));
+  if (target.empty()) {
+    std::cerr << "repair_state: invalid --db path\n";
+    return 1;
+  }
+  if (is_dangerous_root_path(target)) {
+    std::cerr << "repair_state: refusing to operate on root path: " << target.string() << "\n";
+    return 1;
+  }
+
+  std::error_code ec;
+  if (!std::filesystem::exists(target, ec)) {
+    std::cout << "repair_state_target=" << target.string() << "\n";
+    std::cout << "repair_state_changed=no (db path missing)\n";
+    return 0;
+  }
+  if (!std::filesystem::is_directory(target, ec)) {
+    std::cerr << "repair_state: --db is not a directory: " << target.string() << "\n";
+    return 1;
+  }
+
+  const std::set<std::string> preserve = {"keystore", "logs"};
+  std::vector<std::filesystem::path> erase_entries;
+  for (const auto& entry : std::filesystem::directory_iterator(target, ec)) {
+    if (ec) break;
+    const auto name = lowercase_ascii(entry.path().filename().string());
+    if (preserve.find(name) != preserve.end()) continue;
+    erase_entries.push_back(entry.path());
+  }
+  if (ec) {
+    std::cerr << "repair_state: unable to enumerate db dir: " << ec.message() << "\n";
+    return 1;
+  }
+
+  std::cout << "repair_state_target=" << target.string() << "\n";
+  std::cout << "repair_state_preserve=keystore,logs\n";
+  std::cout << "repair_state_delete_entries=" << erase_entries.size() << "\n";
+  for (const auto& p : erase_entries) {
+    std::cout << "delete " << p.filename().string() << "\n";
+  }
+
+  if (dry_run) {
+    std::cout << "repair_state_dry_run=yes\n";
+    return 0;
+  }
+  if (!force) {
+    std::cerr
+        << "repair_state: destructive command refused without --force.\n"
+        << "Use: finalis-cli repair_state --db <dir> --force\n";
+    return 2;
+  }
+
+  for (const auto& p : erase_entries) {
+    std::filesystem::remove_all(p, ec);
+    if (ec) {
+      std::cerr << "repair_state: failed removing " << p.string() << ": " << ec.message() << "\n";
+      return 1;
+    }
+  }
+
+  std::filesystem::create_directories(target / "keystore", ec);
+  if (ec) {
+    std::cerr << "repair_state: failed ensuring keystore dir: " << ec.message() << "\n";
+    return 1;
+  }
+  std::filesystem::create_directories(target / "logs", ec);
+  if (ec) {
+    std::cerr << "repair_state: failed ensuring logs dir: " << ec.message() << "\n";
+    return 1;
+  }
+
+  std::cout << "repair_state_applied=yes\n";
+  return 0;
+}
 
 void print_user_cli_help(std::ostream& os) {
   os << "finalis-cli user/validator commands:\n"
+     << "  " << platform_default_db_path_note() << "\n"
+     << "  Cross-platform defaults: Linux ~/.finalis/mainnet | Windows %APPDATA%\\.finalis\\mainnet\n"
      << "  finalis-cli help [user|dev|all]\n"
      << "  finalis-cli --version\n"
      << "  finalis-cli getWallet [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
@@ -832,8 +949,12 @@ void print_user_cli_help(std::ostream& os) {
 
 void print_dev_cli_help(std::ostream& os) {
   os << "finalis-cli developer/protocol commands:\n"
+     << "  " << platform_default_db_path_note() << "\n"
+     << "  Cross-platform defaults: Linux ~/.finalis/mainnet | Windows %APPDATA%\\.finalis\\mainnet\n"
      << "  finalis-cli tip --db <dir>\n"
      << "  finalis-cli reindex [--db <dir>] [--file <path>]  # clear consensus cache so startup can rebuild\n"
+     << "  finalis-cli repair_state [--db <dir>] [--force] [--dry-run]  # wipe local chain state, preserve keystore/logs\n"
+     << "  finalis-cli full_reindex [--db <dir>] [--force] [--dry-run]  # alias of repair_state\n"
      << "  finalis-cli --print-logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli print_logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
@@ -1116,6 +1237,19 @@ int main(int argc, char** argv) {
     const bool erased = db.erase(finalis::storage::key_consensus_state_commitment_cache());
     std::cout << "reindex_erased=" << (erased ? "yes" : "no") << "\n";
     return 0;
+  }
+
+  if (cmd == "repair_state" || cmd == "--repair_state" || cmd == "full_reindex" || cmd == "--full_reindex") {
+    std::string db_path = default_mainnet_db_path();
+    bool force = false;
+    bool dry_run = false;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--force" || a == "-y") force = true;
+      else if (a == "--dry-run") dry_run = true;
+    }
+    return run_repair_state_command(db_path, force, dry_run);
   }
 
   if (cmd == "slash_records") {
