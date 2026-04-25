@@ -24,6 +24,7 @@ option(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND "Fail configure if secp256k1-zkp con
 option(FINALIS_AUTO_FETCH_DEPS "Allow CMake to fetch missing third-party dependencies." ON)
 option(FINALIS_GENERATE_NGINX_CONFIG "Generate Nginx reverse-proxy config in build output." ON)
 option(FINALIS_BUILD_NGINX "Build and install a local Nginx under build/third_party/nginx/install." ON)
+option(FINALIS_NGINX_BUILD_IN_ALL "Include local Nginx bootstrap target in the default ALL build." ON)
 
 find_package(OpenSSL REQUIRED)
 find_package(Qt5 COMPONENTS Widgets QUIET)
@@ -477,6 +478,7 @@ if(FINALIS_BUILD_NGINX)
     URL ${FINALIS_NGINX_URL}
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     PREFIX ${CMAKE_BINARY_DIR}/third_party/nginx
+    EXCLUDE_FROM_ALL TRUE
     CONFIGURE_COMMAND <SOURCE_DIR>/configure
       --prefix=${FINALIS_NGINX_PREFIX}
       --with-http_ssl_module
@@ -510,7 +512,18 @@ if(FINALIS_BUILD_NGINX)
     DEPENDS finalis_nginx_build ${FINALIS_NGINX_OUTPUT_DIR}/finalis.conf
   )
 
-  add_custom_target(finalis-nginx ALL
-    DEPENDS ${FINALIS_NGINX_PREFIX}/conf/conf.d/finalis.conf
-  )
+  set(_finalis_nginx_in_all ${FINALIS_NGINX_BUILD_IN_ALL})
+  if(DEFINED ENV{CI} AND "$ENV{CI}" STREQUAL "true")
+    set(_finalis_nginx_in_all OFF)
+  endif()
+
+  if(_finalis_nginx_in_all)
+    add_custom_target(finalis-nginx ALL
+      DEPENDS ${FINALIS_NGINX_PREFIX}/conf/conf.d/finalis.conf
+    )
+  else()
+    add_custom_target(finalis-nginx
+      DEPENDS ${FINALIS_NGINX_PREFIX}/conf/conf.d/finalis.conf
+    )
+  endif()
 endif()
