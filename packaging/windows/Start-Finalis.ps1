@@ -29,6 +29,7 @@ if ([string]::IsNullOrWhiteSpace($DataDir)) {
 $appRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $binDir = Join-Path $appRoot "bin"
 $nodeExe = Join-Path $binDir "finalis-node.exe"
+$cliExe = Join-Path $binDir "finalis-cli.exe"
 $lightserverExe = Join-Path $binDir "finalis-lightserver.exe"
 $explorerExe = Join-Path $binDir "finalis-explorer.exe"
 $seedsJson = Join-Path $appRoot "mainnet\SEEDS.json"
@@ -270,6 +271,37 @@ function Reset-FinalisChainState {
     }
 }
 
+function Invoke-FinalisRepairState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CliPath,
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDataDir
+    )
+
+    if (-not (Test-Path $CliPath)) {
+        Write-Warning "finalis-cli not found at $CliPath, using script fallback chain-state reset."
+        Reset-FinalisChainState -TargetDataDir $TargetDataDir
+        return $true
+    }
+
+    try {
+        $proc = Start-Process -FilePath $CliPath `
+            -ArgumentList @("repair_state", "--db", $TargetDataDir, "--force") `
+            -WorkingDirectory $binDir `
+            -Wait -PassThru -NoNewWindow
+        if ($proc.ExitCode -eq 0) {
+            return $true
+        }
+        Write-Warning "finalis-cli repair_state exited with code $($proc.ExitCode); using script fallback reset."
+    } catch {
+        Write-Warning "finalis-cli repair_state failed: $($_.Exception.Message); using script fallback reset."
+    }
+
+    Reset-FinalisChainState -TargetDataDir $TargetDataDir
+    return $true
+}
+
 function Test-NodeErrorContains {
     param(
         [Parameter(Mandatory = $true)]
@@ -412,7 +444,7 @@ $nodeProc = Start-FinalisNodeProcess -ExePath $nodeExe -WorkingDir $appRoot -Arg
 Start-Sleep -Milliseconds 1200
 if ($nodeProc.HasExited -and (Test-NodeErrorContains -NodeErrPath $nodeErr -Pattern "frontier-storage-lane-tip-too-low")) {
     Write-Warning "Detected frontier lane-tip corruption in persisted state. Resetting local chain state and retrying startup once."
-    Reset-FinalisChainState -TargetDataDir $DataDir
+    [void](Invoke-FinalisRepairState -CliPath $cliExe -TargetDataDir $DataDir)
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $nodeProc = Start-FinalisNodeProcess -ExePath $nodeExe -WorkingDir $appRoot -Arguments $nodeArgs -StdOutPath $nodeLog -StdErrPath $nodeErr
 }
