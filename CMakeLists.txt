@@ -470,11 +470,12 @@ if(FINALIS_BUILD_NGINX)
 
   include(ExternalProject)
   set(FINALIS_NGINX_VERSION "1.28.0" CACHE STRING "Nginx version to build locally.")
-  set(FINALIS_NGINX_URL "https://nginx.org/download/nginx-${FINALIS_NGINX_VERSION}.tar.gz" CACHE STRING "Nginx source tarball URL.")
+  set(FINALIS_NGINX_URL "https://github.com/nginx/nginx/archive/refs/tags/release-${FINALIS_NGINX_VERSION}.tar.gz" CACHE STRING "Nginx source tarball URL.")
   set(FINALIS_NGINX_PREFIX "${CMAKE_BINARY_DIR}/third_party/nginx/install" CACHE PATH "Local install prefix for built Nginx.")
 
   ExternalProject_Add(finalis_nginx_build
     URL ${FINALIS_NGINX_URL}
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     PREFIX ${CMAKE_BINARY_DIR}/third_party/nginx
     CONFIGURE_COMMAND <SOURCE_DIR>/configure
       --prefix=${FINALIS_NGINX_PREFIX}
@@ -495,8 +496,8 @@ if(FINALIS_BUILD_NGINX)
       --without-http_fastcgi_module
       --without-http_uwsgi_module
       --without-http_scgi_module
-    BUILD_COMMAND $(MAKE)
-    INSTALL_COMMAND $(MAKE) install
+    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+    INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
     BUILD_BYPRODUCTS ${FINALIS_NGINX_PREFIX}/sbin/nginx
   )
 
