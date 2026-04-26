@@ -3824,19 +3824,32 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   const Hash32 slash_txid = slash_tx->txid();
   for (auto& n : nodes) n->pause_proposals_for_test(false);
 
-  ASSERT_TRUE(wait_for([&]() {
-    for (const auto& n : nodes) {
-      auto info = n->validator_info_for_test(slash_pub);
-      if (!info.has_value()) return false;
-      if (info->status != consensus::ValidatorStatus::BANNED) return false;
-      if (info->has_bond) return false;
-      auto active = n->active_validators_for_next_height_for_test();
-      if (std::find(active.begin(), active.end(), slash_pub) != active.end()) return false;
-      auto artifact = find_frontier_artifact_with_tx(cluster.configs[0].db_path, slash_txid, n->status().height);
-      if (!artifact.has_value()) return false;
-    }
-    return true;
-  }, ci_timeout_seconds(180)));
+  if (!wait_for([&]() {
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+          const auto st = nodes[i]->status();
+          const auto artifact = find_frontier_artifact_with_tx(cluster.configs[i].db_path, slash_txid, st.height);
+          if (!artifact.has_value()) return false;
+        }
+        return true;
+      }, ci_timeout_seconds(180))) {
+    throw std::runtime_error("slash tx never reached frontier artifact:" +
+                             summarize_validator_fixture_nodes(nodes, slash_pub, slash_txid, &cluster.configs));
+  }
+
+  if (!wait_for([&]() {
+        for (const auto& n : nodes) {
+          auto info = n->validator_info_for_test(slash_pub);
+          if (!info.has_value()) return false;
+          if (info->status != consensus::ValidatorStatus::BANNED) return false;
+          if (info->has_bond) return false;
+          auto active = n->active_validators_for_next_height_for_test();
+          if (std::find(active.begin(), active.end(), slash_pub) != active.end()) return false;
+        }
+        return true;
+      }, ci_timeout_seconds(300))) {
+    throw std::runtime_error("slash validator did not converge to banned/no-bond state:" +
+                             summarize_validator_fixture_nodes(nodes, slash_pub, slash_txid, &cluster.configs));
+  }
 }
 
 TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {

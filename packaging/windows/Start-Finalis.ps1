@@ -193,35 +193,6 @@ function Stop-FinalisProcessIfRunning {
     }
 }
 
-function ConvertTo-QuotedCommandArgument {
-    param(
-        [AllowNull()]
-        [object]$Value
-    )
-
-    if ($null -eq $Value) {
-        return '""'
-    }
-
-    $text = [string]$Value
-    if ($text.Length -eq 0) {
-        return '""'
-    }
-
-    # Escape embedded double-quotes for Windows command-line parsing.
-    $escaped = $text.Replace('"', '\"')
-    return '"' + $escaped + '"'
-}
-
-function Build-ArgumentString {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object[]]$Args
-    )
-
-    return (($Args | ForEach-Object { ConvertTo-QuotedCommandArgument -Value $_ }) -join ' ')
-}
-
 function Test-ResetPeerDiscoveryAutomatically {
     param(
         [Parameter(Mandatory = $true)]
@@ -335,9 +306,17 @@ function Start-FinalisNodeProcess {
         [string]$StdErrPath
     )
 
-    $argString = Build-ArgumentString -Args $Arguments
-    return Start-Process -FilePath $ExePath -ArgumentList $argString -WorkingDirectory $WorkingDir `
+    return Start-Process -FilePath $ExePath -ArgumentList $Arguments -WorkingDirectory $WorkingDir `
         -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath -PassThru
+}
+
+function Reset-LogFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    New-Item -ItemType Directory -Force -Path ([System.IO.Path]::GetDirectoryName($Path)) | Out-Null
+    Set-Content -Path $Path -Value "" -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
 function Wait-ForTcpPort {
@@ -438,6 +417,8 @@ Stop-FinalisProcessIfRunning -ProcessName "finalis-node" -ExpectedPath $nodeExe
 
 $nodeLog = Join-Path $logDir "node.log"
 $nodeErr = Join-Path $logDir "node.err.log"
+Reset-LogFile -Path $nodeLog
+Reset-LogFile -Path $nodeErr
 $nodeProc = Start-FinalisNodeProcess -ExePath $nodeExe -WorkingDir $appRoot -Arguments $nodeArgs -StdOutPath $nodeLog -StdErrPath $nodeErr
 
 # Auto-recover one known startup corruption mode by rebuilding chain state from peers.
@@ -446,6 +427,8 @@ if ($nodeProc.HasExited -and (Test-NodeErrorContains -NodeErrPath $nodeErr -Patt
     Write-Warning "Detected frontier lane-tip corruption in persisted state. Resetting local chain state and retrying startup once."
     [void](Invoke-FinalisRepairState -CliPath $cliExe -TargetDataDir $DataDir)
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    Reset-LogFile -Path $nodeLog
+    Reset-LogFile -Path $nodeErr
     $nodeProc = Start-FinalisNodeProcess -ExePath $nodeExe -WorkingDir $appRoot -Arguments $nodeArgs -StdOutPath $nodeLog -StdErrPath $nodeErr
 }
 
@@ -458,8 +441,7 @@ $lightserverArgs = @(
 )
 $lightserverLog = Join-Path $logDir "lightserver.log"
 $lightserverErr = Join-Path $logDir "lightserver.err.log"
-$lightserverArgString = Build-ArgumentString -Args $lightserverArgs
-$lightserverProc = Start-Process -FilePath $lightserverExe -ArgumentList $lightserverArgString -WorkingDirectory $appRoot -RedirectStandardOutput $lightserverLog -RedirectStandardError $lightserverErr -PassThru
+$lightserverProc = Start-Process -FilePath $lightserverExe -ArgumentList $lightserverArgs -WorkingDirectory $appRoot -RedirectStandardOutput $lightserverLog -RedirectStandardError $lightserverErr -PassThru
 
 Start-Sleep -Milliseconds 750
 if ($nodeProc.HasExited) {
@@ -484,8 +466,7 @@ if ($WithExplorer -and (Test-Path $explorerExe)) {
     )
     $explorerLog = Join-Path $logDir "explorer.log"
     $explorerErr = Join-Path $logDir "explorer.err.log"
-    $explorerArgString = Build-ArgumentString -Args $explorerArgs
-    $explorerProc = Start-Process -FilePath $explorerExe -ArgumentList $explorerArgString -WorkingDirectory $appRoot -RedirectStandardOutput $explorerLog -RedirectStandardError $explorerErr -PassThru
+    $explorerProc = Start-Process -FilePath $explorerExe -ArgumentList $explorerArgs -WorkingDirectory $appRoot -RedirectStandardOutput $explorerLog -RedirectStandardError $explorerErr -PassThru
     if (-not (Wait-ForTcpPort -TargetAddress "127.0.0.1" -Port $ExplorerPort -TimeoutSeconds 20)) {
         if ($explorerProc.HasExited) {
             throw "finalis-explorer.exe exited before listening on 127.0.0.1:$ExplorerPort. See $explorerErr"
