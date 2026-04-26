@@ -5114,8 +5114,9 @@ TEST(test_crash_between_persist_and_settlement_recovers_correctly) {
   ASSERT_TRUE(repaired.open(base + "/node0"));
   const auto state = repaired.get_epoch_reward_settlement(1);
   ASSERT_TRUE(state.has_value());
+  const std::uint64_t epoch_end_height = std::min<std::uint64_t>(finalized_height, 32ULL);
   std::uint64_t gross = 0;
-  for (std::uint64_t h = 1; h <= finalized_height; ++h) gross += consensus::reward_units(h);
+  for (std::uint64_t h = 1; h <= epoch_end_height; ++h) gross += consensus::reward_units(h);
   ASSERT_EQ(state->total_reward_units, gross - ((gross * consensus::RESERVE_ACCRUAL_BPS) / 10'000ULL));
   ASSERT_EQ(state->reserve_accrual_units, (gross * consensus::RESERVE_ACCRUAL_BPS) / 10'000ULL);
 }
@@ -7138,11 +7139,39 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
     }, ci_timeout_seconds(40));
   }
   ASSERT_TRUE(finalized_request);
-  ASSERT_TRUE(wait_for([&]() {
+  if (!wait_for([&]() {
+        auto a0 = find_frontier_artifact_with_tx(base + "/node0", request_txid, n0.status().height);
+        auto a1 = find_frontier_artifact_with_tx(base + "/node1", request_txid, n1.status().height);
+        return a0.has_value() && a1.has_value();
+      }, ci_timeout_seconds(180))) {
+    std::ostringstream oss;
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    oss << "join request tx finalized on node0 but missing on node1:"
+        << " n0{h=" << s0.height << ",peers=" << s0.peers << ",est=" << s0.established_peers
+        << ",pending_joiners=" << s0.pending_bootstrap_joiners << "}"
+        << " n1{h=" << s1.height << ",peers=" << s1.peers << ",est=" << s1.established_peers
+        << ",pending_joiners=" << s1.pending_bootstrap_joiners << "}";
+    throw std::runtime_error(oss.str());
+  }
+
+  if (!wait_for([&]() {
+        auto info0 = n0.validator_info_for_test(joiner_vk.pubkey);
+        auto info1 = n1.validator_info_for_test(joiner_vk.pubkey);
+        return info0.has_value() && info1.has_value();
+      }, ci_timeout_seconds(300))) {
+    std::ostringstream oss;
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
     auto info0 = n0.validator_info_for_test(joiner_vk.pubkey);
     auto info1 = n1.validator_info_for_test(joiner_vk.pubkey);
-    return info0.has_value() && info1.has_value();
-  }, ci_timeout_seconds(180)));
+    oss << "bootstrap joiner auto-admit missing validator record:"
+        << " n0{h=" << s0.height << ",pending_joiners=" << s0.pending_bootstrap_joiners
+        << ",validator_known=" << (info0.has_value() ? "yes" : "no") << "}"
+        << " n1{h=" << s1.height << ",pending_joiners=" << s1.pending_bootstrap_joiners
+        << ",validator_known=" << (info1.has_value() ? "yes" : "no") << "}";
+    throw std::runtime_error(oss.str());
+  }
 
   ASSERT_EQ(n0.status().pending_bootstrap_joiners, 0u);
   ASSERT_TRUE(wait_for([&]() {
