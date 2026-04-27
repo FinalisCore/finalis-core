@@ -28,6 +28,7 @@ void register_finality_certificate_tests();
 void register_snapshot_tests();
 void register_mempool_tests();
 void register_hardening_tests();
+void register_node_hardening_tests();
 void register_protocol_scope_tests();
 void register_genesis_tests();
 void register_paths_tests();
@@ -63,6 +64,7 @@ int main() {
   register_snapshot_tests();
   register_mempool_tests();
   register_hardening_tests();
+  register_node_hardening_tests();
   register_protocol_scope_tests();
   register_genesis_tests();
   register_paths_tests();
