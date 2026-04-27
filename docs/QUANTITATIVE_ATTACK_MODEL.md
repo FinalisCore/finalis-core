@@ -55,7 +55,7 @@ should be answered first with:
 
 - [scripts/protocol_attack_sim.py](../scripts/protocol_attack_sim.py)
 
-Current restarted mainnet identity for parameter-review context:
+Current mainnet identity for parameter-review context:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`

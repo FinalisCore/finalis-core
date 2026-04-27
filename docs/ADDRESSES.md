@@ -1,6 +1,6 @@
 # Addresses, Keys, And Script Identity
 
-Current restarted mainnet identity:
+Current mainnet identity:
 
 - `network_name = mainnet`
 - `address_hrp = sc`

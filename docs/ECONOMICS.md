@@ -39,7 +39,7 @@ For a given height, the active entry is the one with the greatest
 
 ### 1.2 Current configured schedule
 
-The restarted mainnet schedule currently exposes one live active entry from
+The mainnet schedule currently exposes one live active entry from
 genesis:
 
 - `activation_height = 0`
@@ -145,7 +145,7 @@ For each finalized transition:
 - settlement at the next epoch boundary applies finalized participation
   adjustment using the live policy and distributes the closed epoch pool
 
-So the live restarted mainnet settlement split is:
+So the live mainnet settlement split is:
 
 - `10%` reserve accrual from gross issuance
 - `87.3%` validator settlement rewards from gross issuance when onboarding is

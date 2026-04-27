@@ -1,6 +1,6 @@
 # Reward Settlement
 
-Current restarted mainnet identity:
+Current mainnet identity:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -42,7 +42,7 @@ transition is finalized.
 
 After the fresh-genesis reset, settlement rows, reward accrual expectations,
 and reserve accounting from the abandoned chain are not valid inputs to the
-current restarted mainnet.
+current mainnet.
 
 ## Per-Transition Accrual
 

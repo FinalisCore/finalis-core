@@ -2,7 +2,7 @@
 
 Minimal standalone Chaumian mint boundary service for local development and integration work.
 
-Current restarted mainnet identity reference:
+Current mainnet identity reference:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -34,7 +34,7 @@ It is a narrow scaffold, not a production mint:
 Fresh-genesis boundary:
 
 - if the configured lightserver reports a different `network_id` or
-  `genesis_hash`, it is not the current restarted mainnet
+  `genesis_hash`, it is not the current mainnet
 - old-chain reserve assumptions or txids from the abandoned chain must not be
   reused as if they were current settlement facts
 

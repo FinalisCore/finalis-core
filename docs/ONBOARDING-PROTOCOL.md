@@ -1,6 +1,6 @@
 # Onboarding Protocol
 
-Current restarted mainnet identity:
+Current mainnet identity:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -108,7 +108,7 @@ Live implementation accepts:
 
 ## 4. Admission PoW
 
-On restarted mainnet, onboarding admission is PoW-gated.
+On mainnet, onboarding admission is PoW-gated.
 
 The onboarding admission PoW is:
 

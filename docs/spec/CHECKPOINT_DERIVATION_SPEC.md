@@ -1,6 +1,6 @@
 # CHECKPOINT_DERIVATION_SPEC
 
-Current restarted mainnet identity:
+Current mainnet identity:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
