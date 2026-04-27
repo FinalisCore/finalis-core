@@ -3833,6 +3833,29 @@ bool Node::overwrite_runtime_frontier_cursor_for_test(std::uint64_t finalized_fr
   return true;
 }
 
+void Node::set_peer_ip_for_test(int peer_id, const std::string& ip) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (peer_id <= 0 || ip.empty()) return;
+  peer_ip_cache_[peer_id] = ip;
+}
+
+void Node::score_peer_for_test(int peer_id, p2p::MisbehaviorReason reason, const std::string& note) {
+  std::lock_guard<std::mutex> lk(mu_);
+  score_peer_locked(peer_id, reason, note);
+}
+
+p2p::PeerScoreStatus Node::peer_score_status_for_test(const std::string& ip,
+                                                      std::optional<std::uint64_t> now_unix_opt) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto now = now_unix_opt.value_or(now_unix());
+  return discipline_.status(ip, now);
+}
+
+void Node::decay_peer_discipline_for_test(std::uint64_t now_unix_value) {
+  std::lock_guard<std::mutex> lk(mu_);
+  discipline_.decay(now_unix_value);
+}
+
 bool Node::verify_quorum_certificate_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered,
                                             std::string* error) const {
   const auto committee = committee_for_height_round(qc.height, qc.round);
@@ -4422,6 +4445,14 @@ void Node::event_loop() {
           std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
       if (!cfg_.disable_p2p && now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms) {
         request_finalized_tip(peer_id);
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      const auto now = now_unix();
+      if (last_peer_discipline_decay_unix_ == 0 || now > last_peer_discipline_decay_unix_) {
+        discipline_.decay(now);
+        last_peer_discipline_decay_unix_ = now;
       }
     }
 
@@ -8831,6 +8862,10 @@ void Node::score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::str
 void Node::score_peer_locked(int peer_id, p2p::MisbehaviorReason reason, const std::string& note) {
   const std::string ip = peer_ip_for_locked(peer_id);
   if (ip.empty()) return;
+  if (reason == p2p::MisbehaviorReason::RATE_LIMIT && is_bootstrap_peer_ip(ip) && established_peer_count() <= 1) {
+    log_line("peer-rate-limit-ignored ip=" + ip + " note=" + note + " reason=bootstrap-liveness-guard");
+    return;
+  }
   const p2p::PeerScoreStatus st = discipline_.add_score(ip, reason, now_unix());
   if (st.banned) {
     log_line("peer-banned ip=" + ip + " score=" + std::to_string(st.score) + " note=" + note);

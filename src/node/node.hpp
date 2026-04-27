@@ -261,6 +261,11 @@ class Node {
   std::optional<p2p::GetIngressRangeMsg> requested_ingress_range_for_test(int peer_id, std::uint32_t lane) const;
   bool overwrite_runtime_next_height_checkpoint_for_test(const storage::FinalizedCommitteeCheckpoint& checkpoint);
   bool overwrite_runtime_frontier_cursor_for_test(std::uint64_t finalized_frontier);
+  void set_peer_ip_for_test(int peer_id, const std::string& ip);
+  void score_peer_for_test(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
+  p2p::PeerScoreStatus peer_score_status_for_test(const std::string& ip,
+                                                  std::optional<std::uint64_t> now_unix = std::nullopt) const;
+  void decay_peer_discipline_for_test(std::uint64_t now_unix);
 
   static std::vector<crypto::KeyPair> deterministic_test_keypairs();
 
@@ -606,6 +611,7 @@ class Node {
   std::vector<std::string> dns_seed_peers_;
   std::set<std::string> preflight_checked_seeds_;
   std::set<std::string> self_peer_endpoints_;
+  std::uint64_t last_peer_discipline_decay_unix_{0};
   p2p::AddrMan addrman_{10'000};
   ChainId chain_id_{};
   std::optional<Hash32> expected_genesis_hash_;

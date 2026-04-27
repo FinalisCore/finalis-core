@@ -381,6 +381,7 @@ add_executable(finalis-tests
   tests/test_frontier_replay.cpp
   tests/test_ingress.cpp
   tests/test_hardening.cpp
+  tests/test_node_hardening.cpp
   tests/test_protocol_scope.cpp
   tests/test_privacy.cpp
   tests/test_genesis.cpp
