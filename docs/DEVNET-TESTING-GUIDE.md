@@ -1,6 +1,6 @@
 # Devnet Testing Guide
 
-Current restarted mainnet identity reference for comparison against local test
+Current mainnet identity reference for comparison against local test
 deployments:
 
 - `network_name = mainnet`
@@ -24,7 +24,7 @@ Use it to test:
 - wallet / explorer local-first behavior across restart
 
 Do not mix abandoned-chain DBs or stale embedded-genesis binaries into these
-tests if the goal is to simulate the current restarted mainnet.
+tests if the goal is to simulate the current mainnet.
 
 ## Basic Commands
 

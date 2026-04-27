@@ -103,7 +103,7 @@ The current live codebase is version-aware:
 - confidential-capable transactions use `TxV2`
 - runtime dispatch uses `AnyTx`
 
-Current restarted mainnet identity:
+Current mainnet identity:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -175,7 +175,7 @@ The schedule is centralized in:
 - [src/common/network.hpp](../src/common/network.hpp)
 - [src/common/network.cpp](../src/common/network.cpp)
 
-The restarted mainnet currently has a single active economics policy from genesis.
+The mainnet currently has a single active economics policy from genesis.
 
 No wall clock data is used in economics activation.
 

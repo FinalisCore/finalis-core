@@ -2,7 +2,7 @@
 
 `Finalis Explorer` is a thin in-tree explorer for exchange and operator support.
 
-Current restarted mainnet identity reference:
+Current mainnet identity reference:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -515,7 +515,7 @@ Ticket PoW observability:
   weight fields
 - explorer presents Ticket PoW as bounded, operator-based, and secondary to
   bond and BFT finality
-- the restarted mainnet begins directly on the live bounded-search policy
+- the mainnet begins directly on the live bounded-search policy
 
 Fresh-genesis boundary:
 
@@ -602,7 +602,7 @@ Stability guarantees:
 Version note:
 
 - explorer presents the live bounded-search ticket policy
-- the restarted mainnet begins with the live bounded-search policy active from
+- the mainnet begins with the live bounded-search policy active from
   genesis
 
 ## Example Responses

@@ -56,7 +56,7 @@ The simulator is faithful at the checkpoint-policy layer, but it is still an ana
 The simulator does not prove the live implementation. It measures protocol behavior under bounded, reproducible adversarial scenarios.
 
 It must not be used as if it were replay input for the abandoned pre-reset
-chain; the current deployment context is the restarted mainnet identity above.
+chain; the current deployment context is the mainnet identity above.
 
 The committed fixture bridge constrains simulator drift:
 

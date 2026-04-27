@@ -6,7 +6,7 @@
 
 `finalis-core` is a finalized-state BFT blockchain in which validator lifecycle, operator-native committee formation, adaptive checkpoint derivation, and future committee eligibility are all derived deterministically from finalized history..
 
-Current restarted mainnet identity:
+Current mainnet identity:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -176,7 +176,7 @@ Dependency notes:
 
 ## Run
 
-Before first startup on the restarted mainnet:
+Before first startup on the mainnet:
 
 - wipe old chain DBs
 - ensure your local validator key is actually present in the intended genesis

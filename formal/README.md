@@ -1,6 +1,6 @@
 # Formal Models
 
-Current restarted mainnet identity context:
+Current mainnet identity context:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`

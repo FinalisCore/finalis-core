@@ -2,7 +2,7 @@
 
 `Finalis Wallet` is the Qt desktop wallet shipped in this repository. It manages a local keystore, reads finalized wallet state through lightserver, signs transactions locally, and exposes the wallet and mint flows already implemented by the backend.
 
-Current restarted mainnet identity reference:
+Current mainnet identity reference:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -116,7 +116,7 @@ Fresh-genesis boundary:
 - if a configured endpoint reports a different `network_id` or `genesis_hash`,
   it is not the same network
 - abandoned-chain DBs or stale wallet assumptions must not be reused as if they
-  belonged to the restarted mainnet
+  belonged to the mainnet
 
 ## Branding assets
 

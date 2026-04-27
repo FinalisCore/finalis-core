@@ -2,7 +2,7 @@
 
 Reference TypeScript SDK for Finalis Wallet API v1.
 
-Current restarted mainnet identity reference:
+Current mainnet identity reference:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
