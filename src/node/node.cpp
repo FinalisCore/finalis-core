@@ -4364,30 +4364,47 @@ bool Node::advance_round_for_test(std::uint64_t expected_height, std::uint32_t t
 bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFrontierRecord& record,
                                                    std::vector<FinalitySig> finality_signatures,
                                                    bool clear_requested_sync,
-                                                   const std::vector<PubKey32>* effective_committee) {
+                                                   const std::vector<PubKey32>* effective_committee,
+                                                   std::string* error) {
   const auto committee =
       effective_committee != nullptr ? *effective_committee : committee_for_height_round(record.transition.height, record.transition.round);
-  if (committee.empty()) return false;
+  if (committee.empty()) {
+    if (error) *error = "empty-committee";
+    return false;
+  }
   const std::size_t quorum = consensus::quorum_threshold(committee.size());
   const auto canonical_sigs = canonicalize_finality_signatures_locked(finality_signatures, quorum);
-  if (canonical_sigs.size() < quorum) return false;
+  if (canonical_sigs.size() < quorum) {
+    if (error) *error = "quorum-not-met";
+    return false;
+  }
 
   const auto transition_id = record.transition.transition_id();
   const FinalityCertificate certificate = make_finality_certificate(record.transition.height, record.transition.round,
                                                                     transition_id, quorum, committee, canonical_sigs);
 
-  if (!canonical_state_.has_value()) return false;
+  if (!canonical_state_.has_value()) {
+    if (error) *error = "missing-canonical-state";
+    return false;
+  }
   consensus::CanonicalDerivedState next_state;
   std::string derivation_error;
   if (!consensus::apply_frontier_record(canonical_derivation_config_locked(), *canonical_state_, record, &next_state,
                                         &derivation_error)) {
     log_line("finalized-state-invariant-violation source=live-frontier-apply height=" +
              std::to_string(record.transition.height) + " detail=" + derivation_error);
+    if (error) *error = "apply-frontier-record-failed:" + derivation_error;
     return false;
   }
 
-  if (!persist_finalized_frontier_record(record, utxos_)) return false;
-  if (!db_.put_finality_certificate(certificate)) return false;
+  if (!persist_finalized_frontier_record(record, utxos_)) {
+    if (error) *error = "persist-frontier-record-failed";
+    return false;
+  }
+  if (!db_.put_finality_certificate(certificate)) {
+    if (error) *error = "put-finality-certificate-failed";
+    return false;
+  }
 
   highest_qc_by_height_[record.transition.height] =
       make_quorum_certificate(record.transition.height, record.transition.round, transition_id, canonical_sigs);
@@ -4407,8 +4424,14 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   round_started_ms_ = now;
   last_finalized_progress_ms_ = now;
 
-  if (!persist_canonical_cache_rows(db_, next_state)) return false;
-  if (!verify_and_persist_consensus_state_commitment_locked(next_state)) return false;
+  if (!persist_canonical_cache_rows(db_, next_state)) {
+    if (error) *error = "persist-canonical-cache-rows-failed";
+    return false;
+  }
+  if (!verify_and_persist_consensus_state_commitment_locked(next_state)) {
+    if (error) *error = "persist-consensus-state-commitment-failed";
+    return false;
+  }
   (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
 
   if (clear_requested_sync) {
@@ -4437,6 +4460,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   maybe_finalize_epoch_committees_locked();
   (void)persist_availability_state_locked();
   (void)db_.put_node_runtime_status_snapshot(build_runtime_status_snapshot_locked(now_unix() * 1000));
+  if (error) error->clear();
   return true;
 }
 bool Node::mempool_contains_for_test(const Hash32& txid) const {
@@ -7252,8 +7276,11 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                " reason=certificate-committee-mismatch");
       return false;
     }
-    if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, true, &expected_committee)) {
-      log_reject("apply-finalized-frontier-effects-failed");
+    std::string apply_error;
+    if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, true, &expected_committee,
+                                                 &apply_error)) {
+      log_reject("apply-finalized-frontier-effects-failed",
+                 apply_error.empty() ? std::string() : " detail=" + apply_error);
       return false;
     }
     clear_sync_request_for_height(transition.height);
@@ -7781,9 +7808,12 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   }
   const auto canonical_sigs = canonicalize_finality_signatures_locked(filtered, expected_quorum);
 
-  if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, false, &expected_committee)) {
+  std::string apply_error;
+  if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, false, &expected_committee,
+                                               &apply_error)) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=apply-failed");
+             " transition=" + short_hash_hex(block_id) + " reason=apply-failed" +
+             (apply_error.empty() ? std::string() : " detail=" + apply_error));
     return false;
   }
 

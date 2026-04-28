@@ -368,7 +368,8 @@ class Node {
   bool apply_finalized_frontier_effects_locked(const consensus::CanonicalFrontierRecord& record,
                                                std::vector<FinalitySig> finality_signatures,
                                                bool clear_requested_sync = false,
-                                               const std::vector<PubKey32>* effective_committee = nullptr);
+                                               const std::vector<PubKey32>* effective_committee = nullptr,
+                                               std::string* error = nullptr);
 
   std::optional<FrontierProposal> build_frontier_transition_locked(std::uint64_t height, std::uint32_t round);
   bool refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error = nullptr);
