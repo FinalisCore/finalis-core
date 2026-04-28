@@ -34,7 +34,7 @@ NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
 USE_SEEDS_JSON="${USE_SEEDS_JSON:-1}"
 GENESIS_BIN="${GENESIS_BIN:-}"
 GENESIS_PATH="${GENESIS_PATH:-${GENESIS_BIN}}"
-ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-1}"
+ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-0}"
 NODE_ROLE="${NODE_ROLE:-auto}"
 RECOVER_PEER_DISCOVERY="${RECOVER_PEER_DISCOVERY:-0}"
 TRUSTED_BOOTSTRAP_PEER="${TRUSTED_BOOTSTRAP_PEER:-}"
@@ -561,6 +561,7 @@ build_node_command() {
   )
 
   if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
+    log "WARNING: enabling --allow-unsafe-genesis-override (intended only for controlled recovery/testing)"
     args+=("--allow-unsafe-genesis-override")
   fi
 
