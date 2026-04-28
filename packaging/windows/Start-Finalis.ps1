@@ -394,7 +394,6 @@ if (Test-Path $seedsJson) {
         }
     }
     if ($seedList.Count -gt 0) {
-        $nodeArgs += @("--no-dns-seeds")
         foreach ($seed in ($seedList | Sort-Object -Unique)) {
             $nodeArgs += @("--peers", $seed)
         }

@@ -14,6 +14,7 @@
 #include <iterator>
 #include <limits>
 #include <cerrno>
+#include <random>
 #include <signal.h>
 #include <cstdlib>
 #include <set>
@@ -353,6 +354,657 @@ std::vector<std::string> parse_endpoint_list(const std::string& raw) {
 
 bool is_local_only_bind(const std::string& host) {
   return host == "127.0.0.1" || host == "localhost" || host == "::1";
+}
+
+bool is_wildcard_bind(const std::string& host) {
+  return host == "0.0.0.0" || host == "::";
+}
+
+bool is_unroutable_ip_literal(const std::string& ip) {
+  in_addr v4{};
+  if (inet_pton(AF_INET, ip.c_str(), &v4) == 1) {
+    const std::uint32_t host = ntohl(v4.s_addr);
+    const std::uint8_t a = static_cast<std::uint8_t>((host >> 24) & 0xFF);
+    const std::uint8_t b = static_cast<std::uint8_t>((host >> 16) & 0xFF);
+    if (a == 0 || a == 10 || a == 127) return true;
+    if (a == 169 && b == 254) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    if (a == 100 && b >= 64 && b <= 127) return true;  // 100.64.0.0/10 (CGNAT)
+    if (a >= 224) return true;
+    return false;
+  }
+  in6_addr v6{};
+  if (inet_pton(AF_INET6, ip.c_str(), &v6) == 1) {
+    if (IN6_IS_ADDR_UNSPECIFIED(&v6) || IN6_IS_ADDR_LOOPBACK(&v6) || IN6_IS_ADDR_MULTICAST(&v6)) return true;
+    const std::uint8_t first = v6.s6_addr[0];
+    const std::uint8_t second = v6.s6_addr[1];
+    if ((first & 0xFE) == 0xFC) return true;                // fc00::/7
+    if (first == 0xFE && (second & 0xC0) == 0x80) return true;  // fe80::/10
+    return false;
+  }
+  return false;
+}
+
+bool endpoint_fingerprint_safe(const std::string& endpoint) {
+  return endpoint.find(';') == std::string::npos;
+}
+
+std::optional<p2p::NetAddress> advertised_endpoint_from_config(const NodeConfig& cfg) {
+  if (!cfg.external_endpoint.empty()) {
+    if (!endpoint_fingerprint_safe(cfg.external_endpoint)) return std::nullopt;
+    auto parsed = p2p::parse_endpoint(cfg.external_endpoint);
+    if (!parsed.has_value() || parsed->port == 0 || parsed->ip.empty()) return std::nullopt;
+    return parsed;
+  }
+  if (!cfg.listen || !cfg.public_mode || is_local_only_bind(cfg.bind_ip) || is_wildcard_bind(cfg.bind_ip)) {
+    return std::nullopt;
+  }
+  return p2p::NetAddress{cfg.bind_ip, cfg.p2p_port};
+}
+
+bool advertised_endpoint_likely_public(const p2p::NetAddress& addr) {
+  if (addr.ip.empty() || addr.port == 0) return false;
+  if (is_unroutable_ip_literal(addr.ip)) return false;
+  return true;
+}
+
+std::array<std::uint8_t, 12> make_stun_transaction_id() {
+  std::array<std::uint8_t, 12> txid{};
+  std::random_device rd;
+  for (auto& b : txid) b = static_cast<std::uint8_t>(rd());
+  return txid;
+}
+
+std::optional<p2p::NetAddress> parse_stun_binding_response(const Bytes& msg, const std::array<std::uint8_t, 12>& txid,
+                                                            std::string* err) {
+  constexpr std::uint16_t kBindingResponse = 0x0101;
+  constexpr std::uint32_t kMagicCookie = 0x2112A442;
+  if (msg.size() < 20) {
+    if (err) *err = "stun_short_response";
+    return std::nullopt;
+  }
+  const auto be16 = [&](std::size_t off) -> std::uint16_t {
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(msg[off]) << 8) | msg[off + 1]);
+  };
+  const auto be32 = [&](std::size_t off) -> std::uint32_t {
+    return (static_cast<std::uint32_t>(msg[off]) << 24) | (static_cast<std::uint32_t>(msg[off + 1]) << 16) |
+           (static_cast<std::uint32_t>(msg[off + 2]) << 8) | static_cast<std::uint32_t>(msg[off + 3]);
+  };
+  const std::uint16_t type = be16(0);
+  const std::uint16_t length = be16(2);
+  const std::uint32_t cookie = be32(4);
+  if (type != kBindingResponse) {
+    if (err) *err = "stun_not_binding_response";
+    return std::nullopt;
+  }
+  if (cookie != kMagicCookie) {
+    if (err) *err = "stun_bad_magic_cookie";
+    return std::nullopt;
+  }
+  for (std::size_t i = 0; i < txid.size(); ++i) {
+    if (msg[8 + i] != txid[i]) {
+      if (err) *err = "stun_transaction_mismatch";
+      return std::nullopt;
+    }
+  }
+  if (20 + length > msg.size()) {
+    if (err) *err = "stun_bad_length";
+    return std::nullopt;
+  }
+
+  std::optional<p2p::NetAddress> mapped;
+  std::size_t pos = 20;
+  const std::size_t end = 20 + length;
+  while (pos + 4 <= end) {
+    const std::uint16_t attr_type = be16(pos);
+    const std::uint16_t attr_len = be16(pos + 2);
+    pos += 4;
+    if (pos + attr_len > end) break;
+    const std::size_t attr = pos;
+
+    if (attr_type == 0x0020 && attr_len >= 8) {  // XOR-MAPPED-ADDRESS
+      const std::uint8_t family = msg[attr + 1];
+      if (family == 0x01) {
+        const std::uint16_t xport = be16(attr + 2);
+        const std::uint32_t xip = be32(attr + 4);
+        const std::uint16_t port = static_cast<std::uint16_t>(xport ^ static_cast<std::uint16_t>(kMagicCookie >> 16));
+        const std::uint32_t ip_host = xip ^ kMagicCookie;
+        in_addr addr{};
+        addr.s_addr = htonl(ip_host);
+        char buf[INET_ADDRSTRLEN] = {};
+        if (::inet_ntop(AF_INET, &addr, buf, sizeof(buf)) != nullptr && port != 0) {
+          mapped = p2p::NetAddress{std::string(buf), port};
+          break;
+        }
+      }
+    } else if (attr_type == 0x0001 && attr_len >= 8 && !mapped.has_value()) {  // MAPPED-ADDRESS fallback
+      const std::uint8_t family = msg[attr + 1];
+      if (family == 0x01) {
+        const std::uint16_t port = be16(attr + 2);
+        const std::uint32_t ip_host = be32(attr + 4);
+        in_addr addr{};
+        addr.s_addr = htonl(ip_host);
+        char buf[INET_ADDRSTRLEN] = {};
+        if (::inet_ntop(AF_INET, &addr, buf, sizeof(buf)) != nullptr && port != 0) {
+          mapped = p2p::NetAddress{std::string(buf), port};
+        }
+      }
+    }
+
+    const std::size_t padded = (static_cast<std::size_t>(attr_len) + 3U) & ~static_cast<std::size_t>(3U);
+    pos += padded;
+  }
+
+  if (!mapped.has_value()) {
+    if (err) *err = "stun_no_mapped_address";
+    return std::nullopt;
+  }
+  return mapped;
+}
+
+std::optional<p2p::NetAddress> stun_query_external_endpoint(const std::string& stun_server, std::uint16_t local_port,
+                                                            std::uint32_t timeout_ms, std::string* err) {
+  if (!net::ensure_sockets()) {
+    if (err) *err = "stun_socket_init_failed";
+    return std::nullopt;
+  }
+  const auto endpoint = p2p::parse_endpoint(stun_server);
+  if (!endpoint.has_value() || endpoint->ip.empty() || endpoint->port == 0) {
+    if (err) *err = "stun_server_invalid";
+    return std::nullopt;
+  }
+
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_protocol = IPPROTO_UDP;
+  addrinfo* res = nullptr;
+  if (::getaddrinfo(endpoint->ip.c_str(), std::to_string(endpoint->port).c_str(), &hints, &res) != 0 || !res) {
+    if (err) *err = "stun_dns_resolve_failed";
+    return std::nullopt;
+  }
+
+  net::SocketHandle fd = net::kInvalidSocket;
+  for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
+    fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (net::valid_socket(fd)) break;
+  }
+  if (!net::valid_socket(fd)) {
+    freeaddrinfo(res);
+    if (err) *err = "stun_socket_create_failed";
+    return std::nullopt;
+  }
+  net::set_close_on_exec(fd);
+  (void)net::set_nonblocking(fd, true);
+  (void)net::set_reuseaddr(fd);
+
+  if (local_port != 0) {
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(local_port);
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
+      freeaddrinfo(res);
+      net::close_socket(fd);
+      if (err) *err = "stun_bind_failed";
+      return std::nullopt;
+    }
+  }
+
+  const auto txid = make_stun_transaction_id();
+  Bytes req(20, 0);
+  req[0] = 0x00;  // Binding Request
+  req[1] = 0x01;
+  req[2] = 0x00;
+  req[3] = 0x00;
+  req[4] = 0x21;
+  req[5] = 0x12;
+  req[6] = 0xA4;
+  req[7] = 0x42;
+  for (std::size_t i = 0; i < txid.size(); ++i) req[8 + i] = txid[i];
+
+  bool sent = false;
+  for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
+    const auto n = ::sendto(fd, reinterpret_cast<const char*>(req.data()), static_cast<int>(req.size()), 0, it->ai_addr,
+                            static_cast<socklen_t>(it->ai_addrlen));
+    if (n == static_cast<int>(req.size())) {
+      sent = true;
+      break;
+    }
+  }
+  freeaddrinfo(res);
+  if (!sent) {
+    net::close_socket(fd);
+    if (err) *err = "stun_send_failed";
+    return std::nullopt;
+  }
+
+  if (!net::wait_readable(fd, std::max<std::uint32_t>(100, timeout_ms))) {
+    net::close_socket(fd);
+    if (err) *err = "stun_timeout";
+    return std::nullopt;
+  }
+
+  std::array<std::uint8_t, 1024> buf{};
+  sockaddr_storage from{};
+  socklen_t from_len = sizeof(from);
+  const int n =
+      ::recvfrom(fd, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0, reinterpret_cast<sockaddr*>(&from),
+                 &from_len);
+  net::close_socket(fd);
+  if (n <= 0) {
+    if (err) *err = "stun_recv_failed";
+    return std::nullopt;
+  }
+  Bytes resp(buf.begin(), buf.begin() + n);
+  return parse_stun_binding_response(resp, txid, err);
+}
+
+std::uint64_t stun_backoff_delay_ms(std::uint32_t fail_count, std::uint32_t base_ms, std::uint32_t max_backoff_ms) {
+  const std::uint32_t capped_fail = std::min<std::uint32_t>(fail_count, 8);
+  const std::uint64_t shift = (1ULL << capped_fail);
+  const std::uint64_t raw = static_cast<std::uint64_t>(std::max<std::uint32_t>(1, base_ms)) * shift;
+  return std::min<std::uint64_t>(raw, std::max<std::uint32_t>(base_ms, max_backoff_ms));
+}
+
+std::optional<std::string> linux_default_gateway_ipv4() {
+#ifdef _WIN32
+  return std::nullopt;
+#else
+  std::ifstream in("/proc/net/route");
+  if (!in.good()) return std::nullopt;
+  std::string line;
+  std::getline(in, line);  // header
+  while (std::getline(in, line)) {
+    std::istringstream iss(line);
+    std::string iface;
+    std::string dest_hex;
+    std::string gateway_hex;
+    if (!(iss >> iface >> dest_hex >> gateway_hex)) continue;
+    if (dest_hex != "00000000") continue;
+    std::uint32_t gw_le = 0;
+    try {
+      gw_le = static_cast<std::uint32_t>(std::stoul(gateway_hex, nullptr, 16));
+    } catch (...) {
+      continue;
+    }
+    in_addr gw{};
+    gw.s_addr = gw_le;  // /proc/net/route stores gateway in little-endian host order
+    char buf[INET_ADDRSTRLEN] = {};
+    if (::inet_ntop(AF_INET, &gw, buf, sizeof(buf)) != nullptr) return std::string(buf);
+  }
+  return std::nullopt;
+#endif
+}
+
+std::optional<p2p::NetAddress> nat_pmp_map_tcp_endpoint(const std::string& gateway_ip, std::uint16_t private_port,
+                                                         std::uint16_t requested_public_port, std::uint32_t lifetime_secs,
+                                                         std::uint32_t timeout_ms, std::string* err) {
+  if (!net::ensure_sockets()) {
+    if (err) *err = "nat_pmp_socket_init_failed";
+    return std::nullopt;
+  }
+  net::SocketHandle fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (!net::valid_socket(fd)) {
+    if (err) *err = "nat_pmp_socket_create_failed";
+    return std::nullopt;
+  }
+  net::set_close_on_exec(fd);
+  (void)net::set_nonblocking(fd, true);
+
+  sockaddr_in gw{};
+  gw.sin_family = AF_INET;
+  gw.sin_port = htons(5351);
+  if (::inet_pton(AF_INET, gateway_ip.c_str(), &gw.sin_addr) != 1) {
+    net::close_socket(fd);
+    if (err) *err = "nat_pmp_gateway_invalid";
+    return std::nullopt;
+  }
+
+  auto send_and_wait = [&](const Bytes& req, Bytes* resp) -> bool {
+    const int sent = ::sendto(fd, reinterpret_cast<const char*>(req.data()), static_cast<int>(req.size()), 0,
+                              reinterpret_cast<const sockaddr*>(&gw), sizeof(gw));
+    if (sent != static_cast<int>(req.size())) return false;
+    if (!net::wait_readable(fd, std::max<std::uint32_t>(100, timeout_ms))) return false;
+    std::array<std::uint8_t, 256> buf{};
+    sockaddr_storage from{};
+    socklen_t from_len = sizeof(from);
+    const int n = ::recvfrom(fd, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
+                             reinterpret_cast<sockaddr*>(&from), &from_len);
+    if (n <= 0) return false;
+    resp->assign(buf.begin(), buf.begin() + n);
+    return true;
+  };
+
+  // Step 1: external address request (opcode 0).
+  Bytes ext_req(2, 0);
+  ext_req[0] = 0;
+  ext_req[1] = 0;
+  Bytes ext_resp;
+  if (!send_and_wait(ext_req, &ext_resp) || ext_resp.size() < 12) {
+    net::close_socket(fd);
+    if (err) *err = "nat_pmp_external_addr_timeout";
+    return std::nullopt;
+  }
+  if (ext_resp[1] != 128 || ext_resp[0] != 0) {
+    net::close_socket(fd);
+    if (err) *err = "nat_pmp_external_addr_bad_response";
+    return std::nullopt;
+  }
+  const std::uint16_t ext_result = static_cast<std::uint16_t>((ext_resp[2] << 8) | ext_resp[3]);
+  if (ext_result != 0) {
+    net::close_socket(fd);
+    if (err) *err = "nat_pmp_external_addr_error_" + std::to_string(ext_result);
+    return std::nullopt;
+  }
+  in_addr ext_ip{};
+  std::memcpy(&ext_ip.s_addr, &ext_resp[8], sizeof(ext_ip.s_addr));
+  char ext_ip_buf[INET_ADDRSTRLEN] = {};
+  if (::inet_ntop(AF_INET, &ext_ip, ext_ip_buf, sizeof(ext_ip_buf)) == nullptr) {
+    net::close_socket(fd);
+    if (err) *err = "nat_pmp_external_addr_parse_failed";
+    return std::nullopt;
+  }
+
+  // Step 2: TCP mapping request (opcode 2).
+  Bytes map_req(12, 0);
+  map_req[0] = 0;
+  map_req[1] = 2;
+  map_req[4] = static_cast<std::uint8_t>((private_port >> 8) & 0xFF);
+  map_req[5] = static_cast<std::uint8_t>(private_port & 0xFF);
+  map_req[6] = static_cast<std::uint8_t>((requested_public_port >> 8) & 0xFF);
+  map_req[7] = static_cast<std::uint8_t>(requested_public_port & 0xFF);
+  map_req[8] = static_cast<std::uint8_t>((lifetime_secs >> 24) & 0xFF);
+  map_req[9] = static_cast<std::uint8_t>((lifetime_secs >> 16) & 0xFF);
+  map_req[10] = static_cast<std::uint8_t>((lifetime_secs >> 8) & 0xFF);
+  map_req[11] = static_cast<std::uint8_t>(lifetime_secs & 0xFF);
+
+  Bytes map_resp;
+  if (!send_and_wait(map_req, &map_resp) || map_resp.size() < 16) {
+    net::close_socket(fd);
+    if (err) *err = "nat_pmp_map_timeout";
+    return std::nullopt;
+  }
+  net::close_socket(fd);
+  if (map_resp[0] != 0 || map_resp[1] != 130) {
+    if (err) *err = "nat_pmp_map_bad_response";
+    return std::nullopt;
+  }
+  const std::uint16_t map_result = static_cast<std::uint16_t>((map_resp[2] << 8) | map_resp[3]);
+  if (map_result != 0) {
+    if (err) *err = "nat_pmp_map_error_" + std::to_string(map_result);
+    return std::nullopt;
+  }
+  const std::uint16_t mapped_public_port = static_cast<std::uint16_t>((map_resp[10] << 8) | map_resp[11]);
+  if (mapped_public_port == 0) {
+    if (err) *err = "nat_pmp_map_zero_public_port";
+    return std::nullopt;
+  }
+  return p2p::NetAddress{ext_ip_buf, mapped_public_port};
+}
+
+std::optional<std::string> parse_http_url_host_port_path(const std::string& url, std::uint16_t* port, std::string* host,
+                                                         std::string* path) {
+  constexpr const char* kHttp = "http://";
+  if (url.rfind(kHttp, 0) != 0) return std::nullopt;
+  const std::string rest = url.substr(std::strlen(kHttp));
+  const auto slash = rest.find('/');
+  const std::string host_port = slash == std::string::npos ? rest : rest.substr(0, slash);
+  *path = slash == std::string::npos ? "/" : rest.substr(slash);
+  const auto colon = host_port.rfind(':');
+  if (colon == std::string::npos) {
+    *host = host_port;
+    *port = 80;
+  } else {
+    *host = host_port.substr(0, colon);
+    try {
+      *port = static_cast<std::uint16_t>(std::stoul(host_port.substr(colon + 1)));
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+  if (host->empty() || *port == 0 || path->empty()) return std::nullopt;
+  return std::string{};
+}
+
+std::optional<std::string> http_request_ipv4(const std::string& host, std::uint16_t port, const std::string& request,
+                                             std::uint32_t timeout_ms) {
+  if (!net::ensure_sockets()) return std::nullopt;
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+  addrinfo* res = nullptr;
+  if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) return std::nullopt;
+
+  net::SocketHandle fd = net::kInvalidSocket;
+  for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
+    fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (!net::valid_socket(fd)) continue;
+    net::set_close_on_exec(fd);
+    (void)net::set_socket_timeouts(fd, timeout_ms);
+    if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+    net::close_socket(fd);
+    fd = net::kInvalidSocket;
+  }
+  freeaddrinfo(res);
+  if (!net::valid_socket(fd)) return std::nullopt;
+
+  std::size_t sent = 0;
+  while (sent < request.size()) {
+    const int n = ::send(fd, request.data() + sent, static_cast<int>(request.size() - sent), 0);
+    if (n <= 0) {
+      net::close_socket(fd);
+      return std::nullopt;
+    }
+    sent += static_cast<std::size_t>(n);
+  }
+
+  std::string out;
+  std::array<char, 4096> buf{};
+  while (true) {
+    const int n = ::recv(fd, buf.data(), static_cast<int>(buf.size()), 0);
+    if (n <= 0) break;
+    out.append(buf.data(), buf.data() + n);
+    if (out.size() > (2 * 1024 * 1024)) break;
+  }
+  net::close_socket(fd);
+  if (out.empty()) return std::nullopt;
+  return out;
+}
+
+std::optional<std::string> http_body_from_response(const std::string& resp) {
+  const auto pos = resp.find("\r\n\r\n");
+  if (pos == std::string::npos) return std::nullopt;
+  return resp.substr(pos + 4);
+}
+
+std::optional<std::string> xml_tag_value(const std::string& xml, const std::string& tag) {
+  const std::string open = "<" + tag + ">";
+  const std::string close = "</" + tag + ">";
+  const auto s = xml.find(open);
+  if (s == std::string::npos) return std::nullopt;
+  const auto e = xml.find(close, s + open.size());
+  if (e == std::string::npos) return std::nullopt;
+  return xml.substr(s + open.size(), e - (s + open.size()));
+}
+
+std::optional<std::string> upnp_igd_discover_location(std::uint32_t timeout_ms) {
+  if (!net::ensure_sockets()) return std::nullopt;
+  net::SocketHandle fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (!net::valid_socket(fd)) return std::nullopt;
+  net::set_close_on_exec(fd);
+  (void)net::set_nonblocking(fd, true);
+
+  const std::string req =
+      "M-SEARCH * HTTP/1.1\r\n"
+      "HOST: 239.255.255.250:1900\r\n"
+      "MAN: \"ssdp:discover\"\r\n"
+      "MX: 1\r\n"
+      "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n";
+  sockaddr_in mcast{};
+  mcast.sin_family = AF_INET;
+  mcast.sin_port = htons(1900);
+  if (::inet_pton(AF_INET, "239.255.255.250", &mcast.sin_addr) != 1) {
+    net::close_socket(fd);
+    return std::nullopt;
+  }
+  const int sent = ::sendto(fd, req.data(), static_cast<int>(req.size()), 0, reinterpret_cast<sockaddr*>(&mcast), sizeof(mcast));
+  if (sent <= 0) {
+    net::close_socket(fd);
+    return std::nullopt;
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max<std::uint32_t>(200, timeout_ms));
+  std::array<char, 4096> buf{};
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!net::wait_readable(fd, 100)) continue;
+    sockaddr_storage from{};
+    socklen_t from_len = sizeof(from);
+    const int n = ::recvfrom(fd, buf.data(), static_cast<int>(buf.size()), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+    if (n <= 0) continue;
+    std::string s(buf.data(), buf.data() + n);
+    std::string lower = s;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const auto lp = lower.find("\nlocation:");
+    if (lp == std::string::npos) continue;
+    const auto start = s.find(':', lp) + 1;
+    const auto end = s.find('\n', start);
+    if (start == std::string::npos || end == std::string::npos) continue;
+    std::string loc = s.substr(start, end - start);
+    while (!loc.empty() && (loc.front() == ' ' || loc.front() == '\t' || loc.front() == '\r')) loc.erase(loc.begin());
+    while (!loc.empty() && (loc.back() == '\r' || loc.back() == ' ' || loc.back() == '\t')) loc.pop_back();
+    net::close_socket(fd);
+    if (!loc.empty()) return loc;
+  }
+  net::close_socket(fd);
+  return std::nullopt;
+}
+
+std::optional<p2p::NetAddress> upnp_igd_map_tcp_endpoint(std::uint16_t private_port, std::uint16_t requested_public_port,
+                                                          std::uint32_t lease_secs, std::uint32_t timeout_ms,
+                                                          std::string* err) {
+  auto location = upnp_igd_discover_location(timeout_ms);
+  if (!location.has_value()) {
+    if (err) *err = "upnp_discovery_failed";
+    return std::nullopt;
+  }
+
+  std::uint16_t loc_port = 0;
+  std::string loc_host;
+  std::string loc_path;
+  if (!parse_http_url_host_port_path(*location, &loc_port, &loc_host, &loc_path).has_value()) {
+    if (err) *err = "upnp_location_invalid";
+    return std::nullopt;
+  }
+  std::ostringstream get_req;
+  get_req << "GET " << loc_path << " HTTP/1.1\r\nHost: " << loc_host << ":" << loc_port
+          << "\r\nConnection: close\r\n\r\n";
+  auto desc_resp = http_request_ipv4(loc_host, loc_port, get_req.str(), timeout_ms);
+  if (!desc_resp.has_value()) {
+    if (err) *err = "upnp_desc_fetch_failed";
+    return std::nullopt;
+  }
+  auto desc_body = http_body_from_response(*desc_resp);
+  if (!desc_body.has_value()) {
+    if (err) *err = "upnp_desc_bad_http";
+    return std::nullopt;
+  }
+
+  std::string service_type;
+  std::size_t st_pos = desc_body->find("urn:schemas-upnp-org:service:WANIPConnection:");
+  if (st_pos != std::string::npos) {
+    const auto end = desc_body->find('<', st_pos);
+    service_type = desc_body->substr(st_pos, end == std::string::npos ? std::string::npos : end - st_pos);
+  } else {
+    st_pos = desc_body->find("urn:schemas-upnp-org:service:WANPPPConnection:");
+    if (st_pos != std::string::npos) {
+      const auto end = desc_body->find('<', st_pos);
+      service_type = desc_body->substr(st_pos, end == std::string::npos ? std::string::npos : end - st_pos);
+    }
+  }
+  auto control_url = xml_tag_value(*desc_body, "controlURL");
+  if (service_type.empty() || !control_url.has_value()) {
+    if (err) *err = "upnp_igd_service_not_found";
+    return std::nullopt;
+  }
+  std::string ctrl_path = *control_url;
+  if (ctrl_path.rfind("http://", 0) == 0) {
+    std::uint16_t cport = 0;
+    std::string chost;
+    std::string cpath;
+    if (!parse_http_url_host_port_path(ctrl_path, &cport, &chost, &cpath).has_value()) {
+      if (err) *err = "upnp_control_url_invalid";
+      return std::nullopt;
+    }
+    loc_host = chost;
+    loc_port = cport;
+    ctrl_path = cpath;
+  } else if (ctrl_path.empty() || ctrl_path[0] != '/') {
+    ctrl_path = "/" + ctrl_path;
+  }
+
+  std::ostringstream add_body;
+  add_body << "<?xml version=\"1.0\"?>"
+           << "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+           << "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+           << "<s:Body><u:AddPortMapping xmlns:u=\"" << service_type << "\">"
+           << "<NewRemoteHost></NewRemoteHost>"
+           << "<NewExternalPort>" << requested_public_port << "</NewExternalPort>"
+           << "<NewProtocol>TCP</NewProtocol>"
+           << "<NewInternalPort>" << private_port << "</NewInternalPort>"
+           << "<NewInternalClient>0.0.0.0</NewInternalClient>"
+           << "<NewEnabled>1</NewEnabled>"
+           << "<NewPortMappingDescription>finalis-node</NewPortMappingDescription>"
+           << "<NewLeaseDuration>" << lease_secs << "</NewLeaseDuration>"
+           << "</u:AddPortMapping></s:Body></s:Envelope>";
+  const std::string add_xml = add_body.str();
+  std::ostringstream add_req;
+  add_req << "POST " << ctrl_path << " HTTP/1.1\r\n"
+          << "Host: " << loc_host << ":" << loc_port << "\r\n"
+          << "Content-Type: text/xml; charset=\"utf-8\"\r\n"
+          << "SOAPAction: \"" << service_type << "#AddPortMapping\"\r\n"
+          << "Content-Length: " << add_xml.size() << "\r\n"
+          << "Connection: close\r\n\r\n"
+          << add_xml;
+  auto add_resp = http_request_ipv4(loc_host, loc_port, add_req.str(), timeout_ms);
+  if (!add_resp.has_value() || add_resp->find(" 200 ") == std::string::npos) {
+    if (err) *err = "upnp_add_port_mapping_failed";
+    return std::nullopt;
+  }
+
+  std::ostringstream ip_body;
+  ip_body << "<?xml version=\"1.0\"?>"
+          << "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+          << "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+          << "<s:Body><u:GetExternalIPAddress xmlns:u=\"" << service_type
+          << "\"></u:GetExternalIPAddress></s:Body></s:Envelope>";
+  const std::string ip_xml = ip_body.str();
+  std::ostringstream ip_req;
+  ip_req << "POST " << ctrl_path << " HTTP/1.1\r\n"
+         << "Host: " << loc_host << ":" << loc_port << "\r\n"
+         << "Content-Type: text/xml; charset=\"utf-8\"\r\n"
+         << "SOAPAction: \"" << service_type << "#GetExternalIPAddress\"\r\n"
+         << "Content-Length: " << ip_xml.size() << "\r\n"
+         << "Connection: close\r\n\r\n"
+         << ip_xml;
+  auto ip_resp = http_request_ipv4(loc_host, loc_port, ip_req.str(), timeout_ms);
+  if (!ip_resp.has_value()) {
+    if (err) *err = "upnp_get_external_ip_failed";
+    return std::nullopt;
+  }
+  auto ip_resp_body = http_body_from_response(*ip_resp);
+  if (!ip_resp_body.has_value()) {
+    if (err) *err = "upnp_get_external_ip_bad_http";
+    return std::nullopt;
+  }
+  auto external_ip = xml_tag_value(*ip_resp_body, "NewExternalIPAddress");
+  if (!external_ip.has_value() || external_ip->empty()) {
+    if (err) *err = "upnp_external_ip_missing";
+    return std::nullopt;
+  }
+  return p2p::NetAddress{*external_ip, requested_public_port};
 }
 
 std::vector<std::string> resolve_ipv4_addresses(const std::string& host) {
@@ -1733,7 +2385,9 @@ bool Node::init() {
   });
   if (!init_local_validator_key()) return false;
   p2p::AddrPolicy addr_policy;
-  addr_policy.required_port = cfg_.network.p2p_default_port;
+  // Accept non-default peer ports so multiple operators behind a single IP
+  // (or one host running several instances) remain discoverable.
+  addr_policy.required_port.reset();
   addr_policy.reject_unroutable = true;
   addrman_.set_policy(addr_policy);
   if (!db_.open(cfg_.db_path)) {
@@ -1907,6 +2561,13 @@ bool Node::init() {
         for (auto it = requested_ingress_ranges_.begin(); it != requested_ingress_ranges_.end();) {
           if (it->first.first == peer_id) {
             it = requested_ingress_ranges_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
+          if (it->first.second == peer_id) {
+            it = requested_sync_height_peers_.erase(it);
           } else {
             ++it;
           }
@@ -2681,6 +3342,29 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   snapshot.db_open = true;
   snapshot.local_finalized_height = finalized_height_;
   snapshot.established_peer_count = established_peer_count();
+  snapshot.inbound_connected = cfg_.disable_p2p ? 0 : p2p_.inbound_count();
+  snapshot.outbound_connected = cfg_.disable_p2p ? peer_count() : p2p_.outbound_count();
+  snapshot.addrman_size = addrman_.size();
+  snapshot.outbound_target = cfg_.outbound_target;
+  if (auto advertised = advertised_endpoint_locked(); advertised.has_value()) {
+    snapshot.advertised_endpoint_present = true;
+    snapshot.advertised_endpoint = advertised->key();
+    snapshot.advertised_endpoint_likely_public = advertised_endpoint_likely_public(*advertised);
+  }
+  snapshot.stun_enabled = cfg_.listen && cfg_.public_mode && !cfg_.disable_p2p && cfg_.external_endpoint.empty() &&
+                          !cfg_.stun_servers.empty();
+  snapshot.stun_last_success = stun_last_success_;
+  snapshot.stun_last_attempt_unix_ms = stun_last_attempt_ms_;
+  snapshot.stun_last_success_unix_ms = stun_last_success_ms_;
+  snapshot.stun_last_server = stun_last_server_;
+  snapshot.stun_last_error_code = stun_last_error_code_;
+  snapshot.stun_backoff_until_unix_ms = stun_backoff_until_ms_;
+  snapshot.stun_endpoint_change_pending = stun_endpoint_change_pending_;
+  snapshot.stun_endpoint_change_hits = stun_candidate_hits_;
+  snapshot.stun_endpoint_change_required_hits = std::max<std::uint32_t>(2, cfg_.stun_hysteresis_samples);
+  if (stun_candidate_endpoint_.has_value()) {
+    snapshot.stun_endpoint_candidate = stun_candidate_endpoint_->key();
+  }
   snapshot.next_height_committee_available = !committee_for_height_round(finalized_height_ + 1, current_round_).empty();
   snapshot.next_height_proposer_available = leader_for_height_round(finalized_height_ + 1, current_round_).has_value();
   snapshot.captured_at_unix_ms = now_ms;
@@ -2792,6 +3476,23 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   if (!snapshot.next_height_committee_available) blockers.push_back("next_height_committee_unavailable");
   if (!snapshot.next_height_proposer_available) blockers.push_back("next_height_proposer_unavailable");
   if (snapshot.bootstrap_sync_incomplete) blockers.push_back("bootstrap_sync_incomplete");
+  if (!isolated_mode && snapshot.established_peer_count == 0) blockers.push_back("no_established_peers");
+  if (!isolated_mode && snapshot.outbound_connected == 0) blockers.push_back("no_outbound_peers");
+  if (!isolated_mode && snapshot.inbound_connected == 0) blockers.push_back("no_inbound_peers");
+  if (!isolated_mode && cfg_.listen && cfg_.public_mode && !snapshot.advertised_endpoint_present) {
+    blockers.push_back("no_advertised_endpoint");
+  }
+  if (!isolated_mode && cfg_.listen && cfg_.public_mode && snapshot.advertised_endpoint_present &&
+      !snapshot.advertised_endpoint_likely_public) {
+    blockers.push_back("advertised_endpoint_not_public");
+  }
+  if (!isolated_mode && snapshot.stun_enabled && !snapshot.stun_last_success &&
+      !snapshot.advertised_endpoint_present) {
+    blockers.push_back("stun_discovery_failed");
+  }
+  if (!isolated_mode && snapshot.outbound_target > 0 && snapshot.addrman_size < snapshot.outbound_target) {
+    blockers.push_back("addrman_under_outbound_target");
+  }
 
   snapshot.registration_ready_preflight = blockers.empty();
   if (snapshot.registration_ready_preflight) {
@@ -2805,6 +3506,7 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
     if (i) snapshot.readiness_blockers_csv += ",";
     snapshot.readiness_blockers_csv += blockers[i];
   }
+  snapshot.readiness_failure_codes_csv = snapshot.readiness_blockers_csv;
   return snapshot;
 }
 
@@ -3604,6 +4306,13 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   if (clear_requested_sync) {
     requested_sync_artifacts_.erase(transition_id);
     requested_sync_heights_.erase(record.transition.height);
+    for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
+      if (it->first.first == record.transition.height) {
+        it = requested_sync_height_peers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
   candidate_frontier_proposals_.clear();
   candidate_block_sizes_.clear();
@@ -4461,6 +5170,9 @@ void Node::event_loop() {
     (void)reap_lightserver_child(true);
     if (!cfg_.disable_p2p) {
       const std::uint64_t now_ms = this->now_ms();
+      maybe_refresh_upnp_igd_external_endpoint(now_ms);
+      maybe_refresh_nat_pmp_external_endpoint(now_ms);
+      maybe_refresh_stun_external_endpoint(now_ms);
       if (outbound_peer_count() < cfg_.outbound_target && now_ms > last_seed_attempt_ms_ + 3000) {
         try_connect_bootstrap_peers();
         last_seed_attempt_ms_ = now_ms;
@@ -4487,6 +5199,9 @@ void Node::send_version(int peer_id) {
   if (bootstrap_validator_pubkey_.has_value()) {
     v.node_software_version +=
         ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
+  }
+  if (auto advertised = current_advertised_endpoint(); advertised.has_value()) {
+    v.node_software_version += ";external_endpoint=" + advertised->key();
   }
   v.node_software_version +=
       ";validator_pubkey=" + hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
@@ -5152,6 +5867,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
     const auto peer_bootstrap = software_fingerprint_value(v->node_software_version, "bootstrap_validator");
     const auto peer_validator = software_fingerprint_value(v->node_software_version, "validator_pubkey");
+    const auto peer_external_endpoint = software_fingerprint_value(v->node_software_version, "external_endpoint");
     if (peer_genesis.has_value() && ascii_lower(*peer_genesis) != local_genesis) {
       log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=genesis-fingerprint-mismatch");
       p2p_.disconnect_peer(peer_id);
@@ -5200,6 +5916,20 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           }
           p2p_.disconnect_peer(peer_id);
           return;
+        }
+      }
+    }
+    if (peer_external_endpoint.has_value() && endpoint_fingerprint_safe(*peer_external_endpoint)) {
+      const auto advertised = p2p::parse_endpoint(*peer_external_endpoint);
+      if (advertised.has_value() && advertised->port != 0 && !advertised->ip.empty()) {
+        const auto info = p2p_.get_peer_info(peer_id);
+        const std::string remote_ip = info.ip.empty() ? endpoint_to_ip(info.endpoint) : info.ip;
+        if (!remote_ip.empty() && advertised->ip == remote_ip) {
+          std::lock_guard<std::mutex> lk(mu_);
+          addrman_.add_or_update(*advertised, now_unix());
+        } else {
+          log_line("ignore-peer-external-endpoint peer_id=" + std::to_string(peer_id) + " advertised=" +
+                   advertised->key() + " reason=ip-mismatch");
         }
       }
     }
@@ -5632,6 +6362,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                    " height=" + std::to_string(proposal->transition.height) + " next_needed=" +
                    std::to_string(finalized_height_ + 1) + " transition=" +
                    short_hash_hex(proposal->transition.transition_id()));
+          score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "uncertified-sync-transition");
+          requested_sync_height_peers_.erase({proposal->transition.height, peer_id});
+          (void)maybe_request_forward_sync_block_locked();
         }
         if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
           accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id);
@@ -6248,6 +6981,13 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
   const auto transition_id = transition.transition_id();
   requested_sync_artifacts_.erase(transition_id);
   requested_sync_heights_.erase(transition.height);
+  for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
+    if (it->first.first == transition.height) {
+      it = requested_sync_height_peers_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   // Frontier runtime accepts either a transition parent or the explicit
   // genesis block handoff at height 0, so the parent link intentionally uses
   // the raw finalized identity value here.
@@ -8564,25 +9304,28 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     return tip_it->second.height >= next_height;
   };
 
-  int target_peer = 0;
-  if (preferred_peer_id != 0 && eligible_peer(preferred_peer_id)) {
-    target_peer = preferred_peer_id;
-  } else {
-    std::uint64_t best_height = 0;
-    for (const auto& [peer_id, tip] : peer_finalized_tips_) {
-      if (!eligible_peer(peer_id)) continue;
-      if (tip.height >= best_height) {
-        best_height = tip.height;
-        target_peer = peer_id;
-      }
+  std::vector<std::pair<int, std::uint64_t>> eligible_peers;
+  eligible_peers.reserve(peer_finalized_tips_.size());
+  for (const auto& [peer_id, tip] : peer_finalized_tips_) {
+    if (!eligible_peer(peer_id)) continue;
+    eligible_peers.emplace_back(peer_id, tip.height);
+  }
+  if (eligible_peers.empty()) return false;
+  std::sort(eligible_peers.begin(), eligible_peers.end(), [](const auto& a, const auto& b) {
+    if (a.second != b.second) return a.second > b.second;
+    return a.first < b.first;
+  });
+  if (preferred_peer_id != 0) {
+    auto it = std::find_if(eligible_peers.begin(), eligible_peers.end(),
+                           [&](const auto& item) { return item.first == preferred_peer_id; });
+    if (it != eligible_peers.end() && it != eligible_peers.begin()) {
+      std::rotate(eligible_peers.begin(), it, it + 1);
     }
   }
-  if (target_peer == 0) return false;
+  const int target_peer = eligible_peers.front().first;
+  const std::uint64_t target_peer_height = eligible_peers.front().second;
 
-  const auto tip_it = peer_finalized_tips_.find(target_peer);
-  if (tip_it == peer_finalized_tips_.end()) return false;
-
-  if (tip_it->second.height > finalized_height_ &&
+  if (target_peer_height > finalized_height_ &&
       !db_.get_finality_certificate_by_height(next_height).has_value()) {
     const auto outstanding = requested_sync_heights_.find(next_height);
     if (outstanding != requested_sync_heights_.end()) {
@@ -8590,27 +9333,36 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
       if (age_ms > std::max<std::uint64_t>(3000, retry_ms * 2)) {
         log_line("sync-stall reason=missing-certificate-for-next-height next_height=" + std::to_string(next_height) +
                  " local_height=" + std::to_string(finalized_height_) + " target_peer_id=" +
-                 std::to_string(target_peer) + " target_peer_height=" + std::to_string(tip_it->second.height) +
+                 std::to_string(target_peer) + " target_peer_height=" + std::to_string(target_peer_height) +
                  " request_age_ms=" + std::to_string(age_ms));
       }
     }
   }
 
-  const std::uint64_t window_end = std::min(tip_it->second.height, finalized_height_ + kForwardSyncWindow);
+  const std::uint64_t window_end = std::min(target_peer_height, finalized_height_ + kForwardSyncWindow);
   bool requested_any = false;
   for (std::uint64_t height = next_height; height <= window_end; ++height) {
     if (db_.get_height_hash(height).has_value()) continue;
-    if (auto it = requested_sync_heights_.find(height); it != requested_sync_heights_.end() &&
-        tms < it->second + retry_ms) {
-      continue;
-    }
+    const auto outstanding = requested_sync_heights_.find(height);
+    const std::uint64_t first_request_ms = (outstanding == requested_sync_heights_.end()) ? tms : outstanding->second;
+    const std::uint64_t age_ms = tms >= first_request_ms ? (tms - first_request_ms) : 0;
+    const std::size_t fanout = (age_ms > retry_ms * 4) ? 3u : (age_ms > retry_ms * 2 ? 2u : 1u);
 
-    requested_sync_heights_[height] = tms;
-    log_line("request-sync-next-height peer_id=" + std::to_string(target_peer) + " next_height=" +
-             std::to_string(height));
-    (void)p2p_.send_to(target_peer, p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
-                       p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{height}), true);
-    requested_any = true;
+    std::size_t sent_for_height = 0;
+    for (const auto& [peer_id, _peer_height] : eligible_peers) {
+      if (sent_for_height >= fanout) break;
+      auto req_it = requested_sync_height_peers_.find({height, peer_id});
+      if (req_it != requested_sync_height_peers_.end() && tms < req_it->second + retry_ms) continue;
+
+      if (outstanding == requested_sync_heights_.end()) requested_sync_heights_[height] = tms;
+      requested_sync_height_peers_[{height, peer_id}] = tms;
+      log_line("request-sync-next-height peer_id=" + std::to_string(peer_id) + " next_height=" +
+               std::to_string(height) + " fanout=" + std::to_string(fanout));
+      (void)p2p_.send_to(peer_id, p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
+                         p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{height}), true);
+      requested_any = true;
+      ++sent_for_height;
+    }
   }
   return requested_any;
 }
@@ -8778,12 +9530,242 @@ void Node::try_connect_bootstrap_peers() {
   }
 }
 
+std::optional<p2p::NetAddress> Node::advertised_endpoint_locked() const {
+  if (auto configured = advertised_endpoint_from_config(cfg_); configured.has_value()) return configured;
+  if (!cfg_.listen || !cfg_.public_mode || cfg_.disable_p2p) return std::nullopt;
+  if (nat_pmp_external_endpoint_.has_value()) return nat_pmp_external_endpoint_;
+  if (upnp_igd_external_endpoint_.has_value()) return upnp_igd_external_endpoint_;
+  if (stun_external_endpoint_.has_value()) return stun_external_endpoint_;
+  return std::nullopt;
+}
+
+std::optional<p2p::NetAddress> Node::current_advertised_endpoint() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return advertised_endpoint_locked();
+}
+
+void Node::maybe_refresh_nat_pmp_external_endpoint(std::uint64_t now_ms) {
+  if (cfg_.disable_p2p || !cfg_.listen || !cfg_.public_mode) return;
+  if (!cfg_.nat_pmp_enabled) return;
+  if (!cfg_.external_endpoint.empty()) return;
+  if (cfg_.p2p_port == 0) return;
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (nat_pmp_external_endpoint_.has_value() && nat_pmp_mapping_expires_ms_ != 0 &&
+        now_ms > nat_pmp_mapping_expires_ms_ + std::max<std::uint32_t>(5'000, cfg_.nat_pmp_timeout_ms)) {
+      nat_pmp_external_endpoint_.reset();
+    }
+    if (nat_pmp_next_refresh_ms_ != 0 && now_ms < nat_pmp_next_refresh_ms_) return;
+  }
+
+  auto gateway = linux_default_gateway_ipv4();
+  if (!gateway.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    nat_pmp_last_attempt_ms_ = now_ms;
+    nat_pmp_last_success_ = false;
+    nat_pmp_last_error_code_ = "nat_pmp_gateway_not_found";
+    nat_pmp_next_refresh_ms_ = now_ms + std::max<std::uint32_t>(10'000, cfg_.stun_refresh_interval_ms);
+    log_line("nat-pmp-refresh status=failed reason=gateway-not-found");
+    return;
+  }
+
+  std::string error;
+  const std::uint32_t lease_secs = std::max<std::uint32_t>(120, cfg_.stun_refresh_interval_ms / 1000U);
+  auto mapped = nat_pmp_map_tcp_endpoint(*gateway, cfg_.p2p_port, cfg_.p2p_port, lease_secs, cfg_.nat_pmp_timeout_ms, &error);
+  std::lock_guard<std::mutex> lk(mu_);
+  nat_pmp_last_attempt_ms_ = now_ms;
+  if (!mapped.has_value()) {
+    nat_pmp_last_success_ = false;
+    nat_pmp_last_error_code_ = error.empty() ? "nat_pmp_map_failed" : error;
+    nat_pmp_next_refresh_ms_ = now_ms + std::max<std::uint32_t>(10'000, cfg_.stun_refresh_interval_ms);
+    log_line("nat-pmp-refresh status=failed gateway=" + *gateway + " reason=" + nat_pmp_last_error_code_);
+    return;
+  }
+  nat_pmp_external_endpoint_ = *mapped;
+  nat_pmp_last_success_ = true;
+  nat_pmp_last_error_code_.clear();
+  nat_pmp_last_success_ms_ = now_ms;
+  nat_pmp_mapping_expires_ms_ = now_ms + static_cast<std::uint64_t>(lease_secs) * 1000ULL;
+  const std::uint64_t margin_ms = std::min<std::uint64_t>(
+      std::max<std::uint32_t>(1'000, cfg_.nat_pmp_refresh_margin_ms), static_cast<std::uint64_t>(lease_secs) * 500ULL);
+  nat_pmp_next_refresh_ms_ = nat_pmp_mapping_expires_ms_ > margin_ms ? nat_pmp_mapping_expires_ms_ - margin_ms : now_ms + 1'000;
+  log_line("nat-pmp-refresh status=ok gateway=" + *gateway + " endpoint=" + nat_pmp_external_endpoint_->key());
+}
+
+void Node::maybe_refresh_upnp_igd_external_endpoint(std::uint64_t now_ms) {
+  if (cfg_.disable_p2p || !cfg_.listen || !cfg_.public_mode) return;
+  if (!cfg_.upnp_igd_enabled) return;
+  if (!cfg_.external_endpoint.empty()) return;
+  if (cfg_.p2p_port == 0) return;
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (upnp_igd_external_endpoint_.has_value() && upnp_igd_mapping_expires_ms_ != 0 &&
+        now_ms > upnp_igd_mapping_expires_ms_ + std::max<std::uint32_t>(5'000, cfg_.upnp_igd_timeout_ms)) {
+      upnp_igd_external_endpoint_.reset();
+    }
+    if (upnp_igd_next_refresh_ms_ != 0 && now_ms < upnp_igd_next_refresh_ms_) return;
+  }
+
+  std::string error;
+  const std::uint32_t lease_secs = std::max<std::uint32_t>(120, cfg_.upnp_igd_lease_seconds);
+  auto mapped = upnp_igd_map_tcp_endpoint(cfg_.p2p_port, cfg_.p2p_port, lease_secs, cfg_.upnp_igd_timeout_ms, &error);
+  std::lock_guard<std::mutex> lk(mu_);
+  upnp_igd_last_attempt_ms_ = now_ms;
+  if (!mapped.has_value()) {
+    upnp_igd_last_success_ = false;
+    upnp_igd_last_error_code_ = error.empty() ? "upnp_igd_map_failed" : error;
+    upnp_igd_next_refresh_ms_ = now_ms + std::max<std::uint32_t>(10'000, cfg_.stun_refresh_interval_ms);
+    log_line("upnp-igd-refresh status=failed reason=" + upnp_igd_last_error_code_);
+    return;
+  }
+  upnp_igd_external_endpoint_ = *mapped;
+  upnp_igd_last_success_ = true;
+  upnp_igd_last_error_code_.clear();
+  upnp_igd_last_success_ms_ = now_ms;
+  upnp_igd_mapping_expires_ms_ = now_ms + static_cast<std::uint64_t>(lease_secs) * 1000ULL;
+  const std::uint64_t margin_ms = std::min<std::uint64_t>(
+      std::max<std::uint32_t>(1'000, cfg_.upnp_igd_refresh_margin_ms), static_cast<std::uint64_t>(lease_secs) * 500ULL);
+  upnp_igd_next_refresh_ms_ =
+      upnp_igd_mapping_expires_ms_ > margin_ms ? upnp_igd_mapping_expires_ms_ - margin_ms : now_ms + 1'000;
+  log_line("upnp-igd-refresh status=ok endpoint=" + upnp_igd_external_endpoint_->key());
+}
+
+void Node::maybe_refresh_stun_external_endpoint(std::uint64_t now_ms) {
+  if (cfg_.disable_p2p || !cfg_.listen || !cfg_.public_mode) return;
+  if (!cfg_.external_endpoint.empty()) return;
+  if (cfg_.stun_servers.empty()) return;
+  const std::uint64_t refresh_ms = std::max<std::uint32_t>(5'000, cfg_.stun_refresh_interval_ms);
+  const std::uint64_t max_backoff_ms = std::max<std::uint32_t>(refresh_ms, cfg_.stun_max_backoff_ms);
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stun_last_attempt_ms_ != 0 && now_ms < stun_last_attempt_ms_ + refresh_ms) return;
+    for (auto it = stun_server_backoff_.begin(); it != stun_server_backoff_.end();) {
+      if (std::find(cfg_.stun_servers.begin(), cfg_.stun_servers.end(), it->first) == cfg_.stun_servers.end()) {
+        it = stun_server_backoff_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  std::string last_error = "stun_all_servers_failed";
+  std::string used_server;
+  std::uint64_t earliest_next_allowed = 0;
+  bool attempted_any = false;
+
+  for (const auto& server : cfg_.stun_servers) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto& st = stun_server_backoff_[server];
+      if (st.next_allowed_ms != 0 && now_ms < st.next_allowed_ms) {
+        if (earliest_next_allowed == 0 || st.next_allowed_ms < earliest_next_allowed) {
+          earliest_next_allowed = st.next_allowed_ms;
+        }
+        continue;
+      }
+      st.last_attempt_ms = now_ms;
+    }
+
+    attempted_any = true;
+    used_server = server;
+    std::string err;
+    auto mapped = stun_query_external_endpoint(server, cfg_.p2p_port, cfg_.stun_timeout_ms, &err);
+    if (mapped.has_value()) {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto& st = stun_server_backoff_[server];
+      st.fail_count = 0;
+      st.next_allowed_ms = now_ms + refresh_ms;
+      st.last_error_code.clear();
+
+      stun_last_attempt_ms_ = now_ms;
+      stun_last_server_ = server;
+      stun_last_error_code_.clear();
+      stun_last_success_ = true;
+      stun_last_success_ms_ = now_ms;
+      stun_backoff_until_ms_ = now_ms + refresh_ms;
+
+      const std::string discovered = mapped->key();
+      if (!stun_external_endpoint_.has_value()) {
+        stun_external_endpoint_ = *mapped;
+        stun_candidate_endpoint_.reset();
+        stun_candidate_hits_ = 0;
+        stun_candidate_since_ms_ = 0;
+        stun_endpoint_change_pending_ = false;
+        return;
+      }
+
+      const std::string current = stun_external_endpoint_->key();
+      if (current == discovered) {
+        stun_candidate_endpoint_.reset();
+        stun_candidate_hits_ = 0;
+        stun_candidate_since_ms_ = 0;
+        stun_endpoint_change_pending_ = false;
+        return;
+      }
+
+      if (!stun_candidate_endpoint_.has_value() || stun_candidate_endpoint_->key() != discovered) {
+        stun_candidate_endpoint_ = *mapped;
+        stun_candidate_hits_ = 1;
+        stun_candidate_since_ms_ = now_ms;
+      } else if (stun_candidate_hits_ < std::numeric_limits<std::uint32_t>::max()) {
+        ++stun_candidate_hits_;
+      }
+
+      stun_endpoint_change_pending_ = true;
+      const std::uint32_t required_hits = std::max<std::uint32_t>(2, cfg_.stun_hysteresis_samples);
+      const bool enough_hits = stun_candidate_hits_ >= required_hits;
+      const bool enough_time = cfg_.stun_hysteresis_min_ms != 0 &&
+                               now_ms >= stun_candidate_since_ms_ + cfg_.stun_hysteresis_min_ms &&
+                               stun_candidate_hits_ >= 2;
+      if (enough_hits || enough_time) {
+        stun_external_endpoint_ = *stun_candidate_endpoint_;
+        stun_candidate_endpoint_.reset();
+        stun_candidate_hits_ = 0;
+        stun_candidate_since_ms_ = 0;
+        stun_endpoint_change_pending_ = false;
+      }
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto& st = stun_server_backoff_[server];
+      st.fail_count = std::min<std::uint32_t>(st.fail_count + 1, 16);
+      st.last_error_code = err.empty() ? "stun_query_failed" : err;
+      const std::uint64_t delay = stun_backoff_delay_ms(st.fail_count, static_cast<std::uint32_t>(refresh_ms),
+                                                         static_cast<std::uint32_t>(max_backoff_ms));
+      st.next_allowed_ms = now_ms + delay;
+      if (earliest_next_allowed == 0 || st.next_allowed_ms < earliest_next_allowed) {
+        earliest_next_allowed = st.next_allowed_ms;
+      }
+    }
+    if (!err.empty()) last_error = err;
+  }
+
+  std::lock_guard<std::mutex> lk(mu_);
+  stun_last_attempt_ms_ = now_ms;
+  stun_last_success_ = false;
+  if (!used_server.empty()) stun_last_server_ = used_server;
+  if (!attempted_any) {
+    stun_last_error_code_ = "stun_all_servers_in_backoff";
+  } else {
+    stun_last_error_code_ = last_error;
+  }
+  stun_backoff_until_ms_ = earliest_next_allowed;
+}
+
 bool Node::has_peer_endpoint(const std::string& host, std::uint16_t port) const {
   const std::string endpoint = host + ":" + std::to_string(port);
   for (int pid : p2p_.peer_ids()) {
     const auto info = p2p_.get_peer_info(pid);
     if (info.endpoint == endpoint) return true;
-    if (info.ip == host && !info.inbound) return true;
+    if (!info.inbound && info.ip == host) {
+      const auto parsed = p2p::parse_endpoint(info.endpoint);
+      if (parsed.has_value() && parsed->port == port) return true;
+    }
   }
   return false;
 }
@@ -8996,6 +9978,68 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.p2p_port = static_cast<std::uint16_t>(std::stoi(*v));
+    } else if (a == "--external-endpoint") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.external_endpoint = *v;
+    } else if (a == "--stun-servers") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.stun_servers.clear();
+      for (const auto& item : parse_endpoint_list(*v)) {
+        if (!item.empty()) cfg.stun_servers.push_back(item);
+      }
+    } else if (a == "--stun-refresh-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.stun_refresh_interval_ms = std::max<std::uint32_t>(5'000, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--stun-timeout-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.stun_timeout_ms = std::max<std::uint32_t>(100, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--stun-max-backoff-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.stun_max_backoff_ms = std::max<std::uint32_t>(cfg.stun_refresh_interval_ms,
+                                                         static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--stun-hysteresis-samples") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.stun_hysteresis_samples = std::max<std::uint32_t>(2, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--stun-hysteresis-min-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.stun_hysteresis_min_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--no-stun") {
+      cfg.stun_servers.clear();
+    } else if (a == "--nat-pmp") {
+      cfg.nat_pmp_enabled = true;
+    } else if (a == "--no-nat-pmp") {
+      cfg.nat_pmp_enabled = false;
+    } else if (a == "--nat-pmp-timeout-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.nat_pmp_timeout_ms = std::max<std::uint32_t>(100, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--nat-pmp-refresh-margin-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.nat_pmp_refresh_margin_ms = std::max<std::uint32_t>(1'000, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--upnp-igd") {
+      cfg.upnp_igd_enabled = true;
+    } else if (a == "--no-upnp-igd") {
+      cfg.upnp_igd_enabled = false;
+    } else if (a == "--upnp-igd-timeout-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.upnp_igd_timeout_ms = std::max<std::uint32_t>(200, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--upnp-igd-refresh-margin-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.upnp_igd_refresh_margin_ms = std::max<std::uint32_t>(1'000, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--upnp-igd-lease-seconds") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.upnp_igd_lease_seconds = std::max<std::uint32_t>(120, static_cast<std::uint32_t>(std::stoul(*v)));
     } else if (a == "--listen") {
       cfg.listen = true;
     } else if (a == "--with-lightserver") {
@@ -9203,6 +10247,30 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     std::cerr << "--genesis override on mainnet requires --allow-unsafe-genesis-override\n";
     return std::nullopt;
   }
+  if (!cfg.external_endpoint.empty()) {
+    if (!endpoint_fingerprint_safe(cfg.external_endpoint)) {
+      std::cerr << "--external-endpoint must not contain ';'\n";
+      return std::nullopt;
+    }
+    const auto parsed = p2p::parse_endpoint(cfg.external_endpoint);
+    if (!parsed.has_value() || parsed->ip.empty() || parsed->port == 0) {
+      std::cerr << "--external-endpoint must be in host:port format with non-zero port\n";
+      return std::nullopt;
+    }
+  }
+  for (const auto& server : cfg.stun_servers) {
+    if (!endpoint_fingerprint_safe(server)) {
+      std::cerr << "--stun-servers entries must not contain ';'\n";
+      return std::nullopt;
+    }
+    const auto parsed = p2p::parse_endpoint(server);
+    if (!parsed.has_value() || parsed->ip.empty() || parsed->port == 0) {
+      std::cerr << "--stun-servers requires host:port entries\n";
+      return std::nullopt;
+    }
+  }
+  cfg.stun_max_backoff_ms = std::max<std::uint32_t>(cfg.stun_refresh_interval_ms, cfg.stun_max_backoff_ms);
+  cfg.stun_hysteresis_samples = std::max<std::uint32_t>(2, cfg.stun_hysteresis_samples);
   if (cfg.validator_passphrase.empty() && !validator_passphrase_env.empty()) {
     const char* pv = std::getenv(validator_passphrase_env.c_str());
     if (pv) cfg.validator_passphrase = pv;

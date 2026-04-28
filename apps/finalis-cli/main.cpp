@@ -7,6 +7,7 @@
 #include <chrono>
 #include <thread>
 #include <ctime>
+#include <deque>
 #include <regex>
 #include <fstream>
 #include <iostream>
@@ -577,6 +578,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"last_deficit\":" << record.last_deficit << ","
               << "\"registration_ready\":" << (record.readiness.registration_ready ? "true" : "false") << ","
               << "\"readiness_blockers\":\"" << record.readiness.readiness_blockers_csv << "\","
+              << "\"readiness_failure_codes\":\"" << record.readiness.readiness_failure_codes_csv << "\","
               << "\"txid\":\"" << record.txid_hex << "\","
               << "\"broadcast_outcome\":\"" << validator_onboarding_broadcast_outcome_name(record.broadcast_outcome)
               << "\","
@@ -603,7 +605,12 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
   std::cout << "registration_ready=" << (record.readiness.registration_ready ? "yes" : "no") << "\n";
   std::cout << "readiness_stable_samples=" << record.readiness.readiness_stable_samples << "\n";
   std::cout << "readiness_blockers=" << record.readiness.readiness_blockers_csv << "\n";
+  std::cout << "readiness_failure_codes=" << record.readiness.readiness_failure_codes_csv << "\n";
   std::cout << "healthy_peer_count=" << record.readiness.healthy_peer_count << "\n";
+  std::cout << "inbound_connected=" << record.readiness.inbound_connected << "\n";
+  std::cout << "outbound_connected=" << record.readiness.outbound_connected << "\n";
+  std::cout << "addrman_size=" << record.readiness.addrman_size << "\n";
+  std::cout << "outbound_target=" << record.readiness.outbound_target << "\n";
   std::cout << "observed_network_height_known=" << (record.readiness.observed_network_height_known ? "yes" : "no")
             << "\n";
   std::cout << "observed_network_finalized_height=" << record.readiness.observed_network_finalized_height << "\n";
@@ -921,6 +928,531 @@ int run_repair_state_command(const std::string& db_path, bool force, bool dry_ru
   return 0;
 }
 
+std::vector<std::string> tail_file_lines(const std::filesystem::path& path, std::size_t max_lines) {
+  std::vector<std::string> out;
+  if (max_lines == 0) return out;
+  std::ifstream in(path);
+  if (!in.good()) return out;
+  std::deque<std::string> ring;
+  std::string line;
+  while (std::getline(in, line)) {
+    ring.push_back(line);
+    if (ring.size() > max_lines) ring.pop_front();
+  }
+  out.assign(ring.begin(), ring.end());
+  return out;
+}
+
+int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, bool as_json) {
+  const auto resolved = std::filesystem::path(expand_user(db_path));
+  finalis::storage::DB db;
+  if (!db.open_readonly(resolved.string()) && !db.open(resolved.string())) {
+    std::cerr << "sync_doctor: failed to open db: " << resolved.string() << "\n";
+    return 1;
+  }
+
+  const auto tip = db.get_tip();
+  const auto runtime = db.get_node_runtime_status_snapshot();
+  const std::uint64_t local_height = tip.has_value() ? tip->height : 0;
+  const std::uint64_t next_height = local_height + 1;
+  const bool next_height_transition_present = db.get_height_hash(next_height).has_value();
+  const bool next_height_certificate_present = db.get_finality_certificate_by_height(next_height).has_value();
+
+  std::uint64_t future_missing_cert_count = 0;
+  for (std::uint64_t h = next_height + 1; h <= next_height + 64; ++h) {
+    if (!db.get_height_hash(h).has_value()) break;
+    if (!db.get_finality_certificate_by_height(h).has_value()) ++future_missing_cert_count;
+  }
+
+  const auto log_path_primary = resolved / "logs" / "node.log";
+  const auto log_path_fallback = resolved / "node.log";
+  const auto log_path = std::filesystem::exists(log_path_primary) ? log_path_primary : log_path_fallback;
+  const auto lines = tail_file_lines(log_path, tail_lines);
+
+  std::size_t stall_missing_next_cert = 0;
+  std::size_t stall_uncertified_transition = 0;
+  std::size_t stall_cert_verification_failed = 0;
+  std::size_t request_sync_next_height = 0;
+  std::size_t recv_finalized_tip = 0;
+  for (const auto& line : lines) {
+    if (line.find("sync-stall reason=missing-certificate-for-next-height") != std::string::npos) {
+      ++stall_missing_next_cert;
+    }
+    if (line.find("sync-stall reason=peer-served-uncertified-transition") != std::string::npos) {
+      ++stall_uncertified_transition;
+    }
+    if (line.find("sync-stall reason=certificate-verification-failed") != std::string::npos) {
+      ++stall_cert_verification_failed;
+    }
+    if (line.find("request-sync-next-height") != std::string::npos) ++request_sync_next_height;
+    if (line.find("recv FINALIZED_TIP") != std::string::npos) ++recv_finalized_tip;
+  }
+
+  std::vector<std::string> findings;
+  if (!runtime.has_value()) findings.push_back("runtime_snapshot_missing");
+  if (runtime.has_value() && runtime->bootstrap_sync_incomplete) findings.push_back("bootstrap_sync_incomplete");
+  if (runtime.has_value() && runtime->healthy_peer_count == 0) findings.push_back("no_healthy_peers");
+  if (!next_height_transition_present && !next_height_certificate_present) findings.push_back("next_height_data_missing");
+  if (future_missing_cert_count > 0) findings.push_back("future_heights_missing_certificates");
+  if (stall_uncertified_transition > 0) findings.push_back("peer_served_uncertified_transition");
+  if (stall_missing_next_cert > 0) findings.push_back("stalled_on_missing_next_height_certificate");
+  if (stall_cert_verification_failed > 0) findings.push_back("certificate_verification_failures");
+
+  if (as_json) {
+    std::ostringstream j;
+    j << "{";
+    j << "\"db\":\"" << json_escape(resolved.string()) << "\"";
+    j << ",\"local_height\":" << local_height;
+    j << ",\"next_height\":" << next_height;
+    j << ",\"next_height_transition_present\":" << (next_height_transition_present ? "true" : "false");
+    j << ",\"next_height_certificate_present\":" << (next_height_certificate_present ? "true" : "false");
+    j << ",\"future_missing_certificate_count\":" << future_missing_cert_count;
+    j << ",\"runtime_snapshot_present\":" << (runtime.has_value() ? "true" : "false");
+    if (runtime.has_value()) {
+      j << ",\"healthy_peer_count\":" << runtime->healthy_peer_count;
+      j << ",\"established_peer_count\":" << runtime->established_peer_count;
+      j << ",\"inbound_connected\":" << runtime->inbound_connected;
+      j << ",\"outbound_connected\":" << runtime->outbound_connected;
+      j << ",\"addrman_size\":" << runtime->addrman_size;
+      j << ",\"outbound_target\":" << runtime->outbound_target;
+      j << ",\"advertised_endpoint_present\":" << (runtime->advertised_endpoint_present ? "true" : "false");
+      j << ",\"advertised_endpoint_likely_public\":" << (runtime->advertised_endpoint_likely_public ? "true" : "false");
+      j << ",\"advertised_endpoint\":\"" << json_escape(runtime->advertised_endpoint) << "\"";
+      j << ",\"stun_enabled\":" << (runtime->stun_enabled ? "true" : "false");
+      j << ",\"stun_last_success\":" << (runtime->stun_last_success ? "true" : "false");
+      j << ",\"stun_last_attempt_unix_ms\":" << runtime->stun_last_attempt_unix_ms;
+      j << ",\"stun_last_success_unix_ms\":" << runtime->stun_last_success_unix_ms;
+      j << ",\"stun_last_server\":\"" << json_escape(runtime->stun_last_server) << "\"";
+      j << ",\"stun_last_error_code\":\"" << json_escape(runtime->stun_last_error_code) << "\"";
+      j << ",\"stun_backoff_until_unix_ms\":" << runtime->stun_backoff_until_unix_ms;
+      j << ",\"stun_endpoint_change_pending\":" << (runtime->stun_endpoint_change_pending ? "true" : "false");
+      j << ",\"stun_endpoint_change_hits\":" << runtime->stun_endpoint_change_hits;
+      j << ",\"stun_endpoint_change_required_hits\":" << runtime->stun_endpoint_change_required_hits;
+      j << ",\"stun_endpoint_candidate\":\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
+      j << ",\"observed_network_height_known\":" << (runtime->observed_network_height_known ? "true" : "false");
+      j << ",\"observed_network_finalized_height\":" << runtime->observed_network_finalized_height;
+      j << ",\"finalized_lag\":" << runtime->finalized_lag;
+      j << ",\"bootstrap_sync_incomplete\":" << (runtime->bootstrap_sync_incomplete ? "true" : "false");
+      j << ",\"readiness_failure_codes_csv\":\"" << json_escape(runtime->readiness_failure_codes_csv) << "\"";
+    }
+    j << ",\"log_tail_path\":\"" << json_escape(log_path.string()) << "\"";
+    j << ",\"log_tail_size\":" << lines.size();
+    j << ",\"log_counters\":{";
+    j << "\"missing_next_cert\":" << stall_missing_next_cert;
+    j << ",\"uncertified_transition\":" << stall_uncertified_transition;
+    j << ",\"certificate_verification_failed\":" << stall_cert_verification_failed;
+    j << ",\"request_sync_next_height\":" << request_sync_next_height;
+    j << ",\"recv_finalized_tip\":" << recv_finalized_tip;
+    j << "}";
+    j << ",\"findings\":[";
+    for (std::size_t i = 0; i < findings.size(); ++i) {
+      if (i != 0) j << ",";
+      j << "\"" << json_escape(findings[i]) << "\"";
+    }
+    j << "]";
+    j << "}\n";
+    std::cout << j.str();
+    return findings.empty() ? 0 : 2;
+  }
+
+  std::cout << "sync_doctor_db=" << resolved.string() << "\n";
+  std::cout << "local_height=" << local_height << "\n";
+  std::cout << "next_height=" << next_height << "\n";
+  std::cout << "next_height_transition_present=" << (next_height_transition_present ? "yes" : "no") << "\n";
+  std::cout << "next_height_certificate_present=" << (next_height_certificate_present ? "yes" : "no") << "\n";
+  std::cout << "future_missing_certificate_count=" << future_missing_cert_count << "\n";
+  if (runtime.has_value()) {
+    std::cout << "healthy_peer_count=" << runtime->healthy_peer_count << "\n";
+    std::cout << "established_peer_count=" << runtime->established_peer_count << "\n";
+    std::cout << "inbound_connected=" << runtime->inbound_connected << "\n";
+    std::cout << "outbound_connected=" << runtime->outbound_connected << "\n";
+    std::cout << "addrman_size=" << runtime->addrman_size << "\n";
+    std::cout << "outbound_target=" << runtime->outbound_target << "\n";
+    std::cout << "advertised_endpoint_present=" << (runtime->advertised_endpoint_present ? "yes" : "no") << "\n";
+    std::cout << "advertised_endpoint_likely_public=" << (runtime->advertised_endpoint_likely_public ? "yes" : "no")
+              << "\n";
+    std::cout << "advertised_endpoint=" << runtime->advertised_endpoint << "\n";
+    std::cout << "stun_enabled=" << (runtime->stun_enabled ? "yes" : "no") << "\n";
+    std::cout << "stun_last_success=" << (runtime->stun_last_success ? "yes" : "no") << "\n";
+    std::cout << "stun_last_attempt_unix_ms=" << runtime->stun_last_attempt_unix_ms << "\n";
+    std::cout << "stun_last_success_unix_ms=" << runtime->stun_last_success_unix_ms << "\n";
+    std::cout << "stun_last_server=" << runtime->stun_last_server << "\n";
+    std::cout << "stun_last_error_code=" << runtime->stun_last_error_code << "\n";
+    std::cout << "stun_backoff_until_unix_ms=" << runtime->stun_backoff_until_unix_ms << "\n";
+    std::cout << "stun_endpoint_change_pending=" << (runtime->stun_endpoint_change_pending ? "yes" : "no") << "\n";
+    std::cout << "stun_endpoint_change_hits=" << runtime->stun_endpoint_change_hits << "\n";
+    std::cout << "stun_endpoint_change_required_hits=" << runtime->stun_endpoint_change_required_hits << "\n";
+    std::cout << "stun_endpoint_candidate=" << runtime->stun_endpoint_candidate << "\n";
+    std::cout << "observed_network_height_known=" << (runtime->observed_network_height_known ? "yes" : "no") << "\n";
+    std::cout << "observed_network_finalized_height=" << runtime->observed_network_finalized_height << "\n";
+    std::cout << "finalized_lag=" << runtime->finalized_lag << "\n";
+    std::cout << "bootstrap_sync_incomplete=" << (runtime->bootstrap_sync_incomplete ? "yes" : "no") << "\n";
+    std::cout << "readiness_failure_codes_csv=" << runtime->readiness_failure_codes_csv << "\n";
+  } else {
+    std::cout << "runtime_snapshot_present=no\n";
+  }
+  std::cout << "log_tail_path=" << log_path.string() << "\n";
+  std::cout << "log_tail_size=" << lines.size() << "\n";
+  std::cout << "log_missing_next_cert=" << stall_missing_next_cert << "\n";
+  std::cout << "log_uncertified_transition=" << stall_uncertified_transition << "\n";
+  std::cout << "log_certificate_verification_failed=" << stall_cert_verification_failed << "\n";
+  std::cout << "log_request_sync_next_height=" << request_sync_next_height << "\n";
+  std::cout << "log_recv_finalized_tip=" << recv_finalized_tip << "\n";
+  std::cout << "findings=";
+  if (findings.empty()) {
+    std::cout << "none\n";
+  } else {
+    for (std::size_t i = 0; i < findings.size(); ++i) {
+      if (i != 0) std::cout << ",";
+      std::cout << findings[i];
+    }
+    std::cout << "\n";
+  }
+  return findings.empty() ? 0 : 2;
+}
+
+int run_fast_sync_command(const std::string& db_path, const std::string& snapshot_path, bool force, bool dry_run) {
+  if (snapshot_path.empty()) {
+    std::cerr << "fast_sync requires --snapshot <file>\n";
+    return 1;
+  }
+  const auto resolved_db = std::filesystem::path(expand_user(db_path));
+  const auto resolved_snapshot = std::filesystem::path(expand_user(snapshot_path));
+  if (!std::filesystem::exists(resolved_snapshot)) {
+    std::cerr << "fast_sync: snapshot file does not exist: " << resolved_snapshot.string() << "\n";
+    return 1;
+  }
+  if (!std::filesystem::is_regular_file(resolved_snapshot)) {
+    std::cerr << "fast_sync: snapshot path is not a file: " << resolved_snapshot.string() << "\n";
+    return 1;
+  }
+
+  const std::set<std::string> preserve = {"keystore", "logs"};
+  std::error_code ec;
+  bool has_chain_state = false;
+  if (std::filesystem::exists(resolved_db, ec) && std::filesystem::is_directory(resolved_db, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(resolved_db, ec)) {
+      if (ec) break;
+      const auto name = lowercase_ascii(entry.path().filename().string());
+      if (preserve.find(name) != preserve.end()) continue;
+      has_chain_state = true;
+      break;
+    }
+  }
+
+  std::cout << "fast_sync_db=" << resolved_db.string() << "\n";
+  std::cout << "fast_sync_snapshot=" << resolved_snapshot.string() << "\n";
+  std::cout << "fast_sync_existing_chain_state=" << (has_chain_state ? "yes" : "no") << "\n";
+
+  if (dry_run) {
+    std::cout << "fast_sync_dry_run=yes\n";
+    if (has_chain_state && !force) {
+      std::cout << "fast_sync_would_fail_without_force=yes\n";
+    }
+    return 0;
+  }
+
+  if (has_chain_state) {
+    if (!force) {
+      std::cerr << "fast_sync: existing chain state detected in " << resolved_db.string() << "\n"
+                << "Use --force to clear chain state while preserving keystore/logs.\n";
+      return 2;
+    }
+    const int repair_rc = run_repair_state_command(resolved_db.string(), true, false);
+    if (repair_rc != 0) return repair_rc;
+  } else {
+    std::filesystem::create_directories(resolved_db / "keystore", ec);
+    if (ec) {
+      std::cerr << "fast_sync: failed ensuring keystore dir: " << ec.message() << "\n";
+      return 1;
+    }
+    std::filesystem::create_directories(resolved_db / "logs", ec);
+    if (ec) {
+      std::cerr << "fast_sync: failed ensuring logs dir: " << ec.message() << "\n";
+      return 1;
+    }
+  }
+
+  finalis::storage::DB db;
+  if (!db.open(resolved_db.string())) {
+    std::cerr << "fast_sync: failed to open db: " << resolved_db.string() << "\n";
+    return 1;
+  }
+
+  finalis::storage::SnapshotManifest manifest;
+  std::string err;
+  if (!finalis::storage::import_snapshot_bundle(db, resolved_snapshot.string(), &manifest, &err)) {
+    std::cerr << "fast_sync failed: " << err << "\n";
+    return 1;
+  }
+
+  std::cout << "fast_sync_applied=yes\n";
+  std::cout << "finalized_height=" << manifest.finalized_height << "\n";
+  std::cout << "finalized_transition_hash=" << finalis::hex_encode32(manifest.finalized_hash) << "\n";
+  std::cout << "entry_count=" << manifest.entry_count << "\n";
+  return 0;
+}
+
+std::vector<std::string> split_csv_nonempty(const std::string& csv) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char ch : csv) {
+    if (ch == ',') {
+      const auto token = trim_copy(cur);
+      if (!token.empty()) out.push_back(token);
+      cur.clear();
+      continue;
+    }
+    cur.push_back(ch);
+  }
+  const auto token = trim_copy(cur);
+  if (!token.empty()) out.push_back(token);
+  return out;
+}
+
+std::string join_csv(const std::vector<std::string>& items) {
+  std::ostringstream oss;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i) oss << ",";
+    oss << items[i];
+  }
+  return oss.str();
+}
+
+bool append_unique_code(std::vector<std::string>* out, const std::string& code) {
+  if (!out || code.empty()) return false;
+  if (std::find(out->begin(), out->end(), code) != out->end()) return false;
+  out->push_back(code);
+  return true;
+}
+
+int run_validator_doctor_command(const std::string& db_path, const std::string& key_file, const std::string& passphrase,
+                                 const std::string& rpc_url, bool as_json) {
+  const auto resolved_db = std::filesystem::path(expand_user(db_path));
+  const auto resolved_key = std::filesystem::path(expand_user(key_file));
+
+  finalis::storage::DB db;
+  if (!db.open_readonly(resolved_db.string()) && !db.open(resolved_db.string())) {
+    std::cerr << "validator_doctor: failed to open db: " << resolved_db.string() << "\n";
+    return 1;
+  }
+
+  const auto tip = db.get_tip();
+  const auto runtime = db.get_node_runtime_status_snapshot();
+  std::vector<std::string> critical_codes;
+  std::vector<std::string> warning_codes;
+  std::vector<std::string> info_codes;
+
+  const std::set<std::string> runtime_critical = {
+      "chain_id_mismatch",
+      "no_healthy_peers",
+      "bootstrap_sync_incomplete",
+      "next_height_committee_unavailable",
+      "next_height_proposer_unavailable",
+  };
+  if (!runtime.has_value()) {
+    append_unique_code(&critical_codes, "runtime_snapshot_missing");
+  } else {
+    for (const auto& code : split_csv_nonempty(runtime->readiness_failure_codes_csv)) {
+      if (runtime_critical.find(code) != runtime_critical.end()) {
+        append_unique_code(&critical_codes, code);
+      } else {
+        append_unique_code(&warning_codes, code);
+      }
+    }
+    if (runtime->finalized_lag > 32) append_unique_code(&critical_codes, "finalized_lag_critical");
+    else if (runtime->finalized_lag > 8) append_unique_code(&warning_codes, "finalized_lag_high");
+    if (!runtime->advertised_endpoint_present) append_unique_code(&warning_codes, "no_advertised_endpoint");
+    if (runtime->advertised_endpoint_present && !runtime->advertised_endpoint_likely_public) {
+      append_unique_code(&warning_codes, "advertised_endpoint_not_public");
+    }
+    if (runtime->stun_enabled && !runtime->stun_last_success) {
+      append_unique_code(&warning_codes, "stun_discovery_failed");
+    }
+    if (runtime->stun_endpoint_change_pending) {
+      append_unique_code(&warning_codes, "stun_endpoint_change_pending");
+    }
+    if (runtime->availability_local_operator_known) {
+      if (runtime->availability_local_invalid_audits > 0) append_unique_code(&warning_codes, "operator_invalid_audits_nonzero");
+      if (runtime->availability_local_missed_audits > runtime->availability_local_successful_audits) {
+        append_unique_code(&warning_codes, "operator_missed_audits_exceed_successes");
+      }
+    } else {
+      append_unique_code(&info_codes, "operator_identity_not_observed");
+    }
+  }
+
+  bool local_validator_key_loaded = false;
+  bool local_validator_registered = false;
+  std::string local_validator_status = "UNKNOWN";
+  if (std::filesystem::exists(resolved_key)) {
+    finalis::keystore::ValidatorKey vk;
+    std::string key_err;
+    if (finalis::keystore::load_validator_keystore(resolved_key.string(), passphrase, &vk, &key_err)) {
+      local_validator_key_loaded = true;
+      const auto validators = db.load_validators();
+      const auto it = validators.find(vk.pubkey);
+      if (it != validators.end()) {
+        local_validator_registered = true;
+        local_validator_status = validator_status_name(it->second.status);
+        if (it->second.status == finalis::consensus::ValidatorStatus::BANNED) {
+          append_unique_code(&critical_codes, "local_validator_banned");
+        } else if (it->second.status == finalis::consensus::ValidatorStatus::SUSPENDED) {
+          append_unique_code(&warning_codes, "local_validator_suspended");
+        } else if (it->second.status == finalis::consensus::ValidatorStatus::EXITING) {
+          append_unique_code(&warning_codes, "local_validator_exiting");
+        } else if (it->second.status == finalis::consensus::ValidatorStatus::PENDING ||
+                   it->second.status == finalis::consensus::ValidatorStatus::ONBOARDING) {
+          append_unique_code(&warning_codes, "local_validator_not_active");
+        }
+      } else {
+        append_unique_code(&warning_codes, "local_validator_not_registered");
+      }
+    } else {
+      append_unique_code(&warning_codes, "local_validator_key_load_failed");
+    }
+  } else {
+    append_unique_code(&warning_codes, "local_validator_key_missing");
+  }
+
+  std::optional<finalis::onboarding::ValidatorOnboardingRecord> onboarding;
+  std::string onboarding_err;
+  finalis::onboarding::ValidatorOnboardingService onboarding_service;
+  finalis::onboarding::ValidatorOnboardingOptions onboarding_options{
+      .db_path = resolved_db.string(),
+      .key_file = resolved_key.string(),
+      .passphrase = passphrase,
+      .rpc_url = rpc_url.empty() ? "http://127.0.0.1:19444/rpc" : rpc_url,
+      .fee = 10'000,
+      .wait_for_sync = true,
+  };
+  onboarding = onboarding_service.status(onboarding_options, &onboarding_err);
+  std::string onboarding_state = "none";
+  std::string onboarding_last_error_code;
+  if (onboarding.has_value()) {
+    onboarding_state = finalis::onboarding::validator_onboarding_state_name(onboarding->state);
+    onboarding_last_error_code = onboarding->last_error_code;
+    if (!onboarding->last_error_code.empty()) {
+      const std::string prefixed = "onboarding_" + onboarding->last_error_code;
+      if (onboarding->state == finalis::onboarding::ValidatorOnboardingState::FAILED) {
+        append_unique_code(&critical_codes, prefixed);
+      } else {
+        append_unique_code(&warning_codes, prefixed);
+      }
+    }
+    if (onboarding->state == finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_SYNC) {
+      append_unique_code(&warning_codes, "onboarding_waiting_for_sync");
+    } else if (onboarding->state == finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_FUNDS) {
+      append_unique_code(&warning_codes, "onboarding_waiting_for_funds");
+    } else if (onboarding->state == finalis::onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION) {
+      append_unique_code(&warning_codes, "onboarding_waiting_for_finalization");
+    } else if (onboarding->state == finalis::onboarding::ValidatorOnboardingState::FAILED) {
+      append_unique_code(&critical_codes, "onboarding_failed");
+    }
+  }
+
+  const std::string overall = !critical_codes.empty() ? "critical" : (!warning_codes.empty() ? "warning" : "ok");
+  const int exit_code = !critical_codes.empty() ? 3 : (!warning_codes.empty() ? 2 : 0);
+
+  if (as_json) {
+    std::ostringstream j;
+    j << "{";
+    j << "\"db\":\"" << json_escape(resolved_db.string()) << "\"";
+    j << ",\"key_file\":\"" << json_escape(resolved_key.string()) << "\"";
+    j << ",\"runtime_snapshot_present\":" << (runtime.has_value() ? "true" : "false");
+    j << ",\"local_height\":" << (tip.has_value() ? tip->height : 0);
+    if (runtime.has_value()) {
+      j << ",\"healthy_peer_count\":" << runtime->healthy_peer_count;
+      j << ",\"established_peer_count\":" << runtime->established_peer_count;
+      j << ",\"inbound_connected\":" << runtime->inbound_connected;
+      j << ",\"outbound_connected\":" << runtime->outbound_connected;
+      j << ",\"addrman_size\":" << runtime->addrman_size;
+      j << ",\"outbound_target\":" << runtime->outbound_target;
+      j << ",\"advertised_endpoint_present\":" << (runtime->advertised_endpoint_present ? "true" : "false");
+      j << ",\"advertised_endpoint_likely_public\":" << (runtime->advertised_endpoint_likely_public ? "true" : "false");
+      j << ",\"advertised_endpoint\":\"" << json_escape(runtime->advertised_endpoint) << "\"";
+      j << ",\"stun_enabled\":" << (runtime->stun_enabled ? "true" : "false");
+      j << ",\"stun_last_success\":" << (runtime->stun_last_success ? "true" : "false");
+      j << ",\"stun_last_attempt_unix_ms\":" << runtime->stun_last_attempt_unix_ms;
+      j << ",\"stun_last_success_unix_ms\":" << runtime->stun_last_success_unix_ms;
+      j << ",\"stun_last_server\":\"" << json_escape(runtime->stun_last_server) << "\"";
+      j << ",\"stun_last_error_code\":\"" << json_escape(runtime->stun_last_error_code) << "\"";
+      j << ",\"stun_backoff_until_unix_ms\":" << runtime->stun_backoff_until_unix_ms;
+      j << ",\"stun_endpoint_change_pending\":" << (runtime->stun_endpoint_change_pending ? "true" : "false");
+      j << ",\"stun_endpoint_change_hits\":" << runtime->stun_endpoint_change_hits;
+      j << ",\"stun_endpoint_change_required_hits\":" << runtime->stun_endpoint_change_required_hits;
+      j << ",\"stun_endpoint_candidate\":\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
+      j << ",\"finalized_lag\":" << runtime->finalized_lag;
+      j << ",\"bootstrap_sync_incomplete\":" << (runtime->bootstrap_sync_incomplete ? "true" : "false");
+      j << ",\"registration_ready\":" << (runtime->registration_ready ? "true" : "false");
+      j << ",\"readiness_failure_codes_csv\":\"" << json_escape(runtime->readiness_failure_codes_csv) << "\"";
+    }
+    j << ",\"local_validator_key_loaded\":" << (local_validator_key_loaded ? "true" : "false");
+    j << ",\"local_validator_registered\":" << (local_validator_registered ? "true" : "false");
+    j << ",\"local_validator_status\":\"" << json_escape(local_validator_status) << "\"";
+    j << ",\"onboarding_state\":\"" << json_escape(onboarding_state) << "\"";
+    j << ",\"onboarding_last_error_code\":\"" << json_escape(onboarding_last_error_code) << "\"";
+    j << ",\"overall\":\"" << overall << "\"";
+    j << ",\"exit_code\":" << exit_code;
+    auto emit_codes = [&](const char* key, const std::vector<std::string>& codes) {
+      j << ",\"" << key << "\":[";
+      for (std::size_t i = 0; i < codes.size(); ++i) {
+        if (i) j << ",";
+        j << "\"" << json_escape(codes[i]) << "\"";
+      }
+      j << "]";
+    };
+    emit_codes("critical_codes", critical_codes);
+    emit_codes("warning_codes", warning_codes);
+    emit_codes("info_codes", info_codes);
+    j << "}\n";
+    std::cout << j.str();
+    return exit_code;
+  }
+
+  std::cout << "validator_doctor_db=" << resolved_db.string() << "\n";
+  std::cout << "validator_doctor_key_file=" << resolved_key.string() << "\n";
+  std::cout << "runtime_snapshot_present=" << (runtime.has_value() ? "yes" : "no") << "\n";
+  std::cout << "local_height=" << (tip.has_value() ? tip->height : 0) << "\n";
+  if (runtime.has_value()) {
+    std::cout << "healthy_peer_count=" << runtime->healthy_peer_count << "\n";
+    std::cout << "established_peer_count=" << runtime->established_peer_count << "\n";
+    std::cout << "inbound_connected=" << runtime->inbound_connected << "\n";
+    std::cout << "outbound_connected=" << runtime->outbound_connected << "\n";
+    std::cout << "addrman_size=" << runtime->addrman_size << "\n";
+    std::cout << "outbound_target=" << runtime->outbound_target << "\n";
+    std::cout << "advertised_endpoint_present=" << (runtime->advertised_endpoint_present ? "yes" : "no") << "\n";
+    std::cout << "advertised_endpoint_likely_public=" << (runtime->advertised_endpoint_likely_public ? "yes" : "no")
+              << "\n";
+    std::cout << "advertised_endpoint=" << runtime->advertised_endpoint << "\n";
+    std::cout << "stun_enabled=" << (runtime->stun_enabled ? "yes" : "no") << "\n";
+    std::cout << "stun_last_success=" << (runtime->stun_last_success ? "yes" : "no") << "\n";
+    std::cout << "stun_last_attempt_unix_ms=" << runtime->stun_last_attempt_unix_ms << "\n";
+    std::cout << "stun_last_success_unix_ms=" << runtime->stun_last_success_unix_ms << "\n";
+    std::cout << "stun_last_server=" << runtime->stun_last_server << "\n";
+    std::cout << "stun_last_error_code=" << runtime->stun_last_error_code << "\n";
+    std::cout << "stun_backoff_until_unix_ms=" << runtime->stun_backoff_until_unix_ms << "\n";
+    std::cout << "stun_endpoint_change_pending=" << (runtime->stun_endpoint_change_pending ? "yes" : "no") << "\n";
+    std::cout << "stun_endpoint_change_hits=" << runtime->stun_endpoint_change_hits << "\n";
+    std::cout << "stun_endpoint_change_required_hits=" << runtime->stun_endpoint_change_required_hits << "\n";
+    std::cout << "stun_endpoint_candidate=" << runtime->stun_endpoint_candidate << "\n";
+    std::cout << "finalized_lag=" << runtime->finalized_lag << "\n";
+    std::cout << "bootstrap_sync_incomplete=" << (runtime->bootstrap_sync_incomplete ? "yes" : "no") << "\n";
+    std::cout << "registration_ready=" << (runtime->registration_ready ? "yes" : "no") << "\n";
+    std::cout << "readiness_failure_codes_csv=" << runtime->readiness_failure_codes_csv << "\n";
+  }
+  std::cout << "local_validator_key_loaded=" << (local_validator_key_loaded ? "yes" : "no") << "\n";
+  std::cout << "local_validator_registered=" << (local_validator_registered ? "yes" : "no") << "\n";
+  std::cout << "local_validator_status=" << local_validator_status << "\n";
+  std::cout << "onboarding_state=" << onboarding_state << "\n";
+  std::cout << "onboarding_last_error_code=" << onboarding_last_error_code << "\n";
+  std::cout << "critical_codes=" << (critical_codes.empty() ? "none" : join_csv(critical_codes)) << "\n";
+  std::cout << "warning_codes=" << (warning_codes.empty() ? "none" : join_csv(warning_codes)) << "\n";
+  std::cout << "info_codes=" << (info_codes.empty() ? "none" : join_csv(info_codes)) << "\n";
+  std::cout << "overall=" << overall << "\n";
+  return exit_code;
+}
+
 void print_user_cli_help(std::ostream& os) {
   os << "finalis-cli user/validator commands:\n"
      << "  " << platform_default_db_path_note() << "\n"
@@ -955,6 +1487,10 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli reindex [--db <dir>] [--file <path>]  # clear consensus cache so startup can rebuild\n"
      << "  finalis-cli repair_state [--db <dir>] [--force] [--dry-run]  # wipe local chain state, preserve keystore/logs\n"
      << "  finalis-cli full_reindex [--db <dir>] [--force] [--dry-run]  # alias of repair_state\n"
+     << "  finalis-cli sync_doctor [--db <dir>] [--tail <n>] [--json]  # diagnose stalled sync and certificate gaps\n"
+     << "  finalis-cli validator_doctor [--db <dir>] [--file <path>] [--pass <pass>] [--rpc <url>] [--json]\n"
+     << "  finalis-cli operator_doctor [--db <dir>] [--file <path>] [--pass <pass>] [--rpc <url>] [--json]  # alias\n"
+     << "  finalis-cli fast_sync [--db <dir>] --snapshot <snapshot.bin> [--force] [--dry-run]\n"
      << "  finalis-cli --print-logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli print_logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
@@ -1252,6 +1788,36 @@ int main(int argc, char** argv) {
     return run_repair_state_command(db_path, force, dry_run);
   }
 
+  if (cmd == "sync_doctor") {
+    std::string db_path = default_mainnet_db_path();
+    std::size_t tail = 400;
+    bool as_json = false;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--tail" && i + 1 < argc) tail = static_cast<std::size_t>(std::stoull(argv[++i]));
+      else if (a == "--json") as_json = true;
+    }
+    return run_sync_doctor_command(db_path, tail, as_json);
+  }
+
+  if (cmd == "validator_doctor" || cmd == "operator_doctor") {
+    std::string db_path = default_mainnet_db_path();
+    std::string key_file = default_mainnet_validator_key_path();
+    std::string passphrase;
+    std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    bool as_json = false;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--file" && i + 1 < argc) key_file = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--json") as_json = true;
+    }
+    return run_validator_doctor_command(db_path, key_file, passphrase, rpc_url, as_json);
+  }
+
   if (cmd == "slash_records") {
     std::string db_path = default_mainnet_db_path();
     std::size_t tail = 20;
@@ -1488,6 +2054,21 @@ int main(int argc, char** argv) {
     std::cout << "finalized_transition_hash=" << finalis::hex_encode32(manifest.finalized_hash) << "\n";
     std::cout << "entry_count=" << manifest.entry_count << "\n";
     return 0;
+  }
+
+  if (cmd == "fast_sync") {
+    std::string db_path = default_mainnet_db_path();
+    std::string snapshot_path;
+    bool force = false;
+    bool dry_run = false;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if ((a == "--snapshot" || a == "--in") && i + 1 < argc) snapshot_path = argv[++i];
+      else if (a == "--force" || a == "-y") force = true;
+      else if (a == "--dry-run") dry_run = true;
+    }
+    return run_fast_sync_command(db_path, snapshot_path, force, dry_run);
   }
 
   if (cmd == "genesis_build") {

@@ -337,6 +337,27 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
     record.readiness.observed_network_finalized_height = object_u64(readiness, "observed_network_finalized_height").value_or(0);
     record.readiness.healthy_peer_count = static_cast<std::size_t>(object_u64(readiness, "healthy_peer_count").value_or(0));
     record.readiness.established_peer_count = static_cast<std::size_t>(object_u64(readiness, "established_peer_count").value_or(0));
+    record.readiness.inbound_connected = static_cast<std::size_t>(object_u64(readiness, "inbound_connected").value_or(0));
+    record.readiness.outbound_connected = static_cast<std::size_t>(object_u64(readiness, "outbound_connected").value_or(0));
+    record.readiness.addrman_size = static_cast<std::size_t>(object_u64(readiness, "addrman_size").value_or(0));
+    record.readiness.outbound_target = static_cast<std::size_t>(object_u64(readiness, "outbound_target").value_or(0));
+    record.readiness.advertised_endpoint_present = object_bool(readiness, "advertised_endpoint_present").value_or(false);
+    record.readiness.advertised_endpoint_likely_public =
+        object_bool(readiness, "advertised_endpoint_likely_public").value_or(false);
+    record.readiness.advertised_endpoint = object_string(readiness, "advertised_endpoint").value_or("");
+    record.readiness.stun_enabled = object_bool(readiness, "stun_enabled").value_or(false);
+    record.readiness.stun_last_success = object_bool(readiness, "stun_last_success").value_or(false);
+    record.readiness.stun_last_attempt_unix_ms = object_u64(readiness, "stun_last_attempt_unix_ms").value_or(0);
+    record.readiness.stun_last_success_unix_ms = object_u64(readiness, "stun_last_success_unix_ms").value_or(0);
+    record.readiness.stun_last_server = object_string(readiness, "stun_last_server").value_or("");
+    record.readiness.stun_last_error_code = object_string(readiness, "stun_last_error_code").value_or("");
+    record.readiness.stun_backoff_until_unix_ms = object_u64(readiness, "stun_backoff_until_unix_ms").value_or(0);
+    record.readiness.stun_endpoint_change_pending = object_bool(readiness, "stun_endpoint_change_pending").value_or(false);
+    record.readiness.stun_endpoint_change_hits =
+        static_cast<std::uint32_t>(object_u64(readiness, "stun_endpoint_change_hits").value_or(0));
+    record.readiness.stun_endpoint_change_required_hits =
+        static_cast<std::uint32_t>(object_u64(readiness, "stun_endpoint_change_required_hits").value_or(0));
+    record.readiness.stun_endpoint_candidate = object_string(readiness, "stun_endpoint_candidate").value_or("");
     record.readiness.finalized_lag = object_u64(readiness, "finalized_lag").value_or(0);
     record.readiness.peer_height_disagreement = object_bool(readiness, "peer_height_disagreement").value_or(false);
     record.readiness.next_height_committee_available = object_bool(readiness, "next_height_committee_available").value_or(false);
@@ -346,6 +367,7 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
     record.readiness.registration_ready = object_bool(readiness, "registration_ready").value_or(false);
     record.readiness.readiness_stable_samples = static_cast<std::uint32_t>(object_u64(readiness, "readiness_stable_samples").value_or(0));
     record.readiness.readiness_blockers_csv = object_string(readiness, "readiness_blockers_csv").value_or("");
+    record.readiness.readiness_failure_codes_csv = object_string(readiness, "readiness_failure_codes_csv").value_or("");
     record.readiness.captured_at_unix_ms = object_u64(readiness, "captured_at_unix_ms").value_or(0);
   }
   return record;

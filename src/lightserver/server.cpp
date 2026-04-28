@@ -1020,6 +1020,24 @@ std::string readiness_json(const storage::NodeRuntimeStatusSnapshot& snapshot) {
       << ",\"observed_network_finalized_height\":" << snapshot.observed_network_finalized_height
       << ",\"healthy_peer_count\":" << snapshot.healthy_peer_count
       << ",\"established_peer_count\":" << snapshot.established_peer_count
+      << ",\"inbound_connected\":" << snapshot.inbound_connected
+      << ",\"outbound_connected\":" << snapshot.outbound_connected
+      << ",\"addrman_size\":" << snapshot.addrman_size
+      << ",\"outbound_target\":" << snapshot.outbound_target
+      << ",\"advertised_endpoint_present\":" << (snapshot.advertised_endpoint_present ? "true" : "false")
+      << ",\"advertised_endpoint_likely_public\":" << (snapshot.advertised_endpoint_likely_public ? "true" : "false")
+      << ",\"advertised_endpoint\":\"" << json_escape(snapshot.advertised_endpoint) << "\""
+      << ",\"stun_enabled\":" << (snapshot.stun_enabled ? "true" : "false")
+      << ",\"stun_last_success\":" << (snapshot.stun_last_success ? "true" : "false")
+      << ",\"stun_last_attempt_unix_ms\":" << snapshot.stun_last_attempt_unix_ms
+      << ",\"stun_last_success_unix_ms\":" << snapshot.stun_last_success_unix_ms
+      << ",\"stun_last_server\":\"" << json_escape(snapshot.stun_last_server) << "\""
+      << ",\"stun_last_error_code\":\"" << json_escape(snapshot.stun_last_error_code) << "\""
+      << ",\"stun_backoff_until_unix_ms\":" << snapshot.stun_backoff_until_unix_ms
+      << ",\"stun_endpoint_change_pending\":" << (snapshot.stun_endpoint_change_pending ? "true" : "false")
+      << ",\"stun_endpoint_change_hits\":" << snapshot.stun_endpoint_change_hits
+      << ",\"stun_endpoint_change_required_hits\":" << snapshot.stun_endpoint_change_required_hits
+      << ",\"stun_endpoint_candidate\":\"" << json_escape(snapshot.stun_endpoint_candidate) << "\""
       << ",\"finalized_lag\":" << snapshot.finalized_lag
       << ",\"peer_height_disagreement\":" << (snapshot.peer_height_disagreement ? "true" : "false")
       << ",\"next_height_committee_available\":" << (snapshot.next_height_committee_available ? "true" : "false")
@@ -1029,6 +1047,7 @@ std::string readiness_json(const storage::NodeRuntimeStatusSnapshot& snapshot) {
       << ",\"registration_ready\":" << (snapshot.registration_ready ? "true" : "false")
       << ",\"readiness_stable_samples\":" << snapshot.readiness_stable_samples
       << ",\"readiness_blockers_csv\":\"" << json_escape(snapshot.readiness_blockers_csv) << "\""
+      << ",\"readiness_failure_codes_csv\":\"" << json_escape(snapshot.readiness_failure_codes_csv) << "\""
       << ",\"captured_at_unix_ms\":" << snapshot.captured_at_unix_ms << "}";
   return oss.str();
 }
@@ -1654,6 +1673,60 @@ std::string Server::handle_rpc_body(const std::string& body) {
     else oss << "null";
     oss << ",\"established_peer_count\":";
     if (runtime.has_value()) oss << runtime->established_peer_count;
+    else oss << "null";
+    oss << ",\"inbound_connected\":";
+    if (runtime.has_value()) oss << runtime->inbound_connected;
+    else oss << "null";
+    oss << ",\"outbound_connected\":";
+    if (runtime.has_value()) oss << runtime->outbound_connected;
+    else oss << "null";
+    oss << ",\"addrman_size\":";
+    if (runtime.has_value()) oss << runtime->addrman_size;
+    else oss << "null";
+    oss << ",\"outbound_target\":";
+    if (runtime.has_value()) oss << runtime->outbound_target;
+    else oss << "null";
+    oss << ",\"advertised_endpoint_present\":";
+    if (runtime.has_value()) oss << (runtime->advertised_endpoint_present ? "true" : "false");
+    else oss << "null";
+    oss << ",\"advertised_endpoint_likely_public\":";
+    if (runtime.has_value()) oss << (runtime->advertised_endpoint_likely_public ? "true" : "false");
+    else oss << "null";
+    oss << ",\"advertised_endpoint\":";
+    if (runtime.has_value()) oss << "\"" << json_escape(runtime->advertised_endpoint) << "\"";
+    else oss << "null";
+    oss << ",\"stun_enabled\":";
+    if (runtime.has_value()) oss << (runtime->stun_enabled ? "true" : "false");
+    else oss << "null";
+    oss << ",\"stun_last_success\":";
+    if (runtime.has_value()) oss << (runtime->stun_last_success ? "true" : "false");
+    else oss << "null";
+    oss << ",\"stun_last_attempt_unix_ms\":";
+    if (runtime.has_value()) oss << runtime->stun_last_attempt_unix_ms;
+    else oss << "null";
+    oss << ",\"stun_last_success_unix_ms\":";
+    if (runtime.has_value()) oss << runtime->stun_last_success_unix_ms;
+    else oss << "null";
+    oss << ",\"stun_last_server\":";
+    if (runtime.has_value()) oss << "\"" << json_escape(runtime->stun_last_server) << "\"";
+    else oss << "null";
+    oss << ",\"stun_last_error_code\":";
+    if (runtime.has_value()) oss << "\"" << json_escape(runtime->stun_last_error_code) << "\"";
+    else oss << "null";
+    oss << ",\"stun_backoff_until_unix_ms\":";
+    if (runtime.has_value()) oss << runtime->stun_backoff_until_unix_ms;
+    else oss << "null";
+    oss << ",\"stun_endpoint_change_pending\":";
+    if (runtime.has_value()) oss << (runtime->stun_endpoint_change_pending ? "true" : "false");
+    else oss << "null";
+    oss << ",\"stun_endpoint_change_hits\":";
+    if (runtime.has_value()) oss << runtime->stun_endpoint_change_hits;
+    else oss << "null";
+    oss << ",\"stun_endpoint_change_required_hits\":";
+    if (runtime.has_value()) oss << runtime->stun_endpoint_change_required_hits;
+    else oss << "null";
+    oss << ",\"stun_endpoint_candidate\":";
+    if (runtime.has_value()) oss << "\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
     else oss << "null";
     oss << ",\"protocol_reserve_balance\":";
     if (auto reserve = view->get_protocol_reserve_balance(); reserve.has_value()) oss << *reserve;
