@@ -26,7 +26,7 @@ EXPLORER_PORT="${EXPLORER_PORT:-18080}"
 EXPLORER_BIND="${EXPLORER_BIND:-0.0.0.0}"
 EXPLORER_RPC_URL="${EXPLORER_RPC_URL:-http://127.0.0.1:${LIGHTSERVER_PORT}/rpc}"
 PUBLIC_NODE="${PUBLIC_NODE:-1}"
-OUTBOUND_TARGET="${OUTBOUND_TARGET:-1}"
+OUTBOUND_TARGET="${OUTBOUND_TARGET:-8}"
 HANDSHAKE_TIMEOUT_MS="${HANDSHAKE_TIMEOUT_MS:-30000}"
 FRAME_TIMEOUT_MS="${FRAME_TIMEOUT_MS:-30000}"
 IDLE_TIMEOUT_MS="${IDLE_TIMEOUT_MS:-600000}"
@@ -581,8 +581,7 @@ build_node_command() {
     args+=(
       "--listen"
       "--bind" "0.0.0.0"
-      "--no-dns-seeds"
-      "--outbound-target" "0"
+      "--outbound-target" "${OUTBOUND_TARGET}"
     )
   else
     local peers
@@ -592,7 +591,6 @@ build_node_command() {
       exit 1
     fi
     args+=(
-      "--no-dns-seeds"
       "--outbound-target" "${OUTBOUND_TARGET}"
     )
     # Use one --peers flag per canonical endpoint to avoid persisting a single
