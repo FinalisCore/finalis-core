@@ -8613,8 +8613,10 @@ bool Node::load_state() {
                                                                &derivation_error);
   if (!derived_ok) {
     const bool lane_tip_low = derivation_error.find("frontier-storage-lane-tip-too-low") != std::string::npos;
+    const bool missing_lane_record =
+        derivation_error.find("frontier-storage-missing-lane-record") != std::string::npos;
     bool repaired = false;
-    if (lane_tip_low) {
+    if (lane_tip_low || missing_lane_record) {
       if (auto bad_transition = parse_transition_hash_from_error(derivation_error); bad_transition.has_value()) {
         std::string repair_error;
         std::uint64_t bad_height = 0;
@@ -8624,7 +8626,8 @@ bool Node::load_state() {
         repaired =
             rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, &bad_height, &new_tip_height, &repair_error);
         if (repaired) {
-          log_line("startup-frontier-tail-repair status=ok reason=lane-tip-too-low bad_height=" +
+          const std::string reason = lane_tip_low ? "lane-tip-too-low" : "missing-lane-record";
+          log_line("startup-frontier-tail-repair status=ok reason=" + reason + " bad_height=" +
                    std::to_string(bad_height) + " new_tip_height=" + std::to_string(new_tip_height) +
                    " effective_cap=" + std::to_string(repair_cap));
           auto repaired_tip = db_.get_tip();
