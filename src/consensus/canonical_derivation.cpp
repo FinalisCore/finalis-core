@@ -1035,13 +1035,7 @@ bool load_certified_frontier_record_from_storage(const storage::DB& db, const Fr
   CertifiedIngressLaneRecords lane_records;
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     const auto required_seq = transition.next_vector.lane_max_seq[lane];
-    auto lane_state = db.get_lane_state(static_cast<std::uint32_t>(lane));
-    if (required_seq == 0 && !lane_state.has_value()) continue;
-    if (!lane_state.has_value() || lane_state->max_seq < required_seq) {
-      if (error) *error = "frontier-storage-lane-tip-too-low transition=" + hex_encode32(transition.transition_id()) +
-                          " lane=" + std::to_string(lane) + " required=" + std::to_string(required_seq);
-      return false;
-    }
+    if (required_seq == 0) continue;
     const auto from_seq = transition.prev_vector.lane_max_seq[lane] + 1;
     const auto to_seq = transition.next_vector.lane_max_seq[lane];
     if (to_seq < from_seq) continue;

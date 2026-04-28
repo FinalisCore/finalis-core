@@ -260,6 +260,20 @@ TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback
   snapshot.adaptive_depth_collapse_after_bond_increase = false;
   snapshot.availability_state_rebuild_triggered = true;
   snapshot.availability_state_rebuild_reason = "invalid_persisted_state";
+  snapshot.advertised_endpoint_present = true;
+  snapshot.advertised_endpoint_likely_public = true;
+  snapshot.advertised_endpoint = "198.51.100.8:19440";
+  snapshot.stun_enabled = true;
+  snapshot.stun_last_success = true;
+  snapshot.stun_last_attempt_unix_ms = 1234567;
+  snapshot.stun_last_success_unix_ms = 1234500;
+  snapshot.stun_last_server = "stun.l.google.com:19302";
+  snapshot.stun_last_error_code = "";
+  snapshot.stun_backoff_until_unix_ms = 1234999;
+  snapshot.stun_endpoint_change_pending = true;
+  snapshot.stun_endpoint_change_hits = 2;
+  snapshot.stun_endpoint_change_required_hits = 3;
+  snapshot.stun_endpoint_candidate = "198.51.100.9:19440";
 
   ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
   const auto loaded = db.get_node_runtime_status_snapshot();
@@ -284,6 +298,20 @@ TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback
   ASSERT_EQ(loaded->adaptive_depth_collapse_after_bond_increase, snapshot.adaptive_depth_collapse_after_bond_increase);
   ASSERT_EQ(loaded->availability_state_rebuild_triggered, snapshot.availability_state_rebuild_triggered);
   ASSERT_EQ(loaded->availability_state_rebuild_reason, snapshot.availability_state_rebuild_reason);
+  ASSERT_EQ(loaded->advertised_endpoint_present, snapshot.advertised_endpoint_present);
+  ASSERT_EQ(loaded->advertised_endpoint_likely_public, snapshot.advertised_endpoint_likely_public);
+  ASSERT_EQ(loaded->advertised_endpoint, snapshot.advertised_endpoint);
+  ASSERT_EQ(loaded->stun_enabled, snapshot.stun_enabled);
+  ASSERT_EQ(loaded->stun_last_success, snapshot.stun_last_success);
+  ASSERT_EQ(loaded->stun_last_attempt_unix_ms, snapshot.stun_last_attempt_unix_ms);
+  ASSERT_EQ(loaded->stun_last_success_unix_ms, snapshot.stun_last_success_unix_ms);
+  ASSERT_EQ(loaded->stun_last_server, snapshot.stun_last_server);
+  ASSERT_EQ(loaded->stun_last_error_code, snapshot.stun_last_error_code);
+  ASSERT_EQ(loaded->stun_backoff_until_unix_ms, snapshot.stun_backoff_until_unix_ms);
+  ASSERT_EQ(loaded->stun_endpoint_change_pending, snapshot.stun_endpoint_change_pending);
+  ASSERT_EQ(loaded->stun_endpoint_change_hits, snapshot.stun_endpoint_change_hits);
+  ASSERT_EQ(loaded->stun_endpoint_change_required_hits, snapshot.stun_endpoint_change_required_hits);
+  ASSERT_EQ(loaded->stun_endpoint_candidate, snapshot.stun_endpoint_candidate);
 }
 
 TEST(test_adaptive_epoch_telemetry_db_roundtrip_and_summary) {

@@ -127,6 +127,48 @@ Action:
 2. review the logged relay endpoint and full broadcast payload
 3. use multi-endpoint finalized cross-checks if you operate multiple readers
 
+### Stalled sync triage (`sync_doctor`)
+
+Use `sync_doctor` on the node DB:
+
+- Linux/macOS: `./build/finalis-cli sync_doctor --db ~/.finalis/mainnet --tail 400`
+- Windows: `.\build\finalis-cli.exe sync_doctor --db "$env:APPDATA\.finalis\mainnet" --tail 400`
+
+Run it 3 times, 60 seconds apart, before classifying severity.
+
+Exit code semantics:
+
+- `0`: no findings
+- `2`: one or more findings
+- `1`: tool/runtime error (treat as operational issue)
+
+Severity thresholds (exact):
+
+- `SEV0 (healthy)`: all 3 samples return exit `0`
+- `SEV1 (watch)`: exit `2`, `finalized_lag <= 15`, and neither `no_healthy_peers` nor `bootstrap_sync_incomplete`
+- `SEV2 (degraded)`: any sample has `finalized_lag` in `[16, 63]`
+- `SEV3 (major)`: any sample has `finalized_lag >= 64`
+- `SEV4 (critical)`: any sample has `no_healthy_peers` or `bootstrap_sync_incomplete`
+- `SEV4 (critical)`: `log_uncertified_transition >= 3` in any sample
+- `SEV4 (critical)`: `log_missing_next_cert >= 10` and `log_request_sync_next_height >= 20` in any sample
+
+Required actions by finding:
+
+- `runtime_snapshot_missing`: ensure `finalis-node` is running and writing to the same `--db` path.
+- `no_healthy_peers`: validate seed reachability, firewall/NAT, and that node is pointed to current chain seeds.
+- `bootstrap_sync_incomplete`: compare `rpc_status`/`get_status` across at least 2 independent endpoints before allowing credits.
+- `peer_served_uncertified_transition`: treat as hostile/invalid peer behavior; rotate peer set and refresh seeds.
+- `stalled_on_missing_next_height_certificate`: keep node in read-only settlement mode until lag drops below threshold.
+- `certificate_verification_failures`: treat as potential chain mismatch or local corruption; stop deposits/withdrawals on this node.
+- `future_heights_missing_certificates`: schedule controlled resync of chain state (preserve keystore).
+
+SEV3/SEV4 recovery procedure:
+
+1. Disable this node for settlement reads.
+2. Run identity cross-check (`finalis-cli rpc_compare`) against trusted endpoints.
+3. If identity matches but lag/failures persist for 3 samples, run `repair_state --force` and resync.
+4. Re-enable only after 3 consecutive `sync_doctor` samples return `SEV0`.
+
 ## Retry guidance by retry class
 
 | `retry_class` | Meaning | Operator action |

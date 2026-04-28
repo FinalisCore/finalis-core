@@ -54,6 +54,20 @@ struct NodeConfig {
   std::size_t outbound_target{8};
   std::size_t max_inbound{64};
   std::uint16_t p2p_port{19440};
+  std::string external_endpoint;
+  std::vector<std::string> stun_servers{"stun.l.google.com:19302", "stun.cloudflare.com:3478"};
+  std::uint32_t stun_refresh_interval_ms{120'000};
+  std::uint32_t stun_timeout_ms{750};
+  std::uint32_t stun_max_backoff_ms{900'000};
+  std::uint32_t stun_hysteresis_samples{3};
+  std::uint32_t stun_hysteresis_min_ms{30'000};
+  bool nat_pmp_enabled{true};
+  std::uint32_t nat_pmp_timeout_ms{750};
+  std::uint32_t nat_pmp_refresh_margin_ms{30'000};
+  bool upnp_igd_enabled{true};
+  std::uint32_t upnp_igd_timeout_ms{1'500};
+  std::uint32_t upnp_igd_refresh_margin_ms{30'000};
+  std::uint32_t upnp_igd_lease_seconds{1200};
   std::string lightserver_bind{"127.0.0.1"};
   std::uint16_t lightserver_port{19444};
   std::vector<std::string> peers;
@@ -62,6 +76,9 @@ struct NodeConfig {
   std::string genesis_path;
   bool disable_p2p{false};
   bool reindex_on_start{true};
+  std::uint64_t startup_frontier_repair_max_rollback{10'000};
+  std::uint32_t startup_frontier_repair_adaptive_percent{5};
+  std::uint64_t startup_frontier_repair_absolute_max_rollback{50'000};
   bool log_json{false};
   std::size_t max_committee{MAX_COMMITTEE};
   std::uint32_t handshake_timeout_ms{10'000};
@@ -351,7 +368,8 @@ class Node {
   bool apply_finalized_frontier_effects_locked(const consensus::CanonicalFrontierRecord& record,
                                                std::vector<FinalitySig> finality_signatures,
                                                bool clear_requested_sync = false,
-                                               const std::vector<PubKey32>* effective_committee = nullptr);
+                                               const std::vector<PubKey32>* effective_committee = nullptr,
+                                               std::string* error = nullptr);
 
   std::optional<FrontierProposal> build_frontier_transition_locked(std::uint64_t height, std::uint32_t round);
   bool refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error = nullptr);
@@ -365,7 +383,8 @@ class Node {
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
 
-  bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos);
+  bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
+                                         std::string* error = nullptr);
   bool begin_finalized_write(const Block& block);
   bool finish_finalized_write(const Block& block);
   bool check_no_incomplete_finalized_write() const;
@@ -467,6 +486,11 @@ class Node {
   bool suppress_self_endpoint_locked(const std::string& endpoint);
   bool is_self_endpoint_suppressed_locked(const std::string& endpoint) const;
   std::optional<p2p::NetAddress> addrman_address_for_peer(const p2p::PeerInfo& info) const;
+  std::optional<p2p::NetAddress> advertised_endpoint_locked() const;
+  std::optional<p2p::NetAddress> current_advertised_endpoint() const;
+  void maybe_refresh_nat_pmp_external_endpoint(std::uint64_t now_ms);
+  void maybe_refresh_upnp_igd_external_endpoint(std::uint64_t now_ms);
+  void maybe_refresh_stun_external_endpoint(std::uint64_t now_ms);
   storage::NodeRuntimeStatusSnapshot build_runtime_status_snapshot_locked(std::uint64_t now_ms);
   void score_peer_locked(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
   void score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
@@ -539,6 +563,7 @@ class Node {
   std::map<Hash32, ValidatorJoinRequest> validator_join_requests_;
   std::map<Hash32, std::uint64_t> requested_sync_artifacts_;
   std::map<std::uint64_t, std::uint64_t> requested_sync_heights_;
+  std::map<std::pair<std::uint64_t, int>, std::uint64_t> requested_sync_height_peers_;
   std::map<int, std::string> peer_ip_cache_;
   std::map<int, bool> peer_inbound_cache_;
   std::map<int, std::uint64_t> peer_keepalive_ms_;
@@ -607,6 +632,38 @@ class Node {
   std::uint64_t last_finalized_tip_poll_ms_{0};
   std::uint32_t registration_ready_streak_{0};
   std::uint64_t last_runtime_status_persist_ms_{0};
+  std::optional<p2p::NetAddress> stun_external_endpoint_;
+  std::optional<p2p::NetAddress> stun_candidate_endpoint_;
+  std::uint32_t stun_candidate_hits_{0};
+  std::uint64_t stun_candidate_since_ms_{0};
+  bool stun_endpoint_change_pending_{false};
+  std::uint64_t stun_backoff_until_ms_{0};
+  struct StunServerBackoffState {
+    std::uint32_t fail_count{0};
+    std::uint64_t next_allowed_ms{0};
+    std::uint64_t last_attempt_ms{0};
+    std::string last_error_code;
+  };
+  std::map<std::string, StunServerBackoffState> stun_server_backoff_;
+  std::string stun_last_server_;
+  std::string stun_last_error_code_;
+  bool stun_last_success_{false};
+  std::uint64_t stun_last_attempt_ms_{0};
+  std::uint64_t stun_last_success_ms_{0};
+  std::optional<p2p::NetAddress> nat_pmp_external_endpoint_;
+  bool nat_pmp_last_success_{false};
+  std::string nat_pmp_last_error_code_;
+  std::uint64_t nat_pmp_last_attempt_ms_{0};
+  std::uint64_t nat_pmp_last_success_ms_{0};
+  std::uint64_t nat_pmp_mapping_expires_ms_{0};
+  std::uint64_t nat_pmp_next_refresh_ms_{0};
+  std::optional<p2p::NetAddress> upnp_igd_external_endpoint_;
+  bool upnp_igd_last_success_{false};
+  std::string upnp_igd_last_error_code_;
+  std::uint64_t upnp_igd_last_attempt_ms_{0};
+  std::uint64_t upnp_igd_last_success_ms_{0};
+  std::uint64_t upnp_igd_mapping_expires_ms_{0};
+  std::uint64_t upnp_igd_next_refresh_ms_{0};
   std::vector<std::string> bootstrap_peers_;
   std::vector<std::string> dns_seed_peers_;
   std::set<std::string> preflight_checked_seeds_;

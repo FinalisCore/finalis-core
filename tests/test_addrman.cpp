@@ -38,7 +38,7 @@ TEST(test_addrman_save_load_roundtrip) {
   std::filesystem::remove(path);
 }
 
-TEST(test_addrman_mainnet_port_filter_rejects_non_19440) {
+TEST(test_addrman_explicit_port_filter_rejects_non_matching_port) {
   p2p::AddrMan am(10);
   p2p::AddrPolicy policy;
   policy.required_port = 19440;
@@ -51,7 +51,7 @@ TEST(test_addrman_mainnet_port_filter_rejects_non_19440) {
   ASSERT_EQ(am.size(), 0u);
 }
 
-TEST(test_addrman_mainnet_port_filter_accepts_19440) {
+TEST(test_addrman_explicit_port_filter_accepts_matching_port) {
   p2p::AddrMan am(10);
   p2p::AddrPolicy policy;
   policy.required_port = 19440;
@@ -86,6 +86,21 @@ TEST(test_addrman_policy_filters_loaded_entries) {
   ASSERT_EQ(picks[0].port, 19440);
 
   std::filesystem::remove(path);
+}
+
+TEST(test_addrman_accepts_nondefault_port_without_required_port_policy) {
+  p2p::AddrMan am(10);
+  p2p::AddrPolicy policy;
+  policy.reject_unroutable = true;
+  am.set_policy(policy);
+
+  am.add_or_update({"138.197.113.69", 28001}, 100);
+  am.mark_success({"138.197.113.69", 28001}, 110);
+
+  ASSERT_EQ(am.size(), 1u);
+  const auto picks = am.select_candidates(10, 200);
+  ASSERT_EQ(picks.size(), 1u);
+  ASSERT_EQ(picks[0].port, 28001);
 }
 
 TEST(test_addr_message_roundtrip_ipv4_ipv6) {

@@ -862,6 +862,25 @@ Bytes serialize_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& sn
   w.u8(snapshot.adaptive_prolonged_contract_buildup ? 1 : 0);
   w.u8(snapshot.adaptive_repeated_sticky_fallback ? 1 : 0);
   w.u8(snapshot.adaptive_depth_collapse_after_bond_increase ? 1 : 0);
+  w.u64le(static_cast<std::uint64_t>(snapshot.inbound_connected));
+  w.u64le(static_cast<std::uint64_t>(snapshot.outbound_connected));
+  w.u64le(static_cast<std::uint64_t>(snapshot.addrman_size));
+  w.u64le(static_cast<std::uint64_t>(snapshot.outbound_target));
+  w.varbytes(Bytes(snapshot.readiness_failure_codes_csv.begin(), snapshot.readiness_failure_codes_csv.end()));
+  w.u8(snapshot.advertised_endpoint_present ? 1 : 0);
+  w.u8(snapshot.advertised_endpoint_likely_public ? 1 : 0);
+  w.varbytes(Bytes(snapshot.advertised_endpoint.begin(), snapshot.advertised_endpoint.end()));
+  w.u8(snapshot.stun_enabled ? 1 : 0);
+  w.u8(snapshot.stun_last_success ? 1 : 0);
+  w.u64le(snapshot.stun_last_attempt_unix_ms);
+  w.u64le(snapshot.stun_last_success_unix_ms);
+  w.varbytes(Bytes(snapshot.stun_last_server.begin(), snapshot.stun_last_server.end()));
+  w.varbytes(Bytes(snapshot.stun_last_error_code.begin(), snapshot.stun_last_error_code.end()));
+  w.u64le(snapshot.stun_backoff_until_unix_ms);
+  w.u8(snapshot.stun_endpoint_change_pending ? 1 : 0);
+  w.u32le(snapshot.stun_endpoint_change_hits);
+  w.u32le(snapshot.stun_endpoint_change_required_hits);
+  w.varbytes(Bytes(snapshot.stun_endpoint_candidate.begin(), snapshot.stun_endpoint_candidate.end()));
   return w.take();
 }
 
@@ -1022,6 +1041,60 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
         snapshot.availability_local_eligibility_score =
             static_cast<std::int64_t>(*local_eligibility ^ 0x8000000000000000ULL);
         snapshot.availability_local_seat_budget = *local_seat_budget;
+        if (r.eof()) return true;
+        auto inbound_connected = r.u64le();
+        auto outbound_connected = r.u64le();
+        auto addrman_size = r.u64le();
+        auto outbound_target = r.u64le();
+        auto failure_codes = r.varbytes();
+        if (!inbound_connected || !outbound_connected || !addrman_size || !outbound_target || !failure_codes) {
+          return false;
+        }
+        snapshot.inbound_connected = static_cast<std::size_t>(*inbound_connected);
+        snapshot.outbound_connected = static_cast<std::size_t>(*outbound_connected);
+        snapshot.addrman_size = static_cast<std::size_t>(*addrman_size);
+        snapshot.outbound_target = static_cast<std::size_t>(*outbound_target);
+        snapshot.readiness_failure_codes_csv = std::string(failure_codes->begin(), failure_codes->end());
+        if (r.eof()) return true;
+        auto advertised_present = r.u8();
+        auto advertised_likely_public = r.u8();
+        auto advertised_endpoint = r.varbytes();
+        if (!advertised_present || !advertised_likely_public || !advertised_endpoint) return false;
+        snapshot.advertised_endpoint_present = (*advertised_present != 0);
+        snapshot.advertised_endpoint_likely_public = (*advertised_likely_public != 0);
+        snapshot.advertised_endpoint = std::string(advertised_endpoint->begin(), advertised_endpoint->end());
+        if (r.eof()) return true;
+        auto stun_enabled = r.u8();
+        auto stun_last_success = r.u8();
+        auto stun_last_attempt = r.u64le();
+        auto stun_last_success_ms = r.u64le();
+        auto stun_last_server = r.varbytes();
+        auto stun_last_error = r.varbytes();
+        if (!stun_enabled || !stun_last_success || !stun_last_attempt || !stun_last_success_ms || !stun_last_server ||
+            !stun_last_error) {
+          return false;
+        }
+        snapshot.stun_enabled = (*stun_enabled != 0);
+        snapshot.stun_last_success = (*stun_last_success != 0);
+        snapshot.stun_last_attempt_unix_ms = *stun_last_attempt;
+        snapshot.stun_last_success_unix_ms = *stun_last_success_ms;
+        snapshot.stun_last_server = std::string(stun_last_server->begin(), stun_last_server->end());
+        snapshot.stun_last_error_code = std::string(stun_last_error->begin(), stun_last_error->end());
+        if (r.eof()) return true;
+        auto stun_backoff_until = r.u64le();
+        auto stun_change_pending = r.u8();
+        auto stun_change_hits = r.u32le();
+        auto stun_change_required_hits = r.u32le();
+        auto stun_candidate = r.varbytes();
+        if (!stun_backoff_until || !stun_change_pending || !stun_change_hits || !stun_change_required_hits || !stun_candidate ||
+            !r.eof()) {
+          return false;
+        }
+        snapshot.stun_backoff_until_unix_ms = *stun_backoff_until;
+        snapshot.stun_endpoint_change_pending = (*stun_change_pending != 0);
+        snapshot.stun_endpoint_change_hits = *stun_change_hits;
+        snapshot.stun_endpoint_change_required_hits = *stun_change_required_hits;
+        snapshot.stun_endpoint_candidate = std::string(stun_candidate->begin(), stun_candidate->end());
         return true;
       })) {
     return std::nullopt;
@@ -1773,6 +1846,12 @@ bool DB::set_finalized_ingress_tip(std::uint64_t seq) {
               << " existing=" << *existing << "\n";
     return false;
   }
+  codec::ByteWriter w;
+  w.u64le(seq);
+  return put(key_finalized_ingress_tip(), w.take());
+}
+
+bool DB::force_set_finalized_ingress_tip(std::uint64_t seq) {
   codec::ByteWriter w;
   w.u64le(seq);
   return put(key_finalized_ingress_tip(), w.take());
