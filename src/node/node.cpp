@@ -6520,6 +6520,33 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       {
         std::lock_guard<std::mutex> lk(mu_);
         bool accepted = false;
+        if (!running_) {
+          if (b->certificate.has_value() && proposal->transition.height >= finalized_height_ + 1) {
+            const auto transition_id = proposal->transition.transition_id();
+            auto [it, inserted] = buffered_sync_frontiers_.try_emplace(
+                proposal->transition.height, BufferedSyncFrontier{*proposal, b->certificate, peer_id});
+            if (!inserted) {
+              const auto existing_id = it->second.proposal.transition.transition_id();
+              if (existing_id == transition_id) {
+                if (it->second.from_peer_id == 0) it->second.from_peer_id = peer_id;
+                accepted = true;
+              }
+            } else {
+              accepted = true;
+            }
+            if (accepted) {
+              log_line("startup-sync-defer-transition peer_id=" + std::to_string(peer_id) +
+                       " height=" + std::to_string(proposal->transition.height) + " transition=" +
+                       short_hash_hex(transition_id));
+            }
+          } else {
+            log_line("startup-sync-drop-transition peer_id=" + std::to_string(peer_id) +
+                     " height=" + std::to_string(proposal->transition.height) +
+                     " reason=node-not-running");
+          }
+          if (accepted) accepted_block_payloads_.insert(payload_id);
+          break;
+        }
         if (proposal->transition.height >= finalized_height_ + 1 && !b->certificate.has_value()) {
           log_line("sync-stall reason=peer-served-uncertified-transition peer_id=" + std::to_string(peer_id) +
                    " height=" + std::to_string(proposal->transition.height) + " next_needed=" +
@@ -7142,14 +7169,6 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
              std::to_string(proposal.transition.round) + " transition=" +
              short_hash_hex(proposal.transition.transition_id()) + " reason=" + reason + extra);
   };
-  if (!running_ && from_network) {
-    log_reject("node-not-running");
-    return false;
-  }
-  if (!finalized_identity_valid_for_frontier_runtime(finalized_height_, finalized_identity_)) {
-    log_reject("invalid-finalized-identity");
-    return false;
-  }
   auto clear_sync_request_for_height = [&](std::uint64_t height) {
     requested_sync_heights_.erase(height);
     for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
@@ -7162,6 +7181,24 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
   };
   const auto& transition = proposal.transition;
   const auto transition_id = transition.transition_id();
+  if (!running_ && from_network) {
+    if (certificate.has_value() && transition.height >= finalized_height_ + 1) {
+      const bool buffered = maybe_buffer_sync_frontier_locked(proposal, certificate, from_peer_id);
+      if (buffered) {
+        log_line("startup-sync-defer-transition path=handle_frontier_block_locked peer_id=" + std::to_string(from_peer_id) +
+                 " height=" + std::to_string(transition.height) + " transition=" + short_hash_hex(transition_id));
+      } else {
+        log_reject("node-not-running-buffer-failed");
+      }
+      return buffered;
+    }
+    log_reject("node-not-running");
+    return false;
+  }
+  if (!finalized_identity_valid_for_frontier_runtime(finalized_height_, finalized_identity_)) {
+    log_reject("invalid-finalized-identity");
+    return false;
+  }
   requested_sync_artifacts_.erase(transition_id);
   // Frontier runtime accepts either a transition parent or the explicit
   // genesis block handoff at height 0, so the parent link intentionally uses
