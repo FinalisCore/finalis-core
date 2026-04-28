@@ -76,6 +76,9 @@ struct NodeConfig {
   std::string genesis_path;
   bool disable_p2p{false};
   bool reindex_on_start{true};
+  std::uint64_t startup_frontier_repair_max_rollback{10'000};
+  std::uint32_t startup_frontier_repair_adaptive_percent{5};
+  std::uint64_t startup_frontier_repair_absolute_max_rollback{50'000};
   bool log_json{false};
   std::size_t max_committee{MAX_COMMITTEE};
   std::uint32_t handshake_timeout_ms{10'000};

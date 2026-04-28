@@ -1025,6 +1025,114 @@ std::vector<std::string> resolve_ipv4_addresses(const std::string& host) {
   return std::vector<std::string>(unique.begin(), unique.end());
 }
 
+std::optional<Hash32> parse_transition_hash_from_error(const std::string& error) {
+  const std::string marker = "transition=";
+  const auto pos = error.find(marker);
+  if (pos == std::string::npos) return std::nullopt;
+  const std::size_t start = pos + marker.size();
+  if (start + 64 > error.size()) return std::nullopt;
+  const auto hex = error.substr(start, 64);
+  auto bytes = hex_decode(hex);
+  if (!bytes.has_value() || bytes->size() != 32) return std::nullopt;
+  Hash32 out{};
+  std::copy(bytes->begin(), bytes->end(), out.begin());
+  return out;
+}
+
+std::uint64_t compute_startup_frontier_repair_cap(const NodeConfig& cfg, std::uint64_t frontier_tip_height) {
+  const std::uint64_t base_cap = std::max<std::uint64_t>(1, cfg.startup_frontier_repair_max_rollback);
+  const std::uint64_t abs_cap =
+      std::max<std::uint64_t>(base_cap, cfg.startup_frontier_repair_absolute_max_rollback);
+  std::uint64_t adaptive_cap = base_cap;
+  if (cfg.startup_frontier_repair_adaptive_percent > 0 && frontier_tip_height > 0) {
+    const unsigned __int128 pct = static_cast<unsigned __int128>(frontier_tip_height) *
+                                  static_cast<unsigned __int128>(cfg.startup_frontier_repair_adaptive_percent);
+    const std::uint64_t pct_cap = static_cast<std::uint64_t>((pct + 99) / 100);  // ceil(tip * percent / 100)
+    adaptive_cap = std::max<std::uint64_t>(adaptive_cap, pct_cap);
+  }
+  return std::min<std::uint64_t>(adaptive_cap, abs_cap);
+}
+
+bool rollback_frontier_tail_from_transition(storage::DB& db, const Hash32& bad_transition_id,
+                                            std::uint64_t max_rollback_blocks, std::uint64_t* bad_height,
+                                            std::uint64_t* new_tip_height, std::string* error) {
+  const auto maybe_max_frontier = db.get_finalized_frontier_height();
+  if (!maybe_max_frontier.has_value()) {
+    if (error) *error = "missing-finalized-frontier-height";
+    return false;
+  }
+  const std::uint64_t max_frontier = *maybe_max_frontier;
+  std::optional<std::uint64_t> matched_height;
+  for (std::uint64_t h = max_frontier; h >= 1; --h) {
+    auto id = db.get_frontier_transition_by_height(h);
+    if (id.has_value() && *id == bad_transition_id) {
+      matched_height = h;
+      break;
+    }
+    if (h == 1) break;
+  }
+  if (!matched_height.has_value()) {
+    if (error) *error = "bad-transition-height-not-found";
+    return false;
+  }
+  const std::uint64_t bad_h = *matched_height;
+  if (max_frontier < bad_h) {
+    if (error) *error = "invalid-frontier-range";
+    return false;
+  }
+  const std::uint64_t rollback_count = max_frontier - bad_h + 1;
+  if (rollback_count > std::max<std::uint64_t>(1, max_rollback_blocks)) {
+    if (error) {
+      *error = "rollback-cap-exceeded need=" + std::to_string(rollback_count) +
+               " cap=" + std::to_string(max_rollback_blocks);
+    }
+    return false;
+  }
+
+  for (std::uint64_t h = max_frontier; h >= bad_h; --h) {
+    const auto transition_id = db.get_frontier_transition_by_height(h);
+    if (transition_id.has_value()) {
+      (void)db.erase(storage::key_frontier_transition(*transition_id));
+    }
+    (void)db.erase(storage::key_frontier_height(h));
+    (void)db.erase(storage::key_finality_certificate_height(h));
+    (void)db.erase(storage::key_height(h));
+    if (h == bad_h) break;
+  }
+
+  const std::uint64_t repaired_tip = bad_h - 1;
+  (void)db.erase(storage::key_finalized_frontier_height());
+  if (!db.set_finalized_frontier_height(repaired_tip)) {
+    if (error) *error = "set-finalized-frontier-height-failed";
+    return false;
+  }
+
+  Hash32 tip_hash = zero_hash();
+  if (repaired_tip > 0) {
+    auto id = db.get_frontier_transition_by_height(repaired_tip);
+    if (!id.has_value()) {
+      if (error) *error = "repaired-tip-transition-missing";
+      return false;
+    }
+    tip_hash = *id;
+    if (!db.set_height_hash(repaired_tip, tip_hash)) {
+      if (error) *error = "set-height-hash-failed";
+      return false;
+    }
+  }
+  if (!db.set_tip(storage::TipState{repaired_tip, tip_hash})) {
+    if (error) *error = "set-tip-failed";
+    return false;
+  }
+  if (!db.flush()) {
+    if (error) *error = "flush-failed";
+    return false;
+  }
+  if (bad_height) *bad_height = bad_h;
+  if (new_tip_height) *new_tip_height = repaired_tip;
+  return true;
+}
+
 std::set<std::string> local_ipv4_addresses() {
   std::set<std::string> ips;
 #ifdef _WIN32
@@ -6194,9 +6302,15 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       if (!transition.has_value()) return;
       auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
       if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) return;
+      auto cert = db_.get_finality_certificate_by_height(transition->height);
+      if (transition->height <= finalized_height_ && !cert.has_value()) {
+        log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
+                 " hash=" + short_hash_hex(gb->hash) + " status=missing-certificate");
+        return;
+      }
       p2p::TransitionMsg msg;
       msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
-      msg.certificate = db_.get_finality_certificate_by_height(transition->height);
+      msg.certificate = cert;
       const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
       log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
                " hash=" + short_hash_hex(gb->hash) + " status=" + (ok ? "ok" : "failed"));
@@ -6238,9 +6352,16 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                  " got=" + std::to_string(ordered_records.size()) + ")");
         return;
       }
+      auto cert = db_.get_finality_certificate_by_height(transition->height);
+      if (transition->height <= finalized_height_ && !cert.has_value()) {
+        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
+                 " status=missing-certificate");
+        return;
+      }
       p2p::TransitionMsg msg;
       msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
-      msg.certificate = db_.get_finality_certificate_by_height(transition->height);
+      msg.certificate = cert;
       const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
       log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
                " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
@@ -6357,7 +6478,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       {
         std::lock_guard<std::mutex> lk(mu_);
         bool accepted = false;
-        if (proposal->transition.height > finalized_height_ + 1 && !b->certificate.has_value()) {
+        if (proposal->transition.height >= finalized_height_ + 1 && !b->certificate.has_value()) {
           log_line("sync-stall reason=peer-served-uncertified-transition peer_id=" + std::to_string(peer_id) +
                    " height=" + std::to_string(proposal->transition.height) + " next_needed=" +
                    std::to_string(finalized_height_ + 1) + " transition=" +
@@ -6365,8 +6486,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "uncertified-sync-transition");
           requested_sync_height_peers_.erase({proposal->transition.height, peer_id});
           (void)maybe_request_forward_sync_block_locked();
-        }
-        if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
+        } else if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
           accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id);
           if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
         } else {
@@ -6975,26 +7095,50 @@ bool Node::handle_timeout_vote(const TimeoutVote& vote, bool from_network, int f
 bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                                         const std::optional<FinalityCertificate>& certificate, int from_peer_id,
                                         bool from_network) {
-  if (!running_ && from_network) return false;
-  if (!finalized_identity_valid_for_frontier_runtime(finalized_height_, finalized_identity_)) return false;
+  auto log_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
+    log_line("frontier-block-reject height=" + std::to_string(proposal.transition.height) + " round=" +
+             std::to_string(proposal.transition.round) + " transition=" +
+             short_hash_hex(proposal.transition.transition_id()) + " reason=" + reason + extra);
+  };
+  if (!running_ && from_network) {
+    log_reject("node-not-running");
+    return false;
+  }
+  if (!finalized_identity_valid_for_frontier_runtime(finalized_height_, finalized_identity_)) {
+    log_reject("invalid-finalized-identity");
+    return false;
+  }
+  auto clear_sync_request_for_height = [&](std::uint64_t height) {
+    requested_sync_heights_.erase(height);
+    for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
+      if (it->first.first == height) {
+        it = requested_sync_height_peers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  };
   const auto& transition = proposal.transition;
   const auto transition_id = transition.transition_id();
   requested_sync_artifacts_.erase(transition_id);
-  requested_sync_heights_.erase(transition.height);
-  for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
-    if (it->first.first == transition.height) {
-      it = requested_sync_height_peers_.erase(it);
-    } else {
-      ++it;
-    }
-  }
   // Frontier runtime accepts either a transition parent or the explicit
   // genesis block handoff at height 0, so the parent link intentionally uses
   // the raw finalized identity value here.
   if (transition.height <= finalized_height_) {
-    return transition.height == finalized_height_ && transition_id == finalized_identity_.id;
+    const bool is_current_tip = transition.height == finalized_height_ && transition_id == finalized_identity_.id;
+    if (is_current_tip) clear_sync_request_for_height(transition.height);
+    if (!is_current_tip) {
+      log_reject("stale-or-mismatch-height",
+                 " local_height=" + std::to_string(finalized_height_) +
+                     " local_transition=" + short_hash_hex(finalized_identity_.id));
+    }
+    return is_current_tip;
   }
   if (transition.height > finalized_height_ + 1 || transition.prev_finalized_hash != finalized_identity_.id) {
+    log_reject("noncontiguous-or-prev-mismatch",
+               " local_next=" + std::to_string(finalized_height_ + 1) +
+                   " local_prev=" + short_hash_hex(finalized_identity_.id) +
+                   " remote_prev=" + short_hash_hex(transition.prev_finalized_hash));
     return false;
   }
   if (canonical_state_.has_value()) (void)ensure_settlement_onboarding_scores_loaded_locked(transition.height);
@@ -7109,11 +7253,17 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       return false;
     }
     if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, true, &expected_committee)) {
+      log_reject("apply-finalized-frontier-effects-failed");
       return false;
     }
+    clear_sync_request_for_height(transition.height);
     broadcast_finalized_tip();
     if (from_peer_id != 0) (void)maybe_request_forward_sync_block_locked(from_peer_id);
     return true;
+  }
+  if (from_network && transition.height == finalized_height_ + 1) {
+    log_reject("missing-certificate-for-next-height");
+    return false;
   }
 
   std::string validation_error;
@@ -7167,6 +7317,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
   }
   candidate_frontier_proposals_[transition_id] = proposal;
   candidate_block_sizes_[transition_id] = proposal.serialize().size();
+  clear_sync_request_for_height(transition.height);
 
   (void)finalize_if_quorum(transition_id, transition.height, transition.round);
   return true;
@@ -8377,11 +8528,43 @@ bool Node::load_state() {
   consensus::CanonicalDerivedState derived_state;
   std::string derivation_error;
   consensus::CanonicalDerivedState frontier_state;
-  if (!consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, canonical_genesis_state, db_,
-                                                               &frontier_state, &derivation_error)) {
-    log_line("finalized-state-invariant-violation source=load-state-frontier-derive detail=" + derivation_error);
-    std::cerr << "load_state: frontier derive failed: " << derivation_error << "\n";
-    return false;
+  bool derived_ok =
+      consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, canonical_genesis_state, db_, &frontier_state,
+                                                               &derivation_error);
+  if (!derived_ok) {
+    const bool lane_tip_low = derivation_error.find("frontier-storage-lane-tip-too-low") != std::string::npos;
+    bool repaired = false;
+    if (lane_tip_low) {
+      if (auto bad_transition = parse_transition_hash_from_error(derivation_error); bad_transition.has_value()) {
+        std::string repair_error;
+        std::uint64_t bad_height = 0;
+        std::uint64_t new_tip_height = 0;
+        const std::uint64_t frontier_tip_height = db_.get_finalized_frontier_height().value_or(finalized_height_);
+        const std::uint64_t repair_cap = compute_startup_frontier_repair_cap(cfg_, frontier_tip_height);
+        repaired =
+            rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, &bad_height, &new_tip_height, &repair_error);
+        if (repaired) {
+          log_line("startup-frontier-tail-repair status=ok reason=lane-tip-too-low bad_height=" +
+                   std::to_string(bad_height) + " new_tip_height=" + std::to_string(new_tip_height) +
+                   " effective_cap=" + std::to_string(repair_cap));
+          auto repaired_tip = db_.get_tip();
+          finalized_height_ = repaired_tip.has_value() ? repaired_tip->height : 0;
+          finalized_identity_ =
+              finalized_identity_for_runtime_tip(finalized_height_, repaired_tip.has_value() ? repaired_tip->hash : zero_hash());
+          derivation_error.clear();
+          derived_ok = consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, canonical_genesis_state, db_,
+                                                                               &frontier_state, &derivation_error);
+        } else {
+          log_line("startup-frontier-tail-repair status=failed reason=" + repair_error +
+                   " effective_cap=" + std::to_string(repair_cap));
+        }
+      }
+    }
+    if (!derived_ok) {
+      log_line("finalized-state-invariant-violation source=load-state-frontier-derive detail=" + derivation_error);
+      std::cerr << "load_state: frontier derive failed: " << derivation_error << "\n";
+      return false;
+    }
   }
   derived_state = std::move(frontier_state);
   if (derived_state.finalized_height > 0 && !derived_state.finalized_identity.is_transition()) {
@@ -10040,6 +10223,18 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.upnp_igd_lease_seconds = std::max<std::uint32_t>(120, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--startup-frontier-repair-max-rollback") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.startup_frontier_repair_max_rollback = std::max<std::uint64_t>(1, std::stoull(*v));
+    } else if (a == "--startup-frontier-repair-adaptive-percent") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.startup_frontier_repair_adaptive_percent = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--startup-frontier-repair-absolute-max-rollback") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.startup_frontier_repair_absolute_max_rollback = std::max<std::uint64_t>(1, std::stoull(*v));
     } else if (a == "--listen") {
       cfg.listen = true;
     } else if (a == "--with-lightserver") {
