@@ -1851,6 +1851,12 @@ bool DB::set_finalized_ingress_tip(std::uint64_t seq) {
   return put(key_finalized_ingress_tip(), w.take());
 }
 
+bool DB::force_set_finalized_ingress_tip(std::uint64_t seq) {
+  codec::ByteWriter w;
+  w.u64le(seq);
+  return put(key_finalized_ingress_tip(), w.take());
+}
+
 std::optional<std::uint64_t> DB::get_finalized_ingress_tip() const {
   auto b = get(key_finalized_ingress_tip());
   if (!b.has_value()) return std::nullopt;

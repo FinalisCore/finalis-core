@@ -1108,6 +1108,7 @@ bool rollback_frontier_tail_from_transition(storage::DB& db, const Hash32& bad_t
   }
 
   Hash32 tip_hash = zero_hash();
+  std::uint64_t repaired_ingress_tip = 0;
   if (repaired_tip > 0) {
     auto id = db.get_frontier_transition_by_height(repaired_tip);
     if (!id.has_value()) {
@@ -1119,6 +1120,21 @@ bool rollback_frontier_tail_from_transition(storage::DB& db, const Hash32& bad_t
       if (error) *error = "set-height-hash-failed";
       return false;
     }
+    auto transition_bytes = db.get_frontier_transition(*id);
+    if (!transition_bytes.has_value()) {
+      if (error) *error = "repaired-tip-transition-bytes-missing";
+      return false;
+    }
+    auto transition = FrontierTransition::parse(*transition_bytes);
+    if (!transition.has_value()) {
+      if (error) *error = "repaired-tip-transition-parse-failed";
+      return false;
+    }
+    repaired_ingress_tip = transition->next_frontier;
+  }
+  if (!db.force_set_finalized_ingress_tip(repaired_ingress_tip)) {
+    if (error) *error = "force-set-finalized-ingress-tip-failed";
+    return false;
   }
   if (!db.set_tip(storage::TipState{repaired_tip, tip_hash})) {
     if (error) *error = "set-tip-failed";
@@ -8242,7 +8258,17 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       }
     }
   }
-  if (!db_.set_finalized_ingress_tip(record.transition.next_frontier)) return fail("set-finalized-ingress-tip-failed");
+  if (!db_.set_finalized_ingress_tip(record.transition.next_frontier)) {
+    const auto existing_ingress_tip = db_.get_finalized_ingress_tip();
+    const bool can_force_rewind = existing_ingress_tip.has_value() && *existing_ingress_tip > record.transition.next_frontier &&
+                                  record.transition.height == finalized_height_ + 1;
+    if (!can_force_rewind || !db_.force_set_finalized_ingress_tip(record.transition.next_frontier)) {
+      return fail("set-finalized-ingress-tip-failed");
+    }
+    log_line("finalized-ingress-tip-rewind-forced height=" + std::to_string(record.transition.height) +
+             " existing=" + std::to_string(*existing_ingress_tip) +
+             " target=" + std::to_string(record.transition.next_frontier));
+  }
   if (!db_.put_frontier_transition(record.transition.transition_id(), record.transition.serialize())) {
     return fail("put-frontier-transition-failed transition=" + short_hash_hex(record.transition.transition_id()));
   }

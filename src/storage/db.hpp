@@ -325,6 +325,7 @@ class DB {
   std::vector<Bytes> load_ingress_slice(std::uint64_t from_exclusive, std::uint64_t to_inclusive) const;
   bool ingress_slice_matches(std::uint64_t from_exclusive, const std::vector<Bytes>& ordered_records) const;
   bool set_finalized_ingress_tip(std::uint64_t seq);
+  bool force_set_finalized_ingress_tip(std::uint64_t seq);
   std::optional<std::uint64_t> get_finalized_ingress_tip() const;
   bool put_ingress_certificate(std::uint32_t lane, std::uint64_t seq, const Bytes& cert_bytes);
   std::optional<Bytes> get_ingress_certificate(std::uint32_t lane, std::uint64_t seq) const;
