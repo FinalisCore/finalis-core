@@ -383,7 +383,8 @@ class Node {
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
 
-  bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos);
+  bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
+                                         std::string* error = nullptr);
   bool begin_finalized_write(const Block& block);
   bool finish_finalized_write(const Block& block);
   bool check_no_incomplete_finalized_write() const;

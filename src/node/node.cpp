@@ -4397,8 +4397,10 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     return false;
   }
 
-  if (!persist_finalized_frontier_record(record, utxos_)) {
-    if (error) *error = "persist-frontier-record-failed";
+  std::string persist_error;
+  if (!persist_finalized_frontier_record(record, utxos_, &persist_error)) {
+    if (error) *error = "persist-frontier-record-failed" +
+                        (persist_error.empty() ? std::string() : ":" + persist_error);
     return false;
   }
   if (!db_.put_finality_certificate(certificate)) {
@@ -8192,27 +8194,34 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int 
   }
 }
 
-bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos) {
+bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
+                                             std::string* error) {
+  auto fail = [&](const std::string& reason) {
+    if (error) *error = reason;
+    return false;
+  };
   if (record.transition.next_frontier !=
       record.transition.prev_frontier + static_cast<std::uint64_t>(record.ordered_records.size())) {
     log_line("finalized-state-invariant-violation source=runtime-write-frontier-continuity height=" +
              std::to_string(record.transition.height));
-    return false;
+    return fail("frontier-continuity-mismatch");
   }
 
   std::uint64_t seq = record.transition.prev_frontier;
   std::uint32_t tx_index = 0;
   for (const auto& ordered_record : record.ordered_records) {
     ++seq;
-    if (!db_.put_ingress_record(seq, ordered_record)) return false;
+    if (!db_.put_ingress_record(seq, ordered_record)) return fail("put-ingress-record-failed seq=" + std::to_string(seq));
     auto tx = parse_any_tx(ordered_record);
     if (!tx.has_value()) {
       log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
                std::to_string(record.transition.height));
-      return false;
+      return fail("ordered-record-tx-parse-failed seq=" + std::to_string(seq));
     }
     const Hash32 txid = txid_any(*tx);
-    if (!db_.put_tx_index(txid, record.transition.height, tx_index++, ordered_record)) return false;
+    if (!db_.put_tx_index(txid, record.transition.height, tx_index++, ordered_record)) {
+      return fail("put-tx-index-failed txid=" + short_hash_hex(txid));
+    }
     if (std::holds_alternative<Tx>(*tx)) {
       const auto& legacy = std::get<Tx>(*tx);
       for (const auto& input : legacy.inputs) {
@@ -8221,21 +8230,36 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
         const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
         if (!spent_out.has_value()) continue;
         const auto spent_scripthash = crypto::sha256(spent_out->script_pubkey);
-        if (!db_.add_script_history(spent_scripthash, record.transition.height, txid)) return false;
+        if (!db_.add_script_history(spent_scripthash, record.transition.height, txid)) {
+          return fail("add-script-history-spent-failed txid=" + short_hash_hex(txid));
+        }
       }
       for (const auto& output : legacy.outputs) {
         const auto received_scripthash = crypto::sha256(output.script_pubkey);
-        if (!db_.add_script_history(received_scripthash, record.transition.height, txid)) return false;
+        if (!db_.add_script_history(received_scripthash, record.transition.height, txid)) {
+          return fail("add-script-history-received-failed txid=" + short_hash_hex(txid));
+        }
       }
     }
   }
-  if (!db_.set_finalized_ingress_tip(record.transition.next_frontier)) return false;
-  if (!db_.put_frontier_transition(record.transition.transition_id(), record.transition.serialize())) return false;
-  if (!db_.map_height_to_frontier_transition(record.transition.height, record.transition.transition_id())) return false;
-  if (!db_.set_finalized_frontier_height(record.transition.height)) return false;
-  if (!db_.set_height_hash(record.transition.height, record.transition.transition_id())) return false;
-  if (!db_.set_tip(storage::TipState{record.transition.height, record.transition.transition_id()})) return false;
-  if (!db_.put(kStartupReplayModeKey, Bytes{'f', 'r', 'o', 'n', 't', 'i', 'e', 'r'})) return false;
+  if (!db_.set_finalized_ingress_tip(record.transition.next_frontier)) return fail("set-finalized-ingress-tip-failed");
+  if (!db_.put_frontier_transition(record.transition.transition_id(), record.transition.serialize())) {
+    return fail("put-frontier-transition-failed transition=" + short_hash_hex(record.transition.transition_id()));
+  }
+  if (!db_.map_height_to_frontier_transition(record.transition.height, record.transition.transition_id())) {
+    return fail("map-height-to-frontier-transition-failed height=" + std::to_string(record.transition.height));
+  }
+  if (!db_.set_finalized_frontier_height(record.transition.height)) return fail("set-finalized-frontier-height-failed");
+  if (!db_.set_height_hash(record.transition.height, record.transition.transition_id())) {
+    return fail("set-height-hash-failed height=" + std::to_string(record.transition.height));
+  }
+  if (!db_.set_tip(storage::TipState{record.transition.height, record.transition.transition_id()})) {
+    return fail("set-tip-failed");
+  }
+  if (!db_.put(kStartupReplayModeKey, Bytes{'f', 'r', 'o', 'n', 't', 'i', 'e', 'r'})) {
+    return fail("set-startup-replay-mode-failed");
+  }
+  if (error) error->clear();
   return true;
 }
 
