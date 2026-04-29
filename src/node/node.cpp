@@ -2804,6 +2804,7 @@ bool Node::init() {
       handle_message(peer_id, msg_type, payload);
     });
     p2p_.set_accept_filter([this](const std::string& ip) {
+      if (is_bootstrap_peer_ip(ip)) return true;
       return !discipline_.is_banned(ip, now_unix());
     });
     p2p_.set_read_timeout_override([this](int peer_id, const p2p::PeerInfo& info) -> std::optional<std::uint32_t> {
@@ -2829,7 +2830,8 @@ bool Node::init() {
         const auto info = p2p_.get_peer_info(peer_id);
         log_line("peer-connected peer_id=" + std::to_string(peer_id) + " dir=" + (info.inbound ? "inbound" : "outbound") +
                  " endpoint=" + detail);
-        if (discipline_.is_banned(endpoint_to_ip(detail), now_unix())) {
+        const std::string ip = endpoint_to_ip(detail);
+        if (!is_bootstrap_peer_ip(ip) && discipline_.is_banned(ip, now_unix())) {
           p2p_.disconnect_peer(peer_id);
           return;
         }
@@ -9882,6 +9884,9 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   }
 
   const std::uint64_t window_end = std::min(target_peer_height, finalized_height_ + kForwardSyncWindow);
+  constexpr std::size_t kMaxSyncRequestsPerPeerPerSweep = 8;
+  std::unordered_map<int, std::size_t> sent_per_peer;
+  sent_per_peer.reserve(eligible_peers.size());
   bool requested_any = false;
   for (std::uint64_t height = next_height; height <= window_end; ++height) {
     if (db_.get_height_hash(height).has_value()) continue;
@@ -9893,6 +9898,8 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     std::size_t sent_for_height = 0;
     for (const auto& [peer_id, _peer_height] : eligible_peers) {
       if (sent_for_height >= fanout) break;
+      auto sent_it = sent_per_peer.find(peer_id);
+      if (sent_it != sent_per_peer.end() && sent_it->second >= kMaxSyncRequestsPerPeerPerSweep) continue;
       auto req_it = requested_sync_height_peers_.find({height, peer_id});
       if (req_it != requested_sync_height_peers_.end() && tms < req_it->second + retry_ms) continue;
 
@@ -9902,6 +9909,7 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
                std::to_string(height) + " fanout=" + std::to_string(fanout));
       (void)p2p_.send_to(peer_id, p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
                          p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{height}), true);
+      ++sent_per_peer[peer_id];
       requested_any = true;
       ++sent_for_height;
     }
@@ -10071,7 +10079,7 @@ void Node::try_connect_bootstrap_peers() {
         if (is_self_endpoint_suppressed_locked(peer)) continue;
       }
       if (has_peer_endpoint(host, port)) continue;
-      if (discipline_.is_banned(host, now_unix())) continue;
+      if (!is_bootstrap_peer_ip(host) && discipline_.is_banned(host, now_unix())) continue;
       if (!seed_preflight_ok(host, port)) continue;
       log_line("peer-connect-attempt endpoint=" + peer + " source=" + candidate.source);
       {
@@ -10414,8 +10422,8 @@ void Node::score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::str
 void Node::score_peer_locked(int peer_id, p2p::MisbehaviorReason reason, const std::string& note) {
   const std::string ip = peer_ip_for_locked(peer_id);
   if (ip.empty()) return;
-  if (reason == p2p::MisbehaviorReason::RATE_LIMIT && is_bootstrap_peer_ip(ip) && established_peer_count() <= 1) {
-    log_line("peer-rate-limit-ignored ip=" + ip + " note=" + note + " reason=bootstrap-liveness-guard");
+  if (reason == p2p::MisbehaviorReason::RATE_LIMIT && is_bootstrap_peer_ip(ip)) {
+    log_line("peer-rate-limit-ignored ip=" + ip + " note=" + note + " reason=bootstrap-peer");
     return;
   }
   const p2p::PeerScoreStatus st = discipline_.add_score(ip, reason, now_unix());
@@ -10481,7 +10489,7 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
     case p2p::MsgType::TRANSITION:
       return get(msg_type, cfg_.block_rate_capacity, cfg_.block_rate_refill).consume(1.0, nms);
     case p2p::MsgType::GET_TRANSITION:
-      return get(msg_type, 30.0, 15.0).consume(1.0, nms);
+      return get(msg_type, 120.0, 60.0).consume(1.0, nms);
     case p2p::MsgType::GET_FINALIZED_TIP:
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);
     case p2p::MsgType::GET_INGRESS_TIPS:
@@ -10505,7 +10513,7 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
     case p2p::MsgType::EPOCH_TICKET:
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);
     case p2p::MsgType::GET_TRANSITION_BY_HEIGHT:
-      return get(msg_type, 30.0, 15.0).consume(1.0, nms);
+      return get(msg_type, 120.0, 60.0).consume(1.0, nms);
     case p2p::MsgType::GET_EPOCH_TICKETS:
       return get(msg_type, 10.0, 5.0).consume(1.0, nms);
     case p2p::MsgType::EPOCH_TICKETS:
