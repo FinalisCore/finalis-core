@@ -1053,25 +1053,34 @@ std::uint64_t compute_startup_frontier_repair_cap(const NodeConfig& cfg, std::ui
   return std::min<std::uint64_t>(adaptive_cap, abs_cap);
 }
 
-std::uint64_t compute_startup_frontier_repair_floor(storage::DB& db) {
+std::uint64_t compute_startup_frontier_repair_floor(storage::DB& db, std::uint64_t frontier_tip_height) {
   std::uint64_t floor_height = 0;
+
+  auto bounded_floor_candidate = [&](std::uint64_t epoch_start_height) {
+    if (epoch_start_height == 0) return;
+    const std::uint64_t candidate = epoch_start_height - 1;
+    // Never let future/non-finalized epoch cache rows force rollback floor above
+    // the locally finalized frontier tip.
+    if (candidate > frontier_tip_height) return;
+    floor_height = std::max<std::uint64_t>(floor_height, candidate);
+  };
 
   const auto checkpoints = db.load_finalized_committee_checkpoints();
   if (!checkpoints.empty()) {
     const auto max_epoch_start = checkpoints.rbegin()->first;
-    if (max_epoch_start > 0) floor_height = std::max<std::uint64_t>(floor_height, max_epoch_start - 1);
+    bounded_floor_candidate(max_epoch_start);
   }
 
   const auto snapshots = db.load_epoch_committee_snapshots();
   if (!snapshots.empty()) {
     const auto max_epoch_start = snapshots.rbegin()->first;
-    if (max_epoch_start > 0) floor_height = std::max<std::uint64_t>(floor_height, max_epoch_start - 1);
+    bounded_floor_candidate(max_epoch_start);
   }
 
   const auto freeze_markers = db.load_epoch_committee_freeze_markers();
   if (!freeze_markers.empty()) {
     const auto max_epoch_start = freeze_markers.rbegin()->first;
-    if (max_epoch_start > 0) floor_height = std::max<std::uint64_t>(floor_height, max_epoch_start - 1);
+    bounded_floor_candidate(max_epoch_start);
   }
 
   return floor_height;
@@ -6485,9 +6494,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
       if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) return;
       auto cert = db_.get_finality_certificate_by_height(transition->height);
-      if (transition->height <= finalized_height_ && !cert.has_value()) {
+      if (!cert.has_value()) {
         log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
                  " hash=" + short_hash_hex(gb->hash) + " status=missing-certificate");
+        return;
+      }
+      if (cert->height != transition->height || cert->frontier_transition_id != gb->hash) {
+        log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
+                 " hash=" + short_hash_hex(gb->hash) + " status=certificate-mismatch");
         return;
       }
       p2p::TransitionMsg msg;
@@ -6535,10 +6549,16 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         return;
       }
       auto cert = db_.get_finality_certificate_by_height(transition->height);
-      if (transition->height <= finalized_height_ && !cert.has_value()) {
+      if (!cert.has_value()) {
         log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
                  " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
                  " status=missing-certificate");
+        return;
+      }
+      if (cert->height != transition->height || cert->frontier_transition_id != *bh) {
+        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
+                 " status=certificate-mismatch");
         return;
       }
       p2p::TransitionMsg msg;
@@ -8800,7 +8820,7 @@ bool Node::load_state() {
         std::uint64_t new_tip_height = 0;
         const std::uint64_t frontier_tip_height = db_.get_finalized_frontier_height().value_or(finalized_height_);
         const std::uint64_t repair_cap = compute_startup_frontier_repair_cap(cfg_, frontier_tip_height);
-        const std::uint64_t repair_floor = compute_startup_frontier_repair_floor(db_);
+        const std::uint64_t repair_floor = compute_startup_frontier_repair_floor(db_, frontier_tip_height);
         repaired =
             rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, repair_floor, &bad_height,
                                                    &new_tip_height, &repair_error);
@@ -8826,11 +8846,18 @@ bool Node::load_state() {
             std::string checkpoint_error;
             if (load_trusted_runtime_checkpoint_from_cache(derivation_cfg, db_, finalized_height_, finalized_identity_.id,
                                                            &checkpoint_state, &checkpoint_error)) {
+              if (checkpoint_state.finalized_height < repair_floor) {
+                checkpoint_error = "checkpoint-below-rollback-floor checkpoint_height=" +
+                                   std::to_string(checkpoint_state.finalized_height) +
+                                   " floor=" + std::to_string(repair_floor);
+                log_line("startup-checkpoint-resume status=failed reason=" + checkpoint_error);
+              } else {
               log_line("startup-checkpoint-resume status=ok source=trusted-cache finalized_height=" +
                        std::to_string(checkpoint_state.finalized_height) + " transition=" +
                        short_hash_hex(checkpoint_state.finalized_identity.id));
               frontier_state = std::move(checkpoint_state);
               derived_ok = true;
+              }
             } else {
               log_line("startup-checkpoint-resume status=failed reason=" + checkpoint_error);
             }
