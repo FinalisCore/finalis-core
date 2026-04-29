@@ -2210,9 +2210,42 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   state.finalized_frontier_vector = transition->next_vector;
   state.finalized_lane_roots = consensus::FrontierLaneRoots{};
   for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
-    if (auto lane_state = db.get_lane_state(lane); lane_state.has_value()) {
-      state.finalized_lane_roots[lane] = lane_state->lane_root;
+    Hash32 lane_root = zero_hash();
+    const std::uint64_t max_seq = state.finalized_frontier_vector.lane_max_seq[lane];
+    for (std::uint64_t seq = 1; seq <= max_seq; ++seq) {
+      auto cert_bytes = db.get_ingress_certificate(lane, seq);
+      if (!cert_bytes.has_value()) {
+        if (error) {
+          *error = "checkpoint-lane-root-rebuild-missing-certificate lane=" + std::to_string(lane) +
+                   " seq=" + std::to_string(seq);
+        }
+        return false;
+      }
+      auto cert = IngressCertificate::parse(*cert_bytes);
+      if (!cert.has_value()) {
+        if (error) {
+          *error = "checkpoint-lane-root-rebuild-invalid-certificate lane=" + std::to_string(lane) +
+                   " seq=" + std::to_string(seq);
+        }
+        return false;
+      }
+      if (cert->lane != lane || cert->seq != seq) {
+        if (error) {
+          *error = "checkpoint-lane-root-rebuild-certificate-index-mismatch lane=" + std::to_string(lane) +
+                   " seq=" + std::to_string(seq);
+        }
+        return false;
+      }
+      if (cert->prev_lane_root != lane_root) {
+        if (error) {
+          *error = "checkpoint-lane-root-rebuild-prev-root-mismatch lane=" + std::to_string(lane) +
+                   " seq=" + std::to_string(seq);
+        }
+        return false;
+      }
+      lane_root = consensus::compute_lane_root_append(lane_root, cert->tx_hash);
     }
+    state.finalized_lane_roots[lane] = lane_root;
   }
 
   state.utxos = db.load_utxos_v2();
