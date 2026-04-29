@@ -6567,6 +6567,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
       log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
                " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
+               " cert_height=" + std::to_string(cert->height) +
                " status=" + (ok ? "ok" : "failed"));
       break;
     }
@@ -6657,6 +6658,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     case p2p::MsgType::TRANSITION: {
       auto b = p2p::de_transition(payload);
       if (!b.has_value()) {
+        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                 " type=TRANSITION reason=decode-failed payload_size=" + std::to_string(payload.size()));
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
         score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-msg");
@@ -6668,6 +6671,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       }
       auto proposal = FrontierProposal::parse(b->frontier_proposal_bytes);
       if (!proposal.has_value()) {
+        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                 " type=TRANSITION reason=frontier-parse-failed payload_size=" + std::to_string(payload.size()) +
+                 " proposal_size=" + std::to_string(b->frontier_proposal_bytes.size()));
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
         score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-frontier-parse");
@@ -6677,6 +6683,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                " height=" + std::to_string(proposal->transition.height) + " hash=" +
                short_hash_hex(proposal->transition.transition_id()) + " prev=" +
                short_hash_hex(proposal->transition.prev_finalized_hash));
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (proposal->transition.height == finalized_height_ + 1) {
+          log_line("sync-recv-next-height peer_id=" + std::to_string(peer_id) +
+                   " height=" + std::to_string(proposal->transition.height) + " has_cert=" +
+                   (b->certificate.has_value() ? "yes" : "no"));
+        }
+      }
       {
         std::lock_guard<std::mutex> lk(mu_);
         bool accepted = false;
