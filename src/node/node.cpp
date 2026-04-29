@@ -6088,22 +6088,25 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   }
 
   (void)db_.put_epoch_ticket(stored);
-  // Consensus note: replayed closed-epoch ticket handling must not diverge by
-  // platform. Keep onboarding score derivation identical across OS targets.
-  best[stored.participant_pubkey] = stored;
-  (void)db_.put_best_epoch_ticket(stored);
-  const auto score_work_hash = stored.work_hash;
-  const auto onboarding_score =
-      static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(score_work_hash)));
-  auto& reward_state = epoch_reward_states_[stored.epoch];
-  reward_state.epoch_start_height = stored.epoch;
-  reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
-  if (canonical_state_.has_value()) {
-    auto& canonical_reward_state = canonical_state_->epoch_reward_states[stored.epoch];
-    canonical_reward_state.epoch_start_height = stored.epoch;
-    canonical_reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
-    canonical_state_->state_commitment =
-        consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+  if (improved) {
+    // Consensus-critical: never let replay/reconcile of a worse ticket
+    // overwrite best epoch ticket state, otherwise onboarding score units can
+    // become message-order dependent and cause settlement commitment drift.
+    best[stored.participant_pubkey] = stored;
+    (void)db_.put_best_epoch_ticket(stored);
+    const auto score_work_hash = stored.work_hash;
+    const auto onboarding_score =
+        static_cast<std::uint64_t>(std::max<std::uint8_t>(1, consensus::leading_zero_bits(score_work_hash)));
+    auto& reward_state = epoch_reward_states_[stored.epoch];
+    reward_state.epoch_start_height = stored.epoch;
+    reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
+    if (canonical_state_.has_value()) {
+      auto& canonical_reward_state = canonical_state_->epoch_reward_states[stored.epoch];
+      canonical_reward_state.epoch_start_height = stored.epoch;
+      canonical_reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
+      canonical_state_->state_commitment =
+          consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+    }
   }
   auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,
                                                              cfg_.max_committee, &validators_.all(), true);
