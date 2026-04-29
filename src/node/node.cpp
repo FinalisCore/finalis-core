@@ -6151,7 +6151,18 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     if (invalid_message_payloads_.contains(payload_id)) {
       known_invalid = true;
     } else {
-      rate_limited = !check_rate_limit_locked(peer_id, msg_type);
+      bool bypass_rate_limit = false;
+      if (msg_type == p2p::MsgType::TRANSITION) {
+        const bool sync_backlog = !requested_sync_heights_.empty() || !requested_sync_artifacts_.empty();
+        bool peer_is_ahead = false;
+        if (auto it = peer_finalized_tips_.find(peer_id); it != peer_finalized_tips_.end()) {
+          peer_is_ahead = it->second.height > finalized_height_;
+        }
+        // During forward sync, dropping TRANSITION frames via generic msg-rate
+        // control can deadlock catch-up at next_height.
+        if (sync_backlog || peer_is_ahead) bypass_rate_limit = true;
+      }
+      rate_limited = !bypass_rate_limit && !check_rate_limit_locked(peer_id, msg_type);
     }
   }
   if (known_invalid) {
@@ -6159,6 +6170,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     return;
   }
   if (rate_limited) {
+    log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) + " type=" + std::string(msg_type_name(msg_type)) +
+             " reason=rate-limited payload_size=" + std::to_string(payload.size()));
     score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");
     return;
   }
