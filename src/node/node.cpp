@@ -9633,11 +9633,19 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     const auto outstanding = requested_sync_heights_.find(next_height);
     if (outstanding != requested_sync_heights_.end()) {
       const std::uint64_t age_ms = tms >= outstanding->second ? (tms - outstanding->second) : 0;
-      if (age_ms > std::max<std::uint64_t>(3000, retry_ms * 2)) {
+      const std::uint64_t no_progress_ms =
+          tms >= last_finalized_progress_ms_ ? (tms - last_finalized_progress_ms_) : 0;
+      const bool stale_enough = no_progress_ms >= 60'000;
+      const bool age_enough = age_ms > std::max<std::uint64_t>(3000, retry_ms * 2);
+      const bool cooldown_elapsed =
+          (last_missing_next_cert_stall_log_ms_ == 0) || (tms >= last_missing_next_cert_stall_log_ms_ + 10'000);
+      if (stale_enough && age_enough && cooldown_elapsed) {
         log_line("sync-stall reason=missing-certificate-for-next-height next_height=" + std::to_string(next_height) +
                  " local_height=" + std::to_string(finalized_height_) + " target_peer_id=" +
                  std::to_string(target_peer) + " target_peer_height=" + std::to_string(target_peer_height) +
-                 " request_age_ms=" + std::to_string(age_ms));
+                 " request_age_ms=" + std::to_string(age_ms) +
+                 " no_progress_ms=" + std::to_string(no_progress_ms));
+        last_missing_next_cert_stall_log_ms_ = tms;
       }
     }
   }
@@ -9762,75 +9770,103 @@ bool Node::endpoint_matches_local_listener(const std::string& host, std::uint16_
 }
 
 void Node::try_connect_bootstrap_peers() {
+  constexpr std::uint64_t kSyncBootstrapLagThreshold = 128;
+  constexpr std::size_t kSyncBootstrapHealthyPeerThreshold = 2;
+
   struct Candidate {
     std::string peer;
     const char* source;
   };
-  std::vector<Candidate> candidates;
+  std::vector<Candidate> static_candidates;
+  std::vector<Candidate> addrman_candidates;
   std::set<std::string> seen;
+  bool sync_bootstrap_mode = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    std::size_t healthy_established_peers = 0;
+    std::uint64_t best_peer_height = finalized_height_;
+    for (const auto& [peer_id, tip] : peer_finalized_tips_) {
+      const auto info = p2p_.get_peer_info(peer_id);
+      if (!info.established()) continue;
+      ++healthy_established_peers;
+      if (tip.height > best_peer_height) best_peer_height = tip.height;
+    }
+    const std::uint64_t finalized_lag = best_peer_height > finalized_height_ ? (best_peer_height - finalized_height_) : 0;
+    sync_bootstrap_mode =
+        finalized_lag > kSyncBootstrapLagThreshold || healthy_established_peers < kSyncBootstrapHealthyPeerThreshold;
+
     for (const auto& p : bootstrap_peers_) {
-      if (seen.insert(p).second) candidates.push_back({p, "seeds"});
+      if (seen.insert(p).second) static_candidates.push_back({p, "seeds"});
     }
     for (const auto& p : dns_seed_peers_) {
-      if (seen.insert(p).second) candidates.push_back({p, "dns"});
+      if (seen.insert(p).second) static_candidates.push_back({p, "dns"});
     }
     if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) {
       for (const auto& a : addrman_.select_candidates(cfg_.outbound_target * 2, now_unix())) {
-        if (seen.insert(a.key()).second) candidates.push_back({a.key(), "addrman"});
+        if (seen.insert(a.key()).second) addrman_candidates.push_back({a.key(), "addrman"});
       }
     }
   }
 
-  for (const auto& candidate : candidates) {
-    const auto& peer = candidate.peer;
-    const auto pos = peer.find(':');
-    if (pos == std::string::npos) continue;
-    const std::string host = peer.substr(0, pos);
-    std::uint16_t port = 0;
-    try {
-      port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
-    } catch (...) {
-      continue;
-    }
-    std::vector<std::string> resolved_self_endpoints;
-    if (endpoint_matches_local_listener(host, port, &resolved_self_endpoints)) {
-      bool should_log = false;
+  auto attempt_candidates = [&](const std::vector<Candidate>& candidates) {
+    for (const auto& candidate : candidates) {
+      const auto& peer = candidate.peer;
+      const auto pos = peer.find(':');
+      if (pos == std::string::npos) continue;
+      const std::string host = peer.substr(0, pos);
+      std::uint16_t port = 0;
+      try {
+        port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
+      } catch (...) {
+        continue;
+      }
+      std::vector<std::string> resolved_self_endpoints;
+      if (endpoint_matches_local_listener(host, port, &resolved_self_endpoints)) {
+        bool should_log = false;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          should_log = suppress_self_endpoint_locked(peer);
+          for (const auto& endpoint : resolved_self_endpoints) {
+            should_log = suppress_self_endpoint_locked(endpoint) || should_log;
+          }
+        }
+        if (should_log) {
+          log_line("self-peer-skip endpoint=" + peer + " reason=local-endpoint-match");
+        }
+        continue;
+      }
       {
         std::lock_guard<std::mutex> lk(mu_);
-        should_log = suppress_self_endpoint_locked(peer);
-        for (const auto& endpoint : resolved_self_endpoints) {
-          should_log = suppress_self_endpoint_locked(endpoint) || should_log;
-        }
+        if (is_self_endpoint_suppressed_locked(peer)) continue;
       }
-      if (should_log) {
-        log_line("self-peer-skip endpoint=" + peer + " reason=local-endpoint-match");
+      if (has_peer_endpoint(host, port)) continue;
+      if (discipline_.is_banned(host, now_unix())) continue;
+      if (!seed_preflight_ok(host, port)) continue;
+      log_line("peer-connect-attempt endpoint=" + peer + " source=" + candidate.source);
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        addrman_.mark_attempt(p2p::NetAddress{host, port}, now_unix());
       }
-      continue;
+      if (!p2p_.connect_to(host, port)) {
+        log_line("peer-connect-failed endpoint=" + peer + " source=" + candidate.source + " reason=tcp-connect-failed");
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        last_bootstrap_source_ = candidate.source;
+        addrman_.mark_success(p2p::NetAddress{host, port}, now_unix());
+      }
     }
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (is_self_endpoint_suppressed_locked(peer)) continue;
-    }
-    if (has_peer_endpoint(host, port)) continue;
-    if (discipline_.is_banned(host, now_unix())) continue;
-    if (!seed_preflight_ok(host, port)) continue;
-    log_line("peer-connect-attempt endpoint=" + peer + " source=" + candidate.source);
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      addrman_.mark_attempt(p2p::NetAddress{host, port}, now_unix());
-    }
-    if (!p2p_.connect_to(host, port)) {
-      log_line("peer-connect-failed endpoint=" + peer + " source=" + candidate.source + " reason=tcp-connect-failed");
-      continue;
-    }
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      last_bootstrap_source_ = candidate.source;
-      addrman_.mark_success(p2p::NetAddress{host, port}, now_unix());
-    }
-  }
+  };
+
+  attempt_candidates(static_candidates);
+  if (sync_bootstrap_mode && outbound_peer_count() >= cfg_.outbound_target) return;
+  if (sync_bootstrap_mode && outbound_peer_count() > 0) return;
+
+  // In normal mode we blend in addrman for broader discovery.
+  // In sync bootstrap mode we spill to addrman only when static/dns could not
+  // establish any outbound path.
+  attempt_candidates(addrman_candidates);
 }
 
 std::optional<p2p::NetAddress> Node::advertised_endpoint_locked() const {
