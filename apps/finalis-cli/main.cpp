@@ -974,6 +974,8 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
   std::size_t stall_cert_verification_failed = 0;
   std::size_t request_sync_next_height = 0;
   std::size_t recv_finalized_tip = 0;
+  std::size_t served_transition_missing_certificate = 0;
+  std::size_t served_transition_certificate_mismatch = 0;
   for (const auto& line : lines) {
     if (line.find("sync-stall reason=missing-certificate-for-next-height") != std::string::npos) {
       ++stall_missing_next_cert;
@@ -986,6 +988,14 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
     }
     if (line.find("request-sync-next-height") != std::string::npos) ++request_sync_next_height;
     if (line.find("recv FINALIZED_TIP") != std::string::npos) ++recv_finalized_tip;
+    if (line.find("send-frontier") != std::string::npos &&
+        line.find("status=missing-certificate") != std::string::npos) {
+      ++served_transition_missing_certificate;
+    }
+    if (line.find("send-frontier") != std::string::npos &&
+        line.find("status=certificate-mismatch") != std::string::npos) {
+      ++served_transition_certificate_mismatch;
+    }
   }
 
   std::vector<std::string> findings;
@@ -997,6 +1007,8 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
   if (stall_uncertified_transition > 0) findings.push_back("peer_served_uncertified_transition");
   if (stall_missing_next_cert > 0) findings.push_back("stalled_on_missing_next_height_certificate");
   if (stall_cert_verification_failed > 0) findings.push_back("certificate_verification_failures");
+  if (served_transition_missing_certificate > 0) findings.push_back("served_transition_missing_certificate");
+  if (served_transition_certificate_mismatch > 0) findings.push_back("served_transition_certificate_mismatch");
 
   if (as_json) {
     std::ostringstream j;
@@ -1043,6 +1055,8 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
     j << ",\"certificate_verification_failed\":" << stall_cert_verification_failed;
     j << ",\"request_sync_next_height\":" << request_sync_next_height;
     j << ",\"recv_finalized_tip\":" << recv_finalized_tip;
+    j << ",\"served_transition_missing_certificate\":" << served_transition_missing_certificate;
+    j << ",\"served_transition_certificate_mismatch\":" << served_transition_certificate_mismatch;
     j << "}";
     j << ",\"findings\":[";
     for (std::size_t i = 0; i < findings.size(); ++i) {
@@ -1098,6 +1112,8 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
   std::cout << "log_certificate_verification_failed=" << stall_cert_verification_failed << "\n";
   std::cout << "log_request_sync_next_height=" << request_sync_next_height << "\n";
   std::cout << "log_recv_finalized_tip=" << recv_finalized_tip << "\n";
+  std::cout << "log_served_transition_missing_certificate=" << served_transition_missing_certificate << "\n";
+  std::cout << "log_served_transition_certificate_mismatch=" << served_transition_certificate_mismatch << "\n";
   std::cout << "findings=";
   if (findings.empty()) {
     std::cout << "none\n";
@@ -1711,6 +1727,20 @@ int main(int argc, char** argv) {
     const std::string journal_cmd =
         "journalctl -u " + service_name + " -n " + std::to_string(tail * 10) + " --no-pager -l -q 2>/dev/null";
     const auto journal_lines = run_command_lines(journal_cmd);
+    std::size_t served_transition_missing_certificate = 0;
+    std::size_t served_transition_certificate_mismatch = 0;
+    for (const auto& line : journal_lines) {
+      if (line.find("send-frontier") != std::string::npos &&
+          line.find("status=missing-certificate") != std::string::npos) {
+        ++served_transition_missing_certificate;
+      }
+      if (line.find("send-frontier") != std::string::npos &&
+          line.find("status=certificate-mismatch") != std::string::npos) {
+        ++served_transition_certificate_mismatch;
+      }
+    }
+    std::cout << "served_transition_missing_certificate=" << served_transition_missing_certificate << "\n";
+    std::cout << "served_transition_certificate_mismatch=" << served_transition_certificate_mismatch << "\n";
     const std::vector<std::string> security_needles = {
         "peer-banned", "peer-soft-muted", "reject-version", "drop-addr", "pre-handshake", "timeout",
         "adopted bootstrap validator", "bootstrap single-node genesis", "pending_joiners"};
