@@ -2804,6 +2804,7 @@ bool Node::init() {
       handle_message(peer_id, msg_type, payload);
     });
     p2p_.set_accept_filter([this](const std::string& ip) {
+      if (is_bootstrap_peer_ip(ip)) return true;
       return !discipline_.is_banned(ip, now_unix());
     });
     p2p_.set_read_timeout_override([this](int peer_id, const p2p::PeerInfo& info) -> std::optional<std::uint32_t> {
@@ -2829,7 +2830,8 @@ bool Node::init() {
         const auto info = p2p_.get_peer_info(peer_id);
         log_line("peer-connected peer_id=" + std::to_string(peer_id) + " dir=" + (info.inbound ? "inbound" : "outbound") +
                  " endpoint=" + detail);
-        if (discipline_.is_banned(endpoint_to_ip(detail), now_unix())) {
+        const std::string ip = endpoint_to_ip(detail);
+        if (!is_bootstrap_peer_ip(ip) && discipline_.is_banned(ip, now_unix())) {
           p2p_.disconnect_peer(peer_id);
           return;
         }
@@ -10077,7 +10079,7 @@ void Node::try_connect_bootstrap_peers() {
         if (is_self_endpoint_suppressed_locked(peer)) continue;
       }
       if (has_peer_endpoint(host, port)) continue;
-      if (discipline_.is_banned(host, now_unix())) continue;
+      if (!is_bootstrap_peer_ip(host) && discipline_.is_banned(host, now_unix())) continue;
       if (!seed_preflight_ok(host, port)) continue;
       log_line("peer-connect-attempt endpoint=" + peer + " source=" + candidate.source);
       {
