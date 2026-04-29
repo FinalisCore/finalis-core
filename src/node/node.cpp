@@ -2234,14 +2234,13 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
     state.availability_state = *availability;
   }
 
-  auto cert = db.get_finality_certificate_by_height(finalized_height);
-  if (cert.has_value()) {
-    state.last_finality_certificate_hash = consensus::canonical_finality_certificate_hash(*cert);
+  // Frontier replay chains prev_finality_link_hash against the finalized
+  // transition-derived link hash, not the serialized finality certificate hash.
+  state.last_finality_certificate_hash = consensus::frontier_finality_link_hash(*transition);
+  if (auto cert = db.get_finality_certificate_by_height(finalized_height); cert.has_value()) {
     state.finalized_block_metadata[finalized_height] =
         consensus::CanonicalFinalizedMetadata{cert->round, cert->quorum_threshold,
                                               static_cast<std::uint32_t>(cert->signatures.size())};
-  } else {
-    state.last_finality_certificate_hash = zero_hash();
   }
 
   if (auto b = db.get(kValidatorJoinWindowStartKey); b.has_value()) {
