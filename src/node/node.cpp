@@ -1053,8 +1053,33 @@ std::uint64_t compute_startup_frontier_repair_cap(const NodeConfig& cfg, std::ui
   return std::min<std::uint64_t>(adaptive_cap, abs_cap);
 }
 
+std::uint64_t compute_startup_frontier_repair_floor(storage::DB& db) {
+  std::uint64_t floor_height = 0;
+
+  const auto checkpoints = db.load_finalized_committee_checkpoints();
+  if (!checkpoints.empty()) {
+    const auto max_epoch_start = checkpoints.rbegin()->first;
+    if (max_epoch_start > 0) floor_height = std::max<std::uint64_t>(floor_height, max_epoch_start - 1);
+  }
+
+  const auto snapshots = db.load_epoch_committee_snapshots();
+  if (!snapshots.empty()) {
+    const auto max_epoch_start = snapshots.rbegin()->first;
+    if (max_epoch_start > 0) floor_height = std::max<std::uint64_t>(floor_height, max_epoch_start - 1);
+  }
+
+  const auto freeze_markers = db.load_epoch_committee_freeze_markers();
+  if (!freeze_markers.empty()) {
+    const auto max_epoch_start = freeze_markers.rbegin()->first;
+    if (max_epoch_start > 0) floor_height = std::max<std::uint64_t>(floor_height, max_epoch_start - 1);
+  }
+
+  return floor_height;
+}
+
 bool rollback_frontier_tail_from_transition(storage::DB& db, const Hash32& bad_transition_id,
-                                            std::uint64_t max_rollback_blocks, std::uint64_t* bad_height,
+                                            std::uint64_t max_rollback_blocks, std::uint64_t rollback_floor_height,
+                                            std::uint64_t* bad_height,
                                             std::uint64_t* new_tip_height, std::string* error) {
   const auto maybe_max_frontier = db.get_finalized_frontier_height();
   if (!maybe_max_frontier.has_value()) {
@@ -1088,6 +1113,16 @@ bool rollback_frontier_tail_from_transition(storage::DB& db, const Hash32& bad_t
     }
     return false;
   }
+  const std::uint64_t repaired_tip = bad_h - 1;
+  if (repaired_tip < rollback_floor_height) {
+    if (error) {
+      *error = "rollback-floor-breached requested_new_tip=" + std::to_string(repaired_tip) +
+               " floor=" + std::to_string(rollback_floor_height) +
+               " bad_height=" + std::to_string(bad_h) +
+               " current_tip=" + std::to_string(max_frontier);
+    }
+    return false;
+  }
 
   for (std::uint64_t h = max_frontier; h >= bad_h; --h) {
     const auto transition_id = db.get_frontier_transition_by_height(h);
@@ -1100,7 +1135,6 @@ bool rollback_frontier_tail_from_transition(storage::DB& db, const Hash32& bad_t
     if (h == bad_h) break;
   }
 
-  const std::uint64_t repaired_tip = bad_h - 1;
   (void)db.erase(storage::key_finalized_frontier_height());
   if (!db.set_finalized_frontier_height(repaired_tip)) {
     if (error) *error = "set-finalized-frontier-height-failed";
@@ -2130,6 +2164,112 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
   codec::ByteWriter w_liveness;
   w_liveness.u64le(state.validator_liveness_window_start_height);
   if (!db.put(kValidatorLivenessWindowStartKey, w_liveness.take())) return false;
+  return true;
+}
+
+bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDerivationConfig& cfg, storage::DB& db,
+                                                std::uint64_t finalized_height, const Hash32& finalized_hash,
+                                                consensus::CanonicalDerivedState* out, std::string* error) {
+  if (!out) {
+    if (error) *error = "null-output";
+    return false;
+  }
+  if (finalized_height == 0) {
+    if (error) *error = "no-finalized-height";
+    return false;
+  }
+
+  auto transition_bytes = db.get_frontier_transition(finalized_hash);
+  if (!transition_bytes.has_value()) {
+    if (error) *error = "checkpoint-tip-transition-missing";
+    return false;
+  }
+  auto transition = FrontierTransition::parse(*transition_bytes);
+  if (!transition.has_value()) {
+    if (error) *error = "checkpoint-tip-transition-parse-failed";
+    return false;
+  }
+  if (transition->height != finalized_height) {
+    if (error) *error = "checkpoint-tip-height-mismatch";
+    return false;
+  }
+
+  consensus::CanonicalDerivedState state;
+  state.finalized_height = finalized_height;
+  state.finalized_identity = consensus::FinalizedIdentity::transition(finalized_hash);
+  state.finalized_frontier = transition->next_frontier;
+  state.finalized_frontier_vector = transition->next_vector;
+  state.finalized_lane_roots = consensus::FrontierLaneRoots{};
+  for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
+    if (auto lane_state = db.get_lane_state(lane); lane_state.has_value()) {
+      state.finalized_lane_roots[lane] = lane_state->lane_root;
+    }
+  }
+
+  state.utxos = db.load_utxos_v2();
+  state.validators.mutable_all() = db.load_validators();
+  state.validator_join_requests = db.load_validator_join_requests();
+  state.epoch_reward_states = db.load_epoch_reward_settlements();
+  state.finalized_committee_checkpoints = db.load_finalized_committee_checkpoints();
+
+  if (auto reserve = db.get_protocol_reserve_balance(); reserve.has_value()) {
+    state.protocol_reserve_balance_units = *reserve;
+  }
+  if (auto persisted_randomness = db.get(kFinalizedRandomnessKey);
+      persisted_randomness.has_value() && persisted_randomness->size() == 32) {
+    std::copy(persisted_randomness->begin(), persisted_randomness->end(), state.finalized_randomness.begin());
+  } else {
+    state.finalized_randomness = consensus::initial_finalized_randomness(cfg.network, cfg.chain_id);
+  }
+  if (auto availability = db.get_availability_persistent_state(); availability.has_value()) {
+    state.availability_state = *availability;
+  }
+
+  auto cert = db.get_finality_certificate_by_height(finalized_height);
+  if (cert.has_value()) {
+    state.last_finality_certificate_hash = consensus::canonical_finality_certificate_hash(*cert);
+    state.finalized_block_metadata[finalized_height] =
+        consensus::CanonicalFinalizedMetadata{cert->round, cert->quorum_threshold,
+                                              static_cast<std::uint32_t>(cert->signatures.size())};
+  } else {
+    state.last_finality_certificate_hash = zero_hash();
+  }
+
+  if (auto b = db.get(kValidatorJoinWindowStartKey); b.has_value()) {
+    codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto v = r.u64le();
+      if (!v.has_value()) return false;
+      state.validator_join_window_start_height = *v;
+      return true;
+    });
+  }
+  if (auto b = db.get(kValidatorJoinWindowCountKey); b.has_value()) {
+    codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto v = r.u32le();
+      if (!v.has_value()) return false;
+      state.validator_join_count_in_window = *v;
+      return true;
+    });
+  }
+  if (auto b = db.get(kValidatorLivenessWindowStartKey); b.has_value()) {
+    codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto v = r.u64le();
+      if (!v.has_value()) return false;
+      state.validator_liveness_window_start_height = *v;
+      return true;
+    });
+  }
+
+  state.state_commitment = consensus::consensus_state_commitment(cfg, state);
+  if (auto persisted = db.get_consensus_state_commitment_cache(); persisted.has_value()) {
+    if (persisted->height != state.finalized_height || persisted->hash != state.finalized_identity.id ||
+        persisted->commitment != state.state_commitment) {
+      if (error) *error = "checkpoint-commitment-cache-mismatch";
+      return false;
+    }
+  }
+
+  *out = std::move(state);
   return true;
 }
 
@@ -8660,13 +8800,16 @@ bool Node::load_state() {
         std::uint64_t new_tip_height = 0;
         const std::uint64_t frontier_tip_height = db_.get_finalized_frontier_height().value_or(finalized_height_);
         const std::uint64_t repair_cap = compute_startup_frontier_repair_cap(cfg_, frontier_tip_height);
+        const std::uint64_t repair_floor = compute_startup_frontier_repair_floor(db_);
         repaired =
-            rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, &bad_height, &new_tip_height, &repair_error);
+            rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, repair_floor, &bad_height,
+                                                   &new_tip_height, &repair_error);
         if (repaired) {
           const std::string reason = lane_tip_low ? "lane-tip-too-low" : "missing-lane-record";
           log_line("startup-frontier-tail-repair status=ok reason=" + reason + " bad_height=" +
                    std::to_string(bad_height) + " new_tip_height=" + std::to_string(new_tip_height) +
-                   " effective_cap=" + std::to_string(repair_cap));
+                   " effective_cap=" + std::to_string(repair_cap) +
+                   " rollback_floor_height=" + std::to_string(repair_floor));
           auto repaired_tip = db_.get_tip();
           finalized_height_ = repaired_tip.has_value() ? repaired_tip->height : 0;
           finalized_identity_ =
@@ -8676,7 +8819,22 @@ bool Node::load_state() {
                                                                                &frontier_state, &derivation_error);
         } else {
           log_line("startup-frontier-tail-repair status=failed reason=" + repair_error +
-                   " effective_cap=" + std::to_string(repair_cap));
+                   " effective_cap=" + std::to_string(repair_cap) +
+                   " rollback_floor_height=" + std::to_string(repair_floor));
+          if (repair_error.find("rollback-floor-breached") != std::string::npos) {
+            consensus::CanonicalDerivedState checkpoint_state;
+            std::string checkpoint_error;
+            if (load_trusted_runtime_checkpoint_from_cache(derivation_cfg, db_, finalized_height_, finalized_identity_.id,
+                                                           &checkpoint_state, &checkpoint_error)) {
+              log_line("startup-checkpoint-resume status=ok source=trusted-cache finalized_height=" +
+                       std::to_string(checkpoint_state.finalized_height) + " transition=" +
+                       short_hash_hex(checkpoint_state.finalized_identity.id));
+              frontier_state = std::move(checkpoint_state);
+              derived_ok = true;
+            } else {
+              log_line("startup-checkpoint-resume status=failed reason=" + checkpoint_error);
+            }
+          }
         }
       }
     }
