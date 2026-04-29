@@ -9633,11 +9633,19 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     const auto outstanding = requested_sync_heights_.find(next_height);
     if (outstanding != requested_sync_heights_.end()) {
       const std::uint64_t age_ms = tms >= outstanding->second ? (tms - outstanding->second) : 0;
-      if (age_ms > std::max<std::uint64_t>(3000, retry_ms * 2)) {
+      const std::uint64_t no_progress_ms =
+          tms >= last_finalized_progress_ms_ ? (tms - last_finalized_progress_ms_) : 0;
+      const bool stale_enough = no_progress_ms >= 60'000;
+      const bool age_enough = age_ms > std::max<std::uint64_t>(3000, retry_ms * 2);
+      const bool cooldown_elapsed =
+          (last_missing_next_cert_stall_log_ms_ == 0) || (tms >= last_missing_next_cert_stall_log_ms_ + 10'000);
+      if (stale_enough && age_enough && cooldown_elapsed) {
         log_line("sync-stall reason=missing-certificate-for-next-height next_height=" + std::to_string(next_height) +
                  " local_height=" + std::to_string(finalized_height_) + " target_peer_id=" +
                  std::to_string(target_peer) + " target_peer_height=" + std::to_string(target_peer_height) +
-                 " request_age_ms=" + std::to_string(age_ms));
+                 " request_age_ms=" + std::to_string(age_ms) +
+                 " no_progress_ms=" + std::to_string(no_progress_ms));
+        last_missing_next_cert_stall_log_ms_ = tms;
       }
     }
   }
