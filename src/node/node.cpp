@@ -6169,6 +6169,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     }
   }
   if (known_invalid) {
+    log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) + " type=" +
+             std::string(msg_type_name(msg_type)) + " reason=known-invalid-payload payload_id=" +
+             short_hash_hex(payload_id) + " payload_size=" + std::to_string(payload.size()));
     score_peer(peer_id, p2p::MisbehaviorReason::DUPLICATE_SPAM, "known-invalid-payload");
     return;
   }
