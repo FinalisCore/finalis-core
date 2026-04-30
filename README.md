@@ -187,6 +187,11 @@ Before first startup on the mainnet:
 ./scripts/start.sh
 ```
 
+## Fast sync command:
+```
+finalis-cli fast_sync --db ~/.finalis/mainnet --snapshot snapshot.bin
+```
+
 Default ports from the current mainnet config:
 
 - P2P: `19440`
