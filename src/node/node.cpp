@@ -6726,14 +6726,6 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-msg");
         return;
       }
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (accepted_block_payloads_.contains(payload_id)) {
-          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                   " type=TRANSITION reason=duplicate-accepted payload_id=" + short_hash_hex(payload_id));
-          return;
-        }
-      }
       auto proposal = FrontierProposal::parse(b->frontier_proposal_bytes);
       if (!proposal.has_value()) {
         log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
@@ -6760,6 +6752,20 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       }
       {
         std::lock_guard<std::mutex> lk(mu_);
+        const bool duplicate_accepted = accepted_block_payloads_.contains(payload_id);
+        const std::uint64_t next_height = finalized_height_ + 1;
+        if (duplicate_accepted && proposal->transition.height < next_height) {
+          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                   " type=TRANSITION reason=duplicate-accepted payload_id=" + short_hash_hex(payload_id) +
+                   " height=" + std::to_string(proposal->transition.height) + " next_height=" +
+                   std::to_string(next_height));
+          return;
+        }
+        if (duplicate_accepted) {
+          log_line("sync-recv-duplicate-horizon-bypass peer_id=" + std::to_string(peer_id) +
+                   " type=TRANSITION payload_id=" + short_hash_hex(payload_id) + " height=" +
+                   std::to_string(proposal->transition.height) + " next_height=" + std::to_string(next_height));
+        }
         bool accepted = false;
         std::string acceptance_path = "none";
         if (!running_) {
