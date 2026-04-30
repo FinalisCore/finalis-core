@@ -2945,6 +2945,8 @@ bool Node::init() {
                    type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake-timeout" : "timeout");
       } else if (type == p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW) {
         score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
+      } else if (type == p2p::PeerManager::PeerEventType::MESSAGE_RX) {
+        log_line("peer-message-rx peer_id=" + std::to_string(peer_id) + " " + detail);
       }
     });
     if (cfg_.listen) {
@@ -6147,6 +6149,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   }
 
   const Hash32 payload_id = message_payload_id(payload);
+  if (msg_type == p2p::MsgType::TRANSITION) {
+    log_line("sync-recv-entry peer_id=" + std::to_string(peer_id) + " type=TRANSITION payload_id=" +
+             short_hash_hex(payload_id) + " payload_size=" + std::to_string(payload.size()));
+  }
   bool known_invalid = false;
   bool rate_limited = false;
   {

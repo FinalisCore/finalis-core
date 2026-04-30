@@ -46,6 +46,7 @@ class PeerManager {
     FRAME_TIMEOUT,
     HANDSHAKE_TIMEOUT,
     QUEUE_OVERFLOW,
+    MESSAGE_RX,
   };
   using PeerEventHandler = std::function<void(int peer_id, PeerEventType type, const std::string& detail)>;
 

@@ -437,6 +437,10 @@ void PeerManager::read_loop(int peer_id) {
       }
       break;
     }
+    if (frame->msg_type == MsgType::TRANSITION) {
+      emit_event(peer_id, PeerEventType::MESSAGE_RX,
+                 "transition-pre-dispatch payload_size=" + std::to_string(frame->payload.size()));
+    }
     if (on_message_) on_message_(peer_id, frame->msg_type, frame->payload);
   }
 
