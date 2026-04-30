@@ -6719,6 +6719,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       if (!b.has_value()) {
         log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
                  " type=TRANSITION reason=decode-failed payload_size=" + std::to_string(payload.size()));
+        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                 " type=TRANSITION reason=decode-failed payload_id=" + short_hash_hex(payload_id));
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
         score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-msg");
@@ -6726,13 +6728,19 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       }
       {
         std::lock_guard<std::mutex> lk(mu_);
-        if (accepted_block_payloads_.contains(payload_id)) return;
+        if (accepted_block_payloads_.contains(payload_id)) {
+          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                   " type=TRANSITION reason=duplicate-accepted payload_id=" + short_hash_hex(payload_id));
+          return;
+        }
       }
       auto proposal = FrontierProposal::parse(b->frontier_proposal_bytes);
       if (!proposal.has_value()) {
         log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
                  " type=TRANSITION reason=frontier-parse-failed payload_size=" + std::to_string(payload.size()) +
                  " proposal_size=" + std::to_string(b->frontier_proposal_bytes.size()));
+        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                 " type=TRANSITION reason=frontier-parse-failed payload_id=" + short_hash_hex(payload_id));
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
         score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-frontier-parse");
@@ -6753,6 +6761,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       {
         std::lock_guard<std::mutex> lk(mu_);
         bool accepted = false;
+        std::string acceptance_path = "none";
         if (!running_) {
           if (b->certificate.has_value() && proposal->transition.height >= finalized_height_ + 1) {
             const auto transition_id = proposal->transition.transition_id();
@@ -6768,6 +6777,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
               accepted = true;
             }
             if (accepted) {
+              acceptance_path = "startup-buffered";
               log_line("startup-sync-defer-transition peer_id=" + std::to_string(peer_id) +
                        " height=" + std::to_string(proposal->transition.height) + " transition=" +
                        short_hash_hex(transition_id));
@@ -6778,6 +6788,11 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                      " reason=node-not-running");
           }
           if (accepted) accepted_block_payloads_.insert(payload_id);
+          if (!accepted) {
+            log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                     " type=TRANSITION reason=not-accepted path=startup payload_id=" +
+                     short_hash_hex(payload_id) + " height=" + std::to_string(proposal->transition.height));
+          }
           break;
         }
         if (proposal->transition.height >= finalized_height_ + 1 && !b->certificate.has_value()) {
@@ -6785,17 +6800,26 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                    " height=" + std::to_string(proposal->transition.height) + " next_needed=" +
                    std::to_string(finalized_height_ + 1) + " transition=" +
                    short_hash_hex(proposal->transition.transition_id()));
+          acceptance_path = "reject-uncertified";
           score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "uncertified-sync-transition");
           requested_sync_height_peers_.erase({proposal->transition.height, peer_id});
           (void)maybe_request_forward_sync_block_locked();
         } else if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
+          acceptance_path = "buffer-forward";
           accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id);
           if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
         } else {
+          acceptance_path = "handle-next";
           accepted = handle_frontier_block_locked(*proposal, b->certificate, peer_id, true);
           if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
         }
         if (accepted) accepted_block_payloads_.insert(payload_id);
+        if (!accepted) {
+          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                   " type=TRANSITION reason=not-accepted path=" + acceptance_path + " payload_id=" +
+                   short_hash_hex(payload_id) + " height=" + std::to_string(proposal->transition.height) +
+                   " has_cert=" + (b->certificate.has_value() ? "yes" : "no"));
+        }
       }
       break;
     }
