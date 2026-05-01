@@ -383,6 +383,7 @@ std::string key_root_index_prefix();
 std::string key_finality_certificate_height(std::uint64_t height);
 std::string key_finality_certificate_height_prefix();
 std::string key_ingress_record_prefix();
+std::string key_finalized_ingress_tip();
 std::string key_ingress_certificate_prefix();
 std::string key_ingress_bytes_prefix();
 std::string key_frontier_transition(const Hash32& id);
