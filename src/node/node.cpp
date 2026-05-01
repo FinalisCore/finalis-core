@@ -1039,6 +1039,8 @@ std::optional<Hash32> parse_transition_hash_from_error(const std::string& error)
   return out;
 }
 
+constexpr std::uint64_t kStartupCheckpointFallbackMaxRewindBlocks = 128;
+
 std::uint64_t compute_startup_frontier_repair_cap(const NodeConfig& cfg, std::uint64_t frontier_tip_height) {
   const std::uint64_t base_cap = std::max<std::uint64_t>(1, cfg.startup_frontier_repair_max_rollback);
   const std::uint64_t abs_cap =
@@ -2387,6 +2389,7 @@ bool rollback_frontier_tail_to_tip(storage::DB& db, std::uint64_t target_tip_hei
 
 bool load_latest_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDerivationConfig& cfg, storage::DB& db,
                                                        std::uint64_t current_finalized_height,
+                                                       std::uint64_t min_allowed_height,
                                                        consensus::CanonicalDerivedState* out,
                                                        std::uint64_t* out_checkpoint_height,
                                                        std::string* error) {
@@ -2401,7 +2404,7 @@ bool load_latest_trusted_runtime_checkpoint_from_cache(const consensus::Canonica
   for (const auto& [epoch_start, _] : checkpoints) {
     if (epoch_start == 0) continue;
     const std::uint64_t candidate_tip = epoch_start - 1;
-    if (candidate_tip == 0 || candidate_tip > current_finalized_height) continue;
+    if (candidate_tip == 0 || candidate_tip > current_finalized_height || candidate_tip < min_allowed_height) continue;
     candidates.insert(candidate_tip);
   }
 
@@ -9078,8 +9081,14 @@ bool Node::load_state() {
               consensus::CanonicalDerivedState fallback_checkpoint_state;
               std::string fallback_error;
               std::uint64_t fallback_height = 0;
+              const std::uint64_t min_rewind_height =
+                  finalized_height_ > kStartupCheckpointFallbackMaxRewindBlocks
+                      ? (finalized_height_ - kStartupCheckpointFallbackMaxRewindBlocks)
+                      : 1;
+              const std::uint64_t min_allowed_fallback_height = std::max<std::uint64_t>(repair_floor, min_rewind_height);
               if (load_latest_trusted_runtime_checkpoint_from_cache(
-                      derivation_cfg, db_, finalized_height_, &fallback_checkpoint_state, &fallback_height, &fallback_error)) {
+                      derivation_cfg, db_, finalized_height_, min_allowed_fallback_height, &fallback_checkpoint_state,
+                      &fallback_height, &fallback_error)) {
                 std::string truncate_error;
                 if (rollback_frontier_tail_to_tip(db_, fallback_height, &truncate_error)) {
                   auto repaired_tip = db_.get_tip();
@@ -9097,7 +9106,8 @@ bool Node::load_state() {
                 }
               } else {
                 log_line("startup-checkpoint-resume status=failed reason=trusted-cache-fallback-unavailable detail=" +
-                         fallback_error);
+                         fallback_error + " min_allowed_height=" + std::to_string(min_allowed_fallback_height) +
+                         " max_rewind=" + std::to_string(kStartupCheckpointFallbackMaxRewindBlocks));
               }
             }
           }
