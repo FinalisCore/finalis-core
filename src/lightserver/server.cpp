@@ -1229,7 +1229,10 @@ std::uint64_t eligibility_bond_amount_for_onboarding(const NetworkConfig& networ
 
 bool readiness_snapshot_is_fresh_for_rpc(const storage::NodeRuntimeStatusSnapshot& snapshot, std::uint64_t now_ms) {
   if (snapshot.captured_at_unix_ms == 0 || snapshot.captured_at_unix_ms > now_ms) return false;
-  return (now_ms - snapshot.captured_at_unix_ms) <= 3'000;
+  // RPC onboarding reads a persisted runtime snapshot, not an in-memory ticker.
+  // A 3s window is too tight under normal scheduler/journal/db latency and
+  // causes false "stale_runtime_snapshot" while readiness fields are healthy.
+  return (now_ms - snapshot.captured_at_unix_ms) <= 30'000;
 }
 
 bool readiness_snapshot_allows_registration_for_rpc(const storage::NodeRuntimeStatusSnapshot& snapshot, std::uint64_t now_ms,
