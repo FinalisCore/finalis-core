@@ -2815,8 +2815,13 @@ bool Node::init() {
     return false;
   }
   if (cfg_.reindex_on_start) {
+    log_line("startup-reindex status=begin stage=consensus-state-commitment-cache-clear");
     const bool erased = db_.erase(storage::key_consensus_state_commitment_cache());
-    if (erased) log_line("startup-reindex cleared=consensus-state-commitment-cache");
+    if (erased) {
+      log_line("startup-reindex status=progress stage=consensus-state-commitment-cache-clear result=cleared");
+    } else {
+      log_line("startup-reindex status=progress stage=consensus-state-commitment-cache-clear result=not-present");
+    }
   }
   if (!init_mainnet_genesis()) {
     std::cerr << "mainnet genesis init failed\n";
@@ -2849,8 +2854,14 @@ bool Node::init() {
   chain_id_ =
       ChainId::from_config_and_db(cfg_.network, db_, std::nullopt, genesis_source_hint_, expected_genesis_hash_);
   if (!load_state()) {
+    if (cfg_.reindex_on_start) {
+      log_line("startup-reindex status=failed stage=load-state");
+    }
     std::cerr << "load_state failed\n";
     return false;
+  }
+  if (cfg_.reindex_on_start) {
+    log_line("startup-reindex status=done stage=load-state");
   }
   {
     std::ostringstream oss;
@@ -9214,9 +9225,18 @@ bool Node::load_state() {
       }
     }
   }
+  if (cfg_.reindex_on_start) {
+    log_line("startup-reindex status=progress stage=canonical-state-commitment-verify");
+  }
   if (using_frontier_replay) (void)db_.erase(storage::key_consensus_state_commitment_cache());
   if (!verify_and_persist_consensus_state_commitment_locked(derived_state)) return false;
+  if (cfg_.reindex_on_start) {
+    log_line("startup-reindex status=progress stage=runtime-hydrate");
+  }
   hydrate_runtime_from_canonical_state_locked(derived_state);
+  if (cfg_.reindex_on_start) {
+    log_line("startup-reindex status=progress stage=canonical-cache-persist");
+  }
   if (!persist_canonical_cache_rows(db_, derived_state)) return false;
 
   const auto existing = db_.get(storage::key_root_index("UTXO", finalized_height_));
@@ -9233,8 +9253,18 @@ bool Node::load_state() {
   for (const auto epoch : db_.load_epoch_ticket_epochs()) rebuild_epochs.insert(epoch);
   for (const auto& [epoch, _] : db_.load_epoch_committee_snapshots()) rebuild_epochs.insert(epoch);
   for (const auto& [epoch, _] : db_.load_epoch_committee_freeze_markers()) rebuild_epochs.insert(epoch);
+  if (cfg_.reindex_on_start) {
+    log_line("startup-reindex status=progress stage=epoch-committee-rebuild begin total_epochs=" +
+             std::to_string(rebuild_epochs.size()));
+  }
+  std::size_t rebuilt_epochs = 0;
   for (const auto epoch : rebuild_epochs) {
     rebuild_epoch_committee_state_locked(epoch, "startup", true);
+    ++rebuilt_epochs;
+    if (cfg_.reindex_on_start && (rebuilt_epochs == rebuild_epochs.size() || (rebuilt_epochs % 32 == 0))) {
+      log_line("startup-reindex status=progress stage=epoch-committee-rebuild done=" +
+               std::to_string(rebuilt_epochs) + "/" + std::to_string(rebuild_epochs.size()));
+    }
   }
   for (auto& [epoch_start, checkpoint] : finalized_committee_checkpoints_) {
     auto snapshot = db_.get_epoch_committee_snapshot(epoch_start);
