@@ -39,6 +39,9 @@ NODE_ROLE="${NODE_ROLE:-auto}"
 RECOVER_PEER_DISCOVERY="${RECOVER_PEER_DISCOVERY:-0}"
 TRUSTED_BOOTSTRAP_PEER="${TRUSTED_BOOTSTRAP_PEER:-}"
 FOLLOW_RECOVERY_LOGS="${FOLLOW_RECOVERY_LOGS:-1}"
+AUTO_FAST_SYNC="${AUTO_FAST_SYNC:-1}"
+SNAPSHOT_FILE="${SNAPSHOT_FILE:-${ROOT_DIR}/snapshot.bin}"
+NO_REINDEX_ON_START="${NO_REINDEX_ON_START:-1}"
 
 log() { printf '[start] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -546,6 +549,32 @@ reset_chain_data_if_requested() {
   chmod 700 "${DB_DIR}/keystore" || true
 }
 
+auto_fast_sync_if_requested() {
+  if [[ "${AUTO_FAST_SYNC}" != "1" ]]; then
+    log "Skipping automatic fast sync (AUTO_FAST_SYNC=0)."
+    return 0
+  fi
+
+  local cli_bin="${ROOT_DIR}/${BUILD_DIR}/finalis-cli"
+  if [[ ! -x "${cli_bin}" ]]; then
+    log "Automatic fast sync skipped: finalis-cli not found at ${cli_bin}"
+    return 0
+  fi
+  if [[ ! -f "${SNAPSHOT_FILE}" ]]; then
+    log "Automatic fast sync skipped: snapshot file not found at ${SNAPSHOT_FILE}"
+    return 0
+  fi
+
+  if [[ -d "${DB_DIR}" ]]; then
+    log "AUTO_FAST_SYNC=1 and DB_DIR exists (${DB_DIR}); running repair_state + fast_sync"
+    "${cli_bin}" repair_state --db "${DB_DIR}" --force
+    "${cli_bin}" fast_sync --db "${DB_DIR}" --snapshot "${SNAPSHOT_FILE}" --force
+  else
+    log "AUTO_FAST_SYNC=1 and DB_DIR does not exist (${DB_DIR}); running fast_sync only"
+    "${cli_bin}" fast_sync --db "${DB_DIR}" --snapshot "${SNAPSHOT_FILE}" --force
+  fi
+}
+
 build_node_command() {
   local node_bin="${ROOT_DIR}/${BUILD_DIR}/finalis-node"
   local genesis_path="$1"
@@ -559,6 +588,10 @@ build_node_command() {
     "--frame-timeout-ms" "${FRAME_TIMEOUT_MS}"
     "--idle-timeout-ms" "${IDLE_TIMEOUT_MS}"
   )
+
+  if [[ "${NO_REINDEX_ON_START}" == "1" ]]; then
+    args+=("--no-reindex")
+  fi
 
   if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
     log "WARNING: enabling --allow-unsafe-genesis-override (intended only for controlled recovery/testing)" >&2
@@ -803,6 +836,7 @@ main() {
   log "Building project with cmake --build ${BUILD_DIR} -j..."
   configure_and_build
   reset_chain_data_if_requested
+  auto_fast_sync_if_requested
 
   local mode
   mode="$(detect_mode)"
