@@ -362,16 +362,17 @@ function Invoke-FinalisFastSyncIfEligible {
 
     Write-Host "Running snapshot fast-sync preflight into empty data dir using $SnapshotPath"
     try {
-        $proc = Start-Process -FilePath $CliPath `
-            -ArgumentList @("fast_sync", "--db", $TargetDataDir, "--snapshot", $SnapshotPath, "--force") `
-            -WorkingDirectory $binDir `
-            -Wait -PassThru -NoNewWindow
-        if ($proc.ExitCode -eq 0) {
+        Push-Location $binDir
+        & $CliPath fast_sync --db "$TargetDataDir" --snapshot "$SnapshotPath" --force
+        $exitCode = $LASTEXITCODE
+        Pop-Location
+        if ($exitCode -eq 0) {
             Write-Host "Snapshot fast-sync preflight completed."
             return $true
         }
-        Write-Warning "Snapshot fast-sync preflight exited with code $($proc.ExitCode); continuing with normal startup."
+        Write-Warning "Snapshot fast-sync preflight exited with code $exitCode; continuing with normal startup."
     } catch {
+        try { Pop-Location } catch {}
         Write-Warning "Snapshot fast-sync preflight failed: $($_.Exception.Message); continuing with normal startup."
     }
     return $false
