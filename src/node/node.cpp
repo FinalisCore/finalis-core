@@ -1047,9 +1047,13 @@ std::uint64_t compute_startup_frontier_repair_cap(const NodeConfig& cfg, std::ui
       std::max<std::uint64_t>(base_cap, cfg.startup_frontier_repair_absolute_max_rollback);
   std::uint64_t adaptive_cap = base_cap;
   if (cfg.startup_frontier_repair_adaptive_percent > 0 && frontier_tip_height > 0) {
-    const unsigned __int128 pct = static_cast<unsigned __int128>(frontier_tip_height) *
-                                  static_cast<unsigned __int128>(cfg.startup_frontier_repair_adaptive_percent);
-    const std::uint64_t pct_cap = static_cast<std::uint64_t>((pct + 99) / 100);  // ceil(tip * percent / 100)
+    const auto pct_wide = wide::mul_u64(frontier_tip_height, cfg.startup_frontier_repair_adaptive_percent);
+    std::uint64_t pct_cap = wide::div_u64(pct_wide, 100);  // floor(tip * percent / 100)
+    // ceil(tip * percent / 100) without compiler-specific 128-bit arithmetic.
+    if (wide::compare_mul_u64(pct_cap, 100, frontier_tip_height, cfg.startup_frontier_repair_adaptive_percent) < 0 &&
+        pct_cap < std::numeric_limits<std::uint64_t>::max()) {
+      ++pct_cap;
+    }
     adaptive_cap = std::max<std::uint64_t>(adaptive_cap, pct_cap);
   }
   return std::min<std::uint64_t>(adaptive_cap, abs_cap);
@@ -10169,7 +10173,7 @@ bool Node::seed_preflight_ok(const std::string& host, std::uint16_t port) {
   if (!net::valid_socket(fd)) return true;
 
   Bytes prefix;
-  if (net::wait_readable(fd, 200) > 0) {
+  if (net::wait_readable(fd, 200)) {
     std::array<std::uint8_t, 16> tmp{};
     const ssize_t n = net::recv_nonblocking(fd, tmp.data(), tmp.size());
     if (n > 0) prefix.assign(tmp.begin(), tmp.begin() + n);
