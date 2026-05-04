@@ -9,7 +9,7 @@ on:
         default: false
   push:
     branches:
-      - main
+      - windowsfix
     tags:
       - "v*"
 
@@ -88,8 +88,13 @@ jobs:
             throw "windeployqt.exe not found under ${{ github.workspace }}\.qt"
           }
           $qtRoot = Split-Path (Split-Path $qtDeploy.FullName -Parent) -Parent
+          $qt5Dir = Join-Path $qtRoot "lib\cmake\Qt5"
+          if (-not (Test-Path $qt5Dir)) {
+            throw "Qt5 CMake package directory not found: $qt5Dir"
+          }
           "version=$version" >> $env:GITHUB_OUTPUT
           "FINALIS_QT_PREFIX=$qtRoot" >> $env:GITHUB_ENV
+          "Qt5_DIR=$qt5Dir" >> $env:GITHUB_ENV
           "VCPKG_ROOT=${{ github.workspace }}\vcpkg" >> $env:GITHUB_ENV
 
       - name: Check signing credentials for tagged release
@@ -218,6 +223,7 @@ jobs:
             "app\scripts\Start-Finalis.ps1",
             "app\WINDOWS-RUN.txt",
             "app\mainnet\SEEDS.json",
+            "app\mainnet\snapshot.bin",
             "installer-assets\finalis-wizard.bmp",
             "installer-assets\finalis-wizard-small.bmp",
             "installer-assets\finalis-app.ico"

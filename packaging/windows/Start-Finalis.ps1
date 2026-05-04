@@ -33,6 +33,7 @@ $cliExe = Join-Path $binDir "finalis-cli.exe"
 $lightserverExe = Join-Path $binDir "finalis-lightserver.exe"
 $explorerExe = Join-Path $binDir "finalis-explorer.exe"
 $seedsJson = Join-Path $appRoot "mainnet\SEEDS.json"
+$snapshotBin = Join-Path $appRoot "mainnet\snapshot.bin"
 $logDir = Join-Path $DataDir "logs"
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -310,6 +311,72 @@ function Start-FinalisNodeProcess {
         -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath -PassThru
 }
 
+function Test-IsChainStateEmpty {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDataDir
+    )
+
+    $markers = @(
+        "tip.bin",
+        "tip.id",
+        "best.id",
+        "state_root.bin",
+        "meta\tip.id",
+        "meta\best.id",
+        "meta\state_root.bin",
+        "rocksdb\CURRENT"
+    )
+
+    foreach ($rel in $markers) {
+        if (Test-Path (Join-Path $TargetDataDir $rel)) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Invoke-FinalisFastSyncIfEligible {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CliPath,
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDataDir,
+        [Parameter(Mandatory = $true)]
+        [string]$SnapshotPath
+    )
+
+    if (-not (Test-Path $CliPath)) {
+        Write-Warning "finalis-cli not found at $CliPath; skipping snapshot fast-sync preflight."
+        return $false
+    }
+    if (-not (Test-Path $SnapshotPath)) {
+        Write-Warning "Snapshot file not found at $SnapshotPath; skipping snapshot fast-sync preflight."
+        return $false
+    }
+    if (-not (Test-IsChainStateEmpty -TargetDataDir $TargetDataDir)) {
+        Write-Host "Chain state already present in $TargetDataDir; skipping snapshot fast-sync preflight."
+        return $false
+    }
+
+    Write-Host "Running snapshot fast-sync preflight into empty data dir using $SnapshotPath"
+    try {
+        $proc = Start-Process -FilePath $CliPath `
+            -ArgumentList @("fast_sync", "--db", $TargetDataDir, "--snapshot", $SnapshotPath, "--force") `
+            -WorkingDirectory $binDir `
+            -Wait -PassThru -NoNewWindow
+        if ($proc.ExitCode -eq 0) {
+            Write-Host "Snapshot fast-sync preflight completed."
+            return $true
+        }
+        Write-Warning "Snapshot fast-sync preflight exited with code $($proc.ExitCode); continuing with normal startup."
+    } catch {
+        Write-Warning "Snapshot fast-sync preflight failed: $($_.Exception.Message); continuing with normal startup."
+    }
+    return $false
+}
+
 function Reset-LogFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -367,6 +434,8 @@ if ($ResetPeerDiscovery.IsPresent) {
     Remove-Item -Path $addrmanPath -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $peersPath -Force -ErrorAction SilentlyContinue
 }
+
+[void](Invoke-FinalisFastSyncIfEligible -CliPath $cliExe -TargetDataDir $DataDir -SnapshotPath $snapshotBin)
 
 $nodeArgs = @(
     "--db", $DataDir,
