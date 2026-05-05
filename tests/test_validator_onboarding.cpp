@@ -174,8 +174,9 @@ TEST(test_validator_onboarding_resume_is_idempotent_for_same_validator) {
   stored.wallet_address = key.address;
   stored.wallet_pubkey_hex = hex_encode(Bytes(key.pubkey.begin(), key.pubkey.end()));
   stored.state = onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION;
-  stored.requested_at_unix_ms = 1;
-  stored.updated_at_unix_ms = 2;
+  const auto now_ms = static_cast<std::uint64_t>(std::time(nullptr)) * 1000ULL;
+  stored.requested_at_unix_ms = now_ms - 10'000;
+  stored.updated_at_unix_ms = now_ms - 5'000;
   stored.wait_for_sync = true;
   stored.fee = 10'000;
   stored.bond_amount = BOND_AMOUNT;
@@ -186,7 +187,7 @@ TEST(test_validator_onboarding_resume_is_idempotent_for_same_validator) {
   stored.selected_inputs.push_back(onboarding::ReservedInput{OutPoint{selected_txid, 0}, 5'100'000'000});
   stored.selected_inputs_reserved = true;
   stored.txid_hex = std::string(64, 'a');
-  stored.broadcast_attempted_at_unix_ms = 10;
+  stored.broadcast_attempted_at_unix_ms = now_ms - 5'000;
   stored.broadcast_outcome = onboarding::ValidatorOnboardingBroadcastOutcome::SENT;
   ASSERT_TRUE(db.put_validator_onboarding_record(key.pubkey, onboarding::ValidatorOnboardingService::serialize_record(stored)));
   db.close();
@@ -310,6 +311,49 @@ TEST(test_validator_onboarding_ambiguous_broadcast_resumes_same_attempt_without_
   ASSERT_EQ(second->txid_hex, txid);
   ASSERT_EQ(second->tx_bytes, tx_bytes);
   ASSERT_TRUE(second->selected_inputs_reserved);
+}
+
+TEST(test_validator_onboarding_waiting_for_finalization_times_out_with_retryable_error) {
+  const auto dir = make_temp_dir("validator-onboarding-finalization-timeout");
+  std::string passphrase;
+  const auto key = create_test_wallet(dir, &passphrase);
+  storage::DB db;
+  ASSERT_TRUE(db.open(dir.string()));
+  ASSERT_TRUE(db.set_tip(storage::TipState{750, Hash32{}}));
+  ASSERT_TRUE(db.put_node_runtime_status_snapshot(ready_snapshot(750)));
+  put_spendable_p2pkh(db, key, 0x71, 60'000'000'000);
+
+  onboarding::ValidatorOnboardingRecord stored;
+  stored.onboarding_id = "finalization-timeout-test";
+  stored.validator_pubkey = key.pubkey;
+  stored.wallet_address = key.address;
+  stored.wallet_pubkey_hex = hex_encode(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  stored.state = onboarding::ValidatorOnboardingState::WAITING_FOR_FINALIZATION;
+  stored.requested_at_unix_ms = 1;
+  stored.updated_at_unix_ms = 1;
+  stored.wait_for_sync = true;
+  stored.fee = 10'000;
+  stored.bond_amount = BOND_AMOUNT;
+  stored.required_amount = BOND_AMOUNT + 10'000;
+  stored.readiness = ready_snapshot(750);
+  Hash32 selected_txid{};
+  selected_txid.fill(0x71);
+  stored.selected_inputs.push_back(onboarding::ReservedInput{OutPoint{selected_txid, 0}, 60'000'000'000});
+  stored.selected_inputs_reserved = true;
+  stored.txid_hex = std::string(64, 'b');
+  stored.broadcast_attempted_at_unix_ms = 1;
+  stored.broadcast_outcome = onboarding::ValidatorOnboardingBroadcastOutcome::SENT;
+  ASSERT_TRUE(db.put_validator_onboarding_record(key.pubkey, onboarding::ValidatorOnboardingService::serialize_record(stored)));
+  db.close();
+
+  onboarding::ValidatorOnboardingService service;
+  std::string err;
+  const auto record = service.start_or_resume(make_options(dir, passphrase), &err);
+  ASSERT_TRUE(record.has_value());
+  ASSERT_EQ(record->state, onboarding::ValidatorOnboardingState::FAILED);
+  ASSERT_EQ(record->last_error_code, "tx_finalization_timeout");
+  ASSERT_TRUE(record->last_error_message.find("retryable=yes") != std::string::npos);
+  ASSERT_TRUE(record->last_error_message.find("retry_class=after_state_change") != std::string::npos);
 }
 
 TEST(test_validator_onboarding_second_invocation_reuses_existing_record) {

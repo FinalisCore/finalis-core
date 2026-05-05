@@ -4,6 +4,7 @@
 
 #include <ctime>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,7 +23,7 @@ namespace {
 
 using consensus::ValidatorStatus;
 
-constexpr std::uint64_t kReadinessSnapshotFreshnessMs = 3'000;
+constexpr std::uint64_t kOnboardingFinalizationTimeoutMs = 20 * 60 * 1000;
 
 std::mutex g_onboarding_lock_index_mu;
 std::map<std::string, std::shared_ptr<std::mutex>> g_onboarding_locks;
@@ -50,7 +51,7 @@ std::string make_onboarding_id(const PubKey32& pub) {
 
 bool readiness_snapshot_is_fresh(const storage::NodeRuntimeStatusSnapshot& snapshot, std::uint64_t now_ms) {
   if (snapshot.captured_at_unix_ms == 0 || snapshot.captured_at_unix_ms > now_ms) return false;
-  return (now_ms - snapshot.captured_at_unix_ms) <= kReadinessSnapshotFreshnessMs;
+  return (now_ms - snapshot.captured_at_unix_ms) <= kOnboardingReadinessFreshnessMs;
 }
 
 bool readiness_snapshot_allows_registration(const storage::NodeRuntimeStatusSnapshot& snapshot, std::uint64_t now_ms,
@@ -237,6 +238,12 @@ void set_error(ValidatorOnboardingRecord* record, const std::string& code, const
   record->last_error_code = code;
   record->last_error_message = message;
   record->updated_at_unix_ms = now_unix_ms();
+}
+
+bool checked_add_u64(std::uint64_t a, std::uint64_t b, std::uint64_t* out) {
+  if (a > std::numeric_limits<std::uint64_t>::max() - b) return false;
+  *out = a + b;
+  return true;
 }
 
 bool persist_record(storage::DB& db, const ValidatorOnboardingRecord& record, std::string* err) {
@@ -510,6 +517,11 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::status(cons
   const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(mainnet_network(), db, planning_height);
   const std::uint64_t eligibility_bond_amount =
       eligibility_bond_amount_for_onboarding(mainnet_network(), db, planning_height, bond_amount);
+  std::uint64_t required_amount = 0;
+  if (!checked_add_u64(bond_amount, options.fee, &required_amount)) {
+    if (err) *err = "fee_overflow";
+    return std::nullopt;
+  }
   if (!existing.has_value()) {
     ValidatorOnboardingRecord record;
     record.onboarding_id = make_onboarding_id(key->pubkey);
@@ -520,7 +532,7 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::status(cons
     record.fee = options.fee;
     record.bond_amount = bond_amount;
     record.eligibility_bond_amount = eligibility_bond_amount;
-    record.required_amount = bond_amount + options.fee;
+    record.required_amount = required_amount;
     record.wait_for_sync = options.wait_for_sync;
     return record;
   }
@@ -541,6 +553,11 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::start_or_re
   const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(mainnet_network(), db, planning_height);
   const std::uint64_t eligibility_bond_amount =
       eligibility_bond_amount_for_onboarding(mainnet_network(), db, planning_height, bond_amount);
+  std::uint64_t required_amount = 0;
+  if (!checked_add_u64(bond_amount, options.fee, &required_amount)) {
+    if (err) *err = "fee_overflow";
+    return std::nullopt;
+  }
   if (auto existing = db.get_validator_onboarding_record(key->pubkey); existing.has_value()) {
     auto parsed = parse_record(*existing);
     if (!parsed.has_value()) {
@@ -559,7 +576,7 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::start_or_re
     record.fee = options.fee;
     record.bond_amount = bond_amount;
     record.eligibility_bond_amount = eligibility_bond_amount;
-    record.required_amount = bond_amount + options.fee;
+    record.required_amount = required_amount;
     record.wait_for_sync = options.wait_for_sync;
   }
   return advance(options, db, record, err);
@@ -634,7 +651,12 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
     record.bond_amount = bond_amount;
     record.eligibility_bond_amount =
         eligibility_bond_amount_for_onboarding(mainnet_network(), db, planning_height, bond_amount);
-    record.required_amount = bond_amount + options.fee;
+    if (!checked_add_u64(bond_amount, options.fee, &record.required_amount)) {
+      record.state = ValidatorOnboardingState::FAILED;
+      set_error(&record, "fee_overflow", "bond_amount + fee overflow");
+      (void)persist_record(db, record, err);
+      return record;
+    }
     record.wait_for_sync = options.wait_for_sync;
 
     const auto validators = db.load_validators();
@@ -835,6 +857,15 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
       }
 
       case ValidatorOnboardingState::WAITING_FOR_FINALIZATION: {
+        if (record.broadcast_attempted_at_unix_ms != 0 &&
+            record.updated_at_unix_ms > record.broadcast_attempted_at_unix_ms &&
+            (record.updated_at_unix_ms - record.broadcast_attempted_at_unix_ms) > kOnboardingFinalizationTimeoutMs) {
+          record.state = ValidatorOnboardingState::FAILED;
+          set_error(&record, "tx_finalization_timeout",
+                    "join transaction not finalized within timeout; retry_class=after_state_change; retryable=yes");
+          (void)persist_record(db, record, err);
+          return record;
+        }
         if (!record.txid_hex.empty()) {
           auto txid = hex_decode(record.txid_hex);
           if (txid.has_value() && txid->size() == 32) {

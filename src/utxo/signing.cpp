@@ -38,6 +38,12 @@ std::vector<OutPoint> prev_outpoints(const std::vector<std::pair<OutPoint, TxOut
   return out;
 }
 
+bool checked_add_u64(std::uint64_t a, std::uint64_t b, std::uint64_t* out) {
+  if (a > std::numeric_limits<std::uint64_t>::max() - b) return false;
+  *out = a + b;
+  return true;
+}
+
 }  // namespace
 
 std::vector<std::pair<OutPoint, TxOut>> deterministic_largest_first_prevs(
@@ -257,8 +263,18 @@ std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<Ou
                                                   const Bytes& change_script_pubkey, std::string* err,
                                                   const ValidatorJoinAdmissionPowBuildContext* pow_ctx) {
   std::uint64_t total_prev = 0;
-  for (const auto& prev : prevs) total_prev += prev.second.value;
-  if (total_prev < bond_amount + fee) {
+  for (const auto& prev : prevs) {
+    if (!checked_add_u64(total_prev, prev.second.value, &total_prev)) {
+      if (err) *err = "prev value overflow";
+      return std::nullopt;
+    }
+  }
+  std::uint64_t required = 0;
+  if (!checked_add_u64(bond_amount, fee, &required)) {
+    if (err) *err = "bond + fee overflow";
+    return std::nullopt;
+  }
+  if (total_prev < required) {
     if (err) *err = "insufficient prev value for bond + fee";
     return std::nullopt;
   }
@@ -312,7 +328,7 @@ std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<Ou
   }
 
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
-  const std::uint64_t change = total_prev - bond_amount - fee;
+  const std::uint64_t change = total_prev - required;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
   return build_signed_p2pkh_tx_multi_input(prevs, funding_privkey_32, outputs, err);
 }
@@ -335,7 +351,12 @@ std::optional<Tx> build_onboarding_registration_tx(const std::vector<std::pair<O
                                                    std::string* err,
                                                    const ValidatorJoinAdmissionPowBuildContext* pow_ctx) {
   std::uint64_t total_prev = 0;
-  for (const auto& prev : prevs) total_prev += prev.second.value;
+  for (const auto& prev : prevs) {
+    if (!checked_add_u64(total_prev, prev.second.value, &total_prev)) {
+      if (err) *err = "prev value overflow";
+      return std::nullopt;
+    }
+  }
   if (total_prev < fee) {
     if (err) *err = "insufficient prev value for fee";
     return std::nullopt;

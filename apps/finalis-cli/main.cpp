@@ -585,6 +585,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"validator_status\":\"" << record.validator_status << "\","
               << "\"finalized_height\":" << record.finalized_height << ","
               << "\"activation_height\":" << record.activation_height << ","
+              << "\"expected_activation_height\":" << record.activation_height << ","
               << "\"last_error_code\":\"" << record.last_error_code << "\","
               << "\"last_error_message\":\"" << record.last_error_message << "\""
               << "}\n";
@@ -622,6 +623,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
   std::cout << "validator_status=" << record.validator_status << "\n";
   if (record.finalized_height != 0) std::cout << "finalized_height=" << record.finalized_height << "\n";
   if (record.activation_height != 0) std::cout << "activation_height=" << record.activation_height << "\n";
+  std::cout << "expected_activation_height=" << record.activation_height << "\n";
   std::cout << "last_error_code=" << record.last_error_code << "\n";
   std::cout << "last_error_message=" << record.last_error_message << "\n";
 }
@@ -2036,18 +2038,25 @@ int main(int argc, char** argv) {
       std::cerr << "snapshot_export requires --out\n";
       return 1;
     }
+    const auto resolved_db = std::filesystem::path(expand_user(db_path));
+    const auto resolved_out = std::filesystem::path(expand_user(out_path));
+    if (std::filesystem::exists(resolved_out) && !std::filesystem::is_regular_file(resolved_out)) {
+      std::cerr << "snapshot_export: --out must be a file path: " << resolved_out.string() << "\n";
+      return 1;
+    }
     finalis::storage::DB db;
-    if (!db.open_readonly(db_path) && !db.open(db_path)) {
-      std::cerr << "failed to open db\n";
+    if (!db.open_readonly(resolved_db.string())) {
+      std::cerr << "snapshot_export: failed to open db readonly: " << resolved_db.string() << "\n";
       return 1;
     }
     finalis::storage::SnapshotManifest manifest;
     std::string err;
-    if (!finalis::storage::export_snapshot_bundle(db, out_path, &manifest, &err)) {
+    if (!finalis::storage::export_snapshot_bundle(db, resolved_out.string(), &manifest, &err)) {
       std::cerr << "snapshot_export failed: " << err << "\n";
       return 1;
     }
-    std::cout << "snapshot=" << out_path << "\n";
+    std::cout << "db=" << resolved_db.string() << "\n";
+    std::cout << "snapshot=" << resolved_out.string() << "\n";
     std::cout << "finalized_height=" << manifest.finalized_height << "\n";
     std::cout << "finalized_transition_hash=" << finalis::hex_encode32(manifest.finalized_hash) << "\n";
     std::cout << "utxo_root=" << finalis::hex_encode32(manifest.utxo_root) << "\n";

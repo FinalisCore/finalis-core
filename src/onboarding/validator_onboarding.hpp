@@ -15,6 +15,8 @@
 
 namespace finalis::onboarding {
 
+inline constexpr std::uint64_t kOnboardingReadinessFreshnessMs = 30'000;
+
 enum class ValidatorOnboardingBroadcastOutcome : std::uint8_t {
   NONE = 0,
   SENT = 1,
