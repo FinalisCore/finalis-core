@@ -1229,10 +1229,13 @@ std::uint64_t eligibility_bond_amount_for_onboarding(const NetworkConfig& networ
 
 bool readiness_snapshot_is_fresh_for_rpc(const storage::NodeRuntimeStatusSnapshot& snapshot, std::uint64_t now_ms) {
   if (snapshot.captured_at_unix_ms == 0 || snapshot.captured_at_unix_ms > now_ms) return false;
-  // RPC onboarding reads a persisted runtime snapshot, not an in-memory ticker.
-  // A 3s window is too tight under normal scheduler/journal/db latency and
-  // causes false "stale_runtime_snapshot" while readiness fields are healthy.
-  return (now_ms - snapshot.captured_at_unix_ms) <= 30'000;
+  return (now_ms - snapshot.captured_at_unix_ms) <= onboarding::kOnboardingReadinessFreshnessMs;
+}
+
+bool checked_add_u64(std::uint64_t a, std::uint64_t b, std::uint64_t* out) {
+  if (a > std::numeric_limits<std::uint64_t>::max() - b) return false;
+  *out = a + b;
+  return true;
 }
 
 bool readiness_snapshot_allows_registration_for_rpc(const storage::NodeRuntimeStatusSnapshot& snapshot, std::uint64_t now_ms,
@@ -1263,7 +1266,10 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
   const std::uint64_t planning_height = tip ? (tip->height + 1) : 0;
   record.bond_amount = registration_bond_amount_for_onboarding(network, db, planning_height);
   record.eligibility_bond_amount = eligibility_bond_amount_for_onboarding(network, db, planning_height, record.bond_amount);
-  record.required_amount = record.bond_amount + fee;
+  if (!checked_add_u64(record.bond_amount, fee, &record.required_amount)) {
+    if (err) *err = "fee_overflow";
+    return std::nullopt;
+  }
   record.wait_for_sync = wait_for_sync;
 
   auto readiness = db.get_node_runtime_status_snapshot();

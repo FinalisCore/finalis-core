@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <cstdlib>
 #include <set>
 
 #include "codec/bytes.hpp"
@@ -14,6 +15,20 @@ namespace {
 
 constexpr std::uint32_t kSnapshotFormatVersion = 2;
 const Bytes kSnapshotMagic{'S', 'C', 'S', 'N', 'A', 'P', '0', '1'};
+
+std::size_t snapshot_import_batch_size() {
+  const char* raw = std::getenv("FINALIS_SNAPSHOT_IMPORT_BATCH_SIZE");
+  constexpr std::size_t kDefaultBatchSize = 4096;
+  if (!raw || *raw == '\0') return kDefaultBatchSize;
+  try {
+    std::size_t v = static_cast<std::size_t>(std::stoull(raw));
+    if (v < 256) v = 256;
+    if (v > 262144) v = 262144;
+    return v;
+  } catch (...) {
+    return kDefaultBatchSize;
+  }
+}
 
 std::optional<TipState> parse_tip_bytes(const Bytes& b) {
   TipState tip;
@@ -483,11 +498,36 @@ bool import_snapshot_bundle(DB& db, const std::string& path, SnapshotManifest* m
   }
   if (!validate_bundle(*bundle, err)) return false;
 
+  struct ScopedBootstrapIngestMode {
+    DB& db_ref;
+    bool attempted_enable{false};
+    explicit ScopedBootstrapIngestMode(DB& db) : db_ref(db) {
+      attempted_enable = true;
+      (void)db_ref.set_bootstrap_ingest_mode(true);
+    }
+    ~ScopedBootstrapIngestMode() {
+      if (attempted_enable) (void)db_ref.set_bootstrap_ingest_mode(false);
+    }
+  } ingest_mode(db);
+
+  // Bootstrap ingest optimization: commit entries in bounded write batches.
+  // This does not change consensus/state-transition rules; it only reduces
+  // write amplification and WAL overhead during empty-DB snapshot import.
+  const std::size_t kImportBatchSize = snapshot_import_batch_size();
+  std::vector<std::pair<std::string, Bytes>> batch;
+  batch.reserve(kImportBatchSize);
   for (const auto& entry : bundle->entries) {
-    if (!db.put(entry.key, entry.value)) {
-      if (err) *err = "failed to write snapshot entry";
+    batch.push_back({entry.key, entry.value});
+    if (batch.size() < kImportBatchSize) continue;
+    if (!db.put_many(batch, true /* disable_wal */)) {
+      if (err) *err = "failed to write snapshot batch";
       return false;
     }
+    batch.clear();
+  }
+  if (!batch.empty() && !db.put_many(batch, true /* disable_wal */)) {
+    if (err) *err = "failed to write snapshot batch";
+    return false;
   }
   if (!db.flush()) {
     if (err) *err = "failed to flush imported snapshot";

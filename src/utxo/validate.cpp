@@ -172,11 +172,23 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
   std::set<PubKey32> reg_outputs;
   std::set<PubKey32> onboarding_outputs;
   std::set<PubKey32> join_req_outputs;
+  std::size_t reg_output_count = 0;
+  std::size_t join_req_output_count = 0;
   for (const auto& out : outputs) {
     PubKey32 pub{};
-    if (is_validator_register_script(out.script_pubkey, &pub)) reg_outputs.insert(pub);
+    if (is_validator_register_script(out.script_pubkey, &pub)) {
+      reg_outputs.insert(pub);
+      ++reg_output_count;
+    }
     if (is_onboarding_registration_script(out.script_pubkey, &pub, nullptr, nullptr)) onboarding_outputs.insert(pub);
-    if (is_validator_join_request_script(out.script_pubkey, &pub, nullptr, nullptr)) join_req_outputs.insert(pub);
+    if (is_validator_join_request_script(out.script_pubkey, &pub, nullptr, nullptr)) {
+      join_req_outputs.insert(pub);
+      ++join_req_output_count;
+    }
+  }
+  if (reg_output_count > 1 || join_req_output_count > 1) {
+    if (error) *error = "multiple validator join outputs not allowed";
+    return false;
   }
   if (onboarding_outputs.size() > 1) {
     if (error) *error = "multiple SCONBREG outputs not allowed";

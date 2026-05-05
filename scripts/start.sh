@@ -41,6 +41,10 @@ TRUSTED_BOOTSTRAP_PEER="${TRUSTED_BOOTSTRAP_PEER:-}"
 FOLLOW_RECOVERY_LOGS="${FOLLOW_RECOVERY_LOGS:-1}"
 AUTO_FAST_SYNC="${AUTO_FAST_SYNC:-1}"
 SNAPSHOT_FILE="${SNAPSHOT_FILE:-${ROOT_DIR}/snapshot.bin}"
+AUTO_FAST_SYNC_FORCE_OVERWRITE="${AUTO_FAST_SYNC_FORCE_OVERWRITE:-0}"
+SYNC_TURBO_MODE="${SYNC_TURBO_MODE:-0}"
+SYNC_TARGET_UTIL_PCT="${SYNC_TARGET_UTIL_PCT:-70}"
+FAST_SYNC_PRELOAD_CACHE="${FAST_SYNC_PRELOAD_CACHE:-0}"
 NO_REINDEX_ON_START="${NO_REINDEX_ON_START:-1}"
 
 log() { printf '[start] %s\n' "$*"; }
@@ -108,6 +112,99 @@ detect_build_jobs() {
     return
   fi
   echo "1"
+}
+
+clamp_percent() {
+  local pct="$1"
+  if [[ -z "${pct}" ]]; then
+    echo "70"
+    return
+  fi
+  if (( pct < 30 )); then
+    echo "30"
+    return
+  fi
+  if (( pct > 90 )); then
+    echo "90"
+    return
+  fi
+  echo "${pct}"
+}
+
+auto_tune_sync_profile_if_requested() {
+  if [[ "${SYNC_TURBO_MODE}" != "1" && "${SYNC_TURBO_MODE}" != "extreme" ]]; then
+    return 0
+  fi
+
+  local cpu_cores
+  cpu_cores="$(detect_build_jobs)"
+  if [[ -z "${cpu_cores}" ]] || (( cpu_cores < 1 )); then
+    cpu_cores=1
+  fi
+  local target_pct
+  if [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
+    target_pct=100
+  else
+    target_pct="$(clamp_percent "${SYNC_TARGET_UTIL_PCT}")"
+  fi
+
+  if [[ -z "${BUILD_JOBS}" ]]; then
+    BUILD_JOBS="$(( (cpu_cores * target_pct) / 100 ))"
+    if (( BUILD_JOBS < 1 )); then BUILD_JOBS=1; fi
+    if (( BUILD_JOBS > cpu_cores )); then BUILD_JOBS="${cpu_cores}"; fi
+  fi
+
+  if [[ "${OUTBOUND_TARGET}" == "8" ]]; then
+    local tuned_outbound="$(( BUILD_JOBS * 2 ))"
+    local outbound_cap=32
+    if [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
+      outbound_cap=96
+    fi
+    if (( tuned_outbound < 8 )); then tuned_outbound=8; fi
+    if (( tuned_outbound > outbound_cap )); then tuned_outbound=outbound_cap; fi
+    OUTBOUND_TARGET="${tuned_outbound}"
+  fi
+
+  if [[ "${FAST_SYNC_PRELOAD_CACHE}" == "0" ]]; then
+    FAST_SYNC_PRELOAD_CACHE="1"
+  fi
+
+  local mem_kb=0
+  if [[ -r /proc/meminfo ]]; then
+    mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+  fi
+  if [[ -z "${mem_kb}" || "${mem_kb}" == "0" ]]; then
+    mem_kb=$((8 * 1024 * 1024))
+  fi
+  local mem_mb=$((mem_kb / 1024))
+  local write_buffer_mb=$((mem_mb / 24))
+  if (( write_buffer_mb < 128 )); then write_buffer_mb=128; fi
+  if (( write_buffer_mb > 1024 )); then write_buffer_mb=1024; fi
+  local max_write_buffers=$((cpu_cores / 2))
+  if (( max_write_buffers < 4 )); then max_write_buffers=4; fi
+  if (( max_write_buffers > 16 )); then max_write_buffers=16; fi
+  local background_jobs="$cpu_cores"
+  if (( background_jobs < 8 )); then background_jobs=8; fi
+  if (( background_jobs > 64 )); then background_jobs=64; fi
+  local target_file_mb=$((write_buffer_mb / 2))
+  if (( target_file_mb < 64 )); then target_file_mb=64; fi
+  if (( target_file_mb > 512 )); then target_file_mb=512; fi
+  local import_batch_size=$((cpu_cores * 2048))
+  if (( import_batch_size < 4096 )); then import_batch_size=4096; fi
+  if (( import_batch_size > 65536 )); then import_batch_size=65536; fi
+
+  export FINALIS_INGEST_MAX_BACKGROUND_JOBS="${background_jobs}"
+  export FINALIS_INGEST_BYTES_PER_SYNC="1048576"
+  export FINALIS_INGEST_WRITE_BUFFER_MB="${write_buffer_mb}"
+  export FINALIS_INGEST_MAX_WRITE_BUFFERS="${max_write_buffers}"
+  export FINALIS_INGEST_MIN_WRITE_BUFFERS_TO_MERGE="2"
+  export FINALIS_INGEST_L0_COMPACTION_TRIGGER="8"
+  export FINALIS_INGEST_TARGET_FILE_SIZE_MB="${target_file_mb}"
+  export FINALIS_SNAPSHOT_IMPORT_BATCH_SIZE="${import_batch_size}"
+
+  log "sync_telemetry cpu_cores=${cpu_cores} target_util_pct=${target_pct} chosen_build_jobs=${BUILD_JOBS} outbound_target=${OUTBOUND_TARGET}"
+  log "sync_telemetry mem_mb=${mem_mb} ingest_bg_jobs=${FINALIS_INGEST_MAX_BACKGROUND_JOBS} ingest_write_buffer_mb=${FINALIS_INGEST_WRITE_BUFFER_MB} ingest_max_write_buffers=${FINALIS_INGEST_MAX_WRITE_BUFFERS} import_batch_size=${FINALIS_SNAPSHOT_IMPORT_BATCH_SIZE}"
+  log "SYNC_TURBO_MODE=${SYNC_TURBO_MODE} active (target=${target_pct}%): BUILD_JOBS=${BUILD_JOBS}, OUTBOUND_TARGET=${OUTBOUND_TARGET}, FAST_SYNC_PRELOAD_CACHE=${FAST_SYNC_PRELOAD_CACHE}"
 }
 
 clear_build_dir() {
@@ -565,13 +662,50 @@ auto_fast_sync_if_requested() {
     return 0
   fi
 
+  if [[ "${FAST_SYNC_PRELOAD_CACHE}" == "1" ]]; then
+    if have dd; then
+      local snapshot_size_bytes=0
+      if [[ -f "${SNAPSHOT_FILE}" ]]; then
+        snapshot_size_bytes="$(wc -c < "${SNAPSHOT_FILE}" 2>/dev/null || echo 0)"
+      fi
+      local preload_start preload_end preload_ms
+      preload_start="$(date +%s%3N 2>/dev/null || true)"
+      log "Preloading snapshot into page cache: ${SNAPSHOT_FILE}"
+      dd if="${SNAPSHOT_FILE}" of=/dev/null bs=8M iflag=fullblock status=none || true
+      preload_end="$(date +%s%3N 2>/dev/null || true)"
+      preload_ms=0
+      if [[ -n "${preload_start}" && -n "${preload_end}" && "${preload_start}" =~ ^[0-9]+$ && "${preload_end}" =~ ^[0-9]+$ ]]; then
+        preload_ms="$((preload_end - preload_start))"
+      fi
+      log "sync_telemetry snapshot_path=${SNAPSHOT_FILE} snapshot_size_bytes=${snapshot_size_bytes} preload_ms=${preload_ms}"
+    fi
+  fi
+
+  local has_chain_state=0
   if [[ -d "${DB_DIR}" ]]; then
-    log "AUTO_FAST_SYNC=1 and DB_DIR exists (${DB_DIR}); running repair_state + fast_sync"
-    "${cli_bin}" repair_state --db "${DB_DIR}" --force
+    local entry name
+    while IFS= read -r entry; do
+      name="$(basename "${entry}" | tr '[:upper:]' '[:lower:]')"
+      if [[ "${name}" == "keystore" || "${name}" == "logs" ]]; then
+        continue
+      fi
+      has_chain_state=1
+      break
+    done < <(find "${DB_DIR}" -mindepth 1 -maxdepth 1 2>/dev/null || true)
+  fi
+
+  if (( has_chain_state == 1 )) && [[ "${AUTO_FAST_SYNC_FORCE_OVERWRITE}" != "1" ]]; then
+    log "Automatic fast sync skipped: existing chain state detected in ${DB_DIR}."
+    log "Set AUTO_FAST_SYNC_FORCE_OVERWRITE=1 (or RESET_CHAIN_DATA=1) to allow destructive re-import."
+    return 0
+  fi
+
+  if (( has_chain_state == 1 )); then
+    log "AUTO_FAST_SYNC_FORCE_OVERWRITE=1: applying destructive fast_sync over existing chain state in ${DB_DIR}"
     "${cli_bin}" fast_sync --db "${DB_DIR}" --snapshot "${SNAPSHOT_FILE}" --force
   else
-    log "AUTO_FAST_SYNC=1 and DB_DIR does not exist (${DB_DIR}); running fast_sync only"
-    "${cli_bin}" fast_sync --db "${DB_DIR}" --snapshot "${SNAPSHOT_FILE}" --force
+    log "AUTO_FAST_SYNC=1 and no existing chain state detected; running fast_sync"
+    "${cli_bin}" fast_sync --db "${DB_DIR}" --snapshot "${SNAPSHOT_FILE}"
   fi
 }
 
@@ -829,6 +963,7 @@ start_explorer_background() {
 
 main() {
   recover_peer_discovery_state_if_requested
+  auto_tune_sync_profile_if_requested
 
   log "Checking/installing build dependencies..."
   install_deps

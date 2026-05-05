@@ -3,6 +3,7 @@
 #include "storage/db.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -19,6 +20,19 @@
 namespace finalis::storage {
 
 namespace {
+
+std::uint64_t env_u64_or_default(const char* key, std::uint64_t def, std::uint64_t min_v, std::uint64_t max_v) {
+  const char* raw = std::getenv(key);
+  if (!raw || *raw == '\0') return def;
+  try {
+    std::uint64_t v = static_cast<std::uint64_t>(std::stoull(raw));
+    if (v < min_v) v = min_v;
+    if (v > max_v) v = max_v;
+    return v;
+  } catch (...) {
+    return def;
+  }
+}
 
 #ifdef SC_HAS_ROCKSDB
 rocksdb::Status open_rocksdb_rw(const rocksdb::Options& options, const std::string& path,
@@ -1297,6 +1311,88 @@ bool DB::put(const std::string& key, const Bytes& value) {
 #else
   mem_[key] = value;
   return flush_file();
+#endif
+}
+
+bool DB::put_many(const std::vector<std::pair<std::string, Bytes>>& entries, bool disable_wal) {
+  if (readonly_) return false;
+  if (entries.empty()) return true;
+#ifdef SC_HAS_ROCKSDB
+  rocksdb::WriteBatch batch;
+  for (const auto& [key, value] : entries) {
+    const auto status =
+        batch.Put(key, rocksdb::Slice(reinterpret_cast<const char*>(value.data()), value.size()));
+    if (!status.ok()) return false;
+  }
+  rocksdb::WriteOptions opts;
+  opts.disableWAL = disable_wal;
+  auto status = rocks_->db->Write(opts, &batch);
+  return status.ok();
+#else
+  for (const auto& [key, value] : entries) mem_[key] = value;
+  return flush_file();
+#endif
+}
+
+bool DB::set_bootstrap_ingest_mode(bool enabled) {
+#ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;
+  const auto reset_baseline = [this]() -> bool {
+    const auto db_opts = rocks_->db->SetDBOptions({
+        {"max_background_jobs", "2"},
+        {"bytes_per_sync", "0"},
+    });
+    if (!db_opts.ok()) return false;
+    const auto cf_opts = rocks_->db->SetOptions(rocks_->db->DefaultColumnFamily(),
+                                                {{"write_buffer_size", "67108864"},
+                                                 {"max_write_buffer_number", "2"},
+                                                 {"min_write_buffer_number_to_merge", "1"},
+                                                 {"level0_file_num_compaction_trigger", "4"},
+                                                 {"target_file_size_base", "67108864"}});
+    return cf_opts.ok();
+  };
+  if (enabled) {
+    const auto max_background_jobs =
+        env_u64_or_default("FINALIS_INGEST_MAX_BACKGROUND_JOBS", 8, 2, 128);
+    const auto bytes_per_sync =
+        env_u64_or_default("FINALIS_INGEST_BYTES_PER_SYNC", 1048576, 0, 64ULL * 1024ULL * 1024ULL);
+    const auto write_buffer_mb =
+        env_u64_or_default("FINALIS_INGEST_WRITE_BUFFER_MB", 128, 32, 4096);
+    const auto max_write_buffers =
+        env_u64_or_default("FINALIS_INGEST_MAX_WRITE_BUFFERS", 6, 2, 64);
+    const auto min_write_buffers_to_merge =
+        env_u64_or_default("FINALIS_INGEST_MIN_WRITE_BUFFERS_TO_MERGE", 2, 1, 16);
+    const auto l0_compaction_trigger =
+        env_u64_or_default("FINALIS_INGEST_L0_COMPACTION_TRIGGER", 8, 2, 64);
+    const auto target_file_size_mb =
+        env_u64_or_default("FINALIS_INGEST_TARGET_FILE_SIZE_MB", 128, 32, 2048);
+
+    const auto db_opts = rocks_->db->SetDBOptions({
+        {"max_background_jobs", std::to_string(max_background_jobs)},
+        {"bytes_per_sync", std::to_string(bytes_per_sync)},
+    });
+    if (!db_opts.ok()) {
+      (void)reset_baseline();
+      return false;
+    }
+    const auto cf_opts = rocks_->db->SetOptions(rocks_->db->DefaultColumnFamily(),
+                                                {{"write_buffer_size", std::to_string(write_buffer_mb * 1024ULL * 1024ULL)},
+                                                 {"max_write_buffer_number", std::to_string(max_write_buffers)},
+                                                 {"min_write_buffer_number_to_merge", std::to_string(min_write_buffers_to_merge)},
+                                                 {"level0_file_num_compaction_trigger", std::to_string(l0_compaction_trigger)},
+                                                 {"target_file_size_base", std::to_string(target_file_size_mb * 1024ULL * 1024ULL)}});
+    if (!cf_opts.ok()) {
+      (void)reset_baseline();
+      return false;
+    }
+    return true;
+  }
+
+  // Reset to conservative baseline for normal runtime.
+  return reset_baseline();
+#else
+  (void)enabled;
+  return true;
 #endif
 }
 

@@ -249,6 +249,37 @@ TEST(test_validator_liveness_counts_only_committee_signers) {
   ASSERT_EQ(p[0], a);
 }
 
+TEST(test_exiting_validator_outflow_does_not_inflate_quorum_or_signature_count) {
+  consensus::ValidatorRegistry vr;
+  vr.set_rules(consensus::ValidatorRules{.min_bond = BOND_AMOUNT, .warmup_blocks = 0, .cooldown_blocks = 0});
+
+  const auto a = key_from_byte(0x41).public_key;
+  const auto b = key_from_byte(0x42).public_key;
+  const auto c = key_from_byte(0x43).public_key;
+
+  std::string err;
+  ASSERT_TRUE(vr.register_bond(a, OutPoint{zero_hash(), 1}, 10, BOND_AMOUNT, &err));
+  ASSERT_TRUE(vr.register_bond(b, OutPoint{zero_hash(), 2}, 10, BOND_AMOUNT, &err));
+  ASSERT_TRUE(vr.register_bond(c, OutPoint{zero_hash(), 3}, 10, BOND_AMOUNT, &err));
+
+  // Force one validator into EXITING (outflow): it must drop from active set.
+  ASSERT_TRUE(vr.request_unbond(c, 11));
+
+  const auto committee = vr.active_sorted(11);
+  ASSERT_EQ(committee.size(), static_cast<std::size_t>(2));
+  ASSERT_TRUE(std::find(committee.begin(), committee.end(), c) == committee.end());
+
+  const std::size_t quorum = consensus::quorum_threshold(committee.size());
+  ASSERT_EQ(quorum, static_cast<std::size_t>(2));
+
+  // Even if an exiting validator signature is present, only committee members count.
+  std::vector<FinalitySig> sigs{{a, Sig64{}}, {c, Sig64{}}};
+  const auto participants = consensus::committee_participants_from_finality(committee, sigs);
+  ASSERT_EQ(participants.size(), static_cast<std::size_t>(1));
+  ASSERT_EQ(participants[0], a);
+  ASSERT_TRUE(participants.size() < quorum);
+}
+
 TEST(test_validator_liveness_window_counts_include_boundary_block) {
   // Model A: count height H first, then roll over when (H+1) hits the window boundary.
   ASSERT_TRUE(!consensus::validator_liveness_window_should_rollover(3, 0, 5));

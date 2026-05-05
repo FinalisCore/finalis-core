@@ -176,6 +176,7 @@ Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-sil
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-silver-light.ico") -Destination (Join-Path $installRoot "finalis-app-icon-silver-light.ico")
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installRoot "finalis-logo-horizontal.png")
 Copy-OptionalFile -Source (Join-Path $repoRoot "mainnet\SEEDS.json") -Destination (Join-Path $mainnetDir "SEEDS.json")
+Copy-OptionalFile -Source (Join-Path $repoRoot "snapshot.bin") -Destination (Join-Path $mainnetDir "snapshot.bin")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-splash-lockup.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard.bmp")
 Convert-PngToBmp -Source (Join-Path $repoRoot "branding\finalis-logo-horizontal.png") -Destination (Join-Path $installerAssetsDir "finalis-wizard-small.bmp")
 Copy-OptionalFile -Source (Join-Path $repoRoot "branding\finalis-token-badge-gold-dark.ico") -Destination (Join-Path $installerAssetsDir "finalis-app.ico")
@@ -204,6 +205,7 @@ Manual one-shot repair command:
 
 Windows joiner mode uses:
   mainnet\SEEDS.json
+  mainnet\snapshot.bin
 
 Wallet:
   bin\finalis-wallet.exe

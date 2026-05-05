@@ -245,6 +245,8 @@ class DB {
   void close();
 
   bool put(const std::string& key, const Bytes& value);
+  bool put_many(const std::vector<std::pair<std::string, Bytes>>& entries, bool disable_wal = false);
+  bool set_bootstrap_ingest_mode(bool enabled);
   std::optional<Bytes> get(const std::string& key) const;
   bool erase(const std::string& key);
   std::map<std::string, Bytes> scan_prefix(const std::string& prefix) const;
