@@ -1137,6 +1137,7 @@ std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& 
       << ",\"required_amount\":" << record.required_amount
       << ",\"last_spendable_balance\":" << record.last_spendable_balance
       << ",\"last_deficit\":" << record.last_deficit
+      << ",\"readiness_captured_at_unix_ms\":" << record.readiness.captured_at_unix_ms
       << ",\"selected_input_count\":" << record.selected_inputs.size()
       << ",\"selected_inputs_reserved\":" << (record.selected_inputs_reserved ? "true" : "false")
       << ",\"txid_hex\":\"" << json_escape(record.txid_hex)
@@ -1341,12 +1342,14 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
                                  : onboarding::ValidatorOnboardingState::FAILED;
     record.last_error_code = "node_not_ready";
     record.last_error_message = "runtime readiness snapshot unavailable";
+    record.readiness.readiness_failure_codes_csv = "runtime_snapshot_unavailable";
     return record;
   }
   if (!readiness_snapshot_allows_registration_for_rpc(*readiness, static_cast<std::uint64_t>(::time(nullptr)) * 1000ULL,
                                                       &readiness_err)) {
     record.state = wait_for_sync ? onboarding::ValidatorOnboardingState::WAITING_FOR_SYNC
                                  : onboarding::ValidatorOnboardingState::FAILED;
+    record.readiness.readiness_failure_codes_csv = readiness_err;
     if (!wait_for_sync) {
       record.last_error_code = "node_not_ready";
       record.last_error_message = readiness_err;
@@ -2426,7 +2429,12 @@ std::string Server::handle_rpc_body(const std::string& body) {
     }
     auto record = onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, "", &err);
     if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
-    if (record->state != onboarding::ValidatorOnboardingState::CHECKING_PREREQS) {
+    const bool stale_only_wait_for_sync =
+        !wait_for_sync &&
+        record->state == onboarding::ValidatorOnboardingState::FAILED &&
+        record->last_error_code == "node_not_ready" &&
+        record->last_error_message == "stale_runtime_snapshot";
+    if (record->state != onboarding::ValidatorOnboardingState::CHECKING_PREREQS && !stale_only_wait_for_sync) {
       return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
 
