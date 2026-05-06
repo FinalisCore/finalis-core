@@ -1299,7 +1299,12 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
 
   const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
   const auto spendable = wallet::spendable_p2pkh_utxos_for_pubkey_hash(db, own_pkh, nullptr);
-  for (const auto& utxo : spendable) record.last_spendable_balance += utxo.prevout.value;
+  for (const auto& utxo : spendable) {
+    if (!checked_add_u64(record.last_spendable_balance, utxo.prevout.value, &record.last_spendable_balance)) {
+      if (err) *err = "spendable_balance_overflow";
+      return std::nullopt;
+    }
+  }
   record.last_deficit = record.last_spendable_balance >= record.required_amount ? 0
                         : record.required_amount - record.last_spendable_balance;
 

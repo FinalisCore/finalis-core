@@ -561,7 +561,8 @@ std::string validator_onboarding_broadcast_outcome_name(
   return "unknown";
 }
 
-void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecord& record, bool as_json) {
+void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecord& record, bool as_json,
+                             const std::string& status_source = "") {
   if (as_json) {
     std::cout << "{"
               << "\"onboarding_id\":\"" << record.onboarding_id << "\","
@@ -588,6 +589,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"expected_activation_height\":" << record.activation_height << ","
               << "\"last_error_code\":\"" << record.last_error_code << "\","
               << "\"last_error_message\":\"" << record.last_error_message << "\""
+              << (status_source.empty() ? "" : (",\"status_source\":\"" + json_escape(status_source) + "\""))
               << "}\n";
     return;
   }
@@ -624,6 +626,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
   if (record.finalized_height != 0) std::cout << "finalized_height=" << record.finalized_height << "\n";
   if (record.activation_height != 0) std::cout << "activation_height=" << record.activation_height << "\n";
   std::cout << "expected_activation_height=" << record.activation_height << "\n";
+  if (!status_source.empty()) std::cout << "status_source=" << status_source << "\n";
   std::cout << "last_error_code=" << record.last_error_code << "\n";
   std::cout << "last_error_message=" << record.last_error_message << "\n";
 }
@@ -1484,9 +1487,9 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli onboarding-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
-     << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync]\n"
-     << "  finalis-cli validator-register-status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--json]\n"
-     << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>]  # cancel attempt before broadcast; detach local tracking after broadcast\n"
+     << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync] [--rpc-only]\n"
+     << "  finalis-cli validator-register-status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--json] [--rpc-only]\n"
+     << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--rpc-only]  # cancel attempt before broadcast; detach local tracking after broadcast\n"
      << "  finalis-cli wallet_create --out <path> [--pass <pass>] [--network mainnet] [--seed-hex <32b-hex>]\n"
      << "  finalis-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network mainnet]\n"
      << "  finalis-cli wallet_address --file <path> [--pass <pass>]\n"
@@ -3273,6 +3276,7 @@ int main(int argc, char** argv) {
     bool wait_for_sync = true;
     bool watch = true;
     bool as_json = false;
+    bool rpc_only = false;
     std::uint64_t timeout_seconds = 600;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -3286,6 +3290,7 @@ int main(int argc, char** argv) {
       else if (a == "--watch") watch = true;
       else if (a == "--no-watch") watch = false;
       else if (a == "--json") as_json = true;
+      else if (a == "--rpc-only") rpc_only = true;
       else if (a == "--timeout-seconds" && i + 1 < argc) timeout_seconds = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (a == "--resume") {
       }
@@ -3303,8 +3308,13 @@ int main(int argc, char** argv) {
     finalis::onboarding::ValidatorOnboardingService service;
     std::string err;
     if (cmd == "validator-register-status") {
+      std::string status_source = "rpc";
       auto record = rpc_onboarding_status_with_local_tracking(rpc_url, options, &err);
       if (!record) {
+        if (rpc_only) {
+          std::cerr << "validator-register-status failed: rpc status failed: " << err << "\n";
+          return 1;
+        }
         std::string local_err;
         record = service.status(options, &local_err);
         if (!record) {
@@ -3312,17 +3322,19 @@ int main(int argc, char** argv) {
                     << (err.empty() ? local_err : ("rpc status failed: " + err + "; local status failed: " + local_err)) << "\n";
           return 1;
         }
+        status_source = "local_fallback";
       }
-      print_onboarding_record(*record, as_json);
+      print_onboarding_record(*record, as_json, status_source);
       return 0;
     }
     if (cmd == "validator-register-cancel") {
       if (!service.cancel(options, &err)) {
         if (db_lock_error(err)) {
           std::string status_err;
-          auto local_status = service.status(options, &status_err);
+          std::optional<finalis::onboarding::ValidatorOnboardingRecord> local_status;
+          if (!rpc_only) local_status = service.status(options, &status_err);
           if (local_status) {
-            print_onboarding_record(*local_status, as_json);
+            print_onboarding_record(*local_status, as_json, "local_fallback");
             const bool pre_broadcast_cancel =
                 finalis::onboarding::validator_onboarding_state_pre_broadcast(local_status->state) ||
                 (local_status->state == finalis::onboarding::ValidatorOnboardingState::BROADCASTING_JOIN_TX &&
@@ -3340,12 +3352,16 @@ int main(int argc, char** argv) {
           }
           auto rpc_status = rpc_onboarding_status_with_local_tracking(rpc_url, options, &status_err);
           if (rpc_status) {
-            print_onboarding_record(*rpc_status, as_json);
+            print_onboarding_record(*rpc_status, as_json, "rpc");
             std::cerr
                 << "validator-register-cancel could not detach local tracking while finalis-node owns the DB. "
                 << "Stop finalis-node and rerun this command if you need to detach the local record.\n";
             return 1;
           }
+        }
+        if (rpc_only && !err.empty()) {
+          std::cerr << "validator-register-cancel failed (rpc-only): " << err << "\n";
+          return 1;
         }
         std::cerr << "validator-register-cancel failed: " << err << "\n";
         return 1;
@@ -3355,7 +3371,7 @@ int main(int argc, char** argv) {
         std::cerr << "validator-register-cancel status failed: " << err << "\n";
         return 1;
       }
-      print_onboarding_record(*record, as_json);
+      print_onboarding_record(*record, as_json, "local_fallback");
       if (record->state == finalis::onboarding::ValidatorOnboardingState::CANCELLED) {
         std::cerr << "validator-register-cancel: pre-broadcast attempt cancelled.\n";
       } else if (record->tracking_detached) {
@@ -3367,6 +3383,10 @@ int main(int argc, char** argv) {
     bool using_rpc = true;
     auto record = finalis::lightserver::rpc_validator_onboarding_start(rpc_url, options, &err);
     if (!record) {
+      if (rpc_only) {
+        std::cerr << "validator-register failed: rpc start failed: " << err << "\n";
+        return 1;
+      }
       std::string local_err;
       record = service.start_or_resume(options, &local_err);
       using_rpc = false;
@@ -3376,7 +3396,7 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
-    print_onboarding_record(*record, as_json);
+    print_onboarding_record(*record, as_json, using_rpc ? "rpc" : "local_fallback");
     if (!watch || finalis::onboarding::validator_onboarding_state_terminal(record->state)) return 0;
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
@@ -3401,7 +3421,7 @@ int main(int argc, char** argv) {
                            updated->readiness.registration_ready != record->readiness.registration_ready ||
                            updated->last_spendable_balance != record->last_spendable_balance;
       if (changed) {
-        print_onboarding_record(*updated, as_json);
+        print_onboarding_record(*updated, as_json, using_rpc ? "rpc" : "local_fallback");
         last_state = current_state;
       }
       if (!updated->txid_hex.empty()) tracked_txid = updated->txid_hex;

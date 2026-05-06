@@ -722,7 +722,14 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
         const auto reserved = reserved_outpoints_except(db, key->pubkey);
         const auto spendable = wallet::spendable_p2pkh_utxos_for_pubkey_hash(db, own_pkh, &reserved);
         record.last_spendable_balance = 0;
-        for (const auto& utxo : spendable) record.last_spendable_balance += utxo.prevout.value;
+        for (const auto& utxo : spendable) {
+          if (!checked_add_u64(record.last_spendable_balance, utxo.prevout.value, &record.last_spendable_balance)) {
+            record.state = ValidatorOnboardingState::FAILED;
+            set_error(&record, "spendable_balance_overflow", "spendable balance overflow");
+            (void)persist_record(db, record, err);
+            return record;
+          }
+        }
         record.last_deficit =
             record.last_spendable_balance >= record.required_amount ? 0 : record.required_amount - record.last_spendable_balance;
         if (record.last_spendable_balance < record.required_amount) {
