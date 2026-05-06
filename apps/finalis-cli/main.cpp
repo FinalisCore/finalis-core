@@ -580,6 +580,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"registration_ready\":" << (record.readiness.registration_ready ? "true" : "false") << ","
               << "\"readiness_blockers\":\"" << record.readiness.readiness_blockers_csv << "\","
               << "\"readiness_failure_codes\":\"" << record.readiness.readiness_failure_codes_csv << "\","
+              << "\"readiness_captured_at_unix_ms\":" << record.readiness.captured_at_unix_ms << ","
               << "\"txid\":\"" << record.txid_hex << "\","
               << "\"broadcast_outcome\":\"" << validator_onboarding_broadcast_outcome_name(record.broadcast_outcome)
               << "\","
@@ -609,6 +610,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
   std::cout << "readiness_stable_samples=" << record.readiness.readiness_stable_samples << "\n";
   std::cout << "readiness_blockers=" << record.readiness.readiness_blockers_csv << "\n";
   std::cout << "readiness_failure_codes=" << record.readiness.readiness_failure_codes_csv << "\n";
+  std::cout << "readiness_captured_at_unix_ms=" << record.readiness.captured_at_unix_ms << "\n";
   std::cout << "healthy_peer_count=" << record.readiness.healthy_peer_count << "\n";
   std::cout << "inbound_connected=" << record.readiness.inbound_connected << "\n";
   std::cout << "outbound_connected=" << record.readiness.outbound_connected << "\n";
