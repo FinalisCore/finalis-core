@@ -189,7 +189,7 @@ Before first startup on the mainnet:
 
 ## Fast sync command:
 ```
-finalis-cli fast_sync --db ~/.finalis/mainnet --snapshot snapshot.bin
+SYNC_TURBO_MODE=extreme ./scripts/start.sh
 ```
 
 Default ports from the current mainnet config:
