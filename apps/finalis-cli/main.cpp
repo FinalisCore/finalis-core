@@ -563,6 +563,16 @@ std::string validator_onboarding_broadcast_outcome_name(
 
 void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecord& record, bool as_json,
                              const std::string& status_source = "") {
+  const auto& net = finalis::mainnet_network();
+  const std::uint64_t activation_epoch_start =
+      record.activation_height == 0 ? 0
+                                    : finalis::consensus::committee_epoch_start(
+                                          std::max<std::uint64_t>(1, record.activation_height), net.committee_epoch_blocks);
+  const std::uint64_t warmup_blocks_remaining =
+      record.activation_height == 0
+          ? 0
+          : (record.activation_height > (record.finalized_height + 1) ? record.activation_height - (record.finalized_height + 1)
+                                                                       : 0);
   if (as_json) {
     std::cout << "{"
               << "\"onboarding_id\":\"" << record.onboarding_id << "\","
@@ -588,6 +598,9 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"finalized_height\":" << record.finalized_height << ","
               << "\"activation_height\":" << record.activation_height << ","
               << "\"expected_activation_height\":" << record.activation_height << ","
+              << "\"warmup_blocks_remaining\":" << warmup_blocks_remaining << ","
+              << "\"activation_epoch_start\":" << activation_epoch_start << ","
+              << "\"expected_activation_epoch_start\":" << activation_epoch_start << ","
               << "\"last_error_code\":\"" << record.last_error_code << "\","
               << "\"last_error_message\":\"" << record.last_error_message << "\""
               << (status_source.empty() ? "" : (",\"status_source\":\"" + json_escape(status_source) + "\""))
@@ -628,6 +641,9 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
   if (record.finalized_height != 0) std::cout << "finalized_height=" << record.finalized_height << "\n";
   if (record.activation_height != 0) std::cout << "activation_height=" << record.activation_height << "\n";
   std::cout << "expected_activation_height=" << record.activation_height << "\n";
+  std::cout << "warmup_blocks_remaining=" << warmup_blocks_remaining << "\n";
+  std::cout << "activation_epoch_start=" << activation_epoch_start << "\n";
+  std::cout << "expected_activation_epoch_start=" << activation_epoch_start << "\n";
   if (!status_source.empty()) std::cout << "status_source=" << status_source << "\n";
   std::cout << "last_error_code=" << record.last_error_code << "\n";
   std::cout << "last_error_message=" << record.last_error_message << "\n";
@@ -3304,6 +3320,7 @@ int main(int argc, char** argv) {
         .key_file = file_path,
         .passphrase = passphrase,
         .rpc_url = rpc_url,
+        .network = finalis::mainnet_network(),
         .fee = fee,
         .wait_for_sync = wait_for_sync,
     };

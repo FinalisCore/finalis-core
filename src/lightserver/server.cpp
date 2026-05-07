@@ -1241,14 +1241,16 @@ bool checked_add_u64(std::uint64_t a, std::uint64_t b, std::uint64_t* out) {
 
 bool readiness_snapshot_allows_registration_for_rpc(const storage::NodeRuntimeStatusSnapshot& snapshot, std::uint64_t now_ms,
                                                     std::string* reason) {
-  if (!readiness_snapshot_is_fresh_for_rpc(snapshot, now_ms)) {
-    if (reason) *reason = "stale_runtime_snapshot";
-    return false;
-  }
   if (!snapshot.registration_ready) {
     if (reason) *reason = snapshot.readiness_blockers_csv.empty() ? "registration readiness false"
                                                                   : snapshot.readiness_blockers_csv;
     return false;
+  }
+  // Freshness is advisory once readiness itself is green. This prevents
+  // long-lived false negatives when snapshot persistence lags but readiness
+  // remains satisfied.
+  if (!readiness_snapshot_is_fresh_for_rpc(snapshot, now_ms)) {
+    if (reason) *reason = "stale_runtime_snapshot";
   }
   return true;
 }

@@ -2407,6 +2407,7 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
       options.key_file = request.key_path.toStdString();
       options.passphrase = request.wallet->passphrase;
       options.rpc_url = request.rpc_url.toStdString();
+      options.network = finalis::network_by_name(request.wallet->network_name);
       options.fee = 10'000;
       options.wait_for_sync = true;
       std::string err;
@@ -2820,6 +2821,7 @@ void WalletWindow::start_onboarding_registration_clicked() {
   options.key_file = key_path.toStdString();
   options.passphrase = wallet_->passphrase;
   options.rpc_url = rpc_url.toStdString();
+  options.network = finalis::network_by_name(wallet_->network_name);
   options.fee = 10'000;
 
   std::string status_err;
@@ -2982,6 +2984,7 @@ void WalletWindow::start_validator_onboarding_clicked() {
   options.key_file = key_path.toStdString();
   options.passphrase = wallet_->passphrase;
   options.rpc_url = rpc_url.toStdString();
+  options.network = finalis::network_by_name(wallet_->network_name);
   options.fee = 10'000;
   options.wait_for_sync = true;
 
