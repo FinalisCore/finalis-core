@@ -2463,10 +2463,21 @@ std::string Server::handle_rpc_body(const std::string& body) {
       record->last_error_message = "invalid wallet address";
       return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
-    auto tx = build_validator_join_request_tx(prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
-                                              Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
-                                              record->bond_amount, record->fee,
-                                              address::p2pkh_script_pubkey(own_address->pubkey_hash), &err);
+    auto tip = live_db.get_tip();
+    const std::uint64_t current_height = tip ? (tip->height + 1) : 1;
+    ValidatorJoinAdmissionPowBuildContext pow_ctx{
+        .network = &cfg_.network,
+        .chain_id = &chain_id_,
+        .current_height = current_height,
+        .finalized_hash_at_height = [&live_db](std::uint64_t anchor_height) -> std::optional<Hash32> {
+          if (anchor_height == 0) return zero_hash();
+          return live_db.get_height_hash(anchor_height);
+        },
+    };
+    auto tx = build_validator_join_request_tx(
+        prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
+        Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey, record->bond_amount, record->fee,
+        address::p2pkh_script_pubkey(own_address->pubkey_hash), &err, &pow_ctx);
     if (!tx.has_value()) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "build_failed";
@@ -2479,8 +2490,6 @@ std::string Server::handle_rpc_body(const std::string& body) {
     const auto validators = live_db.load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
-    auto tip = live_db.get_tip();
-    const std::uint64_t current_height = tip ? (tip->height + 1) : 1;
     const auto min_bond_amount = record->bond_amount;
     const auto max_bond_amount = std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, min_bond_amount);
     ConfidentialPolicy confidential_policy{};
