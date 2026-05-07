@@ -516,9 +516,9 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::status(cons
   auto existing = db.get_validator_onboarding_record(key->pubkey);
   const auto tip = db.get_tip();
   const std::uint64_t planning_height = tip ? (tip->height + 1) : 0;
-  const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(mainnet_network(), db, planning_height);
+  const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(options.network, db, planning_height);
   const std::uint64_t eligibility_bond_amount =
-      eligibility_bond_amount_for_onboarding(mainnet_network(), db, planning_height, bond_amount);
+      eligibility_bond_amount_for_onboarding(options.network, db, planning_height, bond_amount);
   std::uint64_t required_amount = 0;
   if (!checked_add_u64(bond_amount, options.fee, &required_amount)) {
     if (err) *err = "fee_overflow";
@@ -552,9 +552,9 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::start_or_re
   ValidatorOnboardingRecord record;
   const auto tip = db.get_tip();
   const std::uint64_t planning_height = tip ? (tip->height + 1) : 0;
-  const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(mainnet_network(), db, planning_height);
+  const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(options.network, db, planning_height);
   const std::uint64_t eligibility_bond_amount =
-      eligibility_bond_amount_for_onboarding(mainnet_network(), db, planning_height, bond_amount);
+      eligibility_bond_amount_for_onboarding(options.network, db, planning_height, bond_amount);
   std::uint64_t required_amount = 0;
   if (!checked_add_u64(bond_amount, options.fee, &required_amount)) {
     if (err) *err = "fee_overflow";
@@ -588,6 +588,8 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::poll(const 
                                                                           std::string* err) const {
   auto key = load_key(options, err);
   if (!key) return std::nullopt;
+  auto onboarding_mu = onboarding_lock_for_pubkey(key->pubkey);
+  std::lock_guard<std::mutex> guard(*onboarding_mu);
   storage::DB db;
   if (!open_db(options.db_path, &db, err)) return std::nullopt;
   auto existing = db.get_validator_onboarding_record(key->pubkey);
@@ -649,10 +651,10 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
     record.fee = options.fee;
     const auto tip = db.get_tip();
     const std::uint64_t planning_height = tip ? (tip->height + 1) : 0;
-    const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(mainnet_network(), db, planning_height);
+    const std::uint64_t bond_amount = registration_bond_amount_for_onboarding(options.network, db, planning_height);
     record.bond_amount = bond_amount;
     record.eligibility_bond_amount =
-        eligibility_bond_amount_for_onboarding(mainnet_network(), db, planning_height, bond_amount);
+        eligibility_bond_amount_for_onboarding(options.network, db, planning_height, bond_amount);
     if (!checked_add_u64(bond_amount, options.fee, &record.required_amount)) {
       record.state = ValidatorOnboardingState::FAILED;
       set_error(&record, "fee_overflow", "bond_amount + fee overflow");
@@ -679,7 +681,7 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
     }
     if (validator_info.has_value() && validator_info->status == ValidatorStatus::PENDING) {
       record.state = ValidatorOnboardingState::PENDING_ACTIVATION;
-      record.activation_height = validator_info->joined_height + mainnet_network().validator_warmup_blocks;
+      record.activation_height = validator_info->joined_height + options.network.validator_warmup_blocks;
       record.finalized_height = db.get_tip().has_value() ? db.get_tip()->height : 0;
       record.selected_inputs_reserved = false;
       (void)persist_record(db, record, err);

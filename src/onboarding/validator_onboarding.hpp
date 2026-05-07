@@ -81,6 +81,7 @@ struct ValidatorOnboardingOptions {
   std::string key_file;
   std::string passphrase;
   std::string rpc_url;
+  NetworkConfig network{mainnet_network()};
   std::uint64_t fee{10'000};
   bool wait_for_sync{false};
 };
