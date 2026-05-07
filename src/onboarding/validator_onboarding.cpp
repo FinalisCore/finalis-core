@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include "common/address.hpp"
+#include "common/chain_id.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/randomness.hpp"
@@ -814,10 +815,20 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
           (void)persist_record(db, record, err);
           return record;
         }
-        auto tx = build_validator_join_request_tx(prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
-                                                  Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
-                                                  record.bond_amount, record.fee,
-                                                  address::p2pkh_script_pubkey(own_address->pubkey_hash), &build_err);
+        const auto chain_id = ChainId::from_config_and_db(options.network, db);
+        ValidatorJoinAdmissionPowBuildContext pow_ctx{
+            .network = &options.network,
+            .chain_id = &chain_id,
+            .current_height = planning_height == 0 ? 1 : planning_height,
+            .finalized_hash_at_height = [&db](std::uint64_t anchor_height) -> std::optional<Hash32> {
+              if (anchor_height == 0) return zero_hash();
+              return db.get_height_hash(anchor_height);
+            },
+        };
+        auto tx = build_validator_join_request_tx(
+            prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
+            Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey, record.bond_amount, record.fee,
+            address::p2pkh_script_pubkey(own_address->pubkey_hash), &build_err, &pow_ctx);
         if (!tx.has_value()) {
           record.state = ValidatorOnboardingState::FAILED;
           set_error(&record, "build_failed", build_err);
