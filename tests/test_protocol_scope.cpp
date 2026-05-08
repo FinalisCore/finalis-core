@@ -408,6 +408,70 @@ TEST(test_protocol_scope_rejects_tx_when_verify_budget_exceeded_by_join_request_
   ASSERT_TRUE(!r.error.empty());
 }
 
+TEST(test_protocol_scope_verify_budget_exact_limit_accepts_limit_plus_one_rejects) {
+  const auto kp = key_from_byte(29);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+
+  auto build_txv2 = [&](std::size_t input_count) {
+    TxV2 tx;
+    UtxoSetV2 view;
+    tx.version = static_cast<std::uint32_t>(TxVersionKind::CONFIDENTIAL_V2);
+    tx.lock_time = 0;
+
+    std::uint64_t in_sum = 0;
+    for (std::size_t i = 0; i < input_count; ++i) {
+      OutPoint op{};
+      op.txid.fill(static_cast<std::uint8_t>(0x80 + (i & 0x3F)));
+      op.index = static_cast<std::uint32_t>(i);
+      TxOut prev_out{1'000, address::p2pkh_script_pubkey(pkh)};
+      view[op] = UtxoEntryV2(prev_out);
+      in_sum += prev_out.value;
+      tx.inputs.push_back(TxInV2{
+          .prev_txid = op.txid,
+          .prev_index = op.index,
+          .sequence = 0xFFFFFFFF,
+          .kind = TxInputKind::Transparent,
+          .witness = TransparentInputWitnessV2{},
+      });
+    }
+
+    tx.outputs.push_back(TxOutV2{
+        .kind = TxOutputKind::Transparent,
+        .body = TransparentTxOutV2{in_sum - 1, address::p2pkh_script_pubkey(pkh)},
+    });
+    tx.fee = 1;
+    tx.balance_proof.excess_commitment = crypto::Commitment33{};
+    tx.balance_proof.excess_pubkey.fill(0);
+    tx.balance_proof.excess_sig.fill(0);
+
+    for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
+      auto msg = signing_message_for_input_v2(tx, i);
+      ASSERT_TRUE(msg.has_value());
+      auto sig = crypto::ed25519_sign(*msg, kp.private_key);
+      ASSERT_TRUE(sig.has_value());
+      std::get<TransparentInputWitnessV2>(tx.inputs[i].witness).script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
+    }
+    return std::pair<TxV2, UtxoSetV2>{std::move(tx), std::move(view)};
+  };
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 0;
+  policy.max_inputs_per_tx = static_cast<std::uint32_t>(kMaxTxEd25519Verifies + 16);
+  policy.max_outputs_per_tx = 8;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+
+  auto [tx_ok, view_ok] = build_txv2(kMaxTxEd25519Verifies);
+  const auto ok = validate_tx_v2(tx_ok, 1, view_ok, &ctx);
+  ASSERT_TRUE(ok.ok);
+
+  auto [tx_fail, view_fail] = build_txv2(kMaxTxEd25519Verifies + 1);
+  const auto fail = validate_tx_v2(tx_fail, 1, view_fail, &ctx);
+  ASSERT_TRUE(!fail.ok);
+  ASSERT_TRUE(fail.error.find("verify budget exceeded") != std::string::npos);
+}
+
 TEST(test_protocol_scope_roundtrips_mint_deposit_script) {
   Hash32 mint_id{};
   mint_id.fill(0x7C);

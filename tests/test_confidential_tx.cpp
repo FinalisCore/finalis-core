@@ -519,6 +519,87 @@ TEST(test_validate_tx_v2_accepts_confidential_input_with_transparent_output) {
   ASSERT_EQ(result.cost.confidential_verify_weight, 0u);
 }
 
+TEST(test_validate_tx_v2_rejects_duplicate_nullifier_like_confidential_spend_id) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) {
+    return;
+  }
+
+  const auto to = key_from_byte(0x34);
+  const auto shared_one_time_secret = blind_from_byte(0x35);
+  const auto shared_one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(shared_one_time_secret.bytes);
+  ASSERT_TRUE(shared_one_time_pubkey.has_value());
+
+  OutPoint op0{};
+  op0.txid.fill(0x7A);
+  op0.index = 0;
+  OutPoint op1{};
+  op1.txid.fill(0x7B);
+  op1.index = 0;
+
+  UtxoSetV2 view;
+  UtxoConfidentialData prev0{};
+  prev0.value_commitment = *crypto::confidential_amount_commitment(6'000, blind_from_byte(0x36));
+  prev0.one_time_pubkey = *shared_one_time_pubkey;
+  prev0.ephemeral_pubkey = compressed_key(0x37);
+  prev0.scan_tag.value = 0x11;
+  prev0.memo = Bytes{};
+  UtxoConfidentialData prev1{};
+  prev1.value_commitment = *crypto::confidential_amount_commitment(5'000, blind_from_byte(0x38));
+  prev1.one_time_pubkey = *shared_one_time_pubkey;
+  prev1.ephemeral_pubkey = compressed_key(0x39);
+  prev1.scan_tag.value = 0x12;
+  prev1.memo = Bytes{};
+  UtxoEntryV2 entry0;
+  entry0.kind = UtxoOutputKind::Confidential;
+  entry0.body = std::move(prev0);
+  UtxoEntryV2 entry1;
+  entry1.kind = UtxoOutputKind::Confidential;
+  entry1.body = std::move(prev1);
+  view[op0] = std::move(entry0);
+  view[op1] = std::move(entry1);
+
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op0.txid,
+      .prev_index = op0.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::Confidential,
+      .witness = ConfidentialInputWitnessV2{*shared_one_time_pubkey, Sig64{}},
+  });
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op1.txid,
+      .prev_index = op1.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::Confidential,
+      .witness = ConfidentialInputWitnessV2{*shared_one_time_pubkey, Sig64{}},
+  });
+  tx.outputs.push_back(TxOutV2{
+      .kind = TxOutputKind::Transparent,
+      .body = TransparentTxOutV2{10'500, address::p2pkh_script_pubkey(crypto::h160(Bytes(to.public_key.begin(), to.public_key.end())))},
+  });
+  tx.fee = 500;
+
+  const auto total_input_blind =
+      crypto::combine_blinds(std::array<crypto::Blind32, 2>{blind_from_byte(0x36), blind_from_byte(0x38)}, 0);
+  ASSERT_TRUE(total_input_blind.has_value());
+  const auto excess = crypto::confidential_amount_commitment(0, *total_input_blind);
+  ASSERT_TRUE(excess.has_value());
+  tx.balance_proof.excess_commitment = *excess;
+  sign_balance_proof(tx, *total_input_blind, 0x3A);
+  sign_confidential_input(tx, 0, shared_one_time_secret, 0x3B);
+  sign_confidential_input(tx, 1, shared_one_time_secret, 0x3C);
+
+  ConfidentialPolicy policy;
+  policy.activation_height = 1;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_TRUE(result.error.find("duplicate confidential spend id") != std::string::npos);
+}
+
 TEST(test_validate_tx_v2_rejects_invalid_confidential_input_authorization) {
   if (!crypto::confidential_backend_status().confidential_outputs_supported) {
     return;

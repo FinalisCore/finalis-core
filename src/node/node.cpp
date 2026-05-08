@@ -68,6 +68,10 @@ constexpr std::size_t kMaxCandidateBlockBytes = 32 * 1024 * 1024;
 constexpr std::uint32_t kProposalRoundWindow = 32;
 constexpr std::uint64_t kForwardSyncWindow = 16;
 constexpr std::size_t kAdaptiveTelemetryWindowEpochs = 16;
+constexpr std::uint32_t kEpochReconcileRequestMaxTickets = 128;
+constexpr std::size_t kEpochReconcileMinPeersPerTick = 3;
+constexpr std::size_t kEpochReconcileMaxPeersPerTick = 8;
+constexpr std::uint64_t kEpochTicketRejectLogIntervalMs = 10'000;
 
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
@@ -1315,6 +1319,7 @@ constexpr const char* kSmtTreeValidators = "validators";
 
 bool debug_economics_logs_enabled();
 bool debug_finality_logs_enabled();
+bool debug_liveness_logs_enabled();
 
 bool runtime_logs_enabled() {
   if (debug_economics_logs_enabled() || debug_finality_logs_enabled()) return true;
@@ -1329,6 +1334,11 @@ bool debug_economics_logs_enabled() {
 
 bool debug_finality_logs_enabled() {
   const char* enabled = std::getenv("FINALIS_DEBUG_FINALITY");
+  return enabled && std::string_view(enabled) == "1";
+}
+
+bool debug_liveness_logs_enabled() {
+  const char* enabled = std::getenv("FINALIS_DEBUG_LIVENESS");
   return enabled && std::string_view(enabled) == "1";
 }
 
@@ -5499,6 +5509,35 @@ void Node::event_loop() {
           ticket_pow_fallback_round || highest_qc.has_value() ||
           (highest_tc.has_value() && highest_tc->round < current_round_) || current_round_ == 0;
       can_propose = leader.has_value() && *leader == local_key_.public_key;
+      if (debug_liveness_logs_enabled() && now_ms >= last_liveness_log_ms_ + 5000) {
+        const bool local_active = validators_.is_active_for_height(local_key_.public_key, h);
+        const bool local_in_committee =
+            std::find(committee.begin(), committee.end(), local_key_.public_key) != committee.end();
+        const bool timeout_elapsed = now_ms > round_started_ms_ + cfg_.network.round_timeout_ms;
+        std::ostringstream lss;
+        lss << "liveness-debug"
+            << " next_height=" << h
+            << " round=" << current_round_
+            << " finalized_height=" << finalized_height_
+            << " committee_size=" << committee.size()
+            << " quorum=" << quorum
+            << " local_active=" << (local_active ? "yes" : "no")
+            << " local_in_committee=" << (local_in_committee ? "yes" : "no")
+            << " leader=" << (leader.has_value() ? short_pub_hex(*leader) : std::string("none"))
+            << " local_pub=" << short_pub_hex(local_key_.public_key)
+            << " can_propose=" << (can_propose ? "yes" : "no")
+            << " block_interval_elapsed=" << (block_interval_elapsed ? "yes" : "no")
+            << " ticket_window_elapsed=" << (ticket_window_elapsed ? "yes" : "no")
+            << " round_timeout_elapsed=" << (timeout_elapsed ? "yes" : "no")
+            << " round_justification_ready=" << (round_justification_ready ? "yes" : "no")
+            << " has_qc=" << (highest_qc.has_value() ? "yes" : "no")
+            << " has_tc=" << (highest_tc.has_value() ? "yes" : "no")
+            << " paused=" << (pause_proposals_.load() ? "yes" : "no")
+            << " repair_mode=" << (repair_mode_ ? "yes" : "no")
+            << " peers_established=" << established_peer_count();
+        log_line(lss.str());
+        last_liveness_log_ms_ = now_ms;
+      }
       if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && block_interval_elapsed && ticket_window_elapsed &&
           !committee.empty() && round_justification_ready) {
         auto key = std::make_pair(h, current_round_);
@@ -6055,9 +6094,6 @@ bool Node::ensure_required_epoch_committee_state_startup() {
 }
 
 void Node::request_epoch_tickets(int peer_id, std::uint64_t epoch, std::uint32_t max_tickets) {
-#ifdef _WIN32
-  max_tickets = std::max<std::uint32_t>(max_tickets, 2048U);
-#endif
   const bool ok =
       p2p_.send_to(peer_id, p2p::MsgType::GET_EPOCH_TICKETS, p2p::ser_get_epoch_tickets(p2p::GetEpochTicketsMsg{epoch, max_tickets}));
   log_line("epoch-reconcile-request peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(epoch) +
@@ -6088,17 +6124,27 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
     }
   }
   
-  const std::uint64_t interval = std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
+  std::vector<int> eligible_peer_ids;
+  eligible_peer_ids.reserve(p2p_.peer_ids().size());
   for (int peer_id : p2p_.peer_ids()) {
     const auto info = p2p_.get_peer_info(peer_id);
     if (!info.established()) continue;
     if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id)) continue;
+    eligible_peer_ids.push_back(peer_id);
+  }
+  if (eligible_peer_ids.empty()) return;
+  const std::size_t fanout = std::min<std::size_t>(
+      eligible_peer_ids.size(),
+      std::max<std::size_t>(kEpochReconcileMinPeersPerTick,
+                            std::min<std::size_t>(kEpochReconcileMaxPeersPerTick, cfg_.outbound_target)));
+  const std::size_t start = epoch_reconcile_peer_cursor_ % eligible_peer_ids.size();
+  epoch_reconcile_peer_cursor_ = (start + fanout) % eligible_peer_ids.size();
+  const std::uint64_t interval = std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
+  for (std::size_t index = 0; index < fanout; ++index) {
+    const int peer_id = eligible_peer_ids[(start + index) % eligible_peer_ids.size()];
     for (const auto epoch : epochs) {
-      const bool is_settlement_epoch =
-          std::find(settlement_epochs.begin(), settlement_epochs.end(), epoch) != settlement_epochs.end();
-      // Always request settlement epoch regardless of frozen status; skip other frozen epochs only if already synced
-      if (epoch != open_epoch && !is_settlement_epoch && epoch_committee_frozen_locked(epoch) && 
-          db_.get_epoch_committee_snapshot(epoch).has_value()) {
+      // Skip closed/frozen epochs after local checkpoint snapshot is available.
+      if (epoch != open_epoch && epoch_committee_frozen_locked(epoch) && db_.get_epoch_committee_snapshot(epoch).has_value()) {
         auto snapshot = db_.get_epoch_committee_snapshot(epoch);
         if (snapshot.has_value() && !snapshot->ordered_members.empty()) continue;
       }
@@ -6106,7 +6152,7 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
       auto it = epoch_ticket_request_ms_.find(key);
       if (it != epoch_ticket_request_ms_.end() && now_ms < it->second + interval) continue;
       epoch_ticket_request_ms_[key] = now_ms;
-      request_epoch_tickets(peer_id, epoch, 512);
+      request_epoch_tickets(peer_id, epoch, kEpochReconcileRequestMaxTickets);
     }
   }
 }
@@ -6251,8 +6297,24 @@ bool Node::handle_epoch_ticket(const consensus::EpochTicket& ticket, bool from_n
   const bool accepted =
       handle_epoch_ticket_locked(ticket, from_network, from_peer_id, &reject_reason, allow_closed_epoch_reconcile);
   if (!accepted) {
-    log_line("epoch-ticket-rejected peer_id=" + std::to_string(from_peer_id) + " epoch=" + std::to_string(ticket.epoch) +
-             " participant=" + short_pub_hex(ticket.participant_pubkey) + " reason=" + reject_reason);
+    bool should_log = true;
+    std::string suffix;
+    if (from_network && reject_reason == "not-best") {
+      const std::uint64_t tms = now_ms();
+      auto& state = epoch_ticket_reject_log_state_[std::make_tuple(from_peer_id, ticket.epoch, reject_reason)];
+      if (state.first != 0 && tms < state.first + kEpochTicketRejectLogIntervalMs) {
+        ++state.second;
+        should_log = false;
+      } else {
+        if (state.second != 0) suffix = " suppressed=" + std::to_string(state.second);
+        state.first = tms;
+        state.second = 0;
+      }
+    }
+    if (should_log) {
+      log_line("epoch-ticket-rejected peer_id=" + std::to_string(from_peer_id) + " epoch=" + std::to_string(ticket.epoch) +
+               " participant=" + short_pub_hex(ticket.participant_pubkey) + " reason=" + reject_reason + suffix);
+    }
   } else {
     log_line(std::string(from_network ? "epoch-ticket-recv-accepted" : "epoch-ticket-local-accepted") +
              " peer_id=" + std::to_string(from_peer_id) + " epoch=" + std::to_string(ticket.epoch) +
@@ -6782,7 +6844,16 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       bool closed = false;
       {
         std::lock_guard<std::mutex> lk(mu_);
-        tickets = db_.load_epoch_tickets(req->epoch);
+        const auto best_tickets = db_.load_best_epoch_tickets(req->epoch);
+        if (!best_tickets.empty()) {
+          tickets.reserve(best_tickets.size());
+          for (const auto& [_, ticket] : best_tickets) tickets.push_back(ticket);
+        } else {
+          const auto all_tickets = db_.load_epoch_tickets(req->epoch);
+          const auto best_by_pubkey = consensus::best_epoch_tickets_by_pubkey(all_tickets);
+          tickets.reserve(best_by_pubkey.size());
+          for (const auto& [_, ticket] : best_by_pubkey) tickets.push_back(ticket);
+        }
         closed = epoch_committee_closed_locked(req->epoch);
       }
       const std::size_t limit = std::min<std::size_t>(tickets.size(), std::max<std::uint32_t>(1, req->max_tickets));
