@@ -1,3 +1,29 @@
+TEST(test_p2pkh_script_pubkey) {
+  using finalis::address::p2pkh_script_pubkey;
+  using finalis::Bytes;
+  // Test with all zeros
+  std::array<std::uint8_t, 20> zeros{};
+  Bytes script = p2pkh_script_pubkey(zeros);
+  ASSERT_EQ(script.size(), 25u);
+  ASSERT_EQ(script[0], 0x76); // OP_DUP
+  ASSERT_EQ(script[1], 0xA9); // OP_HASH160
+  ASSERT_EQ(script[2], 0x14); // Push 20 bytes
+  for (size_t i = 0; i < 20; ++i) ASSERT_EQ(script[3 + i], 0x00);
+  ASSERT_EQ(script[23], 0x88); // OP_EQUALVERIFY
+  ASSERT_EQ(script[24], 0xAC); // OP_CHECKSIG
+
+  // Test with all ones
+  std::array<std::uint8_t, 20> ones;
+  ones.fill(0xFF);
+  Bytes script_ones = p2pkh_script_pubkey(ones);
+  ASSERT_EQ(script_ones.size(), 25u);
+  for (size_t i = 0; i < 20; ++i) ASSERT_EQ(script_ones[3 + i], 0xFF);
+
+  // Test with a known pattern
+  std::array<std::uint8_t, 20> pattern = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19};
+  Bytes script_pattern = p2pkh_script_pubkey(pattern);
+  for (size_t i = 0; i < 20; ++i) ASSERT_EQ(script_pattern[3 + i], static_cast<std::uint8_t>(i));
+}
 TEST(test_decode_valid_and_invalid_addresses) {
   using finalis::address::encode_p2pkh;
   using finalis::address::decode;
