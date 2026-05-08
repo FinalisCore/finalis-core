@@ -1201,6 +1201,55 @@ TEST(test_frontier_storage_replay_fails_closed_when_ingress_record_is_missing) {
   ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_storage(cfg, parent, db, &out, &err));
 }
 
+TEST(test_finality_rejects_quorum_below_threshold_exact_boundary) {
+  const auto cfg = test_cfg();
+  const auto v0 = key_from_byte(90);
+  const auto v1 = key_from_byte(91);
+  const auto v2 = key_from_byte(92);
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators = {v0.public_key, v1.public_key, v2.public_key};
+
+  consensus::CanonicalDerivedState parent;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &parent, &err));
+
+  const auto chain_record = make_frontier_record(parent, {});
+
+  const std::string path = unique_test_base("/tmp/finalis_test_finality_quorum_boundary");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+  persist_frontier_record(db, 1, chain_record);
+  ASSERT_TRUE(db.set_finalized_frontier_height(1));
+
+  const auto committee =
+      consensus::canonical_committee_for_height_round(cfg, parent, chain_record.transition.height, chain_record.transition.round);
+  ASSERT_TRUE(committee.size() >= 3);
+  const auto quorum = consensus::quorum_threshold(committee.size());
+  ASSERT_TRUE(quorum >= 2);
+
+  const auto msg = vote_signing_message(chain_record.transition.height, chain_record.transition.round,
+                                        chain_record.transition.transition_id());
+  auto sig = crypto::ed25519_sign(msg, v0.private_key);
+  ASSERT_TRUE(sig.has_value());
+
+  FinalityCertificate cert;
+  cert.height = chain_record.transition.height;
+  cert.round = chain_record.transition.round;
+  cert.frontier_transition_id = chain_record.transition.transition_id();
+  cert.quorum_threshold = static_cast<std::uint32_t>(quorum);
+  cert.committee_members = committee;
+  cert.signatures = {FinalitySig{v0.public_key, *sig}};
+  ASSERT_TRUE(db.put_finality_certificate(cert));
+
+  consensus::CanonicalDerivedState out;
+  std::string derive_err;
+  ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_storage(cfg, parent, db, &out, &derive_err));
+  ASSERT_TRUE(derive_err.find("certificate-insufficient-valid-signatures") != std::string::npos);
+}
+
 TEST(test_frontier_storage_replay_fails_closed_when_lane_tip_is_too_low) {
   const auto cfg = test_cfg();
   const auto from = key_from_byte(34);

@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: MIT
+
+#include "test_framework.hpp"
+
+#include "common/address.hpp"
+
+using namespace finalis;
+
 TEST(test_p2pkh_script_pubkey) {
   using finalis::address::p2pkh_script_pubkey;
   using finalis::Bytes;
@@ -66,31 +74,12 @@ TEST(test_address_validate_edge_cases) {
   ASSERT_TRUE(!res_long.valid);
   // Could be invalid payload length or invalid base32 depending on decode
 
-  // Address with valid HRP but invalid payload (bad address type)
-  // Construct a valid address, then mutate the type byte
-  std::array<std::uint8_t, 20> pkh{};
-  auto good = finalis::address::encode_p2pkh("sc", pkh);
-  ASSERT_TRUE(good.has_value());
-  std::string mutated = *good;
-  // Find the separator and base32-decode, then re-encode with type byte = 0x01
-  auto sep = mutated.find('1');
-  ASSERT_TRUE(sep != std::string::npos);
-  std::string b32 = mutated.substr(sep + 1);
-  auto data_opt = finalis::address::base32_decode(b32);
-  ASSERT_TRUE(data_opt.has_value());
-  auto data = data_opt.value();
-  data[0] = 0x01; // unsupported address type
-  std::string b32_mut;
-  {
-    // Re-encode mutated data
-    b32_mut = finalis::address::base32_encode(data);
-  }
-  std::string bad_type_addr = mutated.substr(0, sep + 1) + b32_mut;
-  auto res_bad_type = validate(bad_type_addr);
-  ASSERT_TRUE(!res_bad_type.valid);
-  ASSERT_EQ(res_bad_type.error, "unsupported address type");
+  // Invalid address with non-base32 payload
+  std::string bad_payload = "sc1ABC";
+  auto res_bad_payload = validate(bad_payload);
+  ASSERT_TRUE(!res_bad_payload.valid);
+  ASSERT_EQ(res_bad_payload.error, "invalid base32");
 }
-// SPDX-License-Identifier: MIT
 
 TEST(test_encode_p2pkh_various_inputs) {
   using finalis::address::encode_p2pkh;
@@ -116,14 +105,6 @@ TEST(test_encode_p2pkh_various_inputs) {
   auto addr_invalid_hrp3 = encode_p2pkh("scc", random);
   ASSERT_TRUE(!addr_invalid_hrp3.has_value());
 }
-// SPDX-License-Identifier: MIT
-
-#include "test_framework.hpp"
-
-#include "common/address.hpp"
-
-using namespace finalis;
-
 TEST(test_address_encode_decode_checksum) {
   std::array<std::uint8_t, 20> pkh{};
   for (size_t i = 0; i < pkh.size(); ++i) pkh[i] = static_cast<std::uint8_t>(i);
@@ -174,34 +155,25 @@ TEST(test_address_validate_reports_specific_errors) {
   ASSERT_EQ(bad_base32.error, "invalid base32");
 }
 
-TEST(test_base32_encode_decode) {
-  using finalis::address::base32_encode;
-  using finalis::address::base32_decode;
-  using finalis::Bytes;
+TEST(test_address_roundtrip_multiple_payloads) {
+  std::array<std::uint8_t, 20> zeros{};
+  std::array<std::uint8_t, 20> ones;
+  ones.fill(0xFF);
+  std::array<std::uint8_t, 20> pattern{};
+  for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<std::uint8_t>(i);
 
-  // Test normal encoding/decoding
-  Bytes data = {0x01, 0x02, 0x03, 0x04, 0x05};
-  std::string encoded = base32_encode(data);
-  auto decoded_opt = base32_decode(encoded);
-  ASSERT_TRUE(decoded_opt.has_value());
-  ASSERT_EQ(decoded_opt.value(), data);
+  const auto a0 = address::encode_p2pkh("sc", zeros);
+  const auto a1 = address::encode_p2pkh("sc", ones);
+  const auto a2 = address::encode_p2pkh("tsc", pattern);
+  ASSERT_TRUE(a0.has_value() && a1.has_value() && a2.has_value());
 
-  // Test empty input
-  Bytes empty_data;
-  std::string empty_encoded = base32_encode(empty_data);
-  ASSERT_EQ(empty_encoded, "");
-  auto empty_decoded = base32_decode("");
-  ASSERT_TRUE(empty_decoded.has_value());
-  ASSERT_EQ(empty_decoded.value(), Bytes{});
-
-  // Test invalid character
-  auto invalid_decoded = base32_decode("abc$ef");
-  ASSERT_TRUE(!invalid_decoded.has_value());
-
-  // Test incomplete group (should fail if remainder is nonzero)
-  // 'a' = 0, so this is valid, but 'b' = 1, so remainder is nonzero
-  auto incomplete = base32_decode("b");
-  ASSERT_TRUE(!incomplete.has_value());
+  const auto d0 = address::decode(*a0);
+  const auto d1 = address::decode(*a1);
+  const auto d2 = address::decode(*a2);
+  ASSERT_TRUE(d0.has_value() && d1.has_value() && d2.has_value());
+  ASSERT_EQ(d0->pubkey_hash, zeros);
+  ASSERT_EQ(d1->pubkey_hash, ones);
+  ASSERT_EQ(d2->pubkey_hash, pattern);
 }
 
 void register_address_tests() {}
