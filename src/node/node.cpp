@@ -2809,9 +2809,9 @@ bool Node::init() {
   });
   if (!init_local_validator_key()) return false;
   p2p::AddrPolicy addr_policy;
-  // Accept non-default peer ports so multiple operators behind a single IP
-  // (or one host running several instances) remain discoverable.
-  addr_policy.required_port.reset();
+  // Tighten addrman to the network's canonical P2P port to reduce noisy
+  // endpoint gossip and keep outbound discovery focused on reachable peers.
+  addr_policy.required_port = cfg_.network.p2p_default_port;
   addr_policy.reject_unroutable = true;
   addrman_.set_policy(addr_policy);
   if (!db_.open(cfg_.db_path)) {

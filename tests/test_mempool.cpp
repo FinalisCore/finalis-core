@@ -5,15 +5,158 @@
 #include <ctime>
 
 #include "common/address.hpp"
+#include "consensus/policy_hashcash.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "mempool/mempool.hpp"
-#include "consensus/policy_hashcash.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 
 using namespace finalis;
 
+namespace {
+crypto::KeyPair key_from_byte(std::uint8_t base);
+TxOut p2pkh_out_for_pub(const PubKey32& pub, std::uint64_t value);
+std::optional<Tx> spend_one(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& from, const PubKey32& to_pub,
+                            std::uint64_t value_out);
+Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub);
+}
+
+TEST(test_mempool_rejects_nonexistent_utxo) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(84);
+  const auto k2 = key_from_byte(85);
+
+  // Reference a UTXO that does not exist in the view
+  OutPoint op_missing{};
+  op_missing.txid.fill(0xD0);
+  op_missing.index = 0;
+  TxOut prev_missing = p2pkh_out_for_pub(k1.public_key, 1'000);
+  // Do NOT add to view
+  auto tx_missing = spend_one(op_missing, prev_missing, k1, k2.public_key, 900);
+  ASSERT_TRUE(tx_missing.has_value());
+  std::string err;
+  ASSERT_TRUE(!mp.accept_tx(*tx_missing, view, &err));
+}
+TEST(test_mempool_rejects_invalid_fee_values) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(82);
+  const auto k2 = key_from_byte(83);
+
+  OutPoint op_neg{};
+  op_neg.txid.fill(0xCE);
+  op_neg.index = 0;
+  TxOut prev_neg = p2pkh_out_for_pub(k1.public_key, 1'000);
+  view[op_neg] = UtxoEntry{prev_neg};
+
+  // Negative fee (output > input)
+  auto tx_neg_fee = spend_one(op_neg, prev_neg, k1, k2.public_key, 1'001);
+  ASSERT_TRUE(tx_neg_fee.has_value());
+  std::string err;
+  ASSERT_TRUE(!mp.accept_tx(*tx_neg_fee, view, &err));
+
+  // Excessive fee (output = 0)
+  OutPoint op_excess{};
+  op_excess.txid.fill(0xCF);
+  op_excess.index = 0;
+  TxOut prev_excess = p2pkh_out_for_pub(k1.public_key, 1'000);
+  view[op_excess] = UtxoEntry{prev_excess};
+  auto tx_excess_fee = spend_one(op_excess, prev_excess, k1, k2.public_key, 0);
+  ASSERT_TRUE(tx_excess_fee.has_value());
+  ASSERT_TRUE(mp.accept_tx(*tx_excess_fee, view, &err)); // Acceptable if zero output is allowed, else change to ASSERT_FALSE
+}
+TEST(test_mempool_accepts_edge_case_fee_values) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(80);
+  const auto k2 = key_from_byte(81);
+
+  OutPoint op_zero{};
+  op_zero.txid.fill(0xCC);
+  op_zero.index = 0;
+  TxOut prev_zero = p2pkh_out_for_pub(k1.public_key, 1'000);
+  view[op_zero] = UtxoEntry{prev_zero};
+
+  // Zero fee
+  auto tx_zero_fee = spend_one(op_zero, prev_zero, k1, k2.public_key, 1'000);
+  ASSERT_TRUE(tx_zero_fee.has_value());
+  std::string err;
+  ASSERT_TRUE(mp.accept_tx(*tx_zero_fee, view, &err));
+
+  // Dust threshold fee (using DEFAULT_WALLET_DUST_THRESHOLD_UNITS)
+  OutPoint op_dust{};
+  op_dust.txid.fill(0xCD);
+  op_dust.index = 0;
+  TxOut prev_dust = p2pkh_out_for_pub(k1.public_key, 1'000);
+  view[op_dust] = UtxoEntry{prev_dust};
+  auto tx_dust_fee = spend_one(op_dust, prev_dust, k1, k2.public_key, 1'000 - finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS);
+  ASSERT_TRUE(tx_dust_fee.has_value());
+  ASSERT_TRUE(mp.accept_tx(*tx_dust_fee, view, &err));
+}
+TEST(test_mempool_rejects_double_spend_across_transactions) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(70);
+  const auto k2 = key_from_byte(71);
+
+  OutPoint op{};
+  op.txid.fill(0xBB);
+  op.index = 0;
+  TxOut prev = p2pkh_out_for_pub(k1.public_key, 2'000);
+  view[op] = UtxoEntry{prev};
+
+  // First transaction spends the UTXO
+  auto tx1 = spend_one(op, prev, k1, k2.public_key, 1'500);
+  ASSERT_TRUE(tx1.has_value());
+  std::string err;
+  ASSERT_TRUE(mp.accept_tx(*tx1, view, &err));
+
+  // Second transaction attempts to double spend the same UTXO
+  auto tx2 = spend_one(op, prev, k1, k2.public_key, 1'000);
+  ASSERT_TRUE(tx2.has_value());
+  ASSERT_TRUE(!mp.accept_tx(*tx2, view, &err));
+  ASSERT_TRUE(err.find("double spend in mempool") != std::string::npos);
+}
+TEST(test_mempool_rejects_invalid_signature_and_malformed_tx) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(60);
+  const auto k2 = key_from_byte(61);
+
+  OutPoint op{};
+  op.txid.fill(0xAA);
+  op.index = 0;
+  TxOut prev = p2pkh_out_for_pub(k1.public_key, 1'000);
+  view[op] = UtxoEntry{prev};
+
+  // Invalid signature
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{900, address::p2pkh_script_pubkey(crypto::h160(Bytes(k2.public_key.begin(), k2.public_key.end())))});
+  Sig64 fake_sig{};
+  fake_sig.fill(0xAB);
+  tx.inputs[0].script_sig = make_p2pkh_script_sig(fake_sig, k1.public_key);
+  std::string err;
+  ASSERT_TRUE(!mp.accept_tx(tx, view, &err));
+  ASSERT_TRUE(err.find("signature invalid") != std::string::npos);
+
+  // Malformed transaction (missing outputs)
+  Tx malformed;
+  malformed.version = 1;
+  malformed.lock_time = 0;
+  malformed.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  // No outputs
+  ASSERT_TRUE(!mp.accept_tx(malformed, view, &err));
+}
 namespace {
 
 crypto::KeyPair key_from_byte(std::uint8_t base) {
