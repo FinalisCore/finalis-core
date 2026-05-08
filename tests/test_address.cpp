@@ -1,3 +1,71 @@
+TEST(test_decode_valid_and_invalid_addresses) {
+  using finalis::address::encode_p2pkh;
+  using finalis::address::decode;
+  // Valid address
+  std::array<std::uint8_t, 20> pkh{};
+  for (size_t i = 0; i < pkh.size(); ++i) pkh[i] = static_cast<std::uint8_t>(i);
+  auto addr = encode_p2pkh("sc", pkh);
+  ASSERT_TRUE(addr.has_value());
+  auto dec = decode(*addr);
+  ASSERT_TRUE(dec.has_value());
+  ASSERT_EQ(dec->hrp, "sc");
+  ASSERT_EQ(dec->addr_type, 0x00);
+  ASSERT_EQ(dec->pubkey_hash, pkh);
+
+  // Invalid address (bad checksum)
+  std::string bad = *addr;
+  bad.back() = (bad.back() == 'a') ? 'b' : 'a';
+  auto dec_bad = decode(bad);
+  ASSERT_TRUE(!dec_bad.has_value());
+
+  // Invalid address (unsupported HRP)
+  auto dec_hrp = decode("xx1abcdef");
+  ASSERT_TRUE(!dec_hrp.has_value());
+
+  // Invalid address (empty string)
+  auto dec_empty = decode("");
+  ASSERT_TRUE(!dec_empty.has_value());
+}
+TEST(test_address_validate_edge_cases) {
+  using finalis::address::validate;
+  // Address with valid HRP but too short payload (base32 for 1 byte)
+  std::string short_payload = "sc1aaaaa"; // Not enough for 25 bytes after decoding
+  auto res_short = validate(short_payload);
+  ASSERT_TRUE(!res_short.valid);
+  ASSERT_EQ(res_short.error, "invalid payload length");
+
+  // Address with valid HRP but too long payload (base32 for 40 bytes)
+  std::string long_payload = "sc1" + std::string(40, 'a');
+  auto res_long = validate(long_payload);
+  ASSERT_TRUE(!res_long.valid);
+  // Could be invalid payload length or invalid base32 depending on decode
+
+  // Address with valid HRP but invalid payload (bad address type)
+  // Construct a valid address, then mutate the type byte
+  std::array<std::uint8_t, 20> pkh{};
+  auto good = finalis::address::encode_p2pkh("sc", pkh);
+  ASSERT_TRUE(good.has_value());
+  std::string mutated = *good;
+  // Find the separator and base32-decode, then re-encode with type byte = 0x01
+  auto sep = mutated.find('1');
+  ASSERT_TRUE(sep != std::string::npos);
+  std::string b32 = mutated.substr(sep + 1);
+  auto data_opt = finalis::address::base32_decode(b32);
+  ASSERT_TRUE(data_opt.has_value());
+  auto data = data_opt.value();
+  data[0] = 0x01; // unsupported address type
+  std::string b32_mut;
+  {
+    // Re-encode mutated data
+    b32_mut = finalis::address::base32_encode(data);
+  }
+  std::string bad_type_addr = mutated.substr(0, sep + 1) + b32_mut;
+  auto res_bad_type = validate(bad_type_addr);
+  ASSERT_TRUE(!res_bad_type.valid);
+  ASSERT_EQ(res_bad_type.error, "unsupported address type");
+}
+// SPDX-License-Identifier: MIT
+
 TEST(test_encode_p2pkh_various_inputs) {
   using finalis::address::encode_p2pkh;
   std::array<std::uint8_t, 20> zeros{};
