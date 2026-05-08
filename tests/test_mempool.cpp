@@ -1,3 +1,28 @@
+TEST(test_mempool_rejects_double_spend_across_transactions) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(70);
+  const auto k2 = key_from_byte(71);
+
+  OutPoint op{};
+  op.txid.fill(0xBB);
+  op.index = 0;
+  TxOut prev = p2pkh_out_for_pub(k1.public_key, 2'000);
+  view[op] = UtxoEntry{prev};
+
+  // First transaction spends the UTXO
+  auto tx1 = spend_one(op, prev, k1, k2.public_key, 1'500);
+  ASSERT_TRUE(tx1.has_value());
+  std::string err;
+  ASSERT_TRUE(mp.accept_tx(*tx1, view, &err));
+
+  // Second transaction attempts to double spend the same UTXO
+  auto tx2 = spend_one(op, prev, k1, k2.public_key, 1'000);
+  ASSERT_TRUE(tx2.has_value());
+  ASSERT_TRUE(!mp.accept_tx(*tx2, view, &err));
+  ASSERT_TRUE(err.find("double spend in mempool") != std::string::npos);
+}
 TEST(test_mempool_rejects_invalid_signature_and_malformed_tx) {
   mempool::Mempool mp;
   mempool::UtxoView view;
