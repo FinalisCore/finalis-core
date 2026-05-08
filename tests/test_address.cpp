@@ -56,4 +56,34 @@ TEST(test_address_validate_reports_specific_errors) {
   ASSERT_EQ(bad_base32.error, "invalid base32");
 }
 
+TEST(test_base32_encode_decode) {
+  using finalis::address::base32_encode;
+  using finalis::address::base32_decode;
+  using finalis::Bytes;
+
+  // Test normal encoding/decoding
+  Bytes data = {0x01, 0x02, 0x03, 0x04, 0x05};
+  std::string encoded = base32_encode(data);
+  auto decoded_opt = base32_decode(encoded);
+  ASSERT_TRUE(decoded_opt.has_value());
+  ASSERT_EQ(decoded_opt.value(), data);
+
+  // Test empty input
+  Bytes empty_data;
+  std::string empty_encoded = base32_encode(empty_data);
+  ASSERT_EQ(empty_encoded, "");
+  auto empty_decoded = base32_decode("");
+  ASSERT_TRUE(empty_decoded.has_value());
+  ASSERT_EQ(empty_decoded.value(), Bytes{});
+
+  // Test invalid character
+  auto invalid_decoded = base32_decode("abc$ef");
+  ASSERT_TRUE(!invalid_decoded.has_value());
+
+  // Test incomplete group (should fail if remainder is nonzero)
+  // 'a' = 0, so this is valid, but 'b' = 1, so remainder is nonzero
+  auto incomplete = base32_decode("b");
+  ASSERT_TRUE(!incomplete.has_value());
+}
+
 void register_address_tests() {}
