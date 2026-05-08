@@ -766,6 +766,70 @@ TEST(test_availability_state_epoch_boundary_replay_matches_persisted_restore_bef
   ASSERT_TRUE(consensus::canonical_checkpoints_equal(cp_uninterrupted->second, cp_restarted->second));
 }
 
+TEST(test_state_commitment_identical_after_restart_at_each_epoch_boundary) {
+  auto cfg = test_cfg();
+  cfg.network.committee_epoch_blocks = 3;
+
+  const auto from = key_from_byte(0x61);
+  const std::array<crypto::KeyPair, 9> keys = {
+      key_from_byte(0x62), key_from_byte(0x63), key_from_byte(0x64), key_from_byte(0x65), key_from_byte(0x66),
+      key_from_byte(0x67), key_from_byte(0x68), key_from_byte(0x69), key_from_byte(0x6A),
+  };
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(key_from_byte(90).public_key);
+
+  consensus::CanonicalDerivedState genesis_state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &genesis_state, &err));
+
+  OutPoint op{};
+  op.txid.fill(0xA6);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 30'000);
+  genesis_state.utxos[op] = UtxoEntry{prev};
+  genesis_state.state_commitment = consensus::consensus_state_commitment(cfg, genesis_state);
+
+  std::vector<consensus::CanonicalFrontierRecord> chain;
+  chain.reserve(keys.size());
+  consensus::CanonicalDerivedState build_state = genesis_state;
+  OutPoint current_op = op;
+  TxOut current_prev = prev;
+  crypto::KeyPair current_key = from;
+  std::uint64_t next_value = 29'500;
+  for (const auto& next_key : keys) {
+    const std::vector<Bytes> ordered{raw_signed_spend(current_op, current_prev, current_key, next_key.public_key, next_value)};
+    chain.push_back(make_frontier_record(build_state, ordered, cfg));
+    build_state = apply_frontier_or_throw(cfg, build_state, ordered);
+    auto parsed = Tx::parse(ordered.front());
+    ASSERT_TRUE(parsed.has_value());
+    current_op = OutPoint{parsed->txid(), 0};
+    current_prev = parsed->outputs.at(0);
+    current_key = next_key;
+    next_value -= 250;
+  }
+
+  consensus::CanonicalDerivedState baseline;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, genesis_state, chain, &baseline, &err));
+
+  consensus::CanonicalDerivedState resumed = genesis_state;
+  for (std::size_t i = 0; i < chain.size(); i += cfg.network.committee_epoch_blocks) {
+    const std::size_t end = std::min(chain.size(), i + static_cast<std::size_t>(cfg.network.committee_epoch_blocks));
+    std::vector<consensus::CanonicalFrontierRecord> slice(chain.begin() + static_cast<std::ptrdiff_t>(i),
+                                                          chain.begin() + static_cast<std::ptrdiff_t>(end));
+    consensus::CanonicalDerivedState next;
+    ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, resumed, slice, &next, &err));
+    resumed = std::move(next);
+  }
+
+  ASSERT_EQ(resumed.finalized_height, baseline.finalized_height);
+  ASSERT_EQ(resumed.finalized_identity.kind, baseline.finalized_identity.kind);
+  ASSERT_EQ(resumed.finalized_identity.id, baseline.finalized_identity.id);
+  ASSERT_EQ(resumed.finalized_frontier, baseline.finalized_frontier);
+  ASSERT_EQ(resumed.state_commitment, baseline.state_commitment);
+}
+
 TEST(test_frontier_transition_diverges_explicitly_when_ingress_diverges) {
   const auto cfg = test_cfg();
   const auto from = key_from_byte(19);
@@ -1174,6 +1238,105 @@ TEST(test_frontier_storage_replay_is_consistent_across_two_nodes_with_same_artif
   ASSERT_EQ(consensus::frontier_utxo_state_root(state_a.utxos), consensus::frontier_utxo_state_root(state_b.utxos));
 }
 
+TEST(test_frontier_replay_equivalence_across_two_nodes_with_shuffled_arrival_same_ordered_slice) {
+  const auto cfg = test_cfg();
+  const auto to = key_from_byte(33);
+
+  std::vector<OutPoint> ops;
+  std::vector<TxOut> prevs;
+  std::vector<crypto::KeyPair> spenders;
+  ops.reserve(8);
+  prevs.reserve(8);
+  spenders.reserve(8);
+  for (std::uint8_t i = 0; i < 8; ++i) {
+    OutPoint op{};
+    op.txid.fill(static_cast<std::uint8_t>(0xB0 + i));
+    op.index = 0;
+    ops.push_back(op);
+    spenders.push_back(key_from_byte(static_cast<std::uint8_t>(40 + i)));
+    prevs.push_back(p2pkh_out_for_pub(spenders.back().public_key, 12'000 + static_cast<std::uint64_t>(i) * 100));
+  }
+
+  auto parent = build_parent_state_with_utxo(cfg, 80, ops[0], prevs[0]);
+  for (std::size_t i = 1; i < ops.size(); ++i) {
+    parent.utxos[ops[i]] = UtxoEntry{prevs[i]};
+  }
+  parent.state_commitment = consensus::consensus_state_commitment(cfg, parent);
+
+  std::vector<Bytes> ordered_records;
+  ordered_records.reserve(ops.size());
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    ordered_records.push_back(raw_signed_spend(ops[i], prevs[i], spenders[i], to.public_key,
+                                               11'700 + static_cast<std::uint64_t>(i) * 100));
+  }
+  const auto frontier_record = make_frontier_record(parent, ordered_records);
+
+  std::size_t non_empty_lanes = 0;
+  std::size_t max_lane_depth = 0;
+  for (const auto& lane_records : frontier_record.lane_records) {
+    if (!lane_records.empty()) {
+      ++non_empty_lanes;
+      max_lane_depth = std::max(max_lane_depth, lane_records.size());
+    }
+  }
+  ASSERT_TRUE(non_empty_lanes >= 2u);
+
+  const std::string path_a = unique_test_base("/tmp/finalis_test_frontier_replay_arrival_a");
+  const std::string path_b = unique_test_base("/tmp/finalis_test_frontier_replay_arrival_b");
+  std::filesystem::remove_all(path_a);
+  std::filesystem::remove_all(path_b);
+
+  storage::DB db_a;
+  storage::DB db_b;
+  ASSERT_TRUE(db_a.open(path_a));
+  ASSERT_TRUE(db_b.open(path_b));
+
+  persist_lane_state_seed(db_a, parent);
+  persist_lane_state_seed(db_b, parent);
+
+  // Node A: canonical lane-major persistence.
+  persist_lane_records(db_a, frontier_record);
+
+  // Node B: shuffled cross-lane arrival while preserving in-lane sequence order.
+  for (std::size_t i = 0; i < max_lane_depth; ++i) {
+    for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
+      if (i >= frontier_record.lane_records[lane].size()) continue;
+      const auto& ingress = frontier_record.lane_records[lane][i];
+      ASSERT_TRUE(db_b.put_ingress_bytes(ingress.certificate.txid, ingress.tx_bytes));
+      ASSERT_TRUE(db_b.put_ingress_certificate(static_cast<std::uint32_t>(lane), ingress.certificate.seq,
+                                               ingress.certificate.serialize()));
+      LaneState state;
+      state.epoch = ingress.certificate.epoch;
+      state.lane = ingress.certificate.lane;
+      state.max_seq = ingress.certificate.seq;
+      state.lane_root = consensus::compute_lane_root_append(ingress.certificate.prev_lane_root, ingress.certificate.tx_hash);
+      ASSERT_TRUE(db_b.put_lane_state(state.lane, state));
+    }
+  }
+
+  persist_frontier_record_with_certificate(cfg, parent, db_a, 1, frontier_record);
+  persist_frontier_record_with_certificate(cfg, parent, db_b, 1, frontier_record);
+  ASSERT_TRUE(db_a.set_finalized_frontier_height(1));
+  ASSERT_TRUE(db_b.set_finalized_frontier_height(1));
+
+  consensus::CanonicalDerivedState state_a;
+  consensus::CanonicalDerivedState state_b;
+  std::string err_a;
+  std::string err_b;
+  if (!consensus::derive_canonical_state_from_frontier_storage(cfg, parent, db_a, &state_a, &err_a)) {
+    throw std::runtime_error("derive_canonical_state_from_frontier_storage db_a failed: " + err_a);
+  }
+  if (!consensus::derive_canonical_state_from_frontier_storage(cfg, parent, db_b, &state_b, &err_b)) {
+    throw std::runtime_error("derive_canonical_state_from_frontier_storage db_b failed: " + err_b);
+  }
+
+  ASSERT_EQ(state_a.finalized_identity.kind, state_b.finalized_identity.kind);
+  ASSERT_EQ(state_a.finalized_identity.id, state_b.finalized_identity.id);
+  ASSERT_EQ(state_a.finalized_frontier, state_b.finalized_frontier);
+  ASSERT_EQ(state_a.state_commitment, state_b.state_commitment);
+  ASSERT_EQ(consensus::frontier_utxo_state_root(state_a.utxos), consensus::frontier_utxo_state_root(state_b.utxos));
+}
+
 TEST(test_frontier_storage_replay_fails_closed_when_ingress_record_is_missing) {
   const auto cfg = test_cfg();
   const auto from = key_from_byte(20);
@@ -1404,6 +1567,52 @@ TEST(test_frontier_storage_replay_rejects_tampered_transition_bytes) {
   consensus::CanonicalDerivedState out;
   std::string err;
   ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_storage(cfg, parent, db, &out, &err));
+}
+
+TEST(test_frontier_storage_replay_rejects_tampered_quorum_threshold_metadata) {
+  auto cfg = test_cfg();
+  cfg.max_committee = 3;
+
+  const auto signer = key_from_byte(90);
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators = {signer.public_key};
+
+  consensus::CanonicalDerivedState parent;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &parent, &err));
+
+  const auto chain_record = make_frontier_record(parent, {}, cfg);
+
+  const std::string path = unique_test_base("/tmp/finalis_test_frontier_storage_tampered_quorum_db");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+
+  auto tampered_transition = chain_record.transition;
+  tampered_transition.quorum_threshold += 1;
+  ASSERT_TRUE(db.put_frontier_transition(chain_record.transition.transition_id(), tampered_transition.serialize()));
+  ASSERT_TRUE(db.map_height_to_frontier_transition(1, chain_record.transition.transition_id()));
+  ASSERT_TRUE(db.set_finalized_frontier_height(1));
+
+  FinalityCertificate cert;
+  cert.height = chain_record.transition.height;
+  cert.round = chain_record.transition.round;
+  cert.frontier_transition_id = chain_record.transition.transition_id();
+  cert.quorum_threshold = chain_record.transition.quorum_threshold;
+  cert.committee_members = {signer.public_key};
+  auto sig = crypto::ed25519_sign(
+      vote_signing_message(chain_record.transition.height, chain_record.transition.round, chain_record.transition.transition_id()),
+      signer.private_key);
+  ASSERT_TRUE(sig.has_value());
+  cert.signatures = {FinalitySig{signer.public_key, *sig}};
+  ASSERT_TRUE(db.put_finality_certificate(cert));
+
+  consensus::CanonicalDerivedState out;
+  std::string derive_err;
+  ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_storage(cfg, parent, db, &out, &derive_err));
+  ASSERT_TRUE(!derive_err.empty());
 }
 
 TEST(test_live_validator_membership_state_mid_epoch_is_only_committee_eligible_after_next_epoch_checkpoint) {
