@@ -6722,9 +6722,8 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
   ASSERT_TRUE(keys.size() >= 4u);
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_fork_choice_view_then_weight"), 4, 4, 4);
   auto& nodes = cluster.nodes;
-  Tx tx_round0 = make_fixture_ingress_tx(1, 0x9A);
-  Tx tx_round1 = make_fixture_ingress_tx(1, 0x9B);
-  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx_round0.serialize()}, true, true));
+  Tx tx = make_fixture_ingress_tx(1, 0x9A);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true));
 
   auto& target = nodes[0];
   const std::uint64_t target_height = target->status().height + 1;
@@ -6732,7 +6731,7 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
   const std::uint32_t round1 = 1;
 
   auto proposal_round0 = build_cluster_frontier_proposal_from_records(
-      cluster, keys, {tx_round0.serialize()}, target_height, round0, "/tmp/finalis_it_fork_choice_round0_builder");
+      cluster, keys, {tx.serialize()}, target_height, round0, "/tmp/finalis_it_fork_choice_round0_builder");
   ASSERT_TRUE(proposal_round0.has_value());
   ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_round0)),
             std::string("accepted"));
@@ -6749,24 +6748,33 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
     (void)target->inject_vote_for_test(
         make_test_vote(keys, target_height, round0, frontier_proposal_id(*proposal_round0), pub));
     ++low_view_votes;
-    if (low_view_votes + 1 >= quorum0) break;
+    if (low_view_votes + 1 >= quorum0) break;  // keep this below quorum including local vote
   }
   ASSERT_TRUE(target->status().height + 1 == target_height);
 
-  ASSERT_TRUE(advance_test_frontier_round(*target, target_height, round1));
-  auto proposal_round1 = build_cluster_frontier_proposal_from_records(
-      cluster, keys, {tx_round1.serialize()}, target_height, round1, "/tmp/finalis_it_fork_choice_round1_builder");
-  ASSERT_TRUE(proposal_round1.has_value());
-  ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_round1)),
-            std::string("accepted"));
+  // Advance view with a valid timeout certificate at round0.
+  for (std::size_t i = 0; i < quorum0; ++i) {
+    ASSERT_TRUE(target->inject_timeout_vote_for_test(make_test_timeout_vote(keys, target_height, round0, committee0[i])));
+  }
+  ASSERT_TRUE(wait_for([&]() { return target->status().round >= round1; }, std::chrono::seconds(5)));
+  const std::uint32_t effective_round = std::max<std::uint32_t>(round1, target->status().round);
 
-  const auto committee1 = target->committee_for_height_round_for_test(target_height, round1);
+  auto proposal_round1 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx.serialize()}, target_height, effective_round, "/tmp/finalis_it_fork_choice_round1_builder");
+  ASSERT_TRUE(proposal_round1.has_value());
+  auto tc0 = make_test_timeout_certificate(keys, committee0, target_height, round0, quorum0);
+  ASSERT_TRUE(tc0.signatures.size() >= quorum0);
+  auto repropose_msg = make_test_frontier_propose_msg(*proposal_round1);
+  repropose_msg.justify_tc = tc0;
+  ASSERT_EQ(target->inject_network_propose_result_for_test(repropose_msg), std::string("accepted"));
+
+  const auto committee1 = target->committee_for_height_round_for_test(target_height, effective_round);
   const auto quorum1 = consensus::quorum_threshold(committee1.size());
   std::size_t high_view_votes = 0;
   for (const auto& pub : committee1) {
     if (pub == target->local_validator_pubkey_for_test()) continue;
     (void)target->inject_vote_for_test(
-        make_test_vote(keys, target_height, round1, frontier_proposal_id(*proposal_round1), pub));
+        make_test_vote(keys, target_height, effective_round, frontier_proposal_id(*proposal_round1), pub));
     ++high_view_votes;
     if (high_view_votes >= quorum1) break;
   }
