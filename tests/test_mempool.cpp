@@ -1,3 +1,36 @@
+TEST(test_mempool_rejects_invalid_signature_and_malformed_tx) {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(60);
+  const auto k2 = key_from_byte(61);
+
+  OutPoint op{};
+  op.txid.fill(0xAA);
+  op.index = 0;
+  TxOut prev = p2pkh_out_for_pub(k1.public_key, 1'000);
+  view[op] = UtxoEntry{prev};
+
+  // Invalid signature
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{900, address::p2pkh_script_pubkey(crypto::h160(Bytes(k2.public_key.begin(), k2.public_key.end())))});
+  Bytes fake_sig(64, 0xAB);
+  tx.inputs[0].script_sig = make_p2pkh_script_sig(*reinterpret_cast<Sig64*>(fake_sig.data()), k1.public_key);
+  std::string err;
+  ASSERT_TRUE(!mp.accept_tx(tx, view, &err));
+  ASSERT_TRUE(err.find("signature invalid") != std::string::npos);
+
+  // Malformed transaction (missing outputs)
+  Tx malformed;
+  malformed.version = 1;
+  malformed.lock_time = 0;
+  malformed.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  // No outputs
+  ASSERT_TRUE(!mp.accept_tx(malformed, view, &err));
+}
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"

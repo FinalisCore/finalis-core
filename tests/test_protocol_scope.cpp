@@ -1,3 +1,132 @@
+TEST(test_protocol_scope_rejects_duplicate_inputs) {
+  const auto kp = key_from_byte(30);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0xB1);
+  op.index = 0;
+  TxOut prev_out{10'000, address::p2pkh_script_pubkey(pkh)};
+  UtxoSet view;
+  view[op] = UtxoEntry{prev_out};
+
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  // Add the same input twice
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(pkh)});
+
+  auto msg = signing_message_for_input(tx, 0);
+  ASSERT_TRUE(msg.has_value());
+  auto sig = crypto::ed25519_sign(*msg, kp.private_key);
+  ASSERT_TRUE(sig.has_value());
+  tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
+  tx.inputs[1].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
+
+  auto r = validate_tx(tx, 1, view, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_TRUE(r.error.find("duplicate input outpoint") != std::string::npos);
+}
+
+TEST(test_protocol_scope_rejects_input_output_sum_mismatch) {
+  const auto kp = key_from_byte(31);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0xB2);
+  op.index = 0;
+  TxOut prev_out{10'000, address::p2pkh_script_pubkey(pkh)};
+  UtxoSet view;
+  view[op] = UtxoEntry{prev_out};
+
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  // Output sum greater than input sum
+  tx.outputs.push_back(TxOut{11'000, address::p2pkh_script_pubkey(pkh)});
+
+  auto msg = signing_message_for_input(tx, 0);
+  ASSERT_TRUE(msg.has_value());
+  auto sig = crypto::ed25519_sign(*msg, kp.private_key);
+  ASSERT_TRUE(sig.has_value());
+  tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
+
+  auto r = validate_tx(tx, 1, view, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_TRUE(r.error.find("negative fee") != std::string::npos);
+}
+
+TEST(test_protocol_scope_rejects_missing_utxo) {
+  const auto kp = key_from_byte(32);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0xB3);
+  op.index = 0;
+  // Do not add to view
+
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
+
+  auto msg = signing_message_for_input(tx, 0);
+  ASSERT_TRUE(msg.has_value());
+  auto sig = crypto::ed25519_sign(*msg, kp.private_key);
+  ASSERT_TRUE(sig.has_value());
+  tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
+
+  auto r = validate_tx(tx, 1, UtxoSet{}, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_TRUE(r.error.find("missing utxo") != std::string::npos);
+}
+
+TEST(test_protocol_scope_rejects_invalid_signature) {
+  const auto kp = key_from_byte(33);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0xB4);
+  op.index = 0;
+  TxOut prev_out{10'000, address::p2pkh_script_pubkey(pkh)};
+  UtxoSet view;
+  view[op] = UtxoEntry{prev_out};
+
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(pkh)});
+
+  // Use a random signature (not valid)
+  Bytes fake_sig(64, 0xAB);
+  tx.inputs[0].script_sig = make_p2pkh_script_sig(*reinterpret_cast<Sig64*>(fake_sig.data()), kp.public_key);
+
+  auto r = validate_tx(tx, 1, view, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_TRUE(r.error.find("signature invalid") != std::string::npos);
+}
+
+TEST(test_protocol_scope_rejects_unsupported_input_script) {
+  const auto kp = key_from_byte(34);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0xB5);
+  op.index = 0;
+  TxOut prev_out{10'000, Bytes{0x51}}; // Not a supported script
+  UtxoSet view;
+  view[op] = UtxoEntry{prev_out};
+
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(pkh)});
+
+  // Script sig can be empty, as script_pubkey is not supported
+  auto r = validate_tx(tx, 1, view, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_TRUE(r.error.find("unsupported prev script_pubkey") != std::string::npos);
+}
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
