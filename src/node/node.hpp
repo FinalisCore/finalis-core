@@ -608,6 +608,9 @@ class Node {
   std::optional<consensus::CanonicalDerivedState> canonical_state_;
   std::uint64_t last_open_epoch_ticket_epoch_{0};
   std::map<std::pair<int, std::uint64_t>, std::uint64_t> epoch_ticket_request_ms_;
+  std::uint64_t epoch_reconcile_peer_cursor_{0};
+  std::map<std::tuple<int, std::uint64_t, std::string>, std::pair<std::uint64_t, std::uint32_t>>
+      epoch_ticket_reject_log_state_;
 #ifdef _WIN32
   std::map<std::uint64_t, std::uint64_t> windows_settlement_epoch_reconcile_ms_;
 #endif
@@ -628,6 +631,7 @@ class Node {
   std::uint64_t last_seed_attempt_ms_{0};
   std::uint64_t last_addrman_save_ms_{0};
   std::uint64_t last_summary_log_ms_{0};
+  std::uint64_t last_liveness_log_ms_{0};
   std::uint64_t last_finalized_progress_ms_{0};
   std::uint64_t last_finalized_tip_poll_ms_{0};
   std::uint64_t last_missing_next_cert_stall_log_ms_{0};
