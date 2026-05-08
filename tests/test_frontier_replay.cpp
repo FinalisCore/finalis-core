@@ -1758,6 +1758,26 @@ TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
   ASSERT_EQ(info->status, consensus::ValidatorStatus::ONBOARDING);
 }
 
+TEST(test_frontier_apply_rejects_nondeterministic_transition_metadata) {
+  const auto cfg = test_cfg();
+  const auto from = key_from_byte(0xA5);
+  const auto to = key_from_byte(0xA6);
+
+  OutPoint op{};
+  op.txid.fill(0xB2);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto parent = build_parent_state_with_utxo(cfg, 0, op, prev);
+
+  auto record = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)});
+  record.transition.quorum_threshold += 1;
+
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(!consensus::apply_frontier_record(cfg, parent, record, &out, &err));
+  ASSERT_TRUE(err == "frontier-quorum-threshold-mismatch" || err == "legacy-frontier-quorum-threshold-mismatch");
+}
+
 TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
   auto cfg = live_activation_cfg();
   cfg.max_committee = 5;

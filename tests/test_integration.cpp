@@ -6717,6 +6717,64 @@ TEST(test_only_one_block_can_finalize_per_height_after_vote_locking) {
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_a));
 }
 
+TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(keys.size() >= 4u);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_fork_choice_view_then_weight"), 4, 4, 4);
+  auto& nodes = cluster.nodes;
+  Tx tx_round0 = make_fixture_ingress_tx(1, 0x9A);
+  Tx tx_round1 = make_fixture_ingress_tx(1, 0x9B);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx_round0.serialize()}, true, true));
+
+  auto& target = nodes[0];
+  const std::uint64_t target_height = target->status().height + 1;
+  const std::uint32_t round0 = 0;
+  const std::uint32_t round1 = 1;
+
+  auto proposal_round0 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx_round0.serialize()}, target_height, round0, "/tmp/finalis_it_fork_choice_round0_builder");
+  ASSERT_TRUE(proposal_round0.has_value());
+  ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_round0)),
+            std::string("accepted"));
+
+  const auto committee0 = target->committee_for_height_round_for_test(target_height, round0);
+  ASSERT_EQ(committee0.size(), 4u);
+  const auto quorum0 = consensus::quorum_threshold(committee0.size());
+  ASSERT_TRUE(quorum0 >= 3u);
+
+  // Lower-view candidate gets sub-quorum support and must not finalize.
+  std::size_t low_view_votes = 0;
+  for (const auto& pub : committee0) {
+    if (pub == target->local_validator_pubkey_for_test()) continue;
+    (void)target->inject_vote_for_test(
+        make_test_vote(keys, target_height, round0, frontier_proposal_id(*proposal_round0), pub));
+    ++low_view_votes;
+    if (low_view_votes + 1 >= quorum0) break;
+  }
+  ASSERT_TRUE(target->status().height + 1 == target_height);
+
+  ASSERT_TRUE(advance_test_frontier_round(*target, target_height, round1));
+  auto proposal_round1 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx_round1.serialize()}, target_height, round1, "/tmp/finalis_it_fork_choice_round1_builder");
+  ASSERT_TRUE(proposal_round1.has_value());
+  ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_round1)),
+            std::string("accepted"));
+
+  const auto committee1 = target->committee_for_height_round_for_test(target_height, round1);
+  const auto quorum1 = consensus::quorum_threshold(committee1.size());
+  std::size_t high_view_votes = 0;
+  for (const auto& pub : committee1) {
+    if (pub == target->local_validator_pubkey_for_test()) continue;
+    (void)target->inject_vote_for_test(
+        make_test_vote(keys, target_height, round1, frontier_proposal_id(*proposal_round1), pub));
+    ++high_view_votes;
+    if (high_view_votes >= quorum1) break;
+  }
+
+  ASSERT_TRUE(wait_for([&]() { return target->status().height == target_height; }, std::chrono::seconds(5)));
+  ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_round1));
+}
+
 TEST(test_qc_cannot_unlock_conflicting_payload) {
   const auto keys = node::Node::deterministic_test_keypairs();
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_qc_conflicting_unlock"), 4, 4, 4);
