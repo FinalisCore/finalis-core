@@ -1,3 +1,27 @@
+TEST(test_encode_p2pkh_various_inputs) {
+  using finalis::address::encode_p2pkh;
+  std::array<std::uint8_t, 20> zeros{};
+  std::array<std::uint8_t, 20> ones;
+  ones.fill(0xFF);
+  std::array<std::uint8_t, 20> random = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+                                         0xCD, 0xEF, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80};
+
+  // Valid HRPs
+  auto addr_zeros_sc = encode_p2pkh("sc", zeros);
+  ASSERT_TRUE(addr_zeros_sc.has_value());
+  auto addr_ones_tsc = encode_p2pkh("tsc", ones);
+  ASSERT_TRUE(addr_ones_tsc.has_value());
+  auto addr_random_sc = encode_p2pkh("sc", random);
+  ASSERT_TRUE(addr_random_sc.has_value());
+
+  // Invalid HRPs
+  auto addr_invalid_hrp1 = encode_p2pkh("btc", zeros);
+  ASSERT_TRUE(!addr_invalid_hrp1.has_value());
+  auto addr_invalid_hrp2 = encode_p2pkh("", ones);
+  ASSERT_TRUE(!addr_invalid_hrp2.has_value());
+  auto addr_invalid_hrp3 = encode_p2pkh("scc", random);
+  ASSERT_TRUE(!addr_invalid_hrp3.has_value());
+}
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
