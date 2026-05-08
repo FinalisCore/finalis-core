@@ -6783,6 +6783,76 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_round1));
 }
 
+TEST(test_equivocation_evidence_changes_fork_choice_deterministically) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(keys.size() >= 4u);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_equivocation_fork_choice_deterministic"), 4, 4, 4);
+  auto& nodes = cluster.nodes;
+  Tx tx = make_fixture_ingress_tx(1, 0x9C);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true));
+
+  for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
+
+  auto before = nodes[0]->status();
+  const std::uint64_t target_height = before.height + 1;
+  const std::uint32_t target_round = 0;
+  auto proposal = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx.serialize()}, target_height, target_round,
+      "/tmp/finalis_it_equivocation_fork_choice_deterministic_builder");
+  ASSERT_TRUE(proposal.has_value());
+  const auto canonical_transition_id = frontier_proposal_id(*proposal);
+
+  // Inject an accepted proposal everywhere first so vote processing is anchored to a known candidate.
+  for (auto& n : nodes) {
+    ASSERT_EQ(n->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)), std::string("accepted"));
+  }
+
+  const auto committee = nodes[0]->committee_for_height_round_for_test(target_height, target_round);
+  const auto quorum = consensus::quorum_threshold(committee.size());
+  ASSERT_TRUE(quorum > 0);
+
+  // Validator[0] equivocates: first vote accepted, conflicting vote rejected on all nodes.
+  Vote equiv_a = make_test_vote(keys, target_height, target_round, canonical_transition_id, keys[0].public_key);
+  Vote equiv_b = equiv_a;
+  equiv_b.block_id.fill(0xEE);
+  auto equiv_b_sig = crypto::ed25519_sign(vote_signing_message(equiv_b.height, equiv_b.round, equiv_b.block_id),
+                                          keys[0].private_key);
+  ASSERT_TRUE(equiv_b_sig.has_value());
+  equiv_b.signature = *equiv_b_sig;
+  for (auto& n : nodes) {
+    ASSERT_TRUE(n->inject_vote_for_test(equiv_a));
+    ASSERT_TRUE(!n->inject_vote_for_test(equiv_b));
+  }
+
+  // Complete quorum with non-equivocating committee members for the canonical proposal.
+  std::size_t votes_added = 1;  // equiv_a above
+  for (const auto& pub : committee) {
+    if (pub == keys[0].public_key) continue;
+    const auto vote = make_test_vote(keys, target_height, target_round, canonical_transition_id, pub);
+    for (auto& n : nodes) {
+      ASSERT_TRUE(n->inject_vote_for_test(vote));
+    }
+    ++votes_added;
+    if (votes_added >= quorum) break;
+  }
+  ASSERT_TRUE(votes_added >= quorum);
+
+  for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(false));
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < target_height) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(30)));
+
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    const auto st = nodes[i]->status();
+    ASSERT_EQ(st.height, target_height);
+    ASSERT_EQ(st.transition_hash, canonical_transition_id);
+  }
+}
+
 TEST(test_qc_cannot_unlock_conflicting_payload) {
   const auto keys = node::Node::deterministic_test_keypairs();
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_qc_conflicting_unlock"), 4, 4, 4);
@@ -7082,6 +7152,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   cfg0.validator_warmup_blocks_override = 1;
   cfg0.network.min_block_interval_ms = 100;
   cfg0.network.round_timeout_ms = 200;
+  cfg0.network.validator_join_admission_pow_difficulty_bits = 0;
 
   node::Node n0(cfg0);
   if (!n0.init()) return;
@@ -7110,6 +7181,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
   cfg1.network.min_block_interval_ms = 100;
   cfg1.network.round_timeout_ms = 200;
+  cfg1.network.validator_join_admission_pow_difficulty_bits = 0;
 
   node::Node n1(cfg1);
   if (!n1.init()) {

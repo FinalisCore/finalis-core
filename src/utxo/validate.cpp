@@ -929,6 +929,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
   std::uint64_t in_sum = 0;
   std::uint64_t out_sum = 0;
   std::set<OutPoint> seen_inputs;
+  std::set<PubKey33> seen_confidential_spend_ids;
   std::vector<crypto::Commitment33> input_commitments;
   std::vector<crypto::Commitment33> non_excess_output_commitments;
   std::vector<ScriptAnnotatedOutput> scripted_outputs;
@@ -969,6 +970,10 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       const auto& witness = std::get<ConfidentialInputWitnessV2>(input.witness);
       if (!crypto::compressed_pubkey33_is_canonical(witness.one_time_pubkey)) {
         out.error = "invalid confidential input one_time_pubkey";
+        return out;
+      }
+      if (!seen_confidential_spend_ids.insert(witness.one_time_pubkey).second) {
+        out.error = "duplicate confidential spend id";
         return out;
       }
       if (witness.one_time_pubkey != prev_out.one_time_pubkey) {
