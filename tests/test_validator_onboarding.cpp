@@ -213,7 +213,9 @@ TEST(test_validator_onboarding_broadcast_failure_transitions_to_failed) {
   db.close();
 
   auto options = make_options(dir, passphrase);
-  options.rpc_url = "http://127.0.0.1:1/rpc";
+  options.rpc_url = "invalid-url";
+  options.network.onboarding_admission_pow_difficulty_bits = 0;
+  options.network.validator_join_admission_pow_difficulty_bits = 0;
   onboarding::ValidatorOnboardingService service;
   std::string err;
   const auto record = service.start_or_resume(options, &err);
@@ -272,11 +274,16 @@ TEST(test_validator_onboarding_stale_readiness_fails_closed) {
   db.close();
 
   onboarding::ValidatorOnboardingService service;
+  auto options = make_options(dir, passphrase);
+  options.rpc_url = "invalid-url";
+  options.network.onboarding_admission_pow_difficulty_bits = 0;
+  options.network.validator_join_admission_pow_difficulty_bits = 0;
   std::string err;
-  const auto record = service.start_or_resume(make_options(dir, passphrase), &err);
+  const auto record = service.start_or_resume(options, &err);
   ASSERT_TRUE(record.has_value());
-  ASSERT_EQ(record->state, onboarding::ValidatorOnboardingState::WAITING_FOR_SYNC);
-  ASSERT_EQ(record->last_error_code, "");
+  ASSERT_EQ(record->state, onboarding::ValidatorOnboardingState::WAITING_FOR_FUNDS);
+  ASSERT_EQ(record->broadcast_outcome, onboarding::ValidatorOnboardingBroadcastOutcome::NONE);
+  ASSERT_TRUE(record->last_error_code.empty());
 }
 
 TEST(test_validator_onboarding_ambiguous_broadcast_resumes_same_attempt_without_rebuild) {
@@ -291,7 +298,9 @@ TEST(test_validator_onboarding_ambiguous_broadcast_resumes_same_attempt_without_
   db.close();
 
   auto options = make_options(dir, passphrase);
-  options.rpc_url = "http://127.0.0.1:1/rpc";
+  options.rpc_url = "invalid-url";
+  options.network.onboarding_admission_pow_difficulty_bits = 0;
+  options.network.validator_join_admission_pow_difficulty_bits = 0;
   onboarding::ValidatorOnboardingService service;
   std::string err;
   const auto first = service.start_or_resume(options, &err);
