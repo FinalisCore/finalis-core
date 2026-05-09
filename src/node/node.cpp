@@ -7329,7 +7329,21 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     }
     std::string validation_error;
     if (!validate_frontier_proposal_locked(*proposal, &validation_error)) {
-      log_propose_hard_reject(validation_error);
+      std::string extra;
+      if (validation_error == "frontier-settlement-commitment-mismatch" && canonical_state_.has_value()) {
+        consensus::CanonicalFrontierRecord diag_record{proposal->transition, proposal->ordered_records};
+        consensus::FrontierExecutionResult diag_recomputed;
+        std::string diag_error;
+        std::string diag_details;
+        (void)consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
+                                                              diag_record, &diag_recomputed, &diag_error, &diag_details);
+        if (!diag_details.empty()) {
+          extra = " details=" + diag_details;
+        } else if (!diag_error.empty() && diag_error != validation_error) {
+          extra = " detail=" + diag_error;
+        }
+      }
+      log_propose_hard_reject(validation_error, extra);
       return ProposeHandlingResult::HardReject;
     }
     if (msg.round > 0 && !msg.justify_qc.has_value() && !msg.justify_tc.has_value()) {
@@ -8463,6 +8477,13 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                                                         result.next_utxos, &result.transition, &validation_error)) {
     last_test_hook_error_ = "frontier-build-metadata-failed:" + validation_error;
     return std::nullopt;
+  }
+  if (height == finalized_height_ + 1) {
+    log_line("frontier-build-summary height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(result.transition.transition_id()) +
+             " settlement_commitment=" + short_hash_hex(result.transition.settlement_commitment) +
+             " settlement_payload_hash=" + short_hash_hex(crypto::sha256(result.transition.settlement.serialize())) +
+             " tx_count=" + std::to_string(result.accepted_txs.size()));
   }
   last_test_hook_error_.clear();
   return FrontierProposal{result.transition, selection.ordered_records};
