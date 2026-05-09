@@ -9429,6 +9429,19 @@ bool Node::load_state() {
     if (qc_state.has_value()) highest_qc_by_height_[height] = *qc_state;
     if (qc_payload_id.has_value()) highest_qc_payload_by_height_[height] = *qc_payload_id;
   }
+  {
+    // Recover from persisted stale lock-only safety state at next height.
+    // A lock without a corresponding QC can deadlock round-0 voting after restart
+    // (proposal-local-vote-skip reason=missing-qc) with no way to unlock.
+    const std::uint64_t next_height = finalized_height_ + 1;
+    const bool has_lock = local_vote_locks_.find(next_height) != local_vote_locks_.end();
+    const bool has_qc = highest_qc_by_height_.find(next_height) != highest_qc_by_height_.end();
+    if (has_lock && !has_qc) {
+      log_line("consensus-safety-reset height=" + std::to_string(next_height) +
+               " reason=stale-lock-without-qc-at-startup");
+      clear_consensus_safety_state_locked(next_height);
+    }
+  }
   log_line("startup-progress phase=load-state-done");
   last_open_epoch_ticket_epoch_ = current_epoch_ticket_epoch_locked();
   if (!load_availability_state_locked()) {
