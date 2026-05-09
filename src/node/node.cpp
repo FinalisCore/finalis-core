@@ -5526,7 +5526,10 @@ void Node::event_loop() {
           ticket_pow_fallback_round || highest_qc.has_value() ||
           (highest_tc.has_value() && highest_tc->round < current_round_) || current_round_ == 0;
       can_propose = leader.has_value() && *leader == local_key_.public_key;
-      if (debug_liveness_logs_enabled() && now_ms >= last_liveness_log_ms_ + 5000) {
+      const std::uint64_t stale_ms = cfg_.network.round_timeout_ms * 2ULL;
+      const bool consensus_stalled = now_ms > last_finalized_progress_ms_ + stale_ms;
+      const bool emit_liveness_debug = debug_liveness_logs_enabled() || consensus_stalled;
+      if (emit_liveness_debug && now_ms >= last_liveness_log_ms_ + 5000) {
         const bool local_active = validators_.is_active_for_height(local_key_.public_key, h);
         const bool local_in_committee =
             std::find(committee.begin(), committee.end(), local_key_.public_key) != committee.end();
@@ -5551,6 +5554,7 @@ void Node::event_loop() {
             << " has_tc=" << (highest_tc.has_value() ? "yes" : "no")
             << " paused=" << (pause_proposals_.load() ? "yes" : "no")
             << " repair_mode=" << (repair_mode_ ? "yes" : "no")
+            << " stalled=" << (consensus_stalled ? "yes" : "no")
             << " peers_established=" << established_peer_count();
         log_line(lss.str());
         last_liveness_log_ms_ = now_ms;
