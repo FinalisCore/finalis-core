@@ -75,6 +75,7 @@ struct NodeConfig {
   std::string db_path{"~/.finalis/mainnet"};
   std::string genesis_path;
   bool disable_p2p{false};
+  bool fast_start{false};
   bool reindex_on_start{true};
   std::uint64_t startup_frontier_repair_max_rollback{10'000};
   std::uint32_t startup_frontier_repair_adaptive_percent{5};
@@ -445,6 +446,8 @@ class Node {
   void persist_peers(const std::vector<p2p::PeerInfo>& peers) const;
   void load_addrman();
   void persist_addrman() const;
+  void load_validators_addrman();
+  void persist_validators_addrman(const std::vector<p2p::PeerInfo>& peers) const;
   bool load_availability_state_locked();
   bool persist_availability_state_locked();
   void rebuild_availability_retained_prefixes_from_finalized_frontier_locked();
@@ -514,6 +517,7 @@ class Node {
   std::string lightserver_mode_name() const;
   std::string lightserver_binary_path(bool* sibling_found = nullptr) const;
   bool lightserver_is_public() const;
+  void arm_round0_deadline_locked(std::uint64_t now_ms);
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -536,6 +540,7 @@ class Node {
   std::string last_test_hook_error_;
   std::uint32_t current_round_{0};
   std::uint64_t round_started_ms_{0};
+  std::uint64_t round0_deadline_ms_{0};
   bool reconnect_round_reset_pending_{false};
   bool repair_mode_{false};
   std::uint64_t repair_target_height_{0};
@@ -637,6 +642,7 @@ class Node {
   std::uint64_t last_missing_next_cert_stall_log_ms_{0};
   std::uint32_t registration_ready_streak_{0};
   std::uint64_t last_runtime_status_persist_ms_{0};
+  std::uint64_t last_validators_addrman_persist_height_{0};
   std::optional<p2p::NetAddress> stun_external_endpoint_;
   std::optional<p2p::NetAddress> stun_candidate_endpoint_;
   std::uint32_t stun_candidate_hits_{0};

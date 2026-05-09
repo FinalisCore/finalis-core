@@ -285,6 +285,20 @@ std::map<PubKey32, std::uint64_t> onboarding_score_units_for_replay(const storag
   return onboarding_score_units_from_epoch_tickets(db, epoch_start);
 }
 
+std::map<PubKey32, std::uint64_t> canonicalize_onboarding_scores(
+    const ValidatorRegistry& validators, const std::map<PubKey32, std::uint64_t>& onboarding_scores) {
+  std::map<PubKey32, std::uint64_t> out;
+  if (onboarding_scores.empty()) return out;
+  const auto& known_validators = validators.all();
+  for (const auto& [pub, score] : onboarding_scores) {
+    if (score == 0) continue;
+    // Canonical settlement can only depend on finalized registry identities.
+    if (known_validators.find(pub) == known_validators.end()) continue;
+    out[pub] = score;
+  }
+  return out;
+}
+
 FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivationConfig& cfg,
                                                          const CanonicalDerivedState& prev, std::uint64_t height,
                                                          const PubKey32& leader_pubkey,
@@ -305,7 +319,7 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
       settled_epoch_fees = height >= EMISSION_BLOCKS ? it->second.fee_pool_units : 0;
       reserve_subsidy = height >= EMISSION_BLOCKS ? it->second.reserve_subsidy_units : 0;
       settlement_scores = it->second.reward_score_units;
-      onboarding_scores = it->second.onboarding_score_units;
+      onboarding_scores = canonicalize_onboarding_scores(prev.validators, it->second.onboarding_score_units);
       const auto& econ = active_economics_policy(cfg.network, height);
       const auto threshold_bps = econ.participation_threshold_bps;
       for (auto& [pub, score] : settlement_scores) {
@@ -1245,12 +1259,12 @@ bool verify_frontier_record_against_state_with_replay_options(
     }
     return hex_encode32(crypto::sha256d(w.data()));
   };
-  auto append_h33_settlement_input_diagnostics = [&](std::string* diag, const FrontierTransition& received,
-                                                     const FrontierTransition& expected) {
-    if (!diag || received.height != 33) return;
+  auto append_settlement_input_diagnostics = [&](std::string* diag, const FrontierTransition& received,
+                                                 const FrontierTransition& expected) {
+    if (!diag) return;
     std::ostringstream oss;
     oss << *diag
-        << " h33_settlement received{epoch=" << received.settlement.settlement_epoch_start
+        << " settlement received{epoch=" << received.settlement.settlement_epoch_start
         << ",fees_current=" << received.settlement.current_fees
         << ",fees_settled=" << received.settlement.settled_epoch_fees
         << ",rewards_settled=" << received.settlement.settled_epoch_rewards
@@ -1524,7 +1538,7 @@ bool verify_frontier_record_against_state_with_replay_options(
                              " round=" + std::to_string(record.transition.round) +
                              " actual=" + hex_encode32(record.transition.settlement_commitment) +
                              " expected=" + hex_encode32(expected_transition.settlement_commitment);
-          append_h33_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+          append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
           return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
         } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
           return fail_with("frontier-settlement-mismatch",
@@ -1679,7 +1693,7 @@ bool verify_frontier_record_against_state_with_replay_options(
                            " round=" + std::to_string(record.transition.round) +
                            " actual=" + hex_encode32(record.transition.settlement_commitment) +
                            " expected=" + hex_encode32(expected_transition.settlement_commitment);
-        append_h33_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+        append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
         return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
       } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
         return fail_with("frontier-settlement-mismatch",
