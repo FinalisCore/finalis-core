@@ -73,6 +73,7 @@ constexpr std::size_t kEpochReconcileMinPeersPerTick = 3;
 constexpr std::size_t kEpochReconcileMaxPeersPerTick = 8;
 constexpr std::uint64_t kEpochTicketRejectLogIntervalMs = 10'000;
 constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
+constexpr std::uint64_t kFinalizedTipFreshnessFloorMs = 15'000;
 
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
@@ -3013,6 +3014,7 @@ bool Node::init() {
         peer_keepalive_ms_.erase(peer_id);
         peer_validator_pubkeys_.erase(peer_id);
         peer_finalized_tips_.erase(peer_id);
+        peer_finalized_tip_seen_ms_.erase(peer_id);
         peer_ingress_tips_.erase(peer_id);
         getaddr_requested_peers_.erase(peer_id);
         msg_rate_buckets_.erase(peer_id);
@@ -3908,10 +3910,17 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
 
   const bool isolated_mode = cfg_.disable_p2p;
   std::vector<std::uint64_t> healthy_peer_heights;
+  std::vector<std::uint64_t> fresh_peer_heights;
   bool bootstrap_sync_incomplete = false;
+  const std::uint64_t tip_freshness_ms =
+      std::max<std::uint64_t>(kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
   for (const auto& [peer_id, tip] : peer_finalized_tips_) {
     if (!p2p_.get_peer_info(peer_id).established()) continue;
     healthy_peer_heights.push_back(tip.height);
+    if (auto seen_it = peer_finalized_tip_seen_ms_.find(peer_id); seen_it != peer_finalized_tip_seen_ms_.end()) {
+      const std::uint64_t age_ms = now_ms >= seen_it->second ? (now_ms - seen_it->second) : 0;
+      if (age_ms <= tip_freshness_ms) fresh_peer_heights.push_back(tip.height);
+    }
     if (bootstrap_sync_incomplete_locked(peer_id)) bootstrap_sync_incomplete = true;
   }
   snapshot.bootstrap_sync_incomplete = bootstrap_sync_incomplete;
@@ -3921,12 +3930,15 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
     snapshot.observed_network_finalized_height = finalized_height_;
   } else if (!healthy_peer_heights.empty()) {
     std::sort(healthy_peer_heights.begin(), healthy_peer_heights.end());
-    const auto min_height = healthy_peer_heights.front();
-    const auto max_height = healthy_peer_heights.back();
+    if (!fresh_peer_heights.empty()) std::sort(fresh_peer_heights.begin(), fresh_peer_heights.end());
+    const auto& disagreement_heights = fresh_peer_heights.empty() ? healthy_peer_heights : fresh_peer_heights;
+    const auto min_height = disagreement_heights.front();
+    const auto max_height = disagreement_heights.back();
     snapshot.peer_height_disagreement =
-        healthy_peer_heights.size() > 1 && max_height > min_height && (max_height - min_height) > 2;
+        disagreement_heights.size() > 1 && max_height > min_height && (max_height - min_height) > 2;
     snapshot.observed_network_height_known = true;
-    snapshot.observed_network_finalized_height = healthy_peer_heights[healthy_peer_heights.size() / 2];
+    const auto& observed_heights = fresh_peer_heights.empty() ? healthy_peer_heights : fresh_peer_heights;
+    snapshot.observed_network_finalized_height = observed_heights[observed_heights.size() / 2];
   }
   if (snapshot.observed_network_height_known && snapshot.observed_network_finalized_height > finalized_height_) {
     snapshot.finalized_lag = snapshot.observed_network_finalized_height - finalized_height_;
@@ -6653,6 +6665,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       {
         std::lock_guard<std::mutex> lk(mu_);
         peer_finalized_tips_[peer_id] = *tip;
+        peer_finalized_tip_seen_ms_[peer_id] = now_ms();
       }
       {
         std::lock_guard<std::mutex> lk(mu_);
