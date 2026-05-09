@@ -3911,15 +3911,25 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   const bool isolated_mode = cfg_.disable_p2p;
   std::vector<std::uint64_t> healthy_peer_heights;
   std::vector<std::uint64_t> fresh_peer_heights;
+  std::vector<std::uint64_t> near_tip_fresh_peer_heights;
+  std::vector<std::uint64_t> validator_fresh_peer_heights;
   bool bootstrap_sync_incomplete = false;
   const std::uint64_t tip_freshness_ms =
       std::max<std::uint64_t>(kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
   for (const auto& [peer_id, tip] : peer_finalized_tips_) {
     if (!p2p_.get_peer_info(peer_id).established()) continue;
     healthy_peer_heights.push_back(tip.height);
+    bool active_validator_peer = false;
+    if (auto validator_it = peer_validator_pubkeys_.find(peer_id); validator_it != peer_validator_pubkeys_.end()) {
+      active_validator_peer = validators_.is_active_for_height(validator_it->second, finalized_height_ + 1);
+    }
     if (auto seen_it = peer_finalized_tip_seen_ms_.find(peer_id); seen_it != peer_finalized_tip_seen_ms_.end()) {
       const std::uint64_t age_ms = now_ms >= seen_it->second ? (now_ms - seen_it->second) : 0;
-      if (age_ms <= tip_freshness_ms) fresh_peer_heights.push_back(tip.height);
+      if (age_ms <= tip_freshness_ms) {
+        fresh_peer_heights.push_back(tip.height);
+        if (tip.height + 2 >= finalized_height_) near_tip_fresh_peer_heights.push_back(tip.height);
+        if (active_validator_peer) validator_fresh_peer_heights.push_back(tip.height);
+      }
     }
     if (bootstrap_sync_incomplete_locked(peer_id)) bootstrap_sync_incomplete = true;
   }
@@ -3931,13 +3941,22 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   } else if (!healthy_peer_heights.empty()) {
     std::sort(healthy_peer_heights.begin(), healthy_peer_heights.end());
     if (!fresh_peer_heights.empty()) std::sort(fresh_peer_heights.begin(), fresh_peer_heights.end());
-    const auto& disagreement_heights = fresh_peer_heights.empty() ? healthy_peer_heights : fresh_peer_heights;
+    if (!near_tip_fresh_peer_heights.empty()) std::sort(near_tip_fresh_peer_heights.begin(), near_tip_fresh_peer_heights.end());
+    if (!validator_fresh_peer_heights.empty()) {
+      std::sort(validator_fresh_peer_heights.begin(), validator_fresh_peer_heights.end());
+    }
+    const auto& disagreement_heights =
+        validator_fresh_peer_heights.size() >= 2
+            ? validator_fresh_peer_heights
+            : (!near_tip_fresh_peer_heights.empty()
+                   ? near_tip_fresh_peer_heights
+                   : (fresh_peer_heights.empty() ? healthy_peer_heights : fresh_peer_heights));
     const auto min_height = disagreement_heights.front();
     const auto max_height = disagreement_heights.back();
     snapshot.peer_height_disagreement =
         disagreement_heights.size() > 1 && max_height > min_height && (max_height - min_height) > 2;
     snapshot.observed_network_height_known = true;
-    const auto& observed_heights = fresh_peer_heights.empty() ? healthy_peer_heights : fresh_peer_heights;
+    const auto& observed_heights = disagreement_heights;
     snapshot.observed_network_finalized_height = observed_heights[observed_heights.size() / 2];
   }
   if (snapshot.observed_network_height_known && snapshot.observed_network_finalized_height > finalized_height_) {
