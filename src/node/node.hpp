@@ -75,6 +75,7 @@ struct NodeConfig {
   std::string db_path{"~/.finalis/mainnet"};
   std::string genesis_path;
   bool disable_p2p{false};
+  bool fast_start{false};
   bool reindex_on_start{true};
   std::uint64_t startup_frontier_repair_max_rollback{10'000};
   std::uint32_t startup_frontier_repair_adaptive_percent{5};

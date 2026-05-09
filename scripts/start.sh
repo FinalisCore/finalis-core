@@ -726,6 +726,9 @@ build_node_command() {
   if [[ "${NO_REINDEX_ON_START}" == "1" ]]; then
     args+=("--no-reindex")
   fi
+  if [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
+    args+=("--fast-start")
+  fi
 
   if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
     log "WARNING: enabling --allow-unsafe-genesis-override (intended only for controlled recovery/testing)" >&2

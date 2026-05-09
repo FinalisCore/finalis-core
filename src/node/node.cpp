@@ -2194,7 +2194,9 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
 
 bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDerivationConfig& cfg, storage::DB& db,
                                                 std::uint64_t finalized_height, const Hash32& finalized_hash,
-                                                consensus::CanonicalDerivedState* out, std::string* error) {
+                                                consensus::CanonicalDerivedState* out, std::string* error,
+                                                bool trust_lane_state_roots = false,
+                                                bool allow_commitment_cache_mismatch = false) {
   if (!out) {
     if (error) *error = "null-output";
     return false;
@@ -2226,8 +2228,21 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   state.finalized_frontier_vector = transition->next_vector;
   state.finalized_lane_roots = consensus::FrontierLaneRoots{};
   for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
-    Hash32 lane_root = zero_hash();
     const std::uint64_t max_seq = state.finalized_frontier_vector.lane_max_seq[lane];
+    if (trust_lane_state_roots) {
+      auto lane_state = db.get_lane_state(lane);
+      const std::uint64_t lane_tip = lane_state.has_value() ? lane_state->max_seq : 0;
+      if (lane_tip < max_seq) {
+        if (error) {
+          *error = "checkpoint-lane-state-tip-too-low lane=" + std::to_string(lane) +
+                   " lane_tip=" + std::to_string(lane_tip) + " expected=" + std::to_string(max_seq);
+        }
+        return false;
+      }
+      state.finalized_lane_roots[lane] = lane_state.has_value() ? lane_state->lane_root : zero_hash();
+      continue;
+    }
+    Hash32 lane_root = zero_hash();
     for (std::uint64_t seq = 1; seq <= max_seq; ++seq) {
       auto cert_bytes = db.get_ingress_certificate(lane, seq);
       if (!cert_bytes.has_value()) {
@@ -2321,8 +2336,10 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   if (auto persisted = db.get_consensus_state_commitment_cache(); persisted.has_value()) {
     if (persisted->height != state.finalized_height || persisted->hash != state.finalized_identity.id ||
         persisted->commitment != state.state_commitment) {
-      if (error) *error = "checkpoint-commitment-cache-mismatch";
-      return false;
+      if (!allow_commitment_cache_mismatch) {
+        if (error) *error = "checkpoint-commitment-cache-mismatch";
+        return false;
+      }
     }
   }
 
@@ -9023,6 +9040,7 @@ bool Node::init_mainnet_genesis() {
 }
 
 bool Node::load_state() {
+  log_line("startup-progress phase=load-state-start");
   if (!check_no_incomplete_finalized_write()) return false;
   auto tip = db_.get_tip();
   if (!tip.has_value()) {
@@ -9084,118 +9102,100 @@ bool Node::load_state() {
     return false;
   }
   const bool using_frontier_replay = true;
+  consensus::CanonicalDerivedState derived_state;
+  bool have_derived_state = false;
 
   const auto derivation_cfg = canonical_derivation_config_locked();
-  consensus::CanonicalDerivedState canonical_genesis_state;
-  std::string canonical_error;
-  if (!consensus::build_genesis_canonical_state(derivation_cfg, genesis_state, &canonical_genesis_state,
-                                                &canonical_error)) {
-    log_line("finalized-state-invariant-violation source=load-state-canonical-genesis detail=" + canonical_error);
-    std::cerr << "load_state: canonical genesis failed: " << canonical_error << "\n";
-    return false;
+  if (cfg_.fast_start) {
+    log_line("startup-progress phase=fast-start-attempt");
+    consensus::CanonicalDerivedState fast_state;
+    std::string fast_error;
+    if (load_trusted_runtime_checkpoint_from_cache(derivation_cfg, db_, finalized_height_, finalized_identity_.id,
+                                                   &fast_state, &fast_error, true, true)) {
+      hydrate_runtime_from_canonical_state_locked(fast_state);
+      if (using_frontier_replay) (void)db_.erase(storage::key_consensus_state_commitment_cache());
+      if (!verify_and_persist_consensus_state_commitment_locked(fast_state)) return false;
+      if (!persist_canonical_cache_rows(db_, fast_state)) return false;
+      if (auto existing = db_.get(storage::key_root_index("UTXO", finalized_height_));
+          !existing.has_value() || existing->size() != 32) {
+        (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
+      }
+      log_line("startup-fast-start status=ok finalized_height=" + std::to_string(finalized_height_) +
+               " transition=" + short_hash_hex(finalized_identity_.id));
+      log_line("startup-progress phase=fast-start-done");
+      derived_state = std::move(fast_state);
+      have_derived_state = true;
+    }
+    if (!have_derived_state) {
+      log_line("startup-fast-start status=fallback reason=" + fast_error);
+      log_line("startup-progress phase=fast-start-fallback");
+    }
   }
 
-  consensus::CanonicalDerivedState derived_state;
-  std::string derivation_error;
-  consensus::CanonicalDerivedState frontier_state;
-  bool derived_ok =
-      consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, canonical_genesis_state, db_, &frontier_state,
-                                                               &derivation_error);
-  if (!derived_ok) {
-    const bool lane_tip_low = derivation_error.find("frontier-storage-lane-tip-too-low") != std::string::npos;
-    const bool missing_lane_record =
-        derivation_error.find("frontier-storage-missing-lane-record") != std::string::npos;
-    bool repaired = false;
-    if (lane_tip_low || missing_lane_record) {
-      if (auto bad_transition = parse_transition_hash_from_error(derivation_error); bad_transition.has_value()) {
-        std::string repair_error;
-        std::uint64_t bad_height = 0;
-        std::uint64_t new_tip_height = 0;
-        const std::uint64_t frontier_tip_height = db_.get_finalized_frontier_height().value_or(finalized_height_);
-        const std::uint64_t repair_cap = compute_startup_frontier_repair_cap(cfg_, frontier_tip_height);
-        const std::uint64_t repair_floor = compute_startup_frontier_repair_floor(db_, frontier_tip_height);
-        repaired =
-            rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, repair_floor, &bad_height,
-                                                   &new_tip_height, &repair_error);
-        if (repaired) {
-          const std::string reason = lane_tip_low ? "lane-tip-too-low" : "missing-lane-record";
-          log_line("startup-frontier-tail-repair status=ok reason=" + reason + " bad_height=" +
-                   std::to_string(bad_height) + " new_tip_height=" + std::to_string(new_tip_height) +
-                   " effective_cap=" + std::to_string(repair_cap) +
-                   " rollback_floor_height=" + std::to_string(repair_floor));
-          auto repaired_tip = db_.get_tip();
-          finalized_height_ = repaired_tip.has_value() ? repaired_tip->height : 0;
-          finalized_identity_ =
-              finalized_identity_for_runtime_tip(finalized_height_, repaired_tip.has_value() ? repaired_tip->hash : zero_hash());
-          derivation_error.clear();
-          derived_ok = consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, canonical_genesis_state, db_,
-                                                                               &frontier_state, &derivation_error);
-        } else {
-          log_line("startup-frontier-tail-repair status=failed reason=" + repair_error +
-                   " effective_cap=" + std::to_string(repair_cap) +
-                   " rollback_floor_height=" + std::to_string(repair_floor));
-          if (repair_error.find("rollback-floor-breached") != std::string::npos) {
-            consensus::CanonicalDerivedState checkpoint_state;
-            std::string checkpoint_error;
-            if (load_trusted_runtime_checkpoint_from_cache(derivation_cfg, db_, finalized_height_, finalized_identity_.id,
-                                                           &checkpoint_state, &checkpoint_error)) {
-              if (checkpoint_state.finalized_height < repair_floor) {
-                checkpoint_error = "checkpoint-below-rollback-floor checkpoint_height=" +
-                                   std::to_string(checkpoint_state.finalized_height) +
-                                   " floor=" + std::to_string(repair_floor);
-                log_line("startup-checkpoint-resume status=failed reason=" + checkpoint_error);
-              } else {
-              log_line("startup-checkpoint-resume status=ok source=trusted-cache finalized_height=" +
-                       std::to_string(checkpoint_state.finalized_height) + " transition=" +
-                       short_hash_hex(checkpoint_state.finalized_identity.id));
-              frontier_state = std::move(checkpoint_state);
-              derived_ok = true;
-              }
-            } else {
-              log_line("startup-checkpoint-resume status=failed reason=" + checkpoint_error);
-              consensus::CanonicalDerivedState fallback_checkpoint_state;
-              std::string fallback_error;
-              std::uint64_t fallback_height = 0;
-              const std::uint64_t min_rewind_height =
-                  finalized_height_ > kStartupCheckpointFallbackMaxRewindBlocks
-                      ? (finalized_height_ - kStartupCheckpointFallbackMaxRewindBlocks)
-                      : 1;
-              const std::uint64_t min_allowed_fallback_height = std::max<std::uint64_t>(repair_floor, min_rewind_height);
-              if (load_latest_trusted_runtime_checkpoint_from_cache(
-                      derivation_cfg, db_, finalized_height_, min_allowed_fallback_height, &fallback_checkpoint_state,
-                      &fallback_height, &fallback_error)) {
-                std::string truncate_error;
-                if (rollback_frontier_tail_to_tip(db_, fallback_height, &truncate_error)) {
-                  auto repaired_tip = db_.get_tip();
-                  finalized_height_ = repaired_tip.has_value() ? repaired_tip->height : fallback_height;
-                  finalized_identity_ = finalized_identity_for_runtime_tip(
-                      finalized_height_, repaired_tip.has_value() ? repaired_tip->hash : fallback_checkpoint_state.finalized_identity.id);
-                  log_line("startup-checkpoint-resume status=ok source=trusted-cache-fallback finalized_height=" +
-                           std::to_string(finalized_height_) + " transition=" +
-                           short_hash_hex(fallback_checkpoint_state.finalized_identity.id));
-                  frontier_state = std::move(fallback_checkpoint_state);
-                  derived_ok = true;
-                } else {
-                  log_line("startup-checkpoint-resume status=failed reason=trusted-cache-fallback-truncate-failed detail=" +
-                           truncate_error);
-                }
-              } else {
-                log_line("startup-checkpoint-resume status=failed reason=trusted-cache-fallback-unavailable detail=" +
-                         fallback_error + " min_allowed_height=" + std::to_string(min_allowed_fallback_height) +
-                         " max_rewind=" + std::to_string(kStartupCheckpointFallbackMaxRewindBlocks));
-              }
-            }
+  if (!have_derived_state) {
+    log_line("startup-progress phase=frontier-derive-begin");
+    consensus::CanonicalDerivedState canonical_genesis_state;
+    std::string canonical_error;
+    if (!consensus::build_genesis_canonical_state(derivation_cfg, genesis_state, &canonical_genesis_state,
+                                                  &canonical_error)) {
+      log_line("finalized-state-invariant-violation source=load-state-canonical-genesis detail=" + canonical_error);
+      std::cerr << "load_state: canonical genesis failed: " << canonical_error << "\n";
+      return false;
+    }
+
+    std::string derivation_error;
+    consensus::CanonicalDerivedState frontier_state;
+    bool derived_ok =
+        consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, canonical_genesis_state, db_, &frontier_state,
+                                                                 &derivation_error);
+    if (!derived_ok) {
+      const bool lane_tip_low = derivation_error.find("frontier-storage-lane-tip-too-low") != std::string::npos;
+      const bool missing_lane_record =
+          derivation_error.find("frontier-storage-missing-lane-record") != std::string::npos;
+      bool repaired = false;
+      if (lane_tip_low || missing_lane_record) {
+        if (auto bad_transition = parse_transition_hash_from_error(derivation_error); bad_transition.has_value()) {
+          std::string repair_error;
+          std::uint64_t bad_height = 0;
+          std::uint64_t new_tip_height = 0;
+          const std::uint64_t frontier_tip_height = db_.get_finalized_frontier_height().value_or(finalized_height_);
+          const std::uint64_t repair_cap = compute_startup_frontier_repair_cap(cfg_, frontier_tip_height);
+          const std::uint64_t repair_floor = compute_startup_frontier_repair_floor(db_, frontier_tip_height);
+          repaired =
+              rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, repair_floor, &bad_height,
+                                                     &new_tip_height, &repair_error);
+          if (repaired) {
+            const std::string reason = lane_tip_low ? "lane-tip-too-low" : "missing-lane-record";
+            log_line("startup-frontier-tail-repair status=ok reason=" + reason + " bad_height=" +
+                     std::to_string(bad_height) + " new_tip_height=" + std::to_string(new_tip_height) +
+                     " effective_cap=" + std::to_string(repair_cap) +
+                     " rollback-floor_height=" + std::to_string(repair_floor));
+            auto repaired_tip = db_.get_tip();
+            finalized_height_ = repaired_tip.has_value() ? repaired_tip->height : 0;
+            finalized_identity_ =
+                finalized_identity_for_runtime_tip(finalized_height_, repaired_tip.has_value() ? repaired_tip->hash : zero_hash());
+            derivation_error.clear();
+            derived_ok = consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, canonical_genesis_state, db_,
+                                                                                 &frontier_state, &derivation_error);
+          } else {
+            log_line("startup-frontier-tail-repair status=failed reason=" + repair_error +
+                     " effective_cap=" + std::to_string(repair_cap) +
+                     " rollback-floor_height=" + std::to_string(repair_floor));
           }
         }
       }
+      if (!derived_ok) {
+        log_line("finalized-state-invariant-violation source=load-state-frontier-derive detail=" + derivation_error);
+        std::cerr << "load_state: frontier derive failed: " << derivation_error << "\n";
+        return false;
+      }
     }
-    if (!derived_ok) {
-      log_line("finalized-state-invariant-violation source=load-state-frontier-derive detail=" + derivation_error);
-      std::cerr << "load_state: frontier derive failed: " << derivation_error << "\n";
-      return false;
-    }
+    log_line("startup-progress phase=frontier-derive-done");
+    derived_state = std::move(frontier_state);
+    have_derived_state = true;
   }
-  derived_state = std::move(frontier_state);
+
+  if (!have_derived_state) return false;
   if (derived_state.finalized_height > 0 && !derived_state.finalized_identity.is_transition()) {
     log_line("finalized-state-invariant-violation source=load-state-frontier-kind-mismatch");
     std::cerr << "load_state: frontier replay produced non-transition finalized identity\n";
@@ -9289,10 +9289,12 @@ bool Node::load_state() {
       }
     }
   }
+  log_line("startup-progress phase=cache-verify-begin");
   if (using_frontier_replay) (void)db_.erase(storage::key_consensus_state_commitment_cache());
   if (!verify_and_persist_consensus_state_commitment_locked(derived_state)) return false;
   hydrate_runtime_from_canonical_state_locked(derived_state);
   if (!persist_canonical_cache_rows(db_, derived_state)) return false;
+  log_line("startup-progress phase=cache-verify-done");
 
   const auto existing = db_.get(storage::key_root_index("UTXO", finalized_height_));
   if (!existing.has_value() || existing->size() != 32) {
@@ -9379,6 +9381,7 @@ bool Node::load_state() {
     if (qc_state.has_value()) highest_qc_by_height_[height] = *qc_state;
     if (qc_payload_id.has_value()) highest_qc_payload_by_height_[height] = *qc_payload_id;
   }
+  log_line("startup-progress phase=load-state-done");
   last_open_epoch_ticket_epoch_ = current_epoch_ticket_epoch_locked();
   if (!load_availability_state_locked()) {
     log_line("availability-init-reset reason=load-or-parse-failed");
@@ -10950,6 +10953,8 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       for (const auto& item : parse_endpoint_list(*v)) cfg.peers.push_back(item);
     } else if (a == "--disable-p2p") {
       cfg.disable_p2p = true;
+    } else if (a == "--fast-start") {
+      cfg.fast_start = true;
     } else if (a == "--no-reindex") {
       cfg.reindex_on_start = false;
     } else if (a == "--seeds") {
