@@ -4713,6 +4713,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
                                                    bool clear_requested_sync,
                                                    const std::vector<PubKey32>* effective_committee,
                                                    std::string* error) {
+  const std::uint64_t previous_finalized_height = finalized_height_;
   const auto committee =
       effective_committee != nullptr ? *effective_committee : committee_for_height_round(record.transition.height, record.transition.round);
   if (committee.empty()) {
@@ -4769,9 +4770,37 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   hydrate_runtime_from_canonical_state_locked(next_state);
   mempool_.prune_against_utxo(utxos_);
   const auto now = now_ms();
-  current_round_ = 0;
-  round_started_ms_ = now;
-  last_finalized_progress_ms_ = now;
+  if (finalized_height_ > previous_finalized_height) {
+    current_round_ = 0;
+    round_started_ms_ = now;
+    last_finalized_progress_ms_ = now;
+    proposed_in_round_.clear();
+
+    // Drop stale vote reservations and per-height vote caches at/below the newly finalized tip.
+    for (auto it = local_vote_reservations_.begin(); it != local_vote_reservations_.end();) {
+      if (it->first <= finalized_height_) {
+        it = local_vote_reservations_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = local_timeout_vote_reservations_.begin(); it != local_timeout_vote_reservations_.end();) {
+      if (it->first <= finalized_height_) {
+        it = local_timeout_vote_reservations_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    votes_.clear_height(finalized_height_ + 1);
+    timeout_votes_.clear_height(finalized_height_ + 1);
+    log_line("round-state-reset height=" + std::to_string(finalized_height_ + 1) +
+             " round=0 reason=finalized-advance previous_height=" + std::to_string(previous_finalized_height) +
+             " new_height=" + std::to_string(finalized_height_));
+  } else {
+    current_round_ = 0;
+    round_started_ms_ = now;
+    last_finalized_progress_ms_ = now;
+  }
 
   if (!persist_canonical_cache_rows(db_, next_state)) {
     if (error) *error = "persist-canonical-cache-rows-failed";
