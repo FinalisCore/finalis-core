@@ -7346,7 +7346,9 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       log_propose_hard_reject(validation_error, extra);
       return ProposeHandlingResult::HardReject;
     }
-    if (msg.round > 0 && !msg.justify_qc.has_value() && !msg.justify_tc.has_value()) {
+    const auto justify_committee = committee_for_height_round(msg.height, msg.round);
+    const bool singleton_fallback_round = msg.round > 0 && justify_committee.size() == 1;
+    if (msg.round > 0 && !singleton_fallback_round && !msg.justify_qc.has_value() && !msg.justify_tc.has_value()) {
       log_propose_hard_reject("missing-justify", " local_round=" + std::to_string(current_round_) +
                                                    " justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
       return ProposeHandlingResult::HardReject;
