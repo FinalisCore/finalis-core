@@ -9112,6 +9112,25 @@ bool Node::load_state() {
     std::string fast_error;
     if (load_trusted_runtime_checkpoint_from_cache(derivation_cfg, db_, finalized_height_, finalized_identity_.id,
                                                    &fast_state, &fast_error, true, true)) {
+      const std::uint64_t next_height = finalized_height_ + 1;
+      const auto next_epoch_start = consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks);
+      const auto next_checkpoint_it = fast_state.finalized_committee_checkpoints.find(next_epoch_start);
+      if (next_checkpoint_it == fast_state.finalized_committee_checkpoints.end() ||
+          next_checkpoint_it->second.ordered_members.empty()) {
+        fast_error = "missing-finalized-committee-checkpoint";
+      } else {
+        std::string checkpoint_error;
+        if (!consensus::validate_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
+                                                                  next_checkpoint_it->second, &checkpoint_error)) {
+          fast_error = checkpoint_error.empty() ? "checkpoint-recomputation-mismatch" : checkpoint_error;
+        } else if (!consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state,
+                                                                       next_checkpoint_it->second, next_height,
+                                                                       &checkpoint_error)) {
+          fast_error = checkpoint_error.empty() ? "checkpoint-schedule-mismatch" : checkpoint_error;
+        }
+      }
+    }
+    if (fast_error.empty()) {
       hydrate_runtime_from_canonical_state_locked(fast_state);
       if (using_frontier_replay) (void)db_.erase(storage::key_consensus_state_commitment_cache());
       if (!verify_and_persist_consensus_state_commitment_locked(fast_state)) return false;
