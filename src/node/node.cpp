@@ -8042,8 +8042,14 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
   }
   consensus::CanonicalFrontierRecord certified_record{transition, proposal.ordered_records};
   consensus::FrontierExecutionResult recomputed;
+  std::string validation_diagnostics;
   if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
-                                                       certified_record, &recomputed, error)) {
+                                                       certified_record, &recomputed, error,
+                                                       &validation_diagnostics)) {
+    if (error != nullptr && !validation_diagnostics.empty()) {
+      if (!error->empty()) *error += " details=" + validation_diagnostics;
+      else *error = "details=" + validation_diagnostics;
+    }
     log_line("frontier-validation-failed transition=" + short_hash_hex(transition.transition_id()) + " range=(" +
              std::to_string(transition.prev_frontier + 1) + "," + std::to_string(transition.next_frontier) +
              "] detail=" + (error ? *error : std::string("unknown")));
