@@ -5567,8 +5567,9 @@ void Node::event_loop() {
           build_height = h;
           build_round = current_round_;
         }
-      } else if (!repair_mode_ && !pause_proposals_.load() &&
-                 now_ms > round_started_ms_ + cfg_.network.round_timeout_ms) {
+      }
+      if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal &&
+          now_ms > round_started_ms_ + cfg_.network.round_timeout_ms) {
         const auto timeout_round = current_round_;
         const auto timeout_committee = committee_for_height_round(h, timeout_round);
         const auto timeout_vote_key = std::make_pair(h, timeout_round);
