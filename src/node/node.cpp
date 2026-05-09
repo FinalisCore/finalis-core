@@ -9157,6 +9157,9 @@ bool Node::load_state() {
       }
     }
     if (fast_error.empty()) {
+      // Fast-start checkpoint self-repair can mutate canonical state fields that
+      // are committed; refresh commitment before verification/persist.
+      fast_state.state_commitment = consensus::consensus_state_commitment(derivation_cfg, fast_state);
       hydrate_runtime_from_canonical_state_locked(fast_state);
       if (using_frontier_replay) (void)db_.erase(storage::key_consensus_state_commitment_cache());
       if (!verify_and_persist_consensus_state_commitment_locked(fast_state)) return false;
