@@ -5567,7 +5567,7 @@ void Node::event_loop() {
           build_height = h;
           build_round = current_round_;
         }
-      } else if (!repair_mode_ && !pause_proposals_.load() && ticket_window_elapsed && block_interval_elapsed &&
+      } else if (!repair_mode_ && !pause_proposals_.load() &&
                  now_ms > round_started_ms_ + cfg_.network.round_timeout_ms) {
         const auto timeout_round = current_round_;
         const auto timeout_committee = committee_for_height_round(h, timeout_round);
