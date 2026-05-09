@@ -694,6 +694,16 @@ auto_fast_sync_if_requested() {
     done < <(find "${DB_DIR}" -mindepth 1 -maxdepth 1 2>/dev/null || true)
   fi
 
+  if (( has_chain_state == 1 )) && [[ "${AUTO_FAST_SYNC_FORCE_OVERWRITE}" != "1" ]] && [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
+    local backup_path="${DB_DIR}.pre_fast_sync.$(date +%s)"
+    log "SYNC_TURBO_MODE=extreme: existing chain state detected, auto-enabling destructive fast_sync."
+    log "Creating safety backup: ${backup_path}"
+    rm -rf "${backup_path}"
+    mv "${DB_DIR}" "${backup_path}"
+    mkdir -p "${DB_DIR}"
+    has_chain_state=0
+  fi
+
   if (( has_chain_state == 1 )) && [[ "${AUTO_FAST_SYNC_FORCE_OVERWRITE}" != "1" ]]; then
     log "Automatic fast sync skipped: existing chain state detected in ${DB_DIR}."
     log "Set AUTO_FAST_SYNC_FORCE_OVERWRITE=1 (or RESET_CHAIN_DATA=1) to allow destructive re-import."
