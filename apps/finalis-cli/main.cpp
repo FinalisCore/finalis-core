@@ -1649,6 +1649,7 @@ int main(int argc, char** argv) {
     const auto mining_log = (db_dir / "MiningLOG").string();
     const auto peers_path = (db_dir / "peers.dat").string();
     const auto addrman_path = (db_dir / "addrman.dat").string();
+    const auto validators_addrman_path = (db_dir / "validators-addrman.dat").string();
     const auto key_path = (db_dir / "keystore" / "validator.json").string();
 
     finalis::storage::DB db;
@@ -1735,6 +1736,22 @@ int main(int argc, char** argv) {
       for (const auto& line : addrman) std::cout << line << "\n";
     } else {
       std::cout << "addrman_entries=0\n";
+    }
+    std::cout << "validators_addrman_path=" << validators_addrman_path << "\n";
+    if (std::filesystem::exists(validators_addrman_path)) {
+      std::size_t validators_addrman_total = 0;
+      for (const auto& line : read_lines(validators_addrman_path)) {
+        const auto trimmed = trim_copy(line);
+        if (trimmed.empty() || trimmed[0] == '#') continue;
+        ++validators_addrman_total;
+      }
+      const auto validators_addrman_tail = tail_lines(validators_addrman_path, tail);
+      std::cout << "validators_addrman_entries_total=" << validators_addrman_total << "\n";
+      std::cout << "validators_addrman_entries_tail=" << validators_addrman_tail.size() << "\n";
+      for (const auto& line : validators_addrman_tail) std::cout << line << "\n";
+    } else {
+      std::cout << "validators_addrman_entries_total=0\n";
+      std::cout << "validators_addrman_entries_tail=0\n";
     }
 
     print_section("Mining");

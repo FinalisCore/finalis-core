@@ -72,6 +72,7 @@ constexpr std::uint32_t kEpochReconcileRequestMaxTickets = 128;
 constexpr std::size_t kEpochReconcileMinPeersPerTick = 3;
 constexpr std::size_t kEpochReconcileMaxPeersPerTick = 8;
 constexpr std::uint64_t kEpochTicketRejectLogIntervalMs = 10'000;
+constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
 
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
@@ -2905,6 +2906,7 @@ bool Node::init() {
     // Ensure no stale in-memory state survives re-init.
     current_round_ = 0;
     round_started_ms_ = now_ms();
+    arm_round0_deadline_locked(round_started_ms_);
     candidate_block_sizes_.clear();
     proposed_in_round_.clear();
     logged_committee_rounds_.clear();
@@ -2922,6 +2924,10 @@ bool Node::init() {
 
   round_started_ms_ = now_ms();
   last_finalized_progress_ms_ = now_ms();
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    arm_round0_deadline_locked(round_started_ms_);
+  }
   last_finalized_tip_poll_ms_ = 0;
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -2930,6 +2936,7 @@ bool Node::init() {
 
   load_persisted_peers();
   load_addrman();
+  load_validators_addrman();
   for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
   for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
   const bool allow_default_seed_fallback = !bootstrap_template_mode_;
@@ -3042,6 +3049,7 @@ bool Node::init() {
           votes_.clear_height(current_height);
           timeout_votes_.clear_height(current_height);
           round_started_ms_ = now_ms();
+          arm_round0_deadline_locked(round_started_ms_);
           log_line("peer-loss-reset height=" + std::to_string(current_height) + " reason=no-established-peers");
         }
         return;
@@ -3351,6 +3359,7 @@ void Node::stop() {
     join_local_bus_tasks();
     persist_peers();
     persist_addrman();
+    persist_validators_addrman({});
     p2p_.stop();
     db_.close();
     return;
@@ -3377,6 +3386,7 @@ void Node::stop() {
   if (restart_debug_) log_line("restart-debug p2p-stopped");
   persist_peers(persisted_peers);
   persist_addrman();
+  persist_validators_addrman(persisted_peers);
   if (restart_debug_) log_line("restart-debug peers-persisted");
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -4067,6 +4077,7 @@ bool Node::maybe_repair_next_height_locked(std::uint64_t now_ms, std::string* re
     repair_started_ms_ = now_ms;
     current_round_ = 0;
     round_started_ms_ = now_ms;
+    arm_round0_deadline_locked(round_started_ms_);
     log_line("consensus-repair-enter target_height=" + std::to_string(target_height) +
              " parent_height=" + std::to_string(target_height - 1) + " reason=" + repair_reason_);
   }
@@ -4093,6 +4104,7 @@ bool Node::maybe_repair_next_height_locked(std::uint64_t now_ms, std::string* re
     last_repair_log_ms_ = 0;
     current_round_ = 0;
     round_started_ms_ = now_ms;
+    arm_round0_deadline_locked(round_started_ms_);
     log_line("consensus-repair-exit target_height=" + std::to_string(target_height) + " status=ok");
     if (reason) reason->clear();
     return true;
@@ -4696,6 +4708,7 @@ bool Node::pause_proposals_for_test(bool pause) {
   const auto now = now_ms();
   round_started_ms_ = now;
   last_finalized_progress_ms_ = now;
+  arm_round0_deadline_locked(now);
   return true;
 }
 
@@ -4705,7 +4718,18 @@ bool Node::advance_round_for_test(std::uint64_t expected_height, std::uint32_t t
   if (expected_height != finalized_height_ + 1) return false;
   current_round_ = target_round;
   round_started_ms_ = now_ms();
+  if (current_round_ == 0) arm_round0_deadline_locked(round_started_ms_);
   return true;
+}
+
+void Node::arm_round0_deadline_locked(std::uint64_t now_ms) {
+  const std::uint64_t min_block_interval_ms = static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
+  const std::uint64_t half_round_timeout_ms =
+      std::max<std::uint64_t>(1, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) / 2);
+  const std::uint64_t grace_ms =
+      std::min<std::uint64_t>(static_cast<std::uint64_t>(cfg_.network.round_timeout_ms),
+                              std::max<std::uint64_t>(min_block_interval_ms, half_round_timeout_ms));
+  round0_deadline_ms_ = now_ms + grace_ms;
 }
 
 bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFrontierRecord& record,
@@ -4773,6 +4797,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   if (finalized_height_ > previous_finalized_height) {
     current_round_ = 0;
     round_started_ms_ = now;
+    arm_round0_deadline_locked(now);
     last_finalized_progress_ms_ = now;
     proposed_in_round_.clear();
 
@@ -4799,6 +4824,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   } else {
     current_round_ = 0;
     round_started_ms_ = now;
+    arm_round0_deadline_locked(now);
     last_finalized_progress_ms_ = now;
   }
 
@@ -5354,6 +5380,7 @@ void Node::event_loop() {
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
     std::vector<int> keepalive_peers;
     bool should_build_proposal = false;
+    bool should_persist_validators_addrman = false;
     std::uint64_t build_height = 0;
     std::uint32_t build_round = 0;
     {
@@ -5386,6 +5413,10 @@ void Node::event_loop() {
         auto runtime = build_runtime_status_snapshot_locked(now_unix_ms);
         (void)db_.put_node_runtime_status_snapshot(runtime);
         last_runtime_status_persist_ms_ = now_ms;
+      }
+      if (!cfg_.disable_p2p && finalized_height_ >= last_validators_addrman_persist_height_ + kValidatorsAddrmanPersistIntervalBlocks) {
+        should_persist_validators_addrman = true;
+        last_validators_addrman_persist_height_ = finalized_height_;
       }
       const std::uint64_t min_block_interval_ms = static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
       const std::uint64_t ticket_window_floor_ms = std::min<std::uint64_t>(1000, min_block_interval_ms);
@@ -5597,8 +5628,10 @@ void Node::event_loop() {
           build_round = current_round_;
         }
       }
-      if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal &&
-          now_ms > round_started_ms_ + cfg_.network.round_timeout_ms) {
+      const bool round_timeout_elapsed = now_ms > round_started_ms_ + cfg_.network.round_timeout_ms;
+      const bool round0_grace_elapsed = current_round_ > 0 || now_ms >= round0_deadline_ms_;
+      if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
+          round0_grace_elapsed) {
         const auto timeout_round = current_round_;
         const auto timeout_committee = committee_for_height_round(h, timeout_round);
         const auto timeout_vote_key = std::make_pair(h, timeout_round);
@@ -5699,6 +5732,12 @@ void Node::event_loop() {
       if (!cfg_.disable_p2p && now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms) {
         request_finalized_tip(peer_id);
       }
+    }
+    if (should_persist_validators_addrman) {
+      std::vector<p2p::PeerInfo> persisted_peers;
+      persisted_peers.reserve(p2p_.peer_ids().size());
+      for (int id : p2p_.peer_ids()) persisted_peers.push_back(p2p_.get_peer_info(id));
+      persist_validators_addrman(persisted_peers);
     }
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -6558,6 +6597,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         votes_.clear_height(current_height);
         timeout_votes_.clear_height(current_height);
         round_started_ms_ = now_ms();
+        arm_round0_deadline_locked(round_started_ms_);
         log_line("peer-reconnect-reset height=" + std::to_string(current_height) + " reason=peers-restored");
       }
     }
@@ -9882,6 +9922,73 @@ void Node::load_addrman() {
 void Node::persist_addrman() const {
   const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "addrman.dat";
   (void)addrman_.save(p.string());
+}
+
+void Node::load_validators_addrman() {
+  if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value()) return;
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "validators-addrman.dat";
+  std::ifstream in(p);
+  if (!in.good()) return;
+
+  std::set<std::string> seen;
+  std::size_t added = 0;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    for (const auto& ep : parse_endpoint_list(line)) {
+      if (ep.empty() || seen.find(ep) != seen.end()) continue;
+      const auto parsed = p2p::parse_endpoint(ep);
+      if (!parsed.has_value() || parsed->port == 0) continue;
+
+      bool skip = false;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        skip = is_self_endpoint_suppressed_locked(ep);
+      }
+      if (skip) continue;
+      if (endpoint_matches_local_listener(parsed->ip, parsed->port)) continue;
+
+      addrman_.add_or_update(*parsed, now_unix());
+      seen.insert(ep);
+      ++added;
+    }
+  }
+  if (added > 0) {
+    log_line("validators-addrman-load status=ok file=" + p.string() + " loaded=" + std::to_string(added));
+  }
+}
+
+void Node::persist_validators_addrman(const std::vector<p2p::PeerInfo>& peers) const {
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "validators-addrman.dat";
+  std::ofstream out(p, std::ios::trunc);
+  if (!out.good()) return;
+
+  std::set<std::string> endpoints;
+
+  std::set<int> validator_peer_ids;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto active_height = finalized_height_ + 1;
+    for (const auto& [peer_id, pub] : peer_validator_pubkeys_) {
+      if (!validators_.is_active_for_height(pub, active_height)) continue;
+      validator_peer_ids.insert(peer_id);
+    }
+  }
+  for (const auto& info : peers) {
+    if (!info.established()) continue;
+    if (validator_peer_ids.find(info.id) == validator_peer_ids.end()) continue;
+    if (auto na = addrman_address_for_peer(info); na.has_value()) {
+      endpoints.insert(na->key());
+    }
+  }
+
+  out << "# finalis validators-addrman v1\n";
+  for (const auto& ep : endpoints) {
+    const auto parsed = p2p::parse_endpoint(ep);
+    if (!parsed.has_value() || parsed->port == 0) continue;
+    if (endpoint_matches_local_listener(parsed->ip, parsed->port)) continue;
+    out << ep << "\n";
+  }
 }
 
 std::vector<std::string> Node::resolve_dns_seeds_once() const {
