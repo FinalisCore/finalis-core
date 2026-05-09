@@ -1245,12 +1245,12 @@ bool verify_frontier_record_against_state_with_replay_options(
     }
     return hex_encode32(crypto::sha256d(w.data()));
   };
-  auto append_h33_settlement_input_diagnostics = [&](std::string* diag, const FrontierTransition& received,
-                                                     const FrontierTransition& expected) {
-    if (!diag || received.height != 33) return;
+  auto append_settlement_input_diagnostics = [&](std::string* diag, const FrontierTransition& received,
+                                                 const FrontierTransition& expected) {
+    if (!diag) return;
     std::ostringstream oss;
     oss << *diag
-        << " h33_settlement received{epoch=" << received.settlement.settlement_epoch_start
+        << " settlement received{epoch=" << received.settlement.settlement_epoch_start
         << ",fees_current=" << received.settlement.current_fees
         << ",fees_settled=" << received.settlement.settled_epoch_fees
         << ",rewards_settled=" << received.settlement.settled_epoch_rewards
@@ -1524,7 +1524,7 @@ bool verify_frontier_record_against_state_with_replay_options(
                              " round=" + std::to_string(record.transition.round) +
                              " actual=" + hex_encode32(record.transition.settlement_commitment) +
                              " expected=" + hex_encode32(expected_transition.settlement_commitment);
-          append_h33_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+          append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
           return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
         } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
           return fail_with("frontier-settlement-mismatch",
@@ -1679,7 +1679,7 @@ bool verify_frontier_record_against_state_with_replay_options(
                            " round=" + std::to_string(record.transition.round) +
                            " actual=" + hex_encode32(record.transition.settlement_commitment) +
                            " expected=" + hex_encode32(expected_transition.settlement_commitment);
-        append_h33_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+        append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
         return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
       } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
         return fail_with("frontier-settlement-mismatch",
