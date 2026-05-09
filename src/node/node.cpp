@@ -74,6 +74,7 @@ constexpr std::size_t kEpochReconcileMaxPeersPerTick = 8;
 constexpr std::uint64_t kEpochTicketRejectLogIntervalMs = 10'000;
 constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
 constexpr std::uint64_t kFinalizedTipFreshnessFloorMs = 15'000;
+constexpr std::uint64_t kValidatorsAddrmanEntryTtlSeconds = 7 * 24 * 60 * 60;
 
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
@@ -3034,8 +3035,21 @@ bool Node::init() {
             ++it;
           }
         }
-        requested_sync_artifacts_.clear();
-        requested_sync_heights_.clear();
+        for (auto it = requested_sync_heights_.begin(); it != requested_sync_heights_.end();) {
+          const auto height = it->first;
+          bool still_requested = false;
+          for (const auto& [key, _when] : requested_sync_height_peers_) {
+            if (key.first == height) {
+              still_requested = true;
+              break;
+            }
+          }
+          if (!still_requested) {
+            it = requested_sync_heights_.erase(it);
+          } else {
+            ++it;
+          }
+        }
         const auto current_height = finalized_height_ + 1;
         if (established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height)) {
           reconnect_round_reset_pending_ = true;
@@ -3230,7 +3244,6 @@ bool Node::maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32
   // Trust boundary: height-0 bootstrap adoption is only allowed from an explicitly
   // configured bootstrap peer that advertises bootstrap_validator in VERSION.
   const bool explicit_bootstrap_advertisement = std::string(source) == "version-bootstrap";
-  if (!bootstrap_template_mode_) return false;
   if (bootstrap_handoff_complete_locked()) {
     log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=handoff-complete height=" + std::to_string(finalized_height_));
@@ -3322,7 +3335,6 @@ bool Node::bootstrap_joiner_ready_locked(const PubKey32& pub) const {
 }
 
 bool Node::bootstrap_sync_incomplete_locked(int peer_id) const {
-  if (!bootstrap_template_mode_) return false;
   if (is_validator_) return false;
   if (finalized_height_ == 0) return true;
   const auto it = peer_finalized_tips_.find(peer_id);
@@ -3911,7 +3923,7 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   const bool isolated_mode = cfg_.disable_p2p;
   std::vector<std::uint64_t> healthy_peer_heights;
   std::vector<std::uint64_t> fresh_peer_heights;
-  std::vector<std::uint64_t> near_tip_fresh_peer_heights;
+  std::vector<std::uint64_t> fresh_peer_heights_with_floor;
   std::vector<std::uint64_t> validator_fresh_peer_heights;
   bool bootstrap_sync_incomplete = false;
   const std::uint64_t tip_freshness_ms =
@@ -3927,7 +3939,7 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
       const std::uint64_t age_ms = now_ms >= seen_it->second ? (now_ms - seen_it->second) : 0;
       if (age_ms <= tip_freshness_ms) {
         fresh_peer_heights.push_back(tip.height);
-        if (tip.height + 2 >= finalized_height_) near_tip_fresh_peer_heights.push_back(tip.height);
+        if (tip.height + 2 >= finalized_height_) fresh_peer_heights_with_floor.push_back(tip.height);
         if (active_validator_peer) validator_fresh_peer_heights.push_back(tip.height);
       }
     }
@@ -3941,22 +3953,27 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   } else if (!healthy_peer_heights.empty()) {
     std::sort(healthy_peer_heights.begin(), healthy_peer_heights.end());
     if (!fresh_peer_heights.empty()) std::sort(fresh_peer_heights.begin(), fresh_peer_heights.end());
-    if (!near_tip_fresh_peer_heights.empty()) std::sort(near_tip_fresh_peer_heights.begin(), near_tip_fresh_peer_heights.end());
+    if (!fresh_peer_heights_with_floor.empty()) std::sort(fresh_peer_heights_with_floor.begin(), fresh_peer_heights_with_floor.end());
     if (!validator_fresh_peer_heights.empty()) {
       std::sort(validator_fresh_peer_heights.begin(), validator_fresh_peer_heights.end());
     }
-    const auto& disagreement_heights =
-        validator_fresh_peer_heights.size() >= 2
-            ? validator_fresh_peer_heights
-            : (!near_tip_fresh_peer_heights.empty()
-                   ? near_tip_fresh_peer_heights
-                   : (fresh_peer_heights.empty() ? healthy_peer_heights : fresh_peer_heights));
-    const auto min_height = disagreement_heights.front();
-    const auto max_height = disagreement_heights.back();
-    snapshot.peer_height_disagreement =
-        disagreement_heights.size() > 1 && max_height > min_height && (max_height - min_height) > 2;
+    const auto* observed_source = &healthy_peer_heights;
+    if (!validator_fresh_peer_heights.empty()) {
+      observed_source = &validator_fresh_peer_heights;
+    } else if (!fresh_peer_heights_with_floor.empty()) {
+      observed_source = &fresh_peer_heights_with_floor;
+    } else if (!fresh_peer_heights.empty()) {
+      observed_source = &fresh_peer_heights;
+    }
+    const auto& disagreement_heights = *observed_source;
+    if (!disagreement_heights.empty()) {
+      const auto min_height = disagreement_heights.front();
+      const auto max_height = disagreement_heights.back();
+      snapshot.peer_height_disagreement =
+          disagreement_heights.size() > 1 && max_height > min_height && (max_height - min_height) > 2;
+    }
     snapshot.observed_network_height_known = true;
-    const auto& observed_heights = disagreement_heights;
+    const auto& observed_heights = *observed_source;
     snapshot.observed_network_finalized_height = observed_heights[observed_heights.size() / 2];
   }
   if (snapshot.observed_network_height_known && snapshot.observed_network_finalized_height > finalized_height_) {
@@ -9992,10 +10009,30 @@ void Node::load_validators_addrman() {
 
 void Node::persist_validators_addrman(const std::vector<p2p::PeerInfo>& peers) const {
   const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "validators-addrman.dat";
-  std::ofstream out(p, std::ios::trunc);
-  if (!out.good()) return;
+  std::set<std::string> merged_endpoints;
+  const auto now = now_unix();
+  const std::uint64_t ttl_cutoff = now > kValidatorsAddrmanEntryTtlSeconds ? now - kValidatorsAddrmanEntryTtlSeconds : 0;
+  std::map<std::string, std::uint64_t> addrman_last_seen;
+  for (const auto& entry : addrman_.all()) {
+    addrman_last_seen[entry.addr.key()] = entry.last_seen;
+  }
 
-  std::set<std::string> endpoints;
+  std::ifstream in(p);
+  if (in.good()) {
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      for (const auto& ep : parse_endpoint_list(line)) {
+        if (ep.empty()) continue;
+        const auto parsed = p2p::parse_endpoint(ep);
+        if (!parsed.has_value() || parsed->port == 0) continue;
+        if (endpoint_matches_local_listener(parsed->ip, parsed->port)) continue;
+        const auto seen_it = addrman_last_seen.find(ep);
+        if (seen_it != addrman_last_seen.end() && seen_it->second < ttl_cutoff) continue;
+        merged_endpoints.insert(ep);
+      }
+    }
+  }
 
   std::set<int> validator_peer_ids;
   {
@@ -10010,12 +10047,14 @@ void Node::persist_validators_addrman(const std::vector<p2p::PeerInfo>& peers) c
     if (!info.established()) continue;
     if (validator_peer_ids.find(info.id) == validator_peer_ids.end()) continue;
     if (auto na = addrman_address_for_peer(info); na.has_value()) {
-      endpoints.insert(na->key());
+      merged_endpoints.insert(na->key());
     }
   }
 
+  std::ofstream out(p, std::ios::trunc);
+  if (!out.good()) return;
   out << "# finalis validators-addrman v1\n";
-  for (const auto& ep : endpoints) {
+  for (const auto& ep : merged_endpoints) {
     const auto parsed = p2p::parse_endpoint(ep);
     if (!parsed.has_value() || parsed->port == 0) continue;
     if (endpoint_matches_local_listener(parsed->ip, parsed->port)) continue;
@@ -10104,8 +10143,7 @@ void Node::send_ingress_tips(int peer_id) {
 void Node::request_finalized_tip(int peer_id) {
   log_line("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(finalized_height_) +
            " local_transition=" + short_hash_hex(finalized_identity_.id));
-  (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP,
-                     p2p::ser_finalized_tip(p2p::FinalizedTipMsg{}), true);
+  (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP, Bytes{}, true);
 }
 
 void Node::send_finalized_tip(int peer_id) {
