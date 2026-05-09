@@ -9117,16 +9117,42 @@ bool Node::load_state() {
       const auto next_checkpoint_it = fast_state.finalized_committee_checkpoints.find(next_epoch_start);
       if (next_checkpoint_it == fast_state.finalized_committee_checkpoints.end() ||
           next_checkpoint_it->second.ordered_members.empty()) {
-        fast_error = "missing-finalized-committee-checkpoint";
+        storage::FinalizedCommitteeCheckpoint repaired_checkpoint;
+        std::string checkpoint_error;
+        if (consensus::derive_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
+                                                               &repaired_checkpoint, &checkpoint_error) &&
+            !repaired_checkpoint.ordered_members.empty() &&
+            consensus::validate_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
+                                                                 repaired_checkpoint, &checkpoint_error) &&
+            consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state, repaired_checkpoint,
+                                                               next_height, &checkpoint_error)) {
+          fast_state.finalized_committee_checkpoints[next_epoch_start] = std::move(repaired_checkpoint);
+          log_line("startup-fast-start checkpoint-repair status=ok epoch=" + std::to_string(next_epoch_start) +
+                   " reason=missing-finalized-committee-checkpoint");
+        } else {
+          fast_error = checkpoint_error.empty() ? "missing-finalized-committee-checkpoint" : checkpoint_error;
+        }
       } else {
         std::string checkpoint_error;
         if (!consensus::validate_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
-                                                                  next_checkpoint_it->second, &checkpoint_error)) {
-          fast_error = checkpoint_error.empty() ? "checkpoint-recomputation-mismatch" : checkpoint_error;
-        } else if (!consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state,
-                                                                       next_checkpoint_it->second, next_height,
-                                                                       &checkpoint_error)) {
-          fast_error = checkpoint_error.empty() ? "checkpoint-schedule-mismatch" : checkpoint_error;
+                                                                  next_checkpoint_it->second, &checkpoint_error) ||
+            !consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state,
+                                                                next_checkpoint_it->second, next_height,
+                                                                &checkpoint_error)) {
+          storage::FinalizedCommitteeCheckpoint repaired_checkpoint;
+          if (consensus::derive_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
+                                                                 &repaired_checkpoint, &checkpoint_error) &&
+              !repaired_checkpoint.ordered_members.empty() &&
+              consensus::validate_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
+                                                                   repaired_checkpoint, &checkpoint_error) &&
+              consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state, repaired_checkpoint,
+                                                                 next_height, &checkpoint_error)) {
+            fast_state.finalized_committee_checkpoints[next_epoch_start] = std::move(repaired_checkpoint);
+            log_line("startup-fast-start checkpoint-repair status=ok epoch=" + std::to_string(next_epoch_start) +
+                     " reason=checkpoint-recomputation-mismatch");
+          } else {
+            fast_error = checkpoint_error.empty() ? "checkpoint-recomputation-mismatch" : checkpoint_error;
+          }
         }
       }
     }
