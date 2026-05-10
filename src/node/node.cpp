@@ -3013,6 +3013,7 @@ bool Node::init() {
         peer_ip_cache_.erase(peer_id);
         peer_inbound_cache_.erase(peer_id);
         peer_keepalive_ms_.erase(peer_id);
+        peer_last_finalized_tip_request_ms_.erase(peer_id);
         peer_validator_pubkeys_.erase(peer_id);
         peer_finalized_tips_.erase(peer_id);
         peer_finalized_tip_seen_ms_.erase(peer_id);
@@ -10147,6 +10148,16 @@ void Node::send_ingress_tips(int peer_id) {
 }
 
 void Node::request_finalized_tip(int peer_id) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::uint64_t now = now_ms();
+    constexpr std::uint64_t kFinalizedTipRequestCooldownMs = 1500;
+    if (auto it = peer_last_finalized_tip_request_ms_.find(peer_id);
+        it != peer_last_finalized_tip_request_ms_.end() && now < it->second + kFinalizedTipRequestCooldownMs) {
+      return;
+    }
+    peer_last_finalized_tip_request_ms_[peer_id] = now;
+  }
   log_line("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(finalized_height_) +
            " local_transition=" + short_hash_hex(finalized_identity_.id));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP, Bytes{}, true);
@@ -10405,6 +10416,13 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   const std::uint64_t sync_gap = tms >= last_finalized_progress_ms_ ? (tms - last_finalized_progress_ms_) : 0;
   const std::uint64_t tip_freshness_ms =
       std::max<std::uint64_t>(kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
+  for (auto it = sync_height_rr_cursor_.begin(); it != sync_height_rr_cursor_.end();) {
+    if (it->first < next_height) {
+      it = sync_height_rr_cursor_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 
   // If we have requested blocks but nothing has been finalized in a long time,
   // become more aggressive about retrying to unstick sync
@@ -10515,6 +10533,8 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
 
   const std::uint64_t window_end = std::min(target_peer_height, finalized_height_ + kForwardSyncWindow);
   constexpr std::size_t kMaxSyncRequestsPerPeerPerSweep = kForwardSyncWindow;
+  const std::size_t max_per_peer_per_sweep =
+      strict_sync_sources ? std::min<std::size_t>(8u, eligible_peers.size()) : kMaxSyncRequestsPerPeerPerSweep;
   std::unordered_map<int, std::size_t> sent_per_peer;
   sent_per_peer.reserve(eligible_peers.size());
   bool requested_any = false;
@@ -10528,11 +10548,16 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
                                    : ((age_ms > retry_ms * 4) ? 3u : (age_ms > retry_ms * 2 ? 2u : 1u));
 
     std::size_t sent_for_height = 0;
-    for (const auto& candidate : eligible_peers) {
+    const std::size_t candidate_count = eligible_peers.size();
+    if (candidate_count == 0) break;
+    auto& rr_cursor = sync_height_rr_cursor_[height];
+    rr_cursor %= candidate_count;
+    for (std::size_t step = 0; step < candidate_count; ++step) {
+      const auto& candidate = eligible_peers[(rr_cursor + step) % candidate_count];
       const int peer_id = candidate.peer_id;
       if (sent_for_height >= fanout) break;
       auto sent_it = sent_per_peer.find(peer_id);
-      if (sent_it != sent_per_peer.end() && sent_it->second >= kMaxSyncRequestsPerPeerPerSweep) continue;
+      if (sent_it != sent_per_peer.end() && sent_it->second >= max_per_peer_per_sweep) continue;
       auto req_it = requested_sync_height_peers_.find({height, peer_id});
       if (req_it != requested_sync_height_peers_.end() && tms < req_it->second + retry_ms) continue;
 
@@ -10546,6 +10571,7 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
       requested_any = true;
       ++sent_for_height;
     }
+    rr_cursor = (rr_cursor + std::max<std::size_t>(1, sent_for_height)) % candidate_count;
   }
   return requested_any;
 }
