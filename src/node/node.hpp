@@ -641,6 +641,7 @@ class Node {
   std::uint64_t last_liveness_log_ms_{0};
   std::uint64_t last_finalized_progress_ms_{0};
   std::uint64_t last_finalized_tip_poll_ms_{0};
+  std::size_t finalized_tip_poll_cursor_{0};
   std::uint64_t last_missing_next_cert_stall_log_ms_{0};
   std::uint32_t registration_ready_streak_{0};
   std::uint64_t last_runtime_status_persist_ms_{0};

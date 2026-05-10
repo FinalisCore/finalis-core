@@ -5428,6 +5428,7 @@ void Node::event_loop() {
     std::optional<FrontierProposal> frontier_to_propose;
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
     std::vector<int> keepalive_peers;
+    std::vector<int> finalized_tip_poll_peers;
     bool should_build_proposal = false;
     bool should_persist_validators_addrman = false;
     std::uint64_t build_height = 0;
@@ -5558,10 +5559,49 @@ void Node::event_loop() {
       if (!cfg_.disable_p2p && established_peer_count() > 0 &&
           (sync_progress_stalled || sync_requests_pending) &&
           now_ms >= last_finalized_tip_poll_ms_ + sync_poll_interval_ms) {
-        for (int peer_id : p2p_.peer_ids()) {
+        struct TipPollCandidate {
+          int peer_id{0};
+          std::uint64_t tip_height{0};
+          bool fresh{false};
+          bool active_validator{false};
+        };
+        std::vector<TipPollCandidate> tip_candidates;
+        tip_candidates.reserve(peer_finalized_tips_.size());
+        const std::uint64_t tip_freshness_ms = std::max<std::uint64_t>(
+            kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
+        for (const auto& [peer_id, tip] : peer_finalized_tips_) {
           const auto info = p2p_.get_peer_info(peer_id);
           if (!info.established()) continue;
-          keepalive_peers.push_back(peer_id);
+          bool active_validator = false;
+          if (auto validator_it = peer_validator_pubkeys_.find(peer_id); validator_it != peer_validator_pubkeys_.end()) {
+            active_validator = validators_.is_active_for_height(validator_it->second, finalized_height_ + 1);
+          }
+          bool fresh = false;
+          if (auto seen_it = peer_finalized_tip_seen_ms_.find(peer_id); seen_it != peer_finalized_tip_seen_ms_.end()) {
+            const std::uint64_t age_ms = now_ms >= seen_it->second ? (now_ms - seen_it->second) : 0;
+            fresh = age_ms <= tip_freshness_ms;
+          }
+          tip_candidates.push_back(TipPollCandidate{
+              .peer_id = peer_id,
+              .tip_height = tip.height,
+              .fresh = fresh,
+              .active_validator = active_validator,
+          });
+        }
+        std::sort(tip_candidates.begin(), tip_candidates.end(), [](const auto& a, const auto& b) {
+          if (a.active_validator != b.active_validator) return a.active_validator > b.active_validator;
+          if (a.fresh != b.fresh) return a.fresh > b.fresh;
+          if (a.tip_height != b.tip_height) return a.tip_height > b.tip_height;
+          return a.peer_id < b.peer_id;
+        });
+        if (!tip_candidates.empty()) {
+          const std::size_t batch = std::min<std::size_t>(8, tip_candidates.size());
+          finalized_tip_poll_cursor_ %= tip_candidates.size();
+          for (std::size_t i = 0; i < batch; ++i) {
+            const auto& c = tip_candidates[(finalized_tip_poll_cursor_ + i) % tip_candidates.size()];
+            finalized_tip_poll_peers.push_back(c.peer_id);
+          }
+          finalized_tip_poll_cursor_ = (finalized_tip_poll_cursor_ + batch) % tip_candidates.size();
         }
         last_finalized_tip_poll_ms_ = now_ms;
       }
@@ -5777,15 +5817,8 @@ void Node::event_loop() {
     }
     for (int peer_id : keepalive_peers) {
       send_ping(peer_id);
-      const std::uint64_t now_ms = this->now_ms();
-      const std::uint64_t sync_poll_interval_ms =
-          std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
-      const bool sync_requests_pending = !requested_sync_heights_.empty() || !requested_sync_artifacts_.empty();
-      if (!cfg_.disable_p2p &&
-          (now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms || sync_requests_pending)) {
-        request_finalized_tip(peer_id);
-      }
     }
+    for (int peer_id : finalized_tip_poll_peers) request_finalized_tip(peer_id);
     if (should_persist_validators_addrman) {
       std::vector<p2p::PeerInfo> persisted_peers;
       persisted_peers.reserve(p2p_.peer_ids().size());
