@@ -7736,8 +7736,10 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
       }
       return TimeoutVoteHandlingResult::SoftReject;
     }
-    if (vote.round > current_round_ + 1) {
-      log_timeout_soft_reject("future-round", " local_round=" + std::to_string(current_round_));
+    if (vote.round > current_round_ + kProposalRoundWindow) {
+      log_timeout_soft_reject("future-round",
+                              " local_round=" + std::to_string(current_round_) +
+                                  " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::SoftReject;
     }
     if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) {
@@ -7755,7 +7757,7 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
         log_timeout_hard_reject("tracker-rejected");
         return TimeoutVoteHandlingResult::HardReject;
       }
-      log_timeout_soft_reject("duplicate");
+      log_timeout_soft_reject("duplicate", " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::SoftReject;
     }
     accepted = true;
