@@ -694,13 +694,54 @@ auto_fast_sync_if_requested() {
     done < <(find "${DB_DIR}" -mindepth 1 -maxdepth 1 2>/dev/null || true)
   fi
 
+  preserve_validator_keys_for_destructive_sync() {
+    local source_root="$1"
+    local dest_root="$2"
+    local tmp_keep_root="$3"
+    local -a key_files=()
+    mapfile -t key_files < <(find "${source_root}" -type f -name "validator.json" 2>/dev/null || true)
+    if (( ${#key_files[@]} == 0 )); then
+      return 0
+    fi
+
+    rm -rf "${tmp_keep_root}"
+    mkdir -p "${tmp_keep_root}"
+
+    local key_path rel_path keep_path
+    for key_path in "${key_files[@]}"; do
+      rel_path="${key_path#${source_root}/}"
+      keep_path="${tmp_keep_root}/${rel_path}"
+      mkdir -p "$(dirname "${keep_path}")"
+      cp -f "${key_path}" "${keep_path}"
+    done
+
+    local restored=0
+    while IFS= read -r key_path; do
+      rel_path="${key_path#${tmp_keep_root}/}"
+      keep_path="${dest_root}/${rel_path}"
+      mkdir -p "$(dirname "${keep_path}")"
+      cp -f "${key_path}" "${keep_path}"
+      chmod 600 "${keep_path}" || true
+      restored=$((restored + 1))
+    done < <(find "${tmp_keep_root}" -type f -name "validator.json" 2>/dev/null || true)
+
+    rm -rf "${tmp_keep_root}"
+    if (( restored > 0 )); then
+      mkdir -p "${dest_root}/keystore"
+      chmod 700 "${dest_root}/keystore" || true
+      log "Preserved and restored ${restored} validator.json key file(s) for destructive fast_sync."
+    fi
+  }
+
   if (( has_chain_state == 1 )) && [[ "${AUTO_FAST_SYNC_FORCE_OVERWRITE}" != "1" ]] && [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
     local backup_path="${DB_DIR}.pre_fast_sync.$(date +%s)"
+    local tmp_keep_root="/tmp/finalis.fastsync.keep-keys.$$"
     log "SYNC_TURBO_MODE=extreme: existing chain state detected, auto-enabling destructive fast_sync."
     log "Creating safety backup: ${backup_path}"
     rm -rf "${backup_path}"
     mv "${DB_DIR}" "${backup_path}"
     mkdir -p "${DB_DIR}"
+    preserve_validator_keys_for_destructive_sync "${backup_path}" "${DB_DIR}" "${tmp_keep_root}"
     has_chain_state=0
   fi
 
