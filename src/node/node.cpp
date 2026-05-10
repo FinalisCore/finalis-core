@@ -66,7 +66,7 @@ constexpr std::uint64_t kDefaultPolicyMinRelayFeeUnits = 1'000ULL;
 constexpr std::size_t kMaxCandidateBlocks = 512;
 constexpr std::size_t kMaxCandidateBlockBytes = 32 * 1024 * 1024;
 constexpr std::uint32_t kProposalRoundWindow = 32;
-constexpr std::uint64_t kForwardSyncWindow = 16;
+constexpr std::uint64_t kForwardSyncWindow = 64;
 constexpr std::size_t kAdaptiveTelemetryWindowEpochs = 16;
 constexpr std::uint32_t kEpochReconcileRequestMaxTickets = 128;
 constexpr std::size_t kEpochReconcileMinPeersPerTick = 3;
@@ -10396,6 +10396,8 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   std::uint64_t retry_ms =
       std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
   const std::uint64_t tms = now_ms();
+  const std::uint64_t tip_freshness_ms =
+      std::max<std::uint64_t>(kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
 
   // If we have requested blocks but nothing has been finalized in a long time,
   // become more aggressive about retrying to unstick sync
@@ -10420,26 +10422,49 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     return tip_it->second.height >= next_height;
   };
 
-  std::vector<std::pair<int, std::uint64_t>> eligible_peers;
+  struct SyncPeerCandidate {
+    int peer_id{0};
+    std::uint64_t tip_height{0};
+    bool fresh{false};
+    bool active_validator{false};
+  };
+
+  std::vector<SyncPeerCandidate> eligible_peers;
   eligible_peers.reserve(peer_finalized_tips_.size());
   for (const auto& [peer_id, tip] : peer_finalized_tips_) {
     if (!eligible_peer(peer_id)) continue;
-    eligible_peers.emplace_back(peer_id, tip.height);
+    bool active_validator = false;
+    if (auto validator_it = peer_validator_pubkeys_.find(peer_id); validator_it != peer_validator_pubkeys_.end()) {
+      active_validator = validators_.is_active_for_height(validator_it->second, finalized_height_ + 1);
+    }
+    bool fresh = false;
+    if (auto seen_it = peer_finalized_tip_seen_ms_.find(peer_id); seen_it != peer_finalized_tip_seen_ms_.end()) {
+      const std::uint64_t age_ms = tms >= seen_it->second ? (tms - seen_it->second) : 0;
+      fresh = age_ms <= tip_freshness_ms;
+    }
+    eligible_peers.push_back(SyncPeerCandidate{
+        .peer_id = peer_id,
+        .tip_height = tip.height,
+        .fresh = fresh,
+        .active_validator = active_validator,
+    });
   }
   if (eligible_peers.empty()) return false;
   std::sort(eligible_peers.begin(), eligible_peers.end(), [](const auto& a, const auto& b) {
-    if (a.second != b.second) return a.second > b.second;
-    return a.first < b.first;
+    if (a.active_validator != b.active_validator) return a.active_validator > b.active_validator;
+    if (a.fresh != b.fresh) return a.fresh > b.fresh;
+    if (a.tip_height != b.tip_height) return a.tip_height > b.tip_height;
+    return a.peer_id < b.peer_id;
   });
   if (preferred_peer_id != 0) {
     auto it = std::find_if(eligible_peers.begin(), eligible_peers.end(),
-                           [&](const auto& item) { return item.first == preferred_peer_id; });
+                           [&](const auto& item) { return item.peer_id == preferred_peer_id; });
     if (it != eligible_peers.end() && it != eligible_peers.begin()) {
       std::rotate(eligible_peers.begin(), it, it + 1);
     }
   }
-  const int target_peer = eligible_peers.front().first;
-  const std::uint64_t target_peer_height = eligible_peers.front().second;
+  const int target_peer = eligible_peers.front().peer_id;
+  const std::uint64_t target_peer_height = eligible_peers.front().tip_height;
 
   if (target_peer_height > finalized_height_ &&
       !db_.get_finality_certificate_by_height(next_height).has_value()) {
@@ -10464,7 +10489,7 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   }
 
   const std::uint64_t window_end = std::min(target_peer_height, finalized_height_ + kForwardSyncWindow);
-  constexpr std::size_t kMaxSyncRequestsPerPeerPerSweep = 8;
+  constexpr std::size_t kMaxSyncRequestsPerPeerPerSweep = kForwardSyncWindow;
   std::unordered_map<int, std::size_t> sent_per_peer;
   sent_per_peer.reserve(eligible_peers.size());
   bool requested_any = false;
@@ -10476,7 +10501,8 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     const std::size_t fanout = (age_ms > retry_ms * 4) ? 3u : (age_ms > retry_ms * 2 ? 2u : 1u);
 
     std::size_t sent_for_height = 0;
-    for (const auto& [peer_id, _peer_height] : eligible_peers) {
+    for (const auto& candidate : eligible_peers) {
+      const int peer_id = candidate.peer_id;
       if (sent_for_height >= fanout) break;
       auto sent_it = sent_per_peer.find(peer_id);
       if (sent_it != sent_per_peer.end() && sent_it->second >= kMaxSyncRequestsPerPeerPerSweep) continue;
