@@ -10489,7 +10489,7 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   }
 
   const std::uint64_t window_end = std::min(target_peer_height, finalized_height_ + kForwardSyncWindow);
-  constexpr std::size_t kMaxSyncRequestsPerPeerPerSweep = 8;
+  constexpr std::size_t kMaxSyncRequestsPerPeerPerSweep = kForwardSyncWindow;
   std::unordered_map<int, std::size_t> sent_per_peer;
   sent_per_peer.reserve(eligible_peers.size());
   bool requested_any = false;
