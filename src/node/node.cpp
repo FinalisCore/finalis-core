@@ -3923,22 +3923,27 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
 
   const bool isolated_mode = cfg_.disable_p2p;
   std::vector<std::uint64_t> healthy_peer_heights;
+  std::vector<std::uint64_t> healthy_peer_heights_observed;
   std::vector<std::uint64_t> fresh_peer_heights;
   std::vector<std::uint64_t> fresh_peer_heights_with_floor;
   std::vector<std::uint64_t> validator_fresh_peer_heights;
   bool bootstrap_sync_incomplete = false;
+  constexpr std::uint64_t kObservedHeightExtremeLagBlocks = 64;
   const std::uint64_t tip_freshness_ms =
       std::max<std::uint64_t>(kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
   for (const auto& [peer_id, tip] : peer_finalized_tips_) {
     if (!p2p_.get_peer_info(peer_id).established()) continue;
     healthy_peer_heights.push_back(tip.height);
+    const bool extreme_lag =
+        finalized_height_ > tip.height && (finalized_height_ - tip.height) > kObservedHeightExtremeLagBlocks;
+    if (!extreme_lag) healthy_peer_heights_observed.push_back(tip.height);
     bool active_validator_peer = false;
     if (auto validator_it = peer_validator_pubkeys_.find(peer_id); validator_it != peer_validator_pubkeys_.end()) {
       active_validator_peer = validators_.is_active_for_height(validator_it->second, finalized_height_ + 1);
     }
     if (auto seen_it = peer_finalized_tip_seen_ms_.find(peer_id); seen_it != peer_finalized_tip_seen_ms_.end()) {
       const std::uint64_t age_ms = now_ms >= seen_it->second ? (now_ms - seen_it->second) : 0;
-      if (age_ms <= tip_freshness_ms) {
+      if (age_ms <= tip_freshness_ms && !extreme_lag) {
         fresh_peer_heights.push_back(tip.height);
         if (tip.height + 2 >= finalized_height_) fresh_peer_heights_with_floor.push_back(tip.height);
         if (active_validator_peer) validator_fresh_peer_heights.push_back(tip.height);
@@ -3951,14 +3956,14 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   if (isolated_mode) {
     snapshot.observed_network_height_known = true;
     snapshot.observed_network_finalized_height = finalized_height_;
-  } else if (!healthy_peer_heights.empty()) {
-    std::sort(healthy_peer_heights.begin(), healthy_peer_heights.end());
+  } else if (!healthy_peer_heights_observed.empty()) {
+    std::sort(healthy_peer_heights_observed.begin(), healthy_peer_heights_observed.end());
     if (!fresh_peer_heights.empty()) std::sort(fresh_peer_heights.begin(), fresh_peer_heights.end());
     if (!fresh_peer_heights_with_floor.empty()) std::sort(fresh_peer_heights_with_floor.begin(), fresh_peer_heights_with_floor.end());
     if (!validator_fresh_peer_heights.empty()) {
       std::sort(validator_fresh_peer_heights.begin(), validator_fresh_peer_heights.end());
     }
-    const auto* observed_source = &healthy_peer_heights;
+    const auto* observed_source = &healthy_peer_heights_observed;
     if (!validator_fresh_peer_heights.empty()) {
       observed_source = &validator_fresh_peer_heights;
     } else if (!fresh_peer_heights_with_floor.empty()) {
@@ -10516,14 +10521,30 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   const bool have_fresh_validator_peer = std::any_of(eligible_peers.begin(), eligible_peers.end(), [](const auto& c) {
     return c.active_validator && c.fresh;
   });
-  const bool strict_sync_sources = have_fresh_validator_peer && sync_gap > 5'000;
-  if (strict_sync_sources) {
+  const bool have_fresh_peer = std::any_of(eligible_peers.begin(), eligible_peers.end(), [](const auto& c) {
+    return c.fresh;
+  });
+  bool strict_sync_sources = false;
+  if (have_fresh_validator_peer) {
     std::vector<SyncPeerCandidate> tier1_only;
     tier1_only.reserve(eligible_peers.size());
     for (const auto& c : eligible_peers) {
       if (c.active_validator && c.fresh) tier1_only.push_back(c);
     }
-    if (!tier1_only.empty()) eligible_peers.swap(tier1_only);
+    if (!tier1_only.empty()) {
+      eligible_peers.swap(tier1_only);
+      strict_sync_sources = true;
+    }
+  } else if (have_fresh_peer) {
+    std::vector<SyncPeerCandidate> fresh_only;
+    fresh_only.reserve(eligible_peers.size());
+    for (const auto& c : eligible_peers) {
+      if (c.fresh) fresh_only.push_back(c);
+    }
+    if (!fresh_only.empty()) {
+      eligible_peers.swap(fresh_only);
+      strict_sync_sources = true;
+    }
   }
 
   std::sort(eligible_peers.begin(), eligible_peers.end(), [](const auto& a, const auto& b) {
