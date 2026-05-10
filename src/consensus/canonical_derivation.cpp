@@ -2395,6 +2395,7 @@ std::optional<PubKey32> legacy_checkpoint_ticket_pow_fallback_member_for_round(
 
 std::vector<PubKey32> legacy_checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
                                                             std::uint32_t round) {
+  if (checkpoint.ordered_members.size() >= 2) return checkpoint.ordered_members;
   if (round == 0) return checkpoint.ordered_members;
   if (auto fallback = legacy_checkpoint_ticket_pow_fallback_member_for_round(checkpoint, round); fallback.has_value()) {
     return {*fallback};
@@ -2404,6 +2405,7 @@ std::vector<PubKey32> legacy_checkpoint_committee_for_round(const storage::Final
 
 std::vector<PubKey32> checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
                                                      std::uint32_t round) {
+  if (checkpoint.ordered_members.size() >= 2) return checkpoint.ordered_members;
   if (round < checkpoint.ordered_members.size()) return checkpoint.ordered_members;
   if (auto fallback = checkpoint_ticket_pow_fallback_member_for_round(checkpoint, round); fallback.has_value()) {
     return {*fallback};
