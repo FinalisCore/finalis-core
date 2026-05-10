@@ -5542,6 +5542,8 @@ void Node::event_loop() {
           std::max<std::uint64_t>(200, static_cast<std::uint64_t>(cfg_.idle_timeout_ms) / 3);
       const std::uint64_t sync_poll_interval_ms =
           std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
+      const bool sync_requests_pending = !requested_sync_heights_.empty() || !requested_sync_artifacts_.empty();
+      const bool sync_progress_stalled = now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms;
       for (int peer_id : p2p_.peer_ids()) {
         const auto info = p2p_.get_peer_info(peer_id);
         if (!info.established()) continue;
@@ -5553,7 +5555,7 @@ void Node::event_loop() {
       }
 
       if (!cfg_.disable_p2p && established_peer_count() > 0 &&
-          now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms &&
+          (sync_progress_stalled || sync_requests_pending) &&
           now_ms >= last_finalized_tip_poll_ms_ + sync_poll_interval_ms) {
         for (int peer_id : p2p_.peer_ids()) {
           const auto info = p2p_.get_peer_info(peer_id);
@@ -5777,7 +5779,9 @@ void Node::event_loop() {
       const std::uint64_t now_ms = this->now_ms();
       const std::uint64_t sync_poll_interval_ms =
           std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
-      if (!cfg_.disable_p2p && now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms) {
+      const bool sync_requests_pending = !requested_sync_heights_.empty() || !requested_sync_artifacts_.empty();
+      if (!cfg_.disable_p2p &&
+          (now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms || sync_requests_pending)) {
         request_finalized_tip(peer_id);
       }
     }
@@ -10398,6 +10402,7 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
   std::uint64_t retry_ms =
       std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
   const std::uint64_t tms = now_ms();
+  const std::uint64_t sync_gap = tms >= last_finalized_progress_ms_ ? (tms - last_finalized_progress_ms_) : 0;
   const std::uint64_t tip_freshness_ms =
       std::max<std::uint64_t>(kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
 
@@ -10414,6 +10419,10 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
         retry_ms = std::min(retry_ms, static_cast<std::uint64_t>(2000));
       }
     }
+  }
+
+  if (sync_gap > 15'000) {
+    retry_ms = std::min<std::uint64_t>(retry_ms, 1000);
   }
 
   auto eligible_peer = [&](int peer_id) {
@@ -10452,6 +10461,20 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     });
   }
   if (eligible_peers.empty()) return false;
+
+  const bool have_fresh_validator_peer = std::any_of(eligible_peers.begin(), eligible_peers.end(), [](const auto& c) {
+    return c.active_validator && c.fresh;
+  });
+  const bool strict_sync_sources = have_fresh_validator_peer && sync_gap > 5'000;
+  if (strict_sync_sources) {
+    std::vector<SyncPeerCandidate> tier1_only;
+    tier1_only.reserve(eligible_peers.size());
+    for (const auto& c : eligible_peers) {
+      if (c.active_validator && c.fresh) tier1_only.push_back(c);
+    }
+    if (!tier1_only.empty()) eligible_peers.swap(tier1_only);
+  }
+
   std::sort(eligible_peers.begin(), eligible_peers.end(), [](const auto& a, const auto& b) {
     if (a.active_validator != b.active_validator) return a.active_validator > b.active_validator;
     if (a.fresh != b.fresh) return a.fresh > b.fresh;
@@ -10500,7 +10523,9 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     const auto outstanding = requested_sync_heights_.find(height);
     const std::uint64_t first_request_ms = (outstanding == requested_sync_heights_.end()) ? tms : outstanding->second;
     const std::uint64_t age_ms = tms >= first_request_ms ? (tms - first_request_ms) : 0;
-    const std::size_t fanout = (age_ms > retry_ms * 4) ? 3u : (age_ms > retry_ms * 2 ? 2u : 1u);
+    const std::size_t fanout = sync_gap > 15'000
+                                   ? ((age_ms > retry_ms * 2) ? 3u : 2u)
+                                   : ((age_ms > retry_ms * 4) ? 3u : (age_ms > retry_ms * 2 ? 2u : 1u));
 
     std::size_t sent_for_height = 0;
     for (const auto& candidate : eligible_peers) {
