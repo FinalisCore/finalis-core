@@ -4588,12 +4588,15 @@ std::optional<storage::EpochRewardSettlementState> Node::rebuild_frozen_epoch_re
                                         transition->settlement.current_fees, nullptr);
   }
 
-  mark_epoch_reward_settled_for_height(cfg_.network, epoch_start_height + epoch_blocks, epoch_blocks, rebuilt, nullptr, nullptr);
   auto it = rebuilt.find(epoch_start_height);
   if (it == rebuilt.end()) return std::nullopt;
 
   auto state = it->second;
   state.epoch_start_height = epoch_start_height;
+  // Validation at the settlement boundary (next epoch start) must use the
+  // pre-settlement reward state. Marking this settled here would zero out
+  // expected settlement outputs and cause deterministic hard-rejects.
+  state.settled = false;
   if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(epoch_start_height); checkpoint.has_value()) {
     std::map<PubKey32, std::uint64_t> onboarding;
     for (const auto& member : checkpoint->ordered_members) onboarding[member] = 1;
