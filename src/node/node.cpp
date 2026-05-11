@@ -8023,6 +8023,7 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
   bool accepted = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    const auto now_ms = this->now_ms();
     auto log_timeout_soft_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
       log_line("timeout-vote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
                " reason=" + reason + extra);
@@ -8053,6 +8054,23 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
     if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) {
       log_timeout_hard_reject("invalid-signature", " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::HardReject;
+    }
+    // Conservative liveness catchup: allow a bounded round jump from a valid
+    // higher-round timeout vote when this node is visibly stalled at the same height.
+    const std::uint64_t stall_ms = cfg_.network.round_timeout_ms * 2ULL;
+    const bool consensus_stalled = now_ms > last_finalized_progress_ms_ + stall_ms;
+    if (from_network && !repair_mode_ && !pause_proposals_.load() && vote.height == finalized_height_ + 1 &&
+        vote.round > current_round_ && vote.round <= current_round_ + kProposalRoundWindow &&
+        consensus_stalled) {
+      const auto old_round = current_round_;
+      current_round_ = vote.round;
+      round_started_ms_ = now_ms;
+      const auto leader = leader_for_height_round(vote.height, current_round_);
+      log_line("round-catchup height=" + std::to_string(vote.height) + " old_round=" + std::to_string(old_round) +
+               " new_round=" + std::to_string(current_round_) +
+               " reason=observed-timeout-vote leader=" +
+               (leader.has_value() ? short_pub_hex(*leader) : std::string("none")) +
+               " validator=" + short_pub_hex(vote.validator_pubkey));
     }
     const auto tr = timeout_votes_.add_vote(vote);
     if (!tr.accepted) {
