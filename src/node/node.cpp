@@ -6491,6 +6491,10 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
     if (reject_reason) *reject_reason = "reconcile-nonclosed-epoch";
     return false;
   }
+  if (allow_closed_epoch_reconcile && stored.epoch != current_epoch && epoch_committee_frozen_locked(stored.epoch)) {
+    if (reject_reason) *reject_reason = "closed-frozen-readonly";
+    return false;
+  }
   if (stored.challenge_anchor != epoch_ticket_challenge_anchor_locked(stored.epoch)) {
     if (reject_reason) *reject_reason = "bad-anchor";
     return false;
