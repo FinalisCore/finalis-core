@@ -4561,6 +4561,49 @@ storage::EpochRewardSettlementState Node::epoch_reward_state_for_epoch_locked(st
   return empty;
 }
 
+std::optional<storage::EpochRewardSettlementState> Node::rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(
+    std::uint64_t epoch_start_height) const {
+  const auto epoch_blocks = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
+  const auto epoch_end_height = epoch_start_height + epoch_blocks - 1;
+  if (finalized_height_ < epoch_end_height) return std::nullopt;
+
+  std::map<std::uint64_t, storage::EpochRewardSettlementState> rebuilt;
+  for (std::uint64_t height = epoch_start_height; height <= epoch_end_height; ++height) {
+    const auto transition_id = db_.get_frontier_transition_by_height(height);
+    if (!transition_id.has_value()) return std::nullopt;
+    const auto transition_bytes = db_.get_frontier_transition(*transition_id);
+    if (!transition_bytes.has_value()) return std::nullopt;
+    const auto transition = FrontierTransition::parse(*transition_bytes);
+    if (!transition.has_value()) return std::nullopt;
+    const auto cert = db_.get_finality_certificate_by_height(height);
+    if (!cert.has_value()) return std::nullopt;
+
+    Block reward_block;
+    reward_block.header.height = transition->height;
+    reward_block.header.leader_pubkey = transition->leader_pubkey;
+    const auto canonical_sigs = canonicalize_finality_signatures_locked(
+        cert->signatures, consensus::quorum_threshold(cert->committee_members.size()));
+    accrue_epoch_reward_state_for_block(cfg_.network, validators_, epoch_blocks, rebuilt, reward_block,
+                                        cert->committee_members, canonical_sigs,
+                                        transition->settlement.current_fees, nullptr);
+  }
+
+  mark_epoch_reward_settled_for_height(cfg_.network, epoch_start_height + epoch_blocks, epoch_blocks, rebuilt, nullptr, nullptr);
+  auto it = rebuilt.find(epoch_start_height);
+  if (it == rebuilt.end()) return std::nullopt;
+
+  auto state = it->second;
+  state.epoch_start_height = epoch_start_height;
+  if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(epoch_start_height); checkpoint.has_value()) {
+    std::map<PubKey32, std::uint64_t> onboarding;
+    for (const auto& member : checkpoint->ordered_members) onboarding[member] = 1;
+    state.onboarding_score_units = std::move(onboarding);
+  } else {
+    return std::nullopt;
+  }
+  return state;
+}
+
 consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(std::uint64_t height,
                                                                                const PubKey32& leader_pubkey,
                                                                                std::uint64_t fees_units) const {
@@ -8053,7 +8096,19 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     consensus::FrontierExecutionResult recomputed;
     std::string validation_error;
     std::string validation_diagnostics;
-    if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
+    auto validation_state = *canonical_state_;
+    if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
+        settlement_epoch.has_value() && epoch_committee_frozen_locked(*settlement_epoch)) {
+      const auto rebuilt_state = rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(*settlement_epoch);
+      if (!rebuilt_state.has_value()) {
+        log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
+                 std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
+                 " reason=frozen-epoch-rebuild-unavailable");
+        return false;
+      }
+      validation_state.epoch_reward_states[*settlement_epoch] = *rebuilt_state;
+    }
+    if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), validation_state,
                                                          certified_record, &recomputed, &validation_error,
                                                          &validation_diagnostics)) {
       bool accepted_with_settlement_fallback = false;
@@ -8373,7 +8428,18 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
   consensus::CanonicalFrontierRecord certified_record{transition, proposal.ordered_records};
   consensus::FrontierExecutionResult recomputed;
   std::string validation_diagnostics;
-  if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
+  auto validation_state = *canonical_state_;
+  if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
+      settlement_epoch.has_value() && epoch_committee_frozen_locked(*settlement_epoch)) {
+    const auto rebuilt_state = rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(*settlement_epoch);
+    if (rebuilt_state.has_value()) {
+      validation_state.epoch_reward_states[*settlement_epoch] = *rebuilt_state;
+    } else {
+      if (error) *error = "frozen-epoch-rebuild-unavailable";
+      return false;
+    }
+  }
+  if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), validation_state,
                                                        certified_record, &recomputed, error,
                                                        &validation_diagnostics)) {
     if (error != nullptr && !validation_diagnostics.empty()) {
