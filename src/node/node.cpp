@@ -4598,23 +4598,55 @@ std::optional<storage::EpochRewardSettlementState> Node::rebuild_frozen_epoch_re
   // expected settlement outputs and cause deterministic hard-rejects.
   state.settled = false;
   const auto settlement_boundary_height = epoch_start_height + epoch_blocks;
+  std::vector<PubKey32> boundary_members;
   if (auto boundary_checkpoint = finalized_committee_checkpoint_for_height_locked(settlement_boundary_height);
       boundary_checkpoint.has_value() && !boundary_checkpoint->ordered_members.empty()) {
+    boundary_members = boundary_checkpoint->ordered_members;
     std::map<PubKey32, std::uint64_t> onboarding;
-    for (const auto& member : boundary_checkpoint->ordered_members) onboarding[member] = 1;
+    for (const auto& member : boundary_members) onboarding[member] = 1;
     state.onboarding_score_units = std::move(onboarding);
   } else if (auto snapshot = db_.get_epoch_committee_snapshot(epoch_start_height);
       snapshot.has_value() && !snapshot->ordered_members.empty()) {
+    boundary_members = snapshot->ordered_members;
     std::map<PubKey32, std::uint64_t> onboarding;
-    for (const auto& member : snapshot->ordered_members) onboarding[member] = 1;
+    for (const auto& member : boundary_members) onboarding[member] = 1;
     state.onboarding_score_units = std::move(onboarding);
   } else if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(epoch_start_height);
              checkpoint.has_value() && !checkpoint->ordered_members.empty()) {
+    boundary_members = checkpoint->ordered_members;
     std::map<PubKey32, std::uint64_t> onboarding;
-    for (const auto& member : checkpoint->ordered_members) onboarding[member] = 1;
+    for (const auto& member : boundary_members) onboarding[member] = 1;
     state.onboarding_score_units = std::move(onboarding);
   } else {
     return std::nullopt;
+  }
+
+  if (!boundary_members.empty()) {
+    // Frozen-epoch validation must not depend on any node-local replay residue.
+    // Re-anchor reward/participation maps to finalized authority membership.
+    state.expected_participation_units.clear();
+    state.observed_participation_units.clear();
+    state.reward_score_units.clear();
+
+    std::set<PubKey32> boundary_operators;
+    for (const auto& member : boundary_members) {
+      if (auto it = validators_.all().find(member); it != validators_.all().end()) {
+        boundary_operators.insert(consensus::canonical_operator_id(member, it->second));
+      } else {
+        boundary_operators.insert(member);
+      }
+    }
+    const auto active_operator_count = std::max<std::size_t>(1, boundary_operators.size());
+    const auto reward_height = settlement_boundary_height > 0 ? (settlement_boundary_height - 1) : 0;
+    for (const auto& member : boundary_members) {
+      state.expected_participation_units[member] = 1;
+      state.observed_participation_units[member] = 1;
+      std::uint64_t weight = 1;
+      if (auto it = validators_.all().find(member); it != validators_.all().end()) {
+        weight = consensus::reward_weight(cfg_.network, reward_height, active_operator_count, it->second.bonded_amount);
+      }
+      state.reward_score_units[member] = std::max<std::uint64_t>(1, weight);
+    }
   }
   return state;
 }
