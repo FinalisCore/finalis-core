@@ -620,6 +620,7 @@ class Node {
   std::map<std::tuple<int, std::uint64_t, std::string>, std::pair<std::uint64_t, std::uint32_t>>
       epoch_ticket_reject_log_state_;
   std::map<std::pair<int, std::uint64_t>, std::pair<std::uint64_t, std::uint32_t>> epoch_reconcile_reject_log_state_;
+  std::map<std::uint64_t, std::pair<std::uint64_t, std::uint32_t>> epoch_reconcile_closed_rebuild_log_state_;
 #ifdef _WIN32
   std::map<std::uint64_t, std::uint64_t> windows_settlement_epoch_reconcile_ms_;
 #endif
