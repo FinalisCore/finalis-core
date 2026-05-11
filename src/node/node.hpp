@@ -613,6 +613,9 @@ class Node {
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> local_vote_reservations_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> local_timeout_vote_reservations_;
+  std::map<std::tuple<std::uint64_t, std::uint32_t, PubKey32, Sig64>, std::uint64_t> seen_timeout_vote_messages_ms_;
+  std::map<std::tuple<std::uint64_t, std::uint32_t, PubKey32, std::string>, std::uint32_t>
+      timeout_vote_soft_reject_log_counts_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
   std::map<std::uint64_t, consensus::EpochBestTicket> local_epoch_tickets_;
   std::optional<consensus::CanonicalDerivedState> canonical_state_;
