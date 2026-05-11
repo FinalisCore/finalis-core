@@ -5772,19 +5772,21 @@ void Node::event_loop() {
       }
       const bool round_timeout_elapsed = now_ms > round_started_ms_ + cfg_.network.round_timeout_ms;
       const bool round0_grace_elapsed = current_round_ > 0 || now_ms >= round0_deadline_ms_;
+      bool advanced_round_this_tick = false;
       if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
           round0_grace_elapsed && consensus_stalled && can_propose && !highest_qc.has_value() && !highest_tc.has_value() &&
-          !committee.empty()) {
+          committee.size() == 1) {
         const auto old_round = current_round_;
         current_round_ = old_round + 1;
         round_started_ms_ = now_ms;
+        advanced_round_this_tick = true;
         const auto forced_leader = leader_for_height_round(h, current_round_);
         log_line("round-catchup height=" + std::to_string(h) + " old_round=" + std::to_string(old_round) +
                  " new_round=" + std::to_string(current_round_) +
                  " reason=stalled-no-qc-tc-force-advance leader=" +
                  (forced_leader.has_value() ? short_pub_hex(*forced_leader) : std::string("none")));
       }
-      if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
+      if (!advanced_round_this_tick && !repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
           round0_grace_elapsed) {
         const auto timeout_round = current_round_;
         const auto timeout_committee = committee_for_height_round(h, timeout_round);
@@ -5809,13 +5811,20 @@ void Node::event_loop() {
           log_line("round-timeout-vote-skip height=" + std::to_string(h) + " round=" + std::to_string(timeout_round) +
                    " reason=not-committee-member");
         }
-        if (!timeout_committee.empty()) {
+        const bool allow_timeout_round_advance =
+            !timeout_committee.empty() &&
+            (timeout_committee.size() == 1 ||
+             (highest_tc.has_value() && highest_tc->round < timeout_round));
+        if (allow_timeout_round_advance) {
           const auto old_round = current_round_;
           current_round_ = timeout_round + 1;
           round_started_ms_ = now_ms;
           const auto new_leader = leader_for_height_round(h, current_round_);
+          const std::string reason = timeout_committee.size() == 1
+                                         ? "ticket-pow-fallback-timeout"
+                                         : "tc-driven-timeout-advance";
           log_line("round-catchup height=" + std::to_string(h) + " old_round=" + std::to_string(old_round) +
-                   " new_round=" + std::to_string(current_round_) + " reason=ticket-pow-fallback-timeout" +
+                   " new_round=" + std::to_string(current_round_) + " reason=" + reason +
                    " leader=" + (new_leader.has_value() ? short_pub_hex(*new_leader) : std::string("none")));
         } else if (timeout_evidence_progressed) {
           // Round advancement remains TC-driven outside the deterministic
