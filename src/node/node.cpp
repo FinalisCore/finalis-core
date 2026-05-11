@@ -11081,6 +11081,10 @@ void Node::try_connect_bootstrap_peers() {
   if (sync_bootstrap_mode && outbound_peer_count() >= cfg_.outbound_target) return;
   if (sync_bootstrap_mode && outbound_peer_count() > 0 && established_active_validator_peers() > 0) return;
 
+  // In validator overlay mode, never fan out into generic addrman; keep
+  // consensus connectivity pinned to validator-advertised endpoints.
+  if (validator_overlay_mode) return;
+
   // In normal mode we blend in addrman for broader discovery.
   // In sync bootstrap mode we spill to addrman only when static/dns could not
   // establish any outbound path.
