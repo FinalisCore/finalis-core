@@ -4611,6 +4611,18 @@ consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(s
 
 std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const {
   std::map<PubKey32, std::uint64_t> out;
+  if (epoch_committee_frozen_locked(epoch_start_height)) {
+    if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(epoch_start_height);
+        checkpoint.has_value() && !checkpoint->ordered_members.empty()) {
+      for (const auto& member : checkpoint->ordered_members) out[member] = 1;
+      return out;
+    }
+    if (auto snapshot = db_.get_epoch_committee_snapshot(epoch_start_height);
+        snapshot.has_value() && !snapshot->ordered_members.empty()) {
+      for (const auto& member : snapshot->ordered_members) out[member] = 1;
+      return out;
+    }
+  }
   const bool local_registered = validators_.get(local_key_.public_key).has_value();
   const auto should_ignore_local_unregistered_participant =
       [&](const PubKey32& participant, consensus::EpochTicketOrigin origin) {
@@ -4659,7 +4671,10 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
 
   const auto onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
   if (onboarding_scores.empty()) request_epoch_reconcile();
-  if (epoch_committee_closed_locked(*settlement_epoch) && established_peers != 0) request_epoch_reconcile();
+  if (epoch_committee_closed_locked(*settlement_epoch) && !epoch_committee_frozen_locked(*settlement_epoch) &&
+      established_peers != 0) {
+    request_epoch_reconcile();
+  }
 
   auto& reward_state = epoch_reward_states_[*settlement_epoch];
   reward_state.epoch_start_height = *settlement_epoch;
