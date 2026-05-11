@@ -10260,6 +10260,10 @@ void Node::load_validators_addrman() {
       ++added;
     }
   }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    validators_bootstrap_peers_.assign(seen.begin(), seen.end());
+  }
   if (added > 0) {
     log_line("validators-addrman-load status=ok file=" + p.string() + " loaded=" + std::to_string(added));
   }
@@ -10968,6 +10972,7 @@ void Node::try_connect_bootstrap_peers() {
     const char* source;
   };
   std::vector<Candidate> static_candidates;
+  std::vector<Candidate> validator_candidates;
   std::vector<Candidate> addrman_candidates;
   std::set<std::string> seen;
   bool sync_bootstrap_mode = false;
@@ -10985,6 +10990,9 @@ void Node::try_connect_bootstrap_peers() {
     sync_bootstrap_mode =
         finalized_lag > kSyncBootstrapLagThreshold || healthy_established_peers < kSyncBootstrapHealthyPeerThreshold;
 
+    for (const auto& p : validators_bootstrap_peers_) {
+      if (seen.insert(p).second) validator_candidates.push_back({p, "validators-addrman"});
+    }
     for (const auto& p : bootstrap_peers_) {
       if (seen.insert(p).second) static_candidates.push_back({p, "seeds"});
     }
@@ -11049,9 +11057,23 @@ void Node::try_connect_bootstrap_peers() {
     }
   };
 
+  auto established_active_validator_peers = [&]() -> std::size_t {
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::uint64_t active_height = finalized_height_ + 1;
+    std::size_t count = 0;
+    for (const auto& [peer_id, pub] : peer_validator_pubkeys_) {
+      if (!validators_.is_active_for_height(pub, active_height)) continue;
+      const auto info = p2p_.get_peer_info(peer_id);
+      if (!info.established()) continue;
+      ++count;
+    }
+    return count;
+  };
+
+  attempt_candidates(validator_candidates);
   attempt_candidates(static_candidates);
   if (sync_bootstrap_mode && outbound_peer_count() >= cfg_.outbound_target) return;
-  if (sync_bootstrap_mode && outbound_peer_count() > 0) return;
+  if (sync_bootstrap_mode && outbound_peer_count() > 0 && established_active_validator_peers() > 0) return;
 
   // In normal mode we blend in addrman for broader discovery.
   // In sync bootstrap mode we spill to addrman only when static/dns could not
@@ -11350,6 +11372,9 @@ bool Node::is_bootstrap_peer_ip(const std::string& ip) const {
     if (matches_host(seed)) return true;
   }
   for (const auto& peer : bootstrap_peers_) {
+    if (matches_host(peer)) return true;
+  }
+  for (const auto& peer : validators_bootstrap_peers_) {
     if (matches_host(peer)) return true;
   }
   return false;
