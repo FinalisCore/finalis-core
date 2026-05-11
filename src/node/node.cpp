@@ -78,6 +78,9 @@ constexpr std::uint64_t kTxRelayPeerBackoffMs = 60'000;
 constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
 constexpr std::uint64_t kFinalizedTipFreshnessFloorMs = 15'000;
 constexpr std::uint64_t kValidatorsAddrmanEntryTtlSeconds = 7 * 24 * 60 * 60;
+constexpr std::uint64_t kTimeoutVoteMessageDedupTtlMs = 120'000;
+constexpr std::size_t kMaxSeenTimeoutVoteMessages = 65'536;
+constexpr std::uint32_t kTimeoutVoteDuplicateLogEvery = 32;
 
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
@@ -8025,6 +8028,16 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
     std::lock_guard<std::mutex> lk(mu_);
     const auto now_ms = this->now_ms();
     auto log_timeout_soft_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
+      if (reason == "duplicate") {
+        const auto key = std::make_tuple(vote.height, vote.round, vote.validator_pubkey, reason);
+        auto it = timeout_vote_soft_reject_log_counts_.find(key);
+        if (it == timeout_vote_soft_reject_log_counts_.end()) {
+          timeout_vote_soft_reject_log_counts_.emplace(key, 1);
+        } else {
+          ++it->second;
+          if ((it->second % kTimeoutVoteDuplicateLogEvery) != 0) return;
+        }
+      }
       log_line("timeout-vote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
                " reason=" + reason + extra);
     };
@@ -8054,6 +8067,20 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
     if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) {
       log_timeout_hard_reject("invalid-signature", " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::HardReject;
+    }
+    if (from_network) {
+      const auto dedup_key = std::make_tuple(vote.height, vote.round, vote.validator_pubkey, vote.signature);
+      auto dedup_it = seen_timeout_vote_messages_ms_.find(dedup_key);
+      if (dedup_it != seen_timeout_vote_messages_ms_.end()) {
+        const bool fresh = now_ms <= dedup_it->second + kTimeoutVoteMessageDedupTtlMs;
+        dedup_it->second = now_ms;
+        if (fresh) {
+          log_timeout_soft_reject("duplicate", " validator=" + short_pub_hex(vote.validator_pubkey));
+          return TimeoutVoteHandlingResult::SoftReject;
+        }
+      } else {
+        seen_timeout_vote_messages_ms_.emplace(dedup_key, now_ms);
+      }
     }
     // Conservative liveness catchup: allow a bounded round jump from a valid
     // higher-round timeout vote when this node is visibly stalled at the same height.
@@ -11589,6 +11616,7 @@ bool Node::should_mute_peer_locked(int peer_id) const {
 }
 
 void Node::prune_caches_locked(std::uint64_t height, std::uint32_t round) {
+  const auto now = now_ms();
   for (auto it = proposed_in_round_.begin(); it != proposed_in_round_.end();) {
     if (it->first.first < height || (it->first.first == height && it->first.second + kProposalRoundWindow < round)) {
       it = proposed_in_round_.erase(it);
@@ -11599,6 +11627,24 @@ void Node::prune_caches_locked(std::uint64_t height, std::uint32_t round) {
   for (auto it = logged_committee_rounds_.begin(); it != logged_committee_rounds_.end();) {
     if (it->first < height || (it->first == height && it->second + kProposalRoundWindow < round)) {
       it = logged_committee_rounds_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = seen_timeout_vote_messages_ms_.begin(); it != seen_timeout_vote_messages_ms_.end();) {
+    const bool stale = (it->second + kTimeoutVoteMessageDedupTtlMs) < now;
+    const bool old_height = std::get<0>(it->first) + 2 < height;
+    if (stale || old_height || seen_timeout_vote_messages_ms_.size() > kMaxSeenTimeoutVoteMessages) {
+      it = seen_timeout_vote_messages_ms_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = timeout_vote_soft_reject_log_counts_.begin(); it != timeout_vote_soft_reject_log_counts_.end();) {
+    const bool old_height = std::get<0>(it->first) + 2 < height;
+    const bool old_round = std::get<0>(it->first) == height && (std::get<1>(it->first) + kProposalRoundWindow) < round;
+    if (old_height || old_round) {
+      it = timeout_vote_soft_reject_log_counts_.erase(it);
     } else {
       ++it;
     }
