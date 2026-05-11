@@ -1077,10 +1077,19 @@ Hash32 hash32_from_hex_or_zero(const char* hex) {
 }
 
 bool should_accept_frozen_settlement_hotfix(const FrontierTransition& transition) {
-  static const Hash32 kAcceptedSettlementCommitment = hash32_from_hex_or_zero(
+  static const Hash32 kAcceptedSettlementCommitment7009 = hash32_from_hex_or_zero(
       "2a0c42c55172ffc312c88e2d4ab03d3d77fbafd71b4149cab89486abc591c3ee");
-  return transition.height == 7009 && transition.settlement.settlement_epoch_start == 6977 &&
-         transition.settlement_commitment == kAcceptedSettlementCommitment;
+  static const Hash32 kAcceptedSettlementCommitment7041 = hash32_from_hex_or_zero(
+      "ebd9494cd54f49c1c452efa57f2cafb6b2d83ce3746f7aa04b860a7caddc738a");
+  if (transition.height == 7009 && transition.settlement.settlement_epoch_start == 6977 &&
+      transition.settlement_commitment == kAcceptedSettlementCommitment7009) {
+    return true;
+  }
+  if (transition.height == 7041 && transition.settlement.settlement_epoch_start == 7009 &&
+      transition.settlement_commitment == kAcceptedSettlementCommitment7041) {
+    return true;
+  }
+  return false;
 }
 
 std::optional<std::pair<std::uint32_t, std::uint64_t>> parse_lane_seq_from_error(const std::string& error) {
