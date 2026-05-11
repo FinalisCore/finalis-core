@@ -8060,6 +8060,10 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       if (validation_error == "frontier-settlement-commitment-mismatch") {
         if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
             settlement_epoch.has_value()) {
+          if (epoch_committee_frozen_locked(*settlement_epoch)) {
+            log_line("frontier-settlement-fallback-skipped height=" + std::to_string(transition.height) +
+                     " epoch=" + std::to_string(*settlement_epoch) + " reason=frozen-epoch");
+          } else {
           auto try_reward_state = [&](storage::EpochRewardSettlementState candidate_state, const char* source) -> bool {
             candidate_state.epoch_start_height = *settlement_epoch;
             auto fallback_state = *canonical_state_;
@@ -8113,6 +8117,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
             accepted_with_settlement_fallback =
                 try_reward_state(std::move(empty_onboarding_state), "runtime-empty-onboarding");
           }
+          }
         }
       }
       if (!accepted_with_settlement_fallback) {
@@ -8161,6 +8166,10 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     bool accepted_with_settlement_fallback = false;
     if (validation_error == "frontier-settlement-commitment-mismatch") {
       if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height); settlement_epoch.has_value()) {
+        if (epoch_committee_frozen_locked(*settlement_epoch)) {
+          log_line("frontier-settlement-fallback-skipped height=" + std::to_string(transition.height) +
+                   " epoch=" + std::to_string(*settlement_epoch) + " reason=frozen-epoch");
+        } else {
         auto apply_and_retry = [&](storage::EpochRewardSettlementState candidate_state) {
           candidate_state.epoch_start_height = *settlement_epoch;
           auto& runtime_state = epoch_reward_states_[*settlement_epoch];
@@ -8183,6 +8192,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
         if (!accepted_with_settlement_fallback) {
           candidate_state.onboarding_score_units.clear();
           apply_and_retry(candidate_state);
+        }
         }
       }
     }
