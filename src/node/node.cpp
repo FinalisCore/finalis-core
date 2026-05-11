@@ -73,6 +73,7 @@ constexpr std::size_t kEpochReconcileMinPeersPerTick = 3;
 constexpr std::size_t kEpochReconcileMaxPeersPerTick = 8;
 constexpr std::uint64_t kEpochTicketRejectLogIntervalMs = 10'000;
 constexpr std::uint64_t kEpochReconcileRejectLogIntervalMs = 30'000;
+constexpr std::uint64_t kEpochReconcileClosedRebuildLogIntervalMs = 60'000;
 constexpr std::uint64_t kTxRelayPeerBackoffMs = 60'000;
 constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
 constexpr std::uint64_t kFinalizedTipFreshnessFloorMs = 15'000;
@@ -5748,6 +5749,18 @@ void Node::event_loop() {
       const bool round_timeout_elapsed = now_ms > round_started_ms_ + cfg_.network.round_timeout_ms;
       const bool round0_grace_elapsed = current_round_ > 0 || now_ms >= round0_deadline_ms_;
       if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
+          round0_grace_elapsed && consensus_stalled && can_propose && !highest_qc.has_value() && !highest_tc.has_value() &&
+          !committee.empty()) {
+        const auto old_round = current_round_;
+        current_round_ = old_round + 1;
+        round_started_ms_ = now_ms;
+        const auto forced_leader = leader_for_height_round(h, current_round_);
+        log_line("round-catchup height=" + std::to_string(h) + " old_round=" + std::to_string(old_round) +
+                 " new_round=" + std::to_string(current_round_) +
+                 " reason=stalled-no-qc-tc-force-advance leader=" +
+                 (forced_leader.has_value() ? short_pub_hex(*forced_leader) : std::string("none")));
+      }
+      if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
           round0_grace_elapsed) {
         const auto timeout_round = current_round_;
         const auto timeout_committee = committee_for_height_round(h, timeout_round);
@@ -5776,8 +5789,10 @@ void Node::event_loop() {
           const auto old_round = current_round_;
           current_round_ = timeout_round + 1;
           round_started_ms_ = now_ms;
+          const auto new_leader = leader_for_height_round(h, current_round_);
           log_line("round-catchup height=" + std::to_string(h) + " old_round=" + std::to_string(old_round) +
-                   " new_round=" + std::to_string(current_round_) + " reason=ticket-pow-fallback-timeout");
+                   " new_round=" + std::to_string(current_round_) + " reason=ticket-pow-fallback-timeout" +
+                   " leader=" + (new_leader.has_value() ? short_pub_hex(*new_leader) : std::string("none")));
         } else if (timeout_evidence_progressed) {
           // Round advancement remains TC-driven outside the deterministic
           // deterministic ticket-pow fallback path.
@@ -6510,6 +6525,13 @@ bool Node::handle_epoch_ticket(const consensus::EpochTicket& ticket, bool from_n
   const bool accepted =
       handle_epoch_ticket_locked(ticket, from_network, from_peer_id, &reject_reason, allow_closed_epoch_reconcile);
   if (!accepted) {
+    if (from_network && reject_reason == "bad-anchor") {
+      const auto expected_anchor = epoch_ticket_challenge_anchor_locked(ticket.epoch);
+      log_line("epoch-ticket-anchor-mismatch peer_id=" + std::to_string(from_peer_id) +
+               " epoch=" + std::to_string(ticket.epoch) + " participant=" + short_pub_hex(ticket.participant_pubkey) +
+               " expected_anchor=" + short_hash_hex(expected_anchor) +
+               " got_anchor=" + short_hash_hex(ticket.challenge_anchor));
+    }
     bool should_log = true;
     std::string suffix;
     if (from_network && reject_reason == "not-best") {
@@ -7112,7 +7134,31 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 #ifdef _WIN32
         windows_settlement_epoch_reconcile_ms_[resp->epoch] = now_ms();
 #endif
-        rebuild_epoch_committee_state_locked(resp->epoch, "reconcile-closed", true);
+        const bool already_frozen = epoch_committee_frozen_locked(resp->epoch);
+        const bool already_verified_snapshot = [&]() {
+          auto checkpoint = finalized_committee_checkpoint_for_height_locked(resp->epoch);
+          if (!checkpoint.has_value() || checkpoint->ordered_members.empty()) return false;
+          auto existing = db_.get_epoch_committee_snapshot(resp->epoch);
+          if (!existing.has_value()) return false;
+          const auto expected = epoch_committee_snapshot_from_checkpoint(*checkpoint);
+          return same_epoch_committee_snapshot(*existing, expected);
+        }();
+        if (already_frozen && already_verified_snapshot) {
+          const std::uint64_t tms = now_ms();
+          auto& state = epoch_reconcile_closed_rebuild_log_state_[resp->epoch];
+          if (state.first != 0 && tms < state.first + kEpochReconcileClosedRebuildLogIntervalMs) {
+            ++state.second;
+          } else {
+            std::string suffix;
+            if (state.second != 0) suffix = " suppressed=" + std::to_string(state.second);
+            state.first = tms;
+            state.second = 0;
+            log_line("epoch-reconcile-closed-skip epoch=" + std::to_string(resp->epoch) +
+                     " reason=already-frozen-and-verified" + suffix);
+          }
+        } else {
+          rebuild_epoch_committee_state_locked(resp->epoch, "reconcile-closed", true);
+        }
       }
       bool should_log_reconcile = true;
       std::string reconcile_suffix;
