@@ -72,6 +72,8 @@ constexpr std::uint32_t kEpochReconcileRequestMaxTickets = 128;
 constexpr std::size_t kEpochReconcileMinPeersPerTick = 3;
 constexpr std::size_t kEpochReconcileMaxPeersPerTick = 8;
 constexpr std::uint64_t kEpochTicketRejectLogIntervalMs = 10'000;
+constexpr std::uint64_t kEpochReconcileRejectLogIntervalMs = 30'000;
+constexpr std::uint64_t kTxRelayPeerBackoffMs = 60'000;
 constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
 constexpr std::uint64_t kFinalizedTipFreshnessFloorMs = 15'000;
 constexpr std::uint64_t kValidatorsAddrmanEntryTtlSeconds = 7 * 24 * 60 * 60;
@@ -1044,6 +1046,21 @@ std::optional<Hash32> parse_transition_hash_from_error(const std::string& error)
   Hash32 out{};
   std::copy(bytes->begin(), bytes->end(), out.begin());
   return out;
+}
+
+std::optional<std::uint64_t> parse_height_from_error(const std::string& error) {
+  const std::string marker = "height=";
+  const auto pos = error.find(marker);
+  if (pos == std::string::npos) return std::nullopt;
+  const std::size_t start = pos + marker.size();
+  std::size_t end = start;
+  while (end < error.size() && error[end] >= '0' && error[end] <= '9') ++end;
+  if (end == start) return std::nullopt;
+  try {
+    return static_cast<std::uint64_t>(std::stoull(error.substr(start, end - start)));
+  } catch (...) {
+    return std::nullopt;
+  }
 }
 
 constexpr std::uint64_t kStartupCheckpointFallbackMaxRewindBlocks = 128;
@@ -3106,6 +3123,10 @@ bool Node::init() {
         log_line("peer-timeout peer_id=" + std::to_string(peer_id) + " dir=" + (pi.inbound ? "inbound" : "outbound") +
                  " endpoint=" + pi.endpoint + " detail=" + detail + " stage=" +
                  (type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake" : "frame"));
+        if (!pi.inbound) {
+          std::lock_guard<std::mutex> lk(mu_);
+          peer_tx_relay_backoff_until_ms_[peer_id] = now_ms() + kTxRelayPeerBackoffMs;
+        }
         if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && is_bootstrap_peer_ip(ip)) {
           log_line("bootstrap-timeout peer_id=" + std::to_string(peer_id) + " ip=" + ip + " note=timeout");
           return;
@@ -6212,12 +6233,23 @@ void Node::rebuild_epoch_committee_state_locked(std::uint64_t epoch, const char*
   if (should_be_frozen) (void)db_.put_epoch_committee_freeze_marker(expected_marker);
 
   if (log_summary) {
+    std::ostringstream winners;
+    if (!effective_checkpoint.ordered_members.empty()) {
+      const std::size_t take = std::min<std::size_t>(effective_checkpoint.ordered_members.size(), 4);
+      for (std::size_t i = 0; i < take; ++i) {
+        const auto best = checkpoint_best_ticket_for_member(cfg_.network, validators_, effective_checkpoint, i);
+        if (i) winners << ",";
+        winners << short_pub_hex(effective_checkpoint.ordered_members[i]) << ":" << short_hash_hex(best.best_ticket_hash)
+                << ":" << best.nonce;
+      }
+    }
     log_line(std::string("epoch-committee-rebuilt reason=") + reason + " epoch=" + std::to_string(epoch) +
              " committee=" + std::to_string(snapshot.ordered_members.size()) +
              " closed=" + (should_be_frozen ? "yes" : "no") +
              " snapshot=" + (same_snapshot ? "verified" : "rewritten") +
              " best_index=ignored-for-finalized-checkpoint" +
-             " freeze_marker=" + (should_be_frozen ? (same_marker ? "verified" : "rewritten") : "open"));
+             " freeze_marker=" + (should_be_frozen ? (same_marker ? "verified" : "rewritten") : "open") +
+             " winners=" + winners.str());
   }
   local_epoch_tickets_.erase(epoch);
 }
@@ -7082,9 +7114,29 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 #endif
         rebuild_epoch_committee_state_locked(resp->epoch, "reconcile-closed", true);
       }
-      log_line("epoch-reconcile-recv peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(resp->epoch) +
-               " tickets=" + std::to_string(resp->tickets.size()) + " accepted=" + std::to_string(accepted) +
-               " rejected=" + std::to_string(rejected) + " closed=" + (resp->epoch_closed ? "yes" : "no"));
+      bool should_log_reconcile = true;
+      std::string reconcile_suffix;
+      const bool repetitive_full_reject =
+          !resp->epoch_closed && !resp->tickets.empty() && accepted == 0 && rejected == resp->tickets.size();
+      if (repetitive_full_reject) {
+        const std::uint64_t tms = now_ms();
+        std::lock_guard<std::mutex> lk(mu_);
+        auto& state = epoch_reconcile_reject_log_state_[std::make_pair(peer_id, resp->epoch)];
+        if (state.first != 0 && tms < state.first + kEpochReconcileRejectLogIntervalMs) {
+          ++state.second;
+          should_log_reconcile = false;
+        } else {
+          if (state.second != 0) reconcile_suffix = " suppressed=" + std::to_string(state.second);
+          state.first = tms;
+          state.second = 0;
+        }
+      }
+      if (should_log_reconcile) {
+        log_line("epoch-reconcile-recv peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(resp->epoch) +
+                 " tickets=" + std::to_string(resp->tickets.size()) + " accepted=" + std::to_string(accepted) +
+                 " rejected=" + std::to_string(rejected) + " closed=" + (resp->epoch_closed ? "yes" : "no") +
+                 reconcile_suffix);
+      }
       break;
     }
     case p2p::MsgType::TRANSITION: {
@@ -8834,8 +8886,15 @@ void Node::broadcast_tx(const AnyTx& tx, int skip_peer_id) {
     }
   } else {
     const auto payload = p2p::ser_tx(p2p::TxMsg{serialize_any_tx(tx)});
+    const std::uint64_t now = now_ms();
     for (int id : p2p_.peer_ids()) {
       if (id == skip_peer_id) continue;
+      if (should_mute_peer(id)) continue;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = peer_tx_relay_backoff_until_ms_.find(id);
+        if (it != peer_tx_relay_backoff_until_ms_.end() && now < it->second) continue;
+      }
       (void)p2p_.send_to(id, p2p::MsgType::TX, payload, true);
     }
   }
@@ -9397,9 +9456,17 @@ bool Node::load_state() {
       const bool lane_tip_low = derivation_error.find("frontier-storage-lane-tip-too-low") != std::string::npos;
       const bool missing_lane_record =
           derivation_error.find("frontier-storage-missing-lane-record") != std::string::npos;
+      const bool settlement_commitment_mismatch =
+          derivation_error.find("frontier-settlement-commitment-mismatch") != std::string::npos;
       bool repaired = false;
-      if (lane_tip_low || missing_lane_record) {
-        if (auto bad_transition = parse_transition_hash_from_error(derivation_error); bad_transition.has_value()) {
+      if (lane_tip_low || missing_lane_record || settlement_commitment_mismatch) {
+        std::optional<Hash32> bad_transition = parse_transition_hash_from_error(derivation_error);
+        if (!bad_transition.has_value()) {
+          if (auto bad_height = parse_height_from_error(derivation_error); bad_height.has_value()) {
+            bad_transition = db_.get_frontier_transition_by_height(*bad_height);
+          }
+        }
+        if (bad_transition.has_value()) {
           std::string repair_error;
           std::uint64_t bad_height = 0;
           std::uint64_t new_tip_height = 0;
@@ -9410,7 +9477,10 @@ bool Node::load_state() {
               rollback_frontier_tail_from_transition(db_, *bad_transition, repair_cap, repair_floor, &bad_height,
                                                      &new_tip_height, &repair_error);
           if (repaired) {
-            const std::string reason = lane_tip_low ? "lane-tip-too-low" : "missing-lane-record";
+            std::string reason = "repair-trigger";
+            if (lane_tip_low) reason = "lane-tip-too-low";
+            else if (missing_lane_record) reason = "missing-lane-record";
+            else if (settlement_commitment_mismatch) reason = "settlement-commitment-mismatch";
             log_line("startup-frontier-tail-repair status=ok reason=" + reason + " bad_height=" +
                      std::to_string(bad_height) + " new_tip_height=" + std::to_string(new_tip_height) +
                      " effective_cap=" + std::to_string(repair_cap) +
@@ -10452,6 +10522,8 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
       std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
   const std::uint64_t tms = now_ms();
   const std::uint64_t sync_gap = tms >= last_finalized_progress_ms_ ? (tms - last_finalized_progress_ms_) : 0;
+  const auto status_snapshot = build_runtime_status_snapshot_locked(tms);
+  const std::uint64_t finalized_lag = status_snapshot.finalized_lag;
   const std::uint64_t tip_freshness_ms =
       std::max<std::uint64_t>(kFinalizedTipFreshnessFloorMs, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms) * 3);
   for (auto it = sync_height_rr_cursor_.begin(); it != sync_height_rr_cursor_.end();) {
@@ -10479,6 +10551,9 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
 
   if (sync_gap > 15'000) {
     retry_ms = std::min<std::uint64_t>(retry_ms, 1000);
+  }
+  if (finalized_lag > 16) {
+    retry_ms = std::min<std::uint64_t>(retry_ms, 750);
   }
 
   auto eligible_peer = [&](int peer_id) {
@@ -10525,13 +10600,15 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     return c.fresh;
   });
   bool strict_sync_sources = false;
+  constexpr std::size_t kMinStrictValidatorPeers = 2;
+  const bool high_lag_mode = finalized_lag >= 32 || sync_gap > 20'000;
   if (have_fresh_validator_peer) {
     std::vector<SyncPeerCandidate> tier1_only;
     tier1_only.reserve(eligible_peers.size());
     for (const auto& c : eligible_peers) {
       if (c.active_validator && c.fresh) tier1_only.push_back(c);
     }
-    if (!tier1_only.empty()) {
+    if (!tier1_only.empty() && (!high_lag_mode || tier1_only.size() >= kMinStrictValidatorPeers)) {
       eligible_peers.swap(tier1_only);
       strict_sync_sources = true;
     }
@@ -10585,10 +10662,12 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     }
   }
 
-  const std::uint64_t window_end = std::min(target_peer_height, finalized_height_ + kForwardSyncWindow);
+  const std::uint64_t dynamic_window =
+      finalized_lag >= 256 ? 512 : finalized_lag >= 128 ? 256 : finalized_lag >= 32 ? 128 : kForwardSyncWindow;
+  const std::uint64_t window_end = std::min(target_peer_height, finalized_height_ + dynamic_window);
   constexpr std::size_t kMaxSyncRequestsPerPeerPerSweep = kForwardSyncWindow;
   const std::size_t max_per_peer_per_sweep =
-      strict_sync_sources ? std::min<std::size_t>(8u, eligible_peers.size()) : kMaxSyncRequestsPerPeerPerSweep;
+      strict_sync_sources ? std::min<std::size_t>(16u, eligible_peers.size() * 2) : kMaxSyncRequestsPerPeerPerSweep;
   std::unordered_map<int, std::size_t> sent_per_peer;
   sent_per_peer.reserve(eligible_peers.size());
   bool requested_any = false;
@@ -10597,9 +10676,12 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
     const auto outstanding = requested_sync_heights_.find(height);
     const std::uint64_t first_request_ms = (outstanding == requested_sync_heights_.end()) ? tms : outstanding->second;
     const std::uint64_t age_ms = tms >= first_request_ms ? (tms - first_request_ms) : 0;
-    const std::size_t fanout = sync_gap > 15'000
-                                   ? ((age_ms > retry_ms * 2) ? 3u : 2u)
-                                   : ((age_ms > retry_ms * 4) ? 3u : (age_ms > retry_ms * 2 ? 2u : 1u));
+    std::size_t fanout = sync_gap > 15'000
+                             ? ((age_ms > retry_ms * 2) ? 3u : 2u)
+                             : ((age_ms > retry_ms * 4) ? 3u : (age_ms > retry_ms * 2 ? 2u : 1u));
+    if (high_lag_mode) fanout = std::max<std::size_t>(fanout, 2u);
+    if (finalized_lag >= 128) fanout = std::max<std::size_t>(fanout, 3u);
+    fanout = std::min<std::size_t>(fanout, eligible_peers.size());
 
     std::size_t sent_for_height = 0;
     const std::size_t candidate_count = eligible_peers.size();
