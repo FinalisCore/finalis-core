@@ -10263,9 +10263,11 @@ void Node::load_validators_addrman() {
   {
     std::lock_guard<std::mutex> lk(mu_);
     validators_bootstrap_peers_.assign(seen.begin(), seen.end());
+    prefer_validators_addrman_ = !validators_bootstrap_peers_.empty();
   }
   if (added > 0) {
     log_line("validators-addrman-load status=ok file=" + p.string() + " loaded=" + std::to_string(added));
+    log_line("validators-addrman-overlay mode=enabled endpoints=" + std::to_string(added));
   }
 }
 
@@ -10976,6 +10978,7 @@ void Node::try_connect_bootstrap_peers() {
   std::vector<Candidate> addrman_candidates;
   std::set<std::string> seen;
   bool sync_bootstrap_mode = false;
+  bool validator_overlay_mode = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     std::size_t healthy_established_peers = 0;
@@ -10989,15 +10992,18 @@ void Node::try_connect_bootstrap_peers() {
     const std::uint64_t finalized_lag = best_peer_height > finalized_height_ ? (best_peer_height - finalized_height_) : 0;
     sync_bootstrap_mode =
         finalized_lag > kSyncBootstrapLagThreshold || healthy_established_peers < kSyncBootstrapHealthyPeerThreshold;
+    validator_overlay_mode = prefer_validators_addrman_ && !validators_bootstrap_peers_.empty();
 
     for (const auto& p : validators_bootstrap_peers_) {
       if (seen.insert(p).second) validator_candidates.push_back({p, "validators-addrman"});
     }
-    for (const auto& p : bootstrap_peers_) {
-      if (seen.insert(p).second) static_candidates.push_back({p, "seeds"});
-    }
-    for (const auto& p : dns_seed_peers_) {
-      if (seen.insert(p).second) static_candidates.push_back({p, "dns"});
+    if (!validator_overlay_mode) {
+      for (const auto& p : bootstrap_peers_) {
+        if (seen.insert(p).second) static_candidates.push_back({p, "seeds"});
+      }
+      for (const auto& p : dns_seed_peers_) {
+        if (seen.insert(p).second) static_candidates.push_back({p, "dns"});
+      }
     }
     if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) {
       for (const auto& a : addrman_.select_candidates(cfg_.outbound_target * 2, now_unix())) {

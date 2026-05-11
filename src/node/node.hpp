@@ -684,6 +684,7 @@ class Node {
   std::uint64_t upnp_igd_next_refresh_ms_{0};
   std::vector<std::string> bootstrap_peers_;
   std::vector<std::string> validators_bootstrap_peers_;
+  bool prefer_validators_addrman_{false};
   std::vector<std::string> dns_seed_peers_;
   std::set<std::string> preflight_checked_seeds_;
   std::set<std::string> self_peer_endpoints_;
