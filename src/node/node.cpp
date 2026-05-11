@@ -6442,6 +6442,8 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   consensus::EpochTicket stored = ticket;
   stored.origin = from_network ? consensus::EpochTicketOrigin::NETWORK : consensus::EpochTicketOrigin::LOCAL;
   const std::uint64_t current_epoch = current_epoch_ticket_epoch_locked();
+  const bool closed_epoch_reconcile_read_only =
+      allow_closed_epoch_reconcile && stored.epoch != current_epoch && epoch_committee_closed_locked(stored.epoch);
   if (!from_network) {
     auto local_info = validators_.get(local_key_.public_key);
     if (local_info.has_value()) {
@@ -6516,7 +6518,7 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
   }
 
   (void)db_.put_epoch_ticket(stored);
-  if (improved) {
+  if (improved && !closed_epoch_reconcile_read_only) {
     // Consensus-critical: never let replay/reconcile of a worse ticket
     // overwrite best epoch ticket state, otherwise onboarding score units can
     // become message-order dependent and cause settlement commitment drift.
@@ -6536,13 +6538,15 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
           consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
     }
   }
-  auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,
-                                                             cfg_.max_committee, &validators_.all(), true);
-  if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(stored.epoch); checkpoint.has_value() &&
-      !checkpoint->ordered_members.empty()) {
-    snapshot = epoch_committee_snapshot_from_checkpoint(*checkpoint);
+  if (!closed_epoch_reconcile_read_only) {
+    auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,
+                                                               cfg_.max_committee, &validators_.all(), true);
+    if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(stored.epoch); checkpoint.has_value() &&
+        !checkpoint->ordered_members.empty()) {
+      snapshot = epoch_committee_snapshot_from_checkpoint(*checkpoint);
+    }
+    (void)db_.put_epoch_committee_snapshot(snapshot);
   }
-  (void)db_.put_epoch_committee_snapshot(snapshot);
 
   if (!from_network) {
     local_epoch_tickets_[stored.epoch] = stored;
