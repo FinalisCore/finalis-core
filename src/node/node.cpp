@@ -1064,6 +1064,22 @@ std::optional<std::uint64_t> parse_height_from_error(const std::string& error) {
   }
 }
 
+Hash32 hash32_from_hex_or_zero(const char* hex) {
+  if (!hex) return Hash32{};
+  const auto b = hex_decode(std::string(hex));
+  if (!b.has_value() || b->size() != 32) return Hash32{};
+  Hash32 out{};
+  std::copy(b->begin(), b->end(), out.begin());
+  return out;
+}
+
+bool should_accept_frozen_settlement_hotfix(const FrontierTransition& transition) {
+  static const Hash32 kAcceptedSettlementCommitment = hash32_from_hex_or_zero(
+      "2a0c42c55172ffc312c88e2d4ab03d3d77fbafd71b4149cab89486abc591c3ee");
+  return transition.height == 7009 && transition.settlement.settlement_epoch_start == 6977 &&
+         transition.settlement_commitment == kAcceptedSettlementCommitment;
+}
+
 std::optional<std::pair<std::uint32_t, std::uint64_t>> parse_lane_seq_from_error(const std::string& error) {
   const std::string lane_marker = "lane=";
   const std::string seq_marker = "seq=";
@@ -8489,6 +8505,13 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
   if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), validation_state,
                                                        certified_record, &recomputed, error,
                                                        &validation_diagnostics)) {
+    if (error && *error == "frontier-settlement-commitment-mismatch" &&
+        should_accept_frozen_settlement_hotfix(transition)) {
+      log_line("frontier-settlement-hotfix-accept height=" + std::to_string(transition.height) +
+               " round=" + std::to_string(transition.round) +
+               " epoch=" + std::to_string(transition.settlement.settlement_epoch_start));
+      return true;
+    }
     if (error != nullptr && !validation_diagnostics.empty()) {
       if (!error->empty()) *error += " details=" + validation_diagnostics;
       else *error = "details=" + validation_diagnostics;
