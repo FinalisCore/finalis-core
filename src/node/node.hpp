@@ -573,6 +573,7 @@ class Node {
   std::map<int, bool> peer_inbound_cache_;
   std::map<int, std::uint64_t> peer_keepalive_ms_;
   std::map<int, std::uint64_t> peer_last_finalized_tip_request_ms_;
+  std::map<int, std::uint64_t> peer_tx_relay_backoff_until_ms_;
   std::map<std::uint64_t, std::size_t> sync_height_rr_cursor_;
   std::map<std::string, std::uint64_t> invalid_frame_log_ms_;
   std::map<std::string, std::uint64_t> addr_drop_log_ms_;
@@ -618,6 +619,7 @@ class Node {
   std::uint64_t epoch_reconcile_peer_cursor_{0};
   std::map<std::tuple<int, std::uint64_t, std::string>, std::pair<std::uint64_t, std::uint32_t>>
       epoch_ticket_reject_log_state_;
+  std::map<std::pair<int, std::uint64_t>, std::pair<std::uint64_t, std::uint32_t>> epoch_reconcile_reject_log_state_;
 #ifdef _WIN32
   std::map<std::uint64_t, std::uint64_t> windows_settlement_epoch_reconcile_ms_;
 #endif
