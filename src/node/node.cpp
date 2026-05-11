@@ -4597,7 +4597,13 @@ std::optional<storage::EpochRewardSettlementState> Node::rebuild_frozen_epoch_re
   // pre-settlement reward state. Marking this settled here would zero out
   // expected settlement outputs and cause deterministic hard-rejects.
   state.settled = false;
-  if (auto snapshot = db_.get_epoch_committee_snapshot(epoch_start_height);
+  const auto settlement_boundary_height = epoch_start_height + epoch_blocks;
+  if (auto boundary_checkpoint = finalized_committee_checkpoint_for_height_locked(settlement_boundary_height);
+      boundary_checkpoint.has_value() && !boundary_checkpoint->ordered_members.empty()) {
+    std::map<PubKey32, std::uint64_t> onboarding;
+    for (const auto& member : boundary_checkpoint->ordered_members) onboarding[member] = 1;
+    state.onboarding_score_units = std::move(onboarding);
+  } else if (auto snapshot = db_.get_epoch_committee_snapshot(epoch_start_height);
       snapshot.has_value() && !snapshot->ordered_members.empty()) {
     std::map<PubKey32, std::uint64_t> onboarding;
     for (const auto& member : snapshot->ordered_members) onboarding[member] = 1;
