@@ -1064,6 +1064,30 @@ std::optional<std::uint64_t> parse_height_from_error(const std::string& error) {
   }
 }
 
+std::optional<std::pair<std::uint32_t, std::uint64_t>> parse_lane_seq_from_error(const std::string& error) {
+  const std::string lane_marker = "lane=";
+  const std::string seq_marker = "seq=";
+  const auto lane_pos = error.find(lane_marker);
+  const auto seq_pos = error.find(seq_marker);
+  if (lane_pos == std::string::npos || seq_pos == std::string::npos) return std::nullopt;
+  const std::size_t lane_start = lane_pos + lane_marker.size();
+  std::size_t lane_end = lane_start;
+  while (lane_end < error.size() && error[lane_end] >= '0' && error[lane_end] <= '9') ++lane_end;
+  if (lane_end == lane_start) return std::nullopt;
+  const std::size_t seq_start = seq_pos + seq_marker.size();
+  std::size_t seq_end = seq_start;
+  while (seq_end < error.size() && error[seq_end] >= '0' && error[seq_end] <= '9') ++seq_end;
+  if (seq_end == seq_start) return std::nullopt;
+  try {
+    const auto lane = static_cast<std::uint32_t>(std::stoul(error.substr(lane_start, lane_end - lane_start)));
+    const auto seq = static_cast<std::uint64_t>(std::stoull(error.substr(seq_start, seq_end - seq_start)));
+    if (lane >= INGRESS_LANE_COUNT || seq == 0) return std::nullopt;
+    return std::make_pair(lane, seq);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
 constexpr std::uint64_t kStartupCheckpointFallbackMaxRewindBlocks = 128;
 
 std::uint64_t compute_startup_frontier_repair_cap(const NodeConfig& cfg, std::uint64_t frontier_tip_height) {
@@ -8663,58 +8687,75 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
   }
   (void)ensure_settlement_onboarding_scores_loaded_locked(height);
 
-  FrontierBuildSelection selection;
-  selection.next_vector = canonical_state_->finalized_frontier_vector;
-  std::array<std::uint64_t, finalis::INGRESS_LANE_COUNT> lane_tips{};
-  std::uint64_t max_delta = 0;
-  for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
-    if (auto state = db_.get_lane_state(static_cast<std::uint32_t>(lane)); state.has_value()) {
-      lane_tips[lane] = state->max_seq;
-    } else {
-      lane_tips[lane] = 0;
-    }
-    if (lane_tips[lane] < canonical_state_->finalized_frontier_vector.lane_max_seq[lane]) {
-      last_test_hook_error_ = "frontier-build-lane-tip-rewind lane=" + std::to_string(lane);
-      return std::nullopt;
-    }
-    max_delta = std::max(max_delta, lane_tips[lane] - canonical_state_->finalized_frontier_vector.lane_max_seq[lane]);
-  }
-
-  std::size_t total_bytes = 0;
-  bool capped = false;
-  for (std::uint64_t r = 1; r <= max_delta && !capped; ++r) {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    FrontierBuildSelection selection;
+    selection.next_vector = canonical_state_->finalized_frontier_vector;
+    std::array<std::uint64_t, finalis::INGRESS_LANE_COUNT> lane_tips{};
+    std::uint64_t max_delta = 0;
     for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
-      const auto seq = canonical_state_->finalized_frontier_vector.lane_max_seq[lane] + r;
-      if (seq > lane_tips[lane]) continue;
-      consensus::CertifiedIngressRecord ingress;
-      std::string ingress_error;
-      if (!load_certified_ingress_record_from_db(db_, static_cast<std::uint32_t>(lane), seq, &ingress, &ingress_error)) {
-        last_test_hook_error_ = "frontier-build-ingress-load-failed:" + ingress_error;
-        log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
-                 " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
-                 " reason=" + ingress_error);
+      if (auto state = db_.get_lane_state(static_cast<std::uint32_t>(lane)); state.has_value()) {
+        lane_tips[lane] = state->max_seq;
+      } else {
+        lane_tips[lane] = 0;
+      }
+      if (lane_tips[lane] < canonical_state_->finalized_frontier_vector.lane_max_seq[lane]) {
+        last_test_hook_error_ = "frontier-build-lane-tip-rewind lane=" + std::to_string(lane);
         return std::nullopt;
       }
-      std::string ordered_record_error;
-      if (!inspect_frontier_ordered_record_supported(ingress.tx_bytes, selection.ordered_records.size(), nullptr,
-                                                     &ordered_record_error)) {
-        last_test_hook_error_ = "frontier-build-ordered-record-invalid:" + ordered_record_error;
-        log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
-                 " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
-                 " reason=" + ordered_record_error);
-        return std::nullopt;
-      }
-      if (selection.ordered_records.size() >= kMaxBlockTxs ||
-          total_bytes + ingress.tx_bytes.size() > kMaxBlockBytes) {
-        capped = true;
-        break;
-      }
-      selection.next_vector.lane_max_seq[lane] = seq;
-      selection.lane_records[lane].push_back(ingress);
-      selection.ordered_records.push_back(ingress.tx_bytes);
-      total_bytes += ingress.tx_bytes.size();
+      max_delta = std::max(max_delta, lane_tips[lane] - canonical_state_->finalized_frontier_vector.lane_max_seq[lane]);
     }
-  }
+
+    std::array<Hash32, finalis::INGRESS_LANE_COUNT> expected_lane_roots = canonical_state_->finalized_lane_roots;
+    std::array<bool, finalis::INGRESS_LANE_COUNT> lane_blocked{};
+    std::size_t total_bytes = 0;
+    bool capped = false;
+    for (std::uint64_t r = 1; r <= max_delta && !capped; ++r) {
+      for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
+        if (lane_blocked[lane]) continue;
+        const auto seq = canonical_state_->finalized_frontier_vector.lane_max_seq[lane] + r;
+        if (seq > lane_tips[lane]) continue;
+        if (quarantined_ingress_records_.contains({static_cast<std::uint32_t>(lane), seq})) {
+          lane_blocked[lane] = true;
+          continue;
+        }
+        consensus::CertifiedIngressRecord ingress;
+        std::string ingress_error;
+        if (!load_certified_ingress_record_from_db(db_, static_cast<std::uint32_t>(lane), seq, &ingress, &ingress_error)) {
+          last_test_hook_error_ = "frontier-build-ingress-load-failed:" + ingress_error;
+          log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
+                   " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
+                   " reason=" + ingress_error);
+          return std::nullopt;
+        }
+        if (ingress.certificate.prev_lane_root != expected_lane_roots[lane]) {
+          quarantined_ingress_records_.insert({static_cast<std::uint32_t>(lane), seq});
+          log_line("frontier-ingress-quarantine lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
+                   " reason=prev-root-mismatch expected_prev_root=" + short_hash_hex(expected_lane_roots[lane]) +
+                   " provided_prev_root=" + short_hash_hex(ingress.certificate.prev_lane_root));
+          lane_blocked[lane] = true;
+          continue;
+        }
+        std::string ordered_record_error;
+        if (!inspect_frontier_ordered_record_supported(ingress.tx_bytes, selection.ordered_records.size(), nullptr,
+                                                       &ordered_record_error)) {
+          last_test_hook_error_ = "frontier-build-ordered-record-invalid:" + ordered_record_error;
+          log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
+                   " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
+                   " reason=" + ordered_record_error);
+          return std::nullopt;
+        }
+        if (selection.ordered_records.size() >= kMaxBlockTxs ||
+            total_bytes + ingress.tx_bytes.size() > kMaxBlockBytes) {
+          capped = true;
+          break;
+        }
+        selection.next_vector.lane_max_seq[lane] = seq;
+        selection.lane_records[lane].push_back(ingress);
+        selection.ordered_records.push_back(ingress.tx_bytes);
+        total_bytes += ingress.tx_bytes.size();
+        expected_lane_roots[lane] = consensus::compute_lane_root_append(expected_lane_roots[lane], ingress.certificate.tx_hash);
+      }
+    }
 
   SpecialValidationContext vctx{
       .network = &cfg_.network,
@@ -8734,29 +8775,43 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       },
       .confidential_policy = &confidential_policy_};
 
-  consensus::FrontierExecutionResult result;
-  std::string validation_error;
-  if (!consensus::execute_frontier_lane_prefix(canonical_state_->utxos, canonical_state_->finalized_frontier_vector,
-                                               selection.next_vector, selection.lane_records,
-                                               canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error)) {
-    last_test_hook_error_ = "frontier-build-execution-failed:" + validation_error;
-    return std::nullopt;
+    consensus::FrontierExecutionResult result;
+    std::string validation_error;
+    if (!consensus::execute_frontier_lane_prefix(canonical_state_->utxos, canonical_state_->finalized_frontier_vector,
+                                                 selection.next_vector, selection.lane_records,
+                                                 canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error)) {
+      if (attempt == 0 &&
+          (validation_error.find("frontier-certified-ingress-prev-root-mismatch") != std::string::npos ||
+           validation_error.find("frontier-certified-ingress-prev-root-state-mismatch") != std::string::npos)) {
+        if (auto lane_seq = parse_lane_seq_from_error(validation_error); lane_seq.has_value()) {
+          quarantined_ingress_records_.insert(*lane_seq);
+          log_line("frontier-ingress-quarantine lane=" + std::to_string(lane_seq->first) +
+                   " seq=" + std::to_string(lane_seq->second) +
+                   " reason=execution-prev-root-mismatch retry=1 detail=" + validation_error);
+          continue;
+        }
+      }
+      last_test_hook_error_ = "frontier-build-execution-failed:" + validation_error;
+      return std::nullopt;
+    }
+    if (!consensus::populate_frontier_transition_metadata(canonical_derivation_config_locked(), *canonical_state_, height, round,
+                                                          local_key_.public_key, {}, result.accepted_fee_units,
+                                                          result.next_utxos, &result.transition, &validation_error)) {
+      last_test_hook_error_ = "frontier-build-metadata-failed:" + validation_error;
+      return std::nullopt;
+    }
+    if (height == finalized_height_ + 1) {
+      log_line("frontier-build-summary height=" + std::to_string(height) + " round=" + std::to_string(round) +
+               " transition=" + short_hash_hex(result.transition.transition_id()) +
+               " settlement_commitment=" + short_hash_hex(result.transition.settlement_commitment) +
+               " settlement_payload_hash=" + short_hash_hex(crypto::sha256(result.transition.settlement.serialize())) +
+               " tx_count=" + std::to_string(result.accepted_txs.size()));
+    }
+    last_test_hook_error_.clear();
+    return FrontierProposal{result.transition, selection.ordered_records};
   }
-  if (!consensus::populate_frontier_transition_metadata(canonical_derivation_config_locked(), *canonical_state_, height, round,
-                                                        local_key_.public_key, {}, result.accepted_fee_units,
-                                                        result.next_utxos, &result.transition, &validation_error)) {
-    last_test_hook_error_ = "frontier-build-metadata-failed:" + validation_error;
-    return std::nullopt;
-  }
-  if (height == finalized_height_ + 1) {
-    log_line("frontier-build-summary height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(result.transition.transition_id()) +
-             " settlement_commitment=" + short_hash_hex(result.transition.settlement_commitment) +
-             " settlement_payload_hash=" + short_hash_hex(crypto::sha256(result.transition.settlement.serialize())) +
-             " tx_count=" + std::to_string(result.accepted_txs.size()));
-  }
-  last_test_hook_error_.clear();
-  return FrontierProposal{result.transition, selection.ordered_records};
+  last_test_hook_error_ = "frontier-build-execution-failed:quarantine-retry-exhausted";
+  return std::nullopt;
 }
 
 bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error) {
@@ -10377,6 +10432,19 @@ bool Node::handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& ms
                " local_epoch=" + std::to_string(local_epoch) +
                " peer_epoch=" + std::to_string(peer_epoch) +
                " reason=epoch-mismatch-chain-sync-pending");
+      return true;
+    }
+    std::uint64_t max_peer_height = tip_it->second.height;
+    for (const auto& [id, tip] : peer_finalized_tips_) {
+      const auto info = p2p_.get_peer_info(id);
+      if (!info.established()) continue;
+      max_peer_height = std::max(max_peer_height, tip.height);
+    }
+    if (max_peer_height > tip_it->second.height && (max_peer_height - tip_it->second.height) > 2) {
+      log_line("ingress-tips-stale-skipped peer_id=" + std::to_string(peer_id) +
+               " peer_height=" + std::to_string(tip_it->second.height) +
+               " max_peer_height=" + std::to_string(max_peer_height) +
+               " reason=stale-finalized-tip");
       return true;
     }
   }
