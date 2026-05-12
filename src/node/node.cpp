@@ -6701,10 +6701,19 @@ bool Node::handle_epoch_ticket(const consensus::EpochTicket& ticket, bool from_n
   if (!accepted) {
     if (from_network && reject_reason == "bad-anchor") {
       const auto expected_anchor = epoch_ticket_challenge_anchor_locked(ticket.epoch);
+      const auto checkpoint = finalized_committee_checkpoint_for_height_locked(ticket.epoch);
+      const auto epoch_start = consensus::committee_epoch_start(ticket.epoch, cfg_.network.committee_epoch_blocks);
+      const auto formula_anchor =
+          consensus::committee_epoch_seed(committee_epoch_randomness_for_height_locked(ticket.epoch), epoch_start);
       log_line("epoch-ticket-anchor-mismatch peer_id=" + std::to_string(from_peer_id) +
                " epoch=" + std::to_string(ticket.epoch) + " participant=" + short_pub_hex(ticket.participant_pubkey) +
                " expected_anchor=" + short_hash_hex(expected_anchor) +
-               " got_anchor=" + short_hash_hex(ticket.challenge_anchor));
+               " got_anchor=" + short_hash_hex(ticket.challenge_anchor) +
+               " checkpoint_anchor=" +
+               (checkpoint.has_value() ? short_hash_hex(checkpoint->epoch_seed) : std::string("none")) +
+               " formula_anchor=" + short_hash_hex(formula_anchor) +
+               " finalized_height=" + std::to_string(finalized_height_) +
+               " current_epoch=" + std::to_string(current_epoch_ticket_epoch_locked()));
     }
     bool should_log = true;
     std::string suffix;
