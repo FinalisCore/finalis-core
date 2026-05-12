@@ -4793,6 +4793,7 @@ std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch
 bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height) {
   const auto settlement_epoch = settlement_epoch_for_block_height_locked(height);
   if (!settlement_epoch.has_value()) return true;
+  const auto epoch_blocks = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
 
   std::size_t established_peers = 0;
   for (int peer_id : p2p_.peer_ids()) {
@@ -4831,6 +4832,36 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
     if (canonical_updated) {
       canonical_state_->state_commitment =
           consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+    }
+  }
+
+  // Determinism-critical: once the settlement epoch is fully finalized, force
+  // reward-state reconstruction from finalized chain artifacts and override any
+  // runtime residue. This keeps settlement commitments aligned across nodes.
+  const std::uint64_t settlement_epoch_end = *settlement_epoch + epoch_blocks - 1;
+  if (finalized_height_ >= settlement_epoch_end) {
+    if (auto rebuilt = rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(*settlement_epoch); rebuilt.has_value()) {
+      auto& runtime_reward_state = epoch_reward_states_[*settlement_epoch];
+      runtime_reward_state.epoch_start_height = *settlement_epoch;
+      const bool runtime_state_changed = !same_epoch_reward_state(runtime_reward_state, *rebuilt);
+      if (runtime_state_changed) {
+        runtime_reward_state = *rebuilt;
+        (void)db_.put_epoch_reward_settlement(runtime_reward_state);
+      }
+      if (canonical_state_.has_value()) {
+        auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
+        canonical_reward_state.epoch_start_height = *settlement_epoch;
+        const bool canonical_state_changed = !same_epoch_reward_state(canonical_reward_state, *rebuilt);
+        if (canonical_state_changed) {
+          canonical_reward_state = *rebuilt;
+          canonical_state_->state_commitment =
+              consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
+        }
+      }
+      if (runtime_state_changed) {
+        log_line("settlement-reward-state-rebuilt epoch=" + std::to_string(*settlement_epoch) +
+                 " source=finalized-chain");
+      }
     }
   }
   return true;
