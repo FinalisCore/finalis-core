@@ -5667,6 +5667,7 @@ void Node::event_loop() {
     std::vector<int> finalized_tip_poll_peers;
     bool should_build_proposal = false;
     bool should_persist_validators_addrman = false;
+    bool force_validator_redial = false;
     std::uint64_t build_height = 0;
     std::uint32_t build_round = 0;
     {
@@ -5908,6 +5909,17 @@ void Node::event_loop() {
       const auto leader = leader_for_height_round(h, current_round_);
       const auto highest_qc = highest_qc_for_height_locked(h);
       const auto highest_tc = highest_tc_for_height_locked(h);
+      std::set<PubKey32> established_active_validator_pubkeys;
+      for (const auto& [peer_id, pub] : peer_validator_pubkeys_) {
+        if (!validators_.is_active_for_height(pub, h)) continue;
+        if (std::find(committee.begin(), committee.end(), pub) == committee.end()) continue;
+        const auto info = p2p_.get_peer_info(peer_id);
+        if (!info.established()) continue;
+        established_active_validator_pubkeys.insert(pub);
+      }
+      const std::size_t established_active_validators = established_active_validator_pubkeys.size();
+      const std::size_t required_active_validators = quorum > 0 ? quorum - 1 : 0;
+      const bool quorum_validator_connectivity_ready = established_active_validators >= required_active_validators;
       const bool ticket_pow_fallback_round = current_round_ > 0 && committee.size() == 1;
       const bool round_justification_ready =
           ticket_pow_fallback_round || highest_qc.has_value() ||
@@ -5962,6 +5974,8 @@ void Node::event_loop() {
             << " round_justification_ready=" << (round_justification_ready ? "yes" : "no")
             << " has_qc=" << (highest_qc.has_value() ? "yes" : "no")
             << " has_tc=" << (highest_tc.has_value() ? "yes" : "no")
+            << " established_active_validators=" << established_active_validators
+            << " required_active_validators=" << required_active_validators
             << " paused=" << (pause_proposals_.load() ? "yes" : "no")
             << " repair_mode=" << (repair_mode_ ? "yes" : "no")
             << " stalled=" << (consensus_stalled ? "yes" : "no")
@@ -5969,16 +5983,37 @@ void Node::event_loop() {
         log_line(lss.str());
         last_liveness_log_ms_ = now_ms;
       }
+      const bool round_timeout_elapsed = now_ms > round_started_ms_ + cfg_.network.round_timeout_ms;
+      if (!repair_mode_ && !pause_proposals_.load() && current_round_ == 0 && can_propose && committee_ready &&
+          block_interval_elapsed && ticket_window_elapsed && round_timeout_elapsed && !highest_qc.has_value() &&
+          !highest_tc.has_value() && !quorum_validator_connectivity_ready &&
+          now_ms >= last_round0_no_quorum_log_ms_ + 5000) {
+        log_line("deadlock-break-debug height=" + std::to_string(h) + " round=0" +
+                 " reason=round0-missing-established-active-validator-sessions" +
+                 " established_active_validators=" + std::to_string(established_active_validators) +
+                 " required_active_validators=" + std::to_string(required_active_validators) +
+                 " peers_established=" + std::to_string(established_peer_count()) +
+                 " leader=" + (leader.has_value() ? short_pub_hex(*leader) : std::string("none")));
+        last_round0_no_quorum_log_ms_ = now_ms;
+        force_validator_redial = true;
+      }
       if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && block_interval_elapsed && ticket_window_elapsed &&
-          !committee.empty() && round_justification_ready) {
+          !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           should_build_proposal = true;
           build_height = h;
           build_round = current_round_;
         }
+      } else if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && block_interval_elapsed &&
+                 ticket_window_elapsed && !committee.empty() && round_justification_ready &&
+                 !quorum_validator_connectivity_ready && now_ms >= last_round0_no_quorum_log_ms_ + 5000) {
+        log_line("proposal-build-skip height=" + std::to_string(h) + " round=" + std::to_string(current_round_) +
+                 " reason=missing-established-active-validator-sessions established_active_validators=" +
+                 std::to_string(established_active_validators) + " required_active_validators=" +
+                 std::to_string(required_active_validators));
+        last_round0_no_quorum_log_ms_ = now_ms;
       }
-      const bool round_timeout_elapsed = now_ms > round_started_ms_ + cfg_.network.round_timeout_ms;
       const bool round0_grace_elapsed = current_round_ > 0 || now_ms >= round0_deadline_ms_;
       bool advanced_round_this_tick = false;
       if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
@@ -6149,6 +6184,10 @@ void Node::event_loop() {
       send_ping(peer_id);
     }
     for (int peer_id : finalized_tip_poll_peers) request_finalized_tip(peer_id);
+    if (!cfg_.disable_p2p && force_validator_redial) {
+      try_connect_bootstrap_peers();
+      last_seed_attempt_ms_ = now_ms();
+    }
     if (should_persist_validators_addrman) {
       std::vector<p2p::PeerInfo> persisted_peers;
       persisted_peers.reserve(p2p_.peer_ids().size());
