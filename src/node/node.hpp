@@ -648,6 +648,10 @@ class Node {
   std::uint64_t last_addrman_save_ms_{0};
   std::uint64_t last_summary_log_ms_{0};
   std::uint64_t last_liveness_log_ms_{0};
+  std::uint64_t last_tc_no_qc_log_ms_{0};
+  std::uint64_t tc_no_qc_height_{0};
+  std::uint32_t tc_no_qc_last_round_{0};
+  std::uint32_t tc_no_qc_round_streak_{0};
   std::uint64_t last_finalized_progress_ms_{0};
   std::uint64_t last_finalized_tip_poll_ms_{0};
   std::size_t finalized_tip_poll_cursor_{0};

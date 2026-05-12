@@ -5882,6 +5882,29 @@ void Node::event_loop() {
           ticket_pow_fallback_round || highest_qc.has_value() ||
           (highest_tc.has_value() && highest_tc->round < current_round_) || current_round_ == 0;
       can_propose = leader.has_value() && *leader == local_key_.public_key;
+      if (highest_tc.has_value() && !highest_qc.has_value()) {
+        if (tc_no_qc_height_ != h) {
+          tc_no_qc_height_ = h;
+          tc_no_qc_last_round_ = current_round_;
+          tc_no_qc_round_streak_ = 1;
+        } else if (current_round_ != tc_no_qc_last_round_) {
+          tc_no_qc_last_round_ = current_round_;
+          ++tc_no_qc_round_streak_;
+        }
+        if (tc_no_qc_round_streak_ >= 3 && now_ms >= last_tc_no_qc_log_ms_ + 5000) {
+          log_line("deadlock-break-debug height=" + std::to_string(h) +
+                   " round=" + std::to_string(current_round_) +
+                   " reason=tc-progress-without-qc streak=" + std::to_string(tc_no_qc_round_streak_) +
+                   " has_lock=" + std::string(local_vote_locks_.find(h) != local_vote_locks_.end() ? "yes" : "no") +
+                   " can_propose=" + std::string(can_propose ? "yes" : "no") +
+                   " leader=" + (leader.has_value() ? short_pub_hex(*leader) : std::string("none")));
+          last_tc_no_qc_log_ms_ = now_ms;
+        }
+      } else {
+        tc_no_qc_height_ = h;
+        tc_no_qc_last_round_ = current_round_;
+        tc_no_qc_round_streak_ = 0;
+      }
       const std::uint64_t stale_ms = cfg_.network.round_timeout_ms * 2ULL;
       const bool consensus_stalled = now_ms > last_finalized_progress_ms_ + stale_ms;
       const bool emit_liveness_debug = debug_liveness_logs_enabled() || consensus_stalled;
@@ -5990,21 +6013,69 @@ void Node::event_loop() {
 
     if (should_build_proposal) {
       std::optional<FrontierProposal> built;
+      std::optional<FrontierProposal> reproposal;
       std::string build_error;
       {
         std::lock_guard<std::mutex> lk(mu_);
-        built = build_frontier_transition_locked(build_height, build_round);
-        build_error = last_test_hook_error_;
+        const auto highest_tc = highest_tc_for_height_locked(build_height);
+        const bool tc_driven_round = highest_tc.has_value() && highest_tc->round < build_round && build_round > 0;
+        if (tc_driven_round) {
+          std::optional<Hash32> preferred_payload;
+          if (auto lock_it = local_vote_locks_.find(build_height); lock_it != local_vote_locks_.end()) {
+            preferred_payload = lock_it->second.first;
+          } else if (auto qc_it = highest_qc_payload_by_height_.find(build_height); qc_it != highest_qc_payload_by_height_.end()) {
+            preferred_payload = qc_it->second;
+          }
+          if (preferred_payload.has_value()) {
+            for (const auto& [_, candidate] : candidate_frontier_proposals_) {
+              if (candidate.transition.height != build_height) continue;
+              if (consensus_payload_id(candidate.transition) != *preferred_payload) continue;
+              reproposal = candidate;
+              break;
+            }
+          }
+          if (reproposal.has_value()) {
+            const auto committee = committee_for_height_round(build_height, build_round);
+            reproposal->transition.round = build_round;
+            reproposal->transition.leader_pubkey = local_key_.public_key;
+            reproposal->transition.quorum_threshold = static_cast<std::uint32_t>(consensus::quorum_threshold(committee.size()));
+            reproposal->transition.observed_signers.clear();
+            if (!validate_frontier_proposal_locked(*reproposal, &build_error)) {
+              reproposal.reset();
+            } else {
+              log_line("proposal-lock-reproposal height=" + std::to_string(build_height) +
+                       " round=" + std::to_string(build_round) +
+                       " payload=" + short_hash_hex(*preferred_payload) +
+                       " tc_round=" + std::to_string(highest_tc->round));
+            }
+          }
+        }
+        if (!reproposal.has_value()) {
+          built = build_frontier_transition_locked(build_height, build_round);
+          build_error = last_test_hook_error_;
+          if (tc_driven_round && local_vote_locks_.find(build_height) != local_vote_locks_.end() && built.has_value()) {
+            const auto built_payload = consensus_payload_id(built->transition);
+            const auto locked_payload = local_vote_locks_[build_height].first;
+            if (built_payload != locked_payload) {
+              log_line("proposal-build-skip height=" + std::to_string(build_height) +
+                       " round=" + std::to_string(build_round) +
+                       " reason=tc-round-locked-payload-mismatch built_payload=" + short_hash_hex(built_payload) +
+                       " locked_payload=" + short_hash_hex(locked_payload));
+              built.reset();
+            }
+          }
+        }
       }
-      if (built.has_value()) {
+      const auto& selected = reproposal.has_value() ? reproposal : built;
+      if (selected.has_value()) {
         std::lock_guard<std::mutex> lk(mu_);
         const auto key = std::make_pair(build_height, build_round);
         if (finalized_height_ + 1 == build_height && current_round_ == build_round &&
             proposed_in_round_.find(key) == proposed_in_round_.end()) {
           proposed_in_round_[key] = true;
-          candidate_frontier_proposals_[built->transition.transition_id()] = *built;
-          candidate_block_sizes_[built->transition.transition_id()] = built->serialize().size();
-          frontier_to_propose = *built;
+          candidate_frontier_proposals_[selected->transition.transition_id()] = *selected;
+          candidate_block_sizes_[selected->transition.transition_id()] = selected->serialize().size();
+          frontier_to_propose = *selected;
         }
       } else {
         log_line("proposal-build-skip height=" + std::to_string(build_height) + " round=" + std::to_string(build_round) +
@@ -7802,20 +7873,6 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
                                   " remote_prev=" + short_hash_hex(msg.prev_finalized_hash));
       return ProposeHandlingResult::HardReject;
     }
-    if (from_network && from_peer_id > 0 && is_validator_) {
-      auto peer_validator_it = peer_validator_pubkeys_.find(from_peer_id);
-      if (peer_validator_it == peer_validator_pubkeys_.end()) {
-        log_propose_hard_reject("peer-not-active-validator",
-                                " peer_id=" + std::to_string(from_peer_id) + " detail=missing-validator-pubkey");
-        return ProposeHandlingResult::HardReject;
-      }
-      if (!validators_.is_active_for_height(peer_validator_it->second, msg.height)) {
-        log_propose_hard_reject("peer-not-active-validator",
-                                " peer_id=" + std::to_string(from_peer_id) + " validator=" +
-                                    short_hash_hex(peer_validator_it->second) + " height=" + std::to_string(msg.height));
-        return ProposeHandlingResult::HardReject;
-      }
-    }
     auto proposal = FrontierProposal::parse(msg.frontier_proposal_bytes);
     if (!proposal.has_value()) {
       log_propose_hard_reject("frontier-proposal-parse-failed");
@@ -7830,6 +7887,38 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (transition.prev_finalized_hash != msg.prev_finalized_hash) {
       log_propose_hard_reject("prev-hash-mismatch");
       return ProposeHandlingResult::HardReject;
+    }
+    if (from_network && from_peer_id > 0 && is_validator_) {
+      auto peer_validator_it = peer_validator_pubkeys_.find(from_peer_id);
+      if (peer_validator_it == peer_validator_pubkeys_.end()) {
+        bool allow_fallback = false;
+        std::string fallback_detail = " detail=missing-validator-pubkey";
+        const auto info = p2p_.get_peer_info(from_peer_id);
+        if (info.established()) {
+          if (auto expected_leader = leader_for_height_round(msg.height, msg.round); expected_leader.has_value()) {
+            if (transition.leader_pubkey == *expected_leader &&
+                validators_.is_active_for_height(*expected_leader, msg.height)) {
+              allow_fallback = true;
+              fallback_detail = " detail=established-session-leader-fallback validator=" +
+                                short_hash_hex(*expected_leader);
+            }
+          }
+        }
+        if (!allow_fallback) {
+          log_propose_hard_reject("peer-not-active-validator",
+                                  " peer_id=" + std::to_string(from_peer_id) + fallback_detail);
+          return ProposeHandlingResult::HardReject;
+        }
+        log_line("propose-peer-validator-fallback peer_id=" + std::to_string(from_peer_id) +
+                 " height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) + fallback_detail);
+      }
+      if (peer_validator_it != peer_validator_pubkeys_.end() &&
+          !validators_.is_active_for_height(peer_validator_it->second, msg.height)) {
+        log_propose_hard_reject("peer-not-active-validator",
+                                " peer_id=" + std::to_string(from_peer_id) + " validator=" +
+                                    short_hash_hex(peer_validator_it->second) + " height=" + std::to_string(msg.height));
+        return ProposeHandlingResult::HardReject;
+      }
     }
     const auto transition_id = transition.transition_id();
     const bool local_cached_proposal =
