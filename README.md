@@ -183,11 +183,7 @@ Before first startup on the mainnet:
   validator set
 - ensure your binaries embed the same canonical `genesis.bin` used for launch
 
-```bash
-./scripts/start.sh
-```
 
-## Fast sync command:
 ```
 SYNC_TURBO_MODE=extreme ./scripts/start.sh
 ```
