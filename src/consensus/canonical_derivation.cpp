@@ -285,20 +285,6 @@ std::map<PubKey32, std::uint64_t> onboarding_score_units_for_replay(const storag
   return onboarding_score_units_from_epoch_tickets(db, epoch_start);
 }
 
-std::map<PubKey32, std::uint64_t> canonicalize_onboarding_scores(
-    const ValidatorRegistry& validators, const std::map<PubKey32, std::uint64_t>& onboarding_scores) {
-  std::map<PubKey32, std::uint64_t> out;
-  if (onboarding_scores.empty()) return out;
-  const auto& known_validators = validators.all();
-  for (const auto& [pub, score] : onboarding_scores) {
-    if (score == 0) continue;
-    // Canonical settlement can only depend on finalized registry identities.
-    if (known_validators.find(pub) == known_validators.end()) continue;
-    out[pub] = score;
-  }
-  return out;
-}
-
 std::map<PubKey32, std::uint64_t> checkpoint_onboarding_scores(
     const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
     std::uint64_t epoch_start, std::uint64_t epoch_blocks) {
@@ -337,13 +323,11 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
       const auto checkpoint_scores =
           checkpoint_onboarding_scores(prev.finalized_committee_checkpoints, *settlement_epoch,
                                        cfg.network.committee_epoch_blocks);
-      if (!checkpoint_scores.empty()) {
-        // Conservative canonical rule: if settlement epoch has a finalized
-        // checkpoint, onboarding payouts are keyed only by checkpoint members.
-        onboarding_scores = checkpoint_scores;
-      } else {
-        onboarding_scores = canonicalize_onboarding_scores(prev.validators, it->second.onboarding_score_units);
-      }
+      // Canonical settlement must not depend on mutable runtime ticket replay
+      // residue. Restrict onboarding payout inputs to finalized checkpoint
+      // membership only; if no checkpoint is available, onboarding payout is
+      // deterministically omitted for this settlement.
+      onboarding_scores = checkpoint_scores;
       const auto& econ = active_economics_policy(cfg.network, height);
       const auto threshold_bps = econ.participation_threshold_bps;
       for (auto& [pub, score] : settlement_scores) {
