@@ -7775,8 +7775,13 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       log_propose_hard_reject("prev-hash-mismatch");
       return ProposeHandlingResult::HardReject;
     }
+    const auto transition_id = transition.transition_id();
+    const bool local_cached_proposal =
+        !from_network && transition.leader_pubkey == local_key_.public_key &&
+        candidate_frontier_proposals_.find(transition_id) != candidate_frontier_proposals_.end();
+
     std::string validation_error;
-    if (!validate_frontier_proposal_locked(*proposal, &validation_error)) {
+    if (!local_cached_proposal && !validate_frontier_proposal_locked(*proposal, &validation_error)) {
       std::string extra;
       if (validation_error == "frontier-settlement-commitment-mismatch" && canonical_state_.has_value()) {
         consensus::CanonicalFrontierRecord diag_record{proposal->transition, proposal->ordered_records};
@@ -7793,6 +7798,11 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       }
       log_propose_hard_reject(validation_error, extra);
       return ProposeHandlingResult::HardReject;
+    }
+    if (local_cached_proposal) {
+      log_line("proposal-local-validation-skip height=" + std::to_string(msg.height) +
+               " round=" + std::to_string(msg.round) + " transition=" + short_hash_hex(transition_id) +
+               " reason=locally-built-cached-proposal");
     }
     const auto justify_committee = committee_for_height_round(msg.height, msg.round);
     const bool singleton_fallback_round = msg.round > 0 && justify_committee.size() == 1;
@@ -7849,7 +7859,6 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       current_round_ = msg.round;
     }
 
-    const auto transition_id = transition.transition_id();
     if (candidate_frontier_proposals_.find(transition_id) == candidate_frontier_proposals_.end()) {
       const std::size_t sz = msg.frontier_proposal_bytes.size();
       std::size_t total = 0;
