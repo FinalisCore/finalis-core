@@ -1363,10 +1363,31 @@ std::string network_id_hex(const NetworkConfig& cfg) {
   return hex_encode(Bytes(cfg.network_id.begin(), cfg.network_id.end()));
 }
 
+std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+  codec::ByteWriter w;
+  w.bytes_fixed(cfg.network_id);
+  w.u32le(cfg.protocol_version);
+  w.u64le(cfg.feature_flags);
+  w.u64le(cfg.magic);
+  w.u64le(cfg.committee_epoch_blocks);
+  w.u32le(cfg.max_committee);
+  w.u32le(cv);
+  const auto genesis = hex_decode(chain_id.genesis_hash_hex);
+  if (genesis.has_value() && genesis->size() == 32) {
+    Hash32 g{};
+    std::copy(genesis->begin(), genesis->end(), g.begin());
+    w.bytes_fixed(g);
+  } else {
+    w.bytes_fixed(zero_hash());
+  }
+  return hex_encode32(crypto::sha256d(w.data()));
+}
+
 std::string local_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
   std::ostringstream oss;
   oss << finalis::node_software_version()
-      << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv;
+      << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv
+      << ";crh=" << consensus_rules_fingerprint(cfg, chain_id, cv);
   return oss.str();
 }
 
@@ -6599,6 +6620,19 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
     if (reject_reason) *reject_reason = "epoch-zero";
     return false;
   }
+  if (from_network && stored.epoch == current_epoch) {
+    // Open-epoch ticket flow is consensus-sensitive: accept only from peers that
+    // have proven validator identity and are currently active in validator set.
+    auto peer_it = peer_validator_pubkeys_.find(from_peer_id);
+    if (peer_it == peer_validator_pubkeys_.end()) {
+      if (reject_reason) *reject_reason = "untrusted-open-epoch-source";
+      return false;
+    }
+    if (!validators_.is_active_for_height(peer_it->second, stored.epoch)) {
+      if (reject_reason) *reject_reason = "non-validator-open-epoch-source";
+      return false;
+    }
+  }
   if (epoch_committee_closed_locked(stored.epoch)) {
     if (allow_closed_epoch_reconcile) {
       // Explicit reconciliation may store tickets for a closed epoch, even a
@@ -6820,8 +6854,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     }
     const std::string local_genesis = ascii_lower(chain_id_.genesis_hash_hex);
     const std::string local_nid = ascii_lower(network_id_hex(cfg_.network));
+    const std::string local_crh = ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion));
     const auto peer_genesis = software_fingerprint_value(v->node_software_version, "genesis");
     const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
+    const auto peer_crh = software_fingerprint_value(v->node_software_version, "crh");
     const auto peer_bootstrap = software_fingerprint_value(v->node_software_version, "bootstrap_validator");
     const auto peer_validator = software_fingerprint_value(v->node_software_version, "validator_pubkey");
     const auto peer_external_endpoint = software_fingerprint_value(v->node_software_version, "external_endpoint");
@@ -6832,6 +6868,17 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     }
     if (peer_nid.has_value() && ascii_lower(*peer_nid) != local_nid) {
       log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-fingerprint-mismatch");
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+    if (!peer_crh.has_value()) {
+      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=missing-consensus-rules-fingerprint");
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+    if (ascii_lower(*peer_crh) != local_crh) {
+      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=consensus-rules-fingerprint-mismatch peer_crh=" +
+               ascii_lower(*peer_crh) + " local_crh=" + local_crh);
       p2p_.disconnect_peer(peer_id);
       return;
     }
