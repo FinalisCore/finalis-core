@@ -8213,6 +8213,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     consensus::FrontierExecutionResult recomputed;
     std::string validation_error;
     std::string validation_diagnostics;
+    bool accepted_with_settlement_hotfix = false;
     auto validation_state = *canonical_state_;
     if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
         settlement_epoch.has_value() && epoch_committee_frozen_locked(*settlement_epoch)) {
@@ -8232,6 +8233,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       if (validation_error == "frontier-settlement-commitment-mismatch") {
         if (should_accept_frozen_settlement_hotfix(transition)) {
           accepted_with_settlement_fallback = true;
+          accepted_with_settlement_hotfix = true;
           log_line("frontier-settlement-hotfix-accept height=" + std::to_string(transition.height) +
                    " round=" + std::to_string(transition.round) +
                    " epoch=" + std::to_string(transition.settlement.settlement_epoch_start));
@@ -8314,9 +8316,20 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       return false;
       }
     }
-    const auto expected_committee = recomputed.effective_committee;
-    const std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
-    if (certificate->committee_members != expected_committee || certificate->quorum_threshold != expected_quorum) {
+    std::vector<PubKey32> expected_committee = recomputed.effective_committee;
+    std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
+    if (accepted_with_settlement_hotfix) {
+      expected_committee = certificate->committee_members;
+      expected_quorum = certificate->quorum_threshold;
+      if (expected_quorum != consensus::quorum_threshold(expected_committee.size())) {
+        log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
+                 std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
+                 " reason=certificate-quorum-threshold-invalid");
+        return false;
+      }
+    }
+    if (!accepted_with_settlement_hotfix &&
+        (certificate->committee_members != expected_committee || certificate->quorum_threshold != expected_quorum)) {
       log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
                std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
                " reason=certificate-committee-mismatch");
