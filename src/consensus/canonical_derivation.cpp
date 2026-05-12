@@ -299,6 +299,15 @@ std::map<PubKey32, std::uint64_t> canonicalize_onboarding_scores(
   return out;
 }
 
+std::map<PubKey32, std::uint64_t> checkpoint_onboarding_scores(
+    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start) {
+  std::map<PubKey32, std::uint64_t> out;
+  const auto it = checkpoints.find(epoch_start);
+  if (it == checkpoints.end()) return out;
+  for (const auto& member : it->second.ordered_members) out[member] = 1;
+  return out;
+}
+
 FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivationConfig& cfg,
                                                          const CanonicalDerivedState& prev, std::uint64_t height,
                                                          const PubKey32& leader_pubkey,
@@ -319,7 +328,14 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
       settled_epoch_fees = height >= EMISSION_BLOCKS ? it->second.fee_pool_units : 0;
       reserve_subsidy = height >= EMISSION_BLOCKS ? it->second.reserve_subsidy_units : 0;
       settlement_scores = it->second.reward_score_units;
-      onboarding_scores = canonicalize_onboarding_scores(prev.validators, it->second.onboarding_score_units);
+      const auto checkpoint_scores = checkpoint_onboarding_scores(prev.finalized_committee_checkpoints, *settlement_epoch);
+      if (!checkpoint_scores.empty()) {
+        // Conservative canonical rule: if settlement epoch has a finalized
+        // checkpoint, onboarding payouts are keyed only by checkpoint members.
+        onboarding_scores = checkpoint_scores;
+      } else {
+        onboarding_scores = canonicalize_onboarding_scores(prev.validators, it->second.onboarding_score_units);
+      }
       const auto& econ = active_economics_policy(cfg.network, height);
       const auto threshold_bps = econ.participation_threshold_bps;
       for (auto& [pub, score] : settlement_scores) {
