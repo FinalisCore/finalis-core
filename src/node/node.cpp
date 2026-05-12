@@ -8230,8 +8230,14 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                                                          &validation_diagnostics)) {
       bool accepted_with_settlement_fallback = false;
       if (validation_error == "frontier-settlement-commitment-mismatch") {
+        if (should_accept_frozen_settlement_hotfix(transition)) {
+          accepted_with_settlement_fallback = true;
+          log_line("frontier-settlement-hotfix-accept height=" + std::to_string(transition.height) +
+                   " round=" + std::to_string(transition.round) +
+                   " epoch=" + std::to_string(transition.settlement.settlement_epoch_start));
+        }
         if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
-            settlement_epoch.has_value()) {
+            settlement_epoch.has_value() && !accepted_with_settlement_fallback) {
           if (epoch_committee_frozen_locked(*settlement_epoch)) {
             log_line("frontier-settlement-fallback-skipped height=" + std::to_string(transition.height) +
                      " epoch=" + std::to_string(*settlement_epoch) + " reason=frozen-epoch");
@@ -8832,9 +8838,16 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::string validation_error;
   if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
                                                        certified_record, &recomputed, &validation_error)) {
+    if (validation_error == "frontier-settlement-commitment-mismatch" &&
+        should_accept_frozen_settlement_hotfix(finalized_proposal.transition)) {
+      log_line("frontier-settlement-hotfix-accept height=" + std::to_string(height) +
+               " round=" + std::to_string(round) +
+               " epoch=" + std::to_string(finalized_proposal.transition.settlement.settlement_epoch_start));
+    } else {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=" + validation_error);
     return false;
+    }
   }
   const auto expected_committee = recomputed.effective_committee;
   if (expected_committee.empty()) {
