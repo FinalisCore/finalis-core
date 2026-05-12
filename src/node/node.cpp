@@ -4278,7 +4278,7 @@ std::string Node::inject_network_vote_diagnostic_for_test(const Vote& vote) {
 }
 
 std::string Node::inject_network_propose_result_for_test(const p2p::ProposeMsg& msg) {
-  switch (handle_propose_result(msg, true, nullptr)) {
+  switch (handle_propose_result(msg, true, 0, nullptr)) {
     case ProposeHandlingResult::Accepted:
       return "accepted";
     case ProposeHandlingResult::SoftReject:
@@ -4291,7 +4291,7 @@ std::string Node::inject_network_propose_result_for_test(const p2p::ProposeMsg& 
 
 std::string Node::inject_network_propose_diagnostic_for_test(const p2p::ProposeMsg& msg) {
   std::string reject_reason;
-  switch (handle_propose_result(msg, true, &reject_reason)) {
+  switch (handle_propose_result(msg, true, 0, &reject_reason)) {
     case ProposeHandlingResult::Accepted:
       return "accepted";
     case ProposeHandlingResult::SoftReject:
@@ -7507,7 +7507,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           return;
         }
       }
-      const auto propose_result = handle_propose_result(*p, true);
+      const auto propose_result = handle_propose_result(*p, true, peer_id);
       Hash32 block_id{};
       if (auto proposal = FrontierProposal::parse(p->frontier_proposal_bytes); proposal.has_value()) {
         block_id = proposal->transition.transition_id();
@@ -7705,7 +7705,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   }
 }
 
-Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& msg, bool from_network,
+Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& msg, bool from_network, int from_peer_id,
                                                         std::string* reject_reason) {
   if (from_network && !running_) return ProposeHandlingResult::SoftReject;
   std::optional<Vote> maybe_vote;
@@ -7745,6 +7745,20 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
                               " local_transition=" + short_hash_hex(finalized_identity_.id) +
                                   " remote_prev=" + short_hash_hex(msg.prev_finalized_hash));
       return ProposeHandlingResult::HardReject;
+    }
+    if (from_network && from_peer_id > 0 && is_validator_) {
+      auto peer_validator_it = peer_validator_pubkeys_.find(from_peer_id);
+      if (peer_validator_it == peer_validator_pubkeys_.end()) {
+        log_propose_hard_reject("peer-not-active-validator",
+                                " peer_id=" + std::to_string(from_peer_id) + " detail=missing-validator-pubkey");
+        return ProposeHandlingResult::HardReject;
+      }
+      if (!validators_.is_active_for_height(peer_validator_it->second, msg.height)) {
+        log_propose_hard_reject("peer-not-active-validator",
+                                " peer_id=" + std::to_string(from_peer_id) + " validator=" +
+                                    short_hash_hex(peer_validator_it->second) + " height=" + std::to_string(msg.height));
+        return ProposeHandlingResult::HardReject;
+      }
     }
     auto proposal = FrontierProposal::parse(msg.frontier_proposal_bytes);
     if (!proposal.has_value()) {
@@ -7893,7 +7907,7 @@ propose_done:
 }
 
 bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
-  return handle_propose_result(msg, from_network, nullptr) == ProposeHandlingResult::Accepted;
+  return handle_propose_result(msg, from_network, 0, nullptr) == ProposeHandlingResult::Accepted;
 }
 
 Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_network, int from_peer_id,

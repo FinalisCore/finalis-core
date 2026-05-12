@@ -326,7 +326,7 @@ class Node {
   bool handle_epoch_ticket(const consensus::EpochTicket& ticket, bool from_network, int from_peer_id = 0,
                            bool allow_closed_epoch_reconcile = false);
 
-  ProposeHandlingResult handle_propose_result(const p2p::ProposeMsg& msg, bool from_network,
+  ProposeHandlingResult handle_propose_result(const p2p::ProposeMsg& msg, bool from_network, int from_peer_id = 0,
                                               std::string* reject_reason = nullptr);
   VoteHandlingResult handle_vote_result(const Vote& vote, bool from_network, int from_peer_id = 0,
                                         std::string* reject_reason = nullptr);
