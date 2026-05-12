@@ -300,9 +300,15 @@ std::map<PubKey32, std::uint64_t> canonicalize_onboarding_scores(
 }
 
 std::map<PubKey32, std::uint64_t> checkpoint_onboarding_scores(
-    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start) {
+    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
+    std::uint64_t epoch_start, std::uint64_t epoch_blocks) {
   std::map<PubKey32, std::uint64_t> out;
-  const auto it = checkpoints.find(epoch_start);
+  // Primary source: boundary checkpoint at the next epoch start (the block
+  // height where settlement is applied). Fallback to the settlement epoch
+  // checkpoint for compatibility with historical snapshots.
+  const auto boundary_epoch_start = epoch_start + std::max<std::uint64_t>(1, epoch_blocks);
+  auto it = checkpoints.find(boundary_epoch_start);
+  if (it == checkpoints.end()) it = checkpoints.find(epoch_start);
   if (it == checkpoints.end()) return out;
   for (const auto& member : it->second.ordered_members) out[member] = 1;
   return out;
@@ -328,7 +334,9 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
       settled_epoch_fees = height >= EMISSION_BLOCKS ? it->second.fee_pool_units : 0;
       reserve_subsidy = height >= EMISSION_BLOCKS ? it->second.reserve_subsidy_units : 0;
       settlement_scores = it->second.reward_score_units;
-      const auto checkpoint_scores = checkpoint_onboarding_scores(prev.finalized_committee_checkpoints, *settlement_epoch);
+      const auto checkpoint_scores =
+          checkpoint_onboarding_scores(prev.finalized_committee_checkpoints, *settlement_epoch,
+                                       cfg.network.committee_epoch_blocks);
       if (!checkpoint_scores.empty()) {
         // Conservative canonical rule: if settlement epoch has a finalized
         // checkpoint, onboarding payouts are keyed only by checkpoint members.
