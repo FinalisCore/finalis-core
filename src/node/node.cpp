@@ -5921,6 +5921,7 @@ void Node::event_loop() {
       const std::size_t required_active_validators = quorum > 0 ? quorum - 1 : 0;
       const bool quorum_validator_connectivity_ready = established_active_validators >= required_active_validators;
       const bool ticket_pow_fallback_round = current_round_ > 0 && committee.size() == 1;
+      const bool tc_driven_round = highest_tc.has_value() && highest_tc->round < current_round_;
       const bool round_justification_ready =
           ticket_pow_fallback_round || highest_qc.has_value() ||
           (highest_tc.has_value() && highest_tc->round < current_round_) || current_round_ == 0;
@@ -5997,15 +5998,21 @@ void Node::event_loop() {
         last_round0_no_quorum_log_ms_ = now_ms;
         force_validator_redial = true;
       }
-      if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && block_interval_elapsed && ticket_window_elapsed &&
+      const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
+      if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready && ticket_window_elapsed &&
           !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           should_build_proposal = true;
           build_height = h;
           build_round = current_round_;
+          if (!block_interval_elapsed && tc_driven_round) {
+            log_line("proposal-build-tc-bypass-block-interval height=" + std::to_string(h) +
+                     " round=" + std::to_string(current_round_) +
+                     " tc_round=" + std::to_string(highest_tc->round));
+          }
         }
-      } else if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && block_interval_elapsed &&
+      } else if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready &&
                  ticket_window_elapsed && !committee.empty() && round_justification_ready &&
                  !quorum_validator_connectivity_ready && now_ms >= last_round0_no_quorum_log_ms_ + 5000) {
         log_line("proposal-build-skip height=" + std::to_string(h) + " round=" + std::to_string(current_round_) +
