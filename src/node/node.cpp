@@ -7368,62 +7368,146 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       break;
     }
     case p2p::MsgType::GET_TRANSITION_BY_HEIGHT: {
+      constexpr std::uint64_t kGetTransitionByHeightPerPeerHeightMinIntervalMs = 1500;
+      constexpr std::uint64_t kGetTransitionByHeightActiveSyncTargetTtlMs = 5 * 60 * 1000;
+      constexpr std::uint64_t kGetTransitionByHeightLogCoalesceWindowMs = 30 * 1000;
+      constexpr std::uint64_t kGetTransitionByHeightDefaultHistoryWindow = 512;
       auto gbh = p2p::de_get_transition_by_height(payload);
       if (!gbh.has_value()) {
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-transition-by-height");
         return;
       }
+      const std::uint64_t tms = now_ms();
+      auto log_frontier_by_height = [&](const std::string& status, const std::string& extra = std::string()) {
+        std::string suffix;
+        bool emit = true;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          auto& state = send_frontier_by_height_log_state_[status];
+          if (state.first != 0 && tms < state.first + kGetTransitionByHeightLogCoalesceWindowMs) {
+            ++state.second;
+            emit = false;
+          } else {
+            if (state.second != 0) suffix = " suppressed=" + std::to_string(state.second);
+            state.first = tms;
+            state.second = 0;
+          }
+        }
+        if (!emit) return;
+        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+                 " requested_height=" + std::to_string(gbh->height) +
+                 " status=" + status + extra + suffix);
+      };
+      bool throttled_rate_limit = false;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto& last_req = get_transition_by_height_last_req_ms_[{peer_id, gbh->height}];
+        if (last_req != 0 && tms < last_req + kGetTransitionByHeightPerPeerHeightMinIntervalMs) {
+          throttled_rate_limit = true;
+        } else {
+          last_req = tms;
+        }
+      }
+      if (throttled_rate_limit) {
+        log_frontier_by_height("throttled-rate-limit",
+                               " detail=per-peer-height-min-interval-ms=" +
+                                   std::to_string(kGetTransitionByHeightPerPeerHeightMinIntervalMs));
+        return;
+      }
       log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
                " height=" + std::to_string(gbh->height));
+      {
+        bool allow_historical_replay = false;
+        bool active_sync_target = false;
+        bool active_validator_peer = false;
+        std::uint64_t peer_tip_height = 0;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          if (gbh->height + kGetTransitionByHeightDefaultHistoryWindow < finalized_height_) {
+            for (const auto& [key, requested_ms] : requested_sync_height_peers_) {
+              if (key.second != peer_id) continue;
+              if (tms < requested_ms + kGetTransitionByHeightActiveSyncTargetTtlMs) {
+                active_sync_target = true;
+                break;
+              }
+            }
+            if (auto pit = peer_validator_pubkeys_.find(peer_id); pit != peer_validator_pubkeys_.end()) {
+              const auto info = p2p_.get_peer_info(peer_id);
+              if (info.established() && validators_.is_active_for_height(pit->second, finalized_height_ + 1)) {
+                active_validator_peer = true;
+              }
+            }
+            if (auto tip_it = peer_finalized_tips_.find(peer_id); tip_it != peer_finalized_tips_.end()) {
+              peer_tip_height = tip_it->second.height;
+            }
+            auto& last_h = get_transition_by_height_last_progress_height_[peer_id];
+            auto& last_ms = get_transition_by_height_last_progress_ms_[peer_id];
+            const bool progressing = gbh->height > last_h;
+            if (progressing) {
+              last_h = gbh->height;
+              last_ms = tms;
+            }
+            const bool recent_progress = (last_ms != 0 && tms < last_ms + kGetTransitionByHeightActiveSyncTargetTtlMs);
+            allow_historical_replay = active_sync_target || active_validator_peer || recent_progress;
+          } else {
+            allow_historical_replay = true;
+            auto& last_h = get_transition_by_height_last_progress_height_[peer_id];
+            auto& last_ms = get_transition_by_height_last_progress_ms_[peer_id];
+            if (gbh->height > last_h) {
+              last_h = gbh->height;
+              last_ms = tms;
+            }
+          }
+        }
+        if (!allow_historical_replay) {
+          log_frontier_by_height("throttled-history-window",
+                                 " local_height=" + std::to_string(finalized_height_) +
+                                     " history_window=" + std::to_string(kGetTransitionByHeightDefaultHistoryWindow) +
+                                     " peer_tip_height=" + std::to_string(peer_tip_height) +
+                                     " active_sync_target=" + std::string(active_sync_target ? "yes" : "no") +
+                                     " active_validator_peer=" + std::string(active_validator_peer ? "yes" : "no"));
+          return;
+        }
+      }
       auto bh = db_.get_height_hash(gbh->height);
       if (!bh.has_value()) {
-        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-                 " requested_height=" + std::to_string(gbh->height) + " status=not-found");
+        log_frontier_by_height("not-found");
         return;
       }
       auto transition_bytes = db_.get_frontier_transition(*bh);
       if (!transition_bytes.has_value()) {
-        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
-                 " status=missing-bytes");
+        log_frontier_by_height("missing-bytes", " hash=" + short_hash_hex(*bh));
         return;
       }
       auto transition = FrontierTransition::parse(*transition_bytes);
       if (!transition.has_value()) {
-        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
-                 " status=parse-error");
+        log_frontier_by_height("parse-error", " hash=" + short_hash_hex(*bh));
         return;
       }
       auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
       if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) {
-        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
-                 " status=ingress-slice-mismatch (expected=" + std::to_string(transition->next_frontier - transition->prev_frontier) +
-                 " got=" + std::to_string(ordered_records.size()) + ")");
+        log_frontier_by_height("ingress-slice-mismatch",
+                               " hash=" + short_hash_hex(*bh) + " expected=" +
+                                   std::to_string(transition->next_frontier - transition->prev_frontier) +
+                                   " got=" + std::to_string(ordered_records.size()));
         return;
       }
       auto cert = db_.get_finality_certificate_by_height(transition->height);
       if (!cert.has_value()) {
-        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
-                 " status=missing-certificate");
+        log_frontier_by_height("missing-certificate", " hash=" + short_hash_hex(*bh));
         return;
       }
       if (cert->height != transition->height || cert->frontier_transition_id != *bh) {
-        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-                 " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
-                 " status=certificate-mismatch");
+        log_frontier_by_height("certificate-mismatch", " hash=" + short_hash_hex(*bh));
         return;
       }
       p2p::TransitionMsg msg;
       msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
       msg.certificate = cert;
       const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
-      log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-               " requested_height=" + std::to_string(gbh->height) + " hash=" + short_hash_hex(*bh) +
-               " cert_height=" + std::to_string(cert->height) +
-               " status=" + (ok ? "ok" : "failed"));
+      log_frontier_by_height(ok ? "ok" : "failed",
+                             " hash=" + short_hash_hex(*bh) +
+                                 " cert_height=" + std::to_string(cert->height));
       break;
     }
     case p2p::MsgType::EPOCH_TICKET: {

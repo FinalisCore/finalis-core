@@ -715,6 +715,10 @@ class Node {
   std::map<int, PubKey32> peer_validator_pubkeys_;
   std::map<int, p2p::FinalizedTipMsg> peer_finalized_tips_;
   std::map<int, std::uint64_t> peer_finalized_tip_seen_ms_;
+  std::map<std::pair<int, std::uint64_t>, std::uint64_t> get_transition_by_height_last_req_ms_;
+  std::map<int, std::uint64_t> get_transition_by_height_last_progress_height_;
+  std::map<int, std::uint64_t> get_transition_by_height_last_progress_ms_;
+  std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> send_frontier_by_height_log_state_;
   std::map<int, p2p::IngressTipsMsg> peer_ingress_tips_;
   std::map<std::pair<int, std::uint32_t>, p2p::GetIngressRangeMsg> requested_ingress_ranges_;
   std::optional<FrontierProposal> last_broadcast_finalized_frontier_;
