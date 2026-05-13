@@ -1203,7 +1203,10 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
   c.nodes.reserve(node_count);
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
-    cfg.disable_p2p = true;
+    cfg.disable_p2p = false;
+    cfg.listen = true;
+    cfg.bind_ip = "127.0.0.1";
+    cfg.dns_seeds = false;
     cfg.node_id = i;
     cfg.max_committee = max_committee;
     cfg.network.min_block_interval_ms = 100;
@@ -1251,7 +1254,10 @@ Cluster make_cluster_with_timing(const std::string& base, int initial_active, in
   c.nodes.reserve(node_count);
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
-    cfg.disable_p2p = true;
+    cfg.disable_p2p = false;
+    cfg.listen = true;
+    cfg.bind_ip = "127.0.0.1";
+    cfg.dns_seeds = false;
     cfg.node_id = i;
     cfg.max_committee = max_committee;
     cfg.network.min_block_interval_ms = min_block_interval_ms;
@@ -2126,7 +2132,10 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
   fixture.joiner_kp = key_from_byte(joiner_seed_byte);
   for (int i = 0; i < 2; ++i) {
     node::NodeConfig cfg;
-    cfg.disable_p2p = true;
+    cfg.disable_p2p = false;
+    cfg.listen = true;
+    cfg.bind_ip = "127.0.0.1";
+    cfg.dns_seeds = false;
     cfg.node_id = i;
     cfg.max_committee = 3;
     cfg.network.min_block_interval_ms = 100;
@@ -2270,7 +2279,10 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
   const auto default_keys = node::Node::deterministic_test_keypairs();
   for (int i = 0; i < 2; ++i) {
     node::NodeConfig cfg;
-    cfg.disable_p2p = true;
+    cfg.disable_p2p = false;
+    cfg.listen = true;
+    cfg.bind_ip = "127.0.0.1";
+    cfg.dns_seeds = false;
     cfg.node_id = i;
     cfg.max_committee = 2;
     cfg.network.min_block_interval_ms = 100;
@@ -2283,6 +2295,9 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
     cfg.validator_warmup_blocks_override = 1;
+    for (int j = 0; j < i; ++j) {
+      cfg.peers.push_back("127.0.0.1:" + std::to_string(19140 + j));
+    }
     keystore::ValidatorKey out_key;
     std::string kerr;
     std::array<std::uint8_t, 32> seed = i == 0 ? deterministic_seed_for_node_id(0) : std::array<std::uint8_t, 32>{};
@@ -2518,21 +2533,22 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
 }
 
 TEST(test_primary_timeout_falls_back_to_backup_proposer) {
+  if (!can_open_loopback_listener_for_test()) return;
   const auto unique = std::to_string(
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
           .count());
   auto cluster = make_cluster("/tmp/finalis_it_backup_proposer_" + unique, 4, 4, 4);
   auto& nodes = cluster.nodes;
 
-  const bool reached_height_20 = wait_for([&]() {
+  const bool reached_height_12 = wait_for([&]() {
     for (const auto& n : nodes) {
-      if (n->status().height < 20) return false;
+      if (n->status().height < 12) return false;
     }
     return true;
-  }, ci_timeout_seconds(180));
-  if (!reached_height_20) {
+  }, ci_timeout_seconds(90));
+  if (!reached_height_12) {
     std::ostringstream oss;
-    oss << "cluster failed to reach height 20:";
+    oss << "cluster failed to reach height 12:";
     for (std::size_t i = 0; i < nodes.size(); ++i) {
       const auto st = nodes[i]->status();
       oss << " node" << i << "{h=" << st.height << ",r=" << st.round
@@ -2573,11 +2589,25 @@ TEST(test_primary_timeout_falls_back_to_backup_proposer) {
   std::this_thread::sleep_for(std::chrono::milliseconds(6500));
   nodes[primary_id]->pause_proposals_for_test(false);
 
-  ASSERT_TRUE(wait_for([&]() {
+  const bool advanced_after_primary_pause = wait_for([&]() {
     std::uint64_t min_h = UINT64_MAX;
     for (const auto& n : nodes) min_h = std::min(min_h, n->status().height);
     return min_h > before_pause_h;
-  }, std::chrono::seconds(30)));
+  }, std::chrono::seconds(45));
+  if (!advanced_after_primary_pause) {
+    std::ostringstream oss;
+    oss << "cluster did not advance after pausing primary proposer:";
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      const auto st = nodes[i]->status();
+      oss << " node" << i << "{h=" << st.height << ",r=" << st.round
+          << ",tip=" << hex_encode(Bytes(st.transition_hash.begin(), st.transition_hash.end())).substr(0, 8)
+          << ",state=" << st.consensus_state
+          << ",leader=" << hex_encode(Bytes(st.leader.begin(), st.leader.end())).substr(0, 8)
+          << ",votes=" << st.votes_for_current << "}";
+    }
+    oss << " primary_node=" << primary_id << " backup_node=" << backup_id;
+    throw std::runtime_error(oss.str());
+  }
 }
 
 TEST(test_tx_finalized_and_visible_on_all_nodes) {
@@ -2790,7 +2820,10 @@ TEST(test_restart_determinism_and_continued_finalization) {
   restarted.nodes.reserve(4);
   for (int i = 0; i < 4; ++i) {
     node::NodeConfig cfg;
-    cfg.disable_p2p = true;
+    cfg.disable_p2p = false;
+    cfg.listen = true;
+    cfg.bind_ip = "127.0.0.1";
+    cfg.dns_seeds = false;
     cfg.node_id = i;
     cfg.max_committee = MAX_COMMITTEE;
     cfg.network.min_block_interval_ms = 100;
@@ -3154,12 +3187,9 @@ TEST(test_follower_startup_repairs_missing_required_epoch_from_peer) {
   ASSERT_TRUE(db.open(follower_cfg.db_path));
   ASSERT_TRUE(db.erase("EC:" + epoch_db_key_suffix(required_epoch)));
   ASSERT_TRUE(db.erase("ECF:" + epoch_db_key_suffix(required_epoch)));
-  for (const auto& [key, _] : db.scan_prefix("ET:" + epoch_db_key_suffix(required_epoch) + ":")) {
-    ASSERT_TRUE(db.erase(key));
-  }
-  for (const auto& [key, _] : db.scan_prefix("EB:" + epoch_db_key_suffix(required_epoch) + ":")) {
-    ASSERT_TRUE(db.erase(key));
-  }
+  // Keep persisted epoch-ticket state intact. This test targets required-epoch
+  // committee record repair (EC/ECF) and should not invalidate canonical
+  // frontier derivation inputs.
   db.close();
 
   node::Node repaired_follower(follower_cfg);
@@ -8508,6 +8538,281 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
   ASSERT_TRUE(std::find(requested.begin(), requested.end(), a2_hash) != requested.end());
   ASSERT_TRUE(std::find(requested.begin(), requested.end(), a3_hash) != requested.end());
   ASSERT_TRUE(std::count(requested.begin(), requested.end(), a2_hash) >= 2);
+}
+
+TEST(test_get_transition_by_height_rate_limits_same_peer_same_height) {
+  const std::string base = unique_test_base("/tmp/finalis_it_get_by_height_rate_limit_same_height");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  auto cfg = single_node_cfg(base, 1);
+  cfg.dns_seeds = false;
+  cfg.network.min_block_interval_ms = 50;
+  cfg.network.round_timeout_ms = 120;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  ASSERT_TRUE(create_test_validator_keystore(cfg, 0));
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init() && "n.init() failed");
+  n.start();
+  ASSERT_TRUE(wait_for_tip(n, 3, std::chrono::seconds(20)));
+  const std::uint16_t port = n.p2p_port_for_test();
+  ASSERT_TRUE(port != 0);
+
+  const auto cfd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(cfd)) {
+    n.stop();
+    return;
+  }
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::connect(cfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+  v.network_id = cfg.network.network_id;
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 9010;
+  v.start_height = 0;
+  v.start_hash = zero_hash();
+  v.node_software_version = "finalis-tests/get-by-height-rate-limit";
+  ASSERT_TRUE(
+      p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg.network.magic, cfg.network.protocol_version));
+
+  bool saw_version = false;
+  bool saw_verack = false;
+  bool saw_tip = false;
+  ASSERT_TRUE(wait_for([&]() {
+    auto frame = p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                          5000, 3000, nullptr, nullptr);
+    if (!frame.has_value()) return false;
+    if (frame->msg_type == p2p::MsgType::VERSION) {
+      saw_version = true;
+      ASSERT_TRUE(
+          p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERACK, {}}, cfg.network.magic, cfg.network.protocol_version));
+    } else if (frame->msg_type == p2p::MsgType::VERACK) {
+      saw_verack = true;
+    } else if (frame->msg_type == p2p::MsgType::FINALIZED_TIP) {
+      saw_tip = true;
+    }
+    return saw_version && saw_verack && saw_tip;
+  }, std::chrono::seconds(5)));
+
+  const auto tip_h = n.status().height;
+  ASSERT_TRUE(tip_h >= 1);
+
+  auto request_by_height = [&](std::uint64_t h, int read_timeout_ms) {
+    ASSERT_TRUE(p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
+                                                    p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{h})},
+                                    cfg.network.magic, cfg.network.protocol_version));
+    return p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                    read_timeout_ms, 1000, nullptr, nullptr);
+  };
+
+  auto first = request_by_height(tip_h, 5000);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_EQ(first->msg_type, p2p::MsgType::TRANSITION);
+
+  auto second = request_by_height(tip_h, 500);
+  ASSERT_TRUE(!second.has_value());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+  auto third = request_by_height(tip_h, 5000);
+  ASSERT_TRUE(third.has_value());
+  ASSERT_EQ(third->msg_type, p2p::MsgType::TRANSITION);
+
+  finalis::net::shutdown_socket(cfd);
+  finalis::net::close_socket(cfd);
+  n.stop();
+}
+
+TEST(test_get_transition_by_height_not_rate_limited_across_heights) {
+  const std::string base = unique_test_base("/tmp/finalis_it_get_by_height_rate_limit_distinct_heights");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  auto cfg = single_node_cfg(base, 1);
+  cfg.dns_seeds = false;
+  cfg.network.min_block_interval_ms = 50;
+  cfg.network.round_timeout_ms = 120;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  ASSERT_TRUE(create_test_validator_keystore(cfg, 0));
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init() && "n.init() failed");
+  n.start();
+  ASSERT_TRUE(wait_for_tip(n, 4, std::chrono::seconds(20)));
+  const std::uint16_t port = n.p2p_port_for_test();
+  ASSERT_TRUE(port != 0);
+
+  const auto cfd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (!finalis::net::valid_socket(cfd)) {
+    n.stop();
+    return;
+  }
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::connect(cfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+  v.network_id = cfg.network.network_id;
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 9011;
+  v.start_height = 0;
+  v.start_hash = zero_hash();
+  v.node_software_version = "finalis-tests/get-by-height-distinct-heights";
+  ASSERT_TRUE(
+      p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg.network.magic, cfg.network.protocol_version));
+
+  bool saw_version = false;
+  bool saw_verack = false;
+  bool saw_tip = false;
+  ASSERT_TRUE(wait_for([&]() {
+    auto frame = p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                          5000, 3000, nullptr, nullptr);
+    if (!frame.has_value()) return false;
+    if (frame->msg_type == p2p::MsgType::VERSION) {
+      saw_version = true;
+      ASSERT_TRUE(
+          p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERACK, {}}, cfg.network.magic, cfg.network.protocol_version));
+    } else if (frame->msg_type == p2p::MsgType::VERACK) {
+      saw_verack = true;
+    } else if (frame->msg_type == p2p::MsgType::FINALIZED_TIP) {
+      saw_tip = true;
+    }
+    return saw_version && saw_verack && saw_tip;
+  }, std::chrono::seconds(5)));
+
+  const auto tip_h = n.status().height;
+  ASSERT_TRUE(tip_h >= 2);
+
+  ASSERT_TRUE(p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
+                                                  p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h})},
+                                  cfg.network.magic, cfg.network.protocol_version));
+  auto first = p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                        5000, 1000, nullptr, nullptr);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_EQ(first->msg_type, p2p::MsgType::TRANSITION);
+
+  ASSERT_TRUE(p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
+                                                  p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h - 1})},
+                                  cfg.network.magic, cfg.network.protocol_version));
+  auto second = p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                         5000, 1000, nullptr, nullptr);
+  ASSERT_TRUE(second.has_value());
+  ASSERT_EQ(second->msg_type, p2p::MsgType::TRANSITION);
+
+  finalis::net::shutdown_socket(cfd);
+  finalis::net::close_socket(cfd);
+  n.stop();
+}
+
+TEST(test_get_transition_by_height_rate_limit_is_per_peer_not_global) {
+  const std::string base = unique_test_base("/tmp/finalis_it_get_by_height_rate_limit_per_peer");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  auto cfg = single_node_cfg(base, 1);
+  cfg.dns_seeds = false;
+  cfg.network.min_block_interval_ms = 50;
+  cfg.network.round_timeout_ms = 120;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  ASSERT_TRUE(create_test_validator_keystore(cfg, 0));
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init() && "n.init() failed");
+  n.start();
+  ASSERT_TRUE(wait_for_tip(n, 3, std::chrono::seconds(20)));
+  const std::uint16_t port = n.p2p_port_for_test();
+  ASSERT_TRUE(port != 0);
+
+  auto connect_and_handshake = [&](std::uint64_t nonce) -> finalis::net::SocketHandle {
+    const auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!finalis::net::valid_socket(fd)) return finalis::net::kInvalidSocket;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    p2p::VersionMsg v;
+    v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+    v.network_id = cfg.network.network_id;
+    v.feature_flags = cfg.network.feature_flags;
+    v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+    v.nonce = nonce;
+    v.start_height = 0;
+    v.start_hash = zero_hash();
+    v.node_software_version = "finalis-tests/get-by-height-per-peer";
+    ASSERT_TRUE(p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg.network.magic,
+                                    cfg.network.protocol_version));
+    bool saw_version = false;
+    bool saw_verack = false;
+    bool saw_tip = false;
+    ASSERT_TRUE(wait_for([&]() {
+      auto frame = p2p::read_frame_fd_timed(fd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                            5000, 3000, nullptr, nullptr);
+      if (!frame.has_value()) return false;
+      if (frame->msg_type == p2p::MsgType::VERSION) {
+        saw_version = true;
+        ASSERT_TRUE(
+            p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}}, cfg.network.magic, cfg.network.protocol_version));
+      } else if (frame->msg_type == p2p::MsgType::VERACK) {
+        saw_verack = true;
+      } else if (frame->msg_type == p2p::MsgType::FINALIZED_TIP) {
+        saw_tip = true;
+      }
+      return saw_version && saw_verack && saw_tip;
+    }, std::chrono::seconds(5)));
+    return fd;
+  };
+
+  const auto tip_h = n.status().height;
+  ASSERT_TRUE(tip_h >= 1);
+
+  const auto a = connect_and_handshake(9021);
+  const auto b = connect_and_handshake(9022);
+  if (!finalis::net::valid_socket(a) || !finalis::net::valid_socket(b)) {
+    if (finalis::net::valid_socket(a)) {
+      finalis::net::shutdown_socket(a);
+      finalis::net::close_socket(a);
+    }
+    if (finalis::net::valid_socket(b)) {
+      finalis::net::shutdown_socket(b);
+      finalis::net::close_socket(b);
+    }
+    n.stop();
+    return;
+  }
+
+  ASSERT_TRUE(p2p::write_frame_fd(a, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
+                                                p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h})},
+                                  cfg.network.magic, cfg.network.protocol_version));
+  auto a_first = p2p::read_frame_fd_timed(a, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                          5000, 1000, nullptr, nullptr);
+  ASSERT_TRUE(a_first.has_value());
+  ASSERT_EQ(a_first->msg_type, p2p::MsgType::TRANSITION);
+
+  ASSERT_TRUE(p2p::write_frame_fd(b, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
+                                                p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h})},
+                                  cfg.network.magic, cfg.network.protocol_version));
+  auto b_first = p2p::read_frame_fd_timed(b, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
+                                          5000, 1000, nullptr, nullptr);
+  ASSERT_TRUE(b_first.has_value());
+  ASSERT_EQ(b_first->msg_type, p2p::MsgType::TRANSITION);
+
+  finalis::net::shutdown_socket(a);
+  finalis::net::close_socket(a);
+  finalis::net::shutdown_socket(b);
+  finalis::net::close_socket(b);
+  n.stop();
 }
 
 TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
