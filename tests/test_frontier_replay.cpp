@@ -2395,12 +2395,10 @@ TEST(test_ticket_pow_fallback_begins_after_normal_proposer_rounds_are_exhausted)
   ASSERT_EQ(round2, checkpoint.ordered_members);
 
   const auto round3 = consensus::canonical_committee_for_height_round(cfg, state, 1, 3);
-  ASSERT_EQ(round3.size(), 1u);
-  ASSERT_EQ(round3.front(), c);
+  ASSERT_EQ(round3, checkpoint.ordered_members);
 
   const auto round4 = consensus::canonical_committee_for_height_round(cfg, state, 1, 4);
-  ASSERT_EQ(round4.size(), 1u);
-  ASSERT_EQ(round4.front(), b);
+  ASSERT_EQ(round4, checkpoint.ordered_members);
 
   ASSERT_TRUE(!consensus::checkpoint_ticket_pow_fallback_member_for_round(checkpoint, 0).has_value());
   ASSERT_TRUE(!consensus::checkpoint_ticket_pow_fallback_member_for_round(checkpoint, 1).has_value());
