@@ -46,9 +46,42 @@ constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
 constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
 constexpr std::uint64_t kDefaultPageLimit = 200;
 constexpr std::uint64_t kMaxPageLimit = 1000;
+constexpr std::uint32_t kRelayValidationRulesVersion = 7;
 
 std::string json_escape(const std::string& in);
 std::string server_hrp_for_network(const NetworkConfig& network);
+
+std::string network_id_hex(const NetworkConfig& cfg) {
+  return hex_encode(Bytes(cfg.network_id.begin(), cfg.network_id.end()));
+}
+
+std::string relay_consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+  codec::ByteWriter w;
+  w.bytes_fixed(cfg.network_id);
+  w.u32le(cfg.protocol_version);
+  w.u64le(cfg.feature_flags);
+  w.u64le(cfg.magic);
+  w.u64le(cfg.committee_epoch_blocks);
+  w.u32le(cfg.max_committee);
+  w.u32le(cv);
+  const auto genesis = hex_decode(chain_id.genesis_hash_hex);
+  if (genesis.has_value() && genesis->size() == 32) {
+    Hash32 g{};
+    std::copy(genesis->begin(), genesis->end(), g.begin());
+    w.bytes_fixed(g);
+  } else {
+    w.bytes_fixed(zero_hash());
+  }
+  return hex_encode32(crypto::sha256d(w.data()));
+}
+
+std::string relay_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+  std::ostringstream oss;
+  oss << finalis::lightserver_software_version()
+      << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv
+      << ";crh=" << relay_consensus_rules_fingerprint(cfg, chain_id, cv);
+  return oss.str();
+}
 
 std::optional<std::string> p2pkh_script_to_address(const Bytes& script_pubkey, const std::string& hrp) {
   if (script_pubkey.size() == 25 && script_pubkey[0] == 0x76 && script_pubkey[1] == 0xa9 && script_pubkey[2] == 0x14 &&
@@ -1568,7 +1601,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
   v.start_hash = tip ? tip->hash : zero_hash();
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 424242;
-  v.node_software_version = finalis::lightserver_software_version();
+  v.node_software_version = relay_software_version_fingerprint(cfg_.network, chain_id_, kRelayValidationRulesVersion);
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
     net::close_socket(fd);
