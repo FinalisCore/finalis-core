@@ -4092,7 +4092,9 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   if (snapshot.bootstrap_sync_incomplete) blockers.push_back("bootstrap_sync_incomplete");
   if (!isolated_mode && snapshot.established_peer_count == 0) blockers.push_back("no_established_peers");
   if (!isolated_mode && snapshot.outbound_connected == 0) blockers.push_back("no_outbound_peers");
-  if (!isolated_mode && snapshot.inbound_connected == 0) blockers.push_back("no_inbound_peers");
+  // Inbound reachability is important for network health, but not required for
+  // safe local registration gating. Many operators run behind strict NAT/ACLs.
+  // Keep as telemetry/warning only, not a hard readiness blocker.
   if (!isolated_mode && cfg_.listen && cfg_.public_mode && !snapshot.advertised_endpoint_present) {
     blockers.push_back("no_advertised_endpoint");
   }
@@ -4104,9 +4106,8 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
       !snapshot.advertised_endpoint_present) {
     blockers.push_back("stun_discovery_failed");
   }
-  if (!isolated_mode && snapshot.outbound_target > 0 && snapshot.addrman_size < snapshot.outbound_target) {
-    blockers.push_back("addrman_under_outbound_target");
-  }
+  // Addrman fullness against outbound_target is an operator quality signal, not
+  // a correctness/safety precondition for registration.
 
   snapshot.registration_ready_preflight = blockers.empty();
   if (snapshot.registration_ready_preflight) {
