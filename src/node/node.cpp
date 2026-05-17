@@ -2048,8 +2048,10 @@ void update_validator_liveness_from_finality_impl(consensus::ValidatorRegistry& 
       const std::uint64_t miss = (eligible >= participated) ? (eligible - participated) : 0;
       const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
       const bool currently_effective_active = validators.is_active_for_height(pub, height + 1);
+      const bool block_for_active_set_floor =
+          deferred_exit_fork_active(network, height) && currently_effective_active && effective_active_next_height <= 1;
       if (miss_rate >= miss_rate_exit_threshold_percent) {
-        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+        if (!block_for_active_set_floor) {
           if (!defer_exit_until_epoch_end) {
             info.status = consensus::ValidatorStatus::EXITING;
           }
@@ -2059,7 +2061,7 @@ void update_validator_liveness_from_finality_impl(consensus::ValidatorRegistry& 
           if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
         }
       } else if (miss_rate >= miss_rate_suspend_threshold_percent) {
-        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+        if (!block_for_active_set_floor) {
           info.status = consensus::ValidatorStatus::SUSPENDED;
           info.suspended_until_height = height + suspend_duration_blocks;
           info.penalty_strikes += 1;
