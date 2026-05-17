@@ -742,8 +742,10 @@ void update_validator_liveness_from_finality(const CanonicalDerivationConfig& cf
       const std::uint64_t miss = eligible >= participated ? (eligible - participated) : 0;
       const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
       const bool currently_effective_active = state->validators.is_active_for_height(pub, height + 1);
+      const bool block_for_active_set_floor =
+          deferred_exit_fork_active(cfg.network, height) && currently_effective_active && effective_active_next_height <= 1;
       if (miss_rate >= cfg.validator_miss_rate_exit_threshold_percent) {
-        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+        if (!block_for_active_set_floor) {
           if (!defer_exit_until_epoch_end) {
             info.status = ValidatorStatus::EXITING;
           }
@@ -753,7 +755,7 @@ void update_validator_liveness_from_finality(const CanonicalDerivationConfig& cf
           if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
         }
       } else if (miss_rate >= cfg.validator_miss_rate_suspend_threshold_percent) {
-        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+        if (!block_for_active_set_floor) {
           info.status = ValidatorStatus::SUSPENDED;
           info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
           info.penalty_strikes += 1;
@@ -809,8 +811,10 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
       const std::uint64_t miss = eligible >= participated ? (eligible - participated) : 0;
       const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
       const bool currently_effective_active = state->validators.is_active_for_height(pub, height + 1);
+      const bool block_for_active_set_floor =
+          deferred_exit_fork_active(cfg.network, height) && currently_effective_active && effective_active_next_height <= 1;
       if (miss_rate >= cfg.validator_miss_rate_exit_threshold_percent) {
-        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+        if (!block_for_active_set_floor) {
           if (!defer_exit_until_epoch_end) {
             info.status = ValidatorStatus::EXITING;
           }
@@ -820,7 +824,7 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
           if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
         }
       } else if (miss_rate >= cfg.validator_miss_rate_suspend_threshold_percent) {
-        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+        if (!block_for_active_set_floor) {
           info.status = ValidatorStatus::SUSPENDED;
           info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
           info.penalty_strikes += 1;
