@@ -54,6 +54,7 @@ const NetworkConfig kMainnet{
     .finality_binding_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .availability_recovery_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .confidential_utxo_activation_height = std::numeric_limits<std::uint64_t>::max(),
+    .deferred_exit_activation_height = 10017,
     .default_seeds = {},
     .economics_policies =
         {

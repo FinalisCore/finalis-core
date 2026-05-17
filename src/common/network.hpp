@@ -58,6 +58,7 @@ struct NetworkConfig {
   std::uint64_t finality_binding_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t availability_recovery_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t confidential_utxo_activation_height{std::numeric_limits<std::uint64_t>::max()};
+  std::uint64_t deferred_exit_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::vector<std::string> default_seeds;
   std::vector<EconomicsConfig> economics_policies;
 };

@@ -82,6 +82,10 @@ constexpr std::uint64_t kTimeoutVoteMessageDedupTtlMs = 120'000;
 constexpr std::size_t kMaxSeenTimeoutVoteMessages = 65'536;
 constexpr std::uint32_t kTimeoutVoteDuplicateLogEvery = 32;
 
+inline bool deferred_exit_fork_active(const NetworkConfig& network, std::uint64_t height) {
+  return height >= network.deferred_exit_activation_height;
+}
+
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
   return hex_encode(b);
@@ -2005,6 +2009,7 @@ void update_validator_liveness_from_finality_impl(consensus::ValidatorRegistry& 
                                                   std::uint32_t miss_rate_suspend_threshold_percent,
                                                   std::uint32_t miss_rate_exit_threshold_percent,
                                                   std::uint64_t suspend_duration_blocks,
+                                                  const NetworkConfig& network,
                                                   std::uint64_t committee_epoch_blocks,
                                                   std::size_t* last_participation_eligible_signers, storage::DB* db) {
   if (committee.empty() || !liveness_window_start_height) return;
@@ -2032,8 +2037,9 @@ void update_validator_liveness_from_finality_impl(consensus::ValidatorRegistry& 
   std::size_t effective_active_next_height = validators.active_sorted(height + 1).size();
 
   const bool defer_exit_until_epoch_end =
-      consensus::committee_epoch_start(height, committee_epoch_blocks) ==
-      consensus::committee_epoch_start(height + 1, committee_epoch_blocks);
+      deferred_exit_fork_active(network, height) &&
+      (consensus::committee_epoch_start(height, committee_epoch_blocks) ==
+       consensus::committee_epoch_start(height + 1, committee_epoch_blocks));
 
   for (auto& [pub, info] : all) {
     const std::uint64_t eligible = info.eligible_count_window;
@@ -2076,6 +2082,7 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
                                         std::uint64_t min_bond, std::uint64_t warmup_blocks,
                                         std::uint64_t cooldown_blocks, std::uint64_t join_limit_window_blocks,
                                         std::uint32_t join_limit_max_new,
+                                        const NetworkConfig& network,
                                         std::uint64_t committee_epoch_blocks,
                                         std::uint64_t* join_window_start_height, std::uint32_t* join_count_in_window,
                                         storage::DB* db) {
@@ -2103,8 +2110,9 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
           (void)validators.finalize_withdrawal(pub);
         } else {
           const bool defer_exit_until_epoch_end =
-              consensus::committee_epoch_start(height, committee_epoch_blocks) ==
-              consensus::committee_epoch_start(height + 1, committee_epoch_blocks);
+              deferred_exit_fork_active(network, height) &&
+              (consensus::committee_epoch_start(height, committee_epoch_blocks) ==
+               consensus::committee_epoch_start(height + 1, committee_epoch_blocks));
           if (defer_exit_until_epoch_end) {
             auto it_info = validators.mutable_all().find(pub);
             if (it_info != validators.mutable_all().end()) {
@@ -2180,7 +2188,7 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
   const bool crosses_epoch_boundary =
       consensus::committee_epoch_start(height, committee_epoch_blocks) !=
       consensus::committee_epoch_start(height + 1, committee_epoch_blocks);
-  if (crosses_epoch_boundary) {
+  if (deferred_exit_fork_active(network, height) && crosses_epoch_boundary) {
     for (auto& [_, info] : validators.mutable_all()) {
       if (!info.has_bond) continue;
       if (info.unbond_height == 0) continue;
@@ -10676,7 +10684,7 @@ void Node::update_validator_liveness_from_finality(std::uint64_t height, std::ui
   update_validator_liveness_from_finality_impl(
       validators_, height, committee, finality_sigs, &validator_liveness_window_start_height_, validator_liveness_window_blocks_,
       validator_miss_rate_suspend_threshold_percent_, validator_miss_rate_exit_threshold_percent_, validator_suspend_duration_blocks_,
-      cfg_.network.committee_epoch_blocks,
+      cfg_.network, cfg_.network.committee_epoch_blocks,
       &last_participation_eligible_signers_, &db_);
 }
 
@@ -10684,7 +10692,7 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
   apply_validator_state_changes_impl(validators_, validator_join_requests_, block, pre_utxos, height,
                                      effective_validator_min_bond_for_height(height), validator_warmup_blocks_,
                                      validator_cooldown_blocks_, validator_join_limit_window_blocks_,
-                                     validator_join_limit_max_new_, cfg_.network.committee_epoch_blocks,
+                                     validator_join_limit_max_new_, cfg_.network, cfg_.network.committee_epoch_blocks,
                                      &validator_join_window_start_height_, &validator_join_count_in_window_, &db_);
   validators_.advance_height(height + 1);
   codec::ByteWriter w_start;
