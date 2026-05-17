@@ -46,6 +46,7 @@ SYNC_TURBO_MODE="${SYNC_TURBO_MODE:-0}"
 SYNC_TARGET_UTIL_PCT="${SYNC_TARGET_UTIL_PCT:-70}"
 FAST_SYNC_PRELOAD_CACHE="${FAST_SYNC_PRELOAD_CACHE:-0}"
 NO_REINDEX_ON_START="${NO_REINDEX_ON_START:-1}"
+AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME="${AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME:-1}"
 
 log() { printf '[start] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -762,6 +763,7 @@ auto_fast_sync_if_requested() {
 
 build_node_command() {
   local node_bin="${ROOT_DIR}/${BUILD_DIR}/finalis-node"
+  local cli_bin="${ROOT_DIR}/${BUILD_DIR}/finalis-cli"
   local genesis_path="$1"
   local mode="$2"
   local -a args=(
@@ -779,6 +781,25 @@ build_node_command() {
   fi
   if [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
     args+=("--fast-start")
+  fi
+
+  if [[ "${SYNC_TURBO_MODE}" == "extreme" && "${AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME}" == "1" ]]; then
+    local has_manual_activation=0
+    if [[ -n "${NODE_EXTRA_ARGS}" ]]; then
+      if grep -Eq -- '(^|[[:space:]])--deferred-exit-activation-(height|epoch-start)($|[[:space:]])' <<<"${NODE_EXTRA_ARGS}"; then
+        has_manual_activation=1
+      fi
+    fi
+    if (( has_manual_activation == 0 )) && [[ -x "${cli_bin}" ]]; then
+      local height_line height next_epoch_start
+      height_line="$("${cli_bin}" print_logs 2>/dev/null | awk -F= '/^height=/ {print $2; exit}')"
+      if [[ -n "${height_line}" ]] && [[ "${height_line}" =~ ^[0-9]+$ ]] && (( height_line >= 1 )); then
+        # committee_epoch_start(h) = floor((h-1)/32)*32 + 1; next epoch start adds 32
+        next_epoch_start=$(( (((height_line - 1) / 32) + 1) * 32 + 1 ))
+        args+=("--deferred-exit-activation-height" "${next_epoch_start}")
+        log "SYNC_TURBO_MODE=extreme: auto-set deferred-exit activation to next epoch start ${next_epoch_start} (from height=${height_line})"
+      fi
+    fi
   fi
 
   if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then

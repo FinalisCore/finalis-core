@@ -2965,6 +2965,13 @@ bool Node::init() {
     validator_miss_rate_exit_threshold_percent_ = *cfg_.miss_rate_exit_threshold_percent_override;
   if (cfg_.suspend_duration_blocks_override.has_value())
     validator_suspend_duration_blocks_ = *cfg_.suspend_duration_blocks_override;
+  if (cfg_.deferred_exit_activation_height_override.has_value()) {
+    cfg_.network.deferred_exit_activation_height = *cfg_.deferred_exit_activation_height_override;
+  }
+  if (runtime_logs_enabled()) {
+    std::cout << "[node " << cfg_.node_id
+              << "] deferred-exit-activation-height=" << cfg_.network.deferred_exit_activation_height << "\n";
+  }
   mempool_.set_network(cfg_.network);
   mempool_.set_hashcash_config(policy::HashcashConfig{
       .enabled = cfg_.hashcash_enabled,
@@ -12437,6 +12444,14 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.suspend_duration_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--deferred-exit-activation-height") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.deferred_exit_activation_height_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--deferred-exit-activation-epoch-start") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.deferred_exit_activation_height_override = static_cast<std::uint64_t>(std::stoull(*v));
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;
