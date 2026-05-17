@@ -32,6 +32,10 @@ constexpr std::uint64_t kAdaptiveMinBondFloor = 150ULL * BASE_UNITS_PER_COIN;
 constexpr std::uint64_t kAdaptiveMinBondCeiling = 500ULL * BASE_UNITS_PER_COIN;
 constexpr std::uint64_t kAdaptiveMinBondBase = 150ULL * BASE_UNITS_PER_COIN;
 
+inline bool deferred_exit_fork_active(const NetworkConfig& network, std::uint64_t height) {
+  return height >= network.deferred_exit_activation_height;
+}
+
 bool finalized_identity_valid_for_frontier_parent(const CanonicalDerivedState& prev) {
   if (prev.finalized_identity.is_transition()) return true;
   return prev.finalized_height == 0 && prev.finalized_identity.is_genesis();
@@ -727,8 +731,9 @@ void update_validator_liveness_from_finality(const CanonicalDerivationConfig& cf
   std::size_t effective_active_next_height = state->validators.active_sorted(height + 1).size();
 
   const bool defer_exit_until_epoch_end =
-      committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
-      committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
+      deferred_exit_fork_active(cfg.network, height) &&
+      (committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
+       committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks));
 
   for (auto& [pub, info] : all) {
     const std::uint64_t eligible = info.eligible_count_window;
@@ -793,8 +798,9 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
   std::size_t effective_active_next_height = state->validators.active_sorted(height + 1).size();
 
   const bool defer_exit_until_epoch_end =
-      committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
-      committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
+      deferred_exit_fork_active(cfg.network, height) &&
+      (committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
+       committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks));
 
   for (auto& [pub, info] : all) {
     const std::uint64_t eligible = info.eligible_count_window;
@@ -862,8 +868,9 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
           (void)state->validators.finalize_withdrawal(pub);
         } else {
           const bool defer_exit_until_epoch_end =
-              committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
-              committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
+              deferred_exit_fork_active(cfg.network, height) &&
+              (committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
+               committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks));
           if (defer_exit_until_epoch_end) {
             auto it_info = state->validators.mutable_all().find(pub);
             if (it_info != state->validators.mutable_all().end()) {
@@ -955,7 +962,7 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
   const bool crosses_epoch_boundary =
       committee_epoch_start(height, cfg.network.committee_epoch_blocks) !=
       committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
-  if (crosses_epoch_boundary) {
+  if (deferred_exit_fork_active(cfg.network, height) && crosses_epoch_boundary) {
     for (auto& [_, info] : state->validators.mutable_all()) {
       if (!info.has_bond) continue;
       if (info.unbond_height == 0) continue;
