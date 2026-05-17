@@ -113,6 +113,7 @@ struct NodeConfig {
   std::optional<std::uint32_t> miss_rate_suspend_threshold_percent_override;
   std::optional<std::uint32_t> miss_rate_exit_threshold_percent_override;
   std::optional<std::uint64_t> suspend_duration_blocks_override;
+  std::optional<std::uint64_t> deferred_exit_activation_height_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
