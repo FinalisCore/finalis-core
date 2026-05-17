@@ -722,21 +722,38 @@ void update_validator_liveness_from_finality(const CanonicalDerivationConfig& cf
     return;
   }
 
-  for (auto& [_, info] : all) {
+  // Keep replay behavior aligned with runtime: never let liveness penalties
+  // collapse effective active validators for next height to zero.
+  std::size_t effective_active_next_height = state->validators.active_sorted(height + 1).size();
+
+  const bool defer_exit_until_epoch_end =
+      committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
+      committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
+
+  for (auto& [pub, info] : all) {
     const std::uint64_t eligible = info.eligible_count_window;
     const std::uint64_t participated = info.participated_count_window;
     if (eligible >= 10) {
       const std::uint64_t miss = eligible >= participated ? (eligible - participated) : 0;
       const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
+      const bool currently_effective_active = state->validators.is_active_for_height(pub, height + 1);
       if (miss_rate >= cfg.validator_miss_rate_exit_threshold_percent) {
-        info.status = ValidatorStatus::EXITING;
-        info.last_exit_height = height;
-        info.unbond_height = height;
-        info.penalty_strikes += 1;
+        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+          if (!defer_exit_until_epoch_end) {
+            info.status = ValidatorStatus::EXITING;
+          }
+          info.last_exit_height = height;
+          info.unbond_height = height;
+          info.penalty_strikes += 1;
+          if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
+        }
       } else if (miss_rate >= cfg.validator_miss_rate_suspend_threshold_percent) {
-        info.status = ValidatorStatus::SUSPENDED;
-        info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
-        info.penalty_strikes += 1;
+        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+          info.status = ValidatorStatus::SUSPENDED;
+          info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
+          info.penalty_strikes += 1;
+          if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
+        }
       }
     }
     info.eligible_count_window = 0;
@@ -771,21 +788,38 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
     return;
   }
 
-  for (auto& [_, info] : all) {
+  // Keep replay behavior aligned with runtime: never let liveness penalties
+  // collapse effective active validators for next height to zero.
+  std::size_t effective_active_next_height = state->validators.active_sorted(height + 1).size();
+
+  const bool defer_exit_until_epoch_end =
+      committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
+      committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
+
+  for (auto& [pub, info] : all) {
     const std::uint64_t eligible = info.eligible_count_window;
     const std::uint64_t participated = info.participated_count_window;
     if (eligible >= 10) {
       const std::uint64_t miss = eligible >= participated ? (eligible - participated) : 0;
       const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
+      const bool currently_effective_active = state->validators.is_active_for_height(pub, height + 1);
       if (miss_rate >= cfg.validator_miss_rate_exit_threshold_percent) {
-        info.status = ValidatorStatus::EXITING;
-        info.last_exit_height = height;
-        info.unbond_height = height;
-        info.penalty_strikes += 1;
+        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+          if (!defer_exit_until_epoch_end) {
+            info.status = ValidatorStatus::EXITING;
+          }
+          info.last_exit_height = height;
+          info.unbond_height = height;
+          info.penalty_strikes += 1;
+          if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
+        }
       } else if (miss_rate >= cfg.validator_miss_rate_suspend_threshold_percent) {
-        info.status = ValidatorStatus::SUSPENDED;
-        info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
-        info.penalty_strikes += 1;
+        if (!(currently_effective_active && effective_active_next_height <= 1)) {
+          info.status = ValidatorStatus::SUSPENDED;
+          info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
+          info.penalty_strikes += 1;
+          if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
+        }
       }
     }
     info.eligible_count_window = 0;
@@ -827,7 +861,19 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
           state->validators.ban(pub, height);
           (void)state->validators.finalize_withdrawal(pub);
         } else {
-          state->validators.request_unbond(pub, height);
+          const bool defer_exit_until_epoch_end =
+              committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
+              committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
+          if (defer_exit_until_epoch_end) {
+            auto it_info = state->validators.mutable_all().find(pub);
+            if (it_info != state->validators.mutable_all().end()) {
+              auto& vi = it_info->second;
+              if (vi.unbond_height == 0) vi.unbond_height = height;
+              vi.last_exit_height = std::max(vi.last_exit_height, height);
+            }
+          } else {
+            state->validators.request_unbond(pub, height);
+          }
         }
         continue;
       }
@@ -903,6 +949,18 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
           if (cfg.validator_join_limit_window_blocks > 0) ++state->validator_join_count_in_window;
         }
         break;
+      }
+    }
+  }
+  const bool crosses_epoch_boundary =
+      committee_epoch_start(height, cfg.network.committee_epoch_blocks) !=
+      committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks);
+  if (crosses_epoch_boundary) {
+    for (auto& [_, info] : state->validators.mutable_all()) {
+      if (!info.has_bond) continue;
+      if (info.unbond_height == 0) continue;
+      if (info.status == ValidatorStatus::ACTIVE || info.status == ValidatorStatus::SUSPENDED) {
+        info.status = ValidatorStatus::EXITING;
       }
     }
   }
