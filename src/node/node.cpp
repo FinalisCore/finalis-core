@@ -2111,10 +2111,15 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
           validators.ban(pub, height);
           (void)validators.finalize_withdrawal(pub);
         } else {
+          std::size_t effective_active_next_height = validators.active_sorted(height + 1).size();
+          const bool currently_effective_active = validators.is_active_for_height(pub, height + 1);
+          const bool block_for_active_set_floor =
+              deferred_exit_fork_active(network, height) && currently_effective_active && effective_active_next_height <= 1;
           const bool defer_exit_until_epoch_end =
-              deferred_exit_fork_active(network, height) &&
+              block_for_active_set_floor ||
+              (deferred_exit_fork_active(network, height) &&
               (consensus::committee_epoch_start(height, committee_epoch_blocks) ==
-               consensus::committee_epoch_start(height + 1, committee_epoch_blocks));
+               consensus::committee_epoch_start(height + 1, committee_epoch_blocks)));
           if (defer_exit_until_epoch_end) {
             auto it_info = validators.mutable_all().find(pub);
             if (it_info != validators.mutable_all().end()) {
@@ -2191,11 +2196,15 @@ void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators
       consensus::committee_epoch_start(height, committee_epoch_blocks) !=
       consensus::committee_epoch_start(height + 1, committee_epoch_blocks);
   if (deferred_exit_fork_active(network, height) && crosses_epoch_boundary) {
-    for (auto& [_, info] : validators.mutable_all()) {
+    std::size_t effective_active_next_height = validators.active_sorted(height + 1).size();
+    for (auto& [candidate_pub, info] : validators.mutable_all()) {
       if (!info.has_bond) continue;
       if (info.unbond_height == 0) continue;
       if (info.status == consensus::ValidatorStatus::ACTIVE || info.status == consensus::ValidatorStatus::SUSPENDED) {
+        const bool currently_effective_active = validators.is_active_for_height(candidate_pub, height + 1);
+        if (currently_effective_active && effective_active_next_height <= 1) continue;
         info.status = consensus::ValidatorStatus::EXITING;
+        if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
       }
     }
   }
