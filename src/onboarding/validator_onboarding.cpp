@@ -249,6 +249,31 @@ bool checked_add_u64(std::uint64_t a, std::uint64_t b, std::uint64_t* out) {
   return true;
 }
 
+std::uint64_t rejoin_eligible_height(const consensus::ValidatorInfo& info, std::uint64_t cooldown_blocks) {
+  if (info.last_exit_height == 0 || cooldown_blocks == 0) return info.last_exit_height;
+  if (info.last_exit_height > std::numeric_limits<std::uint64_t>::max() - cooldown_blocks) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return info.last_exit_height + cooldown_blocks;
+}
+
+bool apply_rejoin_policy_error(ValidatorOnboardingRecord* record, const std::string& registry_error,
+                               const std::optional<consensus::ValidatorInfo>& info, std::uint64_t cooldown_blocks) {
+  if (registry_error != "validator_rejoin_exit_not_completed" && registry_error != "validator_rejoin_cooldown") {
+    return false;
+  }
+  if (info.has_value()) record->rejoin_eligible_height = rejoin_eligible_height(*info, cooldown_blocks);
+  if (registry_error == "validator_rejoin_exit_not_completed") {
+    set_error(record, "validator_rejoin_exit_not_completed",
+              "rejoin blocked: validator is EXITING and bonded; complete unbond withdrawal first");
+  } else {
+    set_error(record, "validator_rejoin_cooldown",
+              "rejoin blocked: cooldown not elapsed; earliest is last_exit_height + cooldown_blocks");
+  }
+  record->rejoin_blocked_reason = registry_error;
+  return true;
+}
+
 bool persist_record(storage::DB& db, const ValidatorOnboardingRecord& record, std::string* err) {
   if (!db.put_validator_onboarding_record(record.validator_pubkey, ValidatorOnboardingService::serialize_record(record))) {
     if (err) *err = "failed to persist onboarding record";
@@ -666,6 +691,8 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
 
     const auto validators = db.load_validators();
     const auto join_requests = db.load_validator_join_requests();
+    record.rejoin_eligible_height = 0;
+    record.rejoin_blocked_reason.clear();
     const auto info_it = validators.find(key->pubkey);
     const std::optional<consensus::ValidatorInfo> validator_info =
         (info_it == validators.end()) ? std::nullopt : std::optional<consensus::ValidatorInfo>(info_it->second);
@@ -743,6 +770,23 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
           record.last_error_message.clear();
           (void)persist_record(db, record, err);
           return record;
+        }
+        {
+          consensus::ValidatorRegistry registry;
+          registry.set_rules(consensus::ValidatorRules{
+              .min_bond = consensus::validator_min_bond_units(options.network, planning_height, validators.size()),
+              .warmup_blocks = options.network.validator_warmup_blocks,
+              .cooldown_blocks = options.network.validator_cooldown_blocks,
+          });
+          for (const auto& [pub, info] : validators) registry.upsert(pub, info);
+          std::string gate_err;
+          if (!registry.can_register_bond(key->pubkey, planning_height, record.bond_amount, &gate_err)) {
+            if (apply_rejoin_policy_error(&record, gate_err, validator_info, options.network.validator_cooldown_blocks)) {
+              record.state = ValidatorOnboardingState::FAILED;
+              (void)persist_record(db, record, err);
+              return record;
+            }
+          }
         }
         record.state = ValidatorOnboardingState::SELECTING_UTXOS;
         continue;

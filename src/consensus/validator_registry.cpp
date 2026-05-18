@@ -57,6 +57,10 @@ bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t hei
     if (err) *err = "validator already registered";
     return false;
   }
+  if (v.has_bond && v.status == ValidatorStatus::EXITING) {
+    if (err) *err = "validator_rejoin_exit_not_completed";
+    return false;
+  }
   if (v.has_bond && v.status != ValidatorStatus::EXITING) {
     if (err) *err = "validator bond already active";
     return false;
@@ -67,7 +71,7 @@ bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t hei
       return false;
     }
     if (height < v.last_exit_height + rules_.cooldown_blocks) {
-      if (err) *err = "validator cooldown";
+      if (err) *err = "validator_rejoin_cooldown";
       return false;
     }
   }
