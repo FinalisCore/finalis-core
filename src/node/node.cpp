@@ -10153,6 +10153,15 @@ bool Node::load_state() {
     std::string fast_error;
     if (load_trusted_runtime_checkpoint_from_cache(derivation_cfg, db_, finalized_height_, finalized_identity_.id,
                                                    &fast_state, &fast_error, true, true)) {
+      {
+        PubKey32 reactivated{};
+        if (maybe_reactivate_single_exiting_validator_for_startup_migration(cfg_.network, &fast_state, &reactivated)) {
+          log_line("startup-fast-start-active-set-migration-reactivation height=" +
+                   std::to_string(fast_state.finalized_height) +
+                   " next_height=" + std::to_string(fast_state.finalized_height + 1) +
+                   " pub=" + short_pub_hex(reactivated));
+        }
+      }
       const std::uint64_t next_height = finalized_height_ + 1;
       const auto next_epoch_start = consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks);
       const auto next_checkpoint_it = fast_state.finalized_committee_checkpoints.find(next_epoch_start);
