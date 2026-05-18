@@ -50,6 +50,49 @@ AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME="${AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME:-
 
 log() { printf '[start] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+canonical_validator_key_path() { printf '%s/keystore/validator.json' "$1"; }
+
+extract_validator_pubkey_from_file() {
+  local key_path="$1"
+  python3 - "$key_path" <<'PY'
+import json, re, sys
+p = sys.argv[1]
+try:
+    obj = json.load(open(p, "r", encoding="utf-8"))
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+candidates = []
+for k in ("validator_pubkey", "pubkey", "public_key", "validatorPublicKey"):
+    v = obj.get(k)
+    if isinstance(v, str):
+        candidates.append(v.strip().lower())
+
+for v in candidates:
+    if re.fullmatch(r"[0-9a-f]{64}", v):
+        print(v)
+        raise SystemExit(0)
+print("")
+PY
+}
+
+log_validator_key_identity() {
+  local db_root="$1"
+  local key_path
+  key_path="$(canonical_validator_key_path "${db_root}")"
+  if [[ ! -f "${key_path}" ]]; then
+    log "validator-key-check path=${key_path} status=missing"
+    return 1
+  fi
+  local pub
+  pub="$(extract_validator_pubkey_from_file "${key_path}" || true)"
+  if [[ -n "${pub}" ]]; then
+    log "validator-key-check path=${key_path} pubkey=${pub}"
+  else
+    log "validator-key-check path=${key_path} pubkey=unknown"
+  fi
+}
 
 APT_BUILD_PACKAGES=(
   build-essential
@@ -613,33 +656,24 @@ reset_chain_data_if_requested() {
   rm -rf "${tmp_keep_root}"
   mkdir -p "${tmp_keep_root}"
 
-  local -a kept_keys=()
-  mapfile -t kept_keys < <(find "${data_root}" -type f -name "validator.json" 2>/dev/null || true)
-  if (( ${#kept_keys[@]} > 0 )); then
-    local key_path rel_path keep_path
-    for key_path in "${kept_keys[@]}"; do
-      rel_path="${key_path#${data_root}/}"
-      keep_path="${tmp_keep_root}/${rel_path}"
-      mkdir -p "$(dirname "${keep_path}")"
-      cp -f "${key_path}" "${keep_path}"
-    done
-    log "Preserved ${#kept_keys[@]} validator.json key file(s)"
+  local canonical_src_key
+  canonical_src_key="$(canonical_validator_key_path "${DB_DIR}")"
+  if [[ -f "${canonical_src_key}" ]]; then
+    mkdir -p "${tmp_keep_root}/keystore"
+    cp -f "${canonical_src_key}" "${tmp_keep_root}/keystore/validator.json"
+    log "Preserved canonical validator key ${canonical_src_key}"
+  else
+    log "Canonical validator key not found at ${canonical_src_key}; reset will continue without key preservation."
   fi
 
   find "${data_root}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-  if (( ${#kept_keys[@]} > 0 )); then
-    local restored
-    restored=0
-    while IFS= read -r key_path; do
-      rel_path="${key_path#${tmp_keep_root}/}"
-      keep_path="${data_root}/${rel_path}"
-      mkdir -p "$(dirname "${keep_path}")"
-      cp -f "${key_path}" "${keep_path}"
-      chmod 600 "${keep_path}" || true
-      restored=$((restored + 1))
-    done < <(find "${tmp_keep_root}" -type f -name "validator.json" 2>/dev/null || true)
-    log "Restored ${restored} validator.json key file(s)"
+  if [[ -f "${tmp_keep_root}/keystore/validator.json" ]]; then
+    mkdir -p "${DB_DIR}/keystore"
+    cp -f "${tmp_keep_root}/keystore/validator.json" "${DB_DIR}/keystore/validator.json"
+    chmod 600 "${DB_DIR}/keystore/validator.json" || true
+    log "Restored canonical validator key to ${DB_DIR}/keystore/validator.json"
+    log_validator_key_identity "${DB_DIR}" || true
   fi
 
   rm -rf "${tmp_keep_root}"
@@ -699,39 +733,40 @@ auto_fast_sync_if_requested() {
     local source_root="$1"
     local dest_root="$2"
     local tmp_keep_root="$3"
-    local -a key_files=()
-    mapfile -t key_files < <(find "${source_root}" -type f -name "validator.json" 2>/dev/null || true)
-    if (( ${#key_files[@]} == 0 )); then
+    local canonical_source_key canonical_dest_key
+    canonical_source_key="$(canonical_validator_key_path "${source_root}")"
+    canonical_dest_key="$(canonical_validator_key_path "${dest_root}")"
+    local -a discovered_keys=()
+    mapfile -t discovered_keys < <(find "${source_root}" -type f -name "validator.json" 2>/dev/null || true)
+    if (( ${#discovered_keys[@]} > 1 )); then
+      local key
+      for key in "${discovered_keys[@]}"; do
+        if [[ "${key}" != "${canonical_source_key}" ]]; then
+          log "Refusing destructive fast_sync: ambiguous validator keys found under ${source_root}"
+          printf '%s\n' "${discovered_keys[@]}"
+          exit 1
+        fi
+      done
+    fi
+    if [[ ! -f "${canonical_source_key}" ]]; then
+      if (( ${#discovered_keys[@]} == 1 )); then
+        log "Refusing destructive fast_sync: canonical validator key missing at ${canonical_source_key}; found ${discovered_keys[0]}"
+        exit 1
+      fi
       return 0
     fi
 
     rm -rf "${tmp_keep_root}"
-    mkdir -p "${tmp_keep_root}"
-
-    local key_path rel_path keep_path
-    for key_path in "${key_files[@]}"; do
-      rel_path="${key_path#${source_root}/}"
-      keep_path="${tmp_keep_root}/${rel_path}"
-      mkdir -p "$(dirname "${keep_path}")"
-      cp -f "${key_path}" "${keep_path}"
-    done
-
-    local restored=0
-    while IFS= read -r key_path; do
-      rel_path="${key_path#${tmp_keep_root}/}"
-      keep_path="${dest_root}/${rel_path}"
-      mkdir -p "$(dirname "${keep_path}")"
-      cp -f "${key_path}" "${keep_path}"
-      chmod 600 "${keep_path}" || true
-      restored=$((restored + 1))
-    done < <(find "${tmp_keep_root}" -type f -name "validator.json" 2>/dev/null || true)
-
+    mkdir -p "${tmp_keep_root}/keystore"
+    cp -f "${canonical_source_key}" "${tmp_keep_root}/keystore/validator.json"
+    mkdir -p "$(dirname "${canonical_dest_key}")"
+    cp -f "${tmp_keep_root}/keystore/validator.json" "${canonical_dest_key}"
+    chmod 600 "${canonical_dest_key}" || true
     rm -rf "${tmp_keep_root}"
-    if (( restored > 0 )); then
-      mkdir -p "${dest_root}/keystore"
-      chmod 700 "${dest_root}/keystore" || true
-      log "Preserved and restored ${restored} validator.json key file(s) for destructive fast_sync."
-    fi
+    mkdir -p "${dest_root}/keystore"
+    chmod 700 "${dest_root}/keystore" || true
+    log "Preserved and restored canonical validator key for destructive fast_sync."
+    log_validator_key_identity "${dest_root}" || true
   }
 
   if (( has_chain_state == 1 )) && [[ "${AUTO_FAST_SYNC_FORCE_OVERWRITE}" != "1" ]] && [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
