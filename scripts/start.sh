@@ -46,7 +46,7 @@ SYNC_TURBO_MODE="${SYNC_TURBO_MODE:-0}"
 SYNC_TARGET_UTIL_PCT="${SYNC_TARGET_UTIL_PCT:-70}"
 FAST_SYNC_PRELOAD_CACHE="${FAST_SYNC_PRELOAD_CACHE:-0}"
 NO_REINDEX_ON_START="${NO_REINDEX_ON_START:-1}"
-AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME="${AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME:-1}"
+AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME="${AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME:-0}"
 
 log() { printf '[start] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -797,7 +797,7 @@ build_node_command() {
         # committee_epoch_start(h) = floor((h-1)/32)*32 + 1; next epoch start adds 32
         next_epoch_start=$(( (((height_line - 1) / 32) + 1) * 32 + 1 ))
         args+=("--deferred-exit-activation-height" "${next_epoch_start}")
-        log "SYNC_TURBO_MODE=extreme: auto-set deferred-exit activation to next epoch start ${next_epoch_start} (from height=${height_line})"
+        log "SYNC_TURBO_MODE=extreme: auto-set deferred-exit activation to next epoch start ${next_epoch_start} (from height=${height_line})" >&2
       fi
     fi
   fi
