@@ -1179,6 +1179,8 @@ std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& 
       << "\",\"finalized_height\":" << record.finalized_height
       << ",\"validator_status\":\"" << json_escape(record.validator_status)
       << "\",\"activation_height\":" << record.activation_height
+      << ",\"rejoin_eligible_height\":" << record.rejoin_eligible_height
+      << ",\"rejoin_blocked_reason\":\"" << json_escape(record.rejoin_blocked_reason)
       << ",\"last_error_code\":\"" << json_escape(record.last_error_code)
       << "\",\"last_error_message\":\"" << json_escape(record.last_error_message)
       << "\",\"readiness\":" << readiness_json(record.readiness) << "}";
@@ -1333,6 +1335,27 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
     record.validator_status = "NOT_REGISTERED";
   }
 
+  auto apply_rejoin_policy_error = [&](const std::string& policy_err,
+                                       const std::optional<consensus::ValidatorInfo>& info) -> bool {
+    if (policy_err != "validator_rejoin_exit_not_completed" && policy_err != "validator_rejoin_cooldown") return false;
+    if (info.has_value()) {
+      if (info->last_exit_height > 0 && network.validator_cooldown_blocks > 0 &&
+          info->last_exit_height <= std::numeric_limits<std::uint64_t>::max() - network.validator_cooldown_blocks) {
+        record.rejoin_eligible_height = info->last_exit_height + network.validator_cooldown_blocks;
+      } else {
+        record.rejoin_eligible_height = info->last_exit_height;
+      }
+    }
+    record.rejoin_blocked_reason = policy_err;
+    record.state = onboarding::ValidatorOnboardingState::FAILED;
+    record.last_error_code = policy_err;
+    record.last_error_message =
+        (policy_err == "validator_rejoin_exit_not_completed")
+            ? "rejoin blocked: validator is EXITING and bonded; complete unbond withdrawal first"
+            : "rejoin blocked: cooldown not elapsed; earliest is last_exit_height + cooldown_blocks";
+    return true;
+  };
+
   const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
   const auto spendable = wallet::spendable_p2pkh_utxos_for_pubkey_hash(db, own_pkh, nullptr);
   for (const auto& utxo : spendable) {
@@ -1394,6 +1417,21 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
   if (record.last_spendable_balance < record.required_amount) {
     record.state = onboarding::ValidatorOnboardingState::WAITING_FOR_FUNDS;
     return record;
+  }
+  {
+    consensus::ValidatorRegistry registry;
+    registry.set_rules(consensus::ValidatorRules{
+        .min_bond = consensus::validator_min_bond_units(network, planning_height, validators.size()),
+        .warmup_blocks = network.validator_warmup_blocks,
+        .cooldown_blocks = network.validator_cooldown_blocks,
+    });
+    for (const auto& [pub, info] : validators) registry.upsert(pub, info);
+    std::string gate_err;
+    if (!registry.can_register_bond(key.pubkey, planning_height, record.bond_amount, &gate_err)) {
+      std::optional<consensus::ValidatorInfo> info;
+      if (auto it = validators.find(key.pubkey); it != validators.end()) info = it->second;
+      if (apply_rejoin_policy_error(gate_err, info)) return record;
+    }
   }
   record.state = onboarding::ValidatorOnboardingState::CHECKING_PREREQS;
   return record;
@@ -2472,6 +2510,14 @@ std::string Server::handle_rpc_body(const std::string& body) {
     if (record->state != onboarding::ValidatorOnboardingState::CHECKING_PREREQS && !stale_only_wait_for_sync) {
       return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
+    auto map_rejoin_policy_error = [&](const std::string& text, onboarding::ValidatorOnboardingRecord* rec) {
+      if (!rec) return;
+      if (text.find("validator_rejoin_exit_not_completed") != std::string::npos) {
+        rec->last_error_code = "validator_rejoin_exit_not_completed";
+      } else if (text.find("validator_rejoin_cooldown") != std::string::npos) {
+        rec->last_error_code = "validator_rejoin_cooldown";
+      }
+    };
 
     const auto own_pkh = crypto::h160(Bytes(key->pubkey.begin(), key->pubkey.end()));
     const auto spendable = wallet::spendable_p2pkh_utxos_for_pubkey_hash(live_db, own_pkh, nullptr);
@@ -2552,6 +2598,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "tx_rejected";
       record->last_error_message = vrx.error;
+      map_rejoin_policy_error(vrx.error, &*record);
       record->txid_hex = hex_encode32(txid);
       return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
@@ -2559,6 +2606,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "tx_rejected";
       record->last_error_message = err;
+      map_rejoin_policy_error(err, &*record);
       record->txid_hex = hex_encode32(txid);
       return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }

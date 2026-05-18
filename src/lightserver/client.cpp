@@ -327,6 +327,8 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
   record.finalized_height = object_u64(result, "finalized_height").value_or(0);
   record.validator_status = object_string(result, "validator_status").value_or("");
   record.activation_height = object_u64(result, "activation_height").value_or(0);
+  record.rejoin_eligible_height = object_u64(result, "rejoin_eligible_height").value_or(0);
+  record.rejoin_blocked_reason = object_string(result, "rejoin_blocked_reason").value_or("");
   record.last_error_code = object_string(result, "last_error_code").value_or("");
   record.last_error_message = object_string(result, "last_error_message").value_or("");
   if (const auto* readiness = result->get("readiness"); readiness && readiness->is_object()) {

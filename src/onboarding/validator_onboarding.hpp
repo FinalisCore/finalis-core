@@ -72,6 +72,8 @@ struct ValidatorOnboardingRecord {
   std::uint64_t finalized_height{0};
   std::string validator_status;
   std::uint64_t activation_height{0};
+  std::uint64_t rejoin_eligible_height{0};
+  std::string rejoin_blocked_reason;
   std::string last_error_code;
   std::string last_error_message;
 };
