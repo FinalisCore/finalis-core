@@ -1755,6 +1755,30 @@ bool same_validator_maps(const std::map<PubKey32, consensus::ValidatorInfo>& a,
   return true;
 }
 
+bool maybe_reactivate_single_exiting_validator_for_startup_migration(
+    const NetworkConfig& network, consensus::CanonicalDerivedState* state, PubKey32* reactivated_pubkey) {
+  if (state == nullptr) return false;
+  const std::uint64_t next_height = state->finalized_height + 1;
+  if (deferred_exit_fork_active(network, next_height)) return false;
+  if (next_height > network.deferred_exit_activation_height) return false;
+  if (!state->validators.active_sorted(next_height).empty()) return false;
+
+  std::optional<PubKey32> chosen;
+  for (const auto& [pub, info] : state->validators.all()) {
+    if (info.status != consensus::ValidatorStatus::EXITING) continue;
+    if (!info.has_bond || info.bonded_amount == 0) continue;
+    if (!chosen.has_value() || pub < *chosen) chosen = pub;
+  }
+  if (!chosen.has_value()) return false;
+
+  auto& all = state->validators.mutable_all();
+  auto it = all.find(*chosen);
+  if (it == all.end()) return false;
+  it->second.status = consensus::ValidatorStatus::ACTIVE;
+  if (reactivated_pubkey != nullptr) *reactivated_pubkey = *chosen;
+  return true;
+}
+
 std::string validator_info_debug_string(const consensus::ValidatorInfo& info) {
   std::ostringstream oss;
   oss << "{status=" << static_cast<int>(info.status) << ",joined=" << info.joined_height
@@ -10272,6 +10296,14 @@ bool Node::load_state() {
   }
 
   if (!have_derived_state) return false;
+  {
+    PubKey32 reactivated{};
+    if (maybe_reactivate_single_exiting_validator_for_startup_migration(cfg_.network, &derived_state, &reactivated)) {
+      log_line("startup-active-set-migration-reactivation height=" + std::to_string(derived_state.finalized_height) +
+               " next_height=" + std::to_string(derived_state.finalized_height + 1) +
+               " pub=" + short_pub_hex(reactivated));
+    }
+  }
   if (derived_state.finalized_height > 0 && !derived_state.finalized_identity.is_transition()) {
     log_line("finalized-state-invariant-violation source=load-state-frontier-kind-mismatch");
     std::cerr << "load_state: frontier replay produced non-transition finalized identity\n";
