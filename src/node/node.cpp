@@ -9297,6 +9297,22 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   const std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
   auto sigs = votes_.signatures_for(height, round, block_id);
   std::set<PubKey32> committee_set(expected_committee.begin(), expected_committee.end());
+  if (sigs.empty() && expected_quorum == 1 && expected_committee.size() == 1 &&
+      expected_committee.front() == local_key_.public_key) {
+    if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, block_id), local_key_.private_key);
+        sig.has_value()) {
+      const Vote local_vote{height, round, block_id, local_key_.public_key, *sig};
+      const auto tr = votes_.add_vote(local_vote);
+      if (tr.accepted || tr.duplicate) {
+        sigs = votes_.signatures_for(height, round, block_id);
+        log_line("finalize-quorum1-local-self-vote height=" + std::to_string(height) +
+                 " round=" + std::to_string(round) + " transition=" + short_hash_hex(block_id));
+      }
+    } else {
+      log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+               " transition=" + short_hash_hex(block_id) + " reason=local-vote-sign-failed");
+    }
+  }
   if (sigs.size() < expected_quorum) {
     std::ostringstream oss;
     oss << "finalize-skip height=" << height << " round=" << round << " transition=" << short_hash_hex(block_id)
