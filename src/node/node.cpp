@@ -1836,6 +1836,29 @@ std::size_t repair_invalid_exiting_zero_bond_outpoints(consensus::ValidatorRegis
   return repaired;
 }
 
+std::size_t repair_matured_bootstrap_exiting_records(const NetworkConfig& network, consensus::ValidatorRegistry* validators,
+                                                     std::uint64_t height, std::uint64_t unbond_delay_blocks,
+                                                     const std::function<void(const std::string&)>& log_fn) {
+  if (validators == nullptr) return 0;
+  if (!bootstrap_penalty_exit_protection_active_at_height(network, height)) return 0;
+  std::size_t repaired = 0;
+  for (auto& [pub, info] : validators->mutable_all()) {
+    const bool bootstrap_record =
+        info.joined_height == 0 && info.has_bond && info.bond_outpoint.txid == zero_hash() && info.bond_outpoint.index == 0;
+    if (!bootstrap_record) continue;
+    if (info.status != consensus::ValidatorStatus::EXITING) continue;
+    if (info.unbond_height == 0) continue;
+    if (info.unbond_height > std::numeric_limits<std::uint64_t>::max() - unbond_delay_blocks) continue;
+    if (height < info.unbond_height + unbond_delay_blocks) continue;
+    if (validators->finalize_withdrawal(pub)) {
+      ++repaired;
+      log_fn("validator-bootstrap-exit-repair source=auto height=" + std::to_string(height) + " pub=" + short_pub_hex(pub) +
+             " reason=bootstrap-exiting-matured-unbond");
+    }
+  }
+  return repaired;
+}
+
 std::string validator_info_debug_string(const consensus::ValidatorInfo& info) {
   std::ostringstream oss;
   oss << "{status=" << static_cast<int>(info.status) << ",joined=" << info.joined_height
@@ -9992,6 +10015,9 @@ void Node::hydrate_runtime_from_canonical_state_locked(const consensus::Canonica
   validators_ = state.validators;
   (void)repair_invalid_exiting_zero_bond_outpoints(&validators_, state.finalized_height, cfg_.network.unbond_delay_blocks,
                                                    [this](const std::string& s) { log_line(s); });
+  (void)repair_matured_bootstrap_exiting_records(cfg_.network, &validators_, state.finalized_height,
+                                                 cfg_.network.unbond_delay_blocks,
+                                                 [this](const std::string& s) { log_line(s); });
   validator_join_requests_ = state.validator_join_requests;
   finalized_randomness_ = state.finalized_randomness;
   committee_epoch_randomness_cache_ = state.committee_epoch_randomness_cache;
@@ -10853,6 +10879,9 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
   validators_.advance_height(height + 1);
   (void)repair_invalid_exiting_zero_bond_outpoints(&validators_, height + 1, cfg_.network.unbond_delay_blocks,
                                                    [this](const std::string& s) { log_line(s); });
+  (void)repair_matured_bootstrap_exiting_records(cfg_.network, &validators_, height + 1,
+                                                 cfg_.network.unbond_delay_blocks,
+                                                 [this](const std::string& s) { log_line(s); });
   codec::ByteWriter w_start;
   w_start.u64le(validator_join_window_start_height_);
   (void)db_.put(kValidatorJoinWindowStartKey, w_start.take());
