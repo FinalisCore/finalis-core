@@ -1337,7 +1337,18 @@ std::optional<onboarding::ValidatorOnboardingRecord> onboarding_status_from_read
 
   auto apply_rejoin_policy_error = [&](const std::string& policy_err,
                                        const std::optional<consensus::ValidatorInfo>& info) -> bool {
-    if (policy_err != "validator_rejoin_exit_not_completed" && policy_err != "validator_rejoin_cooldown") return false;
+    if (policy_err != "validator_rejoin_exit_not_completed" && policy_err != "validator_rejoin_cooldown" &&
+        policy_err != "validator_bond_outpoint_invalid") {
+      return false;
+    }
+    if (policy_err == "validator_bond_outpoint_invalid") {
+      record.rejoin_blocked_reason = policy_err;
+      record.state = onboarding::ValidatorOnboardingState::FAILED;
+      record.last_error_code = policy_err;
+      record.last_error_message =
+          "validator state invalid: bonded validator has non-genesis zero bond outpoint; requires state repair";
+      return true;
+    }
     if (info.has_value()) {
       if (info->last_exit_height > 0 && network.validator_cooldown_blocks > 0 &&
           info->last_exit_height <= std::numeric_limits<std::uint64_t>::max() - network.validator_cooldown_blocks) {
@@ -2516,6 +2527,8 @@ std::string Server::handle_rpc_body(const std::string& body) {
         rec->last_error_code = "validator_rejoin_exit_not_completed";
       } else if (text.find("validator_rejoin_cooldown") != std::string::npos) {
         rec->last_error_code = "validator_rejoin_cooldown";
+      } else if (text.find("validator_bond_outpoint_invalid") != std::string::npos) {
+        rec->last_error_code = "validator_bond_outpoint_invalid";
       }
     };
 
