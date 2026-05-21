@@ -28,6 +28,10 @@
 namespace finalis::consensus {
 namespace {
 
+bool bootstrap_validator_record(const ValidatorInfo& info) {
+  return info.joined_height == 0 && info.has_bond && info.bond_outpoint.txid == zero_hash() && info.bond_outpoint.index == 0;
+}
+
 constexpr std::uint64_t kAdaptiveMinBondFloor = 150ULL * BASE_UNITS_PER_COIN;
 constexpr std::uint64_t kAdaptiveMinBondCeiling = 500ULL * BASE_UNITS_PER_COIN;
 constexpr std::uint64_t kAdaptiveMinBondBase = 150ULL * BASE_UNITS_PER_COIN;
@@ -745,6 +749,17 @@ void update_validator_liveness_from_finality(const CanonicalDerivationConfig& cf
       const bool block_for_active_set_floor =
           deferred_exit_fork_active(cfg.network, height) && currently_effective_active && effective_active_next_height <= 1;
       if (miss_rate >= cfg.validator_miss_rate_exit_threshold_percent) {
+        const bool bootstrap_exit_protected =
+            bootstrap_penalty_exit_protection_active_at_height(cfg.network, height) && bootstrap_validator_record(info);
+        if (bootstrap_exit_protected) {
+          if (!block_for_active_set_floor) {
+            info.status = ValidatorStatus::SUSPENDED;
+            info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
+            info.penalty_strikes += 1;
+            if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
+          }
+          continue;
+        }
         if (!block_for_active_set_floor) {
           if (!defer_exit_until_epoch_end) {
             info.status = ValidatorStatus::EXITING;

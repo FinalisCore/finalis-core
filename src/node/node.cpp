@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -1779,6 +1780,62 @@ bool maybe_reactivate_single_exiting_validator_for_startup_migration(
   return true;
 }
 
+bool zero_outpoint(const OutPoint& op) { return op.txid == zero_hash() && op.index == 0; }
+
+bool is_non_genesis_zero_bond_outpoint(const consensus::ValidatorInfo& info) {
+  return info.has_bond && zero_outpoint(info.bond_outpoint) && info.joined_height != 0;
+}
+
+std::string infer_exit_reason(const consensus::ValidatorInfo& before, const consensus::ValidatorInfo& after, std::uint64_t height) {
+  if (after.last_exit_height == height && after.unbond_height == height) {
+    if (after.penalty_strikes > before.penalty_strikes) return "liveness-penalty-exit";
+    return "unbond-spend-exit";
+  }
+  if (after.unbond_height > 0 && after.unbond_height == before.unbond_height) return "deferred-epoch-exit-activation";
+  return "unknown";
+}
+
+void emit_exit_transition_logs(const std::map<PubKey32, consensus::ValidatorInfo>& before,
+                               const std::map<PubKey32, consensus::ValidatorInfo>& after, std::uint64_t height,
+                               const char* source, const std::function<void(const std::string&)>& log_fn) {
+  for (const auto& [pub, post] : after) {
+    auto it = before.find(pub);
+    if (it == before.end()) continue;
+    const auto& pre = it->second;
+    if (pre.status == consensus::ValidatorStatus::EXITING || post.status != consensus::ValidatorStatus::EXITING) continue;
+    std::ostringstream oss;
+    oss << "validator-exit-transition source=" << source << " height=" << height
+        << " pub=" << short_pub_hex(pub) << " reason=" << infer_exit_reason(pre, post, height)
+        << " pre_status=" << static_cast<int>(pre.status) << " post_status=" << static_cast<int>(post.status)
+        << " pre_unbond=" << pre.unbond_height << " post_unbond=" << post.unbond_height
+        << " pre_last_exit=" << pre.last_exit_height << " post_last_exit=" << post.last_exit_height
+        << " pre_penalties=" << pre.penalty_strikes << " post_penalties=" << post.penalty_strikes
+        << " has_bond=" << (post.has_bond ? "1" : "0")
+        << " bond_outpoint=" << short_hash_hex(post.bond_outpoint.txid) << ":" << post.bond_outpoint.index;
+    log_fn(oss.str());
+  }
+}
+
+std::size_t repair_invalid_exiting_zero_bond_outpoints(consensus::ValidatorRegistry* validators, std::uint64_t height,
+                                                       std::uint64_t unbond_delay_blocks,
+                                                       const std::function<void(const std::string&)>& log_fn) {
+  if (validators == nullptr) return 0;
+  std::size_t repaired = 0;
+  for (auto& [pub, info] : validators->mutable_all()) {
+    if (info.status != consensus::ValidatorStatus::EXITING) continue;
+    if (!is_non_genesis_zero_bond_outpoint(info)) continue;
+    if (info.unbond_height == 0) continue;
+    if (info.unbond_height > std::numeric_limits<std::uint64_t>::max() - unbond_delay_blocks) continue;
+    if (height < info.unbond_height + unbond_delay_blocks) continue;
+    if (validators->finalize_withdrawal(pub)) {
+      ++repaired;
+      log_fn("validator-exit-repair source=auto height=" + std::to_string(height) + " pub=" + short_pub_hex(pub) +
+             " reason=non-genesis-zero-bond-outpoint-matured-unbond");
+    }
+  }
+  return repaired;
+}
+
 std::string validator_info_debug_string(const consensus::ValidatorInfo& info) {
   std::ostringstream oss;
   oss << "{status=" << static_cast<int>(info.status) << ",joined=" << info.joined_height
@@ -2036,6 +2093,9 @@ void update_validator_liveness_from_finality_impl(consensus::ValidatorRegistry& 
                                                   const NetworkConfig& network,
                                                   std::uint64_t committee_epoch_blocks,
                                                   std::size_t* last_participation_eligible_signers, storage::DB* db) {
+  const auto bootstrap_validator_record = [](const consensus::ValidatorInfo& info) {
+    return info.joined_height == 0 && info.has_bond && info.bond_outpoint.txid == zero_hash() && info.bond_outpoint.index == 0;
+  };
   if (committee.empty() || !liveness_window_start_height) return;
   const auto participants = consensus::committee_participants_from_finality(committee, finality_sigs);
   std::set<PubKey32> participant_set(participants.begin(), participants.end());
@@ -2075,6 +2135,17 @@ void update_validator_liveness_from_finality_impl(consensus::ValidatorRegistry& 
       const bool block_for_active_set_floor =
           deferred_exit_fork_active(network, height) && currently_effective_active && effective_active_next_height <= 1;
       if (miss_rate >= miss_rate_exit_threshold_percent) {
+        const bool bootstrap_exit_protected =
+            bootstrap_penalty_exit_protection_active_at_height(network, height) && bootstrap_validator_record(info);
+        if (bootstrap_exit_protected) {
+          if (!block_for_active_set_floor) {
+            info.status = consensus::ValidatorStatus::SUSPENDED;
+            info.suspended_until_height = height + suspend_duration_blocks;
+            info.penalty_strikes += 1;
+            if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
+          }
+          continue;
+        }
         if (!block_for_active_set_floor) {
           if (!defer_exit_until_epoch_end) {
             info.status = consensus::ValidatorStatus::EXITING;
@@ -9919,6 +9990,8 @@ void Node::hydrate_runtime_from_canonical_state_locked(const consensus::Canonica
   finalized_identity_ = state.finalized_identity;
   utxos_ = state.utxos;
   validators_ = state.validators;
+  (void)repair_invalid_exiting_zero_bond_outpoints(&validators_, state.finalized_height, cfg_.network.unbond_delay_blocks,
+                                                   [this](const std::string& s) { log_line(s); });
   validator_join_requests_ = state.validator_join_requests;
   finalized_randomness_ = state.finalized_randomness;
   committee_epoch_randomness_cache_ = state.committee_epoch_randomness_cache;
@@ -10755,21 +10828,31 @@ bool Node::validate_validator_registration_rules(const Block& block, std::uint64
 
 void Node::update_validator_liveness_from_finality(std::uint64_t height, std::uint32_t round,
                                             const std::vector<FinalitySig>& finality_sigs) {
+  const auto validators_before = validators_.all();
   std::vector<PubKey32> committee = committee_for_height_round(height, round);
   update_validator_liveness_from_finality_impl(
       validators_, height, committee, finality_sigs, &validator_liveness_window_start_height_, validator_liveness_window_blocks_,
       validator_miss_rate_suspend_threshold_percent_, validator_miss_rate_exit_threshold_percent_, validator_suspend_duration_blocks_,
       cfg_.network, cfg_.network.committee_epoch_blocks,
       &last_participation_eligible_signers_, &db_);
+  emit_exit_transition_logs(validators_before, validators_.all(), height, "liveness", [this](const std::string& s) {
+    log_line(s);
+  });
 }
 
 void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height) {
+  const auto validators_before = validators_.all();
   apply_validator_state_changes_impl(validators_, validator_join_requests_, block, pre_utxos, height,
                                      effective_validator_min_bond_for_height(height), validator_warmup_blocks_,
                                      validator_cooldown_blocks_, validator_join_limit_window_blocks_,
                                      validator_join_limit_max_new_, cfg_.network, cfg_.network.committee_epoch_blocks,
                                      &validator_join_window_start_height_, &validator_join_count_in_window_, &db_);
+  emit_exit_transition_logs(validators_before, validators_.all(), height, "tx-state-change", [this](const std::string& s) {
+    log_line(s);
+  });
   validators_.advance_height(height + 1);
+  (void)repair_invalid_exiting_zero_bond_outpoints(&validators_, height + 1, cfg_.network.unbond_delay_blocks,
+                                                   [this](const std::string& s) { log_line(s); });
   codec::ByteWriter w_start;
   w_start.u64le(validator_join_window_start_height_);
   (void)db_.put(kValidatorJoinWindowStartKey, w_start.take());

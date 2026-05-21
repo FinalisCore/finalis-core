@@ -259,8 +259,15 @@ std::uint64_t rejoin_eligible_height(const consensus::ValidatorInfo& info, std::
 
 bool apply_rejoin_policy_error(ValidatorOnboardingRecord* record, const std::string& registry_error,
                                const std::optional<consensus::ValidatorInfo>& info, std::uint64_t cooldown_blocks) {
-  if (registry_error != "validator_rejoin_exit_not_completed" && registry_error != "validator_rejoin_cooldown") {
+  if (registry_error != "validator_rejoin_exit_not_completed" && registry_error != "validator_rejoin_cooldown" &&
+      registry_error != "validator_bond_outpoint_invalid") {
     return false;
+  }
+  if (registry_error == "validator_bond_outpoint_invalid") {
+    set_error(record, "validator_bond_outpoint_invalid",
+              "validator state invalid: bonded validator has non-genesis zero bond outpoint; requires state repair");
+    record->rejoin_blocked_reason = registry_error;
+    return true;
   }
   if (info.has_value()) record->rejoin_eligible_height = rejoin_eligible_height(*info, cooldown_blocks);
   if (registry_error == "validator_rejoin_exit_not_completed") {

@@ -6,6 +6,11 @@
 #include <limits>
 namespace finalis::consensus {
 
+namespace {
+bool zero_outpoint(const OutPoint& op) { return op.txid == zero_hash() && op.index == 0; }
+bool is_genesis_bond_record(const ValidatorInfo& v) { return v.joined_height == 0 && zero_outpoint(v.bond_outpoint); }
+}  // namespace
+
 PubKey32 canonical_operator_id(const PubKey32& validator_pubkey, const ValidatorInfo& info) {
   return info.operator_id == PubKey32{} ? validator_pubkey : info.operator_id;
 }
@@ -55,6 +60,10 @@ bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t hei
   }
   if (v.status == ValidatorStatus::ACTIVE || v.status == ValidatorStatus::PENDING || v.status == ValidatorStatus::SUSPENDED) {
     if (err) *err = "validator already registered";
+    return false;
+  }
+  if (v.has_bond && zero_outpoint(v.bond_outpoint) && !is_genesis_bond_record(v)) {
+    if (err) *err = "validator_bond_outpoint_invalid";
     return false;
   }
   if (v.has_bond && v.status == ValidatorStatus::EXITING) {
