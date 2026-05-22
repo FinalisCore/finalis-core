@@ -10014,11 +10014,20 @@ void Node::hydrate_runtime_from_canonical_state_locked(const consensus::Canonica
   finalized_identity_ = state.finalized_identity;
   utxos_ = state.utxos;
   validators_ = state.validators;
-  (void)repair_invalid_exiting_zero_bond_outpoints(&validators_, state.finalized_height, cfg_.network.unbond_delay_blocks,
-                                                   [this](const std::string& s) { log_line(s); });
-  (void)repair_matured_bootstrap_exiting_records(cfg_.network, &validators_, state.finalized_height,
-                                                 cfg_.network.unbond_delay_blocks,
+  std::size_t repaired_count = 0;
+  repaired_count +=
+      repair_invalid_exiting_zero_bond_outpoints(&validators_, state.finalized_height, cfg_.network.unbond_delay_blocks,
                                                  [this](const std::string& s) { log_line(s); });
+  repaired_count +=
+      repair_matured_bootstrap_exiting_records(cfg_.network, &validators_, state.finalized_height,
+                                               cfg_.network.unbond_delay_blocks,
+                                               [this](const std::string& s) { log_line(s); });
+  if (repaired_count > 0) {
+    for (const auto& [pub, info] : validators_.all()) (void)db_.put_validator(pub, info);
+    if (canonical_state_.has_value()) canonical_state_->validators = validators_;
+    log_line("validator-repair-persisted source=hydrate repaired=" + std::to_string(repaired_count) +
+             " finalized_height=" + std::to_string(state.finalized_height));
+  }
   validator_join_requests_ = state.validator_join_requests;
   finalized_randomness_ = state.finalized_randomness;
   committee_epoch_randomness_cache_ = state.committee_epoch_randomness_cache;
