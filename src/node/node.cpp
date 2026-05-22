@@ -1840,7 +1840,8 @@ std::size_t repair_matured_bootstrap_exiting_records(const NetworkConfig& networ
                                                      std::uint64_t height, std::uint64_t unbond_delay_blocks,
                                                      const std::function<void(const std::string&)>& log_fn) {
   if (validators == nullptr) return 0;
-  if (!bootstrap_penalty_exit_protection_active_at_height(network, height)) return 0;
+  const std::uint64_t gate_height = height == std::numeric_limits<std::uint64_t>::max() ? height : (height + 1);
+  if (!bootstrap_penalty_exit_protection_active_at_height(network, gate_height)) return 0;
   std::size_t repaired = 0;
   for (auto& [pub, info] : validators->mutable_all()) {
     const bool bootstrap_record =
