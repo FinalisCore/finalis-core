@@ -1691,6 +1691,16 @@ storage::FinalizedCommitteeCheckpoint build_finalized_committee_checkpoint_from_
   return checkpoint;
 }
 
+std::optional<PubKey32> empty_active_set_escape_member_runtime(const consensus::ValidatorRegistry& validators) {
+  std::optional<PubKey32> out;
+  for (const auto& [pub, info] : validators.all()) {
+    if (!info.has_bond || info.bonded_amount == 0) continue;
+    if (info.status == consensus::ValidatorStatus::BANNED || info.status == consensus::ValidatorStatus::ONBOARDING) continue;
+    if (!out.has_value() || pub < *out) out = pub;
+  }
+  return out;
+}
+
 bool finalized_checkpoint_matches_epoch_snapshot(const storage::FinalizedCommitteeCheckpoint& checkpoint,
                                                  const consensus::EpochCommitteeSnapshot& snapshot) {
   if (checkpoint.ordered_members != snapshot.ordered_members) return false;
@@ -4629,11 +4639,31 @@ storage::FinalizedCommitteeCheckpoint Node::build_finalized_committee_checkpoint
       previous_checkpoint_for_epoch(finalized_committee_checkpoints_, epoch_start_height, cfg_.network.committee_epoch_blocks);
   const auto decision = decide_availability_committee_mode(&availability_state_, cfg_.availability, previous_checkpoint,
                                                            validators_, epoch_start_height);
-  return build_finalized_committee_checkpoint_from_candidates(
+  auto checkpoint = build_finalized_committee_checkpoint_from_candidates(
       epoch_start_height, consensus::committee_epoch_seed(epoch_randomness, epoch_start_height),
       ticket_difficulty_bits_for_epoch_locked(epoch_start_height, active_validator_count), active, cfg_.max_committee,
       decision.mode, decision.fallback_reason, decision.eligible_operator_count, decision.min_eligible_operators,
       decision.effective_committee_size, decision.adaptive);
+  if (checkpoint.ordered_members.empty() && active_validator_count == 0 &&
+      empty_active_set_epoch_escape_active_at_height(cfg_.network, epoch_start_height)) {
+    if (auto fallback = empty_active_set_escape_member_runtime(validators_); fallback.has_value()) {
+      auto info = validators_.get(*fallback);
+      if (info.has_value()) {
+        checkpoint.derivation_mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
+        checkpoint.fallback_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
+        checkpoint.ordered_members = {*fallback};
+        checkpoint.ordered_operator_ids = {consensus::canonical_operator_id(*fallback, *info)};
+        checkpoint.ordered_base_weights = {info->bonded_amount};
+        checkpoint.ordered_ticket_bonus_bps = {0};
+        checkpoint.ordered_final_weights = {info->bonded_amount};
+        checkpoint.ordered_ticket_hashes = {zero_hash()};
+        checkpoint.ordered_ticket_nonces = {0};
+        log_line("epoch-empty-active-escape epoch=" + std::to_string(epoch_start_height) +
+                 " selected=" + short_pub_hex(*fallback) + " reason=deterministic-fallback-member");
+      }
+    }
+  }
+  return checkpoint;
 }
 
 void Node::persist_finalized_committee_checkpoint_locked(std::uint64_t epoch_start_height,
