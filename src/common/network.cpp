@@ -56,6 +56,7 @@ const NetworkConfig kMainnet{
     .confidential_utxo_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .deferred_exit_activation_height = 10017,
     .bootstrap_penalty_exit_protection_activation_height = 10145,
+    .empty_active_set_epoch_escape_activation_height = 10145,
     .default_seeds = {},
     .economics_policies =
         {
@@ -104,6 +105,10 @@ bool confidential_utxo_active_at_height(const NetworkConfig& network, std::uint6
 
 bool bootstrap_penalty_exit_protection_active_at_height(const NetworkConfig& network, std::uint64_t height) {
   return height >= network.bootstrap_penalty_exit_protection_activation_height;
+}
+
+bool empty_active_set_epoch_escape_active_at_height(const NetworkConfig& network, std::uint64_t height) {
+  return height >= network.empty_active_set_epoch_escape_activation_height;
 }
 
 bool onboarding_admission_pow_enabled(const NetworkConfig& network) {

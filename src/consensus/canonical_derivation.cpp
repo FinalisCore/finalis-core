@@ -2288,6 +2288,16 @@ bool canonical_checkpoints_equal(const storage::FinalizedCommitteeCheckpoint& a,
          a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces;
 }
 
+std::optional<PubKey32> empty_active_set_escape_member(const ValidatorRegistry& validators) {
+  std::optional<PubKey32> out;
+  for (const auto& [pub, info] : validators.all()) {
+    if (!info.has_bond || info.bonded_amount == 0) continue;
+    if (info.status == ValidatorStatus::BANNED || info.status == ValidatorStatus::ONBOARDING) continue;
+    if (!out.has_value() || pub < *out) out = pub;
+  }
+  return out;
+}
+
 bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
                                              std::uint64_t epoch_start_height,
                                              storage::FinalizedCommitteeCheckpoint* out, std::string* error) {
@@ -2346,6 +2356,25 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
     checkpoint.ordered_final_weights.push_back(finalized_committee_candidate_strength(candidate));
     checkpoint.ordered_ticket_hashes.push_back(candidate.ticket_work_hash);
     checkpoint.ordered_ticket_nonces.push_back(candidate.ticket_nonce);
+  }
+  if (checkpoint.ordered_members.empty() && active_validator_count == 0 &&
+      empty_active_set_epoch_escape_active_at_height(cfg.network, epoch_start_height)) {
+    if (auto fallback = empty_active_set_escape_member(state.validators); fallback.has_value()) {
+      auto info = state.validators.get(*fallback);
+      if (!info.has_value()) {
+        if (error) *error = "escape-fallback-validator-missing-info";
+        return false;
+      }
+      checkpoint.derivation_mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
+      checkpoint.fallback_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
+      checkpoint.ordered_members = {*fallback};
+      checkpoint.ordered_operator_ids = {canonical_operator_id(*fallback, *info)};
+      checkpoint.ordered_base_weights = {info->bonded_amount};
+      checkpoint.ordered_ticket_bonus_bps = {0};
+      checkpoint.ordered_final_weights = {info->bonded_amount};
+      checkpoint.ordered_ticket_hashes = {zero_hash()};
+      checkpoint.ordered_ticket_nonces = {0};
+    }
   }
   *out = std::move(checkpoint);
   return true;

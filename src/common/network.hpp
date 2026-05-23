@@ -60,6 +60,7 @@ struct NetworkConfig {
   std::uint64_t confidential_utxo_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t deferred_exit_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t bootstrap_penalty_exit_protection_activation_height{std::numeric_limits<std::uint64_t>::max()};
+  std::uint64_t empty_active_set_epoch_escape_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::vector<std::string> default_seeds;
   std::vector<EconomicsConfig> economics_policies;
 };
@@ -72,6 +73,7 @@ bool finality_binding_active_at_height(const NetworkConfig& network, std::uint64
 bool availability_recovery_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool confidential_utxo_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool bootstrap_penalty_exit_protection_active_at_height(const NetworkConfig& network, std::uint64_t height);
+bool empty_active_set_epoch_escape_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool onboarding_admission_pow_enabled(const NetworkConfig& network);
 bool validator_join_admission_pow_enabled(const NetworkConfig& network);
 
