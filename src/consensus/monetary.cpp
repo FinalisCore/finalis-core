@@ -76,29 +76,17 @@ std::uint64_t gross_reward_units_for_height(std::uint64_t height) {
 }  // namespace
 
 std::uint64_t reward_units(std::uint64_t height) {
-  return reward_units(height, ECONOMICS_FORK_HEIGHT);
-}
-
-std::uint64_t reward_units(std::uint64_t height, std::uint64_t economics_fork_height) {
-  (void)economics_fork_height;
+  // CLEANSLATE: The sole emission curve is active from genesis.
   return gross_reward_units_for_height(height);
 }
 
 std::uint64_t validator_reward_units(std::uint64_t height) {
-  return validator_reward_units(height, ECONOMICS_FORK_HEIGHT);
-}
-
-std::uint64_t validator_reward_units(std::uint64_t height, std::uint64_t economics_fork_height) {
-  const auto gross = reward_units(height, economics_fork_height);
+  const auto gross = reward_units(height);
   return gross - reserve_share_of_gross(gross);
 }
 
 std::uint64_t reserve_reward_units(std::uint64_t height) {
-  return reserve_reward_units(height, ECONOMICS_FORK_HEIGHT);
-}
-
-std::uint64_t reserve_reward_units(std::uint64_t height, std::uint64_t economics_fork_height) {
-  return reward_units(height, economics_fork_height) - validator_reward_units(height, economics_fork_height);
+  return reward_units(height) - validator_reward_units(height);
 }
 
 std::uint64_t emission_year_budget_units(std::uint64_t year_index) {
@@ -126,20 +114,9 @@ std::uint64_t onboarding_reward_units(std::uint64_t settlement_reward_units) {
   return wide::mul_div_u64(settlement_reward_units, ONBOARDING_REWARD_BPS, 10'000ULL);
 }
 
-bool economics_fork_active(std::uint64_t height) {
-  return economics_fork_active(height, ECONOMICS_FORK_HEIGHT);
-}
-
-bool economics_fork_active(std::uint64_t height, std::uint64_t economics_fork_height) {
-  return height >= economics_fork_height;
-}
-
 std::uint64_t validator_min_bond_units(std::uint64_t height) {
-  return validator_min_bond_units(height, ECONOMICS_FORK_HEIGHT);
-}
-
-std::uint64_t validator_min_bond_units(std::uint64_t height, std::uint64_t economics_fork_height) {
-  if (!economics_fork_active(height, economics_fork_height)) return BOND_AMOUNT;
+  (void)height;
+  // CLEANSLATE: The post-fork minimum applies without a historical branch.
   return POST_FORK_VALIDATOR_MIN_BOND_UNITS;
 }
 
@@ -223,11 +200,6 @@ std::uint64_t apply_participation_penalty_bps(std::uint64_t reward_weight_units,
 
 Payout compute_payout(std::uint64_t height, std::uint64_t fees_units, const PubKey32& leader_pubkey,
                       std::vector<PubKey32> signer_pubkeys) {
-  return compute_payout(height, fees_units, leader_pubkey, std::move(signer_pubkeys), ECONOMICS_FORK_HEIGHT);
-}
-
-Payout compute_payout(std::uint64_t height, std::uint64_t fees_units, const PubKey32& leader_pubkey,
-                      std::vector<PubKey32> signer_pubkeys, std::uint64_t economics_fork_height) {
   std::sort(signer_pubkeys.begin(), signer_pubkeys.end());
   signer_pubkeys.erase(std::unique(signer_pubkeys.begin(), signer_pubkeys.end()), signer_pubkeys.end());
   std::vector<WeightedParticipant> participants;
@@ -235,19 +207,13 @@ Payout compute_payout(std::uint64_t height, std::uint64_t fees_units, const PubK
   for (const auto& pub : signer_pubkeys) {
     participants.push_back(WeightedParticipant{pub, BOND_AMOUNT, effective_weight(BOND_AMOUNT), 10'000});
   }
-  return compute_weighted_payout(height, fees_units, leader_pubkey, std::move(participants), economics_fork_height);
+  return compute_weighted_payout(height, fees_units, leader_pubkey, std::move(participants));
 }
 
 Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, const PubKey32& leader_pubkey,
                                std::vector<WeightedParticipant> participants) {
-  return compute_weighted_payout(height, fees_units, leader_pubkey, std::move(participants), ECONOMICS_FORK_HEIGHT);
-}
-
-Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, const PubKey32& leader_pubkey,
-                               std::vector<WeightedParticipant> participants,
-                               std::uint64_t economics_fork_height) {
   Payout out;
-  const std::uint64_t reward = validator_reward_units(height, economics_fork_height);
+  const std::uint64_t reward = validator_reward_units(height);
   out.total = reward + fees_units;
 
   std::sort(participants.begin(), participants.end(), [](const WeightedParticipant& a, const WeightedParticipant& b) {

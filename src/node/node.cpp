@@ -10839,11 +10839,9 @@ std::uint64_t Node::effective_validator_bond_max_for_height(std::uint64_t height
 
 std::uint64_t Node::effective_min_relay_fee_for_height(std::uint64_t height) const {
   if (cfg_.min_relay_fee_explicit) return cfg_.min_relay_fee;
-  // Relay fee remains a local policy choice, not a consensus rule. When no
-  // explicit operator override is present, the fork enables a small default
-  // floor to avoid fee-free relay as the chain moves toward fee-funded security.
-  if (consensus::economics_fork_active(height)) return kDefaultPolicyMinRelayFeeUnits;
-  return 0;
+  // CLEANSLATE: The fee-relay floor applies from genesis without fork gating.
+  (void)height;
+  return kDefaultPolicyMinRelayFeeUnits;
 }
 
 bool Node::validate_validator_registration_rules(const Block& block, std::uint64_t height) const {

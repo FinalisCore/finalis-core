@@ -5,7 +5,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+
+#include <nlohmann/json.hpp>
 
 namespace finalis::p2p {
 namespace {
@@ -164,13 +165,12 @@ bool AddrMan::save(const std::string& path) const {
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
   for (const auto& [_, e] : entries_) {
-    // FIX: Preserve one-entry-per-line TSV framing when an OS error contains controls.
-    std::string safe_error = e.last_error;
-    std::replace(safe_error.begin(), safe_error.end(), '\t', ' ');
-    std::replace(safe_error.begin(), safe_error.end(), '\n', ' ');
-    std::replace(safe_error.begin(), safe_error.end(), '\r', ' ');
-    out << e.addr.ip << '\t' << e.addr.port << '\t' << e.last_seen << '\t' << e.last_attempt << '\t'
-        << e.success_count << '\t' << e.fail_count << '\t' << e.score << '\t' << safe_error << '\n';
+    // CLEANSLATE: JSON Lines preserves IPv6 addresses and error text without
+    // relying on ambiguous TSV escaping rules.
+    nlohmann::json line{{"ip", e.addr.ip}, {"port", e.addr.port}, {"last_seen", e.last_seen},
+                        {"last_attempt", e.last_attempt}, {"success_count", e.success_count},
+                        {"fail_count", e.fail_count}, {"score", e.score}, {"last_error", e.last_error}};
+    out << line.dump() << '\n';
   }
   return out.good();
 }
@@ -182,25 +182,19 @@ bool AddrMan::load(const std::string& path) {
   std::string line;
   while (std::getline(in, line)) {
     if (line.empty()) continue;
-    std::stringstream ss(line);
     AddrEntry e;
-    std::string port, last_seen, last_attempt, succ, fail, score;
-    if (!std::getline(ss, e.addr.ip, '\t')) continue;
-    if (!std::getline(ss, port, '\t')) continue;
-    if (!std::getline(ss, last_seen, '\t')) continue;
-    if (!std::getline(ss, last_attempt, '\t')) continue;
-    if (!std::getline(ss, succ, '\t')) continue;
-    if (!std::getline(ss, fail, '\t')) continue;
-    if (!std::getline(ss, score, '\t')) continue;
-    std::getline(ss, e.last_error);
     try {
-      e.addr.port = static_cast<std::uint16_t>(std::stoul(port));
-      e.last_seen = std::stoull(last_seen);
-      e.last_attempt = std::stoull(last_attempt);
-      e.success_count = static_cast<std::uint32_t>(std::stoul(succ));
-      e.fail_count = static_cast<std::uint32_t>(std::stoul(fail));
-      e.score = std::stoi(score);
-    } catch (...) {
+      // CLEANSLATE: Parse each persisted address as a self-contained JSON value.
+      const auto parsed = nlohmann::json::parse(line);
+      e.addr.ip = parsed.at("ip").get<std::string>();
+      e.addr.port = parsed.at("port").get<std::uint16_t>();
+      e.last_seen = parsed.at("last_seen").get<std::uint64_t>();
+      e.last_attempt = parsed.at("last_attempt").get<std::uint64_t>();
+      e.success_count = parsed.at("success_count").get<std::uint32_t>();
+      e.fail_count = parsed.at("fail_count").get<std::uint32_t>();
+      e.score = parsed.at("score").get<int>();
+      e.last_error = parsed.at("last_error").get<std::string>();
+    } catch (const nlohmann::json::exception&) {
       continue;
     }
     if (!accepts(e.addr)) continue;

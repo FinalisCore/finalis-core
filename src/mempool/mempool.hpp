@@ -55,6 +55,7 @@ class Mempool {
   std::size_t total_bytes() const;
   bool contains(const Hash32& txid) const;
   MempoolPolicyStats policy_stats() const;
+  void on_finalized_block_timestamp(std::uint64_t ts);
   void set_validation_context(SpecialValidationContext ctx) { ctx_ = ctx; }
   void set_hashcash_config(policy::HashcashConfig cfg) { hashcash_cfg_ = std::move(cfg); }
   void set_network(NetworkConfig cfg) { network_ = std::move(cfg); }
@@ -88,6 +89,7 @@ class Mempool {
   policy::HashcashConfig hashcash_cfg_{};
   NetworkConfig network_{mainnet_network()};
   std::uint32_t full_replacement_margin_bps_{kDefaultFullReplacementMarginBps};
+  std::uint64_t last_finalized_timestamp_{0};
   std::size_t rejected_full_not_good_enough_{0};
   std::size_t evicted_for_better_incoming_{0};
 };

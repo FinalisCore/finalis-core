@@ -23,14 +23,14 @@ TEST(test_reward_schedule_boundaries) {
   ASSERT_TRUE(reward_units(0) > reward_units(BLOCKS_PER_YEAR_365));
   ASSERT_TRUE(reward_units(BLOCKS_PER_YEAR_365) > reward_units(2 * BLOCKS_PER_YEAR_365));
   ASSERT_TRUE(reward_units(EMISSION_BLOCKS - 1) <= reward_units((EMISSION_YEARS - 1) * BLOCKS_PER_YEAR_365));
-  ASSERT_EQ(reward_units(EMISSION_BLOCKS, EMISSION_BLOCKS + 1), 0ULL);
+  // CLEANSLATE: Emission has a single curve and no fork-height parameter.
+  ASSERT_EQ(reward_units(EMISSION_BLOCKS), 0ULL);
 }
 
 TEST(test_reward_after_emission_before_fork_preserves_zero_reward) {
   using namespace finalis::consensus;
-  const std::uint64_t delayed_fork_height = EMISSION_BLOCKS + 100;
-  ASSERT_EQ(reward_units(EMISSION_BLOCKS, delayed_fork_height), 0ULL);
-  ASSERT_EQ(reward_units(EMISSION_BLOCKS + 99, delayed_fork_height), 0ULL);
+  ASSERT_EQ(reward_units(EMISSION_BLOCKS), 0ULL);
+  ASSERT_EQ(reward_units(EMISSION_BLOCKS + 99), 0ULL);
 }
 
 TEST(test_reward_after_emission_remains_zero) {
@@ -208,7 +208,8 @@ TEST(test_post_cap_reserve_subsidy_respects_gap_floor_and_runway_caps) {
 TEST(test_payout_after_emission_before_fork_is_fees_only) {
   using namespace finalis::consensus;
   const std::uint64_t fees = 12345;
-  const auto p = compute_payout(EMISSION_BLOCKS, fees, pub(0x01), {pub(0x02), pub(0x03)}, EMISSION_BLOCKS + 10);
+  // CLEANSLATE: Payouts derive solely from the genesis-active monetary policy.
+  const auto p = compute_payout(EMISSION_BLOCKS, fees, pub(0x01), {pub(0x02), pub(0x03)});
   ASSERT_EQ(p.total, fees);
   std::uint64_t sum = p.leader;
   for (const auto& it : p.signers) sum += it.second;

@@ -96,15 +96,24 @@ void PeerManager::configure_network(std::uint32_t magic, std::uint16_t proto_ver
 
 bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port) {
   if (!net::ensure_sockets()) return false;
-  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  // CLEANSLATE: A dual-stack IPv6 listener accepts both IPv6 and IPv4 peers.
+  listen_fd_ = ::socket(AF_INET6, SOCK_STREAM, 0);
   if (!net::valid_socket(listen_fd_)) return false;
   net::set_close_on_exec(listen_fd_);
   (void)net::set_reuseaddr(listen_fd_);
+  int v6only = 0;
+  if (::setsockopt(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&v6only), sizeof(v6only)) != 0) {
+    net::close_socket(listen_fd_);
+    listen_fd_ = net::kInvalidSocket;
+    return false;
+  }
 
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  if (inet_pton(AF_INET, bind_ip.c_str(), &addr.sin_addr) != 1) {
+  sockaddr_in6 addr{};
+  addr.sin6_family = AF_INET6;
+  addr.sin6_port = htons(port);
+  if (bind_ip == "0.0.0.0" || bind_ip == "::") {
+    addr.sin6_addr = in6addr_any;
+  } else if (inet_pton(AF_INET6, bind_ip.c_str(), &addr.sin6_addr) != 1) {
     net::close_socket(listen_fd_);
     listen_fd_ = net::kInvalidSocket;
     return false;
@@ -115,10 +124,10 @@ bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port)
     listen_fd_ = net::kInvalidSocket;
     return false;
   }
-  sockaddr_in bound{};
+  sockaddr_in6 bound{};
   socklen_t blen = sizeof(bound);
   if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
-    listen_port_ = ntohs(bound.sin_port);
+    listen_port_ = ntohs(bound.sin6_port);
   } else {
     listen_port_ = port;
   }
@@ -138,7 +147,8 @@ bool PeerManager::connect_to(const std::string& host, std::uint16_t port) {
   if (!running_) running_ = true;
 
   addrinfo hints{};
-  hints.ai_family = AF_INET;
+  // CLEANSLATE: Resolve both address families for outbound peers.
+  hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
   if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return false;
@@ -335,7 +345,7 @@ bool PeerManager::set_peer_handshake_meta(int peer_id, std::uint32_t proto_versi
 
 void PeerManager::accept_loop() {
   while (running_) {
-    sockaddr_in addr{};
+    sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
     net::SocketHandle fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
     if (!net::valid_socket(fd)) {
@@ -343,8 +353,19 @@ void PeerManager::accept_loop() {
       continue;
     }
     net::set_close_on_exec(fd);
-    char ipbuf[64]{};
-    inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf));
+    char ipbuf[NI_MAXHOST]{};
+    if (::getnameinfo(reinterpret_cast<sockaddr*>(&addr), len, ipbuf, sizeof(ipbuf), nullptr, 0, NI_NUMERICHOST) != 0) {
+      net::shutdown_socket(fd);
+      net::close_socket(fd);
+      continue;
+    }
+    char portbuf[NI_MAXSERV]{};
+    if (::getnameinfo(reinterpret_cast<sockaddr*>(&addr), len, nullptr, 0, portbuf, sizeof(portbuf), NI_NUMERICSERV) != 0) {
+      net::shutdown_socket(fd);
+      net::close_socket(fd);
+      continue;
+    }
+    const auto peer_port = static_cast<std::uint16_t>(std::stoul(portbuf));
     bool allowed = true;
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -364,7 +385,7 @@ void PeerManager::accept_loop() {
       net::close_socket(fd);
       continue;
     }
-    start_peer(fd, std::string(ipbuf) + ":" + std::to_string(ntohs(addr.sin_port)), ipbuf, true);
+    start_peer(fd, std::string(ipbuf) + ":" + std::to_string(peer_port), ipbuf, true);
   }
 }
 

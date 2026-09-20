@@ -125,13 +125,23 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
         if (err) *err = "hashcash stamp required";
         return false;
       }
+      // CLEANSLATE: A hashcash timestamp is validated against finalized chain
+      // time; accepting it before such a timestamp exists is non-deterministic.
+      if (last_finalized_timestamp_ == 0) {
+        if (err) *err = "no_finalized_timestamp_yet";
+        return false;
+      }
       if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, required_bits,
-                                         static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+                                         last_finalized_timestamp_, err)) {
         return false;
       }
     } else if (v1.hashcash.has_value()) {
+      if (last_finalized_timestamp_ == 0) {
+        if (err) *err = "no_finalized_timestamp_yet";
+        return false;
+      }
       if (!policy::verify_hashcash_stamp(v1, network_, *v1.hashcash, hashcash_cfg_, 0,
-                                         static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+                                         last_finalized_timestamp_, err)) {
         return false;
       }
     }
@@ -191,6 +201,11 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
   eviction_index_[by_txid_[txid].eviction_key] = txid;
   if (accepted_fee) *accepted_fee = vr.cost.fee;
   return true;
+}
+
+void Mempool::on_finalized_block_timestamp(std::uint64_t ts) {
+  // CLEANSLATE: Mempool policy derives time solely from finalized chain state.
+  last_finalized_timestamp_ = ts;
 }
 
 std::vector<AnyTx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
