@@ -164,8 +164,13 @@ bool AddrMan::save(const std::string& path) const {
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
   for (const auto& [_, e] : entries_) {
+    // FIX: Preserve one-entry-per-line TSV framing when an OS error contains controls.
+    std::string safe_error = e.last_error;
+    std::replace(safe_error.begin(), safe_error.end(), '\t', ' ');
+    std::replace(safe_error.begin(), safe_error.end(), '\n', ' ');
+    std::replace(safe_error.begin(), safe_error.end(), '\r', ' ');
     out << e.addr.ip << '\t' << e.addr.port << '\t' << e.last_seen << '\t' << e.last_attempt << '\t'
-        << e.success_count << '\t' << e.fail_count << '\t' << e.score << '\t' << e.last_error << '\n';
+        << e.success_count << '\t' << e.fail_count << '\t' << e.score << '\t' << safe_error << '\n';
   }
   return out.good();
 }

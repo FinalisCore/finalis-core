@@ -17,7 +17,8 @@ namespace finalis::availability {
 inline constexpr std::size_t kAuditChunkSize = 4096;
 inline constexpr std::size_t kReplicationFactor = 3;
 inline constexpr std::size_t kAuditsPerOperatorPerEpoch = 4;
-inline constexpr std::uint64_t kWarmupEpochs = 14;
+// FIX: 100 validator warmup blocks at 32 blocks/epoch round up to four epochs.
+inline constexpr std::uint64_t kWarmupEpochs = 4;
 inline constexpr std::uint64_t kMinWarmupAudits = 50;
 inline constexpr std::uint32_t kMinWarmupSuccessRateBps = 9800;
 inline constexpr std::uint32_t kScoreDecayAlphaBps = 9800;

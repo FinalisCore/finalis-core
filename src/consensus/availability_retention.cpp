@@ -159,6 +159,13 @@ void update_operator_status(AvailabilityOperatorState* state, const Availability
     state->recovery_consecutive_success_epochs = 0;
     return;
   }
+  // FIX: An ACTIVE operator must continue to satisfy the bond floor, not only
+  // satisfy it at activation, otherwise a reduced bond remains eligible.
+  if (state->status == AvailabilityOperatorStatus::ACTIVE && state->bond < cfg.min_bond) {
+    state->status = AvailabilityOperatorStatus::PROBATION;
+    state->recovery_consecutive_success_epochs = 0;
+    return;
+  }
   if (state->status == AvailabilityOperatorStatus::ACTIVE) state->was_ever_active = true;
 }
 
@@ -230,7 +237,8 @@ std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader&
   if (version >= 2) {
     const auto was_ever_active = r.u8();
     const auto recovery_consecutive_success_epochs = r.u32le();
-    if (!was_ever_active || !recovery_consecutive_success_epochs) return std::nullopt;
+    // FIX: false and zero are valid serialized values; only absent reads are malformed.
+    if (!was_ever_active.has_value() || !recovery_consecutive_success_epochs.has_value()) return std::nullopt;
     state.was_ever_active = (*was_ever_active != 0);
     state.recovery_consecutive_success_epochs = *recovery_consecutive_success_epochs;
   } else {

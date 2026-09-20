@@ -4,7 +4,7 @@
 
 #include <filesystem>
 #include <fstream>
-#include <regex>
+#include <nlohmann/json.hpp>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -24,17 +24,19 @@ constexpr std::size_t kNonceLen = 12;
 constexpr std::size_t kTagLen = 16;
 
 std::optional<std::string> find_json_string(const std::string& json, const std::string& key) {
-  std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-  std::smatch m;
-  if (!std::regex_search(json, m, re)) return std::nullopt;
-  return m[1].str();
+  try {
+    const auto parsed = nlohmann::json::parse(json);
+    if (!parsed.is_object() || !parsed.contains(key) || !parsed.at(key).is_string()) return std::nullopt;
+    return parsed.at(key).get<std::string>();
+  } catch (const nlohmann::json::exception&) { return std::nullopt; }
 }
 
 std::optional<std::uint32_t> find_json_u32(const std::string& json, const std::string& key) {
-  std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
-  std::smatch m;
-  if (!std::regex_search(json, m, re)) return std::nullopt;
-  return static_cast<std::uint32_t>(std::stoul(m[1].str()));
+  try {
+    const auto parsed = nlohmann::json::parse(json);
+    if (!parsed.is_object() || !parsed.contains(key) || !parsed.at(key).is_number_unsigned()) return std::nullopt;
+    return parsed.at(key).get<std::uint32_t>();
+  } catch (const nlohmann::json::exception&) { return std::nullopt; }
 }
 
 bool derive_key_pbkdf2(const std::string& passphrase, const Bytes& salt, std::uint32_t iterations, Bytes* out32) {
@@ -132,7 +134,8 @@ std::string default_validator_keystore_path(const std::string& db_dir) {
 }
 
 std::string hrp_for_network(const std::string& network_name) {
-  (void)network_name;
+  // FIX: Testnet addresses require a distinct HRP to prevent cross-network use.
+  if (network_name == "testnet" || network_name == "tsc") return "tsc";
   return "sc";
 }
 

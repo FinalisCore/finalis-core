@@ -5,6 +5,8 @@
 #include <openssl/ripemd.h>
 #include <openssl/sha.h>
 
+#include <stdexcept>
+
 namespace finalis::crypto {
 
 Hash32 sha256(const Bytes& data) {
@@ -30,7 +32,9 @@ std::array<std::uint8_t, 20> h160(const Bytes& data) {
   // On some OpenSSL 3 installs, RIPEMD-160 is unavailable through EVP fetch and
   // the old code silently returned all-zero hashes, collapsing every pubkey to
   // the same address. Use the direct RIPEMD160 primitive instead.
-  if (!RIPEMD160(sha, SHA256_DIGEST_LENGTH, out.data())) out.fill(0);
+  // FIX: A zero hash makes unrelated public keys map to one address. Fail
+  // closed if the required digest primitive is unavailable.
+  if (!RIPEMD160(sha, SHA256_DIGEST_LENGTH, out.data())) throw std::runtime_error("RIPEMD160 unavailable");
   return out;
 }
 

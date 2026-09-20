@@ -102,14 +102,10 @@ struct AvailabilityCommitteeDecision {
 };
 
 std::uint64_t target_committee_size_for_qualified_depth(std::uint64_t qualified_depth) {
-  if (qualified_depth <= 1) return 1;
-  if (qualified_depth == 2) return 2;
-  if (qualified_depth == 3) return 3;
-  if (qualified_depth <= 6) return 4;
-  if (qualified_depth <= 10) return 7;
-  if (qualified_depth <= 16) return 10;
-  if (qualified_depth <= 24) return 16;
-  return 24 + ((qualified_depth - 24) / 2);
+  // FIX: The adaptive protocol has only the discrete 16 and 24 targets.
+  // This helper is the deterministic initial target; transitions are handled
+  // below with persisted hysteresis streaks.
+  return qualified_depth >= 24 ? 24 : 16;
 }
 
 std::uint64_t fallback_recovery_threshold(std::uint64_t target_committee_size) {
@@ -2197,10 +2193,28 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
 std::uint64_t derive_adaptive_committee_target(const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint,
                                                std::uint64_t qualified_depth, std::uint32_t* expand_streak,
                                                std::uint32_t* contract_streak) {
-  (void)previous_checkpoint;
-  if (expand_streak) *expand_streak = 0;
-  if (contract_streak) *contract_streak = 0;
-  return target_committee_size_for_qualified_depth(qualified_depth);
+  constexpr std::uint64_t kSmallTarget = 16;
+  constexpr std::uint64_t kLargeTarget = 24;
+  constexpr std::uint32_t kExpandEpochs = 6;
+  constexpr std::uint32_t kContractEpochs = 4;
+  const auto prior = adaptive_checkpoint_parameters_from_metadata(previous_checkpoint);
+  std::uint64_t target = (prior.target_committee_size == kSmallTarget || prior.target_committee_size == kLargeTarget)
+                             ? prior.target_committee_size
+                             : target_committee_size_for_qualified_depth(qualified_depth);
+  std::uint32_t expand = 0;
+  std::uint32_t contract = 0;
+  // FIX: Persisted streaks make 16/24 transitions deterministic and prevent
+  // one-epoch membership fluctuations from changing the committee target.
+  if (target == kSmallTarget && qualified_depth >= kLargeTarget) {
+    expand = std::min<std::uint32_t>(kExpandEpochs, prior.target_expand_streak + 1);
+    if (expand >= kExpandEpochs) target = kLargeTarget;
+  } else if (target == kLargeTarget && qualified_depth <= kSmallTarget) {
+    contract = std::min<std::uint32_t>(kContractEpochs, prior.target_contract_streak + 1);
+    if (contract >= kContractEpochs) target = kSmallTarget;
+  }
+  if (expand_streak) *expand_streak = expand;
+  if (contract_streak) *contract_streak = contract;
+  return target;
 }
 
 AdaptiveCheckpointParameters derive_adaptive_checkpoint_parameters(

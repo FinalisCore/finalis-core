@@ -3,6 +3,7 @@
 #include "p2p/hardening.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace finalis::p2p {
 
@@ -93,13 +94,18 @@ PeerScoreStatus PeerDiscipline::add_score(const std::string& ip, MisbehaviorReas
     if (static_cast<int>(e.invalid_frame_strikes.size()) >= invalid_frame_ban_threshold_) {
       const int s = reason_score(reason);
       if (static_cast<int>(e.invalid_frame_strikes.size()) == invalid_frame_ban_threshold_) {
-        e.score += s * invalid_frame_ban_threshold_;
+        // FIX: Strike accumulation must saturate rather than overflow signed int.
+        const auto increment = static_cast<std::int64_t>(s) * invalid_frame_ban_threshold_;
+        e.score = static_cast<int>(std::min<std::int64_t>(std::numeric_limits<int>::max(),
+            static_cast<std::int64_t>(e.score) + increment));
       } else {
-        e.score += s;
+        e.score = static_cast<int>(std::min<std::int64_t>(std::numeric_limits<int>::max(),
+            static_cast<std::int64_t>(e.score) + s));
       }
     }
   } else {
-    e.score += reason_score(reason);
+    e.score = static_cast<int>(std::min<std::int64_t>(std::numeric_limits<int>::max(),
+        static_cast<std::int64_t>(e.score) + reason_score(reason)));
   }
   if (e.score >= ban_score_) e.ban_until = std::max(e.ban_until, now_unix + ban_seconds_);
   return status(ip, now_unix);

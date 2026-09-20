@@ -71,10 +71,19 @@ std::optional<WalletSendPlan> plan_wallet_p2pkh_send(const std::vector<std::pair
   plan.amount_units = amount_units;
   plan.requested_fee_units = requested_fee_units;
 
-  const std::uint64_t target = amount_units + requested_fee_units;
+  // FIX: Fee addition is user-controlled and must not wrap the selection target.
+  std::uint64_t target = 0;
+  if (!checked_add_u64(amount_units, requested_fee_units, &target)) {
+    if (err) *err = "amount and fee overflow";
+    return std::nullopt;
+  }
   for (const auto& prev : deterministic_largest_first_prevs(available_prevs)) {
     plan.selected_prevs.push_back(prev);
-    plan.selected_units += prev.second.value;
+    // FIX: Do not let a crafted UTXO set wrap selected funds.
+    if (!checked_add_u64(plan.selected_units, prev.second.value, &plan.selected_units)) {
+      if (err) *err = "selected funds overflow";
+      return std::nullopt;
+    }
     if (plan.selected_units >= target) break;
   }
   if (plan.selected_units < target) {

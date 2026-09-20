@@ -63,11 +63,10 @@ bool readiness_snapshot_allows_registration(const storage::NodeRuntimeStatusSnap
     }
     return false;
   }
-  // Freshness is advisory once readiness itself is green. This prevents
-  // long-lived false negatives when snapshot persistence lags but readiness
-  // remains satisfied.
+  // FIX: A stale readiness snapshot cannot authorize a new bond registration.
   if (!readiness_snapshot_is_fresh(snapshot, now_ms)) {
     if (reason) *reason = "stale_runtime_snapshot";
+    return false;
   }
   return true;
 }

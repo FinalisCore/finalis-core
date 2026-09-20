@@ -3,6 +3,7 @@
 #include "wallet/utxo_selection.hpp"
 
 #include <algorithm>
+#include <limits>
 
 #include "common/address.hpp"
 #include "crypto/hash.hpp"
@@ -150,6 +151,11 @@ std::optional<UtxoSelection> select_deterministic_utxos(
   selection.required_total = required_total;
   for (const auto& utxo : spendable) {
     selection.selected.push_back(utxo);
+    // FIX: Reject totals that cannot be represented instead of wrapping to a smaller balance.
+    if (selection.selected_total > std::numeric_limits<std::uint64_t>::max() - utxo.prevout.value) {
+      if (err) *err = "selectable funds overflow";
+      return std::nullopt;
+    }
     selection.selected_total += utxo.prevout.value;
     if (selection.selected_total >= required_total) return selection;
   }

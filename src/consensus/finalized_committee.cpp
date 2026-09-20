@@ -3,6 +3,7 @@
 #include "consensus/finalized_committee.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 
@@ -135,7 +136,13 @@ std::vector<FinalizedCommitteeCandidate> aggregate_operator_committee_candidates
   for (const auto& validator : validators) {
     const auto operator_id = (validator.operator_id == PubKey32{}) ? validator.pubkey : validator.operator_id;
     auto& agg = by_operator[operator_id];
-    agg.total_bonded_amount += validator.bonded_amount;
+    // FIX: Saturate aggregate bond weight so a maliciously large registry
+    // entry cannot wrap an operator's effective stake downward.
+    if (agg.total_bonded_amount > std::numeric_limits<std::uint64_t>::max() - validator.bonded_amount) {
+      agg.total_bonded_amount = std::numeric_limits<std::uint64_t>::max();
+    } else {
+      agg.total_bonded_amount += validator.bonded_amount;
+    }
     const bool prefer_canonical_representative =
         !agg.has_representative ||
         operator_representative_hash(operator_id, height, validator.pubkey) <

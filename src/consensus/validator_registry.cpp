@@ -88,16 +88,9 @@ bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t hei
 }
 
 bool ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height) {
-  auto& v = validators_[pub];
-  v.status = ValidatorStatus::PENDING;
-  v.joined_height = joined_height;
-  v.bonded_amount = BOND_AMOUNT;
-  v.operator_id = pub;
-  v.has_bond = true;
-  v.bond_outpoint = bond_outpoint;
-  v.unbond_height = 0;
-  v.last_join_height = joined_height;
-  return true;
+  // FIX: Keep the legacy convenience overload subject to the same validation
+  // and initialization path as every other bond registration.
+  return register_bond(pub, bond_outpoint, joined_height, BOND_AMOUNT, nullptr, std::nullopt);
 }
 
 bool ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height,

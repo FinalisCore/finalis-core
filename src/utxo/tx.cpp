@@ -316,6 +316,8 @@ std::optional<FinalityCertificate> FinalityCertificate::parse(const Bytes& b) {
         auto quorum = r.u32le();
         auto committee_count = r.varint();
         if (!h || !round || !block || !quorum || !committee_count) return false;
+        // FIX: Bound attacker-controlled varints before reserve/iteration.
+        if (*committee_count > MAX_COMMITTEE) return false;
         cert.height = *h;
         cert.round = *round;
         cert.frontier_transition_id = *block;
@@ -329,6 +331,8 @@ std::optional<FinalityCertificate> FinalityCertificate::parse(const Bytes& b) {
         }
         auto sig_count = r.varint();
         if (!sig_count) return false;
+        // FIX: Finality signatures are also bounded by the committee maximum.
+        if (*sig_count > MAX_COMMITTEE) return false;
         cert.signatures.clear();
         cert.signatures.reserve(*sig_count);
         for (std::uint64_t i = 0; i < *sig_count; ++i) {

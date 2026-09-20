@@ -120,7 +120,8 @@ bool verify_ingress_certificate(const IngressCertificate& cert, const std::vecto
   std::set<PubKey32> committee_set(committee.begin(), committee.end());
   std::set<PubKey32> seen;
   for (const auto& sig : cert.sigs) {
-    if (!committee_set.empty() && committee_set.find(sig.validator_pubkey) == committee_set.end()) {
+    // FIX: An empty committee authorizes nobody; it must not disable membership checks.
+    if (committee_set.find(sig.validator_pubkey) == committee_set.end()) {
       if (error) *error = "ingress-cert-signer-not-in-committee";
       return false;
     }
