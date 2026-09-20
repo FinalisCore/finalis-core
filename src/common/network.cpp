@@ -51,8 +51,9 @@ const NetworkConfig kMainnet{
     .suspend_duration_blocks = 1'000,
     .onboarding_admission_pow_difficulty_bits = 20,
     .validator_join_admission_pow_difficulty_bits = 22,
-    .finality_binding_activation_height = std::numeric_limits<std::uint64_t>::max(),
-    .availability_recovery_activation_height = std::numeric_limits<std::uint64_t>::max(),
+    // CLEANSLATE: These finalized-state protections are enabled at restart genesis.
+    .finality_binding_activation_height = 0,
+    .availability_recovery_activation_height = 0,
     .confidential_utxo_activation_height = std::numeric_limits<std::uint64_t>::max(),
     .deferred_exit_activation_height = 10017,
     .bootstrap_penalty_exit_protection_activation_height = 10145,
@@ -63,9 +64,11 @@ const NetworkConfig kMainnet{
             EconomicsConfig{
                 .activation_height = kEconomicsV2ActivationHeight,
                 .target_validators = 16,
-                .base_min_bond = 100ULL * kCoin,
-                .min_bond_floor = BOND_AMOUNT,
-                .min_bond_ceiling = BOND_AMOUNT * 10,
+                // CLEANSLATE: Keep the dynamic bond floor, base, and ceiling
+                // coherent with the genesis 1,000 FLS validator minimum.
+                .base_min_bond = 1'000ULL * kCoin,
+                .min_bond_floor = 1'000ULL * kCoin,
+                .min_bond_ceiling = 10'000ULL * kCoin,
                 .max_effective_bond_multiple = 10,
                 .participation_threshold_bps = 8'000,
                 .ticket_bonus_cap_bps = 1'000,

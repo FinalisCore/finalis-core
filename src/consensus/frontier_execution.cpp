@@ -96,8 +96,9 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
         // - some historical builds persisted certificate.epoch as block height
         // - earliest lane records may carry legacy epoch encodings at seq=1
         // Only apply legacy bypasses for replay contexts, or when validation context is unavailable.
-        const bool allow_legacy_epoch_bypass =
-          expected_ingress_epoch == 0 || (ctx && ctx->allow_legacy_ingress_epoch_replay);
+        // FIX: Epoch zero is a valid expected epoch, not permission to accept
+        // arbitrary certificate epochs. Legacy replay is explicit in context.
+        const bool allow_legacy_epoch_bypass = ctx && ctx->allow_legacy_ingress_epoch_replay;
         const bool legacy_epoch_equals_height =
           allow_legacy_epoch_bypass && ctx && ctx->current_height != 0 &&
             record.certificate.epoch == ctx->current_height;

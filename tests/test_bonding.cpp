@@ -676,7 +676,8 @@ TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {
 
   SpecialValidationContext post_fork{
       .validators = &vr,
-      .current_height = consensus::ECONOMICS_FORK_HEIGHT + UNBOND_DELAY_BLOCKS + 50,
+      // CLEANSLATE: Validator economics are active at genesis.
+      .current_height = UNBOND_DELAY_BLOCKS + 50,
   };
   auto r = validate_tx(tx, 1, view, &post_fork);
   ASSERT_TRUE(r.ok);

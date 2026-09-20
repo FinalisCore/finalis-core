@@ -6,7 +6,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
-#include <regex>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <sstream>
 
@@ -20,30 +20,27 @@ namespace {
 constexpr char kPrefix[] = "SCGENV1";
 
 std::optional<std::string> find_string(const std::string& json, const std::string& key) {
-  std::regex re("\\\"" + key + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
-  std::smatch m;
-  if (!std::regex_search(json, m, re)) return std::nullopt;
-  return m[1].str();
+  try {
+    const auto parsed = nlohmann::json::parse(json);
+    if (!parsed.is_object() || !parsed.contains(key) || !parsed.at(key).is_string()) return std::nullopt;
+    return parsed.at(key).get<std::string>();
+  } catch (const nlohmann::json::exception&) { return std::nullopt; }
 }
 
 std::optional<std::uint64_t> find_u64(const std::string& json, const std::string& key) {
-  std::regex re("\\\"" + key + "\\\"\\s*:\\s*([0-9]+)");
-  std::smatch m;
-  if (!std::regex_search(json, m, re)) return std::nullopt;
-  return static_cast<std::uint64_t>(std::stoull(m[1].str()));
+  try {
+    const auto parsed = nlohmann::json::parse(json);
+    if (!parsed.is_object() || !parsed.contains(key) || !parsed.at(key).is_number_unsigned()) return std::nullopt;
+    return parsed.at(key).get<std::uint64_t>();
+  } catch (const nlohmann::json::exception&) { return std::nullopt; }
 }
 
 std::optional<std::vector<std::string>> find_string_array(const std::string& json, const std::string& key) {
-  std::regex re("\\\"" + key + "\\\"\\s*:\\s*\\[([^\\]]*)\\]");
-  std::smatch m;
-  if (!std::regex_search(json, m, re)) return std::nullopt;
-  const std::string body = m[1].str();
-  std::regex item_re("\\\"([^\\\"]*)\\\"");
-  std::vector<std::string> out;
-  for (std::sregex_iterator it(body.begin(), body.end(), item_re), end; it != end; ++it) {
-    out.push_back((*it)[1].str());
-  }
-  return out;
+  try {
+    const auto parsed = nlohmann::json::parse(json);
+    if (!parsed.is_object() || !parsed.contains(key) || !parsed.at(key).is_array()) return std::nullopt;
+    return parsed.at(key).get<std::vector<std::string>>();
+  } catch (const nlohmann::json::exception&) { return std::nullopt; }
 }
 
 bool parse_pubkey_hex(const std::string& s, PubKey32* out) {
@@ -75,6 +72,22 @@ bool has_suffix(const std::string& s, const std::string& suff) {
 std::optional<Document> parse_json(const std::string& json_text, std::string* err) {
   Document d;
 
+  nlohmann::json parsed;
+  try {
+    // FIX: Parse the complete document structurally; regex cannot safely handle
+    // escaped strings, nested objects, or arbitrary whitespace in genesis data.
+    parsed = nlohmann::json::parse(json_text);
+  } catch (const nlohmann::json::exception&) {
+    if (err) *err = "invalid genesis.json";
+    return std::nullopt;
+  }
+  if (!parsed.is_object() || !parsed.contains("initial_committee_params") ||
+      !parsed.at("initial_committee_params").is_object()) {
+    if (err) *err = "missing required genesis.json fields";
+    return std::nullopt;
+  }
+  const auto committee_params_json = parsed.at("initial_committee_params").dump();
+
   auto version = find_u64(json_text, "version");
   auto network_name = find_string(json_text, "network_name");
   auto protocol_version = find_u64(json_text, "protocol_version");
@@ -84,10 +97,10 @@ std::optional<Document> parse_json(const std::string& json_text, std::string* er
   auto initial_height = find_u64(json_text, "initial_height");
   auto validators = find_string_array(json_text, "initial_validators");
   auto initial_active_set_size = find_u64(json_text, "initial_active_set_size");
-  auto min_committee = find_u64(json_text, "min_committee");
-  auto max_committee = find_u64(json_text, "max_committee");
-  auto sizing_rule = find_string(json_text, "sizing_rule");
-  auto c = find_u64(json_text, "C");
+  auto min_committee = find_u64(committee_params_json, "min_committee");
+  auto max_committee = find_u64(committee_params_json, "max_committee");
+  auto sizing_rule = find_string(committee_params_json, "sizing_rule");
+  auto c = find_u64(committee_params_json, "C");
   auto monetary_params_ref = find_string(json_text, "monetary_params_ref");
 
   if (!version || !network_name || !protocol_version || !network_id_hex || !magic || !genesis_time_unix ||

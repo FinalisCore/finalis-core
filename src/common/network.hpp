@@ -55,8 +55,9 @@ struct NetworkConfig {
   std::uint64_t suspend_duration_blocks{1'000};
   std::uint32_t onboarding_admission_pow_difficulty_bits{0};
   std::uint32_t validator_join_admission_pow_difficulty_bits{0};
-  std::uint64_t finality_binding_activation_height{std::numeric_limits<std::uint64_t>::max()};
-  std::uint64_t availability_recovery_activation_height{std::numeric_limits<std::uint64_t>::max()};
+  // CLEANSLATE: Finality binding and availability recovery are live from genesis.
+  std::uint64_t finality_binding_activation_height{0};
+  std::uint64_t availability_recovery_activation_height{0};
   std::uint64_t confidential_utxo_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t deferred_exit_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t bootstrap_penalty_exit_protection_activation_height{std::numeric_limits<std::uint64_t>::max()};

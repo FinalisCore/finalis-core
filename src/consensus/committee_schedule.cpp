@@ -30,15 +30,17 @@ Hash32 compute_committee_root(const std::vector<ValidatorBestTicket>& committee)
     w.u64le(entry.nonce);
     parts.push_back(w.take());
   }
-  return hash_bytes(Bytes{'S', 'E', 'L', 'F', 'C', 'O', 'I', 'N', '_', 'C', 'O', 'M', 'M', 'I', 'T', 'T', 'E',
-                          'E', '_', 'V', '1'},
+  // FIX: Replace a foreign-project separator so committee roots use Finalis's
+  // protocol domain and cannot accidentally share a hash namespace.
+  return hash_bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'C', 'O', 'M', 'M', 'I', 'T', 'T', 'E', 'E',
+                          '_', 'V', '1'},
                     parts);
 }
 
 Hash32 compute_proposer_seed(const Hash32& epoch_anchor, std::uint64_t height, const Hash32& committee_root) {
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'E', 'L', 'F', 'C', 'O', 'I', 'N', '_', 'P', 'R', 'O', 'P', 'O', 'S', 'E', 'R', '_', 'V',
-                '1'});
+  // FIX: Use the Finalis proposer-seed domain separator.
+  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'P', 'R', 'O', 'P', 'O', 'S', 'E', 'R', '_', 'V', '1'});
   w.bytes_fixed(epoch_anchor);
   w.u64le(height);
   w.bytes_fixed(committee_root);
