@@ -304,8 +304,13 @@ class DB {
   // empty batch (no-op, returns true).
   bool write_batch(Batch& batch, bool disable_wal = false);
 
-  bool open(const std::string& path);
-  bool open_readonly(const std::string& path);
+  // On failure, if `error` is non-null it's populated with the underlying
+  // rocksdb::Status's message (lock held by another process, IO error, disk
+  // full, permission denied, corruption, ...) -- distinguishable detail that
+  // a bare `false` return can't carry. Optional and defaulted so none of the
+  // existing call sites across the codebase need to change.
+  bool open(const std::string& path, std::string* error = nullptr);
+  bool open_readonly(const std::string& path, std::string* error = nullptr);
   bool flush();
   void close();
 

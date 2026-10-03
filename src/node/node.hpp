@@ -678,6 +678,10 @@ class Node {
   p2p::PeerManager p2p_;
 
   std::atomic<bool> pause_proposals_{false};
+  // Throttle for log_line's explicit flush (see its definition) -- mutable
+  // since log_line is const, atomic since it's read/written from every
+  // thread that logs, with no mu_ protection over just this timestamp.
+  mutable std::atomic<std::uint64_t> last_log_flush_ms_{0};
   std::uint64_t last_seed_attempt_ms_{0};
   std::uint64_t last_addrman_save_ms_{0};
   std::uint64_t last_summary_log_ms_{0};
