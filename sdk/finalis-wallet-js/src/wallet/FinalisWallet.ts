@@ -1,8 +1,6 @@
 import { decodeAddress, deriveAddressFromPubkey } from '../address/index.js';
 import { keypairFromPrivkeyHex, keypairFromSeed32 } from '../crypto/ed25519.js';
 import { bytesToHex, hexToBytes } from '../crypto/hash.js';
-import { verifyFinalityProof } from '../proofs/finality.js';
-import { verifySmtProof } from '../proofs/smt.js';
 import { LightServerClient } from '../rpc/LightServerClient.js';
 import { p2pkhScriptPubKeyHexFromAddress, scriptHashHex, scriptHashHexFromAddress } from '../script/index.js';
 import { signInputP2PKH, type Tx, txidHex, serializeTx } from '../tx/tx.js';
@@ -64,32 +62,12 @@ export class FinalisWallet {
     return utxos.reduce((sum, u) => sum + u.valueUnits, 0n);
   }
 
-  async getBalanceTrustless(address: string): Promise<bigint> {
-    const utxos = await this.listUtxos(address);
-    if (utxos.length === 0) return 0n;
-    const tip = await this.client.getTip();
-    const headers = await this.client.getHeaderRange(tip.height, tip.height);
-    if (headers.length !== 1) throw new Error('FINALITY_PROOF_INVALID');
-    const head = headers[0];
-    if (!head.utxo_root) throw new Error('TRUSTLESS_NOT_SUPPORTED');
-    if (head.block_hash !== tip.hash) throw new Error('FINALITY_PROOF_INVALID');
-    const committee = await this.client.getCommittee(tip.height);
-    if (!verifyFinalityProof(head.block_hash, head.finality_proof, committee)) {
-      throw new Error('FINALITY_PROOF_INVALID');
-    }
-
-    let sum = 0n;
-    for (const u of utxos) {
-      const p = await this.client.getUtxoProof(u.txid, u.vout, tip.height);
-      if (p.utxo_root !== head.utxo_root) {
-        throw new Error('SMT_PROOF_INVALID');
-      }
-      if (!verifySmtProof(head.utxo_root, p.key_hex, p.value_hex, p.siblings)) {
-        throw new Error('SMT_PROOF_INVALID');
-      }
-      sum += u.valueUnits;
-    }
-    return sum;
+  // Not available against the current lightserver: there is no header RPC that
+  // binds a utxo_root to a finality certificate, and validators sign
+  // vote_signing_message(height, round, transition_id), not a raw block hash.
+  // Fails closed rather than returning an unverified balance.
+  async getBalanceTrustless(_address: string): Promise<bigint> {
+    throw new Error('TRUSTLESS_NOT_SUPPORTED');
   }
 
   async buildTransaction(params: BuildTxParams): Promise<BuildTxResult> {

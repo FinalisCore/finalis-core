@@ -12,7 +12,8 @@ Features:
 - non-custodial key management (Ed25519 seed/private key)
 - address derivation matching core (`sc` / `tsc`)
 - P2PKH script + single-SHA256 scripthash helpers
-- lightserver JSON-RPC client (`get_status`, `get_tip`, `get_headers`, `get_block`, `get_tx`, `get_utxos`, `get_committee`, `broadcast_tx`)
+- lightserver JSON-RPC client (`get_status`, `get_tip`, `get_tx`, `get_utxos`, `get_committee`, `get_roots`, `get_utxo_proof`, `get_validator_proof`, `broadcast_tx`)
+- `getBalanceTrustless` currently fails closed with `TRUSTLESS_NOT_SUPPORTED` (no finality-bound `utxo_root` RPC yet)
 - deterministic UTXO discovery, balance, coin selection, tx build/sign/broadcast/finality wait
 - optional multi-server tip quorum cross-check mode
 
