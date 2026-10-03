@@ -1562,7 +1562,7 @@ bool DB::write_batch(Batch& batch, bool disable_wal) {
 }
 // --- end DB::Batch ----------------------------------------------------------
 
-bool DB::open(const std::string& path) {
+bool DB::open(const std::string& path, std::string* error) {
   path_ = expand_user_home(path);
   (void)ensure_private_dir(path_);
   readonly_ = false;
@@ -1574,17 +1574,24 @@ bool DB::open(const std::string& path) {
   options.create_if_missing = true;
   std::unique_ptr<rocksdb::DB> raw;
   auto s = open_rocksdb_rw(options, path_, &raw);
-  if (!s.ok()) return false;
+  if (!s.ok()) {
+    if (error) *error = s.ToString();
+    return false;
+  }
   rocks_->db = std::move(raw);
   return true;
 #else
   std::error_code ec;
   std::filesystem::create_directories(path_, ec);
-  return load_file();
+  if (!load_file()) {
+    if (error) *error = "in-memory fallback store: load_file failed";
+    return false;
+  }
+  return true;
 #endif
 }
 
-bool DB::open_readonly(const std::string& path) {
+bool DB::open_readonly(const std::string& path, std::string* error) {
   path_ = expand_user_home(path);
   (void)ensure_private_dir(path_);
   readonly_ = true;
@@ -1596,13 +1603,20 @@ bool DB::open_readonly(const std::string& path) {
   options.create_if_missing = false;
   std::unique_ptr<rocksdb::DB> raw;
   auto s = open_rocksdb_ro(options, path_, &raw);
-  if (!s.ok()) return false;
+  if (!s.ok()) {
+    if (error) *error = s.ToString();
+    return false;
+  }
   rocks_->db = std::move(raw);
   return true;
 #else
   std::error_code ec;
   std::filesystem::create_directories(path_, ec);
-  return load_file();
+  if (!load_file()) {
+    if (error) *error = "in-memory fallback store: load_file failed";
+    return false;
+  }
+  return true;
 #endif
 }
 

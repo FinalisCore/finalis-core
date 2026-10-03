@@ -300,6 +300,21 @@ bool is_loopback_seed_host(const std::string& host) {
   return host == "127.0.0.1" || host.rfind("127.", 0) == 0;
 }
 
+// Mirrors apps/finalis-cli/main.cpp's is_dangerous_root_path(): the destructive
+// CLI maintenance commands (repair_state/full_reindex/fast_sync) already guard
+// against an empty or filesystem-root --db path before touching it. The
+// everyday node boot path had no equivalent, even though it also creates
+// directories (ensure_private_dir) and opens/writes a real DB at whatever
+// path is given.
+bool is_dangerous_db_root_path(const std::filesystem::path& p) {
+  std::error_code ec;
+  const auto norm = std::filesystem::weakly_canonical(p, ec);
+  if (ec) return false;
+  if (norm.empty()) return true;
+  if (norm == norm.root_path()) return true;
+  return false;
+}
+
 struct FrontierBuildSelection {
   FrontierVector next_vector{};
   consensus::CertifiedIngressLaneRecords lane_records;
@@ -3062,13 +3077,20 @@ std::vector<crypto::KeyPair> Node::deterministic_test_keypairs() {
 }
 
 bool Node::init() {
-  // systemd/journald captures stdout via a pipe, which is block-buffered by
-  // default. Force line flushing so quiet followers still emit live handshake
-  // and sync diagnostics instead of holding them until process exit.
-  std::cout.setf(std::ios::unitbuf);
+  // Previously: std::cout.setf(std::ios::unitbuf) here, to make systemd/
+  // journald followers see live log output instead of it sitting in a
+  // block-buffer until exit. That turned every Node::log_line call -- most of
+  // them made with mu_ held on the consensus/handshake hot path -- into a
+  // synchronous flush syscall. log_line now does the same job with a
+  // throttled, at-most-once-per-interval flush instead (see its definition),
+  // so live-log visibility is kept without paying a syscall per log line.
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
   genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
   cfg_.db_path = expand_user_home(cfg_.db_path);
+  if (is_dangerous_db_root_path(cfg_.db_path)) {
+    std::cerr << "refusing to use --db path that resolves to empty or filesystem root: " << cfg_.db_path << "\n";
+    return false;
+  }
   const std::filesystem::path dbp(cfg_.db_path);
   const auto parent = dbp.parent_path();
   if (!parent.empty()) (void)ensure_private_dir(parent.string());
@@ -3150,9 +3172,13 @@ bool Node::init() {
   addr_policy.required_port = cfg_.network.p2p_default_port;
   addr_policy.reject_unroutable = true;
   addrman_.set_policy(addr_policy);
-  if (!db_.open(cfg_.db_path)) {
-    std::cerr << "db open failed: " << cfg_.db_path << "\n";
-    return false;
+  {
+    std::string db_open_error;
+    if (!db_.open(cfg_.db_path, &db_open_error)) {
+      std::cerr << "db open failed: " << cfg_.db_path
+                << (db_open_error.empty() ? "" : (" reason=\"" + db_open_error + "\"")) << "\n";
+      return false;
+    }
   }
   if (cfg_.reindex_on_start) {
     const bool erased = db_.erase(storage::key_consensus_state_commitment_cache());
@@ -11107,9 +11133,24 @@ void Node::log_line(const std::string& s) const {
   if (cfg_.log_json) {
     std::cout << "{\"type\":\"log\",\"node_id\":" << cfg_.node_id << ",\"network\":\"" << cfg_.network.name
               << "\",\"msg\":\"" << s << "\"}\n";
-    return;
+  } else {
+    std::cout << "[node " << cfg_.node_id << "] " << s << "\n";
   }
-  std::cout << "[node " << cfg_.node_id << "] " << s << "\n";
+  // Throttled flush instead of std::ios::unitbuf's per-call flush (removed
+  // from Node::init()): most log_line calls happen with mu_ held on the
+  // consensus/handshake hot path, so flushing every single one turned each
+  // call into a potential blocking syscall under lock contention. Flushing
+  // at most once per kLogFlushIntervalMs keeps systemd/journald followers
+  // seeing output live without paying that cost on every line. The atomic
+  // timestamp is safe across the many threads that call log_line
+  // concurrently without mu_ protecting this particular piece of state.
+  constexpr std::uint64_t kLogFlushIntervalMs = 200;
+  const auto now = now_ms();
+  auto last = last_log_flush_ms_.load(std::memory_order_relaxed);
+  if (now >= last + kLogFlushIntervalMs &&
+      last_log_flush_ms_.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+    std::cout.flush();
+  }
 }
 
 void Node::append_mining_log(const Block& block, std::uint32_t round, std::size_t votes, std::size_t quorum) {
