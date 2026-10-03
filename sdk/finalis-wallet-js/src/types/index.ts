@@ -21,20 +21,6 @@ export interface Status {
   version: string;
 }
 
-export interface FinalitySig {
-  pubkey_hex: Hex;
-  sig_hex: Hex;
-}
-
-export interface HeaderEntry {
-  height: bigint;
-  header_hex: Hex;
-  block_hash: Hex;
-  utxo_root?: Hex;
-  validators_root?: Hex;
-  finality_proof: FinalitySig[];
-}
-
 export interface RootPair {
   height: bigint;
   utxo_root: Hex;

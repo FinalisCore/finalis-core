@@ -73,6 +73,7 @@ EXPOSE 19440 19444
 
 ENTRYPOINT ["finalis-node"]
 CMD ["--db", "/var/lib/finalis/db", "--genesis", "/opt/finalis-core/mainnet/genesis.bin", \
+     "--allow-unsafe-genesis-override", \
      "--validator-key-file", "/var/lib/finalis/keystore/validator.json", \
      "--listen", "--bind", "0.0.0.0", "--port", "19440", \
      "--with-lightserver", "--lightserver-bind", "0.0.0.0", "--lightserver-port", "19444", \

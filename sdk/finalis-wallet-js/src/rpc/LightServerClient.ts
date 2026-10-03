@@ -1,6 +1,5 @@
 import type {
   BroadcastResult,
-  HeaderEntry,
   RootPair,
   RpcUtxo,
   Status,
@@ -121,54 +120,6 @@ export class LightServerClient {
       await this.getTip();
     }
     return this.toStatus(await this.callWithRetry(this.urls[0], 'get_status', {}));
-  }
-
-  async getHeaders(fromHeight: bigint, count: bigint): Promise<HeaderEntry[]> {
-    const raw = await this.callWithRetry<Array<{
-      height: number;
-      header_hex: string;
-      block_hash: string;
-      utxo_root?: string;
-      validators_root?: string;
-      finality_proof: Array<{ pubkey_hex: string; sig_hex: string }>;
-    }>>(this.urls[0], 'get_headers', {
-      from_height: Number(fromHeight),
-      count: Number(count),
-    });
-    return raw.map((r) => ({
-      height: BigInt(r.height),
-      header_hex: r.header_hex.toLowerCase(),
-      block_hash: r.block_hash.toLowerCase(),
-      utxo_root: r.utxo_root?.toLowerCase(),
-      validators_root: r.validators_root?.toLowerCase(),
-      finality_proof: r.finality_proof.map((f) => ({ pubkey_hex: f.pubkey_hex.toLowerCase(), sig_hex: f.sig_hex.toLowerCase() })),
-    }));
-  }
-
-  async getHeaderRange(startHeight: bigint, endHeight: bigint): Promise<HeaderEntry[]> {
-    const raw = await this.callWithRetry<Array<{
-      height: number;
-      header_hex: string;
-      block_hash: string;
-      utxo_root?: string;
-      validators_root?: string;
-      finality_proof: Array<{ pubkey_hex: string; sig_hex: string }>;
-    }>>(this.urls[0], 'get_header_range', {
-      start_height: Number(startHeight),
-      end_height: Number(endHeight),
-    });
-    return raw.map((r) => ({
-      height: BigInt(r.height),
-      header_hex: r.header_hex.toLowerCase(),
-      block_hash: r.block_hash.toLowerCase(),
-      utxo_root: r.utxo_root?.toLowerCase(),
-      validators_root: r.validators_root?.toLowerCase(),
-      finality_proof: r.finality_proof.map((f) => ({ pubkey_hex: f.pubkey_hex.toLowerCase(), sig_hex: f.sig_hex.toLowerCase() })),
-    }));
-  }
-
-  async getBlock(hash: string): Promise<{ block_hex: string }> {
-    return this.callWithRetry(this.urls[0], 'get_block', { hash: hash.toLowerCase() });
   }
 
   async getTx(txid: string): Promise<TxLookup | null> {

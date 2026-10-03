@@ -13,6 +13,25 @@ namespace {
 constexpr std::uint64_t kEconomicsV2ActivationHeight = 0;
 constexpr std::uint64_t kCoin = 100'000'000ULL;
 
+constexpr std::uint64_t kTargetValidators = 16;
+constexpr std::uint64_t kBaseMinBond = 1'000ULL * kCoin;
+constexpr std::uint64_t kMinBondFloor = 1'000ULL * kCoin;
+constexpr std::uint64_t kValidatorBondMaxAmount = BOND_AMOUNT * 100;
+// The adaptive minimum bond must never exceed the structural bond cap.
+constexpr std::uint64_t kMinBondCeiling = kValidatorBondMaxAmount;
+
+constexpr std::uint64_t constexpr_isqrt(std::uint64_t v) {
+  std::uint64_t r = 0;
+  while ((r + 1) * (r + 1) <= v) ++r;
+  return r;
+}
+// Peak of consensus::validator_min_bond_units (one active operator, before clamping).
+constexpr std::uint64_t kAdaptiveMinBondPeak = kBaseMinBond * constexpr_isqrt(kTargetValidators * 100'000'000ULL) / 10'000ULL;
+
+static_assert(kMinBondFloor <= kMinBondCeiling, "min bond floor exceeds ceiling");
+static_assert(kMinBondCeiling <= kValidatorBondMaxAmount, "adaptive min bond ceiling exceeds bond max");
+static_assert(kAdaptiveMinBondPeak <= kMinBondCeiling, "adaptive min bond can be clamped by the ceiling");
+
 std::array<std::uint8_t, 16> network_id_for_name(const std::string& name) {
   const std::string s = "finalis:" + name;
   const Hash32 h = crypto::sha256(Bytes(s.begin(), s.end()));
@@ -40,7 +59,7 @@ const NetworkConfig kMainnet{
     .unbond_delay_blocks = UNBOND_DELAY_BLOCKS,
     .validator_min_bond = BOND_AMOUNT,
     .validator_bond_min_amount = BOND_AMOUNT,
-    .validator_bond_max_amount = BOND_AMOUNT * 100,
+    .validator_bond_max_amount = kValidatorBondMaxAmount,
     .validator_warmup_blocks = WARMUP_BLOCKS,
     .validator_cooldown_blocks = 100,
     .validator_join_limit_window_blocks = 1'000,
@@ -55,20 +74,21 @@ const NetworkConfig kMainnet{
     .finality_binding_activation_height = 0,
     .availability_recovery_activation_height = 0,
     .confidential_utxo_activation_height = std::numeric_limits<std::uint64_t>::max(),
-    .deferred_exit_activation_height = 10017,
-    .bootstrap_penalty_exit_protection_activation_height = 10145,
-    .empty_active_set_epoch_escape_activation_height = 10145,
-    .default_seeds = {},
+    // CLEANSLATE: Fresh genesis; these protections are active from genesis.
+    .deferred_exit_activation_height = 0,
+    .bootstrap_penalty_exit_protection_activation_height = 0,
+    .empty_active_set_epoch_escape_activation_height = 0,
+    .default_seeds = {"85.217.171.168:19440", "64.23.244.126:19440"},
     .economics_policies =
         {
             EconomicsConfig{
                 .activation_height = kEconomicsV2ActivationHeight,
-                .target_validators = 16,
-                // CLEANSLATE: Keep the dynamic bond floor, base, and ceiling
-                // coherent with the genesis 1,000 FLS validator minimum.
-                .base_min_bond = 1'000ULL * kCoin,
-                .min_bond_floor = 1'000ULL * kCoin,
-                .min_bond_ceiling = 10'000ULL * kCoin,
+                .target_validators = kTargetValidators,
+                // CLEANSLATE: Adaptive min bond ranges 1,000-4,000 FLS; the ceiling
+                // is pinned to validator_bond_max_amount (see static_asserts above).
+                .base_min_bond = kBaseMinBond,
+                .min_bond_floor = kMinBondFloor,
+                .min_bond_ceiling = kMinBondCeiling,
                 .max_effective_bond_multiple = 10,
                 .participation_threshold_bps = 8'000,
                 .ticket_bonus_cap_bps = 1'000,

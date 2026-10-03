@@ -3,6 +3,7 @@
 #include "node.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <cstdlib>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
 
 #ifndef _WIN32
@@ -12553,7 +12555,18 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
   }
 }
 
-std::optional<NodeConfig> parse_args(int argc, char** argv) {
+// Strict TCP port parse: whole string must be a number in [1, 65535].
+static std::uint16_t parse_port_arg(const std::string& s) {
+  std::size_t pos = 0;
+  const unsigned long v = std::stoul(s, &pos);
+  if (pos != s.size()) throw std::invalid_argument("trailing characters");
+  if (v == 0 || v > 65535) throw std::out_of_range("port must be in [1, 65535]");
+  return static_cast<std::uint16_t>(v);
+}
+
+// Numeric conversions below throw std::invalid_argument / std::out_of_range;
+// parse_args() catches them and reports the offending flag.
+static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std::string* current_flag) {
   NodeConfig cfg;
   cfg.listen = false;  // safe CLI default: outbound-only unless --listen is set
   cfg.network = mainnet_network();
@@ -12564,9 +12577,35 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
   bool bind_explicit = false;
   bool db_explicit = false;
   std::string validator_passphrase_env;
+  // Flags that change consensus-derived state or validator rules. Every mainnet
+  // node must use the canonical NetworkConfig values, so these are rejected there.
+  static constexpr std::array<std::string_view, 11> kMainnetLockedConsensusFlags{
+      "--max-committee",
+      "--validator-min-bond",
+      "--validator-warmup-blocks",
+      "--validator-cooldown-blocks",
+      "--validator-join-limit-window-blocks",
+      "--validator-join-limit-max-new",
+      "--liveness-window-blocks",
+      "--miss-rate-suspend-threshold-percent",
+      "--miss-rate-exit-threshold-percent",
+      "--suspend-duration-blocks",
+      "--deferred-exit-activation-height",
+  };
+  const bool mainnet_consensus_locked = cfg.network.name == "mainnet";
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
+    *current_flag = a;
+    if (mainnet_consensus_locked &&
+        (a == "--deferred-exit-activation-epoch-start" ||
+         std::find(kMainnetLockedConsensusFlags.begin(), kMainnetLockedConsensusFlags.end(), a) !=
+             kMainnetLockedConsensusFlags.end())) {
+      std::cerr << "error: " << a
+                << " overrides a consensus parameter and is not allowed on mainnet; "
+                   "all mainnet nodes must use the canonical network values\n";
+      return std::nullopt;
+    }
     auto next = [&](const std::string& name) -> std::optional<std::string> {
       if (i + 1 >= argc) {
         std::cerr << "missing value for " << name << "\n";
@@ -12585,7 +12624,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     } else if (a == "--port") {
       auto v = next(a);
       if (!v) return std::nullopt;
-      cfg.p2p_port = static_cast<std::uint16_t>(std::stoi(*v));
+      cfg.p2p_port = parse_port_arg(*v);
     } else if (a == "--external-endpoint") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -12671,7 +12710,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     } else if (a == "--lightserver-port") {
       auto v = next(a);
       if (!v) return std::nullopt;
-      cfg.lightserver_port = static_cast<std::uint16_t>(std::stoi(*v));
+      cfg.lightserver_port = parse_port_arg(*v);
     } else if (a == "--bind") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -12908,6 +12947,18 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
   if (!db_explicit) cfg.db_path = default_db_dir_for_network(cfg.network.name);
   if (cfg.public_mode && !bind_explicit) cfg.bind_ip = "0.0.0.0";
   return cfg;
+}
+
+std::optional<NodeConfig> parse_args(int argc, char** argv) {
+  std::string current_flag;
+  try {
+    return parse_args_unchecked(argc, argv, &current_flag);
+  } catch (const std::invalid_argument&) {
+    std::cerr << "error: invalid numeric value for " << current_flag << "\n";
+  } catch (const std::out_of_range& e) {
+    std::cerr << "error: value out of range for " << current_flag << " (" << e.what() << ")\n";
+  }
+  return std::nullopt;
 }
 
 }  // namespace finalis::node
