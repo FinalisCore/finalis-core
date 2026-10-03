@@ -146,8 +146,9 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
       count_eligible_operators_at_checkpoint(state.validators, epoch_start_height, availability_state,
                                              availability_config_with_min_bond(cfg.availability, decision.adaptive.min_bond));
   decision.min_eligible_operators = decision.adaptive.min_eligible_operators;
-  decision.effective_committee_size =
-      std::max<std::uint64_t>(1, std::min(decision.eligible_operator_count, decision.adaptive.target_committee_size));
+  // Spec §11: committee = min(K, len(C)). FALLBACK must not shrink K to the
+  // availability-eligible count; len(C) is applied by the callers' take.
+  decision.effective_committee_size = std::max<std::uint64_t>(1, decision.adaptive.target_committee_size);
   if (decision.min_eligible_operators == 0) return decision;
 
   if (decision.eligible_operator_count < decision.min_eligible_operators) {
@@ -545,7 +546,11 @@ std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_heig
         enforce_availability);
     if (!eligibility.eligible) continue;
     auto& seed = by_operator[operator_id];
-    seed.bonded_amount += info.bonded_amount;
+    if (seed.bonded_amount > std::numeric_limits<std::uint64_t>::max() - info.bonded_amount) {
+      seed.bonded_amount = std::numeric_limits<std::uint64_t>::max();
+    } else {
+      seed.bonded_amount += info.bonded_amount;
+    }
     if (!seed.has_representative || pub < seed.representative_pub) {
       seed.representative_pub = pub;
       seed.has_representative = true;
