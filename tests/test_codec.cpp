@@ -475,6 +475,7 @@ TEST(test_frontier_transition_and_ingress_db_roundtrip) {
   transition.prev_finalized_hash.fill(0x12);
   transition.prev_finality_link_hash.fill(0x13);
   transition.height = 5;
+  transition.timestamp = 1'700'000'000ULL;
   transition.round = 2;
   transition.leader_pubkey.fill(0x14);
   transition.prev_vector.lane_max_seq[0] = 7;
@@ -500,7 +501,14 @@ TEST(test_frontier_transition_and_ingress_db_roundtrip) {
   auto transition_parsed = FrontierTransition::parse(transition_ser);
   ASSERT_TRUE(transition_parsed.has_value());
   ASSERT_EQ(transition_parsed->serialize(), transition_ser);
+  ASSERT_EQ(transition_parsed->timestamp, transition.timestamp);
   const auto transition_id = transition.transition_id();
+
+  auto other = transition;
+  other.timestamp += 1;
+  ASSERT_NE(other.transition_id(), transition_id);
+
+  ASSERT_EQ(mainnet_network().magic, MAGIC);
 
   const std::string path = unique_test_base("/tmp/finalis_test_ingress_db");
   std::filesystem::remove_all(path);

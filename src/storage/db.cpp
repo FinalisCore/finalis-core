@@ -8,13 +8,19 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <thread>
 
 #include "codec/bytes.hpp"
 #include "common/paths.hpp"
 #include "crypto/hash.hpp"
 
 #ifdef SC_HAS_ROCKSDB
+#include <rocksdb/cache.h>
 #include <rocksdb/db.h>
+#include <rocksdb/rate_limiter.h>
+#include <rocksdb/table.h>
+#include <rocksdb/write_batch.h>
+#include <rocksdb/write_buffer_manager.h>
 #endif
 
 namespace finalis::storage {
@@ -57,6 +63,114 @@ rocksdb::Status open_rocksdb_ro(const rocksdb::Options& options, const std::stri
   if (status.ok()) out->reset(raw);
   return status;
 #endif
+}
+
+// Shared literal constants for the two places (build_rocksdb_options() and
+// set_bootstrap_ingest_mode's reset_baseline()) that configure the L0 soft-throttle
+// trigger points, so they can't drift apart the way the old hardcoded reset_baseline()
+// literals did.
+constexpr int kRocksDbLevel0SlowdownWritesTrigger = 12;
+constexpr int kRocksDbLevel0StopWritesTrigger = 24;
+
+// Shared by build_rocksdb_options() (normal open()/open_readonly() path) and
+// set_bootstrap_ingest_mode's reset_baseline() (what "normal runtime" reverts to
+// after a bootstrap-ingest burst ends). Computed once from the same inputs in both
+// places so the two paths can never disagree -- nothing resets max_background_jobs
+// back to a stale hardcoded value.
+std::uint64_t rocksdb_target_parallelism() {
+  const auto hw_threads = std::max<unsigned>(4u, std::thread::hardware_concurrency());
+  return env_u64_or_default("FINALIS_DB_PARALLELISM", hw_threads, 4, 64);
+}
+
+// Same sharing rationale as rocksdb_target_parallelism(): build_rocksdb_options() and
+// reset_baseline() must derive the memtable budget from the same source, or "normal
+// runtime" after an ingest-mode cycle silently diverges from what open() established.
+std::uint64_t rocksdb_target_memtable_budget_mb() {
+  return env_u64_or_default("FINALIS_DB_MEMTABLE_BUDGET_MB", 256, 64, 4096);
+}
+
+struct LevelStyleCfTuning {
+  std::uint64_t write_buffer_size;
+  std::uint64_t max_write_buffer_number;
+  std::uint64_t min_write_buffer_number_to_merge;
+  std::uint64_t level0_file_num_compaction_trigger;
+  std::uint64_t target_file_size_base;
+  std::uint64_t max_bytes_for_level_base;
+};
+
+// Mirrors the exact arithmetic rocksdb::ColumnFamilyOptions::OptimizeLevelStyleCompaction
+// applies internally for a given memtable budget (write_buffer_size = budget/4,
+// target_file_size_base = budget/8, max_bytes_for_level_base = budget,
+// min_write_buffer_number_to_merge = 2, max_write_buffer_number = 6,
+// level0_file_num_compaction_trigger = 2 -- see rocksdb/options.cc in librocksdb-dev).
+// build_rocksdb_options() calls the native OptimizeLevelStyleCompaction() helper directly
+// at DB-open time, which has access to the real Options-builder API. reset_baseline() only
+// has RocksDB's string-keyed SetOptions() available on an already-open DB -- there's no
+// "call OptimizeLevelStyleCompaction dynamically" entry point -- so it replicates the same
+// formula here from the same memtable_budget_mb rather than hardcoding independent literals
+// that would silently drift out of sync with what open() established.
+LevelStyleCfTuning level_style_cf_tuning_for_budget(std::uint64_t memtable_budget_bytes) {
+  LevelStyleCfTuning t;
+  t.write_buffer_size = memtable_budget_bytes / 4;
+  t.max_write_buffer_number = 6;
+  t.min_write_buffer_number_to_merge = 2;
+  t.level0_file_num_compaction_trigger = 2;
+  t.target_file_size_base = memtable_budget_bytes / 8;
+  t.max_bytes_for_level_base = memtable_budget_bytes;
+  return t;
+}
+
+// Centralizes RocksDB tuning for both the read-write and read-only open paths, so
+// compaction has enough background parallelism to keep up with sustained per-block
+// write_batch() bursts, and if it ever does fall behind, degrades via a bounded
+// delayed_write_rate instead of an unbounded slowdown escalating to a hard stop.
+// See the db.cpp/db.hpp blueprint discussion for the write-stall mechanism this
+// addresses: with only 2 background jobs and RocksDB's default
+// level0_stop_writes_trigger, sustained block-finalization writes could make L0
+// climb toward a hard write stop inside rocksdb::DB::Write() -- which DB::write_batch
+// and DB::put call while mu_ is held in the node's finalization path.
+rocksdb::Options build_rocksdb_options() {
+  rocksdb::Options options;
+  options.create_if_missing = true;
+
+  // 1. Parallelism: split into Env::Priority::HIGH (flush) / LOW (compaction)
+  // thread pools under the hood, scoped to this DB's Options rather than
+  // reaching into the process-wide shared Env directly.
+  const auto parallelism = rocksdb_target_parallelism();
+  options.IncreaseParallelism(static_cast<int>(parallelism));
+  options.max_background_jobs = static_cast<int>(parallelism);
+
+  // 2. Coherent level-compaction tuning bundle, sized to a target memtable budget,
+  // instead of ad hoc individual knobs that can drift out of a sane combination.
+  const auto memtable_budget_mb = rocksdb_target_memtable_budget_mb();
+  options.OptimizeLevelStyleCompaction(memtable_budget_mb * 1024ULL * 1024ULL);
+
+  // 3. Explicit, bounded soft-throttle: slowdown triggers well before stop, and
+  // delayed_write_rate is set so "slow" means a known rate, not an unbounded stall.
+  options.level0_slowdown_writes_trigger = kRocksDbLevel0SlowdownWritesTrigger;
+  options.level0_stop_writes_trigger = kRocksDbLevel0StopWritesTrigger;
+  options.delayed_write_rate = static_cast<std::uint64_t>(
+      env_u64_or_default("FINALIS_DB_DELAYED_WRITE_RATE_BYTES_S", 32ULL * 1024 * 1024, 1024 * 1024,
+                          512ULL * 1024 * 1024));
+
+  // 4. Cap background compaction+flush I/O so it can't fully saturate disk
+  // bandwidth and starve the foreground WAL write that DB::write_batch/DB::put
+  // depend on. Defaults are a starting point, not a measured value -- see the
+  // blueprint discussion on why these deserve a real benchmark pass.
+  const auto rate_limit_bytes_s = env_u64_or_default("FINALIS_DB_RATE_LIMITER_BYTES_S", 64ULL * 1024 * 1024,
+                                                      8ULL * 1024 * 1024, 1024ULL * 1024 * 1024);
+  options.rate_limiter.reset(rocksdb::NewGenericRateLimiter(static_cast<std::int64_t>(rate_limit_bytes_s)));
+
+  // 5. Explicit total memtable memory cap, rather than relying only on
+  // write_buffer_size * max_write_buffer_number.
+  options.write_buffer_manager =
+      std::make_shared<rocksdb::WriteBufferManager>(memtable_budget_mb * 1024ULL * 1024ULL);
+
+  // 6. Minor: smaller SST metadata on the bottommost level (less to write during
+  // its compactions) at the cost of slightly worse negative-lookup performance there.
+  options.optimize_filters_for_hits = true;
+
+  return options;
 }
 #endif
 
@@ -1259,6 +1373,195 @@ class DB::RocksImpl {
 DB::DB() = default;
 DB::~DB() = default;
 
+// --- DB::Batch -------------------------------------------------------------
+//
+// Accumulates Put/Delete ops for one atomic DB::write_batch() commit. Every
+// typed method here mirrors the single-op DB::put_X/set_X it stages for, and
+// reuses the exact same key_*/serialize_* helpers (above, file-local) so the
+// batched and non-batched encodings can never drift apart.
+
+struct DB::Batch::Impl {
+#ifdef SC_HAS_ROCKSDB
+  rocksdb::WriteBatch wb;
+#else
+  // nullopt value == delete. Applied to mem_ in order by DB::write_batch().
+  std::vector<std::pair<std::string, std::optional<Bytes>>> ops;
+#endif
+};
+
+DB::Batch::Batch(DB& owner) : db_(owner), impl_(std::make_unique<Impl>()) {}
+DB::Batch::~Batch() = default;
+
+void DB::Batch::put(const std::string& key, const Bytes& value) {
+#ifdef SC_HAS_ROCKSDB
+  impl_->wb.Put(key, rocksdb::Slice(reinterpret_cast<const char*>(value.data()), value.size()));
+#else
+  impl_->ops.emplace_back(key, value);
+#endif
+}
+
+void DB::Batch::erase(const std::string& key) {
+#ifdef SC_HAS_ROCKSDB
+  impl_->wb.Delete(key);
+#else
+  impl_->ops.emplace_back(key, std::nullopt);
+#endif
+}
+
+bool DB::Batch::empty() const {
+#ifdef SC_HAS_ROCKSDB
+  return impl_->wb.Count() == 0;
+#else
+  return impl_->ops.empty();
+#endif
+}
+
+bool DB::Batch::put_finality_certificate(const FinalityCertificate& cert) {
+  if (auto existing = db_.get_finality_certificate_by_height(cert.height); existing.has_value()) {
+    if (existing->frontier_transition_id != cert.frontier_transition_id || existing->serialize() != cert.serialize()) {
+      std::cerr << "finalized-state-invariant-violation source=db-write-finality-certificate height=" << cert.height
+                << " existing_hash=" << hex_encode(Bytes(existing->frontier_transition_id.begin(), existing->frontier_transition_id.end()))
+                << " conflicting_hash=" << hex_encode(Bytes(cert.frontier_transition_id.begin(), cert.frontier_transition_id.end())) << "\n";
+      return false;
+    }
+  }
+  put(key_finality_certificate_height(cert.height), cert.serialize());
+  return true;
+}
+
+bool DB::Batch::set_height_hash(std::uint64_t height, const Hash32& hash) {
+  if (auto existing = db_.get_height_hash(height); existing.has_value() && *existing != hash) {
+    std::cerr << "finalized-state-invariant-violation source=db-write-height-index height=" << height
+              << " existing_hash=" << hex_encode(Bytes(existing->begin(), existing->end()))
+              << " conflicting_hash=" << hex_encode(Bytes(hash.begin(), hash.end())) << "\n";
+    return false;
+  }
+  put(key_height(height), Bytes(hash.begin(), hash.end()));
+  return true;
+}
+
+bool DB::Batch::put_ingress_record(std::uint64_t seq, const Bytes& record_bytes) {
+  const auto key = key_ingress_record(seq);
+  if (auto existing = db_.get(key); existing.has_value() && *existing != record_bytes) {
+    std::cerr << "finalized-state-invariant-violation source=db-write-ingress-record seq=" << seq << "\n";
+    return false;
+  }
+  put(key, record_bytes);
+  return true;
+}
+
+bool DB::Batch::put_frontier_transition(const Hash32& id, const Bytes& transition_bytes) {
+  const auto key = key_frontier_transition(id);
+  if (auto existing = db_.get(key); existing.has_value() && *existing != transition_bytes) {
+    std::cerr << "finalized-state-invariant-violation source=db-write-frontier-transition id="
+              << hex_encode(Bytes(id.begin(), id.end())) << "\n";
+    return false;
+  }
+  put(key, transition_bytes);
+  return true;
+}
+
+bool DB::Batch::map_height_to_frontier_transition(std::uint64_t height, const Hash32& id) {
+  const auto key = key_frontier_height(height);
+  const Bytes value(id.begin(), id.end());
+  if (auto existing = db_.get(key); existing.has_value() && *existing != value) {
+    std::cerr << "finalized-state-invariant-violation source=db-map-frontier-height height=" << height << "\n";
+    return false;
+  }
+  put(key, value);
+  return true;
+}
+
+bool DB::Batch::set_finalized_frontier_height(std::uint64_t height) {
+  if (auto existing = db_.get_finalized_frontier_height(); existing.has_value() && *existing > height) {
+    std::cerr << "finalized-state-invariant-violation source=db-set-finalized-frontier-height height=" << height
+              << " existing=" << *existing << "\n";
+    return false;
+  }
+  codec::ByteWriter w;
+  w.u64le(height);
+  put(key_finalized_frontier_height(), w.take());
+  return true;
+}
+
+void DB::Batch::put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  w.u32le(tx_index);
+  w.varbytes(tx_bytes);
+  put(key_txidx(txid), w.take());
+}
+
+void DB::Batch::add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid) {
+  put(key_script_history(scripthash, height, txid), {});
+}
+
+void DB::Batch::stage_finalized_ingress_tip(std::uint64_t seq) {
+  codec::ByteWriter w;
+  w.u64le(seq);
+  put(key_finalized_ingress_tip(), w.take());
+}
+
+void DB::Batch::set_tip(const TipState& tip) { put(key_tip(), serialize_tip(tip)); }
+
+void DB::Batch::put_utxo_v2(const OutPoint& op, const UtxoEntryV2& entry) {
+  put(key_utxo(op), serialize_utxo_entry_v2(entry));
+}
+
+void DB::Batch::put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxOut& out, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  w.u64le(out.value);
+  w.varbytes(out.script_pubkey);
+  put(key_script_utxo(scripthash, op), w.take());
+}
+
+void DB::Batch::put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info) {
+  put(key_validator(pub), serialize_validator(info));
+}
+
+void DB::Batch::put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req) {
+  put(key_validator_join_request(request_txid), serialize_validator_join_request(req));
+}
+
+void DB::Batch::put_epoch_reward_settlement(const EpochRewardSettlementState& state) {
+  put(key_epoch_reward_settlement(state.epoch_start_height), serialize_epoch_reward_settlement(state));
+}
+
+void DB::Batch::put_protocol_reserve_balance(std::uint64_t balance_units) {
+  codec::ByteWriter w;
+  w.u64le(balance_units);
+  put(key_protocol_reserve_balance(), w.take());
+}
+
+void DB::Batch::put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint) {
+  put(key_finalized_committee_checkpoint(checkpoint.epoch_start_height), serialize_finalized_committee_checkpoint(checkpoint));
+}
+
+void DB::Batch::put_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& snapshot) {
+  put(key_node_runtime_status_snapshot(), serialize_node_runtime_status_snapshot(snapshot));
+}
+
+void DB::Batch::put_consensus_state_commitment_cache(const ConsensusStateCommitmentCache& cache) {
+  put(key_consensus_state_commitment_cache(), serialize_consensus_state_commitment_cache(cache));
+}
+
+bool DB::write_batch(Batch& batch, bool disable_wal) {
+  if (readonly_) return false;
+  if (batch.empty()) return true;
+#ifdef SC_HAS_ROCKSDB
+  rocksdb::WriteOptions opts;
+  opts.disableWAL = disable_wal;
+  return rocks_->db->Write(opts, &batch.impl_->wb).ok();
+#else
+  for (auto& [k, v] : batch.impl_->ops) {
+    if (v.has_value()) mem_[k] = *v; else mem_.erase(k);
+  }
+  return flush_file();
+#endif
+}
+// --- end DB::Batch ----------------------------------------------------------
+
 bool DB::open(const std::string& path) {
   path_ = expand_user_home(path);
   (void)ensure_private_dir(path_);
@@ -1267,7 +1570,7 @@ bool DB::open(const std::string& path) {
   std::error_code ec;
   std::filesystem::create_directories(path_, ec);
   rocks_ = std::make_unique<RocksImpl>();
-  rocksdb::Options options;
+  rocksdb::Options options = build_rocksdb_options();
   options.create_if_missing = true;
   std::unique_ptr<rocksdb::DB> raw;
   auto s = open_rocksdb_rw(options, path_, &raw);
@@ -1289,7 +1592,7 @@ bool DB::open_readonly(const std::string& path) {
   std::error_code ec;
   std::filesystem::create_directories(path_, ec);
   rocks_ = std::make_unique<RocksImpl>();
-  rocksdb::Options options;
+  rocksdb::Options options = build_rocksdb_options();
   options.create_if_missing = false;
   std::unique_ptr<rocksdb::DB> raw;
   auto s = open_rocksdb_ro(options, path_, &raw);
@@ -1338,17 +1641,33 @@ bool DB::set_bootstrap_ingest_mode(bool enabled) {
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;
   const auto reset_baseline = [this]() -> bool {
+    // Everything here must reset to the same values build_rocksdb_options() established
+    // when this DB was opened, not independent hardcoded literals -- otherwise every
+    // bootstrap-ingest-mode cycle silently undoes the Step 3 compaction tuning the
+    // moment ingest mode turns back off, which is exactly the "normal runtime" state
+    // the node spends most of its life in. max_background_jobs/bytes_per_sync/
+    // delayed_write_rate are DBOptions (DB-wide), set via SetDBOptions; the
+    // level-style compaction bundle (write_buffer_size and friends) is
+    // ColumnFamilyOptions, set via SetOptions on the default CF.
+    const auto delayed_write_rate = env_u64_or_default("FINALIS_DB_DELAYED_WRITE_RATE_BYTES_S", 32ULL * 1024 * 1024,
+                                                        1024 * 1024, 512ULL * 1024 * 1024);
     const auto db_opts = rocks_->db->SetDBOptions({
-        {"max_background_jobs", "2"},
+        {"max_background_jobs", std::to_string(rocksdb_target_parallelism())},
         {"bytes_per_sync", "0"},
+        {"delayed_write_rate", std::to_string(delayed_write_rate)},
     });
     if (!db_opts.ok()) return false;
-    const auto cf_opts = rocks_->db->SetOptions(rocks_->db->DefaultColumnFamily(),
-                                                {{"write_buffer_size", "67108864"},
-                                                 {"max_write_buffer_number", "2"},
-                                                 {"min_write_buffer_number_to_merge", "1"},
-                                                 {"level0_file_num_compaction_trigger", "4"},
-                                                 {"target_file_size_base", "67108864"}});
+    const auto tuning = level_style_cf_tuning_for_budget(rocksdb_target_memtable_budget_mb() * 1024ULL * 1024ULL);
+    const auto cf_opts = rocks_->db->SetOptions(
+        rocks_->db->DefaultColumnFamily(),
+        {{"write_buffer_size", std::to_string(tuning.write_buffer_size)},
+         {"max_write_buffer_number", std::to_string(tuning.max_write_buffer_number)},
+         {"min_write_buffer_number_to_merge", std::to_string(tuning.min_write_buffer_number_to_merge)},
+         {"level0_file_num_compaction_trigger", std::to_string(tuning.level0_file_num_compaction_trigger)},
+         {"target_file_size_base", std::to_string(tuning.target_file_size_base)},
+         {"max_bytes_for_level_base", std::to_string(tuning.max_bytes_for_level_base)},
+         {"level0_slowdown_writes_trigger", std::to_string(kRocksDbLevel0SlowdownWritesTrigger)},
+         {"level0_stop_writes_trigger", std::to_string(kRocksDbLevel0StopWritesTrigger)}});
     return cf_opts.ok();
   };
   if (enabled) {

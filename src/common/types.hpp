@@ -16,7 +16,7 @@ using PubKey32 = std::array<std::uint8_t, 32>;
 using PubKey33 = std::array<std::uint8_t, 33>;
 using Sig64 = std::array<std::uint8_t, 64>;
 
-constexpr std::uint32_t MAGIC = 0x53434F49;
+constexpr std::uint32_t MAGIC = 0x499602D2;
 constexpr std::uint16_t PROTOCOL_VERSION = 1;
 constexpr std::uint64_t BLOCK_REWARD = 50'0000'0000ULL;
 constexpr std::uint64_t BOND_AMOUNT = 50'0000'0000ULL;

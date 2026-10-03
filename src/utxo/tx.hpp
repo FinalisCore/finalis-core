@@ -179,6 +179,7 @@ struct FrontierTransition {
   Hash32 prev_finalized_hash{};
   Hash32 prev_finality_link_hash{};
   std::uint64_t height{0};
+  std::uint64_t timestamp{0};
   std::uint32_t round{0};
   PubKey32 leader_pubkey{};
   FrontierVector prev_vector{};

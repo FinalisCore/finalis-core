@@ -1,0 +1,143 @@
+version: "3.8"
+
+# Local private 3-node testnet, mirroring the bare-metal convention already
+# established in scripts/start_lab_node.sh: all nodes share the same
+# mainnet/genesis.bin baked into the image (--allow-unsafe-genesis-override,
+# since that genesis is only being used as a shared starting point, not an
+# actual mainnet deployment), each node generates and persists its own
+# validator key on first run (Node::init_local_validator_key() auto-creates
+# the keystore file if --validator-key-file doesn't exist yet -- no extra
+# flag needed), and nodes find each other via Docker Compose's embedded
+# service-name DNS on the user-defined bridge network instead of LAN IPs.
+
+networks:
+  finalis_net:
+    driver: bridge
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
+
+x-finalis-common: &finalis-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  # Steps 1-3 RocksDB tuning: read directly from the process environment by
+  # src/storage/db.cpp's env_u64_or_default() calls. The Dockerfile already
+  # bakes these in as image defaults; set explicitly here too so the tuning
+  # is visible/overridable per container without rebuilding the image.
+  environment:
+    FINALIS_DB_PARALLELISM: "4"
+    FINALIS_DB_MEMTABLE_BUDGET_MB: "256"
+    FINALIS_DB_RATE_LIMITER_BYTES_S: "67108864"
+    FINALIS_DB_DELAYED_WRITE_RATE_BYTES_S: "33554432"
+  networks:
+    - finalis_net
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *finalis-common
+    container_name: finalis-node1
+    hostname: node1
+    volumes:
+      - node1_data:/var/lib/finalis
+    ports:
+      - "19440:19440"
+      - "19444:19444"
+    command:
+      - "--db"
+      - "/var/lib/finalis/db"
+      - "--genesis"
+      - "/opt/finalis-core/mainnet/genesis.bin"
+      - "--allow-unsafe-genesis-override"
+      - "--node-id"
+      - "1"
+      - "--validator-key-file"
+      - "/var/lib/finalis/keystore/validator.json"
+      - "--validator-passphrase"
+      - "localdevnet"
+      - "--listen"
+      - "--bind"
+      - "0.0.0.0"
+      - "--port"
+      - "19440"
+      - "--with-lightserver"
+      - "--lightserver-bind"
+      - "0.0.0.0"
+      - "--lightserver-port"
+      - "19444"
+      - "--no-dns-seeds"
+      - "--peers"
+      - "node2:19440,node3:19440"
+
+  node2:
+    <<: *finalis-common
+    container_name: finalis-node2
+    hostname: node2
+    volumes:
+      - node2_data:/var/lib/finalis
+    ports:
+      - "19441:19440"
+      - "19445:19444"
+    command:
+      - "--db"
+      - "/var/lib/finalis/db"
+      - "--genesis"
+      - "/opt/finalis-core/mainnet/genesis.bin"
+      - "--allow-unsafe-genesis-override"
+      - "--node-id"
+      - "2"
+      - "--validator-key-file"
+      - "/var/lib/finalis/keystore/validator.json"
+      - "--validator-passphrase"
+      - "localdevnet"
+      - "--listen"
+      - "--bind"
+      - "0.0.0.0"
+      - "--port"
+      - "19440"
+      - "--with-lightserver"
+      - "--lightserver-bind"
+      - "0.0.0.0"
+      - "--lightserver-port"
+      - "19444"
+      - "--no-dns-seeds"
+      - "--peers"
+      - "node1:19440,node3:19440"
+
+  node3:
+    <<: *finalis-common
+    container_name: finalis-node3
+    hostname: node3
+    volumes:
+      - node3_data:/var/lib/finalis
+    ports:
+      - "19442:19440"
+      - "19446:19444"
+    command:
+      - "--db"
+      - "/var/lib/finalis/db"
+      - "--genesis"
+      - "/opt/finalis-core/mainnet/genesis.bin"
+      - "--allow-unsafe-genesis-override"
+      - "--node-id"
+      - "3"
+      - "--validator-key-file"
+      - "/var/lib/finalis/keystore/validator.json"
+      - "--validator-passphrase"
+      - "localdevnet"
+      - "--listen"
+      - "--bind"
+      - "0.0.0.0"
+      - "--port"
+      - "19440"
+      - "--with-lightserver"
+      - "--lightserver-bind"
+      - "0.0.0.0"
+      - "--lightserver-port"
+      - "19444"
+      - "--no-dns-seeds"
+      - "--peers"
+      - "node1:19440,node2:19440"

@@ -541,6 +541,7 @@ Bytes FrontierTransition::serialize() const {
   w.bytes_fixed(prev_finalized_hash);
   w.bytes_fixed(prev_finality_link_hash);
   w.u64le(height);
+  w.u64le(timestamp);
   w.u32le(round);
   w.bytes_fixed(leader_pubkey);
   w.varbytes(prev_vector.serialize());
@@ -566,6 +567,7 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
         auto prev_finalized = r.bytes_fixed<32>();
         auto prev_finality_link = r.bytes_fixed<32>();
         auto height = r.u64le();
+        auto timestamp = r.u64le();
         auto round = r.u32le();
         auto leader = r.bytes_fixed<32>();
         auto prev_vector_bytes = r.varbytes();
@@ -579,9 +581,9 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
         auto decisions = r.bytes_fixed<32>();
         auto quorum = r.u32le();
         auto signer_count = r.varint();
-        if (!prev_finalized || !prev_finality_link || !height || !round || !leader || !prev_vector_bytes ||
-            !next_vector_bytes || !ingress_commitment || !prev || !next || !prev_root || !next_root || !ordered ||
-            !decisions || !quorum || !signer_count) {
+        if (!prev_finalized || !prev_finality_link || !height || !timestamp || !round || !leader ||
+            !prev_vector_bytes || !next_vector_bytes || !ingress_commitment || !prev || !next || !prev_root ||
+            !next_root || !ordered || !decisions || !quorum || !signer_count) {
           return false;
         }
         auto prev_vector = FrontierVector::parse(*prev_vector_bytes);
@@ -590,6 +592,7 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
         out.prev_finalized_hash = *prev_finalized;
         out.prev_finality_link_hash = *prev_finality_link;
         out.height = *height;
+        out.timestamp = *timestamp;
         out.round = *round;
         out.leader_pubkey = *leader;
         out.prev_vector = *prev_vector;

@@ -25,7 +25,7 @@ const NetworkConfig kMainnet{
     .name = "mainnet",
     .network_id =
         std::array<std::uint8_t, 16>{0xfe, 0x56, 0x19, 0x11, 0x73, 0x09, 0x12, 0xcc, 0xed, 0x1e, 0x83, 0xbc, 0x27, 0x3f, 0xab, 0x13},
-    .magic = 1234567890,
+    .magic = MAGIC,
     .protocol_version = PROTOCOL_VERSION,
     .feature_flags = 1ULL,  // bit0: strict-version-handshake-v0.7
     .p2p_default_port = 19440,

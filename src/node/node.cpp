@@ -2389,7 +2389,10 @@ constexpr const char* kConsensusSafetyStatePrefix = "CSAFE:";
 
 bool replay_mode_is_frontier(const Bytes& bytes) { return std::string(bytes.begin(), bytes.end()) == "frontier"; }
 
-bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDerivedState& state) {
+// Core: all reads (scan_prefix, to diff stale rows) stay against `db`'s
+// committed state, exactly as before; every write stages into `batch`
+// instead of hitting the WAL immediately.
+bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state) {
   const std::string utxo_prefix = storage::key_utxo_prefix();
   std::set<std::string> desired_utxos;
   desired_utxos.clear();
@@ -2400,12 +2403,8 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
       utxos_to_erase.push_back(key);
     }
   }
-  for (const auto& key : utxos_to_erase) {
-    if (!db.erase(key)) return false;
-  }
-  for (const auto& [op, entry] : state.utxos) {
-    if (!db.put_utxo_v2(op, entry)) return false;
-  }
+  for (const auto& key : utxos_to_erase) batch.erase(key);
+  for (const auto& [op, entry] : state.utxos) batch.put_utxo_v2(op, entry);
 
   const std::string script_utxo_prefix = storage::key_script_utxo_prefix(Hash32{}).substr(0, 3);
   std::set<std::string> desired_script_utxos;
@@ -2422,27 +2421,21 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
       script_utxos_to_erase.push_back(key);
     }
   }
-  for (const auto& key : script_utxos_to_erase) {
-    if (!db.erase(key)) return false;
-  }
+  for (const auto& key : script_utxos_to_erase) batch.erase(key);
   for (const auto& [op, entry] : state.utxos) {
     const auto transparent = transparent_txout_from_utxo_entry(entry);
     if (!transparent.has_value()) continue;
     const auto scripthash = crypto::sha256(transparent->script_pubkey);
-    if (!db.put_script_utxo(scripthash, op, *transparent, state.finalized_height)) return false;
+    batch.put_script_utxo(scripthash, op, *transparent, state.finalized_height);
   }
 
-  for (const auto& [pub, info] : state.validators.all()) {
-    if (!db.put_validator(pub, info)) return false;
-  }
-  for (const auto& [txid, req] : state.validator_join_requests) {
-    if (!db.put_validator_join_request(txid, req)) return false;
-  }
+  for (const auto& [pub, info] : state.validators.all()) batch.put_validator(pub, info);
+  for (const auto& [txid, req] : state.validator_join_requests) batch.put_validator_join_request(txid, req);
   for (const auto& [epoch, reward_state] : state.epoch_reward_states) {
     (void)epoch;
-    if (!db.put_epoch_reward_settlement(reward_state)) return false;
+    batch.put_epoch_reward_settlement(reward_state);
   }
-  if (!db.put_protocol_reserve_balance(state.protocol_reserve_balance_units)) return false;
+  batch.put_protocol_reserve_balance(state.protocol_reserve_balance_units);
   std::set<std::uint64_t> desired_checkpoint_epochs;
   for (const auto& [epoch, _] : state.finalized_committee_checkpoints) {
     desired_checkpoint_epochs.insert(epoch);
@@ -2460,24 +2453,30 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
       checkpoint_keys_to_erase.push_back(key);
     }
   }
-  for (const auto& key : checkpoint_keys_to_erase) {
-    if (!db.erase(key)) return false;
-  }
+  for (const auto& key : checkpoint_keys_to_erase) batch.erase(key);
   for (const auto& [epoch, checkpoint] : state.finalized_committee_checkpoints) {
     (void)epoch;
-    if (!db.put_finalized_committee_checkpoint(checkpoint)) return false;
+    batch.put_finalized_committee_checkpoint(checkpoint);
   }
-  if (!db.put(kFinalizedRandomnessKey, Bytes(state.finalized_randomness.begin(), state.finalized_randomness.end()))) return false;
+  batch.put(kFinalizedRandomnessKey, Bytes(state.finalized_randomness.begin(), state.finalized_randomness.end()));
   codec::ByteWriter w_start;
   w_start.u64le(state.validator_join_window_start_height);
-  if (!db.put(kValidatorJoinWindowStartKey, w_start.take())) return false;
+  batch.put(kValidatorJoinWindowStartKey, w_start.take());
   codec::ByteWriter w_count;
   w_count.u32le(state.validator_join_count_in_window);
-  if (!db.put(kValidatorJoinWindowCountKey, w_count.take())) return false;
+  batch.put(kValidatorJoinWindowCountKey, w_count.take());
   codec::ByteWriter w_liveness;
   w_liveness.u64le(state.validator_liveness_window_start_height);
-  if (!db.put(kValidatorLivenessWindowStartKey, w_liveness.take())) return false;
+  batch.put(kValidatorLivenessWindowStartKey, w_liveness.take());
   return true;
+}
+
+// Convenience wrapper for non-hot-path callers (genesis/rebuild/fast-sync
+// fixups): stages into a throwaway batch and commits it immediately.
+bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDerivedState& state) {
+  storage::DB::Batch batch(db);
+  if (!persist_canonical_cache_rows(db, batch, state)) return false;
+  return db.write_batch(batch);
 }
 
 bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDerivationConfig& cfg, storage::DB& db,
@@ -2971,18 +2970,21 @@ storage::SlashingRecord make_onchain_slash_record(const SlashEvidence& ev, const
   return rec;
 }
 
-void sync_smt_tree(storage::DB& db, const std::string& tree_id, const std::vector<std::pair<Hash32, Bytes>>& leaves) {
+void sync_smt_tree(storage::DB& db, storage::DB::Batch& batch, const std::string& tree_id,
+                   const std::vector<std::pair<Hash32, Bytes>>& leaves) {
   const std::string prefix = storage::key_smt_leaf_prefix(tree_id);
   std::set<std::string> desired;
   desired.clear();
   for (const auto& [k, _] : leaves) desired.insert(storage::key_smt_leaf(tree_id, k));
   for (const auto& [k, _] : db.scan_prefix(prefix)) {
-    if (desired.find(k) == desired.end()) (void)db.put(k, {});
+    if (desired.find(k) == desired.end()) batch.put(k, {});
   }
-  for (const auto& [k, v] : leaves) (void)db.put(storage::key_smt_leaf(tree_id, k), v);
+  for (const auto& [k, v] : leaves) batch.put(storage::key_smt_leaf(tree_id, k), v);
 }
 
-StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSetV2& utxos,
+// Core: stages every root/leaf write into `batch` instead of writing immediately.
+// `db` is still needed for the scan_prefix reads sync_smt_tree uses to diff stale leaves.
+StateRoots persist_state_roots(storage::DB& db, storage::DB::Batch& batch, std::uint64_t height, const UtxoSetV2& utxos,
                                const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(utxos.size());
@@ -2996,18 +2998,30 @@ StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const Utxo
         {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, validation_rules_version)});
   }
 
-  sync_smt_tree(db, kSmtTreeUtxo, utxo_leaves);
-  sync_smt_tree(db, kSmtTreeValidators, validator_leaves);
+  sync_smt_tree(db, batch, kSmtTreeUtxo, utxo_leaves);
+  sync_smt_tree(db, batch, kSmtTreeValidators, validator_leaves);
 
   StateRoots roots{};
   roots.utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
   roots.validators_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
-  crypto::SparseMerkleTree utxo_tree(db, kSmtTreeUtxo);
-  crypto::SparseMerkleTree validators_tree(db, kSmtTreeValidators);
-  (void)utxo_tree.set_root_for_height(height, roots.utxo_root);
-  (void)validators_tree.set_root_for_height(height, roots.validators_root);
-  (void)db.put(storage::key_root_index("UTXO", height), Bytes(roots.utxo_root.begin(), roots.utxo_root.end()));
-  (void)db.put(storage::key_root_index("VAL", height), Bytes(roots.validators_root.begin(), roots.validators_root.end()));
+  // SparseMerkleTree::set_root_for_height is just storage::key_smt_root(tree_id, height) -> db.put;
+  // stage it directly rather than constructing a tree object bound to the immediate-write db.
+  batch.put(storage::key_smt_root(kSmtTreeUtxo, height), Bytes(roots.utxo_root.begin(), roots.utxo_root.end()));
+  batch.put(storage::key_smt_root(kSmtTreeValidators, height), Bytes(roots.validators_root.begin(), roots.validators_root.end()));
+  batch.put(storage::key_root_index("UTXO", height), Bytes(roots.utxo_root.begin(), roots.utxo_root.end()));
+  batch.put(storage::key_root_index("VAL", height), Bytes(roots.validators_root.begin(), roots.validators_root.end()));
+  return roots;
+}
+
+// Convenience wrapper for the non-hot-path callers (genesis/rebuild/fast-sync
+// fixups): stages into a throwaway batch and commits it immediately, so
+// callers that don't share a batch with surrounding writes still get a single
+// atomic commit instead of the previous handful of separate Put calls.
+StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSetV2& utxos,
+                               const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version) {
+  storage::DB::Batch batch(db);
+  StateRoots roots = persist_state_roots(db, batch, height, utxos, validators, validation_rules_version);
+  (void)db.write_batch(batch);
   return roots;
 }
 
@@ -4526,8 +4540,9 @@ std::string Node::inject_network_propose_diagnostic_for_test(const p2p::ProposeM
 }
 
 bool Node::inject_frontier_transition_for_test(const FrontierProposal& proposal, const FinalityCertificate& certificate) {
+  const auto cert_check = precheck_finality_certificate(certificate, proposal.transition);
   std::lock_guard<std::mutex> lk(mu_);
-  return handle_frontier_block_locked(proposal, certificate, 0, false);
+  return handle_frontier_block_locked(proposal, certificate, 0, false, cert_check);
 }
 
 bool Node::inject_propose_msg_for_test(const p2p::ProposeMsg& msg) { return handle_propose(msg, false); }
@@ -4594,7 +4609,13 @@ bool Node::inject_frontier_block_for_test(const FrontierProposal& proposal, cons
     last_test_hook_error_ = "apply-finalized-frontier-failed:" + apply_error;
     return false;
   }
-  if (handle_frontier_block_locked(proposal, cert, 0, false)) return true;
+  // Already verified via verify_finality_certificate_for_frontier_locked just above
+  // (we'd have returned false otherwise) -- build the precheck result from that, rather
+  // than calling precheck_finality_certificate again and re-running the crypto.
+  CertificateCheck cert_check;
+  cert_check.ok = true;
+  cert_check.canonical_sigs = verified_sigs;
+  if (handle_frontier_block_locked(proposal, cert, 0, false, cert_check)) return true;
   last_test_hook_error_ = "handle-frontier-block-rejected";
   return false;
 }
@@ -5276,13 +5297,19 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     return false;
   }
 
+  // Every write for this finalized block accumulates here and commits once,
+  // atomically, at the very end of this function (db_.write_batch(batch))
+  // instead of each db_.put_X/erase hitting the WAL as a separate synchronous
+  // call while mu_ is held on the network reader thread.
+  storage::DB::Batch batch(db_);
+
   std::string persist_error;
-  if (!persist_finalized_frontier_record(record, utxos_, &persist_error)) {
+  if (!persist_finalized_frontier_record(record, utxos_, batch, &persist_error)) {
     if (error) *error = "persist-frontier-record-failed" +
                         (persist_error.empty() ? std::string() : ":" + persist_error);
     return false;
   }
-  if (!db_.put_finality_certificate(certificate)) {
+  if (!batch.put_finality_certificate(certificate)) {
     if (error) *error = "put-finality-certificate-failed";
     return false;
   }
@@ -5290,12 +5317,15 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   highest_qc_by_height_[record.transition.height] =
       make_quorum_certificate(record.transition.height, record.transition.round, transition_id, canonical_sigs);
   highest_qc_payload_by_height_[record.transition.height] = consensus_payload_id(record.transition);
-  persist_consensus_safety_state_locked(record.transition.height);
+  persist_consensus_safety_state_locked(record.transition.height, batch);
 
   std::vector<Hash32> confirmed_txids;
   for (const auto& raw : record.ordered_records) {
     auto tx = parse_any_tx(raw);
     if (tx.has_value()) confirmed_txids.push_back(txid_any(*tx));
+  }
+  if (record.transition.timestamp != 0) {
+    mempool_.on_finalized_block_timestamp(record.transition.timestamp);
   }
   mempool_.remove_confirmed(confirmed_txids);
   hydrate_runtime_from_canonical_state_locked(next_state);
@@ -5335,15 +5365,15 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     last_finalized_progress_ms_ = now;
   }
 
-  if (!persist_canonical_cache_rows(db_, next_state)) {
+  if (!persist_canonical_cache_rows(db_, batch, next_state)) {
     if (error) *error = "persist-canonical-cache-rows-failed";
     return false;
   }
-  if (!verify_and_persist_consensus_state_commitment_locked(next_state)) {
+  if (!verify_and_persist_consensus_state_commitment_locked(next_state, batch)) {
     if (error) *error = "persist-consensus-state-commitment-failed";
     return false;
   }
-  (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
+  (void)persist_state_roots(db_, batch, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
 
   if (clear_requested_sync) {
     requested_sync_artifacts_.erase(transition_id);
@@ -5361,16 +5391,24 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   votes_.clear_height(record.transition.height);
   timeout_votes_.clear_height(record.transition.height);
   if (finalized_height_ > 0) {
-    clear_consensus_safety_state_locked(finalized_height_);
+    clear_consensus_safety_state_locked(finalized_height_, batch);
     local_vote_locks_.erase(finalized_height_);
     highest_qc_by_height_.erase(finalized_height_);
     highest_qc_payload_by_height_.erase(finalized_height_);
     highest_tc_by_height_.erase(finalized_height_);
   }
-  (void)db_.erase(finalized_write_marker_key());
+  batch.erase(finalized_write_marker_key());
+  // Epoch-committee closeout only fires at epoch boundaries (not every
+  // block) and owns its own checkpoint/telemetry persistence; left on its
+  // existing immediate-write path rather than folded into this batch.
   maybe_finalize_epoch_committees_locked();
-  (void)persist_availability_state_locked();
-  (void)db_.put_node_runtime_status_snapshot(build_runtime_status_snapshot_locked(now_unix() * 1000));
+  persist_availability_state_locked(batch);
+  batch.put_node_runtime_status_snapshot(build_runtime_status_snapshot_locked(now_unix() * 1000));
+
+  if (!db_.write_batch(batch)) {
+    if (error) *error = "write-batch-commit-failed";
+    return false;
+  }
   if (error) error->clear();
   return true;
 }
@@ -5609,7 +5647,7 @@ void Node::decay_peer_discipline_for_test(std::uint64_t now_unix_value) {
 }
 
 bool Node::verify_quorum_certificate_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered,
-                                            std::string* error) const {
+                                            std::string* error, bool skip_signature_crypto) const {
   const auto committee = committee_for_height_round(qc.height, qc.round);
   if (committee.empty()) {
     if (error) *error = "empty-committee";
@@ -5624,7 +5662,9 @@ bool Node::verify_quorum_certificate_locked(const QuorumCertificate& qc, std::ve
   for (const auto& sig : qc.signatures) {
     if (committee_set.find(sig.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(sig.validator_pubkey).second) continue;
-    if (!crypto::ed25519_verify(msg, sig.signature, sig.validator_pubkey)) continue;
+    // See the skip_signature_crypto comment on this method's declaration: only safe when
+    // qc.signatures is already-verified votes_-sourced data, never for network-supplied QCs.
+    if (!skip_signature_crypto && !crypto::ed25519_verify(msg, sig.signature, sig.validator_pubkey)) continue;
     valid.push_back(sig);
   }
   if (valid.size() < quorum) {
@@ -5636,7 +5676,7 @@ bool Node::verify_quorum_certificate_locked(const QuorumCertificate& qc, std::ve
 }
 
 bool Node::verify_timeout_certificate_locked(const TimeoutCertificate& tc, std::vector<FinalitySig>* filtered,
-                                             std::string* error) const {
+                                             std::string* error, bool skip_signature_crypto) const {
   const auto committee = committee_for_height_round(tc.height, tc.round);
   if (committee.empty()) {
     if (error) *error = "empty-committee";
@@ -5651,7 +5691,9 @@ bool Node::verify_timeout_certificate_locked(const TimeoutCertificate& tc, std::
   for (const auto& sig : tc.signatures) {
     if (committee_set.find(sig.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(sig.validator_pubkey).second) continue;
-    if (!crypto::ed25519_verify(msg, sig.signature, sig.validator_pubkey)) continue;
+    // See the skip_signature_crypto comment on this method's declaration: only safe when
+    // tc.signatures is already-verified timeout_votes_-sourced data, never for a network-supplied TC.
+    if (!skip_signature_crypto && !crypto::ed25519_verify(msg, sig.signature, sig.validator_pubkey)) continue;
     valid.push_back(sig);
   }
   if (valid.size() < quorum) {
@@ -5719,6 +5761,19 @@ bool Node::verify_finality_certificate_for_frontier_locked(const FinalityCertifi
   return true;
 }
 
+Node::CertificateCheck Node::precheck_finality_certificate(const FinalityCertificate& cert,
+                                                            const FrontierTransition& transition) const {
+  // verify_finality_certificate_for_frontier_locked touches only its two parameters --
+  // no canonical_state_, no validators_, no committee_for_height_round -- it trusts
+  // cert.committee_members (and checks cert.quorum_threshold against it), which is why it
+  // is safe to run here, before mu_ is ever locked, despite the "_locked" name it kept for
+  // historical reasons. Every handle_frontier_block_locked call site must call this first
+  // and pass the result in; see that function's cert_check parameter comment.
+  CertificateCheck r;
+  r.ok = verify_finality_certificate_for_frontier_locked(cert, transition, &r.canonical_sigs, &r.error);
+  return r;
+}
+
 std::optional<Hash32> Node::quorum_certificate_payload_id_locked(const QuorumCertificate& qc) const {
   auto it = highest_qc_by_height_.find(qc.height);
   if (it != highest_qc_by_height_.end() && it->second.round == qc.round &&
@@ -5747,7 +5802,13 @@ void Node::maybe_record_quorum_certificate_locked(const Hash32& transition_id, s
   QuorumCertificate qc =
       make_quorum_certificate(height, round, transition_id, votes_.signatures_for(height, round, transition_id));
   std::vector<FinalitySig> filtered;
-  if (!verify_quorum_certificate_locked(qc, &filtered, nullptr)) return;
+  // qc.signatures == votes_.signatures_for(...) above: every signature already passed
+  // crypto::ed25519_verify in handle_vote_result before being accepted into votes_ (see the
+  // invariant comment at that call site). Safe to skip the redundant re-verify here --
+  // O(k^2) -> O(k) crypto work across a quorum's accumulation. Do not copy this to a call
+  // site whose qc came from the network (e.g. ProposeMsg::justify_qc); see
+  // verify_quorum_certificate_locked's declaration comment.
+  if (!verify_quorum_certificate_locked(qc, &filtered, nullptr, /*skip_signature_crypto=*/true)) return;
   qc.signatures = std::move(filtered);
   auto frontier_it = candidate_frontier_proposals_.find(transition_id);
   if (frontier_it == candidate_frontier_proposals_.end()) return;
@@ -5767,7 +5828,9 @@ void Node::maybe_record_timeout_certificate_locked(std::uint64_t height, std::ui
   tc.round = round;
   tc.signatures = timeout_votes_.signatures_for(height, round);
   std::vector<FinalitySig> filtered;
-  if (!verify_timeout_certificate_locked(tc, &filtered, nullptr)) return;
+  // Same invariant as maybe_record_quorum_certificate_locked above: tc.signatures ==
+  // timeout_votes_.signatures_for(...), already verified at insertion.
+  if (!verify_timeout_certificate_locked(tc, &filtered, nullptr, /*skip_signature_crypto=*/true)) return;
   tc.signatures = std::move(filtered);
   auto it = highest_tc_by_height_.find(height);
   if (it == highest_tc_by_height_.end() || tc.round > it->second.round) {
@@ -5851,7 +5914,7 @@ void Node::update_local_vote_lock_locked(std::uint64_t height, std::uint32_t rou
   }
 }
 
-void Node::persist_consensus_safety_state_locked(std::uint64_t height) {
+void Node::persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch) {
   std::optional<std::pair<Hash32, std::uint32_t>> lock_state;
   if (auto it = local_vote_locks_.find(height); it != local_vote_locks_.end()) lock_state = it->second;
   std::optional<QuorumCertificate> qc_state;
@@ -5859,13 +5922,21 @@ void Node::persist_consensus_safety_state_locked(std::uint64_t height) {
   std::optional<Hash32> qc_payload_id;
   if (auto it = highest_qc_payload_by_height_.find(height); it != highest_qc_payload_by_height_.end()) qc_payload_id = it->second;
   if (!lock_state.has_value() && !qc_state.has_value()) {
-    (void)db_.erase(key_consensus_safety_state(height));
+    batch.erase(key_consensus_safety_state(height));
     return;
   }
-  (void)db_.put(key_consensus_safety_state(height), serialize_consensus_safety_state(lock_state, qc_state, qc_payload_id));
+  batch.put(key_consensus_safety_state(height), serialize_consensus_safety_state(lock_state, qc_state, qc_payload_id));
 }
 
-void Node::clear_consensus_safety_state_locked(std::uint64_t height) {
+// Convenience wrapper for callers outside the batched finalization path
+// (round-state cleanup on its own, not alongside a broader commit).
+void Node::persist_consensus_safety_state_locked(std::uint64_t height) {
+  storage::DB::Batch batch(db_);
+  persist_consensus_safety_state_locked(height, batch);
+  (void)db_.write_batch(batch);
+}
+
+void Node::clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch) {
   local_vote_locks_.erase(height);
   highest_qc_by_height_.erase(height);
   highest_qc_payload_by_height_.erase(height);
@@ -5877,7 +5948,13 @@ void Node::clear_consensus_safety_state_locked(std::uint64_t height) {
       ++it;
     }
   }
-  (void)db_.erase(key_consensus_safety_state(height));
+  batch.erase(key_consensus_safety_state(height));
+}
+
+void Node::clear_consensus_safety_state_locked(std::uint64_t height) {
+  storage::DB::Batch batch(db_);
+  clear_consensus_safety_state_locked(height, batch);
+  (void)db_.write_batch(batch);
 }
 
 void Node::event_loop() {
@@ -6513,8 +6590,14 @@ std::optional<PubKey32> Node::local_operator_pubkey_locked() const {
   return consensus::canonical_operator_id(local_key_.public_key, *info);
 }
 
+void Node::persist_availability_state_locked(storage::DB::Batch& batch) {
+  batch.put(storage::key_availability_persistent_state(), availability_state_.serialize());
+}
+
 bool Node::persist_availability_state_locked() {
-  return db_.put_availability_persistent_state(availability_state_);
+  storage::DB::Batch batch(db_);
+  persist_availability_state_locked(batch);
+  return db_.write_batch(batch);
 }
 
 bool Node::validate_availability_state_locked(const char* source) const {
@@ -7252,6 +7335,33 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       p2p_.disconnect_peer(peer_id);
       return;
     }
+    // Self-connection check, independent of whether this VERSION carries a
+    // validator_pubkey fingerprint. endpoint_matches_local_listener compares
+    // the ACTUAL observed connection endpoint (inbound or outbound) against
+    // this node's own listener address, so a non-validator peer that happens
+    // to be ourselves (e.g. a NAT-hairpinned self-dial via our own
+    // externally-advertised endpoint) is still caught here, even though it
+    // has no validator_pubkey for the identity-based check further below to
+    // compare against. This runs in addition to, not instead of, that pubkey
+    // check -- the two catch different self-connection shapes.
+    {
+      const auto info = p2p_.get_peer_info(peer_id);
+      if (endpoint_matches_local_listener(info.ip, cfg_.p2p_port)) {
+        bool should_log = false;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          should_log = suppress_self_endpoint_locked(info.endpoint);
+          if (!info.ip.empty()) {
+            should_log = suppress_self_endpoint_locked(info.ip + ":" + std::to_string(cfg_.p2p_port)) || should_log;
+          }
+        }
+        if (should_log) {
+          log_line("self-peer-rejected endpoint=" + info.endpoint + " reason=local-endpoint-match");
+        }
+        p2p_.disconnect_peer(peer_id);
+        return;
+      }
+    }
     if (peer_bootstrap.has_value()) {
       auto b = hex_decode(*peer_bootstrap);
       if (b && b->size() == 32) {
@@ -7897,6 +8007,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                " height=" + std::to_string(proposal->transition.height) + " hash=" +
                short_hash_hex(proposal->transition.transition_id()) + " prev=" +
                short_hash_hex(proposal->transition.prev_finalized_hash));
+      // Runs on this peer's own reader thread, before mu_ is ever locked -- the whole point
+      // of precheck_finality_certificate is that the ed25519 loop over the committee's
+      // signatures (16-24 verifies) happens here, in parallel with every other peer's reader
+      // thread, instead of serializing them all behind mu_ inside handle_frontier_block_locked.
+      std::optional<CertificateCheck> cert_check;
+      if (b->certificate.has_value()) {
+        cert_check = precheck_finality_certificate(*b->certificate, proposal->transition);
+      }
       {
         std::lock_guard<std::mutex> lk(mu_);
         if (proposal->transition.height == finalized_height_ + 1) {
@@ -7971,7 +8089,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
         } else {
           acceptance_path = "handle-next";
-          accepted = handle_frontier_block_locked(*proposal, b->certificate, peer_id, true);
+          accepted = handle_frontier_block_locked(*proposal, b->certificate, peer_id, true, cert_check);
           if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
         }
         if (accepted) accepted_block_payloads_.insert(payload_id);
@@ -8526,6 +8644,13 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
       return VoteHandlingResult::HardReject;
     }
 
+    // INVARIANT: this is the only place (besides the local self-vote in finalize_if_quorum)
+    // that inserts into votes_. Every signature reaching this point has just passed
+    // crypto::ed25519_verify above (or was already cached as valid). Code elsewhere
+    // (verify_quorum_certificate_locked's skip_signature_crypto path,
+    // finalize_if_quorum's committee filter) relies on that being true for everything
+    // votes_.signatures_for(...) returns. If you add another insertion path into votes_,
+    // verify the signature first or that trust breaks silently.
     auto tr = votes_.add_vote(vote);
     if (tr.equivocation && tr.evidence.has_value()) {
       locally_observed_equivocators_.insert(vote.validator_pubkey);
@@ -8659,6 +8784,10 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
                (leader.has_value() ? short_pub_hex(*leader) : std::string("none")) +
                " validator=" + short_pub_hex(vote.validator_pubkey));
     }
+    // INVARIANT: see the matching comment at votes_.add_vote in handle_vote_result.
+    // Everything reaching timeout_votes_.add_vote here has already passed
+    // crypto::ed25519_verify above; verify_timeout_certificate_locked's
+    // skip_signature_crypto path depends on that staying true.
     const auto tr = timeout_votes_.add_vote(vote);
     if (!tr.accepted) {
       if (!tr.duplicate) {
@@ -8682,7 +8811,7 @@ bool Node::handle_timeout_vote(const TimeoutVote& vote, bool from_network, int f
 
 bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                                         const std::optional<FinalityCertificate>& certificate, int from_peer_id,
-                                        bool from_network) {
+                                        bool from_network, const std::optional<CertificateCheck>& cert_check) {
   auto log_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
     log_line("frontier-block-reject height=" + std::to_string(proposal.transition.height) + " round=" +
              std::to_string(proposal.transition.round) + " transition=" +
@@ -8747,19 +8876,28 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                " reason=missing-canonical-state");
       return false;
     }
-    std::vector<FinalitySig> canonical_sigs;
-    std::string cert_error;
-    if (!verify_finality_certificate_for_frontier_locked(*certificate, transition, &canonical_sigs, &cert_error)) {
+    // Certificate signatures are verified by the caller via precheck_finality_certificate,
+    // BEFORE mu_ was locked -- this function never runs the crypto itself anymore. A missing
+    // cert_check here is a caller bug (every handle_frontier_block_locked call site must
+    // precheck first), not a valid "retry under lock" state.
+    if (!cert_check.has_value()) {
       log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
                std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
-               " reason=" + cert_error);
+               " reason=missing-certificate-precheck");
+      return false;
+    }
+    if (!cert_check->ok) {
+      log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
+               std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
+               " reason=" + cert_check->error);
       if (from_network) {
         log_line("sync-stall reason=certificate-verification-failed peer_id=" + std::to_string(from_peer_id) +
                  " height=" + std::to_string(transition.height) + " transition=" + short_hash_hex(transition_id) +
-                 " cert_reason=" + cert_error);
+                 " cert_reason=" + cert_check->error);
       }
       return false;
     }
+    const auto& canonical_sigs = cert_check->canonical_sigs;
     consensus::CanonicalFrontierRecord certified_record{transition, proposal.ordered_records};
     consensus::FrontierExecutionResult recomputed;
     std::string validation_error;
@@ -9011,8 +9149,18 @@ bool Node::maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id) {
     BufferedSyncFrontier buffered = it->second;
     buffered_sync_frontiers_.erase(it);
     const auto expected_height = finalized_height_ + 1;
+    // Unlike the live TRANSITION path in handle_message, `buffered.certificate` only
+    // becomes known after the locked buffered_sync_frontiers_ lookup above, so this precheck
+    // can't be hoisted before mu_ here -- this is the startup/catch-up replay path, not the
+    // steady-state hot path precheck_finality_certificate is optimizing for. Still correct
+    // (same pure, stateless check), just not off the lock in this call path.
+    std::optional<CertificateCheck> cert_check;
+    if (buffered.certificate.has_value()) {
+      cert_check = precheck_finality_certificate(*buffered.certificate, buffered.proposal.transition);
+    }
     if (!handle_frontier_block_locked(buffered.proposal, buffered.certificate,
-                                      buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id, true)) {
+                                      buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id, true,
+                                      cert_check)) {
       log_line("buffer-sync-apply-failed height=" + std::to_string(expected_height) + " hash=" +
                short_hash_hex(buffered.proposal.transition.transition_id()));
       log_line("sync-stall reason=buffered-transition-apply-failed peer_id=" +
@@ -9427,6 +9575,9 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
     if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, block_id), local_key_.private_key);
         sig.has_value()) {
       const Vote local_vote{height, round, block_id, local_key_.public_key, *sig};
+      // INVARIANT: this is the other insertion path into votes_ (see the matching comment
+      // at votes_.add_vote in handle_vote_result). Trusted without a separate verify step
+      // because it is signed with our own private key right above, not attacker-supplied.
       const auto tr = votes_.add_vote(local_vote);
       if (tr.accepted || tr.duplicate) {
         sigs = votes_.signatures_for(height, round, block_id);
@@ -9453,13 +9604,15 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
     return false;
   }
 
+  // sigs (above) == votes_.signatures_for(height, round, block_id): every entry already
+  // passed crypto::ed25519_verify in handle_vote_result (or is our own self-signed vote,
+  // see the branch above) before it was accepted into votes_. No need to re-verify a third
+  // time here -- just the committee-membership/dedup filter.
   std::set<PubKey32> seen;
   std::vector<FinalitySig> filtered;
-  const auto vote_msg = vote_signing_message(height, round, block_id);
   for (const auto& s : sigs) {
     if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(s.validator_pubkey).second) continue;
-    if (!crypto::ed25519_verify(vote_msg, s.signature, s.validator_pubkey)) continue;
     filtered.push_back(s);
   }
   if (filtered.size() < expected_quorum) {
@@ -9786,8 +9939,13 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
     for (Node* peer : peers) {
       if (peer == this) continue;
       spawn_local_bus_task([peer, proposal, certificate]() {
+        // Same hoist-before-lock shape as the live TRANSITION path in handle_message:
+        // this local-bus simulation is itself running on its own task per peer, so
+        // precheck_finality_certificate here is both correct and exercises the same
+        // parallel-verify behavior multi-node tests rely on to look like real peers.
+        const auto cert_check = peer->precheck_finality_certificate(certificate, proposal.transition);
         std::lock_guard<std::mutex> lk(peer->mu_);
-        (void)peer->handle_frontier_block_locked(proposal, certificate, 0, true);
+        (void)peer->handle_frontier_block_locked(proposal, certificate, 0, true, cert_check);
       });
     }
   } else {
@@ -9900,7 +10058,7 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int 
 }
 
 bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                             std::string* error) {
+                                             storage::DB::Batch& batch, std::string* error) {
   auto fail = [&](const std::string& reason) {
     if (error) *error = reason;
     return false;
@@ -9916,7 +10074,7 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
   std::uint32_t tx_index = 0;
   for (const auto& ordered_record : record.ordered_records) {
     ++seq;
-    if (!db_.put_ingress_record(seq, ordered_record)) return fail("put-ingress-record-failed seq=" + std::to_string(seq));
+    if (!batch.put_ingress_record(seq, ordered_record)) return fail("put-ingress-record-failed seq=" + std::to_string(seq));
     auto tx = parse_any_tx(ordered_record);
     if (!tx.has_value()) {
       log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
@@ -9924,9 +10082,7 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       return fail("ordered-record-tx-parse-failed seq=" + std::to_string(seq));
     }
     const Hash32 txid = txid_any(*tx);
-    if (!db_.put_tx_index(txid, record.transition.height, tx_index++, ordered_record)) {
-      return fail("put-tx-index-failed txid=" + short_hash_hex(txid));
-    }
+    batch.put_tx_index(txid, record.transition.height, tx_index++, ordered_record);
     if (std::holds_alternative<Tx>(*tx)) {
       const auto& legacy = std::get<Tx>(*tx);
       for (const auto& input : legacy.inputs) {
@@ -9935,45 +10091,39 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
         const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
         if (!spent_out.has_value()) continue;
         const auto spent_scripthash = crypto::sha256(spent_out->script_pubkey);
-        if (!db_.add_script_history(spent_scripthash, record.transition.height, txid)) {
-          return fail("add-script-history-spent-failed txid=" + short_hash_hex(txid));
-        }
+        batch.add_script_history(spent_scripthash, record.transition.height, txid);
       }
       for (const auto& output : legacy.outputs) {
         const auto received_scripthash = crypto::sha256(output.script_pubkey);
-        if (!db_.add_script_history(received_scripthash, record.transition.height, txid)) {
-          return fail("add-script-history-received-failed txid=" + short_hash_hex(txid));
-        }
+        batch.add_script_history(received_scripthash, record.transition.height, txid);
       }
     }
   }
-  if (!db_.set_finalized_ingress_tip(record.transition.next_frontier)) {
-    const auto existing_ingress_tip = db_.get_finalized_ingress_tip();
-    const bool can_force_rewind = existing_ingress_tip.has_value() && *existing_ingress_tip > record.transition.next_frontier &&
-                                  record.transition.height == finalized_height_ + 1;
-    if (!can_force_rewind || !db_.force_set_finalized_ingress_tip(record.transition.next_frontier)) {
-      return fail("set-finalized-ingress-tip-failed");
-    }
+  // DB::set_finalized_ingress_tip's monotonicity check, replicated here: a
+  // staged write can't read-then-conditionally-write against uncommitted
+  // batch state, so the decision (force-rewind vs. fail) has to happen before
+  // staging, against committed db_ state, exactly as it did before batching.
+  if (auto existing_ingress_tip = db_.get_finalized_ingress_tip();
+      existing_ingress_tip.has_value() && *existing_ingress_tip > record.transition.next_frontier) {
+    const bool can_force_rewind = record.transition.height == finalized_height_ + 1;
+    if (!can_force_rewind) return fail("set-finalized-ingress-tip-failed");
     log_line("finalized-ingress-tip-rewind-forced height=" + std::to_string(record.transition.height) +
              " existing=" + std::to_string(*existing_ingress_tip) +
              " target=" + std::to_string(record.transition.next_frontier));
   }
-  if (!db_.put_frontier_transition(record.transition.transition_id(), record.transition.serialize())) {
+  batch.stage_finalized_ingress_tip(record.transition.next_frontier);
+  if (!batch.put_frontier_transition(record.transition.transition_id(), record.transition.serialize())) {
     return fail("put-frontier-transition-failed transition=" + short_hash_hex(record.transition.transition_id()));
   }
-  if (!db_.map_height_to_frontier_transition(record.transition.height, record.transition.transition_id())) {
+  if (!batch.map_height_to_frontier_transition(record.transition.height, record.transition.transition_id())) {
     return fail("map-height-to-frontier-transition-failed height=" + std::to_string(record.transition.height));
   }
-  if (!db_.set_finalized_frontier_height(record.transition.height)) return fail("set-finalized-frontier-height-failed");
-  if (!db_.set_height_hash(record.transition.height, record.transition.transition_id())) {
+  if (!batch.set_finalized_frontier_height(record.transition.height)) return fail("set-finalized-frontier-height-failed");
+  if (!batch.set_height_hash(record.transition.height, record.transition.transition_id())) {
     return fail("set-height-hash-failed height=" + std::to_string(record.transition.height));
   }
-  if (!db_.set_tip(storage::TipState{record.transition.height, record.transition.transition_id()})) {
-    return fail("set-tip-failed");
-  }
-  if (!db_.put(kStartupReplayModeKey, Bytes{'f', 'r', 'o', 'n', 't', 'i', 'e', 'r'})) {
-    return fail("set-startup-replay-mode-failed");
-  }
+  batch.set_tip(storage::TipState{record.transition.height, record.transition.transition_id()});
+  batch.put(kStartupReplayModeKey, Bytes{'f', 'r', 'o', 'n', 't', 'i', 'e', 'r'});
   if (error) error->clear();
   return true;
 }
@@ -10071,7 +10221,8 @@ void Node::hydrate_runtime_from_canonical_state_locked(const consensus::Canonica
   availability_state_ = state.availability_state;
 }
 
-bool Node::verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state) {
+bool Node::verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state,
+                                                                storage::DB::Batch& batch) {
   const auto commitment = consensus::consensus_state_commitment(canonical_derivation_config_locked(), state);
   if (commitment != state.state_commitment) {
     std::cerr << "consensus state commitment recomputation mismatch\n";
@@ -10086,8 +10237,15 @@ bool Node::verify_and_persist_consensus_state_commitment_locked(const consensus:
     std::cerr << "persisted consensus state commitment mismatch at height " << state.finalized_height << "\n";
     return false;
   }
-  return db_.put_consensus_state_commitment_cache(
+  batch.put_consensus_state_commitment_cache(
       storage::ConsensusStateCommitmentCache{state.finalized_height, state.finalized_identity.id, commitment});
+  return true;
+}
+
+bool Node::verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state) {
+  storage::DB::Batch batch(db_);
+  if (!verify_and_persist_consensus_state_commitment_locked(state, batch)) return false;
+  return db_.write_batch(batch);
 }
 
 bool Node::init_mainnet_genesis() {

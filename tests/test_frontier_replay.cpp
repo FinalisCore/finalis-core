@@ -1717,6 +1717,37 @@ TEST(test_frontier_lane_prefix_rejects_stale_ingress_epoch_with_context) {
   ASSERT_TRUE(err.find("frontier-certified-ingress-epoch-mismatch") != std::string::npos);
 }
 
+TEST(test_verify_ingress_certificate_accepts_valid_signatures_when_committee_context_is_empty) {
+  const auto signer = key_from_byte(115);
+  const auto from = key_from_byte(116);
+  const auto to = key_from_byte(117);
+
+  OutPoint op{};
+  op.txid.fill(0xC1);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto raw = raw_signed_spend(op, prev, from, to.public_key, 9'900);
+  const auto tx = parse_any_tx(raw);
+  ASSERT_TRUE(tx.has_value());
+
+  IngressCertificate cert;
+  cert.epoch = 1;
+  cert.lane = consensus::assign_ingress_lane(*tx);
+  cert.seq = 1;
+  cert.txid = txid_any(*tx);
+  cert.tx_hash = crypto::sha256d(raw);
+  cert.prev_lane_root = zero_hash();
+  const auto signing_hash = cert.signing_hash();
+  const auto msg = Bytes(signing_hash.begin(), signing_hash.end());
+  auto sig = crypto::ed25519_sign(msg, signer.private_key);
+  ASSERT_TRUE(sig.has_value());
+  cert.sigs = {FinalitySig{signer.public_key, *sig}};
+
+  std::string err;
+  ASSERT_TRUE(consensus::verify_ingress_certificate(cert, {}, &err));
+  ASSERT_TRUE(err.empty());
+}
+
 TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
   auto cfg = live_activation_cfg();
   cfg.confidential_policy.activation_height = 0;

@@ -24,3 +24,4 @@ struct Reg {
   do { if (!(x)) throw std::runtime_error(std::string("assert failed: ") + #x); } while (0)
 
 #define ASSERT_EQ(a, b) ASSERT_TRUE((a) == (b))
+#define ASSERT_NE(a, b) ASSERT_TRUE((a) != (b))
