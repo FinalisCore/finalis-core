@@ -1,0 +1,33 @@
+# Keep the build context small and -- more importantly -- keep the host's own
+# out-of-container CMake build tree out of the image entirely. If build/ were
+# copied in, its CMakeCache.txt (host absolute paths, host generator choice)
+# would corrupt the in-container `cmake -S . -B build` configure step.
+build/
+build-*/
+cmake-build-*/
+
+.git/
+.github/
+
+# Large / irrelevant to the C++ build; just bloats the context upload. Kept
+# to genuinely inert files only (never referenced by any CMakeLists.txt rule):
+# snapshot.bin and the *.log files are plain data/output, not build inputs.
+*.log
+snapshot.bin
+violations_vps_*.log
+
+# Editor/IDE and OS cruft.
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Deliberately NOT excluding branding/, *.md, docs/, apps/finalis-wallet,
+# apps/finalis-explorer, sdk/, services/, fuzz/, etc. even though
+# finalis-node/finalis-cli don't need them at runtime: CMakeLists.txt
+# references branding/*.png and several *.md files in an install(FILES ...)
+# rule, and calls add_executable() on other app dirs unconditionally (not
+# gated behind FINALIS_BUILD_FUZZ/Qt5Widgets_FOUND). We never run
+# `cmake --install` here so that rule shouldn't matter in practice, but after
+# the build/ context bug, it's not worth risking a second one to save a few
+# KB of context upload.

@@ -293,6 +293,16 @@ class Node {
   enum class VoteHandlingResult { Accepted, SoftReject, HardReject };
   enum class TimeoutVoteHandlingResult { Accepted, SoftReject, HardReject };
 
+  // Result of pre-verifying a finality certificate's signatures against its
+  // transition. Pure w.r.t. Node state (only cert+transition), so it is
+  // computed before mu_ is locked and threaded into handle_frontier_block_locked
+  // instead of that function re-running the crypto itself while holding mu_.
+  struct CertificateCheck {
+    bool ok{false};
+    std::vector<FinalitySig> canonical_sigs;
+    std::string error;
+  };
+
   void event_loop();
   void handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload);
 
@@ -335,8 +345,12 @@ class Node {
   bool handle_propose(const p2p::ProposeMsg& msg, bool from_network);
   bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0);
   bool handle_timeout_vote(const TimeoutVote& vote, bool from_network, int from_peer_id = 0);
+  // cert_check must be the result of precheck_finality_certificate(*certificate, proposal.transition),
+  // computed by the caller BEFORE mu_ was locked (this function always runs with mu_ held). Passing
+  // std::nullopt here when `certificate` has a value is a caller bug, not a valid "skip" state --
+  // every call site must precheck first. See precheck_finality_certificate's comment for why this is safe.
   bool handle_frontier_block_locked(const FrontierProposal& proposal, const std::optional<FinalityCertificate>& certificate,
-                                    int from_peer_id, bool from_network);
+                                    int from_peer_id, bool from_network, const std::optional<CertificateCheck>& cert_check);
   bool maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
                                          const std::optional<FinalityCertificate>& certificate, int from_peer_id);
   bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
@@ -345,13 +359,27 @@ class Node {
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
                                     std::string* error = nullptr);
   bool finalize_if_quorum(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
+  // skip_signature_crypto must stay false for any qc sourced from the network (e.g. a
+  // ProposeMsg::justify_qc) -- that is the ONLY authentication those signatures ever get.
+  // It may only be set true by a caller whose qc.signatures came from
+  // votes_.signatures_for(...), where every signature already passed crypto::ed25519_verify
+  // once in handle_vote_result before being accepted into votes_ (see the invariant comment
+  // at that votes_.add_vote call site). Today that is exactly maybe_record_quorum_certificate_locked.
   bool verify_quorum_certificate_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered = nullptr,
-                                        std::string* error = nullptr) const;
+                                        std::string* error = nullptr, bool skip_signature_crypto = false) const;
+  // Same contract as verify_quorum_certificate_locked, for timeout_votes_/maybe_record_timeout_certificate_locked.
   bool verify_timeout_certificate_locked(const TimeoutCertificate& tc, std::vector<FinalitySig>* filtered = nullptr,
-                                         std::string* error = nullptr) const;
+                                         std::string* error = nullptr, bool skip_signature_crypto = false) const;
   bool verify_finality_certificate_for_frontier_locked(const FinalityCertificate& cert, const FrontierTransition& transition,
                                                     std::vector<FinalitySig>* canonical_signatures = nullptr,
                                                     std::string* error = nullptr) const;
+  // Pure wrapper around verify_finality_certificate_for_frontier_locked -- touches no Node
+  // member state, so it is safe (and intended) to call before mu_ is locked. See the TRANSITION
+  // case in handle_message for the hot-path use; every handle_frontier_block_locked call site
+  // must call this first and pass the result in, regardless of whether it happens to be on the
+  // network reader thread.
+  CertificateCheck precheck_finality_certificate(const FinalityCertificate& cert,
+                                                 const FrontierTransition& transition) const;
   std::optional<Hash32> quorum_certificate_payload_id_locked(const QuorumCertificate& qc) const;
   std::optional<QuorumCertificate> highest_qc_for_height_locked(std::uint64_t height) const;
   std::optional<TimeoutCertificate> highest_tc_for_height_locked(std::uint64_t height) const;
@@ -363,7 +391,9 @@ class Node {
                                  std::string* reason = nullptr) const;
   bool can_accept_frontier_with_lock_locked(const FrontierTransition& transition, std::string* reason = nullptr) const;
   void update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const Hash32& payload_id);
+  void persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
   void persist_consensus_safety_state_locked(std::uint64_t height);
+  void clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
   void clear_consensus_safety_state_locked(std::uint64_t height);
   std::vector<FinalitySig> canonicalize_finality_signatures_locked(const std::vector<FinalitySig>& signatures,
                                                                    std::size_t quorum) const;
@@ -386,12 +416,14 @@ class Node {
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                         std::string* error = nullptr);
+                                         storage::DB::Batch& batch, std::string* error = nullptr);
   bool begin_finalized_write(const Block& block);
   bool finish_finalized_write(const Block& block);
   bool check_no_incomplete_finalized_write() const;
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
   consensus::CanonicalDerivationConfig canonical_derivation_config_locked() const;
+  bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state,
+                                                            storage::DB::Batch& batch);
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state);
   bool init_local_validator_key();
   bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator);
@@ -452,6 +484,7 @@ class Node {
   void load_validators_addrman();
   void persist_validators_addrman(const std::vector<p2p::PeerInfo>& peers) const;
   bool load_availability_state_locked();
+  void persist_availability_state_locked(storage::DB::Batch& batch);
   bool persist_availability_state_locked();
   void rebuild_availability_retained_prefixes_from_finalized_frontier_locked();
   bool finalize_availability_restore_locked(const char* source);

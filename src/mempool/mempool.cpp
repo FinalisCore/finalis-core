@@ -53,6 +53,49 @@ bool meets_full_replacement_margin(const MempoolEntry& incoming, const MempoolEn
                                 incoming.score_weight) >= 0;
 }
 
+// Shared across the fast pre-filter and the real eviction-comparison checks
+// further down accept_tx -- both reject for the same underlying reason
+// (incoming tx isn't good enough to justify evicting the pool's worst entry),
+// so they must report it identically rather than risk drifting apart.
+constexpr const char* kMempoolFullNotGoodEnough = "mempool full: not good enough";
+
+// Crypto-free fee estimate, used ONLY to decide whether accept_tx's expensive
+// validate_any_tx() call is worth paying for when the pool is at capacity.
+// Never a substitute for real validation -- std::nullopt means "can't tell
+// cheaply," and the caller MUST fall through to validate_any_tx in that case,
+// never treat nullopt as fee=0.
+std::optional<std::uint64_t> fast_estimate_fee(const AnyTx& tx, const UtxoView& view) {
+  return std::visit(
+      [&](const auto& value) -> std::optional<std::uint64_t> {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, TxV2>) {
+          return value.fee;  // plaintext field, no crypto involved
+        } else {
+          // Mirrors validate_tx's in_sum/out_sum arithmetic but skips every
+          // script/signature check. Any ambiguity (missing utxo, confidential-
+          // kind mismatch, overflow, in < out) bails to nullopt -- those cases
+          // fail real validation anyway, so there's nothing to optimistically
+          // assume here.
+          std::uint64_t out_sum = 0;
+          for (const auto& out : value.outputs) {
+            if (out_sum > std::numeric_limits<std::uint64_t>::max() - out.value) return std::nullopt;
+            out_sum += out.value;
+          }
+          std::uint64_t in_sum = 0;
+          for (const auto& in : value.inputs) {
+            const auto it = view.find(OutPoint{in.prev_txid, in.prev_index});
+            if (it == view.end() || it->second.kind != UtxoOutputKind::Transparent) return std::nullopt;
+            const auto& prev_out = std::get<UtxoTransparentData>(it->second.body).out;
+            if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) return std::nullopt;
+            in_sum += prev_out.value;
+          }
+          if (in_sum < out_sum) return std::nullopt;
+          return in_sum - out_sum;
+        }
+      },
+      tx);
+}
+
 }  // namespace
 
 bool Mempool::EvictionKeyLess::operator()(const EvictionKey& a, const EvictionKey& b) const {
@@ -104,6 +147,31 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
     if (spent_outpoints_.find(op) != spent_outpoints_.end()) {
       if (err) *err = "double spend in mempool";
       return false;
+    }
+  }
+
+  // Cheap capacity/fee-rate pre-filter, before paying for crypto verification.
+  // Weight floor: raw.size() alone, ignoring confidential_verify_weight
+  // (unknowable before validation). Real weight is always >= this, so this
+  // fee-rate estimate can only be an OVERestimate of the true rate, never an
+  // underestimate. That makes this a necessary-condition check, not a guess:
+  // if the optimistic rate can't even beat worst_key under EvictionKeyLess,
+  // the real (stricter, margin-inclusive) check further down this function
+  // cannot possibly pass either -- so rejecting here can never reject a tx
+  // that would truly have qualified; it only skips crypto work on ones that
+  // were going to be rejected anyway.
+  const bool pre_full_by_count = by_txid_.size() >= kMaxTxCount;
+  const bool pre_full_by_bytes = total_bytes_ + raw.size() > kMaxPoolBytes;
+  if (pre_full_by_count || pre_full_by_bytes) {
+    if (const auto worst_key = worst_entry_key(); worst_key.has_value()) {
+      if (const auto fast_fee = fast_estimate_fee(tx, view); fast_fee.has_value()) {
+        const EvictionKey fast_key{*fast_fee, std::max<std::uint64_t>(1, raw.size()), txid};
+        if (!EvictionKeyLess{}(*worst_key, fast_key)) {
+          ++rejected_full_not_good_enough_;
+          if (err) *err = kMempoolFullNotGoodEnough;
+          return false;
+        }
+      }
     }
   }
 
@@ -177,13 +245,13 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
     }
     if (!meets_full_replacement_margin(meta.entry, worst_it->second.entry, full_replacement_margin_bps_)) {
       ++rejected_full_not_good_enough_;
-      if (err) *err = "mempool full: not good enough";
+      if (err) *err = kMempoolFullNotGoodEnough;
       for (const auto& op : meta.spent) spent_outpoints_.erase(op);
       return false;
     }
     if (compare_entry_score(meta.entry, worst_it->second.entry) <= 0) {
       ++rejected_full_not_good_enough_;
-      if (err) *err = "mempool full: not good enough";
+      if (err) *err = kMempoolFullNotGoodEnough;
       for (const auto& op : meta.spent) spent_outpoints_.erase(op);
       return false;
     }

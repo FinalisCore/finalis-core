@@ -239,6 +239,71 @@ class DB {
   DB(DB&&) noexcept = default;
   DB& operator=(DB&&) noexcept = default;
 
+  // Accumulates Put/Delete ops for one atomic commit via DB::write_batch(),
+  // instead of each op hitting the WAL as a separate synchronous call.
+  //
+  // Holds a non-owning reference to the owning DB so the handful of ops that
+  // carry an invariant check (e.g. "don't let a finality certificate be
+  // overwritten with a conflicting one") can read *committed* state before
+  // staging their write, exactly as the single-op DB::put_X methods do today.
+  // Nothing staged here touches storage until write_batch() runs.
+  class Batch {
+   public:
+    explicit Batch(DB& owner);
+    ~Batch();
+    // Holds a DB& reference member, so it can't be reseated: no copy, no
+    // move. Every caller constructs one Batch per commit and passes it
+    // around by reference.
+    Batch(const Batch&) = delete;
+    Batch& operator=(const Batch&) = delete;
+    Batch(Batch&&) = delete;
+    Batch& operator=(Batch&&) = delete;
+
+    // Generic staging primitives for call sites that already deal in raw
+    // keys/values (set_tip, SMT leaves/roots, ad hoc runtime-state keys, ...).
+    void put(const std::string& key, const Bytes& value);
+    void erase(const std::string& key);
+
+    // Checked: preserves the existing-value conflict check the single-op
+    // method performs today. Returns false (without staging anything) if the
+    // invariant is violated, matching the current fail-closed behavior.
+    bool put_finality_certificate(const FinalityCertificate& cert);
+    bool set_height_hash(std::uint64_t height, const Hash32& hash);
+    bool put_ingress_record(std::uint64_t seq, const Bytes& record_bytes);
+    bool put_frontier_transition(const Hash32& id, const Bytes& transition_bytes);
+    bool map_height_to_frontier_transition(std::uint64_t height, const Hash32& id);
+    bool set_finalized_frontier_height(std::uint64_t height);
+
+    // Unchecked: thin wrappers reusing the same key/serialization helpers the
+    // single-op methods use, so encoding can't drift between the two paths.
+    void put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes);
+    void add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
+    void stage_finalized_ingress_tip(std::uint64_t seq);
+    void set_tip(const TipState& tip);
+    void put_utxo_v2(const OutPoint& op, const UtxoEntryV2& entry);
+    void put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxOut& out, std::uint64_t height);
+    void put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
+    void put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req);
+    void put_epoch_reward_settlement(const EpochRewardSettlementState& state);
+    void put_protocol_reserve_balance(std::uint64_t balance_units);
+    void put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint);
+    void put_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& snapshot);
+    void put_consensus_state_commitment_cache(const ConsensusStateCommitmentCache& cache);
+
+    bool empty() const;
+
+   private:
+    DB& db_;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    friend class DB;
+  };
+
+  // Commits every staged op in one atomic rocksdb::DB::Write() call (or
+  // applies them to the in-memory fallback store once). Safe to call with an
+  // empty batch (no-op, returns true).
+  bool write_batch(Batch& batch, bool disable_wal = false);
+
   bool open(const std::string& path);
   bool open_readonly(const std::string& path);
   bool flush();

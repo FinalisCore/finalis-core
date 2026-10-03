@@ -188,6 +188,11 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
           auto qc_block = r.bytes_fixed<32>();
           auto qc_count = r.varint();
           if (!qc_height || !qc_round || !qc_block || !qc_count) return false;
+          // FIX: Bound attacker-controlled varint before reserve/iteration -- same
+          // class of pre-auth OOM/crash this guards against in
+          // FinalityCertificate::parse() (tx.cpp); de_propose hand-rolls the same
+          // signature-list decode and had drifted without the bound.
+          if (*qc_count > MAX_COMMITTEE) return false;
           qc.height = *qc_height;
           qc.round = *qc_round;
           qc.frontier_transition_id = *qc_block;
@@ -210,6 +215,8 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
           auto tc_round = r.u32le();
           auto tc_count = r.varint();
           if (!tc_height || !tc_round || !tc_count) return false;
+          // FIX: same bound as the qc_count case above.
+          if (*tc_count > MAX_COMMITTEE) return false;
           tc.height = *tc_height;
           tc.round = *tc_round;
           tc.signatures.reserve(*tc_count);
