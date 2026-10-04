@@ -459,8 +459,6 @@ class Node {
       std::uint64_t height, std::uint8_t ticket_difficulty_bits) const;
   std::optional<std::uint64_t> settlement_epoch_for_block_height_locked(std::uint64_t height) const;
   storage::EpochRewardSettlementState epoch_reward_state_for_epoch_locked(std::uint64_t epoch_start_height) const;
-  std::optional<storage::EpochRewardSettlementState> rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(
-      std::uint64_t epoch_start_height) const;
   std::map<PubKey32, std::uint64_t> compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const;
   bool ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height);
   consensus::DeterministicCoinbasePayout coinbase_payout_for_height_locked(std::uint64_t height,
@@ -468,7 +466,6 @@ class Node {
                                                                            std::uint64_t fees_units) const;
   std::vector<TxOut> coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
                                                         std::uint64_t fees_units) const;
-  void mark_epoch_reward_settled_if_needed_locked(std::uint64_t height);
   std::optional<Hash32> pending_join_request_for_validator_locked(const PubKey32& pub) const;
   std::size_t pending_join_request_count_locked() const;
   bool init_mainnet_genesis();

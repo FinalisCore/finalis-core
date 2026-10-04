@@ -298,6 +298,33 @@ std::map<PubKey32, std::uint64_t> checkpoint_onboarding_scores(
   return out;
 }
 
+// Post-cap reserve subsidy for closing `reward_state` at settlement height
+// `height`, given the reserve balance *before* that epoch's accrual is credited.
+// Single source for the settlement payout (derive_frontier_settlement_from_state,
+// pre-block state) and the reserve debit (mark_epoch_reward_settled_for_height,
+// unmodified copy of that state), so the units paid always equal the units debited.
+std::uint64_t epoch_reserve_subsidy_units(const CanonicalDerivationConfig& cfg, std::uint64_t height,
+                                          const storage::EpochRewardSettlementState& reward_state,
+                                          std::uint64_t reserve_balance_before_accrual) {
+  if (height < EMISSION_BLOCKS) return 0;
+  const auto threshold_bps = active_economics_policy(cfg.network, height).participation_threshold_bps;
+  std::size_t eligible_validator_count = 0;
+  for (const auto& [pub, raw_score] : reward_state.reward_score_units) {
+    const auto expected_it = reward_state.expected_participation_units.find(pub);
+    const auto observed_it = reward_state.observed_participation_units.find(pub);
+    const std::uint64_t expected =
+        expected_it == reward_state.expected_participation_units.end() ? 0 : expected_it->second;
+    const std::uint64_t observed =
+        observed_it == reward_state.observed_participation_units.end() ? 0 : observed_it->second;
+    const std::uint32_t participation_bps =
+        expected == 0 ? 10'000U
+                      : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
+    if (apply_participation_penalty_bps(raw_score, participation_bps, threshold_bps) > 0) ++eligible_validator_count;
+  }
+  return post_cap_reserve_subsidy_units(eligible_validator_count, reward_state.fee_pool_units,
+                                        reserve_balance_before_accrual + reward_state.reserve_accrual_units);
+}
+
 FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivationConfig& cfg,
                                                          const CanonicalDerivedState& prev, std::uint64_t height,
                                                          const PubKey32& leader_pubkey,
@@ -316,7 +343,9 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
     if (it != prev.epoch_reward_states.end() && !it->second.settled) {
       settlement_rewards = it->second.total_reward_units;
       settled_epoch_fees = height >= EMISSION_BLOCKS ? it->second.fee_pool_units : 0;
-      reserve_subsidy = height >= EMISSION_BLOCKS ? it->second.reserve_subsidy_units : 0;
+      // Computed here from the pre-block state, not read back: the stored field
+      // is only filled when this same settlement is applied.
+      reserve_subsidy = epoch_reserve_subsidy_units(cfg, height, it->second, prev.protocol_reserve_balance_units);
       settlement_scores = it->second.reward_score_units;
       const auto checkpoint_scores =
           checkpoint_onboarding_scores(prev.finalized_committee_checkpoints, *settlement_epoch,
@@ -609,25 +638,8 @@ void mark_epoch_reward_settled_for_height(const CanonicalDerivationConfig& cfg, 
   auto& reward_state = state->epoch_reward_states[settlement_epoch];
   reward_state.epoch_start_height = settlement_epoch;
   if (reward_state.settled) return;
-  reward_state.reserve_subsidy_units = 0;
-  if (height >= EMISSION_BLOCKS) {
-    const auto& econ = active_economics_policy(cfg.network, height);
-    std::size_t eligible_validator_count = 0;
-    for (const auto& [pub, raw_score] : reward_state.reward_score_units) {
-      const auto expected_it = reward_state.expected_participation_units.find(pub);
-      const auto observed_it = reward_state.observed_participation_units.find(pub);
-      const std::uint64_t expected = expected_it == reward_state.expected_participation_units.end() ? 0 : expected_it->second;
-      const std::uint64_t observed = observed_it == reward_state.observed_participation_units.end() ? 0 : observed_it->second;
-      const std::uint32_t participation_bps =
-          expected == 0 ? 10'000U
-                        : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
-      const auto adjusted_score = apply_participation_penalty_bps(raw_score, participation_bps, econ.participation_threshold_bps);
-      if (adjusted_score > 0) ++eligible_validator_count;
-    }
-    const auto reserve_after_accrual = state->protocol_reserve_balance_units + reward_state.reserve_accrual_units;
-    reward_state.reserve_subsidy_units = post_cap_reserve_subsidy_units(eligible_validator_count, reward_state.fee_pool_units,
-                                                                        reserve_after_accrual);
-  }
+  reward_state.reserve_subsidy_units =
+      epoch_reserve_subsidy_units(cfg, height, reward_state, state->protocol_reserve_balance_units);
   reward_state.settled = true;
   state->protocol_reserve_balance_units += reward_state.reserve_accrual_units;
   if (state->protocol_reserve_balance_units >= reward_state.reserve_subsidy_units) {
@@ -1799,6 +1811,22 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
 
   CanonicalDerivedState next = prev;
   mark_epoch_reward_settled_for_height(cfg, record.transition.height, &next);
+  {
+    // Invariant: the subsidy paid by this transition's settlement is exactly the
+    // amount debited from the reserve by closing the epoch (0 when nothing settles).
+    std::uint64_t debited = 0;
+    if (const auto settlement_epoch = settlement_epoch_for_height(cfg, record.transition.height);
+        settlement_epoch.has_value()) {
+      const auto prev_it = prev.epoch_reward_states.find(*settlement_epoch);
+      if (prev_it != prev.epoch_reward_states.end() && !prev_it->second.settled) {
+        debited = next.epoch_reward_states[*settlement_epoch].reserve_subsidy_units;
+      }
+    }
+    if (record.transition.settlement.reserve_subsidy_units != debited) {
+      if (error) *error = "frontier-reserve-subsidy-mismatch";
+      return false;
+    }
+  }
   // Participation recorded in this transition belongs to the parent height:
   // account it against the parent committee. prev_finality_signers has
   // already been verified by verify_frontier_record_against_state above.

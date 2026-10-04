@@ -1089,31 +1089,6 @@ std::optional<std::uint64_t> parse_height_from_error(const std::string& error) {
   }
 }
 
-Hash32 hash32_from_hex_or_zero(const char* hex) {
-  if (!hex) return Hash32{};
-  const auto b = hex_decode(std::string(hex));
-  if (!b.has_value() || b->size() != 32) return Hash32{};
-  Hash32 out{};
-  std::copy(b->begin(), b->end(), out.begin());
-  return out;
-}
-
-bool should_accept_frozen_settlement_hotfix(const FrontierTransition& transition) {
-  static const Hash32 kAcceptedSettlementCommitment7009 = hash32_from_hex_or_zero(
-      "2a0c42c55172ffc312c88e2d4ab03d3d77fbafd71b4149cab89486abc591c3ee");
-  static const Hash32 kAcceptedSettlementCommitment7041 = hash32_from_hex_or_zero(
-      "ebd9494cd54f49c1c452efa57f2cafb6b2d83ce3746f7aa04b860a7caddc738a");
-  if (transition.height == 7009 && transition.settlement.settlement_epoch_start == 6977 &&
-      transition.settlement_commitment == kAcceptedSettlementCommitment7009) {
-    return true;
-  }
-  if (transition.height == 7041 && transition.settlement.settlement_epoch_start == 7009 &&
-      transition.settlement_commitment == kAcceptedSettlementCommitment7041) {
-    return true;
-  }
-  return false;
-}
-
 std::optional<std::pair<std::uint32_t, std::uint64_t>> parse_lane_seq_from_error(const std::string& error) {
   const std::string lane_marker = "lane=";
   const std::string seq_marker = "seq=";
@@ -2030,47 +2005,6 @@ bool finalized_identity_valid_for_frontier_runtime(std::uint64_t finalized_heigh
                                                    const consensus::FinalizedIdentity& identity) {
   if (identity.is_transition()) return true;
   return finalized_height == 0 && identity.is_genesis();
-}
-
-void mark_epoch_reward_settled_for_height(const NetworkConfig& network, std::uint64_t height, std::uint64_t epoch_blocks,
-                                          std::map<std::uint64_t, storage::EpochRewardSettlementState>& reward_states,
-                                          std::uint64_t* protocol_reserve_balance_units, storage::DB* db) {
-  const auto epoch_start = consensus::committee_epoch_start(height, epoch_blocks);
-  if (height != epoch_start || epoch_start <= 1 || epoch_start <= epoch_blocks) return;
-  const auto settlement_epoch = epoch_start - epoch_blocks;
-  auto& state = reward_states[settlement_epoch];
-  state.epoch_start_height = settlement_epoch;
-  if (state.settled) return;
-  state.reserve_subsidy_units = 0;
-  if (height >= consensus::EMISSION_BLOCKS) {
-    const auto threshold_bps = active_economics_policy(network, height).participation_threshold_bps;
-    std::size_t eligible_validator_count = 0;
-    for (const auto& [pub, raw_score] : state.reward_score_units) {
-      const auto expected_it = state.expected_participation_units.find(pub);
-      const auto observed_it = state.observed_participation_units.find(pub);
-      const std::uint64_t expected = expected_it == state.expected_participation_units.end() ? 0 : expected_it->second;
-      const std::uint64_t observed = observed_it == state.observed_participation_units.end() ? 0 : observed_it->second;
-      const std::uint32_t participation_bps =
-          expected == 0 ? 10'000U
-                        : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
-      const auto adjusted_score = consensus::apply_participation_penalty_bps(raw_score, participation_bps, threshold_bps);
-      if (adjusted_score > 0) ++eligible_validator_count;
-    }
-    const auto reserve_after_accrual = (protocol_reserve_balance_units ? *protocol_reserve_balance_units : 0) + state.reserve_accrual_units;
-    state.reserve_subsidy_units =
-        consensus::post_cap_reserve_subsidy_units(eligible_validator_count, state.fee_pool_units, reserve_after_accrual);
-  }
-  state.settled = true;
-  if (protocol_reserve_balance_units) {
-    *protocol_reserve_balance_units += state.reserve_accrual_units;
-    if (*protocol_reserve_balance_units >= state.reserve_subsidy_units) {
-      *protocol_reserve_balance_units -= state.reserve_subsidy_units;
-    } else {
-      *protocol_reserve_balance_units = 0;
-    }
-    if (db) (void)db->put_protocol_reserve_balance(*protocol_reserve_balance_units);
-  }
-  if (db) (void)db->put_epoch_reward_settlement(state);
 }
 
 void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators,
@@ -4723,99 +4657,6 @@ storage::EpochRewardSettlementState Node::epoch_reward_state_for_epoch_locked(st
   return empty;
 }
 
-std::optional<storage::EpochRewardSettlementState> Node::rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(
-    std::uint64_t epoch_start_height) const {
-  const auto epoch_blocks = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
-  const auto epoch_end_height = epoch_start_height + epoch_blocks - 1;
-  if (finalized_height_ < epoch_end_height) return std::nullopt;
-
-  // Mirrors canonical derivation exactly (consensus::accrue_frontier_epoch_reward):
-  // transition X books its own emission/leader score plus the participation of
-  // its parent X-1, taken from X's verified prev_finality_signers and scored
-  // against the parent's certified committee.
-  const auto derivation_cfg = canonical_derivation_config_locked();
-  std::map<std::uint64_t, storage::EpochRewardSettlementState> rebuilt;
-  for (std::uint64_t height = epoch_start_height; height <= epoch_end_height; ++height) {
-    const auto transition_id = db_.get_frontier_transition_by_height(height);
-    if (!transition_id.has_value()) return std::nullopt;
-    const auto transition_bytes = db_.get_frontier_transition(*transition_id);
-    if (!transition_bytes.has_value()) return std::nullopt;
-    const auto transition = FrontierTransition::parse(*transition_bytes);
-    if (!transition.has_value()) return std::nullopt;
-
-    std::vector<PubKey32> parent_committee;
-    if (!transition->prev_finality_signers.empty()) {
-      if (height <= 1) return std::nullopt;
-      const auto parent_cert = db_.get_finality_certificate_by_height(height - 1);
-      if (!parent_cert.has_value()) return std::nullopt;
-      parent_committee = parent_cert->committee_members;
-    }
-    consensus::accrue_frontier_epoch_reward(derivation_cfg, validators_, &rebuilt, *transition, parent_committee);
-  }
-
-  auto it = rebuilt.find(epoch_start_height);
-  if (it == rebuilt.end()) return std::nullopt;
-
-  auto state = it->second;
-  state.epoch_start_height = epoch_start_height;
-  // Validation at the settlement boundary (next epoch start) must use the
-  // pre-settlement reward state. Marking this settled here would zero out
-  // expected settlement outputs and cause deterministic hard-rejects.
-  state.settled = false;
-  const auto settlement_boundary_height = epoch_start_height + epoch_blocks;
-  std::vector<PubKey32> boundary_members;
-  if (auto boundary_checkpoint = finalized_committee_checkpoint_for_height_locked(settlement_boundary_height);
-      boundary_checkpoint.has_value() && !boundary_checkpoint->ordered_members.empty()) {
-    boundary_members = boundary_checkpoint->ordered_members;
-    std::map<PubKey32, std::uint64_t> onboarding;
-    for (const auto& member : boundary_members) onboarding[member] = 1;
-    state.onboarding_score_units = std::move(onboarding);
-  } else if (auto snapshot = db_.get_epoch_committee_snapshot(epoch_start_height);
-      snapshot.has_value() && !snapshot->ordered_members.empty()) {
-    boundary_members = snapshot->ordered_members;
-    std::map<PubKey32, std::uint64_t> onboarding;
-    for (const auto& member : boundary_members) onboarding[member] = 1;
-    state.onboarding_score_units = std::move(onboarding);
-  } else if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(epoch_start_height);
-             checkpoint.has_value() && !checkpoint->ordered_members.empty()) {
-    boundary_members = checkpoint->ordered_members;
-    std::map<PubKey32, std::uint64_t> onboarding;
-    for (const auto& member : boundary_members) onboarding[member] = 1;
-    state.onboarding_score_units = std::move(onboarding);
-  } else {
-    return std::nullopt;
-  }
-
-  if (!boundary_members.empty()) {
-    // Frozen-epoch validation must not depend on any node-local replay residue.
-    // Re-anchor reward/participation maps to finalized authority membership.
-    state.expected_participation_units.clear();
-    state.observed_participation_units.clear();
-    state.reward_score_units.clear();
-
-    std::set<PubKey32> boundary_operators;
-    for (const auto& member : boundary_members) {
-      if (auto it = validators_.all().find(member); it != validators_.all().end()) {
-        boundary_operators.insert(consensus::canonical_operator_id(member, it->second));
-      } else {
-        boundary_operators.insert(member);
-      }
-    }
-    const auto active_operator_count = std::max<std::size_t>(1, boundary_operators.size());
-    const auto reward_height = settlement_boundary_height > 0 ? (settlement_boundary_height - 1) : 0;
-    for (const auto& member : boundary_members) {
-      state.expected_participation_units[member] = 1;
-      state.observed_participation_units[member] = 1;
-      std::uint64_t weight = 1;
-      if (auto it = validators_.all().find(member); it != validators_.all().end()) {
-        weight = consensus::reward_weight(cfg_.network, reward_height, active_operator_count, it->second.bonded_amount);
-      }
-      state.reward_score_units[member] = std::max<std::uint64_t>(1, weight);
-    }
-  }
-  return state;
-}
-
 consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(std::uint64_t height,
                                                                                const PubKey32& leader_pubkey,
                                                                                std::uint64_t fees_units) const {
@@ -4909,7 +4750,6 @@ std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch
 bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height) {
   const auto settlement_epoch = settlement_epoch_for_block_height_locked(height);
   if (!settlement_epoch.has_value()) return true;
-  const auto epoch_blocks = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
 
   std::size_t established_peers = 0;
   for (int peer_id : p2p_.peer_ids()) {
@@ -4951,35 +4791,6 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
     }
   }
 
-  // Determinism-critical: once the settlement epoch is fully finalized, force
-  // reward-state reconstruction from finalized chain artifacts and override any
-  // runtime residue. This keeps settlement commitments aligned across nodes.
-  const std::uint64_t settlement_epoch_end = *settlement_epoch + epoch_blocks - 1;
-  if (finalized_height_ >= settlement_epoch_end) {
-    if (auto rebuilt = rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(*settlement_epoch); rebuilt.has_value()) {
-      auto& runtime_reward_state = epoch_reward_states_[*settlement_epoch];
-      runtime_reward_state.epoch_start_height = *settlement_epoch;
-      const bool runtime_state_changed = !same_epoch_reward_state(runtime_reward_state, *rebuilt);
-      if (runtime_state_changed) {
-        runtime_reward_state = *rebuilt;
-        (void)db_.put_epoch_reward_settlement(runtime_reward_state);
-      }
-      if (canonical_state_.has_value()) {
-        auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
-        canonical_reward_state.epoch_start_height = *settlement_epoch;
-        const bool canonical_state_changed = !same_epoch_reward_state(canonical_reward_state, *rebuilt);
-        if (canonical_state_changed) {
-          canonical_reward_state = *rebuilt;
-          canonical_state_->state_commitment =
-              consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
-        }
-      }
-      if (runtime_state_changed) {
-        log_line("settlement-reward-state-rebuilt epoch=" + std::to_string(*settlement_epoch) +
-                 " source=finalized-chain");
-      }
-    }
-  }
   return true;
 }
 
@@ -4993,12 +4804,6 @@ std::vector<TxOut> Node::coinbase_outputs_for_height_locked(std::uint64_t height
     outputs.push_back(TxOut{units, address::p2pkh_script_pubkey(pkh)});
   }
   return outputs;
-}
-
-void Node::mark_epoch_reward_settled_if_needed_locked(std::uint64_t height) {
-  (void)ensure_settlement_onboarding_scores_loaded_locked(height);
-  mark_epoch_reward_settled_for_height(cfg_.network, height, cfg_.network.committee_epoch_blocks, epoch_reward_states_,
-                                       &protocol_reserve_balance_units_, &db_);
 }
 
 std::vector<FinalitySig> Node::canonicalize_finality_signatures_locked(const std::vector<FinalitySig>& signatures,
@@ -8795,94 +8600,11 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     consensus::FrontierExecutionResult recomputed;
     std::string validation_error;
     std::string validation_diagnostics;
-    bool accepted_with_settlement_hotfix = false;
-    auto validation_state = *canonical_state_;
-    if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
-        settlement_epoch.has_value() && epoch_committee_frozen_locked(*settlement_epoch)) {
-      const auto rebuilt_state = rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(*settlement_epoch);
-      if (!rebuilt_state.has_value()) {
-        log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
-                 std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
-                 " reason=frozen-epoch-rebuild-unavailable");
-        return false;
-      }
-      validation_state.epoch_reward_states[*settlement_epoch] = *rebuilt_state;
-    }
-    if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), validation_state,
+    // Settlement is valid only if it matches canonical derivation from canonical
+    // state. No node-local reward state may substitute for it.
+    if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
                                                          certified_record, &recomputed, &validation_error,
                                                          &validation_diagnostics)) {
-      bool accepted_with_settlement_fallback = false;
-      if (validation_error == "frontier-settlement-commitment-mismatch") {
-        if (should_accept_frozen_settlement_hotfix(transition)) {
-          accepted_with_settlement_fallback = true;
-          accepted_with_settlement_hotfix = true;
-          log_line("frontier-settlement-hotfix-accept height=" + std::to_string(transition.height) +
-                   " round=" + std::to_string(transition.round) +
-                   " epoch=" + std::to_string(transition.settlement.settlement_epoch_start));
-        }
-        if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
-            settlement_epoch.has_value() && !accepted_with_settlement_fallback) {
-          if (epoch_committee_frozen_locked(*settlement_epoch)) {
-            log_line("frontier-settlement-fallback-skipped height=" + std::to_string(transition.height) +
-                     " epoch=" + std::to_string(*settlement_epoch) + " reason=frozen-epoch");
-          } else {
-          auto try_reward_state = [&](storage::EpochRewardSettlementState candidate_state, const char* source) -> bool {
-            candidate_state.epoch_start_height = *settlement_epoch;
-            auto fallback_state = *canonical_state_;
-            fallback_state.epoch_reward_states[*settlement_epoch] = candidate_state;
-
-            consensus::FrontierExecutionResult fallback_recomputed;
-            std::string fallback_error;
-            if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), fallback_state,
-                                                                 certified_record, &fallback_recomputed, &fallback_error)) {
-              return false;
-            }
-            recomputed = std::move(fallback_recomputed);
-            auto& runtime_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
-            runtime_reward_state.epoch_start_height = *settlement_epoch;
-            if (!same_epoch_reward_state(runtime_reward_state, candidate_state)) {
-              runtime_reward_state = candidate_state;
-              canonical_state_->state_commitment =
-                  consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
-            }
-            auto& mem_reward_state = epoch_reward_states_[*settlement_epoch];
-            mem_reward_state.epoch_start_height = *settlement_epoch;
-            if (!same_epoch_reward_state(mem_reward_state, candidate_state)) {
-              mem_reward_state = candidate_state;
-              (void)db_.put_epoch_reward_settlement(candidate_state);
-            }
-            log_line("frontier-settlement-fallback-accepted height=" + std::to_string(transition.height) +
-                     " epoch=" + std::to_string(*settlement_epoch) + " source=" + source);
-            return true;
-          };
-
-          const auto ticket_onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
-
-          if (auto persisted_state = db_.get_epoch_reward_settlement(*settlement_epoch); persisted_state.has_value()) {
-            accepted_with_settlement_fallback = try_reward_state(*persisted_state, "persisted-state");
-            if (!accepted_with_settlement_fallback &&
-                (!ticket_onboarding_scores.empty() || !persisted_state->onboarding_score_units.empty())) {
-              auto patched = *persisted_state;
-              patched.onboarding_score_units = ticket_onboarding_scores;
-              accepted_with_settlement_fallback = try_reward_state(std::move(patched), "persisted+ticket-onboarding");
-            }
-          }
-          if (!accepted_with_settlement_fallback) {
-            auto runtime_state = epoch_reward_state_for_epoch_locked(*settlement_epoch);
-            runtime_state.onboarding_score_units = ticket_onboarding_scores;
-            accepted_with_settlement_fallback =
-                try_reward_state(std::move(runtime_state), "runtime+ticket-onboarding");
-          }
-          if (!accepted_with_settlement_fallback) {
-            auto empty_onboarding_state = epoch_reward_state_for_epoch_locked(*settlement_epoch);
-            empty_onboarding_state.onboarding_score_units.clear();
-            accepted_with_settlement_fallback =
-                try_reward_state(std::move(empty_onboarding_state), "runtime-empty-onboarding");
-          }
-          }
-        }
-      }
-      if (!accepted_with_settlement_fallback) {
       last_test_hook_error_ = "frontier-verify-reject:" + validation_error;
       if (!validation_diagnostics.empty()) {
         last_test_hook_error_ += " details=" + validation_diagnostics;
@@ -8896,22 +8618,10 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                  " details=" + validation_diagnostics);
       }
       return false;
-      }
     }
     std::vector<PubKey32> expected_committee = recomputed.effective_committee;
     std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
-    if (accepted_with_settlement_hotfix) {
-      expected_committee = certificate->committee_members;
-      expected_quorum = certificate->quorum_threshold;
-      if (expected_quorum != consensus::quorum_threshold(expected_committee.size())) {
-        log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
-                 std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
-                 " reason=certificate-quorum-threshold-invalid");
-        return false;
-      }
-    }
-    if (!accepted_with_settlement_hotfix &&
-        (certificate->committee_members != expected_committee || certificate->quorum_threshold != expected_quorum)) {
+    if (certificate->committee_members != expected_committee || certificate->quorum_threshold != expected_quorum) {
       log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
                std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
                " reason=certificate-committee-mismatch");
@@ -8936,40 +8646,6 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
 
   std::string validation_error;
   if (!validate_frontier_proposal_locked(proposal, &validation_error)) {
-    bool accepted_with_settlement_fallback = false;
-    if (validation_error == "frontier-settlement-commitment-mismatch") {
-      if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height); settlement_epoch.has_value()) {
-        if (epoch_committee_frozen_locked(*settlement_epoch)) {
-          log_line("frontier-settlement-fallback-skipped height=" + std::to_string(transition.height) +
-                   " epoch=" + std::to_string(*settlement_epoch) + " reason=frozen-epoch");
-        } else {
-        auto apply_and_retry = [&](storage::EpochRewardSettlementState candidate_state) {
-          candidate_state.epoch_start_height = *settlement_epoch;
-          auto& runtime_state = epoch_reward_states_[*settlement_epoch];
-          runtime_state = candidate_state;
-          (void)db_.put_epoch_reward_settlement(runtime_state);
-          if (canonical_state_.has_value()) {
-            auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
-            canonical_reward_state = candidate_state;
-            canonical_state_->state_commitment =
-                consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
-          }
-          validation_error.clear();
-          accepted_with_settlement_fallback = validate_frontier_proposal_locked(proposal, &validation_error);
-        };
-
-        auto candidate_state = epoch_reward_state_for_epoch_locked(*settlement_epoch);
-        const auto ticket_onboarding_scores = compute_onboarding_score_units_for_epoch_locked(*settlement_epoch);
-        candidate_state.onboarding_score_units = ticket_onboarding_scores;
-        apply_and_retry(candidate_state);
-        if (!accepted_with_settlement_fallback) {
-          candidate_state.onboarding_score_units.clear();
-          apply_and_retry(candidate_state);
-        }
-        }
-      }
-    }
-    if (!accepted_with_settlement_fallback) {
     log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
              std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
              " reason=" + validation_error);
@@ -8979,7 +8655,6 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
                " validation_reason=" + validation_error);
     }
     return false;
-    }
   }
   std::string lock_error;
   if (!can_accept_frontier_with_lock_locked(transition, &lock_error)) {
@@ -9156,27 +8831,9 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
   consensus::CanonicalFrontierRecord certified_record{transition, proposal.ordered_records};
   consensus::FrontierExecutionResult recomputed;
   std::string validation_diagnostics;
-  auto validation_state = *canonical_state_;
-  if (auto settlement_epoch = settlement_epoch_for_block_height_locked(transition.height);
-      settlement_epoch.has_value() && epoch_committee_frozen_locked(*settlement_epoch)) {
-    const auto rebuilt_state = rebuild_frozen_epoch_reward_state_from_finalized_chain_locked(*settlement_epoch);
-    if (rebuilt_state.has_value()) {
-      validation_state.epoch_reward_states[*settlement_epoch] = *rebuilt_state;
-    } else {
-      if (error) *error = "frozen-epoch-rebuild-unavailable";
-      return false;
-    }
-  }
-  if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), validation_state,
+  if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
                                                        certified_record, &recomputed, error,
                                                        &validation_diagnostics)) {
-    if (error && *error == "frontier-settlement-commitment-mismatch" &&
-        should_accept_frozen_settlement_hotfix(transition)) {
-      log_line("frontier-settlement-hotfix-accept height=" + std::to_string(transition.height) +
-               " round=" + std::to_string(transition.round) +
-               " epoch=" + std::to_string(transition.settlement.settlement_epoch_start));
-      return true;
-    }
     if (error != nullptr && !validation_diagnostics.empty()) {
       if (!error->empty()) *error += " details=" + validation_diagnostics;
       else *error = "details=" + validation_diagnostics;
@@ -9443,16 +9100,9 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::string validation_error;
   if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
                                                        certified_record, &recomputed, &validation_error)) {
-    if (validation_error == "frontier-settlement-commitment-mismatch" &&
-        should_accept_frozen_settlement_hotfix(finalized_proposal.transition)) {
-      log_line("frontier-settlement-hotfix-accept height=" + std::to_string(height) +
-               " round=" + std::to_string(round) +
-               " epoch=" + std::to_string(finalized_proposal.transition.settlement.settlement_epoch_start));
-    } else {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=" + validation_error);
     return false;
-    }
   }
   const auto expected_committee = recomputed.effective_committee;
   if (expected_committee.empty()) {

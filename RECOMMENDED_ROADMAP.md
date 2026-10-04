@@ -233,6 +233,69 @@ Resolved and built clean: **D5** (item 8), **D1** (item 9), **D3** (item 10). No
   TC-based round jumps), D6 (≥4 genesis validators), D7 (post-cap security budget), state growth
   (`CanonicalDerivedState` pruning and per-block copy).
 
+## G. Phase 4: Strict Monetary & Economic Safety (from the 2026-10-04 monetary audit)
+
+Audit summary: consensus economics uses no floating point. Emission sums to exactly
+`TOTAL_SUPPLY_UNITS` (12 yearly budgets with exact 4/5 decay; the last year takes the remainder).
+Reserve accrual is conserved per epoch. No rounding path can mint above the cap. Two paths
+**destroy** supply (items 12 and 14), and one path lets node-local state override canonical
+settlement (item 13).
+
+- [x] **12. Post-cap reserve subsidy: units paid must equal units debited**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Consensus change (effective from
+    height 2,102,400); ships with the D1 fresh genesis.
+  - Problem: `derive_frontier_settlement_from_state` (`canonical_derivation.cpp:319`) reads the
+    settlement epoch's `reserve_subsidy_units` from the pre-block state, where it is still 0. The
+    subsidy is computed later, in `mark_epoch_reward_settled_for_height` (`:612-637`), which runs on
+    the post-block state during apply and debits the reserve. So the subsidy is never paid, and the
+    reserve is destroyed down to the 140,000 FLS floor after the cap.
+  - Fix: one pure helper, `epoch_reserve_subsidy_units(cfg, height, reward_state, reserve_before_accrual)`,
+    used by both the payout (pre-block state) and the debit (`next` before any other mutation, so the
+    inputs are identical). `apply_frontier_record_impl` additionally rejects a transition whose
+    `settlement.reserve_subsidy_units` differs from the debited amount (`frontier-reserve-subsidy-mismatch`).
+  - Cleanup: deleted the dead node mirror (`node.cpp` `mark_epoch_reward_settled_for_height` +
+    `Node::mark_epoch_reward_settled_if_needed_locked`, which had no callers).
+
+- [x] **13. Remove node-local settlement fallback / hotfix acceptance**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Node-only; no format change.
+  - Problem: on `frontier-settlement-commitment-mismatch`, the node retried verification with
+    node-local reward states (persisted, runtime, ticket-patched) and **overwrote canonical state** with
+    whichever matched. One variant (`apply_and_retry`) wrote canonical state and the DB even when the
+    retry failed. It also accepted hard-coded commitments at heights 7009/7041 from the abandoned chain,
+    and validated settlement-boundary blocks against a `rebuild_frozen_epoch_reward_state_*` substitute
+    instead of canonical state.
+  - Fix: delete `should_accept_frozen_settlement_hotfix`, both fallback blocks, the three hotfix
+    branches, the frozen-epoch `validation_state` substitutions, and the post-apply canonical overwrite.
+    `rebuild_frozen_epoch_reward_state_from_finalized_chain_locked` then has no callers and is deleted.
+    Any settlement that fails canonical verification is rejected.
+  - Done: all five bypass layers were removed (certified-sync `try_reward_state` fallback, uncertified-path
+    `apply_and_retry`, 7009/7041 hotfix at 3 call sites including its committee-check skip, two
+    frozen-epoch `validation_state` substitutions, post-apply canonical overwrite in
+    `ensure_settlement_onboarding_scores_loaded_locked`). Also deleted `should_accept_frozen_settlement_hotfix`,
+    `hash32_from_hex_or_zero`, and the rebuild function.
+  - Left in place (not consensus-affecting): `ensure_settlement_onboarding_scores_loaded_locked` still writes
+    node-local ticket onboarding scores into canonical reward state. That field is neither in the state
+    commitment nor read by the canonical payout, which uses checkpoint members.
+  - Watch: if fast-start nodes reject settlement blocks after this change, the cause is the tip-only
+    `finalized_block_metadata` reload (item 9 follow-up), which the removed rebuild used to mask.
+  - Tests that relied on the fallback will now fail. Fix them by making their settlement canonical;
+    do not restore the bypass.
+
+- [ ] **14. Pre-cap transaction fees must not be burned**
+  - Status: **open — design decision needed.**
+  - Problem: before `EMISSION_BLOCKS`, fees are removed from transaction inputs but never paid
+    (`canonical_derivation.cpp:318`, `:348-350`, `:979`). That burns 12 years of fees, leaves validators
+    with no fee income, and contradicts `docs/ECONOMICS.md` §4.
+  - Requested direction: pay fees to the proposer immediately.
+  - ⚠ Conflict: settlement outputs are part of `settlement_commitment`, which is part of
+    `consensus_payload_id` (the vote-lock identity). Paying the *current round leader* per block would
+    change the payload whenever a different leader re-proposes a locked payload. That breaks lock
+    re-proposal, which is the reason fees were kept out of per-block settlement.
+  - Recommended alternative: pool fees into the epoch `fee_pool_units` from genesis (drop the
+    `height >= EMISSION_BLOCKS` gates) and pay them at epoch settlement by reward score, the same as
+    post-cap. The proposer is still credited through its leader score. The payload stays
+    leader-independent and nothing is burned.
+
 ---
 
 ## Status summary
@@ -251,9 +314,12 @@ Resolved and built clean: **D5** (item 8), **D1** (item 9), **D3** (item 10). No
 | 9 | D1 verified participation record | done — builds clean (**fresh genesis required**) |
 | 10 | D3 timeout window + backoff | done — builds clean |
 | 11 | D2, D4, D6, D7, state growth | **open** |
+| 12 | Post-cap subsidy paid = debited | done — builds clean (consensus; fresh genesis) |
+| 13 | Remove settlement fallback / hotfix | done — builds clean |
+| 14 | Pre-cap fees not burned | **open — design decision** (epoch pooling recommended) |
 
 2026-10-04: the full tree (`cmake --build build -j`, including the test binaries) builds clean. That
-verifies the C++ items 1, 3, 4, 8, 9 and 10. Item 2 needs a `docker build`, item 7 an SDK typecheck. No tests
+verifies the C++ items 1, 3, 4, 8, 9, 10, 12 and 13. Item 2 needs a `docker build`, item 7 an SDK typecheck. No tests
 have been run: in the audit sandbox, every multi-node test fails at node init (listener `errno=2`),
 and the original code fails the same way.
 Verify with `cmake --build build -j`, `ctest --test-dir build --output-on-failure`, and
