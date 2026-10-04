@@ -102,3 +102,5 @@ checkpr.md
 index.html
 mytest.md
 .clinerules
+# generated devnet keys/genesis (scripts/generate_fresh_genesis.sh)
+/devnet/

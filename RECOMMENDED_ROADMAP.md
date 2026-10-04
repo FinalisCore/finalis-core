@@ -374,6 +374,21 @@ settlement (item 13).
     `test_unseeded_bootstrap_template_ignores_default_network_seeds`, which needs them present.
   - Note: the production fallback is unchanged; operators who want no public seeds must pass `--seeds`.
 
+- [ ] **22. Fresh-genesis devnet automation**
+  - Status: **applied — not yet run** (scripts written 2026-10-04; no docker or genesis run yet).
+  - `scripts/generate_fresh_genesis.sh --profile local|production --validators N`: runs `wallet_create`
+    (local `build/finalis-cli`, else the compose image via `--docker`) for N keystores, copies the
+    mainnet parameters from `mainnet/genesis.json` with the new validator set, then runs `genesis_build` +
+    `genesis_verify`. Writes keys, `genesis.{json,bin}` and `manifest.env` to git-ignored
+    `devnet/<UTC stamp>/`. Production uses random per-validator passphrases (`secrets/*.pass`, 0600)
+    and needs a clean git tree.
+  - `scripts/devnet_up.sh [--dir DIR] [--no-build]`: loads the newest manifest, runs `docker compose down
+    -v`, writes `devnet/<stamp>/docker-compose.devnet.yml` to bind-mount genesis and keys read-only
+    into node1–3, passes passphrases with `--validator-passphrase-env`, then runs `up -d --build`.
+  - Notes: devnet_up needs `VALIDATOR_COUNT=3`, matching the compose services. The override drops
+    `--with-lightserver` (no lightserver binary in the image; item 2) and sets `--seeds` to the peer list
+    so the nodes do not dial the public seeds (item 21). Docker Compose is not installed on this host.
+
 ---
 
 ## Status summary
@@ -402,6 +417,7 @@ settlement (item 13).
 | 19 | Self-peer check rejected same-host peers | done — clusters finalize again |
 | 20 | Broadcast under `mu_` (self-deadlock) | done — devnet test passes with 19–21 |
 | 21 | Test nodes dialed public seeds | done — builds clean |
+| 22 | Fresh-genesis devnet scripts | applied — not yet run |
 
 2026-10-04: the full tree (`cmake --build build -j`, including the test binaries) builds clean. That
 verifies the C++ items 1, 3, 4, 8, 9, 10, 12, 13 and 15–21. Item 2 needs a `docker build`, item 7 an
