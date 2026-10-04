@@ -105,11 +105,22 @@ TimeoutVoteTallyResult TimeoutVoteTracker::add_vote(const TimeoutVote& vote) {
   }
 
   const Key key{vote.height, vote.round};
-  std::size_t round_keys_for_height = 0;
-  for (const auto& [k, _] : by_round_) {
-    if (k.height == vote.height) ++round_keys_for_height;
+  if (by_round_.find(key) == by_round_.end()) {
+    // Key orders by (height, round), so this height's rounds are contiguous
+    // and `oldest` is its lowest retained round.
+    const auto oldest = by_round_.lower_bound(Key{vote.height, 0});
+    std::size_t rounds_for_height = 0;
+    for (auto r = oldest; r != by_round_.end() && r->first.height == vote.height; ++r) ++rounds_for_height;
+    if (limits_.max_rounds_per_height == 0) return out;
+    if (rounds_for_height >= limits_.max_rounds_per_height) {
+      if (vote.round < oldest->first.round) {
+        out.stale = true;
+        return out;
+      }
+      out.evicted_round = oldest->first.round;
+      by_round_.erase(oldest);
+    }
   }
-  if (by_round_.find(key) == by_round_.end() && round_keys_for_height >= limits_.max_rounds_per_height) return out;
   by_round_[key][vote.validator_pubkey] = vote.signature;
   seen[vote.validator_pubkey] = vote;
   out.accepted = true;

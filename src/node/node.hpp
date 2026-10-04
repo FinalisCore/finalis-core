@@ -390,9 +390,15 @@ class Node {
                                  const std::optional<TimeoutCertificate>& justify_tc,
                                  std::string* reason = nullptr) const;
   bool can_accept_frontier_with_lock_locked(const FrontierTransition& transition, std::string* reason = nullptr) const;
-  void update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const Hash32& payload_id);
+  bool update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const Hash32& payload_id);
+  // Participation record for the finalized tip, for the next transition's
+  // prev_finality_signers: every verified vote seen for the tip (including
+  // late ones) plus the persisted certificate, filtered against the canonical
+  // parent committee so the result always passes consensus verification.
+  std::vector<FinalitySig> prev_finality_signers_for_next_height_locked() const;
+  bool record_late_finalized_vote_locked(const Vote& vote);
   void persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
-  void persist_consensus_safety_state_locked(std::uint64_t height);
+  bool persist_consensus_safety_state_locked(std::uint64_t height);
   void clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
   void clear_consensus_safety_state_locked(std::uint64_t height);
   std::vector<FinalitySig> canonicalize_finality_signatures_locked(const std::vector<FinalitySig>& signatures,
@@ -462,8 +468,6 @@ class Node {
                                                                            std::uint64_t fees_units) const;
   std::vector<TxOut> coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
                                                         std::uint64_t fees_units) const;
-  void accrue_epoch_reward_for_finalized_block_locked(const Block& block, const std::vector<FinalitySig>& finality_sigs,
-                                                      std::uint64_t finalized_fee_units);
   void mark_epoch_reward_settled_if_needed_locked(std::uint64_t height);
   std::optional<Hash32> pending_join_request_for_validator_locked(const PubKey32& pub) const;
   std::size_t pending_join_request_count_locked() const;
@@ -539,8 +543,6 @@ class Node {
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
   bool validate_validator_registration_rules(const Block& block, std::uint64_t height) const;
-  void update_validator_liveness_from_finality(std::uint64_t height, std::uint32_t round,
-                                               const std::vector<FinalitySig>& finality_sigs);
   std::size_t active_operator_count_for_height_locked(std::uint64_t height) const;
   std::uint64_t effective_validator_min_bond_for_height(std::uint64_t height) const;
   std::uint64_t effective_validator_bond_max_for_height(std::uint64_t height) const;
@@ -642,6 +644,14 @@ class Node {
   std::map<std::uint64_t, Hash32> highest_qc_payload_by_height_;
   std::map<std::uint64_t, TimeoutCertificate> highest_tc_by_height_;
   std::map<std::uint64_t, std::pair<Hash32, std::uint32_t>> local_vote_locks_;
+  struct FinalizedTipVotes {
+    std::uint64_t height{0};
+    std::uint32_t round{0};
+    Hash32 transition_id{};
+    std::set<PubKey32> committee;
+    std::map<PubKey32, Sig64> sigs;
+  };
+  FinalizedTipVotes finalized_tip_votes_;
   std::set<PubKey32> locally_observed_equivocators_;
   std::map<std::tuple<std::uint64_t, std::uint32_t, PubKey32>, Hash32> observed_proposals_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;

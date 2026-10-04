@@ -169,6 +169,23 @@ The finality proof is canonicalized before persistence:
 - duplicates removed
 - truncated to exactly quorum
 
+That truncation makes the certificate compact and deterministic. It is
+**not** a participation signal. Participation of height `H` is carried by
+its child transition `H+1` in `prev_finality_signers`. That field holds every
+vote the `H+1` proposer observed for `(H, round_H, transition_id_H)`, including
+votes that arrived after quorum. Nodes verify it before applying `H+1`:
+
+- canonical encoding (sorted by pubkey, no duplicates)
+- empty if and only if the parent is genesis
+- every signer is a member of `H`'s committee
+- every signature verifies over the vote-signing message for `H`
+- at least `quorum(H)` signers
+
+Liveness and reward accounting for `H` read this record (see
+[REWARD-SETTLEMENT.md](REWARD-SETTLEMENT.md)). Since `prev_finality_signers` is
+part of the transition id, re-proposals of a locked payload refresh it freely:
+the lock payload id excludes it.
+
 The finalized transition then drives:
 
 - finalized tip advancement

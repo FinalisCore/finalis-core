@@ -304,6 +304,11 @@ class DB {
   // empty batch (no-op, returns true).
   bool write_batch(Batch& batch, bool disable_wal = false);
 
+  // Same as write_batch(), but fsyncs the WAL before returning. Use for state
+  // that must survive power loss before a dependent message leaves the process
+  // (e.g. a validator's vote lock, which must be durable before the vote is sent).
+  bool write_batch_durable(Batch& batch);
+
   // On failure, if `error` is non-null it's populated with the underlying
   // rocksdb::Status's message (lock held by another process, IO error, disk
   // full, permission denied, corruption, ...) -- distinguishable detail that

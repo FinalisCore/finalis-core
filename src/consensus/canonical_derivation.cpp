@@ -183,13 +183,6 @@ std::vector<FinalitySig> canonicalize_finality_signatures(const std::vector<Fina
   return out;
 }
 
-std::vector<PubKey32> canonicalize_signer_pubkeys(std::vector<PubKey32> signers, std::size_t quorum) {
-  std::sort(signers.begin(), signers.end());
-  signers.erase(std::unique(signers.begin(), signers.end()), signers.end());
-  if (signers.size() > quorum) signers.resize(quorum);
-  return signers;
-}
-
 bool verify_frontier_finality_certificate_against_state(const CanonicalDerivationConfig& cfg,
                                                         const CanonicalDerivedState& prev,
                                                         const FrontierTransition& transition,
@@ -586,43 +579,23 @@ std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_heig
 }
 
 DeterministicEpochRewardInputs compute_deterministic_epoch_reward_inputs(
-    const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state, std::uint64_t height,
-    const PubKey32& leader_pubkey, const std::vector<PubKey32>& committee, const std::vector<FinalitySig>& finality_sigs) {
+    const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators, std::uint64_t height,
+    const PubKey32& leader_pubkey, const std::vector<PubKey32>& parent_committee,
+    const std::vector<FinalitySig>& parent_signers) {
   DeterministicEpochRewardInputs out;
-  std::set<PubKey32> canonical_members(committee.begin(), committee.end());
-  const auto observed_members = committee_participants_from_finality(committee, finality_sigs);
-  std::set<PubKey32> observed_set(observed_members.begin(), observed_members.end());
-  const auto active_operator_count = active_operator_count_for_height(state.validators, height);
+  std::set<PubKey32> canonical_members(parent_committee.begin(), parent_committee.end());
+  std::set<PubKey32> observed_set;
+  for (const auto& sig : parent_signers) observed_set.insert(sig.validator_pubkey);
+  const auto active_operator_count = active_operator_count_for_height(validators, height);
 
   for (const auto& pub : canonical_members) {
     out.expected_participation_units[pub] += 1;
     if (observed_set.find(pub) != observed_set.end()) out.observed_participation_units[pub] += 1;
-    auto it = state.validators.all().find(pub);
-    if (it == state.validators.all().end()) continue;
+    auto it = validators.all().find(pub);
+    if (it == validators.all().end()) continue;
     out.reward_score_units[pub] += reward_weight(cfg.network, height, active_operator_count, it->second.bonded_amount);
   }
-  if (auto it = state.validators.all().find(leader_pubkey); it != state.validators.all().end()) {
-    out.reward_score_units[leader_pubkey] += reward_weight(cfg.network, height, active_operator_count, it->second.bonded_amount);
-  }
-  return out;
-}
-
-DeterministicEpochRewardInputs compute_deterministic_epoch_reward_inputs(
-    const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state, std::uint64_t height,
-    const PubKey32& leader_pubkey, const std::vector<PubKey32>& committee, const std::vector<PubKey32>& observed_members) {
-  DeterministicEpochRewardInputs out;
-  std::set<PubKey32> canonical_members(committee.begin(), committee.end());
-  std::set<PubKey32> observed_set(observed_members.begin(), observed_members.end());
-  const auto active_operator_count = active_operator_count_for_height(state.validators, height);
-
-  for (const auto& pub : canonical_members) {
-    out.expected_participation_units[pub] += 1;
-    if (observed_set.find(pub) != observed_set.end()) out.observed_participation_units[pub] += 1;
-    auto it = state.validators.all().find(pub);
-    if (it == state.validators.all().end()) continue;
-    out.reward_score_units[pub] += reward_weight(cfg.network, height, active_operator_count, it->second.bonded_amount);
-  }
-  if (auto it = state.validators.all().find(leader_pubkey); it != state.validators.all().end()) {
+  if (auto it = validators.all().find(leader_pubkey); it != validators.all().end()) {
     out.reward_score_units[leader_pubkey] += reward_weight(cfg.network, height, active_operator_count, it->second.bonded_amount);
   }
   return out;
@@ -662,130 +635,6 @@ void mark_epoch_reward_settled_for_height(const CanonicalDerivationConfig& cfg, 
   } else {
     state->protocol_reserve_balance_units = 0;
   }
-}
-
-void accrue_epoch_reward_state_for_block(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state, const Block& block,
-                                         const std::vector<PubKey32>& committee,
-                                         const std::vector<FinalitySig>& finality_sigs) {
-  const auto epoch_start = committee_epoch_start(block.header.height, cfg.network.committee_epoch_blocks);
-  auto& reward_state = state->epoch_reward_states[epoch_start];
-  reward_state.epoch_start_height = epoch_start;
-  const auto gross_reward = reward_units(block.header.height);
-  const auto prior_gross_reward = reward_state.total_reward_units + reward_state.reserve_accrual_units;
-  const auto next_gross_reward = prior_gross_reward + gross_reward;
-  const auto next_reserve =
-      wide::mul_div_u64(next_gross_reward, static_cast<std::uint64_t>(RESERVE_ACCRUAL_BPS), 10'000ULL);
-  const auto reserve_delta = next_reserve - reward_state.reserve_accrual_units;
-  reward_state.reserve_accrual_units = next_reserve;
-  reward_state.total_reward_units += gross_reward - reserve_delta;
-  if (block.header.height >= EMISSION_BLOCKS) reward_state.fee_pool_units += 0;
-  const auto inputs = compute_deterministic_epoch_reward_inputs(cfg, *state, block.header.height, block.header.leader_pubkey,
-                                                                committee, finality_sigs);
-  for (const auto& [pub, units] : inputs.expected_participation_units) reward_state.expected_participation_units[pub] += units;
-  for (const auto& [pub, units] : inputs.observed_participation_units) reward_state.observed_participation_units[pub] += units;
-  for (const auto& [pub, units] : inputs.reward_score_units) reward_state.reward_score_units[pub] += units;
-}
-
-void accrue_epoch_reward_state_for_frontier(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
-                                            const FrontierTransition& transition, const std::vector<PubKey32>& committee) {
-  const auto epoch_start = committee_epoch_start(transition.height, cfg.network.committee_epoch_blocks);
-  auto& reward_state = state->epoch_reward_states[epoch_start];
-  reward_state.epoch_start_height = epoch_start;
-  const auto gross_reward = reward_units(transition.height);
-  const auto prior_gross_reward = reward_state.total_reward_units + reward_state.reserve_accrual_units;
-  const auto next_gross_reward = prior_gross_reward + gross_reward;
-  const auto next_reserve =
-      wide::mul_div_u64(next_gross_reward, static_cast<std::uint64_t>(RESERVE_ACCRUAL_BPS), 10'000ULL);
-  const auto reserve_delta = next_reserve - reward_state.reserve_accrual_units;
-  reward_state.reserve_accrual_units = next_reserve;
-  reward_state.total_reward_units += gross_reward - reserve_delta;
-  if (transition.height >= EMISSION_BLOCKS) reward_state.fee_pool_units += transition.settlement.current_fees;
-  const auto inputs = compute_deterministic_epoch_reward_inputs(cfg, *state, transition.height, transition.leader_pubkey,
-                                                                committee, transition.observed_signers);
-  for (const auto& [pub, units] : inputs.expected_participation_units) reward_state.expected_participation_units[pub] += units;
-  for (const auto& [pub, units] : inputs.observed_participation_units) reward_state.observed_participation_units[pub] += units;
-  for (const auto& [pub, units] : inputs.reward_score_units) reward_state.reward_score_units[pub] += units;
-}
-
-void update_validator_liveness_from_finality(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
-                                             std::uint64_t height, const std::vector<PubKey32>& committee,
-                                             const std::vector<FinalitySig>& finality_sigs) {
-  if (committee.empty()) return;
-  const auto participants = committee_participants_from_finality(committee, finality_sigs);
-  std::set<PubKey32> participant_set(participants.begin(), participants.end());
-  state->last_participation_eligible_signers = participant_set.size();
-
-  auto& all = state->validators.mutable_all();
-  for (const auto& pub : committee) {
-    auto it = all.find(pub);
-    if (it == all.end()) continue;
-    auto& info = it->second;
-    if (info.status != ValidatorStatus::ACTIVE && info.status != ValidatorStatus::SUSPENDED) continue;
-    info.liveness_window_start = state->validator_liveness_window_start_height;
-    ++info.eligible_count_window;
-    if (participant_set.find(pub) != participant_set.end()) ++info.participated_count_window;
-  }
-
-  if (!validator_liveness_window_should_rollover(height, state->validator_liveness_window_start_height,
-                                                 cfg.validator_liveness_window_blocks)) {
-    return;
-  }
-
-  // Keep replay behavior aligned with runtime: never let liveness penalties
-  // collapse effective active validators for next height to zero.
-  std::size_t effective_active_next_height = state->validators.active_sorted(height + 1).size();
-
-  const bool defer_exit_until_epoch_end =
-      deferred_exit_fork_active(cfg.network, height) &&
-      (committee_epoch_start(height, cfg.network.committee_epoch_blocks) ==
-       committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks));
-
-  for (auto& [pub, info] : all) {
-    const std::uint64_t eligible = info.eligible_count_window;
-    const std::uint64_t participated = info.participated_count_window;
-    if (eligible >= 10) {
-      const std::uint64_t miss = eligible >= participated ? (eligible - participated) : 0;
-      const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
-      const bool currently_effective_active = state->validators.is_active_for_height(pub, height + 1);
-      const bool block_for_active_set_floor =
-          deferred_exit_fork_active(cfg.network, height) && currently_effective_active && effective_active_next_height <= 1;
-      if (miss_rate >= cfg.validator_miss_rate_exit_threshold_percent) {
-        const bool bootstrap_exit_protected =
-            bootstrap_penalty_exit_protection_active_at_height(cfg.network, height) && bootstrap_validator_record(info);
-        if (bootstrap_exit_protected) {
-          if (!block_for_active_set_floor) {
-            info.status = ValidatorStatus::SUSPENDED;
-            info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
-            info.penalty_strikes += 1;
-            if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
-          }
-          continue;
-        }
-        if (!block_for_active_set_floor) {
-          if (!defer_exit_until_epoch_end) {
-            info.status = ValidatorStatus::EXITING;
-          }
-          info.last_exit_height = height;
-          info.unbond_height = height;
-          info.penalty_strikes += 1;
-          if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
-        }
-      } else if (miss_rate >= cfg.validator_miss_rate_suspend_threshold_percent) {
-        if (!block_for_active_set_floor) {
-          info.status = ValidatorStatus::SUSPENDED;
-          info.suspended_until_height = height + cfg.validator_suspend_duration_blocks;
-          info.penalty_strikes += 1;
-          if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
-        }
-      }
-    }
-    info.eligible_count_window = 0;
-    info.participated_count_window = 0;
-    info.liveness_window_start = height + 1;
-  }
-  state->validator_liveness_window_start_height =
-      validator_liveness_next_window_start(height, state->validator_liveness_window_start_height,
-                                           cfg.validator_liveness_window_blocks);
 }
 
 void update_validator_liveness_from_observed_participants(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
@@ -1025,14 +874,119 @@ Hash32 frontier_finality_link_hash(const FrontierTransition& transition) {
   w.u32le(transition.round);
   w.bytes_fixed(transition.transition_id());
   w.u32le(transition.quorum_threshold);
-  w.varint(transition.observed_signers.size());
-  for (const auto& pub : transition.observed_signers) w.bytes_fixed(pub);
+  w.varint(transition.prev_finality_signers.size());
+  for (const auto& sig : transition.prev_finality_signers) {
+    w.bytes_fixed(sig.validator_pubkey);
+    w.bytes_fixed(sig.signature);
+  }
   return crypto::sha256d(w.data());
+}
+
+bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                     const std::vector<FinalitySig>& signers, ParentFinalityContext* out,
+                                     std::string* error) {
+  if (!out) {
+    if (error) *error = "missing-parent-context-output";
+    return false;
+  }
+  *out = ParentFinalityContext{};
+  const auto parent_transition_id = prev.finalized_identity.transition_id();
+  if (prev.finalized_height == 0 || !parent_transition_id.has_value()) return true;  // genesis parent
+
+  const auto meta_it = prev.finalized_block_metadata.find(prev.finalized_height);
+  if (meta_it == prev.finalized_block_metadata.end()) {
+    if (error) *error = "missing-parent-finalized-metadata";
+    return false;
+  }
+  out->has_parent = true;
+  out->height = prev.finalized_height;
+  out->round = meta_it->second.round;
+  out->transition_id = *parent_transition_id;
+  out->committee = canonical_committee_for_height_round(cfg, prev, out->height, out->round);
+  const auto all_in = [&](const std::vector<PubKey32>& committee) {
+    std::set<PubKey32> members(committee.begin(), committee.end());
+    for (const auto& sig : signers) {
+      if (members.find(sig.validator_pubkey) == members.end()) return false;
+    }
+    return true;
+  };
+  if (!all_in(out->committee)) {
+    auto legacy = legacy_canonical_committee_for_height_round(cfg, prev, out->height, out->round);
+    if (!legacy.empty() && all_in(legacy)) out->committee = std::move(legacy);
+  }
+  if (out->committee.empty()) {
+    if (error) *error = "missing-parent-committee";
+    return false;
+  }
+  out->quorum = quorum_threshold(out->committee.size());
+  return true;
+}
+
+bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConfig& cfg,
+                                                   const CanonicalDerivedState& prev,
+                                                   const std::vector<FinalitySig>& signers,
+                                                   std::vector<FinalitySig>* canonical, std::string* error) {
+  if (!canonical) {
+    if (error) *error = "missing-signer-output";
+    return false;
+  }
+  std::vector<FinalitySig> sorted = canonicalize_finality_signatures(signers, std::numeric_limits<std::size_t>::max());
+  ParentFinalityContext parent;
+  if (!resolve_parent_finality_context(cfg, prev, sorted, &parent, error)) return false;
+  if (!parent.has_parent) {
+    if (!sorted.empty()) {
+      if (error) *error = "frontier-prev-signers-unexpected-for-genesis-parent";
+      return false;
+    }
+    canonical->clear();
+    return true;
+  }
+  std::set<PubKey32> committee_set(parent.committee.begin(), parent.committee.end());
+  const auto msg = vote_signing_message(parent.height, parent.round, parent.transition_id);
+  for (const auto& sig : sorted) {
+    if (committee_set.find(sig.validator_pubkey) == committee_set.end()) {
+      if (error) *error = "frontier-prev-signer-non-committee";
+      return false;
+    }
+    if (!crypto::ed25519_verify(msg, sig.signature, sig.validator_pubkey)) {
+      if (error) *error = "frontier-prev-signer-invalid-signature";
+      return false;
+    }
+  }
+  if (sorted.size() < parent.quorum) {
+    if (error) *error = "frontier-prev-signers-below-quorum";
+    return false;
+  }
+  *canonical = std::move(sorted);
+  return true;
+}
+
+void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators,
+                                  std::map<std::uint64_t, storage::EpochRewardSettlementState>* reward_states,
+                                  const FrontierTransition& transition,
+                                  const std::vector<PubKey32>& parent_committee) {
+  const auto epoch_start = committee_epoch_start(transition.height, cfg.network.committee_epoch_blocks);
+  auto& reward_state = (*reward_states)[epoch_start];
+  reward_state.epoch_start_height = epoch_start;
+  const auto gross_reward = reward_units(transition.height);
+  const auto prior_gross_reward = reward_state.total_reward_units + reward_state.reserve_accrual_units;
+  const auto next_gross_reward = prior_gross_reward + gross_reward;
+  const auto next_reserve =
+      wide::mul_div_u64(next_gross_reward, static_cast<std::uint64_t>(RESERVE_ACCRUAL_BPS), 10'000ULL);
+  const auto reserve_delta = next_reserve - reward_state.reserve_accrual_units;
+  reward_state.reserve_accrual_units = next_reserve;
+  reward_state.total_reward_units += gross_reward - reserve_delta;
+  if (transition.height >= EMISSION_BLOCKS) reward_state.fee_pool_units += transition.settlement.current_fees;
+  const auto inputs = compute_deterministic_epoch_reward_inputs(cfg, validators, transition.height, transition.leader_pubkey,
+                                                                parent_committee, transition.prev_finality_signers);
+  for (const auto& [pub, units] : inputs.expected_participation_units) reward_state.expected_participation_units[pub] += units;
+  for (const auto& [pub, units] : inputs.observed_participation_units) reward_state.observed_participation_units[pub] += units;
+  for (const auto& [pub, units] : inputs.reward_score_units) reward_state.reward_score_units[pub] += units;
 }
 
 bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
-                                           const std::vector<PubKey32>& observed_signers,
+                                           const std::vector<FinalitySig>& prev_finality_signers,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
                                            std::string* error) {
@@ -1059,13 +1013,9 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
     return false;
   }
   const auto quorum = static_cast<std::uint32_t>(quorum_threshold(committee.size()));
-  const auto canonical_signers = canonicalize_signer_pubkeys(observed_signers, quorum);
-  std::set<PubKey32> committee_set(committee.begin(), committee.end());
-  for (const auto& pub : canonical_signers) {
-    if (committee_set.find(pub) == committee_set.end()) {
-      if (error) *error = "frontier-non-committee-signer";
-      return false;
-    }
+  std::vector<FinalitySig> canonical_signers;
+  if (!canonicalize_and_verify_prev_finality_signers(cfg, prev, prev_finality_signers, &canonical_signers, error)) {
+    return false;
   }
 
   // Frontier transitions normally chain to a finalized transition identity, but
@@ -1077,7 +1027,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   transition->round = round;
   transition->leader_pubkey = leader_pubkey;
   transition->quorum_threshold = quorum;
-  transition->observed_signers = canonical_signers;
+  transition->prev_finality_signers = std::move(canonical_signers);
   transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
   transition->settlement_commitment = transition->settlement.commitment();
   UtxoSetV2 settled_utxos = post_execution_utxos;
@@ -1089,7 +1039,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
 bool populate_frontier_transition_metadata_legacy_for_replay(const CanonicalDerivationConfig& cfg,
                                                              const CanonicalDerivedState& prev, std::uint64_t height,
                                                              std::uint32_t round, const PubKey32& leader_pubkey,
-                                                             const std::vector<PubKey32>& observed_signers,
+                                                             const std::vector<FinalitySig>& prev_finality_signers,
                                                              std::uint64_t accepted_fee_units,
                                                              const UtxoSetV2& post_execution_utxos,
                                                              FrontierTransition* transition,
@@ -1117,13 +1067,9 @@ bool populate_frontier_transition_metadata_legacy_for_replay(const CanonicalDeri
     return false;
   }
   const auto quorum = static_cast<std::uint32_t>(quorum_threshold(committee.size()));
-  const auto canonical_signers = canonicalize_signer_pubkeys(observed_signers, quorum);
-  std::set<PubKey32> committee_set(committee.begin(), committee.end());
-  for (const auto& pub : canonical_signers) {
-    if (committee_set.find(pub) == committee_set.end()) {
-      if (error) *error = "frontier-non-committee-signer";
-      return false;
-    }
+  std::vector<FinalitySig> canonical_signers;
+  if (!canonicalize_and_verify_prev_finality_signers(cfg, prev, prev_finality_signers, &canonical_signers, error)) {
+    return false;
   }
 
   transition->prev_finalized_hash = prev.finalized_identity.id;
@@ -1132,7 +1078,7 @@ bool populate_frontier_transition_metadata_legacy_for_replay(const CanonicalDeri
   transition->round = round;
   transition->leader_pubkey = leader_pubkey;
   transition->quorum_threshold = quorum;
-  transition->observed_signers = canonical_signers;
+  transition->prev_finality_signers = std::move(canonical_signers);
   transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
   transition->settlement_commitment = transition->settlement.commitment();
   UtxoSetV2 settled_utxos = post_execution_utxos;
@@ -1337,9 +1283,12 @@ bool verify_frontier_record_against_state_with_replay_options(
   auto hash_of_bytes = [](const Bytes& b) -> std::string {
     return hex_encode32(crypto::sha256d(b));
   };
-  auto pub_list_fingerprint = [](const std::vector<PubKey32>& pubs) -> std::string {
+  auto signer_list_fingerprint = [](const std::vector<FinalitySig>& sigs) -> std::string {
     codec::ByteWriter w;
-    for (const auto& pub : pubs) w.bytes_fixed(pub);
+    for (const auto& sig : sigs) {
+      w.bytes_fixed(sig.validator_pubkey);
+      w.bytes_fixed(sig.signature);
+    }
     return hex_encode32(crypto::sha256d(w.data()));
   };
   auto pub_u64_map_fingerprint = [](const std::map<PubKey32, std::uint64_t>& values) -> std::string {
@@ -1592,16 +1541,16 @@ bool verify_frontier_record_against_state_with_replay_options(
     FrontierTransition expected_transition = result.transition;
     const bool have_current_expected = populate_frontier_transition_metadata(
         cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-        record.transition.observed_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
+        record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
     FrontierTransition legacy_expected_transition = result.transition;
     std::string legacy_error;
     const bool have_legacy_expected = populate_frontier_transition_metadata_legacy_for_replay(
         cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-        record.transition.observed_signers, result.accepted_fee_units, result.next_utxos, &legacy_expected_transition,
+        record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &legacy_expected_transition,
         &legacy_error);
     const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
       return record.transition.quorum_threshold == expected.quorum_threshold &&
-             record.transition.observed_signers == expected.observed_signers &&
+             record.transition.prev_finality_signers == expected.prev_finality_signers &&
              record.transition.settlement_commitment == record.transition.settlement.commitment() &&
              record.transition.settlement_commitment == expected.settlement_commitment &&
              record.transition.settlement.serialize() == expected.settlement.serialize() &&
@@ -1621,14 +1570,14 @@ bool verify_frontier_record_against_state_with_replay_options(
           return fail_with(legacy_error,
                            "field=metadata-build height=" + std::to_string(record.transition.height) +
                                " round=" + std::to_string(record.transition.round) + " legacy_error=" + legacy_error);
-        } else if (record.transition.observed_signers != expected_transition.observed_signers) {
-          return fail_with("frontier-observed-signers-mismatch",
-                           "field=observed_signers height=" + std::to_string(record.transition.height) +
+        } else if (record.transition.prev_finality_signers != expected_transition.prev_finality_signers) {
+          return fail_with("frontier-prev-signers-mismatch",
+                           "field=prev_finality_signers height=" + std::to_string(record.transition.height) +
                                " round=" + std::to_string(record.transition.round) +
-                               " actual_count=" + std::to_string(record.transition.observed_signers.size()) +
-                               " expected_count=" + std::to_string(expected_transition.observed_signers.size()) +
-                               " actual_fingerprint=" + pub_list_fingerprint(record.transition.observed_signers) +
-                               " expected_fingerprint=" + pub_list_fingerprint(expected_transition.observed_signers));
+                               " actual_count=" + std::to_string(record.transition.prev_finality_signers.size()) +
+                               " expected_count=" + std::to_string(expected_transition.prev_finality_signers.size()) +
+                               " actual_fingerprint=" + signer_list_fingerprint(record.transition.prev_finality_signers) +
+                               " expected_fingerprint=" + signer_list_fingerprint(expected_transition.prev_finality_signers));
         } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
           return fail_with("frontier-settlement-self-commitment-mismatch",
                            "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
@@ -1748,19 +1697,19 @@ bool verify_frontier_record_against_state_with_replay_options(
   FrontierTransition expected_transition = result.transition;
   const bool have_current_expected = populate_frontier_transition_metadata(
       cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-      record.transition.observed_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
+      record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
   FrontierTransition legacy_expected_transition = result.transition;
   std::string legacy_error;
   const bool have_legacy_expected = populate_frontier_transition_metadata_legacy_for_replay(
       cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-      record.transition.observed_signers, result.accepted_fee_units, result.next_utxos, &legacy_expected_transition,
+      record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &legacy_expected_transition,
       &legacy_error);
   if (!have_current_expected && !have_legacy_expected) {
     return false;
   }
   const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
     return record.transition.quorum_threshold == expected.quorum_threshold &&
-           record.transition.observed_signers == expected.observed_signers &&
+           record.transition.prev_finality_signers == expected.prev_finality_signers &&
            record.transition.settlement_commitment == record.transition.settlement.commitment() &&
            record.transition.settlement_commitment == expected.settlement_commitment &&
            record.transition.settlement.serialize() == expected.settlement.serialize() &&
@@ -1776,14 +1725,14 @@ bool verify_frontier_record_against_state_with_replay_options(
                              " round=" + std::to_string(record.transition.round) +
                              " actual=" + std::to_string(record.transition.quorum_threshold) +
                              " expected=" + std::to_string(expected_transition.quorum_threshold));
-      } else if (record.transition.observed_signers != expected_transition.observed_signers) {
-        return fail_with("frontier-observed-signers-mismatch",
-                         "field=observed_signers height=" + std::to_string(record.transition.height) +
+      } else if (record.transition.prev_finality_signers != expected_transition.prev_finality_signers) {
+        return fail_with("frontier-prev-signers-mismatch",
+                         "field=prev_finality_signers height=" + std::to_string(record.transition.height) +
                              " round=" + std::to_string(record.transition.round) +
-                             " actual_count=" + std::to_string(record.transition.observed_signers.size()) +
-                             " expected_count=" + std::to_string(expected_transition.observed_signers.size()) +
-                             " actual_fingerprint=" + pub_list_fingerprint(record.transition.observed_signers) +
-                             " expected_fingerprint=" + pub_list_fingerprint(expected_transition.observed_signers));
+                             " actual_count=" + std::to_string(record.transition.prev_finality_signers.size()) +
+                             " expected_count=" + std::to_string(expected_transition.prev_finality_signers.size()) +
+                             " actual_fingerprint=" + signer_list_fingerprint(record.transition.prev_finality_signers) +
+                             " expected_fingerprint=" + signer_list_fingerprint(expected_transition.prev_finality_signers));
       } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
         return fail_with("frontier-settlement-self-commitment-mismatch",
                          "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
@@ -1850,13 +1799,17 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
 
   CanonicalDerivedState next = prev;
   mark_epoch_reward_settled_for_height(cfg, record.transition.height, &next);
-  const auto committee = !recomputed.effective_committee.empty()
-                             ? recomputed.effective_committee
-                             : canonical_committee_for_height_round(cfg, prev, record.transition.height,
-                                                                    record.transition.round);
-  accrue_epoch_reward_state_for_frontier(cfg, &next, record.transition, committee);
-  update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, committee,
-                                                       record.transition.observed_signers);
+  // Participation recorded in this transition belongs to the parent height:
+  // account it against the parent committee. prev_finality_signers has
+  // already been verified by verify_frontier_record_against_state above.
+  ParentFinalityContext parent;
+  if (!resolve_parent_finality_context(cfg, prev, record.transition.prev_finality_signers, &parent, error)) return false;
+  std::vector<PubKey32> parent_participants;
+  parent_participants.reserve(record.transition.prev_finality_signers.size());
+  for (const auto& sig : record.transition.prev_finality_signers) parent_participants.push_back(sig.validator_pubkey);
+  accrue_frontier_epoch_reward(cfg, next.validators, &next.epoch_reward_states, record.transition, parent.committee);
+  update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, parent.committee,
+                                                       parent_participants);
   const UtxoSetV2 pre_utxos = next.utxos;
   apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos,
                                          record.transition.height);
@@ -1868,10 +1821,19 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
   next.last_finality_certificate_hash = frontier_finality_link_hash(record.transition);
   next.finalized_randomness = advance_finalized_randomness(prev.finalized_randomness, record.transition);
+  // The full signer count of a height is only known once its child records it,
+  // so the parent entry is completed here, and the new height starts at its
+  // quorum (the minimum it is known to have), matching the quorum-truncated
+  // certificate that fast-start restores for the tip.
+  if (parent.has_parent) {
+    if (auto it = next.finalized_block_metadata.find(parent.height); it != next.finalized_block_metadata.end()) {
+      it->second.signature_count = static_cast<std::uint32_t>(parent_participants.size());
+    }
+  }
   next.finalized_block_metadata[next.finalized_height] = CanonicalFinalizedMetadata{
       .round = record.transition.round,
       .quorum_threshold = record.transition.quorum_threshold,
-      .signature_count = static_cast<std::uint32_t>(record.transition.observed_signers.size()),
+      .signature_count = record.transition.quorum_threshold,
   };
   update_availability_from_frontier(cfg, record, &next.availability_state);
   const auto next_epoch = committee_epoch_start(next.finalized_height + 1, cfg.network.committee_epoch_blocks);

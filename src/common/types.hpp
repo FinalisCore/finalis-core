@@ -22,7 +22,6 @@ constexpr std::uint64_t BLOCK_REWARD = 50'0000'0000ULL;
 constexpr std::uint64_t BOND_AMOUNT = 50'0000'0000ULL;
 constexpr std::uint64_t WARMUP_BLOCKS = 100;
 constexpr std::uint64_t UNBOND_DELAY_BLOCKS = 100;
-constexpr std::uint32_t ROUND_TIMEOUT_MS = 5000;
 constexpr std::uint64_t MAX_FUTURE_DRIFT_SECONDS = 120;
 constexpr std::size_t MAX_COMMITTEE = 128;
 

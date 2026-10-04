@@ -23,6 +23,11 @@ struct VoteTallyResult {
 struct TimeoutVoteTallyResult {
   bool accepted{false};
   bool duplicate{false};
+  // Vote's round is older than every round retained for its height while the
+  // window is full. Benign under propagation lag: callers soft-reject it.
+  bool stale{false};
+  // Set when accepting this vote evicted the oldest retained round.
+  std::optional<std::uint32_t> evicted_round;
   std::size_t votes_for_round{0};
 };
 
@@ -59,6 +64,9 @@ class VoteTracker {
 class TimeoutVoteTracker {
  public:
   struct Limits {
+    // Sliding window: at most this many distinct rounds are retained per
+    // height. A vote for a new round beyond it evicts the oldest round
+    // instead of being rejected, so a long stall cannot exhaust the tracker.
     std::size_t max_rounds_per_height{256};
     std::size_t max_votes_global{50'000};
   };

@@ -36,7 +36,14 @@ struct NetworkConfig {
   // Finalized-state metadata persists committee snapshots in deterministic
   // epochs for historical replay and inspection.
   std::uint64_t committee_epoch_blocks{32};
+  // Round pacing (local, not consensus-critical): round r times out after
+  // min(round_timeout_ms * (num/den)^r, max_round_timeout_ms). The growing
+  // timeout lets rounds outlast any bounded message delay (partial synchrony).
+  // num <= den disables the backoff.
   std::uint32_t round_timeout_ms{30'000};
+  std::uint32_t max_round_timeout_ms{300'000};
+  std::uint32_t round_timeout_backoff_num{3};
+  std::uint32_t round_timeout_backoff_den{2};
   std::uint32_t min_block_interval_ms{180'000};
   std::size_t max_payload_len{8 * 1024 * 1024};
   std::uint64_t bond_amount{BOND_AMOUNT};
@@ -67,6 +74,7 @@ struct NetworkConfig {
 };
 
 const NetworkConfig& mainnet_network();
+std::uint64_t round_timeout_ms_for_round(const NetworkConfig& network, std::uint32_t round);
 const NetworkConfig& network_by_name(const std::string& name);  // mainnet only
 const std::vector<EconomicsConfig>& economics_policies(const NetworkConfig& network);
 const EconomicsConfig& active_economics_policy(const NetworkConfig& network, std::uint64_t height);

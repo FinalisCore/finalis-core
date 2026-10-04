@@ -234,11 +234,30 @@ consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::Canoni
   return lane_records;
 }
 
+// Signs the parent's finalized transition with the single-member test committee
+// key (key_from_byte(90)) to form a valid prev_finality_signers record. Empty
+// when the parent is genesis.
+std::vector<FinalitySig> default_prev_finality_signers(const consensus::CanonicalDerivationConfig& cfg,
+                                                       const consensus::CanonicalDerivedState& parent_state) {
+  consensus::ParentFinalityContext parent;
+  std::string err;
+  if (!consensus::resolve_parent_finality_context(cfg, parent_state, {}, &parent, &err) || !parent.has_parent) return {};
+  const auto signer = key_from_byte(90);
+  std::vector<FinalitySig> out;
+  for (const auto& member : parent.committee) {
+    if (member != signer.public_key) continue;
+    auto sig = crypto::ed25519_sign(vote_signing_message(parent.height, parent.round, parent.transition_id),
+                                    signer.private_key);
+    if (sig.has_value()) out.push_back(FinalitySig{member, *sig});
+  }
+  return out;
+}
+
 consensus::CanonicalFrontierRecord make_frontier_record(const consensus::CanonicalDerivedState& parent_state,
                                                         const std::vector<Bytes>& ordered_records,
                                                         const consensus::CanonicalDerivationConfig& cfg = test_cfg(),
                                                         std::uint32_t round = 0,
-                                                        const std::vector<PubKey32>& observed_signers = {},
+                                                        const std::vector<FinalitySig>& prev_signers = {},
                                                         const SpecialValidationContext* vctx = nullptr) {
   FrontierVector next_vector;
   auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector, cfg.network.committee_epoch_blocks);
@@ -251,7 +270,7 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   const auto height = parent_state.finalized_height + 1;
   const auto leader = consensus::canonical_leader_for_height_round(cfg, parent_state, height, round);
   if (!leader.has_value()) throw std::runtime_error("missing canonical leader");
-  const auto signers = observed_signers.empty() ? std::vector<PubKey32>{*leader} : observed_signers;
+  const auto signers = prev_signers.empty() ? default_prev_finality_signers(cfg, parent_state) : prev_signers;
   if (!consensus::populate_frontier_transition_metadata(cfg, parent_state, height, round, *leader, signers,
                                                         result.accepted_fee_units, result.next_utxos, &result.transition,
                                                         &err)) {
@@ -1089,7 +1108,10 @@ TEST(test_frontier_replay_advances_finalized_metadata_deterministically) {
   ASSERT_TRUE(meta_it != out.finalized_block_metadata.end());
   ASSERT_EQ(meta_it->second.round, record.transition.round);
   ASSERT_EQ(meta_it->second.quorum_threshold, record.transition.quorum_threshold);
-  ASSERT_EQ(meta_it->second.signature_count, record.transition.observed_signers.size());
+  // Height 1 has a genesis parent (no prev signers); its own entry starts at
+  // quorum until its child records the full signer count.
+  ASSERT_TRUE(record.transition.prev_finality_signers.empty());
+  ASSERT_EQ(meta_it->second.signature_count, record.transition.quorum_threshold);
   ASSERT_TRUE(out.epoch_reward_states.find(1) != out.epoch_reward_states.end());
 }
 

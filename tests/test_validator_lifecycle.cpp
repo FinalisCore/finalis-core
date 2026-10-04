@@ -3,8 +3,10 @@
 #include "test_framework.hpp"
 
 #include <array>
+#include <limits>
 #include <stdexcept>
 
+#include "common/network.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/validator_registry.hpp"
 #include "consensus/votes.hpp"
@@ -398,3 +400,49 @@ TEST(test_vote_tracker_rejects_same_round_equivocation) {
 }
 
 void register_validator_lifecycle_tests() {}
+
+TEST(test_timeout_tracker_window_evicts_oldest_round) {
+  consensus::TimeoutVoteTracker tracker(consensus::TimeoutVoteTracker::Limits{.max_rounds_per_height = 4});
+  const auto v = key_from_byte(0x51).public_key;
+  for (std::uint32_t r = 0; r < 4; ++r) ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, r, v, Sig64{}}).accepted);
+  const auto res = tracker.add_vote(TimeoutVote{7, 10, v, Sig64{}});
+  ASSERT_TRUE(res.accepted);
+  ASSERT_TRUE(res.evicted_round.has_value());
+  ASSERT_EQ(*res.evicted_round, 0u);
+  ASSERT_TRUE(tracker.signatures_for(7, 0).empty());
+  ASSERT_EQ(tracker.signatures_for(7, 10).size(), 1u);
+}
+
+TEST(test_timeout_tracker_window_soft_rejects_round_older_than_window) {
+  consensus::TimeoutVoteTracker tracker(consensus::TimeoutVoteTracker::Limits{.max_rounds_per_height = 2});
+  const auto a = key_from_byte(0x52).public_key;
+  const auto b = key_from_byte(0x53).public_key;
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, 5, a, Sig64{}}).accepted);
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, 6, a, Sig64{}}).accepted);
+  const auto res = tracker.add_vote(TimeoutVote{7, 1, b, Sig64{}});
+  ASSERT_TRUE(!res.accepted);
+  ASSERT_TRUE(res.stale);
+}
+
+TEST(test_timeout_tracker_window_is_per_height) {
+  consensus::TimeoutVoteTracker tracker(consensus::TimeoutVoteTracker::Limits{.max_rounds_per_height = 1});
+  const auto v = key_from_byte(0x54).public_key;
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, 0, v, Sig64{}}).accepted);
+  const auto res = tracker.add_vote(TimeoutVote{8, 0, v, Sig64{}});
+  ASSERT_TRUE(res.accepted);
+  ASSERT_TRUE(!res.evicted_round.has_value());
+  ASSERT_EQ(tracker.signatures_for(7, 0).size(), 1u);
+}
+
+TEST(test_round_timeout_backoff_grows_and_caps) {
+  NetworkConfig n = mainnet_network();
+  ASSERT_EQ(round_timeout_ms_for_round(n, 0), 30'000u);
+  ASSERT_EQ(round_timeout_ms_for_round(n, 1), 45'000u);
+  ASSERT_EQ(round_timeout_ms_for_round(n, 2), 67'500u);
+  ASSERT_EQ(round_timeout_ms_for_round(n, 6), 300'000u);
+  ASSERT_EQ(round_timeout_ms_for_round(n, std::numeric_limits<std::uint32_t>::max()), 300'000u);
+  n.round_timeout_ms = 1;
+  ASSERT_TRUE(round_timeout_ms_for_round(n, 64) > 1u);  // tiny base still grows
+  n.round_timeout_backoff_num = n.round_timeout_backoff_den;
+  ASSERT_EQ(round_timeout_ms_for_round(n, 50), 1u);  // num <= den disables backoff
+}

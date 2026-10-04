@@ -1560,6 +1560,21 @@ bool DB::write_batch(Batch& batch, bool disable_wal) {
   return flush_file();
 #endif
 }
+
+bool DB::write_batch_durable(Batch& batch) {
+  if (readonly_) return false;
+  if (batch.empty()) return true;
+#ifdef SC_HAS_ROCKSDB
+  rocksdb::WriteOptions opts;
+  opts.sync = true;
+  return rocks_->db->Write(opts, &batch.impl_->wb).ok();
+#else
+  for (auto& [k, v] : batch.impl_->ops) {
+    if (v.has_value()) mem_[k] = *v; else mem_.erase(k);
+  }
+  return flush_file();
+#endif
+}
 // --- end DB::Batch ----------------------------------------------------------
 
 bool DB::open(const std::string& path, std::string* error) {
