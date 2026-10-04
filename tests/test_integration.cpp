@@ -368,7 +368,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   }
   const auto leader = consensus::canonical_leader_for_height_round(derivation_cfg, genesis_derived, 1, 0);
   if (!leader.has_value()) return false;
-  if (!consensus::populate_frontier_transition_metadata(derivation_cfg, genesis_derived, 1, 0, *leader, {*leader},
+  if (!consensus::populate_frontier_transition_metadata(derivation_cfg, genesis_derived, 1, 0, *leader, {},
                                                         exec_result.accepted_fee_units, exec_result.next_utxos,
                                                         &exec_result.transition, &error)) {
     return false;
@@ -582,7 +582,9 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   }
   const auto leader = consensus::canonical_leader_for_height_round(derivation_cfg, fixture.parent, height, round);
   if (!leader.has_value()) return false;
-  if (!consensus::populate_frontier_transition_metadata(derivation_cfg, fixture.parent, height, round, *leader, {*leader},
+  // fixture.parent is the genesis-derived state, so there is no parent
+  // participation to record.
+  if (!consensus::populate_frontier_transition_metadata(derivation_cfg, fixture.parent, height, round, *leader, {},
                                                         exec_result.accepted_fee_units, exec_result.next_utxos,
                                                         &exec_result.transition, &error)) {
     return false;

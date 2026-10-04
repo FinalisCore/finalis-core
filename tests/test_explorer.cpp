@@ -138,7 +138,9 @@ FrontierTransition make_test_transition(std::uint64_t height) {
   transition.ordered_slice_commitment.fill(0x44);
   transition.decisions_commitment.fill(0x55);
   transition.quorum_threshold = 1;
-  transition.observed_signers.push_back(transition.leader_pubkey);
+  Sig64 prev_sig{};
+  prev_sig.fill(0x66);
+  transition.prev_finality_signers.push_back(FinalitySig{transition.leader_pubkey, prev_sig});
   return transition;
 }
 

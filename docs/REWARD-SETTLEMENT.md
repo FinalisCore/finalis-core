@@ -118,13 +118,24 @@ The threshold is taken from:
 
 Participation inputs are derived only from finalized committee data:
 
-- `expected_participation_units` counts blocks where a validator was in the
-  finalized committee and expected to sign
-- `observed_participation_units` counts finalized committee-member credit for
-  that validator on that block
+- participation of height `H` is recorded by its child transition `H+1` in
+  `prev_finality_signers`: the votes the `H+1` proposer observed for
+  `(H, round_H, transition_id_H)`, as pubkey and signature pairs, sorted and
+  unique, all verified, at least the quorum of `H`'s committee (empty only when
+  `H` is genesis)
+- `expected_participation_units` counts, for each member of `H`'s committee, one
+  unit when `H+1` is applied
+- `observed_participation_units` counts one unit for each of those members that
+  appears in `H+1`'s `prev_finality_signers`
+- these units are booked into the epoch of `H+1`; emission, fees and the
+  leader score for `H+1` are booked there too
 
-This keeps settlement replay-safe. It does not depend on whichever valid quorum
-signature subset happened to arrive first on one node.
+This keeps settlement replay-safe: the participation input is part of the
+finalized transition itself, so every node replays the same set. It does not
+depend on whichever valid quorum signature subset happened to arrive first on
+one node, nor on the quorum-truncated finality certificate (which would always
+drop the highest-sorting pubkeys). Validator liveness (suspend / exit miss-rate
+windows) uses the same participation record.
 
 ## Onboarding Settlement Slice
 

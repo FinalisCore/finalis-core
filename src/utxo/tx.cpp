@@ -554,8 +554,11 @@ Bytes FrontierTransition::serialize() const {
   w.bytes_fixed(ordered_slice_commitment);
   w.bytes_fixed(decisions_commitment);
   w.u32le(quorum_threshold);
-  w.varint(observed_signers.size());
-  for (const auto& pub : observed_signers) w.bytes_fixed(pub);
+  w.varint(prev_finality_signers.size());
+  for (const auto& sig : prev_finality_signers) {
+    w.bytes_fixed(sig.validator_pubkey);
+    w.bytes_fixed(sig.signature);
+  }
   w.varbytes(settlement.serialize());
   w.bytes_fixed(settlement_commitment);
   return w.take();
@@ -605,12 +608,14 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
         out.ordered_slice_commitment = *ordered;
         out.decisions_commitment = *decisions;
         out.quorum_threshold = *quorum;
-        out.observed_signers.clear();
-        out.observed_signers.reserve(static_cast<std::size_t>(*signer_count));
+        if (*signer_count > MAX_COMMITTEE) return false;
+        out.prev_finality_signers.clear();
+        out.prev_finality_signers.reserve(static_cast<std::size_t>(*signer_count));
         for (std::uint64_t i = 0; i < *signer_count; ++i) {
           auto pub = r.bytes_fixed<32>();
-          if (!pub) return false;
-          out.observed_signers.push_back(*pub);
+          auto sig = r.bytes_fixed<64>();
+          if (!pub || !sig) return false;
+          out.prev_finality_signers.push_back(FinalitySig{*pub, *sig});
         }
         auto settlement_bytes = r.varbytes();
         auto settlement_commitment = r.bytes_fixed<32>();

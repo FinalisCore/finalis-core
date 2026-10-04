@@ -52,6 +52,9 @@ const NetworkConfig kMainnet{
     .max_committee = MAX_COMMITTEE,
     .committee_epoch_blocks = 32,
     .round_timeout_ms = 30'000,
+    .max_round_timeout_ms = 300'000,
+    .round_timeout_backoff_num = 3,
+    .round_timeout_backoff_den = 2,
     .min_block_interval_ms = 180'000,
     .max_payload_len = 8 * 1024 * 1024,
     .bond_amount = BOND_AMOUNT,
@@ -99,6 +102,21 @@ const NetworkConfig kMainnet{
 }  // namespace
 
 const NetworkConfig& mainnet_network() { return kMainnet; }
+
+std::uint64_t round_timeout_ms_for_round(const NetworkConfig& network, std::uint32_t round) {
+  const std::uint64_t base = std::max<std::uint64_t>(1, network.round_timeout_ms);
+  const std::uint64_t cap = std::max<std::uint64_t>(base, network.max_round_timeout_ms);
+  const std::uint64_t num = network.round_timeout_backoff_num;
+  const std::uint64_t den = std::max<std::uint64_t>(1, network.round_timeout_backoff_den);
+  if (num <= den) return base;
+  std::uint64_t timeout = base;
+  // timeout <= cap < 2^32 and num < 2^32, so timeout * num cannot overflow.
+  // Growing by at least 1 per step bounds the loop by ~log(cap), never by round.
+  for (std::uint32_t r = 0; r < round && timeout < cap; ++r) {
+    timeout = std::max(timeout + 1, timeout * num / den);
+  }
+  return std::min(timeout, cap);
+}
 
 const NetworkConfig& network_by_name(const std::string&) { return kMainnet; }
 

@@ -197,7 +197,14 @@ struct FrontierTransition {
   Hash32 ordered_slice_commitment{};
   Hash32 decisions_commitment{};
   std::uint32_t quorum_threshold{0};
-  std::vector<PubKey32> observed_signers;
+  // Participation record for the parent height (height - 1): the votes this
+  // transition's proposer observed for the parent's finalized
+  // (height - 1, parent round, parent transition id). Sorted by pubkey, unique,
+  // each signature valid, at least the parent committee's quorum. Empty only
+  // when the parent is genesis. Liveness and reward accounting for the parent
+  // height are evaluated from this set, not from the quorum-truncated
+  // finality certificate.
+  std::vector<FinalitySig> prev_finality_signers;
   FrontierSettlement settlement;
   Hash32 settlement_commitment{};
 

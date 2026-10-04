@@ -488,7 +488,9 @@ TEST(test_frontier_transition_and_ingress_db_roundtrip) {
   transition.ordered_slice_commitment.fill(0x44);
   transition.decisions_commitment.fill(0x55);
   transition.quorum_threshold = 1;
-  transition.observed_signers.push_back(transition.leader_pubkey);
+  Sig64 prev_sig{};
+  prev_sig.fill(0x66);
+  transition.prev_finality_signers.push_back(FinalitySig{transition.leader_pubkey, prev_sig});
   transition.settlement.settlement_epoch_start = 1;
   transition.settlement.outputs.push_back({transition.leader_pubkey, 123});
   transition.settlement.total = 123;
