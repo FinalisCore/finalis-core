@@ -114,9 +114,17 @@ bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port)
   if (bind_ip == "0.0.0.0" || bind_ip == "::") {
     addr.sin6_addr = in6addr_any;
   } else if (inet_pton(AF_INET6, bind_ip.c_str(), &addr.sin6_addr) != 1) {
-    net::close_socket(listen_fd_);
-    listen_fd_ = net::kInvalidSocket;
-    return false;
+    // IPv4 literal: bind the dual-stack socket to its IPv4-mapped form (::ffff:a.b.c.d).
+    in_addr v4{};
+    if (inet_pton(AF_INET, bind_ip.c_str(), &v4) != 1) {
+      net::close_socket(listen_fd_);
+      listen_fd_ = net::kInvalidSocket;
+      return false;
+    }
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_addr.s6_addr[10] = 0xff;
+    addr.sin6_addr.s6_addr[11] = 0xff;
+    std::memcpy(&addr.sin6_addr.s6_addr[12], &v4, sizeof(v4));
   }
 
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
@@ -358,6 +366,21 @@ void PeerManager::accept_loop() {
       net::shutdown_socket(fd);
       net::close_socket(fd);
       continue;
+    }
+    // The dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d. Store them as plain
+    // a.b.c.d so bans, bootstrap exemptions, addrman and self-endpoint checks see the
+    // same form as outbound peers and configured endpoints.
+    if (addr.ss_family == AF_INET6) {
+      const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+      if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+        in_addr v4{};
+        std::memcpy(&v4, &sin6->sin6_addr.s6_addr[12], sizeof(v4));
+        if (::inet_ntop(AF_INET, &v4, ipbuf, sizeof(ipbuf)) == nullptr) {
+          net::shutdown_socket(fd);
+          net::close_socket(fd);
+          continue;
+        }
+      }
     }
     char portbuf[NI_MAXSERV]{};
     if (::getnameinfo(reinterpret_cast<sockaddr*>(&addr), len, nullptr, 0, portbuf, sizeof(portbuf), NI_NUMERICSERV) != 0) {

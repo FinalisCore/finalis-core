@@ -296,6 +296,84 @@ settlement (item 13).
     post-cap. The proposer is still credited through its leader score. The payload stays
     leader-independent and nothing is burned.
 
+- [x] **15. Slash transactions must burn the full slashed value**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Consensus change; ships with the
+    D1 fresh genesis.
+  - Problem: the V1 slash paths in `validate_tx` (bond and unbond-output branches) required one
+    `SCBURN` output but never checked its value. A submitter could burn 0 so the whole bond became the
+    fee. After the cap, that fee goes into `fee_pool_units` and is paid out at settlement, so
+    equivocators' bonds were redirected, not destroyed. It also lowered the post-cap reserve subsidy
+    (`monetary.cpp:105`).
+  - Fix: `validate_tx` sums `prev_out.value` over every slash input into `slashed_sum`, and rejects
+    with `slash burn value mismatch` unless `outputs[0].value == slashed_sum`. Summing (not a per-input
+    check) also closes the case of two slash inputs for one validator sharing one burn output.
+  - Note: a slash-only tx now pays no fee; submitters add their own P2PKH input to pay mempool fees.
+  - Tests to add: burn 0 → reject; burn = bond → accept; bond + unbond slash in one tx with burn = one
+    value → reject; burn = sum → accept.
+
+- [x] **16. P2P listener rejected IPv4 bind addresses**
+  - Status: **applied — builds clean (2026-10-04)**; tests 48 and 51 now pass.
+  - Problem: the dual-stack listener (`0992f37`) parsed `bind_ip` with `inet_pton(AF_INET6)` only, so
+    `"127.0.0.1"` (the `NodeConfig` default) failed to parse and every node with `listen=true` failed
+    `init()`. The logged `errno=2` was stale: `inet_pton` does not set `errno`.
+  - Fix: `PeerManager::start_listener` falls back to `inet_pton(AF_INET)` and binds the IPv4-mapped
+    address `::ffff:a.b.c.d`.
+  - Open: the `listener start failed` log still prints a stale `errno` for parse failures.
+
+- [x] **17. TxV2 transparent inputs bypassed the Ed25519 verify budget**
+  - Status: **applied — builds clean (2026-10-04)**; test 327 passes. Consensus/DoS fix.
+  - Problem: `validate_tx_v2` verified each transparent input signature without calling
+    `consume_verify_budget`, so a V2 tx could force more than `kMaxTxEd25519Verifies` (1024) verifies,
+    limited only by `max_inputs_per_tx`. V1 already charged the budget.
+  - Fix: one `consume_verify_budget` call before each V2 transparent `ed25519_verify`, as in V1.
+
+- [x] **18. Test-suite repairs**
+  - Status: **applied — builds clean (2026-10-04)**; tests not re-run.
+  - Stale constants: `test_mainnet_characterization.cpp` bond floor/ceiling (`BOND_AMOUNT * 20` /
+    `* 100`); `test_frontier_replay.cpp` adaptive committee target is now only 16/24 (`38fd2ab`).
+  - Port isolation: cluster fixtures used fixed ports `19040+i` / `19140+i`, so parallel test
+    shards collided (`errno=98`). `make_cluster`, `make_cluster_with_timing`,
+    `make_bonded_joined_validator_fixture` and `make_bonded_live_joiner_fixture` now take OS-assigned
+    ports via `reserve_test_ports()` and store them in `Cluster::ports`; the restart test reuses the
+    original ports. Single-node and lightserver configs (`disable_p2p`) use port 0.
+  - Still failing, not yet triaged (see also 19–20): availability suite baseline (175–182); small networks never reach
+    `NORMAL` because `min_eligible` is now 16 (262, 263, 275–279, 281; needs a design decision);
+    bond re-registration (189, 192); mempool hashcash (220); onboarding state machine (356–359).
+
+- [x] **19. Self-connection check rejected every same-host peer**
+  - Status: **applied — builds clean (2026-10-04)**. Clusters went from h=0 to finalizing (devnet
+    reached h=6).
+  - Problem: the VERSION handler (`5d46f2a`) called `endpoint_matches_local_listener(info.ip,
+    cfg_.p2p_port)` — our own port, so the port test always passed and any peer whose IP is local was
+    rejected as self. Nodes sharing a host or IP could not peer.
+  - Fix: check outbound connections only, using the dialed port from `p2p::parse_endpoint(info.endpoint)`.
+    Inbound self-dials are left to the validator-pubkey identity check.
+
+- [x] **20. Finalization broadcasts sent while holding `mu_`**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Suspected cause of the h=6 stall,
+    not yet confirmed by a thread dump.
+  - Problem: `finalize_if_quorum` (and `handle_frontier_block_locked`) broadcast TRANSITION and
+    FINALIZED_TIP with `mu_` held. `PeerManager::send_to` does a blocking timed write, and on failure
+    calls the event callback synchronously; the DISCONNECTED handler locks `mu_` → same-thread
+    self-deadlock. Blocking writes under `mu_` also stall every other thread.
+  - Fix: queue into `pending_finalized_broadcasts_` / `pending_finalized_tip_broadcast_` under `mu_`;
+    `flush_pending_finalized_broadcasts()` sends after release. Flushed by a guard at the exit of
+    `handle_message`, `handle_propose_result`, `handle_vote_result`, after the local-bus block task, and
+    once per event-loop pass.
+  - Open: other sends under `mu_` remain (e.g. `maybe_request_forward_sync_block_locked`); the same
+    hazard applies to any `p2p_.send_to` reached with `mu_` held.
+  - Result: with 19–21 applied, `test_devnet_4_nodes_finalize_and_faults` passes (2026-10-04).
+
+- [x] **21. Test nodes dialed the public mainnet seeds**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run.
+  - Problem: `Node::init` appends `network.default_seeds` (`85.217.171.168`, `64.23.244.126`) whenever
+    `cfg.seeds` is empty; `dns_seeds = false` does not stop it. Every loopback test cluster also dialed
+    the internet (85 attempts in one devnet run).
+  - Fix: `test_integration.cpp` clears `network.default_seeds` on every P2P-enabled config (cluster
+    builders, joiner/bootstrap/follower configs, handshake tests). Kept for
+    `test_unseeded_bootstrap_template_ignores_default_network_seeds`, which needs them present.
+  - Note: the production fallback is unchanged; operators who want no public seeds must pass `--seeds`.
+
 ---
 
 ## Status summary
@@ -317,10 +395,18 @@ settlement (item 13).
 | 12 | Post-cap subsidy paid = debited | done — builds clean (consensus; fresh genesis) |
 | 13 | Remove settlement fallback / hotfix | done — builds clean |
 | 14 | Pre-cap fees not burned | **open — design decision** (epoch pooling recommended) |
+| 15 | Slash burn = full slashed value | done — builds clean (consensus) |
+| 16 | Listener IPv4 bind regression | done — tests 48/51 pass |
+| 17 | TxV2 verify-budget bypass | done — test 327 passes (consensus) |
+| 18 | Test-suite repairs | partial — constants + port isolation applied; ~25 failures open |
+| 19 | Self-peer check rejected same-host peers | done — clusters finalize again |
+| 20 | Broadcast under `mu_` (self-deadlock) | done — devnet test passes with 19–21 |
+| 21 | Test nodes dialed public seeds | done — builds clean |
 
 2026-10-04: the full tree (`cmake --build build -j`, including the test binaries) builds clean. That
-verifies the C++ items 1, 3, 4, 8, 9, 10, 12 and 13. Item 2 needs a `docker build`, item 7 an SDK typecheck. No tests
-have been run: in the audit sandbox, every multi-node test fails at node init (listener `errno=2`),
-and the original code fails the same way.
+verifies the C++ items 1, 3, 4, 8, 9, 10, 12, 13 and 15–21. Item 2 needs a `docker build`, item 7 an
+SDK typecheck. The multi-node `init` failures (listener `errno=2`) were the item 16 bug, not the
+sandbox. Run the suite directly (`build/finalis-tests`; `FINALIS_TEST_FILTER`,
+`FINALIS_TEST_SHARD_INDEX`/`_COUNT`), since ctest wraps all 595 tests in one ~15 min entry.
 Verify with `cmake --build build -j`, `ctest --test-dir build --output-on-failure`, and
 `npm test` / `npx tsc --noEmit` in `sdk/finalis-wallet-js`.

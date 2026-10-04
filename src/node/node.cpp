@@ -5146,6 +5146,10 @@ PubKey32 Node::local_validator_pubkey_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   return local_key_.public_key;
 }
+std::string Node::consensus_rules_fingerprint_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion));
+}
 std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubKey32& pub) const {
   std::lock_guard<std::mutex> lk(mu_);
   return validators_.get(pub);
@@ -6153,6 +6157,9 @@ void Node::event_loop() {
       handle_propose(local_msg, false);
     }
 
+    // Backstop for finalizations reached from event-loop paths (sync, repair).
+    flush_pending_finalized_broadcasts();
+
     if (timeout_vote_to_broadcast.has_value()) {
       broadcast_timeout_vote(*timeout_vote_to_broadcast);
       const bool ok = handle_timeout_vote(*timeout_vote_to_broadcast, false, 0);
@@ -6906,6 +6913,7 @@ bool Node::handle_epoch_ticket(const consensus::EpochTicket& ticket, bool from_n
 }
 
 void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload) {
+  const FinalizedBroadcastFlushGuard flush_guard{this};  // destroyed last, after any mu_ scope
   if (!p2p::is_known_message_type(msg_type)) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "unknown-msg-type");
     return;
@@ -7021,9 +7029,13 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     // has no validator_pubkey for the identity-based check further below to
     // compare against. This runs in addition to, not instead of, that pubkey
     // check -- the two catch different self-connection shapes.
+    // Only outbound endpoints carry the peer's listener port (the port we dialed);
+    // an inbound source port is ephemeral, so inbound self-dials are left to the
+    // identity check below.
     {
       const auto info = p2p_.get_peer_info(peer_id);
-      if (endpoint_matches_local_listener(info.ip, cfg_.p2p_port)) {
+      const auto remote = info.inbound ? std::nullopt : p2p::parse_endpoint(info.endpoint);
+      if (remote.has_value() && endpoint_matches_local_listener(info.ip, remote->port)) {
         bool should_log = false;
         {
           std::lock_guard<std::mutex> lk(mu_);
@@ -8012,6 +8024,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
 Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& msg, bool from_network, int from_peer_id,
                                                         std::string* reject_reason) {
+  const FinalizedBroadcastFlushGuard flush_guard{this};  // destroyed last, after any mu_ scope
   if (from_network && !running_) return ProposeHandlingResult::SoftReject;
   std::optional<Vote> maybe_vote;
   {
@@ -8251,6 +8264,7 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
 
 Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_network, int from_peer_id,
                                                   std::string* reject_reason) {
+  const FinalizedBroadcastFlushGuard flush_guard{this};  // destroyed last, after any mu_ scope
   if (from_network && !running_) {
     if (reject_reason) *reject_reason = "not-running";
     return VoteHandlingResult::SoftReject;
@@ -8635,7 +8649,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       return false;
     }
     clear_sync_request_for_height(transition.height);
-    broadcast_finalized_tip();
+    pending_finalized_tip_broadcast_ = true;  // mu_ is held; sent by flush_pending_finalized_broadcasts()
     if (from_peer_id != 0) (void)maybe_request_forward_sync_block_locked(from_peer_id);
     return true;
   }
@@ -9177,8 +9191,11 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
 
   const FinalityCertificate cert =
       make_finality_certificate(height, round, block_id, expected_quorum, expected_committee, canonical_sigs);
-  broadcast_finalized_frontier(finalized_proposal, cert);
-  broadcast_finalized_tip();
+  // mu_ is held here; the sends happen in flush_pending_finalized_broadcasts().
+  last_broadcast_finalized_frontier_ = finalized_proposal;
+  last_broadcast_finality_certificate_ = cert;
+  pending_finalized_broadcasts_.emplace_back(std::move(finalized_proposal), cert);
+  pending_finalized_tip_broadcast_ = true;
   return true;
 }
 
@@ -9471,9 +9488,26 @@ void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
   }
 }
 
+void Node::flush_pending_finalized_broadcasts() {
+  std::vector<std::pair<FrontierProposal, FinalityCertificate>> frontiers;
+  std::optional<p2p::FinalizedTipMsg> tip;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    frontiers.swap(pending_finalized_broadcasts_);
+    if (pending_finalized_tip_broadcast_) tip = p2p::FinalizedTipMsg{finalized_height_, finalized_identity_.id};
+    pending_finalized_tip_broadcast_ = false;
+  }
+  for (const auto& [proposal, certificate] : frontiers) broadcast_finalized_frontier(proposal, certificate);
+  if (tip.has_value() && !cfg_.disable_p2p) {
+    const Bytes payload = p2p::ser_finalized_tip(*tip);
+    for (int peer_id : p2p_.peer_ids()) {
+      if (!p2p_.get_peer_info(peer_id).established()) continue;
+      (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, payload, true);
+    }
+  }
+}
+
 void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate) {
-  last_broadcast_finalized_frontier_ = proposal;
-  last_broadcast_finality_certificate_ = certificate;
   if (cfg_.disable_p2p) {
     if (!running_) return;
     std::vector<Node*> peers;
@@ -9489,8 +9523,11 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
         // precheck_finality_certificate here is both correct and exercises the same
         // parallel-verify behavior multi-node tests rely on to look like real peers.
         const auto cert_check = peer->precheck_finality_certificate(certificate, proposal.transition);
-        std::lock_guard<std::mutex> lk(peer->mu_);
-        (void)peer->handle_frontier_block_locked(proposal, certificate, 0, true, cert_check);
+        {
+          std::lock_guard<std::mutex> lk(peer->mu_);
+          (void)peer->handle_frontier_block_locked(proposal, certificate, 0, true, cert_check);
+        }
+        peer->flush_pending_finalized_broadcasts();
       });
     }
   } else {

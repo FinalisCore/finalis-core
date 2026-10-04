@@ -622,6 +622,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   std::uint64_t in_sum = 0;
   std::uint64_t out_sum = 0;
   std::set<OutPoint> seen_inputs;
+  // Total value of slashed bond/unbond inputs; the single SCBURN output must carry exactly this.
+  std::uint64_t slashed_sum = 0;
+  bool has_slash_input = false;
   for (const auto& out : tx.outputs) {
     // Prevent uint64_t overflow when accumulating output values
     if (out_sum > std::numeric_limits<std::uint64_t>::max() - out.value) {
@@ -699,6 +702,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
           return {false, "slash evidence validator not in committee", 0};
         }
+        has_slash_input = true;
+        slashed_sum += prev_out.value;  // bounded by the guarded in_sum below
       } else {
         // UNBOND path
         if (tx.outputs.size() != 1) return {false, "unbond tx must have exactly one output", 0};
@@ -766,6 +771,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
           return {false, "slash evidence validator not in committee", 0};
         }
+        has_slash_input = true;
+        slashed_sum += prev_out.value;  // bounded by the guarded in_sum below
         if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
           return {false, "input sum overflow", 0};
         }
@@ -799,6 +806,11 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     }
 
     return {false, "unsupported prev script_pubkey", 0};
+  }
+
+  // Slash branches enforce exactly one SCBURN output; it must burn every slashed unit.
+  if (has_slash_input && tx.outputs[0].value != slashed_sum) {
+    return {false, "slash burn value mismatch", 0};
   }
 
   if (in_sum < out_sum) return {false, "negative fee", 0};
@@ -1025,6 +1037,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "sighash failed";
       return out;
     }
+    if (!consume_verify_budget(&verify_budget_remaining, 1, &out.error)) return out;
     if (!crypto::ed25519_verify(*msg, sig, pub)) {
       out.error = "signature invalid";
       return out;

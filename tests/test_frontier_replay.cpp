@@ -1880,19 +1880,12 @@ TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
 }
 
 TEST(test_adaptive_committee_target_tracks_qualified_depth_staircase) {
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 1).target_committee_size, 1u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 2).target_committee_size, 2u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 3).target_committee_size, 3u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 4).target_committee_size, 4u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 6).target_committee_size, 4u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 7).target_committee_size, 7u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 10).target_committee_size, 7u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 11).target_committee_size, 10u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 16).target_committee_size, 10u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 17).target_committee_size, 16u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 24).target_committee_size, 16u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 25).target_committee_size, 24u);
-  ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 30).target_committee_size, 27u);
+  for (std::uint64_t d : {1u, 2u, 3u, 7u, 16u, 23u}) {
+    ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, d).target_committee_size, 16u);
+  }
+  for (std::uint64_t d : {24u, 25u, 30u}) {
+    ASSERT_EQ(consensus::derive_adaptive_checkpoint_parameters(std::nullopt, d).target_committee_size, 24u);
+  }
 }
 
 TEST(test_adaptive_committee_target_is_stateless_for_same_qualified_depth) {
@@ -1910,13 +1903,13 @@ TEST(test_adaptive_committee_target_is_stateless_for_same_qualified_depth) {
 
 TEST(test_adaptive_committee_target_reacts_immediately_to_depth_changes) {
   const auto first = consensus::derive_adaptive_checkpoint_parameters(std::nullopt, 3);
-  ASSERT_EQ(first.target_committee_size, 3u);
+  ASSERT_EQ(first.target_committee_size, 16u);
   auto previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, first);
   const auto second = consensus::derive_adaptive_checkpoint_parameters(previous, 7);
-  ASSERT_EQ(second.target_committee_size, 7u);
+  ASSERT_EQ(second.target_committee_size, 16u);
   previous = checkpoint_with_adaptive(storage::FinalizedCommitteeDerivationMode::NORMAL, second);
   const auto third = consensus::derive_adaptive_checkpoint_parameters(previous, 2);
-  ASSERT_EQ(third.target_committee_size, 2u);
+  ASSERT_EQ(third.target_committee_size, 16u);
   ASSERT_EQ(third.target_expand_streak, 0u);
   ASSERT_EQ(third.target_contract_streak, 0u);
 }

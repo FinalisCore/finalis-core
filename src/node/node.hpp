@@ -268,6 +268,8 @@ class Node {
   std::uint64_t round_age_ms_for_test() const;
   Hash32 epoch_ticket_challenge_anchor_for_test(std::uint64_t height) const;
   PubKey32 local_validator_pubkey_for_test() const;
+  // The `crh` value a peer's VERSION must carry to pass the handshake gate.
+  std::string consensus_rules_fingerprint_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
   bool seed_bonded_validator_for_test(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t bond_amount);
   Hash32 canonical_state_commitment_for_test() const;
@@ -505,6 +507,12 @@ class Node {
   void request_finalized_tip(int peer_id);
   void send_finalized_tip(int peer_id);
   void broadcast_finalized_tip();
+  // Must be called WITHOUT mu_ held.
+  void flush_pending_finalized_broadcasts();
+  struct FinalizedBroadcastFlushGuard {
+    Node* node;
+    ~FinalizedBroadcastFlushGuard() { node->flush_pending_finalized_broadcasts(); }
+  };
   bool peer_is_fresh_for_epoch_reconcile_locked(int peer_id, std::uint64_t* peer_height = nullptr,
                                                 std::uint64_t* max_peer_height = nullptr) const;
   std::vector<PubKey32> ingress_committee_locked(std::uint64_t epoch) const;
@@ -768,6 +776,11 @@ class Node {
   std::map<std::pair<int, std::uint32_t>, p2p::GetIngressRangeMsg> requested_ingress_ranges_;
   std::optional<FrontierProposal> last_broadcast_finalized_frontier_;
   std::optional<FinalityCertificate> last_broadcast_finality_certificate_;
+  // Finalization broadcasts queued under mu_ and sent by
+  // flush_pending_finalized_broadcasts() after mu_ is released: a socket send
+  // can block, and a failed send re-enters the peer-event callback, which locks mu_.
+  std::vector<std::pair<FrontierProposal, FinalityCertificate>> pending_finalized_broadcasts_;
+  bool pending_finalized_tip_broadcast_{false};
   bool restart_debug_{false};
   mutable std::mutex lightserver_mu_;
   int lightserver_pid_{-1};
