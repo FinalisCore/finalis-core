@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Generate a fresh validator set and genesis for a devnet or launch ceremony.
 #
 # Output: devnet/<UTC timestamp>/ (git-ignored)

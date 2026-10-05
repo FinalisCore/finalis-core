@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Boot the 3-node Docker devnet from the newest generate_fresh_genesis.sh output.
 #
 # 1. Load devnet/<newest>/manifest.env.
