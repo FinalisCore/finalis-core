@@ -49,21 +49,16 @@ This document helps contributors quickly identify where to read and where to add
 Current `src/` component README coverage is complete for all first-level
 components.
 
-- `src/address/README.md`
-- `src/availability/README.md`
 - `src/codec/README.md`
 - `src/common/README.md`
 - `src/consensus/README.md`
 - `src/crypto/README.md`
 - `src/genesis/README.md`
-- `src/keystore/README.md`
 - `src/lightserver/README.md`
 - `src/mempool/README.md`
-- `src/merkle/README.md`
 - `src/node/README.md`
 - `src/onboarding/README.md`
 - `src/p2p/README.md`
-- `src/policy/README.md`
 - `src/privacy/README.md`
 - `src/storage/README.md`
 - `src/utxo/README.md`
@@ -71,8 +66,8 @@ components.
 
 ## Structure Consolidation Roadmap
 
-A proposed set of low-risk folder consolidations is documented in
-[STRUCTURE_CONSOLIDATION_PROPOSAL.md](STRUCTURE_CONSOLIDATION_PROPOSAL.md).
-This roadmap aims to reduce shallow folder fragmentation and improve codebase navigability.
-Expected outcome: from 19 src/ components to 14, while maintaining build stability and
-test coverage.
+The consolidations in
+[STRUCTURE_CONSOLIDATION_PROPOSAL.md](STRUCTURE_CONSOLIDATION_PROPOSAL.md) are complete: the
+README-only `src/address/`, `src/keystore/`, `src/merkle/` (code in `src/common/`) and
+`src/availability/`, `src/policy/` (code in `src/consensus/`) folders were removed.
+`src/` now has 14 first-level components (previously 19).

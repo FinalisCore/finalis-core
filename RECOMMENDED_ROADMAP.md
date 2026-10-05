@@ -449,6 +449,23 @@ settlement (item 13).
     - Item 4 follow-up still applies: remove the `--deferred-exit-activation-height` auto-injection
       (`AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME`), which the mainnet consensus-flag lock now rejects.
 
+- [ ] **25. Repository hygiene (Group A)**
+  - Status: **applied 2026-10-05 — not committed; no build impact (docs, CI paths, data files only)**
+  - `git rm`: `finalis_rc_fullsuite.txt` (0 bytes, unreferenced) and the README-only folders
+    `src/address/`, `src/availability/`, `src/keystore/`, `src/merkle/`, `src/policy/`
+    (their code lives in `src/common/` and `src/consensus/`).
+  - Docs: `docs/CODEBASE_MAP.md` drops the five READMEs and marks the consolidation proposal done;
+    `docs/ADDRESSES.md` link fixed to `src/common/address.cpp`.
+  - CI: `.github/workflows/simulator-conformance.yml` path filters pointed at the nonexistent
+    `src/availability/retention.*`, so the job never triggered on retention changes. Now
+    `src/consensus/availability_retention.*`.
+  - Local (ignored/untracked) cleanup: `ctest_failures.txt`, `finalis-fullsuite.log`,
+    `violations_vps_*.log`, `.codex`, all `__pycache__/`.
+  - Remaining (Group B/C, tied to item 6): `snapshot.bin` is still read by `scripts/start.sh:49`,
+    `packaging/windows/Start-Finalis.ps1`, `Stage-WindowsRelease.ps1` and
+    `.github/workflows/windows-release.yml:226`. Move the fast-sync snapshot to a release asset first,
+    then `git rm` it. Shrinking `.git` (92 MB) needs `git filter-repo` + force-push (irreversible).
+
 ---
 
 ## Status summary
@@ -480,6 +497,7 @@ settlement (item 13).
 | 22 | Fresh-genesis devnet scripts | done — devnet boots and finalizes; `.env` fix verified 2026-10-05 |
 | 23 | P0 pacing: round-0 timer anchored to the block interval | [x] Verified on 3-node devnet (2026-10-05) |
 | 24 | `start.sh` systemd hardening + mainnet genesis lock | applied — `bash -n` + unit verify clean; host run pending |
+| 25 | Repository hygiene (Group A) | applied — uncommitted; `snapshot.bin` removal open (item 6) |
 
 2026-10-04: the full tree (`cmake --build build -j`, including the test binaries) builds clean. That
 verifies the C++ items 1, 3, 4, 8, 9, 10, 12, 13 and 15–21. Item 2 needs a `docker build`, item 7 an

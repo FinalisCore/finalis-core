@@ -204,7 +204,7 @@ Byte form:
 
 Current helper:
 
-- [src/address/address.cpp](../src/address/address.cpp)
+- [src/common/address.cpp](../src/common/address.cpp)
 
 ## 10. What Exchanges / Wallets Should Rely On
 
