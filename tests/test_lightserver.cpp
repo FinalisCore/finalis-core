@@ -1868,7 +1868,7 @@ TEST(test_snapshot_export_import_bootstraps_imported_db) {
   {
     storage::DB dst;
     ASSERT_TRUE(dst.open(imported_db_path));
-    ASSERT_TRUE(storage::import_snapshot_bundle(dst, snapshot_path, &imported, &err));
+    ASSERT_TRUE(storage::import_snapshot_bundle(dst, snapshot_path, exported.genesis_hash, &imported, &err));
   }
   ASSERT_EQ(imported.finalized_height, exported.finalized_height);
   ASSERT_EQ(imported.finalized_hash, exported.finalized_hash);

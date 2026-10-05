@@ -55,9 +55,15 @@ struct SnapshotBundle {
 
 bool export_snapshot_bundle(const DB& db, const std::string& path, SnapshotManifest* manifest_out = nullptr,
                             std::string* err = nullptr);
+// Reads and validates a bundle without touching any DB. expected_genesis_hash is the
+// importing node's genesis fingerprint (the value stored under key_genesis_hash());
+// nullopt skips the genesis binding check (tests only).
+bool inspect_snapshot_bundle(const std::string& path, const std::optional<Hash32>& expected_genesis_hash,
+                             SnapshotManifest* manifest_out = nullptr, std::string* err = nullptr);
 // The first import slice is intentionally conservative: import into an empty DB
-// only and let existing startup paths consume the resulting keyspace.
-bool import_snapshot_bundle(DB& db, const std::string& path, SnapshotManifest* manifest_out = nullptr,
-                            std::string* err = nullptr);
+// only and let existing startup paths consume the resulting keyspace. The bundle is
+// validated and genesis-bound (see inspect_snapshot_bundle) before anything is written.
+bool import_snapshot_bundle(DB& db, const std::string& path, const std::optional<Hash32>& expected_genesis_hash,
+                            SnapshotManifest* manifest_out = nullptr, std::string* err = nullptr);
 
 }  // namespace finalis::storage

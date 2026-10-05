@@ -94,9 +94,27 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
 ## D. State bootstrap safety
 
 - [ ] **6. Snapshot import safety**
-  - `scripts/start.sh`: default `AUTO_FAST_SYNC=0`.
-  - `import_snapshot_bundle`: verify manifest genesis hash against the embedded `MAINNET_GENESIS_HASH`.
-  - Remove the tracked `snapshot.bin` from the repo.
+  - Status: **genesis binding applied 2026-10-05 — builds clean; tests not run**
+  - Done: genesis binding (`src/storage/snapshot.{hpp,cpp}`, `apps/finalis-cli/main.cpp`).
+    - `import_snapshot_bundle` takes a required `std::optional<Hash32> expected_genesis_hash`
+      (nullopt = tests only). New `inspect_snapshot_bundle` runs the same parse + `validate_bundle`
+      + genesis check without a DB. Both reject with
+      `snapshot genesis mismatch; reject import (snapshot=<hex> expected=<hex>)` before any write.
+    - CLI `fast_sync` / `snapshot_import` default to `MAINNET_GENESIS_HASH`; override with
+      `--expected-genesis-hash <hex32>`. Errors print as `error: ...`.
+    - `fast_sync` calls `inspect_snapshot_bundle` **before** `--force` clears chain state
+      (`run_repair_state_command`), so a foreign or corrupt snapshot no longer wipes the existing DB.
+      Before this, a foreign snapshot was written and the node then refused to boot (`node.cpp:9873`).
+    - Tests: `test_snapshot_import_accepts_matching_genesis`,
+      `test_snapshot_import_rejects_genesis_mismatch_without_writing` (DB stays empty).
+  - Remaining:
+    - Forged state: the genesis hash is public, so this blocks wrong-chain imports, not forged
+      UTXO/validator state. Pin a trusted `(finalized_height, finalized_hash)` (CLI flag or
+      `NetworkConfig` checkpoint) and recompute the UTXO/validator roots from the imported entries.
+    - Testnet `start.sh` should pass `--expected-genesis-hash` (check `EXPECTED_GENESIS_SHA256` uses
+      the same `hash_doc` form first).
+    - `scripts/start.sh`: default `AUTO_FAST_SYNC=0`.
+    - Remove the tracked `snapshot.bin` from the repo.
 
 ## E. Public interface
 
@@ -478,7 +496,7 @@ settlement (item 13).
 | 3b | Bond ceiling invariant | done — builds clean |
 | 4 | Mainnet consensus-flag lock | done — builds clean (`start.sh:821-838` must be removed) |
 | 5 | `parse_args` hardening | partial — applied part builds clean (u32 truncation, signal ordering, other apps) |
-| 6 | Snapshot import safety | **open** |
+| 6 | Snapshot import safety | genesis binding done — builds clean, tests not run; forged-state check **open** |
 | 7 | SDK dead methods | applied — pending SDK typecheck/tests |
 | 8 | D5 durable vote lock | done — builds clean |
 | 9 | D1 verified participation record | done — builds clean (**fresh genesis required**) |

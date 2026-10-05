@@ -2,7 +2,9 @@
 
 #include "test_framework.hpp"
 
+#include <algorithm>
 #include <filesystem>
+#include <optional>
 
 #include "codec/bytes.hpp"
 #include "storage/db.hpp"
@@ -15,6 +17,41 @@ namespace {
 
 std::string unique_snapshot_path(const std::string& stem) {
   return "/tmp/" + stem;
+}
+
+// Minimal DB that passes export and validate_bundle: genesis markers, tip, roots and
+// the finalized height/frontier/certificate records at height 0.
+void populate_minimal_finalized_db(storage::DB* db, const Hash32& genesis_hash) {
+  Hash32 genesis_artifact_id{};
+  genesis_artifact_id.fill(0x02);
+  Hash32 tip_hash{};
+  tip_hash.fill(0x03);
+  Hash32 root{};
+  root.fill(0x04);
+  ASSERT_TRUE(db->put(storage::key_genesis_hash(), Bytes(genesis_hash.begin(), genesis_hash.end())));
+  ASSERT_TRUE(db->put(storage::key_genesis_artifact(), Bytes(genesis_artifact_id.begin(), genesis_artifact_id.end())));
+  ASSERT_TRUE(db->set_tip(storage::TipState{0, tip_hash}));
+  ASSERT_TRUE(db->put(storage::key_root_index("UTXO", 0), Bytes(root.begin(), root.end())));
+  ASSERT_TRUE(db->put(storage::key_root_index("VAL", 0), Bytes(root.begin(), root.end())));
+  ASSERT_TRUE(db->set_height_hash(0, tip_hash));
+  ASSERT_TRUE(db->put(storage::key_frontier_height(0), Bytes(tip_hash.begin(), tip_hash.end())));
+  ASSERT_TRUE(db->put(storage::key_frontier_transition(tip_hash), Bytes{0x01}));
+  ASSERT_TRUE(db->put(storage::key_finality_certificate_height(0), Bytes{0x01}));
+  ASSERT_TRUE(db->flush());
+}
+
+// Exports a minimal snapshot bound to genesis_hash; returns the snapshot path.
+std::string export_minimal_snapshot(const std::string& stem, const Hash32& genesis_hash) {
+  const std::string src_db_path = unique_snapshot_path(stem + "_src_db");
+  const std::string snapshot_path = unique_snapshot_path(stem + ".bin");
+  std::filesystem::remove_all(src_db_path);
+  std::filesystem::remove(snapshot_path);
+  storage::DB src;
+  if (!src.open(src_db_path)) return {};
+  populate_minimal_finalized_db(&src, genesis_hash);
+  std::string err;
+  if (!storage::export_snapshot_bundle(src, snapshot_path, nullptr, &err)) return {};
+  return snapshot_path;
 }
 
 }  // namespace
@@ -103,8 +140,52 @@ TEST(test_snapshot_import_rejects_nonempty_db) {
   ASSERT_TRUE(dst.flush());
 
   storage::SnapshotManifest imported;
-  ASSERT_TRUE(!storage::import_snapshot_bundle(dst, snapshot_path, &imported, &err));
+  ASSERT_TRUE(!storage::import_snapshot_bundle(dst, snapshot_path, std::nullopt, &imported, &err));
   ASSERT_TRUE(err.find("empty db") != std::string::npos);
+}
+
+TEST(test_snapshot_import_accepts_matching_genesis) {
+  Hash32 genesis_hash{};
+  genesis_hash.fill(0x01);
+  const auto snapshot_path = export_minimal_snapshot("finalis_snapshot_genesis_match", genesis_hash);
+  ASSERT_TRUE(!snapshot_path.empty());
+
+  const std::string dst_db_path = unique_snapshot_path("finalis_snapshot_genesis_match_dst_db");
+  std::filesystem::remove_all(dst_db_path);
+  storage::DB dst;
+  ASSERT_TRUE(dst.open(dst_db_path));
+
+  storage::SnapshotManifest imported;
+  std::string err;
+  ASSERT_TRUE(storage::import_snapshot_bundle(dst, snapshot_path, genesis_hash, &imported, &err));
+  ASSERT_EQ(imported.genesis_hash, genesis_hash);
+  const auto stored = dst.get(storage::key_genesis_hash());
+  ASSERT_TRUE(stored.has_value());
+  ASSERT_TRUE(std::equal(stored->begin(), stored->end(), genesis_hash.begin()));
+}
+
+TEST(test_snapshot_import_rejects_genesis_mismatch_without_writing) {
+  Hash32 snapshot_genesis{};
+  snapshot_genesis.fill(0x01);
+  Hash32 node_genesis{};
+  node_genesis.fill(0x7e);
+  const auto snapshot_path = export_minimal_snapshot("finalis_snapshot_genesis_mismatch", snapshot_genesis);
+  ASSERT_TRUE(!snapshot_path.empty());
+
+  std::string err;
+  ASSERT_TRUE(!storage::inspect_snapshot_bundle(snapshot_path, node_genesis, nullptr, &err));
+  ASSERT_TRUE(err.find("snapshot genesis mismatch; reject import") != std::string::npos);
+
+  const std::string dst_db_path = unique_snapshot_path("finalis_snapshot_genesis_mismatch_dst_db");
+  std::filesystem::remove_all(dst_db_path);
+  storage::DB dst;
+  ASSERT_TRUE(dst.open(dst_db_path));
+
+  storage::SnapshotManifest imported;
+  err.clear();
+  ASSERT_TRUE(!storage::import_snapshot_bundle(dst, snapshot_path, node_genesis, &imported, &err));
+  ASSERT_TRUE(err.find("snapshot genesis mismatch; reject import") != std::string::npos);
+  ASSERT_TRUE(dst.scan_prefix("").empty());
 }
 
 void register_snapshot_tests() {}
