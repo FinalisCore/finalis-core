@@ -201,9 +201,60 @@ TEST(test_availability_audit_verification_accepts_valid_and_rejects_invalid_proo
 
   auto bad_prefix = *response;
   bad_prefix.prefix_id.fill(0x99);
+  const auto bad_prefix_hash = availability::availability_audit_response_signing_hash(bad_prefix);
+  auto bad_prefix_sig =
+      crypto::ed25519_sign(Bytes(bad_prefix_hash.begin(), bad_prefix_hash.end()), operator_key.private_key);
+  ASSERT_TRUE(bad_prefix_sig.has_value());
+  bad_prefix.operator_sig = *bad_prefix_sig;
   ASSERT_EQ(availability::verify_audit_response(challenges.front(), payload.prefix, bad_prefix, &evidence, &err),
             availability::AvailabilityAuditOutcome::INVALID_RESPONSE);
   ASSERT_EQ(evidence.violation, availability::InvalidAvailabilityResponseType::WRONG_PREFIX);
+}
+
+TEST(test_availability_unsigned_or_forged_response_is_not_attributed_to_operator) {
+  const auto operator_key = key_from_byte(0x41);
+  const auto attacker_key = key_from_byte(0x5A);
+  const auto payload = sample_payload();
+  Hash32 transition_id{};
+  transition_id.fill(0x77);
+  const auto challenges = availability::build_audit_challenges_for_operator(operator_key.public_key, {payload.prefix}, transition_id,
+                                                                            3, 100);
+  const auto response = availability::make_audit_response(challenges.front(), payload, operator_key.private_key);
+  ASSERT_TRUE(response.has_value());
+
+  // Tampered without re-signing: cannot be pinned on the operator.
+  auto tampered = *response;
+  tampered.prefix_id.fill(0x99);
+  availability::InvalidAvailabilityServiceEvidence evidence;
+  evidence.violation = availability::InvalidAvailabilityResponseType::INVALID_PROOF;
+  std::string err;
+  ASSERT_EQ(availability::verify_audit_response(challenges.front(), payload.prefix, tampered, &evidence, &err),
+            availability::AvailabilityAuditOutcome::NO_RESPONSE);
+  ASSERT_EQ(err, "unattributable-response");
+  ASSERT_EQ(evidence.violation, availability::InvalidAvailabilityResponseType::INVALID_PROOF);  // untouched
+
+  // Signed by someone else: same.
+  auto forged = *response;
+  forged.chunk_bytes[0] ^= 0x01;
+  const auto forged_hash = availability::availability_audit_response_signing_hash(forged);
+  auto forged_sig = crypto::ed25519_sign(Bytes(forged_hash.begin(), forged_hash.end()), attacker_key.private_key);
+  ASSERT_TRUE(forged_sig.has_value());
+  forged.operator_sig = *forged_sig;
+  ASSERT_EQ(availability::verify_audit_response(challenges.front(), payload.prefix, forged, &evidence, &err),
+            availability::AvailabilityAuditOutcome::NO_RESPONSE);
+
+  // Correctly signed but with a truncated proof: rejected on shape.
+  if (!response->proof.siblings.empty()) {
+    auto short_proof = *response;
+    short_proof.proof.siblings.pop_back();
+    const auto short_hash = availability::availability_audit_response_signing_hash(short_proof);
+    auto short_sig = crypto::ed25519_sign(Bytes(short_hash.begin(), short_hash.end()), operator_key.private_key);
+    ASSERT_TRUE(short_sig.has_value());
+    short_proof.operator_sig = *short_sig;
+    ASSERT_EQ(availability::verify_audit_response(challenges.front(), payload.prefix, short_proof, &evidence, &err),
+              availability::AvailabilityAuditOutcome::INVALID_RESPONSE);
+    ASSERT_EQ(err, "invalid-proof-shape");
+  }
 }
 
 TEST(test_availability_score_update_is_deterministic) {
