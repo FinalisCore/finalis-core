@@ -119,16 +119,13 @@ Cluster make_cluster(const std::string& base, int node_count = 4) {
     // multi-minute production cadence.
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
-    cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
+    cfg.p2p_port = 0;  // disable_p2p: never bound or dialed
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.max_committee = static_cast<std::size_t>(node_count);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
-    for (int j = 0; j < i; ++j) {
-      cfg.peers.push_back("127.0.0.1:" + std::to_string(19040 + j));
-    }
     keystore::ValidatorKey created_key;
     std::string kerr;
     if (!keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",

@@ -34,7 +34,13 @@ NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
 USE_SEEDS_JSON="${USE_SEEDS_JSON:-1}"
 GENESIS_BIN="${GENESIS_BIN:-}"
 GENESIS_PATH="${GENESIS_PATH:-${GENESIS_BIN}}"
-ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-1}"
+FINALIS_NETWORK="${FINALIS_NETWORK:-mainnet}"
+ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-0}"
+EXPECTED_GENESIS_SHA256="${EXPECTED_GENESIS_SHA256:-}"
+SERVICE_TIMEOUT_STOP_SEC="${SERVICE_TIMEOUT_STOP_SEC:-300}"
+SERVICE_MEMORY_HIGH="${SERVICE_MEMORY_HIGH:-}"
+SERVICE_MEMORY_MAX="${SERVICE_MEMORY_MAX:-infinity}"
+SERVICE_TASKS_MAX="${SERVICE_TASKS_MAX:-4096}"
 NODE_ROLE="${NODE_ROLE:-auto}"
 RECOVER_PEER_DISCOVERY="${RECOVER_PEER_DISCOVERY:-0}"
 TRUSTED_BOOTSTRAP_PEER="${TRUSTED_BOOTSTRAP_PEER:-}"
@@ -572,6 +578,11 @@ detect_mode() {
 }
 
 resolve_genesis_source() {
+  if [[ "${FINALIS_NETWORK}" == "mainnet" ]]; then
+    # Embedded genesis; the node verifies it against MAINNET_GENESIS_HASH.
+    echo ""
+    return
+  fi
   local default_genesis_bin="${ROOT_DIR}/mainnet/genesis.bin"
   local default_genesis_json="${ROOT_DIR}/mainnet/genesis.json"
   if [[ -n "${GENESIS_PATH}" ]]; then
@@ -597,6 +608,42 @@ sha256_file() {
   else
     echo "sha256-unavailable"
   fi
+}
+
+enforce_genesis_safety_lock() {
+  case "${FINALIS_NETWORK}" in
+    mainnet)
+      if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" != "0" || -n "${GENESIS_PATH}" ]]; then
+        log "MAINNET LOCK: ALLOW_UNSAFE_GENESIS_OVERRIDE/GENESIS_PATH are forbidden; mainnet uses the embedded, hash-pinned genesis."
+        exit 1
+      fi
+      if grep -Eq -- '(^|[[:space:]])--(allow-unsafe-genesis-override|genesis)([[:space:]=]|$)' <<<"${NODE_EXTRA_ARGS}"; then
+        log "MAINNET LOCK: NODE_EXTRA_ARGS may not carry --genesis or --allow-unsafe-genesis-override."
+        exit 1
+      fi
+      ;;
+    testnet)
+      if [[ -z "${GENESIS_PATH}" || ! -f "${GENESIS_PATH}" ]]; then
+        log "FINALIS_NETWORK=testnet requires GENESIS_PATH pointing to an existing genesis artifact."
+        exit 1
+      fi
+      if [[ -z "${EXPECTED_GENESIS_SHA256}" ]]; then
+        log "FINALIS_NETWORK=testnet requires EXPECTED_GENESIS_SHA256."
+        exit 1
+      fi
+      local actual
+      actual="$(sha256_file "${GENESIS_PATH}")"
+      if [[ "${actual}" != "${EXPECTED_GENESIS_SHA256}" ]]; then
+        log "Testnet genesis sha256 mismatch: got ${actual}, want ${EXPECTED_GENESIS_SHA256}"
+        exit 1
+      fi
+      ALLOW_UNSAFE_GENESIS_OVERRIDE=1
+      ;;
+    *)
+      log "Unsupported FINALIS_NETWORK=${FINALIS_NETWORK}. Use mainnet or testnet."
+      exit 1
+      ;;
+  esac
 }
 
 reset_chain_data_if_requested() {
@@ -804,12 +851,14 @@ build_node_command() {
   local -a args=(
     "${node_bin}"
     "--db" "${DB_DIR}"
-    "--genesis" "${genesis_path}"
     "--port" "${P2P_PORT}"
     "--handshake-timeout-ms" "${HANDSHAKE_TIMEOUT_MS}"
     "--frame-timeout-ms" "${FRAME_TIMEOUT_MS}"
     "--idle-timeout-ms" "${IDLE_TIMEOUT_MS}"
   )
+  if [[ -n "${genesis_path}" ]]; then
+    args+=("--genesis" "${genesis_path}")
+  fi
 
   if [[ "${NO_REINDEX_ON_START}" == "1" ]]; then
     args+=("--no-reindex")
@@ -837,8 +886,8 @@ build_node_command() {
     fi
   fi
 
-  if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
-    log "WARNING: enabling --allow-unsafe-genesis-override (intended only for controlled recovery/testing)" >&2
+  if [[ "${FINALIS_NETWORK}" == "testnet" && "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
+    log "WARNING: enabling --allow-unsafe-genesis-override (testnet only)" >&2
     args+=("--allow-unsafe-genesis-override")
   fi
 
@@ -924,14 +973,19 @@ print_summary() {
   local genesis_path="$2"
   local command_line="$3"
   local genesis_sha
-  genesis_sha="$(sha256_file "${genesis_path}")"
+  if [[ -z "${genesis_path}" ]]; then
+    genesis_sha="embedded (binary-pinned)"
+  else
+    genesis_sha="$(sha256_file "${genesis_path}")"
+  fi
   local peers
   peers="$(seed_csv)"
 
   log "Detected mode=${mode}"
+  log "Network=${FINALIS_NETWORK}"
   log "Seed count=$(seed_count)"
   log "DB_DIR=${DB_DIR}"
-  log "Genesis=${genesis_path}"
+  log "Genesis=${genesis_path:-<embedded>}"
   log "Genesis sha256=${genesis_sha}"
   log "All nodes must use this exact genesis artifact or VERSION handshake will be rejected."
   if [[ "${mode}" == "bootstrap" ]]; then
@@ -973,33 +1027,114 @@ install_and_restart_service() {
 
   local service_path="/etc/systemd/system/${SERVICE_NAME}.service"
   local s; s="$(need_sudo)"
+
+  # systemd expands %specifiers in ExecStart; escape literal '%'.
+  local unit_exec="${command_line//%/%%}"
+
+  # Exported shell variables (SYNC_TURBO_MODE tuning) are not inherited by the
+  # service; pass them through explicitly.
+  local env_block="" var
+  for var in FINALIS_INGEST_MAX_BACKGROUND_JOBS FINALIS_INGEST_BYTES_PER_SYNC FINALIS_INGEST_WRITE_BUFFER_MB \
+             FINALIS_INGEST_MAX_WRITE_BUFFERS FINALIS_INGEST_MIN_WRITE_BUFFERS_TO_MERGE \
+             FINALIS_INGEST_L0_COMPACTION_TRIGGER FINALIS_INGEST_TARGET_FILE_SIZE_MB \
+             FINALIS_SNAPSHOT_IMPORT_BATCH_SIZE; do
+    if [[ -n "${!var:-}" ]]; then
+      env_block+="Environment=${var}=${!var}"$'\n'
+    fi
+  done
+
+  local memory_high_line=""
+  if [[ -n "${SERVICE_MEMORY_HIGH}" ]]; then
+    memory_high_line="MemoryHigh=${SERVICE_MEMORY_HIGH}"
+  fi
+
+  # ReadWritePaths= requires the path to exist at unit start.
+  mkdir -p "${DB_DIR}"
+
   ${s} tee "${service_path}" >/dev/null <<EOF
 [Unit]
-Description=Finalis Node
+Description=Finalis Node (${FINALIS_NETWORK})
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=${SERVICE_USER}
-WorkingDirectory=${ROOT_DIR}
-ExecStart=${command_line}
+WorkingDirectory=${DB_DIR}
+${env_block}ExecStart=${unit_exec}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=finalis-node
 Restart=on-failure
-RestartSec=2
-TimeoutStopSec=300
+RestartSec=5
+
+# Graceful shutdown: SIGINT -> node.stop(); SIGKILL only after the grace window.
 KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=${SERVICE_TIMEOUT_STOP_SEC}
+SendSIGKILL=yes
+
+# Filesystem isolation
+UMask=0077
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${DB_DIR}
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# Privilege isolation
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+
+# Kernel surface (AF_NETLINK: getifaddrs)
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
+
+# cgroup resource control (MemoryHigh throttles; MemoryMax is an OOM SIGKILL)
 LimitNOFILE=65535
+TasksMax=${SERVICE_TASKS_MAX}
+${memory_high_line}
+MemoryMax=${SERVICE_MEMORY_MAX}
+MemorySwapMax=0
+OOMScoreAdjust=-500
+CPUWeight=200
+IOWeight=500
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  if have systemd-analyze; then
+    if ! ${s} systemd-analyze verify "${service_path}"; then
+      log "systemd-analyze verify failed for ${service_path}"
+      exit 1
+    fi
+  fi
   ${s} systemctl daemon-reload
   ${s} systemctl enable "${SERVICE_NAME}" >/dev/null || true
   ${s} systemctl restart "${SERVICE_NAME}"
   log "Installed and restarted ${SERVICE_NAME}.service"
+  if have systemd-analyze; then
+    ${s} systemd-analyze security "${SERVICE_NAME}" --no-pager 2>/dev/null | tail -1 || true
+  fi
   ${s} systemctl status "${SERVICE_NAME}" --no-pager || true
   return 0
 }
@@ -1072,6 +1207,7 @@ start_explorer_background() {
 }
 
 main() {
+  enforce_genesis_safety_lock
   recover_peer_discovery_state_if_requested
   auto_tune_sync_profile_if_requested
 

@@ -233,6 +233,222 @@ Resolved and built clean: **D5** (item 8), **D1** (item 9), **D3** (item 10). No
   TC-based round jumps), D6 (≥4 genesis validators), D7 (post-cap security budget), state growth
   (`CanonicalDerivedState` pruning and per-block copy).
 
+## G. Phase 4: Strict Monetary & Economic Safety (from the 2026-10-04 monetary audit)
+
+Audit summary: consensus economics uses no floating point. Emission sums to exactly
+`TOTAL_SUPPLY_UNITS` (12 yearly budgets with exact 4/5 decay; the last year takes the remainder).
+Reserve accrual is conserved per epoch. No rounding path can mint above the cap. Two paths
+**destroy** supply (items 12 and 14), and one path lets node-local state override canonical
+settlement (item 13).
+
+- [x] **12. Post-cap reserve subsidy: units paid must equal units debited**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Consensus change (effective from
+    height 2,102,400); ships with the D1 fresh genesis.
+  - Problem: `derive_frontier_settlement_from_state` (`canonical_derivation.cpp:319`) reads the
+    settlement epoch's `reserve_subsidy_units` from the pre-block state, where it is still 0. The
+    subsidy is computed later, in `mark_epoch_reward_settled_for_height` (`:612-637`), which runs on
+    the post-block state during apply and debits the reserve. So the subsidy is never paid, and the
+    reserve is destroyed down to the 140,000 FLS floor after the cap.
+  - Fix: one pure helper, `epoch_reserve_subsidy_units(cfg, height, reward_state, reserve_before_accrual)`,
+    used by both the payout (pre-block state) and the debit (`next` before any other mutation, so the
+    inputs are identical). `apply_frontier_record_impl` additionally rejects a transition whose
+    `settlement.reserve_subsidy_units` differs from the debited amount (`frontier-reserve-subsidy-mismatch`).
+  - Cleanup: deleted the dead node mirror (`node.cpp` `mark_epoch_reward_settled_for_height` +
+    `Node::mark_epoch_reward_settled_if_needed_locked`, which had no callers).
+
+- [x] **13. Remove node-local settlement fallback / hotfix acceptance**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Node-only; no format change.
+  - Problem: on `frontier-settlement-commitment-mismatch`, the node retried verification with
+    node-local reward states (persisted, runtime, ticket-patched) and **overwrote canonical state** with
+    whichever matched. One variant (`apply_and_retry`) wrote canonical state and the DB even when the
+    retry failed. It also accepted hard-coded commitments at heights 7009/7041 from the abandoned chain,
+    and validated settlement-boundary blocks against a `rebuild_frozen_epoch_reward_state_*` substitute
+    instead of canonical state.
+  - Fix: delete `should_accept_frozen_settlement_hotfix`, both fallback blocks, the three hotfix
+    branches, the frozen-epoch `validation_state` substitutions, and the post-apply canonical overwrite.
+    `rebuild_frozen_epoch_reward_state_from_finalized_chain_locked` then has no callers and is deleted.
+    Any settlement that fails canonical verification is rejected.
+  - Done: all five bypass layers were removed (certified-sync `try_reward_state` fallback, uncertified-path
+    `apply_and_retry`, 7009/7041 hotfix at 3 call sites including its committee-check skip, two
+    frozen-epoch `validation_state` substitutions, post-apply canonical overwrite in
+    `ensure_settlement_onboarding_scores_loaded_locked`). Also deleted `should_accept_frozen_settlement_hotfix`,
+    `hash32_from_hex_or_zero`, and the rebuild function.
+  - Left in place (not consensus-affecting): `ensure_settlement_onboarding_scores_loaded_locked` still writes
+    node-local ticket onboarding scores into canonical reward state. That field is neither in the state
+    commitment nor read by the canonical payout, which uses checkpoint members.
+  - Watch: if fast-start nodes reject settlement blocks after this change, the cause is the tip-only
+    `finalized_block_metadata` reload (item 9 follow-up), which the removed rebuild used to mask.
+  - Tests that relied on the fallback will now fail. Fix them by making their settlement canonical;
+    do not restore the bypass.
+
+- [ ] **14. Pre-cap transaction fees must not be burned**
+  - Status: **open — design decision needed.**
+  - Problem: before `EMISSION_BLOCKS`, fees are removed from transaction inputs but never paid
+    (`canonical_derivation.cpp:318`, `:348-350`, `:979`). That burns 12 years of fees, leaves validators
+    with no fee income, and contradicts `docs/ECONOMICS.md` §4.
+  - Requested direction: pay fees to the proposer immediately.
+  - ⚠ Conflict: settlement outputs are part of `settlement_commitment`, which is part of
+    `consensus_payload_id` (the vote-lock identity). Paying the *current round leader* per block would
+    change the payload whenever a different leader re-proposes a locked payload. That breaks lock
+    re-proposal, which is the reason fees were kept out of per-block settlement.
+  - Recommended alternative: pool fees into the epoch `fee_pool_units` from genesis (drop the
+    `height >= EMISSION_BLOCKS` gates) and pay them at epoch settlement by reward score, the same as
+    post-cap. The proposer is still credited through its leader score. The payload stays
+    leader-independent and nothing is burned.
+
+- [x] **15. Slash transactions must burn the full slashed value**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Consensus change; ships with the
+    D1 fresh genesis.
+  - Problem: the V1 slash paths in `validate_tx` (bond and unbond-output branches) required one
+    `SCBURN` output but never checked its value. A submitter could burn 0 so the whole bond became the
+    fee. After the cap, that fee goes into `fee_pool_units` and is paid out at settlement, so
+    equivocators' bonds were redirected, not destroyed. It also lowered the post-cap reserve subsidy
+    (`monetary.cpp:105`).
+  - Fix: `validate_tx` sums `prev_out.value` over every slash input into `slashed_sum`, and rejects
+    with `slash burn value mismatch` unless `outputs[0].value == slashed_sum`. Summing (not a per-input
+    check) also closes the case of two slash inputs for one validator sharing one burn output.
+  - Note: a slash-only tx now pays no fee; submitters add their own P2PKH input to pay mempool fees.
+  - Tests to add: burn 0 → reject; burn = bond → accept; bond + unbond slash in one tx with burn = one
+    value → reject; burn = sum → accept.
+
+- [x] **16. P2P listener rejected IPv4 bind addresses**
+  - Status: **applied — builds clean (2026-10-04)**; tests 48 and 51 now pass.
+  - Problem: the dual-stack listener (`0992f37`) parsed `bind_ip` with `inet_pton(AF_INET6)` only, so
+    `"127.0.0.1"` (the `NodeConfig` default) failed to parse and every node with `listen=true` failed
+    `init()`. The logged `errno=2` was stale: `inet_pton` does not set `errno`.
+  - Fix: `PeerManager::start_listener` falls back to `inet_pton(AF_INET)` and binds the IPv4-mapped
+    address `::ffff:a.b.c.d`.
+  - Open: the `listener start failed` log still prints a stale `errno` for parse failures.
+
+- [x] **17. TxV2 transparent inputs bypassed the Ed25519 verify budget**
+  - Status: **applied — builds clean (2026-10-04)**; test 327 passes. Consensus/DoS fix.
+  - Problem: `validate_tx_v2` verified each transparent input signature without calling
+    `consume_verify_budget`, so a V2 tx could force more than `kMaxTxEd25519Verifies` (1024) verifies,
+    limited only by `max_inputs_per_tx`. V1 already charged the budget.
+  - Fix: one `consume_verify_budget` call before each V2 transparent `ed25519_verify`, as in V1.
+
+- [x] **18. Test-suite repairs**
+  - Status: **applied — builds clean (2026-10-04)**; tests not re-run.
+  - Stale constants: `test_mainnet_characterization.cpp` bond floor/ceiling (`BOND_AMOUNT * 20` /
+    `* 100`); `test_frontier_replay.cpp` adaptive committee target is now only 16/24 (`38fd2ab`).
+  - Port isolation: cluster fixtures used fixed ports `19040+i` / `19140+i`, so parallel test
+    shards collided (`errno=98`). `make_cluster`, `make_cluster_with_timing`,
+    `make_bonded_joined_validator_fixture` and `make_bonded_live_joiner_fixture` now take OS-assigned
+    ports via `reserve_test_ports()` and store them in `Cluster::ports`; the restart test reuses the
+    original ports. Single-node and lightserver configs (`disable_p2p`) use port 0.
+  - Still failing, not yet triaged (see also 19–20): availability suite baseline (175–182); small networks never reach
+    `NORMAL` because `min_eligible` is now 16 (262, 263, 275–279, 281; needs a design decision);
+    bond re-registration (189, 192); mempool hashcash (220); onboarding state machine (356–359).
+
+- [x] **19. Self-connection check rejected every same-host peer**
+  - Status: **applied — builds clean (2026-10-04)**. Clusters went from h=0 to finalizing (devnet
+    reached h=6).
+  - Problem: the VERSION handler (`5d46f2a`) called `endpoint_matches_local_listener(info.ip,
+    cfg_.p2p_port)` — our own port, so the port test always passed and any peer whose IP is local was
+    rejected as self. Nodes sharing a host or IP could not peer.
+  - Fix: check outbound connections only, using the dialed port from `p2p::parse_endpoint(info.endpoint)`.
+    Inbound self-dials are left to the validator-pubkey identity check.
+
+- [x] **20. Finalization broadcasts sent while holding `mu_`**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run. Suspected cause of the h=6 stall,
+    not yet confirmed by a thread dump.
+  - Problem: `finalize_if_quorum` (and `handle_frontier_block_locked`) broadcast TRANSITION and
+    FINALIZED_TIP with `mu_` held. `PeerManager::send_to` does a blocking timed write, and on failure
+    calls the event callback synchronously; the DISCONNECTED handler locks `mu_` → same-thread
+    self-deadlock. Blocking writes under `mu_` also stall every other thread.
+  - Fix: queue into `pending_finalized_broadcasts_` / `pending_finalized_tip_broadcast_` under `mu_`;
+    `flush_pending_finalized_broadcasts()` sends after release. Flushed by a guard at the exit of
+    `handle_message`, `handle_propose_result`, `handle_vote_result`, after the local-bus block task, and
+    once per event-loop pass.
+  - Open: other sends under `mu_` remain (e.g. `maybe_request_forward_sync_block_locked`); the same
+    hazard applies to any `p2p_.send_to` reached with `mu_` held.
+  - Result: with 19–21 applied, `test_devnet_4_nodes_finalize_and_faults` passes (2026-10-04).
+
+- [x] **21. Test nodes dialed the public mainnet seeds**
+  - Status: **applied — builds clean (2026-10-04)**; tests not run.
+  - Problem: `Node::init` appends `network.default_seeds` (`85.217.171.168`, `64.23.244.126`) whenever
+    `cfg.seeds` is empty; `dns_seeds = false` does not stop it. Every loopback test cluster also dialed
+    the internet (85 attempts in one devnet run).
+  - Fix: `test_integration.cpp` clears `network.default_seeds` on every P2P-enabled config (cluster
+    builders, joiner/bootstrap/follower configs, handshake tests). Kept for
+    `test_unseeded_bootstrap_template_ignores_default_network_seeds`, which needs them present.
+  - Note: the production fallback is unchanged; operators who want no public seeds must pass `--seeds`.
+
+- [ ] **22. Fresh-genesis devnet automation**
+  - Status: **applied — devnet boots (2026-10-05)**; `.env` fix verified by a full `devnet_up.sh` run (2026-10-05).
+  - `scripts/generate_fresh_genesis.sh --profile local|production --validators N`: runs `wallet_create`
+    (local `build/finalis-cli`, else the compose image via `--docker`) for N keystores, copies the
+    mainnet parameters from `mainnet/genesis.json` with the new validator set, then runs `genesis_build` +
+    `genesis_verify`. Writes keys, `genesis.{json,bin}` and `manifest.env` to git-ignored
+    `devnet/<UTC stamp>/`. Production uses random per-validator passphrases (`secrets/*.pass`, 0600)
+    and needs a clean git tree.
+  - `scripts/devnet_up.sh [--dir DIR] [--no-build]`: loads the newest manifest, runs `docker-compose down
+    -v`, writes `devnet/<stamp>/docker-compose.devnet.yml` to bind-mount genesis and keys read-only
+    into node1–3, passes passphrases with `--validator-passphrase-env`, then runs `up -d --build`.
+  - Notes: devnet_up needs `VALIDATOR_COUNT=3`, matching the compose services. The override drops
+    `--with-lightserver` (no lightserver binary in the image; item 2) and sets `--seeds` to the peer list
+    so the nodes do not dial the public seeds (item 21).
+  - 2026-10-05 fix: the override interpolates `${FINALIS_DEVNET_PASS_N:?}`, which devnet_up only
+    exported in its own process, so later `docker-compose ... logs/down` calls failed. devnet_up now
+    writes `devnet/<stamp>/.env` (0600, `FINALIS_DEVNET_PASS_1..3`), passes `--env-file`, and prints
+    the logs command with it. Only `docker-compose` v1 is used, because this host has no Compose v2 plugin.
+    `manifest.env` no longer has a comment header and, in the local profile, also carries
+    `FINALIS_DEVNET_PASS_N`. Production keeps passphrases out of the manifest.
+
+- [x] **23. P0 pacing: round 0 timed out before proposing was allowed**
+  - Status: [x] Verified on 3-node devnet (2026-10-05). Heights 180 s apart, all finalized in round 0,
+    zero `round-timeout-vote`. Unit tests not run. Local timing only: no consensus-format or genesis change, and old and new nodes can run together.
+  - Found on the item-22 devnet: every height took exactly 90 s and two failed rounds. Round 0 started at
+    finalization with a 30 s timeout, but its leader can only propose once the ticket window
+    (`min_block_interval_ms / 2` = 90 s) **and** the block interval (180 s) have both elapsed. So round 0
+    always timed out, round 1 timed out too (45 s), and the block was proposed in round 2 through
+    `proposal-build-tc-bypass-block-interval`. Effects: the 180 s interval was never enforced (90 s blocks),
+    every height produced two timeout certificates, and timeouts had already backed off before any real
+    fault. The old clamp moved `round_started_ms_` only after the window had opened, which was too late.
+  - Fix (`Node` tick, `src/node/node.cpp` ~5693): while in round 0, `round_started_ms_` and
+    `round0_deadline_ms_` are anchored at
+    `last_finalized_progress_ms_ + max(ticket_window_ms, min_block_interval_ms)`, the first moment
+    a round-0 proposal is legal. Round 0 then gets its full timeout after that point.
+  - Trade-off: if the round-0 leader is down, the first timeout now fires at interval + 30 s (210 s on
+    mainnet) instead of 30 s, so a missed slot costs about 2 min more than with the accidental 90 s pacing.
+  - Verify: re-run `scripts/devnet_up.sh`; expect `committee height=` steps about 180 s apart with no
+    `round-timeout-vote ... round=0`.
+
+- [ ] **24. `start.sh` systemd hardening + mainnet genesis lock**
+  - Status: **applied — `bash -n` clean; lock cases and rendered unit (`systemd-analyze verify`) checked
+    in isolation (2026-10-05). Not yet run end-to-end on a host.**
+  - Decision: systemd is the only deployment target for testnet and mainnet. `start.sh` writes the live
+    `/etc/systemd/system/finalis.service`.
+  - Genesis lock: new `FINALIS_NETWORK=mainnet|testnet` (default `mainnet`); `ALLOW_UNSAFE_GENESIS_OVERRIDE`
+    now defaults to `0`. `enforce_genesis_safety_lock()` runs first in `main`, before the build step.
+    - mainnet: fails if `ALLOW_UNSAFE_GENESIS_OVERRIDE != 0`, `GENESIS_PATH` is set, or `NODE_EXTRA_ARGS`
+      contains `--genesis`/`--allow-unsafe-genesis-override`. No `--genesis` is passed, so the node uses
+      the embedded genesis checked against `MAINNET_GENESIS_HASH`. That hash (`eaae655a…b78a`) equals
+      sha256d(`mainnet/genesis.bin`), so existing databases still pass the stored-hash check.
+    - testnet: requires `GENESIS_PATH` and a matching `EXPECTED_GENESIS_SHA256`, then enables the override.
+  - Unit: `KillSignal=SIGINT`, `KillMode=mixed`, `TimeoutStopSec=${SERVICE_TIMEOUT_STOP_SEC:-300}`;
+    `UMask=0077`, `ProtectSystem=strict`, `ProtectHome=read-only` + `ReadWritePaths=${DB_DIR}`,
+    `PrivateTmp`, `PrivateDevices`, `NoNewPrivileges`, empty capability set, `@system-service`
+    syscall filter, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` (netlink for
+    `getifaddrs`), `MemoryDenyWriteExecute`. cgroups: `TasksMax`, optional `MemoryHigh`
+    (`SERVICE_MEMORY_HIGH`), `MemoryMax=infinity` by default (a hard cap is an OOM SIGKILL),
+    `MemorySwapMax=0`, `CPUWeight`/`IOWeight`, `OOMScoreAdjust=-500`. `WorkingDirectory` moved from
+    the source tree to `${DB_DIR}`. `ExecStart` escapes `%` as `%%`. `FINALIS_INGEST_*` /
+    `FINALIS_SNAPSHOT_IMPORT_BATCH_SIZE` are passed as `Environment=` lines; previously
+    `SYNC_TURBO_MODE` tuning never reached the service. The unit is checked with `systemd-analyze verify`
+    before restart; `systemd-analyze security` score is logged after.
+  - Breaking: mainnet runs that set `GENESIS_PATH` or `ALLOW_UNSAFE_GENESIS_OVERRIDE=1` now exit.
+    `scripts/bootstrap_build.sh` forwards to `start.sh` and inherits this.
+  - Follow-ups:
+    - Test on a testnet host: `MemoryDenyWriteExecute` and `SystemCallFilter` can deny RocksDB or
+      library syscalls at runtime (check the journal for `EPERM`/`SIGSYS`).
+    - Explorer unit (`install_and_restart_explorer_service`) and `packaging/linux/finalis-node.service`
+      still lack the hardening block and `TimeoutStopSec`/`KillSignal`.
+    - `apps/finalis-node/main.cpp`: SIGINT/SIGTERM handlers are installed after `node.init()`, so a
+      stop during DB open/reindex terminates without `node.stop()`. Move them before `init()`.
+    - Item 4 follow-up still applies: remove the `--deferred-exit-activation-height` auto-injection
+      (`AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME`), which the mainnet consensus-flag lock now rejects.
+
 ---
 
 ## Status summary
@@ -251,10 +467,24 @@ Resolved and built clean: **D5** (item 8), **D1** (item 9), **D3** (item 10). No
 | 9 | D1 verified participation record | done — builds clean (**fresh genesis required**) |
 | 10 | D3 timeout window + backoff | done — builds clean |
 | 11 | D2, D4, D6, D7, state growth | **open** |
+| 12 | Post-cap subsidy paid = debited | done — builds clean (consensus; fresh genesis) |
+| 13 | Remove settlement fallback / hotfix | done — builds clean |
+| 14 | Pre-cap fees not burned | **open — design decision** (epoch pooling recommended) |
+| 15 | Slash burn = full slashed value | done — builds clean (consensus) |
+| 16 | Listener IPv4 bind regression | done — tests 48/51 pass |
+| 17 | TxV2 verify-budget bypass | done — test 327 passes (consensus) |
+| 18 | Test-suite repairs | partial — constants + port isolation applied; ~25 failures open |
+| 19 | Self-peer check rejected same-host peers | done — clusters finalize again |
+| 20 | Broadcast under `mu_` (self-deadlock) | done — devnet test passes with 19–21 |
+| 21 | Test nodes dialed public seeds | done — builds clean |
+| 22 | Fresh-genesis devnet scripts | done — devnet boots and finalizes; `.env` fix verified 2026-10-05 |
+| 23 | P0 pacing: round-0 timer anchored to the block interval | [x] Verified on 3-node devnet (2026-10-05) |
+| 24 | `start.sh` systemd hardening + mainnet genesis lock | applied — `bash -n` + unit verify clean; host run pending |
 
 2026-10-04: the full tree (`cmake --build build -j`, including the test binaries) builds clean. That
-verifies the C++ items 1, 3, 4, 8, 9 and 10. Item 2 needs a `docker build`, item 7 an SDK typecheck. No tests
-have been run: in the audit sandbox, every multi-node test fails at node init (listener `errno=2`),
-and the original code fails the same way.
+verifies the C++ items 1, 3, 4, 8, 9, 10, 12, 13 and 15–21. Item 2 needs a `docker build`, item 7 an
+SDK typecheck. The multi-node `init` failures (listener `errno=2`) were the item 16 bug, not the
+sandbox. Run the suite directly (`build/finalis-tests`; `FINALIS_TEST_FILTER`,
+`FINALIS_TEST_SHARD_INDEX`/`_COUNT`), since ctest wraps all 595 tests in one ~15 min entry.
 Verify with `cmake --build build -j`, `ctest --test-dir build --output-on-failure`, and
 `npm test` / `npx tsc --noEmit` in `sdk/finalis-wallet-js`.

@@ -135,8 +135,8 @@ TEST(test_characterize_mainnet_defaults_fixed_epoch_committee_runtime) {
   ASSERT_EQ(net.validator_bond_min_amount, BOND_AMOUNT);
   ASSERT_EQ(net.validator_bond_max_amount, BOND_AMOUNT * 100);
   ASSERT_EQ(v2.target_validators, 16ULL);
-  ASSERT_EQ(v2.min_bond_floor, BOND_AMOUNT);
-  ASSERT_EQ(v2.min_bond_ceiling, BOND_AMOUNT * 10);
+  ASSERT_EQ(v2.min_bond_floor, BOND_AMOUNT * 20);
+  ASSERT_EQ(v2.min_bond_ceiling, BOND_AMOUNT * 100);
   ASSERT_EQ(v2.max_effective_bond_multiple, 10ULL);
   ASSERT_EQ(v2.participation_threshold_bps, 8'000U);
   ASSERT_EQ(v2.ticket_bonus_cap_bps, 1'000U);

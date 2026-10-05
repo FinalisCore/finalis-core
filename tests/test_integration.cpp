@@ -291,7 +291,7 @@ node::NodeConfig single_node_cfg(const std::string& base, std::size_t max_commit
   cfg.max_committee = max_committee;
   cfg.network.min_block_interval_ms = 100;
   cfg.network.round_timeout_ms = 200;
-  cfg.p2p_port = 19040;
+  cfg.p2p_port = 0;  // disable_p2p: never bound
   cfg.db_path = base + "/node0";
   cfg.genesis_path = base + "/genesis.json";
   cfg.allow_unsafe_genesis_override = true;
@@ -619,6 +619,19 @@ std::uint16_t reserve_test_port() {
     if (port != 0) return port;
   }
   return 0;
+}
+
+std::vector<std::uint16_t> reserve_test_ports(int count) {
+  std::vector<std::uint16_t> ports;
+  ports.reserve(static_cast<std::size_t>(count));
+  // Ports are released before use, so the OS may hand one out twice; reject duplicates.
+  for (int attempt = 0; static_cast<int>(ports.size()) < count && attempt < count * 8; ++attempt) {
+    const auto port = reserve_test_port();
+    if (port == 0) throw std::runtime_error("reserve_test_port failed");
+    if (std::find(ports.begin(), ports.end(), port) == ports.end()) ports.push_back(port);
+  }
+  if (static_cast<int>(ports.size()) != count) throw std::runtime_error("reserve_test_ports: no distinct ports");
+  return ports;
 }
 
 bool can_open_loopback_listener_for_test() {
@@ -1040,6 +1053,8 @@ struct Cluster {
   std::string base;
   std::vector<node::NodeConfig> configs;
   std::vector<std::unique_ptr<node::Node>> nodes;
+  // OS-assigned loopback ports, one per node; reused on restart so peers can redial.
+  std::vector<std::uint16_t> ports;
 
   Cluster() = default;
   Cluster(const Cluster&) = delete;
@@ -1201,6 +1216,7 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
 
   Cluster c;
   c.base = base;
+  c.ports = reserve_test_ports(node_count);
   c.configs.reserve(node_count);
   c.nodes.reserve(node_count);
   for (int i = 0; i < node_count; ++i) {
@@ -1209,18 +1225,19 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
     cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
     cfg.node_id = i;
     cfg.max_committee = max_committee;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
-    cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
+    cfg.p2p_port = c.ports[i];
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
     for (int j = 0; j < i; ++j) {
-      cfg.peers.push_back("127.0.0.1:" + std::to_string(19040 + j));
+      cfg.peers.push_back("127.0.0.1:" + std::to_string(c.ports[j]));
     }
     keystore::ValidatorKey out_key;
     std::string kerr;
@@ -1252,6 +1269,7 @@ Cluster make_cluster_with_timing(const std::string& base, int initial_active, in
 
   Cluster c;
   c.base = base;
+  c.ports = reserve_test_ports(node_count);
   c.configs.reserve(node_count);
   c.nodes.reserve(node_count);
   for (int i = 0; i < node_count; ++i) {
@@ -1260,18 +1278,19 @@ Cluster make_cluster_with_timing(const std::string& base, int initial_active, in
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
     cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
     cfg.node_id = i;
     cfg.max_committee = max_committee;
     cfg.network.min_block_interval_ms = min_block_interval_ms;
     cfg.network.round_timeout_ms = round_timeout_ms;
-    cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
+    cfg.p2p_port = c.ports[i];
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
     for (int j = 0; j < i; ++j) {
-      cfg.peers.push_back("127.0.0.1:" + std::to_string(19040 + j));
+      cfg.peers.push_back("127.0.0.1:" + std::to_string(c.ports[j]));
     }
     keystore::ValidatorKey out_key;
     std::string kerr;
@@ -1321,6 +1340,7 @@ Cluster make_p2p_cluster(const std::string& base, int initial_active = 2, int no
       cfg.network.round_timeout_ms = 200;
       const std::size_t offset = port_seed + static_cast<std::size_t>(i) * 257u + static_cast<std::size_t>(attempt) * 17u;
       cfg.p2p_port = static_cast<std::uint16_t>(22000u + (offset % 20000u));
+      cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
       cfg.db_path = base + "/node" + std::to_string(i);
       cfg.genesis_path = gpath;
       cfg.allow_unsafe_genesis_override = true;
@@ -2128,6 +2148,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     throw std::runtime_error("bonded fixture failed to write genesis");
   }
   fixture.cluster.base = base;
+  fixture.cluster.ports = reserve_test_ports(2);
   fixture.cluster.configs.reserve(2);
   fixture.cluster.nodes.reserve(2);
   fixture.leader_kp = node::Node::deterministic_test_keypairs()[0];
@@ -2138,12 +2159,13 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
     cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
     cfg.node_id = i;
     cfg.max_committee = 3;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
     cfg.network.validator_join_admission_pow_difficulty_bits = 0;
-    cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
+    cfg.p2p_port = fixture.cluster.ports[i];
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
@@ -2151,7 +2173,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     cfg.validator_passphrase = "test-pass";
     cfg.validator_warmup_blocks_override = 1;
     for (int j = 0; j < i; ++j) {
-      cfg.peers.push_back("127.0.0.1:" + std::to_string(19040 + j));
+      cfg.peers.push_back("127.0.0.1:" + std::to_string(fixture.cluster.ports[j]));
     }
     keystore::ValidatorKey out_key;
     std::string kerr;
@@ -2274,6 +2296,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     throw std::runtime_error("slash fixture failed to write genesis");
   }
   fixture.cluster.base = base;
+  fixture.cluster.ports = reserve_test_ports(2);
   fixture.cluster.configs.reserve(2);
   fixture.cluster.nodes.reserve(2);
   fixture.leader_kp = node::Node::deterministic_test_keypairs()[0];
@@ -2285,12 +2308,13 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
     cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
     cfg.node_id = i;
     cfg.max_committee = 2;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
     cfg.network.validator_join_admission_pow_difficulty_bits = 0;
-    cfg.p2p_port = static_cast<std::uint16_t>(19140 + i);
+    cfg.p2p_port = fixture.cluster.ports[i];
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
@@ -2298,7 +2322,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     cfg.validator_passphrase = "test-pass";
     cfg.validator_warmup_blocks_override = 1;
     for (int j = 0; j < i; ++j) {
-      cfg.peers.push_back("127.0.0.1:" + std::to_string(19140 + j));
+      cfg.peers.push_back("127.0.0.1:" + std::to_string(fixture.cluster.ports[j]));
     }
     keystore::ValidatorKey out_key;
     std::string kerr;
@@ -2708,8 +2732,10 @@ TEST(test_restart_determinism_and_continued_finalization) {
   ASSERT_TRUE(keys.size() >= 4u);
 
   const std::string base = unique_test_base("/tmp/finalis_it_restart");
+  std::vector<std::uint16_t> original_ports;
   {
     auto cluster = make_cluster(base, 4, 4, MAX_COMMITTEE);
+    original_ports = cluster.ports;
     auto& nodes = cluster.nodes;
 
     const bool node0_reached_12 = wait_for_tip(*nodes[0], 12, ci_timeout_seconds(180));
@@ -2819,6 +2845,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
   }
 
   Cluster restarted;
+  restarted.ports = original_ports;
   restarted.nodes.reserve(4);
   for (int i = 0; i < 4; ++i) {
     node::NodeConfig cfg;
@@ -2826,18 +2853,19 @@ TEST(test_restart_determinism_and_continued_finalization) {
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
     cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
     cfg.node_id = i;
     cfg.max_committee = MAX_COMMITTEE;
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
-    cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
+    cfg.p2p_port = restarted.ports[i];
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = base + "/genesis.json";
     cfg.allow_unsafe_genesis_override = true;
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
     for (int j = 0; j < i; ++j) {
-      cfg.peers.push_back("127.0.0.1:" + std::to_string(19040 + j));
+      cfg.peers.push_back("127.0.0.1:" + std::to_string(restarted.ports[j]));
     }
 
     auto n = std::make_unique<node::Node>(cfg);
@@ -3047,7 +3075,7 @@ TEST(test_single_validator_restart_recovers_missing_required_epoch_committee_sta
   cfg.max_committee = MAX_COMMITTEE;
   cfg.network.min_block_interval_ms = 100;
   cfg.network.round_timeout_ms = 200;
-  cfg.p2p_port = 19040;
+  cfg.p2p_port = 0;  // disable_p2p: never bound
   cfg.db_path = base + "/node0";
   cfg.genesis_path = base + "/genesis.json";
   cfg.allow_unsafe_genesis_override = true;
@@ -3097,7 +3125,7 @@ TEST(test_single_validator_restart_recovers_empty_required_epoch_committee_snaps
   cfg.max_committee = MAX_COMMITTEE;
   cfg.network.min_block_interval_ms = 100;
   cfg.network.round_timeout_ms = 200;
-  cfg.p2p_port = 19040;
+  cfg.p2p_port = 0;  // disable_p2p: never bound
   cfg.db_path = base + "/node0";
   cfg.genesis_path = base + "/genesis.json";
   cfg.allow_unsafe_genesis_override = true;
@@ -3124,6 +3152,7 @@ TEST(test_follower_startup_repairs_missing_required_epoch_from_peer) {
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   if (bootstrap_cfg.p2p_port == 0) return;
@@ -3148,6 +3177,7 @@ TEST(test_follower_startup_repairs_missing_required_epoch_from_peer) {
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -3220,6 +3250,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   if (bootstrap_cfg.p2p_port == 0) return;
@@ -3241,6 +3272,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -4107,6 +4139,7 @@ TEST(test_mainnet_seed_bootstrap_and_catchup) {
   join_cfg.listen = true;
   join_cfg.bind_ip = "127.0.0.1";
   join_cfg.dns_seeds = false;
+  join_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   join_cfg.outbound_target = 1;
   join_cfg.p2p_port = static_cast<std::uint16_t>(22000u + ((join_port_seed + 4099u) % 20000u));
   join_cfg.genesis_path = base + "/validators/genesis.json";
@@ -5457,6 +5490,7 @@ TEST(test_inbound_ephemeral_source_port_not_persisted_to_peers_dat) {
   cfg0.p2p_port = port0;
   cfg0.outbound_target = 0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
   cfg0.validator_key_file = cfg0.db_path + "/keystore/validator.json";
@@ -5474,6 +5508,7 @@ TEST(test_inbound_ephemeral_source_port_not_persisted_to_peers_dat) {
   cfg1.p2p_port = 0;
   cfg1.outbound_target = 1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
   cfg1.genesis_path = gpath;
   cfg1.allow_unsafe_genesis_override = true;
@@ -5675,6 +5710,7 @@ TEST(test_reject_cross_network_version_handshake) {
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   node::Node n(cfg);
   ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
@@ -5691,7 +5727,7 @@ TEST(test_reject_cross_network_version_handshake) {
   v.feature_flags = cfg.network.feature_flags;
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 123;
-  v.node_software_version = "handshake-test/0.7";
+  v.node_software_version = "handshake-test/0.7;crh=" + n.consensus_rules_fingerprint_for_test();
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
   n.stop();
@@ -5837,6 +5873,7 @@ TEST(test_skip_exact_self_endpoint_before_dial) {
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = port;
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.outbound_target = 1;
   cfg.peers.push_back("127.0.0.1:" + std::to_string(port));
 
@@ -5866,6 +5903,7 @@ TEST(test_skip_resolved_localhost_self_endpoint_before_dial) {
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = port;
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.outbound_target = 1;
   cfg.peers.push_back("localhost:" + std::to_string(port));
 
@@ -5892,6 +5930,7 @@ TEST(test_reject_self_identity_in_version_handshake) {
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = 0;
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
 
   node::Node n(cfg);
   ASSERT_TRUE(n.init() && "n.init() failed");
@@ -5911,7 +5950,7 @@ TEST(test_reject_self_identity_in_version_handshake) {
   const auto local_pub = n.local_validator_pubkey_for_test();
   v.node_software_version =
       "handshake-test/0.7;validator_pubkey=" +
-      hex_encode(Bytes(local_pub.begin(), local_pub.end()));
+      hex_encode(Bytes(local_pub.begin(), local_pub.end())) + ";crh=" + n.consensus_rules_fingerprint_for_test();
 
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.self_endpoint_suppressed_for_test("127.0.0.1", port); },
@@ -5933,6 +5972,7 @@ TEST(test_self_endpoint_retry_suppression_persists_for_process_lifetime) {
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = port;
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.outbound_target = 1;
   cfg.peers.push_back("127.0.0.1:" + std::to_string(port));
 
@@ -5959,6 +5999,7 @@ TEST(test_reject_magic_mismatch_frame_before_handshake) {
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   node::Node n(cfg);
   ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
@@ -5974,7 +6015,7 @@ TEST(test_reject_magic_mismatch_frame_before_handshake) {
   v.feature_flags = cfg.network.feature_flags;
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 444;
-  v.node_software_version = "magic-mismatch-test/0.7";
+  v.node_software_version = "magic-mismatch-test/0.7;crh=" + n.consensus_rules_fingerprint_for_test();
   NetworkConfig mismatch_net = cfg.network;
   mismatch_net.magic ^= 0x01020304u;
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, mismatch_net, std::chrono::milliseconds(300)));
@@ -5990,6 +6031,7 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   node::Node n(cfg);
   ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
@@ -6005,7 +6047,7 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
   v.feature_flags = cfg.network.feature_flags;
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 321;
-  v.node_software_version = "handshake-test/0.7";
+  v.node_software_version = "handshake-test/0.7;crh=" + n.consensus_rules_fingerprint_for_test();
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_protocol_version >= 1; }, ci_timeout_seconds(2)));
   n.stop();
@@ -6027,6 +6069,7 @@ TEST(test_normal_peer_connection_unaffected_by_self_peer_filtering) {
   cfg0.bind_ip = "127.0.0.1";
   cfg0.p2p_port = port0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
 
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
@@ -6034,6 +6077,7 @@ TEST(test_normal_peer_connection_unaffected_by_self_peer_filtering) {
   cfg1.bind_ip = "127.0.0.1";
   cfg1.p2p_port = port1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.outbound_target = 1;
   cfg1.peers.push_back("127.0.0.1:" + std::to_string(port0));
 
@@ -6076,6 +6120,7 @@ TEST(test_single_node_custom_genesis_bootstraps_and_finalizes) {
   cfg.node_id = 0;
   cfg.disable_p2p = true;
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.listen = false;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
@@ -6150,6 +6195,7 @@ TEST(test_seeded_bootstrap_template_node_does_not_self_bootstrap) {
   node::NodeConfig cfg;
   cfg.node_id = 0;
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.listen = false;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
@@ -6183,6 +6229,7 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
@@ -6199,6 +6246,7 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -6256,6 +6304,7 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
@@ -6280,6 +6329,7 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -6386,6 +6436,7 @@ TEST(test_adopted_bootstrap_identity_persists_across_restart_before_first_block)
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
@@ -6405,6 +6456,7 @@ TEST(test_adopted_bootstrap_identity_persists_across_restart_before_first_block)
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -6459,6 +6511,7 @@ TEST(test_height_zero_bootstrap_adoption_rejects_non_explicit_fallback_path) {
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
@@ -6475,6 +6528,7 @@ TEST(test_height_zero_bootstrap_adoption_rejects_non_explicit_fallback_path) {
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -6521,6 +6575,7 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   node::NodeConfig cfg0;
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
   if (cfg0.p2p_port == 0) return;
@@ -6543,6 +6598,7 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.db_path = base + "/node1";
   cfg1.p2p_port = reserve_test_port();
   if (cfg1.p2p_port == 0) {
@@ -7173,6 +7229,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   node::NodeConfig cfg0;
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
   if (cfg0.p2p_port == 0) return;
@@ -7198,6 +7255,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.db_path = base + "/node1";
   cfg1.p2p_port = reserve_test_port();
   if (cfg1.p2p_port == 0) {
@@ -7366,6 +7424,7 @@ TEST(test_late_joiner_requests_finalized_tip_and_catches_up) {
   node::NodeConfig cfg0;
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
   ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
@@ -7387,6 +7446,7 @@ TEST(test_late_joiner_requests_finalized_tip_and_catches_up) {
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.db_path = base + "/node1";
   cfg1.p2p_port = reserve_test_port();
   if (cfg1.p2p_port == 0) {
@@ -7432,6 +7492,7 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
   node::NodeConfig cfg0;
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
   ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
@@ -7453,6 +7514,7 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.db_path = base + "/node1";
   cfg1.p2p_port = reserve_test_port();
   if (cfg1.p2p_port == 0) {
@@ -7579,6 +7641,7 @@ TEST(test_sync_peer_rejects_tampered_finalized_block_body) {
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
@@ -7622,6 +7685,7 @@ TEST(test_sync_peer_rejects_tampered_finalized_block_body) {
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -7658,6 +7722,7 @@ TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   node::NodeConfig cfg0;
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
   ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
@@ -7679,6 +7744,7 @@ TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.db_path = base + "/node1";
   cfg1.p2p_port = reserve_test_port();
   if (cfg1.p2p_port == 0) {
@@ -7723,6 +7789,7 @@ TEST(test_unregistered_follower_mines_epoch_tickets_without_joining_committee) {
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.listen = true;
   follower_cfg.bind_ip = "127.0.0.1";
   follower_cfg.db_path = base + "/follower";
@@ -7778,6 +7845,7 @@ TEST(test_unregistered_follower_ticket_is_network_accepted_and_paid_at_epoch_bou
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.listen = true;
   follower_cfg.bind_ip = "127.0.0.1";
   follower_cfg.db_path = base + "/follower";
@@ -7835,6 +7903,7 @@ TEST(test_unregistered_follower_onboarding_payout_survives_restart_across_epoch_
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.listen = true;
   follower_cfg.bind_ip = "127.0.0.1";
   follower_cfg.db_path = base + "/follower";
@@ -7920,6 +7989,7 @@ TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticke
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.listen = true;
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
@@ -7964,6 +8034,7 @@ TEST(test_syncing_follower_reconstructs_same_next_height_checkpoint_as_validator
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -8184,6 +8255,7 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.listen = false;
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = 0;
@@ -8267,6 +8339,7 @@ TEST(test_synced_joiner_keeps_outbound_peer_alive_with_short_idle_timeout) {
   node::NodeConfig cfg0;
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
+  cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg0.db_path = base + "/node0";
   cfg0.p2p_port = reserve_test_port();
   ASSERT_TRUE(cfg0.p2p_port != 0 && "Failed to reserve test port for cfg0");
@@ -8289,6 +8362,7 @@ TEST(test_synced_joiner_keeps_outbound_peer_alive_with_short_idle_timeout) {
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
+  cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg1.db_path = base + "/node1";
   cfg1.p2p_port = reserve_test_port();
   if (cfg1.p2p_port == 0) {
@@ -8338,6 +8412,7 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
@@ -8377,6 +8452,7 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
   node::NodeConfig follower_cfg;
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
+  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   follower_cfg.db_path = base + "/follower";
   follower_cfg.p2p_port = reserve_test_port();
   if (follower_cfg.p2p_port == 0) {
@@ -8422,6 +8498,7 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
   node::NodeConfig bootstrap_cfg;
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   bootstrap_cfg.db_path = base + "/bootstrap";
   bootstrap_cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(bootstrap_cfg.p2p_port != 0 && "Failed to reserve test port for bootstrap");
@@ -8549,6 +8626,7 @@ TEST(test_get_transition_by_height_rate_limits_same_peer_same_height) {
 
   auto cfg = single_node_cfg(base, 1);
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.network.min_block_interval_ms = 50;
   cfg.network.round_timeout_ms = 120;
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
@@ -8638,6 +8716,7 @@ TEST(test_get_transition_by_height_not_rate_limited_across_heights) {
 
   auto cfg = single_node_cfg(base, 1);
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.network.min_block_interval_ms = 50;
   cfg.network.round_timeout_ms = 120;
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
@@ -8723,6 +8802,7 @@ TEST(test_get_transition_by_height_rate_limit_is_per_peer_not_global) {
 
   auto cfg = single_node_cfg(base, 1);
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.network.min_block_interval_ms = 50;
   cfg.network.round_timeout_ms = 120;
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
@@ -8854,7 +8934,7 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   v.feature_flags = cfg.network.feature_flags;
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 987;
-  v.node_software_version = "handshake-test/0.7";
+  v.node_software_version = "handshake-test/0.7;crh=" + n.consensus_rules_fingerprint_for_test();
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(1000)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
   n.stop();
@@ -8894,6 +8974,7 @@ TEST(test_single_validator_round0_uses_deterministic_proposer) {
   node::NodeConfig cfg;
   cfg.node_id = 0;
   cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.db_path = base + "/node0";
   cfg.p2p_port = reserve_test_port();
   ASSERT_TRUE(cfg.p2p_port != 0 && "Failed to reserve test port for cfg");
