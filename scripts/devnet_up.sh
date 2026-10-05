@@ -2,11 +2,13 @@
 # Boot the 3-node Docker devnet from the newest generate_fresh_genesis.sh output.
 #
 # 1. Load devnet/<newest>/manifest.env.
-# 2. `docker compose down -v` to purge old containers and data volumes.
+# 2. `docker-compose down -v` to purge old containers and data volumes.
 # 3. Write devnet/<stamp>/docker-compose.devnet.yml, which overlays the shared
 #    services in docker-compose.yml: bind-mounts that devnet's genesis.bin and
 #    per-node keystore (read-only), and passes the passphrase via environment.
-# 4. `docker compose up -d --build`; every node starts from height 0.
+#    Passphrases go to devnet/<stamp>/.env (0600), read with --env-file, so later
+#    `docker-compose ... logs/down` calls work from a fresh shell.
+# 4. `docker-compose up -d --build`; every node starts from height 0.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,13 +41,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if docker compose version >/dev/null 2>&1; then
-  COMPOSE=(docker compose)
-elif command -v docker-compose >/dev/null; then
-  COMPOSE=(docker-compose)
-else
-  die "neither 'docker compose' nor 'docker-compose' is available"
-fi
+command -v docker-compose >/dev/null || die "docker-compose (v1) is not installed"
+COMPOSE=(docker-compose)
 
 # --- locate manifest ----------------------------------------------------------
 if [[ -z "$DEVNET_DIR" ]]; then
@@ -71,7 +68,9 @@ if [[ "$DEVNET_PROFILE" == "production" ]]; then
   log "warning: booting production-profile keys on a local devnet"
 fi
 
-# --- passphrases (exported, never written to the override file) ---------------
+# --- passphrases (written to .env, never to the override file) ----------------
+ENV_FILE="$DEVNET_DIR/.env"
+env_lines=()
 for ((i = 1; i <= VALIDATOR_COUNT; i++)); do
   key_var="VALIDATOR_${i}_KEY"
   [[ -f "$DEVNET_DIR/${!key_var}" ]] || die "missing $DEVNET_DIR/${!key_var}"
@@ -85,8 +84,10 @@ for ((i = 1; i <= VALIDATOR_COUNT; i++)); do
     pass="${!pass_var:-}"
   fi
   [[ -n "$pass" ]] || die "no passphrase for validator $i"
-  export "FINALIS_DEVNET_PASS_$i=$pass"
+  env_lines+=("FINALIS_DEVNET_PASS_$i=$pass")
 done
+( umask 077; printf '%s\n' "${env_lines[@]}" > "$ENV_FILE" )
+chmod 600 "$ENV_FILE"
 
 # --- compose override ---------------------------------------------------------
 OVERRIDE="$DEVNET_DIR/docker-compose.devnet.yml"
@@ -139,7 +140,7 @@ EOF
   done
 } > "$OVERRIDE"
 
-COMPOSE+=(-f "$BASE_COMPOSE" -f "$OVERRIDE")
+COMPOSE+=(-f "$BASE_COMPOSE" -f "$OVERRIDE" --env-file "$ENV_FILE")
 
 # --- purge old state and boot -------------------------------------------------
 log "stopping old devnet and removing data volumes"
@@ -151,4 +152,4 @@ log "starting ${NODES[*]}"
 "${COMPOSE[@]}" "${up_args[@]}" "${NODES[@]}"
 
 "${COMPOSE[@]}" ps
-log "logs: ${COMPOSE[*]} logs -f"
+log "logs: docker-compose -f docker-compose.yml -f ${DEVNET_DIR#"$ROOT_DIR"/}/docker-compose.devnet.yml --env-file ${DEVNET_DIR#"$ROOT_DIR"/}/.env logs -f"

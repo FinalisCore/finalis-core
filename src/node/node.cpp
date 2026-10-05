@@ -5690,9 +5690,18 @@ void Node::event_loop() {
       const bool ticket_window_elapsed = now_ms >= last_finalized_progress_ms_ + ticket_window_ms;
       const bool block_interval_elapsed =
           now_ms >= last_finalized_progress_ms_ + min_block_interval_ms;
-      if (current_round_ == 0 && ticket_window_elapsed) {
-        const std::uint64_t round0_start = last_finalized_progress_ms_ + ticket_window_ms;
-        if (round_started_ms_ < round0_start) round_started_ms_ = round0_start;
+      // Round 0 cannot use the TC bypass, so its leader may only propose once
+      // both the ticket window and the block interval have elapsed. Start the
+      // round-0 timer (and its timeout-vote grace) at that point, so round 0
+      // gets its full timeout after proposing becomes legal instead of timing
+      // out while still gated.
+      if (current_round_ == 0) {
+        const std::uint64_t round0_start =
+            last_finalized_progress_ms_ + std::max<std::uint64_t>(ticket_window_ms, min_block_interval_ms);
+        if (round_started_ms_ < round0_start) {
+          round_started_ms_ = round0_start;
+          arm_round0_deadline_locked(round0_start);
+        }
       }
       maybe_self_bootstrap_template(now_ms);
       std::string repair_reason;

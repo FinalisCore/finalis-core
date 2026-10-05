@@ -375,19 +375,79 @@ settlement (item 13).
   - Note: the production fallback is unchanged; operators who want no public seeds must pass `--seeds`.
 
 - [ ] **22. Fresh-genesis devnet automation**
-  - Status: **applied — not yet run** (scripts written 2026-10-04; no docker or genesis run yet).
+  - Status: **applied — devnet boots (2026-10-05)**; `.env` fix verified by a full `devnet_up.sh` run (2026-10-05).
   - `scripts/generate_fresh_genesis.sh --profile local|production --validators N`: runs `wallet_create`
     (local `build/finalis-cli`, else the compose image via `--docker`) for N keystores, copies the
     mainnet parameters from `mainnet/genesis.json` with the new validator set, then runs `genesis_build` +
     `genesis_verify`. Writes keys, `genesis.{json,bin}` and `manifest.env` to git-ignored
     `devnet/<UTC stamp>/`. Production uses random per-validator passphrases (`secrets/*.pass`, 0600)
     and needs a clean git tree.
-  - `scripts/devnet_up.sh [--dir DIR] [--no-build]`: loads the newest manifest, runs `docker compose down
+  - `scripts/devnet_up.sh [--dir DIR] [--no-build]`: loads the newest manifest, runs `docker-compose down
     -v`, writes `devnet/<stamp>/docker-compose.devnet.yml` to bind-mount genesis and keys read-only
     into node1–3, passes passphrases with `--validator-passphrase-env`, then runs `up -d --build`.
   - Notes: devnet_up needs `VALIDATOR_COUNT=3`, matching the compose services. The override drops
     `--with-lightserver` (no lightserver binary in the image; item 2) and sets `--seeds` to the peer list
-    so the nodes do not dial the public seeds (item 21). Docker Compose is not installed on this host.
+    so the nodes do not dial the public seeds (item 21).
+  - 2026-10-05 fix: the override interpolates `${FINALIS_DEVNET_PASS_N:?}`, which devnet_up only
+    exported in its own process, so later `docker-compose ... logs/down` calls failed. devnet_up now
+    writes `devnet/<stamp>/.env` (0600, `FINALIS_DEVNET_PASS_1..3`), passes `--env-file`, and prints
+    the logs command with it. Only `docker-compose` v1 is used, because this host has no Compose v2 plugin.
+    `manifest.env` no longer has a comment header and, in the local profile, also carries
+    `FINALIS_DEVNET_PASS_N`. Production keeps passphrases out of the manifest.
+
+- [x] **23. P0 pacing: round 0 timed out before proposing was allowed**
+  - Status: [x] Verified on 3-node devnet (2026-10-05). Heights 180 s apart, all finalized in round 0,
+    zero `round-timeout-vote`. Unit tests not run. Local timing only: no consensus-format or genesis change, and old and new nodes can run together.
+  - Found on the item-22 devnet: every height took exactly 90 s and two failed rounds. Round 0 started at
+    finalization with a 30 s timeout, but its leader can only propose once the ticket window
+    (`min_block_interval_ms / 2` = 90 s) **and** the block interval (180 s) have both elapsed. So round 0
+    always timed out, round 1 timed out too (45 s), and the block was proposed in round 2 through
+    `proposal-build-tc-bypass-block-interval`. Effects: the 180 s interval was never enforced (90 s blocks),
+    every height produced two timeout certificates, and timeouts had already backed off before any real
+    fault. The old clamp moved `round_started_ms_` only after the window had opened, which was too late.
+  - Fix (`Node` tick, `src/node/node.cpp` ~5693): while in round 0, `round_started_ms_` and
+    `round0_deadline_ms_` are anchored at
+    `last_finalized_progress_ms_ + max(ticket_window_ms, min_block_interval_ms)`, the first moment
+    a round-0 proposal is legal. Round 0 then gets its full timeout after that point.
+  - Trade-off: if the round-0 leader is down, the first timeout now fires at interval + 30 s (210 s on
+    mainnet) instead of 30 s, so a missed slot costs about 2 min more than with the accidental 90 s pacing.
+  - Verify: re-run `scripts/devnet_up.sh`; expect `committee height=` steps about 180 s apart with no
+    `round-timeout-vote ... round=0`.
+
+- [ ] **24. `start.sh` systemd hardening + mainnet genesis lock**
+  - Status: **applied — `bash -n` clean; lock cases and rendered unit (`systemd-analyze verify`) checked
+    in isolation (2026-10-05). Not yet run end-to-end on a host.**
+  - Decision: systemd is the only deployment target for testnet and mainnet. `start.sh` writes the live
+    `/etc/systemd/system/finalis.service`.
+  - Genesis lock: new `FINALIS_NETWORK=mainnet|testnet` (default `mainnet`); `ALLOW_UNSAFE_GENESIS_OVERRIDE`
+    now defaults to `0`. `enforce_genesis_safety_lock()` runs first in `main`, before the build step.
+    - mainnet: fails if `ALLOW_UNSAFE_GENESIS_OVERRIDE != 0`, `GENESIS_PATH` is set, or `NODE_EXTRA_ARGS`
+      contains `--genesis`/`--allow-unsafe-genesis-override`. No `--genesis` is passed, so the node uses
+      the embedded genesis checked against `MAINNET_GENESIS_HASH`. That hash (`eaae655a…b78a`) equals
+      sha256d(`mainnet/genesis.bin`), so existing databases still pass the stored-hash check.
+    - testnet: requires `GENESIS_PATH` and a matching `EXPECTED_GENESIS_SHA256`, then enables the override.
+  - Unit: `KillSignal=SIGINT`, `KillMode=mixed`, `TimeoutStopSec=${SERVICE_TIMEOUT_STOP_SEC:-300}`;
+    `UMask=0077`, `ProtectSystem=strict`, `ProtectHome=read-only` + `ReadWritePaths=${DB_DIR}`,
+    `PrivateTmp`, `PrivateDevices`, `NoNewPrivileges`, empty capability set, `@system-service`
+    syscall filter, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` (netlink for
+    `getifaddrs`), `MemoryDenyWriteExecute`. cgroups: `TasksMax`, optional `MemoryHigh`
+    (`SERVICE_MEMORY_HIGH`), `MemoryMax=infinity` by default (a hard cap is an OOM SIGKILL),
+    `MemorySwapMax=0`, `CPUWeight`/`IOWeight`, `OOMScoreAdjust=-500`. `WorkingDirectory` moved from
+    the source tree to `${DB_DIR}`. `ExecStart` escapes `%` as `%%`. `FINALIS_INGEST_*` /
+    `FINALIS_SNAPSHOT_IMPORT_BATCH_SIZE` are passed as `Environment=` lines; previously
+    `SYNC_TURBO_MODE` tuning never reached the service. The unit is checked with `systemd-analyze verify`
+    before restart; `systemd-analyze security` score is logged after.
+  - Breaking: mainnet runs that set `GENESIS_PATH` or `ALLOW_UNSAFE_GENESIS_OVERRIDE=1` now exit.
+    `scripts/bootstrap_build.sh` forwards to `start.sh` and inherits this.
+  - Follow-ups:
+    - Test on a testnet host: `MemoryDenyWriteExecute` and `SystemCallFilter` can deny RocksDB or
+      library syscalls at runtime (check the journal for `EPERM`/`SIGSYS`).
+    - Explorer unit (`install_and_restart_explorer_service`) and `packaging/linux/finalis-node.service`
+      still lack the hardening block and `TimeoutStopSec`/`KillSignal`.
+    - `apps/finalis-node/main.cpp`: SIGINT/SIGTERM handlers are installed after `node.init()`, so a
+      stop during DB open/reindex terminates without `node.stop()`. Move them before `init()`.
+    - Item 4 follow-up still applies: remove the `--deferred-exit-activation-height` auto-injection
+      (`AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME`), which the mainnet consensus-flag lock now rejects.
 
 ---
 
@@ -417,7 +477,9 @@ settlement (item 13).
 | 19 | Self-peer check rejected same-host peers | done — clusters finalize again |
 | 20 | Broadcast under `mu_` (self-deadlock) | done — devnet test passes with 19–21 |
 | 21 | Test nodes dialed public seeds | done — builds clean |
-| 22 | Fresh-genesis devnet scripts | applied — not yet run |
+| 22 | Fresh-genesis devnet scripts | done — devnet boots and finalizes; `.env` fix verified 2026-10-05 |
+| 23 | P0 pacing: round-0 timer anchored to the block interval | [x] Verified on 3-node devnet (2026-10-05) |
+| 24 | `start.sh` systemd hardening + mainnet genesis lock | applied — `bash -n` + unit verify clean; host run pending |
 
 2026-10-04: the full tree (`cmake --build build -j`, including the test binaries) builds clean. That
 verifies the C++ items 1, 3, 4, 8, 9, 10, 12, 13 and 15–21. Item 2 needs a `docker build`, item 7 an
