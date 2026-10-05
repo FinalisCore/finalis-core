@@ -7,6 +7,7 @@
 #include <string>
 
 #include "common/types.hpp"
+#include "crypto/secure_memory.hpp"
 
 namespace finalis::keystore {
 
@@ -15,6 +16,8 @@ struct ValidatorKey {
   PubKey32 pubkey{};
   std::string address;
   std::string network_name;
+
+  ~ValidatorKey() { crypto::secure_wipe(privkey); }
 };
 
 bool create_validator_keystore(const std::string& path, const std::string& passphrase, const std::string& network_name,
@@ -24,6 +27,9 @@ bool create_validator_keystore(const std::string& path, const std::string& passp
 bool load_validator_keystore(const std::string& path, const std::string& passphrase, ValidatorKey* out, std::string* err);
 
 bool keystore_exists(const std::string& path);
+
+// True when the keystore at path declares a KDF (i.e. the seed is not stored in plaintext).
+bool keystore_is_encrypted(const std::string& path);
 
 std::string default_validator_keystore_path(const std::string& db_dir);
 

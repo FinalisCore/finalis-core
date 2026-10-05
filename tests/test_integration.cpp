@@ -286,6 +286,7 @@ Bytes serialize_test_finalized_write_marker(std::uint64_t height, const Hash32& 
 
 node::NodeConfig single_node_cfg(const std::string& base, std::size_t max_committee = MAX_COMMITTEE) {
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = max_committee;
@@ -1221,6 +1222,7 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
   c.nodes.reserve(node_count);
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.disable_p2p = false;
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
@@ -1274,6 +1276,7 @@ Cluster make_cluster_with_timing(const std::string& base, int initial_active, in
   c.nodes.reserve(node_count);
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.disable_p2p = false;
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
@@ -1331,6 +1334,7 @@ Cluster make_p2p_cluster(const std::string& base, int initial_active = 2, int no
     std::string last_kerr;
     for (std::uint16_t attempt = 0; attempt < 8; ++attempt) {
       node::NodeConfig cfg;
+      cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
       cfg.disable_p2p = false;
       cfg.listen = true;
       cfg.bind_ip = "127.0.0.1";
@@ -2155,6 +2159,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
   fixture.joiner_kp = key_from_byte(joiner_seed_byte);
   for (int i = 0; i < 2; ++i) {
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.disable_p2p = false;
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
@@ -2304,6 +2309,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
   const auto default_keys = node::Node::deterministic_test_keypairs();
   for (int i = 0; i < 2; ++i) {
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.disable_p2p = false;
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
@@ -2849,6 +2855,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
   restarted.nodes.reserve(4);
   for (int i = 0; i < 4; ++i) {
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.disable_p2p = false;
     cfg.listen = true;
     cfg.bind_ip = "127.0.0.1";
@@ -3070,6 +3077,7 @@ TEST(test_single_validator_restart_recovers_missing_required_epoch_committee_sta
   db.close();
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = MAX_COMMITTEE;
@@ -3120,6 +3128,7 @@ TEST(test_single_validator_restart_recovers_empty_required_epoch_committee_snaps
   db.close();
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = MAX_COMMITTEE;
@@ -3150,6 +3159,7 @@ TEST(test_follower_startup_repairs_missing_required_epoch_from_peer) {
   ASSERT_TRUE(write_mainnet_genesis_file(gpath, 2));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -3175,6 +3185,7 @@ TEST(test_follower_startup_repairs_missing_required_epoch_from_peer) {
   bootstrap.start();
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -3248,6 +3259,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   ASSERT_TRUE(write_mainnet_genesis_file(gpath, 2));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -3270,6 +3282,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
   bootstrap.start();
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -4133,6 +4146,7 @@ TEST(test_mainnet_seed_bootstrap_and_catchup) {
   ASSERT_TRUE(seed_port != 0);
 
   node::NodeConfig join_cfg;
+  join_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   join_cfg.node_id = 7;
   join_cfg.db_path = base + "/joiner";
   join_cfg.disable_p2p = false;
@@ -4249,6 +4263,7 @@ TEST(test_invalid_frame_spam_bans_peer_and_node_stays_alive) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
       cfg.node_id = 0;
   cfg.max_committee = 1;
   cfg.db_path = base + "/node0";
@@ -4287,6 +4302,7 @@ TEST(test_seed_http_port_preflight_does_not_break_node_progress) {
   if (!http.start()) return;
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
       cfg.node_id = 0;
   cfg.max_committee = 1;
   cfg.db_path = base + "/node0";
@@ -4313,6 +4329,7 @@ TEST(test_invalid_frame_ban_threshold_applies_after_strikes) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
       cfg.node_id = 0;
   cfg.max_committee = 1;
   cfg.db_path = base + "/node0";
@@ -4369,6 +4386,7 @@ TEST(test_epoch_reward_settlement_restart_is_deterministic) {
   }
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -4440,6 +4458,7 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
   before.close();
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 4;
@@ -4510,6 +4529,7 @@ TEST(test_block_path_applies_settlement_same_as_quorum_path) {
   Tx tx = make_fixture_ingress_tx(1, 0x90);
 
   node::NodeConfig direct_cfg;
+  direct_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   direct_cfg.disable_p2p = true;
   direct_cfg.node_id = 0;
   direct_cfg.max_committee = 1;
@@ -4614,6 +4634,7 @@ TEST(test_single_validator_respects_min_block_interval_after_finalization) {
   const std::string base = unique_test_base("/tmp/finalis_it_min_block_interval_after_finalize");
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -4653,6 +4674,7 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
   const std::string base = unique_test_base("/tmp/finalis_it_wallet_script_index_rewards");
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -4705,6 +4727,7 @@ TEST(test_finalized_frontier_txs_are_indexed_for_explorer_queries) {
   Tx tx = make_fixture_ingress_tx(1, 0xA7);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -4747,6 +4770,7 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   const std::string base = unique_test_base("/tmp/finalis_it_local_wallet_tx_finalizes");
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -4818,6 +4842,7 @@ TEST(test_tx_status_reports_certified_ingress_before_finalization) {
   const std::string base = unique_test_base("/tmp/finalis_it_tx_status_certified_ingress");
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -4883,6 +4908,7 @@ TEST(test_next_height_runtime_schedule_uses_canonical_state_not_mutable_runtime_
   const std::string base = unique_test_base("/tmp/finalis_it_next_height_schedule_uses_canonical");
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -5114,6 +5140,7 @@ TEST(test_restart_repairs_partial_settlement_state) {
   }
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -5159,6 +5186,7 @@ TEST(test_crash_between_persist_and_settlement_recovers_correctly) {
   }
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -5204,6 +5232,7 @@ TEST(test_crash_between_csaf_and_block_write_does_not_corrupt_state) {
   }
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -5248,6 +5277,7 @@ TEST(test_restart_with_invalid_csaf_rebuilds_correct_state) {
   }
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 1;
@@ -5484,6 +5514,7 @@ TEST(test_inbound_ephemeral_source_port_not_persisted_to_peers_dat) {
   ASSERT_TRUE(port0 != 0);
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.db_path = base + "/node0";
   cfg0.bind_ip = "127.0.0.1";
@@ -5501,6 +5532,7 @@ TEST(test_inbound_ephemeral_source_port_not_persisted_to_peers_dat) {
                                                   deterministic_seed_for_node_id(0), nullptr, nullptr));
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.db_path = base + "/node1";
   cfg1.bind_ip = "127.0.0.1";
@@ -5570,6 +5602,7 @@ TEST(test_load_persisted_peers_splits_legacy_comma_joined_lines) {
   }
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.db_path = db_path.string();
@@ -5707,6 +5740,7 @@ TEST(test_reject_cross_network_version_handshake) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
@@ -5868,6 +5902,7 @@ TEST(test_skip_exact_self_endpoint_before_dial) {
   ASSERT_TRUE(port != 0);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
@@ -5898,6 +5933,7 @@ TEST(test_skip_resolved_localhost_self_endpoint_before_dial) {
   ASSERT_TRUE(port != 0);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
@@ -5925,6 +5961,7 @@ TEST(test_reject_self_identity_in_version_handshake) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
@@ -5967,6 +6004,7 @@ TEST(test_self_endpoint_retry_suppression_persists_for_process_lifetime) {
   ASSERT_TRUE(port != 0);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
@@ -5996,6 +6034,7 @@ TEST(test_reject_magic_mismatch_frame_before_handshake) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
@@ -6028,6 +6067,7 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
@@ -6064,6 +6104,7 @@ TEST(test_normal_peer_connection_unaffected_by_self_peer_filtering) {
   ASSERT_TRUE(port1 != 0);
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.db_path = base + "/node0";
   cfg0.bind_ip = "127.0.0.1";
@@ -6072,6 +6113,7 @@ TEST(test_normal_peer_connection_unaffected_by_self_peer_filtering) {
   cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.db_path = base + "/node1";
   cfg1.bind_ip = "127.0.0.1";
@@ -6117,6 +6159,7 @@ TEST(test_single_node_custom_genesis_bootstraps_and_finalizes) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.disable_p2p = true;
   cfg.dns_seeds = false;
@@ -6156,6 +6199,7 @@ TEST(test_unseeded_bootstrap_template_ignores_default_network_seeds) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.dns_seeds = false;
   cfg.listen = false;
@@ -6193,6 +6237,7 @@ TEST(test_seeded_bootstrap_template_node_does_not_self_bootstrap) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.dns_seeds = false;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6227,6 +6272,7 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6244,6 +6290,7 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   ASSERT_TRUE(wait_for_tip(bootstrap, 1, ci_timeout_seconds(12)));
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6302,6 +6349,7 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6327,6 +6375,7 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
   }
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6434,6 +6483,7 @@ TEST(test_adopted_bootstrap_identity_persists_across_restart_before_first_block)
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6454,6 +6504,7 @@ TEST(test_adopted_bootstrap_identity_persists_across_restart_before_first_block)
   }
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6509,6 +6560,7 @@ TEST(test_height_zero_bootstrap_adoption_rejects_non_explicit_fallback_path) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6526,6 +6578,7 @@ TEST(test_height_zero_bootstrap_adoption_rejects_non_explicit_fallback_path) {
   bootstrap.start();
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6573,6 +6626,7 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -6596,6 +6650,7 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   ASSERT_TRUE(wait_for_tip(n0, 1, std::chrono::seconds(12)));
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7195,6 +7250,7 @@ TEST(test_restart_committee_deterministic_despite_epoch_ticket_order) {
   }
 
   node::NodeConfig cfg_a;
+  cfg_a.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg_a.disable_p2p = true;
   cfg_a.node_id = 0;
   cfg_a.max_committee = 4;
@@ -7227,6 +7283,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7253,6 +7310,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   }
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7422,6 +7480,7 @@ TEST(test_late_joiner_requests_finalized_tip_and_catches_up) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7444,6 +7503,7 @@ TEST(test_late_joiner_requests_finalized_tip_and_catches_up) {
   ASSERT_TRUE(wait_for_tip(n0, 12, std::chrono::seconds(20)));
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7490,6 +7550,7 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7512,6 +7573,7 @@ TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
   ASSERT_TRUE(wait_for_tip(n0, 24, ci_timeout_seconds(25)));
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7639,6 +7701,7 @@ TEST(test_sync_peer_rejects_tampered_finalized_block_body) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7683,6 +7746,7 @@ TEST(test_sync_peer_rejects_tampered_finalized_block_body) {
   bootstrap.stop();
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7720,6 +7784,7 @@ TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7742,6 +7807,7 @@ TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   ASSERT_TRUE(wait_for_tip(n0, 8, std::chrono::seconds(20)));
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7787,6 +7853,7 @@ TEST(test_unregistered_follower_mines_epoch_tickets_without_joining_committee) {
   auto& validator = cluster.nodes[0];
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7843,6 +7910,7 @@ TEST(test_unregistered_follower_ticket_is_network_accepted_and_paid_at_epoch_bou
   auto& validator = cluster.nodes[0];
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7901,6 +7969,7 @@ TEST(test_unregistered_follower_onboarding_payout_survives_restart_across_epoch_
   auto& validator = cluster.nodes[0];
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -7934,6 +8003,7 @@ TEST(test_unregistered_follower_onboarding_payout_survives_restart_across_epoch_
   validator->stop();
 
   node::NodeConfig restart_cfg;
+  restart_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   restart_cfg.disable_p2p = true;
   restart_cfg.node_id = 0;
   restart_cfg.max_committee = 1;
@@ -7987,6 +8057,7 @@ TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticke
   const auto validator_status = validators[0]->status();
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8032,6 +8103,7 @@ TEST(test_syncing_follower_reconstructs_same_next_height_checkpoint_as_validator
   ASSERT_TRUE(wait_for_same_tip(validators, std::chrono::seconds(5)));
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8147,6 +8219,7 @@ TEST(test_startup_repairs_stale_checkpoint_ticket_winners) {
     db.close();
 
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.disable_p2p = true;
     cfg.node_id = 0;
     cfg.max_committee = 2;
@@ -8206,6 +8279,7 @@ TEST(test_reconcile_rebuild_prefers_persisted_epoch_ticket_winners) {
     db.close();
 
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.disable_p2p = true;
     cfg.node_id = 0;
     cfg.max_committee = 2;
@@ -8253,6 +8327,7 @@ TEST(test_syncing_follower_accepts_canonical_block_after_checkpoint_rebuild) {
   const auto target_tip = validators[0]->status();
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 9;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8337,6 +8412,7 @@ TEST(test_synced_joiner_keeps_outbound_peer_alive_with_short_idle_timeout) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg0;
+  cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8360,6 +8436,7 @@ TEST(test_synced_joiner_keeps_outbound_peer_alive_with_short_idle_timeout) {
   ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(15)));
 
   node::NodeConfig cfg1;
+  cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8410,6 +8487,7 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8450,6 +8528,7 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
   bootstrap.stop();
 
   node::NodeConfig follower_cfg;
+  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   follower_cfg.node_id = 1;
   follower_cfg.dns_seeds = false;
   follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8496,6 +8575,7 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   bootstrap_cfg.node_id = 0;
   bootstrap_cfg.dns_seeds = false;
   bootstrap_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
@@ -8905,6 +8985,7 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
@@ -8972,6 +9053,7 @@ TEST(test_single_validator_round0_uses_deterministic_proposer) {
   ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.dns_seeds = false;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds

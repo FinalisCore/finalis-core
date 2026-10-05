@@ -31,6 +31,7 @@ std::string unique_test_path(const char* prefix) {
 
 node::NodeConfig make_cfg(const std::string& db_path) {
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.dns_seeds = false;
   cfg.db_path = db_path;

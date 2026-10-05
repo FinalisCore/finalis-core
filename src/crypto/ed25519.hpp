@@ -5,12 +5,16 @@
 #include <optional>
 
 #include "common/types.hpp"
+#include "crypto/secure_memory.hpp"
 
 namespace finalis::crypto {
 
 struct KeyPair {
   Bytes private_key;  // 32 bytes seed/private scalar (OpenSSL raw private)
   PubKey32 public_key;
+
+  // Destructor only (no constructors) so KeyPair stays an aggregate.
+  ~KeyPair() { secure_wipe(private_key); }
 };
 
 std::optional<KeyPair> keypair_from_seed32(const std::array<std::uint8_t, 32>& seed);

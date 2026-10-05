@@ -137,6 +137,7 @@ add_library(finalis_core
   src/codec/varint.cpp
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
+  src/crypto/secure_memory.cpp
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
   src/crypto/stealth_address.cpp
