@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cerrno>
 #include <cstring>
+#include <exception>
+#include <optional>
 #include <sstream>
 
 #include "p2p/messages.hpp"
@@ -196,26 +198,21 @@ void PeerManager::stop() {
     peers_.clear();
   }
 
-  for (auto& p : peers) {
-    if (net::valid_socket(p->fd)) {
-      net::shutdown_socket(p->fd);
-      net::close_socket(p->fd);
-      p->fd = net::kInvalidSocket;
-    }
-  }
+  // Each reader thread closes its own fd once its writer has exited.
+  for (auto& p : peers) request_close(p, false);
 
   if (was_running || active_readers_.load() != 0) {
     std::unique_lock<std::mutex> lk(reader_wait_mu_);
     reader_wait_cv_.wait_for(lk, std::chrono::seconds(5), [this]() { return active_readers_.load() == 0; });
   }
 
-  std::vector<std::thread> reader_threads;
+  std::vector<ReaderThread> reader_threads;
   {
     std::lock_guard<std::mutex> threads_lk(reader_threads_mu_);
     reader_threads.swap(reader_threads_);
   }
   for (auto& t : reader_threads) {
-    if (t.joinable()) t.join();
+    if (t.thread.joinable()) t.thread.join();
   }
 }
 
@@ -228,43 +225,32 @@ bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
     p = it->second;
   }
 
-  if (p->queued_msgs.load() >= limits_.max_outbound_queue_msgs ||
-      p->queued_bytes.load() + payload.size() > limits_.max_outbound_queue_bytes) {
+  Bytes frame = encode_frame(Frame{msg_type, payload}, magic_, proto_version_);
+  bool overflow = false;
+  {
+    std::lock_guard<std::mutex> wl(p->write_mu);
+    if (p->closing) return false;
+    // A single frame is always admitted into an empty queue so max-size frames stay sendable.
+    if (p->queued_msgs >= limits_.max_outbound_queue_msgs ||
+        (p->queued_msgs > 0 && p->queued_bytes + frame.size() > limits_.max_outbound_queue_bytes)) {
+      overflow = true;
+    } else {
+      p->queued_msgs += 1;
+      p->queued_bytes += frame.size();
+      p->outq.push_back(std::move(frame));
+    }
+  }
+  if (overflow) {
     if (low_priority) {
       emit_event(peer_id, PeerEventType::QUEUE_OVERFLOW, "drop-low-priority");
       return false;
     }
     emit_event(peer_id, PeerEventType::QUEUE_OVERFLOW, "disconnect");
-    disconnect_peer(peer_id);
+    request_close(p, false);
     return false;
   }
-
-  p->queued_msgs.fetch_add(1);
-  p->queued_bytes.fetch_add(payload.size());
-  bool ok = false;
-  int send_errno = 0;
-  {
-    std::lock_guard<std::mutex> wl(p->write_mu);
-    if (!net::valid_socket(p->fd)) {
-      p->queued_msgs.fetch_sub(1);
-      p->queued_bytes.fetch_sub(payload.size());
-      return false;
-    }
-    ok = write_frame_fd_timed(p->fd, Frame{msg_type, payload}, limits_.frame_timeout_ms, magic_, proto_version_);
-    if (!ok) send_errno = net::socket_last_error();
-  }
-  p->queued_msgs.fetch_sub(1);
-  p->queued_bytes.fetch_sub(payload.size());
-  if (!ok) {
-    if (!running_.load()) return false;
-    const auto info = get_peer_info(peer_id);
-    std::ostringstream oss;
-    oss << "send-failed errno=" << send_errno << " err=\"" << net::socket_error_string(send_errno) << "\" "
-        << peer_state_detail(info);
-    emit_event(peer_id, PeerEventType::DISCONNECTED, oss.str());
-    disconnect_peer(peer_id);
-  }
-  return ok;
+  p->out_cv.notify_one();
+  return true;
 }
 
 void PeerManager::broadcast(std::uint16_t msg_type, const Bytes& payload) {
@@ -282,12 +268,62 @@ void PeerManager::disconnect_peer(int peer_id) {
     if (it == peers_.end()) return;
     p = it->second;
   }
-  std::lock_guard<std::mutex> wl(p->write_mu);
-  if (net::valid_socket(p->fd)) {
-    net::shutdown_socket(p->fd);
-    net::close_socket(p->fd);
-    p->fd = net::kInvalidSocket;
+  // Flush already-queued frames (e.g. a reject reason) before tearing down.
+  request_close(p, true);
+}
+
+void PeerManager::request_close(const std::shared_ptr<PeerConn>& p, bool drain) {
+  {
+    std::lock_guard<std::mutex> wl(p->write_mu);
+    if (!p->closing) {
+      p->closing = true;
+      if (!drain) {
+        p->outq.clear();
+        p->queued_msgs = 0;
+        p->queued_bytes = 0;
+      }
+    } else if (!drain) {
+      p->outq.clear();
+      p->queued_msgs = 0;
+      p->queued_bytes = 0;
+    }
   }
+  p->out_cv.notify_all();
+}
+
+void PeerManager::write_loop(const std::shared_ptr<PeerConn>& p) {
+  std::unique_lock<std::mutex> lk(p->write_mu);
+  std::optional<std::chrono::steady_clock::time_point> drain_deadline;
+  while (true) {
+    p->out_cv.wait(lk, [&p]() { return p->closing || !p->outq.empty(); });
+    if (p->outq.empty()) break;  // closing and nothing left to flush
+    if (p->closing) {
+      const auto now = std::chrono::steady_clock::now();
+      if (!drain_deadline) drain_deadline = now + std::chrono::milliseconds(limits_.frame_timeout_ms);
+      if (!running_.load() || now >= *drain_deadline) break;
+    }
+    Bytes frame = std::move(p->outq.front());
+    p->outq.pop_front();
+    p->queued_msgs -= 1;
+    p->queued_bytes -= frame.size();
+    lk.unlock();
+    const bool ok = write_all_timed(p->fd, frame.data(), frame.size(), limits_.frame_timeout_ms);
+    const int send_errno = ok ? 0 : net::socket_last_error();
+    lk.lock();
+    if (!ok) {
+      std::ostringstream oss;
+      oss << "send-failed errno=" << send_errno << " err=\"" << net::socket_error_string(send_errno) << "\"";
+      p->send_fail_detail = oss.str();
+      p->closing = true;
+      p->outq.clear();
+      p->queued_msgs = 0;
+      p->queued_bytes = 0;
+      break;
+    }
+  }
+  lk.unlock();
+  // Wakes the reader blocked in recv; the reader owns the close.
+  net::shutdown_socket(p->fd);
 }
 
 std::vector<int> PeerManager::peer_ids() const {
@@ -427,16 +463,30 @@ void PeerManager::start_peer(net::SocketHandle fd, const std::string& endpoint, 
   active_readers_.fetch_add(1);
   {
     std::lock_guard<std::mutex> lk(reader_threads_mu_);
-    reader_threads_.emplace_back([this, peer_id = p->info.id, p]() {
-      {
-        std::lock_guard<std::mutex> lk(p->start_mu);
-        p->reader_started = true;
+    // Reap finished reader threads so connection churn cannot accumulate
+    // un-joined threads (and their stacks) until stop().
+    for (auto it = reader_threads_.begin(); it != reader_threads_.end();) {
+      if (it->done->load()) {
+        if (it->thread.joinable()) it->thread.join();
+        it = reader_threads_.erase(it);
+      } else {
+        ++it;
       }
-      p->start_cv.notify_all();
-      read_loop(peer_id);
-      active_readers_.fetch_sub(1);
-      reader_wait_cv_.notify_all();
-    });
+    }
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    reader_threads_.push_back(ReaderThread{std::thread([this, p, done]() {
+                                             p->writer = std::thread([this, p]() { write_loop(p); });
+                                             {
+                                               std::lock_guard<std::mutex> lk(p->start_mu);
+                                               p->reader_started = true;
+                                             }
+                                             p->start_cv.notify_all();
+                                             read_loop(p);
+                                             active_readers_.fetch_sub(1);
+                                             reader_wait_cv_.notify_all();
+                                             done->store(true);
+                                           }),
+                                           done});
   }
   {
     std::unique_lock<std::mutex> lk(p->start_mu);
@@ -445,18 +495,14 @@ void PeerManager::start_peer(net::SocketHandle fd, const std::string& endpoint, 
   emit_event(p->info.id, PeerEventType::CONNECTED, endpoint);
 }
 
-void PeerManager::read_loop(int peer_id) {
-  std::shared_ptr<PeerConn> p;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = peers_.find(peer_id);
-    if (it == peers_.end()) return;
-    p = it->second;
-  }
-
+void PeerManager::read_loop(const std::shared_ptr<PeerConn>& p) {
+  const int peer_id = p->info.id;
+  const auto fd = p->fd;  // stable: only this thread closes it
   while (running_) {
-    const auto fd = p->fd;
-    if (!net::valid_socket(fd)) break;
+    {
+      std::lock_guard<std::mutex> wl(p->write_mu);
+      if (p->closing && p->outq.empty()) break;
+    }
     const auto info = get_peer_info(peer_id);
     std::uint32_t header_timeout = info.established() ? limits_.idle_timeout_ms : limits_.handshake_timeout_ms;
     if (info.established() && read_timeout_override_) {
@@ -470,6 +516,12 @@ void PeerManager::read_loop(int peer_id) {
                                      &ferr, &finfo);
     if (!frame.has_value()) {
       if (!running_.load()) break;
+      bool locally_closed = false;
+      {
+        std::lock_guard<std::mutex> wl(p->write_mu);
+        locally_closed = p->closing;
+      }
+      if (locally_closed) break;
       const std::string detail = frame_fail_detail(finfo) + " " + peer_state_detail(info);
       if (ferr == FrameReadError::TIMEOUT_HEADER) {
         emit_event(peer_id, info.established() ? PeerEventType::FRAME_TIMEOUT : PeerEventType::HANDSHAKE_TIMEOUT,
@@ -485,14 +537,35 @@ void PeerManager::read_loop(int peer_id) {
       emit_event(peer_id, PeerEventType::MESSAGE_RX,
                  "transition-pre-dispatch payload_size=" + std::to_string(frame->payload.size()));
     }
-    if (on_message_) on_message_(peer_id, frame->msg_type, frame->payload);
+    if (on_message_) {
+      // SECURITY: an exception escaping a std::thread calls std::terminate, turning any
+      // parser/handler throw into a remote crash. Drop the peer instead.
+      try {
+        on_message_(peer_id, frame->msg_type, frame->payload);
+      } catch (const std::exception& e) {
+        emit_event(peer_id, PeerEventType::FRAME_INVALID,
+                   std::string("reason=HANDLER_EXCEPTION what=\"") + e.what() + "\" " + peer_state_detail(info));
+        break;
+      } catch (...) {
+        emit_event(peer_id, PeerEventType::FRAME_INVALID, "reason=HANDLER_EXCEPTION " + peer_state_detail(info));
+        break;
+      }
+    }
   }
 
-  net::shutdown_socket(p->fd);
-  net::close_socket(p->fd);
-  p->fd = net::kInvalidSocket;
+  request_close(p, false);
+  if (p->writer.joinable()) p->writer.join();
+  std::string send_fail_detail;
+  {
+    std::lock_guard<std::mutex> wl(p->write_mu);
+    net::shutdown_socket(p->fd);
+    net::close_socket(p->fd);
+    p->fd = net::kInvalidSocket;
+    send_fail_detail = p->send_fail_detail;
+  }
   const std::string endpoint = p->info.endpoint;
-  const std::string disconnect_detail = "endpoint=" + endpoint + " " + peer_state_detail(p->info);
+  std::string disconnect_detail = "endpoint=" + endpoint + " " + peer_state_detail(get_peer_info(peer_id));
+  if (!send_fail_detail.empty()) disconnect_detail += " " + send_fail_detail;
   {
     std::lock_guard<std::mutex> lk(mu_);
     peers_.erase(peer_id);

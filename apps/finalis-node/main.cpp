@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
   auto cfg = finalis::node::parse_args(argc, argv);
   if (!cfg.has_value()) {
     std::cerr << "usage: finalis-node [--node-id <id>] [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--port <p>] "
-                 "[--validator-key-file <path>] [--validator-passphrase <pass>] [--validator-passphrase-env <ENV>] "
+                 "[--validator-key-file <path>] [--validator-passphrase <pass>] [--validator-passphrase-env <ENV>] [--allow-unencrypted-keystore] "
                  "[--public] [--listen] [--bind <ip>] [--with-lightserver] [--lightserver-bind <ip>] "
                  "[--lightserver-port <p>] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
                  "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--no-reindex] [--log-json] "

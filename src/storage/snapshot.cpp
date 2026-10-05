@@ -483,20 +483,50 @@ bool export_snapshot_bundle(const DB& db, const std::string& path, SnapshotManif
   return true;
 }
 
-bool import_snapshot_bundle(DB& db, const std::string& path, SnapshotManifest* manifest_out, std::string* err) {
+namespace {
+
+// validate_bundle only proves the bundle is self-consistent; the genesis check binds it
+// to this node's chain. Runs before any DB write so a rejected bundle leaves no state.
+std::optional<SnapshotBundle> load_checked_bundle(const std::string& path,
+                                                  const std::optional<Hash32>& expected_genesis_hash,
+                                                  std::string* err) {
+  Bytes bytes;
+  if (!read_file_bytes(path, &bytes, err)) return std::nullopt;
+  auto bundle = SnapshotBundle::parse(bytes);
+  if (!bundle.has_value()) {
+    if (err) *err = "failed to parse snapshot bundle";
+    return std::nullopt;
+  }
+  if (!validate_bundle(*bundle, err)) return std::nullopt;
+  if (expected_genesis_hash.has_value() && bundle->manifest.genesis_hash != *expected_genesis_hash) {
+    if (err) {
+      *err = "snapshot genesis mismatch; reject import (snapshot=" + hex_encode32(bundle->manifest.genesis_hash) +
+             " expected=" + hex_encode32(*expected_genesis_hash) + ")";
+    }
+    return std::nullopt;
+  }
+  return bundle;
+}
+
+}  // namespace
+
+bool inspect_snapshot_bundle(const std::string& path, const std::optional<Hash32>& expected_genesis_hash,
+                             SnapshotManifest* manifest_out, std::string* err) {
+  auto bundle = load_checked_bundle(path, expected_genesis_hash, err);
+  if (!bundle.has_value()) return false;
+  if (manifest_out) *manifest_out = bundle->manifest;
+  return true;
+}
+
+bool import_snapshot_bundle(DB& db, const std::string& path, const std::optional<Hash32>& expected_genesis_hash,
+                            SnapshotManifest* manifest_out, std::string* err) {
   if (!db.scan_prefix("").empty()) {
     if (err) *err = "snapshot import requires an empty db";
     return false;
   }
 
-  Bytes bytes;
-  if (!read_file_bytes(path, &bytes, err)) return false;
-  auto bundle = SnapshotBundle::parse(bytes);
-  if (!bundle.has_value()) {
-    if (err) *err = "failed to parse snapshot bundle";
-    return false;
-  }
-  if (!validate_bundle(*bundle, err)) return false;
+  auto bundle = load_checked_bundle(path, expected_genesis_hash, err);
+  if (!bundle.has_value()) return false;
 
   struct ScopedBootstrapIngestMode {
     DB& db_ref;

@@ -65,7 +65,8 @@ std::optional<std::uint64_t> ByteReader::u64le() {
 }
 
 std::optional<Bytes> ByteReader::bytes(size_t n) {
-  if (off_ + n > in_.size()) return std::nullopt;
+  // SECURITY: n is attacker-controlled (varbytes); `off_ + n` can wrap.
+  if (n > in_.size() - off_) return std::nullopt;
   Bytes b(in_.begin() + static_cast<long>(off_), in_.begin() + static_cast<long>(off_ + n));
   off_ += n;
   return b;

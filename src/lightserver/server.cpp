@@ -3,9 +3,12 @@
 #include "lightserver/server.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cctype>
 #include <ctime>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -1200,10 +1203,44 @@ std::string onboarding_record_json_for_rpc(const NetworkConfig& network, const s
   return base;
 }
 
-std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const std::string& key_file, const std::string& passphrase,
-                                                                 std::string* err) {
+// SECURITY: the RPC endpoint has no authentication, so it must not act as a confused deputy:
+// key files are confined to <db_path>/keystore, must be passphrase-encrypted (knowing the
+// passphrase is the authorization), and failed unlock attempts are throttled.
+std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const std::string& db_path, const std::string& key_file,
+                                                                 const std::string& passphrase, std::string* err) {
+  static std::atomic<std::uint64_t> last_failure_ms{0};
+  constexpr std::uint64_t kFailureBackoffMs = 1000;
+  const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  std::chrono::steady_clock::now().time_since_epoch())
+                                                  .count());
+  const auto last = last_failure_ms.load();
+  if (last != 0 && now < last + kFailureBackoffMs) {
+    if (err) *err = "keystore unlock rate-limited; retry later";
+    return std::nullopt;
+  }
+  auto fail = [&](const std::string& msg) -> std::optional<keystore::ValidatorKey> {
+    last_failure_ms.store(now);
+    if (err) *err = msg;
+    return std::nullopt;
+  };
+
+  std::error_code ec;
+  const auto allowed_dir = std::filesystem::weakly_canonical(std::filesystem::path(expand_user_home(db_path)) / "keystore", ec);
+  if (ec) return fail("invalid key_file");
+  const auto requested = std::filesystem::path(expand_user_home(key_file));
+  if (std::filesystem::is_symlink(requested, ec)) return fail("invalid key_file");
+  const auto resolved = std::filesystem::weakly_canonical(requested, ec);
+  if (ec) return fail("invalid key_file");
+  const auto rel = resolved.lexically_relative(allowed_dir);
+  if (rel.empty() || rel.is_absolute() || *rel.begin() == "..") return fail("key_file must be inside the node keystore directory");
+  if (!std::filesystem::is_regular_file(resolved, ec)) return fail("invalid key_file");
+  if (passphrase.empty() || !keystore::keystore_is_encrypted(resolved.string())) {
+    return fail("rpc requires a passphrase-encrypted keystore");
+  }
+
   keystore::ValidatorKey key;
-  if (!keystore::load_validator_keystore(key_file, passphrase, &key, err)) return std::nullopt;
+  std::string load_err;
+  if (!keystore::load_validator_keystore(resolved.string(), passphrase, &key, &load_err)) return fail(load_err);
   return key;
 }
 
@@ -2484,7 +2521,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     const bool wait_for_sync = field_bool(params, "wait_for_sync").value_or(true);
     const std::string tracked_txid_hex = field_string(params, "txid_hex").value_or("");
     std::string err;
-    auto key = load_validator_key_for_rpc(*key_file, passphrase, &err);
+    auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
     if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
     storage::DB live_db;
     if (!open_fresh_readonly_db(cfg_.db_path, &live_db)) {
@@ -2504,7 +2541,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     const std::uint64_t fee = field_u64(params, "fee").value_or(10'000);
     const bool wait_for_sync = field_bool(params, "wait_for_sync").value_or(true);
     std::string err;
-    auto key = load_validator_key_for_rpc(*key_file, passphrase, &err);
+    auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
     if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
     storage::DB live_db;
     if (!open_fresh_readonly_db(cfg_.db_path, &live_db)) {

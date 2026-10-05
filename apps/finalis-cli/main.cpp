@@ -1150,7 +1150,8 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
   return findings.empty() ? 0 : 2;
 }
 
-int run_fast_sync_command(const std::string& db_path, const std::string& snapshot_path, bool force, bool dry_run) {
+int run_fast_sync_command(const std::string& db_path, const std::string& snapshot_path, bool force, bool dry_run,
+                          const finalis::Hash32& expected_genesis_hash) {
   if (snapshot_path.empty()) {
     std::cerr << "fast_sync requires --snapshot <file>\n";
     return 1;
@@ -1176,6 +1177,16 @@ int run_fast_sync_command(const std::string& db_path, const std::string& snapsho
       if (preserve.find(name) != preserve.end()) continue;
       has_chain_state = true;
       break;
+    }
+  }
+
+  // Validate and genesis-bind the bundle before --force clears any existing chain state.
+  {
+    std::string inspect_err;
+    if (!finalis::storage::inspect_snapshot_bundle(resolved_snapshot.string(), expected_genesis_hash, nullptr,
+                                                   &inspect_err)) {
+      std::cerr << "error: " << inspect_err << "\n";
+      return 1;
     }
   }
 
@@ -1220,8 +1231,9 @@ int run_fast_sync_command(const std::string& db_path, const std::string& snapsho
 
   finalis::storage::SnapshotManifest manifest;
   std::string err;
-  if (!finalis::storage::import_snapshot_bundle(db, resolved_snapshot.string(), &manifest, &err)) {
-    std::cerr << "fast_sync failed: " << err << "\n";
+  if (!finalis::storage::import_snapshot_bundle(db, resolved_snapshot.string(), expected_genesis_hash, &manifest,
+                                                &err)) {
+    std::cerr << "error: fast_sync failed: " << err << "\n";
     return 1;
   }
 
@@ -1529,11 +1541,11 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli sync_doctor [--db <dir>] [--tail <n>] [--json]  # diagnose stalled sync and certificate gaps\n"
      << "  finalis-cli validator_doctor [--db <dir>] [--file <path>] [--pass <pass>] [--rpc <url>] [--json]\n"
      << "  finalis-cli operator_doctor [--db <dir>] [--file <path>] [--pass <pass>] [--rpc <url>] [--json]  # alias\n"
-     << "  finalis-cli fast_sync [--db <dir>] --snapshot <snapshot.bin> [--force] [--dry-run]\n"
+     << "  finalis-cli fast_sync [--db <dir>] --snapshot <snapshot.bin> [--force] [--dry-run] [--expected-genesis-hash <hex32>]\n"
      << "  finalis-cli --print-logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli print_logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
-     << "  finalis-cli snapshot_import --db <dir> --in <snapshot.bin>\n"
+     << "  finalis-cli snapshot_import --db <dir> --in <snapshot.bin> [--expected-genesis-hash <hex32>]  # default: mainnet genesis\n"
      << "  finalis-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
      << "  finalis-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
      << "  finalis-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
@@ -2106,10 +2118,19 @@ int main(int argc, char** argv) {
   if (cmd == "snapshot_import") {
     std::string db_path = default_mainnet_db_path();
     std::string in_path;
+    finalis::Hash32 expected_genesis = finalis::genesis::MAINNET_GENESIS_HASH;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
       else if (a == "--in" && i + 1 < argc) in_path = argv[++i];
+      else if (a == "--expected-genesis-hash" && i + 1 < argc) {
+        auto h = decode_hex32(argv[++i]);
+        if (!h.has_value()) {
+          std::cerr << "error: --expected-genesis-hash must be 32-byte hex\n";
+          return 1;
+        }
+        expected_genesis = *h;
+      }
     }
     if (in_path.empty()) {
       std::cerr << "snapshot_import requires --in\n";
@@ -2122,8 +2143,8 @@ int main(int argc, char** argv) {
     }
     finalis::storage::SnapshotManifest manifest;
     std::string err;
-    if (!finalis::storage::import_snapshot_bundle(db, in_path, &manifest, &err)) {
-      std::cerr << "snapshot_import failed: " << err << "\n";
+    if (!finalis::storage::import_snapshot_bundle(db, in_path, expected_genesis, &manifest, &err)) {
+      std::cerr << "error: snapshot_import failed: " << err << "\n";
       return 1;
     }
     std::cout << "db=" << db_path << "\n";
@@ -2138,14 +2159,23 @@ int main(int argc, char** argv) {
     std::string snapshot_path;
     bool force = false;
     bool dry_run = false;
+    finalis::Hash32 expected_genesis = finalis::genesis::MAINNET_GENESIS_HASH;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
       else if ((a == "--snapshot" || a == "--in") && i + 1 < argc) snapshot_path = argv[++i];
       else if (a == "--force" || a == "-y") force = true;
       else if (a == "--dry-run") dry_run = true;
+      else if (a == "--expected-genesis-hash" && i + 1 < argc) {
+        auto h = decode_hex32(argv[++i]);
+        if (!h.has_value()) {
+          std::cerr << "error: --expected-genesis-hash must be 32-byte hex\n";
+          return 1;
+        }
+        expected_genesis = *h;
+      }
     }
-    return run_fast_sync_command(db_path, snapshot_path, force, dry_run);
+    return run_fast_sync_command(db_path, snapshot_path, force, dry_run, expected_genesis);
   }
 
   if (cmd == "genesis_build") {

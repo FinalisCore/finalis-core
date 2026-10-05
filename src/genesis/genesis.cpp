@@ -237,7 +237,7 @@ std::optional<Document> decode_bin(const Bytes& bin, std::string* err) {
         d.initial_height = *initial_height;
 
         d.initial_validators.clear();
-        d.initial_validators.reserve(*nvals);
+        d.initial_validators.reserve(std::min<std::uint64_t>(*nvals, r.remaining()));
         for (std::uint64_t i = 0; i < *nvals; ++i) {
           auto pk = r.bytes_fixed<32>();
           if (!pk) return false;
@@ -261,7 +261,7 @@ std::optional<Document> decode_bin(const Bytes& bin, std::string* err) {
         d.monetary_params_ref.assign(monetary->begin(), monetary->end());
 
         d.seeds.clear();
-        d.seeds.reserve(*seed_count);
+        d.seeds.reserve(std::min<std::uint64_t>(*seed_count, r.remaining()));
         for (std::uint64_t i = 0; i < *seed_count; ++i) {
           auto s = r.varbytes();
           if (!s) return false;

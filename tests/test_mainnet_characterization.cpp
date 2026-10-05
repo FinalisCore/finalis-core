@@ -77,6 +77,7 @@ std::unique_ptr<node::Node> make_node(const std::string& base, int node_id, std:
   if (!write_mainnet_genesis_file(gpath, n_validators)) throw std::runtime_error("failed to write genesis");
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = node_id;
   cfg.max_committee = max_committee;
@@ -170,6 +171,7 @@ TEST(test_characterize_mainnet_default_node_builds_epoch_committee_proposal_head
   ASSERT_TRUE(persist_certified_ingress_record(base + "/node", tx.serialize()));
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.disable_p2p = true;
   cfg.node_id = 0;
   cfg.max_committee = 4;

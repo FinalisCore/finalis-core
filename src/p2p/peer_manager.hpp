@@ -5,6 +5,7 @@
 #include <atomic>
 #include <array>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -54,7 +55,7 @@ class PeerManager {
     std::uint32_t handshake_timeout_ms{10'000};
     std::uint32_t frame_timeout_ms{3'000};
     std::uint32_t idle_timeout_ms{120'000};
-    std::size_t max_outbound_queue_bytes{2 * 1024 * 1024};
+    std::size_t max_outbound_queue_bytes{8 * 1024 * 1024};
     std::size_t max_outbound_queue_msgs{2'000};
     std::size_t max_inbound{64};
   };
@@ -86,20 +87,34 @@ class PeerManager {
 
  private:
   struct PeerConn {
+    // Only the peer's reader thread closes fd (after joining the writer), so the
+    // descriptor number can never be reused underneath a concurrent recv/send.
     net::SocketHandle fd{net::kInvalidSocket};
     bool inbound{false};
     PeerInfo info;
-    mutable std::mutex write_mu;
+    mutable std::mutex write_mu;  // guards outq, queued_*, closing, send_fail_detail
+    std::condition_variable out_cv;
+    std::deque<Bytes> outq;  // encoded frames
+    std::size_t queued_bytes{0};
+    std::size_t queued_msgs{0};
+    bool closing{false};
+    std::string send_fail_detail;
+    std::thread writer;
     mutable std::mutex start_mu;
     std::condition_variable start_cv;
     bool reader_started{false};
-    std::atomic<std::size_t> queued_bytes{0};
-    std::atomic<std::size_t> queued_msgs{0};
+  };
+
+  struct ReaderThread {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> done;
   };
 
   void accept_loop();
   void start_peer(net::SocketHandle fd, const std::string& endpoint, const std::string& ip, bool inbound);
-  void read_loop(int peer_id);
+  void read_loop(const std::shared_ptr<PeerConn>& p);
+  void write_loop(const std::shared_ptr<PeerConn>& p);
+  void request_close(const std::shared_ptr<PeerConn>& p, bool drain);
   void emit_event(int peer_id, PeerEventType type, const std::string& detail) const;
 
   net::SocketHandle listen_fd_{net::kInvalidSocket};
@@ -123,7 +138,7 @@ class PeerManager {
   mutable std::mutex reader_wait_mu_;
   std::condition_variable reader_wait_cv_;
   mutable std::mutex reader_threads_mu_;
-  std::vector<std::thread> reader_threads_;
+  std::vector<ReaderThread> reader_threads_;
 };
 
 }  // namespace finalis::p2p

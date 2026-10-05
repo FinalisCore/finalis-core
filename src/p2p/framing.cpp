@@ -2,6 +2,7 @@
 
 #include "p2p/framing.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 #include "codec/bytes.hpp"
@@ -247,10 +248,34 @@ std::optional<Frame> read_frame_fd_timed(net::SocketHandle fd, std::size_t max_p
     return std::nullopt;
   }
 
-  Bytes payload(*len);
+  // SECURITY: grow the buffer as bytes arrive instead of trusting the header length,
+  // so a peer cannot pin max_payload_len of memory per connection with a bare header.
+  constexpr std::size_t kBodyChunk = 64 * 1024;
+  Bytes payload;
   std::size_t body_read = 0;
   bool body_eof = false;
-  if (*len > 0 && !read_exact_timed(fd, payload.data(), payload.size(), body_timeout_ms, &body_read, &body_eof)) {
+  bool body_ok = true;
+  const auto body_start = std::chrono::steady_clock::now();
+  while (payload.size() < *len) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                               body_start).count();
+    if (elapsed >= static_cast<long long>(body_timeout_ms)) {
+      body_ok = false;
+      break;
+    }
+    const std::size_t off = payload.size();
+    const std::size_t want = std::min<std::size_t>(kBodyChunk, *len - off);
+    payload.resize(off + want);
+    std::size_t got = 0;
+    if (!read_exact_timed(fd, payload.data() + off, want,
+                          static_cast<std::uint32_t>(body_timeout_ms - elapsed), &got, &body_eof)) {
+      body_read = off + got;
+      body_ok = false;
+      break;
+    }
+    body_read = payload.size();
+  }
+  if (!body_ok) {
     if (err) *err = body_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;
     if (fail_info) {
       fail_info->reason = body_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;

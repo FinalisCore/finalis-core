@@ -112,6 +112,7 @@ Cluster make_cluster(const std::string& base, int node_count = 4) {
   c.nodes.reserve(static_cast<std::size_t>(node_count));
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.node_id = i;
     cfg.disable_p2p = true;
     // Match the accelerated timing used by the integration harness. These
@@ -1868,7 +1869,7 @@ TEST(test_snapshot_export_import_bootstraps_imported_db) {
   {
     storage::DB dst;
     ASSERT_TRUE(dst.open(imported_db_path));
-    ASSERT_TRUE(storage::import_snapshot_bundle(dst, snapshot_path, &imported, &err));
+    ASSERT_TRUE(storage::import_snapshot_bundle(dst, snapshot_path, exported.genesis_hash, &imported, &err));
   }
   ASSERT_EQ(imported.finalized_height, exported.finalized_height);
   ASSERT_EQ(imported.finalized_hash, exported.finalized_hash);
@@ -1876,6 +1877,7 @@ TEST(test_snapshot_export_import_bootstraps_imported_db) {
   ASSERT_EQ(imported.validators_root, exported.validators_root);
 
   node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 9;
   cfg.disable_p2p = true;
   cfg.db_path = imported_db_path;
