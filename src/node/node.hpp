@@ -45,6 +45,7 @@ struct NodeConfig {
   bool allow_unsafe_genesis_override{false};
   std::string validator_key_file;
   std::string validator_passphrase;
+  bool allow_unencrypted_keystore{false};
   int node_id{0};
   std::string bind_ip{"127.0.0.1"};
   bool listen{true};
@@ -85,7 +86,7 @@ struct NodeConfig {
   std::uint32_t handshake_timeout_ms{10'000};
   std::uint32_t frame_timeout_ms{3'000};
   std::uint32_t idle_timeout_ms{600'000};
-  std::size_t peer_queue_max_bytes{2 * 1024 * 1024};
+  std::size_t peer_queue_max_bytes{8 * 1024 * 1024};
   std::size_t peer_queue_max_msgs{2'000};
   std::uint64_t ban_seconds{600};
   int invalid_frame_ban_threshold{3};
@@ -354,7 +355,10 @@ class Node {
   bool handle_frontier_block_locked(const FrontierProposal& proposal, const std::optional<FinalityCertificate>& certificate,
                                     int from_peer_id, bool from_network, const std::optional<CertificateCheck>& cert_check);
   bool maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
-                                         const std::optional<FinalityCertificate>& certificate, int from_peer_id);
+                                         const std::optional<FinalityCertificate>& certificate, int from_peer_id,
+                                         const std::optional<CertificateCheck>& cert_check);
+  bool insert_buffered_sync_frontier_locked(const FrontierProposal& proposal, const FinalityCertificate& certificate,
+                                            int from_peer_id, const std::optional<CertificateCheck>& cert_check);
   bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
   bool handle_tx(const AnyTx& tx, bool from_network, int from_peer_id = 0);
   bool maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error = nullptr);
@@ -545,6 +549,7 @@ class Node {
   bool should_mute_peer(int peer_id) const;
   void prune_caches_locked(std::uint64_t height, std::uint32_t round);
   bool check_rate_limit_locked(int peer_id, std::uint16_t msg_type);
+  bool check_sync_transition_rate_limit_locked(int peer_id);
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
   bool validate_validator_registration_rules(const Block& block, std::uint64_t height) const;
@@ -642,9 +647,17 @@ class Node {
     FrontierProposal proposal;
     std::optional<FinalityCertificate> certificate;
     int from_peer_id{0};
+    std::size_t bytes{0};
   };
+  // SECURITY: future-height certificates can only be checked for self-consistency until the
+  // committee for that height is known, so the buffer is bounded (height window, per-height
+  // candidates, total bytes) and keeps one candidate per peer instead of first-writer-wins.
+  static constexpr std::uint64_t kMaxBufferedSyncAhead = 256;
+  static constexpr std::size_t kMaxBufferedSyncCandidatesPerHeight = 4;
+  static constexpr std::size_t kMaxBufferedSyncBytes = 256 * 1024 * 1024;
   std::map<Hash32, FrontierProposal> candidate_frontier_proposals_;
-  std::map<std::uint64_t, BufferedSyncFrontier> buffered_sync_frontiers_;
+  std::map<std::uint64_t, std::vector<BufferedSyncFrontier>> buffered_sync_frontiers_;
+  std::size_t buffered_sync_bytes_{0};
   std::map<std::uint64_t, QuorumCertificate> highest_qc_by_height_;
   std::map<std::uint64_t, Hash32> highest_qc_payload_by_height_;
   std::map<std::uint64_t, TimeoutCertificate> highest_tc_by_height_;

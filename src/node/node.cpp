@@ -46,6 +46,7 @@
 #include "common/version.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/secure_memory.hpp"
 #include "crypto/smt.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
@@ -3272,12 +3273,28 @@ bool Node::init_local_validator_key() {
                                                     : cfg_.validator_key_file);
   keystore::ValidatorKey vk;
   std::string kerr;
+  // The passphrase is only needed to open the keystore; do not keep it for the process lifetime.
+  struct WipePassphrase {
+    std::string& s;
+    ~WipePassphrase() { crypto::secure_wipe(s); }
+  } wipe_passphrase{cfg_.validator_passphrase};
+  const bool is_mainnet = cfg_.network.name == "mainnet";
   if (keystore::keystore_exists(key_path)) {
     if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
       std::cerr << "failed to load validator keystore: " << kerr << "\n";
       return false;
     }
+    if (is_mainnet && !keystore::keystore_is_encrypted(key_path)) {
+      std::cerr << "warning: validator keystore " << key_path
+                << " stores the private key UNENCRYPTED; re-create it with a passphrase\n";
+    }
   } else {
+    // SECURITY: never silently write a plaintext validator key on mainnet.
+    if (is_mainnet && cfg_.validator_passphrase.empty() && !cfg_.allow_unencrypted_keystore) {
+      std::cerr << "refusing to create an unencrypted mainnet validator keystore at " << key_path
+                << "; set --validator-passphrase-env (or pass --allow-unencrypted-keystore)\n";
+      return false;
+    }
     if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
                                              keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk, &kerr)) {
       std::cerr << "failed to create validator keystore: " << kerr << "\n";
@@ -3285,8 +3302,13 @@ bool Node::init_local_validator_key() {
     }
     log_line("created validator keystore path=" + key_path);
   }
+  crypto::secure_wipe(local_key_.private_key);
+  local_key_.private_key.reserve(32);
   local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
   local_key_.public_key = vk.pubkey;
+  if (!crypto::lock_memory(local_key_.private_key.data(), local_key_.private_key.size())) {
+    log_line("warning: mlock of validator key failed; key pages may be swapped to disk");
+  }
   log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
   return true;
 }
@@ -6948,10 +6970,12 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           peer_is_ahead = it->second.height > finalized_height_;
         }
         // During forward sync, dropping TRANSITION frames via generic msg-rate
-        // control can deadlock catch-up at next_height.
+        // control can deadlock catch-up at next_height. peer_is_ahead rests on an
+        // unverified FINALIZED_TIP claim, so sync uses a larger but still bounded bucket.
         if (sync_backlog || peer_is_ahead) bypass_rate_limit = true;
       }
-      rate_limited = !bypass_rate_limit && !check_rate_limit_locked(peer_id, msg_type);
+      rate_limited = bypass_rate_limit ? !check_sync_transition_rate_limit_locked(peer_id)
+                                       : !check_rate_limit_locked(peer_id, msg_type);
     }
   }
   if (known_invalid) {
@@ -7392,7 +7416,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       p2p::TransitionMsg msg;
       msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
       msg.certificate = cert;
-      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
+      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
       log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
                " hash=" + short_hash_hex(gb->hash) + " status=" + (ok ? "ok" : "failed"));
       break;
@@ -7534,7 +7558,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       p2p::TransitionMsg msg;
       msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
       msg.certificate = cert;
-      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
+      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
       log_frontier_by_height(ok ? "ok" : "failed",
                              " hash=" + short_hash_hex(*bh) +
                                  " cert_height=" + std::to_string(cert->height));
@@ -7712,6 +7736,17 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       std::optional<CertificateCheck> cert_check;
       if (b->certificate.has_value()) {
         cert_check = precheck_finality_certificate(*b->certificate, proposal->transition);
+        if (!cert_check->ok) {
+          // SECURITY: an internally inconsistent certificate is never produced by an honest
+          // peer; cache and score it so resends cannot burn signature verification for free.
+          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                   " type=TRANSITION reason=certificate-precheck-failed error=" + cert_check->error +
+                   " payload_id=" + short_hash_hex(payload_id));
+          std::lock_guard<std::mutex> lk(mu_);
+          invalid_message_payloads_.insert(payload_id);
+          score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-transition-certificate");
+          return;
+        }
       }
       {
         std::lock_guard<std::mutex> lk(mu_);
@@ -7742,17 +7777,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         if (!running_) {
           if (b->certificate.has_value() && proposal->transition.height >= finalized_height_ + 1) {
             const auto transition_id = proposal->transition.transition_id();
-            auto [it, inserted] = buffered_sync_frontiers_.try_emplace(
-                proposal->transition.height, BufferedSyncFrontier{*proposal, b->certificate, peer_id});
-            if (!inserted) {
-              const auto existing_id = it->second.proposal.transition.transition_id();
-              if (existing_id == transition_id) {
-                if (it->second.from_peer_id == 0) it->second.from_peer_id = peer_id;
-                accepted = true;
-              }
-            } else {
-              accepted = true;
-            }
+            accepted = insert_buffered_sync_frontier_locked(*proposal, *b->certificate, peer_id, cert_check);
             if (accepted) {
               acceptance_path = "startup-buffered";
               log_line("startup-sync-defer-transition peer_id=" + std::to_string(peer_id) +
@@ -7783,7 +7808,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           (void)maybe_request_forward_sync_block_locked();
         } else if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
           acceptance_path = "buffer-forward";
-          accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id);
+          accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id, cert_check);
           if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
         } else {
           acceptance_path = "handle-next";
@@ -8552,7 +8577,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
   const auto transition_id = transition.transition_id();
   if (!running_ && from_network) {
     if (certificate.has_value() && transition.height >= finalized_height_ + 1) {
-      const bool buffered = maybe_buffer_sync_frontier_locked(proposal, certificate, from_peer_id);
+      const bool buffered = maybe_buffer_sync_frontier_locked(proposal, certificate, from_peer_id, cert_check);
       if (buffered) {
         log_line("startup-sync-defer-transition path=handle_frontier_block_locked peer_id=" + std::to_string(from_peer_id) +
                  " height=" + std::to_string(transition.height) + " transition=" + short_hash_hex(transition_id));
@@ -8695,7 +8720,8 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
 }
 
 bool Node::maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
-                                             const std::optional<FinalityCertificate>& certificate, int from_peer_id) {
+                                             const std::optional<FinalityCertificate>& certificate, int from_peer_id,
+                                             const std::optional<CertificateCheck>& cert_check) {
   if (!certificate.has_value()) {
     if (proposal.transition.height > finalized_height_ + 1) {
       log_line("sync-stall reason=missing-certificate-for-future-height peer_id=" + std::to_string(from_peer_id) +
@@ -8712,20 +8738,46 @@ bool Node::maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
   }
   if (transition.height == finalized_height_ + 1) return false;
   if (auto existing = db_.get_height_hash(transition.height); existing.has_value()) return *existing == transition_id;
+  return insert_buffered_sync_frontier_locked(proposal, *certificate, from_peer_id, cert_check);
+}
 
-  auto [it, inserted] = buffered_sync_frontiers_.try_emplace(
-      transition.height, BufferedSyncFrontier{proposal, certificate, from_peer_id});
-  if (!inserted) {
-    const auto existing_id = it->second.proposal.transition.transition_id();
-    if (existing_id != transition_id) {
-      log_line("buffer-sync-conflict height=" + std::to_string(transition.height) + " existing=" +
-               short_hash_hex(existing_id) + " incoming=" + short_hash_hex(transition_id));
-      return false;
+bool Node::insert_buffered_sync_frontier_locked(const FrontierProposal& proposal, const FinalityCertificate& certificate,
+                                                int from_peer_id, const std::optional<CertificateCheck>& cert_check) {
+  const auto& transition = proposal.transition;
+  const auto transition_id = transition.transition_id();
+  auto reject = [&](const std::string& reason) {
+    log_line("buffer-sync-reject peer_id=" + std::to_string(from_peer_id) + " height=" +
+             std::to_string(transition.height) + " hash=" + short_hash_hex(transition_id) + " reason=" + reason);
+    return false;
+  };
+  if (!cert_check.has_value() || !cert_check->ok) return reject("certificate-precheck-failed");
+  if (transition.height <= finalized_height_) return reject("stale-height");
+  if (transition.height > finalized_height_ + kMaxBufferedSyncAhead) return reject("beyond-buffer-window");
+
+  std::size_t bytes = sizeof(BufferedSyncFrontier);
+  for (const auto& rec : proposal.ordered_records) bytes += rec.size();
+
+  auto it = buffered_sync_frontiers_.find(transition.height);
+  if (it != buffered_sync_frontiers_.end()) {
+    for (auto& candidate : it->second) {
+      if (candidate.proposal.transition.transition_id() == transition_id) {
+        if (candidate.from_peer_id == 0) candidate.from_peer_id = from_peer_id;
+        return true;
+      }
     }
-    if (it->second.from_peer_id == 0) it->second.from_peer_id = from_peer_id;
-    return true;
+    for (const auto& candidate : it->second) {
+      if (from_peer_id != 0 && candidate.from_peer_id == from_peer_id) return reject("peer-already-buffered-height");
+    }
+    if (it->second.size() >= kMaxBufferedSyncCandidatesPerHeight) return reject("height-candidates-full");
+    log_line("buffer-sync-conflict height=" + std::to_string(transition.height) + " existing=" +
+             short_hash_hex(it->second.front().proposal.transition.transition_id()) + " incoming=" +
+             short_hash_hex(transition_id));
   }
+  if (buffered_sync_bytes_ + bytes > kMaxBufferedSyncBytes) return reject("buffer-bytes-full");
 
+  buffered_sync_frontiers_[transition.height].push_back(
+      BufferedSyncFrontier{proposal, certificate, from_peer_id, bytes});
+  buffered_sync_bytes_ += bytes;
   log_line("buffer-sync-transition peer_id=" + std::to_string(from_peer_id) + " height=" +
            std::to_string(transition.height) + " hash=" + short_hash_hex(transition_id) + " prev=" +
            short_hash_hex(transition.prev_finalized_hash));
@@ -8734,30 +8786,44 @@ bool Node::maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
 
 bool Node::maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id) {
   bool advanced = false;
+  // Drop candidates that finalized through another path.
+  while (!buffered_sync_frontiers_.empty() && buffered_sync_frontiers_.begin()->first <= finalized_height_) {
+    for (const auto& c : buffered_sync_frontiers_.begin()->second) buffered_sync_bytes_ -= c.bytes;
+    buffered_sync_frontiers_.erase(buffered_sync_frontiers_.begin());
+  }
   while (true) {
     auto it = buffered_sync_frontiers_.find(finalized_height_ + 1);
     if (it == buffered_sync_frontiers_.end()) break;
-    BufferedSyncFrontier buffered = it->second;
+    std::vector<BufferedSyncFrontier> candidates = std::move(it->second);
     buffered_sync_frontiers_.erase(it);
+    for (const auto& c : candidates) buffered_sync_bytes_ -= c.bytes;
     const auto expected_height = finalized_height_ + 1;
-    // Unlike the live TRANSITION path in handle_message, `buffered.certificate` only
-    // becomes known after the locked buffered_sync_frontiers_ lookup above, so this precheck
-    // can't be hoisted before mu_ here -- this is the startup/catch-up replay path, not the
-    // steady-state hot path precheck_finality_certificate is optimizing for. Still correct
-    // (same pure, stateless check), just not off the lock in this call path.
-    std::optional<CertificateCheck> cert_check;
-    if (buffered.certificate.has_value()) {
-      cert_check = precheck_finality_certificate(*buffered.certificate, buffered.proposal.transition);
-    }
-    if (!handle_frontier_block_locked(buffered.proposal, buffered.certificate,
-                                      buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id, true,
-                                      cert_check)) {
+    bool applied = false;
+    for (const auto& buffered : candidates) {
+      // Unlike the live TRANSITION path in handle_message, `buffered.certificate` only
+      // becomes known after the locked buffered_sync_frontiers_ lookup above, so this precheck
+      // can't be hoisted before mu_ here -- this is the startup/catch-up replay path, not the
+      // steady-state hot path precheck_finality_certificate is optimizing for. Still correct
+      // (same pure, stateless check), just not off the lock in this call path.
+      std::optional<CertificateCheck> cert_check;
+      if (buffered.certificate.has_value()) {
+        cert_check = precheck_finality_certificate(*buffered.certificate, buffered.proposal.transition);
+      }
+      const int source_peer = buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id;
+      if (handle_frontier_block_locked(buffered.proposal, buffered.certificate, source_peer, true, cert_check)) {
+        applied = true;
+        break;
+      }
       log_line("buffer-sync-apply-failed height=" + std::to_string(expected_height) + " hash=" +
                short_hash_hex(buffered.proposal.transition.transition_id()));
-      log_line("sync-stall reason=buffered-transition-apply-failed peer_id=" +
-               std::to_string(buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id) +
-               " height=" + std::to_string(expected_height) + " transition=" +
-               short_hash_hex(buffered.proposal.transition.transition_id()));
+      // A finalized transition that fails full validation at its own height was forged.
+      if (buffered.from_peer_id != 0 && running_) {
+        score_peer_locked(buffered.from_peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "buffered-transition-invalid");
+      }
+    }
+    if (!applied) {
+      log_line("sync-stall reason=buffered-transition-apply-failed peer_id=" + std::to_string(preferred_peer_id) +
+               " height=" + std::to_string(expected_height) + " candidates=" + std::to_string(candidates.size()));
       break;
     }
     advanced = true;
@@ -11958,6 +12024,8 @@ bool Node::is_bootstrap_peer_ip(const std::string& ip) const {
     if (matches_host(seed)) return true;
   }
   for (const auto& peer : bootstrap_peers_) {
+    // SECURITY: DNS answers are not operator-vetted; they must not grant ban/rate-limit immunity.
+    if (std::find(dns_seed_peers_.begin(), dns_seed_peers_.end(), peer) != dns_seed_peers_.end()) continue;
     if (matches_host(peer)) return true;
   }
   for (const auto& peer : validators_bootstrap_peers_) {
@@ -12102,6 +12170,16 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
     default:
       return true;
   }
+}
+
+bool Node::check_sync_transition_rate_limit_locked(int peer_id) {
+  if (peer_id <= 0) return true;
+  // Synthetic bucket key: not a wire message type.
+  constexpr std::uint16_t kSyncTransitionBucket = 0xFFFF;
+  auto& buckets = msg_rate_buckets_[peer_id];
+  auto it = buckets.find(kSyncTransitionBucket);
+  if (it == buckets.end()) it = buckets.emplace(kSyncTransitionBucket, p2p::TokenBucket(512.0, 256.0)).first;
+  return it->second.consume(1.0, now_ms());
 }
 
 // Strict TCP port parse: whole string must be a number in [1, 65535].
@@ -12278,6 +12356,13 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.validator_passphrase = *v;
+      crypto::secure_wipe(*v);
+      // SECURITY: argv is world-readable via /proc/<pid>/cmdline and ps; blank it in place.
+      crypto::secure_wipe(argv[i], std::strlen(argv[i]));
+      std::cerr << "warning: --validator-passphrase exposes the secret to other local users at startup; "
+                   "prefer --validator-passphrase-env\n";
+    } else if (a == "--allow-unencrypted-keystore") {
+      cfg.allow_unencrypted_keystore = true;
     } else if (a == "--validator-passphrase-env") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -12494,8 +12579,18 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
   cfg.stun_max_backoff_ms = std::max<std::uint32_t>(cfg.stun_refresh_interval_ms, cfg.stun_max_backoff_ms);
   cfg.stun_hysteresis_samples = std::max<std::uint32_t>(2, cfg.stun_hysteresis_samples);
   if (cfg.validator_passphrase.empty() && !validator_passphrase_env.empty()) {
-    const char* pv = std::getenv(validator_passphrase_env.c_str());
-    if (pv) cfg.validator_passphrase = pv;
+    char* pv = std::getenv(validator_passphrase_env.c_str());
+    if (pv) {
+      cfg.validator_passphrase = pv;
+      // Remove the secret from the process environment (inherited by children, visible in
+      // /proc/<pid>/environ for the initial block).
+      crypto::secure_wipe(pv, std::strlen(pv));
+#ifdef _WIN32
+      _putenv_s(validator_passphrase_env.c_str(), "");
+#else
+      ::unsetenv(validator_passphrase_env.c_str());
+#endif
+    }
   }
   if (!db_explicit) cfg.db_path = default_db_dir_for_network(cfg.network.name);
   if (cfg.public_mode && !bind_explicit) cfg.bind_ip = "0.0.0.0";
