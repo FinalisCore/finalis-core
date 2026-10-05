@@ -170,6 +170,31 @@ TEST(test_version_message_rejects_oversized_software_string) {
   ASSERT_TRUE(!p2p::de_version(w.take()).has_value());
 }
 
+TEST(test_version_message_rejects_wrapping_varbytes_length) {
+  // Regression: a length near 2^64 used to wrap `off + n` and throw from the Bytes ctor,
+  // terminating the node from a single pre-handshake VERSION frame.
+  for (const std::uint64_t len : {~std::uint64_t{0}, ~std::uint64_t{0} - 57, ~std::uint64_t{0} - 100}) {
+    codec::ByteWriter w;
+    w.u32le(PROTOCOL_VERSION);
+    w.bytes_fixed(mainnet_network().network_id);
+    w.u64le(0);
+    w.u64le(0);
+    w.u64le(0);
+    w.u32le(0);
+    w.varint(len);
+    w.u64le(0);
+    Hash32 zero{};
+    w.bytes_fixed(zero);
+    ASSERT_TRUE(!p2p::de_version(w.take()).has_value());
+  }
+  Bytes buf(16, 0);
+  codec::ByteReader r(buf);
+  ASSERT_TRUE(r.u32le().has_value());
+  ASSERT_TRUE(!r.bytes(~std::size_t{0}).has_value());
+  ASSERT_TRUE(!r.bytes(~std::size_t{0} - 3).has_value());
+  ASSERT_TRUE(r.bytes(12).has_value());
+}
+
 TEST(test_peer_manager_starts_reader_before_connected_event) {
   if (!can_open_loopback_listener_for_test()) return;
   const auto net = mainnet_network();

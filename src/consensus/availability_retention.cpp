@@ -184,7 +184,7 @@ std::optional<AvailabilityMerkleProof> parse_merkle_proof(codec::ByteReader& r) 
   AvailabilityMerkleProof proof;
   const auto count = r.varint();
   if (!count.has_value()) return std::nullopt;
-  proof.siblings.reserve(static_cast<std::size_t>(*count));
+  proof.siblings.reserve(std::min<std::uint64_t>(*count, r.remaining()));
   for (std::uint64_t i = 0; i < *count; ++i) {
     auto sibling = r.bytes_fixed<32>();
     if (!sibling.has_value()) return std::nullopt;
@@ -913,14 +913,27 @@ AvailabilityAuditOutcome verify_audit_response(const AvailabilityAuditChallenge&
     if (error) *error = reason;
     return AvailabilityAuditOutcome::INVALID_RESPONSE;
   };
+  // SECURITY: evidence is only attributable to the challenged operator if that operator signed
+  // it. Anything else may have been fabricated by a third party to frame the operator, so it is
+  // treated as "no response from this operator" and produces no evidence.
+  const auto signing_hash = availability_audit_response_signing_hash(r);
+  if (all_zero_sig(r.operator_sig) ||
+      !crypto::ed25519_verify(Bytes(signing_hash.begin(), signing_hash.end()), r.operator_sig,
+                              challenge.operator_pubkey)) {
+    if (error) *error = "unattributable-response";
+    return AvailabilityAuditOutcome::NO_RESPONSE;
+  }
   if (r.challenge_id != challenge.challenge_id || r.operator_pubkey != challenge.operator_pubkey ||
       r.prefix_id != challenge.prefix_id || r.chunk_index != challenge.chunk_index) {
     return invalid(InvalidAvailabilityResponseType::WRONG_PREFIX, "wrong-prefix");
   }
-  if (all_zero_sig(r.operator_sig)) return invalid(InvalidAvailabilityResponseType::MALFORMED_RESPONSE, "missing-signature");
-  const auto signing_hash = availability_audit_response_signing_hash(r);
-  if (!crypto::ed25519_verify(Bytes(signing_hash.begin(), signing_hash.end()), r.operator_sig, r.operator_pubkey)) {
-    return invalid(InvalidAvailabilityResponseType::MALFORMED_RESPONSE, "invalid-signature");
+  // SECURITY: the chunk tree hashes leaves and inner nodes alike and duplicates the last node on
+  // odd levels, so bind the proof to the exact tree shape: in-range index and full depth. This
+  // rejects interior-node-as-leaf and duplicated-tail proofs without changing the committed root.
+  std::size_t expected_depth = 0;
+  for (std::uint64_t n = prefix.chunk_count; n > 1; n = (n + 1) / 2) ++expected_depth;
+  if (prefix.chunk_count == 0 || r.chunk_index >= prefix.chunk_count || r.proof.siblings.size() != expected_depth) {
+    return invalid(InvalidAvailabilityResponseType::INVALID_PROOF, "invalid-proof-shape");
   }
   if (!verify_chunk_merkle_proof(r.chunk_bytes, r.chunk_index, r.proof, prefix.chunk_root)) {
     return invalid(InvalidAvailabilityResponseType::INVALID_PROOF, "invalid-proof");
@@ -2001,7 +2014,7 @@ std::optional<AvailabilityPersistentState> AvailabilityPersistentState::parse(co
 
         auto operator_count = r.varint();
         if (!operator_count) return false;
-        state.operators.reserve(static_cast<std::size_t>(*operator_count));
+        state.operators.reserve(std::min<std::uint64_t>(*operator_count, r.remaining()));
         for (std::uint64_t i = 0; i < *operator_count; ++i) {
           auto operator_state = parse_operator_state(r, state.version);
           if (!operator_state) return false;
@@ -2010,7 +2023,7 @@ std::optional<AvailabilityPersistentState> AvailabilityPersistentState::parse(co
 
         auto prefix_count = r.varint();
         if (!prefix_count) return false;
-        state.retained_prefixes.reserve(static_cast<std::size_t>(*prefix_count));
+        state.retained_prefixes.reserve(std::min<std::uint64_t>(*prefix_count, r.remaining()));
         for (std::uint64_t i = 0; i < *prefix_count; ++i) {
           auto prefix = parse_retained_prefix(r);
           if (!prefix) return false;
@@ -2019,7 +2032,7 @@ std::optional<AvailabilityPersistentState> AvailabilityPersistentState::parse(co
 
         auto evidence_count = r.varint();
         if (!evidence_count) return false;
-        state.evidence.reserve(static_cast<std::size_t>(*evidence_count));
+        state.evidence.reserve(std::min<std::uint64_t>(*evidence_count, r.remaining()));
         for (std::uint64_t i = 0; i < *evidence_count; ++i) {
           auto entry = parse_invalid_evidence(r);
           if (!entry) return false;

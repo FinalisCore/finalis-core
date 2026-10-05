@@ -277,7 +277,7 @@ std::optional<FinalityProof> FinalityProof::parse(const Bytes& b) {
         auto n = r.varint();
         if (!n) return false;
         p.sigs.clear();
-        p.sigs.reserve(*n);
+        p.sigs.reserve(std::min<std::uint64_t>(*n, r.remaining()));
         for (std::uint64_t i = 0; i < *n; ++i) {
           auto pub = r.bytes_fixed<32>();
           auto sig = r.bytes_fixed<64>();
@@ -371,7 +371,7 @@ std::optional<Block> Block::parse(const Bytes& b) {
         auto n = r.varint();
         if (!n || *n < 1) return false;
         blk.txs.clear();
-        blk.txs.reserve(*n);
+        blk.txs.reserve(std::min<std::uint64_t>(*n, r.remaining()));
         for (std::uint64_t i = 0; i < *n; ++i) {
           auto version = r.u32le();
           auto in_count = r.varint();
@@ -403,7 +403,7 @@ std::optional<Block> Block::parse(const Bytes& b) {
         auto sig_count = r.varint();
         if (!sig_count) return false;
         blk.finality_proof.sigs.clear();
-        blk.finality_proof.sigs.reserve(*sig_count);
+        blk.finality_proof.sigs.reserve(std::min<std::uint64_t>(*sig_count, r.remaining()));
         for (std::uint64_t i = 0; i < *sig_count; ++i) {
           auto pub = r.bytes_fixed<32>();
           auto sig = r.bytes_fixed<64>();
@@ -466,7 +466,7 @@ std::optional<FrontierSettlement> FrontierSettlement::parse(const Bytes& b) {
         if (!epoch || !output_count) return false;
         out.settlement_epoch_start = *epoch;
         out.outputs.clear();
-        out.outputs.reserve(static_cast<std::size_t>(*output_count));
+        out.outputs.reserve(std::min<std::uint64_t>(*output_count, r.remaining()));
         for (std::uint64_t i = 0; i < *output_count; ++i) {
           auto pub = r.bytes_fixed<32>();
           auto units = r.u64le();
@@ -656,7 +656,7 @@ std::optional<FrontierProposal> FrontierProposal::parse(const Bytes& b) {
         if (!transition.has_value()) return false;
         out.transition = *transition;
         out.ordered_records.clear();
-        out.ordered_records.reserve(static_cast<std::size_t>(*count));
+        out.ordered_records.reserve(std::min<std::uint64_t>(*count, r.remaining()));
         for (std::uint64_t i = 0; i < *count; ++i) {
           auto record = r.varbytes();
           if (!record) return false;
@@ -703,7 +703,7 @@ std::optional<IngressCertificate> IngressCertificate::parse(const Bytes& b) {
         out.tx_hash = *tx_hash;
         out.prev_lane_root = *prev_lane_root;
         out.sigs.clear();
-        out.sigs.reserve(static_cast<std::size_t>(*sig_count));
+        out.sigs.reserve(std::min<std::uint64_t>(*sig_count, r.remaining()));
         for (std::uint64_t i = 0; i < *sig_count; ++i) {
           auto pub = r.bytes_fixed<32>();
           auto sig = r.bytes_fixed<64>();

@@ -499,7 +499,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         checkpoint.epoch_seed = *seed;
         checkpoint.ticket_difficulty_bits = *difficulty_bits;
         checkpoint.ordered_members.clear();
-        checkpoint.ordered_members.reserve(*count);
+        checkpoint.ordered_members.reserve(std::min<std::uint64_t>(*count, r.remaining()));
         for (std::uint64_t i = 0; i < *count; ++i) {
           auto member = r.bytes_fixed<32>();
           if (!member) return false;
@@ -514,7 +514,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         if (!r.remaining()) return true;
         auto hash_count = r.varint();
         if (!hash_count) return false;
-        checkpoint.ordered_ticket_hashes.reserve(*hash_count);
+        checkpoint.ordered_ticket_hashes.reserve(std::min<std::uint64_t>(*hash_count, r.remaining()));
         for (std::uint64_t i = 0; i < *hash_count; ++i) {
           auto hash = r.bytes_fixed<32>();
           if (!hash) return false;
@@ -523,7 +523,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         if (!r.remaining()) return true;
         auto nonce_count = r.varint();
         if (!nonce_count) return false;
-        checkpoint.ordered_ticket_nonces.reserve(*nonce_count);
+        checkpoint.ordered_ticket_nonces.reserve(std::min<std::uint64_t>(*nonce_count, r.remaining()));
         for (std::uint64_t i = 0; i < *nonce_count; ++i) {
           auto nonce = r.u64le();
           if (!nonce) return false;
@@ -532,7 +532,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         if (!r.remaining()) return true;
         auto operator_count = r.varint();
         if (!operator_count) return false;
-        checkpoint.ordered_operator_ids.reserve(*operator_count);
+        checkpoint.ordered_operator_ids.reserve(std::min<std::uint64_t>(*operator_count, r.remaining()));
         for (std::uint64_t i = 0; i < *operator_count; ++i) {
           auto operator_id = r.bytes_fixed<32>();
           if (!operator_id) return false;
@@ -541,7 +541,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         if (!r.remaining()) return true;
         auto base_weight_count = r.varint();
         if (!base_weight_count) return false;
-        checkpoint.ordered_base_weights.reserve(*base_weight_count);
+        checkpoint.ordered_base_weights.reserve(std::min<std::uint64_t>(*base_weight_count, r.remaining()));
         for (std::uint64_t i = 0; i < *base_weight_count; ++i) {
           auto base_weight = r.u64le();
           if (!base_weight) return false;
@@ -550,7 +550,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         if (!r.remaining()) return true;
         auto ticket_bonus_count = r.varint();
         if (!ticket_bonus_count) return false;
-        checkpoint.ordered_ticket_bonus_bps.reserve(*ticket_bonus_count);
+        checkpoint.ordered_ticket_bonus_bps.reserve(std::min<std::uint64_t>(*ticket_bonus_count, r.remaining()));
         for (std::uint64_t i = 0; i < *ticket_bonus_count; ++i) {
           auto ticket_bonus = r.u32le();
           if (!ticket_bonus) return false;
@@ -559,7 +559,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         if (!r.remaining()) return true;
         auto final_weight_count = r.varint();
         if (!final_weight_count) return false;
-        checkpoint.ordered_final_weights.reserve(*final_weight_count);
+        checkpoint.ordered_final_weights.reserve(std::min<std::uint64_t>(*final_weight_count, r.remaining()));
         for (std::uint64_t i = 0; i < *final_weight_count; ++i) {
           auto final_weight = r.u64le();
           if (!final_weight) return false;
@@ -787,7 +787,7 @@ std::optional<consensus::EpochCommitteeSnapshot> parse_epoch_committee_snapshot(
         snapshot.epoch = *epoch;
         snapshot.challenge_anchor = *anchor;
         snapshot.selected_winners.clear();
-        snapshot.selected_winners.reserve(*winner_count);
+        snapshot.selected_winners.reserve(std::min<std::uint64_t>(*winner_count, r.remaining()));
         for (std::uint64_t i = 0; i < *winner_count; ++i) {
           auto pub = r.bytes_fixed<32>();
           auto work = r.bytes_fixed<32>();
@@ -799,7 +799,7 @@ std::optional<consensus::EpochCommitteeSnapshot> parse_epoch_committee_snapshot(
         auto member_count = r.varint();
         if (!member_count) return false;
         snapshot.ordered_members.clear();
-        snapshot.ordered_members.reserve(*member_count);
+        snapshot.ordered_members.reserve(std::min<std::uint64_t>(*member_count, r.remaining()));
         for (std::uint64_t i = 0; i < *member_count; ++i) {
           auto member = r.bytes_fixed<32>();
           if (!member) return false;
