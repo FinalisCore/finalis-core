@@ -330,3 +330,43 @@ TEST(test_ingress_append_accepts_txv2_payload_when_lane_and_signature_match) {
   ASSERT_TRUE(db.get_ingress_bytes(cert.txid).has_value());
   ASSERT_TRUE(db.get_ingress_certificate(cert.lane, cert.seq).has_value());
 }
+
+TEST(test_frontier_execution_rejects_slice_over_block_confidential_verify_weight) {
+  auto make_tx = [](std::uint8_t tag) {
+    TxV2 tx;
+    TxInV2 in;
+    in.prev_txid.fill(tag);
+    in.kind = TxInputKind::Confidential;
+    in.witness = ConfidentialInputWitnessV2{};
+    tx.inputs.push_back(in);
+    ConfidentialTxOutV2 conf;
+    conf.range_proof = crypto::ProofBytes{Bytes(1000, tag)};
+    tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential, .body = conf});
+    return tx;
+  };
+  const auto a = make_tx(0x31);
+  const auto b = make_tx(0x32);
+  // One confidential input signature + proof bytes + one batch; identity (zero) excess is unsigned.
+  const std::uint64_t per_tx = kConfidentialSignatureVerifyWeight + 1000 + kRangeProofBatchVerifyWeight;
+  ASSERT_EQ(txv2_confidential_verify_weight(a), per_tx);
+  ASSERT_EQ(any_tx_confidential_verify_weight(AnyTx{a}), per_tx);
+  ASSERT_EQ(consensus::ordered_record_confidential_verify_weight(a.serialize()), per_tx);
+
+  const std::vector<Bytes> ordered{a.serialize(), b.serialize()};
+  ConfidentialPolicy policy;
+  SpecialValidationContext ctx;
+  ctx.confidential_policy = &policy;
+
+  // Consensus: the whole transition is invalid when the slice's summed weight exceeds the cap,
+  // even though each tx would merely be rejected on its own.
+  policy.max_block_confidential_verify_weight = 2 * per_tx - 1;
+  consensus::FrontierExecutionResult result;
+  std::string err;
+  ASSERT_TRUE(!consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, &ctx, &result, &err));
+  ASSERT_EQ(err, std::string("frontier-confidential-verify-weight-exceeded"));
+
+  policy.max_block_confidential_verify_weight = 2 * per_tx;
+  err.clear();
+  ASSERT_TRUE(consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, &ctx, &result, &err));
+  ASSERT_EQ(result.decisions.size(), 2u);
+}

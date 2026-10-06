@@ -198,6 +198,8 @@ std::uint64_t derive_adaptive_committee_target(const std::optional<storage::Fina
                                                std::uint64_t qualified_depth, std::uint32_t* expand_streak,
                                                std::uint32_t* contract_streak);
 std::uint64_t derive_adaptive_min_eligible(std::uint64_t target_committee_size);
+// FALLBACK -> NORMAL needs at least this many eligible operators (spec §8: min + 2).
+std::uint64_t fallback_recovery_threshold(std::uint64_t min_eligible_operators);
 std::uint64_t derive_adaptive_min_bond(std::uint64_t target_committee_size, std::uint64_t qualified_depth);
 AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
     const std::optional<storage::FinalizedCommitteeCheckpoint>& checkpoint);

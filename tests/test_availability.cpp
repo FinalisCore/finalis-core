@@ -112,7 +112,9 @@ availability::AvailabilityScenarioSuiteConfig analytics_suite(Hash32 seed) {
   suite.horizon_epochs = 72;
   suite.scenario = analytics_scenario(seed);
   suite.replication_factors = {3, 2};
-  suite.warmup_epochs_values = {14, 8};
+  // Must contain the live default (kWarmupEpochs) so delta/OAT reports find their baseline point.
+  suite.warmup_epochs_values = {static_cast<std::uint32_t>(availability::kWarmupEpochs),
+                                static_cast<std::uint32_t>(availability::kWarmupEpochs * 2)};
   suite.min_warmup_audits_values = {50};
   suite.min_warmup_success_rate_bps_values = {9800};
   suite.score_alpha_bps_values = {9800, 9500};

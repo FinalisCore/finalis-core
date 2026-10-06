@@ -530,6 +530,10 @@ TEST(test_mempool_hashcash_policy_requires_stamp_for_low_fee_txs) {
   ASSERT_TRUE(reparsed.has_value());
   ASSERT_TRUE(reparsed->hashcash.has_value());
   ASSERT_EQ(reparsed->hashcash->bits, 10u);
+  // Stamps are checked against finalized chain time, never local wall clock.
+  ASSERT_TRUE(!mp.accept_tx(*reparsed, view, &err));
+  ASSERT_EQ(err, std::string("no_finalized_timestamp_yet"));
+  mp.on_finalized_block_timestamp(now_unix);
   ASSERT_TRUE(mp.accept_tx(*reparsed, view, &err));
 }
 

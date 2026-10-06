@@ -375,4 +375,58 @@ TEST(test_peer_manager_send_to_closed_peer_returns_false_without_duplicate_disco
   ASSERT_EQ(disconnect_events, 1);
 }
 
+TEST(test_peer_manager_refuses_oversized_payload_without_dropping_peer) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const auto net = mainnet_network();
+  const std::uint16_t port = reserve_test_port();
+  if (port == 0) return;
+
+  p2p::PeerManager listener;
+  p2p::PeerManager dialer;
+  const std::size_t max_payload = 64 * 1024;
+  listener.configure_network(net.magic, net.protocol_version, max_payload);
+  dialer.configure_network(net.magic, net.protocol_version, max_payload);
+  listener.configure_limits({3000, 3000, 3000, 1024 * 1024, 100, 8});
+  dialer.configure_limits({3000, 3000, 3000, 1024 * 1024, 100, 8});
+
+  std::mutex mu;
+  std::condition_variable cv;
+  int connected_peer_id = 0;
+  int pings_received = 0;
+  int disconnect_events = 0;
+
+  listener.set_on_message([&](int, std::uint16_t type, const Bytes&) {
+    if (type != p2p::MsgType::PING) return;
+    std::lock_guard<std::mutex> lk(mu);
+    ++pings_received;
+    cv.notify_all();
+  });
+  dialer.set_on_message([](int, std::uint16_t, const Bytes&) {});
+  dialer.set_on_event([&](int peer_id, p2p::PeerManager::PeerEventType type, const std::string&) {
+    std::lock_guard<std::mutex> lk(mu);
+    if (type == p2p::PeerManager::PeerEventType::CONNECTED) connected_peer_id = peer_id;
+    if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) ++disconnect_events;
+    cv.notify_all();
+  });
+  listener.set_on_event([](int, p2p::PeerManager::PeerEventType, const std::string&) {});
+
+  ASSERT_TRUE(listener.start_listener("127.0.0.1", port));
+  ASSERT_TRUE(dialer.connect_to("127.0.0.1", port));
+  {
+    std::unique_lock<std::mutex> lk(mu);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(2), [&]() { return connected_peer_id != 0; }));
+  }
+
+  ASSERT_TRUE(!dialer.send_to(connected_peer_id, p2p::MsgType::TRANSITION, Bytes(max_payload + 1, 0xAB)));
+  ASSERT_TRUE(dialer.send_to(connected_peer_id, p2p::MsgType::PING, p2p::ser_ping(p2p::PingMsg{7})));
+  {
+    std::unique_lock<std::mutex> lk(mu);
+    ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(2), [&]() { return pings_received >= 1; }));
+    ASSERT_EQ(disconnect_events, 0);
+  }
+
+  listener.stop();
+  dialer.stop();
+}
+
 void register_p2p_tests() {}

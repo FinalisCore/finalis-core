@@ -408,9 +408,10 @@ ModeReason(prevMode, eligibleCount) ==
         ELSE
             [mode |-> "NORMAL", reason |-> "NONE"]
     ELSE
-        IF eligibleCount >= MinEligible + 1 THEN
+        \* Spec §8: +2 recovery margin; min and min + 1 stay sticky.
+        IF eligibleCount >= MinEligible + 2 THEN
             [mode |-> "NORMAL", reason |-> "NONE"]
-        ELSE IF eligibleCount = MinEligible THEN
+        ELSE IF eligibleCount >= MinEligible THEN
             [mode |-> "FALLBACK", reason |-> "HYSTERESIS_RECOVERY_PENDING"]
         ELSE
             [mode |-> "FALLBACK", reason |-> "INSUFFICIENT_ELIGIBLE_OPERATORS"]

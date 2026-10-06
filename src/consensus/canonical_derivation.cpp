@@ -101,18 +101,6 @@ struct AvailabilityCommitteeDecision {
   AdaptiveCheckpointParameters adaptive{};
 };
 
-std::uint64_t target_committee_size_for_qualified_depth(std::uint64_t qualified_depth) {
-  // FIX: The adaptive protocol has only the discrete 16 and 24 targets.
-  // This helper is the deterministic initial target; transitions are handled
-  // below with persisted hysteresis streaks.
-  return qualified_depth >= 24 ? 24 : 16;
-}
-
-std::uint64_t fallback_recovery_threshold(std::uint64_t target_committee_size) {
-  if (target_committee_size <= 3) return target_committee_size;
-  if (target_committee_size <= 7) return target_committee_size + 1;
-  return target_committee_size + 2;
-}
 
 std::optional<storage::FinalizedCommitteeCheckpoint> previous_checkpoint_for_epoch(
     const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state, std::uint64_t epoch_start_height) {
@@ -160,7 +148,7 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   const auto previous_mode =
       previous_checkpoint.has_value() ? std::optional<storage::FinalizedCommitteeDerivationMode>(previous_checkpoint->derivation_mode)
                                       : std::nullopt;
-  const std::uint64_t recovery_threshold = fallback_recovery_threshold(decision.adaptive.target_committee_size);
+  const std::uint64_t recovery_threshold = fallback_recovery_threshold(decision.min_eligible_operators);
   if (previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
       decision.eligible_operator_count < recovery_threshold) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
@@ -2155,8 +2143,18 @@ std::uint64_t qualified_depth_at_checkpoint(const ValidatorRegistry& validators,
   return static_cast<std::uint64_t>(qualified_operators.size());
 }
 
+// Spec §5: availability_min_eligible_operators = committee_size + 3.
 std::uint64_t derive_adaptive_min_eligible(std::uint64_t target_committee_size) {
-  return std::max<std::uint64_t>(1, target_committee_size);
+  return target_committee_size + 3;
+}
+
+// Spec §8: leaving FALLBACK needs min + 2 eligible operators (min and min + 1 stay
+// HYSTERESIS_RECOVERY_PENDING). The +2 margin damps oscillation; it shrinks only for the tiny
+// minimums of the single-operator bootstrap regime, where no margin can be reached.
+std::uint64_t fallback_recovery_threshold(std::uint64_t min_eligible_operators) {
+  if (min_eligible_operators <= 3) return min_eligible_operators;
+  if (min_eligible_operators <= 7) return min_eligible_operators + 1;
+  return min_eligible_operators + 2;
 }
 
 std::uint64_t derive_adaptive_min_bond(std::uint64_t target_committee_size, std::uint64_t qualified_depth) {
@@ -2188,22 +2186,27 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
 std::uint64_t derive_adaptive_committee_target(const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint,
                                                std::uint64_t qualified_depth, std::uint32_t* expand_streak,
                                                std::uint32_t* contract_streak) {
+  // Spec §5: allowed_targets = {16, 24}, initial_target = 16,
+  // expand 16 -> 24 if qualified_depth >= 30 for 4 consecutive epochs,
+  // contract 24 -> 16 if qualified_depth <= 22 for 6 consecutive epochs.
   constexpr std::uint64_t kSmallTarget = 16;
   constexpr std::uint64_t kLargeTarget = 24;
-  constexpr std::uint32_t kExpandEpochs = 6;
-  constexpr std::uint32_t kContractEpochs = 4;
+  constexpr std::uint64_t kExpandMinDepth = 30;
+  constexpr std::uint32_t kExpandEpochs = 4;
+  constexpr std::uint64_t kContractMaxDepth = 22;
+  constexpr std::uint32_t kContractEpochs = 6;
   const auto prior = adaptive_checkpoint_parameters_from_metadata(previous_checkpoint);
   std::uint64_t target = (prior.target_committee_size == kSmallTarget || prior.target_committee_size == kLargeTarget)
                              ? prior.target_committee_size
-                             : target_committee_size_for_qualified_depth(qualified_depth);
+                             : kSmallTarget;
   std::uint32_t expand = 0;
   std::uint32_t contract = 0;
-  // FIX: Persisted streaks make 16/24 transitions deterministic and prevent
-  // one-epoch membership fluctuations from changing the committee target.
-  if (target == kSmallTarget && qualified_depth >= kLargeTarget) {
+  // Persisted streaks count consecutive qualifying epochs; any non-qualifying epoch resets them,
+  // so one-epoch membership fluctuations cannot change the committee target.
+  if (target == kSmallTarget && qualified_depth >= kExpandMinDepth) {
     expand = std::min<std::uint32_t>(kExpandEpochs, prior.target_expand_streak + 1);
     if (expand >= kExpandEpochs) target = kLargeTarget;
-  } else if (target == kLargeTarget && qualified_depth <= kSmallTarget) {
+  } else if (target == kLargeTarget && qualified_depth <= kContractMaxDepth) {
     contract = std::min<std::uint32_t>(kContractEpochs, prior.target_contract_streak + 1);
     if (contract >= kContractEpochs) target = kSmallTarget;
   }

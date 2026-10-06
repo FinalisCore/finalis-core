@@ -197,11 +197,7 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   const auto previous_mode =
       previous_checkpoint.has_value() ? std::optional<storage::FinalizedCommitteeDerivationMode>(previous_checkpoint->derivation_mode)
                                       : std::nullopt;
-  const std::uint64_t recovery_threshold = decision.adaptive.target_committee_size <= 3
-                                               ? decision.adaptive.target_committee_size
-                                               : (decision.adaptive.target_committee_size <= 7
-                                                      ? decision.adaptive.target_committee_size + 1ULL
-                                                      : decision.adaptive.target_committee_size + 2ULL);
+  const std::uint64_t recovery_threshold = consensus::fallback_recovery_threshold(decision.min_eligible_operators);
   if (previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
       decision.eligible_operator_count < recovery_threshold) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
@@ -1576,10 +1572,7 @@ std::vector<consensus::FinalizedCommitteeCandidate> finalized_committee_candidat
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     decision.fallback_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
   } else if (previous_derivation_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
-             decision.eligible_operator_count < (adaptive.target_committee_size <= 3
-                                                     ? adaptive.target_committee_size
-                                                     : (adaptive.target_committee_size <= 7 ? adaptive.target_committee_size + 1ULL
-                                                                                            : adaptive.target_committee_size + 2ULL))) {
+             decision.eligible_operator_count < consensus::fallback_recovery_threshold(decision.min_eligible_operators)) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     decision.fallback_reason = storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING;
   }

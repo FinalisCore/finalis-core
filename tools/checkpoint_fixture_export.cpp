@@ -154,7 +154,7 @@ DerivedCheckpointFixtureExpected derive_checkpoint_fixture_expected(const consen
     out.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     out.reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
   } else if (fixture.previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
-             out.eligible_operator_count < fixture.min_eligible + 1ULL) {
+             out.eligible_operator_count < consensus::fallback_recovery_threshold(fixture.min_eligible)) {
     out.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     out.reason = storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING;
   }
