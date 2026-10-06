@@ -1081,6 +1081,9 @@ UMask=0077
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=${DB_DIR}
+# Lightserver admin RPC socket: /run/finalis/admin.sock (owner-only)
+RuntimeDirectory=finalis
+RuntimeDirectoryMode=0700
 PrivateTmp=true
 PrivateDevices=true
 ProtectProc=invisible

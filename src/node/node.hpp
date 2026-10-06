@@ -76,6 +76,8 @@ struct NodeConfig {
   std::string db_path{"~/.finalis/mainnet"};
   std::string genesis_path;
   bool disable_p2p{false};
+  // Operator consent to run while the committee comes from the emergency prior-committee rule.
+  bool acknowledge_emergency_fallback{false};
   bool fast_start{false};
   bool reindex_on_start{true};
   std::uint64_t startup_frontier_repair_max_rollback{10'000};

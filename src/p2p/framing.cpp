@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
+#include <stdexcept>
 
 #include "codec/bytes.hpp"
 #include "crypto/hash.hpp"
@@ -60,6 +62,9 @@ std::string prefix_kind_string(PrefixKind k) {
 }
 
 Bytes encode_frame(const Frame& f, std::uint32_t magic, std::uint16_t proto_version) {
+  if (f.payload.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::length_error("p2p frame payload exceeds u32 length field");
+  }
   codec::ByteWriter w;
   w.u32le(magic);
   w.u16le(proto_version);

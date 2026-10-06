@@ -525,6 +525,26 @@ committee = first min(K, len(C)) candidates under the final total-order comparat
 
 Unstable top-K selection is forbidden.
 
+### 11.1 Emergency Committee Recovery
+
+The committee is never empty. If no candidate survives (after the empty-active-set escape),
+the checkpoint takes `mode = FALLBACK`, `reason = EMERGENCY_PRIOR_COMMITTEE` and:
+
+```text
+members := []
+for E' in [E, E-1] (the 2 prior epoch checkpoints, newest first):
+    for m in CP[E'].committee_members in order:
+        if len(members) == 4: stop
+        if m already seen: skip
+        if m has no bond, or m.status in {BANNED, ONBOARDING}: skip
+        members.append(m)
+committee := sort_by_pubkey(members)   # weight = own bonded amount, no ticket
+```
+
+If `members` is empty, derivation fails closed (`empty-committee-no-emergency-fallback`).
+Nodes log `CRITICAL` when deriving such a checkpoint and refuse to start on one without
+`--acknowledge-emergency-fallback`.
+
 ## 12. Proposer Schedule Derivation
 
 The proposer schedule for epoch `E+1` is derived exclusively from `CP[E+1]`:

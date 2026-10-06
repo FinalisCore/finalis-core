@@ -1156,6 +1156,12 @@ HistoryFlowClassification classify_wallet_history_flow(std::uint64_t credited, s
   return classify_wallet_history_flow_impl(credited, debited);
 }
 
+WalletWindow::~WalletWindow() {
+  // Workers post results with queued invokeMethod to a QPointer; joining here (before any member
+  // or QObject teardown) guarantees none touches the window after it is gone.
+  background_threads_.shutdown_and_join();
+}
+
 WalletWindow::WalletWindow() {
   build_ui();
   load_settings();
@@ -1774,9 +1780,10 @@ void WalletWindow::poll_finalized_tip_status() {
   const QString wallet_network_name = wallet_ ? QString::fromStdString(wallet_->network_name) : QString{};
   const std::uint64_t generation = ++tip_poll_generation_;
   QPointer<WalletWindow> self(this);
-  std::thread([self, generation, endpoints, wallet_network_name]() mutable {
+  background_threads_.spawn([self, threads = &background_threads_, generation, endpoints, wallet_network_name]() mutable {
     TipPollResult result;
     for (int i = 0; i < endpoints.size(); ++i) {
+      if (threads->shutting_down()) return;
       const QString endpoint = endpoints[i];
       std::string err;
       auto status = lightserver::rpc_get_status(endpoint.toStdString(), &err);
@@ -1842,7 +1849,7 @@ void WalletWindow::poll_finalized_tip_status() {
           }
         },
         Qt::QueuedConnection);
-  }).detach();
+  });
 }
 
 void WalletWindow::apply_selected_theme() {
@@ -2356,7 +2363,7 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
 
   const std::uint64_t generation = ++validator_refresh_generation_;
   QPointer<WalletWindow> self(this);
-  std::thread([self, generation, request = std::move(request), interactive]() mutable {
+  background_threads_.spawn([self, generation, request = std::move(request), interactive]() mutable {
     ValidatorReadinessComputation result;
     result.key_error = request.key_exists ? "Key file is not readable with the current wallet passphrase"
                                           : "Select validator key file";
@@ -2412,7 +2419,7 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
       options.wait_for_sync = true;
       std::string err;
       result.record = finalis::lightserver::rpc_validator_onboarding_status(
-          request.rpc_url.toStdString(), options, request.tracked_txid.toStdString(), &err);
+          finalis::lightserver::kDefaultAdminRpcUrl, options, request.tracked_txid.toStdString(), &err);
       if (!result.record.has_value() && !err.empty()) result.onboarding_error = QString::fromStdString(err);
     }
 
@@ -2744,7 +2751,7 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
           }
         },
         Qt::QueuedConnection);
-  }).detach();
+  });
   }
 
 void WalletWindow::browse_validator_db_path() {
@@ -2833,7 +2840,7 @@ void WalletWindow::start_onboarding_registration_clicked() {
     return;
   }
 
-  auto preview = finalis::lightserver::rpc_validator_onboarding_status(rpc_url.toStdString(), options, "", &err);
+  auto preview = finalis::lightserver::rpc_validator_onboarding_status(finalis::lightserver::kDefaultAdminRpcUrl, options, "", &err);
   if (!preview && !err.empty()) {
     QMessageBox::warning(this, "Register Onboarding Operator", QString::fromStdString(err));
     persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));
@@ -2989,7 +2996,7 @@ void WalletWindow::start_validator_onboarding_clicked() {
   options.wait_for_sync = true;
 
   std::string err;
-  auto preview = finalis::lightserver::rpc_validator_onboarding_status(rpc_url.toStdString(), options, "", &err);
+  auto preview = finalis::lightserver::rpc_validator_onboarding_status(finalis::lightserver::kDefaultAdminRpcUrl, options, "", &err);
   if (!preview && !err.empty()) {
     QMessageBox::warning(this, "Start Validator Onboarding", QString::fromStdString(err));
     persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));
@@ -3018,7 +3025,7 @@ void WalletWindow::start_validator_onboarding_clicked() {
   }
 
   save_settings();
-  auto record = finalis::lightserver::rpc_validator_onboarding_start(rpc_url.toStdString(), options, &err);
+  auto record = finalis::lightserver::rpc_validator_onboarding_start(finalis::lightserver::kDefaultAdminRpcUrl, options, &err);
   if (!record) {
     QMessageBox::warning(this, "Start Validator Onboarding", QString::fromStdString(err));
     persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));
@@ -3244,7 +3251,7 @@ void WalletWindow::request_pending_tx_status_refresh(const QString& txid) {
   pending_tx_status_panel_txid_ = txid;
   const std::uint64_t generation = ++pending_tx_status_generation_;
   QPointer<WalletWindow> self(this);
-  std::thread([self, generation, txid, txid32 = *parsed_txid, endpoints]() mutable {
+  background_threads_.spawn([self, generation, txid, txid32 = *parsed_txid, endpoints]() mutable {
     QString used_endpoint;
     std::string rpc_err;
     std::optional<lightserver::TxStatusView> tx_status;
@@ -3312,7 +3319,7 @@ void WalletWindow::request_pending_tx_status_refresh(const QString& txid) {
           }
         },
         Qt::QueuedConnection);
-  }).detach();
+  });
 }
 
 void WalletWindow::refresh_overview_activity_preview() {
@@ -4001,7 +4008,7 @@ bool WalletWindow::refresh_finalized_send_state(QString* err) {
 
 void WalletWindow::mark_refresh_state_changed() { ++refresh_state_version_; }
 
-WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequest& request) {
+WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequest& request, BackgroundThreads& threads) {
   RefreshResult result;
   std::optional<lightserver::RpcStatusView> status;
   std::optional<lightserver::AddressValidationView> validated_address;
@@ -4068,7 +4075,7 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
 
   for (int i = 0; i < request.endpoints.size(); ++i) {
     const QString endpoint = request.endpoints[i];
-    std::thread([state, i, endpoint, probe_endpoint]() mutable {
+    const bool spawned = threads.spawn([state, i, endpoint, probe_endpoint]() mutable {
       auto probe = probe_endpoint(endpoint);
       {
         std::lock_guard<std::mutex> lock(state->mu);
@@ -4077,16 +4084,28 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
         state->done_count += 1;
       }
       state->cv.notify_one();
-    }).detach();
+    });
+    if (!spawned) {  // window shutting down: count the probe as done (empty result) so the wait ends
+      std::lock_guard<std::mutex> lock(state->mu);
+      state->done_count += 1;
+    }
   }
 
+  // Probe threads (owned by the window's registry) may still be writing after an early
+  // healthy_found wake-up, so only read a snapshot taken under the lock.
+  std::vector<WalletWindow::EndpointProbeResult> probe_results;
   {
     std::unique_lock<std::mutex> lock(state->mu);
     state->cv.wait(lock, [&] { return state->healthy_found || state->done_count == request.endpoints.size(); });
+    probe_results = state->results;
+  }
+  if (threads.shutting_down()) {
+    result.error = "Wallet is shutting down.";
+    return result;
   }
 
-  for (int i = 0; i < static_cast<int>(state->results.size()); ++i) {
-    const auto& probe = state->results[i];
+  for (int i = 0; i < static_cast<int>(probe_results.size()); ++i) {
+    const auto& probe = probe_results[i];
     if (probe.endpoint.isEmpty()) continue;
     if (!probe.healthy) {
       const QString qerr = probe.error.isEmpty() ? "probe failed" : probe.error;
@@ -4127,9 +4146,9 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
                                       [&](const EndpointObservation& obs) { return obs.endpoint == endpoint; });
     if (already != result.observations.end()) continue;
 
-    const auto probe_it = std::find_if(state->results.begin(), state->results.end(),
+    const auto probe_it = std::find_if(probe_results.begin(), probe_results.end(),
                                        [&](const EndpointProbeResult& probe) { return probe.endpoint == endpoint; });
-    if (probe_it != state->results.end()) {
+    if (probe_it != probe_results.end()) {
       if (probe_it->status.has_value()) {
         const auto& endpoint_status = *probe_it->status;
         result.observations.push_back(EndpointObservation{
@@ -4443,7 +4462,10 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   result.remove_sent_txids.assign(remove_sent.begin(), remove_sent.end());
   result.mark_spent_confidential_outpoints = std::move(spent_confidential_outpoints);
   result.released_pending_txids = std::move(released_pending_txids);
-  result.probe_results = state->results;
+  {
+    std::lock_guard<std::mutex> lock(state->mu);
+    result.probe_results = state->results;
+  }
   return result;
 }
 
@@ -4601,8 +4623,10 @@ void WalletWindow::refresh_chain_state(bool interactive) {
   request.finalized_tx_summary_cache = finalized_tx_summary_cache_;
 
   QPointer<WalletWindow> self(this);
-  std::thread([self, generation, base_state_version, interactive, request = std::move(request)]() mutable {
-    auto result = WalletWindow::build_refresh_result(request);
+  // The registry joins this thread before it is destroyed, so the raw pointer stays valid.
+  background_threads_.spawn([self, threads = &background_threads_, generation, base_state_version, interactive,
+                             request = std::move(request)]() mutable {
+    auto result = WalletWindow::build_refresh_result(request, *threads);
     QMetaObject::invokeMethod(
         self,
         [self, generation, base_state_version, interactive, result = std::move(result)]() mutable {
@@ -4610,7 +4634,7 @@ void WalletWindow::refresh_chain_state(bool interactive) {
           self->apply_refresh_result(generation, base_state_version, interactive, std::move(result));
         },
         Qt::QueuedConnection);
-  }).detach();
+  });
 }
 
 std::optional<WalletWindow::LoadedWallet> WalletWindow::load_wallet_file(const QString& path, const QString& passphrase) {
@@ -6222,7 +6246,7 @@ void WalletWindow::submit_mint_deposit() {
 
   const std::uint64_t generation = ++mint_deposit_submit_generation_;
   QPointer<WalletWindow> self(this);
-  std::thread([self, generation, tx_bytes, deposit_txid, mint_url, endpoints, mint_id_copy, recipient_pubkey_hash,
+  background_threads_.spawn([self, generation, tx_bytes, deposit_txid, mint_url, endpoints, mint_id_copy, recipient_pubkey_hash,
                amount_units_copy, amount_text]() mutable {
     MintDepositResult result;
 
@@ -6312,7 +6336,7 @@ void WalletWindow::submit_mint_deposit() {
           self->statusBar()->showMessage(QString("Mint deposit accepted for relay and registered%1.").arg(endpoint_note), 3000);
         },
         Qt::QueuedConnection);
-  }).detach();
+  });
 }
 
 void WalletWindow::issue_mint_note() {
@@ -6412,7 +6436,7 @@ void WalletWindow::submit_mint_redemption() {
 
   const std::uint64_t generation = ++mint_redeem_submit_generation_;
   QPointer<WalletWindow> self(this);
-  std::thread([self, generation, mint_url, redeem_address, selected_notes, amount_units_copy, amount_text]() mutable {
+  background_threads_.spawn([self, generation, mint_url, redeem_address, selected_notes, amount_units_copy, amount_text]() mutable {
     MintRedeemResult result;
     finalis::privacy::MintRedemptionRequest req;
     req.notes = selected_notes;
@@ -6465,7 +6489,7 @@ void WalletWindow::submit_mint_redemption() {
           self->statusBar()->showMessage("Mint redemption created.", 3000);
         },
         Qt::QueuedConnection);
-  }).detach();
+  });
 }
 
 void WalletWindow::refresh_mint_redemption_status() {
@@ -6502,7 +6526,7 @@ void WalletWindow::refresh_mint_redemption_status() {
 
   const std::uint64_t generation = ++mint_status_refresh_generation_;
   QPointer<WalletWindow> self(this);
-  std::thread([self, generation, mint_url, batch_id]() mutable {
+  background_threads_.spawn([self, generation, mint_url, batch_id]() mutable {
     MintStatusResult result;
     std::ostringstream body_json;
     body_json << "{\"redemption_batch_id\":\"" << batch_id.toStdString() << "\"}";
@@ -6553,7 +6577,7 @@ void WalletWindow::refresh_mint_redemption_status() {
           self->statusBar()->showMessage("Mint redemption status refreshed.", 2500);
         },
         Qt::QueuedConnection);
-  }).detach();
+  });
 }
 
 }  // namespace finalis::wallet

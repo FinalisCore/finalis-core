@@ -2234,6 +2234,61 @@ bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, st
          canonical_operator_id(active.front(), *info) == active.front();
 }
 
+std::vector<PubKey32> emergency_fallback_committee_members(
+    const ValidatorRegistry& validators,
+    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
+    std::uint64_t committee_epoch_blocks) {
+  const auto epoch_blocks = std::max<std::uint64_t>(1, committee_epoch_blocks);
+  std::vector<PubKey32> out;
+  std::set<PubKey32> seen;
+  std::uint64_t epoch = epoch_start_height;
+  for (std::uint64_t i = 0; i < kEmergencyFallbackLookbackEpochs && out.size() < kEmergencyFallbackMaxMembers; ++i) {
+    if (epoch <= epoch_blocks) break;
+    epoch -= epoch_blocks;
+    const auto it = checkpoints.find(epoch);
+    if (it == checkpoints.end()) continue;
+    for (const auto& pub : it->second.ordered_members) {
+      if (out.size() >= kEmergencyFallbackMaxMembers) break;
+      if (!seen.insert(pub).second) continue;
+      const auto info = validators.get(pub);
+      if (!info.has_value() || !info->has_bond || info->bonded_amount == 0) continue;
+      if (info->status == ValidatorStatus::BANNED || info->status == ValidatorStatus::ONBOARDING) continue;
+      out.push_back(pub);
+    }
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,
+                                        const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
+                                        std::uint64_t committee_epoch_blocks,
+                                        storage::FinalizedCommitteeCheckpoint* checkpoint) {
+  const auto members =
+      emergency_fallback_committee_members(validators, checkpoints, checkpoint->epoch_start_height, committee_epoch_blocks);
+  if (members.empty()) return false;
+  checkpoint->derivation_mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
+  checkpoint->fallback_reason = storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE;
+  checkpoint->ordered_members.clear();
+  checkpoint->ordered_operator_ids.clear();
+  checkpoint->ordered_base_weights.clear();
+  checkpoint->ordered_ticket_bonus_bps.clear();
+  checkpoint->ordered_final_weights.clear();
+  checkpoint->ordered_ticket_hashes.clear();
+  checkpoint->ordered_ticket_nonces.clear();
+  for (const auto& pub : members) {
+    const auto info = validators.get(pub);  // present: filtered above
+    checkpoint->ordered_members.push_back(pub);
+    checkpoint->ordered_operator_ids.push_back(canonical_operator_id(pub, *info));
+    checkpoint->ordered_base_weights.push_back(info->bonded_amount);
+    checkpoint->ordered_ticket_bonus_bps.push_back(0);
+    checkpoint->ordered_final_weights.push_back(info->bonded_amount);
+    checkpoint->ordered_ticket_hashes.push_back(zero_hash());
+    checkpoint->ordered_ticket_nonces.push_back(0);
+  }
+  return true;
+}
+
 bool bootstrap_operator_grandfathered_for_availability(const ValidatorRegistry& validators, const PubKey32& operator_id,
                                                        std::uint64_t height) {
   for (const auto& [validator_pubkey, info] : validators.all()) {
@@ -2384,6 +2439,13 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
       checkpoint.ordered_ticket_hashes = {zero_hash()};
       checkpoint.ordered_ticket_nonces = {0};
     }
+  }
+  // Never derive an empty committee: recover from recent prior committees, else fail closed.
+  if (checkpoint.ordered_members.empty() &&
+      !apply_emergency_fallback_committee(state.validators, state.finalized_committee_checkpoints,
+                                          cfg.network.committee_epoch_blocks, &checkpoint)) {
+    if (error) *error = "empty-committee-no-emergency-fallback";
+    return false;
   }
   *out = std::move(checkpoint);
   return true;

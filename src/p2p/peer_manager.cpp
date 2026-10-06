@@ -225,6 +225,10 @@ bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
     p = it->second;
   }
 
+  // Peers drop frames above max_payload_len (and score the sender), so never emit one; callers
+  // must chunk. Refusing locally keeps an oversized response from costing us the peer.
+  if (payload.size() > max_payload_len_) return false;
+
   Bytes frame = encode_frame(Frame{msg_type, payload}, magic_, proto_version_);
   bool overflow = false;
   {

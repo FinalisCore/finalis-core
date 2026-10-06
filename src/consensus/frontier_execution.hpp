@@ -51,6 +51,10 @@ bool frontier_merge_certified_ingress(const FrontierVector& prev_vector, const F
                                       const FrontierLaneRoots& prev_lane_roots, FrontierLaneRoots* next_lane_roots,
                                       std::vector<Bytes>* ordered_records, std::string* error);
 
+// Pre-execution confidential verify weight of one ordered record (0 for non-TxV2/unparseable).
+// A transition whose records sum above ConfidentialPolicy::max_block_confidential_verify_weight
+// is invalid ("frontier-confidential-verify-weight-exceeded").
+std::uint64_t ordered_record_confidential_verify_weight(const Bytes& raw_record);
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
                             FrontierExecutionResult* out, std::string* error = nullptr);

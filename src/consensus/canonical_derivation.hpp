@@ -204,6 +204,23 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
 AdaptiveCheckpointParameters derive_adaptive_checkpoint_parameters(
     const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint, std::uint64_t qualified_depth);
 bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, std::uint64_t height);
+
+// Emergency committee recovery (consensus rule). When no candidate survives the checkpoint
+// filters, the committee is the first kEmergencyFallbackMaxMembers distinct members of the
+// kEmergencyFallbackLookbackEpochs most recent prior checkpoints (newest epoch first, checkpoint
+// order within an epoch) that still hold a bond and are not BANNED/ONBOARDING, sorted by pubkey.
+inline constexpr std::size_t kEmergencyFallbackMaxMembers = 4;
+inline constexpr std::uint64_t kEmergencyFallbackLookbackEpochs = 2;
+std::vector<PubKey32> emergency_fallback_committee_members(
+    const ValidatorRegistry& validators,
+    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
+    std::uint64_t committee_epoch_blocks);
+// Fills `checkpoint` (whose ordered_members is empty) with the emergency committee. Returns false
+// when there is no prior committee member to recover from.
+bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,
+                                        const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
+                                        std::uint64_t committee_epoch_blocks,
+                                        storage::FinalizedCommitteeCheckpoint* checkpoint);
 bool bootstrap_operator_grandfathered_for_availability(const ValidatorRegistry& validators, const PubKey32& operator_id,
                                                        std::uint64_t height);
 std::uint64_t count_eligible_operators_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,

@@ -13,6 +13,7 @@ DEFAULT_CONFIGS=(
   "formal/checkpoint_availability_sticky.cfg"
   "formal/checkpoint_availability_ordering.cfg"
   "formal/checkpoint_availability_long_horizon.cfg"
+  "formal/checkpoint_availability_emergency.cfg"
 )
 
 TLA_JAR="${TLA_JAR:-$DEFAULT_JAR}"

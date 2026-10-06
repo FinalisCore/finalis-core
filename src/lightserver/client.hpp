@@ -153,6 +153,9 @@ std::optional<DetailedHistoryPageView> rpc_get_history_page_detailed(const std::
 std::optional<TxView> rpc_get_tx(const std::string& rpc_url, const Hash32& txid, std::string* err);
 std::optional<TxStatusView> rpc_get_tx_status(const std::string& rpc_url, const Hash32& txid, std::string* err);
 BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_bytes, std::string* err);
+// Admin RPCs: only served on the lightserver admin Unix socket (see kDefaultAdminRpcUrl); a TCP
+// endpoint answers them with "method not found".
+inline constexpr const char* kDefaultAdminRpcUrl = "unix:///var/run/finalis/admin.sock";
 std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_status(
     const std::string& rpc_url, const onboarding::ValidatorOnboardingOptions& options, const std::string& tracked_txid_hex,
     std::string* err);

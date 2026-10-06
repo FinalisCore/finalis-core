@@ -965,7 +965,11 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       return out;
     }
     if (input.kind == TxInputKind::Confidential) {
-      ++confidential_input_count;
+      // SECURITY: reject before doing per-input signature work, not after the loop.
+      if (++confidential_input_count > policy.max_confidential_inputs_per_tx) {
+        out.error = "too many confidential inputs";
+        return out;
+      }
       if (!crypto::confidential_backend_status().excess_authorization_available) {
         out.error = "confidential inputs unsupported by zkp backend";
         return out;
@@ -999,6 +1003,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       }
       Hash32 msg32{};
       std::copy(msg->begin(), msg->end(), msg32.begin());
+      if (!consume_verify_budget(&verify_budget_remaining, 1, &out.error)) return out;
       if (!crypto::verify_schnorr_authorization(msg32, witness.one_time_pubkey, witness.spend_sig)) {
         out.error = "confidential input authorization invalid";
         return out;
@@ -1064,7 +1069,10 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       non_excess_output_commitments.push_back(crypto::transparent_amount_commitment(transparent.value));
       continue;
     }
-    ++confidential_output_count;
+    if (++confidential_output_count > policy.max_confidential_outputs_per_tx) {
+      out.error = "too many confidential outputs";
+      return out;
+    }
     if (!crypto::confidential_backend_status().confidential_outputs_supported) {
       out.error = "confidential outputs unsupported by zkp backend";
       return out;
@@ -1098,7 +1106,6 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     proof_commitments.push_back(confidential.value_commitment);
     proofs.push_back(confidential.range_proof);
     non_excess_output_commitments.push_back(confidential.value_commitment);
-    out.cost.confidential_verify_weight += crypto::range_proof_verify_weight(confidential.range_proof);
   }
 
   if (confidential_input_count > policy.max_confidential_inputs_per_tx) {
@@ -1180,7 +1187,31 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
 
   out.ok = true;
   out.cost.fee = tx.fee;
+  // Same weight the block-level cap charges (execute_frontier_slice), so mempool scoring and
+  // block packing agree with consensus.
+  out.cost.confidential_verify_weight = txv2_confidential_verify_weight(tx);
   return out;
+}
+
+std::uint64_t txv2_confidential_verify_weight(const TxV2& tx) {
+  std::uint64_t weight = 0;
+  for (const auto& input : tx.inputs) {
+    if (input.kind == TxInputKind::Confidential) weight += kConfidentialSignatureVerifyWeight;
+  }
+  bool has_range_proof = false;
+  for (const auto& output : tx.outputs) {
+    if (output.kind != TxOutputKind::Confidential) continue;
+    has_range_proof = true;
+    weight += std::get<ConfidentialTxOutV2>(output.body).range_proof.bytes.size();
+  }
+  if (has_range_proof) weight += kRangeProofBatchVerifyWeight;
+  if (!crypto::commitment_is_identity(tx.balance_proof.excess_commitment)) weight += kConfidentialSignatureVerifyWeight;
+  return weight;
+}
+
+std::uint64_t any_tx_confidential_verify_weight(const AnyTx& tx) {
+  if (const auto* v2 = std::get_if<TxV2>(&tx)) return txv2_confidential_verify_weight(*v2);
+  return 0;
 }
 
 AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,

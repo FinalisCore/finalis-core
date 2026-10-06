@@ -132,6 +132,8 @@ const char* checkpoint_fallback_reason_name(storage::FinalizedCommitteeFallbackR
       return "insufficient_eligible_operators";
     case storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING:
       return "hysteresis_recovery_pending";
+    case storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE:
+      return "emergency_prior_committee";
   }
   return "unknown";
 }
@@ -183,8 +185,10 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
         consensus::availability_config_with_min_bond(availability_cfg, decision.adaptive.min_bond));
   }
   if (decision.min_eligible_operators == 0) return decision;
-  decision.effective_committee_size =
-      std::max<std::uint64_t>(1, std::min(decision.eligible_operator_count, decision.adaptive.target_committee_size));
+  // Spec §11 (786f59d): committee = min(K, len(C)); FALLBACK must not shrink K to the eligible
+  // count. Must match consensus::decide_availability_committee_mode or the persisted checkpoint
+  // fails canonical recomputation.
+  decision.effective_committee_size = std::max<std::uint64_t>(1, decision.adaptive.target_committee_size);
   if (decision.eligible_operator_count < decision.min_eligible_operators) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     decision.fallback_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
@@ -1567,8 +1571,7 @@ std::vector<consensus::FinalizedCommitteeCandidate> finalized_committee_candidat
     decision.eligible_operator_count =
         consensus::count_eligible_operators_at_checkpoint(validators, height, *availability_state, adaptive_availability_cfg);
   }
-  decision.effective_committee_size =
-      std::max<std::uint64_t>(1, std::min(decision.eligible_operator_count, adaptive.target_committee_size));
+  decision.effective_committee_size = std::max<std::uint64_t>(1, adaptive.target_committee_size);
   if (decision.min_eligible_operators != 0 && decision.eligible_operator_count < decision.min_eligible_operators) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
     decision.fallback_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS;
@@ -3009,6 +3012,17 @@ bool Node::init() {
   if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(finalized_height_ + 1); checkpoint.has_value()) {
     log_line("epoch-committee-startup next_height=" + std::to_string(finalized_height_ + 1) +
              " source=finalized-checkpoint committee=" + std::to_string(checkpoint->ordered_members.size()));
+    if (checkpoint->fallback_reason == storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE) {
+      log_line("CRITICAL emergency-fallback-committee-active next_height=" + std::to_string(finalized_height_ + 1) +
+               " committee=" + std::to_string(checkpoint->ordered_members.size()) +
+               " acknowledged=" + (cfg_.acknowledge_emergency_fallback ? "true" : "false"));
+      if (!cfg_.acknowledge_emergency_fallback) {
+        std::cerr << "CRITICAL: committee for height " << (finalized_height_ + 1)
+                  << " was derived by the emergency prior-committee rule (no eligible operators).\n"
+                  << "Restart with --acknowledge-emergency-fallback to run in this state.\n";
+        return false;
+      }
+    }
   } else {
     log_line("epoch-committee-startup next_height=" + std::to_string(finalized_height_ + 1) +
              " reason=missing-finalized-committee-checkpoint");
@@ -4508,6 +4522,18 @@ storage::FinalizedCommitteeCheckpoint Node::build_finalized_committee_checkpoint
         log_line("epoch-empty-active-escape epoch=" + std::to_string(epoch_start_height) +
                  " selected=" + short_pub_hex(*fallback) + " reason=deterministic-fallback-member");
       }
+    }
+  }
+  if (checkpoint.ordered_members.empty()) {
+    if (consensus::apply_emergency_fallback_committee(validators_, finalized_committee_checkpoints_,
+                                                      cfg_.network.committee_epoch_blocks, &checkpoint)) {
+      std::string members;
+      for (const auto& pub : checkpoint.ordered_members) members += (members.empty() ? "" : ",") + short_pub_hex(pub);
+      log_line("CRITICAL emergency-fallback-committee epoch=" + std::to_string(epoch_start_height) +
+               " members=" + members + " reason=no-eligible-operators");
+    } else {
+      log_line("CRITICAL empty-committee epoch=" + std::to_string(epoch_start_height) +
+               " reason=no-eligible-operators-and-no-prior-committee");
     }
   }
   return checkpoint;
@@ -9321,6 +9347,7 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
     std::array<Hash32, finalis::INGRESS_LANE_COUNT> expected_lane_roots = canonical_state_->finalized_lane_roots;
     std::array<bool, finalis::INGRESS_LANE_COUNT> lane_blocked{};
     std::size_t total_bytes = 0;
+    std::uint64_t total_verify_weight = 0;
     bool capped = false;
     for (std::uint64_t r = 1; r <= max_delta && !capped; ++r) {
       for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
@@ -9357,11 +9384,14 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                    " reason=" + ordered_record_error);
           return std::nullopt;
         }
+        const auto record_verify_weight = consensus::ordered_record_confidential_verify_weight(ingress.tx_bytes);
         if (selection.ordered_records.size() >= kMaxBlockTxs ||
-            total_bytes + ingress.tx_bytes.size() > kMaxBlockBytes) {
+            total_bytes + ingress.tx_bytes.size() > kMaxBlockBytes ||
+            total_verify_weight + record_verify_weight > confidential_policy_.max_block_confidential_verify_weight) {
           capped = true;
           break;
         }
+        total_verify_weight += record_verify_weight;
         selection.next_vector.lane_max_seq[lane] = seq;
         selection.lane_records[lane].push_back(ingress);
         selection.ordered_records.push_back(ingress.tx_bytes);
@@ -12377,6 +12407,8 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       for (const auto& item : parse_endpoint_list(*v)) cfg.peers.push_back(item);
     } else if (a == "--disable-p2p") {
       cfg.disable_p2p = true;
+    } else if (a == "--acknowledge-emergency-fallback") {
+      cfg.acknowledge_emergency_fallback = true;
     } else if (a == "--fast-start") {
       cfg.fast_start = true;
     } else if (a == "--no-reindex") {

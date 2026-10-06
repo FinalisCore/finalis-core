@@ -273,12 +273,32 @@ bool tx_uses_special_scripts(const AnyTx& tx) {
       tx);
 }
 
+std::uint64_t ordered_record_confidential_verify_weight(const Bytes& raw_record) {
+  const auto tx = parse_any_tx(raw_record);
+  return tx.has_value() ? any_tx_confidential_verify_weight(*tx) : 0;
+}
+
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
                             FrontierExecutionResult* out, std::string* error) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
+  }
+
+  // Consensus: bound the transition's confidential verification work before any state
+  // transition. Every parseable TxV2 is charged, including ones later rejected, because their
+  // signatures and proofs are verified either way.
+  const std::uint64_t max_verify_weight = (ctx && ctx->confidential_policy)
+                                              ? ctx->confidential_policy->max_block_confidential_verify_weight
+                                              : ConfidentialPolicy{}.max_block_confidential_verify_weight;
+  std::uint64_t total_verify_weight = 0;
+  for (const auto& raw_record : ordered_records) {
+    total_verify_weight += ordered_record_confidential_verify_weight(raw_record);
+    if (total_verify_weight > max_verify_weight) {
+      if (error) *error = "frontier-confidential-verify-weight-exceeded";
+      return false;
+    }
   }
 
   UtxoSetV2 work = parent_utxos;
