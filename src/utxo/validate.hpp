@@ -125,6 +125,14 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
                                      const SpecialValidationContext* ctx = nullptr);
 AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                       const SpecialValidationContext* ctx = nullptr);
+
+// Confidential verification weight (consensus). Units are range-proof bytes; signatures and the
+// per-tx range-proof batch carry fixed byte-equivalent charges. Computed from structure alone so a
+// block's total can be bounded before any cryptographic verification or state transition.
+inline constexpr std::uint64_t kConfidentialSignatureVerifyWeight = 256;
+inline constexpr std::uint64_t kRangeProofBatchVerifyWeight = 1024;
+std::uint64_t txv2_confidential_verify_weight(const TxV2& tx);
+std::uint64_t any_tx_confidential_verify_weight(const AnyTx& tx);
 UtxoSetV2 upgrade_utxo_set_v2(const UtxoSet& utxos);
 void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos);
 

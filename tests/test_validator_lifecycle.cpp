@@ -97,8 +97,15 @@ TEST(test_validator_cooldown_enforced_for_exit_rejoin) {
   vr.advance_height(8);
   ASSERT_TRUE(vr.request_unbond(kp->public_key, 8));
 
+  // Rejoin requires the exit to complete first: re-bonding while EXITING would overwrite the
+  // still-locked bond outpoint.
   std::string err;
+  ASSERT_TRUE(!vr.can_register_bond(kp->public_key, 18, BOND_AMOUNT, &err));
+  ASSERT_EQ(err, std::string("validator_rejoin_exit_not_completed"));
+  ASSERT_TRUE(vr.finalize_withdrawal(kp->public_key));
+
   ASSERT_TRUE(!vr.can_register_bond(kp->public_key, 12, BOND_AMOUNT, &err));
+  ASSERT_EQ(err, std::string("validator_rejoin_cooldown"));
   ASSERT_TRUE(vr.can_register_bond(kp->public_key, 18, BOND_AMOUNT, &err));
 }
 
@@ -149,6 +156,9 @@ TEST(test_validator_reregister_keeps_liveness_counters) {
   info->penalty_strikes = 2;
   info->status = consensus::ValidatorStatus::EXITING;
   info->last_exit_height = 12;
+  // Exit completed: bond withdrawn (rejoin while still bonded is rejected).
+  info->has_bond = false;
+  info->bond_outpoint = OutPoint{};
   vr.upsert(kp->public_key, *info);
 
   std::string err;

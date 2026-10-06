@@ -11,6 +11,10 @@
 #include "common/minijson.hpp"
 #include "common/socket_compat.hpp"
 
+#ifndef _WIN32
+#include <sys/un.h>
+#endif
+
 namespace finalis::lightserver {
 namespace {
 
@@ -53,6 +57,35 @@ std::optional<net::SocketHandle> connect_tcp(const std::string& host, std::uint1
   return fd;
 }
 
+// unix://<absolute socket path> -> the lightserver admin surface.
+std::optional<std::string> parse_unix_socket_url(const std::string& url) {
+  const std::string prefix = "unix://";
+  if (url.rfind(prefix, 0) != 0) return std::nullopt;
+  const std::string path = url.substr(prefix.size());
+  if (path.empty() || path.front() != '/') return std::nullopt;
+  return path;
+}
+
+std::optional<net::SocketHandle> connect_unix(const std::string& path) {
+#ifdef _WIN32
+  (void)path;
+  return std::nullopt;
+#else
+  sockaddr_un addr{};
+  if (path.size() >= sizeof(addr.sun_path)) return std::nullopt;
+  const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return std::nullopt;
+  (void)net::set_socket_timeouts(fd, 15'000);
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return std::nullopt;
+  }
+  return fd;
+#endif
+}
+
 std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
   const std::string prefix = "http://";
   if (url.rfind(prefix, 0) != 0) return std::nullopt;
@@ -92,20 +125,29 @@ std::optional<std::string> read_all(net::SocketHandle fd) {
 }
 
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
-  auto parsed = parse_http_url(url);
-  if (!parsed) {
-    if (err) *err = "invalid http url";
-    return std::nullopt;
+  std::optional<net::SocketHandle> fd_opt;
+  std::string path = "/rpc";
+  std::string host_header = "localhost";
+  if (const auto socket_path = parse_unix_socket_url(url); socket_path.has_value()) {
+    fd_opt = connect_unix(*socket_path);
+  } else {
+    auto parsed = parse_http_url(url);
+    if (!parsed) {
+      if (err) *err = "invalid http url";
+      return std::nullopt;
+    }
+    fd_opt = connect_tcp(parsed->host, parsed->port);
+    path = parsed->path;
+    host_header = parsed->host + ":" + std::to_string(parsed->port);
   }
-  auto fd_opt = connect_tcp(parsed->host, parsed->port);
   if (!fd_opt) {
     if (err) *err = "connect failed";
     return std::nullopt;
   }
   const auto fd = *fd_opt;
   std::ostringstream req;
-  req << "POST " << parsed->path << " HTTP/1.1\r\n"
-      << "Host: " << parsed->host << ":" << parsed->port << "\r\n"
+  req << "POST " << path << " HTTP/1.1\r\n"
+      << "Host: " << host_header << "\r\n"
       << "Content-Type: application/json\r\n"
       << "Content-Length: " << body.size() << "\r\n"
       << "Connection: close\r\n\r\n"

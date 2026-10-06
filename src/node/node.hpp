@@ -76,6 +76,8 @@ struct NodeConfig {
   std::string db_path{"~/.finalis/mainnet"};
   std::string genesis_path;
   bool disable_p2p{false};
+  // Operator consent to run while the committee comes from the emergency prior-committee rule.
+  bool acknowledge_emergency_fallback{false};
   bool fast_start{false};
   bool reindex_on_start{true};
   std::uint64_t startup_frontier_repair_max_rollback{10'000};
@@ -584,6 +586,18 @@ class Node {
   std::map<std::uint64_t, Hash32> committee_epoch_randomness_cache_;
   std::uint64_t protocol_reserve_balance_units_{0};
   mutable std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints_;
+  // Result of validate_next_epoch_checkpoint_from_state, which re-derives the whole checkpoint
+  // (including per-operator ticket nonce search). Keyed on everything it reads, so a finalize,
+  // state change, or resync misses the cache rather than needing explicit invalidation.
+  struct NextEpochCheckpointValidation {
+    std::uint64_t epoch_start{0};
+    std::uint64_t finalized_height{0};
+    Hash32 state_commitment{};
+    storage::FinalizedCommitteeCheckpoint checkpoint;
+    bool valid{false};
+    std::string error;
+  };
+  mutable std::optional<NextEpochCheckpointValidation> next_epoch_checkpoint_validation_cache_;
   mutable std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states_;
   std::string last_test_hook_error_;
   std::uint32_t current_round_{0};

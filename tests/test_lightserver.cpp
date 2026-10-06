@@ -9,6 +9,7 @@
 #define getpid _getpid
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -99,6 +100,31 @@ struct Cluster {
   }
 };
 
+// Ephemeral loopback ports for cluster P2P; released before use, so duplicates are rejected.
+std::vector<std::uint16_t> reserve_loopback_ports(int count) {
+  std::vector<std::uint16_t> ports;
+  for (int attempt = 0; static_cast<int>(ports.size()) < count && attempt < count * 8; ++attempt) {
+    if (!finalis::net::ensure_sockets()) break;
+    auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!finalis::net::valid_socket(fd)) break;
+    (void)finalis::net::set_reuseaddr(fd);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    std::uint16_t port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+      sockaddr_in bound{};
+      socklen_t len = sizeof(bound);
+      if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0) port = ntohs(bound.sin_port);
+    }
+    finalis::net::close_socket(fd);
+    if (port != 0 && std::find(ports.begin(), ports.end(), port) == ports.end()) ports.push_back(port);
+  }
+  if (static_cast<int>(ports.size()) != count) throw std::runtime_error("reserve_loopback_ports failed");
+  return ports;
+}
+
 Cluster make_cluster(const std::string& base, int node_count = 4) {
   std::error_code ec;
   std::filesystem::remove_all(base, ec);
@@ -110,17 +136,24 @@ Cluster make_cluster(const std::string& base, int node_count = 4) {
 
   Cluster c;
   c.nodes.reserve(static_cast<std::size_t>(node_count));
+  // Validators must exchange proposals and votes over loopback P2P to reach quorum.
+  const auto ports = reserve_loopback_ports(node_count);
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
     cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.node_id = i;
-    cfg.disable_p2p = true;
+    cfg.disable_p2p = false;
+    cfg.listen = true;
+    cfg.bind_ip = "127.0.0.1";
+    cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
+    for (int j = 0; j < i; ++j) cfg.peers.push_back("127.0.0.1:" + std::to_string(ports[static_cast<std::size_t>(j)]));
     // Match the accelerated timing used by the integration harness. These
     // tests are asserting finalized progression inside seconds, not mainnet's
     // multi-minute production cadence.
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
-    cfg.p2p_port = 0;  // disable_p2p: never bound or dialed
+    cfg.p2p_port = ports[static_cast<std::size_t>(i)];
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.max_committee = static_cast<std::size_t>(node_count);
     cfg.genesis_path = gpath;
@@ -2029,7 +2062,8 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   op.txid.fill(0x6A);
   op.index = 0;
   const auto own_pkh = crypto::h160(Bytes(validator_key.pubkey.begin(), validator_key.pubkey.end()));
-  const TxOut spendable{50'000'000'000, address::p2pkh_script_pubkey(own_pkh)};
+  // Onboarding start now funds the min bond (4000 coins for one active validator) plus fee up front.
+  const TxOut spendable{500'000'000'000, address::p2pkh_script_pubkey(own_pkh)};
   ASSERT_TRUE(db.put_utxo(op, spendable));
   ASSERT_TRUE(db.put_script_utxo(crypto::sha256(spendable.script_pubkey), op, spendable, 1));
   ASSERT_TRUE(db.flush());
@@ -2041,7 +2075,10 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   const std::string start_body =
       std::string(R"({"jsonrpc":"2.0","id":501,"method":"validator_onboarding_start","params":{"key_file":")") + key_file +
       R"(","passphrase":")" + passphrase + R"(","fee":10000,"wait_for_sync":true}})";
-  const auto start_resp = ls.handle_rpc_for_test(start_body);
+  // Admin methods are absent from the public (TCP) surface.
+  const auto public_start_resp = ls.handle_rpc_for_test(start_body);
+  ASSERT_TRUE(public_start_resp.find("\"code\":-32601") != std::string::npos);
+  const auto start_resp = ls.handle_admin_rpc_for_test(start_body);
   ASSERT_TRUE(start_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
   ASSERT_TRUE(start_resp.find("\"onboarding_id\":\"rpc\"") != std::string::npos);
   ASSERT_TRUE(start_resp.find("\"wait_for_sync\":true") != std::string::npos);
@@ -2055,7 +2092,8 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
       std::string(R"({"jsonrpc":"2.0","id":502,"method":"validator_onboarding_status","params":{"key_file":")") + key_file +
       R"(","passphrase":")" + passphrase + R"(","fee":10000,"wait_for_sync":true,"txid_hex":")" + *tracked_txid +
       R"("}})";
-  const auto status_resp = ls.handle_rpc_for_test(status_body);
+  ASSERT_TRUE(ls.handle_rpc_for_test(status_body).find("\"code\":-32601") != std::string::npos);
+  const auto status_resp = ls.handle_admin_rpc_for_test(status_body);
   ASSERT_TRUE(status_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find(std::string("\"txid_hex\":\"") + *tracked_txid + "\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find("\"broadcast_outcome\":\"sent\"") != std::string::npos);
@@ -2068,6 +2106,91 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   ASSERT_TRUE(get_status_resp.find("\"validator_registry_status\":\"NOT_REGISTERED\"") != std::string::npos);
   ASSERT_TRUE(get_status_resp.find("\"onboarding_reward_eligible\":true") != std::string::npos);
   ASSERT_TRUE(get_status_resp.find("\"onboarding_reward_score_units\":7") != std::string::npos);
+}
+
+TEST(test_lightserver_survives_overflowing_content_length) {
+  const std::string base = unique_test_base("/tmp/finalis_light_overflow_cl");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(base));
+    Hash32 tip_hash{};
+    tip_hash[31] = 0x42;
+    ASSERT_TRUE(db.set_tip(storage::TipState{1, tip_hash}));
+    ASSERT_TRUE(db.flush());
+    db.close();
+  }
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lcfg.bind_ip = "127.0.0.1";
+  lcfg.port = 0;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  if (!ls.start()) return;  // no loopback listener in this environment
+  const std::uint16_t port = ls.bound_port();
+
+  // > u64 max: std::stoull used to throw out_of_range on the accept thread and std::terminate.
+  for (const std::string cl : {"99999999999999999999999", "18446744073709551616", "12abc", "-1"}) {
+    auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_TRUE(finalis::net::valid_socket(fd));
+    (void)finalis::net::set_socket_timeouts(fd, 5'000);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ASSERT_TRUE(::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
+    ASSERT_TRUE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string req = "POST /rpc HTTP/1.1\r\nHost: x\r\nContent-Length: " + cl + "\r\n\r\n{}";
+    (void)p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req.data()), req.size());
+    std::array<char, 256> buf{};
+    (void)::recv(fd, buf.data(), buf.size(), 0);  // server closes without a response
+    finalis::net::close_socket(fd);
+  }
+
+  const auto resp = http_post_rpc("127.0.0.1", port, R"({"jsonrpc":"2.0","id":1,"method":"get_tip","params":{}})");
+  ASSERT_TRUE(resp.has_value());
+  ASSERT_TRUE(resp->find("\"height\"") != std::string::npos);
+  ls.stop();
+}
+
+TEST(test_lightserver_rate_limiter_per_ip_and_global_buckets) {
+  lightserver::RateLimiter limiter;
+  const std::uint64_t t0 = 1'000'000;
+  for (std::uint32_t i = 0; i < lightserver::kBroadcastTxPerMinutePerIp; ++i) {
+    ASSERT_TRUE(limiter.check("10.0.0.1", lightserver::RateLimiter::Class::BroadcastTx, t0).allowed);
+  }
+  const auto denied = limiter.check("10.0.0.1", lightserver::RateLimiter::Class::BroadcastTx, t0);
+  ASSERT_TRUE(!denied.allowed);
+  ASSERT_TRUE(denied.retry_after_seconds >= 1u && denied.retry_after_seconds <= 6u);
+  // Separate classes and separate IPs have separate buckets.
+  ASSERT_TRUE(limiter.check("10.0.0.1", lightserver::RateLimiter::Class::Read, t0).allowed);
+  ASSERT_TRUE(limiter.check("10.0.0.2", lightserver::RateLimiter::Class::BroadcastTx, t0).allowed);
+  // Refill: one broadcast token per 6s.
+  ASSERT_TRUE(limiter.check("10.0.0.1", lightserver::RateLimiter::Class::BroadcastTx, t0 + 6'000).allowed);
+
+  lightserver::RateLimiter read_limiter;
+  for (std::uint32_t i = 0; i < lightserver::kPublicReadRequestsPerMinutePerIp; ++i) {
+    ASSERT_TRUE(read_limiter.check("10.0.1.1", lightserver::RateLimiter::Class::Read, t0).allowed);
+  }
+  ASSERT_TRUE(!read_limiter.check("10.0.1.1", lightserver::RateLimiter::Class::Read, t0).allowed);
+
+  // Global cap spans IPs.
+  lightserver::RateLimiter global_limiter;
+  std::uint32_t allowed = 0;
+  for (std::uint32_t ip = 0; ip < 20; ++ip) {
+    for (std::uint32_t i = 0; i < lightserver::kPublicReadRequestsPerMinutePerIp; ++i) {
+      if (global_limiter.check("10.1.0." + std::to_string(ip), lightserver::RateLimiter::Class::Read, t0).allowed) ++allowed;
+    }
+  }
+  ASSERT_EQ(allowed, lightserver::kGlobalRequestsPerMinute);
+}
+
+TEST(test_lightserver_admin_methods_only_on_admin_surface) {
+  ASSERT_TRUE(lightserver::is_admin_rpc_method("validator_onboarding_start"));
+  ASSERT_TRUE(lightserver::is_admin_rpc_method("validator_onboarding_status"));
+  ASSERT_TRUE(!lightserver::is_admin_rpc_method("broadcast_tx"));
+  ASSERT_TRUE(!lightserver::is_admin_rpc_method("get_tip"));
 }
 
 void register_lightserver_tests() {}

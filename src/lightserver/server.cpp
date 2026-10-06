@@ -42,11 +42,17 @@
 #include "utxo/signing.hpp"
 #include "wallet/utxo_selection.hpp"
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/un.h>
+#endif
+
 namespace finalis::lightserver {
 namespace {
 
 constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
 constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
+constexpr std::uint32_t kHttpRequestDeadlineMs = 10'000;
 constexpr std::uint64_t kDefaultPageLimit = 200;
 constexpr std::uint64_t kMaxPageLimit = 1000;
 constexpr std::uint32_t kRelayValidationRulesVersion = 7;
@@ -1203,23 +1209,14 @@ std::string onboarding_record_json_for_rpc(const NetworkConfig& network, const s
   return base;
 }
 
-// SECURITY: the RPC endpoint has no authentication, so it must not act as a confused deputy:
-// key files are confined to <db_path>/keystore, must be passphrase-encrypted (knowing the
-// passphrase is the authorization), and failed unlock attempts are throttled.
+// SECURITY: keystore unlock is reachable only on the admin Unix socket (owner-only, peer uid
+// checked), never on TCP. It still must not act as a confused deputy: key files are confined to
+// <db_path>/keystore and must be passphrase-encrypted (knowing the passphrase is the authorization).
+// The former process-global 1s failure throttle is gone: any client could use it to lock the
+// operator out; public-surface abuse is handled by per-IP token buckets instead.
 std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const std::string& db_path, const std::string& key_file,
                                                                  const std::string& passphrase, std::string* err) {
-  static std::atomic<std::uint64_t> last_failure_ms{0};
-  constexpr std::uint64_t kFailureBackoffMs = 1000;
-  const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  std::chrono::steady_clock::now().time_since_epoch())
-                                                  .count());
-  const auto last = last_failure_ms.load();
-  if (last != 0 && now < last + kFailureBackoffMs) {
-    if (err) *err = "keystore unlock rate-limited; retry later";
-    return std::nullopt;
-  }
   auto fail = [&](const std::string& msg) -> std::optional<keystore::ValidatorKey> {
-    last_failure_ms.store(now);
     if (err) *err = msg;
     return std::nullopt;
   };
@@ -1499,43 +1496,80 @@ bool open_fresh_readonly_db(const std::string& db_path, storage::DB* db) {
   return db->open_readonly(db_path);
 }
 
+// SECURITY: bounded parsing + a whole-request deadline. The accept loop is single-threaded, so a
+// per-recv timeout alone lets one client trickle bytes and hold the server indefinitely.
+bool parse_content_length(const std::string& headers, std::size_t* out) {
+  *out = 0;
+  std::regex cl_re("(^|\r\n)Content-Length:[ \t]*([0-9]{1,10})[ \t]*(\r\n|$)", std::regex_constants::icase);
+  std::smatch m;
+  if (std::regex_search(headers, m, cl_re)) {
+    const auto v = std::stoull(m[2].str());  // <= 10 digits: cannot overflow
+    if (v > kMaxRpcBodyBytes) return false;
+    *out = static_cast<std::size_t>(v);
+    return true;
+  }
+  // Present but malformed (non-numeric, too many digits) is rejected rather than treated as 0.
+  std::regex any_cl("(^|\r\n)Content-Length:", std::regex_constants::icase);
+  return !std::regex_search(headers, any_cl);
+}
+
+bool recv_before_deadline(net::SocketHandle fd, std::array<char, 4096>* buf, std::string* req,
+                          std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return false;
+  const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+  if (!net::wait_readable(fd, static_cast<std::uint32_t>(std::max<long long>(1, remain)))) return false;
+  ssize_t n = ::recv(fd, buf->data(), static_cast<int>(buf->size()), 0);
+  if (n <= 0) return false;
+  req->append(buf->data(), static_cast<size_t>(n));
+  return true;
+}
+
 bool read_http_request(net::SocketHandle fd, std::string* out_req) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHttpRequestDeadlineMs);
   std::string req;
   std::array<char, 4096> buf{};
   while (req.find("\r\n\r\n") == std::string::npos) {
-    ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
-    if (n <= 0) return false;
-    req.append(buf.data(), static_cast<size_t>(n));
+    if (!recv_before_deadline(fd, &buf, &req, deadline)) return false;
     if (req.size() > kMaxHttpHeaderBytes) return false;
   }
 
   const auto hdr_end = req.find("\r\n\r\n");
   const std::string headers = req.substr(0, hdr_end);
-  std::regex cl_re("Content-Length:\\s*([0-9]+)", std::regex_constants::icase);
-  std::smatch m;
   size_t content_len = 0;
-  if (std::regex_search(headers, m, cl_re)) {
-    content_len = static_cast<size_t>(std::stoull(m[1].str()));
-  }
-  if (content_len > kMaxRpcBodyBytes) return false;
+  if (!parse_content_length(headers, &content_len)) return false;
   while (req.size() < hdr_end + 4 + content_len) {
-    ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
-    if (n <= 0) return false;
-    req.append(buf.data(), static_cast<size_t>(n));
+    if (!recv_before_deadline(fd, &buf, &req, deadline)) return false;
   }
   *out_req = req;
   return true;
 }
 
-std::string http_response_json(const std::string& body, int status = 200) {
-  const char* status_text = (status == 200) ? "OK" : "Bad Request";
+std::string http_response_json(const std::string& body, int status = 200, std::uint32_t retry_after_seconds = 0) {
+  const char* status_text = "Bad Request";
+  if (status == 200) status_text = "OK";
+  if (status == 429) status_text = "Too Many Requests";
+  if (status == 503) status_text = "Service Unavailable";
   std::ostringstream oss;
   oss << "HTTP/1.1 " << status << " " << status_text << "\r\n"
       << "Content-Type: application/json\r\n"
-      << "Content-Length: " << body.size() << "\r\n"
-      << "Connection: close\r\n\r\n"
-      << body;
+      << "Content-Length: " << body.size() << "\r\n";
+  if (retry_after_seconds != 0) oss << "Retry-After: " << retry_after_seconds << "\r\n";
+  oss << "Connection: close\r\n\r\n" << body;
   return oss.str();
+}
+
+void send_http_error(net::SocketHandle fd, int status, int rpc_code, const std::string& message,
+                     std::uint32_t retry_after_seconds = 0) {
+  const std::string body = R"({"jsonrpc":"2.0","id":null,"error":{"code":)" + std::to_string(rpc_code) +
+                           R"(,"message":")" + message + R"("}})";
+  const auto resp = http_response_json(body, status, retry_after_seconds);
+  (void)p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(resp.data()), resp.size());
+}
+
+std::uint64_t steady_now_ms() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 }  // namespace
@@ -1573,9 +1607,72 @@ bool Server::start() {
   }
   cfg_.port = bound_port_;
   if (listen(listen_fd_, 64) != 0) return false;
+  // Admin surface is optional: without it the public surface still runs, minus admin methods.
+  if (!start_admin_socket() && !cfg_.admin_socket_path.empty()) {
+    std::cerr << "[lightserver] admin socket unavailable at " << cfg_.admin_socket_path
+              << "; admin RPC (validator onboarding / keystore unlock) disabled\n";
+  }
   running_ = true;
-  accept_thread_ = std::thread([this]() { accept_loop(); });
+  std::size_t workers = cfg_.worker_threads;
+  if (workers == 0) {
+    workers = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 4, 8);
+  }
+  workers_.reserve(workers);
+  for (std::size_t i = 0; i < workers; ++i) workers_.emplace_back([this]() { worker_loop(); });
+  accept_thread_ = std::thread([this]() { accept_loop(listen_fd_, RpcSurface::Public); });
+  if (net::valid_socket(admin_fd_)) {
+    admin_accept_thread_ = std::thread([this]() { accept_loop(admin_fd_, RpcSurface::Admin); });
+  }
   return true;
+}
+
+bool Server::start_admin_socket() {
+#ifdef _WIN32
+  return false;
+#else
+  const auto& path = cfg_.admin_socket_path;
+  if (path.empty()) return false;
+  sockaddr_un addr{};
+  if (path.size() >= sizeof(addr.sun_path)) return false;
+  std::error_code ec;
+  const auto parent = std::filesystem::path(path).parent_path();
+  if (!parent.empty() && !std::filesystem::exists(parent, ec)) {
+    if (!std::filesystem::create_directories(parent, ec) || ec) return false;
+    std::filesystem::permissions(parent, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec);
+  }
+  struct stat st {};
+  if (::lstat(path.c_str(), &st) == 0) {
+    // Never unlink anything but a stale socket; a live one belongs to another server.
+    if (!S_ISSOCK(st.st_mode)) return false;
+    const int probe = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe < 0) return false;
+    sockaddr_un probe_addr{};
+    probe_addr.sun_family = AF_UNIX;
+    std::memcpy(probe_addr.sun_path, path.c_str(), path.size() + 1);
+    const bool live = ::connect(probe, reinterpret_cast<sockaddr*>(&probe_addr), sizeof(probe_addr)) == 0;
+    ::close(probe);
+    if (live) return false;
+    if (::unlink(path.c_str()) != 0) return false;
+  }
+  const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return false;
+  }
+  // Owner-only. The parent directory (systemd RuntimeDirectory, or created 0700 above) closes the
+  // window between bind and chmod; the per-connection peer uid check below is the backstop.
+  if (::chmod(path.c_str(), 0600) != 0 || ::listen(fd, 16) != 0) {
+    ::close(fd);
+    ::unlink(path.c_str());
+    return false;
+  }
+  admin_fd_ = fd;
+  admin_socket_bound_path_ = path;
+  return true;
+#endif
 }
 
 void Server::stop() {
@@ -1586,45 +1683,206 @@ void Server::stop() {
     listen_fd_ = net::kInvalidSocket;
     bound_port_ = 0;
   }
+  if (net::valid_socket(admin_fd_)) {
+    net::shutdown_socket(admin_fd_);
+    net::close_socket(admin_fd_);
+    admin_fd_ = net::kInvalidSocket;
+  }
   if (accept_thread_.joinable()) accept_thread_.join();
+  if (admin_accept_thread_.joinable()) admin_accept_thread_.join();
+  { std::lock_guard<std::mutex> lock(queue_mu_); }  // a worker between predicate check and wait sees the stop
+  queue_cv_.notify_all();
+  for (auto& worker : workers_) {
+    if (worker.joinable()) worker.join();
+  }
+  workers_.clear();
+  {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    for (const auto& job : queue_) net::close_socket(job.fd);
+    queue_.clear();
+  }
+#ifndef _WIN32
+  if (!admin_socket_bound_path_.empty()) {
+    ::unlink(admin_socket_bound_path_.c_str());
+    admin_socket_bound_path_.clear();
+  }
+#endif
 }
 
-std::string Server::handle_rpc_for_test(const std::string& body) { return handle_rpc_body(body); }
+std::string Server::handle_rpc_for_test(const std::string& body) { return handle_rpc_body(body, RpcSurface::Public); }
+std::string Server::handle_admin_rpc_for_test(const std::string& body) {
+  return handle_rpc_body(body, RpcSurface::Admin);
+}
 
-void Server::accept_loop() {
+void Server::accept_loop(net::SocketHandle listen_fd, RpcSurface surface) {
   while (running_) {
-    sockaddr_in addr{};
+    sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
-    auto fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    auto fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
     if (!net::valid_socket(fd)) {
       if (!running_) break;
       continue;
     }
-    (void)net::set_socket_timeouts(fd, 15'000);
-    handle_client(fd);
+    Job job;
+    job.fd = fd;
+    job.surface = surface;
+    if (surface == RpcSurface::Public && addr.ss_family == AF_INET) {
+      char ip[INET_ADDRSTRLEN] = {};
+      const auto* in = reinterpret_cast<const sockaddr_in*>(&addr);
+      if (::inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip)) != nullptr) job.peer_ip = ip;
+    }
+#if defined(__linux__)
+    if (surface == RpcSurface::Admin) {
+      ucred cred{};
+      socklen_t cred_len = sizeof(cred);
+      const bool trusted = ::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0 &&
+                           (cred.uid == ::geteuid() || cred.uid == 0);
+      if (!trusted) {
+        net::close_socket(fd);
+        continue;
+      }
+    }
+#endif
+    bool queued = false;
+    {
+      std::lock_guard<std::mutex> lock(queue_mu_);
+      if (queue_.size() < std::max<std::size_t>(1, cfg_.max_queued_connections)) {
+        queue_.push_back(job);
+        queued = true;
+      }
+    }
+    if (queued) {
+      queue_cv_.notify_one();
+      continue;
+    }
+    // Overloaded: answer immediately on the accept thread, with a short write timeout.
+    (void)net::set_socket_timeouts(fd, 1'000);
+    send_http_error(fd, 503, -32005, "server busy", 1);
     net::shutdown_socket(fd);
     net::close_socket(fd);
   }
 }
 
-void Server::handle_client(net::SocketHandle fd) {
+void Server::worker_loop() {
+  for (;;) {
+    Job job;
+    {
+      std::unique_lock<std::mutex> lock(queue_mu_);
+      queue_cv_.wait(lock, [&] { return !running_ || !queue_.empty(); });
+      if (!running_) return;
+      job = queue_.front();
+      queue_.pop_front();
+    }
+    (void)net::set_socket_timeouts(job.fd, 15'000);
+    // SECURITY: an exception escaping a worker would std::terminate the whole lightserver.
+    try {
+      handle_client(job);
+    } catch (const std::exception& e) {
+      std::cerr << "[lightserver] request failed: " << e.what() << "\n";
+    } catch (...) {
+      std::cerr << "[lightserver] request failed: unknown exception\n";
+    }
+    net::shutdown_socket(job.fd);
+    net::close_socket(job.fd);
+  }
+}
+
+void Server::handle_client(const Job& job) {
+  const auto fd = job.fd;
   std::string req;
   if (!read_http_request(fd, &req)) return;
   const auto first_line_end = req.find("\r\n");
   if (first_line_end == std::string::npos) return;
-  const std::string first = req.substr(0, first_line_end);
-  if (first.rfind("POST /rpc ", 0) != 0) {
-    const std::string body = R"({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid endpoint"}})";
-    const auto resp = http_response_json(body, 400);
-    (void)p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(resp.data()), resp.size());
-    return;
-  }
   const auto hdr_end = req.find("\r\n\r\n");
   if (hdr_end == std::string::npos) return;
+  const bool rpc_endpoint = req.compare(0, 10, "POST /rpc ") == 0;
   const std::string body = req.substr(hdr_end + 4);
-  const std::string out = handle_rpc_body(body);
+  // Every public request is charged, including malformed ones, before any further work.
+  const bool loopback_exempt = cfg_.exempt_loopback_from_rate_limits && job.peer_ip.rfind("127.", 0) == 0;
+  if (job.surface == RpcSurface::Public && !loopback_exempt) {
+    std::optional<std::string> method;
+    if (rpc_endpoint) {
+      if (auto root = minijson::parse(body); root.has_value() && root->is_object()) {
+        if (const auto* m = root->get("method")) method = m->as_string();
+      }
+    }
+    const auto cls = (method.has_value() && *method == "broadcast_tx") ? RateLimiter::Class::BroadcastTx
+                                                                         : RateLimiter::Class::Read;
+    const auto decision = rate_limiter_.check(job.peer_ip, cls, steady_now_ms());
+    if (!decision.allowed) {
+      send_http_error(fd, 429, -32029, "rate limited", decision.retry_after_seconds);
+      return;
+    }
+  }
+  if (!rpc_endpoint) {
+    send_http_error(fd, 400, -32600, "invalid endpoint");
+    return;
+  }
+  const std::string out = handle_rpc_body(body, job.surface);
   const auto resp = http_response_json(out, 200);
   (void)p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(resp.data()), resp.size());
+}
+
+bool is_admin_rpc_method(const std::string& method) {
+  return method == "validator_onboarding_status" || method == "validator_onboarding_start";
+}
+
+bool RateLimiter::take(Bucket* bucket, double per_minute, std::uint64_t now_ms, std::uint32_t* retry_after_seconds) {
+  const double refill_per_ms = per_minute / 60'000.0;
+  if (!bucket->initialized) {
+    bucket->tokens = per_minute;
+    bucket->updated_ms = now_ms;
+    bucket->initialized = true;
+  } else if (now_ms > bucket->updated_ms) {
+    bucket->tokens = std::min(per_minute, bucket->tokens + static_cast<double>(now_ms - bucket->updated_ms) * refill_per_ms);
+    bucket->updated_ms = now_ms;
+  }
+  if (bucket->tokens >= 1.0) {
+    bucket->tokens -= 1.0;
+    return true;
+  }
+  const double wait_ms = (1.0 - bucket->tokens) / refill_per_ms;
+  *retry_after_seconds = std::max<std::uint32_t>(1, static_cast<std::uint32_t>((wait_ms + 999.0) / 1000.0));
+  return false;
+}
+
+void RateLimiter::prune_locked(std::uint64_t now_ms) {
+  constexpr std::uint64_t kIdleMs = 2 * 60'000;  // both buckets are full again after a minute idle
+  for (auto it = per_ip_.begin(); it != per_ip_.end();) {
+    if (now_ms > it->second.last_seen_ms + kIdleMs) {
+      it = per_ip_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+RateLimiter::Decision RateLimiter::check(const std::string& ip, Class cls, std::uint64_t now_ms) {
+  constexpr std::size_t kMaxTrackedIps = 65'536;
+  Decision out;
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = per_ip_.find(ip);
+  if (it == per_ip_.end()) {
+    if (per_ip_.size() >= kMaxTrackedIps) prune_locked(now_ms);
+    if (per_ip_.size() >= kMaxTrackedIps) {
+      // Fail closed rather than grow without bound.
+      out.allowed = false;
+      out.retry_after_seconds = 60;
+      return out;
+    }
+    it = per_ip_.emplace(ip, IpState{}).first;
+  }
+  auto& state = it->second;
+  state.last_seen_ms = now_ms;
+  auto& bucket = cls == Class::BroadcastTx ? state.broadcast : state.read;
+  const double per_ip_rate =
+      cls == Class::BroadcastTx ? kBroadcastTxPerMinutePerIp : kPublicReadRequestsPerMinutePerIp;
+  // Per-IP first so one abusive client cannot drain the global budget it is already denied.
+  if (!take(&bucket, per_ip_rate, now_ms, &out.retry_after_seconds) ||
+      !take(&global_, kGlobalRequestsPerMinute, now_ms, &out.retry_after_seconds)) {
+    out.allowed = false;
+  }
+  return out;
 }
 
 std::string Server::make_error(const std::string& id_token, int code, const std::string& msg) const {
@@ -1753,7 +2011,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
   return true;
 }
 
-std::string Server::handle_rpc_body(const std::string& body) {
+std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface) {
   if (body.size() > kMaxRpcBodyBytes) return make_error("null", -32600, "request too large");
   auto root = minijson::parse(body);
   if (!root.has_value() || !root->is_object()) return make_error("null", -32600, "invalid json");
@@ -1762,6 +2020,8 @@ std::string Server::handle_rpc_body(const std::string& body) {
   const auto* id_value = root->get("id");
   const std::string id = id_value ? minijson::stringify(*id_value) : "null";
   if (!method.has_value()) return make_error(id, -32600, "missing method");
+  // Admin methods do not exist on the public (TCP) surface.
+  if (surface != RpcSurface::Admin && is_admin_rpc_method(*method)) return make_error(id, -32601, "method not found");
   const minijson::Value* params = params_object(*root);
   storage::DB live_db;
   const storage::DB* view = &db_;
@@ -1946,6 +2206,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
           break;
         case storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING:
           oss << "\"hysteresis_recovery_pending\"";
+          break;
+        case storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE:
+          oss << "\"emergency_prior_committee\"";
           break;
         default:
           oss << "\"unknown\"";
@@ -2199,6 +2462,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
           break;
         case storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING:
           oss << "hysteresis_recovery_pending";
+          break;
+        case storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE:
+          oss << "emergency_prior_committee";
           break;
         default:
           oss << "unknown";
@@ -2892,6 +3158,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
         case storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING:
           oss << "\"hysteresis_recovery_pending\"";
           break;
+        case storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE:
+          oss << "\"emergency_prior_committee\"";
+          break;
         default:
           oss << "\"unknown\"";
           break;
@@ -3208,6 +3477,14 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next();
       if (!v) return std::nullopt;
       cfg.max_committee = static_cast<std::size_t>(std::stoull(*v));
+    } else if (a == "--admin-socket") {
+      auto v = next();
+      if (!v || v->empty()) return std::nullopt;
+      cfg.admin_socket_path = *v;
+    } else if (a == "--no-admin-socket") {
+      cfg.admin_socket_path.clear();
+    } else if (a == "--rate-limit-loopback") {
+      cfg.exempt_loopback_from_rate_limits = false;
     } else {
       return std::nullopt;
     }

@@ -538,6 +538,23 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
 void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos);
 ```
 
+Block-level verify weight (consensus rule). Before any state transition, a frontier transition
+sums the structural verify weight of every parseable TxV2 in its ordered slice (including txs that
+are later rejected) and is invalid (`frontier-confidential-verify-weight-exceeded`) when the sum
+exceeds `max_block_confidential_verify_weight`:
+
+```text
+txv2_confidential_verify_weight(tx) =
+    256  * count(confidential inputs)            # spend signature
+  + sum(range_proof.bytes.size())                # per confidential output
+  + 1024 * (1 if any confidential output else 0) # range proof batch
+  + 256  * (1 if excess commitment is not identity else 0)  # excess authorization
+```
+
+Proposers stop adding ingress records before the cap; `TxValidationCost.confidential_verify_weight`
+reports the same value.
+
+
 Extend `SpecialValidationContext`:
 
 ```cpp

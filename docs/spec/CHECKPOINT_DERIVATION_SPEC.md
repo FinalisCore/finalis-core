@@ -208,6 +208,11 @@ dynamic_min_bond = clamp(150 * sqrt(committee_size / max(qualified_depth, 1)), 1
 availability_min_bond = dynamic_min_bond
 ```
 
+Streaks (`target_expand_streak`, `target_contract_streak`) are persisted in the checkpoint, count
+consecutive qualifying epochs, and reset to 0 on any epoch that does not qualify. A prior
+checkpoint whose target is not in `allowed_targets` (genesis / bootstrap grace) restarts at
+`initial_target`.
+
 All amounts above are in whole-coin units conceptually and are implemented in deterministic integer base-unit arithmetic.
 
 ### 5.4 Operator Committee Input
@@ -417,16 +422,21 @@ if prev == NORMAL:
         reason = NONE
 
 if prev == FALLBACK:
-    if eligible >= min + 1:
+    if eligible >= min + 2:
         mode   = NORMAL
         reason = NONE
-    else if eligible == min:
+    else if eligible >= min:          # min or min + 1
         mode   = FALLBACK
         reason = HYSTERESIS_RECOVERY_PENDING
     else:
         mode   = FALLBACK
         reason = INSUFFICIENT_ELIGIBLE_OPERATORS
 ```
+
+The `+2` recovery margin is intentional: a network hovering at the minimum must not oscillate
+between NORMAL and FALLBACK epoch to epoch. Implementation: `fallback_recovery_threshold(min)`.
+It only shrinks for the tiny minimums of the single-operator bootstrap grace (`min <= 3`: `min`,
+`min <= 7`: `min + 1`), which never apply under the live rule `min = committee_size + 3 >= 19`.
 
 Derived observability flag:
 
@@ -524,6 +534,26 @@ committee = first min(K, len(C)) candidates under the final total-order comparat
 ```
 
 Unstable top-K selection is forbidden.
+
+### 11.1 Emergency Committee Recovery
+
+The committee is never empty. If no candidate survives (after the empty-active-set escape),
+the checkpoint takes `mode = FALLBACK`, `reason = EMERGENCY_PRIOR_COMMITTEE` and:
+
+```text
+members := []
+for E' in [E, E-1] (the 2 prior epoch checkpoints, newest first):
+    for m in CP[E'].committee_members in order:
+        if len(members) == 4: stop
+        if m already seen: skip
+        if m has no bond, or m.status in {BANNED, ONBOARDING}: skip
+        members.append(m)
+committee := sort_by_pubkey(members)   # weight = own bonded amount, no ticket
+```
+
+If `members` is empty, derivation fails closed (`empty-committee-no-emergency-fallback`).
+Nodes log `CRITICAL` when deriving such a checkpoint and refuse to start on one without
+`--acknowledge-emergency-fallback`.
 
 ## 12. Proposer Schedule Derivation
 
@@ -644,10 +674,10 @@ function DeriveCheckpointForEpoch(next_epoch, S):
             mode   := NORMAL
             reason := NONE
     else:
-        if eligible_cnt >= min_ops + 1:
+        if eligible_cnt >= min_ops + 2:
             mode   := NORMAL
             reason := NONE
-        else if eligible_cnt == min_ops:
+        else if eligible_cnt >= min_ops:
             mode   := FALLBACK
             reason := HYSTERESIS_RECOVERY_PENDING
         else:

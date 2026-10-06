@@ -1517,9 +1517,9 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli onboarding-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
-     << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync] [--rpc-only]\n"
-     << "  finalis-cli validator-register-status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--json] [--rpc-only]\n"
-     << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--pass <pass>] [--rpc-only]  # cancel attempt before broadcast; detach local tracking after broadcast\n"
+     << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync] [--rpc-only]\n"
+     << "  finalis-cli validator-register-status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--json] [--rpc-only]\n"
+     << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--rpc-only]  # cancel attempt before broadcast; detach local tracking after broadcast\n"
      << "  finalis-cli wallet_create --out <path> [--pass <pass>] [--network mainnet] [--seed-hex <32b-hex>]\n"
      << "  finalis-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network mainnet]\n"
      << "  finalis-cli wallet_address --file <path> [--pass <pass>]\n"
@@ -3337,6 +3337,8 @@ int main(int argc, char** argv) {
     std::string file_path = default_mainnet_validator_key_path();
     std::string passphrase;
     std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    // Onboarding status/start are admin RPCs, served only on the lightserver admin Unix socket.
+    std::string admin_rpc_url = finalis::lightserver::kDefaultAdminRpcUrl;
     std::uint64_t fee = 10'000;
     bool wait_for_sync = true;
     bool watch = true;
@@ -3349,6 +3351,7 @@ int main(int argc, char** argv) {
       else if (a == "--file" && i + 1 < argc) file_path = argv[++i];
       else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
       else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--admin-rpc" && i + 1 < argc) admin_rpc_url = argv[++i];
       else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (a == "--wait-for-sync") wait_for_sync = true;
       else if (a == "--no-wait-for-sync") wait_for_sync = false;
@@ -3375,7 +3378,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (cmd == "validator-register-status") {
       std::string status_source = "rpc";
-      auto record = rpc_onboarding_status_with_local_tracking(rpc_url, options, &err);
+      auto record = rpc_onboarding_status_with_local_tracking(admin_rpc_url, options, &err);
       if (!record) {
         if (rpc_only) {
           std::cerr << "validator-register-status failed: rpc status failed: " << err << "\n";
@@ -3416,7 +3419,7 @@ int main(int argc, char** argv) {
             }
             return 1;
           }
-          auto rpc_status = rpc_onboarding_status_with_local_tracking(rpc_url, options, &status_err);
+          auto rpc_status = rpc_onboarding_status_with_local_tracking(admin_rpc_url, options, &status_err);
           if (rpc_status) {
             print_onboarding_record(*rpc_status, as_json, "rpc");
             std::cerr
@@ -3447,7 +3450,7 @@ int main(int argc, char** argv) {
     }
 
     bool using_rpc = true;
-    auto record = finalis::lightserver::rpc_validator_onboarding_start(rpc_url, options, &err);
+    auto record = finalis::lightserver::rpc_validator_onboarding_start(admin_rpc_url, options, &err);
     if (!record) {
       if (rpc_only) {
         std::cerr << "validator-register failed: rpc start failed: " << err << "\n";
@@ -3472,7 +3475,7 @@ int main(int argc, char** argv) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
       std::optional<finalis::onboarding::ValidatorOnboardingRecord> updated;
       if (using_rpc) {
-        updated = finalis::lightserver::rpc_validator_onboarding_status(rpc_url, options, tracked_txid, &err);
+        updated = finalis::lightserver::rpc_validator_onboarding_status(admin_rpc_url, options, tracked_txid, &err);
       } else {
         updated = service.poll(options, &err);
       }

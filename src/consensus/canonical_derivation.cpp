@@ -101,18 +101,6 @@ struct AvailabilityCommitteeDecision {
   AdaptiveCheckpointParameters adaptive{};
 };
 
-std::uint64_t target_committee_size_for_qualified_depth(std::uint64_t qualified_depth) {
-  // FIX: The adaptive protocol has only the discrete 16 and 24 targets.
-  // This helper is the deterministic initial target; transitions are handled
-  // below with persisted hysteresis streaks.
-  return qualified_depth >= 24 ? 24 : 16;
-}
-
-std::uint64_t fallback_recovery_threshold(std::uint64_t target_committee_size) {
-  if (target_committee_size <= 3) return target_committee_size;
-  if (target_committee_size <= 7) return target_committee_size + 1;
-  return target_committee_size + 2;
-}
 
 std::optional<storage::FinalizedCommitteeCheckpoint> previous_checkpoint_for_epoch(
     const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state, std::uint64_t epoch_start_height) {
@@ -160,7 +148,7 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   const auto previous_mode =
       previous_checkpoint.has_value() ? std::optional<storage::FinalizedCommitteeDerivationMode>(previous_checkpoint->derivation_mode)
                                       : std::nullopt;
-  const std::uint64_t recovery_threshold = fallback_recovery_threshold(decision.adaptive.target_committee_size);
+  const std::uint64_t recovery_threshold = fallback_recovery_threshold(decision.min_eligible_operators);
   if (previous_mode == storage::FinalizedCommitteeDerivationMode::FALLBACK &&
       decision.eligible_operator_count < recovery_threshold) {
     decision.mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
@@ -2155,8 +2143,18 @@ std::uint64_t qualified_depth_at_checkpoint(const ValidatorRegistry& validators,
   return static_cast<std::uint64_t>(qualified_operators.size());
 }
 
+// Spec §5: availability_min_eligible_operators = committee_size + 3.
 std::uint64_t derive_adaptive_min_eligible(std::uint64_t target_committee_size) {
-  return std::max<std::uint64_t>(1, target_committee_size);
+  return target_committee_size + 3;
+}
+
+// Spec §8: leaving FALLBACK needs min + 2 eligible operators (min and min + 1 stay
+// HYSTERESIS_RECOVERY_PENDING). The +2 margin damps oscillation; it shrinks only for the tiny
+// minimums of the single-operator bootstrap regime, where no margin can be reached.
+std::uint64_t fallback_recovery_threshold(std::uint64_t min_eligible_operators) {
+  if (min_eligible_operators <= 3) return min_eligible_operators;
+  if (min_eligible_operators <= 7) return min_eligible_operators + 1;
+  return min_eligible_operators + 2;
 }
 
 std::uint64_t derive_adaptive_min_bond(std::uint64_t target_committee_size, std::uint64_t qualified_depth) {
@@ -2188,22 +2186,27 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
 std::uint64_t derive_adaptive_committee_target(const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint,
                                                std::uint64_t qualified_depth, std::uint32_t* expand_streak,
                                                std::uint32_t* contract_streak) {
+  // Spec §5: allowed_targets = {16, 24}, initial_target = 16,
+  // expand 16 -> 24 if qualified_depth >= 30 for 4 consecutive epochs,
+  // contract 24 -> 16 if qualified_depth <= 22 for 6 consecutive epochs.
   constexpr std::uint64_t kSmallTarget = 16;
   constexpr std::uint64_t kLargeTarget = 24;
-  constexpr std::uint32_t kExpandEpochs = 6;
-  constexpr std::uint32_t kContractEpochs = 4;
+  constexpr std::uint64_t kExpandMinDepth = 30;
+  constexpr std::uint32_t kExpandEpochs = 4;
+  constexpr std::uint64_t kContractMaxDepth = 22;
+  constexpr std::uint32_t kContractEpochs = 6;
   const auto prior = adaptive_checkpoint_parameters_from_metadata(previous_checkpoint);
   std::uint64_t target = (prior.target_committee_size == kSmallTarget || prior.target_committee_size == kLargeTarget)
                              ? prior.target_committee_size
-                             : target_committee_size_for_qualified_depth(qualified_depth);
+                             : kSmallTarget;
   std::uint32_t expand = 0;
   std::uint32_t contract = 0;
-  // FIX: Persisted streaks make 16/24 transitions deterministic and prevent
-  // one-epoch membership fluctuations from changing the committee target.
-  if (target == kSmallTarget && qualified_depth >= kLargeTarget) {
+  // Persisted streaks count consecutive qualifying epochs; any non-qualifying epoch resets them,
+  // so one-epoch membership fluctuations cannot change the committee target.
+  if (target == kSmallTarget && qualified_depth >= kExpandMinDepth) {
     expand = std::min<std::uint32_t>(kExpandEpochs, prior.target_expand_streak + 1);
     if (expand >= kExpandEpochs) target = kLargeTarget;
-  } else if (target == kLargeTarget && qualified_depth <= kSmallTarget) {
+  } else if (target == kLargeTarget && qualified_depth <= kContractMaxDepth) {
     contract = std::min<std::uint32_t>(kContractEpochs, prior.target_contract_streak + 1);
     if (contract >= kContractEpochs) target = kSmallTarget;
   }
@@ -2232,6 +2235,61 @@ bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, st
   const bool genesis_bond = info->bond_outpoint.txid == zero_hash() && info->bond_outpoint.index == 0;
   return info->joined_height == 0 && genesis_bond &&
          canonical_operator_id(active.front(), *info) == active.front();
+}
+
+std::vector<PubKey32> emergency_fallback_committee_members(
+    const ValidatorRegistry& validators,
+    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
+    std::uint64_t committee_epoch_blocks) {
+  const auto epoch_blocks = std::max<std::uint64_t>(1, committee_epoch_blocks);
+  std::vector<PubKey32> out;
+  std::set<PubKey32> seen;
+  std::uint64_t epoch = epoch_start_height;
+  for (std::uint64_t i = 0; i < kEmergencyFallbackLookbackEpochs && out.size() < kEmergencyFallbackMaxMembers; ++i) {
+    if (epoch <= epoch_blocks) break;
+    epoch -= epoch_blocks;
+    const auto it = checkpoints.find(epoch);
+    if (it == checkpoints.end()) continue;
+    for (const auto& pub : it->second.ordered_members) {
+      if (out.size() >= kEmergencyFallbackMaxMembers) break;
+      if (!seen.insert(pub).second) continue;
+      const auto info = validators.get(pub);
+      if (!info.has_value() || !info->has_bond || info->bonded_amount == 0) continue;
+      if (info->status == ValidatorStatus::BANNED || info->status == ValidatorStatus::ONBOARDING) continue;
+      out.push_back(pub);
+    }
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,
+                                        const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
+                                        std::uint64_t committee_epoch_blocks,
+                                        storage::FinalizedCommitteeCheckpoint* checkpoint) {
+  const auto members =
+      emergency_fallback_committee_members(validators, checkpoints, checkpoint->epoch_start_height, committee_epoch_blocks);
+  if (members.empty()) return false;
+  checkpoint->derivation_mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
+  checkpoint->fallback_reason = storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE;
+  checkpoint->ordered_members.clear();
+  checkpoint->ordered_operator_ids.clear();
+  checkpoint->ordered_base_weights.clear();
+  checkpoint->ordered_ticket_bonus_bps.clear();
+  checkpoint->ordered_final_weights.clear();
+  checkpoint->ordered_ticket_hashes.clear();
+  checkpoint->ordered_ticket_nonces.clear();
+  for (const auto& pub : members) {
+    const auto info = validators.get(pub);  // present: filtered above
+    checkpoint->ordered_members.push_back(pub);
+    checkpoint->ordered_operator_ids.push_back(canonical_operator_id(pub, *info));
+    checkpoint->ordered_base_weights.push_back(info->bonded_amount);
+    checkpoint->ordered_ticket_bonus_bps.push_back(0);
+    checkpoint->ordered_final_weights.push_back(info->bonded_amount);
+    checkpoint->ordered_ticket_hashes.push_back(zero_hash());
+    checkpoint->ordered_ticket_nonces.push_back(0);
+  }
+  return true;
 }
 
 bool bootstrap_operator_grandfathered_for_availability(const ValidatorRegistry& validators, const PubKey32& operator_id,
@@ -2384,6 +2442,13 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
       checkpoint.ordered_ticket_hashes = {zero_hash()};
       checkpoint.ordered_ticket_nonces = {0};
     }
+  }
+  // Never derive an empty committee: recover from recent prior committees, else fail closed.
+  if (checkpoint.ordered_members.empty() &&
+      !apply_emergency_fallback_committee(state.validators, state.finalized_committee_checkpoints,
+                                          cfg.network.committee_epoch_blocks, &checkpoint)) {
+    if (error) *error = "empty-committee-no-emergency-fallback";
+    return false;
   }
   *out = std::move(checkpoint);
   return true;

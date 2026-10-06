@@ -85,6 +85,10 @@ storage::NodeRuntimeStatusSnapshot ready_snapshot(std::uint64_t local_height) {
   return snapshot;
 }
 
+// Covers the mainnet dynamic validator min bond (1'000-coin floor scaled by sqrt(target/active),
+// capped at the 5'000-coin ceiling) plus fee, so flows proceed past WAITING_FOR_FUNDS.
+constexpr std::uint64_t kAmpleBondFunding = 10'000ULL * 100'000'000ULL;
+
 onboarding::ValidatorOnboardingOptions make_options(const std::filesystem::path& db_dir, const std::string& passphrase) {
   onboarding::ValidatorOnboardingOptions options;
   options.db_path = db_dir.string();
@@ -209,7 +213,7 @@ TEST(test_validator_onboarding_broadcast_failure_transitions_to_failed) {
   ASSERT_TRUE(db.open(dir.string()));
   ASSERT_TRUE(db.set_tip(storage::TipState{400, Hash32{}}));
   ASSERT_TRUE(db.put_node_runtime_status_snapshot(ready_snapshot(400)));
-  put_spendable_p2pkh(db, key, 0x31, 60'000'000'000);
+  put_spendable_p2pkh(db, key, 0x31, kAmpleBondFunding);
   db.close();
 
   auto options = make_options(dir, passphrase);
@@ -270,7 +274,7 @@ TEST(test_validator_onboarding_stale_readiness_fails_closed) {
   auto snapshot = ready_snapshot(600);
   snapshot.captured_at_unix_ms = 1;
   ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
-  put_spendable_p2pkh(db, key, 0x41, 5'100'000'000);
+  put_spendable_p2pkh(db, key, 0x41, kAmpleBondFunding);
   db.close();
 
   onboarding::ValidatorOnboardingService service;
@@ -281,8 +285,12 @@ TEST(test_validator_onboarding_stale_readiness_fails_closed) {
   std::string err;
   const auto record = service.start_or_resume(options, &err);
   ASSERT_TRUE(record.has_value());
-  ASSERT_EQ(record->state, onboarding::ValidatorOnboardingState::WAITING_FOR_FUNDS);
+  // Funded, but a stale readiness snapshot cannot authorize registration: park before any
+  // input reservation, build, or broadcast.
+  ASSERT_EQ(record->state, onboarding::ValidatorOnboardingState::WAITING_FOR_SYNC);
   ASSERT_EQ(record->broadcast_outcome, onboarding::ValidatorOnboardingBroadcastOutcome::NONE);
+  ASSERT_TRUE(!record->selected_inputs_reserved);
+  ASSERT_TRUE(record->tx_bytes.empty());
   ASSERT_TRUE(record->last_error_code.empty());
 }
 
@@ -294,7 +302,7 @@ TEST(test_validator_onboarding_ambiguous_broadcast_resumes_same_attempt_without_
   ASSERT_TRUE(db.open(dir.string()));
   ASSERT_TRUE(db.set_tip(storage::TipState{700, Hash32{}}));
   ASSERT_TRUE(db.put_node_runtime_status_snapshot(ready_snapshot(700)));
-  put_spendable_p2pkh(db, key, 0x51, 60'000'000'000);
+  put_spendable_p2pkh(db, key, 0x51, kAmpleBondFunding);
   db.close();
 
   auto options = make_options(dir, passphrase);

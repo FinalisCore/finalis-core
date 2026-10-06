@@ -526,9 +526,10 @@ def derive_mode_reason(previous_mode: str, eligible_count: int, min_eligible: in
         if eligible_count < min_eligible:
             return MODE_FALLBACK, REASON_INSUFFICIENT
         return MODE_NORMAL, REASON_NONE
-    if eligible_count >= min_eligible + 1:
+    # Live rule (spec §8): FALLBACK -> NORMAL needs min + 2; min and min + 1 stay sticky.
+    if eligible_count >= min_eligible + 2:
         return MODE_NORMAL, REASON_NONE
-    if eligible_count == min_eligible:
+    if eligible_count >= min_eligible:
         return MODE_FALLBACK, REASON_STICKY
     return MODE_FALLBACK, REASON_INSUFFICIENT
 
@@ -800,7 +801,7 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
             epochs_at_exact_threshold += 1
         if eligible_count < params.min_eligible:
             epochs_below_threshold += 1
-        if eligible_count == params.min_eligible + 1:
+        if eligible_count == params.min_eligible + 2:
             epochs_at_recovery_threshold += 1
         if fallback_sticky and not previous_sticky:
             sticky_fallback_entry_count += 1
@@ -1359,10 +1360,17 @@ def build_join_exit_boundary_adversary() -> SimulationScenario:
     )
 
 
+# Live consensus rules (CHECKPOINT_DERIVATION_SPEC.md §5, §8) at the initial target of 16:
+# - min_eligible = committee_size + 3 = 19
+# - fallback exit at min_eligible + 2 = 21 (29 at size 24): applied to every profile by
+#   derive_mode_reason, not a profile field
+# - grow 16 -> 24 at qualified_depth >= 30 for 4 epochs; shrink 24 -> 16 at <= 22 for 6 epochs.
+#   Not simulated: the simulator holds committee_size fixed per profile, so this profile is the
+#   live regime before any growth.
 CURRENT_LIKE_PROFILE = CandidateProfile(
     name="current_like_baseline",
     committee_size=16,
-    min_eligible=16,
+    min_eligible=19,
     dynamic_min_bond_coins=100.0,
     availability_min_bond_coins=100.0,
     validator_warmup_blocks=100,
@@ -1426,7 +1434,7 @@ def build_large_split_operator_adversary(
     split_count: int = 3,
 ) -> SimulationScenario:
     if min_eligible is None:
-        min_eligible = committee_size + 2
+        min_eligible = committee_size + 3  # live rule: availability_min_eligible_operators
     if availability_min_bond_coins is None:
         availability_min_bond_coins = dynamic_min_bond_coins
     protocol = make_scaled_protocol(
@@ -1489,7 +1497,7 @@ def build_large_availability_griefing_adversary(
     validator_cooldown_blocks: int = 100,
 ) -> SimulationScenario:
     if min_eligible is None:
-        min_eligible = committee_size + 2
+        min_eligible = committee_size + 3  # live rule: availability_min_eligible_operators
     if availability_min_bond_coins is None:
         availability_min_bond_coins = dynamic_min_bond_coins
     protocol = make_scaled_protocol(
@@ -1501,7 +1509,7 @@ def build_large_availability_griefing_adversary(
         validator_cooldown_blocks,
     )
     actors = (ActorSpec(actor_id="honest"), ActorSpec(actor_id="coalition", adversarial=True))
-    total_operator_count = min_eligible + 1
+    total_operator_count = min_eligible + 2  # exactly the FALLBACK recovery threshold
     coalition_operator_count = max(3, committee_size // 8)
     honest_operator_count = total_operator_count - coalition_operator_count
     degraded_epochs_a = {3: STATUS_PROBATION, 4: STATUS_WARMUP, 5: STATUS_ACTIVE}
@@ -1568,7 +1576,7 @@ def build_large_sticky_fallback_threshold_manipulator(
     validator_cooldown_blocks: int = 100,
 ) -> SimulationScenario:
     if min_eligible is None:
-        min_eligible = committee_size + 2
+        min_eligible = committee_size + 3  # live rule: availability_min_eligible_operators
     if availability_min_bond_coins is None:
         availability_min_bond_coins = dynamic_min_bond_coins
     protocol = make_scaled_protocol(
@@ -1580,7 +1588,7 @@ def build_large_sticky_fallback_threshold_manipulator(
         validator_cooldown_blocks,
     )
     actors = (ActorSpec(actor_id="honest"), ActorSpec(actor_id="coalition", adversarial=True))
-    total_operator_count = min_eligible + 1
+    total_operator_count = min_eligible + 2  # exactly the FALLBACK recovery threshold
     coalition_operator_count = 1
     honest_operator_count = total_operator_count - coalition_operator_count
     operators: list[OperatorSpec] = []
@@ -1644,7 +1652,7 @@ def build_large_join_exit_boundary_adversary(
     validator_cooldown_blocks: int = 100,
 ) -> SimulationScenario:
     if min_eligible is None:
-        min_eligible = committee_size + 2
+        min_eligible = committee_size + 3  # live rule: availability_min_eligible_operators
     if availability_min_bond_coins is None:
         availability_min_bond_coins = dynamic_min_bond_coins
     protocol = make_scaled_protocol(

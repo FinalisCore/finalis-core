@@ -1141,6 +1141,10 @@ std::optional<FrontierProposal> build_cluster_frontier_proposal_from_records(
   FrontierProposal proposal;
   auto scratch_cfg = cluster.configs[static_cast<std::size_t>(proposer_id)];
   scratch_cfg.db_path = unique_test_base(scratch_base) + "/node" + std::to_string(proposer_id);
+  // init() binds the P2P listener; the live proposer already holds this port.
+  scratch_cfg.disable_p2p = true;
+  scratch_cfg.listen = false;
+  scratch_cfg.p2p_port = 0;
   {
     node::Node scratch_seed(scratch_cfg);
     if (!scratch_seed.init()) return std::nullopt;
@@ -1806,6 +1810,7 @@ struct OutOfOrderBlockSyncServer {
   Hash32 tip_hash{};
   std::uint64_t tip_height{0};
   PubKey32 bootstrap_pub{};
+  std::string consensus_rules_fingerprint;  // advertised as crh=; peers reject VERSION without it
   std::map<Hash32, p2p::TransitionMsg> transitions;
   mutable std::mutex mu;
   mutable std::mutex client_mu;
@@ -1926,6 +1931,7 @@ struct OutOfOrderBlockSyncServer {
                   hex_encode(Bytes(net.network_id.begin(), net.network_id.end())) + ";cv=7;bootstrap_validator=" +
                   hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end())) + ";validator_pubkey=" +
                   hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end()));
+              if (!consensus_rules_fingerprint.empty()) reply.node_software_version += ";crh=" + consensus_rules_fingerprint;
               (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(reply)}, net.magic,
                                         net.protocol_version);
               sent_version = true;
@@ -2202,11 +2208,12 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
 
   std::uint64_t bond_amount = 0;
   std::optional<FundedTestWallet> funded;
+  // Genesis has no premine: a single key accrues ~6-7 coins/s here vs a ~2828-coin min bond.
   if (!wait_for([&]() {
         bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
         funded = find_funded_test_wallet(*nodes[0], keys, bond_amount, 1);
         return funded.has_value();
-      }, ci_timeout_seconds(300))) {
+      }, ci_timeout_seconds(600))) {
     throw std::runtime_error("bonded fixture failed to find funded wallet");
   }
 
@@ -3696,10 +3703,11 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
   const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0);
 
   std::optional<FundedTestWallet> funded;
+  // Genesis has no premine: rewards accrue ~27 coins/s vs a 4000-coin single-validator min bond.
   ASSERT_TRUE(wait_for([&]() {
     funded = find_funded_test_wallet(n0, keys, bond_amount + 1000, 1);
     return funded.has_value();
-  }, ci_timeout_seconds(120)));
+  }, ci_timeout_seconds(300)));
 
   const auto new_validator = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x93});
   ASSERT_TRUE(new_validator.has_value());
@@ -3735,7 +3743,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
   ASSERT_TRUE(wait_for([&]() {
     funded_after_onboarding = find_funded_test_wallet(n0, keys, bond_amount + 1000, 1);
     return funded_after_onboarding.has_value();
-  }, ci_timeout_seconds(120)));
+  }, ci_timeout_seconds(300)));
 
   storage::DB join_db;
   ASSERT_TRUE(join_db.open_readonly(base + "/node0"));
@@ -6974,7 +6982,9 @@ TEST(test_equivocation_evidence_changes_fork_choice_deterministically) {
     if (pub == keys[0].public_key) continue;
     const auto vote = make_test_vote(keys, target_height, target_round, canonical_transition_id, pub);
     for (auto& n : nodes) {
-      ASSERT_TRUE(n->inject_vote_for_test(vote));
+      // Nodes also gossip their own votes for the injected proposal, so one may finalize first.
+      const auto res = n->inject_network_vote_diagnostic_for_test(vote);
+      ASSERT_TRUE(res == "accepted" || res == "soft-reject:stale-finalized-height");
     }
     ++votes_added;
     if (votes_added >= quorum) break;
@@ -7904,8 +7914,9 @@ TEST(test_unregistered_follower_mines_epoch_tickets_without_joining_committee) {
               snapshot->ordered_members.end());
 }
 
-TEST(test_unregistered_follower_ticket_is_network_accepted_and_paid_at_epoch_boundary) {
-  const std::string base = unique_test_base("/tmp/finalis_it_unknown_follower_epoch_boundary_payout");
+TEST(test_unregistered_follower_open_epoch_ticket_is_rejected_by_validator_and_unpaid) {
+  // Open-epoch ticket intake is validator-only (reason=non-validator-open-epoch-source).
+  const std::string base = unique_test_base("/tmp/finalis_it_unknown_follower_ticket_rejected");
   auto cluster = make_p2p_cluster(base, 1, 1, 1);
   auto& validator = cluster.nodes[0];
 
@@ -7943,14 +7954,20 @@ TEST(test_unregistered_follower_ticket_is_network_accepted_and_paid_at_epoch_bou
   follower.stop();
   validator->stop();
 
+  // Precondition: the follower did mine an epoch-33 ticket locally.
+  storage::DB follower_db;
+  ASSERT_TRUE(follower_db.open_readonly(follower_cfg.db_path));
+  const auto follower_best = follower_db.load_best_epoch_tickets(33);
+  follower_db.close();
+  ASSERT_TRUE(follower_best.find(follower_pub) != follower_best.end());
+
   storage::DB validator_db;
   ASSERT_TRUE(validator_db.open_readonly(base + "/node0"));
   const auto best = validator_db.load_best_epoch_tickets(33);
   auto artifact = load_frontier_artifact_at_height(base + "/node0", 65);
   validator_db.close();
 
-  auto best_it = best.find(follower_pub);
-  ASSERT_TRUE(best_it != best.end());
+  ASSERT_TRUE(best.find(follower_pub) == best.end());
   ASSERT_TRUE(artifact.has_value());
 
   std::uint64_t follower_units = 0;
@@ -7959,85 +7976,7 @@ TEST(test_unregistered_follower_ticket_is_network_accepted_and_paid_at_epoch_bou
     total_units += units;
     if (pub == follower_pub) follower_units += units;
   }
-  ASSERT_TRUE(follower_units > 0);
-  ASSERT_EQ(total_units, artifact->proposal.transition.settlement.total);
-}
-
-TEST(test_unregistered_follower_onboarding_payout_survives_restart_across_epoch_boundary) {
-  const std::string base = unique_test_base("/tmp/finalis_it_unknown_follower_restart_epoch_boundary_payout");
-  auto cluster = make_p2p_cluster(base, 1, 1, 1);
-  auto& validator = cluster.nodes[0];
-
-  node::NodeConfig follower_cfg;
-  follower_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
-  follower_cfg.node_id = 9;
-  follower_cfg.dns_seeds = false;
-  follower_cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
-  follower_cfg.listen = true;
-  follower_cfg.bind_ip = "127.0.0.1";
-  follower_cfg.db_path = base + "/follower";
-  follower_cfg.p2p_port = reserve_test_port();
-  ASSERT_TRUE(follower_cfg.p2p_port != 0);
-  follower_cfg.genesis_path = base + "/genesis.json";
-  follower_cfg.allow_unsafe_genesis_override = true;
-  follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
-  follower_cfg.validator_passphrase = "test-pass";
-  follower_cfg.peers = {"127.0.0.1:" + std::to_string(validator->p2p_port_for_test())};
-  follower_cfg.network.min_block_interval_ms = 100;
-  follower_cfg.network.round_timeout_ms = 200;
-  follower_cfg.max_committee = 1;
-  ASSERT_TRUE(create_test_validator_keystore(follower_cfg, follower_cfg.node_id));
-
-  node::Node follower(follower_cfg);
-  ASSERT_TRUE(follower.init());
-  follower.start();
-
-  ASSERT_TRUE(wait_for([&]() {
-    const auto sv = validator->status();
-    const auto sf = follower.status();
-    return sv.height >= 96 && sf.height == sv.height && sf.transition_hash == sv.transition_hash;
-  }, ci_timeout_seconds(120)));
-
-  const auto follower_pub = follower.local_validator_pubkey_for_test();
-  follower.stop();
-  validator->stop();
-
-  node::NodeConfig restart_cfg;
-  restart_cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
-  restart_cfg.disable_p2p = true;
-  restart_cfg.node_id = 0;
-  restart_cfg.max_committee = 1;
-  restart_cfg.network.min_block_interval_ms = 100;
-  restart_cfg.network.round_timeout_ms = 200;
-  restart_cfg.p2p_port = 0;
-  restart_cfg.db_path = base + "/node0";
-  restart_cfg.genesis_path = base + "/genesis.json";
-  restart_cfg.allow_unsafe_genesis_override = true;
-  restart_cfg.validator_key_file = restart_cfg.db_path + "/keystore/validator.json";
-  restart_cfg.validator_passphrase = "test-pass";
-
-  node::Node restarted(restart_cfg);
-  ASSERT_TRUE(restarted.init());
-  restarted.start();
-  ASSERT_TRUE(wait_for([&]() { return restarted.status().height >= 97; }, ci_timeout_seconds(180)));
-  restarted.stop();
-
-  storage::DB validator_db;
-  ASSERT_TRUE(validator_db.open_readonly(base + "/node0"));
-  const auto best = validator_db.load_best_epoch_tickets(65);
-  auto artifact = load_frontier_artifact_at_height(base + "/node0", 97);
-  validator_db.close();
-
-  ASSERT_TRUE(best.find(follower_pub) != best.end());
-  ASSERT_TRUE(artifact.has_value());
-
-  std::uint64_t follower_units = 0;
-  std::uint64_t total_units = 0;
-  for (const auto& [pub, units] : artifact->proposal.transition.settlement.outputs) {
-    total_units += units;
-    if (pub == follower_pub) follower_units += units;
-  }
-  ASSERT_TRUE(follower_units > 0);
+  ASSERT_EQ(follower_units, 0u);
   ASSERT_EQ(total_units, artifact->proposal.transition.settlement.total);
 }
 
@@ -8515,6 +8454,7 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
   ASSERT_TRUE(a3.has_value());
 
   OutOfOrderBlockSyncServer server;
+  server.consensus_rules_fingerprint = bootstrap.consensus_rules_fingerprint_for_test();
   std::map<Hash32, p2p::TransitionMsg> transitions;
   transitions.emplace(frontier_proposal_id(a1->proposal),
                       p2p::TransitionMsg{a1->proposal.serialize(), a1->certificate});
@@ -8699,12 +8639,30 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
   ASSERT_TRUE(std::count(requested.begin(), requested.end(), a2_hash) >= 2);
 }
 
+// The node also pushes unsolicited frames (tip/ingress gossip, proposals) to a fresh peer; skip them
+// and return only a TRANSITION that arrives before the deadline.
+std::optional<p2p::Frame> read_transition_frame_fd(finalis::net::SocketHandle fd, const NetworkConfig& network, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (true) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) return std::nullopt;
+    auto frame = p2p::read_frame_fd_timed(fd, network.max_payload_len, network.magic, network.protocol_version,
+                                          static_cast<int>(left), 1000, nullptr, nullptr);
+    if (!frame.has_value()) return std::nullopt;
+    if (frame->msg_type == p2p::MsgType::TRANSITION) return frame;
+  }
+}
+
 TEST(test_get_transition_by_height_rate_limits_same_peer_same_height) {
   const std::string base = unique_test_base("/tmp/finalis_it_get_by_height_rate_limit_same_height");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
   auto cfg = single_node_cfg(base, 1);
+  cfg.disable_p2p = false;  // these tests talk to the node's P2P listener directly
+  cfg.listen = true;
+  cfg.bind_ip = "127.0.0.1";
+  cfg.p2p_port = reserve_test_ports(1).at(0);
   cfg.dns_seeds = false;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.network.min_block_interval_ms = 50;
@@ -8716,6 +8674,7 @@ TEST(test_get_transition_by_height_rate_limits_same_peer_same_height) {
   ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   ASSERT_TRUE(wait_for_tip(n, 3, std::chrono::seconds(20)));
+  ASSERT_TRUE(n.pause_proposals_for_test(true));  // freeze the tip so no new TRANSITIONs are pushed
   const std::uint16_t port = n.p2p_port_for_test();
   ASSERT_TRUE(port != 0);
 
@@ -8738,7 +8697,7 @@ TEST(test_get_transition_by_height_rate_limits_same_peer_same_height) {
   v.nonce = 9010;
   v.start_height = 0;
   v.start_hash = zero_hash();
-  v.node_software_version = "finalis-tests/get-by-height-rate-limit";
+  v.node_software_version = "finalis-tests/get-by-height-rate-limit;crh=" + n.consensus_rules_fingerprint_for_test();
   ASSERT_TRUE(
       p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg.network.magic, cfg.network.protocol_version));
 
@@ -8768,8 +8727,7 @@ TEST(test_get_transition_by_height_rate_limits_same_peer_same_height) {
     ASSERT_TRUE(p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
                                                     p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{h})},
                                     cfg.network.magic, cfg.network.protocol_version));
-    return p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
-                                    read_timeout_ms, 1000, nullptr, nullptr);
+    return read_transition_frame_fd(cfd, cfg.network, read_timeout_ms);
   };
 
   auto first = request_by_height(tip_h, 5000);
@@ -8795,6 +8753,10 @@ TEST(test_get_transition_by_height_not_rate_limited_across_heights) {
   std::filesystem::create_directories(base);
 
   auto cfg = single_node_cfg(base, 1);
+  cfg.disable_p2p = false;  // these tests talk to the node's P2P listener directly
+  cfg.listen = true;
+  cfg.bind_ip = "127.0.0.1";
+  cfg.p2p_port = reserve_test_ports(1).at(0);
   cfg.dns_seeds = false;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.network.min_block_interval_ms = 50;
@@ -8806,6 +8768,7 @@ TEST(test_get_transition_by_height_not_rate_limited_across_heights) {
   ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   ASSERT_TRUE(wait_for_tip(n, 4, std::chrono::seconds(20)));
+  ASSERT_TRUE(n.pause_proposals_for_test(true));  // freeze the tip so no new TRANSITIONs are pushed
   const std::uint16_t port = n.p2p_port_for_test();
   ASSERT_TRUE(port != 0);
 
@@ -8828,7 +8791,7 @@ TEST(test_get_transition_by_height_not_rate_limited_across_heights) {
   v.nonce = 9011;
   v.start_height = 0;
   v.start_hash = zero_hash();
-  v.node_software_version = "finalis-tests/get-by-height-distinct-heights";
+  v.node_software_version = "finalis-tests/get-by-height-distinct-heights;crh=" + n.consensus_rules_fingerprint_for_test();
   ASSERT_TRUE(
       p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg.network.magic, cfg.network.protocol_version));
 
@@ -8857,16 +8820,14 @@ TEST(test_get_transition_by_height_not_rate_limited_across_heights) {
   ASSERT_TRUE(p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
                                                   p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h})},
                                   cfg.network.magic, cfg.network.protocol_version));
-  auto first = p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
-                                        5000, 1000, nullptr, nullptr);
+  auto first = read_transition_frame_fd(cfd, cfg.network, 5000);
   ASSERT_TRUE(first.has_value());
   ASSERT_EQ(first->msg_type, p2p::MsgType::TRANSITION);
 
   ASSERT_TRUE(p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
                                                   p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h - 1})},
                                   cfg.network.magic, cfg.network.protocol_version));
-  auto second = p2p::read_frame_fd_timed(cfd, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
-                                         5000, 1000, nullptr, nullptr);
+  auto second = read_transition_frame_fd(cfd, cfg.network, 5000);
   ASSERT_TRUE(second.has_value());
   ASSERT_EQ(second->msg_type, p2p::MsgType::TRANSITION);
 
@@ -8881,6 +8842,10 @@ TEST(test_get_transition_by_height_rate_limit_is_per_peer_not_global) {
   std::filesystem::create_directories(base);
 
   auto cfg = single_node_cfg(base, 1);
+  cfg.disable_p2p = false;  // these tests talk to the node's P2P listener directly
+  cfg.listen = true;
+  cfg.bind_ip = "127.0.0.1";
+  cfg.p2p_port = reserve_test_ports(1).at(0);
   cfg.dns_seeds = false;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   cfg.network.min_block_interval_ms = 50;
@@ -8892,6 +8857,7 @@ TEST(test_get_transition_by_height_rate_limit_is_per_peer_not_global) {
   ASSERT_TRUE(n.init() && "n.init() failed");
   n.start();
   ASSERT_TRUE(wait_for_tip(n, 3, std::chrono::seconds(20)));
+  ASSERT_TRUE(n.pause_proposals_for_test(true));  // freeze the tip so no new TRANSITIONs are pushed
   const std::uint16_t port = n.p2p_port_for_test();
   ASSERT_TRUE(port != 0);
 
@@ -8912,7 +8878,7 @@ TEST(test_get_transition_by_height_rate_limit_is_per_peer_not_global) {
     v.nonce = nonce;
     v.start_height = 0;
     v.start_hash = zero_hash();
-    v.node_software_version = "finalis-tests/get-by-height-per-peer";
+    v.node_software_version = "finalis-tests/get-by-height-per-peer;crh=" + n.consensus_rules_fingerprint_for_test();
     ASSERT_TRUE(p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg.network.magic,
                                     cfg.network.protocol_version));
     bool saw_version = false;
@@ -8957,16 +8923,14 @@ TEST(test_get_transition_by_height_rate_limit_is_per_peer_not_global) {
   ASSERT_TRUE(p2p::write_frame_fd(a, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
                                                 p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h})},
                                   cfg.network.magic, cfg.network.protocol_version));
-  auto a_first = p2p::read_frame_fd_timed(a, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
-                                          5000, 1000, nullptr, nullptr);
+  auto a_first = read_transition_frame_fd(a, cfg.network, 5000);
   ASSERT_TRUE(a_first.has_value());
   ASSERT_EQ(a_first->msg_type, p2p::MsgType::TRANSITION);
 
   ASSERT_TRUE(p2p::write_frame_fd(b, p2p::Frame{p2p::MsgType::GET_TRANSITION_BY_HEIGHT,
                                                 p2p::ser_get_transition_by_height(p2p::GetTransitionByHeightMsg{tip_h})},
                                   cfg.network.magic, cfg.network.protocol_version));
-  auto b_first = p2p::read_frame_fd_timed(b, cfg.network.max_payload_len, cfg.network.magic, cfg.network.protocol_version,
-                                          5000, 1000, nullptr, nullptr);
+  auto b_first = read_transition_frame_fd(b, cfg.network, 5000);
   ASSERT_TRUE(b_first.has_value());
   ASSERT_EQ(b_first->msg_type, p2p::MsgType::TRANSITION);
 

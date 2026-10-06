@@ -587,7 +587,7 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         auto eligible_count = r.u64le();
         auto min_eligible = r.u64le();
         if (!fallback_reason || !eligible_count || !min_eligible) return false;
-        if (*fallback_reason > static_cast<std::uint8_t>(FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING)) {
+        if (*fallback_reason > static_cast<std::uint8_t>(FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE)) {
           return false;
         }
         checkpoint.fallback_reason = static_cast<FinalizedCommitteeFallbackReason>(*fallback_reason);
@@ -1748,6 +1748,12 @@ std::optional<Bytes> DB::get(const std::string& key) const {
 #ifdef SC_HAS_ROCKSDB
   std::string v;
   auto s = rocks_->db->Get(rocksdb::ReadOptions(), key, &v);
+  // SECURITY: a corrupted record must not read as "missing" (e.g. an absent UTXO or checkpoint),
+  // which would silently diverge derived state. Fail-stop; recovery is an operator decision.
+  if (s.IsCorruption()) {
+    std::cerr << "finalized-state-invariant-violation source=db-read-corruption status=" << s.ToString() << "\n";
+    std::abort();
+  }
   if (!s.ok()) return std::nullopt;
   return Bytes(v.begin(), v.end());
 #else
@@ -1776,6 +1782,11 @@ std::map<std::string, Bytes> DB::scan_prefix(const std::string& prefix) const {
     std::string k = it->key().ToString();
     if (k.rfind(prefix, 0) != 0) break;
     out[k] = Bytes(it->value().data(), it->value().data() + it->value().size());
+  }
+  // An iterator error ends Valid() early; a truncated scan must not pass as a complete one.
+  if (const auto s = it->status(); s.IsCorruption()) {
+    std::cerr << "finalized-state-invariant-violation source=db-scan-corruption status=" << s.ToString() << "\n";
+    std::abort();
   }
 #else
   for (const auto& [k, v] : mem_) {

@@ -2,11 +2,16 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <QMainWindow>
@@ -48,6 +53,72 @@ struct HistoryFlowClassification {
 
 HistoryFlowClassification classify_wallet_history_flow(std::uint64_t credited, std::uint64_t debited);
 
+// Owns every background worker a window starts so none can outlive it. Threads are never
+// detached: finished ones are reaped on the next spawn, the rest are joined on shutdown.
+class BackgroundThreads {
+ public:
+  BackgroundThreads() = default;
+  BackgroundThreads(const BackgroundThreads&) = delete;
+  BackgroundThreads& operator=(const BackgroundThreads&) = delete;
+  ~BackgroundThreads() { shutdown_and_join(); }
+
+  // Runs fn on a new owned thread. Returns false (fn is not run) once shutdown has begun.
+  template <typename F>
+  bool spawn(F&& fn) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (shutdown_.load()) return false;
+    reap_finished_locked();
+    threads_.emplace_back([this, f = std::forward<F>(fn)]() mutable {
+      f();
+      std::lock_guard<std::mutex> done_lock(mu_);
+      finished_.push_back(std::this_thread::get_id());
+    });
+    return true;
+  }
+
+  bool shutting_down() const { return shutdown_.load(); }
+
+  void shutdown_and_join() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      shutdown_.store(true);
+    }
+    // Workers may still be spawning (e.g. refresh -> probes) until they observe the flag, so
+    // drain in rounds; spawn() refuses new threads once the flag is set.
+    for (;;) {
+      std::vector<std::thread> batch;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        batch.swap(threads_);
+        finished_.clear();
+      }
+      if (batch.empty()) return;
+      for (auto& t : batch) {
+        if (t.joinable()) t.join();
+      }
+    }
+  }
+
+ private:
+  void reap_finished_locked() {
+    if (finished_.empty()) return;
+    for (auto it = threads_.begin(); it != threads_.end();) {
+      if (std::find(finished_.begin(), finished_.end(), it->get_id()) != finished_.end()) {
+        it->join();  // already past fn(); returns promptly
+        it = threads_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    finished_.clear();
+  }
+
+  std::atomic<bool> shutdown_{false};
+  std::mutex mu_;
+  std::vector<std::thread> threads_;
+  std::vector<std::thread::id> finished_;
+};
+
 class ActivityPage;
 class AdvancedPage;
 class OverviewPage;
@@ -73,6 +144,7 @@ class WalletWindow final : public QMainWindow {
   };
 
   WalletWindow();
+  ~WalletWindow() override;
 
  private:
   struct LoadedWallet {
@@ -273,7 +345,7 @@ class WalletWindow final : public QMainWindow {
   QUrl explorer_home_url() const;
   void open_explorer_home();
   void poll_finalized_tip_status();
-  static RefreshResult build_refresh_result(const RefreshRequest& request);
+  static RefreshResult build_refresh_result(const RefreshRequest& request, BackgroundThreads& threads);
   void apply_refresh_result(std::uint64_t generation, std::uint64_t base_state_version, bool interactive, RefreshResult result);
   void mark_refresh_state_changed();
 
@@ -458,6 +530,8 @@ class WalletWindow final : public QMainWindow {
   std::uint64_t refresh_generation_{0};
   std::uint64_t refresh_state_version_{0};
   std::uint64_t tip_poll_generation_{0};
+  // ~WalletWindow joins this first, so no worker runs against a partly destroyed window.
+  BackgroundThreads background_threads_;
   std::uint64_t mint_status_refresh_generation_{0};
   std::uint64_t mint_deposit_submit_generation_{0};
   std::uint64_t mint_redeem_submit_generation_{0};

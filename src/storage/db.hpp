@@ -62,6 +62,9 @@ enum class FinalizedCommitteeFallbackReason : std::uint8_t {
   NONE = 0,
   INSUFFICIENT_ELIGIBLE_OPERATORS = 1,
   HYSTERESIS_RECOVERY_PENDING = 2,
+  // No candidate survived the normal/fallback filters; the committee was taken from recent
+  // prior committees (consensus::emergency_fallback_committee_members). Operator-visible alarm.
+  EMERGENCY_PRIOR_COMMITTEE = 3,
 };
 
 struct FinalizedCommitteeCheckpoint {
