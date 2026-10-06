@@ -2,9 +2,50 @@
 
 #include "test_framework.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <string>
+
+namespace {
+
+// Live progress on the controlling terminal. ctest captures stdout/stderr (and with
+// --output-on-failure only shows them after a failed run), so progress goes straight to
+// /dev/tty instead: one line rewritten in place, failures kept on their own lines.
+// No terminal (CI, redirected output) or FINALIS_TEST_PROGRESS=0: silently disabled.
+class TtyProgress {
+ public:
+  TtyProgress() {
+#ifndef _WIN32
+    const char* env = std::getenv("FINALIS_TEST_PROGRESS");
+    if (env == nullptr || std::string(env) != "0") tty_ = std::fopen("/dev/tty", "w");
+#endif
+  }
+  ~TtyProgress() {
+    if (!tty_) return;
+    std::fputs("\r\033[2K", tty_);
+    std::fclose(tty_);
+  }
+  TtyProgress(const TtyProgress&) = delete;
+  TtyProgress& operator=(const TtyProgress&) = delete;
+
+  void ok(const std::string& progress) {
+    if (!tty_) return;
+    std::fprintf(tty_, "\r\033[2K[ok %s]", progress.c_str());
+    std::fflush(tty_);
+  }
+  void fail(const std::string& progress, const std::string& name, const std::string& what) {
+    if (!tty_) return;
+    std::fprintf(tty_, "\r\033[2K[fail %s] %s: %s\n", progress.c_str(), name.c_str(), what.c_str());
+    std::fflush(tty_);
+  }
+
+ private:
+  std::FILE* tty_{nullptr};
+};
+
+}  // namespace
 
 std::vector<std::pair<std::string, TestFn>>& tests() {
   static std::vector<std::pair<std::string, TestFn>> t;
@@ -97,17 +138,22 @@ int main() {
   if (shard_count > 1) std::cout << " shard=" << shard_index << "/" << shard_count;
   std::cout << std::endl;
 
+  TtyProgress tty_progress;
   std::size_t index = 0;
   for (const auto& [name, fn] : selected) {
     ++index;
-    std::cout << "[run " << index << "/" << total << "] " << name << std::endl;
+    const std::string progress =
+        std::to_string(index) + "/" + std::to_string(total) + " " + std::to_string(index * 100 / total) + "%";
+    std::cout << "[run " << progress << "] " << name << std::endl;
     try {
       fn();
-      std::cout << "[ok " << index << "/" << total << "] " << name << "\n";
+      std::cout << "[ok " << progress << "] " << name << "\n";
+      tty_progress.ok(progress);
     } catch (const std::exception& e) {
       ++failed;
       failed_names.push_back(name);
-      std::cout << "[fail " << index << "/" << total << "] " << name << ": " << e.what() << "\n";
+      std::cout << "[fail " << progress << "] " << name << ": " << e.what() << "\n";
+      tty_progress.fail(progress, name, e.what());
     }
   }
   if (failed) {
