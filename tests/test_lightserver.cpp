@@ -9,6 +9,7 @@
 #define getpid _getpid
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -99,6 +100,31 @@ struct Cluster {
   }
 };
 
+// Ephemeral loopback ports for cluster P2P; released before use, so duplicates are rejected.
+std::vector<std::uint16_t> reserve_loopback_ports(int count) {
+  std::vector<std::uint16_t> ports;
+  for (int attempt = 0; static_cast<int>(ports.size()) < count && attempt < count * 8; ++attempt) {
+    if (!finalis::net::ensure_sockets()) break;
+    auto fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!finalis::net::valid_socket(fd)) break;
+    (void)finalis::net::set_reuseaddr(fd);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    std::uint16_t port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+      sockaddr_in bound{};
+      socklen_t len = sizeof(bound);
+      if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0) port = ntohs(bound.sin_port);
+    }
+    finalis::net::close_socket(fd);
+    if (port != 0 && std::find(ports.begin(), ports.end(), port) == ports.end()) ports.push_back(port);
+  }
+  if (static_cast<int>(ports.size()) != count) throw std::runtime_error("reserve_loopback_ports failed");
+  return ports;
+}
+
 Cluster make_cluster(const std::string& base, int node_count = 4) {
   std::error_code ec;
   std::filesystem::remove_all(base, ec);
@@ -110,17 +136,24 @@ Cluster make_cluster(const std::string& base, int node_count = 4) {
 
   Cluster c;
   c.nodes.reserve(static_cast<std::size_t>(node_count));
+  // Validators must exchange proposals and votes over loopback P2P to reach quorum.
+  const auto ports = reserve_loopback_ports(node_count);
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
     cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
     cfg.node_id = i;
-    cfg.disable_p2p = true;
+    cfg.disable_p2p = false;
+    cfg.listen = true;
+    cfg.bind_ip = "127.0.0.1";
+    cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
+    for (int j = 0; j < i; ++j) cfg.peers.push_back("127.0.0.1:" + std::to_string(ports[static_cast<std::size_t>(j)]));
     // Match the accelerated timing used by the integration harness. These
     // tests are asserting finalized progression inside seconds, not mainnet's
     // multi-minute production cadence.
     cfg.network.min_block_interval_ms = 100;
     cfg.network.round_timeout_ms = 200;
-    cfg.p2p_port = 0;  // disable_p2p: never bound or dialed
+    cfg.p2p_port = ports[static_cast<std::size_t>(i)];
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.max_committee = static_cast<std::size_t>(node_count);
     cfg.genesis_path = gpath;
@@ -2029,7 +2062,8 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   op.txid.fill(0x6A);
   op.index = 0;
   const auto own_pkh = crypto::h160(Bytes(validator_key.pubkey.begin(), validator_key.pubkey.end()));
-  const TxOut spendable{50'000'000'000, address::p2pkh_script_pubkey(own_pkh)};
+  // Onboarding start now funds the min bond (4000 coins for one active validator) plus fee up front.
+  const TxOut spendable{500'000'000'000, address::p2pkh_script_pubkey(own_pkh)};
   ASSERT_TRUE(db.put_utxo(op, spendable));
   ASSERT_TRUE(db.put_script_utxo(crypto::sha256(spendable.script_pubkey), op, spendable, 1));
   ASSERT_TRUE(db.flush());

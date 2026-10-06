@@ -465,7 +465,11 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
     if (!result.ok) throw std::runtime_error("accept confidential error: " + result.error);
     ASSERT_TRUE(result.ok);
     ASSERT_EQ(result.cost.fee, 500u);
-    ASSERT_EQ(result.cost.confidential_verify_weight, confidential_out.range_proof.bytes.size());
+    // range proof bytes + one range-proof batch + balance-proof excess signature.
+    ASSERT_TRUE(!crypto::commitment_is_identity(tx.balance_proof.excess_commitment));
+    ASSERT_EQ(result.cost.confidential_verify_weight,
+              confidential_out.range_proof.bytes.size() + kRangeProofBatchVerifyWeight +
+                  kConfidentialSignatureVerifyWeight);
 
     UtxoSetV2 applied = view;
     apply_any_tx_to_utxo(AnyTx{tx}, applied);
@@ -516,7 +520,9 @@ TEST(test_validate_tx_v2_accepts_confidential_input_with_transparent_output) {
   if (!result.ok) throw std::runtime_error("accept confidential-input error: " + result.error);
   ASSERT_TRUE(result.ok);
   ASSERT_EQ(result.cost.fee, 500u);
-  ASSERT_EQ(result.cost.confidential_verify_weight, 0u);
+  // One confidential input signature + balance-proof excess signature; no range proofs.
+  ASSERT_TRUE(!crypto::commitment_is_identity(tx.balance_proof.excess_commitment));
+  ASSERT_EQ(result.cost.confidential_verify_weight, 2 * kConfidentialSignatureVerifyWeight);
 }
 
 TEST(test_validate_tx_v2_rejects_duplicate_nullifier_like_confidential_spend_id) {

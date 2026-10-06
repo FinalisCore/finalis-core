@@ -4467,10 +4467,22 @@ std::optional<storage::FinalizedCommitteeCheckpoint> Node::finalized_committee_c
   if (it != finalized_committee_checkpoints_.end()) {
     if (canonical_state_.has_value() && epoch_start == finalized_height_ + 1) {
       std::string error;
-      if (!consensus::validate_next_epoch_checkpoint_from_state(canonical_derivation_config_locked(), *canonical_state_,
-                                                                epoch_start, it->second, &error)) {
+      auto& cached = next_epoch_checkpoint_validation_cache_;
+      if (!cached.has_value() || cached->epoch_start != epoch_start || cached->finalized_height != finalized_height_ ||
+          cached->state_commitment != canonical_state_->state_commitment ||
+          !consensus::canonical_checkpoints_equal(cached->checkpoint, it->second)) {
+        NextEpochCheckpointValidation fresh;
+        fresh.epoch_start = epoch_start;
+        fresh.finalized_height = finalized_height_;
+        fresh.state_commitment = canonical_state_->state_commitment;
+        fresh.checkpoint = it->second;
+        fresh.valid = consensus::validate_next_epoch_checkpoint_from_state(
+            canonical_derivation_config_locked(), *canonical_state_, epoch_start, it->second, &fresh.error);
+        cached = std::move(fresh);
+      }
+      if (!cached->valid) {
         log_line("finalized-state-invariant-violation source=checkpoint-next-height-recompute-mismatch epoch=" +
-                 std::to_string(epoch_start) + " detail=" + error);
+                 std::to_string(epoch_start) + " detail=" + cached->error);
         return std::nullopt;
       }
       if (!consensus::validate_checkpoint_schedule_for_height(canonical_derivation_config_locked(), *canonical_state_,
@@ -8261,6 +8273,13 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     candidate_frontier_proposals_[transition_id] = *proposal;
     prune_caches_locked(msg.height, msg.round);
     (void)finalize_if_quorum(transition_id, msg.height, msg.round);
+    if (finalized_height_ >= msg.height) {
+      // Votes already present (or the quorum-1 self-vote) finalized this proposal; a local
+      // vote now would be stale and must not turn a valid proposal into a peer penalty.
+      log_line("proposal-local-vote-skip height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " transition=" + short_hash_hex(transition_id) + " reason=already-finalized");
+      return ProposeHandlingResult::Accepted;
+    }
 
     std::string vote_reason;
     const auto local_vote_key = std::make_pair(msg.height, msg.round);
