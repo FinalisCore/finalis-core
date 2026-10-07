@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -24,12 +25,7 @@ using namespace finalis;
 
 namespace {
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> seq{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
-}
+using finalis::test::unique_test_base;
 
 std::vector<char*> make_argv(std::vector<std::string>& args) {
   std::vector<char*> out;
@@ -133,5 +129,3 @@ TEST(test_node_parse_args_validator_passphrase_env) {
   ASSERT_TRUE(cfg.has_value());
   ASSERT_EQ(cfg->validator_passphrase, "env-secret");
 }
-
-void register_keystore_tests() {}

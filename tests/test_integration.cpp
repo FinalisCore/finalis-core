@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -44,14 +45,6 @@
 using namespace finalis;
 
 namespace {
-
-long long current_process_id() {
-#ifdef _WIN32
-  return static_cast<long long>(::_getpid());
-#else
-  return static_cast<long long>(::getpid());
-#endif
-}
 
 std::chrono::seconds ci_timeout_seconds(int base_seconds) {
   int scale = 1;
@@ -189,12 +182,7 @@ std::optional<Bytes> load_availability_state_bytes(const std::string& db_path) {
   return db.get(storage::key_availability_persistent_state());
 }
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> unique_counter{0};
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto seq = unique_counter.fetch_add(1, std::memory_order_relaxed);
-  return prefix + "_" + std::to_string(current_process_id()) + "_" + std::to_string(now) + "_" + std::to_string(seq);
-}
+using finalis::test::unique_test_base;
 
 bool same_finality_sig_vector(const std::vector<FinalitySig>& a, const std::vector<FinalitySig>& b) {
   if (a.size() != b.size()) return false;
@@ -879,6 +867,16 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
                                             const std::vector<Bytes>& raw_records, int peer_id,
                                             std::string* error, const crypto::KeyPair* signer_override);
 
+// Genesis has no premine, so tests that fund a validator bond from block rewards wait for the
+// registration floor (~2.8k-4k coins) to accrue; under ASan that exceeds the timeouts. This floor is set
+// on NetworkConfig so the node, replay and the onboarding service all apply it.
+constexpr std::uint64_t kTestRegistrationBondFloor = 100ULL * consensus::BASE_UNITS_PER_COIN;
+
+void apply_test_bond_floor(node::NodeConfig& cfg) {
+  cfg.network.validator_min_bond = kTestRegistrationBondFloor;
+  cfg.network.validator_bond_min_amount = kTestRegistrationBondFloor;
+}
+
 std::optional<FundedTestWallet> find_funded_test_wallet(node::Node& node, const std::vector<crypto::KeyPair>& keys,
                                                         std::uint64_t min_total, std::size_t min_utxo_count = 1) {
   for (std::size_t i = 0; i < keys.size(); ++i) {
@@ -1209,7 +1207,8 @@ struct HttpStubServer {
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
 
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
-                     std::size_t max_committee = MAX_COMMITTEE) {
+                     std::size_t max_committee = MAX_COMMITTEE,
+                     const std::function<void(node::NodeConfig&)>& configure = {}) {
   std::error_code ec;
   std::filesystem::remove_all(base, ec);
   std::filesystem::create_directories(base);
@@ -1251,6 +1250,7 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
                                              deterministic_seed_for_node_id(i), &out_key, &kerr)) {
       throw std::runtime_error("failed to create validator keystore: " + kerr);
     }
+    if (configure) configure(cfg);
 
     auto n = std::make_unique<node::Node>(cfg);
     if (!n->init()) {
@@ -1391,10 +1391,19 @@ Tx make_fixture_ingress_tx(std::uint64_t value, std::uint8_t tag) {
   return tx;
 }
 
-std::uint64_t live_registration_bond_amount_for_test(node::Node& node) {
+// Registration floor the node enforces at its next height: same inputs as the private
+// Node::effective_validator_min_bond_for_height (network bond fields overwritten by CLI overrides).
+std::uint64_t live_registration_bond_amount_for_test(node::Node& node, const node::NodeConfig& cfg) {
   const auto height = node.status().height + 1;
-  const auto active = std::max<std::size_t>(1, node.active_validators_for_next_height_for_test().size());
-  return consensus::validator_min_bond_units(mainnet_network(), height, active);
+  consensus::ValidatorRegistry registry;
+  registry.set_rules(consensus::ValidatorRules{
+      .warmup_blocks = cfg.validator_warmup_blocks_override.value_or(cfg.network.validator_warmup_blocks)});
+  for (const auto& pub : node.active_validators_for_next_height_for_test()) {
+    if (auto info = node.validator_info_for_test(pub); info.has_value()) registry.upsert(pub, *info);
+  }
+  return consensus::effective_validator_min_bond_for_height(
+      cfg.network, cfg.validator_min_bond_override.value_or(cfg.network.validator_min_bond),
+      cfg.validator_bond_min_amount_override.value_or(cfg.network.validator_bond_min_amount), registry, height);
 }
 
 bool restart_single_node_with_seeded_certified_ingress(const node::NodeConfig& cfg, const std::vector<Bytes>& raw_records,
@@ -2186,6 +2195,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     for (int j = 0; j < i; ++j) {
       cfg.peers.push_back("127.0.0.1:" + std::to_string(fixture.cluster.ports[j]));
     }
+    apply_test_bond_floor(cfg);
     keystore::ValidatorKey out_key;
     std::string kerr;
     if (!keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
@@ -2208,9 +2218,9 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
 
   std::uint64_t bond_amount = 0;
   std::optional<FundedTestWallet> funded;
-  // Genesis has no premine: a single key accrues ~6-7 coins/s here vs a ~2828-coin min bond.
+  // Genesis has no premine; apply_test_bond_floor keeps the bond to ~100 coins (~15s of rewards).
   if (!wait_for([&]() {
-        bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
+        bond_amount = live_registration_bond_amount_for_test(*nodes[0], fixture.cluster.configs[0]);
         funded = find_funded_test_wallet(*nodes[0], keys, bond_amount, 1);
         return funded.has_value();
       }, ci_timeout_seconds(600))) {
@@ -2337,6 +2347,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     for (int j = 0; j < i; ++j) {
       cfg.peers.push_back("127.0.0.1:" + std::to_string(fixture.cluster.ports[j]));
     }
+    apply_test_bond_floor(cfg);
     keystore::ValidatorKey out_key;
     std::string kerr;
     std::array<std::uint8_t, 32> seed = i == 0 ? deterministic_seed_for_node_id(0) : std::array<std::uint8_t, 32>{};
@@ -2362,7 +2373,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
   std::uint64_t bond_amount = 0;
   std::optional<FundedTestWallet> funded;
   if (!wait_for([&]() {
-        bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
+        bond_amount = live_registration_bond_amount_for_test(*nodes[0], fixture.cluster.configs[0]);
         funded = find_funded_test_wallet(*nodes[0], default_keys, bond_amount, 1);
         return funded.has_value();
       }, ci_timeout_seconds(300))) {
@@ -2475,10 +2486,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 4u);
 
-  const auto unique = std::to_string(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-  auto cluster = make_cluster("/tmp/finalis_it_faults_" + unique, 4, 4, 4);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_faults"), 4, 4, 4);
   auto& nodes = cluster.nodes;
 
   const bool reached_height_30 = wait_for([&]() {
@@ -2573,10 +2581,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
 
 TEST(test_primary_timeout_falls_back_to_backup_proposer) {
   if (!can_open_loopback_listener_for_test()) return;
-  const auto unique = std::to_string(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-  auto cluster = make_cluster("/tmp/finalis_it_backup_proposer_" + unique, 4, 4, 4);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_backup_proposer"), 4, 4, 4);
   auto& nodes = cluster.nodes;
 
   const bool reached_height_12 = wait_for([&]() {
@@ -3697,13 +3702,20 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
 TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_join) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_to_active_live_path");
-  auto cluster = make_cluster(base, 1, 1, 1);
+  // Admission PoW stays on but at 8 bits: at mainnet's 22 bits mining takes ~19s, longer than the
+  // two-epoch validity window (64 blocks, ~11s at 100ms blocks), so the join raced epoch expiry.
+  // PoW validity/expiry rules are covered in test_bonding.
+  auto cluster = make_cluster(base, 1, 1, 1, [](node::NodeConfig& cfg) {
+    apply_test_bond_floor(cfg);
+    cfg.network.onboarding_admission_pow_difficulty_bits = 8;
+    cfg.network.validator_join_admission_pow_difficulty_bits = 8;
+  });
   auto& n0 = *cluster.nodes[0];
   ASSERT_TRUE(wait_for_tip(n0, 5, ci_timeout_seconds(40)));
-  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0);
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0, cluster.configs[0]);
 
   std::optional<FundedTestWallet> funded;
-  // Genesis has no premine: rewards accrue ~27 coins/s vs a 4000-coin single-validator min bond.
+  // Genesis has no premine: rewards accrue ~27 coins/s; apply_test_bond_floor keeps the bond at ~100 coins.
   ASSERT_TRUE(wait_for([&]() {
     funded = find_funded_test_wallet(n0, keys, bond_amount + 1000, 1);
     return funded.has_value();
@@ -3718,7 +3730,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
   ASSERT_TRUE(onboarding_db.open_readonly(base + "/node0"));
   const auto onboarding_chain_id = ChainId::from_config_and_db(mainnet_network(), onboarding_db);
   ValidatorJoinAdmissionPowBuildContext onboarding_pow_ctx{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &onboarding_chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return onboarding_db.get_height_hash(height); },
@@ -3749,7 +3761,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
   ASSERT_TRUE(join_db.open_readonly(base + "/node0"));
   const auto join_chain_id = ChainId::from_config_and_db(mainnet_network(), join_db);
   ValidatorJoinAdmissionPowBuildContext join_pow_ctx{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &join_chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return join_db.get_height_hash(height); },
@@ -3875,7 +3887,7 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 6; }, ci_timeout_seconds(60)));
 
   const auto slash_pub = keys[0].public_key;
-  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(*nodes[0], cluster.configs[0]);
   Hash32 bond_txid{};
   bond_txid.fill(0xA5);
   const OutPoint bond_op{bond_txid, 0};
@@ -3950,7 +3962,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   }, ci_timeout_seconds(120)));
 
   const auto banned_pub = keys[0].public_key;
-  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0);
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0, cluster.configs[0]);
   Hash32 bond_txid{};
   bond_txid.fill(0xB6);
   const OutPoint bond_op{bond_txid, 0};
@@ -10127,5 +10139,3 @@ TEST(test_frontier_mode_rejects_oversized_or_unexpected_ingress_ranges_from_peer
   ASSERT_TRUE(db.open(cfg.db_path));
   ASSERT_TRUE(!db.get_lane_state(rec.certificate.lane).has_value());
 }
-
-void register_integration_tests() {}

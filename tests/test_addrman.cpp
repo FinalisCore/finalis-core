@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <filesystem>
 
@@ -29,7 +30,7 @@ TEST(test_addrman_save_load_roundtrip) {
   am.mark_attempt({"127.0.0.1", 18444}, 110);
   am.mark_success({"127.0.0.1", 18444}, 120);
 
-  const std::string path = "/tmp/finalis-addrman-test.dat";
+  const std::string path = finalis::test::unique_test_base("/tmp/finalis-addrman-test") + ".dat";
   ASSERT_TRUE(am.save(path));
 
   p2p::AddrMan loaded(10);
@@ -67,7 +68,7 @@ TEST(test_addrman_explicit_port_filter_accepts_matching_port) {
 }
 
 TEST(test_addrman_policy_filters_loaded_entries) {
-  const std::string path = "/tmp/finalis-addrman-filter.dat";
+  const std::string path = finalis::test::unique_test_base("/tmp/finalis-addrman-filter") + ".dat";
   {
     p2p::AddrMan am(10);
     am.add_or_update({"104.28.157.140", 58855}, 100);
@@ -132,5 +133,3 @@ TEST(test_addr_message_roundtrip_ipv4_ipv6) {
   ASSERT_EQ(d->entries[1].ip_version, 6);
   ASSERT_EQ(d->entries[1].port, 19441);
 }
-
-void register_addrman_tests() {}

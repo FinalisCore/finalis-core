@@ -232,5 +232,3 @@ TEST(test_payout_collapses_leader_signer_share_into_leader_output) {
   ASSERT_EQ(p.leader, R);
   ASSERT_TRUE(p.signers.empty());
 }
-
-void register_monetary_tests() {}

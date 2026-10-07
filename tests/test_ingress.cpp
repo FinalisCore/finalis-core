@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <atomic>
 #include <array>
@@ -21,10 +22,7 @@ using namespace finalis;
 
 namespace {
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> seq{0};
-  return prefix + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
-}
+using finalis::test::unique_test_base;
 
 IngressCertificate sample_ingress_certificate(std::uint32_t lane = 3, std::uint64_t seq = 1) {
   IngressCertificate cert;

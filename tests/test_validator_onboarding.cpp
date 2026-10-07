@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -32,13 +33,9 @@ std::uint64_t now_unix_ms() {
 }
 
 std::filesystem::path make_temp_dir(const char* name) {
-  static std::atomic<std::uint64_t> counter{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto seq = counter.fetch_add(1, std::memory_order_relaxed);
   const auto base = std::filesystem::temp_directory_path() / "finalis-tests";
   std::filesystem::create_directories(base);
-  const auto path = base / (std::string(name) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq));
+  const auto path = base / finalis::test::unique_test_base(name);
   std::filesystem::create_directories(path);
   return path;
 }
@@ -400,5 +397,3 @@ TEST(test_validator_onboarding_second_invocation_reuses_existing_record) {
   const auto records = db_check.load_validator_onboarding_records();
   ASSERT_EQ(records.size(), static_cast<std::size_t>(1));
 }
-
-void register_validator_onboarding_tests() {}

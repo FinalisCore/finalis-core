@@ -63,5 +63,3 @@ TEST(test_ed25519_roundtrip) {
   msg[0] ^= 0x01;
   ASSERT_TRUE(!crypto::ed25519_verify(msg, *sig, kp->public_key));
 }
-
-void register_crypto_tests() {}

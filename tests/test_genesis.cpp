@@ -120,5 +120,3 @@ TEST(test_genesis_empty_validator_template_allowed_only_when_requested) {
   ASSERT_TRUE(genesis::validate_document(*doc, mainnet_network(), &err, 0));
   ASSERT_TRUE(!genesis::validate_document(*doc, mainnet_network(), &err, 1));
 }
-
-void register_genesis_tests() {}

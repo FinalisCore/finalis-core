@@ -428,5 +428,3 @@ TEST(test_peer_manager_refuses_oversized_payload_without_dropping_peer) {
   listener.stop();
   dialer.stop();
 }
-
-void register_p2p_tests() {}

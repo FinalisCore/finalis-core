@@ -67,5 +67,3 @@ TEST(test_mint_client_json_roundtrips) {
   ASSERT_EQ(status_resp->l1_txid, "deadbeef");
   ASSERT_EQ(status_resp->amount, 1234u);
 }
-
-void register_privacy_tests() {}

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -16,7 +17,7 @@ using namespace finalis;
 namespace {
 
 std::string unique_snapshot_path(const std::string& stem) {
-  return "/tmp/" + stem;
+  return finalis::test::unique_test_base("/tmp/" + stem);
 }
 
 // Minimal DB that passes export and validate_bundle: genesis markers, tip, roots and
@@ -187,5 +188,3 @@ TEST(test_snapshot_import_rejects_genesis_mismatch_without_writing) {
   ASSERT_TRUE(err.find("snapshot genesis mismatch; reject import") != std::string::npos);
   ASSERT_TRUE(dst.scan_prefix("").empty());
 }
-
-void register_snapshot_tests() {}

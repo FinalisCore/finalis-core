@@ -586,5 +586,3 @@ TEST(test_mempool_accepts_txv2_after_activation_when_variant_validation_succeeds
   ASSERT_TRUE(mp.accept_tx(AnyTx{tx}, view, &err));
   ASSERT_TRUE(mp.contains(tx.txid()));
 }
-
-void register_mempool_tests() {}

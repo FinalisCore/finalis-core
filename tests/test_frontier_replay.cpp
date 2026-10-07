@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <algorithm>
 #include <array>
@@ -25,10 +26,7 @@ using namespace finalis;
 
 namespace {
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> seq{0};
-  return prefix + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
-}
+using finalis::test::unique_test_base;
 
 crypto::KeyPair key_from_byte(std::uint8_t base) {
   std::array<std::uint8_t, 32> seed{};

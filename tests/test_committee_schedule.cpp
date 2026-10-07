@@ -493,5 +493,3 @@ TEST(test_epoch_ticket_better_ignores_source_height_and_uses_only_canonical_fiel
   ASSERT_TRUE(!epoch_ticket_better(a, b));
   ASSERT_TRUE(!epoch_ticket_better(b, a));
 }
-
-void register_committee_schedule_tests() {}

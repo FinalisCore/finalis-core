@@ -864,5 +864,3 @@ TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
   auto r = validate_tx(tx, 1, view, &ctx);
   ASSERT_TRUE(!r.ok);
 }
-
-void register_bonding_tests() {}

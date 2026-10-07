@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -21,13 +22,7 @@
 using namespace finalis;
 
 namespace {
-std::string unique_test_path(const char* prefix) {
-  static std::atomic<std::uint64_t> counter{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto seq = counter.fetch_add(1, std::memory_order_relaxed);
-  return std::string(prefix) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq);
-}
+using finalis::test::unique_test_base;
 }  // namespace
 
 TEST(test_token_bucket_refill_and_consume) {
@@ -100,7 +95,7 @@ TEST(test_operator_id_from_payout_pubkey_persists_through_registry_and_db) {
   ASSERT_TRUE(info.has_value());
   ASSERT_EQ(info->operator_id, payout->public_key);
 
-  const std::string path = unique_test_path("/tmp/finalis_test_operator_id_db");
+  const std::string path = unique_test_base("/tmp/finalis_test_operator_id_db");
   std::filesystem::create_directories(path);
   storage::DB db;
   ASSERT_TRUE(db.open(path));
@@ -111,5 +106,3 @@ TEST(test_operator_id_from_payout_pubkey_persists_through_registry_and_db) {
   ASSERT_EQ(it->second.operator_id, payout->public_key);
   db.close();
 }
-
-void register_hardening_tests() {}

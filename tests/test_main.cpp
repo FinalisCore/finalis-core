@@ -2,10 +2,13 @@
 
 #include "test_framework.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <map>
+#include <optional>
 #include <string>
 
 namespace {
@@ -54,32 +57,25 @@ std::vector<std::pair<std::string, TestFn>>& tests() {
 
 Reg::Reg(const std::string& n, TestFn fn) { tests().push_back({n, std::move(fn)}); }
 
-void register_codec_tests();
-void register_chain_id_tests();
-void register_crypto_tests();
-void register_address_tests();
-void register_p2p_tests();
-void register_addrman_tests();
-void register_monetary_tests();
-void register_committee_schedule_tests();
-void register_state_commitment_tests();
-void register_smt_tests();
-void register_bonding_tests();
-void register_finality_certificate_tests();
-void register_snapshot_tests();
-void register_mempool_tests();
-void register_hardening_tests();
-void register_node_hardening_tests();
-void register_protocol_scope_tests();
-void register_genesis_tests();
-void register_paths_tests();
-void register_keystore_tests();
-void register_wallet_send_policy_tests();
-void register_validator_onboarding_tests();
-void register_integration_tests();
-void register_lightserver_tests();
+std::map<std::string, std::string>& test_tags() {
+  static std::map<std::string, std::string> t;
+  return t;
+}
 
-int main() {
+RegTags::RegTags(const std::string& n, const std::string& tags) { test_tags()[n] = tags; }
+
+namespace {
+
+int usage_error(const std::string& message) {
+  std::cerr << "[tests] " << message << "\n"
+            << "usage: finalis-tests [--list | --list-tags | --run <exact-test-name>]\n"
+            << "  env: FINALIS_TEST_FILTER=<substring>, FINALIS_TEST_SHARD_INDEX/FINALIS_TEST_SHARD_COUNT\n";
+  return 2;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
 #ifdef _WIN32
   if (std::getenv("FINALIS_TEST_QUIET_LOGS") == nullptr) {
     _putenv_s("FINALIS_TEST_QUIET_LOGS", "1");
@@ -89,31 +85,40 @@ int main() {
     setenv("FINALIS_TEST_QUIET_LOGS", "1", 1);
   }
 #endif
-  // Default test runner: current live epoch-ticket runtime.
-  register_codec_tests();
-  register_chain_id_tests();
-  register_crypto_tests();
-  register_address_tests();
-  register_p2p_tests();
-  register_addrman_tests();
-  register_monetary_tests();
-  register_committee_schedule_tests();
-  register_state_commitment_tests();
-  register_smt_tests();
-  register_bonding_tests();
-  register_finality_certificate_tests();
-  register_snapshot_tests();
-  register_mempool_tests();
-  register_hardening_tests();
-  register_node_hardening_tests();
-  register_protocol_scope_tests();
-  register_genesis_tests();
-  register_paths_tests();
-  register_keystore_tests();
-  register_wallet_send_policy_tests();
-  register_validator_onboarding_tests();
-  register_integration_tests();
-  register_lightserver_tests();
+  bool list = false;
+  bool list_tags = false;
+  std::optional<std::string> run_exact;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--list") {
+      list = true;
+    } else if (arg == "--list-tags") {
+      list_tags = true;
+    } else if (arg == "--run") {
+      if (i + 1 >= argc) return usage_error("--run requires a test name");
+      run_exact = argv[++i];
+    } else {
+      return usage_error("unknown argument: " + arg);
+    }
+  }
+
+  // A tag for a name that is not a registered test is a typo; fail loudly instead of silently unlabelling.
+  for (const auto& [name, tags] : test_tags()) {
+    const bool known = std::any_of(tests().begin(), tests().end(), [&](const auto& t) { return t.first == name; });
+    if (!known) return usage_error("TEST_TAGS for unknown test: " + name);
+  }
+
+  if (list || list_tags) {
+    for (const auto& [name, fn] : tests()) {
+      std::cout << name;
+      if (list_tags) {
+        auto it = test_tags().find(name);
+        std::cout << '\t' << (it == test_tags().end() ? "" : it->second);
+      }
+      std::cout << '\n';
+    }
+    return 0;
+  }
 
   int failed = 0;
   std::vector<std::string> failed_names;
@@ -125,17 +130,27 @@ int main() {
 
   std::vector<std::pair<std::string, TestFn>> selected;
   selected.reserve(tests().size());
-  std::size_t shard_counter = 0;
-  for (const auto& [name, fn] : tests()) {
-    if (filter && std::string(name).find(filter) == std::string::npos) continue;
-    if (shard_count > 1 && (shard_counter++ % shard_count) != shard_index) continue;
-    selected.push_back({name, fn});
+  if (run_exact.has_value()) {
+    filter = nullptr;
+    auto it = std::find_if(tests().begin(), tests().end(), [&](const auto& t) { return t.first == *run_exact; });
+    if (it == tests().end()) {
+      std::cerr << "[tests] no test named " << *run_exact << "\n";
+      return 2;
+    }
+    selected.push_back(*it);
+  } else {
+    std::size_t shard_counter = 0;
+    for (const auto& [name, fn] : tests()) {
+      if (filter && std::string(name).find(filter) == std::string::npos) continue;
+      if (shard_count > 1 && (shard_counter++ % shard_count) != shard_index) continue;
+      selected.push_back({name, fn});
+    }
   }
 
   const std::size_t total = selected.size();
   std::cout << "[tests] total=" << total;
   if (filter) std::cout << " filter=\"" << filter << "\"";
-  if (shard_count > 1) std::cout << " shard=" << shard_index << "/" << shard_count;
+  if (shard_count > 1 && !run_exact.has_value()) std::cout << " shard=" << shard_index << "/" << shard_count;
   std::cout << std::endl;
 
   TtyProgress tty_progress;

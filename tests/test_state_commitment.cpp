@@ -189,5 +189,3 @@ TEST(test_validator_root_v3_stable_when_v4_fields_change) {
   const Hash32 root_b = crypto::SparseMerkleTree::compute_root_from_leaves(leaves_b);
   ASSERT_EQ(root_a, root_b);
 }
-
-void register_state_commitment_tests() {}

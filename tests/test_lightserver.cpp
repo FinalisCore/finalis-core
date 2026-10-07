@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -42,12 +43,7 @@ namespace {
 
 constexpr auto kClusterFinalizationTimeout = std::chrono::seconds(120);
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> seq{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
-}
+using finalis::test::unique_test_base;
 
 std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id) {
   std::array<std::uint8_t, 32> seed{};
@@ -713,7 +709,7 @@ TEST(test_lightserver_get_utxos_ignores_stale_or_missing_script_index_entries) {
 }
 
 TEST(test_wallet_spendable_utxos_reconcile_script_index_with_canonical_set) {
-  const std::string base = "/tmp/finalis_wallet_spendable_reconcile";
+  const std::string base = unique_test_base("/tmp/finalis_wallet_spendable_reconcile");
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
@@ -2192,5 +2188,3 @@ TEST(test_lightserver_admin_methods_only_on_admin_surface) {
   ASSERT_TRUE(!lightserver::is_admin_rpc_method("broadcast_tx"));
   ASSERT_TRUE(!lightserver::is_admin_rpc_method("get_tip"));
 }
-
-void register_lightserver_tests() {}

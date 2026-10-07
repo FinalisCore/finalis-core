@@ -485,5 +485,3 @@ TEST(test_protocol_scope_roundtrips_mint_deposit_script) {
   ASSERT_TRUE(parsed_mint_id == mint_id);
   ASSERT_TRUE(parsed_recipient == recipient);
 }
-
-void register_protocol_scope_tests() {}

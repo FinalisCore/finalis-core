@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -21,11 +22,7 @@ using finalis::OutPoint;
 
 namespace {
 std::string unique_test_dir(const char* prefix) {
-  static std::atomic<std::uint64_t> counter{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto seq = counter.fetch_add(1, std::memory_order_relaxed);
-  const std::string dir = std::string(prefix) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq);
+  const std::string dir = finalis::test::unique_test_base(prefix);
   std::filesystem::create_directories(dir);
   return dir;
 }

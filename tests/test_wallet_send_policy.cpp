@@ -284,5 +284,3 @@ TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_
   if (!result.ok) throw std::runtime_error("wallet confidential->transparent builder error: " + result.error);
   ASSERT_TRUE(result.ok);
 }
-
-void register_wallet_send_policy_tests() {}
