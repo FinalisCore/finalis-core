@@ -265,13 +265,6 @@ std::string csafe_db_key(std::uint64_t height) { return "CSAFE:" + epoch_db_key_
 std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id);
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
 
-Bytes serialize_test_finalized_write_marker(std::uint64_t height, const Hash32& block_id) {
-  codec::ByteWriter w;
-  w.u64le(height);
-  w.bytes_fixed(block_id);
-  return w.take();
-}
-
 node::NodeConfig single_node_cfg(const std::string& base, std::size_t max_committee = MAX_COMMITTEE) {
   node::NodeConfig cfg;
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
@@ -9088,24 +9081,6 @@ TEST(test_startup_rejects_invalid_finality_certificate_signature) {
   ASSERT_TRUE(!cert->signatures.empty());
   cert->signatures[0].signature[0] ^= 0x01;
   ASSERT_TRUE(db.put(test_key_finality_certificate_height(tip->height), cert->serialize()));
-  db.close();
-
-  node::Node n(single_node_cfg(base, 1));
-  ASSERT_TRUE(!n.init());
-}
-
-TEST(test_startup_rejects_incomplete_finalized_write_marker) {
-  const auto base = unique_test_base("/tmp/finalis_it_partial_finalized_write");
-  auto cluster = make_cluster(base, 1, 1, 1);
-  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 1, std::chrono::seconds(12)));
-  cluster.nodes[0]->stop();
-  cluster.nodes.clear();
-
-  storage::DB db;
-  ASSERT_TRUE(db.open(base + "/node0"));
-  const auto tip = db.get_tip();
-  ASSERT_TRUE(tip.has_value());
-  ASSERT_TRUE(db.put("FW:PENDING", serialize_test_finalized_write_marker(tip->height, tip->hash)));
   db.close();
 
   node::Node n(single_node_cfg(base, 1));

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "node.hpp"
+#include "node_internal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -57,14 +58,12 @@
 #include "utxo/signing.hpp"
 
 namespace finalis::node {
+using namespace detail;
+
 namespace {
-constexpr std::uint32_t kFixedValidationRulesVersion = 7;
 
 constexpr std::size_t kMaxBlockTxs = 1000;
 constexpr std::size_t kMaxBlockBytes = 1 * 1024 * 1024;
-constexpr std::size_t kMaxIngressRangeRequestRecords = 1024;
-constexpr std::size_t kMaxIngressRangeResponseRecords = 1024;
-constexpr std::size_t kMaxIngressRangeResponseBytes = 512 * 1024;
 constexpr std::size_t kMaxIngressPrevalidationBytes = 512 * 1024;
 constexpr std::size_t kMaxOutstandingIngressRequestsPerPeer = 8;
 constexpr std::uint64_t kDefaultPolicyMinRelayFeeUnits = 1'000ULL;
@@ -81,88 +80,10 @@ constexpr std::uint64_t kEpochReconcileRejectLogIntervalMs = 30'000;
 constexpr std::uint64_t kEpochReconcileClosedRebuildLogIntervalMs = 60'000;
 constexpr std::uint64_t kTxRelayPeerBackoffMs = 60'000;
 constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
-constexpr std::uint64_t kFinalizedTipFreshnessFloorMs = 15'000;
 constexpr std::uint64_t kValidatorsAddrmanEntryTtlSeconds = 7 * 24 * 60 * 60;
 constexpr std::uint64_t kTimeoutVoteMessageDedupTtlMs = 120'000;
 constexpr std::size_t kMaxSeenTimeoutVoteMessages = 65'536;
 constexpr std::uint32_t kTimeoutVoteDuplicateLogEvery = 32;
-
-inline bool deferred_exit_fork_active(const NetworkConfig& network, std::uint64_t height) {
-  return height >= network.deferred_exit_activation_height;
-}
-
-std::string short_pub_hex(const PubKey32& pub) {
-  Bytes b(pub.begin(), pub.begin() + 4);
-  return hex_encode(b);
-}
-
-std::string short_hash_hex(const Hash32& h) {
-  Bytes b(h.begin(), h.begin() + 4);
-  return hex_encode(b);
-}
-
-const char* availability_status_name(availability::AvailabilityOperatorStatus status) {
-  switch (status) {
-    case availability::AvailabilityOperatorStatus::WARMUP:
-      return "WARMUP";
-    case availability::AvailabilityOperatorStatus::ACTIVE:
-      return "ACTIVE";
-    case availability::AvailabilityOperatorStatus::PROBATION:
-      return "PROBATION";
-    case availability::AvailabilityOperatorStatus::EJECTED:
-      return "EJECTED";
-  }
-  return "UNKNOWN";
-}
-
-const char* checkpoint_derivation_mode_name(storage::FinalizedCommitteeDerivationMode mode) {
-  switch (mode) {
-    case storage::FinalizedCommitteeDerivationMode::NORMAL:
-      return "normal";
-    case storage::FinalizedCommitteeDerivationMode::FALLBACK:
-      return "fallback";
-  }
-  return "unknown";
-}
-
-const char* checkpoint_fallback_reason_name(storage::FinalizedCommitteeFallbackReason reason) {
-  switch (reason) {
-    case storage::FinalizedCommitteeFallbackReason::NONE:
-      return "none";
-    case storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS:
-      return "insufficient_eligible_operators";
-    case storage::FinalizedCommitteeFallbackReason::HYSTERESIS_RECOVERY_PENDING:
-      return "hysteresis_recovery_pending";
-    case storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE:
-      return "emergency_prior_committee";
-  }
-  return "unknown";
-}
-
-std::size_t ingress_record_wire_size(const p2p::IngressRecordMsg& record) {
-  constexpr std::size_t kIngressRecordOverhead = 24;
-  const std::size_t cert_size = record.certificate.serialize().size();
-  if (cert_size > std::numeric_limits<std::size_t>::max() - record.tx_bytes.size()) {
-    return std::numeric_limits<std::size_t>::max();
-  }
-  const std::size_t payload_size = cert_size + record.tx_bytes.size();
-  if (payload_size > std::numeric_limits<std::size_t>::max() - kIngressRecordOverhead) {
-    return std::numeric_limits<std::size_t>::max();
-  }
-  return payload_size + kIngressRecordOverhead;
-}
-
-std::size_t ingress_range_wire_size(const p2p::IngressRangeMsg& msg) {
-  std::size_t total = 32;
-  for (const auto& record : msg.records) {
-    const std::size_t record_size = ingress_record_wire_size(record);
-    if (record_size > std::numeric_limits<std::size_t>::max() - total) {
-      return std::numeric_limits<std::size_t>::max();
-    }
-    total += record_size;
-  }
-  return total;
-}
 
 p2p::MisbehaviorReason ingress_fault_reason_for(const std::string& error) {
   if (error == "ingress-equivocation-detected" || error == "ingress-equivocation-evidence-store-failed") {
@@ -257,32 +178,6 @@ struct FrontierBuildSelection {
   std::vector<Bytes> ordered_records;
 };
 
-bool load_certified_ingress_record_from_db(const storage::DB& db, std::uint32_t lane, std::uint64_t seq,
-                                           consensus::CertifiedIngressRecord* out, std::string* error) {
-  if (!out) {
-    if (error) *error = "missing-certified-ingress-output";
-    return false;
-  }
-  const auto cert_bytes = db.get_ingress_certificate(lane, seq);
-  if (!cert_bytes.has_value()) {
-    if (error) *error = "missing-certified-lane-record lane=" + std::to_string(lane) + " seq=" + std::to_string(seq);
-    return false;
-  }
-  const auto cert = IngressCertificate::parse(*cert_bytes);
-  if (!cert.has_value() || cert->lane != lane || cert->seq != seq) {
-    if (error) *error = "invalid-certified-lane-record lane=" + std::to_string(lane) + " seq=" + std::to_string(seq);
-    return false;
-  }
-  const auto tx_bytes = db.get_ingress_bytes(cert->txid);
-  if (!tx_bytes.has_value()) {
-    if (error) *error = "missing-certified-ingress-bytes lane=" + std::to_string(lane) +
-                        " seq=" + std::to_string(seq);
-    return false;
-  }
-  *out = consensus::CertifiedIngressRecord{*cert, *tx_bytes};
-  return true;
-}
-
 bool inspect_frontier_ordered_record_supported(const Bytes& raw_record, std::size_t index, Hash32* txid_out,
                                                std::string* error) {
   const auto tx = parse_any_tx(raw_record);
@@ -294,69 +189,8 @@ bool inspect_frontier_ordered_record_supported(const Bytes& raw_record, std::siz
   return true;
 }
 
-std::vector<std::string> parse_endpoint_list(const std::string& raw) {
-  std::vector<std::string> out;
-  std::string current;
-  current.reserve(raw.size());
-  bool escaping = false;
-  for (char ch : raw) {
-    if (escaping) {
-      current.push_back(ch);
-      escaping = false;
-      continue;
-    }
-    if (ch == '\\') {
-      escaping = true;
-      continue;
-    }
-    if (ch == ',') {
-      if (!current.empty()) out.push_back(current);
-      current.clear();
-      continue;
-    }
-    current.push_back(ch);
-  }
-  if (escaping) current.push_back('\\');
-  if (!current.empty()) out.push_back(current);
-  return out;
-}
-
-bool is_local_only_bind(const std::string& host) {
-  return host == "127.0.0.1" || host == "localhost" || host == "::1";
-}
-
 bool is_wildcard_bind(const std::string& host) {
   return host == "0.0.0.0" || host == "::";
-}
-
-bool is_unroutable_ip_literal(const std::string& ip) {
-  in_addr v4{};
-  if (inet_pton(AF_INET, ip.c_str(), &v4) == 1) {
-    const std::uint32_t host = ntohl(v4.s_addr);
-    const std::uint8_t a = static_cast<std::uint8_t>((host >> 24) & 0xFF);
-    const std::uint8_t b = static_cast<std::uint8_t>((host >> 16) & 0xFF);
-    if (a == 0 || a == 10 || a == 127) return true;
-    if (a == 169 && b == 254) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    if (a == 192 && b == 168) return true;
-    if (a == 100 && b >= 64 && b <= 127) return true;  // 100.64.0.0/10 (CGNAT)
-    if (a >= 224) return true;
-    return false;
-  }
-  in6_addr v6{};
-  if (inet_pton(AF_INET6, ip.c_str(), &v6) == 1) {
-    if (IN6_IS_ADDR_UNSPECIFIED(&v6) || IN6_IS_ADDR_LOOPBACK(&v6) || IN6_IS_ADDR_MULTICAST(&v6)) return true;
-    const std::uint8_t first = v6.s6_addr[0];
-    const std::uint8_t second = v6.s6_addr[1];
-    if ((first & 0xFE) == 0xFC) return true;                // fc00::/7
-    if (first == 0xFE && (second & 0xC0) == 0x80) return true;  // fe80::/10
-    return false;
-  }
-  return false;
-}
-
-bool endpoint_fingerprint_safe(const std::string& endpoint) {
-  return endpoint.find(';') == std::string::npos;
 }
 
 std::optional<p2p::NetAddress> advertised_endpoint_from_config(const NodeConfig& cfg) {
@@ -370,12 +204,6 @@ std::optional<p2p::NetAddress> advertised_endpoint_from_config(const NodeConfig&
     return std::nullopt;
   }
   return p2p::NetAddress{cfg.bind_ip, cfg.p2p_port};
-}
-
-bool advertised_endpoint_likely_public(const p2p::NetAddress& addr) {
-  if (addr.ip.empty() || addr.port == 0) return false;
-  if (is_unroutable_ip_literal(addr.ip)) return false;
-  return true;
 }
 
 std::array<std::uint8_t, 12> make_stun_transaction_id() {
@@ -1023,30 +851,6 @@ std::optional<std::uint64_t> parse_height_from_error(const std::string& error) {
   }
 }
 
-std::optional<std::pair<std::uint32_t, std::uint64_t>> parse_lane_seq_from_error(const std::string& error) {
-  const std::string lane_marker = "lane=";
-  const std::string seq_marker = "seq=";
-  const auto lane_pos = error.find(lane_marker);
-  const auto seq_pos = error.find(seq_marker);
-  if (lane_pos == std::string::npos || seq_pos == std::string::npos) return std::nullopt;
-  const std::size_t lane_start = lane_pos + lane_marker.size();
-  std::size_t lane_end = lane_start;
-  while (lane_end < error.size() && error[lane_end] >= '0' && error[lane_end] <= '9') ++lane_end;
-  if (lane_end == lane_start) return std::nullopt;
-  const std::size_t seq_start = seq_pos + seq_marker.size();
-  std::size_t seq_end = seq_start;
-  while (seq_end < error.size() && error[seq_end] >= '0' && error[seq_end] <= '9') ++seq_end;
-  if (seq_end == seq_start) return std::nullopt;
-  try {
-    const auto lane = static_cast<std::uint32_t>(std::stoul(error.substr(lane_start, lane_end - lane_start)));
-    const auto seq = static_cast<std::uint64_t>(std::stoull(error.substr(seq_start, seq_end - seq_start)));
-    if (lane >= INGRESS_LANE_COUNT || seq == 0) return std::nullopt;
-    return std::make_pair(lane, seq);
-  } catch (...) {
-    return std::nullopt;
-  }
-}
-
 constexpr std::uint64_t kStartupCheckpointFallbackMaxRewindBlocks = 128;
 
 std::uint64_t compute_startup_frontier_repair_cap(const NodeConfig& cfg, std::uint64_t frontier_tip_height) {
@@ -1229,38 +1033,6 @@ std::set<std::string> local_ipv4_addresses() {
   return ips;
 }
 
-bool same_epoch_ticket(const consensus::EpochTicket& a, const consensus::EpochTicket& b) {
-  return a.epoch == b.epoch && a.participant_pubkey == b.participant_pubkey && a.challenge_anchor == b.challenge_anchor &&
-         a.nonce == b.nonce && a.work_hash == b.work_hash && a.source_height == b.source_height && a.origin == b.origin;
-}
-
-bool same_epoch_best_map(const std::map<PubKey32, consensus::EpochBestTicket>& a,
-                         const std::map<PubKey32, consensus::EpochBestTicket>& b) {
-  if (a.size() != b.size()) return false;
-  for (const auto& [pub, ticket] : a) {
-    auto it = b.find(pub);
-    if (it == b.end() || !same_epoch_ticket(ticket, it->second)) return false;
-  }
-  return true;
-}
-
-bool same_epoch_committee_snapshot(const consensus::EpochCommitteeSnapshot& a,
-                                   const consensus::EpochCommitteeSnapshot& b) {
-  if (a.epoch != b.epoch || a.challenge_anchor != b.challenge_anchor || a.ordered_members != b.ordered_members ||
-      a.selected_winners.size() != b.selected_winners.size()) {
-    return false;
-  }
-  for (std::size_t i = 0; i < a.selected_winners.size(); ++i) {
-    const auto& lhs = a.selected_winners[i];
-    const auto& rhs = b.selected_winners[i];
-    if (lhs.participant_pubkey != rhs.participant_pubkey || lhs.work_hash != rhs.work_hash || lhs.nonce != rhs.nonce ||
-        lhs.source_height != rhs.source_height) {
-      return false;
-    }
-  }
-  return true;
-}
-
 std::string launch_mode_name(LightserverLaunchMode mode) {
   switch (mode) {
     case LightserverLaunchMode::Explicit:
@@ -1268,50 +1040,6 @@ std::string launch_mode_name(LightserverLaunchMode mode) {
     default:
       return "disabled";
   }
-}
-
-std::string endpoint_to_ip(std::string endpoint) {
-  const auto pos = endpoint.find(':');
-  if (pos == std::string::npos) return endpoint;
-  return endpoint.substr(0, pos);
-}
-
-std::string token_value(const std::string& s, const std::string& key) {
-  const std::string needle = key + "=";
-  const auto pos = s.find(needle);
-  if (pos == std::string::npos) return "";
-  auto end = s.find(' ', pos + needle.size());
-  if (end == std::string::npos) end = s.size();
-  return s.substr(pos + needle.size(), end - (pos + needle.size()));
-}
-
-std::string ascii_lower(std::string s) {
-  for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-  return s;
-}
-
-std::string network_id_hex(const NetworkConfig& cfg) {
-  return hex_encode(Bytes(cfg.network_id.begin(), cfg.network_id.end()));
-}
-
-std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
-  codec::ByteWriter w;
-  w.bytes_fixed(cfg.network_id);
-  w.u32le(cfg.protocol_version);
-  w.u64le(cfg.feature_flags);
-  w.u64le(cfg.magic);
-  w.u64le(cfg.committee_epoch_blocks);
-  w.u32le(cfg.max_committee);
-  w.u32le(cv);
-  const auto genesis = hex_decode(chain_id.genesis_hash_hex);
-  if (genesis.has_value() && genesis->size() == 32) {
-    Hash32 g{};
-    std::copy(genesis->begin(), genesis->end(), g.begin());
-    w.bytes_fixed(g);
-  } else {
-    w.bytes_fixed(zero_hash());
-  }
-  return hex_encode32(crypto::sha256d(w.data()));
 }
 
 std::string local_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
@@ -1336,45 +1064,11 @@ std::optional<std::string> software_fingerprint_value(const std::string& ua, con
   return std::nullopt;
 }
 
-std::mutex g_local_bus_mu;
-std::vector<Node*> g_local_bus_nodes;
-
-constexpr const char* kSmtTreeUtxo = "utxo";
-constexpr const char* kSmtTreeValidators = "validators";
-
-bool debug_economics_logs_enabled();
-bool debug_finality_logs_enabled();
-bool debug_liveness_logs_enabled();
-
 bool runtime_logs_enabled() {
   if (debug_economics_logs_enabled() || debug_finality_logs_enabled()) return true;
   const char* quiet = std::getenv("FINALIS_TEST_QUIET_LOGS");
   return !(quiet && std::string_view(quiet) == "1");
 }
-
-bool debug_economics_logs_enabled() {
-  const char* enabled = std::getenv("FINALIS_DEBUG_ECONOMICS");
-  return enabled && std::string_view(enabled) == "1";
-}
-
-bool debug_finality_logs_enabled() {
-  const char* enabled = std::getenv("FINALIS_DEBUG_FINALITY");
-  return enabled && std::string_view(enabled) == "1";
-}
-
-bool debug_liveness_logs_enabled() {
-  const char* enabled = std::getenv("FINALIS_DEBUG_LIVENESS");
-  return enabled && std::string_view(enabled) == "1";
-}
-
-bool debug_checkpoint_logs_enabled() {
-  const char* enabled = std::getenv("FINALIS_DEBUG_CHECKPOINTS");
-  return enabled && std::string_view(enabled) == "1";
-}
-
-storage::SlashingRecord make_onchain_slash_record(const SlashEvidence& ev, const Hash32& txid, std::uint64_t observed_height);
-
-std::string finalized_write_marker_key() { return "FW:PENDING"; }
 
 std::string justify_summary(const std::optional<QuorumCertificate>& qc, const std::optional<TimeoutCertificate>& tc) {
   if (qc.has_value()) {
@@ -1398,69 +1092,6 @@ std::string signer_set_summary(const std::vector<FinalitySig>& sigs) {
   return oss.str();
 }
 
-Bytes serialize_finalized_write_marker(std::uint64_t height, const Hash32& block_id) {
-  codec::ByteWriter w;
-  w.u64le(height);
-  w.bytes_fixed(block_id);
-  return w.take();
-}
-
-bool parse_finalized_write_marker(const Bytes& bytes, std::uint64_t* height, Hash32* block_id) {
-  if (!height || !block_id) return false;
-  return codec::parse_exact(bytes, [&](codec::ByteReader& r) {
-    auto parsed_height = r.u64le();
-    auto parsed_block_id = r.bytes_fixed<32>();
-    if (!parsed_height || !parsed_block_id) return false;
-    *height = *parsed_height;
-    *block_id = *parsed_block_id;
-    return true;
-  });
-}
-
-consensus::ValidatorBestTicket checkpoint_best_ticket_for_member(
-    const NetworkConfig& network, const consensus::ValidatorRegistry& validators,
-    const storage::FinalizedCommitteeCheckpoint& checkpoint, std::size_t index) {
-  const auto& pub = checkpoint.ordered_members[index];
-  if (index < checkpoint.ordered_ticket_hashes.size() && index < checkpoint.ordered_ticket_nonces.size()) {
-    return consensus::ValidatorBestTicket{pub, checkpoint.ordered_ticket_hashes[index], checkpoint.ordered_ticket_nonces[index]};
-  }
-
-  const auto epoch = checkpoint.epoch_start_height;
-  PubKey32 operator_id = pub;
-  if (index < checkpoint.ordered_operator_ids.size() && checkpoint.ordered_operator_ids[index] != PubKey32{}) {
-    operator_id = checkpoint.ordered_operator_ids[index];
-      } else if (auto it = validators.all().find(pub); it != validators.all().end()) {
-    operator_id = consensus::canonical_operator_id(pub, it->second);
-  }
-  auto ticket =
-      consensus::best_epoch_ticket_for_operator_id(epoch, checkpoint.epoch_seed, operator_id, epoch,
-                                                   consensus::EPOCH_TICKET_MAX_NONCE);
-  if (ticket.has_value() && consensus::epoch_ticket_meets_difficulty(*ticket, checkpoint.ticket_difficulty_bits)) {
-    return consensus::ValidatorBestTicket{pub, ticket->work_hash, ticket->nonce};
-  }
-  return consensus::ValidatorBestTicket{pub, Hash32{}, 0};
-}
-
-std::vector<consensus::ValidatorBestTicket> checkpoint_winners(
-    const NetworkConfig& network, const consensus::ValidatorRegistry& validators,
-    const storage::FinalizedCommitteeCheckpoint& checkpoint) {
-  std::vector<consensus::ValidatorBestTicket> winners;
-  winners.reserve(checkpoint.ordered_members.size());
-  for (std::size_t i = 0; i < checkpoint.ordered_members.size(); ++i) {
-    winners.push_back(checkpoint_best_ticket_for_member(network, validators, checkpoint, i));
-  }
-  return winners;
-}
-
-std::vector<PubKey32> proposer_schedule_from_checkpoint(const NetworkConfig& network,
-                                                        const consensus::ValidatorRegistry& validators,
-                                                        const storage::FinalizedCommitteeCheckpoint& checkpoint,
-                                                        std::uint64_t height) {
-  const auto winners = checkpoint_winners(network, validators, checkpoint);
-  return consensus::proposer_schedule_from_committee(
-      winners, consensus::compute_proposer_seed(checkpoint.epoch_seed, height, consensus::compute_committee_root(winners)));
-}
-
 std::optional<PubKey32> leader_from_checkpoint(const NetworkConfig& network, const consensus::ValidatorRegistry& validators,
                                                const storage::FinalizedCommitteeCheckpoint& checkpoint,
                                                std::uint64_t height, std::uint32_t round) {
@@ -1470,205 +1101,6 @@ std::optional<PubKey32> leader_from_checkpoint(const NetworkConfig& network, con
   const auto schedule = proposer_schedule_from_checkpoint(network, validators, checkpoint, height);
   if (schedule.empty()) return std::nullopt;
   return schedule[static_cast<std::size_t>(round) % schedule.size()];
-}
-
-bool finalized_checkpoint_matches_epoch_snapshot(const storage::FinalizedCommitteeCheckpoint& checkpoint,
-                                                 const consensus::EpochCommitteeSnapshot& snapshot) {
-  if (checkpoint.ordered_members != snapshot.ordered_members) return false;
-  if (checkpoint.ordered_ticket_hashes.size() != snapshot.selected_winners.size()) return false;
-  if (checkpoint.ordered_ticket_nonces.size() != snapshot.selected_winners.size()) return false;
-  for (std::size_t i = 0; i < snapshot.selected_winners.size(); ++i) {
-    if (checkpoint.ordered_members[i] != snapshot.selected_winners[i].participant_pubkey) return false;
-    if (checkpoint.ordered_ticket_hashes[i] != snapshot.selected_winners[i].work_hash) return false;
-    if (checkpoint.ordered_ticket_nonces[i] != snapshot.selected_winners[i].nonce) return false;
-  }
-  return true;
-}
-
-consensus::EpochCommitteeSnapshot epoch_committee_snapshot_from_checkpoint(
-    const storage::FinalizedCommitteeCheckpoint& checkpoint) {
-  consensus::EpochCommitteeSnapshot snapshot;
-  snapshot.epoch = checkpoint.epoch_start_height;
-  snapshot.challenge_anchor = checkpoint.epoch_seed;
-  snapshot.ordered_members = checkpoint.ordered_members;
-  snapshot.selected_winners.reserve(checkpoint.ordered_members.size());
-  for (std::size_t i = 0; i < checkpoint.ordered_members.size(); ++i) {
-    if (i >= checkpoint.ordered_ticket_hashes.size() || i >= checkpoint.ordered_ticket_nonces.size()) break;
-    snapshot.selected_winners.push_back(consensus::EpochCommitteeMember{
-        .participant_pubkey = checkpoint.ordered_members[i],
-        .work_hash = checkpoint.ordered_ticket_hashes[i],
-        .nonce = checkpoint.ordered_ticket_nonces[i],
-        .source_height = checkpoint.epoch_start_height,
-    });
-  }
-  return snapshot;
-}
-
-struct StateRoots {
-  Hash32 utxo_root{};
-  Hash32 validators_root{};
-};
-
-bool same_validator_info(const consensus::ValidatorInfo& a, const consensus::ValidatorInfo& b) {
-  return a.status == b.status && a.joined_height == b.joined_height && a.bonded_amount == b.bonded_amount &&
-         a.operator_id == b.operator_id && a.has_bond == b.has_bond && a.bond_outpoint.txid == b.bond_outpoint.txid &&
-         a.bond_outpoint.index == b.bond_outpoint.index && a.unbond_height == b.unbond_height &&
-         a.eligible_count_window == b.eligible_count_window && a.participated_count_window == b.participated_count_window &&
-         a.liveness_window_start == b.liveness_window_start && a.suspended_until_height == b.suspended_until_height &&
-         a.last_join_height == b.last_join_height && a.last_exit_height == b.last_exit_height &&
-         a.penalty_strikes == b.penalty_strikes;
-}
-
-bool same_validator_maps(const std::map<PubKey32, consensus::ValidatorInfo>& a,
-                         const std::map<PubKey32, consensus::ValidatorInfo>& b) {
-  if (a.size() != b.size()) return false;
-  auto ita = a.begin();
-  auto itb = b.begin();
-  for (; ita != a.end(); ++ita, ++itb) {
-    if (ita->first != itb->first) return false;
-    if (!same_validator_info(ita->second, itb->second)) return false;
-  }
-  return true;
-}
-
-bool maybe_reactivate_single_exiting_validator_for_startup_migration(
-    const NetworkConfig& network, consensus::CanonicalDerivedState* state, PubKey32* reactivated_pubkey) {
-  if (state == nullptr) return false;
-  const std::uint64_t next_height = state->finalized_height + 1;
-  if (deferred_exit_fork_active(network, next_height)) return false;
-  if (next_height > network.deferred_exit_activation_height) return false;
-  if (!state->validators.active_sorted(next_height).empty()) return false;
-
-  std::optional<PubKey32> chosen;
-  for (const auto& [pub, info] : state->validators.all()) {
-    if (info.status != consensus::ValidatorStatus::EXITING) continue;
-    if (!info.has_bond || info.bonded_amount == 0) continue;
-    if (!chosen.has_value() || pub < *chosen) chosen = pub;
-  }
-  if (!chosen.has_value()) return false;
-
-  auto& all = state->validators.mutable_all();
-  auto it = all.find(*chosen);
-  if (it == all.end()) return false;
-  it->second.status = consensus::ValidatorStatus::ACTIVE;
-  if (reactivated_pubkey != nullptr) *reactivated_pubkey = *chosen;
-  return true;
-}
-
-bool zero_outpoint(const OutPoint& op) { return op.txid == zero_hash() && op.index == 0; }
-
-bool is_non_genesis_zero_bond_outpoint(const consensus::ValidatorInfo& info) {
-  return info.has_bond && zero_outpoint(info.bond_outpoint) && info.joined_height != 0;
-}
-
-std::string infer_exit_reason(const consensus::ValidatorInfo& before, const consensus::ValidatorInfo& after, std::uint64_t height) {
-  if (after.last_exit_height == height && after.unbond_height == height) {
-    if (after.penalty_strikes > before.penalty_strikes) return "liveness-penalty-exit";
-    return "unbond-spend-exit";
-  }
-  if (after.unbond_height > 0 && after.unbond_height == before.unbond_height) return "deferred-epoch-exit-activation";
-  return "unknown";
-}
-
-void emit_exit_transition_logs(const std::map<PubKey32, consensus::ValidatorInfo>& before,
-                               const std::map<PubKey32, consensus::ValidatorInfo>& after, std::uint64_t height,
-                               const char* source, const std::function<void(const std::string&)>& log_fn) {
-  for (const auto& [pub, post] : after) {
-    auto it = before.find(pub);
-    if (it == before.end()) continue;
-    const auto& pre = it->second;
-    if (pre.status == consensus::ValidatorStatus::EXITING || post.status != consensus::ValidatorStatus::EXITING) continue;
-    std::ostringstream oss;
-    oss << "validator-exit-transition source=" << source << " height=" << height
-        << " pub=" << short_pub_hex(pub) << " reason=" << infer_exit_reason(pre, post, height)
-        << " pre_status=" << static_cast<int>(pre.status) << " post_status=" << static_cast<int>(post.status)
-        << " pre_unbond=" << pre.unbond_height << " post_unbond=" << post.unbond_height
-        << " pre_last_exit=" << pre.last_exit_height << " post_last_exit=" << post.last_exit_height
-        << " pre_penalties=" << pre.penalty_strikes << " post_penalties=" << post.penalty_strikes
-        << " has_bond=" << (post.has_bond ? "1" : "0")
-        << " bond_outpoint=" << short_hash_hex(post.bond_outpoint.txid) << ":" << post.bond_outpoint.index;
-    log_fn(oss.str());
-  }
-}
-
-std::size_t repair_invalid_exiting_zero_bond_outpoints(consensus::ValidatorRegistry* validators, std::uint64_t height,
-                                                       std::uint64_t unbond_delay_blocks,
-                                                       const std::function<void(const std::string&)>& log_fn) {
-  if (validators == nullptr) return 0;
-  std::size_t repaired = 0;
-  for (auto& [pub, info] : validators->mutable_all()) {
-    if (info.status != consensus::ValidatorStatus::EXITING) continue;
-    if (!is_non_genesis_zero_bond_outpoint(info)) continue;
-    if (info.unbond_height == 0) continue;
-    if (info.unbond_height > std::numeric_limits<std::uint64_t>::max() - unbond_delay_blocks) continue;
-    if (height < info.unbond_height + unbond_delay_blocks) continue;
-    if (validators->finalize_withdrawal(pub)) {
-      ++repaired;
-      log_fn("validator-exit-repair source=auto height=" + std::to_string(height) + " pub=" + short_pub_hex(pub) +
-             " reason=non-genesis-zero-bond-outpoint-matured-unbond");
-    }
-  }
-  return repaired;
-}
-
-std::size_t repair_matured_bootstrap_exiting_records(const NetworkConfig& network, consensus::ValidatorRegistry* validators,
-                                                     std::uint64_t height, std::uint64_t unbond_delay_blocks,
-                                                     const std::function<void(const std::string&)>& log_fn) {
-  if (validators == nullptr) return 0;
-  const std::uint64_t gate_height = height == std::numeric_limits<std::uint64_t>::max() ? height : (height + 1);
-  if (!bootstrap_penalty_exit_protection_active_at_height(network, gate_height)) return 0;
-  std::size_t repaired = 0;
-  for (auto& [pub, info] : validators->mutable_all()) {
-    const bool bootstrap_record =
-        info.joined_height == 0 && info.has_bond && info.bond_outpoint.txid == zero_hash() && info.bond_outpoint.index == 0;
-    if (!bootstrap_record) continue;
-    if (info.status != consensus::ValidatorStatus::EXITING) continue;
-    if (info.unbond_height == 0) continue;
-    if (info.unbond_height > std::numeric_limits<std::uint64_t>::max() - unbond_delay_blocks) continue;
-    if (height < info.unbond_height + unbond_delay_blocks) continue;
-    if (validators->finalize_withdrawal(pub)) {
-      ++repaired;
-      log_fn("validator-bootstrap-exit-repair source=auto height=" + std::to_string(height) + " pub=" + short_pub_hex(pub) +
-             " reason=bootstrap-exiting-matured-unbond");
-    }
-  }
-  return repaired;
-}
-
-std::string validator_info_debug_string(const consensus::ValidatorInfo& info) {
-  std::ostringstream oss;
-  oss << "{status=" << static_cast<int>(info.status) << ",joined=" << info.joined_height
-      << ",bonded=" << info.bonded_amount << ",operator=" << short_pub_hex(info.operator_id)
-      << ",has_bond=" << (info.has_bond ? "1" : "0")
-      << ",bond_outpoint=" << short_hash_hex(info.bond_outpoint.txid) << ":" << info.bond_outpoint.index
-      << ",unbond=" << info.unbond_height << ",eligible=" << info.eligible_count_window
-      << ",participated=" << info.participated_count_window << ",liveness=" << info.liveness_window_start
-      << ",suspended_until=" << info.suspended_until_height << ",last_join=" << info.last_join_height
-      << ",last_exit=" << info.last_exit_height << ",penalties=" << info.penalty_strikes << "}";
-  return oss.str();
-}
-
-std::string validator_map_mismatch_reason(const std::map<PubKey32, consensus::ValidatorInfo>& a,
-                                          const std::map<PubKey32, consensus::ValidatorInfo>& b) {
-  if (a.size() != b.size()) {
-    return "size persisted=" + std::to_string(a.size()) + " derived=" + std::to_string(b.size());
-  }
-  auto ita = a.begin();
-  auto itb = b.begin();
-  for (; ita != a.end(); ++ita, ++itb) {
-    if (ita->first != itb->first) {
-      return "pubkey persisted=" + short_pub_hex(ita->first) + " derived=" + short_pub_hex(itb->first);
-    }
-    if (!same_validator_info(ita->second, itb->second)) {
-      return "info pubkey=" + short_pub_hex(ita->first) + " persisted=" + validator_info_debug_string(ita->second) +
-             " derived=" + validator_info_debug_string(itb->second);
-    }
-  }
-  return "unknown";
-}
-
-bool same_tx_out(const TxOut& a, const TxOut& b) {
-  return a.value == b.value && a.script_pubkey == b.script_pubkey;
 }
 
 bool same_utxos(const UtxoSetV2& a, const UtxoSetV2& b) {
@@ -1683,373 +1115,14 @@ bool same_utxos(const UtxoSetV2& a, const UtxoSetV2& b) {
   return true;
 }
 
-bool same_join_request(const ValidatorJoinRequest& a, const ValidatorJoinRequest& b) {
-  return a.request_txid == b.request_txid && a.validator_pubkey == b.validator_pubkey &&
-         a.payout_pubkey == b.payout_pubkey && a.bond_outpoint.txid == b.bond_outpoint.txid &&
-         a.bond_outpoint.index == b.bond_outpoint.index && a.bond_amount == b.bond_amount &&
-         a.requested_height == b.requested_height && a.approved_height == b.approved_height && a.status == b.status;
-}
-
-bool same_join_request_maps(const std::map<Hash32, ValidatorJoinRequest>& a,
-                            const std::map<Hash32, ValidatorJoinRequest>& b) {
-  if (a.size() != b.size()) return false;
-  auto ita = a.begin();
-  auto itb = b.begin();
-  for (; ita != a.end(); ++ita, ++itb) {
-    if (ita->first != itb->first) return false;
-    if (!same_join_request(ita->second, itb->second)) return false;
-  }
-  return true;
-}
-
-bool same_epoch_reward_state(const storage::EpochRewardSettlementState& a, const storage::EpochRewardSettlementState& b) {
-  return a.epoch_start_height == b.epoch_start_height && a.total_reward_units == b.total_reward_units &&
-         a.fee_pool_units == b.fee_pool_units && a.reserve_accrual_units == b.reserve_accrual_units &&
-         a.reserve_subsidy_units == b.reserve_subsidy_units &&
-         a.settled == b.settled && a.reward_score_units == b.reward_score_units &&
-         a.onboarding_score_units == b.onboarding_score_units &&
-         a.expected_participation_units == b.expected_participation_units &&
-         a.observed_participation_units == b.observed_participation_units;
-}
-
-bool same_epoch_reward_maps(const std::map<std::uint64_t, storage::EpochRewardSettlementState>& a,
-                            const std::map<std::uint64_t, storage::EpochRewardSettlementState>& b) {
-  if (a.size() != b.size()) return false;
-  auto ita = a.begin();
-  auto itb = b.begin();
-  for (; ita != a.end(); ++ita, ++itb) {
-    if (ita->first != itb->first) return false;
-    if (!same_epoch_reward_state(ita->second, itb->second)) return false;
-  }
-  return true;
-}
-
-bool same_finalized_checkpoint(const storage::FinalizedCommitteeCheckpoint& a,
-                               const storage::FinalizedCommitteeCheckpoint& b) {
-  return a.epoch_start_height == b.epoch_start_height && a.epoch_seed == b.epoch_seed &&
-         a.ticket_difficulty_bits == b.ticket_difficulty_bits && a.derivation_mode == b.derivation_mode &&
-         a.fallback_reason == b.fallback_reason &&
-         a.availability_eligible_operator_count == b.availability_eligible_operator_count &&
-         a.availability_min_eligible_operators == b.availability_min_eligible_operators &&
-         a.adaptive_target_committee_size == b.adaptive_target_committee_size &&
-         a.adaptive_min_eligible == b.adaptive_min_eligible && a.adaptive_min_bond == b.adaptive_min_bond &&
-         a.qualified_depth == b.qualified_depth && a.target_expand_streak == b.target_expand_streak &&
-         a.target_contract_streak == b.target_contract_streak &&
-         a.ordered_members == b.ordered_members &&
-         a.ordered_operator_ids == b.ordered_operator_ids && a.ordered_base_weights == b.ordered_base_weights &&
-         a.ordered_ticket_bonus_bps == b.ordered_ticket_bonus_bps && a.ordered_final_weights == b.ordered_final_weights &&
-         a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces;
-}
-
-bool same_finalized_checkpoint_schedule_material(const storage::FinalizedCommitteeCheckpoint& a,
-                                                 const storage::FinalizedCommitteeCheckpoint& b) {
-  return a.epoch_start_height == b.epoch_start_height && a.epoch_seed == b.epoch_seed &&
-         a.ticket_difficulty_bits == b.ticket_difficulty_bits && a.derivation_mode == b.derivation_mode &&
-         a.fallback_reason == b.fallback_reason &&
-         a.availability_eligible_operator_count == b.availability_eligible_operator_count &&
-         a.availability_min_eligible_operators == b.availability_min_eligible_operators &&
-         a.adaptive_target_committee_size == b.adaptive_target_committee_size &&
-         a.adaptive_min_eligible == b.adaptive_min_eligible && a.adaptive_min_bond == b.adaptive_min_bond &&
-         a.qualified_depth == b.qualified_depth && a.target_expand_streak == b.target_expand_streak &&
-         a.target_contract_streak == b.target_contract_streak && a.ordered_members == b.ordered_members &&
-         a.ordered_operator_ids == b.ordered_operator_ids && a.ordered_base_weights == b.ordered_base_weights &&
-         a.ordered_ticket_bonus_bps == b.ordered_ticket_bonus_bps && a.ordered_final_weights == b.ordered_final_weights;
-}
-
-bool same_finalized_checkpoint_maps(const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& a,
-                                    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& b) {
-  if (a.size() != b.size()) return false;
-  auto ita = a.begin();
-  auto itb = b.begin();
-  for (; ita != a.end(); ++ita, ++itb) {
-    if (ita->first != itb->first) return false;
-    if (!same_finalized_checkpoint(ita->second, itb->second)) return false;
-  }
-  return true;
-}
-
 bool same_consensus_state_commitment_cache(const storage::ConsensusStateCommitmentCache& a,
                                            const storage::ConsensusStateCommitmentCache& b) {
   return a.height == b.height && a.hash == b.hash && a.commitment == b.commitment;
 }
 
-consensus::FinalizedIdentity finalized_identity_for_runtime_tip(std::uint64_t height, const Hash32& id) {
-  // Tip persistence is intentionally type-erased. Runtime rehydrates the
-  // semantic kind from finalized height in the frontier-only runtime.
-  if (height == 0) return consensus::FinalizedIdentity::genesis(id);
-  return consensus::FinalizedIdentity::transition(id);
-}
-
-bool finalized_identity_valid_for_frontier_runtime(std::uint64_t finalized_height,
-                                                   const consensus::FinalizedIdentity& identity) {
-  if (identity.is_transition()) return true;
-  return finalized_height == 0 && identity.is_genesis();
-}
-
-void apply_validator_state_changes_impl(consensus::ValidatorRegistry& validators,
-                                        std::map<Hash32, ValidatorJoinRequest>& validator_join_requests,
-                                        const Block& block, const UtxoSet& pre_utxos, std::uint64_t height,
-                                        std::uint64_t min_bond, std::uint64_t warmup_blocks,
-                                        std::uint64_t cooldown_blocks, std::uint64_t join_limit_window_blocks,
-                                        std::uint32_t join_limit_max_new,
-                                        const NetworkConfig& network,
-                                        std::uint64_t committee_epoch_blocks,
-                                        std::uint64_t* join_window_start_height, std::uint32_t* join_count_in_window,
-                                        storage::DB* db) {
-  validators.set_rules(consensus::ValidatorRules{
-      .min_bond = min_bond,
-      .warmup_blocks = warmup_blocks,
-      .cooldown_blocks = cooldown_blocks,
-  });
-  if (join_window_start_height && join_count_in_window && join_limit_window_blocks > 0) {
-    consensus::advance_validator_join_window(height, join_limit_window_blocks, join_window_start_height, join_count_in_window);
-  }
-
-  for (size_t txi = 1; txi < block.txs.size(); ++txi) {
-    const auto& tx = block.txs[txi];
-    for (const auto& in : tx.inputs) {
-      OutPoint op{in.prev_txid, in.prev_index};
-      auto it = pre_utxos.find(op);
-      if (it == pre_utxos.end()) continue;
-      PubKey32 pub{};
-      SlashEvidence evidence;
-      if (is_validator_register_script(it->second.out.script_pubkey, &pub)) {
-        if (parse_slash_script_sig(in.script_sig, &evidence)) {
-          if (db) (void)db->put_slashing_record(make_onchain_slash_record(evidence, tx.txid(), height));
-          validators.ban(pub, height);
-          (void)validators.finalize_withdrawal(pub);
-        } else {
-          std::size_t effective_active_next_height = validators.active_sorted(height + 1).size();
-          const bool currently_effective_active = validators.is_active_for_height(pub, height + 1);
-          const bool block_for_active_set_floor =
-              deferred_exit_fork_active(network, height) && currently_effective_active && effective_active_next_height <= 1;
-          const bool defer_exit_until_epoch_end =
-              block_for_active_set_floor ||
-              (deferred_exit_fork_active(network, height) &&
-              (consensus::committee_epoch_start(height, committee_epoch_blocks) ==
-               consensus::committee_epoch_start(height + 1, committee_epoch_blocks)));
-          if (defer_exit_until_epoch_end) {
-            auto it_info = validators.mutable_all().find(pub);
-            if (it_info != validators.mutable_all().end()) {
-              auto& vi = it_info->second;
-              if (vi.unbond_height == 0) vi.unbond_height = height;
-              vi.last_exit_height = std::max(vi.last_exit_height, height);
-            }
-          } else {
-            validators.request_unbond(pub, height);
-          }
-        }
-        continue;
-      }
-      if (is_validator_unbond_script(it->second.out.script_pubkey, &pub)) {
-        if (parse_slash_script_sig(in.script_sig, &evidence)) {
-          if (db) (void)db->put_slashing_record(make_onchain_slash_record(evidence, tx.txid(), height));
-          validators.ban(pub, height);
-        }
-        (void)validators.finalize_withdrawal(pub);
-      }
-    }
-  }
-
-  for (const auto& tx : block.txs) {
-    const Hash32 txid = tx.txid();
-    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-      const auto& out = tx.outputs[out_i];
-      PubKey32 onboarding_validator_pub{};
-      PubKey32 onboarding_payout_pub{};
-      Sig64 onboarding_pop{};
-      if (is_onboarding_registration_script(out.script_pubkey, &onboarding_validator_pub, &onboarding_payout_pub,
-                                            &onboarding_pop)) {
-        std::string err;
-        (void)validators.register_onboarding(onboarding_validator_pub, height, &err,
-                                             consensus::canonical_operator_id_from_join_request(onboarding_payout_pub));
-        continue;
-      }
-      PubKey32 validator_pub{};
-      PubKey32 payout_pub{};
-      Sig64 pop{};
-      if (!is_validator_join_request_script(out.script_pubkey, &validator_pub, &payout_pub, &pop)) continue;
-
-      for (std::uint32_t bond_i = 0; bond_i < tx.outputs.size(); ++bond_i) {
-        PubKey32 bond_pub{};
-        if (!is_validator_register_script(tx.outputs[bond_i].script_pubkey, &bond_pub) || bond_pub != validator_pub) continue;
-        ValidatorJoinRequest req;
-        req.request_txid = txid;
-        req.validator_pubkey = validator_pub;
-        req.payout_pubkey = payout_pub;
-        req.bond_outpoint = OutPoint{txid, bond_i};
-        req.bond_amount = tx.outputs[bond_i].value;
-        req.requested_height = height;
-        if (join_count_in_window && join_limit_window_blocks > 0 && join_limit_max_new > 0 &&
-            *join_count_in_window >= join_limit_max_new) {
-          break;
-        }
-        std::string err;
-        if (validators.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err,
-                                     consensus::canonical_operator_id_from_join_request(req.payout_pubkey))) {
-          req.status = ValidatorJoinRequestStatus::APPROVED;
-          req.approved_height = height;
-          validator_join_requests[txid] = req;
-          if (db) (void)db->put_validator_join_request(txid, req);
-          if (join_count_in_window && join_limit_window_blocks > 0) ++(*join_count_in_window);
-        }
-        break;
-      }
-    }
-  }
-
-  // Activate deferred exits exactly at epoch boundary to avoid mid-epoch
-  // active-set collapse while preserving deterministic lifecycle transitions.
-  const bool crosses_epoch_boundary =
-      consensus::committee_epoch_start(height, committee_epoch_blocks) !=
-      consensus::committee_epoch_start(height + 1, committee_epoch_blocks);
-  if (deferred_exit_fork_active(network, height) && crosses_epoch_boundary) {
-    std::size_t effective_active_next_height = validators.active_sorted(height + 1).size();
-    for (auto& [candidate_pub, info] : validators.mutable_all()) {
-      if (!info.has_bond) continue;
-      if (info.unbond_height == 0) continue;
-      if (info.status == consensus::ValidatorStatus::ACTIVE || info.status == consensus::ValidatorStatus::SUSPENDED) {
-        const bool currently_effective_active = validators.is_active_for_height(candidate_pub, height + 1);
-        if (currently_effective_active && effective_active_next_height <= 1) continue;
-        info.status = consensus::ValidatorStatus::EXITING;
-        if (currently_effective_active && effective_active_next_height > 0) --effective_active_next_height;
-      }
-    }
-  }
-}
-
-FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
-                                              std::size_t quorum_threshold, const std::vector<PubKey32>& committee,
-                                              const std::vector<FinalitySig>& signatures) {
-  FinalityCertificate cert;
-  cert.height = height;
-  cert.round = round;
-  cert.frontier_transition_id = transition_id;
-  cert.quorum_threshold = static_cast<std::uint32_t>(quorum_threshold);
-  cert.committee_members = committee;
-  cert.signatures = signatures;
-  return cert;
-}
-
-StateRoots compute_roots_for_state(const UtxoSetV2& utxos, const consensus::ValidatorRegistry& validators,
-                                   std::uint32_t validation_rules_version) {
-  std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
-  utxo_leaves.reserve(utxos.size());
-  for (const auto& [op, ue] : utxos) {
-    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue)});
-  }
-
-  std::vector<std::pair<Hash32, Bytes>> validator_leaves;
-  validator_leaves.reserve(validators.all().size());
-  for (const auto& [pub, info] : validators.all()) {
-    validator_leaves.push_back(
-        {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, validation_rules_version)});
-  }
-
-  StateRoots roots;
-  roots.utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
-  roots.validators_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
-  return roots;
-}
-
-constexpr const char* kValidatorJoinWindowStartKey = "PVAL:JOIN_WINDOW_START";
-constexpr const char* kValidatorJoinWindowCountKey = "PVAL:JOIN_WINDOW_COUNT";
-constexpr const char* kValidatorLivenessWindowStartKey = "PVAL:LIVENESS_WINDOW_START";
-constexpr const char* kFinalizedRandomnessKey = "PRAND:FINALIZED";
 constexpr const char* kStartupReplayModeKey = "REPLAY:MODE";
-constexpr const char* kConsensusSafetyStatePrefix = "CSAFE:";
 
 bool replay_mode_is_frontier(const Bytes& bytes) { return std::string(bytes.begin(), bytes.end()) == "frontier"; }
-
-// Core: all reads (scan_prefix, to diff stale rows) stay against `db`'s
-// committed state, exactly as before; every write stages into `batch`
-// instead of hitting the WAL immediately.
-bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state) {
-  const std::string utxo_prefix = storage::key_utxo_prefix();
-  std::set<std::string> desired_utxos;
-  desired_utxos.clear();
-  for (const auto& [op, _] : state.utxos) desired_utxos.insert(storage::key_utxo(op));
-  std::vector<std::string> utxos_to_erase;
-  for (const auto& [key, _] : db.scan_prefix(utxo_prefix)) {
-    if (desired_utxos.find(key) == desired_utxos.end()) {
-      utxos_to_erase.push_back(key);
-    }
-  }
-  for (const auto& key : utxos_to_erase) batch.erase(key);
-  for (const auto& [op, entry] : state.utxos) batch.put_utxo_v2(op, entry);
-
-  const std::string script_utxo_prefix = storage::key_script_utxo_prefix(Hash32{}).substr(0, 3);
-  std::set<std::string> desired_script_utxos;
-  desired_script_utxos.clear();
-  for (const auto& [op, entry] : state.utxos) {
-    const auto transparent = transparent_txout_from_utxo_entry(entry);
-    if (!transparent.has_value()) continue;
-    const auto scripthash = crypto::sha256(transparent->script_pubkey);
-    desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
-  }
-  std::vector<std::string> script_utxos_to_erase;
-  for (const auto& [key, _] : db.scan_prefix(script_utxo_prefix)) {
-    if (desired_script_utxos.find(key) == desired_script_utxos.end()) {
-      script_utxos_to_erase.push_back(key);
-    }
-  }
-  for (const auto& key : script_utxos_to_erase) batch.erase(key);
-  for (const auto& [op, entry] : state.utxos) {
-    const auto transparent = transparent_txout_from_utxo_entry(entry);
-    if (!transparent.has_value()) continue;
-    const auto scripthash = crypto::sha256(transparent->script_pubkey);
-    batch.put_script_utxo(scripthash, op, *transparent, state.finalized_height);
-  }
-
-  for (const auto& [pub, info] : state.validators.all()) batch.put_validator(pub, info);
-  for (const auto& [txid, req] : state.validator_join_requests) batch.put_validator_join_request(txid, req);
-  for (const auto& [epoch, reward_state] : state.epoch_reward_states) {
-    (void)epoch;
-    batch.put_epoch_reward_settlement(reward_state);
-  }
-  batch.put_protocol_reserve_balance(state.protocol_reserve_balance_units);
-  std::set<std::uint64_t> desired_checkpoint_epochs;
-  for (const auto& [epoch, _] : state.finalized_committee_checkpoints) {
-    desired_checkpoint_epochs.insert(epoch);
-  }
-  std::vector<std::string> checkpoint_keys_to_erase;
-  for (const auto& [key, _] : db.scan_prefix("CE:")) {
-    const auto epoch_bytes = hex_decode(key.substr(3));
-    if (!epoch_bytes.has_value() || epoch_bytes->size() != sizeof(std::uint64_t)) {
-      checkpoint_keys_to_erase.push_back(key);
-      continue;
-    }
-    codec::ByteReader r(*epoch_bytes);
-    const auto epoch = r.u64le();
-    if (!epoch.has_value() || desired_checkpoint_epochs.find(*epoch) == desired_checkpoint_epochs.end()) {
-      checkpoint_keys_to_erase.push_back(key);
-    }
-  }
-  for (const auto& key : checkpoint_keys_to_erase) batch.erase(key);
-  for (const auto& [epoch, checkpoint] : state.finalized_committee_checkpoints) {
-    (void)epoch;
-    batch.put_finalized_committee_checkpoint(checkpoint);
-  }
-  batch.put(kFinalizedRandomnessKey, Bytes(state.finalized_randomness.begin(), state.finalized_randomness.end()));
-  codec::ByteWriter w_start;
-  w_start.u64le(state.validator_join_window_start_height);
-  batch.put(kValidatorJoinWindowStartKey, w_start.take());
-  codec::ByteWriter w_count;
-  w_count.u32le(state.validator_join_count_in_window);
-  batch.put(kValidatorJoinWindowCountKey, w_count.take());
-  codec::ByteWriter w_liveness;
-  w_liveness.u64le(state.validator_liveness_window_start_height);
-  batch.put(kValidatorLivenessWindowStartKey, w_liveness.take());
-  return true;
-}
-
-// Convenience wrapper for non-hot-path callers (genesis/rebuild/fast-sync
-// fixups): stages into a throwaway batch and commits it immediately.
-bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDerivedState& state) {
-  storage::DB::Batch batch(db);
-  if (!persist_canonical_cache_rows(db, batch, state)) return false;
-  return db.write_batch(batch);
-}
 
 bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDerivationConfig& cfg, storage::DB& db,
                                                 std::uint64_t finalized_height, const Hash32& finalized_hash,
@@ -2206,179 +1279,10 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   return true;
 }
 
-bool rollback_frontier_tail_to_tip(storage::DB& db, std::uint64_t target_tip_height, std::string* error) {
-  const auto maybe_max_frontier = db.get_finalized_frontier_height();
-  if (!maybe_max_frontier.has_value()) {
-    if (error) *error = "missing-finalized-frontier-height";
-    return false;
-  }
-  const std::uint64_t max_frontier = *maybe_max_frontier;
-  if (target_tip_height > max_frontier) {
-    if (error) *error = "target-tip-above-frontier";
-    return false;
-  }
-  if (target_tip_height == max_frontier) return true;
-
-  const std::uint64_t erase_from = target_tip_height + 1;
-  for (std::uint64_t h = max_frontier; h >= erase_from; --h) {
-    const auto transition_id = db.get_frontier_transition_by_height(h);
-    if (transition_id.has_value()) {
-      (void)db.erase(storage::key_frontier_transition(*transition_id));
-    }
-    (void)db.erase(storage::key_frontier_height(h));
-    (void)db.erase(storage::key_finality_certificate_height(h));
-    (void)db.erase(storage::key_height(h));
-    if (h == erase_from) break;
-  }
-
-  (void)db.erase(storage::key_finalized_frontier_height());
-  if (!db.set_finalized_frontier_height(target_tip_height)) {
-    if (error) *error = "set-finalized-frontier-height-failed";
-    return false;
-  }
-
-  Hash32 tip_hash = zero_hash();
-  std::uint64_t repaired_ingress_tip = 0;
-  if (target_tip_height > 0) {
-    auto id = db.get_frontier_transition_by_height(target_tip_height);
-    if (!id.has_value()) {
-      if (error) *error = "target-tip-transition-missing";
-      return false;
-    }
-    tip_hash = *id;
-    if (!db.set_height_hash(target_tip_height, tip_hash)) {
-      if (error) *error = "set-height-hash-failed";
-      return false;
-    }
-    auto transition_bytes = db.get_frontier_transition(*id);
-    if (!transition_bytes.has_value()) {
-      if (error) *error = "target-tip-transition-bytes-missing";
-      return false;
-    }
-    auto transition = FrontierTransition::parse(*transition_bytes);
-    if (!transition.has_value()) {
-      if (error) *error = "target-tip-transition-parse-failed";
-      return false;
-    }
-    repaired_ingress_tip = transition->next_frontier;
-  }
-  if (!db.force_set_finalized_ingress_tip(repaired_ingress_tip)) {
-    if (error) *error = "force-set-finalized-ingress-tip-failed";
-    return false;
-  }
-  if (!db.set_tip(storage::TipState{target_tip_height, tip_hash})) {
-    if (error) *error = "set-tip-failed";
-    return false;
-  }
-  if (!db.flush()) {
-    if (error) *error = "flush-failed";
-    return false;
-  }
-  return true;
-}
-
-bool load_latest_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDerivationConfig& cfg, storage::DB& db,
-                                                       std::uint64_t current_finalized_height,
-                                                       std::uint64_t min_allowed_height,
-                                                       consensus::CanonicalDerivedState* out,
-                                                       std::uint64_t* out_checkpoint_height,
-                                                       std::string* error) {
-  if (!out) {
-    if (error) *error = "null-output";
-    return false;
-  }
-  std::set<std::uint64_t, std::greater<std::uint64_t>> candidates;
-  if (current_finalized_height > 0) candidates.insert(current_finalized_height);
-
-  const auto checkpoints = db.load_finalized_committee_checkpoints();
-  for (const auto& [epoch_start, _] : checkpoints) {
-    if (epoch_start == 0) continue;
-    const std::uint64_t candidate_tip = epoch_start - 1;
-    if (candidate_tip == 0 || candidate_tip > current_finalized_height || candidate_tip < min_allowed_height) continue;
-    candidates.insert(candidate_tip);
-  }
-
-  std::string last_error = "no-checkpoint-candidate";
-  for (const auto candidate_height : candidates) {
-    const auto candidate_hash = db.get_height_hash(candidate_height);
-    if (!candidate_hash.has_value()) {
-      last_error = "checkpoint-height-hash-missing height=" + std::to_string(candidate_height);
-      continue;
-    }
-    consensus::CanonicalDerivedState state;
-    std::string checkpoint_error;
-    if (!load_trusted_runtime_checkpoint_from_cache(cfg, db, candidate_height, *candidate_hash, &state, &checkpoint_error)) {
-      last_error = "checkpoint-height=" + std::to_string(candidate_height) + " reason=" + checkpoint_error;
-      continue;
-    }
-    *out = std::move(state);
-    if (out_checkpoint_height) *out_checkpoint_height = candidate_height;
-    return true;
-  }
-  if (error) *error = last_error;
-  return false;
-}
-
-bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
-                                              const storage::FinalizedCommitteeCheckpoint& checkpoint) {
-  if (cert.committee_members == consensus::checkpoint_committee_for_round(checkpoint, cert.round)) return true;
-  if (cert.round == 0) return false;
-  if (auto legacy = consensus::legacy_checkpoint_ticket_pow_fallback_member_for_round(checkpoint, cert.round);
-      legacy.has_value()) {
-    return cert.committee_members.size() == 1 && cert.committee_members.front() == *legacy;
-  }
-  return false;
-}
-
-Bytes make_coinbase_script_sig(std::uint64_t height, std::uint32_t round) {
-  std::ostringstream oss;
-  oss << "cb:" << height << ":" << round;
-  const auto s = oss.str();
-  return Bytes(s.begin(), s.end());
-}
-
-Bytes block_proposal_signing_message(const BlockHeader& header) {
-  const Hash32 bid = header.block_id();
-  return Bytes(bid.begin(), bid.end());
-}
-
 std::string key_consensus_safety_state(std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
   return std::string(kConsensusSafetyStatePrefix) + hex_encode(w.data());
-}
-
-Hash32 consensus_payload_id(const Block& block) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'L', 'O', 'C', 'K', '-', 'P', 'A', 'Y', 'L', 'O', 'A', 'D', '-', 'V', '1'});
-  w.bytes_fixed(block.header.prev_finalized_hash);
-  w.u64le(block.header.height);
-  const std::size_t non_coinbase = block.txs.size() > 1 ? (block.txs.size() - 1) : 0;
-  w.varint(non_coinbase);
-  for (std::size_t i = 1; i < block.txs.size(); ++i) {
-    w.bytes(block.txs[i].serialize_without_hashcash());
-  }
-  return crypto::sha256d(w.data());
-}
-
-Hash32 consensus_payload_id(const FrontierTransition& transition) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'F', 'R', 'O', 'N', 'T', 'I', 'E', 'R', '-', 'L', 'O', 'C', 'K', '-', 'P', 'A', 'Y',
-                'L', 'O', 'A', 'D', '-', 'V', '1'});
-  w.bytes_fixed(transition.prev_finalized_hash);
-  w.bytes_fixed(transition.prev_finality_link_hash);
-  w.u64le(transition.height);
-  w.varbytes(transition.prev_vector.serialize());
-  w.varbytes(transition.next_vector.serialize());
-  w.bytes_fixed(transition.ingress_commitment);
-  w.u64le(transition.prev_frontier);
-  w.u64le(transition.next_frontier);
-  w.bytes_fixed(transition.prev_state_root);
-  w.bytes_fixed(transition.next_state_root);
-  w.bytes_fixed(transition.ordered_slice_commitment);
-  w.bytes_fixed(transition.decisions_commitment);
-  w.bytes_fixed(transition.settlement_commitment);
-  return crypto::sha256d(w.data());
 }
 
 Bytes serialize_consensus_safety_state(const std::optional<std::pair<Hash32, std::uint32_t>>& lock_state,
@@ -2406,57 +1310,6 @@ Bytes serialize_consensus_safety_state(const std::optional<std::pair<Hash32, std
   return w.take();
 }
 
-bool parse_consensus_safety_state(const Bytes& b, std::optional<std::pair<Hash32, std::uint32_t>>* lock_state,
-                                  std::optional<QuorumCertificate>* qc_state, std::optional<Hash32>* qc_payload_id) {
-  std::optional<std::pair<Hash32, std::uint32_t>> parsed_lock;
-  std::optional<QuorumCertificate> parsed_qc;
-  std::optional<Hash32> parsed_payload;
-  const bool ok = codec::parse_exact(b, [&](codec::ByteReader& r) {
-    auto has_lock = r.u8();
-    if (!has_lock) return false;
-    if (*has_lock != 0) {
-      auto lock_block = r.bytes_fixed<32>();
-      auto lock_round = r.u32le();
-      if (!lock_block || !lock_round) return false;
-      parsed_lock = std::make_pair(*lock_block, *lock_round);
-    }
-    auto has_qc = r.u8();
-    if (!has_qc) return false;
-    if (*has_qc != 0) {
-      QuorumCertificate qc;
-      auto height = r.u64le();
-      auto round = r.u32le();
-      auto transition_id = r.bytes_fixed<32>();
-      auto has_payload = r.u8();
-      if (!height || !round || !transition_id || !has_payload) return false;
-      qc.height = *height;
-      qc.round = *round;
-      qc.frontier_transition_id = *transition_id;
-      if (*has_payload != 0) {
-        auto payload = r.bytes_fixed<32>();
-        if (!payload) return false;
-        parsed_payload = *payload;
-      }
-      auto sig_count = r.varint();
-      if (!sig_count) return false;
-      qc.signatures.reserve(*sig_count);
-      for (std::uint64_t i = 0; i < *sig_count; ++i) {
-        auto pub = r.bytes_fixed<32>();
-        auto sig = r.bytes_fixed<64>();
-        if (!pub || !sig) return false;
-        qc.signatures.push_back(FinalitySig{*pub, *sig});
-      }
-      parsed_qc = qc;
-    }
-    return true;
-  });
-  if (!ok) return false;
-  if (lock_state) *lock_state = parsed_lock;
-  if (qc_state) *qc_state = parsed_qc;
-  if (qc_payload_id) *qc_payload_id = parsed_payload;
-  return true;
-}
-
 QuorumCertificate make_quorum_certificate(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
                                           const std::vector<FinalitySig>& signatures) {
   QuorumCertificate qc;
@@ -2479,17 +1332,6 @@ Hash32 vote_equivocation_record_id(const EquivocationEvidence& ev) {
   w.bytes_fixed(ev.a.signature);
   w.bytes_fixed(ev.b.frontier_transition_id);
   w.bytes_fixed(ev.b.signature);
-  return crypto::sha256d(w.data());
-}
-
-Hash32 proposer_equivocation_record_id(const BlockHeader& a, const BlockHeader& b) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'L', 'P', 'R', 'O', 'P'});
-  w.u64le(a.height);
-  w.u32le(a.round);
-  w.bytes_fixed(a.leader_pubkey);
-  w.bytes_fixed(a.block_id());
-  w.bytes_fixed(b.block_id());
   return crypto::sha256d(w.data());
 }
 
@@ -2525,76 +1367,6 @@ storage::SlashingRecord make_proposer_equivocation_record(const PubKey32& leader
   rec.object_a = object_a;
   rec.object_b = object_b;
   return rec;
-}
-
-storage::SlashingRecord make_onchain_slash_record(const SlashEvidence& ev, const Hash32& txid, std::uint64_t observed_height) {
-  storage::SlashingRecord rec;
-  const Hash32 evidence_hash = crypto::sha256d(ev.raw_blob);
-  rec.record_id = evidence_hash;
-  rec.kind = storage::SlashingRecordKind::ONCHAIN_SLASH;
-  rec.validator_pubkey = ev.a.validator_pubkey;
-  rec.height = ev.a.height;
-  rec.round = ev.a.round;
-  rec.observed_height = observed_height;
-  rec.object_a = ev.a.block_id;
-  rec.object_b = ev.b.block_id;
-  rec.txid = txid;
-  return rec;
-}
-
-void sync_smt_tree(storage::DB& db, storage::DB::Batch& batch, const std::string& tree_id,
-                   const std::vector<std::pair<Hash32, Bytes>>& leaves) {
-  const std::string prefix = storage::key_smt_leaf_prefix(tree_id);
-  std::set<std::string> desired;
-  desired.clear();
-  for (const auto& [k, _] : leaves) desired.insert(storage::key_smt_leaf(tree_id, k));
-  for (const auto& [k, _] : db.scan_prefix(prefix)) {
-    if (desired.find(k) == desired.end()) batch.put(k, {});
-  }
-  for (const auto& [k, v] : leaves) batch.put(storage::key_smt_leaf(tree_id, k), v);
-}
-
-// Core: stages every root/leaf write into `batch` instead of writing immediately.
-// `db` is still needed for the scan_prefix reads sync_smt_tree uses to diff stale leaves.
-StateRoots persist_state_roots(storage::DB& db, storage::DB::Batch& batch, std::uint64_t height, const UtxoSetV2& utxos,
-                               const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version) {
-  std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
-  utxo_leaves.reserve(utxos.size());
-  for (const auto& [op, ue] : utxos) {
-    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue)});
-  }
-  std::vector<std::pair<Hash32, Bytes>> validator_leaves;
-  validator_leaves.reserve(validators.all().size());
-  for (const auto& [pub, info] : validators.all()) {
-    validator_leaves.push_back(
-        {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, validation_rules_version)});
-  }
-
-  sync_smt_tree(db, batch, kSmtTreeUtxo, utxo_leaves);
-  sync_smt_tree(db, batch, kSmtTreeValidators, validator_leaves);
-
-  StateRoots roots{};
-  roots.utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
-  roots.validators_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
-  // SparseMerkleTree::set_root_for_height is just storage::key_smt_root(tree_id, height) -> db.put;
-  // stage it directly rather than constructing a tree object bound to the immediate-write db.
-  batch.put(storage::key_smt_root(kSmtTreeUtxo, height), Bytes(roots.utxo_root.begin(), roots.utxo_root.end()));
-  batch.put(storage::key_smt_root(kSmtTreeValidators, height), Bytes(roots.validators_root.begin(), roots.validators_root.end()));
-  batch.put(storage::key_root_index("UTXO", height), Bytes(roots.utxo_root.begin(), roots.utxo_root.end()));
-  batch.put(storage::key_root_index("VAL", height), Bytes(roots.validators_root.begin(), roots.validators_root.end()));
-  return roots;
-}
-
-// Convenience wrapper for the non-hot-path callers (genesis/rebuild/fast-sync
-// fixups): stages into a throwaway batch and commits it immediately, so
-// callers that don't share a batch with surrounding writes still get a single
-// atomic commit instead of the previous handful of separate Put calls.
-StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSetV2& utxos,
-                               const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version) {
-  storage::DB::Batch batch(db);
-  StateRoots roots = persist_state_roots(db, batch, height, utxos, validators, validation_rules_version);
-  (void)db.write_batch(batch);
-  return roots;
 }
 
 }  // namespace
@@ -3232,33 +2004,12 @@ void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
   }
 }
 
-std::optional<Hash32> Node::pending_join_request_for_validator_locked(const PubKey32& pub) const {
-  for (const auto& [request_txid, req] : validator_join_requests_) {
-    if (req.validator_pubkey != pub) continue;
-    if (req.status != ValidatorJoinRequestStatus::REQUESTED) continue;
-    return request_txid;
-  }
-  return std::nullopt;
-}
-
 std::size_t Node::pending_join_request_count_locked() const {
   std::size_t count = 0;
   for (const auto& [_, req] : validator_join_requests_) {
     if (req.status == ValidatorJoinRequestStatus::REQUESTED) ++count;
   }
   return count;
-}
-
-bool Node::bootstrap_joiner_ready_locked(const PubKey32& pub) const {
-  for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
-    if (peer_pub != pub) continue;
-    const auto tip_it = peer_finalized_tips_.find(peer_id);
-    if (tip_it == peer_finalized_tips_.end()) continue;
-    if (tip_it->second.height != finalized_height_ || tip_it->second.hash != finalized_identity_.id) continue;
-    if (!p2p_.get_peer_info(peer_id).established()) continue;
-    return true;
-  }
-  return false;
 }
 
 bool Node::bootstrap_sync_incomplete_locked(int peer_id) const {
@@ -4342,62 +3093,6 @@ std::optional<std::uint64_t> Node::settlement_epoch_for_block_height_locked(std:
   return epoch_start - epoch_blocks;
 }
 
-storage::EpochRewardSettlementState Node::epoch_reward_state_for_epoch_locked(std::uint64_t epoch_start_height) const {
-  auto it = epoch_reward_states_.find(epoch_start_height);
-  if (it != epoch_reward_states_.end()) return it->second;
-  storage::EpochRewardSettlementState empty;
-  empty.epoch_start_height = epoch_start_height;
-  return empty;
-}
-
-consensus::DeterministicCoinbasePayout Node::coinbase_payout_for_height_locked(std::uint64_t height,
-                                                                               const PubKey32& leader_pubkey,
-                                                                               std::uint64_t fees_units) const {
-  std::map<PubKey32, std::uint64_t> settlement_scores;
-  std::map<PubKey32, std::uint64_t> onboarding_scores;
-  std::uint64_t settlement_rewards = 0;
-  std::uint64_t distributed_fee_units = height >= consensus::EMISSION_BLOCKS ? 0 : fees_units;
-  std::uint64_t reserve_subsidy_units = 0;
-  if (auto settlement_epoch = settlement_epoch_for_block_height_locked(height); settlement_epoch.has_value()) {
-    const auto state = epoch_reward_state_for_epoch_locked(*settlement_epoch);
-    if (!state.settled) {
-      settlement_rewards = state.total_reward_units;
-      distributed_fee_units = height >= consensus::EMISSION_BLOCKS ? state.fee_pool_units : fees_units;
-      reserve_subsidy_units = height >= consensus::EMISSION_BLOCKS ? state.reserve_subsidy_units : 0;
-      settlement_scores = state.reward_score_units;
-      onboarding_scores = state.onboarding_score_units;
-      const auto& econ = active_economics_policy(cfg_.network, height);
-      const auto threshold_bps = econ.participation_threshold_bps;
-      for (auto& [pub, score] : settlement_scores) {
-        const auto expected_it = state.expected_participation_units.find(pub);
-        const auto observed_it = state.observed_participation_units.find(pub);
-        const std::uint64_t expected = expected_it == state.expected_participation_units.end() ? 0 : expected_it->second;
-        const std::uint64_t observed = observed_it == state.observed_participation_units.end() ? 0 : observed_it->second;
-        const std::uint32_t participation_bps =
-            expected == 0 ? 10'000U
-                          : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
-        const auto raw_score = score;
-        score = consensus::apply_participation_penalty_bps(score, participation_bps, threshold_bps);
-        if (debug_economics_logs_enabled()) {
-          std::ostringstream oss;
-          oss << "economics-settlement-participation epoch_start=" << *settlement_epoch
-              << " height=" << height
-              << " validator=" << short_pub_hex(pub)
-              << " expected=" << expected
-              << " observed=" << observed
-              << " participation_bps=" << participation_bps
-              << " raw_reward_weight=" << raw_score
-              << " adjusted_reward_weight=" << score
-              << " threshold_bps=" << threshold_bps;
-          log_line(oss.str());
-        }
-      }
-    }
-  }
-  return consensus::compute_epoch_settlement_payout(settlement_rewards, distributed_fee_units, reserve_subsidy_units,
-                                                    leader_pubkey, settlement_scores, onboarding_scores);
-}
-
 std::map<PubKey32, std::uint64_t> Node::compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const {
   std::map<PubKey32, std::uint64_t> out;
   if (epoch_committee_frozen_locked(epoch_start_height)) {
@@ -4487,18 +3182,6 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
   return true;
 }
 
-std::vector<TxOut> Node::coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
-                                                            std::uint64_t fees_units) const {
-  const auto payout = coinbase_payout_for_height_locked(height, leader_pubkey, fees_units);
-  std::vector<TxOut> outputs;
-  outputs.reserve(payout.outputs.size());
-  for (const auto& [pub, units] : payout.outputs) {
-    const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
-    outputs.push_back(TxOut{units, address::p2pkh_script_pubkey(pkh)});
-  }
-  return outputs;
-}
-
 std::vector<FinalitySig> Node::canonicalize_finality_signatures_locked(const std::vector<FinalitySig>& signatures,
                                                                        std::size_t quorum) const {
   std::vector<FinalitySig> out = signatures;
@@ -4517,25 +3200,7 @@ std::vector<FinalitySig> Node::canonicalize_finality_signatures_locked(const std
 bool Node::inject_tx_for_test(const AnyTx& tx, bool relay) {
   if (relay) return handle_tx(tx, false);
   std::lock_guard<std::mutex> lk(mu_);
-  const auto min_bond_amount = effective_validator_min_bond_for_height(finalized_height_ + 1);
-  mempool_.set_validation_context(
-      SpecialValidationContext{
-          .network = &cfg_.network,
-          .chain_id = &chain_id_,
-          .validators = &validators_,
-          .current_height = finalized_height_ + 1,
-          .enforce_variable_bond_range = true,
-          .min_bond_amount = min_bond_amount,
-          .max_bond_amount = effective_validator_bond_max_for_height(finalized_height_ + 1),
-          .unbond_delay_blocks = cfg_.network.unbond_delay_blocks,
-          .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-            return is_committee_member_for(pub, h, round);
-          },
-          .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
-            if (anchor_height == 0) return zero_hash();
-            return db_.get_height_hash(anchor_height);
-          },
-          .confidential_policy = &confidential_policy_});
+  mempool_.set_validation_context(special_validation_context_locked(finalized_height_ + 1));
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }
@@ -4720,7 +3385,6 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     highest_qc_payload_by_height_.erase(finalized_height_);
     highest_tc_by_height_.erase(finalized_height_);
   }
-  batch.erase(finalized_write_marker_key());
   // Epoch-committee closeout only fires at epoch boundaries (not every
   // block) and owns its own checkpoint/telemetry persistence; left on its
   // existing immediate-write path rather than folded into this batch.
@@ -5346,25 +4010,7 @@ void Node::event_loop() {
       const std::uint64_t h = finalized_height_ + 1;
       validators_.advance_height(h);
       const std::uint32_t cv = kFixedValidationRulesVersion;
-      const auto min_bond_amount = effective_validator_min_bond_for_height(h);
-      mempool_.set_validation_context(
-          SpecialValidationContext{
-              .network = &cfg_.network,
-              .chain_id = &chain_id_,
-              .validators = &validators_,
-              .current_height = h,
-              .enforce_variable_bond_range = true,
-              .min_bond_amount = min_bond_amount,
-              .max_bond_amount = effective_validator_bond_max_for_height(h),
-              .unbond_delay_blocks = cfg_.network.unbond_delay_blocks,
-              .is_committee_member = [this](const PubKey32& pub, std::uint64_t ch, std::uint32_t round) {
-                return is_committee_member_for(pub, ch, round);
-              },
-              .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
-                if (anchor_height == 0) return zero_hash();
-                return db_.get_height_hash(anchor_height);
-              },
-              .confidential_policy = &confidential_policy_});
+      mempool_.set_validation_context(special_validation_context_locked(h));
       const std::uint64_t now_ms = this->now_ms();
       const std::uint64_t now_unix_ms = now_unix() * 1000;
       if (now_ms >= last_runtime_status_persist_ms_ + 1000) {
@@ -6052,21 +4698,6 @@ void Node::advance_availability_epoch_locked(std::uint64_t epoch) {
   (void)validate_availability_state_locked("availability-advance-epoch");
 }
 
-void Node::update_availability_from_finalized_frontier_locked(const consensus::CanonicalFrontierRecord& record) {
-  const auto retained =
-      availability::build_retained_prefix_payloads_from_lane_records(record.lane_records, record.transition.height,
-                                                                     cfg_.availability.audit_chunk_size);
-  if (retained.empty()) return;
-  std::map<Hash32, availability::RetainedPrefix> merged;
-  for (const auto& prefix : availability_state_.retained_prefixes) merged[prefix.prefix_id] = prefix;
-  for (const auto& payload : retained) merged[payload.prefix.prefix_id] = payload.prefix;
-  availability_state_.retained_prefixes.clear();
-  availability_state_.retained_prefixes.reserve(merged.size());
-  for (const auto& [_, prefix] : merged) availability_state_.retained_prefixes.push_back(prefix);
-  availability::normalize_availability_persistent_state(&availability_state_);
-  refresh_availability_operator_state_locked(false);
-}
-
 bool Node::load_availability_state_locked() {
   availability_state_rebuild_triggered_ = false;
   availability_state_rebuild_reason_.clear();
@@ -6326,20 +4957,6 @@ bool Node::ensure_required_epoch_committee_state_locked() {
     return false;
   }
   return true;
-}
-
-std::string Node::required_epoch_committee_state_reason_locked(std::uint64_t epoch) const {
-  auto snapshot = db_.get_epoch_committee_snapshot(epoch);
-  auto marker = db_.get_epoch_committee_freeze_marker(epoch);
-  const auto tickets = db_.load_epoch_tickets(epoch);
-  if (!snapshot.has_value() && !marker.has_value() && tickets.empty()) return "missing-snapshot-freeze-marker-and-tickets";
-  if (!snapshot.has_value()) return "missing-snapshot";
-  if (snapshot->ordered_members.empty()) return "empty-committee";
-  if (!marker.has_value()) return "missing-freeze-marker";
-  if (marker->challenge_anchor != snapshot->challenge_anchor) return "freeze-marker-anchor-mismatch";
-  if (marker->member_count != snapshot->ordered_members.size()) return "freeze-marker-member-count-mismatch";
-  if (tickets.empty()) return "tickets-missing";
-  return "unknown";
 }
 
 bool Node::ensure_required_epoch_committee_state_startup() {
@@ -8509,51 +7126,6 @@ bool Node::maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id) {
   return advanced;
 }
 
-bool Node::verify_block_proposer_locked(const Block& block) const {
-  const Bytes bid = block_proposal_signing_message(block.header);
-  if (!crypto::ed25519_verify(bid, block.header.leader_signature, block.header.leader_pubkey)) return false;
-  auto expected = leader_for_height_round(block.header.height, block.header.round);
-  return expected.has_value() && block.header.leader_pubkey == *expected;
-}
-
-bool Node::validate_prev_finality_cert_hash_locked(const Block& block, std::string* error) const {
-  if (!finality_binding_active_at_height(cfg_.network, block.header.height)) {
-    if (block.header.prev_finality_cert_hash != zero_hash()) {
-      if (error) *error = "prev-finality-cert-hash-must-be-zero";
-      return false;
-    }
-    return true;
-  }
-  if (block.header.height <= 1) {
-    if (block.header.prev_finality_cert_hash != zero_hash()) {
-      if (error) *error = "prev-finality-cert-hash-must-be-zero";
-      return false;
-    }
-    return true;
-  }
-
-  Hash32 expected = zero_hash();
-  if (block.header.height == finalized_height_ + 1) {
-    if (!canonical_state_.has_value()) {
-      if (error) *error = "missing-canonical-state";
-      return false;
-    }
-    expected = canonical_state_->last_finality_certificate_hash;
-  } else {
-    auto cert = db_.get_finality_certificate_by_height(block.header.height - 1);
-    if (!cert.has_value()) {
-      if (error) *error = "missing-prev-finality-certificate";
-      return false;
-    }
-    expected = consensus::canonical_finality_certificate_hash(*cert);
-  }
-  if (block.header.prev_finality_cert_hash != expected) {
-    if (error) *error = "prev-finality-cert-hash-mismatch";
-    return false;
-  }
-  return true;
-}
-
 bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, std::string* error) const {
   if (!canonical_state_.has_value()) {
     if (error) *error = "missing-canonical-state";
@@ -8660,24 +7232,7 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
     }
     const auto next_height = finalized_height_ + 1;
     const auto min_bond_amount = effective_validator_min_bond_for_height(next_height);
-    mempool_.set_validation_context(
-        SpecialValidationContext{
-            .network = &cfg_.network,
-            .chain_id = &chain_id_,
-            .validators = &validators_,
-            .current_height = next_height,
-            .enforce_variable_bond_range = true,
-            .min_bond_amount = min_bond_amount,
-            .max_bond_amount = effective_validator_bond_max_for_height(next_height),
-            .unbond_delay_blocks = cfg_.network.unbond_delay_blocks,
-            .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-              return is_committee_member_for(pub, h, round);
-            },
-            .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
-              if (anchor_height == 0) return zero_hash();
-              return db_.get_height_hash(anchor_height);
-            },
-            .confidential_policy = &confidential_policy_});
+    mempool_.set_validation_context(special_validation_context_locked(next_height));
     std::string err;
     std::uint64_t fee = 0;
     const auto min_relay_fee = effective_min_relay_fee_for_height(next_height);
@@ -9052,23 +7607,7 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       }
     }
 
-  SpecialValidationContext vctx{
-      .network = &cfg_.network,
-      .chain_id = &chain_id_,
-      .validators = &validators_,
-      .current_height = height,
-      .enforce_variable_bond_range = true,
-      .min_bond_amount = effective_validator_min_bond_for_height(height),
-      .max_bond_amount = effective_validator_bond_max_for_height(height),
-      .unbond_delay_blocks = cfg_.network.unbond_delay_blocks,
-      .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t r) {
-        return is_committee_member_for(pub, h, r);
-      },
-      .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
-        if (anchor_height == 0) return zero_hash();
-        return db_.get_height_hash(anchor_height);
-      },
-      .confidential_policy = &confidential_policy_};
+  SpecialValidationContext vctx = special_validation_context_locked(height);
 
     consensus::FrontierExecutionResult result;
     std::string validation_error;
@@ -9175,16 +7714,7 @@ void Node::broadcast_propose(const FrontierProposal& proposal, const std::option
   p.justify_qc = justify_qc;
   p.justify_tc = justify_tc;
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
-    for (Node* peer : peers) {
-      if (peer == this) continue;
-      spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); });
-    }
+    for_each_local_bus_peer([&](Node* peer) { spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); }); });
   } else {
     p2p_.broadcast(p2p::MsgType::PROPOSE, p2p::ser_propose(p));
   }
@@ -9192,16 +7722,9 @@ void Node::broadcast_propose(const FrontierProposal& proposal, const std::option
 
 void Node::broadcast_epoch_ticket(const consensus::EpochTicket& ticket) {
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
-    for (Node* peer : peers) {
-      if (peer == this) continue;
+    for_each_local_bus_peer([&](Node* peer) {
       spawn_local_bus_task([peer, ticket]() { (void)peer->handle_epoch_ticket(ticket, true, 0); });
-    }
+    });
   } else {
     p2p_.broadcast(p2p::MsgType::EPOCH_TICKET, p2p::ser_epoch_ticket(p2p::EpochTicketMsg{ticket}));
   }
@@ -9211,16 +7734,9 @@ void Node::broadcast_vote(const Vote& vote) {
   p2p::VoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
-    for (Node* peer : peers) {
-      if (peer == this) continue;
+    for_each_local_bus_peer([&](Node* peer) {
       spawn_local_bus_task([peer, vm]() { (void)peer->handle_vote(vm.vote, true, 0); });
-    }
+    });
   } else {
     p2p_.broadcast(p2p::MsgType::VOTE, p2p::ser_vote(vm));
   }
@@ -9230,16 +7746,9 @@ void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
   p2p::TimeoutVoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
-    for (Node* peer : peers) {
-      if (peer == this) continue;
+    for_each_local_bus_peer([&](Node* peer) {
       spawn_local_bus_task([peer, vm]() { (void)peer->handle_timeout_vote(vm.vote, true, 0); });
-    }
+    });
   } else {
     p2p_.broadcast(p2p::MsgType::TIMEOUT_VOTE, p2p::ser_timeout_vote(vm));
   }
@@ -9266,14 +7775,7 @@ void Node::flush_pending_finalized_broadcasts() {
 
 void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate) {
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
-    for (Node* peer : peers) {
-      if (peer == this) continue;
+    for_each_local_bus_peer([&](Node* peer) {
       spawn_local_bus_task([peer, proposal, certificate]() {
         // Same hoist-before-lock shape as the live TRANSITION path in handle_message:
         // this local-bus simulation is itself running on its own task per peer, so
@@ -9286,7 +7788,7 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
         }
         peer->flush_pending_finalized_broadcasts();
       });
-    }
+    });
   } else {
     p2p::TransitionMsg msg;
     msg.frontier_proposal_bytes = proposal.serialize();
@@ -9297,16 +7799,7 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
 
 void Node::broadcast_tx(const AnyTx& tx, int skip_peer_id) {
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
-    for (Node* peer : peers) {
-      if (peer == this) continue;
-      spawn_local_bus_task([peer, tx]() { peer->handle_tx(tx, true); });
-    }
+    for_each_local_bus_peer([&](Node* peer) { spawn_local_bus_task([peer, tx]() { peer->handle_tx(tx, true); }); });
   } else {
     const auto payload = p2p::ser_tx(p2p::TxMsg{serialize_any_tx(tx)});
     const std::uint64_t now = now_ms();
@@ -9325,15 +7818,8 @@ void Node::broadcast_tx(const AnyTx& tx, int skip_peer_id) {
 
 void Node::broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id) {
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
     const p2p::IngressRecordMsg msg{cert, tx_bytes};
-    for (Node* peer : peers) {
-      if (peer == this) continue;
+    for_each_local_bus_peer([&](Node* peer) {
       spawn_local_bus_task([peer, msg]() {
         std::lock_guard<std::mutex> lk(peer->mu_);
         bool appended = false;
@@ -9341,7 +7827,7 @@ void Node::broadcast_ingress_record(const IngressCertificate& cert, const Bytes&
         if (!peer->handle_ingress_record_locked(0, msg, &appended, &ingress_error)) return;
         if (appended) peer->broadcast_ingress_record(msg.certificate, msg.tx_bytes);
       });
-    }
+    });
   } else {
     const auto payload = p2p::ser_ingress_record(p2p::IngressRecordMsg{cert, tx_bytes});
     for (int id : p2p_.peer_ids()) {
@@ -9361,20 +7847,13 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int 
   if (designated_certifier == local_key_.public_key) return;
 
   if (cfg_.disable_p2p) {
-    if (!running_) return;
-    std::vector<Node*> peers;
-    {
-      std::lock_guard<std::mutex> lk(g_local_bus_mu);
-      peers = g_local_bus_nodes;
-    }
-    for (Node* peer : peers) {
-      if (peer == this) continue;
-      if (peer->local_validator_pubkey_for_test() != designated_certifier) continue;
+    for_each_local_bus_peer([&](Node* peer) {
+      if (peer->local_validator_pubkey_for_test() != designated_certifier) return false;
       spawn_local_bus_task([peer, tx]() { (void)peer->handle_tx(tx, true); });
       log_line("tx-forward-designated lane=" + std::to_string(lane) +
                " designated=" + short_pub_hex(designated_certifier) + " transport=local-bus");
-      return;
-    }
+      return true;
+    });
     return;
   }
 
@@ -9465,39 +7944,6 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
   batch.put(kStartupReplayModeKey, Bytes{'f', 'r', 'o', 'n', 't', 'i', 'e', 'r'});
   if (error) error->clear();
   return true;
-}
-
-bool Node::begin_finalized_write(const Block& block) {
-  if (!db_.put(finalized_write_marker_key(), serialize_finalized_write_marker(block.header.height, block.header.block_id()))) {
-    return false;
-  }
-  return db_.flush();
-}
-
-bool Node::finish_finalized_write(const Block& block) {
-  std::uint64_t marker_height = 0;
-  Hash32 marker_block_id{};
-  auto marker = db_.get(finalized_write_marker_key());
-  if (!marker.has_value() || !parse_finalized_write_marker(*marker, &marker_height, &marker_block_id) ||
-      marker_height != block.header.height || marker_block_id != block.header.block_id()) {
-    return false;
-  }
-  if (!db_.erase(finalized_write_marker_key())) return false;
-  return db_.flush();
-}
-
-bool Node::check_no_incomplete_finalized_write() const {
-  auto marker = db_.get(finalized_write_marker_key());
-  if (!marker.has_value()) return true;
-  std::uint64_t height = 0;
-  Hash32 block_id{};
-  if (!parse_finalized_write_marker(*marker, &height, &block_id)) {
-    std::cerr << "incomplete finalized write marker is malformed\n";
-    return false;
-  }
-  std::cerr << "incomplete finalized write marker detected for height " << height << " block " << hex_encode32(block_id)
-            << "\n";
-  return false;
 }
 
 consensus::CanonicalDerivationConfig Node::canonical_derivation_config_locked() const {
@@ -9734,7 +8180,6 @@ bool Node::init_mainnet_genesis() {
 
 bool Node::load_state() {
   log_line("startup-progress phase=load-state-start");
-  if (!check_no_incomplete_finalized_write()) return false;
   auto tip = db_.get_tip();
   if (!tip.has_value()) {
     finalized_height_ = 0;
@@ -10181,67 +8626,6 @@ bool Node::load_state() {
   return true;
 }
 
-std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
-  return committee_for_height_round(height, 0);
-}
-
-std::vector<consensus::WeightedParticipant> Node::reward_participants_for_height_round(std::uint64_t height,
-                                                                                       std::uint32_t round) const {
-  const auto active_operator_count = active_operator_count_for_height_locked(height);
-  if (height <= finalized_height_) {
-    if (auto cert = db_.get_finality_certificate_by_height(height); cert.has_value()) {
-      std::set<PubKey32> rewarded;
-      std::vector<consensus::WeightedParticipant> out;
-      out.reserve(cert->signatures.size());
-      for (const auto& sig : cert->signatures) {
-        if (!rewarded.insert(sig.validator_pubkey).second) continue;
-        auto it = validators_.all().find(sig.validator_pubkey);
-        if (it == validators_.all().end()) continue;
-        out.push_back(consensus::WeightedParticipant{
-            .pubkey = sig.validator_pubkey,
-            .bonded_amount = it->second.bonded_amount,
-            .effective_weight =
-                consensus::reward_weight(cfg_.network, height, active_operator_count, it->second.bonded_amount),
-            .participation_bps = 10'000,
-        });
-      }
-      if (!out.empty()) return out;
-    }
-  }
-
-  auto committee = committee_for_height_round(height, round);
-  std::vector<consensus::WeightedParticipant> committee_participants;
-  committee_participants.reserve(committee.size());
-  for (const auto& pub : committee) {
-    auto it = validators_.all().find(pub);
-    if (it == validators_.all().end()) continue;
-    committee_participants.push_back(consensus::WeightedParticipant{
-        .pubkey = pub,
-        .bonded_amount = it->second.bonded_amount,
-        .effective_weight = consensus::reward_weight(cfg_.network, height, active_operator_count, it->second.bonded_amount),
-        .participation_bps = 10'000,
-    });
-  }
-  std::vector<consensus::WeightedParticipant> out;
-  out.reserve(committee.size());
-  for (const auto& pub : committee) {
-    auto it = validators_.all().find(pub);
-    if (it == validators_.all().end()) continue;
-    const auto& vi = it->second;
-    if (vi.status == consensus::ValidatorStatus::SUSPENDED) continue;
-    if (vi.eligible_count_window == 0 || vi.participated_count_window > 0) {
-      out.push_back(consensus::WeightedParticipant{
-          .pubkey = pub,
-          .bonded_amount = vi.bonded_amount,
-          .effective_weight = consensus::reward_weight(cfg_.network, height, active_operator_count, vi.bonded_amount),
-          .participation_bps = 10'000,
-      });
-    }
-  }
-  if (out.empty()) return committee_participants;
-  return out;
-}
-
 std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std::uint32_t round) const {
   if (height == finalized_height_ + 1) {
     if (canonical_state_.has_value()) {
@@ -10334,80 +8718,24 @@ std::uint64_t Node::effective_min_relay_fee_for_height(std::uint64_t height) con
   return kDefaultPolicyMinRelayFeeUnits;
 }
 
-bool Node::validate_validator_registration_rules(const Block& block, std::uint64_t height) const {
-  std::uint64_t window_start = validator_join_window_start_height_;
-  std::uint32_t window_count = validator_join_count_in_window_;
-  consensus::advance_validator_join_window(height, validator_join_limit_window_blocks_, &window_start, &window_count);
-
-  auto registry = validators_;
-  registry.set_rules(consensus::ValidatorRules{
-      .min_bond = effective_validator_min_bond_for_height(height),
-      .warmup_blocks = validator_warmup_blocks_,
-      .cooldown_blocks = validator_cooldown_blocks_,
-  });
-  const auto min_bond_amount = effective_validator_min_bond_for_height(height);
-  const auto max_bond_amount = effective_validator_bond_max_for_height(height);
-  std::size_t new_regs = 0;
-  for (std::size_t txi = 0; txi < block.txs.size(); ++txi) {
-    const auto& tx = block.txs[txi];
-    const Hash32 txid = tx.txid();
-    std::map<PubKey32, PubKey32> join_request_operator_ids;
-    for (const auto& out : tx.outputs) {
-      PubKey32 validator_pub{};
-      PubKey32 payout_pub{};
-      Sig64 pop{};
-      if (!is_validator_join_request_script(out.script_pubkey, &validator_pub, &payout_pub, &pop)) continue;
-      join_request_operator_ids[validator_pub] = consensus::canonical_operator_id_from_join_request(payout_pub);
-    }
-    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-      const auto& out = tx.outputs[out_i];
-      PubKey32 pub{};
-      if (!is_validator_register_script(out.script_pubkey, &pub)) continue;
-      if (out.value < min_bond_amount || out.value > max_bond_amount) return false;
-
-      std::string err;
-      if (!registry.can_register_bond(pub, height, out.value, &err)) return false;
-      if (validator_join_limit_window_blocks_ > 0 && validator_join_limit_max_new_ > 0 &&
-          window_count + static_cast<std::uint32_t>(new_regs + 1) > validator_join_limit_max_new_) {
-        return false;
-      }
-      auto operator_it = join_request_operator_ids.find(pub);
-      if (operator_it == join_request_operator_ids.end()) return false;
-      if (!registry.register_bond(pub, OutPoint{txid, out_i}, height, out.value, &err, operator_it->second)) return false;
-      ++new_regs;
-    }
-  }
-  return true;
-}
-
-void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height) {
-  const auto validators_before = validators_.all();
-  apply_validator_state_changes_impl(validators_, validator_join_requests_, block, pre_utxos, height,
-                                     effective_validator_min_bond_for_height(height), validator_warmup_blocks_,
-                                     validator_cooldown_blocks_, validator_join_limit_window_blocks_,
-                                     validator_join_limit_max_new_, cfg_.network, cfg_.network.committee_epoch_blocks,
-                                     &validator_join_window_start_height_, &validator_join_count_in_window_, &db_);
-  emit_exit_transition_logs(validators_before, validators_.all(), height, "tx-state-change", [this](const std::string& s) {
-    log_line(s);
-  });
-  validators_.advance_height(height + 1);
-  (void)repair_invalid_exiting_zero_bond_outpoints(&validators_, height + 1, cfg_.network.unbond_delay_blocks,
-                                                   [this](const std::string& s) { log_line(s); });
-  (void)repair_matured_bootstrap_exiting_records(cfg_.network, &validators_, height + 1,
-                                                 cfg_.network.unbond_delay_blocks,
-                                                 [this](const std::string& s) { log_line(s); });
-  codec::ByteWriter w_start;
-  w_start.u64le(validator_join_window_start_height_);
-  (void)db_.put(kValidatorJoinWindowStartKey, w_start.take());
-  codec::ByteWriter w_count;
-  w_count.u32le(validator_join_count_in_window_);
-  (void)db_.put(kValidatorJoinWindowCountKey, w_count.take());
-  codec::ByteWriter w_epoch;
-  w_epoch.u64le(validator_liveness_window_start_height_);
-  (void)db_.put(kValidatorLivenessWindowStartKey, w_epoch.take());
-  for (const auto& [pub, info] : validators_.all()) {
-    db_.put_validator(pub, info);
-  }
+SpecialValidationContext Node::special_validation_context_locked(std::uint64_t height) const {
+  return SpecialValidationContext{
+      .network = &cfg_.network,
+      .chain_id = &chain_id_,
+      .validators = &validators_,
+      .current_height = height,
+      .enforce_variable_bond_range = true,
+      .min_bond_amount = effective_validator_min_bond_for_height(height),
+      .max_bond_amount = effective_validator_bond_max_for_height(height),
+      .unbond_delay_blocks = cfg_.network.unbond_delay_blocks,
+      .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+        return is_committee_member_for(pub, h, round);
+      },
+      .finalized_hash_at_height = [this](std::uint64_t anchor_height) -> std::optional<Hash32> {
+        if (anchor_height == 0) return zero_hash();
+        return db_.get_height_hash(anchor_height);
+      },
+      .confidential_policy = &confidential_policy_};
 }
 
 std::uint64_t Node::now_unix() const {
@@ -10445,38 +8773,14 @@ void Node::log_line(const std::string& s) const {
   }
 }
 
-void Node::append_mining_log(const Block& block, std::uint32_t round, std::size_t votes, std::size_t quorum) {
-  if (mining_log_path_.empty()) return;
-  if (block.txs.empty()) return;
-
-  const std::size_t committee_size = committee_for_height_round(block.header.height, round).size();
-
-  std::uint64_t coinbase_total = 0;
-  for (const auto& out : block.txs[0].outputs) coinbase_total += out.value;
-  const std::uint64_t generated_coin = consensus::reward_units(block.header.height);
-  const std::uint64_t validator_generated_coin = consensus::validator_reward_units(block.header.height);
-  const std::uint64_t reserve_generated_coin = consensus::reserve_reward_units(block.header.height);
-  const std::uint64_t fees = (coinbase_total > validator_generated_coin) ? (coinbase_total - validator_generated_coin) : 0;
-  const std::size_t active_validators = validators_.active_sorted(block.header.height + 1).size();
-
-  std::time_t ts = static_cast<std::time_t>(block.header.timestamp);
-  std::tm tm_utc{};
-#if defined(_WIN32)
-  gmtime_s(&tm_utc, &ts);
-#else
-  gmtime_r(&ts, &tm_utc);
-#endif
-  std::ostringstream iso;
-  iso << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");
-
-  std::ofstream out(mining_log_path_, std::ios::app);
-  if (!out.good()) return;
-  out << block.header.timestamp << " | " << iso.str() << " | h=" << block.header.height << " | round=" << round
-      << " | generated_coin=" << generated_coin << " | validator_generated_coin=" << validator_generated_coin
-      << " | reserve_generated_coin=" << reserve_generated_coin << " | fees=" << fees
-      << " | coinbase_total=" << coinbase_total
-      << " | active_validators=" << active_validators << " | committee=" << committee_size << " | votes=" << votes
-      << "/" << quorum << " | transition_hash=" << hex_encode32(block.header.block_id()) << "\n";
+std::vector<Node*> Node::local_bus_peers() const {
+  std::vector<Node*> peers;
+  {
+    std::lock_guard<std::mutex> lk(g_local_bus_mu);
+    peers = g_local_bus_nodes;
+  }
+  peers.erase(std::remove(peers.begin(), peers.end(), this), peers.end());
+  return peers;
 }
 
 void Node::spawn_local_bus_task(std::function<void()> fn) {
@@ -10745,16 +9049,6 @@ void Node::send_finalized_tip(int peer_id) {
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
   log_line("send-finalized-tip peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(tip.height) +
            " transition=" + short_hash_hex(tip.hash) + " status=" + (ok ? "ok" : "failed"));
-}
-
-void Node::broadcast_finalized_tip() {
-  if (cfg_.disable_p2p) return;
-  p2p::FinalizedTipMsg tip{finalized_height_, finalized_identity_.id};
-  const Bytes payload = p2p::ser_finalized_tip(tip);
-  for (int peer_id : p2p_.peer_ids()) {
-    if (!p2p_.get_peer_info(peer_id).established()) continue;
-    (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, payload, true);
-  }
 }
 
 bool Node::peer_is_fresh_for_epoch_reconcile_locked(int peer_id, std::uint64_t* peer_height,
@@ -11661,11 +9955,6 @@ std::size_t Node::established_peer_count() const {
 std::size_t Node::outbound_peer_count() const {
   if (cfg_.disable_p2p) return peer_count();
   return p2p_.outbound_count();
-}
-
-std::string Node::peer_ip_for(int peer_id) const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return peer_ip_for_locked(peer_id);
 }
 
 std::string Node::peer_ip_for_locked(int peer_id) const {
