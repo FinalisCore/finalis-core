@@ -32,9 +32,13 @@ x-finalis-common: &finalis-common
     FINALIS_DB_MEMTABLE_BUDGET_MB: "256"
     FINALIS_DB_RATE_LIMITER_BYTES_S: "67108864"
     FINALIS_DB_DELAYED_WRITE_RATE_BYTES_S: "33554432"
+    # Keystore passphrase via env, not argv (argv is visible in ps). Local devnet default only.
+    FINALIS_VALIDATOR_PASSPHRASE: "${FINALIS_VALIDATOR_PASSPHRASE:-localdevnet}"
   networks:
     - finalis_net
-  restart: unless-stopped
+  # Bounded retries: fail-stop exits (78 = unacknowledged emergency fallback committee, SIGABRT =
+  # RocksDB corruption) need an operator decision, not an endless restart loop.
+  restart: on-failure:5
 
 services:
   node1:
@@ -56,8 +60,8 @@ services:
       - "1"
       - "--validator-key-file"
       - "/var/lib/finalis/keystore/validator.json"
-      - "--validator-passphrase"
-      - "localdevnet"
+      - "--validator-passphrase-env"
+      - "FINALIS_VALIDATOR_PASSPHRASE"
       - "--listen"
       - "--bind"
       - "0.0.0.0"
@@ -91,8 +95,8 @@ services:
       - "2"
       - "--validator-key-file"
       - "/var/lib/finalis/keystore/validator.json"
-      - "--validator-passphrase"
-      - "localdevnet"
+      - "--validator-passphrase-env"
+      - "FINALIS_VALIDATOR_PASSPHRASE"
       - "--listen"
       - "--bind"
       - "0.0.0.0"
@@ -126,8 +130,8 @@ services:
       - "3"
       - "--validator-key-file"
       - "/var/lib/finalis/keystore/validator.json"
-      - "--validator-passphrase"
-      - "localdevnet"
+      - "--validator-passphrase-env"
+      - "FINALIS_VALIDATOR_PASSPHRASE"
       - "--listen"
       - "--bind"
       - "0.0.0.0"

@@ -171,6 +171,9 @@ For self-hosted exchange infrastructure:
   policy where possible
 - monitor finalized height and finalized transition hash continuously
 - cross-check multiple endpoints before production crediting
+- public lightserver rate limits, the loopback exemption (use `--rate-limit-loopback` behind a
+  same-host reverse proxy), the admin socket and node fail-stop states are documented in
+  [LIGHTSERVER-OPERATIONS.md](LIGHTSERVER-OPERATIONS.md)
 
 Example startup:
 

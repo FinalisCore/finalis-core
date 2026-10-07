@@ -50,7 +50,8 @@ type DerivationMode        = { NORMAL, FALLBACK }
 type FallbackReason        = {
     NONE,
     INSUFFICIENT_ELIGIBLE_OPERATORS,
-    HYSTERESIS_RECOVERY_PENDING
+    HYSTERESIS_RECOVERY_PENDING,
+    EMERGENCY_PRIOR_COMMITTEE        // §11.1
 }
 
 type AvailabilityStateEnum = {
@@ -546,10 +547,15 @@ for E' in [E, E-1] (the 2 prior epoch checkpoints, newest first):
     for m in CP[E'].committee_members in order:
         if len(members) == 4: stop
         if m already seen: skip
-        if m has no bond, or m.status in {BANNED, ONBOARDING}: skip
+        if m has no bond, or m.status in {BANNED, ONBOARDING, EXITING}: skip
         members.append(m)
 committee := sort_by_pubkey(members)   # weight = own bonded amount, no ticket
 ```
+
+`EXITING` members are skipped because they announced departure and may already be offline.
+`SUSPENDED` and `PENDING` members remain eligible: an emergency typically follows a mass liveness
+failure in which most prior members are suspended for miss rate, and excluding them would leave
+the recovery set empty.
 
 If `members` is empty, derivation fails closed (`empty-committee-no-emergency-fallback`).
 Nodes log `CRITICAL` when deriving such a checkpoint and refuse to start on one without

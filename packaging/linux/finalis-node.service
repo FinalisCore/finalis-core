@@ -3,12 +3,15 @@ Description=Finalis Node
 Documentation=https://github.com/finalis-core/finalis-core
 After=network-online.target
 Wants=network-online.target
+# Bound crash loops: after 5 failed starts in 5 minutes the unit stays failed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=finalis
 Group=finalis
-WorkingDirectory=/opt/finalis-core
+WorkingDirectory=/var/lib/finalis
 Environment="FINALIS_HOME=/var/lib/finalis"
 
 # Paths - adjust to your deployment location
@@ -30,9 +33,45 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=finalis-node
 
-# Restart behavior
+# Restart behavior. Never restart on fail-stop states that need an operator decision:
+#   78      unacknowledged emergency fallback committee (--acknowledge-emergency-fallback)
+#   SIGABRT RocksDB corruption detected (finalized-state-invariant-violation source=db-*)
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78 SIGABRT
+
+# Graceful shutdown: SIGINT -> node.stop(); SIGKILL only after the grace window.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=120
+
+# Filesystem isolation
+UMask=0077
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/finalis
+# Lightserver admin RPC socket: /run/finalis/admin.sock (owner-only). /var/run -> /run.
+RuntimeDirectory=finalis
+RuntimeDirectoryMode=0700
+PrivateTmp=true
+PrivateDevices=true
+
+# Privilege isolation
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+
+# Kernel surface (AF_NETLINK: getifaddrs)
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
 
 # Resource limits
 LimitNOFILE=65536

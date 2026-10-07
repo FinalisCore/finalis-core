@@ -1,0 +1,77 @@
+name: linux-ci
+
+on:
+  push:
+    branches-ignore:
+      - 'windows-installer-test'
+  pull_request:
+    branches-ignore:
+      - 'windows-installer-test'
+  workflow_dispatch:
+
+concurrency:
+  group: linux-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FINALIS_TEST_QUIET_LOGS: '1'
+  # Node/lightserver/explorer only: no local nginx build, no Qt wallet.
+  CMAKE_COMMON_FLAGS: >-
+    -G Ninja
+    -DFINALIS_BUILD_NGINX=OFF
+    -DFINALIS_GENERATE_NGINX_CONFIG=OFF
+
+jobs:
+  release:
+    name: build + ctest (Release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
+            libssl-dev libsodium-dev librocksdb-dev nlohmann-json3-dev
+      - name: Configure
+        run: cmake -S . -B build $CMAKE_COMMON_FLAGS -DCMAKE_BUILD_TYPE=Release -DFINALIS_STRICT_WARNINGS=ON
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 5400
+      - name: Fuzz smoke
+        run: |
+          ./build/fuzz_p2p_frame
+          ./build/fuzz_tx_parse
+
+  sanitize:
+    name: ASan/UBSan shard ${{ matrix.shard }}/4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      FINALIS_TEST_SHARD_INDEX: ${{ matrix.shard }}
+      FINALIS_TEST_SHARD_COUNT: '4'
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1:detect_stack_use_after_return=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
+            libssl-dev libsodium-dev librocksdb-dev nlohmann-json3-dev
+      - name: Configure
+        run: cmake -S . -B build $CMAKE_COMMON_FLAGS -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFINALIS_SANITIZE=ON
+      - name: Build
+        run: cmake --build build --target finalis-tests fuzz_p2p_frame fuzz_tx_parse -j"$(nproc)"
+      - name: Test
+        run: ./build/finalis-tests
+      - name: Fuzz smoke
+        if: matrix.shard == 0
+        run: |
+          ./build/fuzz_p2p_frame
+          ./build/fuzz_tx_parse

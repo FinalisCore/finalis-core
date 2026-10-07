@@ -226,6 +226,9 @@ class Node {
   ~Node() noexcept;
 
   bool init();
+  // True when init() failed on a state that needs an operator decision (e.g. an unacknowledged
+  // emergency fallback committee); retrying unchanged cannot succeed.
+  bool init_requires_operator_action() const { return init_requires_operator_action_; }
   void start();
   void stop();
 
@@ -600,6 +603,7 @@ class Node {
   mutable std::optional<NextEpochCheckpointValidation> next_epoch_checkpoint_validation_cache_;
   mutable std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states_;
   std::string last_test_hook_error_;
+  bool init_requires_operator_action_{false};
   std::uint32_t current_round_{0};
   std::uint64_t round_started_ms_{0};
   std::uint64_t round0_deadline_ms_{0};

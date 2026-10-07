@@ -2255,7 +2255,12 @@ std::vector<PubKey32> emergency_fallback_committee_members(
       if (!seen.insert(pub).second) continue;
       const auto info = validators.get(pub);
       if (!info.has_value() || !info->has_bond || info->bonded_amount == 0) continue;
-      if (info->status == ValidatorStatus::BANNED || info->status == ValidatorStatus::ONBOARDING) continue;
+      // EXITING operators announced departure and may already be offline. SUSPENDED stays
+      // eligible: emergencies follow mass liveness failures, when most prior members are suspended.
+      if (info->status == ValidatorStatus::BANNED || info->status == ValidatorStatus::ONBOARDING ||
+          info->status == ValidatorStatus::EXITING) {
+        continue;
+      }
       out.push_back(pub);
     }
   }

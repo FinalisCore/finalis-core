@@ -1069,6 +1069,9 @@ StandardError=journal
 SyslogIdentifier=finalis-node
 Restart=on-failure
 RestartSec=5
+# Fail-stop states that need an operator decision: 78 = unacknowledged emergency fallback
+# committee, SIGABRT = RocksDB corruption detected.
+RestartPreventExitStatus=78 SIGABRT
 
 # Graceful shutdown: SIGINT -> node.stop(); SIGKILL only after the grace window.
 KillSignal=SIGINT

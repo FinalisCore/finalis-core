@@ -3013,6 +3013,7 @@ bool Node::init() {
         std::cerr << "CRITICAL: committee for height " << (finalized_height_ + 1)
                   << " was derived by the emergency prior-committee rule (no eligible operators).\n"
                   << "Restart with --acknowledge-emergency-fallback to run in this state.\n";
+        init_requires_operator_action_ = true;
         return false;
       }
     }
