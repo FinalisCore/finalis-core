@@ -456,18 +456,8 @@ class Node {
   Hash32 committee_epoch_randomness_for_height_locked(std::uint64_t height) const;
   std::optional<storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoint_for_height_locked(
       std::uint64_t height) const;
-  storage::FinalizedCommitteeCheckpoint build_finalized_committee_checkpoint_locked(
-      std::uint64_t epoch_start_height, std::size_t active_validator_count,
-      const std::vector<consensus::FinalizedCommitteeCandidate>& active,
-      const Hash32& epoch_randomness) const;
-  void persist_finalized_committee_checkpoint_locked(std::uint64_t epoch_start_height,
-                                                     std::size_t active_validator_count,
-                                                     const std::vector<consensus::FinalizedCommitteeCandidate>& active,
-                                                     const Hash32& epoch_randomness);
   std::uint8_t ticket_difficulty_bits_for_epoch_locked(std::uint64_t epoch_start_height,
                                                        std::size_t active_validator_count) const;
-  std::vector<consensus::FinalizedCommitteeCandidate> finalized_committee_candidates_for_height_locked(
-      std::uint64_t height, std::uint8_t ticket_difficulty_bits) const;
   std::optional<std::uint64_t> settlement_epoch_for_block_height_locked(std::uint64_t height) const;
   storage::EpochRewardSettlementState epoch_reward_state_for_epoch_locked(std::uint64_t epoch_start_height) const;
   std::map<PubKey32, std::uint64_t> compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const;

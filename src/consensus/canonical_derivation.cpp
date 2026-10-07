@@ -410,12 +410,8 @@ std::size_t active_operator_count_for_height(const ValidatorRegistry& validators
 
 std::uint64_t effective_validator_min_bond_for_height(const CanonicalDerivationConfig& cfg,
                                                       const CanonicalDerivedState& state, std::uint64_t height) {
-  if (cfg.validator_min_bond_override != BOND_AMOUNT || cfg.validator_bond_min_amount != BOND_AMOUNT) {
-    return std::max<std::uint64_t>(cfg.validator_min_bond_override, cfg.validator_bond_min_amount);
-  }
-  const auto active_operator_count = active_operator_count_for_height(state.validators, height);
-  return std::max<std::uint64_t>(cfg.validator_bond_min_amount,
-                                 validator_min_bond_units(cfg.network, height, active_operator_count));
+  return consensus::effective_validator_min_bond_for_height(cfg.network, cfg.validator_min_bond_override,
+                                                            cfg.validator_bond_min_amount, state.validators, height);
 }
 
 std::uint8_t ticket_difficulty_bits_for_epoch(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
@@ -861,6 +857,16 @@ void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, Canonic
 }
 
 }  // namespace
+
+std::uint64_t effective_validator_min_bond_for_height(const NetworkConfig& network, std::uint64_t min_bond_override,
+                                                      std::uint64_t bond_min_amount, const ValidatorRegistry& validators,
+                                                      std::uint64_t height) {
+  if (min_bond_override != BOND_AMOUNT || bond_min_amount != BOND_AMOUNT) {
+    return std::max<std::uint64_t>(min_bond_override, bond_min_amount);
+  }
+  const auto active_operator_count = active_operator_count_for_height(validators, height);
+  return std::max<std::uint64_t>(bond_min_amount, validator_min_bond_units(network, height, active_operator_count));
+}
 
 Hash32 canonical_finality_certificate_hash(const FinalityCertificate& cert) {
   return canonical_finality_certificate_hash_impl(cert);

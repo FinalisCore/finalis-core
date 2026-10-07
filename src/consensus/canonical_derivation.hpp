@@ -207,6 +207,13 @@ AdaptiveCheckpointParameters derive_adaptive_checkpoint_parameters(
     const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint, std::uint64_t qualified_depth);
 bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, std::uint64_t height);
 
+// Registration bond floor at `height` (PROTOCOL-SPEC min_bond(height)). Single source of truth for
+// replay validation and the live node (proposer, mempool). Values equal to BOND_AMOUNT mean "no
+// override"; anything else pins the floor to max(min_bond_override, bond_min_amount).
+std::uint64_t effective_validator_min_bond_for_height(const NetworkConfig& network, std::uint64_t min_bond_override,
+                                                      std::uint64_t bond_min_amount, const ValidatorRegistry& validators,
+                                                      std::uint64_t height);
+
 // Emergency committee recovery (consensus rule). When no candidate survives the checkpoint
 // filters, the committee is the first kEmergencyFallbackMaxMembers distinct members of the
 // kEmergencyFallbackLookbackEpochs most recent prior checkpoints (newest epoch first, checkpoint

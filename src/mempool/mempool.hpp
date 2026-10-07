@@ -51,12 +51,17 @@ class Mempool {
                                       std::vector<std::string>* diagnostics = nullptr) const;
   void remove_confirmed(const std::vector<Hash32>& txids);
   void prune_against_utxo(const UtxoView& view);
+  // Drops txs whose admission PoW (SCONBREG / SCVALJRQ) no longer validates under the current
+  // context, i.e. its epoch fell out of {current, previous}. Such txs can never be selected for a
+  // block, and would otherwise hold their inputs until restart. Returns the number dropped.
+  std::size_t prune_expired_admission_pow();
   std::size_t size() const;
   std::size_t total_bytes() const;
   bool contains(const Hash32& txid) const;
   MempoolPolicyStats policy_stats() const;
   void on_finalized_block_timestamp(std::uint64_t ts);
-  void set_validation_context(SpecialValidationContext ctx) { ctx_ = ctx; }
+  // Also prunes expired admission PoW txs when ctx.current_height advances.
+  void set_validation_context(SpecialValidationContext ctx);
   void set_hashcash_config(policy::HashcashConfig cfg) { hashcash_cfg_ = std::move(cfg); }
   void set_network(NetworkConfig cfg) { network_ = std::move(cfg); }
   void set_full_replacement_margin_bps(std::uint32_t margin_bps) { full_replacement_margin_bps_ = margin_bps; }

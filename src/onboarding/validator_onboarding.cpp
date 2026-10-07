@@ -12,12 +12,15 @@
 #include "common/address.hpp"
 #include "common/chain_id.hpp"
 #include "codec/bytes.hpp"
+#include "consensus/canonical_derivation.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/randomness.hpp"
 #include "crypto/hash.hpp"
 #include "common/keystore.hpp"
 #include "lightserver/client.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
+#include "utxo/validate.hpp"
 
 namespace finalis::onboarding {
 namespace {
@@ -288,9 +291,9 @@ bool persist_record(storage::DB& db, const ValidatorOnboardingRecord& record, st
   return true;
 }
 
-std::size_t active_operator_count_for_onboarding(const NetworkConfig& network,
-                                                 const std::map<PubKey32, consensus::ValidatorInfo>& validators,
-                                                 std::uint64_t height) {
+consensus::ValidatorRegistry validator_registry_for_onboarding(const NetworkConfig& network,
+                                                              const std::map<PubKey32, consensus::ValidatorInfo>& validators,
+                                                              std::uint64_t height) {
   consensus::ValidatorRegistry registry;
   registry.set_rules(consensus::ValidatorRules{
       .min_bond = consensus::validator_min_bond_units(network, height, validators.size()),
@@ -298,27 +301,16 @@ std::size_t active_operator_count_for_onboarding(const NetworkConfig& network,
       .cooldown_blocks = network.validator_cooldown_blocks,
   });
   for (const auto& [pub, info] : validators) registry.upsert(pub, info);
-  std::set<PubKey32> operators;
-  for (const auto& pub : registry.active_sorted(height)) {
-    auto it = validators.find(pub);
-    if (it == validators.end()) continue;
-    operators.insert(consensus::canonical_operator_id(pub, it->second));
-  }
-  return operators.size();
+  return registry;
 }
 
+// Must equal the floor the node mempool/proposer and replay enforce; adaptive_min_bond is the
+// committee-eligibility floor (see eligibility_bond_amount_for_onboarding), not the registration floor.
 std::uint64_t registration_bond_amount_for_onboarding(const NetworkConfig& network, storage::DB& db,
                                                       std::uint64_t planning_height) {
-  const auto epoch_start = consensus::committee_epoch_start(std::max<std::uint64_t>(1, planning_height),
-                                                            network.committee_epoch_blocks);
-  if (auto checkpoint = db.get_finalized_committee_checkpoint(epoch_start); checkpoint.has_value() &&
-      checkpoint->adaptive_min_bond != 0) {
-    return checkpoint->adaptive_min_bond;
-  }
-  const auto validators = db.load_validators();
-  const auto active_operator_count = active_operator_count_for_onboarding(network, validators, planning_height);
-  return std::max<std::uint64_t>(network.validator_bond_min_amount,
-                                 consensus::validator_min_bond_units(network, planning_height, active_operator_count));
+  const auto registry = validator_registry_for_onboarding(network, db.load_validators(), planning_height);
+  return consensus::effective_validator_min_bond_for_height(network, network.validator_min_bond,
+                                                            network.validator_bond_min_amount, registry, planning_height);
 }
 
 std::uint64_t eligibility_bond_amount_for_onboarding(const NetworkConfig& network, storage::DB& db,
@@ -329,6 +321,52 @@ std::uint64_t eligibility_bond_amount_for_onboarding(const NetworkConfig& networ
     return std::max<std::uint64_t>(registration_bond_amount, checkpoint->adaptive_min_bond);
   }
   return registration_bond_amount;
+}
+
+// True when the built join tx's admission PoW no longer validates at the local finalized tip. It was
+// valid when built, so its epoch has left {current, previous}: the tx can never be included, and the
+// node mempool drops it (Mempool::prune_expired_admission_pow), freeing its inputs for a rebuild.
+// Lightserver reports only "tx_invalid" on rejection, so expiry is detected locally.
+bool join_tx_admission_pow_expired(const NetworkConfig& network, storage::DB& db, const Bytes& tx_bytes) {
+  if (!validator_join_admission_pow_enabled(network) || tx_bytes.empty()) return false;
+  const auto parsed = parse_any_tx(tx_bytes);
+  const auto tip = db.get_tip();
+  if (!parsed.has_value() || !tip.has_value() || !std::holds_alternative<Tx>(*parsed)) return false;
+  const auto& tx = std::get<Tx>(*parsed);
+  const auto chain_id = ChainId::from_config_and_db(network, db);
+  SpecialValidationContext ctx{
+      .network = &network,
+      .chain_id = &chain_id,
+      .current_height = tip->height + 1,
+      .finalized_hash_at_height = [&db](std::uint64_t anchor_height) -> std::optional<Hash32> {
+        if (anchor_height == 0) return zero_hash();
+        return db.get_height_hash(anchor_height);
+      },
+  };
+  std::vector<OutPoint> inputs;
+  for (const auto& in : tx.inputs) inputs.push_back(OutPoint{in.prev_txid, in.prev_index});
+  for (const auto& out : tx.outputs) {
+    ValidatorJoinRequestScriptData join_req{};
+    if (!parse_validator_join_request_script(out.script_pubkey, &join_req)) continue;
+    for (const auto& bond : tx.outputs) {
+      PubKey32 reg_pub{};
+      if (!is_validator_register_script(bond.script_pubkey, &reg_pub) || reg_pub != join_req.validator_pubkey) continue;
+      return !validate_admission_pow(join_req, inputs, bond.value, ctx, nullptr);
+    }
+  }
+  return false;
+}
+
+// Sends the record back to BUILDING_JOIN_TX with its reserved inputs so a fresh PoW is mined at the tip.
+void reset_join_tx_for_pow_rebuild(ValidatorOnboardingRecord* record) {
+  record->tx_bytes.clear();
+  record->txid_hex.clear();
+  record->broadcast_attempted_at_unix_ms = 0;
+  record->broadcast_outcome = ValidatorOnboardingBroadcastOutcome::NONE;
+  record->broadcast_result = "admission pow epoch expired; rebuilding join transaction";
+  record->last_error_code.clear();
+  record->last_error_message.clear();
+  record->state = ValidatorOnboardingState::BUILDING_JOIN_TX;
 }
 
 std::set<OutPoint> reserved_outpoints_except(const storage::DB& db, const PubKey32& owner_pubkey) {
@@ -903,6 +941,10 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
             (void)persist_record(db, record, err);
             return record;
           }
+          if (join_tx_admission_pow_expired(options.network, db, record.tx_bytes)) {
+            reset_join_tx_for_pow_rebuild(&record);
+            continue;
+          }
           std::string rpc_err;
           auto result = lightserver::rpc_broadcast_tx(options.rpc_url, record.tx_bytes, &rpc_err);
           record.broadcast_attempted_at_unix_ms = now_unix_ms();
@@ -910,6 +952,11 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
           record.broadcast_result = !result.error.empty() ? result.error : rpc_err;
           record.rpc_endpoint = options.rpc_url;
           if (!result.txid_hex.empty()) record.txid_hex = result.txid_hex;
+          if (result.outcome == lightserver::BroadcastOutcome::Rejected &&
+              join_tx_admission_pow_expired(options.network, db, record.tx_bytes)) {
+            reset_join_tx_for_pow_rebuild(&record);
+            continue;
+          }
           if (result.outcome == lightserver::BroadcastOutcome::Rejected) {
             record.state = ValidatorOnboardingState::FAILED;
             set_error(&record, "tx_rejected", result.error.empty() ? "broadcast rejected" : result.error);
@@ -929,6 +976,11 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
       }
 
       case ValidatorOnboardingState::WAITING_FOR_FINALIZATION: {
+        if (!find_join_request_for_pubkey(join_requests, key->pubkey).has_value() &&
+            join_tx_admission_pow_expired(options.network, db, record.tx_bytes)) {
+          reset_join_tx_for_pow_rebuild(&record);
+          continue;
+        }
         if (record.broadcast_attempted_at_unix_ms != 0 &&
             record.updated_at_unix_ms > record.broadcast_attempted_at_unix_ms &&
             (record.updated_at_unix_ms - record.broadcast_attempted_at_unix_ms) > kOnboardingFinalizationTimeoutMs) {

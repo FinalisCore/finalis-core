@@ -28,6 +28,41 @@ std::vector<OutPoint> input_outpoints(const AnyTx& tx) {
       tx);
 }
 
+// (value, script) of every transparent output; v2 transparent outputs can carry special scripts too.
+std::vector<std::pair<std::uint64_t, const Bytes*>> transparent_outputs(const AnyTx& tx) {
+  std::vector<std::pair<std::uint64_t, const Bytes*>> out;
+  if (const auto* v1 = std::get_if<Tx>(&tx)) {
+    for (const auto& o : v1->outputs) out.push_back({o.value, &o.script_pubkey});
+  } else {
+    for (const auto& o : std::get<TxV2>(tx).outputs) {
+      if (const auto* t = std::get_if<TransparentTxOutV2>(&o.body)) out.push_back({t->value, &t->script_pubkey});
+    }
+  }
+  return out;
+}
+
+// Same admission PoW checks validate_any_tx applies in select_for_block, so a tx dropped here is
+// exactly one block selection would skip forever.
+bool admission_pow_invalid(const AnyTx& tx, const SpecialValidationContext& ctx) {
+  const auto outputs = transparent_outputs(tx);
+  for (const auto& [value, script] : outputs) {
+    OnboardingRegistrationScriptData onboarding_req{};
+    if (parse_onboarding_registration_script(*script, &onboarding_req) &&
+        !validate_onboarding_admission_pow(onboarding_req, ctx, nullptr)) {
+      return true;
+    }
+    ValidatorJoinRequestScriptData join_req{};
+    if (!parse_validator_join_request_script(*script, &join_req)) continue;
+    for (const auto& [bond_value, bond_script] : outputs) {
+      PubKey32 reg_pub{};
+      if (!is_validator_register_script(*bond_script, &reg_pub) || reg_pub != join_req.validator_pubkey) continue;
+      if (!validate_admission_pow(join_req, input_outpoints(tx), bond_value, ctx, nullptr)) return true;
+      break;
+    }
+  }
+  return false;
+}
+
 std::uint64_t effective_score_weight(const TxValidationCost& cost) {
   const auto base = std::max<std::uint64_t>(1, static_cast<std::uint64_t>(cost.serialized_size));
   return base + (cost.confidential_verify_weight * 4);
@@ -328,6 +363,27 @@ void Mempool::remove_confirmed(const std::vector<Hash32>& txids) {
     auto erase_it = it++;
     erase_entry(erase_it);
   }
+}
+
+void Mempool::set_validation_context(SpecialValidationContext ctx) {
+  const bool height_advanced = !ctx_.has_value() || ctx.current_height > ctx_->current_height;
+  ctx_ = std::move(ctx);
+  if (height_advanced) (void)prune_expired_admission_pow();
+}
+
+std::size_t Mempool::prune_expired_admission_pow() {
+  if (!ctx_.has_value()) return 0;
+  std::size_t dropped = 0;
+  for (auto it = by_txid_.begin(); it != by_txid_.end();) {
+    if (!admission_pow_invalid(it->second.entry.tx, *ctx_)) {
+      ++it;
+      continue;
+    }
+    auto erase_it = it++;
+    erase_entry(erase_it);
+    ++dropped;
+  }
+  return dropped;
 }
 
 void Mempool::prune_against_utxo(const UtxoView& view) {
