@@ -4851,6 +4851,79 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   ASSERT_TRUE(loc->height >= 34u);
 }
 
+// Three disable_p2p nodes on the in-process local bus (no sockets): node0 is the only validator, node1 and
+// node2 follow it. Covers Node::for_each_local_bus_peer with multiple peers: finalized-frontier delivery,
+// the designated-certifier forward (bool early exit) and the certifier's TX re-broadcast to every peer.
+// (A multi-validator committee cannot finalize on the local bus: the proposal gate counts P2P sessions.)
+TEST(test_local_bus_multi_node_delivers_frontiers_and_forwards_tx_to_designated_certifier) {
+  const auto base = unique_test_base("/tmp/finalis_it_local_bus_multi_node");
+  ASSERT_TRUE(write_mainnet_genesis_file(base + "/genesis.json", 1));
+  const auto keys = node::Node::deterministic_test_keypairs();
+  std::vector<std::unique_ptr<node::Node>> nodes;
+  for (int i = 0; i < 3; ++i) {
+    auto cfg = single_node_cfg(base, 1);
+    cfg.node_id = i;
+    cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    keystore::ValidatorKey key;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                    deterministic_seed_for_node_id(i), &key, &kerr));
+    nodes.push_back(std::make_unique<node::Node>(cfg));
+    ASSERT_TRUE(nodes.back()->init());
+  }
+  // Bus order is start() order: [node1, node2, node0]. Followers start first so they see every frontier.
+  nodes[1]->start();
+  nodes[2]->start();
+  nodes[0]->start();
+
+  // Followers can only advance if node0's TRANSITION broadcasts reach both of them over the bus.
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 3) return false;
+    }
+    funded = find_funded_test_wallet(*nodes[1], keys, 1'000'000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+
+  // Freeze height so the tx stays in every mempool once delivered.
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = nodes[0]->status();
+    for (const auto& n : nodes) {
+      const auto s = n->status();
+      if (s.height != s0.height || s.transition_hash != s0.transition_hash) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(30)));
+  const auto committee = nodes[1]->committee_for_height_round_for_test(nodes[1]->status().height + 1, 0);
+  ASSERT_TRUE(committee == std::vector<PubKey32>{nodes[0]->local_validator_pubkey_for_test()});
+
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  const auto& prev = funded->utxos.front();
+  std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
+                             TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
+  std::string err;
+  const auto tx = build_signed_p2pkh_tx_single_input(
+      prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  // Injected locally into node1 (from_network=false: node1 never broadcasts it). node1's forward must
+  // skip node2 (fn returns false) and stop at node0, the designated certifier (fn returns true). node0
+  // then re-broadcasts to node1 and node2, which is node2's only way to receive it.
+  ASSERT_TRUE(nodes[1]->inject_tx_for_test(*tx, true));
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (!n->mempool_contains_for_test(tx->txid())) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(30)));
+
+  for (auto& n : nodes) n->stop();
+}
+
 TEST(test_tx_status_reports_certified_ingress_before_finalization) {
   const std::string base = unique_test_base("/tmp/finalis_it_tx_status_certified_ingress");
 
