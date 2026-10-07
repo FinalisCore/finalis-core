@@ -50,6 +50,7 @@
 #include "crypto/smt.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
+#include "lightserver/server.hpp"
 #include "common/keystore.hpp"
 #include "common/merkle.hpp"
 #include "utxo/confidential_tx.hpp"
@@ -3614,6 +3615,10 @@ bool Node::start_lightserver_child() {
       "127.0.0.1",
       "--relay-port",
       std::to_string(cfg_.p2p_port),
+      // Pin the child's admin socket to the path clients (CLI/wallet kDefaultAdminRpcUrl) dial.
+      // Two args: the lightserver parser does not accept --admin-socket=<path>.
+      "--admin-socket",
+      lightserver::kDefaultAdminSocketPath,
   };
 
   std::vector<char*> argv;
