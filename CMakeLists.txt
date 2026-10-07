@@ -178,6 +178,7 @@ add_library(finalis_core
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
   src/node/node.cpp
+  src/node/node_internal.cpp
   src/lightserver/client.cpp
   src/lightserver/server.cpp
 )
