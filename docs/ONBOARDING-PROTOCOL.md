@@ -273,6 +273,13 @@ Current external surfaces include:
 
 - CLI onboarding registration
 - wallet onboarding registration
+
+Both reach the node through the lightserver admin Unix socket (`validator_onboarding_start` /
+`validator_onboarding_status`). These methods are never served over TCP. For access rules and the
+procedure, see [LIGHTSERVER-OPERATIONS.md §2](LIGHTSERVER-OPERATIONS.md#2-admin-socket).
+
+Read-only surfaces:
+
 - lightserver visibility for:
   - `ONBOARDING` status
   - onboarding reward eligibility / score visibility

@@ -21,6 +21,7 @@
 - Public rate limits (token buckets): 100 req/min per IP, `broadcast_tx` 10/min per IP, 1000/min
   global; over limit returns HTTP 429 with `Retry-After`. Loopback peers are exempt unless
   `--rate-limit-loopback` is set (required behind a same-host reverse proxy).
+- Operator runbook: [docs/LIGHTSERVER-OPERATIONS.md](../../docs/LIGHTSERVER-OPERATIONS.md).
 
 ## Non-Goals
 

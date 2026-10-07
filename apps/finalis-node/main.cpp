@@ -10,6 +10,7 @@
 using finalis::node::Node;
 
 namespace {
+constexpr int kExitOperatorActionRequired = 78;  // EX_CONFIG
 volatile std::sig_atomic_t g_stop = 0;
 void on_sigint(int) { g_stop = 1; }
 }  // namespace
@@ -49,7 +50,8 @@ int main(int argc, char** argv) {
   Node node(*cfg);
   if (!node.init()) {
     std::cerr << "node init failed\n";
-    return 1;
+    // Distinct code so service managers stop restarting (systemd RestartPreventExitStatus=78).
+    return node.init_requires_operator_action() ? kExitOperatorActionRequired : 1;
   }
   node.start();
 

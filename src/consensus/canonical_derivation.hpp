@@ -210,7 +210,7 @@ bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, st
 // Emergency committee recovery (consensus rule). When no candidate survives the checkpoint
 // filters, the committee is the first kEmergencyFallbackMaxMembers distinct members of the
 // kEmergencyFallbackLookbackEpochs most recent prior checkpoints (newest epoch first, checkpoint
-// order within an epoch) that still hold a bond and are not BANNED/ONBOARDING, sorted by pubkey.
+// order within an epoch) that still hold a bond and are not BANNED/ONBOARDING/EXITING, sorted by pubkey.
 inline constexpr std::size_t kEmergencyFallbackMaxMembers = 4;
 inline constexpr std::uint64_t kEmergencyFallbackLookbackEpochs = 2;
 std::vector<PubKey32> emergency_fallback_committee_members(

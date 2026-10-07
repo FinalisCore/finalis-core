@@ -2596,7 +2596,11 @@ TEST(test_emergency_fallback_committee_recovers_from_prior_committees) {
     ASSERT_TRUE(validators.register_bond(kp.public_key, bond, 0, 100, &err, kp.public_key));
     keys.push_back(kp.public_key);
   }
-  validators.ban(keys[1], 1);  // banned members are never recovered
+  validators.ban(keys[1], 1);                        // banned members are never recovered
+  ASSERT_TRUE(validators.request_unbond(keys[2], 1));  // EXITING: never recovered
+  auto suspended = *validators.get(keys[3]);           // SUSPENDED: still recovered
+  suspended.status = consensus::ValidatorStatus::SUSPENDED;
+  validators.upsert(keys[3], suspended);
 
   // Epoch length 4: epoch 13 looks back at 9 (newest) then 5; epoch 1 is outside the window.
   std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> checkpoints;
@@ -2605,8 +2609,8 @@ TEST(test_emergency_fallback_committee_recovers_from_prior_committees) {
   checkpoints[9].ordered_members = {keys[0], keys[1], keys[2], keys[3]};
 
   auto members = consensus::emergency_fallback_committee_members(validators, checkpoints, 13, 4);
-  // Newest epoch first, skipping the banned and duplicate members, capped at 4.
-  std::vector<PubKey32> expected{keys[0], keys[2], keys[3], keys[4]};
+  // Newest epoch first, skipping banned, exiting and duplicate members, capped at 4.
+  std::vector<PubKey32> expected{keys[0], keys[3], keys[4], keys[5]};
   std::sort(expected.begin(), expected.end());
   ASSERT_EQ(members, expected);
 
