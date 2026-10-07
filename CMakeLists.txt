@@ -179,6 +179,9 @@ add_library(finalis_core
   src/p2p/peer_manager.cpp
   src/node/node.cpp
   src/node/node_internal.cpp
+  src/node/node_test_hooks.cpp
+  src/node/node_args.cpp
+  src/node/node_state.cpp
   src/lightserver/client.cpp
   src/lightserver/server.cpp
 )
