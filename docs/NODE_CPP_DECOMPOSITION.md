@@ -45,6 +45,18 @@ so the split requires **no public API change** and **no change to `Node`'s priva
 | **Canonical derived state** | The state (UTXOs, validators, rewards, …) re-derived from finalized frontier storage at startup. |
 | **`_locked` suffix** | The function **must be called with `Node::mu_` held**. Functions without the suffix either lock `mu_` themselves or don't touch guarded state. |
 
+### Note A: Local bus topology constraint
+
+The local bus (`g_local_bus_mu` / `g_local_bus_nodes`) is **not** a replacement for real P2P when running multi-validator consensus. A node may only propose a block if `p2p_.get_peer_info(...).established()` returns a sufficient peer count. With `disable_p2p = true` this count is always zero, so a validator on the local bus believes it has no peers and never proposes.
+
+**Consequence:** a local-bus cluster with more than one validator can never finalize blocks. The local bus is only suitable for:
+
+- Single-validator + follower nodes (validator proposes, followers receive via broadcast)
+- Tests that exercise broadcast/forward paths without consensus finalization
+- Single-node initialization and configuration tests
+
+**For multi-validator consensus tests, use real P2P** (`disable_p2p = false`) with `make_cluster` or equivalent fixtures. This is why `test_local_bus_multi_node_delivers_frontiers_and_forwards_tx_to_designated_certifier` uses one validator and two followers, not three validators.
+
 ### 2.2 Area breakdown
 
 Every definition was assigned to one logical area. "LOC" is the sum of function body lengths
