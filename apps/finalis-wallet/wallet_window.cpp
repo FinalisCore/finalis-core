@@ -61,6 +61,7 @@
 #include <QWidget>
 
 #include "confidential_memo.hpp"
+#include "confidential_receive.hpp"
 
 #include "common/address.hpp"
 #include "codec/bytes.hpp"
@@ -4662,48 +4663,19 @@ void WalletWindow::import_received_confidential_tx() {
     return;
   }
   const auto& tx = std::get<TxV2>(*any_tx);
+  std::size_t already_imported = 0;
   bool imported_any = false;
-  for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
-    const auto& output = tx.outputs[i];
-    if (output.kind != TxOutputKind::Confidential) continue;
-    const auto& confidential = std::get<ConfidentialTxOutV2>(output.body);
-    const std::string one_time_hex = finalis::hex_encode(Bytes(confidential.one_time_pubkey.begin(), confidential.one_time_pubkey.end()));
-    const std::string ephemeral_hex = finalis::hex_encode(Bytes(confidential.ephemeral_pubkey.begin(), confidential.ephemeral_pubkey.end()));
-    const auto request_it = std::find_if(
-        state.confidential_requests.begin(), state.confidential_requests.end(),
-        [&](const WalletStore::ConfidentialRequestRecord& req) {
-          return !req.consumed && req.one_time_pubkey_hex == one_time_hex &&
-                 req.ephemeral_pubkey_hex == ephemeral_hex && req.scan_tag == confidential.scan_tag.value;
-        });
-    if (request_it == state.confidential_requests.end()) continue;
-    auto memo_key = decode_hex32_string(request_it->memo_key_hex);
-    auto spend_secret = decode_hex32_string(request_it->spend_secret_hex);
-    OnScopeExit wipe_keys{[&] {
-      wipe_optional(memo_key);
-      wipe_optional(spend_secret);
-    }};
-    if (!memo_key || !spend_secret) continue;
-    auto recovery = decrypt_confidential_recovery_memo(confidential.memo, *memo_key, confidential.one_time_pubkey,
-                                                       confidential.ephemeral_pubkey);
-    if (!recovery) continue;
-    crypto::ScopedWipe<Hash32> wipe_blind(recovery->blind.bytes);
-    WalletStore::ConfidentialCoinRecord coin{
-        .txid_hex = hex_encode32(*txid),
-        .vout = static_cast<std::uint32_t>(i),
-        .account_id = request_it->account_id,
-        .amount = recovery->amount,
-        .value_commitment_hex = finalis::hex_encode(Bytes(confidential.value_commitment.bytes.begin(), confidential.value_commitment.bytes.end())),
-        .one_time_pubkey_hex = one_time_hex,
-        .ephemeral_pubkey_hex = ephemeral_hex,
-        .spend_secret_hex = request_it->spend_secret_hex,
-        .blinding_factor_hex = finalis::hex_encode(Bytes(recovery->blind.bytes.begin(), recovery->blind.bytes.end())),
-        .spent = false,
-    };
-    if (!store_.upsert_confidential_coin(coin)) continue;
-    (void)store_.set_confidential_request_consumed(request_it->request_id, true);
+  for (const auto& match : match_received_confidential_outputs(tx, *txid, state, &already_imported)) {
+    if (!store_.upsert_confidential_coin(match.coin)) continue;
+    (void)store_.set_confidential_request_consumed(match.request_id, true);
     imported_any = true;
   }
   if (!imported_any) {
+    if (already_imported > 0) {
+      QMessageBox::information(this, "Import Received Confidential Tx",
+                               "The confidential outputs of that TxV2 are already in this wallet.");
+      return;
+    }
     QMessageBox::warning(this, "Import Received Confidential Tx",
                          "No matching confidential output for any local receive request was found in that finalized TxV2.");
     return;
