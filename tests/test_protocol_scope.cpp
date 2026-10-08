@@ -455,7 +455,6 @@ TEST(test_protocol_scope_verify_budget_exact_limit_accepts_limit_plus_one_reject
   };
 
   ConfidentialPolicy policy;
-  policy.activation_height = 0;
   policy.max_inputs_per_tx = static_cast<std::uint32_t>(kMaxTxEd25519Verifies + 16);
   policy.max_outputs_per_tx = 8;
   SpecialValidationContext ctx;

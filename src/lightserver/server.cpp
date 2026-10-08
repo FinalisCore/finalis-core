@@ -2885,7 +2885,6 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const auto min_bond_amount = record->bond_amount;
     const auto max_bond_amount = std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, min_bond_amount);
     ConfidentialPolicy confidential_policy{};
-    confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
         .network = &cfg_.network,
         .chain_id = &chain_id_,
@@ -3370,7 +3369,6 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const std::uint64_t broadcast_max_bond =
         std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, broadcast_min_bond);
     ConfidentialPolicy confidential_policy{};
-    confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
         .network = &cfg_.network,
         .chain_id = &chain_id_,

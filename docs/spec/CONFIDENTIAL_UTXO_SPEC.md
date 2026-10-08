@@ -5,7 +5,7 @@
 This document defines a concrete repository-facing implementation plan for
 confidential UTXOs in Finalis Core.
 
-It is not yet a live consensus change. It specifies:
+`TxV2` is valid from genesis; there is no activation height. It specifies:
 
 - header and source file layout
 - exact C++ struct placement by file
@@ -507,7 +507,6 @@ Add:
 
 ```cpp
 struct ConfidentialPolicy {
-  std::uint64_t activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint32_t max_inputs_per_tx{64};
   std::uint32_t max_outputs_per_tx{32};
   std::uint32_t max_confidential_inputs_per_tx{16};
@@ -842,13 +841,12 @@ Add tx summary fields:
 
 Explorer must remain finalized-only.
 
-## 12. Network and Activation
+## 12. Network Policy
 
 In [src/common/network.hpp](../../src/common/network.hpp), add:
 
 ```cpp
 struct ConfidentialPolicy {
-  std::uint64_t activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint32_t max_inputs_per_tx{64};
   std::uint32_t max_outputs_per_tx{32};
   std::uint32_t max_confidential_inputs_per_tx{16};
@@ -867,11 +865,7 @@ And in `NetworkConfig`:
 ConfidentialPolicy confidential_policy{};
 ```
 
-Activation rule:
-
-- `TxV2` is invalid if `height < confidential_policy.activation_height`
-
-This must be replay-stable and fail closed.
+There is no activation rule: `TxV2` is valid from genesis (height 1) on every network.
 
 ## 13. Minimal Implementation Order
 
@@ -884,14 +878,13 @@ Implement in this order:
 5. update node/lightserver/explorer parsing to `parse_any_tx`
 6. update mempool scoring and verify-weight limits
 7. add wallet confidential receive/send support
-8. add activation height
-9. add block-level confidential verify-weight enforcement
+8. add block-level confidential verify-weight enforcement
 
 Do not invert this order. In particular:
 
 - do not land wallet UX before parser and validator support
 - do not land mempool support before a consensus verify-weight model exists
-- do not activate before replay and codec tests are complete
+- do not launch before replay and codec tests are complete
 
 ## 14. Required Tests
 
@@ -904,8 +897,7 @@ Minimum acceptance tests:
 - balance equation rejects inflation
 - range-proof batch verification determinism
 - mempool score replacement favors higher confidential score-rate, not raw fee-per-byte
-- pre-activation `TxV2` rejection
-- post-activation `TxV2` acceptance
+- `TxV2` acceptance from height 1 (no activation gate)
 - replay of old history unchanged when no `TxV2` exists
 
 ## 15. Security Notes

@@ -109,7 +109,6 @@ bool runtime_logs_enabled() {
 Node::Node(NodeConfig cfg) : cfg_(std::move(cfg)) {
   finalized_identity_ = finalized_identity_for_runtime_tip(0, zero_hash());
   finalized_randomness_ = zero_hash();
-  confidential_policy_.activation_height = cfg_.network.confidential_utxo_activation_height;
   restart_debug_ = restart_debug_enabled();
 }
 

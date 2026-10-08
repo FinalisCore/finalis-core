@@ -90,7 +90,6 @@ struct BlockValidationResult {
 };
 
 struct ConfidentialPolicy {
-  std::uint64_t activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint32_t max_inputs_per_tx{64};
   std::uint32_t max_outputs_per_tx{32};
   std::uint32_t max_confidential_inputs_per_tx{16};

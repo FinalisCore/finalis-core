@@ -537,32 +537,8 @@ TEST(test_mempool_hashcash_policy_requires_stamp_for_low_fee_txs) {
   ASSERT_TRUE(mp.accept_tx(*reparsed, view, &err));
 }
 
-TEST(test_mempool_rejects_txv2_before_activation_via_variant_validation) {
-  mempool::Mempool mp;
-  mempool::UtxoView view;
-  const auto k1 = key_from_byte(70);
-  const auto k2 = key_from_byte(71);
-
-  OutPoint op{};
-  op.txid.fill(0x71);
-  op.index = 0;
-  TxOut prev = p2pkh_out_for_pub(k1.public_key, 10'000);
-  view[op] = UtxoEntry{prev};
-
-  ConfidentialPolicy policy;
-  policy.activation_height = 500;
-  SpecialValidationContext ctx;
-  ctx.confidential_policy = &policy;
-  ctx.current_height = 100;
-  mp.set_validation_context(ctx);
-
-  const auto tx = make_transparent_only_v2_tx(op, k1, k2.public_key, 10'000, 9'800);
-  std::string err;
-  ASSERT_TRUE(!mp.accept_tx(AnyTx{tx}, view, &err));
-  ASSERT_TRUE(err.find("tx invalid: confidential tx not active") != std::string::npos);
-}
-
-TEST(test_mempool_accepts_txv2_after_activation_when_variant_validation_succeeds) {
+// TxV2 is valid from genesis: no activation height gates it.
+TEST(test_mempool_accepts_txv2_at_height_1_when_variant_validation_succeeds) {
   mempool::Mempool mp;
   mempool::UtxoView view;
   const auto k1 = key_from_byte(72);
@@ -575,10 +551,9 @@ TEST(test_mempool_accepts_txv2_after_activation_when_variant_validation_succeeds
   view[op] = UtxoEntry{prev};
 
   ConfidentialPolicy policy;
-  policy.activation_height = 0;
   SpecialValidationContext ctx;
   ctx.confidential_policy = &policy;
-  ctx.current_height = 100;
+  ctx.current_height = 1;
   mp.set_validation_context(ctx);
 
   const auto tx = make_transparent_only_v2_tx(op, k1, k2.public_key, 10'000, 9'800);

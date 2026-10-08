@@ -381,30 +381,7 @@ TEST(test_validate_any_tx_dispatches_v1_against_utxoset_v2) {
   ASSERT_EQ(result.cost.confidential_verify_weight, 0u);
 }
 
-TEST(test_validate_tx_v2_rejects_pre_activation) {
-  const auto from = key_from_byte(0x23);
-  const auto to = key_from_byte(0x24);
-  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
-
-  OutPoint op{};
-  op.txid.fill(0x45);
-  op.index = 0;
-  UtxoSetV2 view;
-  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
-
-  auto tx = make_transparent_only_v2_tx(op, from, to.public_key, 10'000, 9'500);
-  ConfidentialPolicy policy;
-  policy.activation_height = 100;
-  SpecialValidationContext ctx;
-  ctx.current_height = 99;
-  ctx.confidential_policy = &policy;
-
-  const auto result = validate_tx_v2(tx, 1, view, &ctx);
-  ASSERT_TRUE(!result.ok);
-  ASSERT_TRUE(result.error.find("not active") != std::string::npos);
-}
-
-TEST(test_validate_tx_v2_accepts_transparent_only_post_activation) {
+TEST(test_validate_tx_v2_accepts_transparent_only) {
   const auto from = key_from_byte(0x25);
   const auto to = key_from_byte(0x26);
   const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
@@ -417,7 +394,6 @@ TEST(test_validate_tx_v2_accepts_transparent_only_post_activation) {
 
   auto tx = make_transparent_only_v2_tx(op, from, to.public_key, 10'000, 9'250);
   ConfidentialPolicy policy;
-  policy.activation_height = 100;
   SpecialValidationContext ctx;
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
@@ -452,7 +428,6 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
   auto tx = make_confidential_output_v2_tx(op, from, 10'000, 500, 9'000, valid_blind, confidential_out, 500);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 100;
   SpecialValidationContext ctx;
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
@@ -511,7 +486,6 @@ TEST(test_validate_tx_v2_accepts_confidential_input_with_transparent_output) {
   auto tx = make_confidential_input_v2_tx(op, spend_secret, input_blind, recipient.public_key, 10'000, 9'500);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 300;
   SpecialValidationContext ctx;
   ctx.current_height = 300;
   ctx.confidential_policy = &policy;
@@ -596,7 +570,6 @@ TEST(test_validate_tx_v2_rejects_duplicate_nullifier_like_confidential_spend_id)
   sign_confidential_input(tx, 1, shared_one_time_secret, 0x3C);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 1;
   SpecialValidationContext ctx;
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
@@ -638,7 +611,6 @@ TEST(test_validate_tx_v2_rejects_invalid_confidential_input_authorization) {
   std::get<ConfidentialInputWitnessV2>(tx.inputs[0].witness).spend_sig[0] ^= 0x01;
 
   ConfidentialPolicy policy;
-  policy.activation_height = 300;
   SpecialValidationContext ctx;
   ctx.current_height = 300;
   ctx.confidential_policy = &policy;
@@ -674,7 +646,6 @@ TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 100;
   SpecialValidationContext ctx;
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
@@ -715,7 +686,6 @@ TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
   auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, 9'500, bounds_blind, confidential_out, 500);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 100;
   policy.max_range_proof_bytes = 2;
   policy.max_memo_bytes = 2;
   SpecialValidationContext ctx;
@@ -764,7 +734,6 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 100;
   SpecialValidationContext ctx;
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
@@ -802,7 +771,6 @@ TEST(test_validate_tx_v2_rejects_invalid_excess_authorization) {
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 200;
   SpecialValidationContext ctx;
   ctx.current_height = 200;
   ctx.confidential_policy = &policy;
@@ -851,7 +819,6 @@ TEST(test_validate_tx_v2_rejects_validator_join_request_without_matching_registe
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 1;
   SpecialValidationContext ctx;
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
@@ -902,7 +869,6 @@ TEST(test_validate_tx_v2_accepts_matching_validator_register_and_join_request_ou
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  policy.activation_height = 1;
   SpecialValidationContext ctx;
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;

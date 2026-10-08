@@ -893,10 +893,6 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
     return out;
   }
   const auto& policy = *ctx->confidential_policy;
-  if (ctx->current_height < policy.activation_height) {
-    out.error = "confidential tx not active";
-    return out;
-  }
   if (tx.version != static_cast<std::uint32_t>(TxVersionKind::CONFIDENTIAL_V2)) {
     out.error = "unsupported tx version";
     return out;

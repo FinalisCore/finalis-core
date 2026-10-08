@@ -1813,7 +1813,6 @@ TEST(test_verify_ingress_certificate_accepts_valid_signatures_when_committee_con
 
 TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
   auto cfg = live_activation_cfg();
-  cfg.confidential_policy.activation_height = 0;
 
   const auto from = key_from_byte(0xA2);
   const auto validator = key_from_byte(0xA3);
