@@ -701,7 +701,8 @@ void Node::maybe_record_timeout_certificate_locked(std::uint64_t height, std::ui
 void Node::run_confidential_supply_audit_locked(const char* trigger) {
   if (!canonical_state_.has_value()) return;
   last_confidential_supply_audit_ =
-      consensus::audit_confidential_supply(canonical_state_->utxos, canonical_state_->confidential_supply);
+      consensus::audit_confidential_supply(canonical_state_->utxos, canonical_state_->confidential_supply,
+                                           canonical_state_->confidential_pool_value);
   const auto& r = last_confidential_supply_audit_;
   const std::string line = std::string("confidential-supply-audit status=") +
                            consensus::confidential_supply_audit_status_name(r.status) + " trigger=" + trigger +
@@ -2432,7 +2433,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
 
     consensus::FrontierExecutionResult result;
     std::string validation_error;
-    if (!consensus::execute_frontier_lane_prefix(canonical_state_->utxos, canonical_state_->finalized_frontier_vector,
+    if (!consensus::execute_frontier_lane_prefix(canonical_state_->utxos, canonical_state_->confidential_pool_value,
+                                                 canonical_state_->finalized_frontier_vector,
                                                  selection.next_vector, selection.lane_records,
                                                  canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error)) {
       if (attempt == 0 &&

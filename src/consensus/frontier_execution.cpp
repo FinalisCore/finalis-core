@@ -2,9 +2,11 @@
 
 #include "consensus/frontier_execution.hpp"
 
+#include <limits>
 #include <set>
 #include <type_traits>
 
+#include "consensus/confidential_supply.hpp"
 #include "consensus/ingress.hpp"
 #include "consensus/randomness.hpp"
 #include "codec/bytes.hpp"
@@ -278,9 +280,9 @@ std::uint64_t ordered_record_confidential_verify_weight(const Bytes& raw_record)
   return tx.has_value() ? any_tx_confidential_verify_weight(*tx) : 0;
 }
 
-bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_frontier,
-                            const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
-                            FrontierExecutionResult* out, std::string* error) {
+bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_confidential_pool_value,
+                            std::uint64_t prev_frontier, const std::vector<Bytes>& ordered_records,
+                            const SpecialValidationContext* ctx, FrontierExecutionResult* out, std::string* error) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
@@ -307,6 +309,7 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_fr
   decisions.reserve(ordered_records.size());
   std::vector<AnyTx> accepted_txs;
   std::uint64_t accepted_fee_units = 0;
+  std::uint64_t confidential_pool_value = parent_confidential_pool_value;
 
   for (const auto& raw_record : ordered_records) {
     FrontierDecision decision;
@@ -349,6 +352,23 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_fr
       decisions.push_back(decision);
       continue;
     }
+    // Consensus turnstile: value can only leave the confidential pool if it entered it. Rejecting the
+    // tx (not the slice) keeps a certified record from wedging its ingress lane; a transition that
+    // accepts such a tx still fails recomputation of its decisions and state root.
+    std::uint64_t next_pool_value = confidential_pool_value;
+    if (const auto* v2 = std::get_if<TxV2>(&*tx)) {
+      __int128 delta = 0;
+      const bool resolved = txv2_confidential_pool_delta(*v2, work, &delta);
+      const __int128 next = static_cast<__int128>(confidential_pool_value) + delta;
+      if (!resolved || next < 0 || next > static_cast<__int128>(std::numeric_limits<std::uint64_t>::max())) {
+        decision.accepted = false;
+        decision.reject_reason = FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE;
+        decisions.push_back(decision);
+        continue;
+      }
+      next_pool_value = static_cast<std::uint64_t>(next);
+    }
+    confidential_pool_value = next_pool_value;
 
     for (const auto& domain : domains) consumed_domains.insert(domain);
     apply_accepted_tx_to_utxos(*tx, &work);
@@ -370,6 +390,7 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_fr
   result.accepted_txs = std::move(accepted_txs);
   result.next_utxos = std::move(work);
   result.accepted_fee_units = accepted_fee_units;
+  result.next_confidential_pool_value = confidential_pool_value;
   *out = std::move(result);
   return true;
 }
@@ -377,11 +398,13 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t prev_fr
 bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
                             FrontierExecutionResult* out, std::string* error) {
-  return execute_frontier_slice(upgrade_utxo_set_v2(parent_utxos), prev_frontier, ordered_records, ctx, out, error);
+  // A v1 UtxoSet holds no confidential outputs, so its turnstile value is 0.
+  return execute_frontier_slice(upgrade_utxo_set_v2(parent_utxos), 0, prev_frontier, ordered_records, ctx, out, error);
 }
 
-bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, const FrontierVector& prev_vector,
-                                  const FrontierVector& next_vector, const CertifiedIngressLaneRecords& lane_records,
+bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t parent_confidential_pool_value,
+                                  const FrontierVector& prev_vector, const FrontierVector& next_vector,
+                                  const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
                                   FrontierExecutionResult* out, std::string* error) {
   FrontierLaneRoots recomputed_lane_roots{};
@@ -410,7 +433,10 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, const FrontierV
   }
 
   FrontierExecutionResult result;
-  if (!execute_frontier_slice(parent_utxos, prev_vector.total_count(), ordered_records, ctx, &result, error)) return false;
+  if (!execute_frontier_slice(parent_utxos, parent_confidential_pool_value, prev_vector.total_count(), ordered_records, ctx,
+                              &result, error)) {
+    return false;
+  }
   result.transition.prev_vector = prev_vector;
   result.transition.next_vector = next_vector;
   result.transition.ingress_commitment = frontier_ingress_commitment(prev_vector, next_vector, recomputed_lane_roots);
@@ -425,7 +451,7 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
                                   const FrontierVector& next_vector, const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
                                   FrontierExecutionResult* out, std::string* error) {
-  return execute_frontier_lane_prefix(upgrade_utxo_set_v2(parent_utxos), prev_vector, next_vector, lane_records,
+  return execute_frontier_lane_prefix(upgrade_utxo_set_v2(parent_utxos), 0, prev_vector, next_vector, lane_records,
                                       prev_lane_roots, ctx, out, error);
 }
 

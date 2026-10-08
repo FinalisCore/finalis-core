@@ -1683,7 +1683,8 @@ int main(int argc, char** argv) {
                 << " tip_height=" << (tip.has_value() ? tip->height : 0) << "\n";
       return 2;
     }
-    const auto result = finalis::consensus::audit_confidential_supply(db.load_utxos_v2(), *ledger);
+    const auto committed_pool = db.get_confidential_pool_value().value_or(0);
+    const auto result = finalis::consensus::audit_confidential_supply(db.load_utxos_v2(), *ledger, committed_pool);
     std::cout << "status=" << finalis::consensus::confidential_supply_audit_status_name(result.status)
               << " height=" << ledger_height << " pool_value=" << result.pool_value
               << " confidential_utxos=" << result.confidential_utxo_count << " txv2_count=" << ledger->txv2_count;

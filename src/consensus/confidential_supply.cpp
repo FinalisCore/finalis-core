@@ -16,6 +16,22 @@ void mark_unknown(ConfidentialSupplyLedger* ledger) { ledger->known = false; }
 
 }  // namespace
 
+bool txv2_confidential_pool_delta(const TxV2& tx, const UtxoSetV2& utxos, __int128* delta) {
+  __int128 d = 0;
+  for (const auto& in : tx.inputs) {
+    if (in.kind != TxInputKind::Transparent) continue;
+    const auto it = utxos.find(OutPoint{in.prev_txid, in.prev_index});
+    if (it == utxos.end() || it->second.kind != UtxoOutputKind::Transparent) return false;
+    d += std::get<UtxoTransparentData>(it->second.body).out.value;
+  }
+  for (const auto& out : tx.outputs) {
+    if (out.kind == TxOutputKind::Transparent) d -= std::get<TransparentTxOutV2>(out.body).value;
+  }
+  d -= tx.fee;
+  *delta = d;
+  return true;
+}
+
 void account_confidential_supply(const UtxoSetV2& pre_slice_utxos, const std::vector<AnyTx>& accepted_txs,
                                  std::uint64_t height, ConfidentialSupplyLedger* ledger) {
   if (!ledger || !ledger->known) return;
@@ -63,7 +79,8 @@ void account_confidential_supply(const UtxoSetV2& pre_slice_utxos, const std::ve
   }
 }
 
-ConfidentialSupplyAuditResult audit_confidential_supply(const UtxoSetV2& utxos, const ConfidentialSupplyLedger& ledger) {
+ConfidentialSupplyAuditResult audit_confidential_supply(const UtxoSetV2& utxos, const ConfidentialSupplyLedger& ledger,
+                                                        std::uint64_t committed_pool_value) {
   ConfidentialSupplyAuditResult out;
   out.pool_value = ledger.pool_value;
   if (!ledger.known) {
@@ -75,6 +92,12 @@ ConfidentialSupplyAuditResult audit_confidential_supply(const UtxoSetV2& utxos, 
     out.status = ConfidentialSupplyAuditStatus::Failed;
     out.detail = "turnstile-negative pool_value=" + std::to_string(ledger.pool_value) +
                  " first_negative_height=" + std::to_string(ledger.first_negative_height);
+    return out;
+  }
+  if (static_cast<std::uint64_t>(ledger.pool_value) != committed_pool_value) {
+    out.status = ConfidentialSupplyAuditStatus::Failed;
+    out.detail = "committed-pool-mismatch committed=" + std::to_string(committed_pool_value) +
+                 " recomputed=" + std::to_string(ledger.pool_value);
     return out;
   }
   crypto::CommitmentSum lhs = ledger.excess_sum;

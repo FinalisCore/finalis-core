@@ -103,6 +103,9 @@ struct CanonicalDerivedState {
   Hash32 finalized_randomness{};
   std::map<std::uint64_t, Hash32> committee_epoch_randomness_cache;
   std::uint64_t protocol_reserve_balance_units{0};
+  // Confidential turnstile P: value held in confidential (TxV2) outputs, accounted from public boundary
+  // flows only. Committed; a TxV2 that would make it negative is invalid (confidential-turnstile-negative).
+  std::uint64_t confidential_pool_value{0};
   std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
   std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints;
   std::map<std::uint64_t, CanonicalFinalizedMetadata> finalized_block_metadata;

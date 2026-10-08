@@ -352,7 +352,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
   }
   consensus::FrontierExecutionResult exec_result;
-  if (!consensus::execute_frontier_lane_prefix(genesis_derived.utxos, genesis_derived.finalized_frontier_vector,
+  if (!consensus::execute_frontier_lane_prefix(genesis_derived.utxos, genesis_derived.confidential_pool_value, genesis_derived.finalized_frontier_vector,
                                                next_vector, lane_records, genesis_derived.finalized_lane_roots, nullptr,
                                                &exec_result, &error)) {
     return false;
@@ -565,7 +565,7 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   if (!persist_certified_ingress_fixture(cfg, db, ordered_records, &fixture)) return false;
 
   consensus::FrontierExecutionResult exec_result;
-  if (!consensus::execute_frontier_lane_prefix(fixture.parent.utxos, fixture.parent.finalized_frontier_vector,
+  if (!consensus::execute_frontier_lane_prefix(fixture.parent.utxos, fixture.parent.confidential_pool_value, fixture.parent.finalized_frontier_vector,
                                                fixture.next_vector, fixture.lane_records,
                                                fixture.parent.finalized_lane_roots, nullptr,
                                                &exec_result, &error)) {

@@ -952,11 +952,11 @@ ShieldFixture shield_9000() {
 TEST(test_confidential_supply_audit_invariant_holds) {
   if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
   consensus::ConfidentialSupplyLedger empty;
-  ASSERT_TRUE(consensus::audit_confidential_supply(UtxoSetV2{}, empty).status ==
+  ASSERT_TRUE(consensus::audit_confidential_supply(UtxoSetV2{}, empty, 0).status ==
               consensus::ConfidentialSupplyAuditStatus::Ok);
 
   auto f = shield_9000();
-  auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+  auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger, static_cast<std::uint64_t>(std::max<std::int64_t>(0, f.ledger.pool_value)));
   if (audit.status != consensus::ConfidentialSupplyAuditStatus::Ok) throw std::runtime_error(audit.detail);
   ASSERT_EQ(f.ledger.pool_value, 9'000);
   ASSERT_EQ(audit.confidential_utxo_count, 1u);
@@ -966,7 +966,7 @@ TEST(test_confidential_supply_audit_invariant_holds) {
   const auto unshield =
       make_confidential_input_v2_tx(f.confidential_op, f.spend_secret, f.value_blind, recipient.public_key, 9'000, 8'500);
   apply_validated(&f, unshield, 2);
-  audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+  audit = consensus::audit_confidential_supply(f.utxos, f.ledger, static_cast<std::uint64_t>(std::max<std::int64_t>(0, f.ledger.pool_value)));
   if (audit.status != consensus::ConfidentialSupplyAuditStatus::Ok) throw std::runtime_error(audit.detail);
   ASSERT_EQ(f.ledger.pool_value, 0);
   ASSERT_EQ(f.ledger.txv2_count, 2u);
@@ -986,7 +986,7 @@ TEST(test_confidential_supply_audit_detects_inflation) {
     auto f = shield_9000();
     auto& entry = std::get<UtxoConfidentialData>(f.utxos.at(f.confidential_op).body);
     entry.value_commitment = *crypto::confidential_amount_commitment(9'001, f.value_blind);
-    const auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+    const auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger, static_cast<std::uint64_t>(std::max<std::int64_t>(0, f.ledger.pool_value)));
     ASSERT_TRUE(audit.status == consensus::ConfidentialSupplyAuditStatus::Failed);
     ASSERT_TRUE(audit.detail.find("commitment-identity-mismatch") != std::string::npos);
   }
@@ -1000,7 +1000,7 @@ TEST(test_confidential_supply_audit_detects_inflation) {
     consensus::account_confidential_supply(f.utxos, {AnyTx{inflated}}, 7, &f.ledger);
     ASSERT_TRUE(f.ledger.pool_value < 0);
     ASSERT_EQ(f.ledger.first_negative_height, 7u);
-    const auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+    const auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger, static_cast<std::uint64_t>(std::max<std::int64_t>(0, f.ledger.pool_value)));
     ASSERT_TRUE(audit.status == consensus::ConfidentialSupplyAuditStatus::Failed);
     ASSERT_TRUE(audit.detail.find("turnstile-negative") != std::string::npos);
   }
@@ -1008,7 +1008,7 @@ TEST(test_confidential_supply_audit_detects_inflation) {
   {
     consensus::ConfidentialSupplyLedger unknown;
     unknown.known = false;
-    ASSERT_TRUE(consensus::audit_confidential_supply(UtxoSetV2{}, unknown).status ==
+    ASSERT_TRUE(consensus::audit_confidential_supply(UtxoSetV2{}, unknown, 0).status ==
                 consensus::ConfidentialSupplyAuditStatus::Unavailable);
   }
 }

@@ -320,6 +320,7 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   if (auto reserve = db.get_protocol_reserve_balance(); reserve.has_value()) {
     state.protocol_reserve_balance_units = *reserve;
   }
+  if (auto pool = db.get_confidential_pool_value(); pool.has_value()) state.confidential_pool_value = *pool;
   if (auto persisted_randomness = db.get(kFinalizedRandomnessKey);
       persisted_randomness.has_value() && persisted_randomness->size() == 32) {
     std::copy(persisted_randomness->begin(), persisted_randomness->end(), state.finalized_randomness.begin());
@@ -995,6 +996,18 @@ bool Node::load_state() {
       } else {
         log_line("finalized-state-invariant-violation source=load-state-protocol-reserve-balance-mismatch");
         std::cerr << "load_state: protocol reserve balance mismatch\n";
+        return false;
+      }
+    }
+  }
+  if (auto persisted_pool = db_.get_confidential_pool_value(); persisted_pool.has_value()) {
+    if (*persisted_pool != derived_state.confidential_pool_value) {
+      if (stale_canonical_cache_tip) {
+        log_line("canonical-cache-rewrite source=load-state-confidential-pool-mismatch");
+        canonical_cache_rewrite_needed = true;
+      } else {
+        log_line("finalized-state-invariant-violation source=load-state-confidential-pool-mismatch");
+        std::cerr << "load_state: confidential pool value mismatch\n";
         return false;
       }
     }

@@ -684,6 +684,7 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
     batch.put_epoch_reward_settlement(reward_state);
   }
   batch.put_protocol_reserve_balance(state.protocol_reserve_balance_units);
+  batch.put_confidential_pool_value(state.confidential_pool_value);
   std::set<std::uint64_t> desired_checkpoint_epochs;
   for (const auto& [epoch, _] : state.finalized_committee_checkpoints) {
     desired_checkpoint_epochs.insert(epoch);

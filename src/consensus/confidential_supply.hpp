@@ -26,7 +26,10 @@ namespace finalis::consensus {
 // value created by a broken range proof (that still balances mod the group order); the turnstile
 // does, as soon as more value leaves the pool than entered it (pool_value < 0).
 //
-// Derived state only: not part of the consensus state commitment, and never fails block application.
+// The turnstile is a consensus rule: CanonicalDerivedState::confidential_pool_value is committed and
+// frontier execution rejects any TxV2 that would make it negative. This ledger is an independent,
+// history-derived recomputation kept as defense in depth: the audit cross-checks it against the
+// committed value and checks the commitment identity. It never fails block application.
 struct ConfidentialSupplyLedger {
   // False when history was not replayed (e.g. fast-start without a persisted ledger), or on an
   // internal accounting error; the audit then reports Unavailable instead of a verdict.
@@ -39,6 +42,11 @@ struct ConfidentialSupplyLedger {
 
   bool operator==(const ConfidentialSupplyLedger&) const = default;
 };
+
+// Consensus turnstile: change in the confidential pool caused by `tx`, i.e. transparent inputs minus
+// transparent outputs minus fee, resolving inputs against `utxos` (the set the tx spends from).
+// False if a transparent input is missing from `utxos`.
+bool txv2_confidential_pool_delta(const TxV2& tx, const UtxoSetV2& utxos, __int128* delta);
 
 // Accounts the accepted transactions of one finalized slice, in order. `pre_slice_utxos` is the UTXO
 // set before the slice; outputs created earlier in the same slice are resolved from `accepted_txs`.
@@ -54,8 +62,11 @@ struct ConfidentialSupplyAuditResult {
   std::size_t confidential_utxo_count{0};
 };
 
-// O(confidential UTXOs). Checks pool_value >= 0 and the commitment identity above.
-ConfidentialSupplyAuditResult audit_confidential_supply(const UtxoSetV2& utxos, const ConfidentialSupplyLedger& ledger);
+// O(confidential UTXOs). Checks that the ledger's independently derived pool value never went negative
+// and equals `committed_pool_value` (the consensus P), then the commitment identity against it. With the
+// consensus rule in place, any failure indicates a bug or corrupted state.
+ConfidentialSupplyAuditResult audit_confidential_supply(const UtxoSetV2& utxos, const ConfidentialSupplyLedger& ledger,
+                                                        std::uint64_t committed_pool_value);
 
 const char* confidential_supply_audit_status_name(ConfidentialSupplyAuditStatus status);
 

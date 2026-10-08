@@ -181,6 +181,7 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   add_exact_key(db, &kvs, key_finalized_frontier_height());
   add_exact_key(db, &kvs, key_finalized_ingress_tip());
   add_exact_key(db, &kvs, key_protocol_reserve_balance());
+  add_exact_key(db, &kvs, key_confidential_pool_value());
   add_exact_key(db, &kvs, key_availability_persistent_state());
   add_exact_key(db, &kvs, key_consensus_state_commitment_cache());
   add_prefix(db, &kvs, "H:");

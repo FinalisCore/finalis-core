@@ -1315,6 +1315,7 @@ std::string key_node_runtime_status_snapshot() { return "NRS"; }
 std::string key_availability_persistent_state() { return "APS"; }
 std::string key_consensus_state_commitment_cache() { return "CSC:TIP"; }
 std::string key_protocol_reserve_balance() { return "PRB"; }
+std::string key_confidential_pool_value() { return "CPOOL"; }
 std::string key_validator_onboarding(const PubKey32& pub) { return "VO:" + hex_encode(Bytes(pub.begin(), pub.end())); }
 std::string key_txidx_prefix() { return "X:"; }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
@@ -1541,6 +1542,12 @@ void DB::Batch::put_protocol_reserve_balance(std::uint64_t balance_units) {
   codec::ByteWriter w;
   w.u64le(balance_units);
   put(key_protocol_reserve_balance(), w.take());
+}
+
+void DB::Batch::put_confidential_pool_value(std::uint64_t value_units) {
+  codec::ByteWriter w;
+  w.u64le(value_units);
+  put(key_confidential_pool_value(), w.take());
 }
 
 void DB::Batch::put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint) {
@@ -2050,6 +2057,21 @@ bool DB::put_protocol_reserve_balance(std::uint64_t balance_units) {
 
 std::optional<std::uint64_t> DB::get_protocol_reserve_balance() const {
   auto b = get(key_protocol_reserve_balance());
+  if (!b.has_value()) return std::nullopt;
+  std::optional<std::uint64_t> out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto value = r.u64le();
+        if (!value || !r.eof()) return false;
+        out = *value;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
+std::optional<std::uint64_t> DB::get_confidential_pool_value() const {
+  auto b = get(key_confidential_pool_value());
   if (!b.has_value()) return std::nullopt;
   std::optional<std::uint64_t> out;
   if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {

@@ -21,6 +21,7 @@
 #include "storage/db.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/signing.hpp"
+#include "wallet/confidential_builder.hpp"
 
 using namespace finalis;
 
@@ -299,7 +300,7 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector, cfg.network.committee_epoch_blocks);
   consensus::FrontierExecutionResult result;
   std::string err;
-  if (!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.finalized_frontier_vector, next_vector,
+  if (!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.confidential_pool_value, parent_state.finalized_frontier_vector, next_vector,
                                                lane_records, parent_state.finalized_lane_roots, vctx, &result, &err)) {
     throw std::runtime_error("frontier execution failed: " + err);
   }
@@ -1774,7 +1775,7 @@ TEST(test_frontier_lane_prefix_rejects_stale_ingress_epoch_with_context) {
 
   consensus::FrontierExecutionResult result;
   std::string err;
-  ASSERT_TRUE(!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.finalized_frontier_vector,
+  ASSERT_TRUE(!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.confidential_pool_value, parent_state.finalized_frontier_vector,
                                                        next_vector, lane_records, parent_state.finalized_lane_roots,
                                                        &ctx, &result, &err));
   ASSERT_TRUE(err.find("frontier-certified-ingress-epoch-mismatch") != std::string::npos);
@@ -2625,4 +2626,274 @@ TEST(test_emergency_fallback_committee_recovers_from_prior_committees) {
   first.epoch_start_height = 1;
   ASSERT_TRUE(!consensus::apply_emergency_fallback_committee(validators, checkpoints, 4, &first));
   ASSERT_TRUE(first.ordered_members.empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Confidential turnstile (consensus rule): CanonicalDerivedState::confidential_pool_value P is
+// committed, and a TxV2 that would take P below zero is rejected.
+// ---------------------------------------------------------------------------------------------
+namespace {
+
+struct TestShieldedCoin {
+  OutPoint op;
+  std::uint64_t amount{0};
+  crypto::Blind32 spend_secret;
+  crypto::Blind32 value_blind;
+  crypto::Commitment33 commitment;
+  PubKey33 one_time_pubkey{};
+};
+
+crypto::Blind32 test_scalar(std::uint8_t tag, std::uint8_t seed) {
+  return crypto::Blind32{crypto::sha256(Bytes{'t', 'u', 'r', 'n', tag, seed})};
+}
+
+SpecialValidationContext txv2_vctx(const consensus::CanonicalDerivationConfig& cfg,
+                                   const consensus::CanonicalDerivedState& parent) {
+  SpecialValidationContext ctx;
+  ctx.network = &cfg.network;
+  ctx.chain_id = &cfg.chain_id;
+  ctx.current_height = parent.finalized_height + 1;
+  ctx.confidential_policy = &cfg.confidential_policy;
+  return ctx;
+}
+
+// Shields `conf_value` of a P2PKH UTXO (input = change + conf_value + fee); fills `coin`.
+Bytes make_shield(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& owner, std::uint64_t conf_value,
+                  std::uint64_t change_value, std::uint64_t fee, std::uint8_t seed, TestShieldedCoin* coin) {
+  coin->amount = conf_value;
+  coin->spend_secret = test_scalar('s', seed);
+  coin->value_blind = test_scalar('b', seed);
+  const auto one_time = crypto::secp256k1_pubkey_from_scalar(coin->spend_secret.bytes);
+  const auto ephemeral = crypto::secp256k1_pubkey_from_scalar(test_scalar('e', seed).bytes);
+  if (!one_time || !ephemeral) throw std::runtime_error("shield key derivation failed");
+  coin->one_time_pubkey = *one_time;
+  std::string err;
+  const auto out = wallet::build_confidential_output(
+      wallet::ConfidentialRecipient{.one_time_pubkey = *one_time, .ephemeral_pubkey = *ephemeral, .scan_tag = {}, .memo = {}},
+      crypto::ConfidentialOutputSecrets{.amount = conf_value, .value_blind = coin->value_blind}, test_scalar('n', seed).bytes,
+      &err);
+  if (!out) throw std::runtime_error("shield output: " + err);
+  coin->commitment = out->value_commitment;
+  std::optional<TransparentTxOutV2> change;
+  if (change_value > 0) change = TransparentTxOutV2{change_value, prev.script_pubkey};
+  const auto tx = wallet::build_txv2_transparent_to_confidential(op, prev, owner.private_key, prev.value, change, *out,
+                                                                 coin->value_blind, conf_value, fee, &err);
+  if (!tx) throw std::runtime_error("shield tx: " + err);
+  coin->op = OutPoint{tx->txid(), change_value > 0 ? 1u : 0u};
+  return tx->serialize();
+}
+
+// Spends a whole confidential coin to a transparent output (amount = value_out + fee).
+Bytes make_unshield(const TestShieldedCoin& coin, const PubKey32& to_pub, std::uint64_t fee, std::uint8_t seed) {
+  std::string err;
+  const auto tx = wallet::build_txv2_confidential_to_transparent(
+      wallet::ConfidentialOwnedCoin{.outpoint = coin.op,
+                                    .amount = coin.amount,
+                                    .spend_secret = coin.spend_secret,
+                                    .value_blind = coin.value_blind,
+                                    .value_commitment = coin.commitment,
+                                    .one_time_pubkey = coin.one_time_pubkey},
+      TransparentTxOutV2{coin.amount - fee, p2pkh_script_for_pub(to_pub)}, fee, test_scalar('a', seed).bytes,
+      test_scalar('x', seed).bytes, &err);
+  if (!tx) throw std::runtime_error("unshield tx: " + err);
+  return tx->serialize();
+}
+
+// A confidential UTXO that never passed through the turnstile: what a broken range proof would mint.
+TestShieldedCoin inject_unaccounted_coin(const consensus::CanonicalDerivationConfig& cfg,
+                                         consensus::CanonicalDerivedState* state, std::uint64_t amount, std::uint8_t seed) {
+  TestShieldedCoin coin;
+  coin.amount = amount;
+  coin.spend_secret = test_scalar('S', seed);
+  coin.value_blind = test_scalar('B', seed);
+  coin.commitment = *crypto::confidential_amount_commitment(amount, coin.value_blind);
+  coin.one_time_pubkey = *crypto::secp256k1_pubkey_from_scalar(coin.spend_secret.bytes);
+  coin.op.txid = crypto::sha256(Bytes{'i', 'n', 'j', seed});
+  coin.op.index = 0;
+  UtxoEntryV2 entry;
+  entry.kind = UtxoOutputKind::Confidential;
+  entry.body = UtxoConfidentialData{.value_commitment = coin.commitment,
+                                    .one_time_pubkey = coin.one_time_pubkey,
+                                    .ephemeral_pubkey = *crypto::secp256k1_pubkey_from_scalar(test_scalar('E', seed).bytes),
+                                    .scan_tag = {},
+                                    .memo = {}};
+  state->utxos[coin.op] = entry;
+  state->state_commitment = consensus::consensus_state_commitment(cfg, *state);
+  return coin;
+}
+
+consensus::FrontierExecutionResult execute_v2(const consensus::CanonicalDerivationConfig& cfg,
+                                              const consensus::CanonicalDerivedState& parent,
+                                              const std::vector<Bytes>& ordered) {
+  const auto vctx = txv2_vctx(cfg, parent);
+  consensus::FrontierExecutionResult result;
+  std::string err;
+  if (!consensus::execute_frontier_slice(parent.utxos, parent.confidential_pool_value, parent.finalized_frontier, ordered,
+                                         &vctx, &result, &err)) {
+    throw std::runtime_error("execute_frontier_slice: " + err);
+  }
+  return result;
+}
+
+consensus::CanonicalDerivedState apply_v2_or_throw(const consensus::CanonicalDerivationConfig& cfg,
+                                                   const consensus::CanonicalDerivedState& parent,
+                                                   const std::vector<Bytes>& ordered,
+                                                   consensus::CanonicalFrontierRecord* record_out = nullptr) {
+  const auto vctx = txv2_vctx(cfg, parent);
+  const auto record = make_frontier_record(parent, ordered, cfg, 0, {}, &vctx);
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  if (!consensus::apply_frontier_record(cfg, parent, record, &out, &err)) {
+    throw std::runtime_error("apply_frontier_record: " + err);
+  }
+  if (record_out) *record_out = record;
+  return out;
+}
+
+struct TurnstileFixture {
+  consensus::CanonicalDerivationConfig cfg = test_cfg();
+  crypto::KeyPair owner = key_from_byte(0xB1);
+  OutPoint funding_op{};
+  TxOut funding;
+  consensus::CanonicalDerivedState genesis;
+
+  TurnstileFixture() {
+    funding_op.txid.fill(0xB2);
+    funding = p2pkh_out_for_pub(owner.public_key, 10'000);
+    genesis = build_parent_state_with_utxo(cfg, 0, funding_op, funding);
+  }
+};
+
+}  // namespace
+
+TEST(test_turnstile_accepts_valid_block) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  ASSERT_EQ(f.genesis.confidential_pool_value, 0u);
+  TestShieldedCoin coin;
+  const auto shield = make_shield(f.funding_op, f.funding, f.owner, 9'000, 0, 1'000, 1, &coin);
+  const auto next = apply_v2_or_throw(f.cfg, f.genesis, {shield});
+  ASSERT_EQ(next.confidential_pool_value, 9'000u);
+  ASSERT_TRUE(next.utxos.find(coin.op) != next.utxos.end());
+  ASSERT_TRUE(next.confidential_supply.known);
+  ASSERT_EQ(next.confidential_supply.pool_value, 9'000);
+  const auto audit = consensus::audit_confidential_supply(next.utxos, next.confidential_supply, next.confidential_pool_value);
+  if (audit.status != consensus::ConfidentialSupplyAuditStatus::Ok) throw std::runtime_error(audit.detail);
+}
+
+TEST(test_turnstile_rejects_negative_pool_block) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  auto parent = f.genesis;  // P = 0
+  const auto inflated = inject_unaccounted_coin(f.cfg, &parent, 5'000, 2);
+  const auto unshield = make_unshield(inflated, key_from_byte(0xB3).public_key, 500, 2);
+
+  const auto exec = execute_v2(f.cfg, parent, {unshield});
+  ASSERT_EQ(exec.decisions.size(), 1u);
+  ASSERT_TRUE(!exec.decisions[0].accepted);
+  ASSERT_TRUE(exec.decisions[0].reject_reason == FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE);
+  ASSERT_EQ(exec.next_confidential_pool_value, 0u);
+
+  // The honest block (tx rejected) applies; P and the inflated coin are untouched.
+  const auto next = apply_v2_or_throw(f.cfg, parent, {unshield});
+  ASSERT_EQ(next.confidential_pool_value, 0u);
+  ASSERT_TRUE(next.utxos.find(inflated.op) != next.utxos.end());
+
+  // A block whose proposer accepted the tx (as if P were 5,000) is rejected outright by validators.
+  auto lying_parent = parent;
+  lying_parent.confidential_pool_value = 5'000;
+  const auto lying_vctx = txv2_vctx(f.cfg, lying_parent);
+  const auto lying_record = make_frontier_record(lying_parent, {unshield}, f.cfg, 0, {}, &lying_vctx);
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(!consensus::apply_frontier_record(f.cfg, parent, lying_record, &out, &err));
+  ASSERT_TRUE(!err.empty());
+}
+
+TEST(test_turnstile_rejects_at_zero) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  auto parent = f.genesis;  // P = 0
+  const auto inflated = inject_unaccounted_coin(f.cfg, &parent, 1, 3);
+  const auto unshield = make_unshield(inflated, key_from_byte(0xB4).public_key, 1, 3);  // even 1 unit out
+  TestShieldedCoin coin;
+  const auto shield = make_shield(f.funding_op, f.funding, f.owner, 9'000, 0, 1'000, 3, &coin);
+  // Unshield first (P = 0, rejected), then shield (accepted): order within the slice is consensus.
+  const auto exec = execute_v2(f.cfg, parent, {unshield, shield});
+  ASSERT_EQ(exec.decisions.size(), 2u);
+  ASSERT_TRUE(exec.decisions[0].reject_reason == FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE);
+  ASSERT_TRUE(exec.decisions[1].accepted);
+  ASSERT_EQ(exec.next_confidential_pool_value, 9'000u);
+}
+
+TEST(test_turnstile_across_multiple_blocks) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  // Block 1: shield 5,000 (change 4,000, fee 1,000) -> P = 5,000.
+  TestShieldedCoin coin1;
+  const auto shield1 = make_shield(f.funding_op, f.funding, f.owner, 5'000, 4'000, 1'000, 4, &coin1);
+  const auto s1 = apply_v2_or_throw(f.cfg, f.genesis, {shield1});
+  ASSERT_EQ(s1.confidential_pool_value, 5'000u);
+  // Block 2: shield 3,000 of the 4,000 change (fee 1,000) -> P = 8,000.
+  const auto shield1_tx = TxV2::parse(shield1);
+  ASSERT_TRUE(shield1_tx.has_value());
+  const OutPoint change_op{shield1_tx->txid(), 0};
+  const TxOut change{4'000, f.funding.script_pubkey};
+  TestShieldedCoin coin2;
+  const auto shield2 = make_shield(change_op, change, f.owner, 3'000, 0, 1'000, 5, &coin2);
+  const auto s2 = apply_v2_or_throw(f.cfg, s1, {shield2});
+  ASSERT_EQ(s2.confidential_pool_value, 8'000u);
+  // Block 3: unshield coin1 (4,500 out + 500 fee) -> P = 3,000.
+  const auto s3 = apply_v2_or_throw(f.cfg, s2, {make_unshield(coin1, key_from_byte(0xB5).public_key, 500, 6)});
+  ASSERT_EQ(s3.confidential_pool_value, 3'000u);
+  // Block 4: an unaccounted 6,000 coin cannot be cashed out against P = 3,000.
+  auto parent4 = s3;
+  const auto inflated = inject_unaccounted_coin(f.cfg, &parent4, 6'000, 7);
+  const auto unshield_inflated = make_unshield(inflated, key_from_byte(0xB6).public_key, 500, 7);
+  const auto exec4 = execute_v2(f.cfg, parent4, {unshield_inflated});
+  ASSERT_TRUE(exec4.decisions[0].reject_reason == FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE);
+  const auto s4 = apply_v2_or_throw(f.cfg, parent4, {unshield_inflated});
+  ASSERT_EQ(s4.confidential_pool_value, 3'000u);
+  // Block 5: the legitimate coin2 (3,000) still unshields, taking P exactly to 0.
+  const auto s5 = apply_v2_or_throw(f.cfg, s4, {make_unshield(coin2, key_from_byte(0xB7).public_key, 500, 8)});
+  ASSERT_EQ(s5.confidential_pool_value, 0u);
+}
+
+TEST(test_turnstile_state_commitment_includes_p) {
+  TurnstileFixture f;
+  auto other = f.genesis;
+  other.confidential_pool_value = 1;
+  ASSERT_TRUE(consensus::consensus_state_commitment(f.cfg, f.genesis) !=
+              consensus::consensus_state_commitment(f.cfg, other));
+}
+
+TEST(test_turnstile_restart_preserves_p) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  TestShieldedCoin coin;
+  const auto shield = make_shield(f.funding_op, f.funding, f.owner, 7'000, 2'000, 1'000, 9, &coin);
+  consensus::CanonicalFrontierRecord r1;
+  const auto s1 = apply_v2_or_throw(f.cfg, f.genesis, {shield}, &r1);
+  ASSERT_EQ(s1.confidential_pool_value, 7'000u);
+
+  // Restart = replay of the finalized chain from genesis (the default startup path).
+  consensus::CanonicalDerivedState replayed;
+  std::string err;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(f.cfg, f.genesis, {r1}, &replayed, &err));
+  ASSERT_EQ(replayed.confidential_pool_value, 7'000u);
+  ASSERT_EQ(replayed.state_commitment, s1.state_commitment);
+
+  // Persisted copy (written with the canonical cache rows, read by fast-start and the startup check).
+  const auto dir = unique_test_base("/tmp/finalis_turnstile_restart");
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(dir));
+    storage::DB::Batch batch(db);
+    batch.put_confidential_pool_value(s1.confidential_pool_value);
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  storage::DB db;
+  ASSERT_TRUE(db.open(dir));
+  ASSERT_TRUE(db.get_confidential_pool_value().has_value());
+  ASSERT_EQ(*db.get_confidential_pool_value(), 7'000u);
 }
