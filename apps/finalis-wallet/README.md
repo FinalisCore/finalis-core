@@ -1,6 +1,6 @@
 # Finalis Wallet
 
-`Finalis Wallet` is the Qt desktop wallet shipped in this repository. It manages a local keystore, reads finalized wallet state through lightserver, signs transactions locally, and exposes the wallet and mint flows already implemented by the backend.
+`Finalis Wallet` is the Qt desktop wallet shipped in this repository. It manages a local keystore, reads finalized wallet state through lightserver, signs transactions locally, and exposes the wallet flows already implemented by the backend.
 
 Current mainnet identity reference:
 
@@ -21,7 +21,6 @@ cmake --build build --target finalis-wallet -j"$(nproc)"
 ## Connected services
 
 - Lightserver: finalized-state reads and transaction broadcast
-- Mint endpoint: optional mint deposit, issuance, and redemption flows
 
 The wallet does not embed a node. It depends on the configured external endpoints.
 
@@ -46,7 +45,6 @@ The wallet is now split into screen widgets under `apps/finalis-wallet/widgets/`
 `Advanced` contains the operator-heavy and protocol-heavy sections:
 
 - `Validator`
-- `Mint / Privacy`
 - `Connections`
 - `Diagnostics`
 
@@ -137,7 +135,7 @@ The wallet uses resource-backed branding assets from:
 - local connection settings with multi-endpoint lightserver failover under `Advanced`
 - persisted Light and Dark themes through `QSettings`
 - minimal About dialog and resource-backed branding
-- optional validator and mint interactions under `Advanced`
+- optional validator interactions under `Advanced`
 - local-first cached status / activity / pending-tx surfaces
 
 The UI remains intentionally narrow. It does not expose backend capabilities that are not already present.

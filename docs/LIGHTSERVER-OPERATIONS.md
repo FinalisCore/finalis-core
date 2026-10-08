@@ -96,7 +96,7 @@ Behaviour:
 
 ### 3.1 Loopback exemption and reverse proxies
 
-Clients connecting from `127.0.0.0/8` (local explorer, mint service, local wallet) are exempt by
+Clients connecting from `127.0.0.0/8` (local explorer, local wallet) are exempt by
 default. Behind a same-host reverse proxy every client appears as `127.0.0.1`, so the limits would
 never apply. In that case:
 

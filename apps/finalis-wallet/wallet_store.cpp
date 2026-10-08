@@ -40,7 +40,6 @@ std::string key_history(std::uint64_t seq) {
   std::snprintf(buf, sizeof(buf), "HIST:%020llu", static_cast<unsigned long long>(seq));
   return std::string(buf);
 }
-std::string key_note(const std::string& note_ref) { return "NOTE:" + note_ref; }
 std::string key_meta(const std::string& name) { return "META:" + name; }
 std::string key_snapshot() { return "SNAPSHOT:wallet"; }
 std::string key_view_snapshot() { return "SNAPSHOT:view"; }
@@ -302,7 +301,6 @@ Bytes serialize_wallet_view_snapshot(const WalletStore::WalletViewSnapshot& snap
   w.varbytes(to_bytes(snapshot.activity_finalized_count_text));
   w.varbytes(to_bytes(snapshot.activity_pending_count_text));
   w.varbytes(to_bytes(snapshot.activity_local_count_text));
-  w.varbytes(to_bytes(snapshot.activity_mint_count_text));
   w.varbytes(to_bytes(snapshot.activity_confidential_count_text));
   auto write_rows = [&](const std::vector<WalletStore::ViewSnapshotRow>& rows) {
     w.u32le(static_cast<std::uint32_t>(rows.size()));
@@ -331,11 +329,10 @@ std::optional<WalletStore::WalletViewSnapshot> parse_wallet_view_snapshot(const 
         auto activity_finalized_count_text = r.varbytes();
         auto activity_pending_count_text = r.varbytes();
         auto activity_local_count_text = r.varbytes();
-        auto activity_mint_count_text = r.varbytes();
         auto activity_confidential_count_text = r.varbytes();
         if (!version || !balance_text || !pending_balance_text || !confidential_balance_text ||
             !confidential_request_summary_text || !confidential_coin_summary_text || !activity_finalized_count_text ||
-            !activity_pending_count_text || !activity_local_count_text || !activity_mint_count_text ||
+            !activity_pending_count_text || !activity_local_count_text ||
             !activity_confidential_count_text) {
           return false;
         }
@@ -348,7 +345,6 @@ std::optional<WalletStore::WalletViewSnapshot> parse_wallet_view_snapshot(const 
         out.activity_finalized_count_text = from_bytes(*activity_finalized_count_text);
         out.activity_pending_count_text = from_bytes(*activity_pending_count_text);
         out.activity_local_count_text = from_bytes(*activity_local_count_text);
-        out.activity_mint_count_text = from_bytes(*activity_mint_count_text);
         out.activity_confidential_count_text = from_bytes(*activity_confidential_count_text);
         auto read_rows = [&](std::vector<WalletStore::ViewSnapshotRow>* rows) -> bool {
           auto count = r.u32le();
@@ -423,28 +419,6 @@ std::optional<WalletStore::PendingTxStatusRecord> parse_pending_tx_status_record
         out.finalized_depth = *finalized_depth;
         out.credit_safe = (*credit_safe != 0);
         out.transition_hash = from_bytes(*transition_hash);
-        return true;
-      })) {
-    return std::nullopt;
-  }
-  return out;
-}
-
-Bytes serialize_note(std::uint64_t amount, bool active) {
-  codec::ByteWriter w;
-  w.u64le(amount);
-  w.u8(active ? 1 : 0);
-  return w.take();
-}
-
-std::optional<std::pair<std::uint64_t, bool>> parse_note(const Bytes& value) {
-  std::pair<std::uint64_t, bool> out{};
-  if (!codec::parse_exact(value, [&](codec::ByteReader& r) {
-        auto amount = r.u64le();
-        auto active = r.u8();
-        if (!amount || !active) return false;
-        out.first = *amount;
-        out.second = (*active != 0);
         return true;
       })) {
     return std::nullopt;
@@ -640,7 +614,6 @@ bool WalletStore::load(State* out) const {
   if (!out) return false;
   out->sent_txids.clear();
   out->local_events.clear();
-  out->mint_notes.clear();
   out->pending_spends.clear();
   out->finalized_history.clear();
   out->history_cursor_height.reset();
@@ -676,18 +649,6 @@ bool WalletStore::load(State* out) const {
     out->local_events.push_back(from_bytes(value));
   }
 
-  for (const auto& [key, value] : db_.scan_prefix("NOTE:")) {
-    auto parsed = parse_note(value);
-    if (!parsed) continue;
-    out->mint_notes.push_back(MintNoteRecord{key.substr(5), parsed->first, parsed->second});
-  }
-  std::sort(out->mint_notes.begin(), out->mint_notes.end(),
-            [](const auto& a, const auto& b) { return a.note_ref < b.note_ref; });
-
-  out->mint_deposit_ref = get_string(key_meta("mint_deposit_ref")).value_or("");
-  out->mint_last_deposit_txid = get_string(key_meta("mint_last_deposit_txid")).value_or("");
-  out->mint_last_deposit_vout = get_u32(key_meta("mint_last_deposit_vout")).value_or(0);
-  out->mint_last_redemption_batch_id = get_string(key_meta("mint_last_redemption_batch_id")).value_or("");
   out->history_cursor_height = get_u64(key_meta("history_cursor_height"));
   out->history_cursor_txid = get_string(key_meta("history_cursor_txid"));
   out->confidential_primary_account_id = get_string(key_meta("confidential_primary_account_id"));
@@ -861,22 +822,6 @@ bool WalletStore::append_local_event(const std::string& line) {
   return db_.put(key_event_seq(), w.take());
 }
 
-bool WalletStore::upsert_mint_note(const std::string& note_ref, std::uint64_t amount, bool active) {
-  return db_.put(key_note(note_ref), serialize_note(amount, active));
-}
-
-bool WalletStore::set_mint_deposit_ref(const std::string& value) { return set_string(key_meta("mint_deposit_ref"), value); }
-
-bool WalletStore::set_mint_last_deposit_txid(const std::string& value) {
-  return set_string(key_meta("mint_last_deposit_txid"), value);
-}
-
-bool WalletStore::set_mint_last_deposit_vout(std::uint32_t value) { return set_u32(key_meta("mint_last_deposit_vout"), value); }
-
-bool WalletStore::set_mint_last_redemption_batch_id(const std::string& value) {
-  return set_string(key_meta("mint_last_redemption_batch_id"), value);
-}
-
 bool WalletStore::upsert_confidential_account(const ConfidentialAccountRecord& record) {
   if (!can_persist_confidential_secrets()) return false;
   const auto encrypted = encrypt_secret_payload(passphrase_, serialize_confidential_account_plain(record));
@@ -939,12 +884,6 @@ bool WalletStore::can_persist_confidential_secrets() const { return !passphrase_
 
 bool WalletStore::set_string(const std::string& key, const std::string& value) { return db_.put(key, to_bytes(value)); }
 
-bool WalletStore::set_u32(const std::string& key, std::uint32_t value) {
-  codec::ByteWriter w;
-  w.u32le(value);
-  return db_.put(key, w.take());
-}
-
 bool WalletStore::set_u64(const std::string& key, std::uint64_t value) {
   codec::ByteWriter w;
   w.u64le(value);
@@ -955,21 +894,6 @@ std::optional<std::string> WalletStore::get_string(const std::string& key) const
   auto value = db_.get(key);
   if (!value) return std::nullopt;
   return from_bytes(*value);
-}
-
-std::optional<std::uint32_t> WalletStore::get_u32(const std::string& key) const {
-  auto value = db_.get(key);
-  if (!value) return std::nullopt;
-  std::uint32_t out = 0;
-  if (!codec::parse_exact(*value, [&](codec::ByteReader& r) {
-        auto parsed = r.u32le();
-        if (!parsed) return false;
-        out = *parsed;
-        return true;
-      })) {
-    return std::nullopt;
-  }
-  return out;
 }
 
 std::optional<std::uint64_t> WalletStore::get_u64(const std::string& key) const {

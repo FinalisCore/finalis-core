@@ -148,8 +148,6 @@ add_library(finalis_core
   src/common/merkle.cpp
   src/common/address.cpp
   src/consensus/availability_retention.cpp
-  src/privacy/mint_client.cpp
-  src/privacy/mint_scripts.cpp
   src/wallet/utxo_selection.cpp
   src/wallet/confidential_builder.cpp
   src/utxo/tx.cpp
@@ -392,7 +390,6 @@ add_executable(finalis-tests
   tests/test_hardening.cpp
   tests/test_node_hardening.cpp
   tests/test_protocol_scope.cpp
-  tests/test_privacy.cpp
   tests/test_genesis.cpp
   tests/test_paths.cpp
   tests/test_keystore.cpp

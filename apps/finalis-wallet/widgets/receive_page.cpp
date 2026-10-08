@@ -192,7 +192,7 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   help_layout->setSpacing(8);
   auto* help = new QLabel(
       "This screen is intentionally narrow: it gives you the current wallet address and receive guidance. "
-      "Connection setup, mint workflows, and validator tools stay under Advanced.",
+      "Connection setup and validator tools stay under Advanced.",
       help_box);
   help->setWordWrap(true);
   help->setProperty("role", QVariant(QStringLiteral("muted")));

@@ -128,11 +128,6 @@ class SettingsPage;
 
 class WalletWindow final : public QMainWindow {
  public:
-  struct MintNote {
-    QString note_ref;
-    std::uint64_t amount{0};
-  };
-
   struct ChainRecord {
     QString status;
     QString kind;
@@ -163,17 +158,8 @@ class WalletWindow final : public QMainWindow {
     finalis::Bytes script_pubkey;
   };
 
-  struct MintRecord {
-    QString status;
-    QString kind;
-    QString reference;
-    QString amount;
-    QString height_or_state;
-    QString details;
-  };
-
   struct HistoryRowRef {
-    enum class Source { Chain, Mint, Local, Confidential };
+    enum class Source { Chain, Local, Confidential };
     Source source{Source::Chain};
     int index{-1};
   };
@@ -311,7 +297,6 @@ class WalletWindow final : public QMainWindow {
   void request_pending_tx_status_refresh(const QString& txid);
   void refresh_overview_activity_preview();
   void update_selected_history_detail();
-  void render_mint_state();
   void reset_send_review_panel();
   void show_send_inline_warning(const QString& text);
   void show_send_inline_status(const QString& text);
@@ -336,11 +321,6 @@ class WalletWindow final : public QMainWindow {
   void populate_send_max_amount();
   void submit_send();
   void show_selected_history_detail();
-  void show_selected_mint_detail();
-  void submit_mint_deposit();
-  void issue_mint_note();
-  void submit_mint_redemption();
-  void refresh_mint_redemption_status();
   void refresh_history_table();
   QUrl explorer_home_url() const;
   void open_explorer_home();
@@ -422,7 +402,6 @@ class WalletWindow final : public QMainWindow {
   QLabel* activity_finalized_count_label_{nullptr};
   QLabel* activity_pending_count_label_{nullptr};
   QLabel* activity_local_count_label_{nullptr};
-  QLabel* activity_mint_count_label_{nullptr};
   QLabel* activity_confidential_count_label_{nullptr};
   QLabel* activity_detail_title_label_{nullptr};
   QTextEdit* activity_detail_view_{nullptr};
@@ -445,25 +424,9 @@ class WalletWindow final : public QMainWindow {
   QLabel* send_review_inputs_label_{nullptr};
   QLabel* send_review_note_label_{nullptr};
 
-  QLineEdit* mint_deposit_amount_edit_{nullptr};
-  QLineEdit* mint_redeem_amount_edit_{nullptr};
-  QLineEdit* mint_redeem_address_edit_{nullptr};
-  QLineEdit* mint_issue_amount_edit_{nullptr};
-  QLabel* mint_deposit_ref_label_{nullptr};
-  QLabel* mint_notes_label_{nullptr};
-  QLabel* mint_redemption_label_{nullptr};
-  QLabel* mint_status_label_{nullptr};
-  QLabel* mint_private_balance_label_{nullptr};
-  QLabel* mint_note_count_label_{nullptr};
-  QTableWidget* mint_deposits_view_{nullptr};
-  QTableWidget* mint_notes_view_{nullptr};
-  QTableWidget* mint_redemptions_view_{nullptr};
-  QPushButton* mint_detail_button_{nullptr};
 
   QTextEdit* lightserver_urls_edit_{nullptr};
   QCheckBox* pin_lightserver_endpoint_checkbox_{nullptr};
-  QLineEdit* mint_url_edit_{nullptr};
-  QLineEdit* mint_id_edit_{nullptr};
   QComboBox* theme_combo_{nullptr};
   QLabel* branding_symbol_label_{nullptr};
   QLabel* connection_summary_label_{nullptr};
@@ -472,10 +435,6 @@ class WalletWindow final : public QMainWindow {
   QTextEdit* validator_details_view_{nullptr};
   QPushButton* save_settings_button_{nullptr};
   QPushButton* about_button_{nullptr};
-  QPushButton* mint_deposit_button_{nullptr};
-  QPushButton* mint_issue_button_{nullptr};
-  QPushButton* mint_redeem_button_{nullptr};
-  QPushButton* mint_redeem_status_button_{nullptr};
   QTimer* finalized_tip_poll_timer_{nullptr};
 
   std::optional<LoadedWallet> wallet_;
@@ -487,17 +446,11 @@ class WalletWindow final : public QMainWindow {
   std::optional<std::uint64_t> finalized_history_cursor_height_;
   std::optional<std::string> finalized_history_cursor_txid_;
   std::uint64_t tip_height_{0};
-  QString mint_deposit_ref_;
-  QString mint_last_deposit_txid_;
-  std::uint32_t mint_last_deposit_vout_{0};
-  QString mint_last_redemption_batch_id_;
   QString confidential_receive_address_;
   std::uint64_t confidential_balance_units_{0};
   std::size_t confidential_coin_count_{0};
   bool confidential_storage_locked_{false};
-  std::vector<MintNote> mint_notes_;
   std::vector<ChainRecord> chain_records_;
-  std::vector<MintRecord> mint_records_;
   std::vector<ConfidentialRequestView> confidential_request_views_;
   std::vector<ConfidentialCoinView> confidential_coin_views_;
   std::vector<HistoryRowRef> history_row_refs_;
@@ -532,15 +485,9 @@ class WalletWindow final : public QMainWindow {
   std::uint64_t tip_poll_generation_{0};
   // ~WalletWindow joins this first, so no worker runs against a partly destroyed window.
   BackgroundThreads background_threads_;
-  std::uint64_t mint_status_refresh_generation_{0};
-  std::uint64_t mint_deposit_submit_generation_{0};
-  std::uint64_t mint_redeem_submit_generation_{0};
   std::uint64_t last_validator_auto_refresh_ms_{0};
   std::uint64_t validator_refresh_generation_{0};
   bool tip_poll_in_flight_{false};
-  bool mint_status_refresh_in_flight_{false};
-  bool mint_deposit_submit_in_flight_{false};
-  bool mint_redeem_submit_in_flight_{false};
   bool validator_refresh_in_flight_{false};
   bool refresh_in_flight_{false};
   std::vector<EndpointProbeResult> last_endpoint_probe_results_;

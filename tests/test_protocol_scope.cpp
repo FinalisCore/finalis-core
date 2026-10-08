@@ -7,7 +7,6 @@
 #include "common/address.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
-#include "privacy/mint_scripts.hpp"
 #include "utxo/validate.hpp"
 
 using namespace finalis;
@@ -329,13 +328,11 @@ TEST(test_protocol_scope_allows_settlement_output_scripts) {
   Hash32 h{};
   h.fill(0x42);
   ASSERT_TRUE(is_supported_base_layer_output_script(burn_script(h)));
-
-  Hash32 mint_id{};
-  mint_id.fill(0x33);
-  ASSERT_TRUE(is_supported_base_layer_output_script(privacy::mint_deposit_script_pubkey(mint_id, pkh)));
 }
 
-TEST(test_protocol_scope_allows_mint_deposit_output_in_standard_tx) {
+// The removed mint deposit script ("SCMINTDEP" || mint_id || pkh) had no spend path, so outputs paying
+// to it burned funds. It must stay rejected.
+TEST(test_protocol_scope_rejects_legacy_mint_deposit_output) {
   const auto kp = key_from_byte(24);
   const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   OutPoint op{};
@@ -345,11 +342,14 @@ TEST(test_protocol_scope_allows_mint_deposit_output_in_standard_tx) {
   UtxoSet view;
   view[op] = UtxoEntry{prev_out};
 
-  Hash32 mint_id{};
-  mint_id.fill(0x5A);
-  auto tx = make_spend_tx(op, prev_out, kp, {TxOut{49'000, privacy::mint_deposit_script_pubkey(mint_id, pkh)}});
+  Bytes legacy_mint_deposit{'S', 'C', 'M', 'I', 'N', 'T', 'D', 'E', 'P'};
+  legacy_mint_deposit.insert(legacy_mint_deposit.end(), 32, 0x5A);
+  legacy_mint_deposit.insert(legacy_mint_deposit.end(), pkh.begin(), pkh.end());
+  ASSERT_TRUE(!is_supported_base_layer_output_script(legacy_mint_deposit));
+  auto tx = make_spend_tx(op, prev_out, kp, {TxOut{49'000, legacy_mint_deposit}});
   auto r = validate_tx(tx, 1, view, nullptr);
-  ASSERT_TRUE(r.ok);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("unsupported script_pubkey"));
 }
 
 TEST(test_protocol_scope_rejects_tx_with_too_many_inputs) {
@@ -470,18 +470,4 @@ TEST(test_protocol_scope_verify_budget_exact_limit_accepts_limit_plus_one_reject
   const auto fail = validate_tx_v2(tx_fail, 1, view_fail, &ctx);
   ASSERT_TRUE(!fail.ok);
   ASSERT_TRUE(fail.error.find("verify budget exceeded") != std::string::npos);
-}
-
-TEST(test_protocol_scope_roundtrips_mint_deposit_script) {
-  Hash32 mint_id{};
-  mint_id.fill(0x7C);
-  std::array<std::uint8_t, 20> recipient{};
-  recipient.fill(0x19);
-
-  const Bytes spk = privacy::mint_deposit_script_pubkey(mint_id, recipient);
-  Hash32 parsed_mint_id{};
-  std::array<std::uint8_t, 20> parsed_recipient{};
-  ASSERT_TRUE(privacy::is_mint_deposit_script(spk, &parsed_mint_id, &parsed_recipient));
-  ASSERT_TRUE(parsed_mint_id == mint_id);
-  ASSERT_TRUE(parsed_recipient == recipient);
 }

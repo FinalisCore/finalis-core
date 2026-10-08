@@ -76,8 +76,6 @@
 #include "common/keystore.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
-#include "privacy/mint_client.hpp"
-#include "privacy/mint_scripts.hpp"
 #include "wallet/confidential_builder.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
@@ -632,19 +630,6 @@ QString format_bps_percentage(std::uint64_t bps) {
 
 QString yes_no_text(bool value) { return value ? "yes" : "no"; }
 
-QString mint_endpoint(const QString& base_url, const QString& path) {
-  QString out = base_url.trimmed();
-  while (out.endsWith('/')) out.chop(1);
-  return out + path;
-}
-
-QString random_hex_string(std::size_t bytes_len) {
-  std::random_device rd;
-  Bytes b(bytes_len, 0);
-  for (auto& v : b) v = static_cast<std::uint8_t>(rd());
-  return QString::fromStdString(hex_encode(b));
-}
-
 std::string network_id_hex_for_wallet_network(const std::string& network_name) {
   const auto& net = finalis::network_by_name(network_name);
   return finalis::hex_encode(finalis::Bytes(net.network_id.begin(), net.network_id.end()));
@@ -945,24 +930,6 @@ QString display_chain_kind(const QString& kind) {
   return kind.trimmed().isEmpty() ? "Activity" : kind.trimmed();
 }
 
-QString display_mint_kind(const QString& kind) {
-  const QString lower = kind.trimmed().toLower();
-  if (lower == "deposit") return "Mint Deposit";
-  if (lower == "redemption") return "Mint Redemption";
-  if (lower == "note") return "Mint Note";
-  if (lower == "issue") return "Mint Issue";
-  if (lower == "status") return "Mint Status";
-  return kind.trimmed().isEmpty() ? "Mint" : kind.trimmed();
-}
-
-QString mint_state_badge(const QString& state) {
-  const QString lower = state.trimmed().toLower();
-  if (lower == "finalized" || lower == "issued") return "FINALIZED";
-  if (lower == "broadcast" || lower == "pending" || lower == "registered") return "PENDING";
-  if (lower == "rejected" || lower == "failed") return "FAILED";
-  return state.trimmed().isEmpty() ? "INFO" : state.trimmed().toUpper();
-}
-
 void configure_table(QTableWidget* table, const QStringList& headers) {
   table->setColumnCount(headers.size());
   table->setHorizontalHeaderLabels(headers);
@@ -1069,26 +1036,6 @@ void install_table_copy_menu(QTableWidget* table, QWidget* owner) {
       QApplication::clipboard()->setText(values.join(" | "));
     }
   });
-}
-
-std::optional<std::vector<std::size_t>> choose_note_subset_exact(const std::vector<finalis::wallet::WalletWindow::MintNote>& notes,
-                                                                 std::uint64_t target) {
-  std::map<std::uint64_t, std::vector<std::size_t>> reachable;
-  reachable[0] = {};
-  for (std::size_t i = 0; i < notes.size(); ++i) {
-    std::vector<std::pair<std::uint64_t, std::vector<std::size_t>>> additions;
-    for (const auto& [sum, indexes] : reachable) {
-      if (sum + notes[i].amount > target) continue;
-      if (reachable.find(sum + notes[i].amount) != reachable.end()) continue;
-      auto next = indexes;
-      next.push_back(i);
-      additions.push_back({sum + notes[i].amount, std::move(next)});
-    }
-    for (auto& [sum, indexes] : additions) reachable.emplace(sum, std::move(indexes));
-    auto it = reachable.find(target);
-    if (it != reachable.end()) return it->second;
-  }
-  return std::nullopt;
 }
 
 std::vector<WalletWindow::ChainRecord> normalize_chain_records_for_display(const std::vector<WalletWindow::ChainRecord>& records) {
@@ -1218,8 +1165,6 @@ void WalletWindow::build_ui() {
   auto* unlock_confidential_action = wallet_menu->addAction("Unlock Confidential State");
   auto* history_detail_action = view_menu->addAction("Selected Record Details");
   history_detail_action->setShortcut(QKeySequence("Ctrl+D"));
-  auto* mint_detail_action = wallet_menu->addAction("Selected Mint Details");
-  mint_detail_action->setShortcut(QKeySequence("Ctrl+M"));
   auto* about_action = help_menu->addAction("About");
 
   auto* header_card = new QFrame(this);
@@ -1378,7 +1323,6 @@ void WalletWindow::build_ui() {
   activity_finalized_count_label_ = activity_page_->finalized_count_label();
   activity_pending_count_label_ = activity_page_->pending_count_label();
   activity_local_count_label_ = activity_page_->local_count_label();
-  activity_mint_count_label_ = activity_page_->mint_count_label();
   activity_confidential_count_label_ = activity_page_->confidential_count_label();
   activity_detail_title_label_ = activity_page_->detail_title_label();
   activity_detail_view_ = activity_page_->detail_view();
@@ -1400,29 +1344,9 @@ void WalletWindow::build_ui() {
   validator_rpc_url_edit_ = advanced_page_->validator_rpc_url_edit();
   validator_details_view_ = advanced_page_->validator_details_view();
 
-  mint_deposit_amount_edit_ = advanced_page_->mint_deposit_amount_edit();
-  mint_redeem_amount_edit_ = advanced_page_->mint_redeem_amount_edit();
-  mint_redeem_address_edit_ = advanced_page_->mint_redeem_address_edit();
-  mint_issue_amount_edit_ = advanced_page_->mint_issue_amount_edit();
-  mint_deposit_ref_label_ = advanced_page_->mint_deposit_ref_label();
-  mint_notes_label_ = advanced_page_->mint_notes_label();
-  mint_redemption_label_ = advanced_page_->mint_redemption_label();
-  mint_status_label_ = advanced_page_->mint_status_label();
-  mint_private_balance_label_ = advanced_page_->mint_private_balance_label();
-  mint_note_count_label_ = advanced_page_->mint_note_count_label();
-  mint_deposits_view_ = advanced_page_->mint_deposits_view();
-  mint_notes_view_ = advanced_page_->mint_notes_view();
-  mint_redemptions_view_ = advanced_page_->mint_redemptions_view();
-  mint_detail_button_ = advanced_page_->mint_detail_button();
-  mint_deposit_button_ = advanced_page_->mint_deposit_button();
-  mint_issue_button_ = advanced_page_->mint_issue_button();
-  mint_redeem_button_ = advanced_page_->mint_redeem_button();
-  mint_redeem_status_button_ = advanced_page_->mint_redeem_status_button();
 
   lightserver_urls_edit_ = advanced_page_->lightserver_urls_edit();
   pin_lightserver_endpoint_checkbox_ = advanced_page_->pin_lightserver_endpoint_checkbox();
-  mint_url_edit_ = advanced_page_->mint_url_edit();
-  mint_id_edit_ = advanced_page_->mint_id_edit();
   connection_summary_label_ = advanced_page_->connection_summary_label();
   save_settings_button_ = advanced_page_->save_settings_button();
   crosscheck_detail_view_ = advanced_page_->crosscheck_detail_view();
@@ -1577,12 +1501,6 @@ void WalletWindow::build_ui() {
   connect(validator_rpc_url_edit_, &QLineEdit::editingFinished, this, [this]() { save_settings(); refresh_validator_readiness_panel(false); });
   connect(history_detail_button_, &QPushButton::clicked, this, [this]() { show_selected_history_detail(); });
   connect(history_detail_action, &QAction::triggered, this, [this]() { show_selected_history_detail(); });
-  connect(mint_deposit_button_, &QPushButton::clicked, this, [this]() { submit_mint_deposit(); });
-  connect(mint_issue_button_, &QPushButton::clicked, this, [this]() { issue_mint_note(); });
-  connect(mint_redeem_button_, &QPushButton::clicked, this, [this]() { submit_mint_redemption(); });
-  connect(mint_redeem_status_button_, &QPushButton::clicked, this, [this]() { refresh_mint_redemption_status(); });
-  connect(mint_detail_button_, &QPushButton::clicked, this, [this]() { show_selected_mint_detail(); });
-  connect(mint_detail_action, &QAction::triggered, this, [this]() { show_selected_mint_detail(); });
   connect(about_action, &QAction::triggered, this, [this]() { show_about(); });
   connect(about_button_, &QPushButton::clicked, this, [this]() { show_about(); });
   connect(save_settings_button_, &QPushButton::clicked, this, [this]() { save_connection_settings(); });
@@ -1590,9 +1508,6 @@ void WalletWindow::build_ui() {
   connect(history_filter_combo_, &QComboBox::currentTextChanged, this, [this](const QString&) { refresh_history_table(); });
   connect(history_view_, &QTableWidget::cellDoubleClicked, this, [this](int, int) { show_selected_history_detail(); });
   connect(history_view_, &QTableWidget::itemSelectionChanged, this, [this]() { update_selected_history_detail(); });
-  connect(mint_deposits_view_, &QTableWidget::cellDoubleClicked, this, [this](int, int) { show_selected_mint_detail(); });
-  connect(mint_notes_view_, &QTableWidget::cellDoubleClicked, this, [this](int, int) { show_selected_mint_detail(); });
-  connect(mint_redemptions_view_, &QTableWidget::cellDoubleClicked, this, [this](int, int) { show_selected_mint_detail(); });
   connect(tabs_, &QTabWidget::currentChanged, this, [this](int index) {
     if (!header_title_label_) return;
     switch (index) {
@@ -1608,32 +1523,21 @@ void WalletWindow::build_ui() {
 
   const QString mono = mono_font_family();
   history_view_->setFont(QFont(mono));
-  mint_deposits_view_->setFont(QFont(mono));
-  mint_notes_view_->setFont(QFont(mono));
-  mint_redemptions_view_->setFont(QFont(mono));
   wallet_file_label_->setFont(QFont(mono));
   receive_address_home_label_->setFont(QFont(mono));
   receive_address_label_->setFont(QFont(mono));
   send_address_edit_->setFont(QFont(mono));
-  mint_redeem_address_edit_->setFont(QFont(mono));
   lightserver_urls_edit_->setFont(QFont(mono));
-  mint_id_edit_->setFont(QFont(mono));
   connection_summary_label_->setFont(QFont(mono));
   crosscheck_detail_view_->setFont(QFont(mono));
   adaptive_regime_view_->setFont(QFont(mono));
-  mint_notes_label_->setFont(QFont(mono));
   activity_detail_view_->setFont(QFont(mono));
   overview_page_->activity_preview_table()->setFont(QFont(mono));
   install_copy_menu(receive_address_home_label_, this);
   install_copy_menu(receive_address_label_, this);
-  install_copy_menu(mint_deposit_ref_label_, this);
-  install_copy_menu(mint_redemption_label_, this);
   install_table_copy_menu(history_view_, this);
   install_table_copy_menu(receive_confidential_requests_table_, this);
   install_table_copy_menu(receive_confidential_coins_table_, this);
-  install_table_copy_menu(mint_deposits_view_, this);
-  install_table_copy_menu(mint_notes_view_, this);
-  install_table_copy_menu(mint_redemptions_view_, this);
   connect(quit_action, &QAction::triggered, this, [this]() { close(); });
 
   send_max_button_->setEnabled(false);
@@ -1690,8 +1594,6 @@ void WalletWindow::load_settings() {
   pin_lightserver_endpoint_checkbox_->setChecked(load_value("lightserver_pin_first", false).toBool());
   last_successful_lightserver_endpoint_ =
       normalize_lightserver_endpoint(load_value("lightserver_last_good", QString{}).toString());
-  mint_url_edit_->setText(load_value("mint_url", "http://127.0.0.1:8090").toString());
-  mint_id_edit_->setText(load_value("mint_id", "").toString());
   validator_db_path_edit_->setText(load_value("validator/db_path", default_mainnet_db_path()).toString());
   validator_key_path_edit_->setText(load_value("validator/key_path", default_mainnet_validator_key_path()).toString());
   validator_rpc_url_edit_->setText(load_value("validator/rpc_url", "http://127.0.0.1:19444/rpc").toString());
@@ -1704,12 +1606,6 @@ void WalletWindow::load_settings() {
   const int history_idx = history_filter_combo_->findText(history_filter);
   if (history_idx >= 0) history_filter_combo_->setCurrentIndex(history_idx);
   restore_table_sort(history_view_, settings.contains("history_table_sort_column") ? settings : legacy, "history_table", 4);
-  restore_table_sort(mint_deposits_view_,
-                     settings.contains("mint_deposits_table_sort_column") ? settings : legacy, "mint_deposits_table", 0);
-  restore_table_sort(mint_notes_view_,
-                     settings.contains("mint_notes_table_sort_column") ? settings : legacy, "mint_notes_table", 1);
-  restore_table_sort(mint_redemptions_view_,
-                     settings.contains("mint_redemptions_table_sort_column") ? settings : legacy, "mint_redemptions_table", 0);
 }
 
 void WalletWindow::save_settings() const {
@@ -1720,8 +1616,6 @@ void WalletWindow::save_settings() const {
   settings.setValue("lightserver_pin_first", pin_lightserver_endpoint_checkbox_ &&
                                                  pin_lightserver_endpoint_checkbox_->isChecked());
   settings.setValue("lightserver_last_good", last_successful_lightserver_endpoint_);
-  settings.setValue("mint_url", mint_url_edit_->text().trimmed());
-  settings.setValue("mint_id", mint_id_edit_->text().trimmed());
   settings.setValue("validator/db_path", validator_db_path_edit_ ? validator_db_path_edit_->text().trimmed() : QString{});
   settings.setValue("validator/key_path", validator_key_path_edit_ ? validator_key_path_edit_->text().trimmed() : QString{});
   settings.setValue("validator/rpc_url", validator_rpc_url_edit_ ? validator_rpc_url_edit_->text().trimmed() : QString{});
@@ -1729,12 +1623,6 @@ void WalletWindow::save_settings() const {
   settings.setValue("history_filter", history_filter_combo_->currentText());
   settings.setValue("history_table_sort_column", history_view_->horizontalHeader()->sortIndicatorSection());
   settings.setValue("history_table_sort_order", static_cast<int>(history_view_->horizontalHeader()->sortIndicatorOrder()));
-  settings.setValue("mint_deposits_table_sort_column", mint_deposits_view_->horizontalHeader()->sortIndicatorSection());
-  settings.setValue("mint_deposits_table_sort_order", static_cast<int>(mint_deposits_view_->horizontalHeader()->sortIndicatorOrder()));
-  settings.setValue("mint_notes_table_sort_column", mint_notes_view_->horizontalHeader()->sortIndicatorSection());
-  settings.setValue("mint_notes_table_sort_order", static_cast<int>(mint_notes_view_->horizontalHeader()->sortIndicatorOrder()));
-  settings.setValue("mint_redemptions_table_sort_column", mint_redemptions_view_->horizontalHeader()->sortIndicatorSection());
-  settings.setValue("mint_redemptions_table_sort_order", static_cast<int>(mint_redemptions_view_->horizontalHeader()->sortIndicatorOrder()));
 }
 
 QUrl WalletWindow::explorer_home_url() const {
@@ -1869,7 +1757,6 @@ void WalletWindow::apply_selected_theme() {
     if (!pixmap.isNull()) branding_symbol_label_->setPixmap(pixmap);
   }
   render_history_view();
-  render_mint_state();
 }
 
 QStringList WalletWindow::configured_lightserver_endpoints() const {
@@ -2125,7 +2012,6 @@ void WalletWindow::update_wallet_views() {
 
 void WalletWindow::update_connection_views() {
   const QStringList configured = configured_lightserver_endpoints();
-  const QString mint = mint_url_edit_->text().trimmed();
   const QString chain = current_chain_name_.isEmpty() ? "not refreshed" : current_chain_name_;
   const QString transition_hash =
       current_transition_hash_.isEmpty() ? "-" : elide_middle(current_transition_hash_, 10);
@@ -2145,9 +2031,8 @@ void WalletWindow::update_connection_views() {
                           .arg(last_lightserver_error_.isEmpty() ? "unavailable" : last_lightserver_error_);
   }
   QString summary =
-      QString("RPC endpoints: %1\nMint service: %2\nChain: %3\nTransition hash: %4\nLast refresh: %5")
+      QString("RPC endpoints: %1\nChain: %2\nTransition hash: %3\nLast refresh: %4")
           .arg(lightserver_summary)
-          .arg(mint.isEmpty() ? "not configured" : mint)
           .arg(chain)
           .arg(transition_hash)
           .arg(refreshed);
@@ -2175,9 +2060,7 @@ void WalletWindow::update_connection_views() {
       header_connection_label_->setText(refresh_in_flight_ ? "No healthy endpoint · Refreshing..." : "No healthy endpoint");
     }
   }
-  mint_status_label_->setText(mint.isEmpty() ? "Mint service is not configured yet." : "Mint service configured: " + mint);
   update_adaptive_regime_view();
-  render_mint_state();
 }
 
 void WalletWindow::update_adaptive_regime_view() {
@@ -3327,7 +3210,7 @@ void WalletWindow::refresh_overview_activity_preview() {
   if (!table) return;
   table->setUpdatesEnabled(false);
   table->setRowCount(0);
-  if (chain_records_.empty() && mint_records_.empty() && wallet_view_snapshot_.has_value() &&
+  if (chain_records_.empty() && wallet_view_snapshot_.has_value() &&
       !wallet_view_snapshot_->overview_activity_rows.empty()) {
     table->setRowCount(static_cast<int>(wallet_view_snapshot_->overview_activity_rows.size()));
     int row_index = 0;
@@ -3359,10 +3242,6 @@ void WalletWindow::refresh_overview_activity_preview() {
     add_row(title_case_status(rec.status), display_chain_kind(rec.kind),
             rec.status.trimmed().toUpper() == "PENDING" ? rec.height : QString("Height %1").arg(rec.height));
   }
-  for (const auto& rec : mint_records_) {
-    if (added >= 4) break;
-    add_row(title_case_status(rec.status), display_mint_kind(rec.kind), rec.height_or_state.isEmpty() ? "-" : rec.height_or_state);
-  }
   if (added == 0) {
     add_row("Info", "No recent activity yet", "waiting for finalized activity");
   }
@@ -3370,164 +3249,16 @@ void WalletWindow::refresh_overview_activity_preview() {
   table->setUpdatesEnabled(true);
 }
 
-void WalletWindow::render_mint_state() {
-  if (!mint_deposits_view_ || !mint_notes_view_ || !mint_redemptions_view_) return;
-  mint_deposit_ref_label_->setText(mint_deposit_ref_.isEmpty() ? "No active deposit reference yet." : mint_deposit_ref_);
-  mint_redemption_label_->setText(mint_last_redemption_batch_id_.isEmpty() ? "No redemption batch yet." : mint_last_redemption_batch_id_);
-  std::uint64_t private_total = 0;
-  std::map<std::uint64_t, std::size_t, std::greater<std::uint64_t>> by_amount;
-  for (const auto& note : mint_notes_) {
-    private_total += note.amount;
-    by_amount[note.amount] += 1;
-  }
-  mint_records_.clear();
-  mint_deposits_view_->setUpdatesEnabled(false);
-  mint_notes_view_->setUpdatesEnabled(false);
-  mint_redemptions_view_->setUpdatesEnabled(false);
-  mint_deposits_view_->setSortingEnabled(false);
-  mint_notes_view_->setSortingEnabled(false);
-  mint_redemptions_view_->setSortingEnabled(false);
-  mint_deposits_view_->setRowCount(0);
-  mint_notes_view_->setRowCount(0);
-  mint_redemptions_view_->setRowCount(0);
-  mint_private_balance_label_->setText(format_coin_amount(private_total));
-  mint_note_count_label_->setText(QString::number(mint_notes_.size()));
-  if (mint_notes_.empty()) {
-    mint_notes_label_->setText("No active private notes yet.");
-  } else {
-    QStringList summary_lines;
-    for (const auto& [amount, count] : by_amount) {
-      summary_lines.push_back(QString("%1 x %2").arg(QString::number(count), format_coin_amount(amount)));
-    }
-    mint_notes_view_->setRowCount(static_cast<int>(mint_notes_.size()));
-    int note_row = 0;
-    for (const auto& note : mint_notes_) {
-      const QString amount = format_coin_amount(note.amount);
-      const QString details = QString("Active note\nReference: %1\nAmount: %2").arg(note.note_ref, amount);
-      mint_records_.push_back(MintRecord{"FINALIZED", "note", note.note_ref, amount, "active", details});
-      const int row = note_row++;
-      auto* status_item = new QTableWidgetItem("FINALIZED");
-      status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
-      apply_status_item_style(status_item);
-      mint_notes_view_->setItem(row, 0, status_item);
-      mint_notes_view_->setItem(row, 1, new QTableWidgetItem(amount));
-      mint_notes_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(note.note_ref, 10)));
-      mint_notes_view_->setItem(row, 3, new QTableWidgetItem("active"));
-    }
-    mint_notes_label_->setText(summary_lines.join("\n"));
-  }
-  if (mint_notes_view_->rowCount() == 0) {
-    mint_notes_view_->setRowCount(1);
-    auto* item = new QTableWidgetItem("No private notes available yet");
-    item->setData(Qt::UserRole, -1);
-    mint_notes_view_->setItem(0, 0, item);
-  }
-
-  mint_deposits_view_->setRowCount(10);
-  mint_redemptions_view_->setRowCount(12);
-  int deposit_rows = 0;
-  int redemption_rows = 0;
-  for (int i = local_history_lines_.size() - 1; i >= 0; --i) {
-    const QString line = local_history_lines_[i];
-    if (line.startsWith("[mint-deposit]") && deposit_rows < 10) {
-      const QString details = trim_after_token(line, "[mint-deposit]");
-      const QString amount = extract_amount_prefix(details);
-      mint_records_.push_back(MintRecord{"PENDING", "deposit", mint_deposit_ref_, amount, "registered", details});
-      const int row = deposit_rows++;
-      auto* status_item = new QTableWidgetItem("PENDING");
-      status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
-      apply_status_item_style(status_item);
-      mint_deposits_view_->setItem(row, 0, status_item);
-      mint_deposits_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
-      mint_deposits_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(mint_deposit_ref_, 10)));
-      mint_deposits_view_->setItem(row, 3, new QTableWidgetItem(elide_middle(mint_last_deposit_txid_, 10)));
-    } else if (line.startsWith("[mint-redeem]") && redemption_rows < 12) {
-      const QString batch = extract_field_value(line, "batch");
-      const QString amount = extract_field_value(line, "amount");
-      const QString notes = extract_field_value(line, "notes");
-      const QString details = QString("batch=%1  amount=%2  notes=%3").arg(batch, amount, notes);
-      mint_records_.push_back(MintRecord{"PENDING", "redemption", batch, amount, "pending", details});
-      const int row = redemption_rows++;
-      auto* status_item = new QTableWidgetItem("PENDING");
-      status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
-      apply_status_item_style(status_item);
-      mint_redemptions_view_->setItem(row, 0, status_item);
-      mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
-      mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(batch, 10)));
-      mint_redemptions_view_->setItem(row, 3, new QTableWidgetItem("pending"));
-    } else if (line.startsWith("[mint-status]") && redemption_rows < 12) {
-      const QString batch = extract_field_value(line, "batch");
-      const QString state = extract_field_value(line, "state");
-      const QString txid = extract_field_value(line, "l1_txid");
-      const QString details = QString("batch=%1  state=%2  tx=%3")
-                                  .arg(batch, state, txid.isEmpty() ? "-" : elide_middle(txid, 8));
-      mint_records_.push_back(MintRecord{mint_state_badge(state), "status", batch, {}, state, details});
-      const int row = redemption_rows++;
-      auto* status_item = new QTableWidgetItem(mint_state_badge(state));
-      status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
-      apply_status_item_style(status_item);
-      mint_redemptions_view_->setItem(row, 0, status_item);
-      mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem("-"));
-      mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(batch, 10)));
-      mint_redemptions_view_->setItem(row, 3, new QTableWidgetItem(state.isEmpty() ? "-" : state));
-    } else if (line.startsWith("[mint-issue]") && redemption_rows < 12) {
-      const QString issuance = extract_field_value(line, "issuance");
-      const QString amount = extract_field_value(line, "amount");
-      const QString notes = extract_field_value(line, "notes");
-      const QString details = QString("issuance=%1  amount=%2  notes=%3").arg(issuance, amount, notes);
-      mint_records_.push_back(MintRecord{"FINALIZED", "issue", issuance, amount, "issued", details});
-      const int row = redemption_rows++;
-      auto* status_item = new QTableWidgetItem("FINALIZED");
-      status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
-      apply_status_item_style(status_item);
-      mint_redemptions_view_->setItem(row, 0, status_item);
-      mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
-      mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(issuance, 10)));
-      mint_redemptions_view_->setItem(row, 3, new QTableWidgetItem("issued"));
-    }
-    if (deposit_rows >= 10 && redemption_rows >= 12) break;
-  }
-  mint_deposits_view_->setRowCount(deposit_rows);
-  mint_redemptions_view_->setRowCount(redemption_rows);
-  if (mint_deposits_view_->rowCount() == 0) {
-    mint_deposits_view_->setRowCount(1);
-    auto* item = new QTableWidgetItem("No mint deposits recorded yet");
-    item->setData(Qt::UserRole, -1);
-    mint_deposits_view_->setItem(0, 0, item);
-  }
-  if (mint_redemptions_view_->rowCount() == 0) {
-    mint_redemptions_view_->setRowCount(1);
-    auto* item = new QTableWidgetItem("No mint redemptions recorded yet");
-    item->setData(Qt::UserRole, -1);
-    mint_redemptions_view_->setItem(0, 0, item);
-  }
-  mint_deposits_view_->setSortingEnabled(true);
-  mint_notes_view_->setSortingEnabled(true);
-  mint_redemptions_view_->setSortingEnabled(true);
-  mint_deposits_view_->setUpdatesEnabled(true);
-  mint_notes_view_->setUpdatesEnabled(true);
-  mint_redemptions_view_->setUpdatesEnabled(true);
-  mint_detail_button_->setEnabled(!mint_records_.empty());
-}
-
 void WalletWindow::save_wallet_local_state() {
   if (!wallet_) return;
   QSettings settings(kSettingsOrg, kSettingsApp);
   settings.setValue("wallet/last_opened_file", QString::fromStdString(wallet_->file_path));
-  (void)store_.set_mint_deposit_ref(mint_deposit_ref_.toStdString());
-  (void)store_.set_mint_last_deposit_txid(mint_last_deposit_txid_.toStdString());
-  (void)store_.set_mint_last_deposit_vout(mint_last_deposit_vout_);
-  (void)store_.set_mint_last_redemption_batch_id(mint_last_redemption_batch_id_.toStdString());
-  for (const auto& note : mint_notes_) {
-    (void)store_.upsert_mint_note(note.note_ref.toStdString(), note.amount, true);
-  }
 }
 
 void WalletWindow::load_wallet_local_state() {
   utxos_.clear();
   local_sent_txids_.clear();
   local_history_lines_.clear();
-  mint_notes_.clear();
   confidential_request_views_.clear();
   confidential_coin_views_.clear();
   confidential_receive_address_ = "not configured";
@@ -3631,10 +3362,6 @@ void WalletWindow::load_wallet_local_state() {
   }
   chain_records_ = normalize_chain_records_for_display(chain_records_);
   for (const auto& line : state.local_events) local_history_lines_.push_back(QString::fromStdString(line));
-  mint_deposit_ref_ = QString::fromStdString(state.mint_deposit_ref);
-  mint_last_deposit_txid_ = QString::fromStdString(state.mint_last_deposit_txid);
-  mint_last_deposit_vout_ = state.mint_last_deposit_vout;
-  mint_last_redemption_batch_id_ = QString::fromStdString(state.mint_last_redemption_batch_id);
   if (store_.can_persist_confidential_secrets()) {
     const auto primary_account_id = state.confidential_primary_account_id.value_or("");
     const auto account_it = std::find_if(state.confidential_accounts.begin(), state.confidential_accounts.end(),
@@ -3690,12 +3417,8 @@ void WalletWindow::load_wallet_local_state() {
   } else if (wallet_ && wallet_->passphrase.empty()) {
     confidential_storage_locked_ = true;
   }
-  for (const auto& note : state.mint_notes) {
-    if (note.active) mint_notes_.push_back(MintNote{QString::fromStdString(note.note_ref), note.amount});
-  }
   mark_refresh_state_changed();
   render_confidential_receive_views();
-  render_mint_state();
 }
 
 bool WalletWindow::open_wallet_store() {
@@ -5126,7 +4849,7 @@ void WalletWindow::show_about() {
   box.setText("Finalis Wallet");
   box.setInformativeText(
       "Qt desktop wallet for finalized-state operations.\n"
-      "It connects to configured lightserver and mint services and does not embed a node.");
+      "It connects to configured lightserver services and does not embed a node.");
   box.setStandardButtons(QMessageBox::Ok);
   box.exec();
 }
@@ -5811,40 +5534,6 @@ void WalletWindow::show_selected_history_detail() {
   if (activity_detail_view_) activity_detail_view_->setFocus();
 }
 
-void WalletWindow::show_selected_mint_detail() {
-  QTableWidget* table = nullptr;
-  if (mint_deposits_view_->hasFocus()) table = mint_deposits_view_;
-  if (!table && mint_notes_view_->hasFocus()) table = mint_notes_view_;
-  if (!table && mint_redemptions_view_->hasFocus()) table = mint_redemptions_view_;
-  if (!table && mint_redemptions_view_->currentRow() >= 0) table = mint_redemptions_view_;
-  if (!table && mint_deposits_view_->currentRow() >= 0) table = mint_deposits_view_;
-  if (!table && mint_notes_view_->currentRow() >= 0) table = mint_notes_view_;
-  if (!table) {
-    QMessageBox::information(this, "Mint Details", "Select a mint row first.");
-    return;
-  }
-  const int row = table->currentRow();
-  auto* item = row >= 0 ? table->item(row, 0) : nullptr;
-  if (!item) {
-    QMessageBox::information(this, "Mint Details", "Select a mint row first.");
-    return;
-  }
-  const int index = item->data(Qt::UserRole).toInt();
-  if (index < 0 || static_cast<std::size_t>(index) >= mint_records_.size()) {
-    QMessageBox::information(this, "Mint Details", "The selected row does not have mint details.");
-    return;
-  }
-  const auto& rec = mint_records_[static_cast<std::size_t>(index)];
-  QMessageBox::information(
-      this, "Mint Details",
-      QString("Status: %1\nKind: %2\nReference: %3\nAmount: %4\n\n%5")
-          .arg(rec.status,
-               rec.kind,
-               rec.reference.isEmpty() ? "-" : elide_middle(rec.reference, 12),
-               rec.amount.isEmpty() ? "-" : rec.amount,
-               rec.details));
-}
-
 void WalletWindow::update_selected_history_detail() {
   if (!activity_detail_title_label_ || !activity_detail_view_) return;
   const int row = history_view_ ? history_view_->currentRow() : -1;
@@ -5926,16 +5615,6 @@ void WalletWindow::update_selected_history_detail() {
                  reservation_text));
     return;
   }
-  if (static_cast<std::size_t>(ref.index) >= mint_records_.size()) return;
-  const auto& rec = mint_records_[static_cast<std::size_t>(ref.index)];
-  activity_detail_title_label_->setText(QString("%1 · %2").arg(title_case_status(rec.status), display_mint_kind(rec.kind)));
-  activity_detail_view_->setPlainText(
-      QString("Status: %1\nCategory: %2\nReference: %3\nAmount: %4\n\n%5")
-          .arg(title_case_status(rec.status),
-               display_mint_kind(rec.kind),
-               rec.reference.isEmpty() ? "-" : rec.reference,
-               rec.amount.isEmpty() ? "-" : rec.amount,
-               rec.details));
 }
 
 void WalletWindow::refresh_history_table() {
@@ -5945,13 +5624,12 @@ void WalletWindow::refresh_history_table() {
   history_row_refs_.clear();
   const QString filter = history_filter_combo_ ? history_filter_combo_->currentText() : "All";
   history_view_->setSortingEnabled(false);
-  if (chain_records_.empty() && local_history_lines_.empty() && mint_records_.empty() && confidential_coin_views_.empty() &&
+  if (chain_records_.empty() && local_history_lines_.empty() && confidential_coin_views_.empty() &&
       wallet_view_snapshot_.has_value()) {
     const auto& snapshot = *wallet_view_snapshot_;
     if (activity_finalized_count_label_) activity_finalized_count_label_->setText(QString::fromStdString(snapshot.activity_finalized_count_text));
     if (activity_pending_count_label_) activity_pending_count_label_->setText(QString::fromStdString(snapshot.activity_pending_count_text));
     if (activity_local_count_label_) activity_local_count_label_->setText(QString::fromStdString(snapshot.activity_local_count_text));
-    if (activity_mint_count_label_) activity_mint_count_label_->setText(QString::fromStdString(snapshot.activity_mint_count_text));
     if (activity_confidential_count_label_) activity_confidential_count_label_->setText(QString::fromStdString(snapshot.activity_confidential_count_text));
     int populated_rows = 0;
     history_view_->setRowCount(static_cast<int>(snapshot.history_rows.size()));
@@ -5981,7 +5659,6 @@ void WalletWindow::refresh_history_table() {
   int finalized_count = 0;
   int pending_count = 0;
   int local_count = 0;
-  int mint_count = 0;
   int confidential_count = 0;
   struct HistoryDisplayRow {
     QString type;
@@ -6002,13 +5679,11 @@ void WalletWindow::refresh_history_table() {
                       HistoryRowRef::Source source, int index, int bucket) {
     if (filter == "On-Chain" && source != HistoryRowRef::Source::Chain) return;
     if (filter == "Local" && source != HistoryRowRef::Source::Local) return;
-    if (filter == "Mint" && source != HistoryRowRef::Source::Mint) return;
     if (filter == "Confidential" && source != HistoryRowRef::Source::Confidential) return;
     if (filter == "Pending" && status.trimmed().toUpper() != "PENDING") return;
     if (status.trimmed().toUpper() == "FINALIZED") ++finalized_count;
     if (status.trimmed().toUpper() == "PENDING") ++pending_count;
     if (source == HistoryRowRef::Source::Local) ++local_count;
-    if (source == HistoryRowRef::Source::Mint) ++mint_count;
     if (source == HistoryRowRef::Source::Confidential) ++confidential_count;
     bool height_ok = false;
     const qulonglong numeric_height = height_or_state.toULongLong(&height_ok);
@@ -6043,14 +5718,6 @@ void WalletWindow::refresh_history_table() {
              local_history_state(line),
              HistoryRowRef::Source::Local, static_cast<int>(i), bucket);
   }
-  for (std::size_t i = 0; i < mint_records_.size(); ++i) {
-    const auto& rec = mint_records_[i];
-    const QString upper = rec.status.trimmed().toUpper();
-    const int bucket = upper == "PENDING" ? 5 : 6;
-    push_row(display_mint_kind(rec.kind), rec.status, rec.amount.isEmpty() ? "-" : rec.amount,
-             elide_middle(rec.reference, 10), rec.height_or_state.isEmpty() ? "-" : rec.height_or_state,
-             HistoryRowRef::Source::Mint, static_cast<int>(i), bucket);
-  }
   for (std::size_t i = 0; i < confidential_coin_views_.size(); ++i) {
     const auto& rec = confidential_coin_views_[i];
     const bool reserved = pending_confidential_reservations_.find(rec.outpoint) != pending_confidential_reservations_.end();
@@ -6072,8 +5739,7 @@ void WalletWindow::refresh_history_table() {
     const auto& row_data = rows[i];
     const int row = static_cast<int>(i);
     const QString source_suffix =
-        row_data.source == HistoryRowRef::Source::Local ? " (local)"
-        : (row_data.source == HistoryRowRef::Source::Mint ? " (mint)" : QString{});
+        row_data.source == HistoryRowRef::Source::Local ? " (local)" : QString{};
     history_view_->setItem(row, 0, new QTableWidgetItem(row_data.type + source_suffix));
     const bool local_pending = row_data.status.trimmed().toUpper() == "PENDING" &&
                                (row_data.source == HistoryRowRef::Source::Chain || row_data.source == HistoryRowRef::Source::Local);
@@ -6094,7 +5760,6 @@ void WalletWindow::refresh_history_table() {
     QString message = "No history recorded yet";
     if (filter == "On-Chain") message = "No on-chain records yet";
     else if (filter == "Local") message = "No local activity records yet";
-    else if (filter == "Mint") message = "No mint records yet";
     else if (filter == "Confidential") message = "No confidential coin records yet";
     else if (filter == "Pending") message = "No pending records";
     auto* item = new QTableWidgetItem(message);
@@ -6107,7 +5772,6 @@ void WalletWindow::refresh_history_table() {
   if (activity_finalized_count_label_) activity_finalized_count_label_->setText(QString("Finalized: %1").arg(finalized_count));
   if (activity_pending_count_label_) activity_pending_count_label_->setText(QString("Pending: %1").arg(pending_count));
   if (activity_local_count_label_) activity_local_count_label_->setText(QString("Local: %1").arg(local_count));
-  if (activity_mint_count_label_) activity_mint_count_label_->setText(QString("Mint: %1").arg(mint_count));
   if (activity_confidential_count_label_) {
     activity_confidential_count_label_->setText(QString("Confidential: %1").arg(confidential_count));
   }
@@ -6131,8 +5795,6 @@ void WalletWindow::persist_wallet_view_snapshot() {
       activity_pending_count_label_ ? activity_pending_count_label_->text().toStdString() : "";
   snapshot.activity_local_count_text =
       activity_local_count_label_ ? activity_local_count_label_->text().toStdString() : "";
-  snapshot.activity_mint_count_text =
-      activity_mint_count_label_ ? activity_mint_count_label_->text().toStdString() : "";
   snapshot.activity_confidential_count_text =
       activity_confidential_count_label_ ? activity_confidential_count_label_->text().toStdString() : "";
   if (auto* preview = overview_page_->activity_preview_table()) {
@@ -6155,429 +5817,6 @@ void WalletWindow::persist_wallet_view_snapshot() {
   }
   wallet_view_snapshot_ = snapshot;
   (void)store_.set_wallet_view_snapshot(snapshot);
-}
-
-void WalletWindow::submit_mint_deposit() {
-  if (!ensure_wallet_loaded("Mint Deposit")) return;
-  if (mint_deposit_submit_in_flight_) {
-    statusBar()->showMessage("Mint deposit submission already in progress.", 2000);
-    return;
-  }
-  const QString mint_url = mint_url_edit_->text().trimmed();
-  const QString mint_id_hex = mint_id_edit_->text().trimmed();
-  if (configured_lightserver_endpoints().isEmpty() || mint_url.isEmpty() || mint_id_hex.isEmpty()) {
-    QMessageBox::warning(this, "Mint Deposit", "Configure lightserver endpoints, mint URL, and mint ID first.");
-    return;
-  }
-  auto mint_id = decode_hex32_string(mint_id_hex.toStdString());
-  if (!mint_id) {
-    QMessageBox::warning(this, "Mint Deposit", "Mint ID must be 32-byte hex.");
-    return;
-  }
-  auto amount_units = parse_coin_amount(mint_deposit_amount_edit_->text());
-  if (!amount_units || *amount_units == 0) {
-    QMessageBox::warning(this, "Mint Deposit", "Enter a valid deposit amount.");
-    return;
-  }
-
-  const QStringList endpoints = ordered_lightserver_endpoints();
-  if (endpoints.isEmpty()) {
-    QMessageBox::warning(this, "Mint Deposit", "Configure at least one lightserver endpoint first.");
-    return;
-  }
-
-  if (utxos_.empty()) refresh_chain_state(false);
-  std::vector<std::pair<OutPoint, TxOut>> prevs;
-  std::uint64_t selected = 0;
-  for (const auto& utxo : utxos_) {
-    auto txid = decode_hex32_string(utxo.txid_hex);
-    if (!txid) continue;
-    prevs.push_back({OutPoint{*txid, utxo.vout}, TxOut{utxo.value, utxo.script_pubkey}});
-    selected += utxo.value;
-    if (selected >= *amount_units) break;
-  }
-  if (selected < *amount_units) {
-    QMessageBox::warning(this, "Mint Deposit", "Insufficient finalized UTXOs.");
-    return;
-  }
-
-  std::string err;
-  auto key = load_wallet_key(&err);
-  if (!key) {
-    QMessageBox::warning(this, "Mint Deposit", QString::fromStdString(err));
-    return;
-  }
-  auto own_decoded = finalis::address::decode(wallet_->address);
-  if (!own_decoded) {
-    QMessageBox::warning(this, "Mint Deposit", "Wallet address is invalid.");
-    return;
-  }
-  std::vector<TxOut> outputs;
-  outputs.push_back(TxOut{
-      *amount_units, finalis::privacy::mint_deposit_script_pubkey(*mint_id, own_decoded->pubkey_hash)});
-  const std::uint64_t change = selected - *amount_units;
-  if (change > 0) outputs.push_back(TxOut{change, finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash)});
-
-  auto tx = finalis::build_signed_p2pkh_tx_multi_input(
-      prevs, finalis::Bytes(key->privkey.begin(), key->privkey.end()), outputs, &err);
-  if (!tx) {
-    QMessageBox::warning(this, "Mint Deposit", QString::fromStdString(err));
-    return;
-  }
-
-  struct MintDepositResult {
-    bool success{false};
-    QString error;
-    QString used_endpoint;
-    QString deposit_txid_hex;
-    QString mint_deposit_ref;
-  };
-
-  const Bytes tx_bytes = tx->serialize();
-  const Hash32 deposit_txid = tx->txid();
-  const auto recipient_pubkey_hash = own_decoded->pubkey_hash;
-  const auto mint_id_copy = *mint_id;
-  const std::uint64_t amount_units_copy = *amount_units;
-  const QString amount_text = format_coin_amount(*amount_units);
-
-  mint_deposit_submit_in_flight_ = true;
-  if (mint_deposit_button_) mint_deposit_button_->setEnabled(false);
-  statusBar()->showMessage("Submitting mint deposit...", 2000);
-
-  const std::uint64_t generation = ++mint_deposit_submit_generation_;
-  QPointer<WalletWindow> self(this);
-  background_threads_.spawn([self, generation, tx_bytes, deposit_txid, mint_url, endpoints, mint_id_copy, recipient_pubkey_hash,
-               amount_units_copy, amount_text]() mutable {
-    MintDepositResult result;
-
-    std::string last_broadcast_err;
-    bool sent = false;
-    for (int i = 0; i < endpoints.size(); ++i) {
-      const QString endpoint = endpoints[i];
-      std::string call_err;
-      auto broadcast = lightserver::rpc_broadcast_tx(endpoint.toStdString(), tx_bytes, &call_err);
-      if (broadcast.outcome == lightserver::BroadcastOutcome::Ambiguous) {
-        if (!call_err.empty()) last_broadcast_err = call_err;
-        continue;
-      }
-      if (broadcast.outcome != lightserver::BroadcastOutcome::Sent) {
-        last_broadcast_err = !broadcast.error.empty() ? broadcast.error : call_err;
-        continue;
-      }
-      result.used_endpoint = endpoint;
-      sent = true;
-      break;
-    }
-    if (!sent) {
-      result.error = QString("Broadcast failed: %1")
-                         .arg(last_broadcast_err.empty() ? "unable to submit transaction" : QString::fromStdString(last_broadcast_err));
-        QMetaObject::invokeMethod(
-          self.data(),
-          [self, generation, result = std::move(result)]() mutable {
-            if (!self) return;
-            if (generation != self->mint_deposit_submit_generation_) return;
-            self->mint_deposit_submit_in_flight_ = false;
-            if (self->mint_deposit_button_) self->mint_deposit_button_->setEnabled(true);
-            QMessageBox::warning(self, "Mint Deposit", result.error);
-          },
-          Qt::QueuedConnection);
-      return;
-    }
-
-    std::string err;
-    finalis::privacy::MintDepositRegistrationRequest req;
-    req.chain = "mainnet";
-    req.deposit_txid = deposit_txid;
-    req.deposit_vout = 0;
-    req.mint_id = mint_id_copy;
-    req.recipient_pubkey_hash = recipient_pubkey_hash;
-    req.amount = amount_units_copy;
-    auto reg_body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/deposits/register").toStdString(),
-                                                    finalis::privacy::to_json(req), &err);
-    if (!reg_body) {
-      result.error = "Mint registration failed: " + QString::fromStdString(err);
-    } else {
-      auto reg = finalis::privacy::parse_mint_deposit_registration_response(*reg_body);
-      if (!reg || !reg->accepted) {
-        result.error = "Mint registration was rejected.";
-      } else {
-        result.success = true;
-        result.deposit_txid_hex = QString::fromStdString(hex_encode32(deposit_txid));
-        result.mint_deposit_ref = QString::fromStdString(reg->mint_deposit_ref);
-      }
-    }
-
-    QMetaObject::invokeMethod(
-      self.data(),
-        [self, generation, amount_text, result = std::move(result)]() mutable {
-          if (!self) return;
-          if (generation != self->mint_deposit_submit_generation_) return;
-
-          self->mint_deposit_submit_in_flight_ = false;
-          if (self->mint_deposit_button_) self->mint_deposit_button_->setEnabled(true);
-
-          if (!result.success) {
-            QMessageBox::warning(self, "Mint Deposit", result.error);
-            return;
-          }
-
-          self->mint_deposit_ref_ = result.mint_deposit_ref;
-          self->mint_last_deposit_txid_ = result.deposit_txid_hex;
-          self->mint_last_deposit_vout_ = 0;
-          self->save_wallet_local_state();
-          self->render_mint_state();
-          self->append_local_event(QString("[mint-deposit] %1 %2 ref=%3")
-                                       .arg(amount_text)
-                                       .arg(elide_middle(self->mint_last_deposit_txid_, 12))
-                                       .arg(self->mint_deposit_ref_));
-          self->refresh_chain_state(false);
-          const QString endpoint_note =
-              result.used_endpoint.isEmpty() ? QString{} : QString(" via %1").arg(display_lightserver_endpoint(result.used_endpoint));
-          self->statusBar()->showMessage(QString("Mint deposit accepted for relay and registered%1.").arg(endpoint_note), 3000);
-        },
-        Qt::QueuedConnection);
-  });
-}
-
-void WalletWindow::issue_mint_note() {
-  if (!ensure_wallet_loaded("Issue Note")) return;
-  const QString mint_url = mint_url_edit_->text().trimmed();
-  if (mint_url.isEmpty() || mint_deposit_ref_.isEmpty()) {
-    QMessageBox::warning(this, "Issue Note", "Create and register a mint deposit first.");
-    return;
-  }
-  auto amount_units = parse_coin_amount(mint_issue_amount_edit_->text());
-  if (!amount_units || *amount_units == 0) {
-    QMessageBox::warning(this, "Issue Note", "Enter a valid issue amount.");
-    return;
-  }
-  const auto denominations = split_into_denominations(*amount_units);
-  if (denominations.empty()) {
-    QMessageBox::warning(this, "Issue Note", "Failed to derive note denominations.");
-    return;
-  }
-
-  finalis::privacy::MintBlindIssueRequest req;
-  req.mint_deposit_ref = mint_deposit_ref_.toStdString();
-  for (const auto denom : denominations) {
-    req.blinded_messages.push_back(random_hex_string(64).toStdString());
-    req.note_amounts.push_back(denom);
-  }
-
-  std::string err;
-  auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/issuance/blind").toStdString(),
-                                              finalis::privacy::to_json(req), &err);
-  if (!body) {
-    QMessageBox::warning(this, "Issue Note", "Mint issuance failed: " + QString::fromStdString(err));
-    return;
-  }
-  auto resp = finalis::privacy::parse_mint_blind_issue_response(*body);
-  if (!resp || resp->note_refs.empty()) {
-    QMessageBox::warning(this, "Issue Note", "Mint issuance response was invalid.");
-    return;
-  }
-
-  for (std::size_t i = 0; i < resp->note_refs.size(); ++i) {
-    const std::uint64_t amount = i < resp->note_amounts.size() ? resp->note_amounts[i] : *amount_units;
-    mint_notes_.push_back(MintNote{QString::fromStdString(resp->note_refs[i]), amount});
-    (void)store_.upsert_mint_note(resp->note_refs[i], amount, true);
-  }
-  save_wallet_local_state();
-  render_mint_state();
-  append_local_event(QString("[mint-issue] issuance=%1 amount=%2 notes=%3")
-                         .arg(QString::fromStdString(resp->issuance_id))
-                         .arg(format_coin_amount(*amount_units))
-                         .arg(resp->note_refs.size()));
-  statusBar()->showMessage("Mint note issued.", 3000);
-}
-
-void WalletWindow::submit_mint_redemption() {
-  if (!ensure_wallet_loaded("Redeem")) return;
-  if (mint_redeem_submit_in_flight_) {
-    statusBar()->showMessage("Mint redemption submission already in progress.", 2000);
-    return;
-  }
-  const QString mint_url = mint_url_edit_->text().trimmed();
-  if (mint_url.isEmpty()) {
-    QMessageBox::warning(this, "Redeem", "Configure a mint URL first.");
-    return;
-  }
-  const QString redeem_address = mint_redeem_address_edit_->text().trimmed();
-  if (!finalis::address::decode(redeem_address.toStdString()).has_value()) {
-    QMessageBox::warning(this, "Redeem", "Destination address is invalid.");
-    return;
-  }
-  auto amount_units = parse_coin_amount(mint_redeem_amount_edit_->text());
-  if (!amount_units || *amount_units == 0) {
-    QMessageBox::warning(this, "Redeem", "Enter a valid redemption amount.");
-    return;
-  }
-
-  auto selected_indexes = choose_note_subset_exact(mint_notes_, *amount_units);
-  if (!selected_indexes) {
-    QMessageBox::warning(this, "Redeem", "No exact note combination matches that redemption amount.");
-    return;
-  }
-  std::vector<std::string> selected_notes;
-  for (auto idx : *selected_indexes) selected_notes.push_back(mint_notes_[idx].note_ref.toStdString());
-
-  struct MintRedeemResult {
-    bool success{false};
-    QString error;
-    QString batch_id;
-  };
-
-  const std::uint64_t amount_units_copy = *amount_units;
-  const QString amount_text = format_coin_amount(*amount_units);
-
-  mint_redeem_submit_in_flight_ = true;
-  if (mint_redeem_button_) mint_redeem_button_->setEnabled(false);
-  statusBar()->showMessage("Submitting mint redemption...", 2000);
-
-  const std::uint64_t generation = ++mint_redeem_submit_generation_;
-  QPointer<WalletWindow> self(this);
-  background_threads_.spawn([self, generation, mint_url, redeem_address, selected_notes, amount_units_copy, amount_text]() mutable {
-    MintRedeemResult result;
-    finalis::privacy::MintRedemptionRequest req;
-    req.notes = selected_notes;
-    req.redeem_address = redeem_address.toStdString();
-    req.amount = amount_units_copy;
-    std::string err;
-    auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/redemptions/create").toStdString(),
-                                                finalis::privacy::to_json(req), &err);
-    if (!body) {
-      result.error = "Mint redemption failed: " + QString::fromStdString(err);
-    } else {
-      auto resp = finalis::privacy::parse_mint_redemption_response(*body);
-      if (!resp || !resp->accepted) {
-        result.error = "Mint redemption was rejected.";
-      } else {
-        result.success = true;
-        result.batch_id = QString::fromStdString(resp->redemption_batch_id);
-      }
-    }
-
-    QMetaObject::invokeMethod(
-      self.data(),
-        [self, generation, selected_notes, amount_text, result = std::move(result)]() mutable {
-          if (!self) return;
-          if (generation != self->mint_redeem_submit_generation_) return;
-
-          self->mint_redeem_submit_in_flight_ = false;
-          if (self->mint_redeem_button_) self->mint_redeem_button_->setEnabled(true);
-
-          if (!result.success) {
-            QMessageBox::warning(self, "Redeem", result.error);
-            return;
-          }
-
-          self->mint_last_redemption_batch_id_ = result.batch_id;
-          for (const auto& note_ref : selected_notes) {
-            auto it = std::find_if(self->mint_notes_.begin(), self->mint_notes_.end(),
-                                   [&](const MintNote& note) { return note.note_ref.toStdString() == note_ref; });
-            if (it != self->mint_notes_.end()) (void)self->store_.upsert_mint_note(note_ref, it->amount, false);
-            self->mint_notes_.erase(std::remove_if(self->mint_notes_.begin(), self->mint_notes_.end(),
-                                                   [&](const MintNote& note) { return note.note_ref.toStdString() == note_ref; }),
-                                    self->mint_notes_.end());
-          }
-          self->save_wallet_local_state();
-          self->render_mint_state();
-          self->append_local_event(QString("[mint-redeem] batch=%1 amount=%2 notes=%3")
-                                       .arg(self->mint_last_redemption_batch_id_)
-                                       .arg(amount_text)
-                                       .arg(selected_notes.size()));
-          self->statusBar()->showMessage("Mint redemption created.", 3000);
-        },
-        Qt::QueuedConnection);
-  });
-}
-
-void WalletWindow::refresh_mint_redemption_status() {
-  if (mint_last_redemption_batch_id_.isEmpty()) {
-    QMessageBox::information(this, "Redemption Status", "No redemption batch has been created yet.");
-    return;
-  }
-  const QString mint_url = mint_url_edit_->text().trimmed();
-  if (mint_url.isEmpty()) {
-    QMessageBox::warning(this, "Redemption Status", "Configure a mint URL first.");
-    return;
-  }
-
-  if (mint_status_refresh_in_flight_) {
-    statusBar()->showMessage("Mint redemption status refresh already in progress.", 2000);
-    return;
-  }
-
-  struct MintStatusResult {
-    bool request_ok{false};
-    bool parse_ok{false};
-    QString error;
-    QString state;
-    QString l1_txid;
-    std::uint64_t amount{0};
-  };
-
-  const QString batch_id = mint_last_redemption_batch_id_;
-  mint_status_refresh_in_flight_ = true;
-  if (mint_redeem_status_button_) mint_redeem_status_button_->setEnabled(false);
-  if (mint_status_label_) {
-    mint_status_label_->setText(QString("Refreshing redemption %1...").arg(batch_id));
-  }
-
-  const std::uint64_t generation = ++mint_status_refresh_generation_;
-  QPointer<WalletWindow> self(this);
-  background_threads_.spawn([self, generation, mint_url, batch_id]() mutable {
-    MintStatusResult result;
-    std::ostringstream body_json;
-    body_json << "{\"redemption_batch_id\":\"" << batch_id.toStdString() << "\"}";
-    std::string err;
-    auto body = lightserver::http_post_json_raw(
-        mint_endpoint(mint_url, "/redemptions/status").toStdString(), body_json.str(), &err);
-    if (!body) {
-      result.error = QString::fromStdString(err);
-    } else {
-      result.request_ok = true;
-      auto resp = finalis::privacy::parse_mint_redemption_status_response(*body);
-      if (resp) {
-        result.parse_ok = true;
-        result.state = QString::fromStdString(resp->state);
-        result.l1_txid = QString::fromStdString(resp->l1_txid);
-        result.amount = resp->amount;
-      }
-    }
-
-    QMetaObject::invokeMethod(
-      self.data(),
-        [self, generation, batch_id, result = std::move(result)]() mutable {
-          if (!self) return;
-          if (generation != self->mint_status_refresh_generation_) return;
-
-          self->mint_status_refresh_in_flight_ = false;
-          if (self->mint_redeem_status_button_) self->mint_redeem_status_button_->setEnabled(true);
-
-          if (!result.request_ok) {
-            QMessageBox::warning(self, "Redemption Status", "Status query failed: " + result.error);
-            return;
-          }
-          if (!result.parse_ok) {
-            QMessageBox::warning(self, "Redemption Status", "Status response was invalid.");
-            return;
-          }
-          if (self->mint_status_label_) {
-            self->mint_status_label_->setText(QString("Redemption %1: state=%2 l1_txid=%3 amount=%4")
-                                                  .arg(batch_id)
-                                                  .arg(result.state)
-                                                  .arg(result.l1_txid)
-                                                  .arg(format_coin_amount(result.amount)));
-          }
-          self->append_local_event(QString("[mint-status] batch=%1 state=%2 l1_txid=%3")
-                                       .arg(batch_id)
-                                       .arg(result.state)
-                                       .arg(elide_middle(result.l1_txid, 12)));
-          self->statusBar()->showMessage("Mint redemption status refreshed.", 2500);
-        },
-        Qt::QueuedConnection);
-  });
 }
 
 }  // namespace finalis::wallet
