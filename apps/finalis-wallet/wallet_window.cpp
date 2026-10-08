@@ -12,7 +12,7 @@
 #include <array>
 #include <algorithm>
 #include <map>
-#include <random>
+#include <cstdlib>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -60,7 +60,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
-#include <openssl/evp.h>
+#include "confidential_memo.hpp"
 
 #include "common/address.hpp"
 #include "codec/bytes.hpp"
@@ -71,6 +71,7 @@
 #include "common/types.hpp"
 #include "consensus/monetary.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/secure_memory.hpp"
 #include "crypto/stealth_address.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "common/keystore.hpp"
@@ -263,11 +264,41 @@ std::optional<Bytes> decode_hex_bytes_string(const std::string& hex) {
   return finalis::hex_decode(hex);
 }
 
+// Secrets (spend/view keys, blinds, nonces) come from here; a CSPRNG failure must never yield a
+// predictable key, so fail closed.
 Hash32 random_hash32() {
-  std::random_device rd;
   Hash32 out{};
-  for (auto& b : out) b = static_cast<std::uint8_t>(rd());
+  if (!crypto::secure_random_bytes(out.data(), out.size())) std::abort();
   return out;
+}
+
+// Runs f on scope exit; used to wipe secrets on every return path.
+template <typename F>
+struct OnScopeExit {
+  F f;
+  ~OnScopeExit() { f(); }
+};
+template <typename F>
+OnScopeExit(F) -> OnScopeExit<F>;
+
+// Private-key copy for a single call: the temporary is wiped at the end of the full-expression.
+struct WipedBytes {
+  Bytes bytes;
+  ~WipedBytes() { crypto::secure_wipe(bytes); }
+};
+
+template <std::size_t N>
+WipedBytes key_bytes(const std::array<std::uint8_t, N>& key) {
+  return WipedBytes{Bytes(key.begin(), key.end())};
+}
+
+void wipe_optional(std::optional<Hash32>& h) {
+  if (h) crypto::secure_wipe(*h);
+}
+
+void wipe_qstring(QString& s) {
+  s.fill(QChar(0));
+  s.clear();
 }
 
 enum class WalletSendMode : std::uint8_t {
@@ -312,9 +343,6 @@ QString wallet_send_mode_recipient_label(WalletSendMode mode) {
   return "Recipient";
 }
 
-constexpr std::uint32_t kConfidentialRecoveryMemoVersion = 1;
-constexpr std::size_t kWalletMemoTagLen = 16;
-
 struct ParsedConfidentialRecipient {
   wallet::ConfidentialRecipient recipient;
   std::optional<Hash32> memo_key;
@@ -335,127 +363,6 @@ std::string encode_local_stealth_address(const PubKey33& view_pubkey, const PubK
   payload.insert(payload.end(), view_pubkey.begin(), view_pubkey.end());
   payload.insert(payload.end(), spend_pubkey.begin(), spend_pubkey.end());
   return "scstealth1:" + finalis::hex_encode(payload);
-}
-
-Bytes confidential_memo_nonce(const PubKey33& ephemeral_pubkey) {
-  Bytes preimage(ephemeral_pubkey.begin(), ephemeral_pubkey.end());
-  preimage.push_back(0x6d);
-  preimage.push_back(0x65);
-  preimage.push_back(0x6d);
-  preimage.push_back(0x6f);
-  const auto digest = crypto::sha256d(preimage);
-  return Bytes(digest.begin(), digest.begin() + 12);
-}
-
-bool aes_gcm_encrypt_wallet_memo(const Bytes& key32, const Bytes& nonce12, const Bytes& plaintext, Bytes* out_cipher_and_tag) {
-  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) return false;
-  int ok = EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
-  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce12.size()), nullptr);
-  ok = ok && EVP_EncryptInit_ex(ctx, nullptr, nullptr, key32.data(), nonce12.data());
-  if (!ok) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  Bytes cipher(plaintext.size() + kWalletMemoTagLen, 0);
-  int out_len = 0;
-  int total = 0;
-  if (EVP_EncryptUpdate(ctx, cipher.data(), &out_len, plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  total += out_len;
-  if (EVP_EncryptFinal_ex(ctx, cipher.data() + total, &out_len) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  total += out_len;
-  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kWalletMemoTagLen), cipher.data() + total) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  total += static_cast<int>(kWalletMemoTagLen);
-  cipher.resize(static_cast<std::size_t>(total));
-  EVP_CIPHER_CTX_free(ctx);
-  *out_cipher_and_tag = std::move(cipher);
-  return true;
-}
-
-bool aes_gcm_decrypt_wallet_memo(const Bytes& key32, const Bytes& nonce12, const Bytes& cipher_and_tag, Bytes* out_plaintext) {
-  if (cipher_and_tag.size() < kWalletMemoTagLen) return false;
-  const std::size_t clen = cipher_and_tag.size() - kWalletMemoTagLen;
-  const std::uint8_t* tag = cipher_and_tag.data() + clen;
-  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) return false;
-  int ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
-  ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce12.size()), nullptr);
-  ok = ok && EVP_DecryptInit_ex(ctx, nullptr, nullptr, key32.data(), nonce12.data());
-  if (!ok) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  Bytes plain(clen, 0);
-  int out_len = 0;
-  int total = 0;
-  if (EVP_DecryptUpdate(ctx, plain.data(), &out_len, cipher_and_tag.data(), static_cast<int>(clen)) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  total += out_len;
-  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kWalletMemoTagLen), const_cast<std::uint8_t*>(tag)) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  if (EVP_DecryptFinal_ex(ctx, plain.data() + total, &out_len) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    return false;
-  }
-  total += out_len;
-  plain.resize(static_cast<std::size_t>(total));
-  EVP_CIPHER_CTX_free(ctx);
-  *out_plaintext = std::move(plain);
-  return true;
-}
-
-std::optional<Bytes> encrypt_confidential_recovery_memo(std::uint64_t amount, const crypto::Blind32& blind,
-                                                        const Hash32& memo_key, const PubKey33& ephemeral_pubkey) {
-  codec::ByteWriter w;
-  w.u32le(kConfidentialRecoveryMemoVersion);
-  w.u64le(amount);
-  w.bytes_fixed(blind.bytes);
-  const Bytes plain = w.take();
-  Bytes cipher;
-  const Bytes key(memo_key.begin(), memo_key.end());
-  if (!aes_gcm_encrypt_wallet_memo(key, confidential_memo_nonce(ephemeral_pubkey), plain, &cipher)) return std::nullopt;
-  return cipher;
-}
-
-struct ConfidentialRecoveryPayload {
-  std::uint64_t amount{0};
-  crypto::Blind32 blind{};
-};
-
-std::optional<ConfidentialRecoveryPayload> decrypt_confidential_recovery_memo(const Bytes& cipher_and_tag, const Hash32& memo_key,
-                                                                              const PubKey33& ephemeral_pubkey) {
-  Bytes plain;
-  const Bytes key(memo_key.begin(), memo_key.end());
-  if (!aes_gcm_decrypt_wallet_memo(key, confidential_memo_nonce(ephemeral_pubkey), cipher_and_tag, &plain)) {
-    return std::nullopt;
-  }
-  ConfidentialRecoveryPayload out;
-  if (!codec::parse_exact(plain, [&](codec::ByteReader& r) {
-        auto version = r.u32le();
-        auto amount = r.u64le();
-        auto blind = r.bytes_fixed<32>();
-        if (!version || !amount || !blind) return false;
-        if (*version != kConfidentialRecoveryMemoVersion) return false;
-        out.amount = *amount;
-        std::copy(blind->begin(), blind->end(), out.blind.bytes.begin());
-        return true;
-      })) {
-    return std::nullopt;
-  }
-  return out;
 }
 
 std::optional<ParsedConfidentialRecipient> parse_confidential_request_uri(const QString& text, QString* err) {
@@ -552,6 +459,10 @@ std::optional<wallet::ConfidentialOwnedCoin> select_exact_confidential_coin(
     auto one_time_pubkey = decode_hex33_string(coin.one_time_pubkey_hex);
     auto spend_secret = decode_blind32_string(coin.spend_secret_hex);
     auto value_blind = decode_blind32_string(coin.blinding_factor_hex);
+    OnScopeExit wipe_decoded{[&] {
+      if (spend_secret) crypto::secure_wipe(spend_secret->bytes);
+      if (value_blind) crypto::secure_wipe(value_blind->bytes);
+    }};
     if (!txid || !value_commitment || !one_time_pubkey || !spend_secret || !value_blind) continue;
     wallet::ConfidentialOwnedCoin out;
     out.outpoint = OutPoint{*txid, coin.vout};
@@ -2799,8 +2710,8 @@ void WalletWindow::start_onboarding_registration_clicked() {
   }
 
   auto tx = finalis::build_onboarding_registration_tx(
-      selected_prevs, finalis::Bytes(funding_key->privkey.begin(), funding_key->privkey.end()), validator_key.pubkey,
-      finalis::Bytes(validator_key.privkey.begin(), validator_key.privkey.end()), funding_key->pubkey, options.fee,
+      selected_prevs, key_bytes(funding_key->privkey).bytes, validator_key.pubkey,
+      key_bytes(validator_key.privkey).bytes, funding_key->pubkey, options.fee,
       finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), &err, &pow_ctx);
   if (!tx.has_value()) {
     QMessageBox::warning(this, "Register Onboarding Operator", QString::fromStdString(err));
@@ -4383,8 +4294,9 @@ std::optional<QString> WalletWindow::prompt_passphrase(const QString& title, boo
                                              QLineEdit::Password, "", &ok);
   if (!ok) return std::nullopt;
   if (!confirm) return pass;
-  const QString confirm_pass = QInputDialog::getText(const_cast<WalletWindow*>(this), title, "Confirm passphrase",
-                                                     QLineEdit::Password, "", &ok);
+  QString confirm_pass = QInputDialog::getText(const_cast<WalletWindow*>(this), title, "Confirm passphrase",
+                                               QLineEdit::Password, "", &ok);
+  OnScopeExit wipe_confirm{[&] { wipe_qstring(confirm_pass); }};
   if (!ok) return std::nullopt;
   if (pass != confirm_pass) {
     QMessageBox::warning(const_cast<WalletWindow*>(this), title, "Passphrases do not match.");
@@ -4536,8 +4448,9 @@ void WalletWindow::create_confidential_account() {
       this, "New Confidential Account", "Account label", QLineEdit::Normal, "Primary confidential account", &ok);
   if (!ok) return;
 
-  const Hash32 view_secret = random_hash32();
-  const Hash32 spend_secret = random_hash32();
+  Hash32 view_secret = random_hash32();
+  Hash32 spend_secret = random_hash32();
+  crypto::ScopedWipe<Hash32, Hash32> wipe_secrets(view_secret, spend_secret);
   auto view_pubkey = crypto::secp256k1_pubkey_from_scalar(view_secret);
   auto spend_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret);
   if (!view_pubkey || !spend_pubkey) {
@@ -4576,15 +4489,24 @@ void WalletWindow::import_confidential_account() {
   const QString label = QInputDialog::getText(
       this, "Import Confidential Account", "Account label", QLineEdit::Normal, "Imported confidential account", &ok);
   if (!ok) return;
-  const QString view_hex = QInputDialog::getText(
+  QString view_hex = QInputDialog::getText(
       this, "Import Confidential Account", "View secret hex (32 bytes)", QLineEdit::Normal, {}, &ok);
+  QString spend_hex;
+  OnScopeExit wipe_inputs{[&] {
+    wipe_qstring(view_hex);
+    wipe_qstring(spend_hex);
+  }};
   if (!ok) return;
-  const QString spend_hex = QInputDialog::getText(
+  spend_hex = QInputDialog::getText(
       this, "Import Confidential Account", "Spend secret hex (32 bytes)", QLineEdit::Normal, {}, &ok);
   if (!ok) return;
 
   auto view_secret = decode_hex32_string(view_hex.trimmed().toStdString());
   auto spend_secret = decode_hex32_string(spend_hex.trimmed().toStdString());
+  OnScopeExit wipe_secrets{[&] {
+    wipe_optional(view_secret);
+    wipe_optional(spend_secret);
+  }};
   if (!view_secret || !spend_secret) {
     QMessageBox::warning(this, "Import Confidential Account", "View and spend secrets must both be 32-byte hex values.");
     return;
@@ -4640,15 +4562,17 @@ void WalletWindow::generate_confidential_request() {
                          "No confidential account is configured locally yet.");
     return;
   }
-  const Hash32 spend_secret = random_hash32();
+  Hash32 spend_secret = random_hash32();
+  Hash32 memo_key = random_hash32();
+  Hash32 ephemeral_secret = random_hash32();
+  crypto::ScopedWipe<Hash32, Hash32, Hash32> wipe_secrets(spend_secret, memo_key, ephemeral_secret);
   auto one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret);
   if (!one_time_pubkey) {
     QMessageBox::warning(this, "Generate Confidential Request", "Failed to derive a one-time confidential receive key.");
     return;
   }
-  const Hash32 memo_key = random_hash32();
-  const Hash32 ephemeral_secret = random_hash32();
   auto ephemeral_pubkey = crypto::secp256k1_pubkey_from_scalar(ephemeral_secret);
+  crypto::secure_wipe(ephemeral_secret);  // only the pubkey is ever used
   if (!ephemeral_pubkey) {
     QMessageBox::warning(this, "Generate Confidential Request", "Failed to derive an ephemeral request key.");
     return;
@@ -4754,9 +4678,15 @@ void WalletWindow::import_received_confidential_tx() {
     if (request_it == state.confidential_requests.end()) continue;
     auto memo_key = decode_hex32_string(request_it->memo_key_hex);
     auto spend_secret = decode_hex32_string(request_it->spend_secret_hex);
+    OnScopeExit wipe_keys{[&] {
+      wipe_optional(memo_key);
+      wipe_optional(spend_secret);
+    }};
     if (!memo_key || !spend_secret) continue;
-    auto recovery = decrypt_confidential_recovery_memo(confidential.memo, *memo_key, confidential.ephemeral_pubkey);
+    auto recovery = decrypt_confidential_recovery_memo(confidential.memo, *memo_key, confidential.one_time_pubkey,
+                                                       confidential.ephemeral_pubkey);
     if (!recovery) continue;
+    crypto::ScopedWipe<Hash32> wipe_blind(recovery->blind.bytes);
     WalletStore::ConfidentialCoinRecord coin{
         .txid_hex = hex_encode32(*txid),
         .vout = static_cast<std::uint32_t>(i),
@@ -4821,7 +4751,10 @@ void WalletWindow::export_wallet_secret() {
     return;
   }
 
-  const QString privkey_hex = QString::fromStdString(finalis::hex_encode(finalis::Bytes(key.privkey.begin(), key.privkey.end())));
+  std::string privkey_hex_std = finalis::hex_encode(key_bytes(key.privkey).bytes);
+  QString privkey_hex = QString::fromStdString(privkey_hex_std);
+  crypto::secure_wipe(privkey_hex_std);
+  OnScopeExit wipe_export{[&] { wipe_qstring(privkey_hex); }};
   QMessageBox::information(
       this, "Export Backup",
       "Store this private key offline.\n\nPrivate key:\n" + privkey_hex +
@@ -5250,7 +5183,7 @@ void WalletWindow::submit_send() {
     }
 
     auto tx = finalis::build_signed_p2pkh_tx_multi_input(
-        plan->selected_prevs, finalis::Bytes(key->privkey.begin(), key->privkey.end()), plan->outputs, &err);
+        plan->selected_prevs, key_bytes(key->privkey).bytes, plan->outputs, &err);
     if (!tx) {
       QMessageBox::warning(this, "Send", QString::fromStdString(err));
       return;
@@ -5320,24 +5253,26 @@ void WalletWindow::submit_send() {
         .amount = *amount_units,
         .value_blind = crypto::Blind32{random_hash32()},
     };
+    Hash32 rangeproof_nonce = random_hash32();
+    crypto::ScopedWipe<Hash32, Hash32> wipe_secrets(secrets.value_blind.bytes, rangeproof_nonce);
     auto recipient = parsed_recipient->recipient;
     if (parsed_recipient->memo_key.has_value()) {
       auto recovery_memo =
           encrypt_confidential_recovery_memo(*amount_units, secrets.value_blind, *parsed_recipient->memo_key,
-                                             recipient.ephemeral_pubkey);
+                                             recipient.one_time_pubkey, recipient.ephemeral_pubkey);
       if (!recovery_memo) {
         QMessageBox::warning(this, "Send", "Failed to encrypt confidential recovery memo.");
         return;
       }
       recipient.memo = *recovery_memo;
     }
-    auto confidential_out = build_confidential_output(recipient, secrets, random_hash32(), &err);
+    auto confidential_out = build_confidential_output(recipient, secrets, rangeproof_nonce, &err);
     if (!confidential_out) {
       QMessageBox::warning(this, "Send", QString::fromStdString(err));
       return;
     }
     auto tx = build_txv2_transparent_to_confidential(
-        selected_prev->first, selected_prev->second, Bytes(key->privkey.begin(), key->privkey.end()),
+        selected_prev->first, selected_prev->second, key_bytes(key->privkey).bytes,
         selected_prev->second.value, change_output, *confidential_out, secrets.value_blind, *amount_units,
         applied_fee_units, &err);
     if (!tx) {
@@ -5392,13 +5327,16 @@ void WalletWindow::submit_send() {
       QMessageBox::warning(this, "Send", selection_err);
       return;
     }
+    Hash32 spend_auth_nonce = random_hash32();
+    Hash32 excess_auth_nonce = random_hash32();
+    crypto::ScopedWipe<Hash32, Hash32> wipe_nonces(spend_auth_nonce, excess_auth_nonce);
     auto tx = build_txv2_confidential_to_transparent(
         *coin,
         TransparentTxOutV2{
             *amount_units,
             finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
         },
-        finalis::DEFAULT_WALLET_SEND_FEE_UNITS, random_hash32(), random_hash32(), &err);
+        finalis::DEFAULT_WALLET_SEND_FEE_UNITS, spend_auth_nonce, excess_auth_nonce, &err);
     if (!tx) {
       QMessageBox::warning(this, "Send", QString::fromStdString(err));
       return;
@@ -5463,7 +5401,7 @@ void WalletWindow::submit_send() {
             if (retry_plan) {
               auto retry_tx = finalis::build_signed_p2pkh_tx_multi_input(
                   retry_plan->selected_prevs,
-                  finalis::Bytes(cached_key->privkey.begin(), cached_key->privkey.end()),
+                  key_bytes(cached_key->privkey).bytes,
                   retry_plan->outputs, &err);
               if (retry_tx) {
                 Bytes retry_bytes = retry_tx->serialize();

@@ -25,6 +25,7 @@ bool resign_transparent_input(TxV2& tx, const Bytes& private_key_32, std::size_t
     return false;
   }
   std::array<std::uint8_t, 32> seed{};
+  crypto::ScopedWipe<std::array<std::uint8_t, 32>> wipe_seed(seed);
   std::copy(private_key_32.begin(), private_key_32.end(), seed.begin());
   auto kp = crypto::keypair_from_seed32(seed);
   if (!kp.has_value()) {
@@ -150,11 +151,12 @@ std::optional<TxV2> build_txv2_transparent_to_confidential(
   tx.fee = fee;
 
   const auto transparent_output_value = transparent_output.has_value() ? transparent_output->value : 0;
-  const auto excess_blind = crypto::combine_blinds(std::span<const crypto::Blind32>(&confidential_output_blind, 1), 0);
+  auto excess_blind = crypto::combine_blinds(std::span<const crypto::Blind32>(&confidential_output_blind, 1), 0);
   if (!excess_blind.has_value()) {
     if (err) *err = "failed to compute confidential output excess blind";
     return std::nullopt;
   }
+  crypto::ScopedWipe<Hash32> wipe_excess(excess_blind->bytes);
   const auto excess_commitment = crypto::confidential_amount_commitment(
       transparent_input_value - transparent_output_value - confidential_output_value - fee, *excess_blind);
   if (!excess_commitment.has_value()) {

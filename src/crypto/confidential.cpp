@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "crypto/confidential.hpp"
+#include "crypto/secure_memory.hpp"
 
 #include <algorithm>
 #include <array>
@@ -42,8 +43,18 @@ std::array<std::uint8_t, 32> scalar_from_u64(std::uint64_t value) {
 }
 
 #if defined(SC_HAS_SECP256K1)
+// Re-blind the signing context after this many secret-dependent operations.
+constexpr std::uint32_t kSignCtxRerandomizeInterval = 64;
+
 struct SecpBackend {
+  // Shared, never mutated after init: parsing, serialization, verification, public-value commitments.
   secp256k1_context* ctx{nullptr};
+  // Secret-dependent generator multiplications (keys, blinds, signing, range proofs). Randomized
+  // (secp256k1_context_randomize) at creation and every kSignCtxRerandomizeInterval uses for
+  // side-channel blinding; randomizing mutates it, so all use is serialized by sign_mu.
+  secp256k1_context* sign_ctx{nullptr};
+  std::mutex sign_mu;
+  std::uint32_t sign_uses{0};
 #if defined(SC_HAS_SECP256K1_ZKP)
   const secp256k1_generator* value_generator{nullptr};
 #endif
@@ -56,10 +67,40 @@ SecpBackend& backend() {
   return state;
 }
 
+// Fresh 32-byte CSPRNG seed. On RNG failure the previous blinding stays in place; results are
+// identical either way, only the side-channel hardening is not refreshed.
+bool randomize_context(secp256k1_context* ctx) {
+  std::array<unsigned char, 32> seed{};
+  ScopedWipe<std::array<unsigned char, 32>> wipe_seed(seed);
+  if (!secure_random_bytes(seed.data(), seed.size())) return false;
+  return secp256k1_context_randomize(ctx, seed.data()) == 1;
+}
+
+// Exclusive handle on the signing context; re-randomizes it on the configured interval.
+class SignCtx {
+ public:
+  SignCtx() : lock_(backend().sign_mu) {
+    auto& state = backend();
+    if (++state.sign_uses % kSignCtxRerandomizeInterval == 0) (void)randomize_context(state.sign_ctx);
+  }
+  secp256k1_context* get() const { return backend().sign_ctx; }
+
+ private:
+  std::lock_guard<std::mutex> lock_;
+};
+
 bool parse_pubkey(const PubKey33& bytes, secp256k1_pubkey* pubkey_out) {
   if (!backend().ctx) return false;
   return secp256k1_ec_pubkey_parse(backend().ctx, pubkey_out, bytes.data(), bytes.size()) == 1;
 }
+
+#if defined(SC_HAS_SECP256K1_ZKP)
+// secp256k1_keypair embeds the secret key.
+struct KeypairWipe {
+  secp256k1_keypair& keypair;
+  ~KeypairWipe() { secure_wipe(&keypair, sizeof(keypair)); }
+};
+#endif
 
 bool parse_xonly_pubkey(const PubKey32& bytes, secp256k1_xonly_pubkey* pubkey_out) {
 #if defined(SC_HAS_SECP256K1_ZKP)
@@ -202,7 +243,10 @@ bool confidential_crypto_init() {
   std::call_once(once, []() {
     auto& state = backend();
     state.ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
-    state.status.secp256k1_available = state.ctx != nullptr;
+    state.sign_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
+    if (state.ctx != nullptr) (void)randomize_context(state.ctx);
+    if (state.sign_ctx != nullptr) (void)randomize_context(state.sign_ctx);
+    state.status.secp256k1_available = state.ctx != nullptr && state.sign_ctx != nullptr;
 #if defined(SC_HAS_SECP256K1_ZKP)
     state.status.zkp_backend_available = state.ctx != nullptr;
     state.value_generator = secp256k1_generator_h;
@@ -239,7 +283,10 @@ std::optional<PubKey33> secp256k1_pubkey_from_scalar(const Hash32& scalar32) {
 #if defined(SC_HAS_SECP256K1)
   if (!confidential_crypto_init()) return std::nullopt;
   secp256k1_pubkey pubkey{};
-  if (secp256k1_ec_pubkey_create(backend().ctx, &pubkey, scalar32.data()) != 1) return std::nullopt;
+  {
+    SignCtx sign;
+    if (secp256k1_ec_pubkey_create(sign.get(), &pubkey, scalar32.data()) != 1) return std::nullopt;
+  }
   return serialize_pubkey(pubkey);
 #else
   (void)scalar32;
@@ -316,8 +363,11 @@ std::optional<Commitment33> confidential_amount_commitment(std::uint64_t amount,
   if (!confidential_crypto_init()) return std::nullopt;
   if (!backend().status.rangeproof_backend_available || backend().value_generator == nullptr) return std::nullopt;
   secp256k1_pedersen_commitment commitment{};
-  if (secp256k1_pedersen_commit(backend().ctx, &commitment, blind.bytes.data(), amount, backend().value_generator) != 1) {
-    return std::nullopt;
+  {
+    SignCtx sign;
+    if (secp256k1_pedersen_commit(sign.get(), &commitment, blind.bytes.data(), amount, backend().value_generator) != 1) {
+      return std::nullopt;
+    }
   }
   return serialize_pedersen_commitment(commitment);
 #else
@@ -332,7 +382,11 @@ std::optional<PubKey32> excess_xonly_pubkey_from_scalar(const Blind32& blind) {
   if (!confidential_crypto_init()) return std::nullopt;
   if (!backend().status.excess_authorization_available) return std::nullopt;
   secp256k1_keypair keypair{};
-  if (secp256k1_keypair_create(backend().ctx, &keypair, blind.bytes.data()) != 1) return std::nullopt;
+  KeypairWipe wipe_keypair{keypair};
+  {
+    SignCtx sign;
+    if (secp256k1_keypair_create(sign.get(), &keypair, blind.bytes.data()) != 1) return std::nullopt;
+  }
   secp256k1_xonly_pubkey xonly{};
   if (secp256k1_keypair_xonly_pub(backend().ctx, &xonly, nullptr, &keypair) != 1) return std::nullopt;
   return serialize_xonly_pubkey(xonly);
@@ -355,9 +409,11 @@ std::optional<Sig64> sign_schnorr_authorization(const Hash32& msg32, const Blind
   if (!confidential_crypto_init()) return std::nullopt;
   if (!backend().status.excess_authorization_available) return std::nullopt;
   secp256k1_keypair keypair{};
-  if (secp256k1_keypair_create(backend().ctx, &keypair, secret_scalar.bytes.data()) != 1) return std::nullopt;
+  KeypairWipe wipe_keypair{keypair};
+  SignCtx sign;
+  if (secp256k1_keypair_create(sign.get(), &keypair, secret_scalar.bytes.data()) != 1) return std::nullopt;
   Sig64 sig{};
-  if (secp256k1_schnorrsig_sign32(backend().ctx, sig.data(), msg32.data(), &keypair, aux32.data()) != 1) {
+  if (secp256k1_schnorrsig_sign32(sign.get(), sig.data(), msg32.data(), &keypair, aux32.data()) != 1) {
     return std::nullopt;
   }
   return sig;
@@ -438,7 +494,8 @@ std::optional<ProofBytes> sign_output_range_proof(const Commitment33& commitment
   ProofBytes out;
   out.bytes.resize(secp256k1_rangeproof_max_size(backend().ctx, UINT64_MAX, 64));
   size_t proof_len = out.bytes.size();
-  if (secp256k1_rangeproof_sign(backend().ctx, out.bytes.data(), &proof_len, shape.min_value, &parsed, blind.bytes.data(),
+  SignCtx sign;
+  if (secp256k1_rangeproof_sign(sign.get(), out.bytes.data(), &proof_len, shape.min_value, &parsed, blind.bytes.data(),
                                 nonce32.data(), shape.exp, shape.min_bits, amount, nullptr, 0, nullptr, 0,
                                 backend().value_generator) != 1) {
     return std::nullopt;

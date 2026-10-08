@@ -148,6 +148,8 @@ class WalletWindow final : public QMainWindow {
     std::string network_name;
     std::string address;
     std::string pubkey_hex;
+
+    ~LoadedWallet() { crypto::secure_wipe(passphrase); }
   };
 
   struct WalletUtxo {

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/types.hpp"
+#include "crypto/secure_memory.hpp"
 #include "storage/db.hpp"
 #include "utxo/tx.hpp"
 
@@ -16,6 +17,11 @@ namespace finalis::wallet {
 
 class WalletStore {
  public:
+  WalletStore() = default;
+  WalletStore(const WalletStore&) = delete;
+  WalletStore& operator=(const WalletStore&) = delete;
+  ~WalletStore() { crypto::secure_wipe(passphrase_); }
+
   struct PendingSpend {
     std::string txid_hex;
     std::vector<OutPoint> inputs;
@@ -96,6 +102,8 @@ class WalletStore {
     std::string view_key_material_hex;
     std::string spend_key_material_hex;
     bool active{true};
+
+    ~ConfidentialAccountRecord() { crypto::secure_wipe(view_key_material_hex); crypto::secure_wipe(spend_key_material_hex); }
   };
 
   struct ConfidentialCoinRecord {
@@ -109,6 +117,8 @@ class WalletStore {
     std::string spend_secret_hex;
     std::string blinding_factor_hex;
     bool spent{false};
+
+    ~ConfidentialCoinRecord() { crypto::secure_wipe(spend_secret_hex); crypto::secure_wipe(blinding_factor_hex); }
   };
 
   struct ConfidentialRequestRecord {
@@ -120,6 +130,8 @@ class WalletStore {
     std::string spend_secret_hex;
     std::string memo_key_hex;
     bool consumed{false};
+
+    ~ConfidentialRequestRecord() { crypto::secure_wipe(spend_secret_hex); crypto::secure_wipe(memo_key_hex); }
   };
 
   struct State {

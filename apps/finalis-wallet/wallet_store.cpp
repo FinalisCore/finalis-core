@@ -112,15 +112,18 @@ bool aes_gcm_decrypt(const Bytes& key32, const Bytes& nonce12, const Bytes& ciph
   int total = 0;
   if (EVP_DecryptUpdate(ctx, plain.data(), &out_len, cipher_and_tag.data(), static_cast<int>(clen)) != 1) {
     EVP_CIPHER_CTX_free(ctx);
+    crypto::secure_wipe(plain);
     return false;
   }
   total += out_len;
   if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kWalletTagLen), const_cast<std::uint8_t*>(tag)) != 1) {
     EVP_CIPHER_CTX_free(ctx);
+    crypto::secure_wipe(plain);
     return false;
   }
   if (EVP_DecryptFinal_ex(ctx, plain.data() + total, &out_len) != 1) {
     EVP_CIPHER_CTX_free(ctx);
+    crypto::secure_wipe(plain);
     return false;
   }
   total += out_len;
@@ -128,6 +131,19 @@ bool aes_gcm_decrypt(const Bytes& key32, const Bytes& nonce12, const Bytes& ciph
   EVP_CIPHER_CTX_free(ctx);
   *out_plaintext = std::move(plain);
   return true;
+}
+
+// Secret hex fields go through these so the transient byte copies are wiped.
+void write_secret(codec::ByteWriter& w, const std::string& secret) {
+  Bytes b = to_bytes(secret);
+  w.varbytes(b);
+  crypto::secure_wipe(b);
+}
+
+std::string take_secret(std::optional<Bytes>& b) {
+  std::string out = from_bytes(*b);
+  crypto::secure_wipe(*b);
+  return out;
 }
 
 bool random_bytes(Bytes* out) {
@@ -432,8 +448,8 @@ Bytes serialize_confidential_account_plain(const WalletStore::ConfidentialAccoun
   w.varbytes(to_bytes(record.account_id));
   w.varbytes(to_bytes(record.label));
   w.varbytes(to_bytes(record.stealth_address));
-  w.varbytes(to_bytes(record.view_key_material_hex));
-  w.varbytes(to_bytes(record.spend_key_material_hex));
+  write_secret(w, record.view_key_material_hex);
+  write_secret(w, record.spend_key_material_hex);
   w.u8(record.active ? 1 : 0);
   return w.take();
 }
@@ -455,8 +471,8 @@ std::optional<WalletStore::ConfidentialAccountRecord> parse_confidential_account
         out.account_id = from_bytes(*account_id);
         out.label = from_bytes(*label);
         out.stealth_address = from_bytes(*stealth_address);
-        out.view_key_material_hex = from_bytes(*view_key_material);
-        out.spend_key_material_hex = from_bytes(*spend_key_material);
+        out.view_key_material_hex = take_secret(view_key_material);
+        out.spend_key_material_hex = take_secret(spend_key_material);
         out.active = (*active != 0);
         return true;
       })) {
@@ -475,8 +491,8 @@ Bytes serialize_confidential_coin_plain(const WalletStore::ConfidentialCoinRecor
   w.varbytes(to_bytes(record.value_commitment_hex));
   w.varbytes(to_bytes(record.one_time_pubkey_hex));
   w.varbytes(to_bytes(record.ephemeral_pubkey_hex));
-  w.varbytes(to_bytes(record.spend_secret_hex));
-  w.varbytes(to_bytes(record.blinding_factor_hex));
+  write_secret(w, record.spend_secret_hex);
+  write_secret(w, record.blinding_factor_hex);
   w.u8(record.spent ? 1 : 0);
   return w.take();
 }
@@ -507,8 +523,8 @@ std::optional<WalletStore::ConfidentialCoinRecord> parse_confidential_coin_plain
         out.value_commitment_hex = from_bytes(*commitment);
         out.one_time_pubkey_hex = from_bytes(*one_time);
         out.ephemeral_pubkey_hex = from_bytes(*ephemeral);
-        out.spend_secret_hex = from_bytes(*spend_secret);
-        out.blinding_factor_hex = from_bytes(*blinding);
+        out.spend_secret_hex = take_secret(spend_secret);
+        out.blinding_factor_hex = take_secret(blinding);
         out.spent = (*spent != 0);
         return true;
       })) {
@@ -525,8 +541,8 @@ Bytes serialize_confidential_request_plain(const WalletStore::ConfidentialReques
   w.varbytes(to_bytes(record.one_time_pubkey_hex));
   w.varbytes(to_bytes(record.ephemeral_pubkey_hex));
   w.u8(record.scan_tag);
-  w.varbytes(to_bytes(record.spend_secret_hex));
-  w.varbytes(to_bytes(record.memo_key_hex));
+  write_secret(w, record.spend_secret_hex);
+  write_secret(w, record.memo_key_hex);
   w.u8(record.consumed ? 1 : 0);
   return w.take();
 }
@@ -553,8 +569,8 @@ std::optional<WalletStore::ConfidentialRequestRecord> parse_confidential_request
         out.one_time_pubkey_hex = from_bytes(*one_time_pubkey_hex);
         out.ephemeral_pubkey_hex = from_bytes(*ephemeral_pubkey_hex);
         out.scan_tag = *scan_tag;
-        out.spend_secret_hex = from_bytes(*spend_secret_hex);
-        out.memo_key_hex = from_bytes(*memo_key_hex);
+        out.spend_secret_hex = take_secret(spend_secret_hex);
+        out.memo_key_hex = take_secret(memo_key_hex);
         out.consumed = (*consumed != 0);
         return true;
       })) {
@@ -569,6 +585,7 @@ Bytes encrypt_secret_payload(const std::string& passphrase, const Bytes& plain) 
   Bytes nonce(kWalletNonceLen, 0);
   if (!random_bytes(&salt) || !random_bytes(&nonce)) return {};
   Bytes key32;
+  crypto::ScopedWipe<Bytes> wipe_key(key32);
   if (!derive_key_pbkdf2(passphrase, salt, kConfidentialWalletPbkdf2Iterations, &key32)) return {};
   Bytes cipher_and_tag;
   if (!aes_gcm_encrypt(key32, nonce, plain, &cipher_and_tag)) return {};
@@ -593,9 +610,11 @@ std::optional<Bytes> decrypt_secret_payload(const std::string& passphrase, const
         if (!version || !iterations || !salt || !nonce || !cipher_and_tag) return false;
         if (*version != kConfidentialWalletRecordVersion) return false;
         Bytes key32;
+        crypto::ScopedWipe<Bytes> wipe_key(key32);
         if (!derive_key_pbkdf2(passphrase, *salt, *iterations, &key32)) return false;
         return aes_gcm_decrypt(key32, *nonce, *cipher_and_tag, &plain);
       })) {
+    crypto::secure_wipe(plain);
     return std::nullopt;
   }
   return plain;
@@ -605,6 +624,7 @@ std::optional<Bytes> decrypt_secret_payload(const std::string& passphrase, const
 
 bool WalletStore::open(const std::string& wallet_file_path, const std::string& passphrase) {
   path_ = wallet_file_path + ".walletdb";
+  crypto::secure_wipe(passphrase_);
   passphrase_ = passphrase;
   std::filesystem::create_directories(path_);
   return db_.open(path_);
@@ -671,6 +691,7 @@ bool WalletStore::load(State* out) const {
     auto plain = decrypt_secret_payload(passphrase_, value);
     if (!plain) continue;
     auto parsed = parse_confidential_account_plain(*plain);
+    crypto::secure_wipe(*plain);
     if (!parsed) continue;
     out->confidential_accounts.push_back(*parsed);
   }
@@ -681,6 +702,7 @@ bool WalletStore::load(State* out) const {
     auto plain = decrypt_secret_payload(passphrase_, value);
     if (!plain) continue;
     auto parsed = parse_confidential_coin_plain(*plain);
+    crypto::secure_wipe(*plain);
     if (!parsed) continue;
     out->confidential_coins.push_back(*parsed);
   }
@@ -693,6 +715,7 @@ bool WalletStore::load(State* out) const {
     auto plain = decrypt_secret_payload(passphrase_, value);
     if (!plain) continue;
     auto parsed = parse_confidential_request_plain(*plain);
+    crypto::secure_wipe(*plain);
     if (!parsed) continue;
     out->confidential_requests.push_back(*parsed);
   }
@@ -824,7 +847,9 @@ bool WalletStore::append_local_event(const std::string& line) {
 
 bool WalletStore::upsert_confidential_account(const ConfidentialAccountRecord& record) {
   if (!can_persist_confidential_secrets()) return false;
-  const auto encrypted = encrypt_secret_payload(passphrase_, serialize_confidential_account_plain(record));
+  Bytes plain = serialize_confidential_account_plain(record);
+  const auto encrypted = encrypt_secret_payload(passphrase_, plain);
+  crypto::secure_wipe(plain);
   if (encrypted.empty()) return false;
   return db_.put(key_confidential_account(record.account_id), encrypted);
 }
@@ -836,7 +861,9 @@ bool WalletStore::set_confidential_primary_account_id(const std::optional<std::s
 
 bool WalletStore::upsert_confidential_coin(const ConfidentialCoinRecord& record) {
   if (!can_persist_confidential_secrets()) return false;
-  const auto encrypted = encrypt_secret_payload(passphrase_, serialize_confidential_coin_plain(record));
+  Bytes plain = serialize_confidential_coin_plain(record);
+  const auto encrypted = encrypt_secret_payload(passphrase_, plain);
+  crypto::secure_wipe(plain);
   if (encrypted.empty()) return false;
   return db_.put(key_confidential_coin(record.txid_hex, record.vout), encrypted);
 }
@@ -845,9 +872,10 @@ bool WalletStore::set_confidential_coin_spent(const std::string& txid_hex, std::
   if (!can_persist_confidential_secrets()) return false;
   const auto current = db_.get(key_confidential_coin(txid_hex, vout));
   if (!current) return false;
-  const auto plain = decrypt_secret_payload(passphrase_, *current);
+  auto plain = decrypt_secret_payload(passphrase_, *current);
   if (!plain) return false;
   auto parsed = parse_confidential_coin_plain(*plain);
+  crypto::secure_wipe(*plain);
   if (!parsed) return false;
   parsed->spent = spent;
   return upsert_confidential_coin(*parsed);
@@ -859,7 +887,9 @@ bool WalletStore::remove_confidential_coin(const std::string& txid_hex, std::uin
 
 bool WalletStore::upsert_confidential_request(const ConfidentialRequestRecord& record) {
   if (!can_persist_confidential_secrets()) return false;
-  const auto encrypted = encrypt_secret_payload(passphrase_, serialize_confidential_request_plain(record));
+  Bytes plain = serialize_confidential_request_plain(record);
+  const auto encrypted = encrypt_secret_payload(passphrase_, plain);
+  crypto::secure_wipe(plain);
   if (encrypted.empty()) return false;
   return db_.put(key_confidential_request(record.request_id), encrypted);
 }
@@ -868,9 +898,10 @@ bool WalletStore::set_confidential_request_consumed(const std::string& request_i
   if (!can_persist_confidential_secrets()) return false;
   const auto current = db_.get(key_confidential_request(request_id));
   if (!current) return false;
-  const auto plain = decrypt_secret_payload(passphrase_, *current);
+  auto plain = decrypt_secret_payload(passphrase_, *current);
   if (!plain) return false;
   auto parsed = parse_confidential_request_plain(*plain);
+  crypto::secure_wipe(*plain);
   if (!parsed) return false;
   parsed->consumed = consumed;
   return upsert_confidential_request(*parsed);

@@ -13,7 +13,6 @@
 #include <cstdlib>
 #include <sstream>
 #include <optional>
-#include <random>
 #include <set>
 #include <string>
 #include <algorithm>
@@ -37,6 +36,7 @@
 #include "consensus/randomness.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/secure_memory.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
 #include "common/keystore.hpp"
@@ -2587,8 +2587,10 @@ int main(int argc, char** argv) {
       }
       seed = *s;
     } else {
-      std::random_device rd;
-      for (auto& b : seed) b = static_cast<std::uint8_t>(rd());
+      if (!finalis::crypto::secure_random_bytes(seed.data(), seed.size())) {
+        std::cerr << "secure RNG unavailable\n";
+        return 1;
+      }
     }
 
     auto kp = finalis::crypto::keypair_from_seed32(seed);
