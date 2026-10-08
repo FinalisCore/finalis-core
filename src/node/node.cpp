@@ -890,6 +890,8 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   if (stun_candidate_endpoint_.has_value()) {
     snapshot.stun_endpoint_candidate = stun_candidate_endpoint_->key();
   }
+  snapshot.abstaining_heights.assign(abstain_heights_.begin(), abstain_heights_.end());
+
   snapshot.next_height_committee_available = !committee_for_height_round(finalized_height_ + 1, current_round_).empty();
   snapshot.next_height_proposer_available = leader_for_height_round(finalized_height_ + 1, current_round_).has_value();
   snapshot.captured_at_unix_ms = now_ms;
@@ -1409,8 +1411,11 @@ void Node::event_loop() {
         force_validator_redial = true;
       }
       const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
+      // SAFETY: an abstaining node may already have proposed at this height before losing its
+      // safety state; proposing again could be a different payload (proposer equivocation).
       if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready && ticket_window_elapsed &&
-          !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready) {
+          !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready &&
+          !abstaining_at_height_locked(h)) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           should_build_proposal = true;
@@ -1456,7 +1461,9 @@ void Node::event_loop() {
         const bool local_timeout_member =
             std::find(timeout_committee.begin(), timeout_committee.end(), local_key_.public_key) != timeout_committee.end();
         bool timeout_evidence_progressed = local_timeout_reserved;
-        if (local_timeout_member && !local_timeout_reserved) {
+        // Timeout votes are blocked too while abstaining (conservative: no signatures at all at h).
+        const bool abstaining = abstaining_at_height_locked(h);
+        if (local_timeout_member && !local_timeout_reserved && !abstaining) {
           if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(h, timeout_round), local_key_.private_key);
               sig.has_value()) {
             local_timeout_vote_reservations_.insert(timeout_vote_key);
@@ -1470,6 +1477,9 @@ void Node::event_loop() {
         } else if (!local_timeout_member) {
           log_line("round-timeout-vote-skip height=" + std::to_string(h) + " round=" + std::to_string(timeout_round) +
                    " reason=not-committee-member");
+        } else if (abstaining) {
+          log_line("round-timeout-vote-skip height=" + std::to_string(h) + " round=" + std::to_string(timeout_round) +
+                   " reason=abstain-corrupt-safety-state");
         }
         const bool allow_timeout_round_advance =
             !timeout_committee.empty() &&

@@ -35,6 +35,12 @@ inline constexpr const char* kConsensusSafetyStatePrefix = "CSAFE:";
 // Full FrontierProposal behind the local vote lock at a height, written in the same durable batch
 // as the lock so a restarted node can still re-propose / re-vote its locked payload.
 inline constexpr const char* kConsensusLockedProposalPrefix = "CSLP:";
+// Second copy of each CSAFE: row, written in the same atomic batch with a differently keyed
+// checksum. Load falls back to it when the primary is unreadable.
+inline constexpr const char* kConsensusSafetyMirrorPrefix = "CSAFE_MIRROR:";
+// Raw bytes of a safety-state row that could not be read at startup. While present above the
+// finalized height, the node abstains from signing anything at that height.
+inline constexpr const char* kConsensusSafetyQuarantinePrefix = "CSAFE_QUARANTINE:";
 
 // --- In-process local bus (disable_p2p mode); defined in node_internal.cpp ---
 extern std::mutex g_local_bus_mu;
@@ -132,6 +138,15 @@ Hash32 consensus_payload_id(const FrontierTransition& transition);
 bool parse_consensus_safety_state(const Bytes& b, std::optional<std::pair<Hash32, std::uint32_t>>* lock_state,
                                   std::optional<QuorumCertificate>* qc_state, std::optional<Hash32>* qc_payload_id);
 std::string key_consensus_locked_proposal(std::uint64_t height);
+std::string key_consensus_safety_state(std::uint64_t height);
+std::string key_consensus_safety_mirror(std::uint64_t height);
+std::string key_consensus_safety_quarantine(std::uint64_t height);
+// Wraps a serialized safety state as magic | version | inner | checksum. The checksum domain
+// differs between primary and mirror so a copy stored under the wrong key fails verification.
+Bytes seal_consensus_safety_row(const Bytes& inner, bool mirror);
+// Returns the inner state bytes, or nullopt if magic/version/checksum do not verify. A primary
+// row without the magic is a legacy (pre-checksum) row and is returned unchanged.
+std::optional<Bytes> unseal_consensus_safety_row(const Bytes& row, bool mirror);
 void sync_smt_tree(storage::DB& db, storage::DB::Batch& batch, const std::string& tree_id,
                    const std::vector<std::pair<Hash32, Bytes>>& leaves);
 StateRoots persist_state_roots(storage::DB& db, storage::DB::Batch& batch, std::uint64_t height, const UtxoSetV2& utxos,

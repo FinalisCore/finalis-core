@@ -1036,6 +1036,16 @@ std::string tx_status_json(const Hash32& txid, const std::optional<storage::DB::
   return oss.str();
 }
 
+// Heights where the node refuses to sign (unreadable consensus safety state); see Node::load_state.
+std::string abstaining_heights_json(const std::vector<std::uint64_t>& heights) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < heights.size(); ++i) {
+    if (i != 0) out += ",";
+    out += std::to_string(heights[i]);
+  }
+  return out + "]";
+}
+
 std::string readiness_json(const storage::NodeRuntimeStatusSnapshot& snapshot) {
   std::ostringstream oss;
   oss << "{\"chain_id_ok\":" << (snapshot.chain_id_ok ? "true" : "false")
@@ -1063,6 +1073,7 @@ std::string readiness_json(const storage::NodeRuntimeStatusSnapshot& snapshot) {
       << ",\"stun_endpoint_change_hits\":" << snapshot.stun_endpoint_change_hits
       << ",\"stun_endpoint_change_required_hits\":" << snapshot.stun_endpoint_change_required_hits
       << ",\"stun_endpoint_candidate\":\"" << minijson::escape(snapshot.stun_endpoint_candidate) << "\""
+      << ",\"abstaining_heights\":" << abstaining_heights_json(snapshot.abstaining_heights)
       << ",\"finalized_lag\":" << snapshot.finalized_lag
       << ",\"peer_height_disagreement\":" << (snapshot.peer_height_disagreement ? "true" : "false")
       << ",\"next_height_committee_available\":" << (snapshot.next_height_committee_available ? "true" : "false")
@@ -2108,6 +2119,9 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     else oss << "null";
     oss << ",\"stun_endpoint_candidate\":";
     if (runtime.has_value()) oss << "\"" << minijson::escape(runtime->stun_endpoint_candidate) << "\"";
+    else oss << "null";
+    oss << ",\"abstaining_heights\":";
+    if (runtime.has_value()) oss << abstaining_heights_json(runtime->abstaining_heights);
     else oss << "null";
     oss << ",\"protocol_reserve_balance\":";
     if (auto reserve = view->get_protocol_reserve_balance(); reserve.has_value()) oss << *reserve;

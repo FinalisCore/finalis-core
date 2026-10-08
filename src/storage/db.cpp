@@ -1009,6 +1009,8 @@ Bytes serialize_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& sn
   w.u32le(snapshot.stun_endpoint_change_hits);
   w.u32le(snapshot.stun_endpoint_change_required_hits);
   w.varbytes(Bytes(snapshot.stun_endpoint_candidate.begin(), snapshot.stun_endpoint_candidate.end()));
+  w.varint(snapshot.abstaining_heights.size());
+  for (const auto h : snapshot.abstaining_heights) w.u64le(h);
   return w.take();
 }
 
@@ -1214,8 +1216,7 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
         auto stun_change_hits = r.u32le();
         auto stun_change_required_hits = r.u32le();
         auto stun_candidate = r.varbytes();
-        if (!stun_backoff_until || !stun_change_pending || !stun_change_hits || !stun_change_required_hits || !stun_candidate ||
-            !r.eof()) {
+        if (!stun_backoff_until || !stun_change_pending || !stun_change_hits || !stun_change_required_hits || !stun_candidate) {
           return false;
         }
         snapshot.stun_backoff_until_unix_ms = *stun_backoff_until;
@@ -1223,7 +1224,15 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
         snapshot.stun_endpoint_change_hits = *stun_change_hits;
         snapshot.stun_endpoint_change_required_hits = *stun_change_required_hits;
         snapshot.stun_endpoint_candidate = std::string(stun_candidate->begin(), stun_candidate->end());
-        return true;
+        if (r.eof()) return true;
+        auto abstain_count = r.varint();
+        if (!abstain_count || *abstain_count > 1024) return false;
+        for (std::uint64_t i = 0; i < *abstain_count; ++i) {
+          auto h = r.u64le();
+          if (!h) return false;
+          snapshot.abstaining_heights.push_back(*h);
+        }
+        return r.eof();
       })) {
     return std::nullopt;
   }

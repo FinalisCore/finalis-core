@@ -1077,25 +1077,73 @@ bool Node::load_state() {
     for (std::size_t i = 0; i < 8; ++i) height |= static_cast<std::uint64_t>((*height_bytes)[i]) << (8 * i);
     return height;
   };
-  for (const auto& [key, value] : db_.scan_prefix(kConsensusSafetyStatePrefix)) {
-    const auto height = parse_height_key(key, kConsensusSafetyStatePrefix);
-    if (!height.has_value()) continue;
-    if (*height <= finalized_height_) {
-      (void)db_.erase(key);
-      continue;
+  abstain_heights_.clear();
+  std::set<std::uint64_t> safety_heights;
+  for (const char* prefix : {kConsensusSafetyStatePrefix, kConsensusSafetyMirrorPrefix}) {
+    for (const auto& [key, value] : db_.scan_prefix(prefix)) {
+      const auto height = parse_height_key(key, prefix);
+      if (!height.has_value()) continue;
+      if (*height <= finalized_height_) {
+        (void)db_.erase(key);
+        continue;
+      }
+      safety_heights.insert(*height);
     }
+  }
+  for (const auto height : safety_heights) {
+    const auto primary_row = db_.get(key_consensus_safety_state(height));
+    const auto mirror_row = db_.get(key_consensus_safety_mirror(height));
     std::optional<std::pair<Hash32, std::uint32_t>> lock_state;
     std::optional<QuorumCertificate> qc_state;
     std::optional<Hash32> qc_payload_id;
-    if (!parse_consensus_safety_state(value, &lock_state, &qc_state, &qc_payload_id)) {
-      // Rows are written atomically, so this is storage corruption, not a torn write.
-      log_line("consensus-safety-row-dropped height=" + std::to_string(*height) + " reason=parse-failed");
-      (void)db_.erase(key);
+    auto decode = [&](const std::optional<Bytes>& row, bool mirror) {
+      if (!row.has_value()) return false;
+      const auto inner = unseal_consensus_safety_row(*row, mirror);
+      if (!inner.has_value()) return false;
+      lock_state.reset();
+      qc_state.reset();
+      qc_payload_id.reset();
+      return parse_consensus_safety_state(*inner, &lock_state, &qc_state, &qc_payload_id);
+    };
+    const bool primary_ok = decode(primary_row, false);
+    const bool mirror_ok = !primary_ok && decode(mirror_row, true);
+    if (!primary_ok && !mirror_ok) {
+      // Both copies unreadable: the lock (if any) is lost.
+      // A node outside a multi-member committee for this height cannot have voted here, so the
+      // row could only have held an observed QC and is safe to drop. Committees of size < 2 use
+      // per-round fallback members, so membership is not knowable for every round: quarantine.
+      if (height == finalized_height_ + 1) {
+        const auto committee = committee_for_height_round(height, 0);
+        if (committee.size() >= 2 &&
+            std::find(committee.begin(), committee.end(), local_key_.public_key) == committee.end()) {
+          log_line("consensus-safety-row-dropped height=" + std::to_string(height) +
+                   " reason=unreadable-not-committee-member");
+          storage::DB::Batch drop(db_);
+          drop.erase(key_consensus_safety_state(height));
+          drop.erase(key_consensus_safety_mirror(height));
+          if (!db_.write_batch_durable(drop)) return false;
+          continue;
+        }
+      }
+      // SAFETY: never erase what may be this node's only record of a broadcast vote. Keep the
+      // raw bytes (a fixed binary may be able to read them) and abstain at this height.
+      log_line("Consensus safety state for height " + std::to_string(height) +
+               " unreadable, quarantining and abstaining from voting");
+      storage::DB::Batch quarantine(db_);
+      if (!db_.get(key_consensus_safety_quarantine(height)).has_value()) {
+        quarantine.put(key_consensus_safety_quarantine(height), primary_row.has_value() ? *primary_row : *mirror_row);
+      }
+      quarantine.erase(key_consensus_safety_state(height));
+      quarantine.erase(key_consensus_safety_mirror(height));
+      if (!db_.write_batch_durable(quarantine)) return false;
       continue;
+    }
+    if (mirror_ok) {
+      log_line("consensus-safety-primary-repaired height=" + std::to_string(height) + " source=mirror");
     }
     bool qc_valid = true;
     if (qc_state.has_value()) {
-      if (qc_state->height != *height || !qc_payload_id.has_value()) {
+      if (qc_state->height != height || !qc_payload_id.has_value()) {
         qc_valid = false;
       } else {
         std::vector<FinalitySig> filtered;
@@ -1104,16 +1152,46 @@ bool Node::load_state() {
     } else if (qc_payload_id.has_value()) {
       qc_valid = false;
     }
-    if (lock_state.has_value()) local_vote_locks_[*height] = *lock_state;
+    if (lock_state.has_value()) local_vote_locks_[height] = *lock_state;
     if (qc_valid) {
-      if (qc_state.has_value()) highest_qc_by_height_[*height] = *qc_state;
-      if (qc_payload_id.has_value()) highest_qc_payload_by_height_[*height] = *qc_payload_id;
+      if (qc_state.has_value()) highest_qc_by_height_[height] = *qc_state;
+      if (qc_payload_id.has_value()) highest_qc_payload_by_height_[height] = *qc_payload_id;
     } else {
       // Drop only the unverifiable QC; the lock is kept.
-      log_line("consensus-safety-qc-dropped height=" + std::to_string(*height) + " reason=invalid-persisted-qc" +
+      log_line("consensus-safety-qc-dropped height=" + std::to_string(height) + " reason=invalid-persisted-qc" +
                " lock=" + std::string(lock_state.has_value() ? "kept" : "none"));
-      if (!persist_consensus_safety_state_locked(*height)) return false;
     }
+    // Rewrite both sealed copies when the primary was bad, legacy-format, or the mirror is missing.
+    const bool needs_rewrite = !qc_valid || mirror_ok || !mirror_row.has_value() ||
+                               !unseal_consensus_safety_row(*mirror_row, true).has_value();
+    if (needs_rewrite && !persist_consensus_safety_state_locked(height)) return false;
+  }
+  for (const auto& [key, value] : db_.scan_prefix(kConsensusSafetyQuarantinePrefix)) {
+    const auto height = parse_height_key(key, kConsensusSafetyQuarantinePrefix);
+    if (!height.has_value()) continue;
+    if (*height <= finalized_height_) {
+      (void)db_.erase(key);
+      continue;
+    }
+    abstain_heights_.insert(*height);
+  }
+  if (cfg_.unsafe_discard_vote_lock_height.has_value()) {
+    const auto h = *cfg_.unsafe_discard_vote_lock_height;
+    if (abstain_heights_.count(h) != 0) {
+      log_line("OPERATOR OVERRIDE: discarding corrupted vote lock at height " + std::to_string(h));
+      std::cerr << "OPERATOR OVERRIDE: discarding corrupted vote lock at height " << h << "\n";
+      storage::DB::Batch discard(db_);
+      discard.erase(key_consensus_safety_quarantine(h));
+      discard.erase(key_consensus_locked_proposal(h));
+      if (!db_.write_batch_durable(discard)) return false;
+      abstain_heights_.erase(h);
+    } else {
+      log_line("operator-override-ignored flag=unsafe-discard-vote-lock-at-height height=" + std::to_string(h) +
+               " reason=no-quarantined-safety-state-at-height");
+    }
+  }
+  for (const auto h : abstain_heights_) {
+    log_line("consensus-abstain height=" + std::to_string(h) + " reason=unreadable-safety-state");
   }
   for (const auto& [key, value] : db_.scan_prefix(kConsensusLockedProposalPrefix)) {
     const auto height = parse_height_key(key, kConsensusLockedProposalPrefix);

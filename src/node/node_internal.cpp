@@ -764,6 +764,72 @@ std::string key_consensus_locked_proposal(std::uint64_t height) {
   return std::string(kConsensusLockedProposalPrefix) + hex_encode(w.data());
 }
 
+std::string key_consensus_safety_state(std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return std::string(kConsensusSafetyStatePrefix) + hex_encode(w.data());
+}
+
+std::string key_consensus_safety_mirror(std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return std::string(kConsensusSafetyMirrorPrefix) + hex_encode(w.data());
+}
+
+std::string key_consensus_safety_quarantine(std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return std::string(kConsensusSafetyQuarantinePrefix) + hex_encode(w.data());
+}
+
+namespace {
+
+// Legacy rows start with a 0/1 has-lock flag, so this magic cannot collide with them.
+constexpr std::array<std::uint8_t, 4> kConsensusSafetyRowMagic{'C', 'S', 'F', '2'};
+constexpr std::uint8_t kConsensusSafetyRowVersion = 2;
+
+Hash32 consensus_safety_row_checksum(const Bytes& inner, bool mirror) {
+  const std::string domain = mirror ? "SC-CSAFE-MIRROR-V2" : "SC-CSAFE-PRIMARY-V2";
+  codec::ByteWriter w;
+  w.bytes(Bytes(domain.begin(), domain.end()));
+  w.varbytes(inner);
+  return crypto::sha256d(w.data());
+}
+
+}  // namespace
+
+Bytes seal_consensus_safety_row(const Bytes& inner, bool mirror) {
+  codec::ByteWriter w;
+  w.bytes(Bytes(kConsensusSafetyRowMagic.begin(), kConsensusSafetyRowMagic.end()));
+  w.u8(kConsensusSafetyRowVersion);
+  w.varbytes(inner);
+  w.bytes_fixed(consensus_safety_row_checksum(inner, mirror));
+  return w.take();
+}
+
+std::optional<Bytes> unseal_consensus_safety_row(const Bytes& row, bool mirror) {
+  const bool has_magic = row.size() >= kConsensusSafetyRowMagic.size() &&
+                         std::equal(kConsensusSafetyRowMagic.begin(), kConsensusSafetyRowMagic.end(), row.begin());
+  if (!has_magic) {
+    if (mirror) return std::nullopt;
+    return row;
+  }
+  std::optional<Bytes> inner;
+  const bool ok = codec::parse_exact(row, [&](codec::ByteReader& r) {
+    auto magic = r.bytes_fixed<4>();
+    auto version = r.u8();
+    auto body = r.varbytes();
+    auto checksum = r.bytes_fixed<32>();
+    if (!magic || !version || !body || !checksum) return false;
+    if (*version != kConsensusSafetyRowVersion) return false;
+    if (*checksum != consensus_safety_row_checksum(*body, mirror)) return false;
+    inner = std::move(*body);
+    return true;
+  });
+  if (!ok) return std::nullopt;
+  return inner;
+}
+
 bool parse_consensus_safety_state(const Bytes& b, std::optional<std::pair<Hash32, std::uint32_t>>* lock_state,
                                   std::optional<QuorumCertificate>* qc_state, std::optional<Hash32>* qc_payload_id) {
   std::optional<std::pair<Hash32, std::uint32_t>> parsed_lock;

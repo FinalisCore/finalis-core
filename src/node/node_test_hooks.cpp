@@ -297,6 +297,11 @@ bool Node::has_candidate_frontier_proposal_for_test(const Hash32& transition_id)
   return candidate_frontier_proposals_.find(transition_id) != candidate_frontier_proposals_.end();
 }
 
+std::set<std::uint64_t> Node::abstain_heights_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return abstain_heights_;
+}
+
 std::size_t Node::timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const {
   std::lock_guard<std::mutex> lk(mu_);
   return timeout_votes_.signatures_for(height, round).size();

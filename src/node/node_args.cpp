@@ -220,6 +220,17 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       for (const auto& item : parse_endpoint_list(*v)) cfg.seeds.push_back(item);
     } else if (a == "--allow-unsafe-genesis-override") {
       cfg.allow_unsafe_genesis_override = true;
+    } else if (a == "--unsafe-discard-vote-lock-at-height" ||
+               a.rfind("--unsafe-discard-vote-lock-at-height=", 0) == 0) {
+      // Emergency recovery only; see Node::load_state. Accepts "--flag N" and "--flag=N".
+      std::optional<std::string> v;
+      if (const auto eq = a.find('='); eq != std::string::npos) {
+        v = a.substr(eq + 1);
+      } else {
+        v = next(a);
+      }
+      if (!v) return std::nullopt;
+      cfg.unsafe_discard_vote_lock_height = std::stoull(*v);
     } else if (a == "--outbound-target") {
       auto v = next(a);
       if (!v) return std::nullopt;

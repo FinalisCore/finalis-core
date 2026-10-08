@@ -135,6 +135,8 @@ struct NodeRuntimeStatusSnapshot {
   std::uint32_t stun_endpoint_change_hits{0};
   std::uint32_t stun_endpoint_change_required_hits{0};
   std::string stun_endpoint_candidate;
+  // Heights at which the node abstains from signing because its consensus safety state was unreadable.
+  std::vector<std::uint64_t> abstaining_heights;
   std::uint64_t finalized_lag{0};
   bool peer_height_disagreement{false};
   bool next_height_committee_available{false};

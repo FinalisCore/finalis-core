@@ -260,7 +260,16 @@ std::string epoch_db_key_suffix(std::uint64_t epoch) {
   return hex_encode(b);
 }
 
-std::string csafe_db_key(std::uint64_t height) { return "CSAFE:" + epoch_db_key_suffix(height); }
+// Consensus-safety keys encode the height little-endian (node key_consensus_safety_state), unlike
+// the big-endian epoch keys above.
+std::string csafe_height_suffix(std::uint64_t height) {
+  Bytes b(8);
+  for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((height >> (i * 8)) & 0xff);
+  return hex_encode(b);
+}
+std::string csafe_db_key(std::uint64_t height) { return "CSAFE:" + csafe_height_suffix(height); }
+std::string csafe_mirror_db_key(std::uint64_t height) { return "CSAFE_MIRROR:" + csafe_height_suffix(height); }
+std::string csafe_quarantine_db_key(std::uint64_t height) { return "CSAFE_QUARANTINE:" + csafe_height_suffix(height); }
 
 std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id);
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
@@ -5351,13 +5360,16 @@ TEST(test_crash_between_csaf_and_block_write_does_not_corrupt_state) {
   {
     auto cluster = make_cluster(base, 1, 1, 1);
     ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 6; }, std::chrono::seconds(30)));
-    next_height = cluster.nodes[0]->status().height + 1;
     cluster.nodes[0]->stop();
   }
 
   {
     storage::DB db;
     ASSERT_TRUE(db.open(base + "/node0"));
+    // Read the tip after shutdown: a block finalized while stopping would otherwise move the target height.
+    const auto tip = db.get_tip();
+    ASSERT_TRUE(tip.has_value());
+    next_height = tip->height + 1;
     ASSERT_TRUE(db.put(csafe_db_key(next_height), Bytes{0x01, 0x02, 0x03}));
     ASSERT_TRUE(db.flush());
   }
@@ -5376,13 +5388,26 @@ TEST(test_crash_between_csaf_and_block_write_does_not_corrupt_state) {
   cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
   cfg.validator_passphrase = "test-pass";
 
-  node::Node restarted(cfg);
-  ASSERT_TRUE(restarted.init());
-  restarted.stop();
+  // An unreadable row may be the only record of a broadcast vote: it is quarantined (not erased)
+  // and the node abstains at that height while otherwise running normally.
+  {
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_TRUE(restarted.abstain_heights_for_test().count(next_height) == 1);
+    restarted.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    // Sole validator abstaining: nothing is signed, so the height cannot finalize.
+    ASSERT_EQ(restarted.status().height + 1, next_height);
+    ASSERT_TRUE(restarted.abstain_heights_for_test().count(next_height) == 1);
+    restarted.stop();
+  }
 
   storage::DB db;
   ASSERT_TRUE(db.open(base + "/node0"));
   ASSERT_TRUE(!db.get(csafe_db_key(next_height)).has_value());
+  const auto quarantined = db.get(csafe_quarantine_db_key(next_height));
+  ASSERT_TRUE(quarantined.has_value());
+  ASSERT_TRUE(*quarantined == (Bytes{0x01, 0x02, 0x03}));
 }
 
 TEST(test_restart_with_invalid_csaf_rebuilds_correct_state) {
@@ -5428,6 +5453,173 @@ TEST(test_restart_with_invalid_csaf_rebuilds_correct_state) {
   storage::DB db;
   ASSERT_TRUE(db.open(base + "/node0"));
   ASSERT_TRUE(!db.get(csafe_db_key(next_height)).has_value());
+}
+
+// Single validator, stopped, with an unreadable safety-state row at its next height.
+// Returns the next height; fills *cfg with a restart config for the node.
+std::uint64_t setup_single_validator_with_unreadable_safety_row(const std::string& base, node::NodeConfig* cfg) {
+  {
+    auto cluster = make_cluster(base, 1, 1, 1);
+    if (!wait_for([&]() { return cluster.nodes[0]->status().height >= 4; }, std::chrono::seconds(30))) return 0;
+    cluster.nodes[0]->stop();
+  }
+  std::uint64_t next_height = 0;
+  {
+    storage::DB db;
+    if (!db.open(base + "/node0")) return 0;
+    const auto tip = db.get_tip();
+    if (!tip.has_value()) return 0;
+    next_height = tip->height + 1;
+    if (!db.put(csafe_db_key(next_height), Bytes{0xDE, 0xAD})) return 0;
+    if (!db.flush()) return 0;
+  }
+  cfg->allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg->disable_p2p = true;
+  cfg->node_id = 0;
+  cfg->max_committee = 1;
+  cfg->network.min_block_interval_ms = 100;
+  cfg->network.round_timeout_ms = 200;
+  cfg->p2p_port = 0;
+  cfg->db_path = base + "/node0";
+  cfg->genesis_path = base + "/genesis.json";
+  cfg->allow_unsafe_genesis_override = true;
+  cfg->validator_key_file = cfg->db_path + "/keystore/validator.json";
+  cfg->validator_passphrase = "test-pass";
+  return next_height;
+}
+
+TEST(test_unreadable_safety_state_abstention_survives_second_restart) {
+  const std::string base = unique_test_base("/tmp/finalis_it_csaf_abstain_two_restarts");
+  node::NodeConfig cfg;
+  const auto next_height = setup_single_validator_with_unreadable_safety_row(base, &cfg);
+  ASSERT_TRUE(next_height > 0);
+  for (int restart = 0; restart < 2; ++restart) {
+    node::Node n(cfg);
+    ASSERT_TRUE(n.init());
+    ASSERT_EQ(n.status().height + 1, next_height);
+    const auto abstain = n.abstain_heights_for_test();
+    ASSERT_EQ(abstain.size(), 1u);
+    ASSERT_TRUE(abstain.count(next_height) == 1);
+    n.stop();
+  }
+  storage::DB db;
+  ASSERT_TRUE(db.open(base + "/node0"));
+  ASSERT_TRUE(!db.get(csafe_db_key(next_height)).has_value());
+  const auto quarantined = db.get(csafe_quarantine_db_key(next_height));
+  ASSERT_TRUE(quarantined.has_value());
+  ASSERT_TRUE(*quarantined == (Bytes{0xDE, 0xAD}));
+}
+
+TEST(test_unsafe_discard_vote_lock_override_resumes_single_validator) {
+  const std::string base = unique_test_base("/tmp/finalis_it_csaf_override");
+  node::NodeConfig cfg;
+  const auto next_height = setup_single_validator_with_unreadable_safety_row(base, &cfg);
+  ASSERT_TRUE(next_height > 0);
+
+  // Override naming a different height is ignored: the node still abstains.
+  {
+    auto wrong = cfg;
+    wrong.unsafe_discard_vote_lock_height = next_height + 5;
+    node::Node n(wrong);
+    ASSERT_TRUE(n.init());
+    ASSERT_TRUE(n.abstain_heights_for_test().count(next_height) == 1);
+    n.stop();
+  }
+
+  // Override at exactly the quarantined height: abstention dropped and the chain moves again.
+  {
+    auto override_cfg = cfg;
+    override_cfg.unsafe_discard_vote_lock_height = next_height;
+    node::Node n(override_cfg);
+    ASSERT_TRUE(n.init());
+    ASSERT_TRUE(n.abstain_heights_for_test().empty());
+    n.start();
+    ASSERT_TRUE(wait_for([&]() { return n.status().height >= next_height + 1; }, std::chrono::seconds(30)));
+    n.stop();
+  }
+  storage::DB db;
+  ASSERT_TRUE(db.open(base + "/node0"));
+  ASSERT_TRUE(!db.get(csafe_quarantine_db_key(next_height)).has_value());
+}
+
+TEST(test_unreadable_safety_state_abstains_and_network_finalizes_without_it) {
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_csaf_abstain_cluster"), 4, 4, 4);
+  ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 2; }, ci_timeout_seconds(60)));
+  for (auto& n : cluster.nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, ci_timeout_seconds(30)));
+
+  const std::size_t victim = 3;
+  cluster.nodes[victim]->stop();
+  cluster.nodes[victim].reset();
+  std::uint64_t h = 0;
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cluster.configs[victim].db_path));
+    const auto tip = db.get_tip();
+    ASSERT_TRUE(tip.has_value());
+    h = tip->height + 1;
+    ASSERT_TRUE(db.put(csafe_db_key(h), Bytes{0xBA, 0xD0}));
+    ASSERT_TRUE(db.flush());
+  }
+  cluster.nodes[victim] = std::make_unique<node::Node>(cluster.configs[victim]);
+  ASSERT_TRUE(cluster.nodes[victim]->init());
+  ASSERT_TRUE(cluster.nodes[victim]->local_is_committee_member_for_test(h, 0));
+  ASSERT_TRUE(cluster.nodes[victim]->abstain_heights_for_test().count(h) == 1);
+  cluster.nodes[victim]->start();
+
+  // The other three (a quorum of four) finalize h without the abstaining node.
+  for (auto& n : cluster.nodes) ASSERT_TRUE(n->pause_proposals_for_test(false));
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : cluster.nodes) {
+      if (n->status().height < h + 2) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(120)));
+  // h finalized: the abstention is released and the node votes normally again from h+1.
+  ASSERT_TRUE(cluster.nodes[victim]->abstain_heights_for_test().empty());
+}
+
+// A corrupt primary row is recovered from its mirror: the lock survives and nothing is quarantined.
+TEST(test_safety_state_mirror_recovers_corrupted_primary) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(keys.size() >= 4u);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_csaf_mirror"), 4, 4, 4);
+  Tx tx = make_fixture_ingress_tx(1, 0x8C);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true));
+  const std::uint64_t h = cluster.nodes[0]->status().height + 1;
+  auto proposal = build_cluster_frontier_proposal_from_records(cluster, keys, {tx.serialize()}, h, 0,
+                                                               "/tmp/finalis_it_csaf_mirror_a0");
+  ASSERT_TRUE(proposal.has_value());
+  std::size_t ti = cluster.nodes.size();
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(h, 0)) {
+      ti = k;
+      break;
+    }
+  }
+  ASSERT_TRUE(ti < cluster.nodes.size());
+  ASSERT_TRUE(advance_test_frontier_round(*cluster.nodes[ti], h, 0));
+  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+            std::string("accepted"));
+  const auto lock_before = cluster.nodes[ti]->local_vote_lock_for_test(h);
+  ASSERT_TRUE(lock_before.has_value());
+
+  cluster.nodes[ti]->stop();
+  cluster.nodes[ti].reset();
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cluster.configs[ti].db_path));
+    ASSERT_TRUE(db.get(csafe_mirror_db_key(h)).has_value());
+    ASSERT_TRUE(db.put(csafe_db_key(h), Bytes{0x43, 0x53, 0x46, 0x32, 0xFF}));  // magic, then garbage
+    ASSERT_TRUE(db.flush());
+  }
+  cluster.nodes[ti] = std::make_unique<node::Node>(cluster.configs[ti]);
+  ASSERT_TRUE(cluster.nodes[ti]->init());
+  ASSERT_TRUE(cluster.nodes[ti]->abstain_heights_for_test().empty());
+  const auto lock_after = cluster.nodes[ti]->local_vote_lock_for_test(h);
+  ASSERT_TRUE(lock_after.has_value());
+  ASSERT_TRUE(lock_after->first == lock_before->first);
+  ASSERT_EQ(lock_after->second, lock_before->second);
 }
 
 TEST(test_db_rejects_conflicting_same_height_finalized_writes) {

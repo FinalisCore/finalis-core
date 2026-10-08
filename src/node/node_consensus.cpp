@@ -74,12 +74,6 @@ std::string signer_set_summary(const std::vector<FinalitySig>& sigs) {
   return oss.str();
 }
 
-std::string key_consensus_safety_state(std::uint64_t height) {
-  codec::ByteWriter w;
-  w.u64le(height);
-  return std::string(kConsensusSafetyStatePrefix) + hex_encode(w.data());
-}
-
 Bytes serialize_consensus_safety_state(const std::optional<std::pair<Hash32, std::uint32_t>>& lock_state,
                                        const std::optional<QuorumCertificate>& qc_state,
                                        const std::optional<Hash32>& qc_payload_id) {
@@ -697,6 +691,10 @@ void Node::maybe_record_timeout_certificate_locked(std::uint64_t height, std::ui
   }
 }
 
+bool Node::abstaining_at_height_locked(std::uint64_t height) const {
+  return abstain_heights_.find(height) != abstain_heights_.end();
+}
+
 bool Node::can_vote_for_frontier_locked(const FrontierTransition& transition,
                                         const std::optional<QuorumCertificate>& justify_qc,
                                         const std::optional<TimeoutCertificate>& justify_tc,
@@ -704,6 +702,12 @@ bool Node::can_vote_for_frontier_locked(const FrontierTransition& transition,
   const auto payload_id = consensus_payload_id(transition);
   const auto height = transition.height;
   const auto round = transition.round;
+  // SAFETY: this node's vote history at `height` was lost (unreadable safety state), so any
+  // vote here could contradict one already broadcast. Checked before the normal lock rules.
+  if (abstaining_at_height_locked(height)) {
+    if (reason) *reason = "abstain-corrupt-safety-state";
+    return false;
+  }
   auto it = local_vote_locks_.find(height);
   if (it == local_vote_locks_.end()) return true;
   const auto& [locked_payload_id, locked_round] = it->second;
@@ -833,9 +837,14 @@ void Node::persist_consensus_safety_state_locked(std::uint64_t height, storage::
   if (auto it = highest_qc_payload_by_height_.find(height); it != highest_qc_payload_by_height_.end()) qc_payload_id = it->second;
   if (!lock_state.has_value() && !qc_state.has_value()) {
     batch.erase(key_consensus_safety_state(height));
+    batch.erase(key_consensus_safety_mirror(height));
     return;
   }
-  batch.put(key_consensus_safety_state(height), serialize_consensus_safety_state(lock_state, qc_state, qc_payload_id));
+  // Primary and mirror go in the same atomic batch; load_state falls back to the mirror when the
+  // primary is unreadable and abstains only if both are.
+  const Bytes inner = serialize_consensus_safety_state(lock_state, qc_state, qc_payload_id);
+  batch.put(key_consensus_safety_state(height), seal_consensus_safety_row(inner, false));
+  batch.put(key_consensus_safety_mirror(height), seal_consensus_safety_row(inner, true));
 }
 
 // Convenience wrapper for callers outside the batched finalization path
@@ -861,7 +870,13 @@ void Node::clear_consensus_safety_state_locked(std::uint64_t height, storage::DB
     }
   }
   batch.erase(key_consensus_safety_state(height));
+  batch.erase(key_consensus_safety_mirror(height));
   batch.erase(key_consensus_locked_proposal(height));
+  // The height is final, so an abstention there has done its job.
+  if (abstain_heights_.erase(height) != 0) {
+    log_line("consensus-abstain-end height=" + std::to_string(height) + " reason=height-finalized");
+  }
+  batch.erase(key_consensus_safety_quarantine(height));
 }
 
 void Node::clear_consensus_safety_state_locked(std::uint64_t height) {
@@ -2213,8 +2228,10 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   const std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
   auto sigs = votes_.signatures_for(height, round, block_id);
   std::set<PubKey32> committee_set(expected_committee.begin(), expected_committee.end());
+  // The quorum-1 self-vote below signs without going through can_vote_for_frontier_locked, so the
+  // abstention must be enforced here as well.
   if (sigs.empty() && expected_quorum == 1 && expected_committee.size() == 1 &&
-      expected_committee.front() == local_key_.public_key) {
+      expected_committee.front() == local_key_.public_key && !abstaining_at_height_locked(height)) {
     if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, block_id), local_key_.private_key);
         sig.has_value()) {
       const Vote local_vote{height, round, block_id, local_key_.public_key, *sig};
