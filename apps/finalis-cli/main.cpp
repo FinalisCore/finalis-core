@@ -563,8 +563,8 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"warmup_blocks_remaining\":" << warmup_blocks_remaining << ","
               << "\"activation_epoch_start\":" << activation_epoch_start << ","
               << "\"expected_activation_epoch_start\":" << activation_epoch_start << ","
-              << "\"last_error_code\":\"" << record.last_error_code << "\","
-              << "\"last_error_message\":\"" << record.last_error_message << "\""
+              << "\"last_error_code\":\"" << finalis::minijson::escape(record.last_error_code) << "\","
+              << "\"last_error_message\":\"" << finalis::minijson::escape(record.last_error_message) << "\""
               << (status_source.empty() ? "" : (",\"status_source\":\"" + finalis::minijson::escape(status_source) + "\""))
               << "}\n";
     return;
