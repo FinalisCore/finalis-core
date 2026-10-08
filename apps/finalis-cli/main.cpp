@@ -30,6 +30,7 @@
 #include "common/socket_compat.hpp"
 #include "common/wide_arith.hpp"
 #include "common/version.hpp"
+#include "consensus/confidential_supply.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/epoch_committee.hpp"
 #include "consensus/epoch_tickets.hpp"
@@ -1398,6 +1399,7 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
      << "  finalis-cli snapshot_import --db <dir> --in <snapshot.bin> [--expected-genesis-hash <hex32>]  # default: mainnet genesis\n"
      << "  finalis-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
+     << "  finalis-cli confidential_supply_audit [--db <dir>]   (exit 0=ok 2=unavailable 3=FAILED)\n"
      << "  finalis-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
      << "  finalis-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
      << "  finalis-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-transition <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-transition <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
@@ -1653,6 +1655,42 @@ int main(int argc, char** argv) {
       std::cout << "slashing_records=unknown\n";
     }
     return 0;
+  }
+
+  if (cmd == "confidential_supply_audit") {
+    std::string db_path = default_mainnet_db_path();
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+    }
+    db_path = expand_user(db_path);
+    finalis::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "confidential_supply_audit: failed to open db: " << db_path << "\n";
+      return 1;
+    }
+    const auto raw = db.get("CSUPPLY:LEDGER");
+    std::uint64_t ledger_height = 0;
+    const auto ledger =
+        raw.has_value() ? finalis::consensus::parse_confidential_supply_ledger(*raw, &ledger_height) : std::nullopt;
+    const auto tip = db.get_tip();
+    if (!ledger.has_value()) {
+      std::cout << "status=unavailable detail=no-persisted-ledger\n";
+      return 2;
+    }
+    if (!tip.has_value() || tip->height != ledger_height) {
+      std::cout << "status=unavailable detail=ledger-height-mismatch ledger_height=" << ledger_height
+                << " tip_height=" << (tip.has_value() ? tip->height : 0) << "\n";
+      return 2;
+    }
+    const auto result = finalis::consensus::audit_confidential_supply(db.load_utxos_v2(), *ledger);
+    std::cout << "status=" << finalis::consensus::confidential_supply_audit_status_name(result.status)
+              << " height=" << ledger_height << " pool_value=" << result.pool_value
+              << " confidential_utxos=" << result.confidential_utxo_count << " txv2_count=" << ledger->txv2_count;
+    if (!result.detail.empty()) std::cout << " detail=" << result.detail;
+    std::cout << "\n";
+    if (result.status == finalis::consensus::ConfidentialSupplyAuditStatus::Ok) return 0;
+    return result.status == finalis::consensus::ConfidentialSupplyAuditStatus::Failed ? 3 : 2;
   }
 
   if (cmd == "--reindex" || cmd == "reindex") {

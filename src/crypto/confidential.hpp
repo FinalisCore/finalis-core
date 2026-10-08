@@ -62,15 +62,39 @@ std::optional<Sig64> sign_excess_authorization(const Hash32& msg32, const Blind3
 bool verify_excess_authorization(const Hash32& msg32, const Commitment33& commitment, const PubKey32& excess_pubkey,
                                  const Sig64& sig);
 std::optional<Blind32> combine_blinds(std::span<const Blind32> blinds, std::size_t npositive);
+// Borromean range-proof parameters. Consensus accepts only kCanonicalRangeProofShape: a full 64-bit
+// proof reveals nothing about the amount, whereas a non-zero minimum, an exponent or fewer bits each
+// publish amount information and split users into distinguishable sets.
+struct RangeProofShape {
+  std::uint64_t min_value{0};
+  int exp{0};
+  int min_bits{64};
+  bool operator==(const RangeProofShape&) const = default;
+};
+inline constexpr RangeProofShape kCanonicalRangeProofShape{};
+
 std::optional<ProofBytes> sign_output_range_proof(const Commitment33& commitment, std::uint64_t amount,
-                                                  const Blind32& blind, const Hash32& nonce32);
-std::optional<Commitment33> add_commitments(std::span<const Commitment33> commitments);
-std::optional<Commitment33> subtract_commitments(const Commitment33& lhs, const Commitment33& rhs);
+                                                  const Blind32& blind, const Hash32& nonce32,
+                                                  const RangeProofShape& shape = kCanonicalRangeProofShape);
+// Cheap header-only check (no verification): exponent 0, minimum value 0, 64-bit mantissa.
+bool range_proof_has_canonical_shape(const ProofBytes& proof);
 bool verify_commitment_tally(std::span<const Commitment33> positives, std::span<const Commitment33> negatives);
+
+// Running sum of Pedersen commitments as a curve point (secp256k1-zkp has no public commitment
+// addition). `infinity` is the identity; otherwise `point` is the compressed sum.
+struct CommitmentSum {
+  bool infinity{true};
+  PubKey33 point{};
+  bool operator==(const CommitmentSum&) const = default;
+};
+// Adds a commitment to the sum. The all-zero identity sentinel is a no-op. False on a malformed commitment.
+bool commitment_sum_add(CommitmentSum* sum, const Commitment33& commitment);
+bool commitment_sum_add(CommitmentSum* sum, const CommitmentSum& other);
+// value * H as a CommitmentSum (identity for 0).
+std::optional<CommitmentSum> commitment_sum_of_value(std::uint64_t value);
 
 bool verify_output_range_proof(const Commitment33& commitment, const ProofBytes& proof);
 bool verify_output_range_proofs_batch(std::span<const Commitment33> commitments, std::span<const ProofBytes> proofs);
 
-std::size_t range_proof_verify_weight(const ProofBytes& proof);
 
 }  // namespace finalis::crypto

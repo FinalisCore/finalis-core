@@ -813,6 +813,15 @@ bool Node::load_state() {
       // Fast-start checkpoint self-repair can mutate canonical state fields that
       // are committed; refresh commitment before verification/persist.
       fast_state.state_commitment = consensus::consensus_state_commitment(derivation_cfg, fast_state);
+      // The supply ledger is history-derived: restore it only if it was persisted for this exact tip.
+      fast_state.confidential_supply.known = false;
+      if (const auto raw = db_.get(kConfidentialSupplyLedgerKey); raw.has_value()) {
+        std::uint64_t ledger_height = 0;
+        if (auto ledger = consensus::parse_confidential_supply_ledger(*raw, &ledger_height);
+            ledger.has_value() && ledger_height == finalized_height_) {
+          fast_state.confidential_supply = *ledger;
+        }
+      }
       hydrate_runtime_from_canonical_state_locked(fast_state);
       if (using_frontier_replay) (void)db_.erase(storage::key_consensus_state_commitment_cache());
       if (!verify_and_persist_consensus_state_commitment_locked(fast_state)) return false;
@@ -1014,6 +1023,9 @@ bool Node::load_state() {
   if (!verify_and_persist_consensus_state_commitment_locked(derived_state)) return false;
   hydrate_runtime_from_canonical_state_locked(derived_state);
   if (!persist_canonical_cache_rows(db_, derived_state)) return false;
+  (void)db_.put(kConfidentialSupplyLedgerKey,
+                consensus::serialize_confidential_supply_ledger(derived_state.confidential_supply, finalized_height_));
+  run_confidential_supply_audit_locked("startup");
   log_line("startup-progress phase=cache-verify-done");
 
   const auto existing = db_.get(storage::key_root_index("UTXO", finalized_height_));

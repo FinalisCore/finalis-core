@@ -9,6 +9,7 @@
 #include "codec/bytes.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "consensus/confidential_supply.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/validate.hpp"
 
@@ -180,29 +181,13 @@ TxV2 make_confidential_output_v2_tx(const OutPoint& op, const crypto::KeyPair& f
   tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential, .body = confidential_out});
   tx.fee = fee;
 
-  if (crypto::confidential_backend_status().confidential_outputs_supported) {
-    const auto blind_excess = crypto::combine_blinds(std::span<const crypto::Blind32>(&confidential_blind, 1), 0);
-    if (!blind_excess.has_value()) throw std::runtime_error("blind sum failed");
-    const auto excess = crypto::confidential_amount_commitment(value_in - transparent_value_out - confidential_value - fee,
-                                                               *blind_excess);
-    if (!excess.has_value()) throw std::runtime_error("excess commitment failed");
-    tx.balance_proof.excess_commitment = *excess;
-    sign_balance_proof(tx, *blind_excess, 0x5A);
-  } else {
-    std::vector<crypto::Commitment33> inputs{crypto::transparent_amount_commitment(value_in)};
-    std::vector<crypto::Commitment33> outputs;
-    if (transparent_value_out > 0) outputs.push_back(crypto::transparent_amount_commitment(transparent_value_out));
-    outputs.push_back(confidential_out.value_commitment);
-    outputs.push_back(crypto::transparent_amount_commitment(fee));
-    const auto input_sum = crypto::add_commitments(inputs);
-    const auto output_sum = crypto::add_commitments(outputs);
-    if (!input_sum.has_value() || !output_sum.has_value()) throw std::runtime_error("commitment sum failed");
-    const auto excess = crypto::subtract_commitments(*input_sum, *output_sum);
-    if (!excess.has_value()) throw std::runtime_error("commitment subtract failed");
-    tx.balance_proof.excess_commitment = *excess;
-    tx.balance_proof.excess_pubkey.fill(0);
-    tx.balance_proof.excess_sig.fill(0x52);
-  }
+  const auto blind_excess = crypto::combine_blinds(std::span<const crypto::Blind32>(&confidential_blind, 1), 0);
+  if (!blind_excess.has_value()) throw std::runtime_error("blind sum failed");
+  const auto excess = crypto::confidential_amount_commitment(value_in - transparent_value_out - confidential_value - fee,
+                                                             *blind_excess);
+  if (!excess.has_value()) throw std::runtime_error("excess commitment failed");
+  tx.balance_proof.excess_commitment = *excess;
+  sign_balance_proof(tx, *blind_excess, 0x5A);
 
   resign_input0(tx, from);
   return tx;
@@ -876,4 +861,276 @@ TEST(test_validate_tx_v2_accepts_matching_validator_register_and_join_request_ou
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
   ASSERT_TRUE(result.ok);
   ASSERT_EQ(result.cost.fee, 1'000u);
+}
+
+TEST(test_commitment_sum_is_homomorphic) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  const auto r1 = blind_from_byte(0x11);
+  const auto r2 = blind_from_byte(0x12);
+  const std::array<crypto::Blind32, 2> blinds{r1, r2};
+  const auto r12 = crypto::combine_blinds(blinds, 2);
+  ASSERT_TRUE(r12.has_value());
+  const auto c1 = crypto::confidential_amount_commitment(3, r1);
+  const auto c2 = crypto::confidential_amount_commitment(5, r2);
+  const auto c12 = crypto::confidential_amount_commitment(8, *r12);
+  ASSERT_TRUE(c1.has_value() && c2.has_value() && c12.has_value());
+  crypto::CommitmentSum sum;
+  ASSERT_TRUE(crypto::commitment_sum_add(&sum, *c1));
+  ASSERT_TRUE(crypto::commitment_sum_add(&sum, *c2));
+  crypto::CommitmentSum expected;
+  ASSERT_TRUE(crypto::commitment_sum_add(&expected, *c12));
+  ASSERT_TRUE(sum == expected);
+
+  // C(0, r) + C(0, -r) is the point at infinity.
+  const std::array<crypto::Blind32, 1> one{r1};
+  const auto neg_r1 = crypto::combine_blinds(one, 0);
+  ASSERT_TRUE(neg_r1.has_value());
+  crypto::CommitmentSum zero;
+  ASSERT_TRUE(crypto::commitment_sum_add(&zero, *crypto::confidential_amount_commitment(0, r1)));
+  ASSERT_TRUE(crypto::commitment_sum_add(&zero, *crypto::confidential_amount_commitment(0, *neg_r1)));
+  ASSERT_TRUE(zero.infinity);
+
+  const auto v8 = crypto::commitment_sum_of_value(8);
+  crypto::CommitmentSum c8;
+  ASSERT_TRUE(crypto::commitment_sum_add(&c8, crypto::transparent_amount_commitment(8)));
+  ASSERT_TRUE(v8.has_value() && *v8 == c8);
+}
+
+namespace {
+
+struct ShieldFixture {
+  UtxoSetV2 utxos;
+  consensus::ConfidentialSupplyLedger ledger;
+  OutPoint confidential_op;
+  crypto::Blind32 spend_secret;
+  crypto::Blind32 value_blind;
+};
+
+// Applies a validated tx at `height` the way apply_frontier_record does: account, then apply.
+void apply_validated(ShieldFixture* f, const TxV2& tx, std::uint64_t height) {
+  ConfidentialPolicy policy;
+  SpecialValidationContext ctx;
+  ctx.current_height = height;
+  ctx.confidential_policy = &policy;
+  const auto result = validate_tx_v2(tx, 1, f->utxos, &ctx);
+  if (!result.ok) throw std::runtime_error("fixture tx invalid: " + result.error);
+  consensus::account_confidential_supply(f->utxos, {AnyTx{tx}}, height, &f->ledger);
+  apply_any_tx_to_utxo(AnyTx{tx}, f->utxos);
+}
+
+// Shields 9,000 of a 10,000 transparent UTXO (fee 1,000) into one spendable confidential output.
+ShieldFixture shield_9000() {
+  ShieldFixture f;
+  const auto from = key_from_byte(0x61);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0x62);
+  f.utxos[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+
+  f.spend_secret = blind_from_byte(0x63);
+  f.value_blind = blind_from_byte(0x64);
+  const auto commitment = crypto::confidential_amount_commitment(9'000, f.value_blind);
+  const auto proof = crypto::sign_output_range_proof(*commitment, 9'000, f.value_blind, nonce_from_byte(0x65));
+  const auto one_time = crypto::secp256k1_pubkey_from_scalar(f.spend_secret.bytes);
+  if (!commitment || !proof || !one_time) throw std::runtime_error("fixture output build failed");
+  const ConfidentialTxOutV2 out{
+      .value_commitment = *commitment,
+      .one_time_pubkey = *one_time,
+      .ephemeral_pubkey = compressed_key(0x66),
+      .scan_tag = crypto::ScanTag{0x67},
+      .range_proof = *proof,
+      .memo = Bytes{},
+  };
+  const auto tx = make_confidential_output_v2_tx(op, from, 10'000, 0, 9'000, f.value_blind, out, 1'000);
+  apply_validated(&f, tx, 1);
+  f.confidential_op = OutPoint{tx.txid(), 0};
+  return f;
+}
+
+}  // namespace
+
+TEST(test_confidential_supply_audit_invariant_holds) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  consensus::ConfidentialSupplyLedger empty;
+  ASSERT_TRUE(consensus::audit_confidential_supply(UtxoSetV2{}, empty).status ==
+              consensus::ConfidentialSupplyAuditStatus::Ok);
+
+  auto f = shield_9000();
+  auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+  if (audit.status != consensus::ConfidentialSupplyAuditStatus::Ok) throw std::runtime_error(audit.detail);
+  ASSERT_EQ(f.ledger.pool_value, 9'000);
+  ASSERT_EQ(audit.confidential_utxo_count, 1u);
+
+  // Unshield all of it: 8,500 transparent + 500 fee. The pool returns to 0.
+  const auto recipient = key_from_byte(0x68);
+  const auto unshield =
+      make_confidential_input_v2_tx(f.confidential_op, f.spend_secret, f.value_blind, recipient.public_key, 9'000, 8'500);
+  apply_validated(&f, unshield, 2);
+  audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+  if (audit.status != consensus::ConfidentialSupplyAuditStatus::Ok) throw std::runtime_error(audit.detail);
+  ASSERT_EQ(f.ledger.pool_value, 0);
+  ASSERT_EQ(f.ledger.txv2_count, 2u);
+  ASSERT_EQ(audit.confidential_utxo_count, 0u);
+
+  std::uint64_t height = 0;
+  const auto roundtrip =
+      consensus::parse_confidential_supply_ledger(consensus::serialize_confidential_supply_ledger(f.ledger, 2), &height);
+  ASSERT_TRUE(roundtrip.has_value() && *roundtrip == f.ledger);
+  ASSERT_EQ(height, 2u);
+}
+
+TEST(test_confidential_supply_audit_detects_inflation) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  // (a) A stored confidential commitment worth more than was shielded breaks the commitment identity.
+  {
+    auto f = shield_9000();
+    auto& entry = std::get<UtxoConfidentialData>(f.utxos.at(f.confidential_op).body);
+    entry.value_commitment = *crypto::confidential_amount_commitment(9'001, f.value_blind);
+    const auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+    ASSERT_TRUE(audit.status == consensus::ConfidentialSupplyAuditStatus::Failed);
+    ASSERT_TRUE(audit.detail.find("commitment-identity-mismatch") != std::string::npos);
+  }
+  // (b) Value created inside the pool (as a broken range proof would allow) shows up when it is
+  // unshielded: more leaves the pool than ever entered it. Accounted directly, bypassing validation.
+  {
+    auto f = shield_9000();
+    const auto recipient = key_from_byte(0x69);
+    const auto inflated = make_confidential_input_v2_tx(f.confidential_op, f.spend_secret, f.value_blind,
+                                                        recipient.public_key, 20'000, 19'500);
+    consensus::account_confidential_supply(f.utxos, {AnyTx{inflated}}, 7, &f.ledger);
+    ASSERT_TRUE(f.ledger.pool_value < 0);
+    ASSERT_EQ(f.ledger.first_negative_height, 7u);
+    const auto audit = consensus::audit_confidential_supply(f.utxos, f.ledger);
+    ASSERT_TRUE(audit.status == consensus::ConfidentialSupplyAuditStatus::Failed);
+    ASSERT_TRUE(audit.detail.find("turnstile-negative") != std::string::npos);
+  }
+  // (c) A ledger that was never derived from history yields no verdict rather than a false pass.
+  {
+    consensus::ConfidentialSupplyLedger unknown;
+    unknown.known = false;
+    ASSERT_TRUE(consensus::audit_confidential_supply(UtxoSetV2{}, unknown).status ==
+                consensus::ConfidentialSupplyAuditStatus::Unavailable);
+  }
+}
+
+namespace {
+
+// A shield tx whose single confidential output carries a proof of the given shape.
+std::pair<TxV2, UtxoSetV2> shield_with_proof_shape(const crypto::RangeProofShape& shape) {
+  const auto from = key_from_byte(0x71);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0x72);
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{10'000, address::p2pkh_script_pubkey(from_pkh)});
+  const auto blind = blind_from_byte(0x73);
+  const auto commitment = crypto::confidential_amount_commitment(9'000, blind);
+  const auto proof = crypto::sign_output_range_proof(*commitment, 9'000, blind, nonce_from_byte(0x74), shape);
+  if (!commitment || !proof) throw std::runtime_error("proof build failed");
+  const ConfidentialTxOutV2 out{
+      .value_commitment = *commitment,
+      .one_time_pubkey = compressed_key(0x75),
+      .ephemeral_pubkey = compressed_key(0x76),
+      .scan_tag = crypto::ScanTag{0x77},
+      .range_proof = *proof,
+      .memo = Bytes{},
+  };
+  return {make_confidential_output_v2_tx(op, from, 10'000, 0, 9'000, blind, out, 1'000), view};
+}
+
+ConfidentialTxOutV2 only_confidential_output(const TxV2& tx) {
+  for (const auto& out : tx.outputs) {
+    if (out.kind == TxOutputKind::Confidential) return std::get<ConfidentialTxOutV2>(out.body);
+  }
+  throw std::runtime_error("no confidential output");
+}
+
+}  // namespace
+
+TEST(test_range_proof_correct_shape_accepted) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  const auto [tx, view] = shield_with_proof_shape(crypto::kCanonicalRangeProofShape);
+  const auto out = only_confidential_output(tx);
+  ASSERT_TRUE(crypto::range_proof_has_canonical_shape(out.range_proof));
+  ConfidentialPolicy policy;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  if (!result.ok) throw std::runtime_error(result.error);
+}
+
+TEST(test_range_proof_wrong_shape_rejected) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  const std::vector<crypto::RangeProofShape> leaky{
+      // exponent (with 64 bits the library normalizes exp back to 0, so use fewer bits to keep it)
+      {.min_value = 0, .exp = 1, .min_bits = 40},
+      {.min_value = 1'000, .exp = 0, .min_bits = 64}, // public minimum
+      {.min_value = 0, .exp = 0, .min_bits = 32},     // fewer bits
+  };
+  for (const auto& shape : leaky) {
+    const auto [tx, view] = shield_with_proof_shape(shape);
+    const auto out = only_confidential_output(tx);
+    // The proof itself is cryptographically valid; only its shape is non-canonical.
+    ASSERT_TRUE(crypto::verify_output_range_proof(out.value_commitment, out.range_proof));
+    ASSERT_TRUE(!crypto::range_proof_has_canonical_shape(out.range_proof));
+    ConfidentialPolicy policy;
+    SpecialValidationContext ctx;
+    ctx.current_height = 1;
+    ctx.confidential_policy = &policy;
+    const auto result = validate_tx_v2(tx, 1, view, &ctx);
+    ASSERT_TRUE(!result.ok);
+    ASSERT_EQ(result.error, std::string("range-proof-shape-invalid"));
+  }
+}
+
+TEST(test_validate_tx_v2_checks_tally_before_range_proofs) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  auto [tx, view] = shield_with_proof_shape(crypto::kCanonicalRangeProofShape);
+  // Break both the balance (fee no longer matches the excess) and the proof body (header intact).
+  tx.fee = 900;
+  for (auto& out : tx.outputs) {
+    if (out.kind != TxOutputKind::Confidential) continue;
+    auto& proof = std::get<ConfidentialTxOutV2>(out.body).range_proof.bytes;
+    proof.back() ^= 0x01;
+    ASSERT_TRUE(crypto::range_proof_has_canonical_shape(crypto::ProofBytes{proof}));
+  }
+  resign_input0(tx, key_from_byte(0x71));
+  ConfidentialPolicy policy;
+  SpecialValidationContext ctx;
+  ctx.current_height = 1;
+  ctx.confidential_policy = &policy;
+  const auto result = validate_tx_v2(tx, 1, view, &ctx);
+  ASSERT_TRUE(!result.ok);
+  ASSERT_EQ(result.error, std::string("commitment balance mismatch"));
+}
+
+namespace {
+
+TxV2 txv2_with_counts(std::size_t inputs, std::size_t outputs) {
+  TxV2 tx;
+  for (std::size_t i = 0; i < inputs; ++i) {
+    TxInV2 in;
+    in.prev_txid.fill(static_cast<std::uint8_t>(i));
+    in.prev_index = static_cast<std::uint32_t>(i);
+    tx.inputs.push_back(in);
+  }
+  for (std::size_t i = 0; i < outputs; ++i) {
+    tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent, .body = TransparentTxOutV2{1, Bytes{0x51}}});
+  }
+  return tx;
+}
+
+}  // namespace
+
+TEST(test_txv2_too_many_inputs_rejected) {
+  ASSERT_TRUE(TxV2::parse(txv2_with_counts(kTxV2MaxInputs, 1).serialize()).has_value());
+  ASSERT_TRUE(!TxV2::parse(txv2_with_counts(kTxV2MaxInputs + 1, 1).serialize()).has_value());
+  ASSERT_TRUE(!parse_any_tx(txv2_with_counts(kTxV2MaxInputs + 1, 1).serialize()).has_value());
+}
+
+TEST(test_txv2_too_many_outputs_rejected) {
+  ASSERT_TRUE(TxV2::parse(txv2_with_counts(1, kTxV2MaxOutputs).serialize()).has_value());
+  ASSERT_TRUE(!TxV2::parse(txv2_with_counts(1, kTxV2MaxOutputs + 1).serialize()).has_value());
+  ASSERT_TRUE(!parse_any_tx(txv2_with_counts(1, kTxV2MaxOutputs + 1).serialize()).has_value());
 }

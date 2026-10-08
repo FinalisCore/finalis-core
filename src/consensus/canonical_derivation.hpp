@@ -12,6 +12,7 @@
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "consensus/availability_retention.hpp"
+#include "consensus/confidential_supply.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/validator_registry.hpp"
 #include "storage/db.hpp"
@@ -110,6 +111,8 @@ struct CanonicalDerivedState {
   std::uint64_t validator_liveness_window_start_height{0};
   std::size_t last_participation_eligible_signers{0};
   availability::AvailabilityPersistentState availability_state;
+  // Derived supply-audit accumulators; deliberately not part of state_commitment.
+  ConfidentialSupplyLedger confidential_supply;
   Hash32 state_commitment{};
 };
 

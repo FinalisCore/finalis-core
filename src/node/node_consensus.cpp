@@ -7,6 +7,7 @@
 #include "node_internal.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <array>
 #include <set>
 #include <sstream>
@@ -381,6 +382,11 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     if (error) *error = "put-finality-certificate-failed";
     return false;
   }
+  batch.put(kConfidentialSupplyLedgerKey,
+            consensus::serialize_confidential_supply_ledger(next_state.confidential_supply, record.transition.height));
+  const bool block_had_txv2 =
+      next_state.confidential_supply.txv2_count != canonical_state_->confidential_supply.txv2_count ||
+      next_state.confidential_supply.known != canonical_state_->confidential_supply.known;
 
   highest_qc_by_height_[record.transition.height] =
       make_quorum_certificate(record.transition.height, record.transition.round, transition_id, canonical_sigs);
@@ -397,6 +403,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   }
   mempool_.remove_confirmed(confirmed_txids);
   hydrate_runtime_from_canonical_state_locked(next_state);
+  if (block_had_txv2) run_confidential_supply_audit_locked("finalized-block");
   mempool_.prune_against_utxo(utxos_);
   const auto now = now_ms();
   if (finalized_height_ > previous_finalized_height) {
@@ -688,6 +695,25 @@ void Node::maybe_record_timeout_certificate_locked(std::uint64_t height, std::ui
       log_line("round-catchup height=" + std::to_string(height) + " old_round=" + std::to_string(round) +
                " new_round=" + std::to_string(current_round_) + " reason=timeout-certificate");
     }
+  }
+}
+
+void Node::run_confidential_supply_audit_locked(const char* trigger) {
+  if (!canonical_state_.has_value()) return;
+  last_confidential_supply_audit_ =
+      consensus::audit_confidential_supply(canonical_state_->utxos, canonical_state_->confidential_supply);
+  const auto& r = last_confidential_supply_audit_;
+  const std::string line = std::string("confidential-supply-audit status=") +
+                           consensus::confidential_supply_audit_status_name(r.status) + " trigger=" + trigger +
+                           " height=" + std::to_string(finalized_height_) + " pool_value=" + std::to_string(r.pool_value) +
+                           " confidential_utxos=" + std::to_string(r.confidential_utxo_count) +
+                           (r.detail.empty() ? std::string() : " detail=" + r.detail);
+  if (r.status == consensus::ConfidentialSupplyAuditStatus::Failed) {
+    // Possible hidden inflation or corrupted confidential state: operators must investigate.
+    log_line("CRITICAL " + line);
+    std::cerr << "CRITICAL " << line << "\n";
+  } else {
+    log_line(line);
   }
 }
 

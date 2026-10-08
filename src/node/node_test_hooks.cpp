@@ -297,6 +297,12 @@ bool Node::has_candidate_frontier_proposal_for_test(const Hash32& transition_id)
   return candidate_frontier_proposals_.find(transition_id) != candidate_frontier_proposals_.end();
 }
 
+consensus::ConfidentialSupplyAuditResult Node::confidential_supply_audit_for_test() {
+  std::lock_guard<std::mutex> lk(mu_);
+  run_confidential_supply_audit_locked("test");
+  return last_confidential_supply_audit_;
+}
+
 std::set<std::uint64_t> Node::abstain_heights_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   return abstain_heights_;

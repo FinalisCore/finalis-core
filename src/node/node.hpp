@@ -276,6 +276,7 @@ class Node {
   bool local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
   bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
   std::set<std::uint64_t> abstain_heights_for_test() const;
+  consensus::ConfidentialSupplyAuditResult confidential_supply_audit_for_test();
   std::size_t timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   bool local_timeout_vote_reserved_for_test(std::uint64_t height, std::uint32_t round) const;
   bool local_is_committee_member_for_test(std::uint64_t height, std::uint32_t round) const;
@@ -436,6 +437,8 @@ class Node {
                                  std::string* reason = nullptr) const;
   bool can_accept_frontier_with_lock_locked(const FrontierTransition& transition, std::string* reason = nullptr) const;
   bool abstaining_at_height_locked(std::uint64_t height) const;
+  // Audits canonical_state_'s confidential supply ledger; logs loudly on failure. Never blocks consensus.
+  void run_confidential_supply_audit_locked(const char* trigger);
   // `proposal` is the full proposal being voted for; it is persisted with the lock (see
   // kConsensusLockedProposalPrefix) so the locked payload survives a restart.
   bool update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal);
@@ -722,6 +725,7 @@ class Node {
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
   std::map<std::uint64_t, consensus::EpochBestTicket> local_epoch_tickets_;
   std::optional<consensus::CanonicalDerivedState> canonical_state_;
+  consensus::ConfidentialSupplyAuditResult last_confidential_supply_audit_;
   std::uint64_t last_open_epoch_ticket_epoch_{0};
   std::map<std::pair<int, std::uint64_t>, std::uint64_t> epoch_ticket_request_ms_;
   std::uint64_t epoch_reconcile_peer_cursor_{0};

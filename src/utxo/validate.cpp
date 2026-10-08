@@ -1097,6 +1097,11 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "confidential range proof too large";
       return out;
     }
+    // Header-only, so it runs before any proof verification.
+    if (!crypto::range_proof_has_canonical_shape(confidential.range_proof)) {
+      out.error = "range-proof-shape-invalid";
+      return out;
+    }
     total_range_proof_bytes += confidential.range_proof.bytes.size();
     proof_commitments.push_back(confidential.value_commitment);
     proofs.push_back(confidential.range_proof);
@@ -1119,11 +1124,6 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
                                          &out.error)) {
     return out;
   }
-  if (!proof_commitments.empty() && !crypto::verify_output_range_proofs_batch(proof_commitments, proofs)) {
-    out.error = "range proof invalid";
-    return out;
-  }
-
   // Fee validation:
   // 1. Pure transparent: transparent inputs must EXACTLY match transparent outputs + fee
   // 2. Transparent inputs with confidential outputs: transparent inputs must cover transparent outputs + fee;
@@ -1178,6 +1178,13 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "excess authorization invalid";
       return out;
     }
+  }
+
+  // DoS ordering: range-proof verification is by far the most expensive check, so it runs last, after
+  // the cheap shape checks, fee checks, commitment tally and excess signature have all passed.
+  if (!proof_commitments.empty() && !crypto::verify_output_range_proofs_batch(proof_commitments, proofs)) {
+    out.error = "range proof invalid";
+    return out;
   }
 
   out.ok = true;

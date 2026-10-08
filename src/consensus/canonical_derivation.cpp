@@ -1835,6 +1835,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   const UtxoSetV2 pre_utxos = next.utxos;
   apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos,
                                          record.transition.height);
+  account_confidential_supply(pre_utxos, recomputed.accepted_txs, record.transition.height, &next.confidential_supply);
   next.finalized_height = record.transition.height;
   next.finalized_frontier = recomputed.transition.next_frontier;
   next.finalized_frontier_vector = recomputed.transition.next_vector;

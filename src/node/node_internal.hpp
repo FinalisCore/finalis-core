@@ -35,6 +35,8 @@ inline constexpr const char* kConsensusSafetyStatePrefix = "CSAFE:";
 // Full FrontierProposal behind the local vote lock at a height, written in the same durable batch
 // as the lock so a restarted node can still re-propose / re-vote its locked payload.
 inline constexpr const char* kConsensusLockedProposalPrefix = "CSLP:";
+// Confidential supply-audit ledger at the finalized tip (consensus::serialize_confidential_supply_ledger).
+inline constexpr const char* kConfidentialSupplyLedgerKey = "CSUPPLY:LEDGER";
 // Second copy of each CSAFE: row, written in the same atomic batch with a differently keyed
 // checksum. Load falls back to it when the primary is unreadable.
 inline constexpr const char* kConsensusSafetyMirrorPrefix = "CSAFE_MIRROR:";

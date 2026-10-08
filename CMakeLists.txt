@@ -159,6 +159,7 @@ add_library(finalis_core
   src/consensus/monetary.cpp
   src/consensus/committee_schedule.cpp
   src/consensus/canonical_derivation.cpp
+  src/consensus/confidential_supply.cpp
   src/consensus/frontier_execution.cpp
   src/consensus/ingress.cpp
   src/consensus/epoch_tickets.cpp
