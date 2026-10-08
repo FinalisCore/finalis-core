@@ -11,7 +11,6 @@
 #include <string_view>
 
 #include "codec/bytes.hpp"
-#include "common/version.hpp"
 #include "consensus/state_commitment.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/smt.hpp"

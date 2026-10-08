@@ -8,57 +8,16 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
-#include <cctype>
-#include <cstdio>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iomanip>
-#include <iostream>
-#include <iterator>
-#include <limits>
-#include <cerrno>
-#include <random>
-#include <signal.h>
-#include <cstdlib>
 #include <set>
 #include <sstream>
-#include <stdexcept>
-#include <string_view>
 
-#ifndef _WIN32
-#include <ifaddrs.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
-
-#include "common/address.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/canonical_derivation.hpp"
-#include "consensus/randomness.hpp"
-#include "consensus/state_commitment.hpp"
-#include "consensus/finalized_committee.hpp"
 #include "consensus/ingress.hpp"
 #include "consensus/validator_registry.hpp"
-#include "consensus/monetary.hpp"
-#include "common/paths.hpp"
-#include "common/socket_compat.hpp"
-#include "common/wide_arith.hpp"
-#include "common/version.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
-#include "crypto/secure_memory.hpp"
-#include "crypto/smt.hpp"
-#include "genesis/embedded_mainnet.hpp"
-#include "genesis/genesis.hpp"
-#include "lightserver/server.hpp"
-#include "common/keystore.hpp"
-#include "common/merkle.hpp"
 #include "utxo/confidential_tx.hpp"
-#include "utxo/signing.hpp"
 
 namespace finalis::node {
 using namespace detail;
