@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "consensus/availability_retention.hpp"
@@ -43,6 +44,9 @@ enum class LightserverLaunchMode {
 struct NodeConfig {
   NetworkConfig network{mainnet_network()};
   bool allow_unsafe_genesis_override{false};
+  // --unsafe-discard-vote-lock-at-height: drop a quarantined (unreadable) consensus safety row at
+  // exactly this height instead of abstaining there. Ignored unless such a row exists.
+  std::optional<std::uint64_t> unsafe_discard_vote_lock_height;
   std::string validator_key_file;
   std::string validator_passphrase;
   bool allow_unencrypted_keystore{false};
@@ -268,6 +272,11 @@ class Node {
   std::optional<PubKey32> proposer_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   std::optional<QuorumCertificate> highest_qc_for_height_for_test(std::uint64_t height) const;
   std::optional<TimeoutCertificate> highest_tc_for_height_for_test(std::uint64_t height) const;
+  std::optional<std::pair<Hash32, std::uint32_t>> local_vote_lock_for_test(std::uint64_t height) const;
+  bool local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
+  bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
+  std::set<std::uint64_t> abstain_heights_for_test() const;
+  consensus::ConfidentialSupplyAuditResult confidential_supply_audit_for_test();
   std::size_t timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   bool local_timeout_vote_reserved_for_test(std::uint64_t height, std::uint32_t round) const;
   bool local_is_committee_member_for_test(std::uint64_t height, std::uint32_t round) const;
@@ -312,7 +321,34 @@ class Node {
   };
 
   void event_loop();
+  // P2P connection lifecycle events (registered with p2p_ in init()).
+  void on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail);
   void handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload);
+  // Per-message handlers called by handle_message (after dedup and rate limiting; all but
+  // on_version/on_verack also after the handshake gate).
+  void on_version(int peer_id, const Bytes& payload);
+  void on_verack(int peer_id, const Bytes& payload);
+  void on_get_finalized_tip(int peer_id, const Bytes& payload);
+  void on_finalized_tip(int peer_id, const Bytes& payload);
+  void on_get_ingress_tips(int peer_id, const Bytes& payload);
+  void on_ingress_tips(int peer_id, const Bytes& payload);
+  void on_get_ingress_range(int peer_id, const Bytes& payload);
+  void on_ingress_range(int peer_id, const Bytes& payload);
+  void on_ingress_record(int peer_id, const Bytes& payload);
+  void on_get_transition(int peer_id, const Bytes& payload);
+  void on_get_transition_by_height(int peer_id, const Bytes& payload);
+  void on_epoch_ticket(int peer_id, const Bytes& payload);
+  void on_get_epoch_tickets(int peer_id, const Bytes& payload);
+  void on_epoch_tickets(int peer_id, const Bytes& payload);
+  void on_transition(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_propose(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_getaddr(int peer_id, const Bytes& payload);
+  void on_addr(int peer_id, const Bytes& payload);
+  void on_ping(int peer_id, const Bytes& payload);
+  void on_pong(int peer_id, const Bytes& payload);
 
   void send_version(int peer_id);
   void maybe_send_verack(int peer_id);
@@ -331,7 +367,6 @@ class Node {
   bool recover_single_validator_epoch_committee_locked(std::uint64_t epoch, const char* reason);
   bool ensure_required_epoch_committee_state_locked();
   bool ensure_required_epoch_committee_state_startup();
-  std::string required_epoch_committee_state_reason_locked(std::uint64_t epoch) const;
   storage::EpochCommitteeFreezeMarker make_epoch_committee_freeze_marker_locked(
       const consensus::EpochCommitteeSnapshot& snapshot) const;
   void rebuild_epoch_committee_state_locked(std::uint64_t epoch, const char* reason, bool log_summary);
@@ -401,7 +436,12 @@ class Node {
                                  const std::optional<TimeoutCertificate>& justify_tc,
                                  std::string* reason = nullptr) const;
   bool can_accept_frontier_with_lock_locked(const FrontierTransition& transition, std::string* reason = nullptr) const;
-  bool update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const Hash32& payload_id);
+  bool abstaining_at_height_locked(std::uint64_t height) const;
+  // Audits canonical_state_'s confidential supply ledger; logs loudly on failure. Never blocks consensus.
+  void run_confidential_supply_audit_locked(const char* trigger);
+  // `proposal` is the full proposal being voted for; it is persisted with the lock (see
+  // kConsensusLockedProposalPrefix) so the locked payload survives a restart.
+  bool update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal);
   // Participation record for the finalized tip, for the next transition's
   // prev_finality_signers: every verified vote seen for the tip (including
   // late ones) plus the persisted certificate, filtered against the canonical
@@ -434,10 +474,12 @@ class Node {
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
                                          storage::DB::Batch& batch, std::string* error = nullptr);
-  bool begin_finalized_write(const Block& block);
-  bool finish_finalized_write(const Block& block);
-  bool check_no_incomplete_finalized_write() const;
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
+  // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
+  std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {
+    if (!canonical_state_) return std::nullopt;
+    return canonical_state_->confidential_pool_value;
+  }
   consensus::CanonicalDerivationConfig canonical_derivation_config_locked() const;
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state,
                                                             storage::DB::Batch& batch);
@@ -447,46 +489,22 @@ class Node {
   bool maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32& pub, std::uint64_t peer_height,
                                                  const char* source);
   void maybe_self_bootstrap_template(std::uint64_t now_ms);
-  bool bootstrap_joiner_ready_locked(const PubKey32& pub) const;
   bool bootstrap_sync_incomplete_locked(int peer_id) const;
-  bool verify_block_proposer_locked(const Block& block) const;
   bool check_and_record_proposer_equivocation_locked(const FrontierTransition& transition);
-  bool validate_prev_finality_cert_hash_locked(const Block& block, std::string* error = nullptr) const;
   bool validate_frontier_proposal_locked(const FrontierProposal& proposal, std::string* error = nullptr) const;
   Hash32 committee_epoch_randomness_for_height_locked(std::uint64_t height) const;
   std::optional<storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoint_for_height_locked(
       std::uint64_t height) const;
-  storage::FinalizedCommitteeCheckpoint build_finalized_committee_checkpoint_locked(
-      std::uint64_t epoch_start_height, std::size_t active_validator_count,
-      const std::vector<consensus::FinalizedCommitteeCandidate>& active,
-      const Hash32& epoch_randomness) const;
-  void persist_finalized_committee_checkpoint_locked(std::uint64_t epoch_start_height,
-                                                     std::size_t active_validator_count,
-                                                     const std::vector<consensus::FinalizedCommitteeCandidate>& active,
-                                                     const Hash32& epoch_randomness);
   std::uint8_t ticket_difficulty_bits_for_epoch_locked(std::uint64_t epoch_start_height,
                                                        std::size_t active_validator_count) const;
-  std::vector<consensus::FinalizedCommitteeCandidate> finalized_committee_candidates_for_height_locked(
-      std::uint64_t height, std::uint8_t ticket_difficulty_bits) const;
   std::optional<std::uint64_t> settlement_epoch_for_block_height_locked(std::uint64_t height) const;
-  storage::EpochRewardSettlementState epoch_reward_state_for_epoch_locked(std::uint64_t epoch_start_height) const;
   std::map<PubKey32, std::uint64_t> compute_onboarding_score_units_for_epoch_locked(std::uint64_t epoch_start_height) const;
   bool ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t height);
-  consensus::DeterministicCoinbasePayout coinbase_payout_for_height_locked(std::uint64_t height,
-                                                                           const PubKey32& leader_pubkey,
-                                                                           std::uint64_t fees_units) const;
-  std::vector<TxOut> coinbase_outputs_for_height_locked(std::uint64_t height, const PubKey32& leader_pubkey,
-                                                        std::uint64_t fees_units) const;
-  std::optional<Hash32> pending_join_request_for_validator_locked(const PubKey32& pub) const;
   std::size_t pending_join_request_count_locked() const;
   bool init_mainnet_genesis();
   bool load_state();
-  void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
   bool is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const;
-  std::vector<PubKey32> committee_for_height(std::uint64_t height) const;
   std::vector<PubKey32> committee_for_height_round(std::uint64_t height, std::uint32_t round) const;
-  std::vector<consensus::WeightedParticipant> reward_participants_for_height_round(std::uint64_t height,
-                                                                                   std::uint32_t round) const;
   std::optional<PubKey32> leader_for_height_round(std::uint64_t height, std::uint32_t round) const;
   void load_persisted_peers();
   void persist_peers() const;
@@ -501,7 +519,6 @@ class Node {
   void rebuild_availability_retained_prefixes_from_finalized_frontier_locked();
   bool finalize_availability_restore_locked(const char* source);
   bool validate_availability_state_locked(const char* source) const;
-  void update_availability_from_finalized_frontier_locked(const consensus::CanonicalFrontierRecord& record);
   void advance_availability_epoch_locked(std::uint64_t epoch);
   void refresh_availability_operator_state_locked(bool advance_epoch);
   std::optional<PubKey32> local_operator_pubkey_locked() const;
@@ -515,7 +532,6 @@ class Node {
   void send_ingress_tips(int peer_id);
   void request_finalized_tip(int peer_id);
   void send_finalized_tip(int peer_id);
-  void broadcast_finalized_tip();
   // Must be called WITHOUT mu_ held.
   void flush_pending_finalized_broadcasts();
   struct FinalizedBroadcastFlushGuard {
@@ -538,7 +554,6 @@ class Node {
   std::size_t established_peer_count() const;
   std::size_t outbound_peer_count() const;
   std::string peer_ip_for_locked(int peer_id) const;
-  std::string peer_ip_for(int peer_id) const;
   bool is_bootstrap_peer_ip(const std::string& ip) const;
   bool suppress_self_endpoint_locked(const std::string& endpoint);
   bool is_self_endpoint_suppressed_locked(const std::string& endpoint) const;
@@ -557,11 +572,11 @@ class Node {
   bool check_sync_transition_rate_limit_locked(int peer_id);
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
-  bool validate_validator_registration_rules(const Block& block, std::uint64_t height) const;
   std::size_t active_operator_count_for_height_locked(std::uint64_t height) const;
   std::uint64_t effective_validator_min_bond_for_height(std::uint64_t height) const;
   std::uint64_t effective_validator_bond_max_for_height(std::uint64_t height) const;
   std::uint64_t effective_min_relay_fee_for_height(std::uint64_t height) const;
+  SpecialValidationContext special_validation_context_locked(std::uint64_t height) const;
   bool start_lightserver_child();
   void stop_lightserver_child();
   bool reap_lightserver_child(bool verbose);
@@ -575,7 +590,20 @@ class Node {
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
   void log_line(const std::string& s) const;
-  void append_mining_log(const Block& block, std::uint32_t round, std::size_t votes, std::size_t quorum);
+  // disable_p2p mode only: the other in-process nodes on the local bus (snapshot, excludes this).
+  std::vector<Node*> local_bus_peers() const;
+  // Calls fn(peer) for each local-bus peer; no-op unless running_. If fn returns bool,
+  // returning true stops the iteration.
+  void for_each_local_bus_peer(auto&& fn) {
+    if (!running_) return;
+    for (Node* peer : local_bus_peers()) {
+      if constexpr (std::is_same_v<decltype(fn(peer)), bool>) {
+        if (fn(peer)) return;
+      } else {
+        fn(peer);
+      }
+    }
+  }
   void spawn_local_bus_task(std::function<void()> fn);
   void join_local_bus_tasks();
 
@@ -680,6 +708,9 @@ class Node {
   std::map<std::uint64_t, Hash32> highest_qc_payload_by_height_;
   std::map<std::uint64_t, TimeoutCertificate> highest_tc_by_height_;
   std::map<std::uint64_t, std::pair<Hash32, std::uint32_t>> local_vote_locks_;
+  // Heights whose persisted safety state was unreadable at startup (see kConsensusSafetyQuarantinePrefix).
+  // SAFETY: nothing is signed or proposed at these heights until they finalize.
+  std::set<std::uint64_t> abstain_heights_;
   struct FinalizedTipVotes {
     std::uint64_t height{0};
     std::uint32_t round{0};
@@ -699,6 +730,7 @@ class Node {
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
   std::map<std::uint64_t, consensus::EpochBestTicket> local_epoch_tickets_;
   std::optional<consensus::CanonicalDerivedState> canonical_state_;
+  consensus::ConfidentialSupplyAuditResult last_confidential_supply_audit_;
   std::uint64_t last_open_epoch_ticket_epoch_{0};
   std::map<std::pair<int, std::uint64_t>, std::uint64_t> epoch_ticket_request_ms_;
   std::uint64_t epoch_reconcile_peer_cursor_{0};

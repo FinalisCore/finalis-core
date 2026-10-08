@@ -2,6 +2,7 @@
 
 #include "test_framework.hpp"
 
+#include "crypto/confidential.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "common/merkle.hpp"
@@ -64,4 +65,24 @@ TEST(test_ed25519_roundtrip) {
   ASSERT_TRUE(!crypto::ed25519_verify(msg, *sig, kp->public_key));
 }
 
-void register_crypto_tests() {}
+// The signing context is re-randomized periodically; blinding must never change results.
+TEST(test_secp_signing_context_rerandomization_preserves_results) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  crypto::Blind32 secret{};
+  secret.bytes.fill(0x5a);
+  Hash32 msg{};
+  msg.fill(0x01);
+  Hash32 aux{};
+  aux.fill(0x02);
+  const auto pub = crypto::secp256k1_pubkey_from_scalar(secret.bytes);
+  const auto commit = crypto::confidential_amount_commitment(42, secret);
+  const auto sig = crypto::sign_schnorr_authorization(msg, secret, aux);
+  ASSERT_TRUE(pub.has_value() && commit.has_value() && sig.has_value());
+  for (int i = 0; i < 200; ++i) {  // > 3 re-randomization intervals
+    ASSERT_TRUE(crypto::secp256k1_pubkey_from_scalar(secret.bytes) == pub);
+    ASSERT_TRUE(crypto::confidential_amount_commitment(42, secret) == commit);
+    const auto again = crypto::sign_schnorr_authorization(msg, secret, aux);
+    ASSERT_TRUE(again == sig);  // BIP340 signing is deterministic in (key, msg, aux)
+    ASSERT_TRUE(crypto::verify_schnorr_authorization(msg, *pub, *again));
+  }
+}

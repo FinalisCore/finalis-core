@@ -71,11 +71,6 @@ analysis/parameter_recommendation_replay_depth/
 analysis/parameter_recommendation_replay_expanded_depth/
 analysis/parameter_recommendation_threshold/
 
-# local finalis-mint runtime files
-services/finalis-mint/*.state.json
-services/finalis-mint/*.secrets.json
-services/finalis-mint/*.lock
-services/finalis-mint/email-spool/
 
 
 # secp256k1-zkp

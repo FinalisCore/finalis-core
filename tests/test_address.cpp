@@ -175,5 +175,3 @@ TEST(test_address_roundtrip_multiple_payloads) {
   ASSERT_EQ(d1->pubkey_hash, ones);
   ASSERT_EQ(d2->pubkey_hash, pattern);
 }
-
-void register_address_tests() {}

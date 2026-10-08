@@ -40,5 +40,3 @@ TEST(test_compare_chain_identity_detects_mismatch_fields) {
   ASSERT_TRUE(!mg.match);
   ASSERT_TRUE(mg.magic_differs);
 }
-
-void register_chain_id_tests() {}

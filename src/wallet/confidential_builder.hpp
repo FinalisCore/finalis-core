@@ -6,6 +6,7 @@
 #include <string>
 
 #include "crypto/confidential.hpp"
+#include "crypto/secure_memory.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/validate.hpp"
@@ -26,6 +27,12 @@ struct ConfidentialOwnedCoin {
   crypto::Blind32 value_blind{};
   crypto::Commitment33 value_commitment{};
   PubKey33 one_time_pubkey{};
+
+  // Destructor only (no constructors) so the struct stays an aggregate.
+  ~ConfidentialOwnedCoin() {
+    crypto::secure_wipe(spend_secret.bytes);
+    crypto::secure_wipe(value_blind.bytes);
+  }
 };
 
 std::optional<ConfidentialTxOutV2> build_confidential_output(

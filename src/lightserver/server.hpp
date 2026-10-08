@@ -78,7 +78,7 @@ struct Config {
   std::string admin_socket_path{kDefaultAdminSocketPath};
   std::size_t worker_threads{0};  // 0 = clamp(hardware_concurrency, 4, 8)
   std::size_t max_queued_connections{64};
-  // Loopback peers (explorer, mint service, local wallet) skip the public rate limits. Set false
+  // Loopback peers (explorer, local wallet) skip the public rate limits. Set false
   // when a same-host reverse proxy fronts the lightserver, or every client shares 127.0.0.1.
   bool exempt_loopback_from_rate_limits{true};
 };

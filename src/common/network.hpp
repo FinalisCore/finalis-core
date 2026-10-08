@@ -62,10 +62,10 @@ struct NetworkConfig {
   std::uint64_t suspend_duration_blocks{1'000};
   std::uint32_t onboarding_admission_pow_difficulty_bits{0};
   std::uint32_t validator_join_admission_pow_difficulty_bits{0};
-  // CLEANSLATE: Finality binding and availability recovery are live from genesis.
+  // CLEANSLATE: Finality binding, availability recovery and confidential UTXOs (TxV2) are live from
+  // genesis; TxV2 has no activation height.
   std::uint64_t finality_binding_activation_height{0};
   std::uint64_t availability_recovery_activation_height{0};
-  std::uint64_t confidential_utxo_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t deferred_exit_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t bootstrap_penalty_exit_protection_activation_height{std::numeric_limits<std::uint64_t>::max()};
   std::uint64_t empty_active_set_epoch_escape_activation_height{std::numeric_limits<std::uint64_t>::max()};
@@ -80,7 +80,6 @@ const std::vector<EconomicsConfig>& economics_policies(const NetworkConfig& netw
 const EconomicsConfig& active_economics_policy(const NetworkConfig& network, std::uint64_t height);
 bool finality_binding_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool availability_recovery_active_at_height(const NetworkConfig& network, std::uint64_t height);
-bool confidential_utxo_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool bootstrap_penalty_exit_protection_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool empty_active_set_epoch_escape_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool onboarding_admission_pow_enabled(const NetworkConfig& network);

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
 #include <openssl/evp.h>
-#include <openssl/hmac.h>
 
 #include <array>
 #include <chrono>
@@ -13,9 +12,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <sstream>
-#include <iomanip>
 #include <optional>
-#include <random>
 #include <set>
 #include <string>
 #include <algorithm>
@@ -26,17 +23,20 @@
 
 #include "common/address.hpp"
 #include "common/chain_id.hpp"
+#include "common/minijson.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
 #include "common/socket_compat.hpp"
 #include "common/wide_arith.hpp"
 #include "common/version.hpp"
+#include "consensus/confidential_supply.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/epoch_committee.hpp"
 #include "consensus/epoch_tickets.hpp"
 #include "consensus/randomness.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/secure_memory.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
 #include "common/keystore.hpp"
@@ -45,8 +45,6 @@
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "consensus/policy_hashcash.hpp"
-#include "privacy/mint_client.hpp"
-#include "privacy/mint_scripts.hpp"
 #include "storage/db.hpp"
 #include "storage/snapshot.hpp"
 #include "utxo/signing.hpp"
@@ -60,44 +58,6 @@ std::string short_pub_hex(const finalis::PubKey32& pub) {
 
 std::string short_hash_hex(const finalis::Hash32& hash) {
   return finalis::hex_encode(finalis::Bytes(hash.begin(), hash.begin() + 6));
-}
-
-std::string json_escape(const std::string& in) {
-  std::ostringstream oss;
-  for (unsigned char c : in) {
-    switch (c) {
-      case '\\':
-        oss << "\\\\";
-        break;
-      case '"':
-        oss << "\\\"";
-        break;
-      case '\b':
-        oss << "\\b";
-        break;
-      case '\f':
-        oss << "\\f";
-        break;
-      case '\n':
-        oss << "\\n";
-        break;
-      case '\r':
-        oss << "\\r";
-        break;
-      case '\t':
-        oss << "\\t";
-        break;
-      default:
-        if (c < 0x20) {
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(c) << std::dec
-              << std::setfill(' ');
-        } else {
-          oss << static_cast<char>(c);
-        }
-        break;
-    }
-  }
-  return oss.str();
 }
 
 const char* epoch_ticket_origin_name(finalis::consensus::EpochTicketOrigin origin) {
@@ -206,20 +166,9 @@ std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body,
                                           const std::string& bearer_token, std::string* err);
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err);
-std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err);
-std::optional<std::string> http_get_json(const std::string& url, std::string* err);
-std::optional<std::string> http_get_text(const std::string& url, std::string* err);
 using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
 std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
                                                        const HttpHeaders& headers, std::string* err);
-std::optional<std::string> http_get_json_with_headers(const std::string& url, const HttpHeaders& headers,
-                                                      std::string* err);
-
-std::string sha256_hex_string(const std::string& data) {
-  finalis::Bytes b(data.begin(), data.end());
-  const auto h = finalis::crypto::sha256(b);
-  return finalis::hex_encode(finalis::Bytes(h.begin(), h.end()));
-}
 
 std::optional<std::uint64_t> parse_coin_amount_text(const std::string& text) {
   auto trim_local = [](const std::string& in) {
@@ -264,48 +213,6 @@ std::optional<std::uint64_t> parse_coin_amount_text(const std::string& text) {
     }
   }
   return units;
-}
-
-std::optional<std::string> hmac_sha256_hex(const finalis::Bytes& key, const std::string& data) {
-  unsigned int out_len = 0;
-  unsigned char out[EVP_MAX_MD_SIZE];
-  if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-            reinterpret_cast<const unsigned char*>(data.data()), data.size(), out, &out_len)) {
-    return std::nullopt;
-  }
-  return finalis::hex_encode(finalis::Bytes(out, out + out_len));
-}
-
-std::optional<HttpHeaders> operator_signed_headers_for_url(const std::string& method, const std::string& url,
-                                                           const std::string& body, const std::string& key_id,
-                                                           const std::string& secret_hex, std::string* err) {
-  if (key_id.empty() || secret_hex.empty()) {
-    if (err) *err = "operator auth requires key id and secret";
-    return std::nullopt;
-  }
-  auto parsed = parse_http_url(url);
-  if (!parsed) {
-    if (err) *err = "url must be http://host:port/path";
-    return std::nullopt;
-  }
-  auto secret_opt = finalis::hex_decode(secret_hex);
-  if (!secret_opt || secret_opt->size() < 16) {
-    if (err) *err = "operator secret must be at least 16 bytes of hex";
-    return std::nullopt;
-  }
-  const auto timestamp = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
-  const auto body_hash = sha256_hex_string(body);
-  const auto payload = method + "\n" + parsed->path + "\n" + timestamp + "\n" + body_hash;
-  auto sig = hmac_sha256_hex(*secret_opt, payload);
-  if (!sig) {
-    if (err) *err = "failed to sign operator request";
-    return std::nullopt;
-  }
-  return HttpHeaders{
-      {"X-Finalis-Operator-Key", key_id},
-      {"X-Finalis-Timestamp", timestamp},
-      {"X-Finalis-Signature", *sig},
-  };
 }
 
 std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
@@ -360,61 +267,6 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
 
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
   return http_post_json(url, body, "", err);
-}
-
-std::optional<std::string> http_get_json_with_headers(const std::string& url, const HttpHeaders& headers,
-                                                      std::string* err) {
-  auto parsed = parse_http_url(url);
-  if (!parsed) {
-    if (err) *err = "url must be http://host:port/path";
-    return std::nullopt;
-  }
-  auto fd_opt = connect_tcp(parsed->host, parsed->port);
-  if (!fd_opt.has_value()) {
-    if (err) *err = "connect failed";
-    return std::nullopt;
-  }
-  const auto fd = *fd_opt;
-  std::ostringstream req;
-  req << "GET " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port << "\r\n";
-  for (const auto& [k, v] : headers) {
-    req << k << ": " << v << "\r\n";
-  }
-  req << "Connection: close\r\n\r\n";
-  const auto req_s = req.str();
-  if (!finalis::p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req_s.data()), req_s.size())) {
-    finalis::net::close_socket(fd);
-    if (err) *err = "send failed";
-    return std::nullopt;
-  }
-  std::string resp;
-  std::array<char, 4096> buf{};
-  while (true) {
-    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
-    if (n <= 0) break;
-    resp.append(buf.data(), static_cast<std::size_t>(n));
-  }
-  finalis::net::close_socket(fd);
-  const auto pos = resp.find("\r\n\r\n");
-  if (pos == std::string::npos) {
-    if (err) *err = "bad http response";
-    return std::nullopt;
-  }
-  return resp.substr(pos + 4);
-}
-
-std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err) {
-  HttpHeaders headers;
-  if (!bearer_token.empty()) headers.push_back({"Authorization", "Bearer " + bearer_token});
-  return http_get_json_with_headers(url, headers, err);
-}
-
-std::optional<std::string> http_get_json(const std::string& url, std::string* err) {
-  return http_get_json(url, "", err);
-}
-
-std::optional<std::string> http_get_text(const std::string& url, std::string* err) {
-  return http_get_json_with_headers(url, HttpHeaders{}, err);
 }
 
 std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
@@ -601,9 +453,9 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"warmup_blocks_remaining\":" << warmup_blocks_remaining << ","
               << "\"activation_epoch_start\":" << activation_epoch_start << ","
               << "\"expected_activation_epoch_start\":" << activation_epoch_start << ","
-              << "\"last_error_code\":\"" << record.last_error_code << "\","
-              << "\"last_error_message\":\"" << record.last_error_message << "\""
-              << (status_source.empty() ? "" : (",\"status_source\":\"" + json_escape(status_source) + "\""))
+              << "\"last_error_code\":\"" << finalis::minijson::escape(record.last_error_code) << "\","
+              << "\"last_error_message\":\"" << finalis::minijson::escape(record.last_error_message) << "\""
+              << (status_source.empty() ? "" : (",\"status_source\":\"" + finalis::minijson::escape(status_source) + "\""))
               << "}\n";
     return;
   }
@@ -1036,7 +888,7 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
   if (as_json) {
     std::ostringstream j;
     j << "{";
-    j << "\"db\":\"" << json_escape(resolved.string()) << "\"";
+    j << "\"db\":\"" << finalis::minijson::escape(resolved.string()) << "\"";
     j << ",\"local_height\":" << local_height;
     j << ",\"next_height\":" << next_height;
     j << ",\"next_height_transition_present\":" << (next_height_transition_present ? "true" : "false");
@@ -1052,25 +904,25 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
       j << ",\"outbound_target\":" << runtime->outbound_target;
       j << ",\"advertised_endpoint_present\":" << (runtime->advertised_endpoint_present ? "true" : "false");
       j << ",\"advertised_endpoint_likely_public\":" << (runtime->advertised_endpoint_likely_public ? "true" : "false");
-      j << ",\"advertised_endpoint\":\"" << json_escape(runtime->advertised_endpoint) << "\"";
+      j << ",\"advertised_endpoint\":\"" << finalis::minijson::escape(runtime->advertised_endpoint) << "\"";
       j << ",\"stun_enabled\":" << (runtime->stun_enabled ? "true" : "false");
       j << ",\"stun_last_success\":" << (runtime->stun_last_success ? "true" : "false");
       j << ",\"stun_last_attempt_unix_ms\":" << runtime->stun_last_attempt_unix_ms;
       j << ",\"stun_last_success_unix_ms\":" << runtime->stun_last_success_unix_ms;
-      j << ",\"stun_last_server\":\"" << json_escape(runtime->stun_last_server) << "\"";
-      j << ",\"stun_last_error_code\":\"" << json_escape(runtime->stun_last_error_code) << "\"";
+      j << ",\"stun_last_server\":\"" << finalis::minijson::escape(runtime->stun_last_server) << "\"";
+      j << ",\"stun_last_error_code\":\"" << finalis::minijson::escape(runtime->stun_last_error_code) << "\"";
       j << ",\"stun_backoff_until_unix_ms\":" << runtime->stun_backoff_until_unix_ms;
       j << ",\"stun_endpoint_change_pending\":" << (runtime->stun_endpoint_change_pending ? "true" : "false");
       j << ",\"stun_endpoint_change_hits\":" << runtime->stun_endpoint_change_hits;
       j << ",\"stun_endpoint_change_required_hits\":" << runtime->stun_endpoint_change_required_hits;
-      j << ",\"stun_endpoint_candidate\":\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
+      j << ",\"stun_endpoint_candidate\":\"" << finalis::minijson::escape(runtime->stun_endpoint_candidate) << "\"";
       j << ",\"observed_network_height_known\":" << (runtime->observed_network_height_known ? "true" : "false");
       j << ",\"observed_network_finalized_height\":" << runtime->observed_network_finalized_height;
       j << ",\"finalized_lag\":" << runtime->finalized_lag;
       j << ",\"bootstrap_sync_incomplete\":" << (runtime->bootstrap_sync_incomplete ? "true" : "false");
-      j << ",\"readiness_failure_codes_csv\":\"" << json_escape(runtime->readiness_failure_codes_csv) << "\"";
+      j << ",\"readiness_failure_codes_csv\":\"" << finalis::minijson::escape(runtime->readiness_failure_codes_csv) << "\"";
     }
-    j << ",\"log_tail_path\":\"" << json_escape(log_path.string()) << "\"";
+    j << ",\"log_tail_path\":\"" << finalis::minijson::escape(log_path.string()) << "\"";
     j << ",\"log_tail_size\":" << lines.size();
     j << ",\"log_counters\":{";
     j << "\"missing_next_cert\":" << stall_missing_next_cert;
@@ -1084,7 +936,7 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
     j << ",\"findings\":[";
     for (std::size_t i = 0; i < findings.size(); ++i) {
       if (i != 0) j << ",";
-      j << "\"" << json_escape(findings[i]) << "\"";
+      j << "\"" << finalis::minijson::escape(findings[i]) << "\"";
     }
     j << "]";
     j << "}\n";
@@ -1408,8 +1260,8 @@ int run_validator_doctor_command(const std::string& db_path, const std::string& 
   if (as_json) {
     std::ostringstream j;
     j << "{";
-    j << "\"db\":\"" << json_escape(resolved_db.string()) << "\"";
-    j << ",\"key_file\":\"" << json_escape(resolved_key.string()) << "\"";
+    j << "\"db\":\"" << finalis::minijson::escape(resolved_db.string()) << "\"";
+    j << ",\"key_file\":\"" << finalis::minijson::escape(resolved_key.string()) << "\"";
     j << ",\"runtime_snapshot_present\":" << (runtime.has_value() ? "true" : "false");
     j << ",\"local_height\":" << (tip.has_value() ? tip->height : 0);
     if (runtime.has_value()) {
@@ -1421,35 +1273,35 @@ int run_validator_doctor_command(const std::string& db_path, const std::string& 
       j << ",\"outbound_target\":" << runtime->outbound_target;
       j << ",\"advertised_endpoint_present\":" << (runtime->advertised_endpoint_present ? "true" : "false");
       j << ",\"advertised_endpoint_likely_public\":" << (runtime->advertised_endpoint_likely_public ? "true" : "false");
-      j << ",\"advertised_endpoint\":\"" << json_escape(runtime->advertised_endpoint) << "\"";
+      j << ",\"advertised_endpoint\":\"" << finalis::minijson::escape(runtime->advertised_endpoint) << "\"";
       j << ",\"stun_enabled\":" << (runtime->stun_enabled ? "true" : "false");
       j << ",\"stun_last_success\":" << (runtime->stun_last_success ? "true" : "false");
       j << ",\"stun_last_attempt_unix_ms\":" << runtime->stun_last_attempt_unix_ms;
       j << ",\"stun_last_success_unix_ms\":" << runtime->stun_last_success_unix_ms;
-      j << ",\"stun_last_server\":\"" << json_escape(runtime->stun_last_server) << "\"";
-      j << ",\"stun_last_error_code\":\"" << json_escape(runtime->stun_last_error_code) << "\"";
+      j << ",\"stun_last_server\":\"" << finalis::minijson::escape(runtime->stun_last_server) << "\"";
+      j << ",\"stun_last_error_code\":\"" << finalis::minijson::escape(runtime->stun_last_error_code) << "\"";
       j << ",\"stun_backoff_until_unix_ms\":" << runtime->stun_backoff_until_unix_ms;
       j << ",\"stun_endpoint_change_pending\":" << (runtime->stun_endpoint_change_pending ? "true" : "false");
       j << ",\"stun_endpoint_change_hits\":" << runtime->stun_endpoint_change_hits;
       j << ",\"stun_endpoint_change_required_hits\":" << runtime->stun_endpoint_change_required_hits;
-      j << ",\"stun_endpoint_candidate\":\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
+      j << ",\"stun_endpoint_candidate\":\"" << finalis::minijson::escape(runtime->stun_endpoint_candidate) << "\"";
       j << ",\"finalized_lag\":" << runtime->finalized_lag;
       j << ",\"bootstrap_sync_incomplete\":" << (runtime->bootstrap_sync_incomplete ? "true" : "false");
       j << ",\"registration_ready\":" << (runtime->registration_ready ? "true" : "false");
-      j << ",\"readiness_failure_codes_csv\":\"" << json_escape(runtime->readiness_failure_codes_csv) << "\"";
+      j << ",\"readiness_failure_codes_csv\":\"" << finalis::minijson::escape(runtime->readiness_failure_codes_csv) << "\"";
     }
     j << ",\"local_validator_key_loaded\":" << (local_validator_key_loaded ? "true" : "false");
     j << ",\"local_validator_registered\":" << (local_validator_registered ? "true" : "false");
-    j << ",\"local_validator_status\":\"" << json_escape(local_validator_status) << "\"";
-    j << ",\"onboarding_state\":\"" << json_escape(onboarding_state) << "\"";
-    j << ",\"onboarding_last_error_code\":\"" << json_escape(onboarding_last_error_code) << "\"";
+    j << ",\"local_validator_status\":\"" << finalis::minijson::escape(local_validator_status) << "\"";
+    j << ",\"onboarding_state\":\"" << finalis::minijson::escape(onboarding_state) << "\"";
+    j << ",\"onboarding_last_error_code\":\"" << finalis::minijson::escape(onboarding_last_error_code) << "\"";
     j << ",\"overall\":\"" << overall << "\"";
     j << ",\"exit_code\":" << exit_code;
     auto emit_codes = [&](const char* key, const std::vector<std::string>& codes) {
       j << ",\"" << key << "\":[";
       for (std::size_t i = 0; i < codes.size(); ++i) {
         if (i) j << ",";
-        j << "\"" << json_escape(codes[i]) << "\"";
+        j << "\"" << finalis::minijson::escape(codes[i]) << "\"";
       }
       j << "]";
     };
@@ -1547,41 +1399,7 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
      << "  finalis-cli snapshot_import --db <dir> --in <snapshot.bin> [--expected-genesis-hash <hex32>]  # default: mainnet genesis\n"
      << "  finalis-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
-     << "  finalis-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
-     << "  finalis-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
-     << "  finalis-cli mint_deposit_register --url http://host:port/path --deposit-txid <hex32> --deposit-vout <u32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--chain mainnet]\n"
-     << "  finalis-cli mint_issue_blinds --url http://host:port/path --mint-deposit-ref <id> --blind <msg> --note-amount <u64> [--blind <msg> --note-amount <u64> ...]\n"
-     << "  finalis-cli mint_redeem_create --url http://host:port/path --redeem-address <addr> --amount <u64> --note <opaque> [--note <opaque> ...]\n"
-     << "  finalis-cli mint_redeem_approve_broadcast --url http://host:port/path --batch-id <id> --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
-     << "  finalis-cli mint_redeem_update --url http://host:port/path --batch-id <id> --state <broadcast|rejected> [--l1-txid <hex32>] --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_reserves --url http://host:port/path\n"
-     << "  finalis-cli mint_reserve_alerts --url http://host:port/path\n"
-     << "  finalis-cli mint_reserve_health --url http://host:port/path\n"
-     << "  finalis-cli mint_reserve_metrics --url http://host:port/path\n"
-     << "  finalis-cli mint_worker_status --url http://host:port/path\n"
-     << "  finalis-cli mint_alert_history --url http://host:port/path\n"
-     << "  finalis-cli mint_alert_ack --url http://host:port/path --event-id <id> --operator-key-id <id> --operator-secret-hex <hex> [--note <text>]\n"
-     << "  finalis-cli mint_alert_silence --url http://host:port/path --event-type <type> --until <unix> --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]\n"
-     << "  finalis-cli mint_alert_silences --url http://host:port/path\n"
-     << "  finalis-cli mint_event_policy --url http://host:port/path\n"
-     << "  finalis-cli mint_event_policy_update --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--retention-limit <n>] [--export-include-acknowledged true|false]\n"
-     << "  finalis-cli mint_notifier_list --url http://host:port/path\n"
-     << "  finalis-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--retry-max-attempts <n>] [--retry-backoff-seconds <n>] [--auth-type none|bearer|basic] [--auth-token-secret-ref <ref>] [--auth-user-secret-ref <ref>] [--auth-pass-secret-ref <ref>] [--tls-verify true|false] [--tls-ca-file <path>] [--tls-client-cert-file <path>] [--tls-client-key-file <path>] [--email-to <addr>] [--email-from <addr>]\n"
-     << "  finalis-cli mint_dead_letters --url http://host:port/path\n"
-     << "  finalis-cli mint_dead_letter_replay --url http://host:port/path --dead-letter-id <id> --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_incident_timeline_export --url http://host:port/path\n"
-     << "  finalis-cli mint_reserve_consolidation_plan --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_reserve_consolidate --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_redemptions_pause --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]\n"
-     << "  finalis-cli mint_redemptions_resume --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_redemptions_auto_pause_enable --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_redemptions_auto_pause_disable --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_redemptions_policy --url http://host:port/path\n"
-     << "  finalis-cli mint_accounting_summary --url http://host:port/path\n"
-     << "  finalis-cli mint_attest_reserves --url http://host:port/path\n"
-     << "  finalis-cli mint_audit_export --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
-     << "  finalis-cli mint_api_example\n"
+     << "  finalis-cli confidential_supply_audit [--db <dir>]   (exit 0=ok 2=unavailable 3=FAILED)\n"
      << "  finalis-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
      << "  finalis-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
      << "  finalis-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-transition <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-transition <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
@@ -1837,6 +1655,43 @@ int main(int argc, char** argv) {
       std::cout << "slashing_records=unknown\n";
     }
     return 0;
+  }
+
+  if (cmd == "confidential_supply_audit") {
+    std::string db_path = default_mainnet_db_path();
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+    }
+    db_path = expand_user(db_path);
+    finalis::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "confidential_supply_audit: failed to open db: " << db_path << "\n";
+      return 1;
+    }
+    const auto raw = db.get("CSUPPLY:LEDGER");
+    std::uint64_t ledger_height = 0;
+    const auto ledger =
+        raw.has_value() ? finalis::consensus::parse_confidential_supply_ledger(*raw, &ledger_height) : std::nullopt;
+    const auto tip = db.get_tip();
+    if (!ledger.has_value()) {
+      std::cout << "status=unavailable detail=no-persisted-ledger\n";
+      return 2;
+    }
+    if (!tip.has_value() || tip->height != ledger_height) {
+      std::cout << "status=unavailable detail=ledger-height-mismatch ledger_height=" << ledger_height
+                << " tip_height=" << (tip.has_value() ? tip->height : 0) << "\n";
+      return 2;
+    }
+    const auto committed_pool = db.get_confidential_pool_value().value_or(0);
+    const auto result = finalis::consensus::audit_confidential_supply(db.load_utxos_v2(), *ledger, committed_pool);
+    std::cout << "status=" << finalis::consensus::confidential_supply_audit_status_name(result.status)
+              << " height=" << ledger_height << " pool_value=" << result.pool_value
+              << " confidential_utxos=" << result.confidential_utxo_count << " txv2_count=" << ledger->txv2_count;
+    if (!result.detail.empty()) std::cout << " detail=" << result.detail;
+    std::cout << "\n";
+    if (result.status == finalis::consensus::ConfidentialSupplyAuditStatus::Ok) return 0;
+    return result.status == finalis::consensus::ConfidentialSupplyAuditStatus::Failed ? 3 : 2;
   }
 
   if (cmd == "--reindex" || cmd == "reindex") {
@@ -2732,8 +2587,10 @@ int main(int argc, char** argv) {
       }
       seed = *s;
     } else {
-      std::random_device rd;
-      for (auto& b : seed) b = static_cast<std::uint8_t>(rd());
+      if (!finalis::crypto::secure_random_bytes(seed.data(), seed.size())) {
+        std::cerr << "secure RNG unavailable\n";
+        return 1;
+      }
     }
 
     auto kp = finalis::crypto::keypair_from_seed32(seed);
@@ -3091,7 +2948,7 @@ int main(int argc, char** argv) {
     if (!have_local_validator) {
       if (as_json) {
         std::cout << "{"
-                  << "\"db\":\"" << json_escape(db_path) << "\","
+                  << "\"db\":\"" << finalis::minijson::escape(db_path) << "\","
                   << "\"finalized_height\":" << finalized_height << ","
                   << "\"inspected_finalized_height\":" << inspected_finalized_height << ","
                   << "\"economics_height\":" << economics_height << ","
@@ -3228,7 +3085,7 @@ int main(int argc, char** argv) {
 
     if (as_json) {
       std::cout << "{"
-                << "\"db\":\"" << json_escape(db_path) << "\","
+                << "\"db\":\"" << finalis::minijson::escape(db_path) << "\","
                 << "\"finalized_height\":" << finalized_height << ","
                 << "\"inspected_finalized_height\":" << inspected_finalized_height << ","
                 << "\"economics_height\":" << economics_height << ","
@@ -3253,7 +3110,7 @@ int main(int argc, char** argv) {
                 << ","
                 << "\"local_validator_present\":true,"
                 << "\"local_validator_pubkey\":\"" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\","
-                << "\"local_validator_address\":\"" << json_escape(vk.address) << "\","
+                << "\"local_validator_address\":\"" << finalis::minijson::escape(vk.address) << "\","
                 << "\"local_validator_registered\":" << (it != validators.end() ? "true" : "false");
       if (it != validators.end()) {
         std::cout << ",\"local_validator_status\":\"" << validator_status_name(it->second.status) << "\""
@@ -3287,7 +3144,7 @@ int main(int argc, char** argv) {
           std::cout << ",\"settlement_epoch_total_reward_units\":null"
                     << ",\"settlement_epoch_settled\":null";
         }
-        std::cout << ",\"local_validator_settlement_reason\":\"" << json_escape(settlement_reason) << "\"";
+        std::cout << ",\"local_validator_settlement_reason\":\"" << finalis::minijson::escape(settlement_reason) << "\"";
       }
       std::cout << "}\n";
       return 0;
@@ -4084,946 +3941,6 @@ int main(int argc, char** argv) {
 
     std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
     std::cout << "tx_hex=" << finalis::hex_encode(tx->serialize()) << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_deposit_create") {
-    std::string prev_txid_hex;
-    std::uint32_t prev_index = 0;
-    std::uint64_t prev_value = 0;
-    std::string from_priv_hex;
-    std::string mint_id_hex;
-    std::string recipient_addr;
-    std::string change_addr;
-    std::uint64_t amount = 0;
-    std::uint64_t fee = 0;
-
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
-      else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-      else if (a == "--from-privkey" && i + 1 < argc) from_priv_hex = argv[++i];
-      else if (a == "--mint-id" && i + 1 < argc) mint_id_hex = argv[++i];
-      else if (a == "--recipient-address" && i + 1 < argc) recipient_addr = argv[++i];
-      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
-      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-    }
-
-    auto prev_txid = decode_hex32(prev_txid_hex);
-    auto priv = decode_hex32(from_priv_hex);
-    auto mint_id = decode_hex32(mint_id_hex);
-    auto recipient = finalis::address::decode(recipient_addr);
-    if (!prev_txid.has_value() || !priv.has_value() || !mint_id.has_value() || !recipient.has_value()) {
-      std::cerr << "invalid required args\n";
-      return 1;
-    }
-    if (prev_value < amount + fee) {
-      std::cerr << "insufficient prev output value\n";
-      return 1;
-    }
-
-    auto kp = finalis::crypto::keypair_from_seed32(*priv);
-    if (!kp.has_value()) {
-      std::cerr << "invalid private key\n";
-      return 1;
-    }
-    auto from_pkh = finalis::crypto::h160(finalis::Bytes(kp->public_key.begin(), kp->public_key.end()));
-    finalis::OutPoint op{*prev_txid, prev_index};
-    finalis::TxOut prev_out{prev_value, finalis::address::p2pkh_script_pubkey(from_pkh)};
-
-    std::vector<finalis::TxOut> outputs;
-    outputs.push_back(finalis::TxOut{
-        amount, finalis::privacy::mint_deposit_script_pubkey(*mint_id, recipient->pubkey_hash)});
-
-    const std::uint64_t change = prev_value - amount - fee;
-    if (change > 0) {
-      if (!change_addr.empty()) {
-        auto ch = finalis::address::decode(change_addr);
-        if (!ch.has_value()) {
-          std::cerr << "invalid --change-address\n";
-          return 1;
-        }
-        outputs.push_back(finalis::TxOut{change, finalis::address::p2pkh_script_pubkey(ch->pubkey_hash)});
-      } else {
-        outputs.push_back(finalis::TxOut{change, finalis::address::p2pkh_script_pubkey(from_pkh)});
-      }
-    }
-
-    std::string err;
-    auto tx = finalis::build_signed_p2pkh_tx_single_input(op, prev_out, finalis::Bytes(priv->begin(), priv->end()), outputs, &err);
-    if (!tx.has_value()) {
-      std::cerr << "mint deposit tx build failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
-    std::cout << "tx_hex=" << finalis::hex_encode(tx->serialize()) << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_deposit_status") {
-    std::string db_path = default_mainnet_db_path();
-    std::string mint_id_hex;
-    std::string recipient_addr;
-    std::size_t tail = 20;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
-      else if (a == "--mint-id" && i + 1 < argc) mint_id_hex = argv[++i];
-      else if (a == "--recipient-address" && i + 1 < argc) recipient_addr = argv[++i];
-      else if (a == "--tail" && i + 1 < argc) tail = static_cast<std::size_t>(std::stoull(argv[++i]));
-    }
-
-    std::optional<finalis::Hash32> mint_filter;
-    if (!mint_id_hex.empty()) {
-      auto id = decode_hex32(mint_id_hex);
-      if (!id) {
-        std::cerr << "invalid --mint-id\n";
-        return 1;
-      }
-      mint_filter = *id;
-    }
-    std::optional<std::array<std::uint8_t, 20>> recipient_filter;
-    if (!recipient_addr.empty()) {
-      auto addr = finalis::address::decode(recipient_addr);
-      if (!addr) {
-        std::cerr << "invalid --recipient-address\n";
-        return 1;
-      }
-      recipient_filter = addr->pubkey_hash;
-    }
-
-    finalis::storage::DB db;
-    if (!db.open_readonly(db_path) && !db.open(db_path)) {
-      std::cerr << "failed to open db\n";
-      return 1;
-    }
-
-    struct MintDepositRow {
-      finalis::OutPoint outpoint;
-      finalis::Hash32 mint_id{};
-      std::array<std::uint8_t, 20> recipient{};
-      std::uint64_t value{0};
-      std::uint64_t height{0};
-      finalis::Hash32 txid{};
-    };
-
-    std::vector<MintDepositRow> rows;
-    const auto utxos = db.load_utxos();
-    for (const auto& [op, entry] : utxos) {
-      finalis::Hash32 mint_id{};
-      std::array<std::uint8_t, 20> recipient{};
-      if (!finalis::privacy::is_mint_deposit_script(entry.out.script_pubkey, &mint_id, &recipient)) continue;
-      if (mint_filter.has_value() && mint_id != *mint_filter) continue;
-      if (recipient_filter.has_value() && recipient != *recipient_filter) continue;
-      MintDepositRow row;
-      row.outpoint = op;
-      row.mint_id = mint_id;
-      row.recipient = recipient;
-      row.value = entry.out.value;
-      row.txid = op.txid;
-      auto loc = db.get_tx_index(op.txid);
-      if (loc) row.height = loc->height;
-      rows.push_back(row);
-    }
-
-    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
-      if (a.height != b.height) return a.height > b.height;
-      return a.outpoint.index < b.outpoint.index;
-    });
-
-    std::cout << "mint_deposits=" << rows.size() << "\n";
-    const std::size_t limit = std::min<std::size_t>(tail, rows.size());
-    for (std::size_t i = 0; i < limit; ++i) {
-      const auto& row = rows[i];
-      std::cout << "txid=" << finalis::hex_encode32(row.txid)
-                << " vout=" << row.outpoint.index
-                << " value=" << row.value
-                << " height=" << row.height
-                << " mint_id=" << finalis::hex_encode32(row.mint_id)
-                << " recipient_pkh=" << finalis::hex_encode(finalis::Bytes(row.recipient.begin(), row.recipient.end()))
-                << "\n";
-    }
-    return 0;
-  }
-
-  if (cmd == "mint_deposit_register") {
-    std::string url;
-    std::string chain = "mainnet";
-    std::string deposit_txid_hex;
-    std::uint32_t deposit_vout = 0;
-    std::string mint_id_hex;
-    std::string recipient_addr;
-    std::uint64_t amount = 0;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--chain" && i + 1 < argc) chain = argv[++i];
-      else if (a == "--deposit-txid" && i + 1 < argc) deposit_txid_hex = argv[++i];
-      else if (a == "--deposit-vout" && i + 1 < argc) deposit_vout = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--mint-id" && i + 1 < argc) mint_id_hex = argv[++i];
-      else if (a == "--recipient-address" && i + 1 < argc) recipient_addr = argv[++i];
-      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-    }
-
-    auto deposit_txid = decode_hex32(deposit_txid_hex);
-    auto mint_id = decode_hex32(mint_id_hex);
-    auto recipient = finalis::address::decode(recipient_addr);
-    if (url.empty() || !deposit_txid || !mint_id || !recipient) {
-      std::cerr << "invalid required args\n";
-      return 1;
-    }
-
-    finalis::privacy::MintDepositRegistrationRequest req;
-    req.chain = chain;
-    req.deposit_txid = *deposit_txid;
-    req.deposit_vout = deposit_vout;
-    req.mint_id = *mint_id;
-    req.recipient_pubkey_hash = recipient->pubkey_hash;
-    req.amount = amount;
-
-    std::string err;
-    auto body = http_post_json(url, finalis::privacy::to_json(req), &err);
-    if (!body) {
-      std::cerr << "mint_deposit_register failed: " << err << "\n";
-      return 1;
-    }
-    auto resp = finalis::privacy::parse_mint_deposit_registration_response(*body);
-    if (!resp) {
-      std::cerr << "mint_deposit_register parse failed\n";
-      return 1;
-    }
-    auto finalization_depth_required = find_json_u64(*body, "finalization_depth_required");
-    std::cout << "accepted=" << (resp->accepted ? "true" : "false") << "\n";
-    if (finalization_depth_required.has_value()) {
-      std::cout << "finalization_depth_required=" << *finalization_depth_required << "\n";
-    }
-    std::cout << "mint_deposit_ref=" << resp->mint_deposit_ref << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_issue_blinds") {
-    std::string url;
-    std::string mint_deposit_ref;
-    std::vector<std::string> blinds;
-    std::vector<std::uint64_t> note_amounts;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--mint-deposit-ref" && i + 1 < argc) mint_deposit_ref = argv[++i];
-      else if (a == "--blind" && i + 1 < argc) blinds.push_back(argv[++i]);
-      else if (a == "--note-amount" && i + 1 < argc) {
-        note_amounts.push_back(static_cast<std::uint64_t>(std::stoull(argv[++i])));
-      }
-    }
-    if (url.empty() || mint_deposit_ref.empty() || blinds.empty() || blinds.size() != note_amounts.size()) {
-      std::cerr << "mint_issue_blinds requires --url, --mint-deposit-ref, and matching --blind/--note-amount pairs\n";
-      return 1;
-    }
-    finalis::privacy::MintBlindIssueRequest req;
-    req.mint_deposit_ref = mint_deposit_ref;
-    req.blinded_messages = blinds;
-    req.note_amounts = note_amounts;
-
-    std::string err;
-    auto body = http_post_json(url, finalis::privacy::to_json(req), &err);
-    if (!body) {
-      std::cerr << "mint_issue_blinds failed: " << err << "\n";
-      return 1;
-    }
-    auto resp = finalis::privacy::parse_mint_blind_issue_response(*body);
-    if (!resp) {
-      std::cerr << "mint_issue_blinds parse failed\n";
-      return 1;
-    }
-    std::cout << "issuance_id=" << resp->issuance_id << "\n";
-    std::cout << "mint_epoch=" << resp->mint_epoch << "\n";
-    std::cout << "signed_blinds=" << resp->signed_blinds.size() << "\n";
-    for (std::size_t i = 0; i < resp->signed_blinds.size(); ++i) {
-      std::cout << "signed_blind[" << i << "]=" << resp->signed_blinds[i] << "\n";
-      if (i < resp->note_refs.size()) {
-        std::cout << "note_ref[" << i << "]=" << resp->note_refs[i] << "\n";
-      }
-      if (i < resp->note_amounts.size()) {
-        std::cout << "note_amount[" << i << "]=" << resp->note_amounts[i] << "\n";
-      }
-    }
-    return 0;
-  }
-
-  if (cmd == "mint_redeem_create") {
-    std::string url;
-    std::string redeem_address;
-    std::vector<std::string> notes;
-    std::uint64_t amount = 0;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--redeem-address" && i + 1 < argc) redeem_address = argv[++i];
-      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-      else if (a == "--note" && i + 1 < argc) notes.push_back(argv[++i]);
-    }
-    if (url.empty() || redeem_address.empty() || amount == 0 || notes.empty()) {
-      std::cerr << "mint_redeem_create requires --url, --redeem-address, --amount, and at least one --note\n";
-      return 1;
-    }
-    finalis::privacy::MintRedemptionRequest req;
-    req.notes = notes;
-    req.redeem_address = redeem_address;
-    req.amount = amount;
-
-    std::string err;
-    auto body = http_post_json(url, finalis::privacy::to_json(req), &err);
-    if (!body) {
-      std::cerr << "mint_redeem_create failed: " << err << "\n";
-      return 1;
-    }
-    auto resp = finalis::privacy::parse_mint_redemption_response(*body);
-    if (!resp) {
-      std::cerr << "mint_redeem_create parse failed\n";
-      return 1;
-    }
-    std::cout << "accepted=" << (resp->accepted ? "true" : "false") << "\n";
-    std::cout << "redemption_batch_id=" << resp->redemption_batch_id << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_redeem_approve_broadcast") {
-    std::string url;
-    std::string batch_id;
-    std::string operator_key_id;
-    std::string operator_secret_hex;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--batch-id" && i + 1 < argc) batch_id = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-    }
-    if (url.empty() || batch_id.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_redeem_approve_broadcast requires --url, --batch-id, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    std::ostringstream body_json;
-    body_json << "{\"redemption_batch_id\":\"" << batch_id << "\"}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_redeem_approve_broadcast failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
-    if (!body) {
-      std::cerr << "mint_redeem_approve_broadcast failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_redeem_status") {
-    std::string url;
-    std::string batch_id;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--batch-id" && i + 1 < argc) batch_id = argv[++i];
-    }
-    if (url.empty() || batch_id.empty()) {
-      std::cerr << "mint_redeem_status requires --url and --batch-id\n";
-      return 1;
-    }
-
-    std::ostringstream body_json;
-    body_json << "{\"redemption_batch_id\":\"" << batch_id << "\"}";
-
-    std::string err;
-    auto body = http_post_json(url, body_json.str(), &err);
-    if (!body) {
-      std::cerr << "mint_redeem_status failed: " << err << "\n";
-      return 1;
-    }
-    auto resp = finalis::privacy::parse_mint_redemption_status_response(*body);
-    if (!resp) {
-      std::cerr << "mint_redeem_status parse failed\n";
-      return 1;
-    }
-    auto finalization_depth = find_json_u64(*body, "finalization_depth");
-    std::cout << "state=" << resp->state << "\n";
-    std::cout << "l1_txid=" << resp->l1_txid << "\n";
-    std::cout << "amount=" << resp->amount << "\n";
-    if (finalization_depth.has_value()) {
-      std::cout << "finalization_depth=" << *finalization_depth << "\n";
-    }
-    return 0;
-  }
-
-  if (cmd == "mint_redeem_update") {
-    std::string url;
-    std::string batch_id;
-    std::string state;
-    std::string l1_txid;
-    std::string operator_key_id;
-    std::string operator_secret_hex;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--batch-id" && i + 1 < argc) batch_id = argv[++i];
-      else if (a == "--state" && i + 1 < argc) state = argv[++i];
-      else if (a == "--l1-txid" && i + 1 < argc) l1_txid = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-    }
-    if (url.empty() || batch_id.empty() || state.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_redeem_update requires --url, --batch-id, --state, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    std::ostringstream body_json;
-    body_json << "{\"redemption_batch_id\":\"" << batch_id << "\",\"state\":\"" << state << "\"";
-    if (!l1_txid.empty()) body_json << ",\"l1_txid\":\"" << l1_txid << "\"";
-    body_json << "}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_redeem_update failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
-    if (!body) {
-      std::cerr << "mint_redeem_update failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_reserves") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_reserves requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << "mint_reserves failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_reserve_alerts") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_reserve_alerts requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << "mint_reserve_alerts failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_reserve_health") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_reserve_health requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << "mint_reserve_health failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_reserve_metrics") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_reserve_metrics requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_text(url, &err);
-    if (!body) {
-      std::cerr << "mint_reserve_metrics failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body;
-    return 0;
-  }
-
-  if (cmd == "mint_alert_history") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_alert_history requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << "mint_alert_history failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_alert_ack") {
-    std::string url, event_id, operator_key_id, operator_secret_hex, note;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--event-id" && i + 1 < argc) event_id = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-      else if (a == "--note" && i + 1 < argc) note = argv[++i];
-    }
-    if (url.empty() || event_id.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_alert_ack requires --url, --event-id, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    const std::string body_json = std::string("{\"event_id\":\"") + event_id + "\",\"note\":\"" + note + "\"}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json, operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_alert_ack failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json, *headers, &err);
-    if (!body) {
-      std::cerr << "mint_alert_ack failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_alert_silence") {
-    std::string url, event_type, operator_key_id, operator_secret_hex, reason;
-    std::string until;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--event-type" && i + 1 < argc) event_type = argv[++i];
-      else if (a == "--until" && i + 1 < argc) until = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-      else if (a == "--reason" && i + 1 < argc) reason = argv[++i];
-    }
-    if (url.empty() || event_type.empty() || until.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_alert_silence requires --url, --event-type, --until, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    const std::string body_json = std::string("{\"event_type\":\"") + event_type + "\",\"until_ts\":" + until + ",\"reason\":\"" + reason + "\"}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json, operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_alert_silence failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json, *headers, &err);
-    if (!body) {
-      std::cerr << "mint_alert_silence failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_alert_silences" || cmd == "mint_event_policy" || cmd == "mint_notifier_list" ||
-      cmd == "mint_dead_letters" || cmd == "mint_incident_timeline_export" || cmd == "mint_worker_status") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << cmd << " requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << cmd << " failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_event_policy_update") {
-    std::string url, operator_key_id, operator_secret_hex, retention_limit, export_ack;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-      else if (a == "--retention-limit" && i + 1 < argc) retention_limit = argv[++i];
-      else if (a == "--export-include-acknowledged" && i + 1 < argc) export_ack = argv[++i];
-    }
-    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_event_policy_update requires --url, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    std::ostringstream body_json;
-    body_json << "{";
-    bool first = true;
-    if (!retention_limit.empty()) {
-      body_json << "\"event_retention_limit\":" << retention_limit;
-      first = false;
-    }
-    if (!export_ack.empty()) {
-      if (!first) body_json << ",";
-      body_json << "\"export_include_acknowledged\":" << ((export_ack == "true" || export_ack == "1") ? "true" : "false");
-    }
-    body_json << "}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_event_policy_update failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
-    if (!body) {
-      std::cerr << "mint_event_policy_update failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_notifier_upsert") {
-    std::string url, operator_key_id, operator_secret_hex, notifier_id, kind, target, enabled, email_to, email_from, retry_max_attempts, retry_backoff_seconds, auth_type, auth_token_secret_ref, auth_user_secret_ref, auth_pass_secret_ref, tls_verify, tls_ca_file, tls_client_cert_file, tls_client_key_file;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-      else if (a == "--notifier-id" && i + 1 < argc) notifier_id = argv[++i];
-      else if (a == "--kind" && i + 1 < argc) kind = argv[++i];
-      else if (a == "--target" && i + 1 < argc) target = argv[++i];
-      else if (a == "--enabled" && i + 1 < argc) enabled = argv[++i];
-      else if (a == "--retry-max-attempts" && i + 1 < argc) retry_max_attempts = argv[++i];
-      else if (a == "--retry-backoff-seconds" && i + 1 < argc) retry_backoff_seconds = argv[++i];
-      else if (a == "--auth-type" && i + 1 < argc) auth_type = argv[++i];
-      else if (a == "--auth-token-secret-ref" && i + 1 < argc) auth_token_secret_ref = argv[++i];
-      else if (a == "--auth-user-secret-ref" && i + 1 < argc) auth_user_secret_ref = argv[++i];
-      else if (a == "--auth-pass-secret-ref" && i + 1 < argc) auth_pass_secret_ref = argv[++i];
-      else if (a == "--tls-verify" && i + 1 < argc) tls_verify = argv[++i];
-      else if (a == "--tls-ca-file" && i + 1 < argc) tls_ca_file = argv[++i];
-      else if (a == "--tls-client-cert-file" && i + 1 < argc) tls_client_cert_file = argv[++i];
-      else if (a == "--tls-client-key-file" && i + 1 < argc) tls_client_key_file = argv[++i];
-      else if (a == "--email-to" && i + 1 < argc) email_to = argv[++i];
-      else if (a == "--email-from" && i + 1 < argc) email_from = argv[++i];
-    }
-    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty() || notifier_id.empty() || kind.empty() || target.empty()) {
-      std::cerr << "mint_notifier_upsert requires --url, --operator-key-id, --operator-secret-hex, --notifier-id, --kind, and --target\n";
-      return 1;
-    }
-    const bool enabled_value = !(enabled == "false" || enabled == "0");
-    std::ostringstream body_json;
-    body_json << "{\"notifier_id\":\"" << notifier_id << "\",\"kind\":\"" << kind
-              << "\",\"target\":\"" << target << "\",\"enabled\":" << (enabled_value ? "true" : "false");
-    if (!retry_max_attempts.empty()) body_json << ",\"retry_max_attempts\":" << retry_max_attempts;
-    if (!retry_backoff_seconds.empty()) body_json << ",\"retry_backoff_seconds\":" << retry_backoff_seconds;
-    if (!auth_type.empty()) body_json << ",\"auth_type\":\"" << auth_type << "\"";
-    if (!auth_token_secret_ref.empty()) body_json << ",\"auth_token_secret_ref\":\"" << auth_token_secret_ref << "\"";
-    if (!auth_user_secret_ref.empty()) body_json << ",\"auth_user_secret_ref\":\"" << auth_user_secret_ref << "\"";
-    if (!auth_pass_secret_ref.empty()) body_json << ",\"auth_pass_secret_ref\":\"" << auth_pass_secret_ref << "\"";
-    if (!tls_verify.empty()) body_json << ",\"tls_verify\":" << ((tls_verify == "true" || tls_verify == "1") ? "true" : "false");
-    if (!tls_ca_file.empty()) body_json << ",\"tls_ca_file\":\"" << tls_ca_file << "\"";
-    if (!tls_client_cert_file.empty()) body_json << ",\"tls_client_cert_file\":\"" << tls_client_cert_file << "\"";
-    if (!tls_client_key_file.empty()) body_json << ",\"tls_client_key_file\":\"" << tls_client_key_file << "\"";
-    if (!email_to.empty()) body_json << ",\"email_to\":\"" << email_to << "\"";
-    if (!email_from.empty()) body_json << ",\"email_from\":\"" << email_from << "\"";
-    body_json << "}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_notifier_upsert failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
-    if (!body) {
-      std::cerr << "mint_notifier_upsert failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_dead_letter_replay") {
-    std::string url, operator_key_id, operator_secret_hex, dead_letter_id;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-      else if (a == "--dead-letter-id" && i + 1 < argc) dead_letter_id = argv[++i];
-    }
-    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty() || dead_letter_id.empty()) {
-      std::cerr << "mint_dead_letter_replay requires --url, --dead-letter-id, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    const std::string body_json = std::string("{\"dead_letter_id\":\"") + dead_letter_id + "\"}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json, operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_dead_letter_replay failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json, *headers, &err);
-    if (!body) {
-      std::cerr << "mint_dead_letter_replay failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_reserve_consolidate") {
-    std::string url;
-    std::string operator_key_id;
-    std::string operator_secret_hex;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-    }
-    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_reserve_consolidate requires --url, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    const std::string body_json = "{}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json, operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_reserve_consolidate failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json, *headers, &err);
-    if (!body) {
-      std::cerr << "mint_reserve_consolidate failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_reserve_consolidation_plan") {
-    std::string url;
-    std::string operator_key_id;
-    std::string operator_secret_hex;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-    }
-    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_reserve_consolidation_plan requires --url, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    std::string err;
-    auto headers = operator_signed_headers_for_url("GET", url, "", operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_reserve_consolidation_plan failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_get_json_with_headers(url, *headers, &err);
-    if (!body) {
-      std::cerr << "mint_reserve_consolidation_plan failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_redemptions_pause" || cmd == "mint_redemptions_resume" ||
-      cmd == "mint_redemptions_auto_pause_enable" || cmd == "mint_redemptions_auto_pause_disable") {
-    std::string url;
-    std::string operator_key_id;
-    std::string operator_secret_hex;
-    std::string reason;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-      else if (a == "--reason" && i + 1 < argc) reason = argv[++i];
-    }
-    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << cmd << " requires --url, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    const bool paused = (cmd == "mint_redemptions_pause");
-    const bool auto_pause_enabled =
-        (cmd == "mint_redemptions_auto_pause_enable") ? true :
-        (cmd == "mint_redemptions_auto_pause_disable") ? false : false;
-    std::ostringstream body_json;
-    body_json << "{\"redemptions_paused\":" << (paused ? "true" : "false")
-              << ",\"pause_reason\":\"" << reason << "\"";
-    if (cmd == "mint_redemptions_auto_pause_enable" || cmd == "mint_redemptions_auto_pause_disable") {
-      body_json << ",\"auto_pause_enabled\":" << (auto_pause_enabled ? "true" : "false");
-    }
-    body_json << "}";
-    std::string err;
-    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << cmd << " failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
-    if (!body) {
-      std::cerr << cmd << " failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_redemptions_policy") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_redemptions_policy requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << "mint_redemptions_policy failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_accounting_summary") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_accounting_summary requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << "mint_accounting_summary failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_attest_reserves") {
-    std::string url;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-    }
-    if (url.empty()) {
-      std::cerr << "mint_attest_reserves requires --url\n";
-      return 1;
-    }
-    std::string err;
-    auto body = http_get_json(url, &err);
-    if (!body) {
-      std::cerr << "mint_attest_reserves failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_audit_export") {
-    std::string url;
-    std::string operator_key_id;
-    std::string operator_secret_hex;
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
-      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
-    }
-    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
-      std::cerr << "mint_audit_export requires --url, --operator-key-id, and --operator-secret-hex\n";
-      return 1;
-    }
-    std::string err;
-    auto headers = operator_signed_headers_for_url("GET", url, "", operator_key_id, operator_secret_hex, &err);
-    if (!headers) {
-      std::cerr << "mint_audit_export failed: " << err << "\n";
-      return 1;
-    }
-    auto body = http_get_json_with_headers(url, *headers, &err);
-    if (!body) {
-      std::cerr << "mint_audit_export failed: " << err << "\n";
-      return 1;
-    }
-    std::cout << *body << "\n";
-    return 0;
-  }
-
-  if (cmd == "mint_api_example") {
-    finalis::privacy::MintDepositRegistrationRequest deposit_req;
-    deposit_req.chain = "mainnet";
-    deposit_req.deposit_txid.fill(0x11);
-    deposit_req.deposit_vout = 0;
-    deposit_req.mint_id.fill(0x22);
-    deposit_req.recipient_pubkey_hash.fill(0x33);
-    deposit_req.amount = 100000;
-
-    finalis::privacy::MintBlindIssueRequest issue_req;
-    issue_req.mint_deposit_ref = "example-ref";
-    issue_req.blinded_messages = {"blind-msg-1", "blind-msg-2"};
-    issue_req.note_amounts = {40000, 60000};
-
-    finalis::privacy::MintRedemptionRequest redeem_req;
-    redeem_req.notes = {"note-1", "note-2"};
-    redeem_req.redeem_address = "sc1example";
-    redeem_req.amount = 100000;
-
-    std::cout << "deposit_registration=" << finalis::privacy::to_json(deposit_req) << "\n";
-    std::cout << "blind_issue=" << finalis::privacy::to_json(issue_req) << "\n";
-    std::cout << "redemption=" << finalis::privacy::to_json(redeem_req) << "\n";
     return 0;
   }
 

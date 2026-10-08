@@ -76,7 +76,6 @@ const NetworkConfig kMainnet{
     // CLEANSLATE: These finalized-state protections are enabled at restart genesis.
     .finality_binding_activation_height = 0,
     .availability_recovery_activation_height = 0,
-    .confidential_utxo_activation_height = std::numeric_limits<std::uint64_t>::max(),
     // CLEANSLATE: Fresh genesis; these protections are active from genesis.
     .deferred_exit_activation_height = 0,
     .bootstrap_penalty_exit_protection_activation_height = 0,
@@ -138,10 +137,6 @@ bool finality_binding_active_at_height(const NetworkConfig& network, std::uint64
 
 bool availability_recovery_active_at_height(const NetworkConfig& network, std::uint64_t height) {
   return height >= network.availability_recovery_activation_height;
-}
-
-bool confidential_utxo_active_at_height(const NetworkConfig& network, std::uint64_t height) {
-  return height >= network.confidential_utxo_activation_height;
 }
 
 bool bootstrap_penalty_exit_protection_active_at_height(const NetworkConfig& network, std::uint64_t height) {

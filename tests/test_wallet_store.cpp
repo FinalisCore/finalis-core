@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -21,11 +22,7 @@ using finalis::OutPoint;
 
 namespace {
 std::string unique_test_dir(const char* prefix) {
-  static std::atomic<std::uint64_t> counter{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto seq = counter.fetch_add(1, std::memory_order_relaxed);
-  const std::string dir = std::string(prefix) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq);
+  const std::string dir = finalis::test::unique_test_base(prefix);
   std::filesystem::create_directories(dir);
   return dir;
 }
@@ -58,12 +55,6 @@ TEST(test_wallet_store_persists_sent_events_and_notes) {
   ASSERT_TRUE(store.set_history_cursor(10, std::string("tx-final-2")));
     ASSERT_TRUE(store.append_local_event("event-one"));
     ASSERT_TRUE(store.append_local_event("event-two"));
-    ASSERT_TRUE(store.upsert_mint_note("note-a", 250000000, true));
-    ASSERT_TRUE(store.upsert_mint_note("note-b", 50000000, false));
-    ASSERT_TRUE(store.set_mint_deposit_ref("dep-ref"));
-    ASSERT_TRUE(store.set_mint_last_deposit_txid("txid1"));
-    ASSERT_TRUE(store.set_mint_last_deposit_vout(3));
-    ASSERT_TRUE(store.set_mint_last_redemption_batch_id("batch-9"));
   }
 
   WalletStore reload;
@@ -89,11 +80,6 @@ TEST(test_wallet_store_persists_sent_events_and_notes) {
   ASSERT_EQ(state.local_events.size(), 2u);
   ASSERT_EQ(state.local_events[0], "event-one");
   ASSERT_EQ(state.local_events[1], "event-two");
-  ASSERT_EQ(state.mint_notes.size(), 2u);
-  ASSERT_EQ(state.mint_deposit_ref, "dep-ref");
-  ASSERT_EQ(state.mint_last_deposit_txid, "txid1");
-  ASSERT_EQ(state.mint_last_deposit_vout, 3u);
-  ASSERT_EQ(state.mint_last_redemption_batch_id, "batch-9");
   const auto reserved = WalletStore::reserved_pending_outpoints(state);
   ASSERT_EQ(reserved.size(), 1u);
   ASSERT_TRUE(reserved.find(state.pending_spends[0].inputs[0]) != reserved.end());
@@ -301,7 +287,6 @@ TEST(test_wallet_store_persists_wallet_view_snapshot) {
     snapshot.activity_finalized_count_text = "Finalized: 6";
     snapshot.activity_pending_count_text = "Pending: 2";
     snapshot.activity_local_count_text = "Local: 1";
-    snapshot.activity_mint_count_text = "Mint: 0";
     snapshot.activity_confidential_count_text = "Confidential: 3";
     snapshot.overview_activity_rows.push_back(
         {.col0 = "Finalized", .col1 = "Received", .col2 = "Height 77"});

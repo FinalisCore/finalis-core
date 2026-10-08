@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -44,14 +45,6 @@
 using namespace finalis;
 
 namespace {
-
-long long current_process_id() {
-#ifdef _WIN32
-  return static_cast<long long>(::_getpid());
-#else
-  return static_cast<long long>(::getpid());
-#endif
-}
 
 std::chrono::seconds ci_timeout_seconds(int base_seconds) {
   int scale = 1;
@@ -189,12 +182,7 @@ std::optional<Bytes> load_availability_state_bytes(const std::string& db_path) {
   return db.get(storage::key_availability_persistent_state());
 }
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> unique_counter{0};
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto seq = unique_counter.fetch_add(1, std::memory_order_relaxed);
-  return prefix + "_" + std::to_string(current_process_id()) + "_" + std::to_string(now) + "_" + std::to_string(seq);
-}
+using finalis::test::unique_test_base;
 
 bool same_finality_sig_vector(const std::vector<FinalitySig>& a, const std::vector<FinalitySig>& b) {
   if (a.size() != b.size()) return false;
@@ -272,17 +260,19 @@ std::string epoch_db_key_suffix(std::uint64_t epoch) {
   return hex_encode(b);
 }
 
-std::string csafe_db_key(std::uint64_t height) { return "CSAFE:" + epoch_db_key_suffix(height); }
+// Consensus-safety keys encode the height little-endian (node key_consensus_safety_state), unlike
+// the big-endian epoch keys above.
+std::string csafe_height_suffix(std::uint64_t height) {
+  Bytes b(8);
+  for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((height >> (i * 8)) & 0xff);
+  return hex_encode(b);
+}
+std::string csafe_db_key(std::uint64_t height) { return "CSAFE:" + csafe_height_suffix(height); }
+std::string csafe_mirror_db_key(std::uint64_t height) { return "CSAFE_MIRROR:" + csafe_height_suffix(height); }
+std::string csafe_quarantine_db_key(std::uint64_t height) { return "CSAFE_QUARANTINE:" + csafe_height_suffix(height); }
 
 std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id);
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
-
-Bytes serialize_test_finalized_write_marker(std::uint64_t height, const Hash32& block_id) {
-  codec::ByteWriter w;
-  w.u64le(height);
-  w.bytes_fixed(block_id);
-  return w.take();
-}
 
 node::NodeConfig single_node_cfg(const std::string& base, std::size_t max_committee = MAX_COMMITTEE) {
   node::NodeConfig cfg;
@@ -362,7 +352,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
     lane_records[lane].push_back(consensus::CertifiedIngressRecord{cert, raw});
   }
   consensus::FrontierExecutionResult exec_result;
-  if (!consensus::execute_frontier_lane_prefix(genesis_derived.utxos, genesis_derived.finalized_frontier_vector,
+  if (!consensus::execute_frontier_lane_prefix(genesis_derived.utxos, genesis_derived.confidential_pool_value, genesis_derived.finalized_frontier_vector,
                                                next_vector, lane_records, genesis_derived.finalized_lane_roots, nullptr,
                                                &exec_result, &error)) {
     return false;
@@ -575,7 +565,7 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   if (!persist_certified_ingress_fixture(cfg, db, ordered_records, &fixture)) return false;
 
   consensus::FrontierExecutionResult exec_result;
-  if (!consensus::execute_frontier_lane_prefix(fixture.parent.utxos, fixture.parent.finalized_frontier_vector,
+  if (!consensus::execute_frontier_lane_prefix(fixture.parent.utxos, fixture.parent.confidential_pool_value, fixture.parent.finalized_frontier_vector,
                                                fixture.next_vector, fixture.lane_records,
                                                fixture.parent.finalized_lane_roots, nullptr,
                                                &exec_result, &error)) {
@@ -878,6 +868,16 @@ struct Cluster;
 bool append_live_certified_ingress_to_nodes(const std::string& db_path, const std::vector<node::Node*>& nodes,
                                             const std::vector<Bytes>& raw_records, int peer_id,
                                             std::string* error, const crypto::KeyPair* signer_override);
+
+// Genesis has no premine, so tests that fund a validator bond from block rewards wait for the
+// registration floor (~2.8k-4k coins) to accrue; under ASan that exceeds the timeouts. This floor is set
+// on NetworkConfig so the node, replay and the onboarding service all apply it.
+constexpr std::uint64_t kTestRegistrationBondFloor = 100ULL * consensus::BASE_UNITS_PER_COIN;
+
+void apply_test_bond_floor(node::NodeConfig& cfg) {
+  cfg.network.validator_min_bond = kTestRegistrationBondFloor;
+  cfg.network.validator_bond_min_amount = kTestRegistrationBondFloor;
+}
 
 std::optional<FundedTestWallet> find_funded_test_wallet(node::Node& node, const std::vector<crypto::KeyPair>& keys,
                                                         std::uint64_t min_total, std::size_t min_utxo_count = 1) {
@@ -1209,7 +1209,8 @@ struct HttpStubServer {
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
 
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
-                     std::size_t max_committee = MAX_COMMITTEE) {
+                     std::size_t max_committee = MAX_COMMITTEE,
+                     const std::function<void(node::NodeConfig&)>& configure = {}) {
   std::error_code ec;
   std::filesystem::remove_all(base, ec);
   std::filesystem::create_directories(base);
@@ -1251,6 +1252,7 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
                                              deterministic_seed_for_node_id(i), &out_key, &kerr)) {
       throw std::runtime_error("failed to create validator keystore: " + kerr);
     }
+    if (configure) configure(cfg);
 
     auto n = std::make_unique<node::Node>(cfg);
     if (!n->init()) {
@@ -1391,10 +1393,19 @@ Tx make_fixture_ingress_tx(std::uint64_t value, std::uint8_t tag) {
   return tx;
 }
 
-std::uint64_t live_registration_bond_amount_for_test(node::Node& node) {
+// Registration floor the node enforces at its next height: same inputs as the private
+// Node::effective_validator_min_bond_for_height (network bond fields overwritten by CLI overrides).
+std::uint64_t live_registration_bond_amount_for_test(node::Node& node, const node::NodeConfig& cfg) {
   const auto height = node.status().height + 1;
-  const auto active = std::max<std::size_t>(1, node.active_validators_for_next_height_for_test().size());
-  return consensus::validator_min_bond_units(mainnet_network(), height, active);
+  consensus::ValidatorRegistry registry;
+  registry.set_rules(consensus::ValidatorRules{
+      .warmup_blocks = cfg.validator_warmup_blocks_override.value_or(cfg.network.validator_warmup_blocks)});
+  for (const auto& pub : node.active_validators_for_next_height_for_test()) {
+    if (auto info = node.validator_info_for_test(pub); info.has_value()) registry.upsert(pub, *info);
+  }
+  return consensus::effective_validator_min_bond_for_height(
+      cfg.network, cfg.validator_min_bond_override.value_or(cfg.network.validator_min_bond),
+      cfg.validator_bond_min_amount_override.value_or(cfg.network.validator_bond_min_amount), registry, height);
 }
 
 bool restart_single_node_with_seeded_certified_ingress(const node::NodeConfig& cfg, const std::vector<Bytes>& raw_records,
@@ -1419,10 +1430,11 @@ bool restart_single_node_with_seeded_certified_ingress(const node::NodeConfig& c
   return true;
 }
 
-bool append_live_certified_ingress_to_nodes(const std::string& db_path, const std::vector<node::Node*>& nodes,
-                                            const std::vector<Bytes>& raw_records, int peer_id = 7,
-                                            std::string* error = nullptr,
-                                            const crypto::KeyPair* signer_override = nullptr) {
+// One attempt: derive lane seqs from a read-only open of db_path, then inject into every node.
+// *injected_any is set once any node has accepted a range.
+bool append_live_certified_ingress_to_nodes_once(const std::string& db_path, const std::vector<node::Node*>& nodes,
+                                                 const std::vector<Bytes>& raw_records, int peer_id, std::string* error,
+                                                 const crypto::KeyPair* signer_override, bool* injected_any) {
   if (nodes.empty()) return false;
   struct PendingRange {
     std::uint32_t lane{0};
@@ -1493,9 +1505,38 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
         }
         return false;
       }
+      *injected_any = true;
     }
   }
   return true;
+}
+
+// db_path is opened read-only while its owning node is live and writing. A read-only RocksDB
+// open is a point-in-time view that can miss the writer's most recent lane-state updates
+// (notably when it races a memtable flush / WAL rotation), so the derived seq can lag the
+// node's real lane tip and the node rejects it with ingress-seq-discontinuity. Re-derive from
+// a fresh open and retry, but only while no node has accepted anything yet: once a node has
+// appended, a rejection elsewhere is a real divergence and must surface.
+bool append_live_certified_ingress_to_nodes(const std::string& db_path, const std::vector<node::Node*>& nodes,
+                                            const std::vector<Bytes>& raw_records, int peer_id = 7,
+                                            std::string* error = nullptr,
+                                            const crypto::KeyPair* signer_override = nullptr) {
+  constexpr int kMaxAttempts = 10;
+  std::string attempt_error;
+  for (int attempt = 1;; ++attempt) {
+    attempt_error.clear();
+    bool injected_any = false;
+    if (append_live_certified_ingress_to_nodes_once(db_path, nodes, raw_records, peer_id, &attempt_error,
+                                                    signer_override, &injected_any)) {
+      return true;
+    }
+    const bool stale_seq_view = attempt_error.find("reason=ingress-seq-discontinuity") != std::string::npos ||
+                                attempt_error.find("reason=ingress-prev-lane-root-mismatch") != std::string::npos;
+    if (injected_any || !stale_seq_view || attempt >= kMaxAttempts) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50 * attempt));
+  }
+  if (error) *error = attempt_error;
+  return false;
 }
 
 bool append_live_certified_ingress_to_cluster(Cluster& cluster, const std::vector<Bytes>& raw_records, int peer_id = 7,
@@ -1516,8 +1557,11 @@ void append_live_certified_tx_or_throw(Cluster& cluster, const Tx& tx, const std
   throw std::runtime_error(context + ": " + ingress_error);
 }
 
+// keep_validator_keys: preserve each node's keystore across the wipe so local keys stay in the
+// genesis committee (otherwise init() generates fresh keys and no node can cast its own vote).
 bool restart_cluster_with_seeded_certified_ingress(Cluster* cluster, const std::vector<Bytes>& raw_records,
-                                                   bool start_nodes = true, bool pause_nodes = false) {
+                                                   bool start_nodes = true, bool pause_nodes = false,
+                                                   bool keep_validator_keys = false) {
   if (!cluster) return false;
   for (auto& n : cluster->nodes) {
     if (n) n->stop();
@@ -1526,7 +1570,19 @@ bool restart_cluster_with_seeded_certified_ingress(Cluster* cluster, const std::
 
   for (const auto& cfg : cluster->configs) {
     std::error_code ec;
+    std::string saved_key;
+    if (keep_validator_keys) {
+      std::ifstream in(cfg.validator_key_file, std::ios::binary);
+      if (!in) return false;
+      saved_key.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
     std::filesystem::remove_all(cfg.db_path, ec);
+    if (keep_validator_keys) {
+      std::filesystem::create_directories(std::filesystem::path(cfg.validator_key_file).parent_path(), ec);
+      std::ofstream out(cfg.validator_key_file, std::ios::binary | std::ios::trunc);
+      if (!out) return false;
+      out << saved_key;
+    }
     {
       node::Node seed(cfg);
       if (!seed.init()) return false;
@@ -2186,6 +2242,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     for (int j = 0; j < i; ++j) {
       cfg.peers.push_back("127.0.0.1:" + std::to_string(fixture.cluster.ports[j]));
     }
+    apply_test_bond_floor(cfg);
     keystore::ValidatorKey out_key;
     std::string kerr;
     if (!keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
@@ -2208,9 +2265,9 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
 
   std::uint64_t bond_amount = 0;
   std::optional<FundedTestWallet> funded;
-  // Genesis has no premine: a single key accrues ~6-7 coins/s here vs a ~2828-coin min bond.
+  // Genesis has no premine; apply_test_bond_floor keeps the bond to ~100 coins (~15s of rewards).
   if (!wait_for([&]() {
-        bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
+        bond_amount = live_registration_bond_amount_for_test(*nodes[0], fixture.cluster.configs[0]);
         funded = find_funded_test_wallet(*nodes[0], keys, bond_amount, 1);
         return funded.has_value();
       }, ci_timeout_seconds(600))) {
@@ -2337,6 +2394,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
     for (int j = 0; j < i; ++j) {
       cfg.peers.push_back("127.0.0.1:" + std::to_string(fixture.cluster.ports[j]));
     }
+    apply_test_bond_floor(cfg);
     keystore::ValidatorKey out_key;
     std::string kerr;
     std::array<std::uint8_t, 32> seed = i == 0 ? deterministic_seed_for_node_id(0) : std::array<std::uint8_t, 32>{};
@@ -2362,7 +2420,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
   std::uint64_t bond_amount = 0;
   std::optional<FundedTestWallet> funded;
   if (!wait_for([&]() {
-        bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
+        bond_amount = live_registration_bond_amount_for_test(*nodes[0], fixture.cluster.configs[0]);
         funded = find_funded_test_wallet(*nodes[0], default_keys, bond_amount, 1);
         return funded.has_value();
       }, ci_timeout_seconds(300))) {
@@ -2475,10 +2533,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 4u);
 
-  const auto unique = std::to_string(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-  auto cluster = make_cluster("/tmp/finalis_it_faults_" + unique, 4, 4, 4);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_faults"), 4, 4, 4);
   auto& nodes = cluster.nodes;
 
   const bool reached_height_30 = wait_for([&]() {
@@ -2573,10 +2628,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
 
 TEST(test_primary_timeout_falls_back_to_backup_proposer) {
   if (!can_open_loopback_listener_for_test()) return;
-  const auto unique = std::to_string(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-  auto cluster = make_cluster("/tmp/finalis_it_backup_proposer_" + unique, 4, 4, 4);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_backup_proposer"), 4, 4, 4);
   auto& nodes = cluster.nodes;
 
   const bool reached_height_12 = wait_for([&]() {
@@ -3697,13 +3749,20 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
 TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_join) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_to_active_live_path");
-  auto cluster = make_cluster(base, 1, 1, 1);
+  // Admission PoW stays on but at 8 bits: at mainnet's 22 bits mining takes ~19s, longer than the
+  // two-epoch validity window (64 blocks, ~11s at 100ms blocks), so the join raced epoch expiry.
+  // PoW validity/expiry rules are covered in test_bonding.
+  auto cluster = make_cluster(base, 1, 1, 1, [](node::NodeConfig& cfg) {
+    apply_test_bond_floor(cfg);
+    cfg.network.onboarding_admission_pow_difficulty_bits = 8;
+    cfg.network.validator_join_admission_pow_difficulty_bits = 8;
+  });
   auto& n0 = *cluster.nodes[0];
   ASSERT_TRUE(wait_for_tip(n0, 5, ci_timeout_seconds(40)));
-  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0);
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0, cluster.configs[0]);
 
   std::optional<FundedTestWallet> funded;
-  // Genesis has no premine: rewards accrue ~27 coins/s vs a 4000-coin single-validator min bond.
+  // Genesis has no premine: rewards accrue ~27 coins/s; apply_test_bond_floor keeps the bond at ~100 coins.
   ASSERT_TRUE(wait_for([&]() {
     funded = find_funded_test_wallet(n0, keys, bond_amount + 1000, 1);
     return funded.has_value();
@@ -3718,7 +3777,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
   ASSERT_TRUE(onboarding_db.open_readonly(base + "/node0"));
   const auto onboarding_chain_id = ChainId::from_config_and_db(mainnet_network(), onboarding_db);
   ValidatorJoinAdmissionPowBuildContext onboarding_pow_ctx{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &onboarding_chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return onboarding_db.get_height_hash(height); },
@@ -3749,7 +3808,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
   ASSERT_TRUE(join_db.open_readonly(base + "/node0"));
   const auto join_chain_id = ChainId::from_config_and_db(mainnet_network(), join_db);
   ValidatorJoinAdmissionPowBuildContext join_pow_ctx{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &join_chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return join_db.get_height_hash(height); },
@@ -3875,7 +3934,7 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 6; }, ci_timeout_seconds(60)));
 
   const auto slash_pub = keys[0].public_key;
-  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(*nodes[0]);
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(*nodes[0], cluster.configs[0]);
   Hash32 bond_txid{};
   bond_txid.fill(0xA5);
   const OutPoint bond_op{bond_txid, 0};
@@ -3950,7 +4009,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   }, ci_timeout_seconds(120)));
 
   const auto banned_pub = keys[0].public_key;
-  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0);
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0, cluster.configs[0]);
   Hash32 bond_txid{};
   bond_txid.fill(0xB6);
   const OutPoint bond_op{bond_txid, 0};
@@ -4846,6 +4905,79 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   ASSERT_TRUE(loc->height >= 34u);
 }
 
+// Three disable_p2p nodes on the in-process local bus (no sockets): node0 is the only validator, node1 and
+// node2 follow it. Covers Node::for_each_local_bus_peer with multiple peers: finalized-frontier delivery,
+// the designated-certifier forward (bool early exit) and the certifier's TX re-broadcast to every peer.
+// (A multi-validator committee cannot finalize on the local bus: the proposal gate counts P2P sessions.)
+TEST(test_local_bus_multi_node_delivers_frontiers_and_forwards_tx_to_designated_certifier) {
+  const auto base = unique_test_base("/tmp/finalis_it_local_bus_multi_node");
+  ASSERT_TRUE(write_mainnet_genesis_file(base + "/genesis.json", 1));
+  const auto keys = node::Node::deterministic_test_keypairs();
+  std::vector<std::unique_ptr<node::Node>> nodes;
+  for (int i = 0; i < 3; ++i) {
+    auto cfg = single_node_cfg(base, 1);
+    cfg.node_id = i;
+    cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    keystore::ValidatorKey key;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                    deterministic_seed_for_node_id(i), &key, &kerr));
+    nodes.push_back(std::make_unique<node::Node>(cfg));
+    ASSERT_TRUE(nodes.back()->init());
+  }
+  // Bus order is start() order: [node1, node2, node0]. Followers start first so they see every frontier.
+  nodes[1]->start();
+  nodes[2]->start();
+  nodes[0]->start();
+
+  // Followers can only advance if node0's TRANSITION broadcasts reach both of them over the bus.
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 3) return false;
+    }
+    funded = find_funded_test_wallet(*nodes[1], keys, 1'000'000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+
+  // Freeze height so the tx stays in every mempool once delivered.
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = nodes[0]->status();
+    for (const auto& n : nodes) {
+      const auto s = n->status();
+      if (s.height != s0.height || s.transition_hash != s0.transition_hash) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(30)));
+  const auto committee = nodes[1]->committee_for_height_round_for_test(nodes[1]->status().height + 1, 0);
+  ASSERT_TRUE(committee == std::vector<PubKey32>{nodes[0]->local_validator_pubkey_for_test()});
+
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  const auto& prev = funded->utxos.front();
+  std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
+                             TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
+  std::string err;
+  const auto tx = build_signed_p2pkh_tx_single_input(
+      prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  // Injected locally into node1 (from_network=false: node1 never broadcasts it). node1's forward must
+  // skip node2 (fn returns false) and stop at node0, the designated certifier (fn returns true). node0
+  // then re-broadcasts to node1 and node2, which is node2's only way to receive it.
+  ASSERT_TRUE(nodes[1]->inject_tx_for_test(*tx, true));
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (!n->mempool_contains_for_test(tx->txid())) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(30)));
+
+  for (auto& n : nodes) n->stop();
+}
+
 TEST(test_tx_status_reports_certified_ingress_before_finalization) {
   const std::string base = unique_test_base("/tmp/finalis_it_tx_status_certified_ingress");
 
@@ -5228,13 +5360,16 @@ TEST(test_crash_between_csaf_and_block_write_does_not_corrupt_state) {
   {
     auto cluster = make_cluster(base, 1, 1, 1);
     ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 6; }, std::chrono::seconds(30)));
-    next_height = cluster.nodes[0]->status().height + 1;
     cluster.nodes[0]->stop();
   }
 
   {
     storage::DB db;
     ASSERT_TRUE(db.open(base + "/node0"));
+    // Read the tip after shutdown: a block finalized while stopping would otherwise move the target height.
+    const auto tip = db.get_tip();
+    ASSERT_TRUE(tip.has_value());
+    next_height = tip->height + 1;
     ASSERT_TRUE(db.put(csafe_db_key(next_height), Bytes{0x01, 0x02, 0x03}));
     ASSERT_TRUE(db.flush());
   }
@@ -5253,13 +5388,26 @@ TEST(test_crash_between_csaf_and_block_write_does_not_corrupt_state) {
   cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
   cfg.validator_passphrase = "test-pass";
 
-  node::Node restarted(cfg);
-  ASSERT_TRUE(restarted.init());
-  restarted.stop();
+  // An unreadable row may be the only record of a broadcast vote: it is quarantined (not erased)
+  // and the node abstains at that height while otherwise running normally.
+  {
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_TRUE(restarted.abstain_heights_for_test().count(next_height) == 1);
+    restarted.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    // Sole validator abstaining: nothing is signed, so the height cannot finalize.
+    ASSERT_EQ(restarted.status().height + 1, next_height);
+    ASSERT_TRUE(restarted.abstain_heights_for_test().count(next_height) == 1);
+    restarted.stop();
+  }
 
   storage::DB db;
   ASSERT_TRUE(db.open(base + "/node0"));
   ASSERT_TRUE(!db.get(csafe_db_key(next_height)).has_value());
+  const auto quarantined = db.get(csafe_quarantine_db_key(next_height));
+  ASSERT_TRUE(quarantined.has_value());
+  ASSERT_TRUE(*quarantined == (Bytes{0x01, 0x02, 0x03}));
 }
 
 TEST(test_restart_with_invalid_csaf_rebuilds_correct_state) {
@@ -5305,6 +5453,173 @@ TEST(test_restart_with_invalid_csaf_rebuilds_correct_state) {
   storage::DB db;
   ASSERT_TRUE(db.open(base + "/node0"));
   ASSERT_TRUE(!db.get(csafe_db_key(next_height)).has_value());
+}
+
+// Single validator, stopped, with an unreadable safety-state row at its next height.
+// Returns the next height; fills *cfg with a restart config for the node.
+std::uint64_t setup_single_validator_with_unreadable_safety_row(const std::string& base, node::NodeConfig* cfg) {
+  {
+    auto cluster = make_cluster(base, 1, 1, 1);
+    if (!wait_for([&]() { return cluster.nodes[0]->status().height >= 4; }, std::chrono::seconds(30))) return 0;
+    cluster.nodes[0]->stop();
+  }
+  std::uint64_t next_height = 0;
+  {
+    storage::DB db;
+    if (!db.open(base + "/node0")) return 0;
+    const auto tip = db.get_tip();
+    if (!tip.has_value()) return 0;
+    next_height = tip->height + 1;
+    if (!db.put(csafe_db_key(next_height), Bytes{0xDE, 0xAD})) return 0;
+    if (!db.flush()) return 0;
+  }
+  cfg->allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg->disable_p2p = true;
+  cfg->node_id = 0;
+  cfg->max_committee = 1;
+  cfg->network.min_block_interval_ms = 100;
+  cfg->network.round_timeout_ms = 200;
+  cfg->p2p_port = 0;
+  cfg->db_path = base + "/node0";
+  cfg->genesis_path = base + "/genesis.json";
+  cfg->allow_unsafe_genesis_override = true;
+  cfg->validator_key_file = cfg->db_path + "/keystore/validator.json";
+  cfg->validator_passphrase = "test-pass";
+  return next_height;
+}
+
+TEST(test_unreadable_safety_state_abstention_survives_second_restart) {
+  const std::string base = unique_test_base("/tmp/finalis_it_csaf_abstain_two_restarts");
+  node::NodeConfig cfg;
+  const auto next_height = setup_single_validator_with_unreadable_safety_row(base, &cfg);
+  ASSERT_TRUE(next_height > 0);
+  for (int restart = 0; restart < 2; ++restart) {
+    node::Node n(cfg);
+    ASSERT_TRUE(n.init());
+    ASSERT_EQ(n.status().height + 1, next_height);
+    const auto abstain = n.abstain_heights_for_test();
+    ASSERT_EQ(abstain.size(), 1u);
+    ASSERT_TRUE(abstain.count(next_height) == 1);
+    n.stop();
+  }
+  storage::DB db;
+  ASSERT_TRUE(db.open(base + "/node0"));
+  ASSERT_TRUE(!db.get(csafe_db_key(next_height)).has_value());
+  const auto quarantined = db.get(csafe_quarantine_db_key(next_height));
+  ASSERT_TRUE(quarantined.has_value());
+  ASSERT_TRUE(*quarantined == (Bytes{0xDE, 0xAD}));
+}
+
+TEST(test_unsafe_discard_vote_lock_override_resumes_single_validator) {
+  const std::string base = unique_test_base("/tmp/finalis_it_csaf_override");
+  node::NodeConfig cfg;
+  const auto next_height = setup_single_validator_with_unreadable_safety_row(base, &cfg);
+  ASSERT_TRUE(next_height > 0);
+
+  // Override naming a different height is ignored: the node still abstains.
+  {
+    auto wrong = cfg;
+    wrong.unsafe_discard_vote_lock_height = next_height + 5;
+    node::Node n(wrong);
+    ASSERT_TRUE(n.init());
+    ASSERT_TRUE(n.abstain_heights_for_test().count(next_height) == 1);
+    n.stop();
+  }
+
+  // Override at exactly the quarantined height: abstention dropped and the chain moves again.
+  {
+    auto override_cfg = cfg;
+    override_cfg.unsafe_discard_vote_lock_height = next_height;
+    node::Node n(override_cfg);
+    ASSERT_TRUE(n.init());
+    ASSERT_TRUE(n.abstain_heights_for_test().empty());
+    n.start();
+    ASSERT_TRUE(wait_for([&]() { return n.status().height >= next_height + 1; }, std::chrono::seconds(30)));
+    n.stop();
+  }
+  storage::DB db;
+  ASSERT_TRUE(db.open(base + "/node0"));
+  ASSERT_TRUE(!db.get(csafe_quarantine_db_key(next_height)).has_value());
+}
+
+TEST(test_unreadable_safety_state_abstains_and_network_finalizes_without_it) {
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_csaf_abstain_cluster"), 4, 4, 4);
+  ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 2; }, ci_timeout_seconds(60)));
+  for (auto& n : cluster.nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, ci_timeout_seconds(30)));
+
+  const std::size_t victim = 3;
+  cluster.nodes[victim]->stop();
+  cluster.nodes[victim].reset();
+  std::uint64_t h = 0;
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cluster.configs[victim].db_path));
+    const auto tip = db.get_tip();
+    ASSERT_TRUE(tip.has_value());
+    h = tip->height + 1;
+    ASSERT_TRUE(db.put(csafe_db_key(h), Bytes{0xBA, 0xD0}));
+    ASSERT_TRUE(db.flush());
+  }
+  cluster.nodes[victim] = std::make_unique<node::Node>(cluster.configs[victim]);
+  ASSERT_TRUE(cluster.nodes[victim]->init());
+  ASSERT_TRUE(cluster.nodes[victim]->local_is_committee_member_for_test(h, 0));
+  ASSERT_TRUE(cluster.nodes[victim]->abstain_heights_for_test().count(h) == 1);
+  cluster.nodes[victim]->start();
+
+  // The other three (a quorum of four) finalize h without the abstaining node.
+  for (auto& n : cluster.nodes) ASSERT_TRUE(n->pause_proposals_for_test(false));
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : cluster.nodes) {
+      if (n->status().height < h + 2) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(120)));
+  // h finalized: the abstention is released and the node votes normally again from h+1.
+  ASSERT_TRUE(cluster.nodes[victim]->abstain_heights_for_test().empty());
+}
+
+// A corrupt primary row is recovered from its mirror: the lock survives and nothing is quarantined.
+TEST(test_safety_state_mirror_recovers_corrupted_primary) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(keys.size() >= 4u);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_csaf_mirror"), 4, 4, 4);
+  Tx tx = make_fixture_ingress_tx(1, 0x8C);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true));
+  const std::uint64_t h = cluster.nodes[0]->status().height + 1;
+  auto proposal = build_cluster_frontier_proposal_from_records(cluster, keys, {tx.serialize()}, h, 0,
+                                                               "/tmp/finalis_it_csaf_mirror_a0");
+  ASSERT_TRUE(proposal.has_value());
+  std::size_t ti = cluster.nodes.size();
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(h, 0)) {
+      ti = k;
+      break;
+    }
+  }
+  ASSERT_TRUE(ti < cluster.nodes.size());
+  ASSERT_TRUE(advance_test_frontier_round(*cluster.nodes[ti], h, 0));
+  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+            std::string("accepted"));
+  const auto lock_before = cluster.nodes[ti]->local_vote_lock_for_test(h);
+  ASSERT_TRUE(lock_before.has_value());
+
+  cluster.nodes[ti]->stop();
+  cluster.nodes[ti].reset();
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cluster.configs[ti].db_path));
+    ASSERT_TRUE(db.get(csafe_mirror_db_key(h)).has_value());
+    ASSERT_TRUE(db.put(csafe_db_key(h), Bytes{0x43, 0x53, 0x46, 0x32, 0xFF}));  // magic, then garbage
+    ASSERT_TRUE(db.flush());
+  }
+  cluster.nodes[ti] = std::make_unique<node::Node>(cluster.configs[ti]);
+  ASSERT_TRUE(cluster.nodes[ti]->init());
+  ASSERT_TRUE(cluster.nodes[ti]->abstain_heights_for_test().empty());
+  const auto lock_after = cluster.nodes[ti]->local_vote_lock_for_test(h);
+  ASSERT_TRUE(lock_after.has_value());
+  ASSERT_TRUE(lock_after->first == lock_before->first);
+  ASSERT_EQ(lock_after->second, lock_before->second);
 }
 
 TEST(test_db_rejects_conflicting_same_height_finalized_writes) {
@@ -6866,6 +7181,100 @@ TEST(test_only_one_block_can_finalize_per_height_after_vote_locking) {
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_a));
   ASSERT_TRUE(!target->inject_propose_msg_for_test(make_test_frontier_propose_msg(*proposal_b)));
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_a));
+}
+
+// Regression: load_state used to drop a next-height vote lock that had no QC, so a validator that
+// voted for A, crashed and restarted could then sign a conflicting payload at the same height.
+TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(keys.size() >= 4u);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_vote_lock_restart"), 4, 4, 4);
+  Tx tx = make_fixture_ingress_tx(1, 0x8B);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true));
+  const std::uint64_t target_height = cluster.nodes[0]->status().height + 1;
+  const std::uint32_t round0 = 0;
+  const std::uint32_t round1 = 1;
+
+  // A carries the ingress record, B is empty: same height, conflicting payloads.
+  // Built up front because the builder drives nodes[0]'s round and needs it running.
+  auto proposal_a0 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx.serialize()}, target_height, round0, "/tmp/finalis_it_vote_lock_restart_a0");
+  auto proposal_b0 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {}, target_height, round0, "/tmp/finalis_it_vote_lock_restart_b0");
+  auto proposal_a1 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx.serialize()}, target_height, round1, "/tmp/finalis_it_vote_lock_restart_a1");
+  auto proposal_b1 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {}, target_height, round1, "/tmp/finalis_it_vote_lock_restart_b1");
+  ASSERT_TRUE(proposal_a0.has_value());
+  ASSERT_TRUE(proposal_b0.has_value());
+  ASSERT_TRUE(proposal_a1.has_value());
+  ASSERT_TRUE(proposal_b1.has_value());
+  const auto a0_id = frontier_proposal_id(*proposal_a0);
+  const auto b0_id = frontier_proposal_id(*proposal_b0);
+  const auto a1_id = frontier_proposal_id(*proposal_a1);
+  const auto b1_id = frontier_proposal_id(*proposal_b1);
+  ASSERT_TRUE(a0_id != b0_id);
+
+  // Target: a committee member for both rounds (cluster.nodes[0] need not be one).
+  std::size_t ti = cluster.nodes.size();
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(target_height, round0) &&
+        cluster.nodes[k]->local_is_committee_member_for_test(target_height, round1)) {
+      ti = k;
+      break;
+    }
+  }
+  ASSERT_TRUE(ti < cluster.nodes.size());
+
+  // 1. Vote for A at (h, 0): this creates the durable lock.
+  ASSERT_TRUE(advance_test_frontier_round(*cluster.nodes[ti], target_height, round0));
+  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_a0)),
+            std::string("accepted"));
+  ASSERT_TRUE(cluster.nodes[ti]->local_vote_recorded_for_test(target_height, round0, a0_id));
+  ASSERT_TRUE(cluster.nodes[ti]->status().height + 1 == target_height);  // one vote: no quorum
+  const auto lock_before = cluster.nodes[ti]->local_vote_lock_for_test(target_height);
+  ASSERT_TRUE(lock_before.has_value());
+  ASSERT_EQ(lock_before->second, round0);
+  ASSERT_TRUE(!cluster.nodes[ti]->highest_qc_for_height_for_test(target_height).has_value());
+
+  // 2. Crash/restart the validator.
+  cluster.nodes[ti]->stop();
+  cluster.nodes[ti].reset();
+  cluster.nodes[ti] = std::make_unique<node::Node>(cluster.configs[ti]);
+  ASSERT_TRUE(cluster.nodes[ti]->init());
+  auto& target = cluster.nodes[ti];
+  ASSERT_TRUE(target->status().height + 1 == target_height);
+  const auto lock_after = target->local_vote_lock_for_test(target_height);
+  ASSERT_TRUE(lock_after.has_value());
+  ASSERT_TRUE(lock_after->first == lock_before->first);
+  ASSERT_EQ(lock_after->second, lock_before->second);
+  ASSERT_TRUE(target->has_candidate_frontier_proposal_for_test(a0_id));
+  ASSERT_TRUE(target->pause_proposals_for_test(true));
+  target->start();
+
+  // 3a. Conflicting proposal at the same (h, 0): must not be signed.
+  ASSERT_TRUE(advance_test_frontier_round(*target, target_height, round0));
+  (void)target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_b0));
+  ASSERT_TRUE(!target->local_vote_recorded_for_test(target_height, round0, b0_id));
+
+  // 3b. Conflicting proposal at (h, 1) justified only by a TC: a TC cannot unlock.
+  const auto committee0 = target->committee_for_height_round_for_test(target_height, round0);
+  const auto quorum0 = consensus::quorum_threshold(committee0.size());
+  const auto tc0 = make_test_timeout_certificate(keys, committee0, target_height, round0, quorum0);
+  ASSERT_TRUE(tc0.signatures.size() >= quorum0);
+  auto b1_msg = make_test_frontier_propose_msg(*proposal_b1);
+  b1_msg.justify_tc = tc0;
+  (void)target->inject_network_propose_result_for_test(b1_msg);
+  ASSERT_TRUE(!target->local_vote_recorded_for_test(target_height, round1, b1_id));
+  const auto lock_final = target->local_vote_lock_for_test(target_height);
+  ASSERT_TRUE(lock_final.has_value());
+  ASSERT_TRUE(lock_final->first == lock_before->first);
+
+  // 4. Liveness: a TC-round re-proposal of the locked payload is still votable after restart.
+  auto a1_msg = make_test_frontier_propose_msg(*proposal_a1);
+  a1_msg.justify_tc = tc0;
+  ASSERT_EQ(target->inject_network_propose_result_for_test(a1_msg), std::string("accepted"));
+  ASSERT_TRUE(target->local_vote_recorded_for_test(target_height, round1, a1_id));
 }
 
 TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
@@ -9082,24 +9491,6 @@ TEST(test_startup_rejects_invalid_finality_certificate_signature) {
   ASSERT_TRUE(!n.init());
 }
 
-TEST(test_startup_rejects_incomplete_finalized_write_marker) {
-  const auto base = unique_test_base("/tmp/finalis_it_partial_finalized_write");
-  auto cluster = make_cluster(base, 1, 1, 1);
-  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 1, std::chrono::seconds(12)));
-  cluster.nodes[0]->stop();
-  cluster.nodes.clear();
-
-  storage::DB db;
-  ASSERT_TRUE(db.open(base + "/node0"));
-  const auto tip = db.get_tip();
-  ASSERT_TRUE(tip.has_value());
-  ASSERT_TRUE(db.put("FW:PENDING", serialize_test_finalized_write_marker(tip->height, tip->hash)));
-  db.close();
-
-  node::Node n(single_node_cfg(base, 1));
-  ASSERT_TRUE(!n.init());
-}
-
 TEST(test_startup_rejects_stale_persisted_validator_cache) {
   const auto base = unique_test_base("/tmp/finalis_it_validator_cache_mismatch");
   auto cluster = make_cluster(base, 1, 1, 1);
@@ -10127,5 +10518,3 @@ TEST(test_frontier_mode_rejects_oversized_or_unexpected_ingress_ranges_from_peer
   ASSERT_TRUE(db.open(cfg.db_path));
   ASSERT_TRUE(!db.get_lane_state(rec.certificate.lane).has_value());
 }
-
-void register_integration_tests() {}

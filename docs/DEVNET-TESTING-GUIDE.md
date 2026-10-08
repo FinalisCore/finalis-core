@@ -194,13 +194,12 @@ Goal:
 
 Procedure:
 
-1. start a fresh network with wiped DBs
-2. activate confidential policy at the intended test height
-3. submit:
+1. start a fresh network with wiped DBs (`TxV2` is valid from genesis; nothing to activate)
+2. submit:
    - transparent -> confidential `TxV2`
    - confidential -> transparent `TxV2`
-4. restart one node
-5. compare finalized height, tx status, and resulting UTXO state after replay
+3. restart one node
+4. compare finalized height, tx status, and resulting UTXO state after replay
 
 Expected invariant:
 

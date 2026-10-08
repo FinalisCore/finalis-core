@@ -221,136 +221,11 @@ AdvancedPage::AdvancedPage(QWidget* parent) : QWidget(parent) {
   validator_layout->addStretch(1);
   tabs_->addTab(wrap_scroll(validator, this), "Validator");
 
-  auto* mint = new QWidget(this);
-  auto* mint_layout = new QVBoxLayout(mint);
-  configure_page_layout(mint_layout);
-  auto* mint_intro = new QLabel(
-      "Mint / Privacy uses an external mint service. These flows are optional and remain separate from normal on-chain wallet activity.",
-      mint);
-  mint_intro->setWordWrap(true);
-  mint_intro->setProperty("role", QVariant(QStringLiteral("muted")));
-  mint_layout->addWidget(mint_intro);
-
-  auto* mint_summary_box = new QGroupBox("Mint Overview", mint);
-  auto* mint_summary_grid = new QGridLayout(mint_summary_box);
-  mint_summary_grid->setHorizontalSpacing(14);
-  mint_summary_grid->setVerticalSpacing(10);
-  mint_summary_grid->setColumnStretch(1, 1);
-  mint_summary_grid->addWidget(new QLabel("Current deposit ref:", mint_summary_box), 0, 0);
-  mint_deposit_ref_label_ = new QLabel("-", mint_summary_box);
-  mint_deposit_ref_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-  mint_summary_grid->addWidget(mint_deposit_ref_label_, 0, 1);
-  mint_summary_grid->addWidget(new QLabel("Last redemption batch:", mint_summary_box), 1, 0);
-  mint_redemption_label_ = new QLabel("-", mint_summary_box);
-  mint_redemption_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-  mint_summary_grid->addWidget(mint_redemption_label_, 1, 1);
-  mint_summary_grid->addWidget(new QLabel("Private balance:", mint_summary_box), 2, 0);
-  mint_private_balance_label_ = new QLabel("0 FLS", mint_summary_box);
-  mint_summary_grid->addWidget(mint_private_balance_label_, 2, 1);
-  mint_summary_grid->addWidget(new QLabel("Active notes:", mint_summary_box), 3, 0);
-  mint_note_count_label_ = new QLabel("0", mint_summary_box);
-  mint_summary_grid->addWidget(mint_note_count_label_, 3, 1);
-  mint_status_label_ = new QLabel("Mint service is not configured yet.", mint_summary_box);
-  mint_status_label_->setWordWrap(true);
-  mint_summary_grid->addWidget(mint_status_label_, 4, 0, 1, 2);
-  mint_layout->addWidget(mint_summary_box);
-
-  auto* mint_ops = new QWidget(mint);
-  auto* mint_ops_layout = new QVBoxLayout(mint_ops);
-  mint_ops_layout->setContentsMargins(0, 0, 0, 0);
-  mint_ops_layout->setSpacing(12);
-
-  auto* mint_left = new QVBoxLayout();
-  auto* mint_right = new QVBoxLayout();
-  mint_left->setSpacing(12);
-  mint_right->setSpacing(12);
-
-  auto* mint_deposit_box = new QGroupBox("Step 1: Deposit To Mint", mint_ops);
-  auto* mint_deposit_form = new QFormLayout(mint_deposit_box);
-  configure_form_layout(mint_deposit_form);
-  mint_deposit_amount_edit_ = new QLineEdit(mint_deposit_box);
-  mint_deposit_button_ = new QPushButton("Create Mint Deposit", mint_deposit_box);
-  mint_deposit_form->addRow("Amount (FLS)", mint_deposit_amount_edit_);
-  mint_deposit_form->addRow("", mint_deposit_button_);
-  mint_left->addWidget(mint_deposit_box);
-
-  auto* mint_issue_box = new QGroupBox("Step 2: Issue Private Notes", mint_ops);
-  auto* mint_issue_form = new QFormLayout(mint_issue_box);
-  configure_form_layout(mint_issue_form);
-  mint_issue_amount_edit_ = new QLineEdit(mint_issue_box);
-  mint_issue_button_ = new QPushButton("Issue Private Notes", mint_issue_box);
-  mint_notes_label_ = new QLabel("-", mint_issue_box);
-  mint_notes_label_->setWordWrap(true);
-  mint_notes_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-  mint_issue_form->addRow("Issue amount (FLS)", mint_issue_amount_edit_);
-  mint_issue_form->addRow("Note mix", mint_notes_label_);
-  mint_issue_form->addRow("", mint_issue_button_);
-  mint_left->addWidget(mint_issue_box);
-
-  auto* mint_redeem_box = new QGroupBox("Step 3: Redeem Back To Wallet", mint_ops);
-  auto* mint_redeem_form = new QFormLayout(mint_redeem_box);
-  configure_form_layout(mint_redeem_form);
-  mint_redeem_amount_edit_ = new QLineEdit(mint_redeem_box);
-  mint_redeem_address_edit_ = new QLineEdit(mint_redeem_box);
-  auto* mint_redeem_actions = new QHBoxLayout();
-  mint_redeem_actions->setSpacing(8);
-  mint_redeem_button_ = new QPushButton("Create Redemption", mint_redeem_box);
-  mint_redeem_status_button_ = new QPushButton("Check Redemption Status", mint_redeem_box);
-  mint_redeem_actions->addWidget(mint_redeem_button_);
-  mint_redeem_actions->addWidget(mint_redeem_status_button_);
-  mint_redeem_actions->addStretch(1);
-  mint_redeem_form->addRow("Amount (FLS)", mint_redeem_amount_edit_);
-  mint_redeem_form->addRow("Destination address", mint_redeem_address_edit_);
-  mint_redeem_form->addRow("", mint_redeem_actions);
-  mint_left->addWidget(mint_redeem_box);
-  mint_left->addStretch(1);
-
-  auto* deposits_box = new QGroupBox("Recent Deposits", mint_ops);
-  auto* deposits_layout = new QVBoxLayout(deposits_box);
-  mint_deposits_view_ = new QTableWidget(deposits_box);
-  mint_deposits_view_->setMinimumHeight(120);
-  configure_table(mint_deposits_view_, {"Status", "Amount", "Reference", "Chain"});
-  deposits_layout->addWidget(mint_deposits_view_);
-  mint_right->addWidget(deposits_box);
-
-  auto* notes_box = new QGroupBox("Note Inventory", mint_ops);
-  auto* notes_layout = new QVBoxLayout(notes_box);
-  mint_notes_view_ = new QTableWidget(notes_box);
-  mint_notes_view_->setMinimumHeight(140);
-  configure_table(mint_notes_view_, {"Status", "Amount", "Reference", "State"});
-  notes_layout->addWidget(mint_notes_view_);
-  mint_right->addWidget(notes_box);
-
-  auto* redemption_box = new QGroupBox("Recent Redemptions", mint_ops);
-  auto* redemption_layout = new QVBoxLayout(redemption_box);
-  auto* redemption_actions = new QHBoxLayout();
-  redemption_actions->setSpacing(8);
-  mint_detail_button_ = new QPushButton("Selected Mint Details", redemption_box);
-  redemption_actions->addStretch(1);
-  redemption_actions->addWidget(mint_detail_button_);
-  redemption_layout->addLayout(redemption_actions);
-  mint_redemptions_view_ = new QTableWidget(redemption_box);
-  mint_redemptions_view_->setMinimumHeight(140);
-  configure_table(mint_redemptions_view_, {"Status", "Amount", "Reference", "Chain/State"});
-  redemption_layout->addWidget(mint_redemptions_view_);
-  mint_right->addWidget(redemption_box);
-
-  mint_ops_layout->addLayout(mint_left);
-  mint_ops_layout->addLayout(mint_right);
-  mint_layout->addWidget(mint_ops);
-  mint_layout->addStretch(1);
-
-  auto* mint_scroll = new QScrollArea(this);
-  mint_scroll->setWidgetResizable(true);
-  mint_scroll->setFrameShape(QFrame::NoFrame);
-  mint_scroll->setWidget(mint);
-  tabs_->addTab(mint_scroll, "Mint / Privacy");
-
   auto* connections = new QWidget(this);
   auto* connections_layout = new QVBoxLayout(connections);
   configure_page_layout(connections_layout);
   auto* connections_intro = new QLabel(
-      "Connections controls where the wallet reads finalized state and where optional mint operations are sent. Edit service endpoints here.",
+      "Connections controls where the wallet reads finalized state. Edit service endpoints here.",
       connections);
   connections_intro->setWordWrap(true);
   connections_intro->setProperty("role", QVariant(QStringLiteral("muted")));
@@ -365,14 +240,8 @@ AdvancedPage::AdvancedPage(QWidget* parent) : QWidget(parent) {
   lightserver_urls_edit_->setPlaceholderText("http://127.0.0.1:8080/rpc\nhttp://127.0.0.1:8081/rpc");
   lightserver_urls_edit_->setMinimumHeight(96);
   pin_lightserver_endpoint_checkbox_ = new QCheckBox("Always try the first endpoint first", settings_box);
-  mint_url_edit_ = new QLineEdit(settings_box);
-  mint_id_edit_ = new QLineEdit(settings_box);
-  mint_url_edit_->setPlaceholderText("http://127.0.0.1:8090");
-  mint_id_edit_->setPlaceholderText("32-byte hex");
   settings_form->addRow("Finalized-state RPC endpoints", lightserver_urls_edit_);
   settings_form->addRow("", pin_lightserver_endpoint_checkbox_);
-  settings_form->addRow("Mint service URL", mint_url_edit_);
-  settings_form->addRow("Mint ID (hex32)", mint_id_edit_);
   save_settings_button_ = new QPushButton("Save Connection Settings", settings_box);
   settings_form->addRow("", save_settings_button_);
   connections_layout->addWidget(settings_box);
@@ -386,7 +255,7 @@ AdvancedPage::AdvancedPage(QWidget* parent) : QWidget(parent) {
   connections_layout->addWidget(summary_box);
 
   auto* note = new QLabel(
-      "Changing these settings affects how the wallet refreshes finalized data and where advanced mint actions are sent. "
+      "Changing these settings affects how the wallet refreshes finalized data. "
       "It does not change consensus rules or make pending network activity visible.",
       connections);
   note->setWordWrap(true);

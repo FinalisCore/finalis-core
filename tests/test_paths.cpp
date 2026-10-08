@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -26,7 +27,7 @@ std::vector<char*> make_argv(std::vector<std::string>& args) {
 TEST(test_paths_default_db_dir_and_expand_home) {
   ASSERT_EQ(default_db_dir_for_network("mainnet"), "~/.finalis/mainnet");
 
-  const std::string fake_home = "/tmp/finalis_test_home_paths";
+  const std::string fake_home = finalis::test::unique_test_base("/tmp/finalis_test_home_paths");
 #ifdef _WIN32
   _putenv_s("HOME", fake_home.c_str());
 #else
@@ -36,7 +37,7 @@ TEST(test_paths_default_db_dir_and_expand_home) {
 }
 
 TEST(test_node_default_db_path_uses_home_by_network) {
-  const std::string home = "/tmp/finalis_test_home_default_db";
+  const std::string home = finalis::test::unique_test_base("/tmp/finalis_test_home_default_db");
   std::filesystem::remove_all(home);
   std::filesystem::create_directories(home);
 #ifdef _WIN32
@@ -81,5 +82,3 @@ TEST(test_parse_args_unescapes_comma_separated_peers_and_seeds) {
   ASSERT_EQ(cfg->seeds.size(), 1u);
   ASSERT_EQ(cfg->seeds[0], "1.2.3.4:19440,5.6.7.8:19440");
 }
-
-void register_paths_tests() {}

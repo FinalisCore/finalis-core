@@ -71,7 +71,6 @@ This plan is execution-focused: each tier has release-gate intent, explicit test
 - Add next:
   - `test_mempool_eviction_is_stable_under_equal_fee_rate_and_equal_fee`
   - `test_mempool_reject_reason_is_deterministic_for_multi_violation_tx`
-  - `test_mempool_txv2_policy_boundary_at_activation_height_exact`
 
 ### 5) Parse/serialization rejection surface
 - Owner: Networking owner + UTXO/validation owner

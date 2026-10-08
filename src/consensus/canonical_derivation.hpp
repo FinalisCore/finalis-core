@@ -12,6 +12,7 @@
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "consensus/availability_retention.hpp"
+#include "consensus/confidential_supply.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/validator_registry.hpp"
 #include "storage/db.hpp"
@@ -102,6 +103,9 @@ struct CanonicalDerivedState {
   Hash32 finalized_randomness{};
   std::map<std::uint64_t, Hash32> committee_epoch_randomness_cache;
   std::uint64_t protocol_reserve_balance_units{0};
+  // Confidential turnstile P: value held in confidential (TxV2) outputs, accounted from public boundary
+  // flows only. Committed; a TxV2 that would make it negative is invalid (confidential-turnstile-negative).
+  std::uint64_t confidential_pool_value{0};
   std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
   std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints;
   std::map<std::uint64_t, CanonicalFinalizedMetadata> finalized_block_metadata;
@@ -110,6 +114,8 @@ struct CanonicalDerivedState {
   std::uint64_t validator_liveness_window_start_height{0};
   std::size_t last_participation_eligible_signers{0};
   availability::AvailabilityPersistentState availability_state;
+  // Derived supply-audit accumulators; deliberately not part of state_commitment.
+  ConfidentialSupplyLedger confidential_supply;
   Hash32 state_commitment{};
 };
 
@@ -206,6 +212,13 @@ AdaptiveCheckpointParameters adaptive_checkpoint_parameters_from_metadata(
 AdaptiveCheckpointParameters derive_adaptive_checkpoint_parameters(
     const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint, std::uint64_t qualified_depth);
 bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, std::uint64_t height);
+
+// Registration bond floor at `height` (PROTOCOL-SPEC min_bond(height)). Single source of truth for
+// replay validation and the live node (proposer, mempool). Values equal to BOND_AMOUNT mean "no
+// override"; anything else pins the floor to max(min_bond_override, bond_min_amount).
+std::uint64_t effective_validator_min_bond_for_height(const NetworkConfig& network, std::uint64_t min_bond_override,
+                                                      std::uint64_t bond_min_amount, const ValidatorRegistry& validators,
+                                                      std::uint64_t height);
 
 // Emergency committee recovery (consensus rule). When no candidate survives the checkpoint
 // filters, the committee is the first kEmergencyFallbackMaxMembers distinct members of the

@@ -57,7 +57,6 @@ constexpr std::uint64_t kDefaultPageLimit = 200;
 constexpr std::uint64_t kMaxPageLimit = 1000;
 constexpr std::uint32_t kRelayValidationRulesVersion = 7;
 
-std::string json_escape(const std::string& in);
 std::string server_hrp_for_network(const NetworkConfig& network);
 
 std::string network_id_hex(const NetworkConfig& cfg) {
@@ -520,18 +519,18 @@ std::string tx_summaries_json(const std::vector<TxSummaryRow>& rows) {
     oss << ",\"input_count\":" << row.input_count
         << ",\"output_count\":" << row.output_count
         << ",\"primary_sender\":";
-    if (row.primary_sender.has_value()) oss << "\"" << json_escape(*row.primary_sender) << "\""; else oss << "null";
+    if (row.primary_sender.has_value()) oss << "\"" << minijson::escape(*row.primary_sender) << "\""; else oss << "null";
     oss << ",\"primary_recipient\":";
-    if (row.primary_recipient.has_value()) oss << "\"" << json_escape(*row.primary_recipient) << "\""; else oss << "null";
+    if (row.primary_recipient.has_value()) oss << "\"" << minijson::escape(*row.primary_recipient) << "\""; else oss << "null";
     oss << ",\"recipient_count\":" << row.recipient_count
         << ",\"recipients\":[";
     for (std::size_t j = 0; j < row.recipients.size(); ++j) {
       if (j) oss << ",";
-      oss << "\"" << json_escape(row.recipients[j]) << "\"";
+      oss << "\"" << minijson::escape(row.recipients[j]) << "\"";
     }
     oss << "]"
-        << ",\"flow_kind\":\"" << json_escape(row.flow_kind) << "\""
-        << ",\"flow_summary\":\"" << json_escape(row.flow_summary) << "\"}";
+        << ",\"flow_kind\":\"" << minijson::escape(row.flow_kind) << "\""
+        << ",\"flow_summary\":\"" << minijson::escape(row.flow_summary) << "\"}";
   }
   oss << "]}";
   return oss.str();
@@ -628,8 +627,8 @@ std::string paged_detailed_history_json(const storage::DB& db, const Hash32& scr
     if (i) oss << ",";
     const auto& row = rows[i];
     oss << "{\"txid\":\"" << hex_encode32(row.txid) << "\",\"height\":" << row.height
-        << ",\"direction\":\"" << json_escape(row.direction) << "\",\"net_amount\":" << row.net_amount
-        << ",\"detail\":\"" << json_escape(row.detail) << "\"}";
+        << ",\"direction\":\"" << minijson::escape(row.direction) << "\",\"net_amount\":" << row.net_amount
+        << ",\"detail\":\"" << minijson::escape(row.detail) << "\"}";
   }
   oss << "],\"has_more\":" << (has_more ? "true" : "false")
       << ",\"ordering\":\"height_asc_txid_asc\"";
@@ -641,22 +640,6 @@ std::string paged_detailed_history_json(const storage::DB& db, const Hash32& scr
   }
   oss << "}";
   return oss.str();
-}
-
-std::string json_escape(const std::string& in) {
-  std::string out;
-  out.reserve(in.size() + 8);
-  for (char c : in) {
-    if (c == '"' || c == '\\') {
-      out.push_back('\\');
-      out.push_back(c);
-    } else if (c == '\n') {
-      out += "\\n";
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
 }
 
 std::optional<Hash32> parse_hex32(const std::string& s) {
@@ -821,7 +804,7 @@ std::string decoded_tx_output_json(const TxOut& out, const NetworkConfig& networ
   oss << "{\"amount\":" << out.value
       << ",\"script_hex\":\"" << hex_encode(out.script_pubkey) << "\"";
   if (auto addr = p2pkh_script_to_address(out.script_pubkey, server_hrp_for_network(network)); addr.has_value()) {
-    oss << ",\"address\":\"" << json_escape(*addr) << "\"";
+    oss << ",\"address\":\"" << minijson::escape(*addr) << "\"";
   } else {
     oss << ",\"address\":null";
   }
@@ -1053,6 +1036,16 @@ std::string tx_status_json(const Hash32& txid, const std::optional<storage::DB::
   return oss.str();
 }
 
+// Heights where the node refuses to sign (unreadable consensus safety state); see Node::load_state.
+std::string abstaining_heights_json(const std::vector<std::uint64_t>& heights) {
+  std::string out = "[";
+  for (std::size_t i = 0; i < heights.size(); ++i) {
+    if (i != 0) out += ",";
+    out += std::to_string(heights[i]);
+  }
+  return out + "]";
+}
+
 std::string readiness_json(const storage::NodeRuntimeStatusSnapshot& snapshot) {
   std::ostringstream oss;
   oss << "{\"chain_id_ok\":" << (snapshot.chain_id_ok ? "true" : "false")
@@ -1068,18 +1061,19 @@ std::string readiness_json(const storage::NodeRuntimeStatusSnapshot& snapshot) {
       << ",\"outbound_target\":" << snapshot.outbound_target
       << ",\"advertised_endpoint_present\":" << (snapshot.advertised_endpoint_present ? "true" : "false")
       << ",\"advertised_endpoint_likely_public\":" << (snapshot.advertised_endpoint_likely_public ? "true" : "false")
-      << ",\"advertised_endpoint\":\"" << json_escape(snapshot.advertised_endpoint) << "\""
+      << ",\"advertised_endpoint\":\"" << minijson::escape(snapshot.advertised_endpoint) << "\""
       << ",\"stun_enabled\":" << (snapshot.stun_enabled ? "true" : "false")
       << ",\"stun_last_success\":" << (snapshot.stun_last_success ? "true" : "false")
       << ",\"stun_last_attempt_unix_ms\":" << snapshot.stun_last_attempt_unix_ms
       << ",\"stun_last_success_unix_ms\":" << snapshot.stun_last_success_unix_ms
-      << ",\"stun_last_server\":\"" << json_escape(snapshot.stun_last_server) << "\""
-      << ",\"stun_last_error_code\":\"" << json_escape(snapshot.stun_last_error_code) << "\""
+      << ",\"stun_last_server\":\"" << minijson::escape(snapshot.stun_last_server) << "\""
+      << ",\"stun_last_error_code\":\"" << minijson::escape(snapshot.stun_last_error_code) << "\""
       << ",\"stun_backoff_until_unix_ms\":" << snapshot.stun_backoff_until_unix_ms
       << ",\"stun_endpoint_change_pending\":" << (snapshot.stun_endpoint_change_pending ? "true" : "false")
       << ",\"stun_endpoint_change_hits\":" << snapshot.stun_endpoint_change_hits
       << ",\"stun_endpoint_change_required_hits\":" << snapshot.stun_endpoint_change_required_hits
-      << ",\"stun_endpoint_candidate\":\"" << json_escape(snapshot.stun_endpoint_candidate) << "\""
+      << ",\"stun_endpoint_candidate\":\"" << minijson::escape(snapshot.stun_endpoint_candidate) << "\""
+      << ",\"abstaining_heights\":" << abstaining_heights_json(snapshot.abstaining_heights)
       << ",\"finalized_lag\":" << snapshot.finalized_lag
       << ",\"peer_height_disagreement\":" << (snapshot.peer_height_disagreement ? "true" : "false")
       << ",\"next_height_committee_available\":" << (snapshot.next_height_committee_available ? "true" : "false")
@@ -1088,8 +1082,8 @@ std::string readiness_json(const storage::NodeRuntimeStatusSnapshot& snapshot) {
       << ",\"registration_ready_preflight\":" << (snapshot.registration_ready_preflight ? "true" : "false")
       << ",\"registration_ready\":" << (snapshot.registration_ready ? "true" : "false")
       << ",\"readiness_stable_samples\":" << snapshot.readiness_stable_samples
-      << ",\"readiness_blockers_csv\":\"" << json_escape(snapshot.readiness_blockers_csv) << "\""
-      << ",\"readiness_failure_codes_csv\":\"" << json_escape(snapshot.readiness_failure_codes_csv) << "\""
+      << ",\"readiness_blockers_csv\":\"" << minijson::escape(snapshot.readiness_blockers_csv) << "\""
+      << ",\"readiness_failure_codes_csv\":\"" << minijson::escape(snapshot.readiness_failure_codes_csv) << "\""
       << ",\"captured_at_unix_ms\":" << snapshot.captured_at_unix_ms << "}";
   return oss.str();
 }
@@ -1100,17 +1094,17 @@ std::string broadcast_result_json(bool accepted, const std::string& txid_hex, co
                                   const std::string& retry_class, bool mempool_full,
                                   const std::optional<std::uint64_t>& min_fee_rate_to_enter_when_full_milliunits_per_byte) {
   std::ostringstream oss;
-  oss << "{\"ok\":true,\"accepted\":" << (accepted ? "true" : "false") << ",\"status\":\"" << json_escape(status)
+  oss << "{\"ok\":true,\"accepted\":" << (accepted ? "true" : "false") << ",\"status\":\"" << minijson::escape(status)
       << "\",\"finalized\":false";
-  if (!txid_hex.empty()) oss << ",\"txid\":\"" << json_escape(txid_hex) << "\"";
-  if (!message.empty()) oss << ",\"message\":\"" << json_escape(message) << "\"";
-  if (error_code.has_value()) oss << ",\"error_code\":\"" << json_escape(*error_code) << "\"";
+  if (!txid_hex.empty()) oss << ",\"txid\":\"" << minijson::escape(txid_hex) << "\"";
+  if (!message.empty()) oss << ",\"message\":\"" << minijson::escape(message) << "\"";
+  if (error_code.has_value()) oss << ",\"error_code\":\"" << minijson::escape(*error_code) << "\"";
   if (error_message.has_value()) {
-    oss << ",\"error_message\":\"" << json_escape(*error_message) << "\"";
-    oss << ",\"error\":\"" << json_escape(*error_message) << "\"";
+    oss << ",\"error_message\":\"" << minijson::escape(*error_message) << "\"";
+    oss << ",\"error\":\"" << minijson::escape(*error_message) << "\"";
   }
   oss << ",\"retryable\":" << (retryable ? "true" : "false");
-  oss << ",\"retry_class\":\"" << json_escape(retry_class) << "\"";
+  oss << ",\"retry_class\":\"" << minijson::escape(retry_class) << "\"";
   oss << ",\"mempool_full\":" << (mempool_full ? "true" : "false");
   if (min_fee_rate_to_enter_when_full_milliunits_per_byte.has_value()) {
     oss << ",\"min_fee_rate_to_enter_when_full\":" << *min_fee_rate_to_enter_when_full_milliunits_per_byte;
@@ -1168,9 +1162,9 @@ std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& 
   std::ostringstream oss;
   oss << "{\"validator_pubkey_hex\":\""
       << hex_encode(Bytes(record.validator_pubkey.begin(), record.validator_pubkey.end()))
-      << "\",\"onboarding_id\":\"" << json_escape(record.onboarding_id)
-      << "\",\"wallet_address\":\"" << json_escape(record.wallet_address)
-      << "\",\"wallet_pubkey_hex\":\"" << json_escape(record.wallet_pubkey_hex)
+      << "\",\"onboarding_id\":\"" << minijson::escape(record.onboarding_id)
+      << "\",\"wallet_address\":\"" << minijson::escape(record.wallet_address)
+      << "\",\"wallet_pubkey_hex\":\"" << minijson::escape(record.wallet_pubkey_hex)
       << "\",\"state\":\"" << onboarding::validator_onboarding_state_name(record.state)
       << "\",\"wait_for_sync\":" << (record.wait_for_sync ? "true" : "false")
       << ",\"fee\":" << record.fee
@@ -1182,16 +1176,16 @@ std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& 
       << ",\"readiness_captured_at_unix_ms\":" << record.readiness.captured_at_unix_ms
       << ",\"selected_input_count\":" << record.selected_inputs.size()
       << ",\"selected_inputs_reserved\":" << (record.selected_inputs_reserved ? "true" : "false")
-      << ",\"txid_hex\":\"" << json_escape(record.txid_hex)
+      << ",\"txid_hex\":\"" << minijson::escape(record.txid_hex)
       << "\",\"broadcast_outcome\":\"" << broadcast_outcome_name
-      << "\",\"rpc_endpoint\":\"" << json_escape(record.rpc_endpoint)
+      << "\",\"rpc_endpoint\":\"" << minijson::escape(record.rpc_endpoint)
       << "\",\"finalized_height\":" << record.finalized_height
-      << ",\"validator_status\":\"" << json_escape(record.validator_status)
+      << ",\"validator_status\":\"" << minijson::escape(record.validator_status)
       << "\",\"activation_height\":" << record.activation_height
       << ",\"rejoin_eligible_height\":" << record.rejoin_eligible_height
-      << ",\"rejoin_blocked_reason\":\"" << json_escape(record.rejoin_blocked_reason)
-      << ",\"last_error_code\":\"" << json_escape(record.last_error_code)
-      << "\",\"last_error_message\":\"" << json_escape(record.last_error_message)
+      << ",\"rejoin_blocked_reason\":\"" << minijson::escape(record.rejoin_blocked_reason)
+      << ",\"last_error_code\":\"" << minijson::escape(record.last_error_code)
+      << "\",\"last_error_message\":\"" << minijson::escape(record.last_error_message)
       << "\",\"readiness\":" << readiness_json(record.readiness) << "}";
   return oss.str();
 }
@@ -1888,7 +1882,7 @@ RateLimiter::Decision RateLimiter::check(const std::string& ip, Class cls, std::
 std::string Server::make_error(const std::string& id_token, int code, const std::string& msg) const {
   std::ostringstream oss;
   oss << "{\"jsonrpc\":\"2.0\",\"id\":" << id_token << ",\"error\":{\"code\":" << code << ",\"message\":\""
-      << json_escape(msg) << "\"}}";
+      << minijson::escape(msg) << "\"}}";
   return oss.str();
 }
 
@@ -2091,7 +2085,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (runtime.has_value()) oss << (runtime->advertised_endpoint_likely_public ? "true" : "false");
     else oss << "null";
     oss << ",\"advertised_endpoint\":";
-    if (runtime.has_value()) oss << "\"" << json_escape(runtime->advertised_endpoint) << "\"";
+    if (runtime.has_value()) oss << "\"" << minijson::escape(runtime->advertised_endpoint) << "\"";
     else oss << "null";
     oss << ",\"stun_enabled\":";
     if (runtime.has_value()) oss << (runtime->stun_enabled ? "true" : "false");
@@ -2106,10 +2100,10 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (runtime.has_value()) oss << runtime->stun_last_success_unix_ms;
     else oss << "null";
     oss << ",\"stun_last_server\":";
-    if (runtime.has_value()) oss << "\"" << json_escape(runtime->stun_last_server) << "\"";
+    if (runtime.has_value()) oss << "\"" << minijson::escape(runtime->stun_last_server) << "\"";
     else oss << "null";
     oss << ",\"stun_last_error_code\":";
-    if (runtime.has_value()) oss << "\"" << json_escape(runtime->stun_last_error_code) << "\"";
+    if (runtime.has_value()) oss << "\"" << minijson::escape(runtime->stun_last_error_code) << "\"";
     else oss << "null";
     oss << ",\"stun_backoff_until_unix_ms\":";
     if (runtime.has_value()) oss << runtime->stun_backoff_until_unix_ms;
@@ -2124,7 +2118,10 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (runtime.has_value()) oss << runtime->stun_endpoint_change_required_hits;
     else oss << "null";
     oss << ",\"stun_endpoint_candidate\":";
-    if (runtime.has_value()) oss << "\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
+    if (runtime.has_value()) oss << "\"" << minijson::escape(runtime->stun_endpoint_candidate) << "\"";
+    else oss << "null";
+    oss << ",\"abstaining_heights\":";
+    if (runtime.has_value()) oss << abstaining_heights_json(runtime->abstaining_heights);
     else oss << "null";
     oss << ",\"protocol_reserve_balance\":";
     if (auto reserve = view->get_protocol_reserve_balance(); reserve.has_value()) oss << *reserve;
@@ -2272,7 +2269,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     else oss << "null";
     oss << ",\"state_rebuild_reason\":";
     if (runtime.has_value()) {
-      oss << "\"" << json_escape(runtime->availability_state_rebuild_reason) << "\"";
+      oss << "\"" << minijson::escape(runtime->availability_state_rebuild_reason) << "\"";
     } else {
       oss << "null";
     }
@@ -2339,7 +2336,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (local_registry_pubkey.has_value()) {
       auto it = validators.find(*local_registry_pubkey);
       if (it != validators.end()) {
-        oss << "\"" << json_escape(validator_status_name_for_rpc(std::optional<consensus::ValidatorInfo>(it->second))) << "\"";
+        oss << "\"" << minijson::escape(validator_status_name_for_rpc(std::optional<consensus::ValidatorInfo>(it->second))) << "\"";
       } else {
         oss << "\"NOT_REGISTERED\"";
       }
@@ -2652,7 +2649,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         running_root = consensus::compute_lane_root_append(running_root, cert->tx_hash);
       }
       oss << "]";
-      if (!ok) oss << ",\"failure\":\"" << json_escape(failure) << "\"";
+      if (!ok) oss << ",\"failure\":\"" << minijson::escape(failure) << "\"";
       oss << "}";
       return make_result(id, oss.str());
     }
@@ -2678,7 +2675,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       const auto commitment = consensus::frontier_ordered_slice_commitment(ordered_records);
       oss << ",\"slice_commitment\":\"" << hex_encode32(commitment) << "\"";
     } else {
-      oss << ",\"failure\":\"" << json_escape(mismatch_detail) << "\"";
+      oss << ",\"failure\":\"" << minijson::escape(mismatch_detail) << "\"";
     }
     oss << "}";
     return make_result(id, oss.str());
@@ -2788,7 +2785,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const std::string tracked_txid_hex = field_string(params, "txid_hex").value_or("");
     std::string err;
     auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
-    if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
+    if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
     storage::DB live_db;
     if (!open_fresh_readonly_db(cfg_.db_path, &live_db)) {
       return make_result(
@@ -2796,7 +2793,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     auto record =
         onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, tracked_txid_hex, &err);
-    if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
+    if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
     return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
   }
 
@@ -2808,14 +2805,14 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const bool wait_for_sync = field_bool(params, "wait_for_sync").value_or(true);
     std::string err;
     auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
-    if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
+    if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
     storage::DB live_db;
     if (!open_fresh_readonly_db(cfg_.db_path, &live_db)) {
       return make_result(
           id, std::string("{\"state\":\"failed\",\"last_error_message\":\"failed to open db\"}"));
     }
     auto record = onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, "", &err);
-    if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + json_escape(err) + "\"}");
+    if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
     const bool stale_only_wait_for_sync =
         !wait_for_sync &&
         record->state == onboarding::ValidatorOnboardingState::FAILED &&
@@ -2888,7 +2885,6 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const auto min_bond_amount = record->bond_amount;
     const auto max_bond_amount = std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, min_bond_amount);
     ConfidentialPolicy confidential_policy{};
-    confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
         .network = &cfg_.network,
         .chain_id = &chain_id_,
@@ -2946,14 +2942,14 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (!validated.valid) {
       oss << ",\"normalized_address\":null,\"network_hint\":null,\"server_network_match\":null"
           << ",\"addr_type\":null,\"pubkey_hash_hex\":null,\"script_pubkey_hex\":null,\"scripthash_hex\":null"
-          << ",\"error\":\"" << json_escape(validated.error) << "\"}";
+          << ",\"error\":\"" << minijson::escape(validated.error) << "\"}";
       return make_result(id, oss.str());
     }
 
     const auto& decoded = *validated.decoded;
     const auto script_pubkey = address::p2pkh_script_pubkey(decoded.pubkey_hash);
     const auto scripthash = crypto::sha256(script_pubkey);
-    oss << ",\"normalized_address\":\"" << json_escape(*validated.normalized_address)
+    oss << ",\"normalized_address\":\"" << minijson::escape(*validated.normalized_address)
         << "\",\"hrp\":\"" << decoded.hrp
         << "\",\"network_hint\":\"" << network_hint_for_hrp(decoded.hrp)
         << "\",\"server_network_match\":" << (decoded.hrp == server_hrp ? "true" : "false")
@@ -3373,7 +3369,6 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const std::uint64_t broadcast_max_bond =
         std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, broadcast_min_bond);
     ConfidentialPolicy confidential_policy{};
-    confidential_policy.activation_height = cfg_.network.confidential_utxo_activation_height;
     SpecialValidationContext ctx{
         .network = &cfg_.network,
         .chain_id = &chain_id_,

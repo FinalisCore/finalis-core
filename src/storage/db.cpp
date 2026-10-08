@@ -1009,6 +1009,8 @@ Bytes serialize_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& sn
   w.u32le(snapshot.stun_endpoint_change_hits);
   w.u32le(snapshot.stun_endpoint_change_required_hits);
   w.varbytes(Bytes(snapshot.stun_endpoint_candidate.begin(), snapshot.stun_endpoint_candidate.end()));
+  w.varint(snapshot.abstaining_heights.size());
+  for (const auto h : snapshot.abstaining_heights) w.u64le(h);
   return w.take();
 }
 
@@ -1214,8 +1216,7 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
         auto stun_change_hits = r.u32le();
         auto stun_change_required_hits = r.u32le();
         auto stun_candidate = r.varbytes();
-        if (!stun_backoff_until || !stun_change_pending || !stun_change_hits || !stun_change_required_hits || !stun_candidate ||
-            !r.eof()) {
+        if (!stun_backoff_until || !stun_change_pending || !stun_change_hits || !stun_change_required_hits || !stun_candidate) {
           return false;
         }
         snapshot.stun_backoff_until_unix_ms = *stun_backoff_until;
@@ -1223,7 +1224,15 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
         snapshot.stun_endpoint_change_hits = *stun_change_hits;
         snapshot.stun_endpoint_change_required_hits = *stun_change_required_hits;
         snapshot.stun_endpoint_candidate = std::string(stun_candidate->begin(), stun_candidate->end());
-        return true;
+        if (r.eof()) return true;
+        auto abstain_count = r.varint();
+        if (!abstain_count || *abstain_count > 1024) return false;
+        for (std::uint64_t i = 0; i < *abstain_count; ++i) {
+          auto h = r.u64le();
+          if (!h) return false;
+          snapshot.abstaining_heights.push_back(*h);
+        }
+        return r.eof();
       })) {
     return std::nullopt;
   }
@@ -1306,6 +1315,7 @@ std::string key_node_runtime_status_snapshot() { return "NRS"; }
 std::string key_availability_persistent_state() { return "APS"; }
 std::string key_consensus_state_commitment_cache() { return "CSC:TIP"; }
 std::string key_protocol_reserve_balance() { return "PRB"; }
+std::string key_confidential_pool_value() { return "CPOOL"; }
 std::string key_validator_onboarding(const PubKey32& pub) { return "VO:" + hex_encode(Bytes(pub.begin(), pub.end())); }
 std::string key_txidx_prefix() { return "X:"; }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
@@ -1532,6 +1542,12 @@ void DB::Batch::put_protocol_reserve_balance(std::uint64_t balance_units) {
   codec::ByteWriter w;
   w.u64le(balance_units);
   put(key_protocol_reserve_balance(), w.take());
+}
+
+void DB::Batch::put_confidential_pool_value(std::uint64_t value_units) {
+  codec::ByteWriter w;
+  w.u64le(value_units);
+  put(key_confidential_pool_value(), w.take());
 }
 
 void DB::Batch::put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint) {
@@ -2041,6 +2057,21 @@ bool DB::put_protocol_reserve_balance(std::uint64_t balance_units) {
 
 std::optional<std::uint64_t> DB::get_protocol_reserve_balance() const {
   auto b = get(key_protocol_reserve_balance());
+  if (!b.has_value()) return std::nullopt;
+  std::optional<std::uint64_t> out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto value = r.u64le();
+        if (!value || !r.eof()) return false;
+        out = *value;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
+std::optional<std::uint64_t> DB::get_confidential_pool_value() const {
+  auto b = get(key_confidential_pool_value());
   if (!b.has_value()) return std::nullopt;
   std::optional<std::uint64_t> out;
   if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {

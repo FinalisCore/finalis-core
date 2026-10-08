@@ -17,6 +17,8 @@
 
 namespace finalis::mempool {
 
+inline constexpr const char* kMempoolConfidentialTurnstile = "confidential-turnstile-would-go-negative";
+
 using UtxoView = UtxoSetV2;
 
 struct MempoolEntry {
@@ -51,15 +53,26 @@ class Mempool {
                                       std::vector<std::string>* diagnostics = nullptr) const;
   void remove_confirmed(const std::vector<Hash32>& txids);
   void prune_against_utxo(const UtxoView& view);
+  // Drops txs whose admission PoW (SCONBREG / SCVALJRQ) no longer validates under the current
+  // context, i.e. its epoch fell out of {current, previous}. Such txs can never be selected for a
+  // block, and would otherwise hold their inputs until restart. Returns the number dropped.
+  std::size_t prune_expired_admission_pow();
   std::size_t size() const;
   std::size_t total_bytes() const;
   bool contains(const Hash32& txid) const;
   MempoolPolicyStats policy_stats() const;
   void on_finalized_block_timestamp(std::uint64_t ts);
-  void set_validation_context(SpecialValidationContext ctx) { ctx_ = ctx; }
+  // Also prunes expired admission PoW txs when ctx.current_height advances.
+  void set_validation_context(SpecialValidationContext ctx);
   void set_hashcash_config(policy::HashcashConfig cfg) { hashcash_cfg_ = std::move(cfg); }
   void set_network(NetworkConfig cfg) { network_ = std::move(cfg); }
   void set_full_replacement_margin_bps(std::uint32_t margin_bps) { full_replacement_margin_bps_ = margin_bps; }
+  // Committed turnstile P of the mempool's chain view (CanonicalDerivedState::confidential_pool_value).
+  // Policy only: TxV2s that would take P below zero (or past u64) are refused admission, and on a
+  // change of P already-admitted ones that now would are dropped. Execution re-checks against the P
+  // of the slice the tx lands in and stays the authority. nullopt disables the check. Returns the
+  // number of entries dropped.
+  std::size_t set_confidential_pool_value(std::optional<std::uint64_t> pool_value);
 
  private:
   struct EvictionKey {
@@ -76,6 +89,8 @@ class Mempool {
     MempoolEntry entry;
     std::vector<OutPoint> spent;
     EvictionKey eviction_key;
+    // TxV2 only: effect on P. Fixed at admission, since every input is a confirmed UTXO.
+    std::optional<__int128> confidential_pool_delta;
   };
 
   void erase_entry(std::map<Hash32, TxMeta>::iterator it);
@@ -86,6 +101,7 @@ class Mempool {
   std::map<OutPoint, Hash32> spent_outpoints_;
   std::size_t total_bytes_{0};
   std::optional<SpecialValidationContext> ctx_;
+  std::optional<std::uint64_t> confidential_pool_value_;
   policy::HashcashConfig hashcash_cfg_{};
   NetworkConfig network_{mainnet_network()};
   std::uint32_t full_replacement_margin_bps_{kDefaultFullReplacementMarginBps};

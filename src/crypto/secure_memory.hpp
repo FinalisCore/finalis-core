@@ -50,6 +50,9 @@ class ScopedWipe {
   std::tuple<Ts&...> refs_;
 };
 
+// OS-seeded CSPRNG (OpenSSL RAND_bytes). Returns false on failure; callers must fail closed.
+bool secure_random_bytes(void* p, std::size_t n);
+
 // Best-effort: keep a secret's pages out of swap. Failure (e.g. RLIMIT_MEMLOCK) is non-fatal.
 bool lock_memory(const void* p, std::size_t n);
 void unlock_memory(const void* p, std::size_t n);

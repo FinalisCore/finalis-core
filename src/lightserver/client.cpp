@@ -284,22 +284,6 @@ std::optional<Hash32> parse_hex32_field(const std::string& hex) {
   return out;
 }
 
-std::string json_escape(const std::string& in) {
-  std::string out;
-  out.reserve(in.size() + 8);
-  for (char c : in) {
-    if (c == '"' || c == '\\') {
-      out.push_back('\\');
-      out.push_back(c);
-    } else if (c == '\n') {
-      out += "\\n";
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
-}
-
 std::optional<onboarding::ValidatorOnboardingState> parse_onboarding_state(const std::string& state) {
   using onboarding::ValidatorOnboardingState;
   if (state == "idle") return ValidatorOnboardingState::IDLE;
@@ -505,7 +489,7 @@ std::optional<AddressValidationView> rpc_validate_address(const std::string& rpc
                                                           std::string* err) {
   const std::string body_json =
       std::string(R"({"jsonrpc":"2.0","id":41,"method":"validate_address","params":{"address":")") +
-      json_escape(address) + R"("}})";
+      minijson::escape(address) + R"("}})";
   auto body = http_post_json(rpc_url, body_json, err);
   if (!body) return std::nullopt;
   auto root = minijson::parse(*body);
@@ -855,9 +839,9 @@ std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_st
     std::string* err) {
   std::ostringstream body_json;
   body_json << R"({"jsonrpc":"2.0","id":6,"method":"validator_onboarding_status","params":{"key_file":")"
-            << json_escape(options.key_file) << R"(","passphrase":")" << json_escape(options.passphrase) << R"(","fee":)" << options.fee
+            << minijson::escape(options.key_file) << R"(","passphrase":")" << minijson::escape(options.passphrase) << R"(","fee":)" << options.fee
             << R"(,"wait_for_sync":)" << (options.wait_for_sync ? "true" : "false");
-  if (!tracked_txid_hex.empty()) body_json << R"(,"txid_hex":")" << json_escape(tracked_txid_hex) << "\"";
+  if (!tracked_txid_hex.empty()) body_json << R"(,"txid_hex":")" << minijson::escape(tracked_txid_hex) << "\"";
   body_json << "}}";
   auto body = http_post_json(rpc_url, body_json.str(), err);
   if (!body) return std::nullopt;
@@ -876,7 +860,7 @@ std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_st
     const std::string& rpc_url, const onboarding::ValidatorOnboardingOptions& options, std::string* err) {
   std::ostringstream body_json;
   body_json << R"({"jsonrpc":"2.0","id":7,"method":"validator_onboarding_start","params":{"key_file":")"
-            << json_escape(options.key_file) << R"(","passphrase":")" << json_escape(options.passphrase) << R"(","fee":)" << options.fee
+            << minijson::escape(options.key_file) << R"(","passphrase":")" << minijson::escape(options.passphrase) << R"(","fee":)" << options.fee
             << R"(,"wait_for_sync":)" << (options.wait_for_sync ? "true" : "false") << "}}";
   auto body = http_post_json(rpc_url, body_json.str(), err);
   if (!body) return std::nullopt;

@@ -22,7 +22,6 @@ class ActivityPage final : public QWidget {
   QLabel* finalized_count_label() const { return finalized_count_label_; }
   QLabel* pending_count_label() const { return pending_count_label_; }
   QLabel* local_count_label() const { return local_count_label_; }
-  QLabel* mint_count_label() const { return mint_count_label_; }
   QLabel* confidential_count_label() const { return confidential_count_label_; }
   QLabel* detail_title_label() const { return detail_title_label_; }
   QTextEdit* detail_view() const { return detail_view_; }
@@ -34,7 +33,6 @@ class ActivityPage final : public QWidget {
   QLabel* finalized_count_label_{nullptr};
   QLabel* pending_count_label_{nullptr};
   QLabel* local_count_label_{nullptr};
-  QLabel* mint_count_label_{nullptr};
   QLabel* confidential_count_label_{nullptr};
   QLabel* detail_title_label_{nullptr};
   QTextEdit* detail_view_{nullptr};

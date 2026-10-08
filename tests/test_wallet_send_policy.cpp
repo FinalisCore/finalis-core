@@ -225,7 +225,6 @@ TEST(test_wallet_confidential_builder_creates_valid_transparent_to_confidential_
   UtxoSetV2 view;
   view[prev.first] = UtxoEntryV2{prev.second};
   ConfidentialPolicy policy;
-  policy.activation_height = 0;
   SpecialValidationContext ctx;
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
@@ -275,7 +274,6 @@ TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_
   };
   view[op] = confidential_entry;
   ConfidentialPolicy policy;
-  policy.activation_height = 0;
   SpecialValidationContext ctx;
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
@@ -284,5 +282,3 @@ TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_
   if (!result.ok) throw std::runtime_error("wallet confidential->transparent builder error: " + result.error);
   ASSERT_TRUE(result.ok);
 }
-
-void register_wallet_send_policy_tests() {}

@@ -409,8 +409,6 @@ TEST(test_vote_tracker_rejects_same_round_equivocation) {
   ASSERT_TRUE(repeat.evidence.has_value());
 }
 
-void register_validator_lifecycle_tests() {}
-
 TEST(test_timeout_tracker_window_evicts_oldest_round) {
   consensus::TimeoutVoteTracker tracker(consensus::TimeoutVoteTracker::Limits{.max_rounds_per_height = 4});
   const auto v = key_from_byte(0x51).public_key;

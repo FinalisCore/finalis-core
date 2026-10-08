@@ -141,6 +141,8 @@ enum class FrontierRejectReason : std::uint8_t {
   TX_PARSE_FAILED = 1,
   TX_INVALID = 2,
   CONFLICT_DOMAIN_USED = 3,
+  // A TxV2 that would take more value out of the confidential pool than ever entered it.
+  CONFIDENTIAL_TURNSTILE_NEGATIVE = 4,
 };
 
 struct FrontierDecision {

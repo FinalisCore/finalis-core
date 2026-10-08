@@ -151,7 +151,7 @@ OverviewPage::OverviewPage(QWidget* parent) : QWidget(parent) {
 
   auto* note = new QLabel(
       "Overview stays focused on balance, wallet identity, finalized status, and recent activity. "
-      "Validator, mint, and diagnostics remain under Advanced.",
+      "Validator tools and diagnostics remain under Advanced.",
       this);
   note->setWordWrap(true);
   note->setProperty("role", QVariant(QStringLiteral("muted")));

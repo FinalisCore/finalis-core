@@ -135,6 +135,8 @@ struct NodeRuntimeStatusSnapshot {
   std::uint32_t stun_endpoint_change_hits{0};
   std::uint32_t stun_endpoint_change_required_hits{0};
   std::string stun_endpoint_candidate;
+  // Heights at which the node abstains from signing because its consensus safety state was unreadable.
+  std::vector<std::uint64_t> abstaining_heights;
   std::uint64_t finalized_lag{0};
   bool peer_height_disagreement{false};
   bool next_height_committee_available{false};
@@ -289,6 +291,7 @@ class DB {
     void put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req);
     void put_epoch_reward_settlement(const EpochRewardSettlementState& state);
     void put_protocol_reserve_balance(std::uint64_t balance_units);
+    void put_confidential_pool_value(std::uint64_t value_units);
     void put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint);
     void put_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& snapshot);
     void put_consensus_state_commitment_cache(const ConsensusStateCommitmentCache& cache);
@@ -366,6 +369,7 @@ class DB {
   std::map<std::uint64_t, EpochRewardSettlementState> load_epoch_reward_settlements() const;
   bool put_protocol_reserve_balance(std::uint64_t balance_units);
   std::optional<std::uint64_t> get_protocol_reserve_balance() const;
+  std::optional<std::uint64_t> get_confidential_pool_value() const;
   bool put_epoch_ticket(const consensus::EpochTicket& ticket);
   std::vector<consensus::EpochTicket> load_epoch_tickets(std::uint64_t epoch) const;
   std::vector<std::uint64_t> load_epoch_ticket_epochs() const;
@@ -490,6 +494,7 @@ std::string key_node_runtime_status_snapshot();
 std::string key_availability_persistent_state();
 std::string key_consensus_state_commitment_cache();
 std::string key_protocol_reserve_balance();
+std::string key_confidential_pool_value();
 std::string key_adaptive_epoch_telemetry_prefix();
 std::string key_validator_onboarding(const PubKey32& pub);
 AdaptiveTelemetrySummary summarize_adaptive_epoch_telemetry(

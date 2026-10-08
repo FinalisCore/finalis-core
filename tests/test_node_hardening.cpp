@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -21,13 +22,7 @@ using namespace finalis;
 
 namespace {
 
-std::string unique_test_path(const char* prefix) {
-  static std::atomic<std::uint64_t> counter{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto seq = counter.fetch_add(1, std::memory_order_relaxed);
-  return std::string(prefix) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq);
-}
+using finalis::test::unique_test_base;
 
 node::NodeConfig make_cfg(const std::string& db_path) {
   node::NodeConfig cfg;
@@ -42,7 +37,7 @@ node::NodeConfig make_cfg(const std::string& db_path) {
 }  // namespace
 
 TEST(test_node_rate_limit_does_not_score_single_bootstrap_peer_during_sync) {
-  auto cfg = make_cfg(unique_test_path("/tmp/finalis_test_node_rate_limit_bootstrap_guard"));
+  auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_rate_limit_bootstrap_guard"));
   cfg.seeds = {"64.23.244.126:19440"};
   node::Node n(cfg);
   ASSERT_TRUE(n.init());
@@ -66,7 +61,7 @@ TEST(test_node_rate_limit_does_not_score_single_bootstrap_peer_during_sync) {
 }
 
 TEST(test_node_rate_limit_still_scores_non_bootstrap_peer) {
-  auto cfg = make_cfg(unique_test_path("/tmp/finalis_test_node_rate_limit_non_bootstrap"));
+  auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_rate_limit_non_bootstrap"));
   node::Node n(cfg);
   ASSERT_TRUE(n.init());
 
@@ -84,7 +79,7 @@ TEST(test_node_rate_limit_still_scores_non_bootstrap_peer) {
 }
 
 TEST(test_node_peer_discipline_decay_hook_reduces_score) {
-  auto cfg = make_cfg(unique_test_path("/tmp/finalis_test_node_peer_decay"));
+  auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_peer_decay"));
   node::Node n(cfg);
   ASSERT_TRUE(n.init());
 
@@ -102,5 +97,3 @@ TEST(test_node_peer_discipline_decay_hook_reduces_score) {
 
   n.stop();
 }
-
-void register_node_hardening_tests() {}

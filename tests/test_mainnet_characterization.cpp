@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -20,12 +21,7 @@ using namespace finalis;
 
 namespace {
 
-std::string unique_test_base(const std::string& prefix) {
-  return prefix + "_" +
-         std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count());
-}
+using finalis::test::unique_test_base;
 
 std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id) {
   std::array<std::uint8_t, 32> seed{};
@@ -216,5 +212,3 @@ TEST(test_characterize_mainnet_runtime_is_deterministic_routing_with_current_val
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("SCVALREG output out of v7 bond range"));
 }
-
-void register_mainnet_characterization_tests() {}

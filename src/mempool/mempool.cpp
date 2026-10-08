@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <ctime>
+#include <limits>
 
 #include "codec/bytes.hpp"
 #include "common/wide_arith.hpp"
+#include "consensus/confidential_supply.hpp"
 #include "utxo/validate.hpp"
 
 namespace finalis::mempool {
@@ -26,6 +28,41 @@ std::vector<OutPoint> input_outpoints(const AnyTx& tx) {
         return out;
       },
       tx);
+}
+
+// (value, script) of every transparent output; v2 transparent outputs can carry special scripts too.
+std::vector<std::pair<std::uint64_t, const Bytes*>> transparent_outputs(const AnyTx& tx) {
+  std::vector<std::pair<std::uint64_t, const Bytes*>> out;
+  if (const auto* v1 = std::get_if<Tx>(&tx)) {
+    for (const auto& o : v1->outputs) out.push_back({o.value, &o.script_pubkey});
+  } else {
+    for (const auto& o : std::get<TxV2>(tx).outputs) {
+      if (const auto* t = std::get_if<TransparentTxOutV2>(&o.body)) out.push_back({t->value, &t->script_pubkey});
+    }
+  }
+  return out;
+}
+
+// Same admission PoW checks validate_any_tx applies in select_for_block, so a tx dropped here is
+// exactly one block selection would skip forever.
+bool admission_pow_invalid(const AnyTx& tx, const SpecialValidationContext& ctx) {
+  const auto outputs = transparent_outputs(tx);
+  for (const auto& [value, script] : outputs) {
+    OnboardingRegistrationScriptData onboarding_req{};
+    if (parse_onboarding_registration_script(*script, &onboarding_req) &&
+        !validate_onboarding_admission_pow(onboarding_req, ctx, nullptr)) {
+      return true;
+    }
+    ValidatorJoinRequestScriptData join_req{};
+    if (!parse_validator_join_request_script(*script, &join_req)) continue;
+    for (const auto& [bond_value, bond_script] : outputs) {
+      PubKey32 reg_pub{};
+      if (!is_validator_register_script(*bond_script, &reg_pub) || reg_pub != join_req.validator_pubkey) continue;
+      if (!validate_admission_pow(join_req, input_outpoints(tx), bond_value, ctx, nullptr)) return true;
+      break;
+    }
+  }
+  return false;
 }
 
 std::uint64_t effective_score_weight(const TxValidationCost& cost) {
@@ -58,6 +95,12 @@ bool meets_full_replacement_margin(const MempoolEntry& incoming, const MempoolEn
 // (incoming tx isn't good enough to justify evicting the pool's worst entry),
 // so they must report it identically rather than risk drifting apart.
 constexpr const char* kMempoolFullNotGoodEnough = "mempool full: not good enough";
+
+// Same bounds execute_frontier_slice applies to the turnstile.
+bool pool_value_admits(std::uint64_t pool_value, __int128 delta) {
+  const __int128 next = static_cast<__int128>(pool_value) + delta;
+  return next >= 0 && next <= static_cast<__int128>(std::numeric_limits<std::uint64_t>::max());
+}
 
 // Crypto-free fee estimate, used ONLY to decide whether accept_tx's expensive
 // validate_any_tx() call is worth paying for when the pool is at capacity.
@@ -185,6 +228,18 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
     return false;
   }
 
+  // Turnstile pre-check: arithmetic on public values only, against the current committed P.
+  std::optional<__int128> pool_delta;
+  if (const auto* v2 = std::get_if<TxV2>(&tx)) {
+    __int128 delta = 0;
+    if (!consensus::txv2_confidential_pool_delta(*v2, view, &delta) ||
+        (confidential_pool_value_.has_value() && !pool_value_admits(*confidential_pool_value_, delta))) {
+      if (err) *err = kMempoolConfidentialTurnstile;
+      return false;
+    }
+    pool_delta = delta;
+  }
+
   if (std::holds_alternative<Tx>(tx)) {
     const auto& v1 = std::get<Tx>(tx);
     const auto required_bits = policy::required_hashcash_bits(hashcash_cfg_, v1, vr.cost.fee, by_txid_.size());
@@ -220,6 +275,7 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
                             vr.cost.confidential_verify_weight};
   meta.eviction_key = EvictionKey{meta.entry.fee, meta.entry.score_weight, meta.entry.txid};
   meta.spent = spent_inputs;
+  meta.confidential_pool_delta = pool_delta;
   for (const auto& op : meta.spent) spent_outpoints_[op] = txid;
 
   const bool full_by_count = by_txid_.size() >= kMaxTxCount;
@@ -328,6 +384,45 @@ void Mempool::remove_confirmed(const std::vector<Hash32>& txids) {
     auto erase_it = it++;
     erase_entry(erase_it);
   }
+}
+
+std::size_t Mempool::set_confidential_pool_value(std::optional<std::uint64_t> pool_value) {
+  if (pool_value == confidential_pool_value_) return 0;
+  confidential_pool_value_ = pool_value;
+  if (!pool_value.has_value()) return 0;
+  std::size_t dropped = 0;
+  for (auto it = by_txid_.begin(); it != by_txid_.end();) {
+    const auto& delta = it->second.confidential_pool_delta;
+    if (!delta.has_value() || pool_value_admits(*pool_value, *delta)) {
+      ++it;
+      continue;
+    }
+    auto erase_it = it++;
+    erase_entry(erase_it);
+    ++dropped;
+  }
+  return dropped;
+}
+
+void Mempool::set_validation_context(SpecialValidationContext ctx) {
+  const bool height_advanced = !ctx_.has_value() || ctx.current_height > ctx_->current_height;
+  ctx_ = std::move(ctx);
+  if (height_advanced) (void)prune_expired_admission_pow();
+}
+
+std::size_t Mempool::prune_expired_admission_pow() {
+  if (!ctx_.has_value()) return 0;
+  std::size_t dropped = 0;
+  for (auto it = by_txid_.begin(); it != by_txid_.end();) {
+    if (!admission_pow_invalid(it->second.entry.tx, *ctx_)) {
+      ++it;
+      continue;
+    }
+    auto erase_it = it++;
+    erase_entry(erase_it);
+    ++dropped;
+  }
+  return dropped;
 }
 
 void Mempool::prune_against_utxo(const UtxoView& view) {

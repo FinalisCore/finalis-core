@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #include <array>
 #include <atomic>
@@ -30,10 +31,7 @@ crypto::KeyPair key_from_byte(std::uint8_t base) {
   return *kp;
 }
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> seq{0};
-  return prefix + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
-}
+using finalis::test::unique_test_base;
 
 TxOut p2pkh_out_for_pub(const PubKey32& pub, std::uint64_t value) {
   const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
@@ -255,7 +253,6 @@ TEST(test_frontier_execution_accepts_supported_txv2_ordered_record_with_activati
 
   std::vector<Bytes> ordered{raw_signed_spend_v2(op, from, to.public_key, 10'000, 9'800)};
   ConfidentialPolicy policy;
-  policy.activation_height = 0;
   SpecialValidationContext ctx;
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;

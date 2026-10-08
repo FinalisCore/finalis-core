@@ -148,8 +148,6 @@ add_library(finalis_core
   src/common/merkle.cpp
   src/common/address.cpp
   src/consensus/availability_retention.cpp
-  src/privacy/mint_client.cpp
-  src/privacy/mint_scripts.cpp
   src/wallet/utxo_selection.cpp
   src/wallet/confidential_builder.cpp
   src/utxo/tx.cpp
@@ -161,6 +159,7 @@ add_library(finalis_core
   src/consensus/monetary.cpp
   src/consensus/committee_schedule.cpp
   src/consensus/canonical_derivation.cpp
+  src/consensus/confidential_supply.cpp
   src/consensus/frontier_execution.cpp
   src/consensus/ingress.cpp
   src/consensus/epoch_tickets.cpp
@@ -178,6 +177,14 @@ add_library(finalis_core
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
   src/node/node.cpp
+  src/node/node_internal.cpp
+  src/node/node_test_hooks.cpp
+  src/node/node_args.cpp
+  src/node/node_state.cpp
+  src/node/node_consensus.cpp
+  src/node/node_ingress.cpp
+  src/node/node_network.cpp
+  src/node/node_validator_ops.cpp
   src/lightserver/client.cpp
   src/lightserver/server.cpp
 )
@@ -254,6 +261,10 @@ if(FINALIS_SANITIZE)
   target_link_options(checkpoint-fixture-export PRIVATE -fsanitize=address,undefined)
 endif()
 
+# Confidential verify-weight calibration (not a test; run manually from a Release build).
+add_executable(finalis-bench-confidential tools/bench_confidential_verify.cpp)
+target_link_libraries(finalis-bench-confidential PRIVATE finalis_core)
+
 add_executable(finalis-explorer apps/finalis-explorer/main.cpp)
 target_link_libraries(finalis-explorer PRIVATE finalis_core)
 if(FINALIS_SANITIZE)
@@ -271,6 +282,7 @@ if(Qt5Widgets_FOUND)
     apps/finalis-wallet/refresh_gate.cpp
     apps/finalis-wallet/wallet_window.cpp
     apps/finalis-wallet/wallet_store.cpp
+    apps/finalis-wallet/confidential_memo.cpp
     apps/finalis-wallet/widgets/activity_page.cpp
     apps/finalis-wallet/widgets/advanced_page.cpp
     apps/finalis-wallet/widgets/overview_page.cpp
@@ -318,6 +330,7 @@ if(Qt5Widgets_FOUND)
     apps/finalis-wallet/refresh_gate.cpp
     apps/finalis-wallet/wallet_window.cpp
     apps/finalis-wallet/wallet_store.cpp
+    apps/finalis-wallet/confidential_memo.cpp
     apps/finalis-wallet/widgets/activity_page.cpp
     apps/finalis-wallet/widgets/advanced_page.cpp
     apps/finalis-wallet/widgets/overview_page.cpp
@@ -360,6 +373,7 @@ add_executable(finalis-tests
   apps/finalis-wallet/history_merge.cpp
   apps/finalis-wallet/refresh_gate.cpp
   apps/finalis-wallet/wallet_store.cpp
+  apps/finalis-wallet/confidential_memo.cpp
   tests/test_main.cpp
   tests/test_codec.cpp
   tests/test_chain_id.cpp
@@ -384,13 +398,13 @@ add_executable(finalis-tests
   tests/test_hardening.cpp
   tests/test_node_hardening.cpp
   tests/test_protocol_scope.cpp
-  tests/test_privacy.cpp
   tests/test_genesis.cpp
   tests/test_paths.cpp
   tests/test_keystore.cpp
   tests/test_wallet_send_policy.cpp
   tests/test_validator_onboarding.cpp
   tests/test_wallet_store.cpp
+  tests/test_wallet_confidential_memo.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp
   tests/test_lightserver.cpp

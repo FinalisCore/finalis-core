@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/types.hpp"
+#include "crypto/secure_memory.hpp"
 #include "storage/db.hpp"
 #include "utxo/tx.hpp"
 
@@ -16,11 +17,10 @@ namespace finalis::wallet {
 
 class WalletStore {
  public:
-  struct MintNoteRecord {
-    std::string note_ref;
-    std::uint64_t amount{0};
-    bool active{true};
-  };
+  WalletStore() = default;
+  WalletStore(const WalletStore&) = delete;
+  WalletStore& operator=(const WalletStore&) = delete;
+  ~WalletStore() { crypto::secure_wipe(passphrase_); }
 
   struct PendingSpend {
     std::string txid_hex;
@@ -77,7 +77,6 @@ class WalletStore {
     std::string activity_finalized_count_text;
     std::string activity_pending_count_text;
     std::string activity_local_count_text;
-    std::string activity_mint_count_text;
     std::string activity_confidential_count_text;
     std::vector<ViewSnapshotRow> overview_activity_rows;
     std::vector<ViewSnapshotRow> history_rows;
@@ -103,6 +102,8 @@ class WalletStore {
     std::string view_key_material_hex;
     std::string spend_key_material_hex;
     bool active{true};
+
+    ~ConfidentialAccountRecord() { crypto::secure_wipe(view_key_material_hex); crypto::secure_wipe(spend_key_material_hex); }
   };
 
   struct ConfidentialCoinRecord {
@@ -116,6 +117,8 @@ class WalletStore {
     std::string spend_secret_hex;
     std::string blinding_factor_hex;
     bool spent{false};
+
+    ~ConfidentialCoinRecord() { crypto::secure_wipe(spend_secret_hex); crypto::secure_wipe(blinding_factor_hex); }
   };
 
   struct ConfidentialRequestRecord {
@@ -127,20 +130,17 @@ class WalletStore {
     std::string spend_secret_hex;
     std::string memo_key_hex;
     bool consumed{false};
+
+    ~ConfidentialRequestRecord() { crypto::secure_wipe(spend_secret_hex); crypto::secure_wipe(memo_key_hex); }
   };
 
   struct State {
     std::vector<std::string> sent_txids;
     std::vector<std::string> local_events;
-    std::vector<MintNoteRecord> mint_notes;
     std::vector<PendingSpend> pending_spends;
     std::vector<FinalizedHistoryRecord> finalized_history;
     std::optional<std::uint64_t> history_cursor_height;
     std::optional<std::string> history_cursor_txid;
-    std::string mint_deposit_ref;
-    std::string mint_last_deposit_txid;
-    std::uint32_t mint_last_deposit_vout{0};
-    std::string mint_last_redemption_batch_id;
     std::vector<ConfidentialAccountRecord> confidential_accounts;
     std::vector<ConfidentialCoinRecord> confidential_coins;
     std::vector<ConfidentialRequestRecord> confidential_requests;
@@ -168,11 +168,6 @@ class WalletStore {
   bool upsert_pending_tx_status(const PendingTxStatusRecord& record);
   bool remove_pending_tx_status(const std::string& txid_hex);
   bool append_local_event(const std::string& line);
-  bool upsert_mint_note(const std::string& note_ref, std::uint64_t amount, bool active);
-  bool set_mint_deposit_ref(const std::string& value);
-  bool set_mint_last_deposit_txid(const std::string& value);
-  bool set_mint_last_deposit_vout(std::uint32_t value);
-  bool set_mint_last_redemption_batch_id(const std::string& value);
   bool upsert_confidential_account(const ConfidentialAccountRecord& record);
   bool set_confidential_primary_account_id(const std::optional<std::string>& account_id);
   bool upsert_confidential_coin(const ConfidentialCoinRecord& record);
@@ -188,10 +183,8 @@ class WalletStore {
  private:
   bool prune_pending_tx_status_cache();
   bool set_string(const std::string& key, const std::string& value);
-  bool set_u32(const std::string& key, std::uint32_t value);
   bool set_u64(const std::string& key, std::uint64_t value);
   std::optional<std::string> get_string(const std::string& key) const;
-  std::optional<std::uint32_t> get_u32(const std::string& key) const;
   std::optional<std::uint64_t> get_u64(const std::string& key) const;
   std::uint64_t next_event_seq() const;
   std::uint64_t next_history_seq() const;

@@ -10,6 +10,13 @@
 
 namespace finalis {
 
+// Hard TxV2 limits, enforced while parsing so a hostile encoding cannot force large allocations.
+// ConfidentialPolicy's defaults are these same values.
+inline constexpr std::uint32_t kTxV2MaxInputs = 64;
+inline constexpr std::uint32_t kTxV2MaxOutputs = 32;
+inline constexpr std::uint32_t kTxV2MaxRangeProofBytes = 5134;
+inline constexpr std::uint32_t kTxV2MaxMemoBytes = 128;
+
 enum class TxVersionKind : std::uint32_t {
   TRANSPARENT_V1 = 1,
   CONFIDENTIAL_V2 = 2,

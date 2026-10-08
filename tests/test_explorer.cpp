@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -34,10 +35,7 @@ using namespace finalis;
 namespace {
 
 std::filesystem::path unique_test_cache_path(const char* stem) {
-  static std::atomic<std::uint64_t> seq{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto name = std::string(stem) + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + ".json";
+  const auto name = finalis::test::unique_test_base(stem) + ".json";
   return std::filesystem::temp_directory_path() / name;
 }
 

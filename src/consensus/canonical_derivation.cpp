@@ -410,12 +410,8 @@ std::size_t active_operator_count_for_height(const ValidatorRegistry& validators
 
 std::uint64_t effective_validator_min_bond_for_height(const CanonicalDerivationConfig& cfg,
                                                       const CanonicalDerivedState& state, std::uint64_t height) {
-  if (cfg.validator_min_bond_override != BOND_AMOUNT || cfg.validator_bond_min_amount != BOND_AMOUNT) {
-    return std::max<std::uint64_t>(cfg.validator_min_bond_override, cfg.validator_bond_min_amount);
-  }
-  const auto active_operator_count = active_operator_count_for_height(state.validators, height);
-  return std::max<std::uint64_t>(cfg.validator_bond_min_amount,
-                                 validator_min_bond_units(cfg.network, height, active_operator_count));
+  return consensus::effective_validator_min_bond_for_height(cfg.network, cfg.validator_min_bond_override,
+                                                            cfg.validator_bond_min_amount, state.validators, height);
 }
 
 std::uint8_t ticket_difficulty_bits_for_epoch(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
@@ -861,6 +857,16 @@ void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, Canonic
 }
 
 }  // namespace
+
+std::uint64_t effective_validator_min_bond_for_height(const NetworkConfig& network, std::uint64_t min_bond_override,
+                                                      std::uint64_t bond_min_amount, const ValidatorRegistry& validators,
+                                                      std::uint64_t height) {
+  if (min_bond_override != BOND_AMOUNT || bond_min_amount != BOND_AMOUNT) {
+    return std::max<std::uint64_t>(min_bond_override, bond_min_amount);
+  }
+  const auto active_operator_count = active_operator_count_for_height(validators, height);
+  return std::max<std::uint64_t>(bond_min_amount, validator_min_bond_units(network, height, active_operator_count));
+}
 
 Hash32 canonical_finality_certificate_hash(const FinalityCertificate& cert) {
   return canonical_finality_certificate_hash_impl(cert);
@@ -1491,7 +1497,8 @@ bool verify_frontier_record_against_state_with_replay_options(
     }
     auto vctx = build_validation_context(record.transition.height);
     FrontierExecutionResult result;
-    if (!execute_frontier_slice(prev.utxos, prev.finalized_frontier, record.ordered_records, &vctx, &result, error)) {
+    if (!execute_frontier_slice(prev.utxos, prev.confidential_pool_value, prev.finalized_frontier, record.ordered_records,
+                                &vctx, &result, error)) {
       if (error && error->empty()) *error = "frontier-execution-failed";
       return false;
     }
@@ -1665,7 +1672,8 @@ bool verify_frontier_record_against_state_with_replay_options(
   }
   auto vctx = build_validation_context(record.transition.height);
   FrontierExecutionResult result;
-  if (!execute_frontier_lane_prefix(prev.utxos, prev.finalized_frontier_vector, record.transition.next_vector,
+  if (!execute_frontier_lane_prefix(prev.utxos, prev.confidential_pool_value, prev.finalized_frontier_vector,
+                                    record.transition.next_vector,
                                     record.lane_records, prev.finalized_lane_roots, &vctx, &result, error)) {
     if (error && error->empty()) *error = "frontier-execution-failed";
     return false;
@@ -1829,11 +1837,13 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   const UtxoSetV2 pre_utxos = next.utxos;
   apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos,
                                          record.transition.height);
+  account_confidential_supply(pre_utxos, recomputed.accepted_txs, record.transition.height, &next.confidential_supply);
   next.finalized_height = record.transition.height;
   next.finalized_frontier = recomputed.transition.next_frontier;
   next.finalized_frontier_vector = recomputed.transition.next_vector;
   next.finalized_lane_roots = recomputed.next_lane_roots;
   next.utxos = std::move(recomputed.next_utxos);
+  next.confidential_pool_value = recomputed.next_confidential_pool_value;
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
   next.last_finality_certificate_hash = frontier_finality_link_hash(record.transition);
   next.finalized_randomness = advance_finalized_randomness(prev.finalized_randomness, record.transition);
@@ -2096,7 +2106,7 @@ Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const Ca
   const auto availability_prefix_root = crypto::SparseMerkleTree::compute_root_from_leaves(availability_prefix_leaves);
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'C', 'A', 'N', 'O', 'N', '-', 'S', 'T', 'A', 'T', 'E', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'C', 'A', 'N', 'O', 'N', '-', 'S', 'T', 'A', 'T', 'E', '-', 'V', '2'});
   w.u64le(state.finalized_height);
   w.u64le(state.finalized_frontier);
   // The canonical state commitment intentionally binds only the finalized
@@ -2120,6 +2130,7 @@ Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const Ca
   w.u64le(state.validator_join_window_start_height);
   w.u32le(state.validator_join_count_in_window);
   w.u64le(state.validator_liveness_window_start_height);
+  w.u64le(state.confidential_pool_value);
   return crypto::sha256d(w.data());
 }
 

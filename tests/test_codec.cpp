@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_paths.hpp"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -23,12 +24,7 @@ using namespace finalis;
 
 namespace {
 
-std::string unique_test_base(const std::string& prefix) {
-  static std::atomic<std::uint64_t> seq{0};
-  const auto pid = static_cast<std::uint64_t>(::getpid());
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  return prefix + "_" + std::to_string(pid) + "_" + std::to_string(now) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
-}
+using finalis::test::unique_test_base;
 
 }  // namespace
 
@@ -568,5 +564,3 @@ TEST(test_frontier_transition_and_ingress_db_roundtrip) {
   ASSERT_TRUE(frontier_height.has_value());
   ASSERT_EQ(*frontier_height, 1u);
 }
-
-void register_codec_tests() {}

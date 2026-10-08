@@ -36,13 +36,12 @@ void test_activity_page_local_filter_and_chips() {
   finalis::wallet::ActivityPage page;
   auto* filter = page.filter_combo();
   require(filter != nullptr, "activity filter combo missing");
-  require(filter->count() == 6, "activity filter count mismatch");
+  require(filter->count() == 5, "activity filter count mismatch");
   require(filter->itemText(0).toStdString() == "All", "activity filter missing All");
   require(filter->itemText(1).toStdString() == "On-Chain", "activity filter missing On-Chain");
   require(filter->itemText(2).toStdString() == "Local", "activity filter missing Local");
-  require(filter->itemText(3).toStdString() == "Mint", "activity filter missing Mint");
-  require(filter->itemText(4).toStdString() == "Confidential", "activity filter missing Confidential");
-  require(filter->itemText(5).toStdString() == "Pending", "activity filter missing Pending");
+  require(filter->itemText(3).toStdString() == "Confidential", "activity filter missing Confidential");
+  require(filter->itemText(4).toStdString() == "Pending", "activity filter missing Pending");
 
   auto* local = page.local_count_label();
   require(local != nullptr, "local chip missing");
@@ -61,7 +60,6 @@ void test_wallet_window_history_selection_updates_detail_panel() {
   require(window.activity_detail_view_ != nullptr, "wallet detail view missing");
 
   window.chain_records_.clear();
-  window.mint_records_.clear();
   window.local_history_lines_.clear();
   window.history_row_refs_.clear();
   window.chain_records_.push_back(finalis::wallet::WalletWindow::ChainRecord{
@@ -161,7 +159,6 @@ void test_wallet_window_local_filter_preserves_rendered_ordering() {
   require(window.activity_local_count_label_ != nullptr, "wallet local count chip missing");
 
   window.chain_records_.clear();
-  window.mint_records_.clear();
   window.local_history_lines_.clear();
   window.history_row_refs_.clear();
 

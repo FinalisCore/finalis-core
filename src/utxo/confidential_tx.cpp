@@ -8,12 +8,8 @@
 namespace finalis {
 namespace {
 
-constexpr std::uint64_t kMaxTxV2Inputs = 10'000;
-constexpr std::uint64_t kMaxTxV2Outputs = 10'000;
 constexpr std::size_t kMaxWitnessBytes = 256 * 1024;
 constexpr std::size_t kMaxScriptBytes = 256 * 1024;
-constexpr std::size_t kMaxProofBytes = 256 * 1024;
-constexpr std::size_t kMaxMemoBytes = 64 * 1024;
 
 void serialize_txin_v2(codec::ByteWriter& w, const TxInV2& in) {
   w.bytes_fixed(in.prev_txid);
@@ -93,7 +89,7 @@ bool parse_txout_v2(codec::ByteReader& r, TxOutV2* out) {
     auto range_proof = r.varbytes();
     auto memo = r.varbytes();
     if (!value_commitment || !one_time_pubkey || !ephemeral_pubkey || !scan_tag || !range_proof || !memo) return false;
-    if (range_proof->size() > kMaxProofBytes || memo->size() > kMaxMemoBytes) return false;
+    if (range_proof->size() > kTxV2MaxRangeProofBytes || memo->size() > kTxV2MaxMemoBytes) return false;
     result.body = ConfidentialTxOutV2{
         .value_commitment = crypto::Commitment33{*value_commitment},
         .one_time_pubkey = *one_time_pubkey,
@@ -132,7 +128,7 @@ std::optional<TxV2> TxV2::parse(const Bytes& b) {
           auto input_count = r.varint();
           if (!version || !input_count) return false;
           if (*version != static_cast<std::uint32_t>(TxVersionKind::CONFIDENTIAL_V2)) return false;
-          if (*input_count > kMaxTxV2Inputs) return false;
+          if (*input_count > kTxV2MaxInputs) return false;
           tx.version = *version;
           tx.inputs.clear();
           tx.inputs.reserve(*input_count);
@@ -143,7 +139,7 @@ std::optional<TxV2> TxV2::parse(const Bytes& b) {
           }
 
           auto output_count = r.varint();
-          if (!output_count || *output_count > kMaxTxV2Outputs) return false;
+          if (!output_count || *output_count > kTxV2MaxOutputs) return false;
           tx.outputs.clear();
           tx.outputs.reserve(*output_count);
           for (std::uint64_t i = 0; i < *output_count; ++i) {

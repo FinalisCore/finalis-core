@@ -267,8 +267,8 @@ Confidential note:
 - multisig address encoding
 - Taproot / SegWit witness versioning
 
-There are other script forms in the chain for validator registration and mint
-flows, but ordinary user-facing addresses are currently P2PKH only.
+There are other script forms in the chain for validator registration and
+lifecycle, but ordinary user-facing addresses are currently P2PKH only.
 
 ## 13. Security Notes
 
