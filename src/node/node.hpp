@@ -313,7 +313,34 @@ class Node {
   };
 
   void event_loop();
+  // P2P connection lifecycle events (registered with p2p_ in init()).
+  void on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail);
   void handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload);
+  // Per-message handlers called by handle_message (after dedup and rate limiting; all but
+  // on_version/on_verack also after the handshake gate).
+  void on_version(int peer_id, const Bytes& payload);
+  void on_verack(int peer_id, const Bytes& payload);
+  void on_get_finalized_tip(int peer_id, const Bytes& payload);
+  void on_finalized_tip(int peer_id, const Bytes& payload);
+  void on_get_ingress_tips(int peer_id, const Bytes& payload);
+  void on_ingress_tips(int peer_id, const Bytes& payload);
+  void on_get_ingress_range(int peer_id, const Bytes& payload);
+  void on_ingress_range(int peer_id, const Bytes& payload);
+  void on_ingress_record(int peer_id, const Bytes& payload);
+  void on_get_transition(int peer_id, const Bytes& payload);
+  void on_get_transition_by_height(int peer_id, const Bytes& payload);
+  void on_epoch_ticket(int peer_id, const Bytes& payload);
+  void on_get_epoch_tickets(int peer_id, const Bytes& payload);
+  void on_epoch_tickets(int peer_id, const Bytes& payload);
+  void on_transition(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_propose(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_getaddr(int peer_id, const Bytes& payload);
+  void on_addr(int peer_id, const Bytes& payload);
+  void on_ping(int peer_id, const Bytes& payload);
+  void on_pong(int peer_id, const Bytes& payload);
 
   void send_version(int peer_id);
   void maybe_send_verack(int peer_id);

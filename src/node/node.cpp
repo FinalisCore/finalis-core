@@ -1275,154 +1275,7 @@ bool Node::init() {
       return std::max<std::uint32_t>(cfg_.idle_timeout_ms, 600'000u);
     });
     p2p_.set_on_event([this](int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
-      if (type == p2p::PeerManager::PeerEventType::CONNECTED) {
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          peer_ip_cache_[peer_id] = endpoint_to_ip(detail);
-          peer_inbound_cache_[peer_id] = p2p_.get_peer_info(peer_id).inbound;
-          peer_keepalive_ms_[peer_id] = now_ms();
-        }
-        const auto info = p2p_.get_peer_info(peer_id);
-        log_line("peer-connected peer_id=" + std::to_string(peer_id) + " dir=" + (info.inbound ? "inbound" : "outbound") +
-                 " endpoint=" + detail);
-        const std::string ip = endpoint_to_ip(detail);
-        if (!is_bootstrap_peer_ip(ip) && discipline_.is_banned(ip, now_unix())) {
-          p2p_.disconnect_peer(peer_id);
-          return;
-        }
-        if (!info.version_tx) send_version(peer_id);
-        return;
-      }
-      if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) {
-        std::lock_guard<std::mutex> lk(mu_);
-        const bool inbound = [&]() {
-          auto it = peer_inbound_cache_.find(peer_id);
-          if (it != peer_inbound_cache_.end()) return it->second;
-          return false;
-        }();
-        log_line("peer-disconnected peer_id=" + std::to_string(peer_id) + " dir=" + (inbound ? "inbound" : "outbound") +
-                 " detail=" + detail);
-        const bool had_round_activity =
-            proposed_in_round_.find(std::make_pair(finalized_height_ + 1, current_round_)) != proposed_in_round_.end() ||
-            local_vote_reservations_.find(std::make_pair(finalized_height_ + 1, current_round_)) !=
-                local_vote_reservations_.end() ||
-            local_timeout_vote_reservations_.find(std::make_pair(finalized_height_ + 1, current_round_)) !=
-                local_timeout_vote_reservations_.end() ||
-            !votes_.participants_for(finalized_height_ + 1, current_round_).empty() ||
-            !timeout_votes_.signatures_for(finalized_height_ + 1, current_round_).empty();
-        peer_ip_cache_.erase(peer_id);
-        peer_inbound_cache_.erase(peer_id);
-        peer_keepalive_ms_.erase(peer_id);
-        peer_last_finalized_tip_request_ms_.erase(peer_id);
-        peer_validator_pubkeys_.erase(peer_id);
-        peer_finalized_tips_.erase(peer_id);
-        peer_finalized_tip_seen_ms_.erase(peer_id);
-        peer_ingress_tips_.erase(peer_id);
-        getaddr_requested_peers_.erase(peer_id);
-        msg_rate_buckets_.erase(peer_id);
-        vote_verify_buckets_.erase(peer_id);
-        tx_verify_buckets_.erase(peer_id);
-        for (auto it = requested_ingress_ranges_.begin(); it != requested_ingress_ranges_.end();) {
-          if (it->first.first == peer_id) {
-            it = requested_ingress_ranges_.erase(it);
-          } else {
-            ++it;
-          }
-        }
-        for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
-          if (it->first.second == peer_id) {
-            it = requested_sync_height_peers_.erase(it);
-          } else {
-            ++it;
-          }
-        }
-        for (auto it = requested_sync_heights_.begin(); it != requested_sync_heights_.end();) {
-          const auto height = it->first;
-          bool still_requested = false;
-          for (const auto& [key, _when] : requested_sync_height_peers_) {
-            if (key.first == height) {
-              still_requested = true;
-              break;
-            }
-          }
-          if (!still_requested) {
-            it = requested_sync_heights_.erase(it);
-          } else {
-            ++it;
-          }
-        }
-        const auto current_height = finalized_height_ + 1;
-        if (established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height)) {
-          reconnect_round_reset_pending_ = true;
-        }
-        const bool should_reset_round_state =
-            established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height) &&
-            (current_round_ > 0 || had_round_activity);
-        if (should_reset_round_state) {
-          current_round_ = 0;
-          proposed_in_round_.clear();
-          local_vote_reservations_.clear();
-          local_timeout_vote_reservations_.clear();
-          votes_.clear_height(current_height);
-          timeout_votes_.clear_height(current_height);
-          round_started_ms_ = now_ms();
-          arm_round0_deadline_locked(round_started_ms_);
-          log_line("peer-loss-reset height=" + std::to_string(current_height) + " reason=no-established-peers");
-        }
-        return;
-      }
-      if (type == p2p::PeerManager::PeerEventType::FRAME_INVALID) {
-        const auto pi = p2p_.get_peer_info(peer_id);
-        const std::string ip = pi.ip.empty() ? endpoint_to_ip(pi.endpoint) : pi.ip;
-        const std::uint64_t tms = now_ms();
-        bool should_log = false;
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          auto& last = invalid_frame_log_ms_[ip];
-          if (tms > last + 10'000) {
-            should_log = true;
-            last = tms;
-          }
-        }
-        const std::string klass = token_value(detail, "class");
-        if (should_log) {
-          std::ostringstream oss;
-          oss << "frame-parse-fail peer_id=" << peer_id << " dir=" << (pi.inbound ? "inbound" : "outbound")
-              << " endpoint=" << pi.endpoint << " " << detail;
-          log_line(oss.str());
-          if (klass == "HTTP" || klass == "JSON") {
-            log_line("peer sent HTTP/JSON bytes; likely dialing lightserver port (19444) instead of P2P");
-          } else if (klass == "TLS") {
-            log_line("peer sent TLS handshake bytes; do not place TLS/proxy in front of P2P port");
-          } else if (token_value(detail, "reason") == "MAGIC_MISMATCH") {
-            log_line("magic mismatch: peer is likely on a different network");
-          }
-        }
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "invalid-frame");
-      } else if (type == p2p::PeerManager::PeerEventType::FRAME_TIMEOUT ||
-                 type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT) {
-        const auto pi = p2p_.get_peer_info(peer_id);
-        const std::string ip = pi.ip.empty() ? endpoint_to_ip(pi.endpoint) : pi.ip;
-        log_line("peer-timeout peer_id=" + std::to_string(peer_id) + " dir=" + (pi.inbound ? "inbound" : "outbound") +
-                 " endpoint=" + pi.endpoint + " detail=" + detail + " stage=" +
-                 (type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake" : "frame"));
-        if (!pi.inbound) {
-          std::lock_guard<std::mutex> lk(mu_);
-          peer_tx_relay_backoff_until_ms_[peer_id] = now_ms() + kTxRelayPeerBackoffMs;
-        }
-        if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && is_bootstrap_peer_ip(ip)) {
-          log_line("bootstrap-timeout peer_id=" + std::to_string(peer_id) + " ip=" + ip + " note=timeout");
-          return;
-        }
-        score_peer(peer_id, type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT
-                                ? p2p::MisbehaviorReason::HANDSHAKE_TIMEOUT
-                                : p2p::MisbehaviorReason::INVALID_FRAME,
-                   type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake-timeout" : "timeout");
-      } else if (type == p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW) {
-        score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
-      } else if (type == p2p::PeerManager::PeerEventType::MESSAGE_RX) {
-        log_line("peer-message-rx peer_id=" + std::to_string(peer_id) + " " + detail);
-      }
+      on_peer_event(peer_id, type, detail);
     });
     if (cfg_.listen) {
       if (!p2p_.start_listener(cfg_.bind_ip, cfg_.p2p_port)) {
@@ -1454,6 +1307,157 @@ bool Node::init() {
   }
 
   return true;
+}
+
+void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
+  if (type == p2p::PeerManager::PeerEventType::CONNECTED) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      peer_ip_cache_[peer_id] = endpoint_to_ip(detail);
+      peer_inbound_cache_[peer_id] = p2p_.get_peer_info(peer_id).inbound;
+      peer_keepalive_ms_[peer_id] = now_ms();
+    }
+    const auto info = p2p_.get_peer_info(peer_id);
+    log_line("peer-connected peer_id=" + std::to_string(peer_id) + " dir=" + (info.inbound ? "inbound" : "outbound") +
+             " endpoint=" + detail);
+    const std::string ip = endpoint_to_ip(detail);
+    if (!is_bootstrap_peer_ip(ip) && discipline_.is_banned(ip, now_unix())) {
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+    if (!info.version_tx) send_version(peer_id);
+    return;
+  }
+  if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const bool inbound = [&]() {
+      auto it = peer_inbound_cache_.find(peer_id);
+      if (it != peer_inbound_cache_.end()) return it->second;
+      return false;
+    }();
+    log_line("peer-disconnected peer_id=" + std::to_string(peer_id) + " dir=" + (inbound ? "inbound" : "outbound") +
+             " detail=" + detail);
+    const bool had_round_activity =
+        proposed_in_round_.find(std::make_pair(finalized_height_ + 1, current_round_)) != proposed_in_round_.end() ||
+        local_vote_reservations_.find(std::make_pair(finalized_height_ + 1, current_round_)) !=
+            local_vote_reservations_.end() ||
+        local_timeout_vote_reservations_.find(std::make_pair(finalized_height_ + 1, current_round_)) !=
+            local_timeout_vote_reservations_.end() ||
+        !votes_.participants_for(finalized_height_ + 1, current_round_).empty() ||
+        !timeout_votes_.signatures_for(finalized_height_ + 1, current_round_).empty();
+    peer_ip_cache_.erase(peer_id);
+    peer_inbound_cache_.erase(peer_id);
+    peer_keepalive_ms_.erase(peer_id);
+    peer_last_finalized_tip_request_ms_.erase(peer_id);
+    peer_validator_pubkeys_.erase(peer_id);
+    peer_finalized_tips_.erase(peer_id);
+    peer_finalized_tip_seen_ms_.erase(peer_id);
+    peer_ingress_tips_.erase(peer_id);
+    getaddr_requested_peers_.erase(peer_id);
+    msg_rate_buckets_.erase(peer_id);
+    vote_verify_buckets_.erase(peer_id);
+    tx_verify_buckets_.erase(peer_id);
+    for (auto it = requested_ingress_ranges_.begin(); it != requested_ingress_ranges_.end();) {
+      if (it->first.first == peer_id) {
+        it = requested_ingress_ranges_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = requested_sync_height_peers_.begin(); it != requested_sync_height_peers_.end();) {
+      if (it->first.second == peer_id) {
+        it = requested_sync_height_peers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = requested_sync_heights_.begin(); it != requested_sync_heights_.end();) {
+      const auto height = it->first;
+      bool still_requested = false;
+      for (const auto& [key, _when] : requested_sync_height_peers_) {
+        if (key.first == height) {
+          still_requested = true;
+          break;
+        }
+      }
+      if (!still_requested) {
+        it = requested_sync_heights_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    const auto current_height = finalized_height_ + 1;
+    if (established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height)) {
+      reconnect_round_reset_pending_ = true;
+    }
+    const bool should_reset_round_state =
+        established_peer_count() == 0 && !single_node_bootstrap_active_locked(current_height) &&
+        (current_round_ > 0 || had_round_activity);
+    if (should_reset_round_state) {
+      current_round_ = 0;
+      proposed_in_round_.clear();
+      local_vote_reservations_.clear();
+      local_timeout_vote_reservations_.clear();
+      votes_.clear_height(current_height);
+      timeout_votes_.clear_height(current_height);
+      round_started_ms_ = now_ms();
+      arm_round0_deadline_locked(round_started_ms_);
+      log_line("peer-loss-reset height=" + std::to_string(current_height) + " reason=no-established-peers");
+    }
+    return;
+  }
+  if (type == p2p::PeerManager::PeerEventType::FRAME_INVALID) {
+    const auto pi = p2p_.get_peer_info(peer_id);
+    const std::string ip = pi.ip.empty() ? endpoint_to_ip(pi.endpoint) : pi.ip;
+    const std::uint64_t tms = now_ms();
+    bool should_log = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto& last = invalid_frame_log_ms_[ip];
+      if (tms > last + 10'000) {
+        should_log = true;
+        last = tms;
+      }
+    }
+    const std::string klass = token_value(detail, "class");
+    if (should_log) {
+      std::ostringstream oss;
+      oss << "frame-parse-fail peer_id=" << peer_id << " dir=" << (pi.inbound ? "inbound" : "outbound")
+          << " endpoint=" << pi.endpoint << " " << detail;
+      log_line(oss.str());
+      if (klass == "HTTP" || klass == "JSON") {
+        log_line("peer sent HTTP/JSON bytes; likely dialing lightserver port (19444) instead of P2P");
+      } else if (klass == "TLS") {
+        log_line("peer sent TLS handshake bytes; do not place TLS/proxy in front of P2P port");
+      } else if (token_value(detail, "reason") == "MAGIC_MISMATCH") {
+        log_line("magic mismatch: peer is likely on a different network");
+      }
+    }
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "invalid-frame");
+  } else if (type == p2p::PeerManager::PeerEventType::FRAME_TIMEOUT ||
+             type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT) {
+    const auto pi = p2p_.get_peer_info(peer_id);
+    const std::string ip = pi.ip.empty() ? endpoint_to_ip(pi.endpoint) : pi.ip;
+    log_line("peer-timeout peer_id=" + std::to_string(peer_id) + " dir=" + (pi.inbound ? "inbound" : "outbound") +
+             " endpoint=" + pi.endpoint + " detail=" + detail + " stage=" +
+             (type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake" : "frame"));
+    if (!pi.inbound) {
+      std::lock_guard<std::mutex> lk(mu_);
+      peer_tx_relay_backoff_until_ms_[peer_id] = now_ms() + kTxRelayPeerBackoffMs;
+    }
+    if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && is_bootstrap_peer_ip(ip)) {
+      log_line("bootstrap-timeout peer_id=" + std::to_string(peer_id) + " ip=" + ip + " note=timeout");
+      return;
+    }
+    score_peer(peer_id, type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT
+                            ? p2p::MisbehaviorReason::HANDSHAKE_TIMEOUT
+                            : p2p::MisbehaviorReason::INVALID_FRAME,
+               type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake-timeout" : "timeout");
+  } else if (type == p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW) {
+    score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
+  } else if (type == p2p::PeerManager::PeerEventType::MESSAGE_RX) {
+    log_line("peer-message-rx peer_id=" + std::to_string(peer_id) + " " + detail);
+  }
 }
 
 bool Node::init_local_validator_key() {
@@ -4508,200 +4512,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     return;
   }
 
-  if (msg_type == p2p::MsgType::VERSION) {
-    auto v = p2p::de_version(payload);
-    if (!v.has_value()) {
-      score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-version");
-      return;
-    }
-    // Duplicate VERSION on an established connection is intentional in bootstrap-template
-    // mode: after self-bootstrap, the node refreshes peer metadata with the bound
-    // bootstrap validator identity. This handler keeps VERSION processing idempotent.
-    log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-             " start_height=" + std::to_string(v->start_height) + " start_hash=" + short_hash_hex(v->start_hash));
-    if (v->network_id != cfg_.network.network_id) {
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        ++rejected_network_id_;
-      }
-      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-mismatch");
-      score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "network-id-mismatch");
-      p2p_.disconnect_peer(peer_id);
-      return;
-    }
-    if (v->proto_version != static_cast<std::uint32_t>(cfg_.network.protocol_version)) {
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        ++rejected_protocol_version_;
-      }
-      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=unsupported-protocol peer_proto=" +
-               std::to_string(v->proto_version) + " local_proto=" + std::to_string(cfg_.network.protocol_version));
-      p2p_.disconnect_peer(peer_id);
-      return;
-    }
-    const std::string local_genesis = ascii_lower(chain_id_.genesis_hash_hex);
-    const std::string local_nid = ascii_lower(network_id_hex(cfg_.network));
-    const std::string local_crh = ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion));
-    const auto peer_genesis = software_fingerprint_value(v->node_software_version, "genesis");
-    const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
-    const auto peer_crh = software_fingerprint_value(v->node_software_version, "crh");
-    const auto peer_bootstrap = software_fingerprint_value(v->node_software_version, "bootstrap_validator");
-    const auto peer_validator = software_fingerprint_value(v->node_software_version, "validator_pubkey");
-    const auto peer_external_endpoint = software_fingerprint_value(v->node_software_version, "external_endpoint");
-    if (peer_genesis.has_value() && ascii_lower(*peer_genesis) != local_genesis) {
-      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=genesis-fingerprint-mismatch");
-      p2p_.disconnect_peer(peer_id);
-      return;
-    }
-    if (peer_nid.has_value() && ascii_lower(*peer_nid) != local_nid) {
-      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-fingerprint-mismatch");
-      p2p_.disconnect_peer(peer_id);
-      return;
-    }
-    if (!peer_crh.has_value()) {
-      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=missing-consensus-rules-fingerprint");
-      p2p_.disconnect_peer(peer_id);
-      return;
-    }
-    if (ascii_lower(*peer_crh) != local_crh) {
-      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=consensus-rules-fingerprint-mismatch peer_crh=" +
-               ascii_lower(*peer_crh) + " local_crh=" + local_crh);
-      p2p_.disconnect_peer(peer_id);
-      return;
-    }
-    // Self-connection check, independent of whether this VERSION carries a
-    // validator_pubkey fingerprint. endpoint_matches_local_listener compares
-    // the ACTUAL observed connection endpoint (inbound or outbound) against
-    // this node's own listener address, so a non-validator peer that happens
-    // to be ourselves (e.g. a NAT-hairpinned self-dial via our own
-    // externally-advertised endpoint) is still caught here, even though it
-    // has no validator_pubkey for the identity-based check further below to
-    // compare against. This runs in addition to, not instead of, that pubkey
-    // check -- the two catch different self-connection shapes.
-    // Only outbound endpoints carry the peer's listener port (the port we dialed);
-    // an inbound source port is ephemeral, so inbound self-dials are left to the
-    // identity check below.
-    {
-      const auto info = p2p_.get_peer_info(peer_id);
-      const auto remote = info.inbound ? std::nullopt : p2p::parse_endpoint(info.endpoint);
-      if (remote.has_value() && endpoint_matches_local_listener(info.ip, remote->port)) {
-        bool should_log = false;
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          should_log = suppress_self_endpoint_locked(info.endpoint);
-          if (!info.ip.empty()) {
-            should_log = suppress_self_endpoint_locked(info.ip + ":" + std::to_string(cfg_.p2p_port)) || should_log;
-          }
-        }
-        if (should_log) {
-          log_line("self-peer-rejected endpoint=" + info.endpoint + " reason=local-endpoint-match");
-        }
-        p2p_.disconnect_peer(peer_id);
-        return;
-      }
-    }
-    if (peer_bootstrap.has_value()) {
-      auto b = hex_decode(*peer_bootstrap);
-      if (b && b->size() == 32) {
-        PubKey32 pub{};
-        std::copy(b->begin(), b->end(), pub.begin());
-        (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap");
-      }
-    }
-    if (peer_validator.has_value()) {
-      auto b = hex_decode(*peer_validator);
-      if (b && b->size() == 32) {
-        PubKey32 pub{};
-        std::copy(b->begin(), b->end(), pub.begin());
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          peer_validator_pubkeys_[peer_id] = pub;
-        }
-        if (!peer_bootstrap.has_value()) {
-          (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-validator-fallback");
-        }
-        if (pub == local_key_.public_key) {
-          const auto info = p2p_.get_peer_info(peer_id);
-          bool should_log = false;
-          std::string display_endpoint = info.endpoint;
-          {
-            std::lock_guard<std::mutex> lk(mu_);
-            peer_validator_pubkeys_.erase(peer_id);
-            should_log = suppress_self_endpoint_locked(info.endpoint);
-            if (!info.ip.empty()) {
-              should_log = suppress_self_endpoint_locked(info.ip + ":" + std::to_string(cfg_.p2p_port)) || should_log;
-              if (display_endpoint.empty()) display_endpoint = info.ip + ":" + std::to_string(cfg_.p2p_port);
-            }
-          }
-          if (should_log) {
-            log_line("self-peer-rejected endpoint=" + display_endpoint + " reason=identity-match");
-          }
-          p2p_.disconnect_peer(peer_id);
-          return;
-        }
-      }
-    }
-    if (peer_external_endpoint.has_value() && endpoint_fingerprint_safe(*peer_external_endpoint)) {
-      const auto advertised = p2p::parse_endpoint(*peer_external_endpoint);
-      if (advertised.has_value() && advertised->port != 0 && !advertised->ip.empty()) {
-        const auto info = p2p_.get_peer_info(peer_id);
-        const std::string remote_ip = info.ip.empty() ? endpoint_to_ip(info.endpoint) : info.ip;
-        if (!remote_ip.empty() && advertised->ip == remote_ip) {
-          std::lock_guard<std::mutex> lk(mu_);
-          addrman_.add_or_update(*advertised, now_unix());
-        } else {
-          log_line("ignore-peer-external-endpoint peer_id=" + std::to_string(peer_id) + " advertised=" +
-                   advertised->key() + " reason=ip-mismatch");
-        }
-      }
-    }
-    p2p_.set_peer_handshake_meta(peer_id, v->proto_version, v->network_id, v->feature_flags);
-    p2p_.mark_handshake_rx(peer_id, true, false);
+  if (msg_type == p2p::MsgType::VERSION) return on_version(peer_id, payload);
 
-    auto info = p2p_.get_peer_info(peer_id);
-    if (!info.version_tx) send_version(peer_id);
-
-    {
-      auto i = p2p_.get_peer_info(peer_id);
-      (void)i;
-    }
-
-    maybe_send_verack(peer_id);
-    return;
-  }
-
-  if (msg_type == p2p::MsgType::VERACK) {
-    log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
-    p2p_.mark_handshake_rx(peer_id, false, true);
-    maybe_request_getaddr(peer_id);
-    send_finalized_tip(peer_id);
-    request_finalized_tip(peer_id);
-    send_ingress_tips(peer_id);
-    request_ingress_tips(peer_id);
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      const auto current_height = finalized_height_ + 1;
-      if (reconnect_round_reset_pending_ && !single_node_bootstrap_active_locked(current_height)) {
-        reconnect_round_reset_pending_ = false;
-        current_round_ = 0;
-        proposed_in_round_.clear();
-        local_vote_reservations_.clear();
-        local_timeout_vote_reservations_.clear();
-        votes_.clear_height(current_height);
-        timeout_votes_.clear_height(current_height);
-        round_started_ms_ = now_ms();
-        arm_round0_deadline_locked(round_started_ms_);
-        log_line("peer-reconnect-reset height=" + std::to_string(current_height) + " reason=peers-restored");
-      }
-    }
-    auto pi = p2p_.get_peer_info(peer_id);
-    auto na = addrman_address_for_peer(pi);
-    if (na.has_value()) {
-      std::lock_guard<std::mutex> lk(mu_);
-      addrman_.mark_success(*na, now_unix());
-    }
-    return;
-  }
+  if (msg_type == p2p::MsgType::VERACK) return on_verack(peer_id, payload);
 
   const auto info = p2p_.get_peer_info(peer_id);
   if (!info.established()) {
@@ -4730,846 +4543,1122 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   }
 
   switch (msg_type) {
-    case p2p::MsgType::GET_FINALIZED_TIP: {
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
-      send_finalized_tip(peer_id);
+    case p2p::MsgType::GET_FINALIZED_TIP:
+      return on_get_finalized_tip(peer_id, payload);
+    case p2p::MsgType::FINALIZED_TIP:
+      return on_finalized_tip(peer_id, payload);
+    case p2p::MsgType::GET_INGRESS_TIPS:
+      return on_get_ingress_tips(peer_id, payload);
+    case p2p::MsgType::INGRESS_TIPS:
+      return on_ingress_tips(peer_id, payload);
+    case p2p::MsgType::GET_INGRESS_RANGE:
+      return on_get_ingress_range(peer_id, payload);
+    case p2p::MsgType::INGRESS_RANGE:
+      return on_ingress_range(peer_id, payload);
+    case p2p::MsgType::INGRESS_RECORD:
+      return on_ingress_record(peer_id, payload);
+    case p2p::MsgType::GET_TRANSITION:
+      return on_get_transition(peer_id, payload);
+    case p2p::MsgType::GET_TRANSITION_BY_HEIGHT:
+      return on_get_transition_by_height(peer_id, payload);
+    case p2p::MsgType::EPOCH_TICKET:
+      return on_epoch_ticket(peer_id, payload);
+    case p2p::MsgType::GET_EPOCH_TICKETS:
+      return on_get_epoch_tickets(peer_id, payload);
+    case p2p::MsgType::EPOCH_TICKETS:
+      return on_epoch_tickets(peer_id, payload);
+    case p2p::MsgType::TRANSITION:
+      return on_transition(peer_id, payload, payload_id);
+    case p2p::MsgType::PROPOSE:
+      return on_propose(peer_id, payload, payload_id);
+    case p2p::MsgType::VOTE:
+      return on_vote(peer_id, payload, payload_id);
+    case p2p::MsgType::TIMEOUT_VOTE:
+      return on_timeout_vote(peer_id, payload, payload_id);
+    case p2p::MsgType::TX:
+      return on_tx(peer_id, payload, payload_id);
+    case p2p::MsgType::GETADDR:
+      return on_getaddr(peer_id, payload);
+    case p2p::MsgType::ADDR:
+      return on_addr(peer_id, payload);
+    case p2p::MsgType::PING:
+      return on_ping(peer_id, payload);
+    case p2p::MsgType::PONG:
+      return on_pong(peer_id, payload);
+    default:
       break;
+  }
+}
+
+void Node::on_version(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::VERSION;
+  auto v = p2p::de_version(payload);
+  if (!v.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-version");
+    return;
+  }
+  // Duplicate VERSION on an established connection is intentional in bootstrap-template
+  // mode: after self-bootstrap, the node refreshes peer metadata with the bound
+  // bootstrap validator identity. This handler keeps VERSION processing idempotent.
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " start_height=" + std::to_string(v->start_height) + " start_hash=" + short_hash_hex(v->start_hash));
+  if (v->network_id != cfg_.network.network_id) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++rejected_network_id_;
     }
-    case p2p::MsgType::FINALIZED_TIP: {
-      auto tip = p2p::de_finalized_tip(payload);
-      if (!tip.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-finalized-tip");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " height=" + std::to_string(tip->height) + " hash=" + short_hash_hex(tip->hash));
+    log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-mismatch");
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "network-id-mismatch");
+    p2p_.disconnect_peer(peer_id);
+    return;
+  }
+  if (v->proto_version != static_cast<std::uint32_t>(cfg_.network.protocol_version)) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++rejected_protocol_version_;
+    }
+    log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=unsupported-protocol peer_proto=" +
+             std::to_string(v->proto_version) + " local_proto=" + std::to_string(cfg_.network.protocol_version));
+    p2p_.disconnect_peer(peer_id);
+    return;
+  }
+  const std::string local_genesis = ascii_lower(chain_id_.genesis_hash_hex);
+  const std::string local_nid = ascii_lower(network_id_hex(cfg_.network));
+  const std::string local_crh = ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion));
+  const auto peer_genesis = software_fingerprint_value(v->node_software_version, "genesis");
+  const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
+  const auto peer_crh = software_fingerprint_value(v->node_software_version, "crh");
+  const auto peer_bootstrap = software_fingerprint_value(v->node_software_version, "bootstrap_validator");
+  const auto peer_validator = software_fingerprint_value(v->node_software_version, "validator_pubkey");
+  const auto peer_external_endpoint = software_fingerprint_value(v->node_software_version, "external_endpoint");
+  if (peer_genesis.has_value() && ascii_lower(*peer_genesis) != local_genesis) {
+    log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=genesis-fingerprint-mismatch");
+    p2p_.disconnect_peer(peer_id);
+    return;
+  }
+  if (peer_nid.has_value() && ascii_lower(*peer_nid) != local_nid) {
+    log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-fingerprint-mismatch");
+    p2p_.disconnect_peer(peer_id);
+    return;
+  }
+  if (!peer_crh.has_value()) {
+    log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=missing-consensus-rules-fingerprint");
+    p2p_.disconnect_peer(peer_id);
+    return;
+  }
+  if (ascii_lower(*peer_crh) != local_crh) {
+    log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=consensus-rules-fingerprint-mismatch peer_crh=" +
+             ascii_lower(*peer_crh) + " local_crh=" + local_crh);
+    p2p_.disconnect_peer(peer_id);
+    return;
+  }
+  // Self-connection check, independent of whether this VERSION carries a
+  // validator_pubkey fingerprint. endpoint_matches_local_listener compares
+  // the ACTUAL observed connection endpoint (inbound or outbound) against
+  // this node's own listener address, so a non-validator peer that happens
+  // to be ourselves (e.g. a NAT-hairpinned self-dial via our own
+  // externally-advertised endpoint) is still caught here, even though it
+  // has no validator_pubkey for the identity-based check further below to
+  // compare against. This runs in addition to, not instead of, that pubkey
+  // check -- the two catch different self-connection shapes.
+  // Only outbound endpoints carry the peer's listener port (the port we dialed);
+  // an inbound source port is ephemeral, so inbound self-dials are left to the
+  // identity check below.
+  {
+    const auto info = p2p_.get_peer_info(peer_id);
+    const auto remote = info.inbound ? std::nullopt : p2p::parse_endpoint(info.endpoint);
+    if (remote.has_value() && endpoint_matches_local_listener(info.ip, remote->port)) {
+      bool should_log = false;
       {
         std::lock_guard<std::mutex> lk(mu_);
-        peer_finalized_tips_[peer_id] = *tip;
-        peer_finalized_tip_seen_ms_[peer_id] = now_ms();
+        should_log = suppress_self_endpoint_locked(info.endpoint);
+        if (!info.ip.empty()) {
+          should_log = suppress_self_endpoint_locked(info.ip + ":" + std::to_string(cfg_.p2p_port)) || should_log;
+        }
       }
+      if (should_log) {
+        log_line("self-peer-rejected endpoint=" + info.endpoint + " reason=local-endpoint-match");
+      }
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+  }
+  if (peer_bootstrap.has_value()) {
+    auto b = hex_decode(*peer_bootstrap);
+    if (b && b->size() == 32) {
+      PubKey32 pub{};
+      std::copy(b->begin(), b->end(), pub.begin());
+      (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap");
+    }
+  }
+  if (peer_validator.has_value()) {
+    auto b = hex_decode(*peer_validator);
+    if (b && b->size() == 32) {
+      PubKey32 pub{};
+      std::copy(b->begin(), b->end(), pub.begin());
       {
         std::lock_guard<std::mutex> lk(mu_);
-        auto it = peer_validator_pubkeys_.find(peer_id);
-        if (it != peer_validator_pubkeys_.end()) {
-          (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, it->second, tip->height, "finalized-tip-fallback");
-        }
-        (void)maybe_request_forward_sync_block_locked(peer_id);
-        const std::uint64_t retry_ms =
-            std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
-        const std::uint64_t tms = now_ms();
-        auto req_it = requested_sync_artifacts_.find(tip->hash);
-        const bool request_stale = req_it == requested_sync_artifacts_.end() || tms >= req_it->second + retry_ms;
-        const bool have_tip_artifact = db_.get_frontier_transition(tip->hash).has_value();
-        if (tip->height > finalized_height_ && !have_tip_artifact && request_stale) {
-          log_line("request-sync-tip-transition peer_id=" + std::to_string(peer_id) + " remote_height=" +
-                   std::to_string(tip->height) + " remote_hash=" + short_hash_hex(tip->hash));
-          requested_sync_artifacts_[tip->hash] = tms;
-          auto req = p2p::GetTransitionMsg{tip->hash};
-          (void)p2p_.send_to(peer_id, p2p::MsgType::GET_TRANSITION, p2p::ser_get_transition(req));
-        }
+        peer_validator_pubkeys_[peer_id] = pub;
       }
-      request_ingress_tips(peer_id);
-      break;
-    }
-    case p2p::MsgType::GET_INGRESS_TIPS: {
-      auto req = p2p::de_get_ingress_tips(payload);
-      if (!req.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-ingress-tips");
-        return;
+      if (!peer_bootstrap.has_value()) {
+        (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-validator-fallback");
       }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
-      send_ingress_tips(peer_id);
-      break;
-    }
-    case p2p::MsgType::INGRESS_TIPS: {
-      auto tips = p2p::de_ingress_tips(payload);
-      if (!tips.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-ingress-tips");
-        return;
-      }
-      std::ostringstream oss;
-      oss << "recv " << msg_type_name(msg_type) << " peer_id=" << peer_id << " tips=";
-      for (std::size_t lane = 0; lane < tips->lane_tips.size(); ++lane) {
-        if (lane) oss << ",";
-        oss << lane << ":" << tips->lane_tips[lane];
-      }
-      log_line(oss.str());
-      std::lock_guard<std::mutex> lk(mu_);
-      (void)handle_ingress_tips_locked(peer_id, *tips);
-      break;
-    }
-    case p2p::MsgType::GET_INGRESS_RANGE: {
-      auto req = p2p::de_get_ingress_range(payload);
-      if (!req.has_value() || req->lane >= INGRESS_LANE_COUNT || req->from_seq == 0 || req->to_seq < req->from_seq) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-get-ingress-range");
-        return;
-      }
-      const std::uint64_t requested_count = req->to_seq - req->from_seq + 1;
-      if (requested_count > kMaxIngressRangeRequestRecords) {
-        log_line("ingress-range-request-clamped peer_id=" + std::to_string(peer_id) + " lane=" +
-                 std::to_string(req->lane) + " requested=[" + std::to_string(req->from_seq) + "," +
-                 std::to_string(req->to_seq) + "] limit=" + std::to_string(kMaxIngressRangeRequestRecords));
-        req->to_seq = req->from_seq + static_cast<std::uint64_t>(kMaxIngressRangeRequestRecords) - 1;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " lane=" + std::to_string(req->lane) + " range=[" + std::to_string(req->from_seq) + "," +
-               std::to_string(req->to_seq) + "]");
-      p2p::IngressRangeMsg msg;
-      msg.lane = req->lane;
-      msg.from_seq = req->from_seq;
-      msg.to_seq = req->to_seq;
-      bool complete = true;
-      for (std::uint64_t seq = req->from_seq; seq <= req->to_seq; ++seq) {
-        auto cert_bytes = db_.get_ingress_certificate(req->lane, seq);
-        if (!cert_bytes.has_value()) {
-          complete = false;
-          break;
-        }
-        auto cert = IngressCertificate::parse(*cert_bytes);
-        if (!cert.has_value()) {
-          complete = false;
-          break;
-        }
-        auto tx_bytes = db_.get_ingress_bytes(cert->txid);
-        if (!tx_bytes.has_value()) {
-          complete = false;
-          break;
-        }
-        msg.records.push_back(p2p::IngressRecordMsg{*cert, *tx_bytes});
-        if (msg.records.size() > kMaxIngressRangeResponseRecords ||
-            ingress_range_wire_size(msg) > kMaxIngressRangeResponseBytes) {
-          complete = false;
-          break;
-        }
-      }
-      if (!complete) {
-        log_line("ingress-range-response-skipped peer_id=" + std::to_string(peer_id) + " lane=" +
-                 std::to_string(req->lane) + " range=[" + std::to_string(req->from_seq) + "," +
-                 std::to_string(req->to_seq) + "] reason=incomplete-local-range");
-        return;
-      }
-      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::INGRESS_RANGE, p2p::ser_ingress_range(msg), true);
-      log_line("send-ingress-range peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(req->lane) +
-               " range=[" + std::to_string(req->from_seq) + "," + std::to_string(req->to_seq) +
-               "] status=" + (ok ? "ok" : "failed"));
-      break;
-    }
-    case p2p::MsgType::INGRESS_RANGE: {
-      auto range = p2p::de_ingress_range(payload);
-      if (!range.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-ingress-range");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " lane=" + std::to_string(range->lane) + " range=[" + std::to_string(range->from_seq) + "," +
-               std::to_string(range->to_seq) + "] records=" + std::to_string(range->records.size()));
-      std::lock_guard<std::mutex> lk(mu_);
-      std::string ingress_error;
-      if (!handle_ingress_range_locked(peer_id, *range, &ingress_error)) {
-        // ingress-epoch-mismatch is not peer misbehavior: it occurs when the peer
-        // is in a different committee epoch (i.e., they are ahead of us in chain
-        // sync). Scoring them would cause them to be banned before we can catch up.
-        if (ingress_error != "ingress-epoch-mismatch") {
-          const auto reason = ingress_fault_reason_for(ingress_error);
-          const std::string note = ingress_error.empty() ? "invalid-ingress-range" : ingress_error;
-          score_peer_locked(peer_id, reason, note);
-        }
-      }
-      break;
-    }
-    case p2p::MsgType::INGRESS_RECORD: {
-      auto record = p2p::de_ingress_record(payload);
-      if (!record.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-ingress-record");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " lane=" + std::to_string(record->certificate.lane) +
-               " seq=" + std::to_string(record->certificate.seq) +
-               " txid=" + short_hash_hex(record->certificate.txid));
-      std::lock_guard<std::mutex> lk(mu_);
-      std::string ingress_error;
-      bool appended = false;
-      if (!handle_ingress_record_locked(peer_id, *record, &appended, &ingress_error)) {
-        // Same epoch-mismatch guard as INGRESS_RANGE: don't penalise a peer
-        // whose certificates belong to a later committee epoch.
-        if (ingress_error != "ingress-epoch-mismatch") {
-          const auto reason = ingress_fault_reason_for(ingress_error);
-          const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
-          score_peer_locked(peer_id, reason, note);
-        }
-        return;
-      }
-      if (appended) broadcast_ingress_record(record->certificate, record->tx_bytes, peer_id);
-      break;
-    }
-    case p2p::MsgType::GET_TRANSITION: {
-      auto gb = p2p::de_get_transition(payload);
-      if (!gb.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-transition");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " hash=" + short_hash_hex(gb->hash));
-      auto transition_bytes = db_.get_frontier_transition(gb->hash);
-      if (!transition_bytes.has_value()) return;
-      auto transition = FrontierTransition::parse(*transition_bytes);
-      if (!transition.has_value()) return;
-      auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
-      if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) return;
-      auto cert = db_.get_finality_certificate_by_height(transition->height);
-      if (!cert.has_value()) {
-        log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
-                 " hash=" + short_hash_hex(gb->hash) + " status=missing-certificate");
-        return;
-      }
-      if (cert->height != transition->height || cert->frontier_transition_id != gb->hash) {
-        log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
-                 " hash=" + short_hash_hex(gb->hash) + " status=certificate-mismatch");
-        return;
-      }
-      p2p::TransitionMsg msg;
-      msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
-      msg.certificate = cert;
-      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
-      log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
-               " hash=" + short_hash_hex(gb->hash) + " status=" + (ok ? "ok" : "failed"));
-      break;
-    }
-    case p2p::MsgType::GET_TRANSITION_BY_HEIGHT: {
-      constexpr std::uint64_t kGetTransitionByHeightPerPeerHeightMinIntervalMs = 1500;
-      constexpr std::uint64_t kGetTransitionByHeightActiveSyncTargetTtlMs = 5 * 60 * 1000;
-      constexpr std::uint64_t kGetTransitionByHeightLogCoalesceWindowMs = 30 * 1000;
-      constexpr std::uint64_t kGetTransitionByHeightDefaultHistoryWindow = 512;
-      auto gbh = p2p::de_get_transition_by_height(payload);
-      if (!gbh.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-transition-by-height");
-        return;
-      }
-      const std::uint64_t tms = now_ms();
-      auto log_frontier_by_height = [&](const std::string& status, const std::string& extra = std::string()) {
-        std::string suffix;
-        bool emit = true;
+      if (pub == local_key_.public_key) {
+        const auto info = p2p_.get_peer_info(peer_id);
+        bool should_log = false;
+        std::string display_endpoint = info.endpoint;
         {
           std::lock_guard<std::mutex> lk(mu_);
-          auto& state = send_frontier_by_height_log_state_[status];
-          if (state.first != 0 && tms < state.first + kGetTransitionByHeightLogCoalesceWindowMs) {
-            ++state.second;
-            emit = false;
-          } else {
-            if (state.second != 0) suffix = " suppressed=" + std::to_string(state.second);
-            state.first = tms;
-            state.second = 0;
+          peer_validator_pubkeys_.erase(peer_id);
+          should_log = suppress_self_endpoint_locked(info.endpoint);
+          if (!info.ip.empty()) {
+            should_log = suppress_self_endpoint_locked(info.ip + ":" + std::to_string(cfg_.p2p_port)) || should_log;
+            if (display_endpoint.empty()) display_endpoint = info.ip + ":" + std::to_string(cfg_.p2p_port);
           }
         }
-        if (!emit) return;
-        log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
-                 " requested_height=" + std::to_string(gbh->height) +
-                 " status=" + status + extra + suffix);
-      };
-      bool throttled_rate_limit = false;
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto& last_req = get_transition_by_height_last_req_ms_[{peer_id, gbh->height}];
-        if (last_req != 0 && tms < last_req + kGetTransitionByHeightPerPeerHeightMinIntervalMs) {
-          throttled_rate_limit = true;
-        } else {
-          last_req = tms;
+        if (should_log) {
+          log_line("self-peer-rejected endpoint=" + display_endpoint + " reason=identity-match");
         }
-      }
-      if (throttled_rate_limit) {
-        log_frontier_by_height("throttled-rate-limit",
-                               " detail=per-peer-height-min-interval-ms=" +
-                                   std::to_string(kGetTransitionByHeightPerPeerHeightMinIntervalMs));
+        p2p_.disconnect_peer(peer_id);
         return;
       }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " height=" + std::to_string(gbh->height));
-      {
-        bool allow_historical_replay = false;
-        bool active_sync_target = false;
-        bool active_validator_peer = false;
-        std::uint64_t peer_tip_height = 0;
-        {
-          std::lock_guard<std::mutex> lk(mu_);
-          if (gbh->height + kGetTransitionByHeightDefaultHistoryWindow < finalized_height_) {
-            for (const auto& [key, requested_ms] : requested_sync_height_peers_) {
-              if (key.second != peer_id) continue;
-              if (tms < requested_ms + kGetTransitionByHeightActiveSyncTargetTtlMs) {
-                active_sync_target = true;
-                break;
-              }
-            }
-            if (auto pit = peer_validator_pubkeys_.find(peer_id); pit != peer_validator_pubkeys_.end()) {
-              const auto info = p2p_.get_peer_info(peer_id);
-              if (info.established() && validators_.is_active_for_height(pit->second, finalized_height_ + 1)) {
-                active_validator_peer = true;
-              }
-            }
-            if (auto tip_it = peer_finalized_tips_.find(peer_id); tip_it != peer_finalized_tips_.end()) {
-              peer_tip_height = tip_it->second.height;
-            }
-            auto& last_h = get_transition_by_height_last_progress_height_[peer_id];
-            auto& last_ms = get_transition_by_height_last_progress_ms_[peer_id];
-            const bool progressing = gbh->height > last_h;
-            if (progressing) {
-              last_h = gbh->height;
-              last_ms = tms;
-            }
-            const bool recent_progress = (last_ms != 0 && tms < last_ms + kGetTransitionByHeightActiveSyncTargetTtlMs);
-            allow_historical_replay = active_sync_target || active_validator_peer || recent_progress;
-          } else {
-            allow_historical_replay = true;
-            auto& last_h = get_transition_by_height_last_progress_height_[peer_id];
-            auto& last_ms = get_transition_by_height_last_progress_ms_[peer_id];
-            if (gbh->height > last_h) {
-              last_h = gbh->height;
-              last_ms = tms;
-            }
+    }
+  }
+  if (peer_external_endpoint.has_value() && endpoint_fingerprint_safe(*peer_external_endpoint)) {
+    const auto advertised = p2p::parse_endpoint(*peer_external_endpoint);
+    if (advertised.has_value() && advertised->port != 0 && !advertised->ip.empty()) {
+      const auto info = p2p_.get_peer_info(peer_id);
+      const std::string remote_ip = info.ip.empty() ? endpoint_to_ip(info.endpoint) : info.ip;
+      if (!remote_ip.empty() && advertised->ip == remote_ip) {
+        std::lock_guard<std::mutex> lk(mu_);
+        addrman_.add_or_update(*advertised, now_unix());
+      } else {
+        log_line("ignore-peer-external-endpoint peer_id=" + std::to_string(peer_id) + " advertised=" +
+                 advertised->key() + " reason=ip-mismatch");
+      }
+    }
+  }
+  p2p_.set_peer_handshake_meta(peer_id, v->proto_version, v->network_id, v->feature_flags);
+  p2p_.mark_handshake_rx(peer_id, true, false);
+
+  auto info = p2p_.get_peer_info(peer_id);
+  if (!info.version_tx) send_version(peer_id);
+
+  {
+    auto i = p2p_.get_peer_info(peer_id);
+    (void)i;
+  }
+
+  maybe_send_verack(peer_id);
+  return;
+}
+
+void Node::on_verack(int peer_id, const Bytes& /*payload*/) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::VERACK;
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
+  p2p_.mark_handshake_rx(peer_id, false, true);
+  maybe_request_getaddr(peer_id);
+  send_finalized_tip(peer_id);
+  request_finalized_tip(peer_id);
+  send_ingress_tips(peer_id);
+  request_ingress_tips(peer_id);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto current_height = finalized_height_ + 1;
+    if (reconnect_round_reset_pending_ && !single_node_bootstrap_active_locked(current_height)) {
+      reconnect_round_reset_pending_ = false;
+      current_round_ = 0;
+      proposed_in_round_.clear();
+      local_vote_reservations_.clear();
+      local_timeout_vote_reservations_.clear();
+      votes_.clear_height(current_height);
+      timeout_votes_.clear_height(current_height);
+      round_started_ms_ = now_ms();
+      arm_round0_deadline_locked(round_started_ms_);
+      log_line("peer-reconnect-reset height=" + std::to_string(current_height) + " reason=peers-restored");
+    }
+  }
+  auto pi = p2p_.get_peer_info(peer_id);
+  auto na = addrman_address_for_peer(pi);
+  if (na.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    addrman_.mark_success(*na, now_unix());
+  }
+  return;
+}
+
+void Node::on_get_finalized_tip(int peer_id, const Bytes& /*payload*/) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::GET_FINALIZED_TIP;
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
+  send_finalized_tip(peer_id);
+  return;
+}
+
+void Node::on_finalized_tip(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::FINALIZED_TIP;
+  auto tip = p2p::de_finalized_tip(payload);
+  if (!tip.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-finalized-tip");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " height=" + std::to_string(tip->height) + " hash=" + short_hash_hex(tip->hash));
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    peer_finalized_tips_[peer_id] = *tip;
+    peer_finalized_tip_seen_ms_[peer_id] = now_ms();
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = peer_validator_pubkeys_.find(peer_id);
+    if (it != peer_validator_pubkeys_.end()) {
+      (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, it->second, tip->height, "finalized-tip-fallback");
+    }
+    (void)maybe_request_forward_sync_block_locked(peer_id);
+    const std::uint64_t retry_ms =
+        std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
+    const std::uint64_t tms = now_ms();
+    auto req_it = requested_sync_artifacts_.find(tip->hash);
+    const bool request_stale = req_it == requested_sync_artifacts_.end() || tms >= req_it->second + retry_ms;
+    const bool have_tip_artifact = db_.get_frontier_transition(tip->hash).has_value();
+    if (tip->height > finalized_height_ && !have_tip_artifact && request_stale) {
+      log_line("request-sync-tip-transition peer_id=" + std::to_string(peer_id) + " remote_height=" +
+               std::to_string(tip->height) + " remote_hash=" + short_hash_hex(tip->hash));
+      requested_sync_artifacts_[tip->hash] = tms;
+      auto req = p2p::GetTransitionMsg{tip->hash};
+      (void)p2p_.send_to(peer_id, p2p::MsgType::GET_TRANSITION, p2p::ser_get_transition(req));
+    }
+  }
+  request_ingress_tips(peer_id);
+  return;
+}
+
+void Node::on_get_ingress_tips(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::GET_INGRESS_TIPS;
+  auto req = p2p::de_get_ingress_tips(payload);
+  if (!req.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-ingress-tips");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
+  send_ingress_tips(peer_id);
+  return;
+}
+
+void Node::on_ingress_tips(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::INGRESS_TIPS;
+  auto tips = p2p::de_ingress_tips(payload);
+  if (!tips.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-ingress-tips");
+    return;
+  }
+  std::ostringstream oss;
+  oss << "recv " << msg_type_name(msg_type) << " peer_id=" << peer_id << " tips=";
+  for (std::size_t lane = 0; lane < tips->lane_tips.size(); ++lane) {
+    if (lane) oss << ",";
+    oss << lane << ":" << tips->lane_tips[lane];
+  }
+  log_line(oss.str());
+  std::lock_guard<std::mutex> lk(mu_);
+  (void)handle_ingress_tips_locked(peer_id, *tips);
+  return;
+}
+
+void Node::on_get_ingress_range(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::GET_INGRESS_RANGE;
+  auto req = p2p::de_get_ingress_range(payload);
+  if (!req.has_value() || req->lane >= INGRESS_LANE_COUNT || req->from_seq == 0 || req->to_seq < req->from_seq) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-get-ingress-range");
+    return;
+  }
+  const std::uint64_t requested_count = req->to_seq - req->from_seq + 1;
+  if (requested_count > kMaxIngressRangeRequestRecords) {
+    log_line("ingress-range-request-clamped peer_id=" + std::to_string(peer_id) + " lane=" +
+             std::to_string(req->lane) + " requested=[" + std::to_string(req->from_seq) + "," +
+             std::to_string(req->to_seq) + "] limit=" + std::to_string(kMaxIngressRangeRequestRecords));
+    req->to_seq = req->from_seq + static_cast<std::uint64_t>(kMaxIngressRangeRequestRecords) - 1;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " lane=" + std::to_string(req->lane) + " range=[" + std::to_string(req->from_seq) + "," +
+           std::to_string(req->to_seq) + "]");
+  p2p::IngressRangeMsg msg;
+  msg.lane = req->lane;
+  msg.from_seq = req->from_seq;
+  msg.to_seq = req->to_seq;
+  bool complete = true;
+  for (std::uint64_t seq = req->from_seq; seq <= req->to_seq; ++seq) {
+    auto cert_bytes = db_.get_ingress_certificate(req->lane, seq);
+    if (!cert_bytes.has_value()) {
+      complete = false;
+      break;
+    }
+    auto cert = IngressCertificate::parse(*cert_bytes);
+    if (!cert.has_value()) {
+      complete = false;
+      break;
+    }
+    auto tx_bytes = db_.get_ingress_bytes(cert->txid);
+    if (!tx_bytes.has_value()) {
+      complete = false;
+      break;
+    }
+    msg.records.push_back(p2p::IngressRecordMsg{*cert, *tx_bytes});
+    if (msg.records.size() > kMaxIngressRangeResponseRecords ||
+        ingress_range_wire_size(msg) > kMaxIngressRangeResponseBytes) {
+      complete = false;
+      break;
+    }
+  }
+  if (!complete) {
+    log_line("ingress-range-response-skipped peer_id=" + std::to_string(peer_id) + " lane=" +
+             std::to_string(req->lane) + " range=[" + std::to_string(req->from_seq) + "," +
+             std::to_string(req->to_seq) + "] reason=incomplete-local-range");
+    return;
+  }
+  const bool ok = p2p_.send_to(peer_id, p2p::MsgType::INGRESS_RANGE, p2p::ser_ingress_range(msg), true);
+  log_line("send-ingress-range peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(req->lane) +
+           " range=[" + std::to_string(req->from_seq) + "," + std::to_string(req->to_seq) +
+           "] status=" + (ok ? "ok" : "failed"));
+  return;
+}
+
+void Node::on_ingress_range(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::INGRESS_RANGE;
+  auto range = p2p::de_ingress_range(payload);
+  if (!range.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-ingress-range");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " lane=" + std::to_string(range->lane) + " range=[" + std::to_string(range->from_seq) + "," +
+           std::to_string(range->to_seq) + "] records=" + std::to_string(range->records.size()));
+  std::lock_guard<std::mutex> lk(mu_);
+  std::string ingress_error;
+  if (!handle_ingress_range_locked(peer_id, *range, &ingress_error)) {
+    // ingress-epoch-mismatch is not peer misbehavior: it occurs when the peer
+    // is in a different committee epoch (i.e., they are ahead of us in chain
+    // sync). Scoring them would cause them to be banned before we can catch up.
+    if (ingress_error != "ingress-epoch-mismatch") {
+      const auto reason = ingress_fault_reason_for(ingress_error);
+      const std::string note = ingress_error.empty() ? "invalid-ingress-range" : ingress_error;
+      score_peer_locked(peer_id, reason, note);
+    }
+  }
+  return;
+}
+
+void Node::on_ingress_record(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::INGRESS_RECORD;
+  auto record = p2p::de_ingress_record(payload);
+  if (!record.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-ingress-record");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " lane=" + std::to_string(record->certificate.lane) +
+           " seq=" + std::to_string(record->certificate.seq) +
+           " txid=" + short_hash_hex(record->certificate.txid));
+  std::lock_guard<std::mutex> lk(mu_);
+  std::string ingress_error;
+  bool appended = false;
+  if (!handle_ingress_record_locked(peer_id, *record, &appended, &ingress_error)) {
+    // Same epoch-mismatch guard as INGRESS_RANGE: don't penalise a peer
+    // whose certificates belong to a later committee epoch.
+    if (ingress_error != "ingress-epoch-mismatch") {
+      const auto reason = ingress_fault_reason_for(ingress_error);
+      const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
+      score_peer_locked(peer_id, reason, note);
+    }
+    return;
+  }
+  if (appended) broadcast_ingress_record(record->certificate, record->tx_bytes, peer_id);
+  return;
+}
+
+void Node::on_get_transition(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::GET_TRANSITION;
+  auto gb = p2p::de_get_transition(payload);
+  if (!gb.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-transition");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " hash=" + short_hash_hex(gb->hash));
+  auto transition_bytes = db_.get_frontier_transition(gb->hash);
+  if (!transition_bytes.has_value()) return;
+  auto transition = FrontierTransition::parse(*transition_bytes);
+  if (!transition.has_value()) return;
+  auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
+  if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) return;
+  auto cert = db_.get_finality_certificate_by_height(transition->height);
+  if (!cert.has_value()) {
+    log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
+             " hash=" + short_hash_hex(gb->hash) + " status=missing-certificate");
+    return;
+  }
+  if (cert->height != transition->height || cert->frontier_transition_id != gb->hash) {
+    log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
+             " hash=" + short_hash_hex(gb->hash) + " status=certificate-mismatch");
+    return;
+  }
+  p2p::TransitionMsg msg;
+  msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
+  msg.certificate = cert;
+  const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
+  log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
+           " hash=" + short_hash_hex(gb->hash) + " status=" + (ok ? "ok" : "failed"));
+  return;
+}
+
+void Node::on_get_transition_by_height(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::GET_TRANSITION_BY_HEIGHT;
+  constexpr std::uint64_t kGetTransitionByHeightPerPeerHeightMinIntervalMs = 1500;
+  constexpr std::uint64_t kGetTransitionByHeightActiveSyncTargetTtlMs = 5 * 60 * 1000;
+  constexpr std::uint64_t kGetTransitionByHeightLogCoalesceWindowMs = 30 * 1000;
+  constexpr std::uint64_t kGetTransitionByHeightDefaultHistoryWindow = 512;
+  auto gbh = p2p::de_get_transition_by_height(payload);
+  if (!gbh.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-transition-by-height");
+    return;
+  }
+  const std::uint64_t tms = now_ms();
+  auto log_frontier_by_height = [&](const std::string& status, const std::string& extra = std::string()) {
+    std::string suffix;
+    bool emit = true;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto& state = send_frontier_by_height_log_state_[status];
+      if (state.first != 0 && tms < state.first + kGetTransitionByHeightLogCoalesceWindowMs) {
+        ++state.second;
+        emit = false;
+      } else {
+        if (state.second != 0) suffix = " suppressed=" + std::to_string(state.second);
+        state.first = tms;
+        state.second = 0;
+      }
+    }
+    if (!emit) return;
+    log_line("send-frontier-by-height peer_id=" + std::to_string(peer_id) +
+             " requested_height=" + std::to_string(gbh->height) +
+             " status=" + status + extra + suffix);
+  };
+  bool throttled_rate_limit = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto& last_req = get_transition_by_height_last_req_ms_[{peer_id, gbh->height}];
+    if (last_req != 0 && tms < last_req + kGetTransitionByHeightPerPeerHeightMinIntervalMs) {
+      throttled_rate_limit = true;
+    } else {
+      last_req = tms;
+    }
+  }
+  if (throttled_rate_limit) {
+    log_frontier_by_height("throttled-rate-limit",
+                           " detail=per-peer-height-min-interval-ms=" +
+                               std::to_string(kGetTransitionByHeightPerPeerHeightMinIntervalMs));
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " height=" + std::to_string(gbh->height));
+  {
+    bool allow_historical_replay = false;
+    bool active_sync_target = false;
+    bool active_validator_peer = false;
+    std::uint64_t peer_tip_height = 0;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (gbh->height + kGetTransitionByHeightDefaultHistoryWindow < finalized_height_) {
+        for (const auto& [key, requested_ms] : requested_sync_height_peers_) {
+          if (key.second != peer_id) continue;
+          if (tms < requested_ms + kGetTransitionByHeightActiveSyncTargetTtlMs) {
+            active_sync_target = true;
+            break;
           }
         }
-        if (!allow_historical_replay) {
-          log_frontier_by_height("throttled-history-window",
-                                 " local_height=" + std::to_string(finalized_height_) +
-                                     " history_window=" + std::to_string(kGetTransitionByHeightDefaultHistoryWindow) +
-                                     " peer_tip_height=" + std::to_string(peer_tip_height) +
-                                     " active_sync_target=" + std::string(active_sync_target ? "yes" : "no") +
-                                     " active_validator_peer=" + std::string(active_validator_peer ? "yes" : "no"));
-          return;
+        if (auto pit = peer_validator_pubkeys_.find(peer_id); pit != peer_validator_pubkeys_.end()) {
+          const auto info = p2p_.get_peer_info(peer_id);
+          if (info.established() && validators_.is_active_for_height(pit->second, finalized_height_ + 1)) {
+            active_validator_peer = true;
+          }
+        }
+        if (auto tip_it = peer_finalized_tips_.find(peer_id); tip_it != peer_finalized_tips_.end()) {
+          peer_tip_height = tip_it->second.height;
+        }
+        auto& last_h = get_transition_by_height_last_progress_height_[peer_id];
+        auto& last_ms = get_transition_by_height_last_progress_ms_[peer_id];
+        const bool progressing = gbh->height > last_h;
+        if (progressing) {
+          last_h = gbh->height;
+          last_ms = tms;
+        }
+        const bool recent_progress = (last_ms != 0 && tms < last_ms + kGetTransitionByHeightActiveSyncTargetTtlMs);
+        allow_historical_replay = active_sync_target || active_validator_peer || recent_progress;
+      } else {
+        allow_historical_replay = true;
+        auto& last_h = get_transition_by_height_last_progress_height_[peer_id];
+        auto& last_ms = get_transition_by_height_last_progress_ms_[peer_id];
+        if (gbh->height > last_h) {
+          last_h = gbh->height;
+          last_ms = tms;
         }
       }
-      auto bh = db_.get_height_hash(gbh->height);
-      if (!bh.has_value()) {
-        log_frontier_by_height("not-found");
-        return;
-      }
-      auto transition_bytes = db_.get_frontier_transition(*bh);
-      if (!transition_bytes.has_value()) {
-        log_frontier_by_height("missing-bytes", " hash=" + short_hash_hex(*bh));
-        return;
-      }
-      auto transition = FrontierTransition::parse(*transition_bytes);
-      if (!transition.has_value()) {
-        log_frontier_by_height("parse-error", " hash=" + short_hash_hex(*bh));
-        return;
-      }
-      auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
-      if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) {
-        log_frontier_by_height("ingress-slice-mismatch",
-                               " hash=" + short_hash_hex(*bh) + " expected=" +
-                                   std::to_string(transition->next_frontier - transition->prev_frontier) +
-                                   " got=" + std::to_string(ordered_records.size()));
-        return;
-      }
-      auto cert = db_.get_finality_certificate_by_height(transition->height);
-      if (!cert.has_value()) {
-        log_frontier_by_height("missing-certificate", " hash=" + short_hash_hex(*bh));
-        return;
-      }
-      if (cert->height != transition->height || cert->frontier_transition_id != *bh) {
-        log_frontier_by_height("certificate-mismatch", " hash=" + short_hash_hex(*bh));
-        return;
-      }
-      p2p::TransitionMsg msg;
-      msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
-      msg.certificate = cert;
-      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
-      log_frontier_by_height(ok ? "ok" : "failed",
-                             " hash=" + short_hash_hex(*bh) +
-                                 " cert_height=" + std::to_string(cert->height));
-      break;
     }
-    case p2p::MsgType::EPOCH_TICKET: {
-      auto t = p2p::de_epoch_ticket(payload);
-      if (!t.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-epoch-ticket");
-        return;
-      }
-      {
-        std::uint64_t peer_height = 0;
-        std::uint64_t max_peer_height = 0;
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id, &peer_height, &max_peer_height)) {
-          log_line("epoch-ticket-drop peer_id=" + std::to_string(peer_id) +
-                   " epoch=" + std::to_string(t->ticket.epoch) +
-                   " reason=peer-tip-stale-for-reconcile peer_height=" + std::to_string(peer_height) +
-                   " max_peer_height=" + std::to_string(max_peer_height));
-          return;
-        }
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " epoch=" + std::to_string(t->ticket.epoch) + " participant=" + short_pub_hex(t->ticket.participant_pubkey));
-      (void)handle_epoch_ticket(t->ticket, true, peer_id);
-      break;
+    if (!allow_historical_replay) {
+      log_frontier_by_height("throttled-history-window",
+                             " local_height=" + std::to_string(finalized_height_) +
+                                 " history_window=" + std::to_string(kGetTransitionByHeightDefaultHistoryWindow) +
+                                 " peer_tip_height=" + std::to_string(peer_tip_height) +
+                                 " active_sync_target=" + std::string(active_sync_target ? "yes" : "no") +
+                                 " active_validator_peer=" + std::string(active_validator_peer ? "yes" : "no"));
+      return;
     }
-    case p2p::MsgType::GET_EPOCH_TICKETS: {
-      auto req = p2p::de_get_epoch_tickets(payload);
-      if (!req.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-epoch-tickets");
-        return;
-      }
-      std::vector<consensus::EpochTicket> tickets;
-      bool closed = false;
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        const auto best_tickets = db_.load_best_epoch_tickets(req->epoch);
-        if (!best_tickets.empty()) {
-          tickets.reserve(best_tickets.size());
-          for (const auto& [_, ticket] : best_tickets) tickets.push_back(ticket);
-        } else {
-          const auto all_tickets = db_.load_epoch_tickets(req->epoch);
-          const auto best_by_pubkey = consensus::best_epoch_tickets_by_pubkey(all_tickets);
-          tickets.reserve(best_by_pubkey.size());
-          for (const auto& [_, ticket] : best_by_pubkey) tickets.push_back(ticket);
-        }
-        closed = epoch_committee_closed_locked(req->epoch);
-      }
-      const std::size_t limit = std::min<std::size_t>(tickets.size(), std::max<std::uint32_t>(1, req->max_tickets));
-      tickets.resize(limit);
-      const bool ok = p2p_.send_to(
-          peer_id, p2p::MsgType::EPOCH_TICKETS, p2p::ser_epoch_tickets(p2p::EpochTicketsMsg{req->epoch, closed, tickets}));
-      log_line("epoch-reconcile-response peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(req->epoch) +
-               " tickets=" + std::to_string(tickets.size()) + " closed=" + (closed ? "yes" : "no") +
-               " status=" + (ok ? "ok" : "failed"));
-      break;
+  }
+  auto bh = db_.get_height_hash(gbh->height);
+  if (!bh.has_value()) {
+    log_frontier_by_height("not-found");
+    return;
+  }
+  auto transition_bytes = db_.get_frontier_transition(*bh);
+  if (!transition_bytes.has_value()) {
+    log_frontier_by_height("missing-bytes", " hash=" + short_hash_hex(*bh));
+    return;
+  }
+  auto transition = FrontierTransition::parse(*transition_bytes);
+  if (!transition.has_value()) {
+    log_frontier_by_height("parse-error", " hash=" + short_hash_hex(*bh));
+    return;
+  }
+  auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
+  if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) {
+    log_frontier_by_height("ingress-slice-mismatch",
+                           " hash=" + short_hash_hex(*bh) + " expected=" +
+                               std::to_string(transition->next_frontier - transition->prev_frontier) +
+                               " got=" + std::to_string(ordered_records.size()));
+    return;
+  }
+  auto cert = db_.get_finality_certificate_by_height(transition->height);
+  if (!cert.has_value()) {
+    log_frontier_by_height("missing-certificate", " hash=" + short_hash_hex(*bh));
+    return;
+  }
+  if (cert->height != transition->height || cert->frontier_transition_id != *bh) {
+    log_frontier_by_height("certificate-mismatch", " hash=" + short_hash_hex(*bh));
+    return;
+  }
+  p2p::TransitionMsg msg;
+  msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
+  msg.certificate = cert;
+  const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
+  log_frontier_by_height(ok ? "ok" : "failed",
+                         " hash=" + short_hash_hex(*bh) +
+                             " cert_height=" + std::to_string(cert->height));
+  return;
+}
+
+void Node::on_epoch_ticket(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::EPOCH_TICKET;
+  auto t = p2p::de_epoch_ticket(payload);
+  if (!t.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-epoch-ticket");
+    return;
+  }
+  {
+    std::uint64_t peer_height = 0;
+    std::uint64_t max_peer_height = 0;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id, &peer_height, &max_peer_height)) {
+      log_line("epoch-ticket-drop peer_id=" + std::to_string(peer_id) +
+               " epoch=" + std::to_string(t->ticket.epoch) +
+               " reason=peer-tip-stale-for-reconcile peer_height=" + std::to_string(peer_height) +
+               " max_peer_height=" + std::to_string(max_peer_height));
+      return;
     }
-    case p2p::MsgType::EPOCH_TICKETS: {
-      auto resp = p2p::de_epoch_tickets(payload);
-      if (!resp.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-epoch-tickets");
-        return;
-      }
-      {
-        std::uint64_t peer_height = 0;
-        std::uint64_t max_peer_height = 0;
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id, &peer_height, &max_peer_height)) {
-          log_line("epoch-reconcile-drop peer_id=" + std::to_string(peer_id) +
-                   " epoch=" + std::to_string(resp->epoch) +
-                   " reason=peer-tip-stale-for-reconcile peer_height=" + std::to_string(peer_height) +
-                   " max_peer_height=" + std::to_string(max_peer_height));
-          return;
-        }
-      }
-      std::size_t accepted = 0;
-      std::size_t rejected = 0;
-      for (const auto& ticket : resp->tickets) {
-        if (handle_epoch_ticket(ticket, true, peer_id, resp->epoch_closed)) {
-          ++accepted;
-        } else {
-          ++rejected;
-        }
-      }
-      if (resp->epoch_closed) {
-        std::lock_guard<std::mutex> lk(mu_);
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " epoch=" + std::to_string(t->ticket.epoch) + " participant=" + short_pub_hex(t->ticket.participant_pubkey));
+  (void)handle_epoch_ticket(t->ticket, true, peer_id);
+  return;
+}
+
+void Node::on_get_epoch_tickets(int peer_id, const Bytes& payload) {
+  auto req = p2p::de_get_epoch_tickets(payload);
+  if (!req.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-epoch-tickets");
+    return;
+  }
+  std::vector<consensus::EpochTicket> tickets;
+  bool closed = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto best_tickets = db_.load_best_epoch_tickets(req->epoch);
+    if (!best_tickets.empty()) {
+      tickets.reserve(best_tickets.size());
+      for (const auto& [_, ticket] : best_tickets) tickets.push_back(ticket);
+    } else {
+      const auto all_tickets = db_.load_epoch_tickets(req->epoch);
+      const auto best_by_pubkey = consensus::best_epoch_tickets_by_pubkey(all_tickets);
+      tickets.reserve(best_by_pubkey.size());
+      for (const auto& [_, ticket] : best_by_pubkey) tickets.push_back(ticket);
+    }
+    closed = epoch_committee_closed_locked(req->epoch);
+  }
+  const std::size_t limit = std::min<std::size_t>(tickets.size(), std::max<std::uint32_t>(1, req->max_tickets));
+  tickets.resize(limit);
+  const bool ok = p2p_.send_to(
+      peer_id, p2p::MsgType::EPOCH_TICKETS, p2p::ser_epoch_tickets(p2p::EpochTicketsMsg{req->epoch, closed, tickets}));
+  log_line("epoch-reconcile-response peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(req->epoch) +
+           " tickets=" + std::to_string(tickets.size()) + " closed=" + (closed ? "yes" : "no") +
+           " status=" + (ok ? "ok" : "failed"));
+  return;
+}
+
+void Node::on_epoch_tickets(int peer_id, const Bytes& payload) {
+  auto resp = p2p::de_epoch_tickets(payload);
+  if (!resp.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-epoch-tickets");
+    return;
+  }
+  {
+    std::uint64_t peer_height = 0;
+    std::uint64_t max_peer_height = 0;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!peer_is_fresh_for_epoch_reconcile_locked(peer_id, &peer_height, &max_peer_height)) {
+      log_line("epoch-reconcile-drop peer_id=" + std::to_string(peer_id) +
+               " epoch=" + std::to_string(resp->epoch) +
+               " reason=peer-tip-stale-for-reconcile peer_height=" + std::to_string(peer_height) +
+               " max_peer_height=" + std::to_string(max_peer_height));
+      return;
+    }
+  }
+  std::size_t accepted = 0;
+  std::size_t rejected = 0;
+  for (const auto& ticket : resp->tickets) {
+    if (handle_epoch_ticket(ticket, true, peer_id, resp->epoch_closed)) {
+      ++accepted;
+    } else {
+      ++rejected;
+    }
+  }
+  if (resp->epoch_closed) {
+    std::lock_guard<std::mutex> lk(mu_);
 #ifdef _WIN32
-        windows_settlement_epoch_reconcile_ms_[resp->epoch] = now_ms();
+    windows_settlement_epoch_reconcile_ms_[resp->epoch] = now_ms();
 #endif
-        const bool already_frozen = epoch_committee_frozen_locked(resp->epoch);
-        const bool already_verified_snapshot = [&]() {
-          auto checkpoint = finalized_committee_checkpoint_for_height_locked(resp->epoch);
-          if (!checkpoint.has_value() || checkpoint->ordered_members.empty()) return false;
-          auto existing = db_.get_epoch_committee_snapshot(resp->epoch);
-          if (!existing.has_value()) return false;
-          const auto expected = epoch_committee_snapshot_from_checkpoint(*checkpoint);
-          return same_epoch_committee_snapshot(*existing, expected);
-        }();
-        if (already_frozen && already_verified_snapshot) {
-          const std::uint64_t tms = now_ms();
-          auto& state = epoch_reconcile_closed_rebuild_log_state_[resp->epoch];
-          if (state.first != 0 && tms < state.first + kEpochReconcileClosedRebuildLogIntervalMs) {
-            ++state.second;
-          } else {
-            std::string suffix;
-            if (state.second != 0) suffix = " suppressed=" + std::to_string(state.second);
-            state.first = tms;
-            state.second = 0;
-            log_line("epoch-reconcile-closed-skip epoch=" + std::to_string(resp->epoch) +
-                     " reason=already-frozen-and-verified" + suffix);
-          }
-        } else {
-          rebuild_epoch_committee_state_locked(resp->epoch, "reconcile-closed", true);
-        }
+    const bool already_frozen = epoch_committee_frozen_locked(resp->epoch);
+    const bool already_verified_snapshot = [&]() {
+      auto checkpoint = finalized_committee_checkpoint_for_height_locked(resp->epoch);
+      if (!checkpoint.has_value() || checkpoint->ordered_members.empty()) return false;
+      auto existing = db_.get_epoch_committee_snapshot(resp->epoch);
+      if (!existing.has_value()) return false;
+      const auto expected = epoch_committee_snapshot_from_checkpoint(*checkpoint);
+      return same_epoch_committee_snapshot(*existing, expected);
+    }();
+    if (already_frozen && already_verified_snapshot) {
+      const std::uint64_t tms = now_ms();
+      auto& state = epoch_reconcile_closed_rebuild_log_state_[resp->epoch];
+      if (state.first != 0 && tms < state.first + kEpochReconcileClosedRebuildLogIntervalMs) {
+        ++state.second;
+      } else {
+        std::string suffix;
+        if (state.second != 0) suffix = " suppressed=" + std::to_string(state.second);
+        state.first = tms;
+        state.second = 0;
+        log_line("epoch-reconcile-closed-skip epoch=" + std::to_string(resp->epoch) +
+                 " reason=already-frozen-and-verified" + suffix);
       }
-      bool should_log_reconcile = true;
-      std::string reconcile_suffix;
-      const bool repetitive_full_reject =
-          !resp->epoch_closed && !resp->tickets.empty() && accepted == 0 && rejected == resp->tickets.size();
-      if (repetitive_full_reject) {
-        const std::uint64_t tms = now_ms();
-        std::lock_guard<std::mutex> lk(mu_);
-        auto& state = epoch_reconcile_reject_log_state_[std::make_pair(peer_id, resp->epoch)];
-        if (state.first != 0 && tms < state.first + kEpochReconcileRejectLogIntervalMs) {
-          ++state.second;
-          should_log_reconcile = false;
-        } else {
-          if (state.second != 0) reconcile_suffix = " suppressed=" + std::to_string(state.second);
-          state.first = tms;
-          state.second = 0;
-        }
-      }
-      if (should_log_reconcile) {
-        log_line("epoch-reconcile-recv peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(resp->epoch) +
-                 " tickets=" + std::to_string(resp->tickets.size()) + " accepted=" + std::to_string(accepted) +
-                 " rejected=" + std::to_string(rejected) + " closed=" + (resp->epoch_closed ? "yes" : "no") +
-                 reconcile_suffix);
-      }
-      break;
+    } else {
+      rebuild_epoch_committee_state_locked(resp->epoch, "reconcile-closed", true);
     }
-    case p2p::MsgType::TRANSITION: {
-      auto b = p2p::de_transition(payload);
-      if (!b.has_value()) {
-        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                 " type=TRANSITION reason=decode-failed payload_size=" + std::to_string(payload.size()));
-        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                 " type=TRANSITION reason=decode-failed payload_id=" + short_hash_hex(payload_id));
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-msg");
-        return;
-      }
-      auto proposal = FrontierProposal::parse(b->frontier_proposal_bytes);
-      if (!proposal.has_value()) {
-        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                 " type=TRANSITION reason=frontier-parse-failed payload_size=" + std::to_string(payload.size()) +
-                 " proposal_size=" + std::to_string(b->frontier_proposal_bytes.size()));
-        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                 " type=TRANSITION reason=frontier-parse-failed payload_id=" + short_hash_hex(payload_id));
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-frontier-parse");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " height=" + std::to_string(proposal->transition.height) + " hash=" +
-               short_hash_hex(proposal->transition.transition_id()) + " prev=" +
-               short_hash_hex(proposal->transition.prev_finalized_hash));
-      // Runs on this peer's own reader thread, before mu_ is ever locked -- the whole point
-      // of precheck_finality_certificate is that the ed25519 loop over the committee's
-      // signatures (16-24 verifies) happens here, in parallel with every other peer's reader
-      // thread, instead of serializing them all behind mu_ inside handle_frontier_block_locked.
-      std::optional<CertificateCheck> cert_check;
-      if (b->certificate.has_value()) {
-        cert_check = precheck_finality_certificate(*b->certificate, proposal->transition);
-        if (!cert_check->ok) {
-          // SECURITY: an internally inconsistent certificate is never produced by an honest
-          // peer; cache and score it so resends cannot burn signature verification for free.
-          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                   " type=TRANSITION reason=certificate-precheck-failed error=" + cert_check->error +
-                   " payload_id=" + short_hash_hex(payload_id));
-          std::lock_guard<std::mutex> lk(mu_);
-          invalid_message_payloads_.insert(payload_id);
-          score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-transition-certificate");
-          return;
-        }
-      }
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (proposal->transition.height == finalized_height_ + 1) {
-          log_line("sync-recv-next-height peer_id=" + std::to_string(peer_id) +
-                   " height=" + std::to_string(proposal->transition.height) + " has_cert=" +
-                   (b->certificate.has_value() ? "yes" : "no"));
-        }
-      }
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        const bool duplicate_accepted = accepted_block_payloads_.contains(payload_id);
-        const std::uint64_t next_height = finalized_height_ + 1;
-        if (duplicate_accepted && proposal->transition.height < next_height) {
-          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                   " type=TRANSITION reason=duplicate-accepted payload_id=" + short_hash_hex(payload_id) +
-                   " height=" + std::to_string(proposal->transition.height) + " next_height=" +
-                   std::to_string(next_height));
-          return;
-        }
-        if (duplicate_accepted) {
-          log_line("sync-recv-duplicate-horizon-bypass peer_id=" + std::to_string(peer_id) +
-                   " type=TRANSITION payload_id=" + short_hash_hex(payload_id) + " height=" +
-                   std::to_string(proposal->transition.height) + " next_height=" + std::to_string(next_height));
-        }
-        bool accepted = false;
-        std::string acceptance_path = "none";
-        if (!running_) {
-          if (b->certificate.has_value() && proposal->transition.height >= finalized_height_ + 1) {
-            const auto transition_id = proposal->transition.transition_id();
-            accepted = insert_buffered_sync_frontier_locked(*proposal, *b->certificate, peer_id, cert_check);
-            if (accepted) {
-              acceptance_path = "startup-buffered";
-              log_line("startup-sync-defer-transition peer_id=" + std::to_string(peer_id) +
-                       " height=" + std::to_string(proposal->transition.height) + " transition=" +
-                       short_hash_hex(transition_id));
-            }
-          } else {
-            log_line("startup-sync-drop-transition peer_id=" + std::to_string(peer_id) +
-                     " height=" + std::to_string(proposal->transition.height) +
-                     " reason=node-not-running");
-          }
-          if (accepted) accepted_block_payloads_.insert(payload_id);
-          if (!accepted) {
-            log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                     " type=TRANSITION reason=not-accepted path=startup payload_id=" +
-                     short_hash_hex(payload_id) + " height=" + std::to_string(proposal->transition.height));
-          }
-          break;
-        }
-        if (proposal->transition.height >= finalized_height_ + 1 && !b->certificate.has_value()) {
-          log_line("sync-stall reason=peer-served-uncertified-transition peer_id=" + std::to_string(peer_id) +
-                   " height=" + std::to_string(proposal->transition.height) + " next_needed=" +
-                   std::to_string(finalized_height_ + 1) + " transition=" +
-                   short_hash_hex(proposal->transition.transition_id()));
-          acceptance_path = "reject-uncertified";
-          score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "uncertified-sync-transition");
-          requested_sync_height_peers_.erase({proposal->transition.height, peer_id});
-          (void)maybe_request_forward_sync_block_locked();
-        } else if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
-          acceptance_path = "buffer-forward";
-          accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id, cert_check);
-          if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
-        } else {
-          acceptance_path = "handle-next";
-          accepted = handle_frontier_block_locked(*proposal, b->certificate, peer_id, true, cert_check);
-          if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
-        }
-        if (accepted) accepted_block_payloads_.insert(payload_id);
-        if (!accepted) {
-          log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
-                   " type=TRANSITION reason=not-accepted path=" + acceptance_path + " payload_id=" +
-                   short_hash_hex(payload_id) + " height=" + std::to_string(proposal->transition.height) +
-                   " has_cert=" + (b->certificate.has_value() ? "yes" : "no"));
-        }
-      }
-      break;
+  }
+  bool should_log_reconcile = true;
+  std::string reconcile_suffix;
+  const bool repetitive_full_reject =
+      !resp->epoch_closed && !resp->tickets.empty() && accepted == 0 && rejected == resp->tickets.size();
+  if (repetitive_full_reject) {
+    const std::uint64_t tms = now_ms();
+    std::lock_guard<std::mutex> lk(mu_);
+    auto& state = epoch_reconcile_reject_log_state_[std::make_pair(peer_id, resp->epoch)];
+    if (state.first != 0 && tms < state.first + kEpochReconcileRejectLogIntervalMs) {
+      ++state.second;
+      should_log_reconcile = false;
+    } else {
+      if (state.second != 0) reconcile_suffix = " suppressed=" + std::to_string(state.second);
+      state.first = tms;
+      state.second = 0;
     }
-    case p2p::MsgType::PROPOSE: {
-      auto p = p2p::de_propose(payload);
-      if (!p.has_value()) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-propose-msg");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round));
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (bootstrap_sync_incomplete_locked(peer_id)) {
-          log_line("defer-consensus peer_id=" + std::to_string(peer_id) + " type=PROPOSE reason=bootstrap-sync-incomplete" +
-                   " local_height=" + std::to_string(finalized_height_));
-          return;
+  }
+  if (should_log_reconcile) {
+    log_line("epoch-reconcile-recv peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(resp->epoch) +
+             " tickets=" + std::to_string(resp->tickets.size()) + " accepted=" + std::to_string(accepted) +
+             " rejected=" + std::to_string(rejected) + " closed=" + (resp->epoch_closed ? "yes" : "no") +
+             reconcile_suffix);
+  }
+  return;
+}
+
+void Node::on_transition(int peer_id, const Bytes& payload, const Hash32& payload_id) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::TRANSITION;
+  auto b = p2p::de_transition(payload);
+  if (!b.has_value()) {
+    log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+             " type=TRANSITION reason=decode-failed payload_size=" + std::to_string(payload.size()));
+    log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+             " type=TRANSITION reason=decode-failed payload_id=" + short_hash_hex(payload_id));
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-msg");
+    return;
+  }
+  auto proposal = FrontierProposal::parse(b->frontier_proposal_bytes);
+  if (!proposal.has_value()) {
+    log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+             " type=TRANSITION reason=frontier-parse-failed payload_size=" + std::to_string(payload.size()) +
+             " proposal_size=" + std::to_string(b->frontier_proposal_bytes.size()));
+    log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+             " type=TRANSITION reason=frontier-parse-failed payload_id=" + short_hash_hex(payload_id));
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-frontier-parse");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " height=" + std::to_string(proposal->transition.height) + " hash=" +
+           short_hash_hex(proposal->transition.transition_id()) + " prev=" +
+           short_hash_hex(proposal->transition.prev_finalized_hash));
+  // Runs on this peer's own reader thread, before mu_ is ever locked -- the whole point
+  // of precheck_finality_certificate is that the ed25519 loop over the committee's
+  // signatures (16-24 verifies) happens here, in parallel with every other peer's reader
+  // thread, instead of serializing them all behind mu_ inside handle_frontier_block_locked.
+  std::optional<CertificateCheck> cert_check;
+  if (b->certificate.has_value()) {
+    cert_check = precheck_finality_certificate(*b->certificate, proposal->transition);
+    if (!cert_check->ok) {
+      // SECURITY: an internally inconsistent certificate is never produced by an honest
+      // peer; cache and score it so resends cannot burn signature verification for free.
+      log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+               " type=TRANSITION reason=certificate-precheck-failed error=" + cert_check->error +
+               " payload_id=" + short_hash_hex(payload_id));
+      std::lock_guard<std::mutex> lk(mu_);
+      invalid_message_payloads_.insert(payload_id);
+      score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-transition-certificate");
+      return;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (proposal->transition.height == finalized_height_ + 1) {
+      log_line("sync-recv-next-height peer_id=" + std::to_string(peer_id) +
+               " height=" + std::to_string(proposal->transition.height) + " has_cert=" +
+               (b->certificate.has_value() ? "yes" : "no"));
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const bool duplicate_accepted = accepted_block_payloads_.contains(payload_id);
+    const std::uint64_t next_height = finalized_height_ + 1;
+    if (duplicate_accepted && proposal->transition.height < next_height) {
+      log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+               " type=TRANSITION reason=duplicate-accepted payload_id=" + short_hash_hex(payload_id) +
+               " height=" + std::to_string(proposal->transition.height) + " next_height=" +
+               std::to_string(next_height));
+      return;
+    }
+    if (duplicate_accepted) {
+      log_line("sync-recv-duplicate-horizon-bypass peer_id=" + std::to_string(peer_id) +
+               " type=TRANSITION payload_id=" + short_hash_hex(payload_id) + " height=" +
+               std::to_string(proposal->transition.height) + " next_height=" + std::to_string(next_height));
+    }
+    bool accepted = false;
+    std::string acceptance_path = "none";
+    if (!running_) {
+      if (b->certificate.has_value() && proposal->transition.height >= finalized_height_ + 1) {
+        const auto transition_id = proposal->transition.transition_id();
+        accepted = insert_buffered_sync_frontier_locked(*proposal, *b->certificate, peer_id, cert_check);
+        if (accepted) {
+          acceptance_path = "startup-buffered";
+          log_line("startup-sync-defer-transition peer_id=" + std::to_string(peer_id) +
+                   " height=" + std::to_string(proposal->transition.height) + " transition=" +
+                   short_hash_hex(transition_id));
         }
+      } else {
+        log_line("startup-sync-drop-transition peer_id=" + std::to_string(peer_id) +
+                 " height=" + std::to_string(proposal->transition.height) +
+                 " reason=node-not-running");
       }
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (accepted_propose_payloads_.contains(payload_id)) {
-          Hash32 block_id{};
-          if (auto proposal = FrontierProposal::parse(p->frontier_proposal_bytes); proposal.has_value()) {
-            block_id = proposal->transition.transition_id();
-          }
-          const std::string result_name = "duplicate";
-          log_line("proposal-duplicate-skip peer_id=" + std::to_string(peer_id) +
-                   " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round) +
-                   " transition=" + short_hash_hex(block_id) + " payload=" +
-                   hex_encode(Bytes(payload_id.begin(), payload_id.end())) + " result=" + result_name);
-          return;
-        }
+      if (accepted) accepted_block_payloads_.insert(payload_id);
+      if (!accepted) {
+        log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+                 " type=TRANSITION reason=not-accepted path=startup payload_id=" +
+                 short_hash_hex(payload_id) + " height=" + std::to_string(proposal->transition.height));
       }
-      const auto propose_result = handle_propose_result(*p, true, peer_id);
+      return;
+    }
+    if (proposal->transition.height >= finalized_height_ + 1 && !b->certificate.has_value()) {
+      log_line("sync-stall reason=peer-served-uncertified-transition peer_id=" + std::to_string(peer_id) +
+               " height=" + std::to_string(proposal->transition.height) + " next_needed=" +
+               std::to_string(finalized_height_ + 1) + " transition=" +
+               short_hash_hex(proposal->transition.transition_id()));
+      acceptance_path = "reject-uncertified";
+      score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "uncertified-sync-transition");
+      requested_sync_height_peers_.erase({proposal->transition.height, peer_id});
+      (void)maybe_request_forward_sync_block_locked();
+    } else if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
+      acceptance_path = "buffer-forward";
+      accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id, cert_check);
+      if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
+    } else {
+      acceptance_path = "handle-next";
+      accepted = handle_frontier_block_locked(*proposal, b->certificate, peer_id, true, cert_check);
+      if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
+    }
+    if (accepted) accepted_block_payloads_.insert(payload_id);
+    if (!accepted) {
+      log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) +
+               " type=TRANSITION reason=not-accepted path=" + acceptance_path + " payload_id=" +
+               short_hash_hex(payload_id) + " height=" + std::to_string(proposal->transition.height) +
+               " has_cert=" + (b->certificate.has_value() ? "yes" : "no"));
+    }
+  }
+  return;
+}
+
+void Node::on_propose(int peer_id, const Bytes& payload, const Hash32& payload_id) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::PROPOSE;
+  auto p = p2p::de_propose(payload);
+  if (!p.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-propose-msg");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round));
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bootstrap_sync_incomplete_locked(peer_id)) {
+      log_line("defer-consensus peer_id=" + std::to_string(peer_id) + " type=PROPOSE reason=bootstrap-sync-incomplete" +
+               " local_height=" + std::to_string(finalized_height_));
+      return;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (accepted_propose_payloads_.contains(payload_id)) {
       Hash32 block_id{};
       if (auto proposal = FrontierProposal::parse(p->frontier_proposal_bytes); proposal.has_value()) {
         block_id = proposal->transition.transition_id();
       }
-      const char* result_name = propose_result == ProposeHandlingResult::Accepted
-                                    ? "accepted"
-                                    : (propose_result == ProposeHandlingResult::SoftReject ? "soft-reject" : "hard-reject");
-      log_line("proposal-dispatch-result peer_id=" + std::to_string(peer_id) +
+      const std::string result_name = "duplicate";
+      log_line("proposal-duplicate-skip peer_id=" + std::to_string(peer_id) +
                " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round) +
-               " transition=" + short_hash_hex(block_id) + " result=" + result_name);
-      if (propose_result == ProposeHandlingResult::HardReject) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PROPOSE, "invalid-propose");
-      } else if (propose_result == ProposeHandlingResult::Accepted) {
-        std::lock_guard<std::mutex> lk(mu_);
-        accepted_propose_payloads_.insert(payload_id);
-      }
-      break;
+               " transition=" + short_hash_hex(block_id) + " payload=" +
+               hex_encode(Bytes(payload_id.begin(), payload_id.end())) + " result=" + result_name);
+      return;
     }
-    case p2p::MsgType::VOTE: {
-      auto v = p2p::de_vote(payload);
-      if (!v.has_value()) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-vote-msg");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round) +
-               " transition=" + short_hash_hex(v->vote.frontier_transition_id));
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (bootstrap_sync_incomplete_locked(peer_id)) {
-          log_line("defer-consensus peer_id=" + std::to_string(peer_id) + " type=VOTE reason=bootstrap-sync-incomplete" +
-                   " local_height=" + std::to_string(finalized_height_));
-          return;
-        }
-      }
-      const auto vote_result = handle_vote_result(v->vote, true, peer_id);
-      if (vote_result == VoteHandlingResult::HardReject) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-vote");
-      }
-      break;
-    }
-    case p2p::MsgType::TIMEOUT_VOTE: {
-      auto v = p2p::de_timeout_vote(payload);
-      if (!v.has_value()) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-timeout-vote-msg");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round));
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (bootstrap_sync_incomplete_locked(peer_id)) {
-          log_line("defer-consensus peer_id=" + std::to_string(peer_id) +
-                   " type=TIMEOUT_VOTE reason=bootstrap-sync-incomplete" +
-                   " local_height=" + std::to_string(finalized_height_));
-          return;
-        }
-      }
-      const auto timeout_result = handle_timeout_vote_result(v->vote, true, peer_id);
-      if (timeout_result == TimeoutVoteHandlingResult::HardReject) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-timeout-vote");
-      }
-      break;
-    }
-    case p2p::MsgType::TX: {
-      auto m = p2p::de_tx(payload);
-      if (!m.has_value()) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-msg");
-        return;
-      }
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (accepted_tx_payloads_.contains(payload_id)) return;
-      }
-      auto tx = parse_any_tx(m->tx_bytes);
-      if (!tx.has_value()) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-parse");
-        return;
-      }
-      if (!handle_tx(*tx, true, peer_id)) {
-        std::lock_guard<std::mutex> lk(mu_);
-        invalid_message_payloads_.insert(payload_id);
-        score_peer_locked(peer_id, p2p::MisbehaviorReason::DUPLICATE_SPAM, "tx-rejected");
-      } else {
-        std::lock_guard<std::mutex> lk(mu_);
-        accepted_tx_payloads_.insert(payload_id);
-      }
-      break;
-    }
-    case p2p::MsgType::GETADDR: {
-      auto req = p2p::de_getaddr(payload);
-      if (!req.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-getaddr");
-        return;
-      }
-      p2p::AddrMsg msg;
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        const auto addrs = addrman_.select_candidates(256, now_unix());
-        msg.entries.reserve(addrs.size());
-        for (const auto& a : addrs) {
-          p2p::AddrEntryMsg e;
-          std::array<std::uint8_t, 16> bin{};
-          if (inet_pton(AF_INET, a.ip.c_str(), bin.data()) == 1) {
-            e.ip_version = 4;
-          } else if (inet_pton(AF_INET6, a.ip.c_str(), bin.data()) == 1) {
-            e.ip_version = 6;
-          } else {
-            continue;
-          }
-          e.ip = bin;
-          e.port = a.port;
-          e.last_seen_unix = now_unix();
-          msg.entries.push_back(e);
-        }
-      }
-      (void)p2p_.send_to(peer_id, p2p::MsgType::ADDR, p2p::ser_addr(msg), true);
-      break;
-    }
-    case p2p::MsgType::ADDR: {
-      auto msg = p2p::de_addr(payload);
-      if (!msg.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-addr");
-        return;
-      }
-      std::lock_guard<std::mutex> lk(mu_);
-      for (const auto& e : msg->entries) {
-        char ipbuf[INET6_ADDRSTRLEN]{};
-        const char* s = nullptr;
-        if (e.ip_version == 4) {
-          s = inet_ntop(AF_INET, e.ip.data(), ipbuf, sizeof(ipbuf));
-        } else if (e.ip_version == 6) {
-          s = inet_ntop(AF_INET6, e.ip.data(), ipbuf, sizeof(ipbuf));
-        }
-        if (!s || e.port == 0) continue;
-        const p2p::NetAddress na{std::string(ipbuf), e.port};
-        const auto reject = addrman_.validate(na);
-        if (reject != p2p::AddrRejectReason::NONE) {
-          const std::string reason = (reject == p2p::AddrRejectReason::PORT_MISMATCH)   ? "port"
-                                     : (reject == p2p::AddrRejectReason::UNROUTABLE_IP) ? "unroutable"
-                                                                                         : "invalid";
-          const std::string log_key = reason + ":" + na.ip;
-          auto& last = addr_drop_log_ms_[log_key];
-          const std::uint64_t now = now_ms();
-          if (now > last + 10'000) {
-            last = now;
-            log_line("drop-addr peer_id=" + std::to_string(peer_id) + " ip=" + na.ip + ":" + std::to_string(na.port) +
-                     " reason=" + reason);
-          }
-          continue;
-        }
-        addrman_.add_or_update(na, e.last_seen_unix);
-      }
-      break;
-    }
-    case p2p::MsgType::PING: {
-      auto ping = p2p::de_ping(payload);
-      if (!ping.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-ping");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " nonce=" + std::to_string(ping->nonce));
-      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PONG, p2p::ser_ping(*ping), true);
-      log_line(std::string("send ") + msg_type_name(p2p::MsgType::PONG) + " peer_id=" + std::to_string(peer_id) +
-               " nonce=" + std::to_string(ping->nonce) + " status=" + (ok ? "ok" : "failed"));
-      break;
-    }
-    case p2p::MsgType::PONG: {
-      auto pong = p2p::de_ping(payload);
-      if (!pong.has_value()) {
-        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-pong");
-        return;
-      }
-      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
-               " nonce=" + std::to_string(pong->nonce));
-      break;
-    }
-    default:
-      break;
   }
+  const auto propose_result = handle_propose_result(*p, true, peer_id);
+  Hash32 block_id{};
+  if (auto proposal = FrontierProposal::parse(p->frontier_proposal_bytes); proposal.has_value()) {
+    block_id = proposal->transition.transition_id();
+  }
+  const char* result_name = propose_result == ProposeHandlingResult::Accepted
+                                ? "accepted"
+                                : (propose_result == ProposeHandlingResult::SoftReject ? "soft-reject" : "hard-reject");
+  log_line("proposal-dispatch-result peer_id=" + std::to_string(peer_id) +
+           " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round) +
+           " transition=" + short_hash_hex(block_id) + " result=" + result_name);
+  if (propose_result == ProposeHandlingResult::HardReject) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PROPOSE, "invalid-propose");
+  } else if (propose_result == ProposeHandlingResult::Accepted) {
+    std::lock_guard<std::mutex> lk(mu_);
+    accepted_propose_payloads_.insert(payload_id);
+  }
+  return;
+}
+
+void Node::on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::VOTE;
+  auto v = p2p::de_vote(payload);
+  if (!v.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-vote-msg");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round) +
+           " transition=" + short_hash_hex(v->vote.frontier_transition_id));
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bootstrap_sync_incomplete_locked(peer_id)) {
+      log_line("defer-consensus peer_id=" + std::to_string(peer_id) + " type=VOTE reason=bootstrap-sync-incomplete" +
+               " local_height=" + std::to_string(finalized_height_));
+      return;
+    }
+  }
+  const auto vote_result = handle_vote_result(v->vote, true, peer_id);
+  if (vote_result == VoteHandlingResult::HardReject) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-vote");
+  }
+  return;
+}
+
+void Node::on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::TIMEOUT_VOTE;
+  auto v = p2p::de_timeout_vote(payload);
+  if (!v.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-timeout-vote-msg");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round));
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bootstrap_sync_incomplete_locked(peer_id)) {
+      log_line("defer-consensus peer_id=" + std::to_string(peer_id) +
+               " type=TIMEOUT_VOTE reason=bootstrap-sync-incomplete" +
+               " local_height=" + std::to_string(finalized_height_));
+      return;
+    }
+  }
+  const auto timeout_result = handle_timeout_vote_result(v->vote, true, peer_id);
+  if (timeout_result == TimeoutVoteHandlingResult::HardReject) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-timeout-vote");
+  }
+  return;
+}
+
+void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id) {
+  auto m = p2p::de_tx(payload);
+  if (!m.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-msg");
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (accepted_tx_payloads_.contains(payload_id)) return;
+  }
+  auto tx = parse_any_tx(m->tx_bytes);
+  if (!tx.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-parse");
+    return;
+  }
+  if (!handle_tx(*tx, true, peer_id)) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::DUPLICATE_SPAM, "tx-rejected");
+  } else {
+    std::lock_guard<std::mutex> lk(mu_);
+    accepted_tx_payloads_.insert(payload_id);
+  }
+  return;
+}
+
+void Node::on_getaddr(int peer_id, const Bytes& payload) {
+  auto req = p2p::de_getaddr(payload);
+  if (!req.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-getaddr");
+    return;
+  }
+  p2p::AddrMsg msg;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto addrs = addrman_.select_candidates(256, now_unix());
+    msg.entries.reserve(addrs.size());
+    for (const auto& a : addrs) {
+      p2p::AddrEntryMsg e;
+      std::array<std::uint8_t, 16> bin{};
+      if (inet_pton(AF_INET, a.ip.c_str(), bin.data()) == 1) {
+        e.ip_version = 4;
+      } else if (inet_pton(AF_INET6, a.ip.c_str(), bin.data()) == 1) {
+        e.ip_version = 6;
+      } else {
+        continue;
+      }
+      e.ip = bin;
+      e.port = a.port;
+      e.last_seen_unix = now_unix();
+      msg.entries.push_back(e);
+    }
+  }
+  (void)p2p_.send_to(peer_id, p2p::MsgType::ADDR, p2p::ser_addr(msg), true);
+  return;
+}
+
+void Node::on_addr(int peer_id, const Bytes& payload) {
+  auto msg = p2p::de_addr(payload);
+  if (!msg.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-addr");
+    return;
+  }
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& e : msg->entries) {
+    char ipbuf[INET6_ADDRSTRLEN]{};
+    const char* s = nullptr;
+    if (e.ip_version == 4) {
+      s = inet_ntop(AF_INET, e.ip.data(), ipbuf, sizeof(ipbuf));
+    } else if (e.ip_version == 6) {
+      s = inet_ntop(AF_INET6, e.ip.data(), ipbuf, sizeof(ipbuf));
+    }
+    if (!s || e.port == 0) continue;
+    const p2p::NetAddress na{std::string(ipbuf), e.port};
+    const auto reject = addrman_.validate(na);
+    if (reject != p2p::AddrRejectReason::NONE) {
+      const std::string reason = (reject == p2p::AddrRejectReason::PORT_MISMATCH)   ? "port"
+                                 : (reject == p2p::AddrRejectReason::UNROUTABLE_IP) ? "unroutable"
+                                                                                     : "invalid";
+      const std::string log_key = reason + ":" + na.ip;
+      auto& last = addr_drop_log_ms_[log_key];
+      const std::uint64_t now = now_ms();
+      if (now > last + 10'000) {
+        last = now;
+        log_line("drop-addr peer_id=" + std::to_string(peer_id) + " ip=" + na.ip + ":" + std::to_string(na.port) +
+                 " reason=" + reason);
+      }
+      continue;
+    }
+    addrman_.add_or_update(na, e.last_seen_unix);
+  }
+  return;
+}
+
+void Node::on_ping(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::PING;
+  auto ping = p2p::de_ping(payload);
+  if (!ping.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-ping");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " nonce=" + std::to_string(ping->nonce));
+  const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PONG, p2p::ser_ping(*ping), true);
+  log_line(std::string("send ") + msg_type_name(p2p::MsgType::PONG) + " peer_id=" + std::to_string(peer_id) +
+           " nonce=" + std::to_string(ping->nonce) + " status=" + (ok ? "ok" : "failed"));
+  return;
+}
+
+void Node::on_pong(int peer_id, const Bytes& payload) {
+  constexpr std::uint16_t msg_type = p2p::MsgType::PONG;
+  auto pong = p2p::de_ping(payload);
+  if (!pong.has_value()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-pong");
+    return;
+  }
+  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+           " nonce=" + std::to_string(pong->nonce));
+  return;
 }
 
 Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& msg, bool from_network, int from_peer_id,
