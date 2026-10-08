@@ -125,7 +125,6 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
 bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDerivedState& state);
 bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
                                               const storage::FinalizedCommitteeCheckpoint& checkpoint);
-Hash32 consensus_payload_id(const Block& block);
 Hash32 consensus_payload_id(const FrontierTransition& transition);
 bool parse_consensus_safety_state(const Bytes& b, std::optional<std::pair<Hash32, std::uint32_t>>* lock_state,
                                   std::optional<QuorumCertificate>* qc_state, std::optional<Hash32>* qc_payload_id);

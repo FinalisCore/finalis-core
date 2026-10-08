@@ -738,19 +738,6 @@ bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
   return false;
 }
 
-Hash32 consensus_payload_id(const Block& block) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'L', 'O', 'C', 'K', '-', 'P', 'A', 'Y', 'L', 'O', 'A', 'D', '-', 'V', '1'});
-  w.bytes_fixed(block.header.prev_finalized_hash);
-  w.u64le(block.header.height);
-  const std::size_t non_coinbase = block.txs.size() > 1 ? (block.txs.size() - 1) : 0;
-  w.varint(non_coinbase);
-  for (std::size_t i = 1; i < block.txs.size(); ++i) {
-    w.bytes(block.txs[i].serialize_without_hashcash());
-  }
-  return crypto::sha256d(w.data());
-}
-
 Hash32 consensus_payload_id(const FrontierTransition& transition) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'F', 'R', 'O', 'N', 'T', 'I', 'E', 'R', '-', 'L', 'O', 'C', 'K', '-', 'P', 'A', 'Y',
