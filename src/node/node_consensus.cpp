@@ -405,6 +405,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   hydrate_runtime_from_canonical_state_locked(next_state);
   if (block_had_txv2) run_confidential_supply_audit_locked("finalized-block");
   mempool_.prune_against_utxo(utxos_);
+  (void)mempool_.set_confidential_pool_value(next_state.confidential_pool_value);
   const auto now = now_ms();
   if (finalized_height_ > previous_finalized_height) {
     current_round_ = 0;

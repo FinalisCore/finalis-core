@@ -561,3 +561,154 @@ TEST(test_mempool_accepts_txv2_at_height_1_when_variant_validation_succeeds) {
   ASSERT_TRUE(mp.accept_tx(AnyTx{tx}, view, &err));
   ASSERT_TRUE(mp.contains(tx.txid()));
 }
+
+namespace {
+
+crypto::Blind32 blind32_from_byte(std::uint8_t seed) {
+  crypto::Blind32 out;
+  out.bytes.fill(seed);
+  return out;
+}
+
+// Confidential input of `value_in` spent to one transparent output: takes value_in out of the
+// confidential pool, i.e. its turnstile delta is -(value_out + fee) = -value_in.
+TxV2 make_pool_withdrawal_v2_tx(mempool::UtxoView& view, std::uint8_t seed, const PubKey32& to_pub,
+                                std::uint64_t value_in, std::uint64_t value_out) {
+  const auto spend_secret = blind32_from_byte(seed);
+  const auto value_blind = blind32_from_byte(static_cast<std::uint8_t>(seed + 1));
+  const auto one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret.bytes);
+  const auto input_commitment = crypto::confidential_amount_commitment(value_in, value_blind);
+  if (!one_time_pubkey || !input_commitment) throw std::runtime_error("confidential input setup failed");
+
+  OutPoint op{};
+  op.txid.fill(seed);
+  UtxoEntryV2 entry;
+  entry.kind = UtxoOutputKind::Confidential;
+  entry.body = UtxoConfidentialData{
+      .value_commitment = *input_commitment,
+      .one_time_pubkey = *one_time_pubkey,
+      .ephemeral_pubkey = *one_time_pubkey,
+      .scan_tag = crypto::ScanTag{seed},
+      .memo = Bytes{0x01},
+  };
+  view[op] = entry;
+
+  TxV2 tx;
+  tx.inputs.push_back(TxInV2{
+      .prev_txid = op.txid,
+      .prev_index = op.index,
+      .sequence = 0xFFFFFFFF,
+      .kind = TxInputKind::Confidential,
+      .witness = ConfidentialInputWitnessV2{*one_time_pubkey, Sig64{}},
+  });
+  const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
+  tx.outputs.push_back(TxOutV2{
+      .kind = TxOutputKind::Transparent,
+      .body = TransparentTxOutV2{value_out, address::p2pkh_script_pubkey(to_pkh)},
+  });
+  tx.fee = value_in - value_out;
+
+  const auto excess = crypto::confidential_amount_commitment(0, value_blind);
+  const auto excess_pubkey = crypto::excess_xonly_pubkey_from_scalar(value_blind);
+  if (!excess || !excess_pubkey) throw std::runtime_error("excess setup failed");
+  tx.balance_proof.excess_commitment = *excess;
+  tx.balance_proof.excess_pubkey = *excess_pubkey;
+  tx.balance_proof.excess_sig.fill(0);
+  const auto balance_msg = balance_proof_message_v2(tx);
+  Hash32 aux{};
+  aux.fill(0x5A);
+  const auto excess_sig = crypto::sign_excess_authorization(*balance_msg, value_blind, aux);
+  if (!excess_sig) throw std::runtime_error("excess signature failed");
+  tx.balance_proof.excess_sig = *excess_sig;
+
+  const auto input_msg = signing_message_for_input_v2(tx, 0);
+  Hash32 msg32{};
+  std::copy(input_msg->begin(), input_msg->end(), msg32.begin());
+  const auto spend_sig = crypto::sign_schnorr_authorization(msg32, spend_secret, aux);
+  if (!spend_sig) throw std::runtime_error("spend signature failed");
+  std::get<ConfidentialInputWitnessV2>(tx.inputs[0].witness).spend_sig = *spend_sig;
+  return tx;
+}
+
+struct TurnstileFixture {
+  mempool::Mempool mp;
+  mempool::UtxoView view;
+  ConfidentialPolicy policy;
+  crypto::KeyPair recipient = key_from_byte(0x91);
+
+  TurnstileFixture() {
+    SpecialValidationContext ctx;
+    ctx.confidential_policy = &policy;
+    ctx.current_height = 10;
+    mp.set_validation_context(ctx);
+  }
+};
+
+}  // namespace
+
+TEST(test_mempool_turnstile_rejects_negative_pool_tx) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  // Withdraws 10'000 (9'500 out + 500 fee) from a pool that only holds 5'000.
+  const auto tx = make_pool_withdrawal_v2_tx(f.view, 0xA1, f.recipient.public_key, 10'000, 9'500);
+  ASSERT_EQ(f.mp.set_confidential_pool_value(5'000), 0u);
+  std::string err;
+  ASSERT_TRUE(!f.mp.accept_tx(AnyTx{tx}, f.view, &err));
+  ASSERT_EQ(err, std::string(mempool::kMempoolConfidentialTurnstile));
+  ASSERT_TRUE(!f.mp.contains(tx.txid()));
+  ASSERT_EQ(f.mp.size(), 0u);
+}
+
+TEST(test_mempool_turnstile_accepts_valid_tx) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  // Boundary: the withdrawal takes P exactly to zero.
+  const auto withdrawal = make_pool_withdrawal_v2_tx(f.view, 0xB1, f.recipient.public_key, 10'000, 9'500);
+  ASSERT_EQ(f.mp.set_confidential_pool_value(10'000), 0u);
+  std::string err;
+  ASSERT_TRUE(f.mp.accept_tx(AnyTx{withdrawal}, f.view, &err));
+  ASSERT_TRUE(f.mp.contains(withdrawal.txid()));
+
+  // A transparent-only TxV2 has delta 0 and is admitted even with an empty pool.
+  const auto sender = key_from_byte(0xB5);
+  OutPoint op{};
+  op.txid.fill(0xB5);
+  f.view[op] = UtxoEntry{p2pkh_out_for_pub(sender.public_key, 10'000)};
+  const auto transparent = make_transparent_only_v2_tx(op, sender, f.recipient.public_key, 10'000, 9'800);
+  ASSERT_EQ(f.mp.set_confidential_pool_value(0), 1u);  // the withdrawal no longer fits
+  ASSERT_TRUE(f.mp.accept_tx(AnyTx{transparent}, f.view, &err));
+  ASSERT_TRUE(f.mp.contains(transparent.txid()));
+}
+
+// The node calls set_confidential_pool_value with the new committed P after each finalized block.
+TEST(test_mempool_turnstile_updates_after_finalization) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  TurnstileFixture f;
+  const auto first = make_pool_withdrawal_v2_tx(f.view, 0xC1, f.recipient.public_key, 10'000, 9'500);
+  const auto second = make_pool_withdrawal_v2_tx(f.view, 0xC5, f.recipient.public_key, 8'000, 7'500);
+  std::string err;
+
+  // P = 20'000: both fit individually and are admitted against the current P.
+  ASSERT_EQ(f.mp.set_confidential_pool_value(20'000), 0u);
+  ASSERT_TRUE(f.mp.accept_tx(AnyTx{first}, f.view, &err));
+  ASSERT_TRUE(f.mp.accept_tx(AnyTx{second}, f.view, &err));
+
+  // Finalization drops P to 9'000: `first` (-10'000) is evicted, `second` (-8'000) stays.
+  ASSERT_EQ(f.mp.set_confidential_pool_value(9'000), 1u);
+  ASSERT_TRUE(!f.mp.contains(first.txid()));
+  ASSERT_TRUE(f.mp.contains(second.txid()));
+
+  // Re-submitting `first` is refused at the new P...
+  ASSERT_TRUE(!f.mp.accept_tx(AnyTx{first}, f.view, &err));
+  ASSERT_EQ(err, std::string(mempool::kMempoolConfidentialTurnstile));
+
+  // ...and admitted again once a later finalization raises P.
+  ASSERT_EQ(f.mp.set_confidential_pool_value(12'000), 0u);
+  ASSERT_TRUE(f.mp.accept_tx(AnyTx{first}, f.view, &err));
+  ASSERT_TRUE(f.mp.contains(first.txid()));
+
+  // Unchanged P is a no-op; nullopt disables the check without evicting anything.
+  ASSERT_EQ(f.mp.set_confidential_pool_value(12'000), 0u);
+  ASSERT_EQ(f.mp.set_confidential_pool_value(std::nullopt), 0u);
+  ASSERT_EQ(f.mp.size(), 2u);
+}

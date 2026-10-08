@@ -223,6 +223,7 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
     const auto next_height = finalized_height_ + 1;
     const auto min_bond_amount = effective_validator_min_bond_for_height(next_height);
     mempool_.set_validation_context(special_validation_context_locked(next_height));
+    (void)mempool_.set_confidential_pool_value(mempool_confidential_pool_value_locked());
     std::string err;
     std::uint64_t fee = 0;
     const auto min_relay_fee = effective_min_relay_fee_for_height(next_height);

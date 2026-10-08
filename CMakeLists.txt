@@ -261,6 +261,10 @@ if(FINALIS_SANITIZE)
   target_link_options(checkpoint-fixture-export PRIVATE -fsanitize=address,undefined)
 endif()
 
+# Confidential verify-weight calibration (not a test; run manually from a Release build).
+add_executable(finalis-bench-confidential tools/bench_confidential_verify.cpp)
+target_link_libraries(finalis-bench-confidential PRIVATE finalis_core)
+
 add_executable(finalis-explorer apps/finalis-explorer/main.cpp)
 target_link_libraries(finalis-explorer PRIVATE finalis_core)
 if(FINALIS_SANITIZE)

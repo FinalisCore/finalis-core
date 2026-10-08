@@ -160,6 +160,7 @@ bool Node::inject_tx_for_test(const AnyTx& tx, bool relay) {
   if (relay) return handle_tx(tx, false);
   std::lock_guard<std::mutex> lk(mu_);
   mempool_.set_validation_context(special_validation_context_locked(finalized_height_ + 1));
+  (void)mempool_.set_confidential_pool_value(mempool_confidential_pool_value_locked());
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }

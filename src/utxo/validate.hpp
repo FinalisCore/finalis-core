@@ -128,6 +128,21 @@ AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block,
 // Confidential verification weight (consensus). Units are range-proof bytes; signatures and the
 // per-tx range-proof batch carry fixed byte-equivalent charges. Computed from structure alone so a
 // block's total can be bounded before any cryptographic verification or state transition.
+//
+// Calibration (tools/bench_confidential_verify.cpp, Release, i7-1355U, single thread, idle; median
+// of 7 rounds). 1 weight unit ~= 0.72 us, set by range-proof verify (3.67 ms / 5126-byte proof):
+//   range proof verify (canonical 64-bit)  3671 us   weight 5126   0.72 us/unit
+//   schnorr verify (confidential input)      30 us   weight  256   0.12 us/unit  (~5x overcharged)
+//   schnorr verify (excess)                  36 us   weight  256   0.14 us/unit  (~5x overcharged)
+//   commitment tally (1 pos / 3 neg)         22 us   unweighted
+//   full T->C 1 in / 1 conf out            3950 us   weight 6406   0.62 us/unit
+//   full T->C 1 in / 12 conf out (max)    45297 us   weight 62792  0.72 us/unit
+//   full C->T 1 conf in / 1 out             187 us   weight  512   0.36 us/unit
+//   full C->T 16 conf in / 1 out (max)      857 us   weight 4352   0.20 us/unit
+// With 4 busy sibling threads: unchanged. With 11 (all cores busy): every op 2-4x slower, ratios hold
+// within ~2x. max_block_confidential_verify_weight (2,000,000) ~= 1.4 s single-core verify, idle.
+// Signatures are overweighted; txs without range proofs carry no per-tx charge for tally/parse work.
+// Values are unchanged pending a policy decision.
 inline constexpr std::uint64_t kConfidentialSignatureVerifyWeight = 256;
 inline constexpr std::uint64_t kRangeProofBatchVerifyWeight = 1024;
 std::uint64_t txv2_confidential_verify_weight(const TxV2& tx);

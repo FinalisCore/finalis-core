@@ -475,6 +475,11 @@ class Node {
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
                                          storage::DB::Batch& batch, std::string* error = nullptr);
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
+  // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
+  std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {
+    if (!canonical_state_) return std::nullopt;
+    return canonical_state_->confidential_pool_value;
+  }
   consensus::CanonicalDerivationConfig canonical_derivation_config_locked() const;
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state,
                                                             storage::DB::Batch& batch);
