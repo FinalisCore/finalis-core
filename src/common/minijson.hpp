@@ -288,11 +288,16 @@ class Parser {
   }
 };
 
-inline std::string escape(const std::string& input) {
+}  // namespace detail
+
+// RFC 8259 string escaping (without the surrounding quotes). Bytes >= 0x80 pass through unchanged.
+inline std::string escape(std::string_view input) {
+  static constexpr char kHex[] = "0123456789abcdef";
   std::string out;
   out.reserve(input.size() + 8);
-  for (char ch : input) {
-    switch (ch) {
+  for (const char ch : input) {
+    const auto c = static_cast<unsigned char>(ch);
+    switch (c) {
       case '"':
         out += "\\\"";
         break;
@@ -315,14 +320,18 @@ inline std::string escape(const std::string& input) {
         out += "\\t";
         break;
       default:
-        out.push_back(ch);
+        if (c < 0x20) {
+          out += "\\u00";
+          out.push_back(kHex[c >> 4]);
+          out.push_back(kHex[c & 0x0F]);
+        } else {
+          out.push_back(ch);
+        }
         break;
     }
   }
   return out;
 }
-
-}  // namespace detail
 
 inline std::optional<Value> parse(std::string_view input) {
   return detail::Parser(input).parse();
@@ -337,7 +346,7 @@ inline std::string stringify(const Value& value) {
     case Value::Type::Number:
       return value.string_value;
     case Value::Type::String:
-      return "\"" + detail::escape(value.string_value) + "\"";
+      return "\"" + escape(value.string_value) + "\"";
     case Value::Type::Array: {
       std::string out = "[";
       for (std::size_t i = 0; i < value.array_value.size(); ++i) {
@@ -353,7 +362,7 @@ inline std::string stringify(const Value& value) {
       for (const auto& [key, item] : value.object_value) {
         if (!first) out += ",";
         first = false;
-        out += "\"" + detail::escape(key) + "\":" + stringify(item);
+        out += "\"" + escape(key) + "\":" + stringify(item);
       }
       out += "}";
       return out;

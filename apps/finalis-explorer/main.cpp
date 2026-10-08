@@ -640,22 +640,6 @@ std::string html_escape(const std::string& in) {
   return out;
 }
 
-std::string json_escape(const std::string& in) {
-  std::string out;
-  out.reserve(in.size() + 8);
-  for (char c : in) {
-    if (c == '"' || c == '\\') {
-      out.push_back('\\');
-      out.push_back(c);
-    } else if (c == '\n') {
-      out += "\\n";
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
-}
-
 std::string json_bool(bool v) { return v ? "true" : "false"; }
 
 std::string json_u64_or_null(const std::optional<std::uint64_t>& v) {
@@ -663,7 +647,7 @@ std::string json_u64_or_null(const std::optional<std::uint64_t>& v) {
 }
 
 std::string json_string_or_null(const std::optional<std::string>& v) {
-  return v.has_value() ? ("\"" + json_escape(*v) + "\"") : "null";
+  return v.has_value() ? ("\"" + finalis::minijson::escape(*v) + "\"") : "null";
 }
 
 ApiError make_error(int http_status, std::string code, std::string message) {
@@ -671,7 +655,7 @@ ApiError make_error(int http_status, std::string code, std::string message) {
 }
 
 std::string error_json(const ApiError& err) {
-  return std::string("{\"error\":{\"code\":\"") + json_escape(err.code) + "\",\"message\":\"" + json_escape(err.message) + "\"}}";
+  return std::string("{\"error\":{\"code\":\"") + finalis::minijson::escape(err.code) + "\",\"message\":\"" + finalis::minijson::escape(err.message) + "\"}}";
 }
 
 Response html_response(int status, std::string body) {
@@ -859,19 +843,19 @@ void push_partner_event(const std::string& partner_id, const std::string& event_
 
 std::string partner_event_json(const PartnerEvent& evt) {
   std::ostringstream oss;
-  oss << "{\"sequence\":" << evt.sequence << ",\"partner_id\":\"" << json_escape(evt.partner_id)
-      << "\",\"event_type\":\"" << json_escape(evt.event_type)
-      << "\",\"object_id\":\"" << json_escape(evt.object_id) << "\",\"state\":\"" << json_escape(evt.state)
+  oss << "{\"sequence\":" << evt.sequence << ",\"partner_id\":\"" << finalis::minijson::escape(evt.partner_id)
+      << "\",\"event_type\":\"" << finalis::minijson::escape(evt.event_type)
+      << "\",\"object_id\":\"" << finalis::minijson::escape(evt.object_id) << "\",\"state\":\"" << finalis::minijson::escape(evt.state)
       << "\",\"emitted_unix_ms\":" << evt.emitted_unix_ms << "}";
   return oss.str();
 }
 
 std::string partner_withdrawal_json(const PartnerWithdrawal& w) {
   std::ostringstream oss;
-  oss << "{\"partner_id\":\"" << json_escape(w.partner_id) << "\",\"client_withdrawal_id\":\"" << json_escape(w.client_withdrawal_id)
-      << "\",\"txid\":\"" << json_escape(w.txid)
-      << "\",\"state\":\"" << json_escape(w.state) << "\",\"retryable\":" << json_bool(w.retryable)
-      << ",\"retry_class\":\"" << json_escape(w.retry_class) << "\""
+  oss << "{\"partner_id\":\"" << finalis::minijson::escape(w.partner_id) << "\",\"client_withdrawal_id\":\"" << finalis::minijson::escape(w.client_withdrawal_id)
+      << "\",\"txid\":\"" << finalis::minijson::escape(w.txid)
+      << "\",\"state\":\"" << finalis::minijson::escape(w.state) << "\",\"retryable\":" << json_bool(w.retryable)
+      << ",\"retry_class\":\"" << finalis::minijson::escape(w.retry_class) << "\""
       << ",\"error_code\":" << json_string_or_null(w.error_code)
       << ",\"error_message\":" << json_string_or_null(w.error_message)
       << ",\"finalized_height\":" << json_u64_or_null(w.finalized_height)
@@ -883,8 +867,8 @@ std::string partner_withdrawal_json(const PartnerWithdrawal& w) {
 
 std::string partner_idempotency_meta_json(const std::string& status, std::uint64_t first_seen_unix_ms, const std::string& request_hash) {
   std::ostringstream oss;
-  oss << "{\"status\":\"" << json_escape(status) << "\",\"first_seen_unix_ms\":" << first_seen_unix_ms
-      << ",\"request_hash\":\"" << json_escape(request_hash) << "\"}";
+  oss << "{\"status\":\"" << finalis::minijson::escape(status) << "\",\"first_seen_unix_ms\":" << first_seen_unix_ms
+      << ",\"request_hash\":\"" << finalis::minijson::escape(request_hash) << "\"}";
   return oss.str();
 }
 
@@ -1676,7 +1660,7 @@ RpcCallResult rpc_call(const std::string& rpc_url, const std::string& method, co
   const auto started = std::chrono::steady_clock::now();
   RpcCallResult out;
   const std::string body =
-      std::string(R"({"jsonrpc":"2.0","id":1,"method":")") + json_escape(method) + R"(","params":)" + params_json + "}";
+      std::string(R"({"jsonrpc":"2.0","id":1,"method":")") + finalis::minijson::escape(method) + R"(","params":)" + params_json + "}";
   std::string err;
   auto raw = g_http_post_json_raw(rpc_url, body, &err);
   if (!raw.has_value()) {
@@ -2444,10 +2428,10 @@ void append_webhook_audit_log(const Config& cfg, const std::string& event, const
   if (!path.parent_path().empty() && !finalis::ensure_private_dir(path.parent_path().string())) return;
   std::ofstream out(path, std::ios::binary | std::ios::app);
   if (!out) return;
-  out << "{\"ts_unix_ms\":" << now_unix_ms() << ",\"event\":\"" << json_escape(event) << "\",\"partner_id\":\""
-      << json_escape(partner_id) << "\",\"sequence\":" << sequence << ",\"delivery_id\":\"" << json_escape(delivery_id)
+  out << "{\"ts_unix_ms\":" << now_unix_ms() << ",\"event\":\"" << finalis::minijson::escape(event) << "\",\"partner_id\":\""
+      << finalis::minijson::escape(partner_id) << "\",\"sequence\":" << sequence << ",\"delivery_id\":\"" << finalis::minijson::escape(delivery_id)
       << "\",\"attempt\":" << attempt
-      << ",\"success\":" << json_bool(success) << ",\"detail\":\"" << json_escape(detail) << "\"}\n";
+      << ",\"success\":" << json_bool(success) << ",\"detail\":\"" << finalis::minijson::escape(detail) << "\"}\n";
 }
 
 void append_partner_auth_audit_log(const Config& cfg, const HttpRequest& req, const std::string& path, const std::string& client_ip,
@@ -2459,10 +2443,10 @@ void append_partner_auth_audit_log(const Config& cfg, const HttpRequest& req, co
   std::ofstream out(log_path, std::ios::binary | std::ios::app);
   if (!out) return;
   out << "{\"ts_unix_ms\":" << now_unix_ms() << ",\"event\":\"partner_auth\",\"success\":" << json_bool(success)
-      << ",\"code\":\"" << json_escape(code) << "\",\"http_status\":" << http_status
-      << ",\"method\":\"" << json_escape(req.method) << "\",\"path\":\"" << json_escape(path)
-      << "\",\"client_ip\":\"" << json_escape(client_ip) << "\",\"partner_id\":\""
-      << json_escape(partner_id.empty() ? "unknown" : partner_id) << "\"}\n";
+      << ",\"code\":\"" << finalis::minijson::escape(code) << "\",\"http_status\":" << http_status
+      << ",\"method\":\"" << finalis::minijson::escape(req.method) << "\",\"path\":\"" << finalis::minijson::escape(path)
+      << "\",\"client_ip\":\"" << finalis::minijson::escape(client_ip) << "\",\"partner_id\":\""
+      << finalis::minijson::escape(partner_id.empty() ? "unknown" : partner_id) << "\"}\n";
 }
 
 struct PartnerAuthAuditEntry {
@@ -3062,7 +3046,7 @@ std::optional<finalis::FrontierTransition> fetch_transition_by_height(const Conf
 }
 
 std::optional<finalis::FrontierTransition> fetch_transition_by_hash(const Config& cfg, const std::string& hash_hex, std::string* err) {
-  auto res = rpc_call(cfg.rpc_url, "get_transition", std::string("{\"hash\":\"") + json_escape(hash_hex) + "\"}");
+  auto res = rpc_call(cfg.rpc_url, "get_transition", std::string("{\"hash\":\"") + finalis::minijson::escape(hash_hex) + "\"}");
   if (!res.result.has_value() || !res.result->is_object()) {
     if (err) {
       if (rpc_not_found(res)) *err = "not_found";
@@ -3255,7 +3239,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
       out.value = std::move(*cached);
       return out;
     }
-    auto rpc = rpc_call(cfg.rpc_url, "get_transition", std::string("{\"hash\":\"") + json_escape(ident) + "\"}");
+    auto rpc = rpc_call(cfg.rpc_url, "get_transition", std::string("{\"hash\":\"") + finalis::minijson::escape(ident) + "\"}");
     if (!rpc.result.has_value()) {
       out.error = rpc_not_found(rpc) ? not_found_error() : upstream_error(rpc.error);
       return out;
@@ -3765,7 +3749,7 @@ std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& c
   params << "{\"txids\":[";
   for (std::size_t i = 0; i < txids.size(); ++i) {
     if (i) params << ",";
-    params << "\"" << json_escape(txids[i]) << "\"";
+    params << "\"" << finalis::minijson::escape(txids[i]) << "\"";
   }
   params << "]}";
   auto res = rpc_call(cfg.rpc_url, "get_tx_summaries", params.str());
@@ -3801,20 +3785,20 @@ std::map<std::string, TxSummaryBatchItem> fetch_tx_summary_batch(const Config& c
 
 std::string render_status_json(const StatusResult& result, std::optional<std::uint64_t> refreshed_unix_ms) {
   std::ostringstream oss;
-  oss << "{\"network\":\"" << json_escape(result.network) << "\","
-      << "\"network_id\":\"" << json_escape(result.network_id) << "\","
-      << "\"genesis_hash\":\"" << json_escape(result.genesis_hash) << "\","
+  oss << "{\"network\":\"" << finalis::minijson::escape(result.network) << "\","
+      << "\"network_id\":\"" << finalis::minijson::escape(result.network_id) << "\","
+      << "\"genesis_hash\":\"" << finalis::minijson::escape(result.genesis_hash) << "\","
       << "\"finalized_height\":" << result.finalized_height << ","
-      << "\"finalized_transition_hash\":\"" << json_escape(result.finalized_transition_hash) << "\","
-      << "\"backend_version\":\"" << json_escape(result.backend_version) << "\","
-      << "\"wallet_api_version\":\"" << json_escape(result.wallet_api_version) << "\","
+      << "\"finalized_transition_hash\":\"" << finalis::minijson::escape(result.finalized_transition_hash) << "\","
+      << "\"backend_version\":\"" << finalis::minijson::escape(result.backend_version) << "\","
+      << "\"wallet_api_version\":\"" << finalis::minijson::escape(result.wallet_api_version) << "\","
       << "\"protocol_reserve_balance\":" << json_u64_or_null(result.protocol_reserve_balance) << ","
       << "\"healthy_peer_count\":" << result.healthy_peer_count << ","
       << "\"established_peer_count\":" << result.established_peer_count << ","
       << "\"latest_finality_committee_size\":" << result.latest_finality_committee_size << ","
       << "\"latest_finality_quorum_threshold\":" << result.latest_finality_quorum_threshold << ","
       << "\"committee_snapshot\":{\"finalized_height\":" << result.finalized_height
-      << ",\"finalized_transition_hash\":\"" << json_escape(result.finalized_transition_hash) << "\""
+      << ",\"finalized_transition_hash\":\"" << finalis::minijson::escape(result.finalized_transition_hash) << "\""
       << ",\"committee_size\":" << result.latest_finality_committee_size
       << ",\"quorum_threshold\":" << result.latest_finality_quorum_threshold << "},"
       << "\"sync\":{\"observed_network_height_known\":" << json_bool(result.observed_network_height_known)
@@ -3889,7 +3873,7 @@ std::string render_status_json(const StatusResult& result, std::optional<std::ui
       << "\"ticket_pow\":{\"difficulty\":" << result.ticket_pow_difficulty
       << ",\"difficulty_min\":" << result.ticket_pow_difficulty_min
       << ",\"difficulty_max\":" << result.ticket_pow_difficulty_max
-      << ",\"epoch_health\":\"" << json_escape(result.ticket_pow_epoch_health) << "\""
+      << ",\"epoch_health\":\"" << finalis::minijson::escape(result.ticket_pow_epoch_health) << "\""
       << ",\"streak_up\":" << result.ticket_pow_streak_up
       << ",\"streak_down\":" << result.ticket_pow_streak_down
       << ",\"nonce_search_limit\":" << result.ticket_pow_nonce_search_limit
@@ -3902,28 +3886,28 @@ std::string render_status_json(const StatusResult& result, std::optional<std::ui
 
 std::string render_tx_json(const TxResult& result) {
   std::ostringstream oss;
-  oss << "{\"txid\":\"" << json_escape(result.txid) << "\","
+  oss << "{\"txid\":\"" << finalis::minijson::escape(result.txid) << "\","
       << "\"found\":" << json_bool(result.found) << ","
       << "\"finalized\":" << json_bool(result.finalized) << ","
       << "\"height\":" << json_u64_or_null(result.finalized_height) << ","
       << "\"finalized_height\":" << json_u64_or_null(result.finalized_height) << ","
       << "\"finalized_depth\":" << result.finalized_depth << ","
       << "\"credit_safe\":" << json_bool(result.credit_safe) << ","
-      << "\"status_label\":\"" << json_escape(result.status_label) << "\","
-      << "\"transition_hash\":\"" << json_escape(result.transition_hash) << "\","
-      << "\"data_source\":\"" << json_escape(result.data_source) << "\","
+      << "\"status_label\":\"" << finalis::minijson::escape(result.status_label) << "\","
+      << "\"transition_hash\":\"" << finalis::minijson::escape(result.transition_hash) << "\","
+      << "\"data_source\":\"" << finalis::minijson::escape(result.data_source) << "\","
       << "\"data_refreshed_unix_ms\":" << json_u64_or_null(result.data_refreshed_unix_ms) << ","
       << "\"timestamp\":" << json_u64_or_null(result.timestamp) << ",\"inputs\":[";
   for (std::size_t i = 0; i < result.inputs.size(); ++i) {
     if (i) oss << ",";
-    oss << "{\"prev_txid\":\"" << json_escape(result.inputs[i].prev_txid) << "\",\"vout\":" << result.inputs[i].vout << "}";
+    oss << "{\"prev_txid\":\"" << finalis::minijson::escape(result.inputs[i].prev_txid) << "\",\"vout\":" << result.inputs[i].vout << "}";
   }
   oss << "],\"outputs\":[";
   for (std::size_t i = 0; i < result.outputs.size(); ++i) {
     if (i) oss << ",";
     oss << "{\"amount\":" << result.outputs[i].amount << ",\"address\":"
         << json_string_or_null(result.outputs[i].address) << ",\"script_hex\":\""
-        << json_escape(result.outputs[i].script_hex) << "\",\"decoded_kind\":"
+        << finalis::minijson::escape(result.outputs[i].script_hex) << "\",\"decoded_kind\":"
         << json_string_or_null(result.outputs[i].decoded_kind)
         << ",\"validator_pubkey_hex\":" << json_string_or_null(result.outputs[i].validator_pubkey_hex)
         << ",\"payout_pubkey_hex\":" << json_string_or_null(result.outputs[i].payout_pubkey_hex)
@@ -3944,7 +3928,7 @@ std::string render_tx_json(const TxResult& result) {
       << (result.fee.has_value() ? std::to_string(*result.fee) : "null") << ","
       << "\"input_count\":" << result.inputs.size() << ",\"output_count\":" << result.outputs.size()
       << ",\"decoded_output_count\":" << decoded_output_count
-      << ",\"flow\":{\"kind\":\"" << json_escape(result.flow_kind) << "\",\"summary\":\"" << json_escape(result.flow_summary) << "\"}"
+      << ",\"flow\":{\"kind\":\"" << finalis::minijson::escape(result.flow_kind) << "\",\"summary\":\"" << finalis::minijson::escape(result.flow_summary) << "\"}"
       << ",\"primary_sender\":" << json_string_or_null(result.primary_sender)
       << ",\"primary_recipient\":" << json_string_or_null(result.primary_recipient)
       << ",\"recipient_count\":" << decoded_recipients.size()
@@ -3960,15 +3944,15 @@ std::string render_transition_json(const Config& cfg, const TransitionResult& re
   const auto summary = compute_transition_summary(cfg, result);
   std::ostringstream oss;
   oss << "{\"found\":" << json_bool(result.found) << ",\"finalized\":true,"
-      << "\"height\":" << result.height << ",\"hash\":\"" << json_escape(result.hash) << "\","
-      << "\"prev_finalized_hash\":\"" << json_escape(result.prev_finalized_hash) << "\","
-      << "\"data_source\":\"" << json_escape(result.data_source) << "\","
+      << "\"height\":" << result.height << ",\"hash\":\"" << finalis::minijson::escape(result.hash) << "\","
+      << "\"prev_finalized_hash\":\"" << finalis::minijson::escape(result.prev_finalized_hash) << "\","
+      << "\"data_source\":\"" << finalis::minijson::escape(result.data_source) << "\","
       << "\"data_refreshed_unix_ms\":" << json_u64_or_null(result.data_refreshed_unix_ms) << ","
       << "\"timestamp\":" << json_u64_or_null(result.timestamp) << ",\"round\":" << result.round
       << ",\"tx_count\":" << result.tx_count << ",\"txids\":[";
   for (std::size_t i = 0; i < result.txids.size(); ++i) {
     if (i) oss << ",";
-    oss << "\"" << json_escape(result.txids[i]) << "\"";
+    oss << "\"" << finalis::minijson::escape(result.txids[i]) << "\"";
   }
   oss << "],\"summary\":{\"tx_count\":" << result.tx_count
       << ",\"finalized_out\":" << summary.finalized_out
@@ -3978,7 +3962,7 @@ std::string render_transition_json(const Config& cfg, const TransitionResult& re
   for (const auto& [kind, count] : summary.flow_mix) {
     if (!first_flow) oss << ",";
     first_flow = false;
-    oss << "\"" << json_escape(kind) << "\":" << count;
+    oss << "\"" << finalis::minijson::escape(kind) << "\":" << count;
   }
   oss << "}},\"finalized_only\":true,\"snapshot_kind\":\"finalized_transition\"}";
   return oss.str();
@@ -3998,7 +3982,7 @@ std::string render_address_json(const AddressResult& result) {
       self_transfer_total += static_cast<std::uint64_t>(item.net_amount >= 0 ? item.net_amount : -item.net_amount);
     }
   }
-  oss << "{\"address\":\"" << json_escape(result.address) << "\","
+  oss << "{\"address\":\"" << finalis::minijson::escape(result.address) << "\","
       << "\"found\":" << json_bool(result.found) << ",\"finalized_balance\":" << finalized_balance
       << ",\"history_slice_complete\":" << json_bool(!result.history.has_more)
       << ",\"summary\":{\"finalized_balance\":" << finalized_balance
@@ -4008,16 +3992,16 @@ std::string render_address_json(const AddressResult& result) {
       << "},\"utxos\":[";
   for (std::size_t i = 0; i < result.utxos.size(); ++i) {
     if (i) oss << ",";
-    oss << "{\"txid\":\"" << json_escape(result.utxos[i].txid) << "\",\"vout\":" << result.utxos[i].vout
+    oss << "{\"txid\":\"" << finalis::minijson::escape(result.utxos[i].txid) << "\",\"vout\":" << result.utxos[i].vout
         << ",\"amount\":" << result.utxos[i].amount << ",\"height\":" << result.utxos[i].height << "}";
   }
   oss << "],\"history\":{\"items\":[";
   for (std::size_t i = 0; i < result.history.items.size(); ++i) {
     if (i) oss << ",";
-    oss << "{\"txid\":\"" << json_escape(result.history.items[i].txid) << "\",\"height\":"
-        << result.history.items[i].height << ",\"direction\":\"" << json_escape(result.history.items[i].direction)
+    oss << "{\"txid\":\"" << finalis::minijson::escape(result.history.items[i].txid) << "\",\"height\":"
+        << result.history.items[i].height << ",\"direction\":\"" << finalis::minijson::escape(result.history.items[i].direction)
         << "\",\"net_amount\":" << result.history.items[i].net_amount
-        << ",\"detail\":\"" << json_escape(result.history.items[i].detail) << "\"}";
+        << ",\"detail\":\"" << finalis::minijson::escape(result.history.items[i].detail) << "\"}";
   }
   oss << "],\"has_more\":" << json_bool(result.history.has_more) << ",\"next_cursor\":"
       << json_string_or_null(result.history.next_cursor)
@@ -4028,8 +4012,8 @@ std::string render_address_json(const AddressResult& result) {
 
 std::string render_search_json(const SearchResult& result) {
   std::ostringstream oss;
-  oss << "{\"query\":\"" << json_escape(result.query) << "\","
-      << "\"classification\":\"" << json_escape(search_classification_name(result.classification)) << "\","
+  oss << "{\"query\":\"" << finalis::minijson::escape(result.query) << "\","
+      << "\"classification\":\"" << finalis::minijson::escape(search_classification_name(result.classification)) << "\","
       << "\"target\":" << json_string_or_null(result.target) << ","
       << "\"found\":" << json_bool(result.found) << ",\"finalized_only\":true}";
   return oss.str();
@@ -4062,9 +4046,9 @@ std::string render_committee_json(const CommitteeResult& result, std::optional<s
     if (i) oss << ",";
     const auto& member = result.members[i];
     oss << "{\"operator_id\":" << json_string_or_null(member.operator_id)
-        << ",\"resolved_operator_id\":\"" << json_escape(member.resolved_operator_id) << "\""
-        << ",\"operator_id_source\":\"" << json_escape(member.operator_id_source) << "\""
-        << ",\"representative_pubkey\":\"" << json_escape(member.representative_pubkey) << "\""
+        << ",\"resolved_operator_id\":\"" << finalis::minijson::escape(member.resolved_operator_id) << "\""
+        << ",\"operator_id_source\":\"" << finalis::minijson::escape(member.operator_id_source) << "\""
+        << ",\"representative_pubkey\":\"" << finalis::minijson::escape(member.representative_pubkey) << "\""
         << ",\"base_weight\":" << json_u64_or_null(member.base_weight)
         << ",\"ticket_bonus_bps\":" << json_u64_or_null(member.ticket_bonus_bps)
         << ",\"final_weight\":" << json_u64_or_null(member.final_weight)
@@ -4084,7 +4068,7 @@ std::string render_recent_tx_json(const std::vector<RecentTxResult>& items, std:
     if (i) oss << ",";
     const auto& item = items[i];
     if (item.total_out.has_value()) finalized_out_total += *item.total_out;
-    oss << "{\"txid\":\"" << json_escape(item.txid) << "\""
+    oss << "{\"txid\":\"" << finalis::minijson::escape(item.txid) << "\""
         << ",\"height\":" << json_u64_or_null(item.height)
         << ",\"timestamp\":" << json_u64_or_null(item.timestamp)
         << ",\"finalized_out\":" << json_u64_or_null(item.total_out)
@@ -4119,7 +4103,7 @@ std::string render_health_json(bool ok, const std::optional<ApiError>& err = std
   std::ostringstream oss;
   oss << "{\"ok\":" << json_bool(ok) << ",\"finalized_only\":true,\"upstream_ok\":" << json_bool(ok);
   if (err.has_value()) {
-    oss << ",\"error\":{\"code\":\"" << json_escape(err->code) << "\",\"message\":\"" << json_escape(err->message) << "\"}";
+    oss << ",\"error\":{\"code\":\"" << finalis::minijson::escape(err->code) << "\",\"message\":\"" << finalis::minijson::escape(err->message) << "\"}";
   }
   oss << "}";
   return oss.str();
@@ -5042,8 +5026,8 @@ void upsert_partner_withdrawal(const Config& cfg, const PartnerWithdrawal& withd
       if (sig.has_value()) {
         const std::string delivery_id = partner_webhook_delivery_id(withdrawal.partner_id, evt.sequence);
         std::ostringstream payload;
-        payload << "{\"delivery_id\":\"" << json_escape(delivery_id) << "\",\"event\":" << evt_json << ",\"signature\":\""
-                << json_escape(*sig) << "\",\"signature_algorithm\":\"hmac_sha256\"}";
+        payload << "{\"delivery_id\":\"" << finalis::minijson::escape(delivery_id) << "\",\"event\":" << evt_json << ",\"signature\":\""
+                << finalis::minijson::escape(*sig) << "\",\"signature_algorithm\":\"hmac_sha256\"}";
         PartnerWebhookDelivery d;
         d.partner_id = withdrawal.partner_id;
         d.sequence = evt.sequence;
@@ -5130,36 +5114,36 @@ Response render_metrics_response() {
       const auto sep = key.rfind('|');
       const std::string route = sep == std::string::npos ? key : key.substr(0, sep);
       const std::string status = sep == std::string::npos ? "0" : key.substr(sep + 1);
-      oss << "finalis_http_requests_total{route=\"" << json_escape(route) << "\",status=\"" << json_escape(status) << "\"} "
+      oss << "finalis_http_requests_total{route=\"" << finalis::minijson::escape(route) << "\",status=\"" << finalis::minijson::escape(status) << "\"} "
           << count << "\n";
     }
     for (const auto& [key, count] : g_metrics_http_request_duration_bucket_ms) {
       const auto sep = key.rfind('|');
       const std::string route = sep == std::string::npos ? key : key.substr(0, sep);
       const std::string le = sep == std::string::npos ? "0" : key.substr(sep + 1);
-      oss << "finalis_http_request_duration_milliseconds_bucket{route=\"" << json_escape(route) << "\",le=\"" << json_escape(le)
+      oss << "finalis_http_request_duration_milliseconds_bucket{route=\"" << finalis::minijson::escape(route) << "\",le=\"" << finalis::minijson::escape(le)
           << "\"} " << count << "\n";
     }
     for (const auto& [route, sum] : g_metrics_http_request_duration_sum_ms) {
-      oss << "finalis_http_request_duration_milliseconds_sum{route=\"" << json_escape(route) << "\"} " << sum << "\n";
+      oss << "finalis_http_request_duration_milliseconds_sum{route=\"" << finalis::minijson::escape(route) << "\"} " << sum << "\n";
     }
     for (const auto& [route, cnt] : g_metrics_http_request_duration_count) {
-      oss << "finalis_http_request_duration_milliseconds_count{route=\"" << json_escape(route) << "\"} " << cnt << "\n";
+      oss << "finalis_http_request_duration_milliseconds_count{route=\"" << finalis::minijson::escape(route) << "\"} " << cnt << "\n";
     }
     oss << "finalis_partner_auth_failures_total " << g_metrics_partner_auth_failures_total << "\n";
     for (const auto& [reason, count] : g_metrics_partner_auth_failures_by_reason_total) {
-      oss << "finalis_partner_auth_failures_by_reason_total{reason=\"" << json_escape(reason) << "\"} " << count << "\n";
+      oss << "finalis_partner_auth_failures_by_reason_total{reason=\"" << finalis::minijson::escape(reason) << "\"} " << count << "\n";
     }
     oss << "finalis_partner_rate_limited_total " << g_metrics_partner_rate_limited_total << "\n";
     for (const auto& [scope, count] : g_metrics_partner_rate_limited_by_scope_total) {
-      oss << "finalis_partner_rate_limited_by_scope_total{scope=\"" << json_escape(scope) << "\"} " << count << "\n";
+      oss << "finalis_partner_rate_limited_by_scope_total{scope=\"" << finalis::minijson::escape(scope) << "\"} " << count << "\n";
     }
     for (const auto& [key, count] : g_metrics_partner_rate_limited_by_partner_scope_total) {
       const auto sep = key.rfind('|');
       const std::string partner_id = sep == std::string::npos ? key : key.substr(0, sep);
       const std::string scope = sep == std::string::npos ? "unknown" : key.substr(sep + 1);
-      oss << "finalis_partner_rate_limited_by_partner_scope_total{partner_id=\"" << json_escape(partner_id)
-          << "\",scope=\"" << json_escape(scope) << "\"} " << count << "\n";
+      oss << "finalis_partner_rate_limited_by_partner_scope_total{partner_id=\"" << finalis::minijson::escape(partner_id)
+          << "\",scope=\"" << finalis::minijson::escape(scope) << "\"} " << count << "\n";
     }
     oss << "finalis_partner_withdrawal_submissions_total " << g_metrics_partner_withdrawal_submissions_total << "\n";
     oss << "finalis_partner_webhook_deliveries_total " << g_metrics_partner_webhook_deliveries_total << "\n";
@@ -5171,31 +5155,31 @@ Response render_metrics_response() {
       const auto sep = key.rfind('|');
       const std::string outcome = sep == std::string::npos ? key : key.substr(0, sep);
       const std::string le = sep == std::string::npos ? "0" : key.substr(sep + 1);
-      oss << "finalis_partner_webhook_delivery_latency_seconds_bucket{outcome=\"" << json_escape(outcome)
-          << "\",le=\"" << json_escape(le) << "\"} " << count << "\n";
+      oss << "finalis_partner_webhook_delivery_latency_seconds_bucket{outcome=\"" << finalis::minijson::escape(outcome)
+          << "\",le=\"" << finalis::minijson::escape(le) << "\"} " << count << "\n";
     }
     for (const auto& [outcome, count] : g_metrics_partner_webhook_delivery_latency_count) {
-      oss << "finalis_partner_webhook_delivery_latency_seconds_bucket{outcome=\"" << json_escape(outcome)
+      oss << "finalis_partner_webhook_delivery_latency_seconds_bucket{outcome=\"" << finalis::minijson::escape(outcome)
           << "\",le=\"+Inf\"} " << count << "\n";
     }
     for (const auto& [outcome, sum] : g_metrics_partner_webhook_delivery_latency_sum_seconds) {
-      oss << "finalis_partner_webhook_delivery_latency_seconds_sum{outcome=\"" << json_escape(outcome) << "\"} " << sum << "\n";
+      oss << "finalis_partner_webhook_delivery_latency_seconds_sum{outcome=\"" << finalis::minijson::escape(outcome) << "\"} " << sum << "\n";
     }
     for (const auto& [outcome, count] : g_metrics_partner_webhook_delivery_latency_count) {
-      oss << "finalis_partner_webhook_delivery_latency_seconds_count{outcome=\"" << json_escape(outcome) << "\"} " << count << "\n";
+      oss << "finalis_partner_webhook_delivery_latency_seconds_count{outcome=\"" << finalis::minijson::escape(outcome) << "\"} " << count << "\n";
     }
   }
   oss << "finalis_partner_webhook_queue_depth " << webhook_queue_depth << "\n";
   oss << "finalis_partner_webhook_dlq_depth " << webhook_dlq_depth << "\n";
   oss << "finalis_partner_webhook_oldest_age_seconds " << webhook_oldest_age_seconds << "\n";
   for (const auto& [partner_id, depth] : webhook_queue_depth_by_partner) {
-    oss << "finalis_partner_webhook_queue_depth_by_partner{partner_id=\"" << json_escape(partner_id) << "\"} " << depth << "\n";
+    oss << "finalis_partner_webhook_queue_depth_by_partner{partner_id=\"" << finalis::minijson::escape(partner_id) << "\"} " << depth << "\n";
   }
   for (const auto& [partner_id, depth] : webhook_dlq_depth_by_partner) {
-    oss << "finalis_partner_webhook_dlq_depth_by_partner{partner_id=\"" << json_escape(partner_id) << "\"} " << depth << "\n";
+    oss << "finalis_partner_webhook_dlq_depth_by_partner{partner_id=\"" << finalis::minijson::escape(partner_id) << "\"} " << depth << "\n";
   }
   for (const auto& [partner_id, age] : webhook_oldest_age_seconds_by_partner) {
-    oss << "finalis_partner_webhook_oldest_age_seconds_by_partner{partner_id=\"" << json_escape(partner_id) << "\"} " << age << "\n";
+    oss << "finalis_partner_webhook_oldest_age_seconds_by_partner{partner_id=\"" << finalis::minijson::escape(partner_id) << "\"} " << age << "\n";
   }
   Response resp;
   resp.status = 200;
@@ -5556,12 +5540,12 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
       if (!first) oss << ",";
       first = false;
       if (!tx_lookup.value.has_value()) {
-        oss << "{\"txid\":\"" << json_escape(item.string_value)
+        oss << "{\"txid\":\"" << finalis::minijson::escape(item.string_value)
             << "\",\"status\":\"not_found\",\"finalized\":false,\"credit_safe\":false,\"finalized_depth\":0,"
             << "\"height\":null,\"transition_hash\":null}";
       } else {
         const auto& tx = *tx_lookup.value;
-        oss << "{\"txid\":\"" << json_escape(tx.txid) << "\",\"status\":\"" << json_escape(tx.found ? "finalized" : "not_found")
+        oss << "{\"txid\":\"" << finalis::minijson::escape(tx.txid) << "\",\"status\":\"" << finalis::minijson::escape(tx.found ? "finalized" : "not_found")
             << "\",\"finalized\":" << json_bool(tx.finalized)
             << ",\"credit_safe\":" << json_bool(tx.credit_safe)
             << ",\"finalized_depth\":" << tx.finalized_depth
@@ -5655,7 +5639,7 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
       return json_response(200, partner_withdrawal_submit_response_json(*existing_withdrawal, idempotency_status,
                                                                         idempotency_first_seen_unix_ms, body_hash));
     }
-    auto broadcast = rpc_call(cfg.rpc_url, "broadcast_tx", std::string("{\"tx_hex\":\"") + json_escape(*tx_hex) + "\"}");
+    auto broadcast = rpc_call(cfg.rpc_url, "broadcast_tx", std::string("{\"tx_hex\":\"") + finalis::minijson::escape(*tx_hex) + "\"}");
     if (!broadcast.result.has_value() || !broadcast.result->is_object()) {
       return json_error_response(upstream_error(broadcast.error.empty() ? "broadcast failed" : broadcast.error));
     }
@@ -5748,11 +5732,11 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     for (std::size_t i = 0; i < items.size(); ++i) {
       if (i) oss << ",";
       const auto& item = items[i];
-      oss << "{\"partner_id\":\"" << json_escape(item.partner_id) << "\",\"sequence\":" << item.sequence << ",\"delivery_id\":\""
-          << json_escape(item.delivery_id) << "\",\"attempts\":" << item.attempts << ",\"replay_attempts\":" << item.replay_attempts
+      oss << "{\"partner_id\":\"" << finalis::minijson::escape(item.partner_id) << "\",\"sequence\":" << item.sequence << ",\"delivery_id\":\""
+          << finalis::minijson::escape(item.delivery_id) << "\",\"attempts\":" << item.attempts << ",\"replay_attempts\":" << item.replay_attempts
           << ",\"quarantined\":" << json_bool(item.quarantined) << ",\"quarantine_reason\":\""
-          << json_escape(item.quarantine_reason) << "\",\"quarantined_unix_ms\":" << item.quarantined_unix_ms
-          << ",\"failed_unix_ms\":" << item.failed_unix_ms << ",\"last_error\":\"" << json_escape(item.last_error)
+          << finalis::minijson::escape(item.quarantine_reason) << "\",\"quarantined_unix_ms\":" << item.quarantined_unix_ms
+          << ",\"failed_unix_ms\":" << item.failed_unix_ms << ",\"last_error\":\"" << finalis::minijson::escape(item.last_error)
           << "\"}";
     }
     oss << "],\"api_version\":\"v1\"}";
@@ -5835,7 +5819,7 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     g_partner_webhook_cv.notify_one();
     if (persist_needed) persist_explorer_snapshot(cfg);
     return json_response(200, std::string("{\"replayed\":true,\"sequence\":") + std::to_string(replay_sequence) +
-                                  ",\"delivery_id\":\"" + json_escape(replay_delivery_id) + "\",\"replay_attempts\":" +
+                                  ",\"delivery_id\":\"" + finalis::minijson::escape(replay_delivery_id) + "\",\"replay_attempts\":" +
                                   std::to_string(replay_attempts) + ",\"api_version\":\"v1\"}");
   }
   if (path == "/api/v1/audit/auth") {
@@ -5864,9 +5848,9 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
       if (i) oss << ",";
       const auto& e = entries[i];
       oss << "{\"ts_unix_ms\":" << e.ts_unix_ms << ",\"success\":" << json_bool(e.success) << ",\"code\":\""
-          << json_escape(e.code) << "\",\"http_status\":" << e.http_status << ",\"method\":\"" << json_escape(e.method)
-          << "\",\"path\":\"" << json_escape(e.path) << "\",\"client_ip\":\"" << json_escape(e.client_ip)
-          << "\",\"partner_id\":\"" << json_escape(e.partner_id) << "\"}";
+          << finalis::minijson::escape(e.code) << "\",\"http_status\":" << e.http_status << ",\"method\":\"" << finalis::minijson::escape(e.method)
+          << "\",\"path\":\"" << finalis::minijson::escape(e.path) << "\",\"client_ip\":\"" << finalis::minijson::escape(e.client_ip)
+          << "\",\"partner_id\":\"" << finalis::minijson::escape(e.partner_id) << "\"}";
     }
     oss << "],\"api_version\":\"v1\"}";
     return json_response(200, oss.str());

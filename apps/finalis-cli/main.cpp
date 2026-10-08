@@ -13,7 +13,6 @@
 #include <iostream>
 #include <cstdlib>
 #include <sstream>
-#include <iomanip>
 #include <optional>
 #include <random>
 #include <set>
@@ -26,6 +25,7 @@
 
 #include "common/address.hpp"
 #include "common/chain_id.hpp"
+#include "common/minijson.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
 #include "common/socket_compat.hpp"
@@ -60,44 +60,6 @@ std::string short_pub_hex(const finalis::PubKey32& pub) {
 
 std::string short_hash_hex(const finalis::Hash32& hash) {
   return finalis::hex_encode(finalis::Bytes(hash.begin(), hash.begin() + 6));
-}
-
-std::string json_escape(const std::string& in) {
-  std::ostringstream oss;
-  for (unsigned char c : in) {
-    switch (c) {
-      case '\\':
-        oss << "\\\\";
-        break;
-      case '"':
-        oss << "\\\"";
-        break;
-      case '\b':
-        oss << "\\b";
-        break;
-      case '\f':
-        oss << "\\f";
-        break;
-      case '\n':
-        oss << "\\n";
-        break;
-      case '\r':
-        oss << "\\r";
-        break;
-      case '\t':
-        oss << "\\t";
-        break;
-      default:
-        if (c < 0x20) {
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(c) << std::dec
-              << std::setfill(' ');
-        } else {
-          oss << static_cast<char>(c);
-        }
-        break;
-    }
-  }
-  return oss.str();
 }
 
 const char* epoch_ticket_origin_name(finalis::consensus::EpochTicketOrigin origin) {
@@ -603,7 +565,7 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
               << "\"expected_activation_epoch_start\":" << activation_epoch_start << ","
               << "\"last_error_code\":\"" << record.last_error_code << "\","
               << "\"last_error_message\":\"" << record.last_error_message << "\""
-              << (status_source.empty() ? "" : (",\"status_source\":\"" + json_escape(status_source) + "\""))
+              << (status_source.empty() ? "" : (",\"status_source\":\"" + finalis::minijson::escape(status_source) + "\""))
               << "}\n";
     return;
   }
@@ -1036,7 +998,7 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
   if (as_json) {
     std::ostringstream j;
     j << "{";
-    j << "\"db\":\"" << json_escape(resolved.string()) << "\"";
+    j << "\"db\":\"" << finalis::minijson::escape(resolved.string()) << "\"";
     j << ",\"local_height\":" << local_height;
     j << ",\"next_height\":" << next_height;
     j << ",\"next_height_transition_present\":" << (next_height_transition_present ? "true" : "false");
@@ -1052,25 +1014,25 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
       j << ",\"outbound_target\":" << runtime->outbound_target;
       j << ",\"advertised_endpoint_present\":" << (runtime->advertised_endpoint_present ? "true" : "false");
       j << ",\"advertised_endpoint_likely_public\":" << (runtime->advertised_endpoint_likely_public ? "true" : "false");
-      j << ",\"advertised_endpoint\":\"" << json_escape(runtime->advertised_endpoint) << "\"";
+      j << ",\"advertised_endpoint\":\"" << finalis::minijson::escape(runtime->advertised_endpoint) << "\"";
       j << ",\"stun_enabled\":" << (runtime->stun_enabled ? "true" : "false");
       j << ",\"stun_last_success\":" << (runtime->stun_last_success ? "true" : "false");
       j << ",\"stun_last_attempt_unix_ms\":" << runtime->stun_last_attempt_unix_ms;
       j << ",\"stun_last_success_unix_ms\":" << runtime->stun_last_success_unix_ms;
-      j << ",\"stun_last_server\":\"" << json_escape(runtime->stun_last_server) << "\"";
-      j << ",\"stun_last_error_code\":\"" << json_escape(runtime->stun_last_error_code) << "\"";
+      j << ",\"stun_last_server\":\"" << finalis::minijson::escape(runtime->stun_last_server) << "\"";
+      j << ",\"stun_last_error_code\":\"" << finalis::minijson::escape(runtime->stun_last_error_code) << "\"";
       j << ",\"stun_backoff_until_unix_ms\":" << runtime->stun_backoff_until_unix_ms;
       j << ",\"stun_endpoint_change_pending\":" << (runtime->stun_endpoint_change_pending ? "true" : "false");
       j << ",\"stun_endpoint_change_hits\":" << runtime->stun_endpoint_change_hits;
       j << ",\"stun_endpoint_change_required_hits\":" << runtime->stun_endpoint_change_required_hits;
-      j << ",\"stun_endpoint_candidate\":\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
+      j << ",\"stun_endpoint_candidate\":\"" << finalis::minijson::escape(runtime->stun_endpoint_candidate) << "\"";
       j << ",\"observed_network_height_known\":" << (runtime->observed_network_height_known ? "true" : "false");
       j << ",\"observed_network_finalized_height\":" << runtime->observed_network_finalized_height;
       j << ",\"finalized_lag\":" << runtime->finalized_lag;
       j << ",\"bootstrap_sync_incomplete\":" << (runtime->bootstrap_sync_incomplete ? "true" : "false");
-      j << ",\"readiness_failure_codes_csv\":\"" << json_escape(runtime->readiness_failure_codes_csv) << "\"";
+      j << ",\"readiness_failure_codes_csv\":\"" << finalis::minijson::escape(runtime->readiness_failure_codes_csv) << "\"";
     }
-    j << ",\"log_tail_path\":\"" << json_escape(log_path.string()) << "\"";
+    j << ",\"log_tail_path\":\"" << finalis::minijson::escape(log_path.string()) << "\"";
     j << ",\"log_tail_size\":" << lines.size();
     j << ",\"log_counters\":{";
     j << "\"missing_next_cert\":" << stall_missing_next_cert;
@@ -1084,7 +1046,7 @@ int run_sync_doctor_command(const std::string& db_path, std::size_t tail_lines, 
     j << ",\"findings\":[";
     for (std::size_t i = 0; i < findings.size(); ++i) {
       if (i != 0) j << ",";
-      j << "\"" << json_escape(findings[i]) << "\"";
+      j << "\"" << finalis::minijson::escape(findings[i]) << "\"";
     }
     j << "]";
     j << "}\n";
@@ -1408,8 +1370,8 @@ int run_validator_doctor_command(const std::string& db_path, const std::string& 
   if (as_json) {
     std::ostringstream j;
     j << "{";
-    j << "\"db\":\"" << json_escape(resolved_db.string()) << "\"";
-    j << ",\"key_file\":\"" << json_escape(resolved_key.string()) << "\"";
+    j << "\"db\":\"" << finalis::minijson::escape(resolved_db.string()) << "\"";
+    j << ",\"key_file\":\"" << finalis::minijson::escape(resolved_key.string()) << "\"";
     j << ",\"runtime_snapshot_present\":" << (runtime.has_value() ? "true" : "false");
     j << ",\"local_height\":" << (tip.has_value() ? tip->height : 0);
     if (runtime.has_value()) {
@@ -1421,35 +1383,35 @@ int run_validator_doctor_command(const std::string& db_path, const std::string& 
       j << ",\"outbound_target\":" << runtime->outbound_target;
       j << ",\"advertised_endpoint_present\":" << (runtime->advertised_endpoint_present ? "true" : "false");
       j << ",\"advertised_endpoint_likely_public\":" << (runtime->advertised_endpoint_likely_public ? "true" : "false");
-      j << ",\"advertised_endpoint\":\"" << json_escape(runtime->advertised_endpoint) << "\"";
+      j << ",\"advertised_endpoint\":\"" << finalis::minijson::escape(runtime->advertised_endpoint) << "\"";
       j << ",\"stun_enabled\":" << (runtime->stun_enabled ? "true" : "false");
       j << ",\"stun_last_success\":" << (runtime->stun_last_success ? "true" : "false");
       j << ",\"stun_last_attempt_unix_ms\":" << runtime->stun_last_attempt_unix_ms;
       j << ",\"stun_last_success_unix_ms\":" << runtime->stun_last_success_unix_ms;
-      j << ",\"stun_last_server\":\"" << json_escape(runtime->stun_last_server) << "\"";
-      j << ",\"stun_last_error_code\":\"" << json_escape(runtime->stun_last_error_code) << "\"";
+      j << ",\"stun_last_server\":\"" << finalis::minijson::escape(runtime->stun_last_server) << "\"";
+      j << ",\"stun_last_error_code\":\"" << finalis::minijson::escape(runtime->stun_last_error_code) << "\"";
       j << ",\"stun_backoff_until_unix_ms\":" << runtime->stun_backoff_until_unix_ms;
       j << ",\"stun_endpoint_change_pending\":" << (runtime->stun_endpoint_change_pending ? "true" : "false");
       j << ",\"stun_endpoint_change_hits\":" << runtime->stun_endpoint_change_hits;
       j << ",\"stun_endpoint_change_required_hits\":" << runtime->stun_endpoint_change_required_hits;
-      j << ",\"stun_endpoint_candidate\":\"" << json_escape(runtime->stun_endpoint_candidate) << "\"";
+      j << ",\"stun_endpoint_candidate\":\"" << finalis::minijson::escape(runtime->stun_endpoint_candidate) << "\"";
       j << ",\"finalized_lag\":" << runtime->finalized_lag;
       j << ",\"bootstrap_sync_incomplete\":" << (runtime->bootstrap_sync_incomplete ? "true" : "false");
       j << ",\"registration_ready\":" << (runtime->registration_ready ? "true" : "false");
-      j << ",\"readiness_failure_codes_csv\":\"" << json_escape(runtime->readiness_failure_codes_csv) << "\"";
+      j << ",\"readiness_failure_codes_csv\":\"" << finalis::minijson::escape(runtime->readiness_failure_codes_csv) << "\"";
     }
     j << ",\"local_validator_key_loaded\":" << (local_validator_key_loaded ? "true" : "false");
     j << ",\"local_validator_registered\":" << (local_validator_registered ? "true" : "false");
-    j << ",\"local_validator_status\":\"" << json_escape(local_validator_status) << "\"";
-    j << ",\"onboarding_state\":\"" << json_escape(onboarding_state) << "\"";
-    j << ",\"onboarding_last_error_code\":\"" << json_escape(onboarding_last_error_code) << "\"";
+    j << ",\"local_validator_status\":\"" << finalis::minijson::escape(local_validator_status) << "\"";
+    j << ",\"onboarding_state\":\"" << finalis::minijson::escape(onboarding_state) << "\"";
+    j << ",\"onboarding_last_error_code\":\"" << finalis::minijson::escape(onboarding_last_error_code) << "\"";
     j << ",\"overall\":\"" << overall << "\"";
     j << ",\"exit_code\":" << exit_code;
     auto emit_codes = [&](const char* key, const std::vector<std::string>& codes) {
       j << ",\"" << key << "\":[";
       for (std::size_t i = 0; i < codes.size(); ++i) {
         if (i) j << ",";
-        j << "\"" << json_escape(codes[i]) << "\"";
+        j << "\"" << finalis::minijson::escape(codes[i]) << "\"";
       }
       j << "]";
     };
@@ -3091,7 +3053,7 @@ int main(int argc, char** argv) {
     if (!have_local_validator) {
       if (as_json) {
         std::cout << "{"
-                  << "\"db\":\"" << json_escape(db_path) << "\","
+                  << "\"db\":\"" << finalis::minijson::escape(db_path) << "\","
                   << "\"finalized_height\":" << finalized_height << ","
                   << "\"inspected_finalized_height\":" << inspected_finalized_height << ","
                   << "\"economics_height\":" << economics_height << ","
@@ -3228,7 +3190,7 @@ int main(int argc, char** argv) {
 
     if (as_json) {
       std::cout << "{"
-                << "\"db\":\"" << json_escape(db_path) << "\","
+                << "\"db\":\"" << finalis::minijson::escape(db_path) << "\","
                 << "\"finalized_height\":" << finalized_height << ","
                 << "\"inspected_finalized_height\":" << inspected_finalized_height << ","
                 << "\"economics_height\":" << economics_height << ","
@@ -3253,7 +3215,7 @@ int main(int argc, char** argv) {
                 << ","
                 << "\"local_validator_present\":true,"
                 << "\"local_validator_pubkey\":\"" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\","
-                << "\"local_validator_address\":\"" << json_escape(vk.address) << "\","
+                << "\"local_validator_address\":\"" << finalis::minijson::escape(vk.address) << "\","
                 << "\"local_validator_registered\":" << (it != validators.end() ? "true" : "false");
       if (it != validators.end()) {
         std::cout << ",\"local_validator_status\":\"" << validator_status_name(it->second.status) << "\""
@@ -3287,7 +3249,7 @@ int main(int argc, char** argv) {
           std::cout << ",\"settlement_epoch_total_reward_units\":null"
                     << ",\"settlement_epoch_settled\":null";
         }
-        std::cout << ",\"local_validator_settlement_reason\":\"" << json_escape(settlement_reason) << "\"";
+        std::cout << ",\"local_validator_settlement_reason\":\"" << finalis::minijson::escape(settlement_reason) << "\"";
       }
       std::cout << "}\n";
       return 0;

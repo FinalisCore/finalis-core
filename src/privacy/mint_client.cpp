@@ -6,25 +6,10 @@
 #include <sstream>
 
 #include "codec/bytes.hpp"
+#include "common/minijson.hpp"
 
 namespace finalis::privacy {
 namespace {
-
-std::string json_escape(const std::string& s) {
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default: out.push_back(c); break;
-    }
-  }
-  return out;
-}
 
 std::string hex20(const std::array<std::uint8_t, 20>& v) {
   return hex_encode(Bytes(v.begin(), v.end()));
@@ -82,7 +67,7 @@ std::string json_string_array(const std::vector<std::string>& items) {
   oss << "[";
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (i) oss << ",";
-    oss << "\"" << json_escape(items[i]) << "\"";
+    oss << "\"" << minijson::escape(items[i]) << "\"";
   }
   oss << "]";
   return oss.str();
@@ -104,7 +89,7 @@ std::string json_u64_array(const std::vector<std::uint64_t>& items) {
 std::string to_json(const MintDepositRegistrationRequest& req) {
   std::ostringstream oss;
   oss << "{"
-      << "\"chain\":\"" << json_escape(req.chain) << "\","
+      << "\"chain\":\"" << minijson::escape(req.chain) << "\","
       << "\"deposit_txid\":\"" << hex_encode32(req.deposit_txid) << "\","
       << "\"deposit_vout\":" << req.deposit_vout << ","
       << "\"mint_id\":\"" << hex_encode32(req.mint_id) << "\","
@@ -117,7 +102,7 @@ std::string to_json(const MintDepositRegistrationRequest& req) {
 std::string to_json(const MintBlindIssueRequest& req) {
   std::ostringstream oss;
   oss << "{"
-      << "\"mint_deposit_ref\":\"" << json_escape(req.mint_deposit_ref) << "\","
+      << "\"mint_deposit_ref\":\"" << minijson::escape(req.mint_deposit_ref) << "\","
       << "\"blinded_messages\":" << json_string_array(req.blinded_messages) << ","
       << "\"note_amounts\":" << json_u64_array(req.note_amounts)
       << "}";
@@ -128,7 +113,7 @@ std::string to_json(const MintRedemptionRequest& req) {
   std::ostringstream oss;
   oss << "{"
       << "\"notes\":" << json_string_array(req.notes) << ","
-      << "\"redeem_address\":\"" << json_escape(req.redeem_address) << "\","
+      << "\"redeem_address\":\"" << minijson::escape(req.redeem_address) << "\","
       << "\"amount\":" << req.amount
       << "}";
   return oss.str();
