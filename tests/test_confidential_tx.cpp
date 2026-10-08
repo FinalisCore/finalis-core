@@ -1165,3 +1165,40 @@ TEST(test_txv2_confidential_verify_weight_formula) {
   transparent.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent, .body = TransparentTxOutV2{1, Bytes{0x51}}});
   ASSERT_EQ(txv2_confidential_verify_weight(transparent), 0u);
 }
+
+// The output limit matches the proof-byte cap: 12 canonical proofs fit, 13 never could.
+TEST(test_validate_tx_v2_confidential_output_limit_is_12) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  ConfidentialPolicy policy;
+  ASSERT_EQ(policy.max_confidential_outputs_per_tx, 12u);
+  ASSERT_TRUE(12ull * kTxV2MaxRangeProofBytes <= policy.max_total_proof_bytes_per_tx);
+  ASSERT_TRUE(13ull * kTxV2MaxRangeProofBytes > policy.max_total_proof_bytes_per_tx);
+
+  const auto from = key_from_byte(0x29);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0x49);
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{100'000, address::p2pkh_script_pubkey(from_pkh)});
+  SpecialValidationContext ctx;
+  ctx.current_height = 100;
+  ctx.confidential_policy = &policy;
+
+  auto make = [&](std::size_t n_outputs) {
+    TxV2 tx;
+    tx.inputs.push_back(TxInV2{.prev_txid = op.txid, .prev_index = op.index, .sequence = 0xFFFFFFFF,
+                               .kind = TxInputKind::Transparent, .witness = TransparentInputWitnessV2{}});
+    for (std::size_t i = 0; i < n_outputs; ++i) {
+      tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential,
+                                   .body = make_valid_confidential_output(static_cast<std::uint8_t>(0x10 + 8 * i), 1'000)});
+    }
+    tx.fee = 500;
+    resign_input0(tx, from);
+    return tx;
+  };
+  const auto at_limit = validate_tx_v2(make(12), 1, view, &ctx);
+  ASSERT_TRUE(at_limit.error != "too many confidential outputs");
+  const auto over = validate_tx_v2(make(13), 1, view, &ctx);
+  ASSERT_TRUE(!over.ok);
+  ASSERT_EQ(over.error, std::string("too many confidential outputs"));
+}

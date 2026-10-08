@@ -93,7 +93,8 @@ struct ConfidentialPolicy {
   std::uint32_t max_inputs_per_tx{kTxV2MaxInputs};
   std::uint32_t max_outputs_per_tx{kTxV2MaxOutputs};
   std::uint32_t max_confidential_inputs_per_tx{16};
-  std::uint32_t max_confidential_outputs_per_tx{16};
+  // 12 canonical range proofs (<= 5134 bytes each) fit max_total_proof_bytes_per_tx; 13 do not.
+  std::uint32_t max_confidential_outputs_per_tx{12};
   std::uint32_t max_memo_bytes{kTxV2MaxMemoBytes};
   std::uint32_t max_range_proof_bytes{kTxV2MaxRangeProofBytes};
   std::uint32_t max_total_proof_bytes_per_tx{65536};

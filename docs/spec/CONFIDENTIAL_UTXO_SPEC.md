@@ -510,7 +510,7 @@ struct ConfidentialPolicy {
   std::uint32_t max_inputs_per_tx{64};
   std::uint32_t max_outputs_per_tx{32};
   std::uint32_t max_confidential_inputs_per_tx{16};
-  std::uint32_t max_confidential_outputs_per_tx{16};
+  std::uint32_t max_confidential_outputs_per_tx{12};
   std::uint32_t max_memo_bytes{128};
   std::uint32_t max_range_proof_bytes{1024};
   std::uint32_t max_total_proof_bytes_per_tx{16384};
@@ -854,7 +854,7 @@ struct ConfidentialPolicy {
   std::uint32_t max_inputs_per_tx{64};
   std::uint32_t max_outputs_per_tx{32};
   std::uint32_t max_confidential_inputs_per_tx{16};
-  std::uint32_t max_confidential_outputs_per_tx{16};
+  std::uint32_t max_confidential_outputs_per_tx{12};
   std::uint32_t max_memo_bytes{128};
   std::uint32_t max_range_proof_bytes{1024};
   std::uint32_t max_total_proof_bytes_per_tx{16384};
