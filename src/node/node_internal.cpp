@@ -758,6 +758,12 @@ Hash32 consensus_payload_id(const FrontierTransition& transition) {
   return crypto::sha256d(w.data());
 }
 
+std::string key_consensus_locked_proposal(std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return std::string(kConsensusLockedProposalPrefix) + hex_encode(w.data());
+}
+
 bool parse_consensus_safety_state(const Bytes& b, std::optional<std::pair<Hash32, std::uint32_t>>* lock_state,
                                   std::optional<QuorumCertificate>* qc_state, std::optional<Hash32>* qc_payload_id) {
   std::optional<std::pair<Hash32, std::uint32_t>> parsed_lock;

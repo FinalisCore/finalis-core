@@ -277,6 +277,26 @@ std::optional<TimeoutCertificate> Node::highest_tc_for_height_for_test(std::uint
   return highest_tc_for_height_locked(height);
 }
 
+std::optional<std::pair<Hash32, std::uint32_t>> Node::local_vote_lock_for_test(std::uint64_t height) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = local_vote_locks_.find(height);
+  if (it == local_vote_locks_.end()) return std::nullopt;
+  return it->second;
+}
+
+bool Node::local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& sig : votes_.signatures_for(height, round, transition_id)) {
+    if (sig.validator_pubkey == local_key_.public_key) return true;
+  }
+  return false;
+}
+
+bool Node::has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return candidate_frontier_proposals_.find(transition_id) != candidate_frontier_proposals_.end();
+}
+
 std::size_t Node::timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const {
   std::lock_guard<std::mutex> lk(mu_);
   return timeout_votes_.signatures_for(height, round).size();

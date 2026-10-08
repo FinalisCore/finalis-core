@@ -269,6 +269,9 @@ class Node {
   std::optional<PubKey32> proposer_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   std::optional<QuorumCertificate> highest_qc_for_height_for_test(std::uint64_t height) const;
   std::optional<TimeoutCertificate> highest_tc_for_height_for_test(std::uint64_t height) const;
+  std::optional<std::pair<Hash32, std::uint32_t>> local_vote_lock_for_test(std::uint64_t height) const;
+  bool local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
+  bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
   std::size_t timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   bool local_timeout_vote_reserved_for_test(std::uint64_t height, std::uint32_t round) const;
   bool local_is_committee_member_for_test(std::uint64_t height, std::uint32_t round) const;
@@ -428,7 +431,9 @@ class Node {
                                  const std::optional<TimeoutCertificate>& justify_tc,
                                  std::string* reason = nullptr) const;
   bool can_accept_frontier_with_lock_locked(const FrontierTransition& transition, std::string* reason = nullptr) const;
-  bool update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const Hash32& payload_id);
+  // `proposal` is the full proposal being voted for; it is persisted with the lock (see
+  // kConsensusLockedProposalPrefix) so the locked payload survives a restart.
+  bool update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal);
   // Participation record for the finalized tip, for the next transition's
   // prev_finality_signers: every verified vote seen for the tip (including
   // late ones) plus the persisted certificate, filtered against the canonical

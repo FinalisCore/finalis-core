@@ -32,6 +32,9 @@ inline constexpr const char* kValidatorJoinWindowCountKey = "PVAL:JOIN_WINDOW_CO
 inline constexpr const char* kValidatorLivenessWindowStartKey = "PVAL:LIVENESS_WINDOW_START";
 inline constexpr const char* kFinalizedRandomnessKey = "PRAND:FINALIZED";
 inline constexpr const char* kConsensusSafetyStatePrefix = "CSAFE:";
+// Full FrontierProposal behind the local vote lock at a height, written in the same durable batch
+// as the lock so a restarted node can still re-propose / re-vote its locked payload.
+inline constexpr const char* kConsensusLockedProposalPrefix = "CSLP:";
 
 // --- In-process local bus (disable_p2p mode); defined in node_internal.cpp ---
 extern std::mutex g_local_bus_mu;
@@ -128,6 +131,7 @@ bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
 Hash32 consensus_payload_id(const FrontierTransition& transition);
 bool parse_consensus_safety_state(const Bytes& b, std::optional<std::pair<Hash32, std::uint32_t>>* lock_state,
                                   std::optional<QuorumCertificate>* qc_state, std::optional<Hash32>* qc_payload_id);
+std::string key_consensus_locked_proposal(std::uint64_t height);
 void sync_smt_tree(storage::DB& db, storage::DB::Batch& batch, const std::string& tree_id,
                    const std::vector<std::pair<Hash32, Bytes>>& leaves);
 StateRoots persist_state_roots(storage::DB& db, storage::DB::Batch& batch, std::uint64_t height, const UtxoSetV2& utxos,

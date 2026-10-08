@@ -760,12 +760,24 @@ bool Node::can_accept_frontier_with_lock_locked(const FrontierTransition& transi
 }
 
 // Returns false only if the lock changed and could not be made durable.
-bool Node::update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const Hash32& payload_id) {
+//
+// SAFETY INVARIANT: once this node has signed a vote for payload P at height h, the lock (P, round)
+// is durable and is released only when h finalizes (clear_consensus_safety_state_locked from the
+// finalization batch). It may move to another payload only through can_vote_for_frontier_locked,
+// i.e. a valid QC for that payload from a round in [locked_round, proposal_round). Neither a TC nor
+// a restart releases it. The proposal body is persisted alongside so that, after a restart, this
+// node can still re-propose P in a TC-driven round instead of deadlocking on a payload it cannot
+// reconstruct.
+bool Node::update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal) {
+  const auto payload_id = consensus_payload_id(proposal.transition);
   auto it = local_vote_locks_.find(height);
   if (it != local_vote_locks_.end() && it->second.first == payload_id && it->second.second == round) return true;
   if (it == local_vote_locks_.end() || round >= it->second.second) {
     local_vote_locks_[height] = {payload_id, round};
-    return persist_consensus_safety_state_locked(height);
+    storage::DB::Batch batch(db_);
+    persist_consensus_safety_state_locked(height, batch);
+    batch.put(key_consensus_locked_proposal(height), proposal.serialize());
+    return db_.write_batch_durable(batch);
   }
   return true;
 }
@@ -834,6 +846,8 @@ bool Node::persist_consensus_safety_state_locked(std::uint64_t height) {
   return db_.write_batch_durable(batch);
 }
 
+// SAFETY: releases the local vote lock at `height`. Only call this for a height that has
+// finalized; calling it for an open height lets this node sign a conflicting payload there.
 void Node::clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch) {
   local_vote_locks_.erase(height);
   highest_qc_by_height_.erase(height);
@@ -847,6 +861,7 @@ void Node::clear_consensus_safety_state_locked(std::uint64_t height, storage::DB
     }
   }
   batch.erase(key_consensus_safety_state(height));
+  batch.erase(key_consensus_locked_proposal(height));
 }
 
 void Node::clear_consensus_safety_state_locked(std::uint64_t height) {
@@ -1484,7 +1499,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       // SAFETY: the lock must be durable before the vote can leave this process.
       // Otherwise a crash after broadcast loses it and, on restart, this node
       // could sign a conflicting payload at the same (height, round).
-      if (!update_local_vote_lock_locked(msg.height, msg.round, consensus_payload_id(transition))) {
+      if (!update_local_vote_lock_locked(msg.height, msg.round, *proposal)) {
         log_propose_hard_reject("local-vote-lock-persist-failed");
         return ProposeHandlingResult::HardReject;
       }
@@ -1642,7 +1657,7 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
     if (vote.validator_pubkey == local_key_.public_key) {
       auto frontier_it = candidate_frontier_proposals_.find(vote.frontier_transition_id);
       if (frontier_it != candidate_frontier_proposals_.end()) {
-        update_local_vote_lock_locked(vote.height, vote.round, consensus_payload_id(frontier_it->second.transition));
+        update_local_vote_lock_locked(vote.height, vote.round, frontier_it->second);
       }
     }
     relay_vote = from_network && !should_mute_peer_locked(from_peer_id);

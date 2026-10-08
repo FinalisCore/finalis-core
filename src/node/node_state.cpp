@@ -1065,54 +1065,91 @@ bool Node::load_state() {
       }
     }
   }
-  for (const auto& [key, value] : db_.scan_prefix(kConsensusSafetyStatePrefix)) {
-    if (key.size() <= std::strlen(kConsensusSafetyStatePrefix)) continue;
-    auto height_bytes = hex_decode(key.substr(std::strlen(kConsensusSafetyStatePrefix)));
-    if (!height_bytes.has_value() || height_bytes->size() != 8) continue;
+  // SAFETY: a persisted local vote lock for a height that has not finalized is restored as-is and
+  // is never dropped at startup, whether or not a QC exists for it. Dropping it would let this node
+  // sign a payload conflicting with a vote it already broadcast (see update_local_vote_lock_locked).
+  // Rows at or below the finalized height are released, as the finalization batch would have done.
+  auto parse_height_key = [](const std::string& key, const char* prefix) -> std::optional<std::uint64_t> {
+    if (key.size() <= std::strlen(prefix)) return std::nullopt;
+    auto height_bytes = hex_decode(key.substr(std::strlen(prefix)));
+    if (!height_bytes.has_value() || height_bytes->size() != 8) return std::nullopt;
     std::uint64_t height = 0;
     for (std::size_t i = 0; i < 8; ++i) height |= static_cast<std::uint64_t>((*height_bytes)[i]) << (8 * i);
+    return height;
+  };
+  for (const auto& [key, value] : db_.scan_prefix(kConsensusSafetyStatePrefix)) {
+    const auto height = parse_height_key(key, kConsensusSafetyStatePrefix);
+    if (!height.has_value()) continue;
+    if (*height <= finalized_height_) {
+      (void)db_.erase(key);
+      continue;
+    }
     std::optional<std::pair<Hash32, std::uint32_t>> lock_state;
     std::optional<QuorumCertificate> qc_state;
     std::optional<Hash32> qc_payload_id;
     if (!parse_consensus_safety_state(value, &lock_state, &qc_state, &qc_payload_id)) {
+      // Rows are written atomically, so this is storage corruption, not a torn write.
+      log_line("consensus-safety-row-dropped height=" + std::to_string(*height) + " reason=parse-failed");
       (void)db_.erase(key);
       continue;
     }
-    if (height != finalized_height_ + 1) {
-      (void)db_.erase(key);
-      continue;
-    }
-    bool valid = true;
+    bool qc_valid = true;
     if (qc_state.has_value()) {
-      if (qc_state->height != height || !qc_payload_id.has_value()) {
-        valid = false;
+      if (qc_state->height != *height || !qc_payload_id.has_value()) {
+        qc_valid = false;
       } else {
         std::vector<FinalitySig> filtered;
-        valid = verify_quorum_certificate_locked(*qc_state, &filtered, nullptr);
+        qc_valid = verify_quorum_certificate_locked(*qc_state, &filtered, nullptr);
       }
     } else if (qc_payload_id.has_value()) {
-      valid = false;
+      qc_valid = false;
     }
-    if (!valid) {
+    if (lock_state.has_value()) local_vote_locks_[*height] = *lock_state;
+    if (qc_valid) {
+      if (qc_state.has_value()) highest_qc_by_height_[*height] = *qc_state;
+      if (qc_payload_id.has_value()) highest_qc_payload_by_height_[*height] = *qc_payload_id;
+    } else {
+      // Drop only the unverifiable QC; the lock is kept.
+      log_line("consensus-safety-qc-dropped height=" + std::to_string(*height) + " reason=invalid-persisted-qc" +
+               " lock=" + std::string(lock_state.has_value() ? "kept" : "none"));
+      if (!persist_consensus_safety_state_locked(*height)) return false;
+    }
+  }
+  for (const auto& [key, value] : db_.scan_prefix(kConsensusLockedProposalPrefix)) {
+    const auto height = parse_height_key(key, kConsensusLockedProposalPrefix);
+    if (!height.has_value()) continue;
+    if (*height <= finalized_height_) {
       (void)db_.erase(key);
       continue;
     }
-    if (lock_state.has_value()) local_vote_locks_[height] = *lock_state;
-    if (qc_state.has_value()) highest_qc_by_height_[height] = *qc_state;
-    if (qc_payload_id.has_value()) highest_qc_payload_by_height_[height] = *qc_payload_id;
-  }
-  {
-    // Recover from persisted stale lock-only safety state at next height.
-    // A lock without a corresponding QC can deadlock round-0 voting after restart
-    // (proposal-local-vote-skip reason=missing-qc) with no way to unlock.
-    const std::uint64_t next_height = finalized_height_ + 1;
-    const bool has_lock = local_vote_locks_.find(next_height) != local_vote_locks_.end();
-    const bool has_qc = highest_qc_by_height_.find(next_height) != highest_qc_by_height_.end();
-    if (has_lock && !has_qc) {
-      log_line("consensus-safety-reset height=" + std::to_string(next_height) +
-               " reason=stale-lock-without-qc-at-startup");
-      clear_consensus_safety_state_locked(next_height);
+    // Restore the locked proposal as a candidate so the TC-round re-proposal path in the
+    // proposer loop can rebuild it; without it a lock held across a network-wide restart can
+    // never be satisfied (the deadlock that previously motivated dropping the lock here).
+    const auto lock_it = local_vote_locks_.find(*height);
+    auto proposal = FrontierProposal::parse(value);
+    if (lock_it == local_vote_locks_.end() || !proposal.has_value() || proposal->transition.height != *height ||
+        consensus_payload_id(proposal->transition) != lock_it->second.first) {
+      log_line("consensus-locked-proposal-ignored height=" + std::to_string(*height) +
+               " reason=" + std::string(lock_it == local_vote_locks_.end() ? "no-lock"
+                                        : !proposal.has_value()             ? "parse-failed"
+                                                                            : "payload-mismatch"));
+      continue;
     }
+    const auto transition_id = proposal->transition.transition_id();
+    candidate_block_sizes_[transition_id] = value.size();
+    candidate_frontier_proposals_[transition_id] = std::move(*proposal);
+    log_line("consensus-locked-proposal-restored height=" + std::to_string(*height) +
+             " round=" + std::to_string(lock_it->second.second) + " payload=" + short_hash_hex(lock_it->second.first));
+  }
+  for (const auto& [height, lock] : local_vote_locks_) {
+    const bool has_body = std::any_of(candidate_frontier_proposals_.begin(), candidate_frontier_proposals_.end(),
+                                      [&](const auto& kv) {
+                                        return kv.second.transition.height == height &&
+                                               consensus_payload_id(kv.second.transition) == lock.first;
+                                      });
+    log_line("consensus-safety-lock-restored height=" + std::to_string(height) + " round=" +
+             std::to_string(lock.second) + " payload=" + short_hash_hex(lock.first) +
+             " proposal=" + std::string(has_body ? "restored" : "missing"));
   }
   log_line("startup-progress phase=load-state-done");
   last_open_epoch_ticket_epoch_ = current_epoch_ticket_epoch_locked();

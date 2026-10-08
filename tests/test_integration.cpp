@@ -1548,8 +1548,11 @@ void append_live_certified_tx_or_throw(Cluster& cluster, const Tx& tx, const std
   throw std::runtime_error(context + ": " + ingress_error);
 }
 
+// keep_validator_keys: preserve each node's keystore across the wipe so local keys stay in the
+// genesis committee (otherwise init() generates fresh keys and no node can cast its own vote).
 bool restart_cluster_with_seeded_certified_ingress(Cluster* cluster, const std::vector<Bytes>& raw_records,
-                                                   bool start_nodes = true, bool pause_nodes = false) {
+                                                   bool start_nodes = true, bool pause_nodes = false,
+                                                   bool keep_validator_keys = false) {
   if (!cluster) return false;
   for (auto& n : cluster->nodes) {
     if (n) n->stop();
@@ -1558,7 +1561,19 @@ bool restart_cluster_with_seeded_certified_ingress(Cluster* cluster, const std::
 
   for (const auto& cfg : cluster->configs) {
     std::error_code ec;
+    std::string saved_key;
+    if (keep_validator_keys) {
+      std::ifstream in(cfg.validator_key_file, std::ios::binary);
+      if (!in) return false;
+      saved_key.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
     std::filesystem::remove_all(cfg.db_path, ec);
+    if (keep_validator_keys) {
+      std::filesystem::create_directories(std::filesystem::path(cfg.validator_key_file).parent_path(), ec);
+      std::ofstream out(cfg.validator_key_file, std::ios::binary | std::ios::trunc);
+      if (!out) return false;
+      out << saved_key;
+    }
     {
       node::Node seed(cfg);
       if (!seed.init()) return false;
@@ -6974,6 +6989,100 @@ TEST(test_only_one_block_can_finalize_per_height_after_vote_locking) {
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_a));
   ASSERT_TRUE(!target->inject_propose_msg_for_test(make_test_frontier_propose_msg(*proposal_b)));
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_a));
+}
+
+// Regression: load_state used to drop a next-height vote lock that had no QC, so a validator that
+// voted for A, crashed and restarted could then sign a conflicting payload at the same height.
+TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(keys.size() >= 4u);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_vote_lock_restart"), 4, 4, 4);
+  Tx tx = make_fixture_ingress_tx(1, 0x8B);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true));
+  const std::uint64_t target_height = cluster.nodes[0]->status().height + 1;
+  const std::uint32_t round0 = 0;
+  const std::uint32_t round1 = 1;
+
+  // A carries the ingress record, B is empty: same height, conflicting payloads.
+  // Built up front because the builder drives nodes[0]'s round and needs it running.
+  auto proposal_a0 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx.serialize()}, target_height, round0, "/tmp/finalis_it_vote_lock_restart_a0");
+  auto proposal_b0 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {}, target_height, round0, "/tmp/finalis_it_vote_lock_restart_b0");
+  auto proposal_a1 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {tx.serialize()}, target_height, round1, "/tmp/finalis_it_vote_lock_restart_a1");
+  auto proposal_b1 = build_cluster_frontier_proposal_from_records(
+      cluster, keys, {}, target_height, round1, "/tmp/finalis_it_vote_lock_restart_b1");
+  ASSERT_TRUE(proposal_a0.has_value());
+  ASSERT_TRUE(proposal_b0.has_value());
+  ASSERT_TRUE(proposal_a1.has_value());
+  ASSERT_TRUE(proposal_b1.has_value());
+  const auto a0_id = frontier_proposal_id(*proposal_a0);
+  const auto b0_id = frontier_proposal_id(*proposal_b0);
+  const auto a1_id = frontier_proposal_id(*proposal_a1);
+  const auto b1_id = frontier_proposal_id(*proposal_b1);
+  ASSERT_TRUE(a0_id != b0_id);
+
+  // Target: a committee member for both rounds (cluster.nodes[0] need not be one).
+  std::size_t ti = cluster.nodes.size();
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(target_height, round0) &&
+        cluster.nodes[k]->local_is_committee_member_for_test(target_height, round1)) {
+      ti = k;
+      break;
+    }
+  }
+  ASSERT_TRUE(ti < cluster.nodes.size());
+
+  // 1. Vote for A at (h, 0): this creates the durable lock.
+  ASSERT_TRUE(advance_test_frontier_round(*cluster.nodes[ti], target_height, round0));
+  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_a0)),
+            std::string("accepted"));
+  ASSERT_TRUE(cluster.nodes[ti]->local_vote_recorded_for_test(target_height, round0, a0_id));
+  ASSERT_TRUE(cluster.nodes[ti]->status().height + 1 == target_height);  // one vote: no quorum
+  const auto lock_before = cluster.nodes[ti]->local_vote_lock_for_test(target_height);
+  ASSERT_TRUE(lock_before.has_value());
+  ASSERT_EQ(lock_before->second, round0);
+  ASSERT_TRUE(!cluster.nodes[ti]->highest_qc_for_height_for_test(target_height).has_value());
+
+  // 2. Crash/restart the validator.
+  cluster.nodes[ti]->stop();
+  cluster.nodes[ti].reset();
+  cluster.nodes[ti] = std::make_unique<node::Node>(cluster.configs[ti]);
+  ASSERT_TRUE(cluster.nodes[ti]->init());
+  auto& target = cluster.nodes[ti];
+  ASSERT_TRUE(target->status().height + 1 == target_height);
+  const auto lock_after = target->local_vote_lock_for_test(target_height);
+  ASSERT_TRUE(lock_after.has_value());
+  ASSERT_TRUE(lock_after->first == lock_before->first);
+  ASSERT_EQ(lock_after->second, lock_before->second);
+  ASSERT_TRUE(target->has_candidate_frontier_proposal_for_test(a0_id));
+  ASSERT_TRUE(target->pause_proposals_for_test(true));
+  target->start();
+
+  // 3a. Conflicting proposal at the same (h, 0): must not be signed.
+  ASSERT_TRUE(advance_test_frontier_round(*target, target_height, round0));
+  (void)target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_b0));
+  ASSERT_TRUE(!target->local_vote_recorded_for_test(target_height, round0, b0_id));
+
+  // 3b. Conflicting proposal at (h, 1) justified only by a TC: a TC cannot unlock.
+  const auto committee0 = target->committee_for_height_round_for_test(target_height, round0);
+  const auto quorum0 = consensus::quorum_threshold(committee0.size());
+  const auto tc0 = make_test_timeout_certificate(keys, committee0, target_height, round0, quorum0);
+  ASSERT_TRUE(tc0.signatures.size() >= quorum0);
+  auto b1_msg = make_test_frontier_propose_msg(*proposal_b1);
+  b1_msg.justify_tc = tc0;
+  (void)target->inject_network_propose_result_for_test(b1_msg);
+  ASSERT_TRUE(!target->local_vote_recorded_for_test(target_height, round1, b1_id));
+  const auto lock_final = target->local_vote_lock_for_test(target_height);
+  ASSERT_TRUE(lock_final.has_value());
+  ASSERT_TRUE(lock_final->first == lock_before->first);
+
+  // 4. Liveness: a TC-round re-proposal of the locked payload is still votable after restart.
+  auto a1_msg = make_test_frontier_propose_msg(*proposal_a1);
+  a1_msg.justify_tc = tc0;
+  ASSERT_EQ(target->inject_network_propose_result_for_test(a1_msg), std::string("accepted"));
+  ASSERT_TRUE(target->local_vote_recorded_for_test(target_height, round1, a1_id));
 }
 
 TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
