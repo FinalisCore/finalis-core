@@ -1421,10 +1421,11 @@ bool restart_single_node_with_seeded_certified_ingress(const node::NodeConfig& c
   return true;
 }
 
-bool append_live_certified_ingress_to_nodes(const std::string& db_path, const std::vector<node::Node*>& nodes,
-                                            const std::vector<Bytes>& raw_records, int peer_id = 7,
-                                            std::string* error = nullptr,
-                                            const crypto::KeyPair* signer_override = nullptr) {
+// One attempt: derive lane seqs from a read-only open of db_path, then inject into every node.
+// *injected_any is set once any node has accepted a range.
+bool append_live_certified_ingress_to_nodes_once(const std::string& db_path, const std::vector<node::Node*>& nodes,
+                                                 const std::vector<Bytes>& raw_records, int peer_id, std::string* error,
+                                                 const crypto::KeyPair* signer_override, bool* injected_any) {
   if (nodes.empty()) return false;
   struct PendingRange {
     std::uint32_t lane{0};
@@ -1495,9 +1496,38 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
         }
         return false;
       }
+      *injected_any = true;
     }
   }
   return true;
+}
+
+// db_path is opened read-only while its owning node is live and writing. A read-only RocksDB
+// open is a point-in-time view that can miss the writer's most recent lane-state updates
+// (notably when it races a memtable flush / WAL rotation), so the derived seq can lag the
+// node's real lane tip and the node rejects it with ingress-seq-discontinuity. Re-derive from
+// a fresh open and retry, but only while no node has accepted anything yet: once a node has
+// appended, a rejection elsewhere is a real divergence and must surface.
+bool append_live_certified_ingress_to_nodes(const std::string& db_path, const std::vector<node::Node*>& nodes,
+                                            const std::vector<Bytes>& raw_records, int peer_id = 7,
+                                            std::string* error = nullptr,
+                                            const crypto::KeyPair* signer_override = nullptr) {
+  constexpr int kMaxAttempts = 10;
+  std::string attempt_error;
+  for (int attempt = 1;; ++attempt) {
+    attempt_error.clear();
+    bool injected_any = false;
+    if (append_live_certified_ingress_to_nodes_once(db_path, nodes, raw_records, peer_id, &attempt_error,
+                                                    signer_override, &injected_any)) {
+      return true;
+    }
+    const bool stale_seq_view = attempt_error.find("reason=ingress-seq-discontinuity") != std::string::npos ||
+                                attempt_error.find("reason=ingress-prev-lane-root-mismatch") != std::string::npos;
+    if (injected_any || !stale_seq_view || attempt >= kMaxAttempts) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50 * attempt));
+  }
+  if (error) *error = attempt_error;
+  return false;
 }
 
 bool append_live_certified_ingress_to_cluster(Cluster& cluster, const std::vector<Bytes>& raw_records, int peer_id = 7,
