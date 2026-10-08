@@ -1200,14 +1200,12 @@ std::uint64_t txv2_confidential_verify_weight(const TxV2& tx) {
   for (const auto& input : tx.inputs) {
     if (input.kind == TxInputKind::Confidential) weight += kConfidentialSignatureVerifyWeight;
   }
-  bool has_range_proof = false;
   for (const auto& output : tx.outputs) {
     if (output.kind != TxOutputKind::Confidential) continue;
-    has_range_proof = true;
-    weight += std::get<ConfidentialTxOutV2>(output.body).range_proof.bytes.size();
+    weight += std::get<ConfidentialTxOutV2>(output.body).range_proof.bytes.size() + kConfidentialOutputVerifyWeight;
   }
-  if (has_range_proof) weight += kRangeProofBatchVerifyWeight;
   if (!crypto::commitment_is_identity(tx.balance_proof.excess_commitment)) weight += kConfidentialSignatureVerifyWeight;
+  if (weight != 0) weight += kConfidentialTxBaseVerifyWeight;
   return weight;
 }
 

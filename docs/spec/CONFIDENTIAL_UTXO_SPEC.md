@@ -543,12 +543,16 @@ are later rejected) and is invalid (`frontier-confidential-verify-weight-exceede
 exceeds `max_block_confidential_verify_weight`:
 
 ```text
-txv2_confidential_verify_weight(tx) =
-    256  * count(confidential inputs)            # spend signature
-  + sum(range_proof.bytes.size())                # per confidential output
-  + 1024 * (1 if any confidential output else 0) # range proof batch
-  + 256  * (1 if excess commitment is not identity else 0)  # excess authorization
+w(tx) =
+    64  * count(confidential inputs)                          # spend signature + tally term
+  + sum(range_proof.bytes.size() + 256)                      # per confidential output
+  + 64  * (1 if excess commitment is not identity else 0)    # excess authorization
+txv2_confidential_verify_weight(tx) = w(tx) == 0 ? 0 : w(tx) + 256   # per-tx base
 ```
+
+Unit: one range-proof byte (~0.72 us). The constants are calibrated by
+`tools/bench_confidential_verify.cpp`; measurements are recorded next to them in
+`src/utxo/validate.hpp`. Every benchmarked shape is charged at or above its measured cost.
 
 Proposers stop adding ingress records before the cap; `TxValidationCost.confidential_verify_weight`
 reports the same value.
