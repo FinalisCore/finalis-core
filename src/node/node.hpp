@@ -295,6 +295,8 @@ class Node {
   std::optional<FrontierProposal> build_frontier_proposal_for_test(std::uint64_t height, std::uint32_t round);
   std::string last_test_hook_error_for_test() const;
   std::optional<p2p::GetIngressRangeMsg> requested_ingress_range_for_test(int peer_id, std::uint32_t lane) const;
+  // The node's live ingress lane tip, read through its own DB handle.
+  std::optional<LaneState> lane_state_for_test(std::uint32_t lane) const;
   bool overwrite_runtime_next_height_checkpoint_for_test(const storage::FinalizedCommitteeCheckpoint& checkpoint);
   bool overwrite_runtime_frontier_cursor_for_test(std::uint64_t finalized_frontier);
   void set_peer_ip_for_test(int peer_id, const std::string& ip);

@@ -22,6 +22,9 @@ std::uint32_t assign_ingress_lane(const TxV2& tx);
 std::uint32_t assign_ingress_lane(const AnyTx& tx);
 Hash32 compute_lane_root_append(const Hash32& prev_root, const Hash32& tx_hash);
 
+// tx_bytes parse, and their txid, hash and lane match the certificate.
+bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_bytes, std::string* error = nullptr);
+
 bool validate_ingress_certificate_epoch(const IngressCertificate& cert, std::uint64_t expected_epoch,
                                        std::string* error = nullptr);
 
