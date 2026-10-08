@@ -182,6 +182,10 @@ add_library(finalis_core
   src/node/node_test_hooks.cpp
   src/node/node_args.cpp
   src/node/node_state.cpp
+  src/node/node_consensus.cpp
+  src/node/node_ingress.cpp
+  src/node/node_network.cpp
+  src/node/node_validator_ops.cpp
   src/lightserver/client.cpp
   src/lightserver/server.cpp
 )

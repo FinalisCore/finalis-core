@@ -31,6 +31,59 @@ std::string short_hash_hex(const Hash32& h) {
   return hex_encode(b);
 }
 
+const char* msg_type_name(std::uint16_t msg_type) {
+  switch (msg_type) {
+    case p2p::MsgType::VERSION:
+      return "VERSION";
+    case p2p::MsgType::VERACK:
+      return "VERACK";
+    case p2p::MsgType::GET_FINALIZED_TIP:
+      return "GET_FINALIZED_TIP";
+    case p2p::MsgType::FINALIZED_TIP:
+      return "FINALIZED_TIP";
+    case p2p::MsgType::PROPOSE:
+      return "PROPOSE";
+    case p2p::MsgType::VOTE:
+      return "VOTE";
+    case p2p::MsgType::TIMEOUT_VOTE:
+      return "TIMEOUT_VOTE";
+    case p2p::MsgType::GET_TRANSITION:
+      return "GET_TRANSITION";
+    case p2p::MsgType::TRANSITION:
+      return "TRANSITION";
+    case p2p::MsgType::TX:
+      return "TX";
+    case p2p::MsgType::GETADDR:
+      return "GETADDR";
+    case p2p::MsgType::ADDR:
+      return "ADDR";
+    case p2p::MsgType::PING:
+      return "PING";
+    case p2p::MsgType::PONG:
+      return "PONG";
+    case p2p::MsgType::GET_TRANSITION_BY_HEIGHT:
+      return "GET_TRANSITION_BY_HEIGHT";
+    case p2p::MsgType::EPOCH_TICKET:
+      return "EPOCH_TICKET";
+    case p2p::MsgType::GET_EPOCH_TICKETS:
+      return "GET_EPOCH_TICKETS";
+    case p2p::MsgType::EPOCH_TICKETS:
+      return "EPOCH_TICKETS";
+    case p2p::MsgType::INGRESS_RECORD:
+      return "INGRESS_RECORD";
+    case p2p::MsgType::GET_INGRESS_TIPS:
+      return "GET_INGRESS_TIPS";
+    case p2p::MsgType::INGRESS_TIPS:
+      return "INGRESS_TIPS";
+    case p2p::MsgType::GET_INGRESS_RANGE:
+      return "GET_INGRESS_RANGE";
+    case p2p::MsgType::INGRESS_RANGE:
+      return "INGRESS_RANGE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 const char* availability_status_name(availability::AvailabilityOperatorStatus status) {
   switch (status) {
     case availability::AvailabilityOperatorStatus::WARMUP:

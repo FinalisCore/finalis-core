@@ -52,6 +52,7 @@ inline bool zero_outpoint(const OutPoint& op) { return op.txid == zero_hash() &&
 // --- Helpers (defined in node_internal.cpp) ---
 std::string short_pub_hex(const PubKey32& pub);
 std::string short_hash_hex(const Hash32& h);
+const char* msg_type_name(std::uint16_t msg_type);
 const char* availability_status_name(availability::AvailabilityOperatorStatus status);
 const char* checkpoint_derivation_mode_name(storage::FinalizedCommitteeDerivationMode mode);
 const char* checkpoint_fallback_reason_name(storage::FinalizedCommitteeFallbackReason reason);
