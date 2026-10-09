@@ -10,6 +10,7 @@
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTextEdit>
+#include <QThread>
 
 #include <cstdlib>
 #include <iostream>
@@ -179,17 +180,18 @@ void test_wallet_window_local_filter_preserves_rendered_ordering() {
   require(table->item(0, 1)->text().toStdString() == "Pending (local)", "local pending row status mismatch");
   require(table->item(1, 0)->text().toStdString() == "Local Send (local)", "local finalized row type mismatch");
   require(table->item(1, 1)->text().toStdString() == "Finalized", "local finalized row status mismatch");
-  require(table->item(2, 0)->text().toStdString() == "Local Event (local)", "local release row type mismatch");
-  require(table->item(2, 1)->text().toStdString() == "Info", "local release row status mismatch");
-  require(table->item(3, 0)->text().toStdString() == "Onboarding (local)", "local onboarding row type mismatch");
-  require(table->item(3, 1)->text().toStdString() == "Info", "local onboarding row status mismatch");
+  // Same-bucket local rows render newest-first, so the later onboarding line precedes the release line.
+  require(table->item(2, 0)->text().toStdString() == "Onboarding (local)", "local onboarding row type mismatch");
+  require(table->item(2, 1)->text().toStdString() == "Info", "local onboarding row status mismatch");
+  require(table->item(3, 0)->text().toStdString() == "Local Event (local)", "local release row type mismatch");
+  require(table->item(3, 1)->text().toStdString() == "Info", "local release row status mismatch");
   require(window.activity_local_count_label_->text().toStdString() == "Local: 4", "local count chip mismatch");
 }
 
 void test_advanced_page_onboarding_defaults() {
   finalis::wallet::AdvancedPage page;
   require(page.tab_widget() != nullptr, "advanced tabs missing");
-  require(page.tab_widget()->count() == 4, "advanced tab count mismatch");
+  require(page.tab_widget()->count() == 3, "advanced tab count mismatch");
   require(page.tab_widget()->tabText(0).toStdString() == "Validator", "validator tab missing");
 
   auto* summary = page.validator_summary_label();
@@ -202,7 +204,7 @@ void test_advanced_page_onboarding_defaults() {
 
   auto* action = page.validator_action_button();
   require(action != nullptr, "validator action button missing");
-  require(action->text().toStdString() == "Start Validator Onboarding", "validator action button text mismatch");
+  require(action->text().toStdString() == "Register Validator", "validator action button text mismatch");
 
   auto* details = page.validator_details_container();
   require(details != nullptr, "validator details container missing");
@@ -257,6 +259,18 @@ void test_wallet_window_adaptive_regime_diagnostics_render_current_status() {
           "adaptive regime detail missing sticky fallback flag");
 }
 
+// The onboarding panel refreshes on a background thread and update_validator_onboarding_view() is throttled to once per
+// 15s, so drive the refresh directly and pump events until the worker's result has been applied.
+void refresh_onboarding_view_and_wait(finalis::wallet::WalletWindow& window) {
+  window.refresh_validator_readiness_panel(false);
+  const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + 10'000;
+  while (window.validator_refresh_in_flight_) {
+    require(QDateTime::currentMSecsSinceEpoch() < deadline, "validator onboarding refresh timed out");
+    QApplication::processEvents();
+    QThread::msleep(5);
+  }
+}
+
 void test_wallet_window_onboarding_badge_states() {
   QSettings settings(kSettingsOrg, kSettingsApp);
   settings.clear();
@@ -264,19 +278,19 @@ void test_wallet_window_onboarding_badge_states() {
   finalis::wallet::WalletWindow window;
   require(window.validator_state_label_ != nullptr, "wallet validator state label missing");
 
-  window.update_validator_onboarding_view();
+  refresh_onboarding_view_and_wait(window);
   require(window.validator_state_label_->text().contains("IDLE"), "wallet onboarding state missing idle badge");
   require(window.validator_state_label_->text().contains("Not started"), "wallet onboarding state missing idle text");
 
   settings.setValue("validator/last_txid", "abcd1234");
   settings.setValue("validator/detached_local", false);
   settings.sync();
-  window.update_validator_onboarding_view();
+  refresh_onboarding_view_and_wait(window);
   require(window.validator_state_label_->text().contains("TRACKED"), "wallet onboarding state missing tracked badge");
 
   settings.setValue("validator/detached_local", true);
   settings.sync();
-  window.update_validator_onboarding_view();
+  refresh_onboarding_view_and_wait(window);
   require(window.validator_state_label_->text().contains("DETACHED"), "wallet onboarding state missing detached badge");
 }
 
@@ -337,19 +351,42 @@ int main(int argc, char** argv) {
     return 1;
   }
   qputenv("XDG_CONFIG_HOME", QByteArray(settings_dir));
+  // Isolate HOME too: WalletWindow falls back to ~/.finalis/mainnet/keystore/validator.json and would block on a
+  // passphrase prompt if the developer machine has one.
+  qputenv("HOME", QByteArray(settings_dir));
   qputenv("QT_QPA_PLATFORM", QByteArray("offscreen"));
   QApplication app(argc, argv);
   try {
-  test_activity_page_local_filter_and_chips();
-  test_wallet_window_history_selection_updates_detail_panel();
-  test_wallet_window_confidential_detail_shows_reservation_gate();
-  test_wallet_window_local_filter_preserves_rendered_ordering();
+    std::cout << "Starting test 1: test_activity_page_local_filter_and_chips" << std::endl;
+    test_activity_page_local_filter_and_chips();
+    std::cout << "Completed test 1" << std::endl;
+    std::cout << "Starting test 2: test_wallet_window_history_selection_updates_detail_panel" << std::endl;
+    test_wallet_window_history_selection_updates_detail_panel();
+    std::cout << "Completed test 2" << std::endl;
+    std::cout << "Starting test 3: test_wallet_window_confidential_detail_shows_reservation_gate" << std::endl;
+    test_wallet_window_confidential_detail_shows_reservation_gate();
+    std::cout << "Completed test 3" << std::endl;
+    std::cout << "Starting test 4: test_wallet_window_local_filter_preserves_rendered_ordering" << std::endl;
+    test_wallet_window_local_filter_preserves_rendered_ordering();
+    std::cout << "Completed test 4" << std::endl;
+    std::cout << "Starting test 5: test_advanced_page_onboarding_defaults" << std::endl;
     test_advanced_page_onboarding_defaults();
+    std::cout << "Completed test 5" << std::endl;
+    std::cout << "Starting test 6: test_wallet_window_adaptive_regime_diagnostics_render_current_status" << std::endl;
     test_wallet_window_adaptive_regime_diagnostics_render_current_status();
+    std::cout << "Completed test 6" << std::endl;
+    std::cout << "Starting test 7: test_wallet_window_onboarding_badge_states" << std::endl;
     test_wallet_window_onboarding_badge_states();
+    std::cout << "Completed test 7" << std::endl;
+    std::cout << "Starting test 8: test_wallet_window_defaults_to_lightserver_rpc_port" << std::endl;
     test_wallet_window_defaults_to_lightserver_rpc_port();
+    std::cout << "Completed test 8" << std::endl;
+    std::cout << "Starting test 9: test_wallet_history_flow_classification_uses_net_wallet_effect" << std::endl;
     test_wallet_history_flow_classification_uses_net_wallet_effect();
+    std::cout << "Completed test 9" << std::endl;
+    std::cout << "Starting test 10: test_onboarding_failed_state_wording_contract" << std::endl;
     test_onboarding_failed_state_wording_contract();
+    std::cout << "Completed test 10" << std::endl;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;
