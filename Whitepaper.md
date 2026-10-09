@@ -1,7 +1,7 @@
 # Finalis: A Finalized-Tip Byzantine Settlement Protocol
 
 **Technical Whitepaper**  
-April 2026 | reikagitakashi@gmail.com
+October 2026 | reikagitakashi@gmail.com
 
 ## Abstract
 
@@ -95,7 +95,7 @@ Ingress validity requires:
 - lane assignment recomputes and matches certificate lane
 - strict sequence continuity and `prev_lane_root` chaining
 
-Stale-epoch ingress is rejected. Equivocation at fixed `(epoch, lane, seq)` is rejected and persisted as deterministic evidence.
+Stale-epoch ingress is rejected. Equivocation at fixed `(epoch, lane, seq)` is rejected and persisted as deterministic evidence. Re-delivery of a record whose certificate is identical to the one already stored (for example, a record first received by gossip and then again in a range-sync response) is an idempotent no-op, not a sequence violation; genuine gaps remain rejected.
 
 **Proposition 3 (Ingress Epoch Freshness).**  
 Certified ingress from a stale epoch cannot enter canonical execution.
@@ -190,6 +190,27 @@ transparent outputs in `TxV2`.
 *Proof sketch.* Validation dispatch uses shared script-semantic checks for
 `SCONBREG`, `SCVALJRQ`, and `SCVALREG` invariants.
 
+### 7.1 Confidential Outputs
+
+Confidential UTXOs are enabled from genesis. A confidential output carries a Pedersen value commitment, a one-time stealth public key, and a range proof. A `TxV2` balances when its commitments, transparent values, and fee sum to an excess commitment, and that excess is authorized by a BIP340 Schnorr signature under the excess blind. Each confidential input is authorized by a Schnorr signature under its one-time spend key.
+
+Consensus bounds on confidential work:
+
+- at most 16 confidential inputs and 12 confidential outputs per transaction; 12 canonical range proofs (at most 5,134 bytes each) fit the 65,536-byte per-transaction proof budget, and 13 do not
+- a structural verify weight per `TxV2`, computed before any cryptographic verification: 64 per confidential input, range-proof bytes + 256 per confidential output, 64 for a non-identity excess, plus a 256 per-transaction base when any of these apply; the unit is one range-proof byte (about 0.72 µs of verification, calibrated by benchmark)
+- a block-level cap of 2,000,000 verify weight over every parseable `TxV2` in the ordered frontier slice, including transactions later rejected; a slice above the cap is an invalid transition
+
+**Proposition 6 (Confidential Turnstile).**  
+The value held in confidential outputs never goes negative in canonical state.
+
+*Proof sketch.* Canonical derived state commits a pool value `P`, updated
+only from public data: each accepted `TxV2` adds its transparent inputs minus
+transparent outputs minus fee. Frontier execution rejects any `TxV2` that would
+make `P` negative, so a forged range proof cannot withdraw more transparent
+value than has entered the confidential pool.
+
+The reference wallet draws fresh auxiliary randomness from the operating-system CSPRNG for every confidential Schnorr signature (spend and excess). This is wallet hygiene, not a consensus rule: BIP340 signatures stay valid for any auxiliary input.
+
 ## 8. Economics and Incentives
 
 Economics is separated into two deterministic planes:
@@ -226,7 +247,7 @@ Finalis security requires:
 
 The protocol intentionally prefers safe halt over speculative reconstruction when authoritative finalized artifacts are missing or inconsistent.
 
-**Proposition 6 (Fail-Closed Recovery).**  
+**Proposition 7 (Fail-Closed Recovery).**  
 Missing/inconsistent authoritative finalized artifacts lead to halt, not
 speculative canonical continuation.
 
@@ -280,3 +301,4 @@ Security posture:
 - `docs/ADVERSARIAL_MODEL.md`
 - `docs/spec/CHECKPOINT_DERIVATION_SPEC.md`
 - `docs/spec/AVAILABILITY_STATE_COMPLETENESS.md`
+- `docs/spec/CONFIDENTIAL_UTXO_SPEC.md`
