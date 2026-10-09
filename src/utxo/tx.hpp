@@ -199,9 +199,13 @@ struct FrontierTransition {
   Hash32 ordered_slice_commitment{};
   Hash32 decisions_commitment{};
   std::uint32_t quorum_threshold{0};
-  // Participation record for the parent height (height - 1): the votes this
+  // Round of the parent's precommits recorded in prev_finality_signers. A transition can be
+  // re-proposed in a later round and finalized there, so this can differ from the parent
+  // transition's own round; it is the canonical commit round of the parent.
+  std::uint32_t prev_finality_round{0};
+  // Participation record for the parent height (height - 1): the precommits this
   // transition's proposer observed for the parent's finalized
-  // (height - 1, parent round, parent transition id). Sorted by pubkey, unique,
+  // (height - 1, prev_finality_round, parent transition id). Sorted by pubkey, unique,
   // each signature valid, at least the parent committee's quorum. Empty only
   // when the parent is genesis. Liveness and reward accounting for the parent
   // height are evaluated from this set, not from the quorum-truncated

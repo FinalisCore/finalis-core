@@ -144,18 +144,21 @@ struct ParentFinalityContext {
   std::size_t quorum{0};
 };
 
-// Resolves the parent (prev.finalized_height) context. The committee is the
-// canonical committee for (parent height, parent round). Signatures are not checked here.
+// Resolves the parent (prev.finalized_height) context at the parent's commit round, which a child
+// names in prev_finality_round and which is never earlier than the parent transition's own round.
+// The committee is the canonical committee for (parent height, commit round). Signatures are not
+// checked here.
 bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                                     const std::vector<FinalitySig>& signers, ParentFinalityContext* out,
+                                     std::uint32_t parent_commit_round, ParentFinalityContext* out,
                                      std::string* error);
-// Sorts and dedups `signers` by pubkey, then requires: empty iff the parent is
-// genesis; otherwise every signer is a parent committee member with a valid
-// vote signature over (parent height, parent round, parent transition id), and
-// the count is at least the parent quorum.
+// Sorts and dedups `signers` by pubkey, then requires: empty and commit round 0 iff the parent is
+// genesis; otherwise every signer is a parent committee member with a valid precommit signature
+// over (parent height, parent_commit_round, parent transition id), and the count is at least the
+// parent quorum.
 bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConfig& cfg,
                                                    const CanonicalDerivedState& prev,
                                                    const std::vector<FinalitySig>& signers,
+                                                   std::uint32_t parent_commit_round,
                                                    std::vector<FinalitySig>* canonical, std::string* error);
 // Accrues one finalized frontier transition into its epoch's reward state:
 // emission and fees for transition.height, the leader's score, and committee
@@ -168,6 +171,7 @@ void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const Va
                                   const std::vector<PubKey32>& parent_committee);
 bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
+                                           std::uint32_t prev_finality_round,
                                            const std::vector<FinalitySig>& prev_finality_signers,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,

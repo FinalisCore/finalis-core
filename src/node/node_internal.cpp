@@ -44,6 +44,8 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "PROPOSE";
     case p2p::MsgType::VOTE:
       return "VOTE";
+    case p2p::MsgType::PREVOTE:
+      return "PREVOTE";
     case p2p::MsgType::TIMEOUT_VOTE:
       return "TIMEOUT_VOTE";
     case p2p::MsgType::GET_TRANSITION:
@@ -733,26 +735,6 @@ bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
   return cert.committee_members == consensus::checkpoint_committee_for_round(checkpoint, cert.round);
 }
 
-Hash32 consensus_payload_id(const FrontierTransition& transition) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'F', 'R', 'O', 'N', 'T', 'I', 'E', 'R', '-', 'L', 'O', 'C', 'K', '-', 'P', 'A', 'Y',
-                'L', 'O', 'A', 'D', '-', 'V', '1'});
-  w.bytes_fixed(transition.prev_finalized_hash);
-  w.bytes_fixed(transition.prev_finality_link_hash);
-  w.u64le(transition.height);
-  w.varbytes(transition.prev_vector.serialize());
-  w.varbytes(transition.next_vector.serialize());
-  w.bytes_fixed(transition.ingress_commitment);
-  w.u64le(transition.prev_frontier);
-  w.u64le(transition.next_frontier);
-  w.bytes_fixed(transition.prev_state_root);
-  w.bytes_fixed(transition.next_state_root);
-  w.bytes_fixed(transition.ordered_slice_commitment);
-  w.bytes_fixed(transition.decisions_commitment);
-  w.bytes_fixed(transition.settlement_commitment);
-  return crypto::sha256d(w.data());
-}
-
 std::string key_consensus_locked_proposal(std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -826,53 +808,56 @@ std::optional<Bytes> unseal_consensus_safety_row(const Bytes& row, bool mirror) 
 }
 
 bool parse_consensus_safety_state(const Bytes& b, std::optional<std::pair<Hash32, std::uint32_t>>* lock_state,
-                                  std::optional<QuorumCertificate>* qc_state, std::optional<Hash32>* qc_payload_id) {
+                                  std::optional<QuorumCertificate>* valid_polka,
+                                  std::map<std::uint32_t, Hash32>* prevotes) {
   std::optional<std::pair<Hash32, std::uint32_t>> parsed_lock;
-  std::optional<QuorumCertificate> parsed_qc;
-  std::optional<Hash32> parsed_payload;
+  std::optional<QuorumCertificate> parsed_polka;
+  std::map<std::uint32_t, Hash32> parsed_prevotes;
   const bool ok = codec::parse_exact(b, [&](codec::ByteReader& r) {
     auto has_lock = r.u8();
     if (!has_lock) return false;
     if (*has_lock != 0) {
-      auto lock_block = r.bytes_fixed<32>();
+      auto lock_id = r.bytes_fixed<32>();
       auto lock_round = r.u32le();
-      if (!lock_block || !lock_round) return false;
-      parsed_lock = std::make_pair(*lock_block, *lock_round);
+      if (!lock_id || !lock_round) return false;
+      parsed_lock = std::make_pair(*lock_id, *lock_round);
     }
-    auto has_qc = r.u8();
-    if (!has_qc) return false;
-    if (*has_qc != 0) {
-      QuorumCertificate qc;
+    auto has_polka = r.u8();
+    if (!has_polka) return false;
+    if (*has_polka != 0) {
+      QuorumCertificate polka;
       auto height = r.u64le();
       auto round = r.u32le();
       auto transition_id = r.bytes_fixed<32>();
-      auto has_payload = r.u8();
-      if (!height || !round || !transition_id || !has_payload) return false;
-      qc.height = *height;
-      qc.round = *round;
-      qc.frontier_transition_id = *transition_id;
-      if (*has_payload != 0) {
-        auto payload = r.bytes_fixed<32>();
-        if (!payload) return false;
-        parsed_payload = *payload;
-      }
       auto sig_count = r.varint();
-      if (!sig_count) return false;
-      qc.signatures.reserve(*sig_count);
+      if (!height || !round || !transition_id || !sig_count) return false;
+      if (*sig_count > MAX_COMMITTEE) return false;
+      polka.height = *height;
+      polka.round = *round;
+      polka.frontier_transition_id = *transition_id;
+      polka.signatures.reserve(*sig_count);
       for (std::uint64_t i = 0; i < *sig_count; ++i) {
         auto pub = r.bytes_fixed<32>();
         auto sig = r.bytes_fixed<64>();
         if (!pub || !sig) return false;
-        qc.signatures.push_back(FinalitySig{*pub, *sig});
+        polka.signatures.push_back(FinalitySig{*pub, *sig});
       }
-      parsed_qc = qc;
+      parsed_polka = std::move(polka);
+    }
+    auto prevote_count = r.varint();
+    if (!prevote_count) return false;
+    for (std::uint64_t i = 0; i < *prevote_count; ++i) {
+      auto round = r.u32le();
+      auto transition_id = r.bytes_fixed<32>();
+      if (!round || !transition_id) return false;
+      if (!parsed_prevotes.emplace(*round, *transition_id).second) return false;
     }
     return true;
   });
   if (!ok) return false;
   if (lock_state) *lock_state = parsed_lock;
-  if (qc_state) *qc_state = parsed_qc;
-  if (qc_payload_id) *qc_payload_id = parsed_payload;
+  if (valid_polka) *valid_polka = std::move(parsed_polka);
+  if (prevotes) *prevotes = std::move(parsed_prevotes);
   return true;
 }
 

@@ -271,6 +271,12 @@ consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::Canoni
   return lane_records;
 }
 
+// Commit round of the parent in these fixtures: the parent's own round (no re-proposals). 0 for genesis.
+std::uint32_t fixture_parent_commit_round(const consensus::CanonicalDerivedState& parent_state) {
+  auto it = parent_state.finalized_block_metadata.find(parent_state.finalized_height);
+  return it == parent_state.finalized_block_metadata.end() ? 0 : it->second.round;
+}
+
 // Signs the parent's finalized transition with the single-member test committee
 // key (key_from_byte(90)) to form a valid prev_finality_signers record. Empty
 // when the parent is genesis.
@@ -278,7 +284,11 @@ std::vector<FinalitySig> default_prev_finality_signers(const consensus::Canonica
                                                        const consensus::CanonicalDerivedState& parent_state) {
   consensus::ParentFinalityContext parent;
   std::string err;
-  if (!consensus::resolve_parent_finality_context(cfg, parent_state, {}, &parent, &err) || !parent.has_parent) return {};
+  if (!consensus::resolve_parent_finality_context(cfg, parent_state, fixture_parent_commit_round(parent_state), &parent,
+                                                  &err) ||
+      !parent.has_parent) {
+    return {};
+  }
   const auto signer = key_from_byte(90);
   std::vector<FinalitySig> out;
   for (const auto& member : parent.committee) {
@@ -308,7 +318,8 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   const auto leader = consensus::canonical_leader_for_height_round(cfg, parent_state, height, round);
   if (!leader.has_value()) throw std::runtime_error("missing canonical leader");
   const auto signers = prev_signers.empty() ? default_prev_finality_signers(cfg, parent_state) : prev_signers;
-  if (!consensus::populate_frontier_transition_metadata(cfg, parent_state, height, round, *leader, signers,
+  if (!consensus::populate_frontier_transition_metadata(cfg, parent_state, height, round, *leader,
+                                                        fixture_parent_commit_round(parent_state), signers,
                                                         result.accepted_fee_units, result.next_utxos, &result.transition,
                                                         &err)) {
     throw std::runtime_error("frontier metadata population failed: " + err);

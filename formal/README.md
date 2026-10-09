@@ -126,3 +126,42 @@ This model corresponds directly to:
 - [docs/spec/AVAILABILITY_STATE_COMPLETENESS.md](../docs/spec/AVAILABILITY_STATE_COMPLETENESS.md)
 
 It is a bounded formal verification artifact, not a proof of the full implementation or byte-level codec.
+
+## Two-Phase Finality Model
+
+- Spec: [two_phase_finality.tla](two_phase_finality.tla), bindings in
+  [MC_two_phase_finality.tla](MC_two_phase_finality.tla)
+- TLC configs:
+  - [two_phase_finality.cfg](two_phase_finality.cfg): `TypeOK`, `Agreement` (must hold)
+  - [two_phase_finality_reach.cfg](two_phase_finality_reach.cfg): `NothingFinalizes` (must be violated: finality is reachable)
+  - [two_phase_finality_reach_cross.cfg](two_phase_finality_reach_cross.cfg): `NoCrossRoundFinality` (must be violated: later-round finality is reachable)
+  - [two_phase_finality_mutation.cfg](two_phase_finality_mutation.cfg): `LockRule = FALSE`, `Agreement` (must be violated: the model detects forks)
+
+Exhaustive check: [two_phase_finality_abstract.tla](two_phase_finality_abstract.tla), an
+over-approximation of the detailed model (it drops the local round, timed-out rounds and honest
+proposal rules, each of which only restricts honest behaviour, so Agreement there implies Agreement
+here). Rounds 0..3, 3 honest + 1 Byzantine, two values:
+
+- [two_phase_finality_abstract.cfg](two_phase_finality_abstract.cfg): `TypeOK`, `Agreement` hold
+  (complete search, 2,395,836 distinct states, depth 25, under a minute)
+- `_reach`, `_reach_cross`: violated as expected (finality and later-round finality reachable)
+- `_lock_mutation` (`LockRule = FALSE`), `_floor_mutation` (`FloorRule = FALSE`): `Agreement`
+  violated, i.e. both rules are necessary
+
+The detailed model is too large to finish (stopped past 150M distinct states without a
+counterexample); it is the readable mapping onto the code. Without the vote-round floor it produced
+the counterexample that led to `local_vote_round_floor_locked` (see
+[two_phase_finality_floor_mutation.cfg](two_phase_finality_floor_mutation.cfg)).
+
+Run: `./scripts/run_tlc.sh --spec formal/two_phase_finality_abstract.tla --config formal/two_phase_finality_abstract.cfg`
+
+It models the voting rules of [docs/spec/TWO_PHASE_FINALITY.md](../docs/spec/TWO_PHASE_FINALITY.md) at
+one height as implemented in `src/node/node_consensus.cpp`: 4 validators (1 Byzantine, quorum 3),
+two values, rounds 0..2 with a Byzantine leader in round 1. The Byzantine validator has signed every
+prevote and precommit and proposed every value with every proof-of-lock round. Honest nodes act on
+quorums in any order, time out, catch up rounds, reset on reconnect, and restart (losing the
+in-memory timed-out rounds; lock, valid value and own prevotes are durable).
+
+It abstracts away (each abstraction only adds behaviours): transition ids as abstract values that a
+fresh proposal may reuse, body availability, TC formation, the per-round reservations that a reset
+clears, and the once-per-round limit on honest proposals. Liveness is not checked.

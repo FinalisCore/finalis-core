@@ -74,7 +74,14 @@ bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std
                             std::uint64_t bond_amount, const SpecialValidationContext& ctx, std::string* err = nullptr);
 bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& req, const SpecialValidationContext& ctx,
                                        std::string* err = nullptr);
+// Precommit: a quorum of these for one (height, round, transition_id) is finality.
 Bytes vote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
+// Prevote: a quorum of these (a polka) lets a validator lock on transition_id and precommit it.
+Bytes prevote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
+// Signed by the leader of (height, round). pol_round is the round of the attached prevote quorum
+// when the leader re-proposes its valid value.
+Bytes propose_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
+                              std::optional<std::uint32_t> pol_round);
 Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);
 bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubKey32* out_pub = nullptr);

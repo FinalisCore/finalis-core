@@ -35,6 +35,7 @@ enum MsgType : std::uint16_t {
   INGRESS_RANGE = 20,
   GET_INGRESS_TIPS = 21,
   INGRESS_TIPS = 22,
+  PREVOTE = 24,
 };
 
 struct VersionMsg {
@@ -59,11 +60,22 @@ struct ProposeMsg {
   std::uint32_t round{0};
   Hash32 prev_finalized_hash{};
   Bytes frontier_proposal_bytes;
-  std::optional<QuorumCertificate> justify_qc;
+  // Proof of lock: a prevote quorum for the proposed transition at pol->round < round. Present
+  // exactly when the leader re-proposes its valid value (the transition's own round is then
+  // <= pol->round).
+  std::optional<QuorumCertificate> pol;
   std::optional<TimeoutCertificate> justify_tc;
+  // Leader of (height, round) over propose_signing_message(height, round, transition id, pol round).
+  Sig64 proposer_signature{};
 };
 
+// Precommit.
 struct VoteMsg {
+  Vote vote;
+};
+
+// Prevote: same fields as a precommit, different signing domain.
+struct PrevoteMsg {
   Vote vote;
 };
 
@@ -154,6 +166,8 @@ Bytes ser_propose(const ProposeMsg& m);
 std::optional<ProposeMsg> de_propose(const Bytes& b);
 Bytes ser_vote(const VoteMsg& m);
 std::optional<VoteMsg> de_vote(const Bytes& b);
+Bytes ser_prevote(const PrevoteMsg& m);
+std::optional<PrevoteMsg> de_prevote(const Bytes& b);
 Bytes ser_timeout_vote(const TimeoutVoteMsg& m);
 std::optional<TimeoutVoteMsg> de_timeout_vote(const Bytes& b);
 Bytes ser_get_transition(const GetTransitionMsg& m);

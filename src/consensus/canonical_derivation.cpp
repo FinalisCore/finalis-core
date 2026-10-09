@@ -180,7 +180,8 @@ bool verify_frontier_finality_certificate_against_state(const CanonicalDerivatio
     if (error) *error = "certificate-height-mismatch";
     return false;
   }
-  if (cert.round != transition.round) {
+  // A transition re-proposed as the valid value can be precommitted in a later round.
+  if (cert.round < transition.round) {
     if (error) *error = "certificate-round-mismatch";
     return false;
   }
@@ -188,7 +189,7 @@ bool verify_frontier_finality_certificate_against_state(const CanonicalDerivatio
     if (error) *error = "certificate-transition-id-mismatch";
     return false;
   }
-  const auto committee = canonical_committee_for_height_round(cfg, prev, transition.height, transition.round);
+  const auto committee = canonical_committee_for_height_round(cfg, prev, transition.height, cert.round);
   if (committee.empty()) {
     if (error) *error = "missing-canonical-committee";
     return false;
@@ -886,7 +887,7 @@ Hash32 frontier_finality_link_hash(const FrontierTransition& transition) {
 }
 
 bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                                     const std::vector<FinalitySig>& signers, ParentFinalityContext* out,
+                                     std::uint32_t parent_commit_round, ParentFinalityContext* out,
                                      std::string* error) {
   if (!out) {
     if (error) *error = "missing-parent-context-output";
@@ -903,7 +904,12 @@ bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const
   }
   out->has_parent = true;
   out->height = prev.finalized_height;
-  out->round = meta_it->second.round;
+  // Precommits can finalize the parent in a round after its own; the child names that round.
+  if (parent_commit_round < meta_it->second.round) {
+    if (error) *error = "parent-commit-round-before-parent-round";
+    return false;
+  }
+  out->round = parent_commit_round;
   out->transition_id = *parent_transition_id;
   out->committee = canonical_committee_for_height_round(cfg, prev, out->height, out->round);
   if (out->committee.empty()) {
@@ -917,6 +923,7 @@ bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const
 bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConfig& cfg,
                                                    const CanonicalDerivedState& prev,
                                                    const std::vector<FinalitySig>& signers,
+                                                   std::uint32_t parent_commit_round,
                                                    std::vector<FinalitySig>* canonical, std::string* error) {
   if (!canonical) {
     if (error) *error = "missing-signer-output";
@@ -924,9 +931,9 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
   }
   std::vector<FinalitySig> sorted = canonicalize_finality_signatures(signers, std::numeric_limits<std::size_t>::max());
   ParentFinalityContext parent;
-  if (!resolve_parent_finality_context(cfg, prev, sorted, &parent, error)) return false;
+  if (!resolve_parent_finality_context(cfg, prev, parent_commit_round, &parent, error)) return false;
   if (!parent.has_parent) {
-    if (!sorted.empty()) {
+    if (!sorted.empty() || parent_commit_round != 0) {
       if (error) *error = "frontier-prev-signers-unexpected-for-genesis-parent";
       return false;
     }
@@ -978,6 +985,7 @@ void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const Va
 
 bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
+                                           std::uint32_t prev_finality_round,
                                            const std::vector<FinalitySig>& prev_finality_signers,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
@@ -1006,7 +1014,8 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   }
   const auto quorum = static_cast<std::uint32_t>(quorum_threshold(committee.size()));
   std::vector<FinalitySig> canonical_signers;
-  if (!canonicalize_and_verify_prev_finality_signers(cfg, prev, prev_finality_signers, &canonical_signers, error)) {
+  if (!canonicalize_and_verify_prev_finality_signers(cfg, prev, prev_finality_signers, prev_finality_round,
+                                                     &canonical_signers, error)) {
     return false;
   }
 
@@ -1019,6 +1028,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   transition->round = round;
   transition->leader_pubkey = leader_pubkey;
   transition->quorum_threshold = quorum;
+  transition->prev_finality_round = prev_finality_round;
   transition->prev_finality_signers = std::move(canonical_signers);
   transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
   transition->settlement_commitment = transition->settlement.commitment();
@@ -1456,11 +1466,13 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     FrontierTransition expected_transition = result.transition;
     const bool have_current_expected = populate_frontier_transition_metadata(
         cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-        record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
+        record.transition.prev_finality_round, record.transition.prev_finality_signers, result.accepted_fee_units,
+        result.next_utxos, &expected_transition, error);
     if (!have_current_expected) return false;
     const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
       return record.transition.quorum_threshold == expected.quorum_threshold &&
-             record.transition.prev_finality_signers == expected.prev_finality_signers &&
+             record.transition.prev_finality_round == expected.prev_finality_round &&
+           record.transition.prev_finality_signers == expected.prev_finality_signers &&
              record.transition.settlement_commitment == record.transition.settlement.commitment() &&
              record.transition.settlement_commitment == expected.settlement_commitment &&
              record.transition.settlement.serialize() == expected.settlement.serialize() &&
@@ -1599,10 +1611,12 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   FrontierTransition expected_transition = result.transition;
   const bool have_current_expected = populate_frontier_transition_metadata(
       cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-      record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
+      record.transition.prev_finality_round, record.transition.prev_finality_signers, result.accepted_fee_units,
+      result.next_utxos, &expected_transition, error);
   if (!have_current_expected) return false;
   const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
     return record.transition.quorum_threshold == expected.quorum_threshold &&
+           record.transition.prev_finality_round == expected.prev_finality_round &&
            record.transition.prev_finality_signers == expected.prev_finality_signers &&
            record.transition.settlement_commitment == record.transition.settlement.commitment() &&
            record.transition.settlement_commitment == expected.settlement_commitment &&
@@ -1697,7 +1711,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   // account it against the parent committee. prev_finality_signers has
   // already been verified by verify_frontier_record_against_state above.
   ParentFinalityContext parent;
-  if (!resolve_parent_finality_context(cfg, prev, record.transition.prev_finality_signers, &parent, error)) return false;
+  if (!resolve_parent_finality_context(cfg, prev, record.transition.prev_finality_round, &parent, error)) return false;
   std::vector<PubKey32> parent_participants;
   parent_participants.reserve(record.transition.prev_finality_signers.size());
   for (const auto& sig : record.transition.prev_finality_signers) parent_participants.push_back(sig.validator_pubkey);

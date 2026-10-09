@@ -305,10 +305,11 @@ settlement (item 13).
     (`canonical_derivation.cpp:318`, `:348-350`, `:979`). That burns 12 years of fees, leaves validators
     with no fee income, and contradicts `docs/ECONOMICS.md` §4.
   - Requested direction: pay fees to the proposer immediately.
-  - ⚠ Conflict: settlement outputs are part of `settlement_commitment`, which is part of
-    `consensus_payload_id` (the vote-lock identity). Paying the *current round leader* per block would
-    change the payload whenever a different leader re-proposes a locked payload. That breaks lock
-    re-proposal, which is the reason fees were kept out of per-block settlement.
+  - Former conflict (resolved by two-phase finality): with the old payload-id vote lock, paying the
+    *current round leader* per block changed the locked payload on every re-proposal. Under two-phase
+    finality the valid value is re-proposed unchanged (its builder's `leader_pubkey` and settlement
+    included), so paying the transition's `leader_pubkey` no longer interferes with locking. The
+    choice below is now purely economic.
   - Recommended alternative: pool fees into the epoch `fee_pool_units` from genesis (drop the
     `height >= EMISSION_BLOCKS` gates) and pay them at epoch settlement by reward score, the same as
     post-cap. The proposer is still credited through its leader score. The payload stays

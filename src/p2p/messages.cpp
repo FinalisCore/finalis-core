@@ -28,6 +28,7 @@ bool is_known_message_type(std::uint16_t msg_type) {
     case MsgType::FINALIZED_TIP:
     case MsgType::PROPOSE:
     case MsgType::VOTE:
+    case MsgType::PREVOTE:
     case MsgType::TIMEOUT_VOTE:
     case MsgType::GET_TRANSITION:
     case MsgType::TRANSITION:
@@ -143,13 +144,13 @@ Bytes ser_propose(const ProposeMsg& m) {
   w.u32le(m.round);
   w.bytes_fixed(m.prev_finalized_hash);
   w.varbytes(m.frontier_proposal_bytes);
-  w.u8(m.justify_qc.has_value() ? 1 : 0);
-  if (m.justify_qc.has_value()) {
-    w.u64le(m.justify_qc->height);
-    w.u32le(m.justify_qc->round);
-    w.bytes_fixed(m.justify_qc->frontier_transition_id);
-    w.varint(m.justify_qc->signatures.size());
-    for (const auto& sig : m.justify_qc->signatures) {
+  w.u8(m.pol.has_value() ? 1 : 0);
+  if (m.pol.has_value()) {
+    w.u64le(m.pol->height);
+    w.u32le(m.pol->round);
+    w.bytes_fixed(m.pol->frontier_transition_id);
+    w.varint(m.pol->signatures.size());
+    for (const auto& sig : m.pol->signatures) {
       w.bytes_fixed(sig.validator_pubkey);
       w.bytes_fixed(sig.signature);
     }
@@ -164,6 +165,7 @@ Bytes ser_propose(const ProposeMsg& m) {
       w.bytes_fixed(sig.signature);
     }
   }
+  w.bytes_fixed(m.proposer_signature);
   return w.take();
 }
 
@@ -203,9 +205,9 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
             if (!pub || !sig) return false;
             qc.signatures.push_back(FinalitySig{*pub, *sig});
           }
-          m.justify_qc = qc;
+          m.pol = qc;
         } else {
-          m.justify_qc.reset();
+          m.pol.reset();
         }
         auto has_tc = r.u8();
         if (!has_tc) return false;
@@ -230,6 +232,9 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
         } else {
           m.justify_tc.reset();
         }
+        auto proposer_sig = r.bytes_fixed<64>();
+        if (!proposer_sig) return false;
+        m.proposer_signature = *proposer_sig;
         return true;
       }))
     return std::nullopt;
@@ -263,6 +268,14 @@ std::optional<VoteMsg> de_vote(const Bytes& b) {
         return true;
       })) return std::nullopt;
   return m;
+}
+
+Bytes ser_prevote(const PrevoteMsg& m) { return ser_vote(VoteMsg{m.vote}); }
+
+std::optional<PrevoteMsg> de_prevote(const Bytes& b) {
+  auto v = de_vote(b);
+  if (!v.has_value()) return std::nullopt;
+  return PrevoteMsg{v->vote};
 }
 
 Bytes ser_timeout_vote(const TimeoutVoteMsg& m) {

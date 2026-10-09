@@ -1,6 +1,6 @@
 # TWO_PHASE_FINALITY
 
-Status: design, for review. Nothing here is implemented yet.
+Status: implemented (pending external BFT review, §8.5). Sections 1–2 describe the one-phase protocol it replaced.
 
 ## 1. Problem
 
@@ -93,6 +93,13 @@ On a polka for `(h, r, id)` with the proposal for `id` known, the first time in 
 On `Q` precommits for `(h, r, id)` at any round, with the proposal known: finalize (unchanged path:
 `finalize_if_quorum` → `apply_finalized_frontier_effects_locked`).
 
+Vote-round floor: a validator never prevotes or precommits in a round below the highest round it
+has already voted in (`max(locked_round, highest sent prevote round)`, both durable). Tendermint
+gets this for free because its round only grows; here reconnect resets and restarts move the local
+round back to 0. Without it, a late polka can make a node precommit at round `r` after it already
+prevoted something else at `r' > r`, and two values finalize (TLC counterexample,
+`formal/two_phase_finality.tla`).
+
 On TC for `(h, r)`: move to `r + 1`, step `propose`. Timeouts per step grow with the round as
 `round_timeout_ms_for_round` does today.
 
@@ -104,8 +111,9 @@ on different nodes. The local `FinalityCertificate.round` may then differ betwee
 verification of `prev_finality_signers` at `h + 1`.
 
 Change: `FrontierTransition` gains `prev_finality_round`. `prev_finality_signers` must be `≥ Q(h)`
-precommits for `(h, prev_finality_round, id(h))`. Canonical `finalized_block_metadata[h].round` is
-taken from the applied `h + 1` transition; the local certificate round is local evidence only.
+precommits for `(h, prev_finality_round, id(h))`, with `prev_finality_round ≥` the parent
+transition's own round. Canonical `finalized_block_metadata[h].round` stays the transition's own
+round (deterministic on every node); the local certificate round is local evidence only.
 
 ## 4. Why it is safe and live (sketch)
 
@@ -168,14 +176,23 @@ Fresh chain, no migration. Wire changes (`PREVOTE`, `ProposeMsg` fields, `prev_f
 part of genesis protocol version. Docs to update with the change: `CONSENSUS.md`, `LIVE_PROTOCOL.md`,
 whitepaper §2–3 (restore a cross-round safety proposition with this proof).
 
-## 8. Open questions for review
+## 8. Decisions
 
-1. Proposer signature: proposals are unsigned today and any committee peer can relay a transition
-   naming any leader. Tendermint's safety does not depend on it, liveness does. Proposed: sign.
-2. TC instead of nil prevotes / precommits for round changes: keeps existing code; the liveness
-   argument above assumes TC formation after `Δ`. Confirm acceptable.
-3. Step timeouts: one `round_timeout_ms` per round today; Tendermint uses propose / prevote /
-   precommit timeouts. Proposed: keep one round timer, gate precommit wait inside it.
-4. Certified-ingress gate on both prevote and precommit (§3.3): keeps the "QC ⇒ `f + 1` honest
-   holders" guarantee.
-5. External BFT review before mainnet.
+1. Proposer signature: proposals are signed by the leader of `(h, r)` over
+   `(h, r, id, valid_round)`, re-proposals included. Safety does not depend on it, liveness does.
+2. Round changes use TC, no nil prevotes / precommits. The liveness argument assumes TC formation
+   after `Δ`.
+3. One `round_timeout_ms` per round; no separate propose / prevote / precommit timeouts.
+4. Certified-ingress gate on both prevote and precommit: keeps "finality certificate ⇒ `f + 1`
+   honest holders of the slice's records".
+5. Open: external BFT review before mainnet. Bounded model check done:
+   `formal/two_phase_finality_abstract.tla` (Agreement holds, complete search, rounds 0..3,
+   `n = 4`, `f = 1`; dropping the lock rule or the vote-round floor each yields a fork).
+
+Implementation notes beyond §3:
+
+- A body that arrives after its polka or precommit quorum (proposal or uncertified transition
+  delivery) re-runs polka and finality checks for every round from its own to the current one.
+- After a restart or a reconnect reset clears the vote trackers, the node re-adds its own recorded
+  prevotes and the precommit its lock implies (Ed25519 is deterministic, so these are the votes
+  already sent).

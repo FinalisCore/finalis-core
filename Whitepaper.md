@@ -52,26 +52,35 @@ A transition `T_h` is finalized iff:
 1. `h = H_f + 1`
 2. certificate payload matches `T_h`
 3. committee context is valid for `(h, r)`
-4. at least `Q` distinct committee signatures verify on the vote message
+4. at least `Q` distinct committee precommit signatures verify on the precommit message
 
 The runtime rejects work outside `H_f + 1` on the live path.
 
-Rounds advance on timeout. A proposal for round `r > 0` must carry a justification for the same
-height from a lower round: either a QC or a TC.
+Finality is two-phase, following Tendermint [Buchman, Kwon, Milosevic 2018], with timeout
+certificates (TC) in place of nil votes. The leader of `(h, r)` signs a proposal; validators
+**prevote** its `transition_id`; a quorum of prevotes for one `(h, r, id)` (a **polka**) makes a
+validator lock on `id` at `r` and **precommit** it; `Q` precommits for one `(h, r, id)` finalize
+it. Prevotes and precommits use separate signing domains.
 
-A validator votes for a proposal only if it holds, in its local store, a valid ingress certificate for every record of the proposed slice; otherwise it defers the vote and fetches the missing records from peers. A QC therefore implies that at least `f + 1` honest validators hold the finalized slice's certified records.
+Rounds advance on a TC. A proposal for round `r > 0` carries a TC or a polka from a lower round.
+A leader that has seen a polka (its *valid value*) re-proposes that transition unchanged with the
+polka as proof of lock (`pol`); otherwise it builds a fresh transition at `r`.
 
-Each validator keeps a durable vote lock `(payload, round)` per height, set when it votes. The
-payload identity excludes the round, leader and `prev_finality_signers`, so a locked payload can be
-re-proposed in a later round. A validator may vote for a different payload only if the proposal
-carries a valid QC for that payload from a round in `[locked_round, r)`. A TC never releases a lock,
-and neither does a restart: the lock is persisted before the vote is sent, and a validator whose
-safety state is unreadable abstains at that height. A validator never votes in a round it has
-already sent a timeout vote for.
+A validator prevotes a proposal `P` in round `r` at most once, and only if it is unlocked, locked
+on `id(P)`, or `P` carries a polka from a round `≥` its lock round. It precommits only on a polka
+in its current round, after its lock is durable. Lock, valid value and signed prevotes are
+persisted before the corresponding message is sent; a validator whose safety state is unreadable
+abstains at that height. A validator never votes in a round it has already sent a timeout vote for.
+
+A validator prevotes and precommits only if it holds, in its local store, a valid ingress certificate for every record of the proposed slice; otherwise it defers and fetches the missing records from peers. A finality certificate therefore implies that at least `f + 1` honest validators hold the finalized slice's certified records.
+
+One transition can be finalized by precommits from different rounds on different nodes, so the
+child transition names the parent's commit round (`prev_finality_round`) alongside its
+participation record `prev_finality_signers`.
 
 ### 3.1 Safety intuition
 
-Two conflicting finalized transitions at the same `(h, r)` require two quorum signer sets over different payloads. Quorum intersection implies at least one overlapping honest signer would need to sign conflicting messages, violating Byzantine assumptions.
+Two conflicting finalized transitions at the same `(h, r)` require two quorum signer sets over different payloads. Quorum intersection implies at least one overlapping honest signer would need to sign conflicting messages, violating Byzantine assumptions. Across rounds, the honest precommitters of a finalized transition are locked on it, and a lock moves only to a later polka, which those locked validators never help form for anything else (Proposition 3).
 
 ### 3.2 Liveness assumptions
 
@@ -101,24 +110,20 @@ different `(h', r', id(T_{h'}))`.
 `(height, round, transition_id)`. Any tuple change changes the verified
 message.
 
-**Open problem: cross-round safety.**  
-Proposition 1 covers a single round. The current one-phase rule does not
-guarantee that two distinct transitions cannot finalize at the same height in
-different rounds:
+**Proposition 3 (Cross-Round Safety).**  
+With `n = 3f + 1` committee members, at most `f` Byzantine, no two distinct transitions finalize
+at the same height, in any rounds.
 
-- the lock compares payload identity, which excludes round and leader, so two
-  transitions with the same payload (for example two empty slices) proposed in
-  different rounds can each collect a QC, and they are distinct finalized
-  transitions;
-- because a QC is itself finality, a lock can never be released safely before
-  the height finalizes, so locks split across payloads with no QC can halt the
-  height.
-
-With `n = 3f + 1`, finality from a single voting round cannot be both safe and
-live under asynchrony. Finality is being moved to two voting phases (prevote,
-then precommit; see `docs/spec/TWO_PHASE_FINALITY.md`), under which a value is
-locked only after a prevote quorum and a lock moves only on a newer prevote
-quorum. Cross-round safety is claimed only once that design is in force.
+*Proof sketch.* Let `T` finalize with precommits at round `r`, and let `S` be the honest
+precommitters; `|S| ≥ f + 1`, and each locked `T` at `r` after seeing a polka for `T` at `r`.
+A finality certificate for `U ≠ T` at round `r' ≥ r` needs a polka for `U` at `r'`. At `r` that
+would need an honest validator to prevote twice in one round (quorum intersection). For `r' > r`,
+let `r*` be the first round above `r` with a polka for some `U ≠ T`. Its `2f + 1` prevotes cannot
+all come from the `≤ 2f` validators outside `S`, so some member of `S`, locked on `T` at a round
+`ℓ ≥ r`, prevoted `U` at `r*`. It does so only for a proposal carrying a polka for `U` at a round
+in `[ℓ, r*)`, and no such polka exists (none at `r`, none in `(r, r*)` by minimality of `r*`).
+Contradiction. A finality certificate for `U` at `r' < r` is covered by the symmetric argument
+with the roles of `T` and `U` exchanged. Full argument: `docs/spec/TWO_PHASE_FINALITY.md` §4.
 
 ## 4. Certified Ingress Layer
 
@@ -137,7 +142,7 @@ Ingress validity requires:
 
 Stale-epoch ingress is rejected. Equivocation at fixed `(epoch, lane, seq)` is rejected and persisted as deterministic evidence. Re-delivery of a record whose certificate is identical to the one already stored (for example, a record first received by gossip and then again in a range-sync response) is an idempotent no-op, not a sequence violation; genuine gaps remain rejected.
 
-**Proposition 3 (Ingress Epoch Freshness).**  
+**Proposition 4 (Ingress Epoch Freshness).**  
 Certified ingress from a stale epoch cannot enter canonical execution.
 
 *Proof sketch.* Ingress validation enforces
@@ -188,7 +193,7 @@ Authoritative replay inputs are:
 
 Non-authoritative caches may be rebuilt and cannot change canonical output.
 
-**Proposition 4 (Replay Uniqueness).**  
+**Proposition 5 (Replay Uniqueness).**  
 For fixed authoritative finalized inputs, canonical derived state is unique.
 
 *Proof sketch.* Replay applies a deterministic transition function in height
@@ -223,7 +228,7 @@ Validation hardening includes:
 - max-fee policy enforcement on both V1 and V2 paths
 - V2 fee validation: transparent inputs must cover transparent outputs + fee; confidential value conservation is enforced via commitment balance checks
 
-**Proposition 5 (Script-Parity Invariant).**  
+**Proposition 6 (Script-Parity Invariant).**  
 Validator-control script semantics are consistent across legacy `Tx` and
 transparent outputs in `TxV2`.
 
@@ -242,7 +247,7 @@ Consensus bounds on confidential work:
 
 Independently of confidential work, a frontier slice is an invalid transition above 1,000 records or 1 MiB of raw transaction bytes.
 
-**Proposition 6 (Confidential Turnstile).**  
+**Proposition 7 (Confidential Turnstile).**  
 The value held in confidential outputs never goes negative in canonical state.
 
 *Proof sketch.* Canonical derived state commits a pool value `P`, updated
@@ -290,7 +295,7 @@ Finalis security requires:
 
 The protocol intentionally prefers safe halt over speculative reconstruction when authoritative finalized artifacts are missing or inconsistent.
 
-**Proposition 7 (Fail-Closed Recovery).**  
+**Proposition 8 (Fail-Closed Recovery).**  
 Missing/inconsistent authoritative finalized artifacts lead to halt, not
 speculative canonical continuation.
 
@@ -336,6 +341,8 @@ Security posture:
 
 ## References
 
+- E. Buchman, J. Kwon, Z. Milosevic, "The latest gossip on BFT consensus", 2018 (arXiv:1807.04938)
+- `docs/spec/TWO_PHASE_FINALITY.md`
 - `docs/PROTOCOL-SPEC.md`
 - `docs/CONSENSUS.md`
 - `docs/LIVE_PROTOCOL.md`

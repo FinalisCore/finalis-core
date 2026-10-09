@@ -251,6 +251,7 @@ class Node {
   bool inject_ingress_range_for_test(const p2p::IngressRangeMsg& msg, int peer_id = 1);
   std::string inject_ingress_range_result_for_test(const p2p::IngressRangeMsg& msg, int peer_id = 1);
   void set_requested_ingress_range_for_test(int peer_id, const p2p::GetIngressRangeMsg& msg);
+  void mark_local_round_timed_out_for_test(std::uint64_t height, std::uint32_t round);
   std::size_t deferred_certified_vote_count_for_test() const;
   bool observe_frontier_proposal_for_test(const FrontierProposal& proposal);
   bool inject_frontier_block_for_test(const FrontierProposal& proposal, const std::vector<FinalitySig>& finality_signatures);
@@ -271,10 +272,13 @@ class Node {
   std::vector<PubKey32> committee_for_next_height_for_test() const;
   std::vector<PubKey32> committee_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   std::optional<PubKey32> proposer_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
-  std::optional<QuorumCertificate> highest_qc_for_height_for_test(std::uint64_t height) const;
+  std::optional<QuorumCertificate> valid_polka_for_height_for_test(std::uint64_t height) const;
   std::optional<TimeoutCertificate> highest_tc_for_height_for_test(std::uint64_t height) const;
   std::optional<std::pair<Hash32, std::uint32_t>> local_vote_lock_for_test(std::uint64_t height) const;
+  // Precommit signed by this node.
   bool local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
+  bool local_prevote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
+  std::string inject_network_prevote_result_for_test(const Vote& vote);
   bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
   std::set<std::uint64_t> abstain_heights_for_test() const;
   consensus::ConfidentialSupplyAuditResult confidential_supply_audit_for_test();
@@ -347,6 +351,7 @@ class Node {
   void on_transition(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_propose(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_prevote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_getaddr(int peer_id, const Bytes& payload);
@@ -391,6 +396,9 @@ class Node {
   TimeoutVoteHandlingResult handle_timeout_vote_result(const TimeoutVote& vote, bool from_network, int from_peer_id = 0);
   bool handle_propose(const p2p::ProposeMsg& msg, bool from_network);
   bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0);
+  VoteHandlingResult handle_prevote_result(const Vote& vote, bool from_network, int from_peer_id = 0,
+                                           std::string* reject_reason = nullptr);
+  bool handle_prevote(const Vote& vote, bool from_network, int from_peer_id = 0);
   bool handle_timeout_vote(const TimeoutVote& vote, bool from_network, int from_peer_id = 0);
   // cert_check must be the result of precheck_finality_certificate(*certificate, proposal.transition),
   // computed by the caller BEFORE mu_ was locked (this function always runs with mu_ held). Passing
@@ -409,15 +417,14 @@ class Node {
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
                                     std::string* error = nullptr);
   bool finalize_if_quorum(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
-  // skip_signature_crypto must stay false for any qc sourced from the network (e.g. a
-  // ProposeMsg::justify_qc) -- that is the ONLY authentication those signatures ever get.
-  // It may only be set true by a caller whose qc.signatures came from
-  // votes_.signatures_for(...), where every signature already passed crypto::ed25519_verify
-  // once in handle_vote_result before being accepted into votes_ (see the invariant comment
-  // at that votes_.add_vote call site). Today that is exactly maybe_record_quorum_certificate_locked.
-  bool verify_quorum_certificate_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered = nullptr,
-                                        std::string* error = nullptr, bool skip_signature_crypto = false) const;
-  // Same contract as verify_quorum_certificate_locked, for timeout_votes_/maybe_record_timeout_certificate_locked.
+  // Verifies a polka: a quorum of committee prevotes for (qc.height, qc.round, qc id).
+  // skip_signature_crypto must stay false for any qc sourced from the network (a
+  // ProposeMsg::pol) -- that is the ONLY authentication those signatures ever get. It may only be
+  // set true by a caller whose qc.signatures came from prevotes_.signatures_for(...), where every
+  // signature already passed crypto::ed25519_verify in handle_prevote_result.
+  bool verify_polka_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered = nullptr,
+                           std::string* error = nullptr, bool skip_signature_crypto = false) const;
+  // Same contract as verify_polka_locked, for timeout_votes_/maybe_record_timeout_certificate_locked.
   bool verify_timeout_certificate_locked(const TimeoutCertificate& tc, std::vector<FinalitySig>* filtered = nullptr,
                                          std::string* error = nullptr, bool skip_signature_crypto = false) const;
   bool verify_finality_certificate_for_frontier_locked(const FinalityCertificate& cert, const FrontierTransition& transition,
@@ -430,27 +437,48 @@ class Node {
   // network reader thread.
   CertificateCheck precheck_finality_certificate(const FinalityCertificate& cert,
                                                  const FrontierTransition& transition) const;
-  std::optional<Hash32> quorum_certificate_payload_id_locked(const QuorumCertificate& qc) const;
-  std::optional<QuorumCertificate> highest_qc_for_height_locked(std::uint64_t height) const;
+  // The valid value (Tendermint validValue/validRound): the highest-round polka seen at `height`.
+  std::optional<QuorumCertificate> valid_polka_for_height_locked(std::uint64_t height) const;
   std::optional<TimeoutCertificate> highest_tc_for_height_locked(std::uint64_t height) const;
-  void maybe_record_quorum_certificate_locked(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
+  // Called whenever prevotes for (height, round, transition_id) change. On a polka it records the
+  // valid value and, in the current round, locks and returns this node's precommit to broadcast.
+  std::optional<Vote> on_prevotes_changed_locked(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
+  // A candidate body just became known. Polkas and precommit quorums for it that arrived first, in
+  // any round from its own to the current one, take effect now (precommits queue for the flush).
+  void on_candidate_body_locked(const FrontierTransition& transition);
   void maybe_record_timeout_certificate_locked(std::uint64_t height, std::uint32_t round);
-  bool can_vote_for_frontier_locked(const FrontierTransition& transition,
-                                 const std::optional<QuorumCertificate>& justify_qc,
-                                 const std::optional<TimeoutCertificate>& justify_tc,
-                                 std::string* reason = nullptr) const;
-  bool can_accept_frontier_with_lock_locked(const FrontierTransition& transition, std::string* reason = nullptr) const;
+  // Prevote rule for a proposal of `transition_id` at `height` carrying a polka at `pol_round`:
+  // allowed iff unlocked, locked on the same transition, or locked at a round <= pol_round.
+  bool can_prevote_locked(std::uint64_t height, const Hash32& transition_id, std::optional<std::uint32_t> pol_round,
+                          std::string* reason = nullptr) const;
   bool abstaining_at_height_locked(std::uint64_t height) const;
   // Audits canonical_state_'s confidential supply ledger; logs loudly on failure. Never blocks consensus.
   void run_confidential_supply_audit_locked(const char* trigger);
-  // `proposal` is the full proposal being voted for; it is persisted with the lock (see
-  // kConsensusLockedProposalPrefix) so the locked payload survives a restart.
-  bool update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal);
+  // Locks on `proposal` at `round` after seeing its polka; durable before the precommit is sent.
+  bool lock_on_polka_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal);
+  // SAFETY: lowest round this node may still prevote or precommit in at `height`: the highest round
+  // it already voted in (durable prevotes, lock). Reconnect resets and restarts move current_round_
+  // back to 0; voting below this floor would let a late polka produce a precommit at a round older
+  // than a prevote already sent, which breaks the cross-round safety argument (found by TLC,
+  // formal/two_phase_finality.tla).
+  std::uint32_t local_vote_round_floor_locked(std::uint64_t height) const;
+  // Puts this node's own signed votes at `height` back into the trackers after they were cleared
+  // (restart, reconnect reset): its recorded prevotes, and the precommit its lock implies.
+  // Ed25519 is deterministic, so the re-signed votes are the ones already sent.
+  void reseed_local_votes_locked(std::uint64_t height);
+  // Records a prevote this node signed; durable before the prevote is sent.
+  bool record_local_prevote_locked(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
   // Participation record for the finalized tip, for the next transition's
   // prev_finality_signers: every verified vote seen for the tip (including
   // late ones) plus the persisted certificate, filtered against the canonical
   // parent committee so the result always passes consensus verification.
-  std::vector<FinalitySig> prev_finality_signers_for_next_height_locked() const;
+  // Parent participation the next proposer records: the parent's commit round and the precommits
+  // observed for it.
+  struct PrevFinalityRecord {
+    std::uint32_t round{0};
+    std::vector<FinalitySig> signers;
+  };
+  PrevFinalityRecord prev_finality_record_for_next_height_locked() const;
   bool record_late_finalized_vote_locked(const Vote& vote);
   void persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
   bool persist_consensus_safety_state_locked(std::uint64_t height);
@@ -458,7 +486,10 @@ class Node {
   void clear_consensus_safety_state_locked(std::uint64_t height);
   std::vector<FinalitySig> canonicalize_finality_signatures_locked(const std::vector<FinalitySig>& signatures,
                                                                    std::size_t quorum) const;
+  // commit_round: the round of the precommits in finality_signatures (>= the transition's own
+  // round when the transition was re-proposed as the valid value).
   bool apply_finalized_frontier_effects_locked(const consensus::CanonicalFrontierRecord& record,
+                                               std::uint32_t commit_round,
                                                std::vector<FinalitySig> finality_signatures,
                                                bool clear_requested_sync = false,
                                                const std::vector<PubKey32>* effective_committee = nullptr,
@@ -467,9 +498,9 @@ class Node {
   std::optional<FrontierProposal> build_frontier_transition_locked(std::uint64_t height, std::uint32_t round);
   bool refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error = nullptr);
   void broadcast_epoch_ticket(const consensus::EpochTicket& ticket);
-  void broadcast_propose(const FrontierProposal& proposal, const std::optional<QuorumCertificate>& justify_qc = std::nullopt,
-                         const std::optional<TimeoutCertificate>& justify_tc = std::nullopt);
+  void broadcast_propose(const p2p::ProposeMsg& msg);
   void broadcast_vote(const Vote& vote);
+  void broadcast_prevote(const Vote& vote);
   void broadcast_timeout_vote(const TimeoutVote& vote);
   void broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate);
   void broadcast_tx(const AnyTx& tx, int skip_peer_id = 0);
@@ -660,11 +691,14 @@ class Node {
   ConfidentialPolicy confidential_policy_{};
   UtxoSetV2 utxos_;
   mempool::Mempool mempool_;
-  consensus::VoteTracker votes_;
+  consensus::VoteTracker votes_;      // precommits
+  consensus::VoteTracker prevotes_;
   consensus::TimeoutVoteTracker timeout_votes_;
   p2p::PeerDiscipline discipline_{30, 100, 600};
   p2p::VoteVerifyCache vote_verify_cache_{20'000};
   p2p::VoteVerifyCache invalid_vote_verify_cache_{20'000};
+  p2p::VoteVerifyCache prevote_verify_cache_{20'000};
+  p2p::VoteVerifyCache invalid_prevote_verify_cache_{20'000};
   p2p::RecentHashCache invalid_message_payloads_{16'384};
   p2p::RecentHashCache accepted_propose_payloads_{4'096};
   p2p::RecentHashCache accepted_block_payloads_{4'096};
@@ -722,10 +756,14 @@ class Node {
   std::map<Hash32, std::pair<p2p::ProposeMsg, int>> deferred_certified_votes_;
   std::map<std::uint64_t, std::vector<BufferedSyncFrontier>> buffered_sync_frontiers_;
   std::size_t buffered_sync_bytes_{0};
-  std::map<std::uint64_t, QuorumCertificate> highest_qc_by_height_;
-  std::map<std::uint64_t, Hash32> highest_qc_payload_by_height_;
+  // Valid value per height: the highest-round polka (prevote quorum). Its proposal is kept in
+  // candidate_frontier_proposals_ and persisted under kConsensusLockedProposalPrefix.
+  std::map<std::uint64_t, QuorumCertificate> valid_polka_by_height_;
   std::map<std::uint64_t, TimeoutCertificate> highest_tc_by_height_;
+  // (locked transition id, locked round), set on a polka in the current round before precommitting.
   std::map<std::uint64_t, std::pair<Hash32, std::uint32_t>> local_vote_locks_;
+  // Prevotes this node signed, per (height, round). Durable: a restart must not prevote twice.
+  std::map<std::pair<std::uint64_t, std::uint32_t>, Hash32> local_prevotes_;
   // Heights whose persisted safety state was unreadable at startup (see kConsensusSafetyQuarantinePrefix).
   // SAFETY: nothing is signed or proposed at these heights until they finalize.
   std::set<std::uint64_t> abstain_heights_;
@@ -742,6 +780,10 @@ class Node {
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> local_vote_reservations_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> local_timeout_vote_reservations_;
+  // Rounds this node has signed a timeout vote for. It never votes in such a round afterwards
+  // (a late vote can complete a QC after the round was abandoned). Unlike the reservations above,
+  // round resets do not clear it; only finalization of the height does.
+  std::set<std::pair<std::uint64_t, std::uint32_t>> local_timed_out_rounds_;
   std::map<std::tuple<std::uint64_t, std::uint32_t, PubKey32, Sig64>, std::uint64_t> seen_timeout_vote_messages_ms_;
   std::map<std::tuple<std::uint64_t, std::uint32_t, PubKey32, std::string>, std::uint32_t>
       timeout_vote_soft_reject_log_counts_;
@@ -864,6 +906,8 @@ class Node {
   // flush_pending_finalized_broadcasts() after mu_ is released: a socket send
   // can block, and a failed send re-enters the peer-event callback, which locks mu_.
   std::vector<std::pair<FrontierProposal, FinalityCertificate>> pending_finalized_broadcasts_;
+  // This node's precommits produced under mu_ on paths that cannot send; flushed with the above.
+  std::vector<Vote> pending_local_precommits_;
   bool pending_finalized_tip_broadcast_{false};
   bool restart_debug_{false};
   mutable std::mutex lightserver_mu_;

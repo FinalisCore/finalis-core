@@ -542,6 +542,29 @@ Bytes vote_signing_message(std::uint64_t height, std::uint32_t round, const Hash
   return Bytes(msg.begin(), msg.end());
 }
 
+Bytes prevote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'P', 'R', 'E', 'V', 'O', 'T', 'E', '-', 'V', '1'});
+  w.u64le(height);
+  w.u32le(round);
+  w.bytes_fixed(transition_id);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes propose_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
+                              std::optional<std::uint32_t> pol_round) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'P', 'R', 'O', 'P', 'O', 'S', 'E', '-', 'V', '1'});
+  w.u64le(height);
+  w.u32le(round);
+  w.bytes_fixed(transition_id);
+  w.u8(pol_round.has_value() ? 1 : 0);
+  w.u32le(pol_round.value_or(0));
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
 Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'O', 'U', 'T', '-', 'V', '1'});

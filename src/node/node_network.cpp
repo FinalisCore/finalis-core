@@ -819,7 +819,9 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
       local_vote_reservations_.clear();
       local_timeout_vote_reservations_.clear();
       votes_.clear_height(current_height);
+      prevotes_.clear_height(current_height);
       timeout_votes_.clear_height(current_height);
+      reseed_local_votes_locked(current_height);
       round_started_ms_ = now_ms();
       arm_round0_deadline_locked(round_started_ms_);
       log_line("peer-loss-reset height=" + std::to_string(current_height) + " reason=no-established-peers");
@@ -1061,6 +1063,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       return on_propose(peer_id, payload, payload_id);
     case p2p::MsgType::VOTE:
       return on_vote(peer_id, payload, payload_id);
+    case p2p::MsgType::PREVOTE:
+      return on_prevote(peer_id, payload, payload_id);
     case p2p::MsgType::TIMEOUT_VOTE:
       return on_timeout_vote(peer_id, payload, payload_id);
     case p2p::MsgType::TX:
@@ -1260,7 +1264,9 @@ void Node::on_verack(int peer_id, const Bytes& /*payload*/) {
       local_vote_reservations_.clear();
       local_timeout_vote_reservations_.clear();
       votes_.clear_height(current_height);
+      prevotes_.clear_height(current_height);
       timeout_votes_.clear_height(current_height);
+      reseed_local_votes_locked(current_height);
       round_started_ms_ = now_ms();
       arm_round0_deadline_locked(round_started_ms_);
       log_line("peer-reconnect-reset height=" + std::to_string(current_height) + " reason=peers-restored");
@@ -1416,15 +1422,7 @@ void Node::on_pong(int peer_id, const Bytes& payload) {
   return;
 }
 
-void Node::broadcast_propose(const FrontierProposal& proposal, const std::optional<QuorumCertificate>& justify_qc,
-                             const std::optional<TimeoutCertificate>& justify_tc) {
-  p2p::ProposeMsg p;
-  p.height = proposal.transition.height;
-  p.round = proposal.transition.round;
-  p.prev_finalized_hash = proposal.transition.prev_finalized_hash;
-  p.frontier_proposal_bytes = proposal.serialize();
-  p.justify_qc = justify_qc;
-  p.justify_tc = justify_tc;
+void Node::broadcast_propose(const p2p::ProposeMsg& p) {
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) { spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); }); });
   } else {
@@ -1454,6 +1452,18 @@ void Node::broadcast_vote(const Vote& vote) {
   }
 }
 
+void Node::broadcast_prevote(const Vote& vote) {
+  p2p::PrevoteMsg vm;
+  vm.vote = vote;
+  if (cfg_.disable_p2p) {
+    for_each_local_bus_peer([&](Node* peer) {
+      spawn_local_bus_task([peer, vm]() { (void)peer->handle_prevote(vm.vote, true, 0); });
+    });
+  } else {
+    p2p_.broadcast(p2p::MsgType::PREVOTE, p2p::ser_prevote(vm));
+  }
+}
+
 void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
   p2p::TimeoutVoteMsg vm;
   vm.vote = vote;
@@ -1469,11 +1479,17 @@ void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
 void Node::flush_pending_finalized_broadcasts() {
   std::vector<std::pair<FrontierProposal, FinalityCertificate>> frontiers;
   std::optional<p2p::FinalizedTipMsg> tip;
+  std::vector<Vote> precommits;
   {
     std::lock_guard<std::mutex> lk(mu_);
     frontiers.swap(pending_finalized_broadcasts_);
+    precommits.swap(pending_local_precommits_);
     if (pending_finalized_tip_broadcast_) tip = p2p::FinalizedTipMsg{finalized_height_, finalized_identity_.id};
     pending_finalized_tip_broadcast_ = false;
+  }
+  for (const auto& vote : precommits) {
+    broadcast_vote(vote);
+    (void)handle_vote(vote, false, 0);
   }
   for (const auto& [proposal, certificate] : frontiers) broadcast_finalized_frontier(proposal, certificate);
   if (tip.has_value() && !cfg_.disable_p2p) {
@@ -2573,6 +2589,8 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
     case p2p::MsgType::PROPOSE:
       return get(msg_type, cfg_.propose_rate_capacity, cfg_.propose_rate_refill).consume(1.0, nms);
     case p2p::MsgType::VOTE:
+      return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::PREVOTE:
       return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
     case p2p::MsgType::TIMEOUT_VOTE:
       return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);

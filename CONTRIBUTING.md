@@ -74,7 +74,7 @@ divide up where its methods are *defined*.
 | `node_state.cpp` | 1,140 | Loading and persisting runtime state: startup state load, genesis, frontier storage, hydration from canonical state. | `load_state`, `init_mainnet_genesis`, `persist_finalized_frontier_record`, `hydrate_runtime_from_canonical_state_locked` |
 | `node_test_hooks.cpp` | 450 | Methods that exist only for tests (`*_for_test`). | `inject_tx_for_test`, `advance_round_for_test`, `committee_for_height_round_for_test`, `seed_bonded_validator_for_test` |
 | `node_args.cpp` | 450 | Command-line argument parsing into `NodeConfig`. | `parse_args`, `parse_args_unchecked`, `parse_port_arg` |
-| `node_internal.hpp` / `.cpp` | 140 / 870 | Free helper functions and constants used by two or more node files (namespace `finalis::node::detail`). | `short_hash_hex`, `msg_type_name`, `consensus_payload_id`, `make_finality_certificate`, `consensus_rules_fingerprint`, `debug_finality_logs_enabled` |
+| `node_internal.hpp` / `.cpp` | 140 / 870 | Free helper functions and constants used by two or more node files (namespace `finalis::node::detail`). | `short_hash_hex`, `msg_type_name`, `parse_consensus_safety_state`, `make_finality_certificate`, `consensus_rules_fingerprint`, `debug_finality_logs_enabled` |
 
 Line counts are approximate and will drift. For the full analysis behind the split, see the
 detailed technical decomposition analysis in

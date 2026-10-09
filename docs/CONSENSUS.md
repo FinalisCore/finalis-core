@@ -57,28 +57,49 @@ boundary. It already incorporates:
 Consensus does not recompute those policy decisions in the live proposal/vote
 path. It consumes the finalized checkpoint output.
 
+## Overview
+
+Finality is two-phase (Tendermint, Buchman / Kwon / Milosevic 2018, with timeout
+certificates instead of nil votes). Design and safety argument:
+[spec/TWO_PHASE_FINALITY.md](spec/TWO_PHASE_FINALITY.md).
+
+1. The leader of `(H, r)` proposes a transition.
+2. Validators **prevote** its `transition_id`.
+3. A **polka** (quorum of prevotes for one `(H, r, id)`) makes a validator lock
+   on `id` at `r` and **precommit** it.
+4. A quorum of precommits for one `(H, r, id)` is the finality certificate.
+
+Rounds advance on a timeout certificate (TC). `id` is always the transition id;
+there is no payload-level identity.
+
 ## Proposal
 
-A proposal consists of:
+A proposal (`PROPOSE`) consists of:
 
-- `height`
-- `round`
-- `prev_finalized_hash`
-- serialized block bytes
-- optional `justify_qc`
+- `height`, `round`, `prev_finalized_hash`
+- serialized frontier proposal
+- optional `pol`: a polka for the proposed transition at `pol.round < round`
+- optional `justify_tc`
+- `proposer_signature` by the leader of `(height, round)` over
+  `sha256d("SC-PROPOSE-V1" || height || round || id || pol_round)`
 
-The serialized payload may contain either transparent-only transactions or the
-currently supported confidential-capable `TxV2` subset.
+Two shapes are valid:
+
+- fresh: `transition.round == round`, no `pol`
+- re-proposal of the leader's valid value: the transition unchanged
+  (`transition.round <= pol.round < round`) with its polka
 
 The node accepts a proposal only if:
 
-- `height == finalized_height + 1`
-- `round == current_round`
+- `height == finalized_height + 1` and `round >= current_round`
 - `prev_finalized_hash` matches the current finalized tip hash
-- the proposer matches the deterministic proposer for `(height, round)`
-- the proposer signature is valid
-- block transaction validation succeeds
-- if a QC is present, it is valid for the proposal
+- the proposer signature is valid for the leader of `(height, round)`
+- the transition validates against canonical state (its own leader and round)
+- `round > 0` carries a `pol` or a TC (except the singleton fallback)
+- a `pol`, if present, verifies as a polka for exactly this transition
+
+The serialized payload may contain either transparent-only transactions or the
+currently supported confidential-capable `TxV2` subset.
 
 Important boundary:
 
@@ -86,100 +107,72 @@ Important boundary:
 - if the checkpoint was derived in `fallback` mode, the live consensus path
   still uses that already-finalized committee output directly
 
-## Vote
+## Prevote
 
-A vote is over:
+`PREVOTE` carries `(height, round, id)` signed over
+`sha256d("SC-PREVOTE-V1" || height || round || id)`.
 
-`(height, round, block_id)`
+A validator prevotes once per round, for the round's proposal, only if:
 
-The signed message is the canonical vote-signing message for that exact tuple.
+- it has not timed out of the round
+- unlocked, or locked on `id`, or the proposal's `pol.round >= locked_round`
+- it holds, in its local certified-ingress store, every record of the
+  proposal's lane ranges, and those certificates validate (epoch, signatures,
+  committee membership, lane, sequence, lane-root chaining) and merge to exactly
+  the proposal's ordered slice
 
-Vote acceptance requires:
-
-- `height == finalized_height + 1`
-- validator is in the committee for `(height, round)`
-- signature verifies over the canonical vote-signing message
-- the vote tracker accepts it under the lock / relock rules
-
-A validator emits its own vote for a proposal only when it also holds, in its
-local certified-ingress store, every record of the proposal's lane ranges, and
-those certificates validate (epoch, signatures, committee membership, lane,
-sequence, lane-root chaining) and merge to exactly the proposal's ordered slice.
-If records are missing it defers the vote, requests the missing ranges from the
-peer that sent the proposal and from peers whose advertised lane tips cover
-them, and re-handles the proposal once they arrive. Because every honest voter
-holds the certified records, any finalized slice can be fetched from at least
+If records are missing it defers, requests the missing ranges from the peer
+that sent the proposal and from peers whose advertised lane tips cover them,
+and re-handles the proposal once they arrive. Because every honest voter holds
+the certified records, any finalized slice can be fetched from at least
 `f + 1` honest validators.
 
-Votes are not over a generic height-only or block-only object. They are bound
-to the exact round and block identifier.
+## Precommit
 
-## Quorum Certificate
+The precommit is the existing `VOTE` over `(height, round, id)` (domain
+`SC-VOTE-V1`). On a polka for `(H, r, id)` with the proposal known:
 
-A QC contains:
+- any round: the polka becomes the **valid value** if `r` is the highest polka
+  round seen at `H`; its proposal is persisted
+- `r` is the current round, not timed out, and the certified-ingress gate is
+  `Ready`: lock `(id, r)` durably, then precommit
 
-- `height`
-- `round`
-- `block_id`
-- quorum signatures
+Vote acceptance requires `height == finalized_height + 1`, a committee member
+for `(height, round)`, and a valid signature in the right domain.
 
-QC validation requires:
+## Certificates
 
-- committee lookup for `(height, round)`
-- deduplication by signer pubkey
-- all signatures verify over `(height, round, block_id)`
-- signer count after filtering is at least quorum
-
-Finality threshold remains:
-
-`floor(2N/3) + 1`
-
-where `N` is the committee size for that height.
+Polka and finality certificate share one shape: `height`, `round`,
+`transition_id`, quorum signatures. Validation: committee for
+`(height, round)`, dedup by signer, signatures in the matching domain (prevote
+or precommit), at least quorum `floor(2N/3) + 1`.
 
 ## Lock Rules
 
-Each node keeps:
+Per height, durable (primary + mirror rows, one atomic batch, written before
+the corresponding message leaves the process):
 
-- a local vote lock per height
-- a highest known QC for that height
+- lock `(locked_id, locked_round)`, set only on a polka in the current round
+- valid polka (highest-round polka) and its proposal
+- the transition this node prevoted in each round
 
-The node may vote for block `B` at height `H` only if one of the following
-holds:
+The lock moves only to a polka from a later round, and is released when the
+height finalizes. A node never prevotes or precommits in a round below the
+highest round it already voted in (its lock round and its latest prevote
+round); round resets on reconnect and restarts do not lower that floor. A node never votes in a round for which it has already signed
+a timeout vote. A node with unreadable safety state abstains at that height.
 
-1. no local lock exists at `H`
-2. the local lock already points to the same consensus payload as `B`
-3. a valid QC is supplied and:
-   - `QC.height == H`
-   - `QC.round < proposal.round`
-   - `QC` resolves to the same payload as `B`
-   - `QC.round >= locked_round`
-
-The lock is updated when the node votes.
-
-A node never votes in a round for which it has already signed a timeout vote.
-That record survives round resets and is cleared only when the height
-finalizes.
-
-This preserves the live safety property that a QC cannot unlock a conflicting
-payload.
-
-Known limitation: the lock compares the consensus payload id, which excludes
-round, leader and `prev_finality_signers`. Two transitions with the same payload
-proposed in different rounds can therefore each collect a QC, and since a QC is
-finality they are two distinct finalized transitions at one height. Because a
-QC is finality, a lock also cannot be released safely before finalization, so
-locks split across payloads without a QC can halt a height. The fix is two-phase
-finality (prevote, precommit): see
-[spec/TWO_PHASE_FINALITY.md](spec/TWO_PHASE_FINALITY.md).
+The leader re-proposes its valid value unchanged with the polka as `pol`;
+without one it builds a fresh transition.
 
 ## Finalization
 
 A block finalizes when the node has:
 
 - the block body
-- the effective committee recomputed for the certified frontier transition at
-  `(height, round)`
-- at least quorum valid signatures for the same `(height, round, block_id)`
+- the committee for `(height, commit_round)`, where `commit_round` is the round
+  of the precommits (`>= transition.round` when the transition was re-proposed)
+- at least quorum valid precommits for the same `(height, commit_round, id)`
 
 Before applying finality effects, the node re-verifies the certified frontier
 record against current canonical state and derives the expected committee/quorum
@@ -195,19 +188,24 @@ The finality proof is canonicalized before persistence:
 That truncation makes the certificate compact and deterministic. It is
 **not** a participation signal. Participation of height `H` is carried by
 its child transition `H+1` in `prev_finality_signers`. That field holds every
-vote the `H+1` proposer observed for `(H, round_H, transition_id_H)`, including
-votes that arrived after quorum. Nodes verify it before applying `H+1`:
+precommit the `H+1` proposer observed for
+`(H, prev_finality_round, transition_id_H)`, including precommits that arrived
+after quorum. `prev_finality_round` is a field of `H+1`: one transition can be
+finalized by precommits from different rounds on different nodes, so the child
+names the commit round instead of each node using its local certificate. Nodes
+verify it before applying `H+1`:
 
 - canonical encoding (sorted by pubkey, no duplicates)
 - empty if and only if the parent is genesis
-- every signer is a member of `H`'s committee
+- `prev_finality_round >= round_H`
+- every signer is a member of `H`'s committee at `prev_finality_round`
 - every signature verifies over the vote-signing message for `H`
 - at least `quorum(H)` signers
 
 Liveness and reward accounting for `H` read this record (see
-[REWARD-SETTLEMENT.md](REWARD-SETTLEMENT.md)). Since `prev_finality_signers` is
-part of the transition id, re-proposals of a locked payload refresh it freely:
-the lock payload id excludes it.
+[REWARD-SETTLEMENT.md](REWARD-SETTLEMENT.md)). Re-proposals carry the
+transition unchanged, so its `prev_finality_signers` is the one recorded when it
+was first built.
 
 The finalized transition then drives:
 
@@ -269,11 +267,13 @@ local heuristics during proposal/vote handling.
 ## Invariants
 
 - only `finalized_height + 1` is processed in the live path
-- votes are bound to `(height, round, block_id)`
+- prevotes and precommits are bound to `(height, round, transition_id)` in
+  separate signing domains
 - the committee for a height comes from the finalized checkpoint for that
   height's epoch
 - checkpoint output is deterministic from finalized state only
-- a QC cannot unlock a conflicting payload
+- a precommit follows a polka and a durable lock; a lock moves only to a later
+  polka, so at most one transition finalizes per height
 - finalized transition delivery and local quorum finalization use the same
   state transition
 - local finalization rechecks committee/quorum from recomputed transition state
