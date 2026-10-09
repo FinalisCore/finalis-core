@@ -156,8 +156,21 @@ holds:
 
 The lock is updated when the node votes.
 
+A node never votes in a round for which it has already signed a timeout vote.
+That record survives round resets and is cleared only when the height
+finalizes.
+
 This preserves the live safety property that a QC cannot unlock a conflicting
 payload.
+
+Known limitation: the lock compares the consensus payload id, which excludes
+round, leader and `prev_finality_signers`. Two transitions with the same payload
+proposed in different rounds can therefore each collect a QC, and since a QC is
+finality they are two distinct finalized transitions at one height. Because a
+QC is finality, a lock also cannot be released safely before finalization, so
+locks split across payloads without a QC can halt a height. The fix is two-phase
+finality (prevote, precommit): see
+[spec/TWO_PHASE_FINALITY.md](spec/TWO_PHASE_FINALITY.md).
 
 ## Finalization
 

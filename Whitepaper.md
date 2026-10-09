@@ -61,10 +61,13 @@ height from a lower round: either a QC or a TC.
 
 A validator votes for a proposal only if it holds, in its local store, a valid ingress certificate for every record of the proposed slice; otherwise it defers the vote and fetches the missing records from peers. A QC therefore implies that at least `f + 1` honest validators hold the finalized slice's certified records.
 
-Each validator keeps a durable vote lock `(payload, round)` per height, set when it votes. It may
-vote for a different payload only if the proposal carries a valid QC for that payload from a round
-in `[locked_round, r)`. A TC never releases a lock, and neither does a restart: the lock is persisted
-before the vote is sent, and a validator whose safety state is unreadable abstains at that height.
+Each validator keeps a durable vote lock `(payload, round)` per height, set when it votes. The
+payload identity excludes the round, leader and `prev_finality_signers`, so a locked payload can be
+re-proposed in a later round. A validator may vote for a different payload only if the proposal
+carries a valid QC for that payload from a round in `[locked_round, r)`. A TC never releases a lock,
+and neither does a restart: the lock is persisted before the vote is sent, and a validator whose
+safety state is unreadable abstains at that height. A validator never votes in a round it has
+already sent a timeout vote for.
 
 ### 3.1 Safety intuition
 
@@ -98,16 +101,24 @@ different `(h', r', id(T_{h'}))`.
 `(height, round, transition_id)`. Any tuple change changes the verified
 message.
 
-**Proposition 3 (Cross-Round Safety).**  
-Under the same assumptions, two distinct transitions cannot both finalize at the
-same height, in any rounds.
+**Open problem: cross-round safety.**  
+Proposition 1 covers a single round. The current one-phase rule does not
+guarantee that two distinct transitions cannot finalize at the same height in
+different rounds:
 
-*Proof sketch.* Let `P` finalize at `(h, r)` with quorum `S`. Every honest
-member of `S` holds a lock on `P` from round `r`. Suppose some round `r' > r` is
-the first in which a QC forms for a payload `P' != P`, with quorum `S'`. `S`
-and `S'` share an honest validator. Locked on `P` at round `>= r`, it votes for
-`P'` only with a QC for `P'` from a round in `[r, r')`. By Proposition 1 none
-exists at `r`, and by minimality of `r'` none exists in `(r, r')`.
+- the lock compares payload identity, which excludes round and leader, so two
+  transitions with the same payload (for example two empty slices) proposed in
+  different rounds can each collect a QC, and they are distinct finalized
+  transitions;
+- because a QC is itself finality, a lock can never be released safely before
+  the height finalizes, so locks split across payloads with no QC can halt the
+  height.
+
+With `n = 3f + 1`, finality from a single voting round cannot be both safe and
+live under asynchrony. Finality is being moved to two voting phases (prevote,
+then precommit; see `docs/spec/TWO_PHASE_FINALITY.md`), under which a value is
+locked only after a prevote quorum and a lock moves only on a newer prevote
+quorum. Cross-round safety is claimed only once that design is in force.
 
 ## 4. Certified Ingress Layer
 
@@ -126,7 +137,7 @@ Ingress validity requires:
 
 Stale-epoch ingress is rejected. Equivocation at fixed `(epoch, lane, seq)` is rejected and persisted as deterministic evidence. Re-delivery of a record whose certificate is identical to the one already stored (for example, a record first received by gossip and then again in a range-sync response) is an idempotent no-op, not a sequence violation; genuine gaps remain rejected.
 
-**Proposition 4 (Ingress Epoch Freshness).**  
+**Proposition 3 (Ingress Epoch Freshness).**  
 Certified ingress from a stale epoch cannot enter canonical execution.
 
 *Proof sketch.* Ingress validation enforces
@@ -177,7 +188,7 @@ Authoritative replay inputs are:
 
 Non-authoritative caches may be rebuilt and cannot change canonical output.
 
-**Proposition 5 (Replay Uniqueness).**  
+**Proposition 4 (Replay Uniqueness).**  
 For fixed authoritative finalized inputs, canonical derived state is unique.
 
 *Proof sketch.* Replay applies a deterministic transition function in height
@@ -212,7 +223,7 @@ Validation hardening includes:
 - max-fee policy enforcement on both V1 and V2 paths
 - V2 fee validation: transparent inputs must cover transparent outputs + fee; confidential value conservation is enforced via commitment balance checks
 
-**Proposition 6 (Script-Parity Invariant).**  
+**Proposition 5 (Script-Parity Invariant).**  
 Validator-control script semantics are consistent across legacy `Tx` and
 transparent outputs in `TxV2`.
 
@@ -231,7 +242,7 @@ Consensus bounds on confidential work:
 
 Independently of confidential work, a frontier slice is an invalid transition above 1,000 records or 1 MiB of raw transaction bytes.
 
-**Proposition 7 (Confidential Turnstile).**  
+**Proposition 6 (Confidential Turnstile).**  
 The value held in confidential outputs never goes negative in canonical state.
 
 *Proof sketch.* Canonical derived state commits a pool value `P`, updated
@@ -279,7 +290,7 @@ Finalis security requires:
 
 The protocol intentionally prefers safe halt over speculative reconstruction when authoritative finalized artifacts are missing or inconsistent.
 
-**Proposition 8 (Fail-Closed Recovery).**  
+**Proposition 7 (Fail-Closed Recovery).**  
 Missing/inconsistent authoritative finalized artifacts lead to halt, not
 speculative canonical continuation.
 
