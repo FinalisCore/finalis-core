@@ -229,6 +229,33 @@ Expected invariant:
 - endpoint failure does not blank the surface
 - stale finalized cache is labeled explicitly
 
+### 9. Consensus Chaos (Liveness And Safety Under Faults)
+
+`scripts/chaos_devnet.py` runs N local validator processes with fast timing and routes every
+directed link through an in-process TCP proxy (nodes only dial configured peers; addrman rejects
+loopback addresses). It alternates fault windows with healed windows:
+
+- crash (SIGKILL up to `f` nodes) and graceful restart
+- partitions (random splits, including ones with no quorum on either side)
+- isolation flaps of one node (exercises the reconnect round reset)
+- link latency
+- crash combined with a partition
+
+Pass criteria:
+
+- no fork: every `finalized height=H transition=T` log line agrees across nodes (exit 3 otherwise)
+- after each heal, a new height finalizes within `--recovery-deadline` (exit 2 otherwise)
+- at the end, every node reaches the same tip
+
+```bash
+cmake --build build -j
+scripts/chaos_devnet.py --nodes 7 --duration 900 --seed 7 --workdir /tmp/finalis-chaos
+```
+
+It generates a genesis with `scripts/generate_fresh_genesis.sh` (or reuses `--genesis-dir`) and
+writes `report.md`, `report.json` and `node<i>.log` to the workdir. Use different `--seed` values
+for different fault schedules; a failing seed reproduces the same schedule.
+
 ## Useful Existing Tests
 
 Targeted checks already exist in:

@@ -492,6 +492,12 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     if (error) *error = "write-batch-commit-failed";
     return false;
   }
+  // Stable, parseable record of every finalization (scripts/chaos_devnet.py compares these across
+  // nodes to detect forks and measure rounds per height).
+  log_line("finalized height=" + std::to_string(record.transition.height) + " transition=" +
+           hex_encode32(transition_id) + " round=" + std::to_string(record.transition.round) +
+           " commit_round=" + std::to_string(commit_round) + " source=" +
+           (clear_requested_sync ? "delivered" : "quorum"));
   if (error) error->clear();
   return true;
 }
@@ -795,6 +801,38 @@ std::uint32_t Node::local_vote_round_floor_locked(std::uint64_t height) const {
     if (it->first.first == height) floor = std::max(floor, it->first.second);
   }
   return floor;
+}
+
+Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_t height) const {
+  constexpr std::size_t kRounds = 3;  // latest rounds only: older ones cannot complete a useful TC or polka
+  LocalVoteRebroadcast out;
+  std::vector<std::uint32_t> timed_out;
+  for (auto it = local_timed_out_rounds_.lower_bound({height, 0});
+       it != local_timed_out_rounds_.end() && it->first == height; ++it) {
+    timed_out.push_back(it->second);
+  }
+  for (std::size_t k = timed_out.size() > kRounds ? timed_out.size() - kRounds : 0; k < timed_out.size(); ++k) {
+    if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(height, timed_out[k]), local_key_.private_key)) {
+      out.timeouts.push_back(TimeoutVote{height, timed_out[k], local_key_.public_key, *sig});
+    }
+  }
+  std::vector<std::pair<std::uint32_t, Hash32>> prevotes;
+  for (auto it = local_prevotes_.lower_bound({height, 0}); it != local_prevotes_.end() && it->first.first == height; ++it) {
+    prevotes.emplace_back(it->first.second, it->second);
+  }
+  for (std::size_t k = prevotes.size() > kRounds ? prevotes.size() - kRounds : 0; k < prevotes.size(); ++k) {
+    const auto& [round, transition_id] = prevotes[k];
+    if (auto sig = crypto::ed25519_sign(prevote_signing_message(height, round, transition_id), local_key_.private_key)) {
+      out.prevotes.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
+    }
+  }
+  if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end()) {
+    const auto& [transition_id, round] = lock->second;
+    if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key)) {
+      out.precommits.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
+    }
+  }
+  return out;
 }
 
 void Node::reseed_local_votes_locked(std::uint64_t height) {

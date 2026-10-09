@@ -1083,6 +1083,7 @@ void Node::event_loop() {
     (void)reap_lightserver_child(true);
     std::optional<p2p::ProposeMsg> propose_to_send;
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
+    LocalVoteRebroadcast votes_to_rebroadcast;
     std::vector<int> keepalive_peers;
     std::vector<int> finalized_tip_poll_peers;
     bool should_build_proposal = false;
@@ -1362,6 +1363,14 @@ void Node::event_loop() {
       }
       const std::uint64_t stale_ms = cfg_.network.round_timeout_ms * 2ULL;
       const bool consensus_stalled = now_ms > last_finalized_progress_ms_ + stale_ms;
+      // LIVENESS: a vote is otherwise sent once. Votes lost while peers were unreachable (partition,
+      // reconnect) are never retransmitted, and a TC missing one side's timeout votes never forms, so
+      // a healed partition could halt the height for good. While stalled, re-gossip this node's own
+      // votes at h.
+      if (consensus_stalled && now_ms >= last_consensus_rebroadcast_ms_ + cfg_.network.round_timeout_ms) {
+        last_consensus_rebroadcast_ms_ = now_ms;
+        votes_to_rebroadcast = local_votes_for_rebroadcast_locked(h);
+      }
       const std::uint64_t current_round_timeout_ms = round_timeout_ms_for_round(cfg_.network, current_round_);
       const bool emit_liveness_debug = debug_liveness_logs_enabled() || consensus_stalled;
       if (emit_liveness_debug && now_ms >= last_liveness_log_ms_ + 5000) {
@@ -1572,6 +1581,15 @@ void Node::event_loop() {
     // Backstop for finalizations reached from event-loop paths (sync, repair).
     flush_pending_finalized_broadcasts();
 
+    for (const auto& v : votes_to_rebroadcast.timeouts) broadcast_timeout_vote(v);
+    for (const auto& v : votes_to_rebroadcast.prevotes) broadcast_prevote(v);
+    for (const auto& v : votes_to_rebroadcast.precommits) broadcast_vote(v);
+    if (!votes_to_rebroadcast.timeouts.empty() || !votes_to_rebroadcast.prevotes.empty() ||
+        !votes_to_rebroadcast.precommits.empty()) {
+      log_line("consensus-rebroadcast timeouts=" + std::to_string(votes_to_rebroadcast.timeouts.size()) +
+               " prevotes=" + std::to_string(votes_to_rebroadcast.prevotes.size()) +
+               " precommits=" + std::to_string(votes_to_rebroadcast.precommits.size()));
+    }
     if (timeout_vote_to_broadcast.has_value()) {
       broadcast_timeout_vote(*timeout_vote_to_broadcast);
       const bool ok = handle_timeout_vote(*timeout_vote_to_broadcast, false, 0);

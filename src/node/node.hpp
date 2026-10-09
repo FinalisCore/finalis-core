@@ -462,6 +462,15 @@ class Node {
   // than a prevote already sent, which breaks the cross-round safety argument (found by TLC,
   // formal/two_phase_finality.tla).
   std::uint32_t local_vote_round_floor_locked(std::uint64_t height) const;
+  // This node's own votes at `height` for re-gossip while the height is stalled: timeout votes,
+  // prevotes and the precommit its lock implies, for the latest few rounds. Re-signed; Ed25519 is
+  // deterministic, so these are the messages already sent.
+  struct LocalVoteRebroadcast {
+    std::vector<TimeoutVote> timeouts;
+    std::vector<Vote> prevotes;
+    std::vector<Vote> precommits;
+  };
+  LocalVoteRebroadcast local_votes_for_rebroadcast_locked(std::uint64_t height) const;
   // Puts this node's own signed votes at `height` back into the trackers after they were cleared
   // (restart, reconnect reset): its recorded prevotes, and the precommit its lock implies.
   // Ed25519 is deterministic, so the re-signed votes are the ones already sent.
@@ -830,6 +839,7 @@ class Node {
   std::uint32_t tc_no_qc_last_round_{0};
   std::uint32_t tc_no_qc_round_streak_{0};
   std::uint64_t last_finalized_progress_ms_{0};
+  std::uint64_t last_consensus_rebroadcast_ms_{0};
   std::uint64_t last_finalized_tip_poll_ms_{0};
   std::size_t finalized_tip_poll_cursor_{0};
   std::uint64_t last_missing_next_cert_stall_log_ms_{0};

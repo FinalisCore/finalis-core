@@ -193,6 +193,12 @@ Implementation notes beyond §3:
 
 - A body that arrives after its polka or precommit quorum (proposal or uncertified transition
   delivery) re-runs polka and finality checks for every round from its own to the current one.
+- Re-gossip: while a height is stalled (`2 × round_timeout_ms` without finality), every
+  `round_timeout_ms` a validator re-sends its own timeout votes, prevotes and lock-implied
+  precommit for the latest three rounds at that height (re-signed, byte-identical). Without it a
+  vote lost during a partition is never retransmitted, and a TC that misses one side's timeout
+  votes never forms: a healed no-quorum partition halted the height for good
+  (`scripts/chaos_devnet.py`, first run).
 - After a restart or a reconnect reset clears the vote trackers, the node re-adds its own recorded
   prevotes and the precommit its lock implies (Ed25519 is deterministic, so these are the votes
   already sent).
