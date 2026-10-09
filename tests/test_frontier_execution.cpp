@@ -343,8 +343,10 @@ TEST(test_frontier_execution_rejects_slice_over_block_confidential_verify_weight
   };
   const auto a = make_tx(0x31);
   const auto b = make_tx(0x32);
-  // One confidential input signature + proof bytes + one batch; identity (zero) excess is unsigned.
-  const std::uint64_t per_tx = kConfidentialSignatureVerifyWeight + 1000 + kRangeProofBatchVerifyWeight;
+  // One confidential input signature + proof bytes and output charge + tx base; identity (zero)
+  // excess is unsigned.
+  const std::uint64_t per_tx = kConfidentialSignatureVerifyWeight + 1000 + kConfidentialOutputVerifyWeight +
+                               kConfidentialTxBaseVerifyWeight;
   ASSERT_EQ(txv2_confidential_verify_weight(a), per_tx);
   ASSERT_EQ(any_tx_confidential_verify_weight(AnyTx{a}), per_tx);
   ASSERT_EQ(consensus::ordered_record_confidential_verify_weight(a.serialize()), per_tx);

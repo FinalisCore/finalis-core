@@ -1501,7 +1501,13 @@ bool append_live_certified_ingress_to_nodes_once(const std::string& db_path, con
         if (error) {
           *error = "node=" + std::to_string(n->p2p_port_for_test()) + " lane=" + std::to_string(lane) +
                    " range=[" + std::to_string(range.from_seq) + "," + std::to_string(range.to_seq) + "] reason=" +
-                   ingress_error;
+                   ingress_error + " live_tips=";
+          for (auto* other : nodes) {
+            if (!other) continue;
+            const auto st = other->lane_state_for_test(lane);
+            *error += std::to_string(other->p2p_port_for_test()) + ":" + (st ? std::to_string(st->max_seq) : "none") +
+                      "@h" + std::to_string(other->status().height) + " ";
+          }
         }
         return false;
       }
@@ -10424,6 +10430,81 @@ TEST(test_frontier_mode_rejects_conflicting_ingress_record_from_peer_fixture) {
   const auto evidence =
       db2.get_ingress_equivocation_evidence(rec_a.certificate.epoch, rec_a.certificate.lane, rec_a.certificate.seq);
   ASSERT_TRUE(evidence.has_value());
+}
+
+// A range response overlapping records the node already holds (gossip won the race) must be a
+// no-op for those records, not an ingress-seq-discontinuity that scores an honest peer.
+TEST(test_frontier_mode_accepts_ingress_range_overlapping_held_records) {
+  const auto base = unique_test_base("/tmp/finalis_it_ingress_sync_overlap");
+  auto cfg = single_node_cfg(base, 1);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  ASSERT_TRUE(create_test_validator_keystore(cfg, 0));
+
+  Tx tx_a;
+  tx_a.version = 1;
+  tx_a.outputs.push_back(TxOut{16, Bytes{'h'}});
+  const auto rec_a = make_signed_ingress_record_msg(tx_a.serialize(), 1, 1, zero_hash());
+  const auto root_a = consensus::compute_lane_root_append(zero_hash(), rec_a.certificate.tx_hash);
+  Tx tx_b;
+  tx_b.version = 1;
+  tx_b.outputs.push_back(TxOut{17, Bytes{'n'}});
+  Bytes tx_b_bytes = tx_b.serialize();
+  for (int i = 0; i < 256; ++i) {
+    tx_b.outputs[0].script_pubkey = Bytes{static_cast<std::uint8_t>(i)};
+    tx_b_bytes = tx_b.serialize();
+    auto parsed = Tx::parse(tx_b_bytes);
+    ASSERT_TRUE(parsed.has_value());
+    if (consensus::assign_ingress_lane(*parsed) == rec_a.certificate.lane) break;
+  }
+  const auto rec_b = make_signed_ingress_record_msg(tx_b_bytes, 1, 2, root_a);
+  ASSERT_EQ(rec_b.certificate.lane, rec_a.certificate.lane);
+  const auto lane = rec_a.certificate.lane;
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(cfg.db_path));
+  ASSERT_TRUE(db.put_ingress_bytes(rec_a.certificate.txid, rec_a.tx_bytes));
+  ASSERT_TRUE(db.put_ingress_certificate(lane, rec_a.certificate.seq, rec_a.certificate.serialize()));
+  ASSERT_TRUE(db.put_lane_state(lane, LaneState{rec_a.certificate.epoch, lane, rec_a.certificate.seq, root_a}));
+  db.close();
+
+  node::Node target(cfg);
+  ASSERT_TRUE(target.init());
+
+  // Held record with a payload that does not match its certificate is still rejected.
+  auto tampered = rec_a;
+  tampered.tx_bytes = tx_b_bytes;
+  target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 1});
+  p2p::IngressRangeMsg bad;
+  bad.lane = lane;
+  bad.from_seq = 1;
+  bad.to_seq = 1;
+  bad.records.push_back(tampered);
+  ASSERT_TRUE(!target.inject_ingress_range_result_for_test(bad, 5).empty());
+
+  // Exact re-delivery of the held record.
+  target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 1});
+  p2p::IngressRangeMsg same;
+  same.lane = lane;
+  same.from_seq = 1;
+  same.to_seq = 1;
+  same.records.push_back(rec_a);
+  ASSERT_EQ(target.inject_ingress_range_result_for_test(same, 5), std::string{});
+  ASSERT_EQ(target.lane_state_for_test(lane)->max_seq, 1u);
+
+  // Held prefix plus a new record: the new one appends on top of the held tip.
+  target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 2});
+  p2p::IngressRangeMsg overlap;
+  overlap.lane = lane;
+  overlap.from_seq = 1;
+  overlap.to_seq = 2;
+  overlap.records.push_back(rec_a);
+  overlap.records.push_back(rec_b);
+  ASSERT_EQ(target.inject_ingress_range_result_for_test(overlap, 5), std::string{});
+  const auto tip = target.lane_state_for_test(lane);
+  ASSERT_TRUE(tip.has_value());
+  ASSERT_EQ(tip->max_seq, 2u);
+  ASSERT_EQ(tip->lane_root, consensus::compute_lane_root_append(root_a, rec_b.certificate.tx_hash));
+  target.stop();
 }
 
 TEST(test_frontier_mode_rejects_incomplete_or_invalid_ingress_ranges_from_peer_fixture) {

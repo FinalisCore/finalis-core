@@ -568,6 +568,7 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
                " seq=" + std::to_string(expected_seq) + " reason=range-seq-mismatch");
       return false;
     }
+    bool already_held = false;
     if (auto existing_bytes = db_.get_ingress_certificate(msg.lane, expected_seq); existing_bytes.has_value()) {
       auto existing = IngressCertificate::parse(*existing_bytes);
       if (!existing.has_value()) {
@@ -587,6 +588,20 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
                  " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
         return false;
       }
+      already_held = *existing == record.certificate;
+    }
+    if (already_held) {
+      // Already appended, typically via gossip racing this range response: a no-op, as in
+      // append_validated_ingress_record, not a discontinuity to score the peer for. The local tip
+      // already covers this seq, so simulated_state stays put. The payload must still match.
+      validation_error.clear();
+      if (!consensus::validate_ingress_payload(record.certificate, record.tx_bytes, &validation_error)) {
+        if (error) *error = validation_error;
+        log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
+                 " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
+        return false;
+      }
+      continue;
     }
     validation_error.clear();
     if (!consensus::validate_ingress_append(simulated_state, record.certificate, record.tx_bytes,

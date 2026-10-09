@@ -425,11 +425,11 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
     if (!result.ok) throw std::runtime_error("accept confidential error: " + result.error);
     ASSERT_TRUE(result.ok);
     ASSERT_EQ(result.cost.fee, 500u);
-    // range proof bytes + one range-proof batch + balance-proof excess signature.
+    // range proof bytes + output charge + balance-proof excess signature + tx base.
     ASSERT_TRUE(!crypto::commitment_is_identity(tx.balance_proof.excess_commitment));
     ASSERT_EQ(result.cost.confidential_verify_weight,
-              confidential_out.range_proof.bytes.size() + kRangeProofBatchVerifyWeight +
-                  kConfidentialSignatureVerifyWeight);
+              confidential_out.range_proof.bytes.size() + kConfidentialOutputVerifyWeight +
+                  kConfidentialSignatureVerifyWeight + kConfidentialTxBaseVerifyWeight);
 
     UtxoSetV2 applied = view;
     apply_any_tx_to_utxo(AnyTx{tx}, applied);
@@ -479,9 +479,9 @@ TEST(test_validate_tx_v2_accepts_confidential_input_with_transparent_output) {
   if (!result.ok) throw std::runtime_error("accept confidential-input error: " + result.error);
   ASSERT_TRUE(result.ok);
   ASSERT_EQ(result.cost.fee, 500u);
-  // One confidential input signature + balance-proof excess signature; no range proofs.
+  // One confidential input signature + balance-proof excess signature + tx base; no range proofs.
   ASSERT_TRUE(!crypto::commitment_is_identity(tx.balance_proof.excess_commitment));
-  ASSERT_EQ(result.cost.confidential_verify_weight, 2 * kConfidentialSignatureVerifyWeight);
+  ASSERT_EQ(result.cost.confidential_verify_weight, 2 * kConfidentialSignatureVerifyWeight + kConfidentialTxBaseVerifyWeight);
 }
 
 TEST(test_validate_tx_v2_rejects_duplicate_nullifier_like_confidential_spend_id) {
@@ -1133,4 +1133,72 @@ TEST(test_txv2_too_many_outputs_rejected) {
   ASSERT_TRUE(TxV2::parse(txv2_with_counts(1, kTxV2MaxOutputs).serialize()).has_value());
   ASSERT_TRUE(!TxV2::parse(txv2_with_counts(1, kTxV2MaxOutputs + 1).serialize()).has_value());
   ASSERT_TRUE(!parse_any_tx(txv2_with_counts(1, kTxV2MaxOutputs + 1).serialize()).has_value());
+}
+
+TEST(test_txv2_confidential_verify_weight_formula) {
+  TxV2 tx;
+  for (std::uint8_t i = 0; i < 2; ++i) {
+    TxInV2 in;
+    in.prev_txid.fill(i);
+    in.kind = TxInputKind::Confidential;
+    in.witness = ConfidentialInputWitnessV2{};
+    tx.inputs.push_back(in);
+  }
+  for (std::size_t bytes : {std::size_t{5126}, std::size_t{5134}, std::size_t{100}}) {
+    ConfidentialTxOutV2 conf;
+    conf.range_proof = crypto::ProofBytes{Bytes(bytes, 0x01)};
+    tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential, .body = conf});
+  }
+  tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent, .body = TransparentTxOutV2{1, Bytes{0x51}}});
+  ASSERT_TRUE(crypto::commitment_is_identity(tx.balance_proof.excess_commitment));
+  const std::uint64_t outputs = 5126 + 5134 + 100 + 3 * kConfidentialOutputVerifyWeight;
+  ASSERT_EQ(txv2_confidential_verify_weight(tx),
+            2 * kConfidentialSignatureVerifyWeight + outputs + kConfidentialTxBaseVerifyWeight);
+
+  tx.balance_proof.excess_commitment.bytes[0] = 0x02;  // non-identity excess adds its signature
+  ASSERT_EQ(txv2_confidential_verify_weight(tx),
+            3 * kConfidentialSignatureVerifyWeight + outputs + kConfidentialTxBaseVerifyWeight);
+
+  // Transparent-only TxV2: no confidential verification work, no base charge.
+  TxV2 transparent;
+  transparent.inputs.push_back(TxInV2{.kind = TxInputKind::Transparent, .witness = TransparentInputWitnessV2{}});
+  transparent.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent, .body = TransparentTxOutV2{1, Bytes{0x51}}});
+  ASSERT_EQ(txv2_confidential_verify_weight(transparent), 0u);
+}
+
+// The output limit matches the proof-byte cap: 12 canonical proofs fit, 13 never could.
+TEST(test_validate_tx_v2_confidential_output_limit_is_12) {
+  if (!crypto::confidential_backend_status().confidential_outputs_supported) return;
+  ConfidentialPolicy policy;
+  ASSERT_EQ(policy.max_confidential_outputs_per_tx, 12u);
+  ASSERT_TRUE(12ull * kTxV2MaxRangeProofBytes <= policy.max_total_proof_bytes_per_tx);
+  ASSERT_TRUE(13ull * kTxV2MaxRangeProofBytes > policy.max_total_proof_bytes_per_tx);
+
+  const auto from = key_from_byte(0x29);
+  const auto from_pkh = crypto::h160(Bytes(from.public_key.begin(), from.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0x49);
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{100'000, address::p2pkh_script_pubkey(from_pkh)});
+  SpecialValidationContext ctx;
+  ctx.current_height = 100;
+  ctx.confidential_policy = &policy;
+
+  auto make = [&](std::size_t n_outputs) {
+    TxV2 tx;
+    tx.inputs.push_back(TxInV2{.prev_txid = op.txid, .prev_index = op.index, .sequence = 0xFFFFFFFF,
+                               .kind = TxInputKind::Transparent, .witness = TransparentInputWitnessV2{}});
+    for (std::size_t i = 0; i < n_outputs; ++i) {
+      tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential,
+                                   .body = make_valid_confidential_output(static_cast<std::uint8_t>(0x10 + 8 * i), 1'000)});
+    }
+    tx.fee = 500;
+    resign_input0(tx, from);
+    return tx;
+  };
+  const auto at_limit = validate_tx_v2(make(12), 1, view, &ctx);
+  ASSERT_TRUE(at_limit.error != "too many confidential outputs");
+  const auto over = validate_tx_v2(make(13), 1, view, &ctx);
+  ASSERT_TRUE(!over.ok);
+  ASSERT_EQ(over.error, std::string("too many confidential outputs"));
 }

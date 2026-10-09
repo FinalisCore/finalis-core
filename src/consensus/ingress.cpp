@@ -18,6 +18,8 @@ Hash32 outpoint_anchor_hash(const TxIn& in) {
   return crypto::sha256d(w.take());
 }
 
+}  // namespace
+
 bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_bytes, std::string* error) {
   const auto tx = parse_any_tx(tx_bytes);
   if (!tx.has_value()) {
@@ -43,8 +45,6 @@ bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_by
   }
   return true;
 }
-
-}  // namespace
 
 Hash32 ingress_lane_anchor(const Tx& tx) {
   if (tx.inputs.empty()) return tx.txid();

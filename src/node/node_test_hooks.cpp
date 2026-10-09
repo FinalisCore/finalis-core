@@ -443,6 +443,11 @@ std::optional<p2p::GetIngressRangeMsg> Node::requested_ingress_range_for_test(in
   return it->second;
 }
 
+std::optional<LaneState> Node::lane_state_for_test(std::uint32_t lane) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return db_.get_lane_state(lane);
+}
+
 bool Node::overwrite_runtime_next_height_checkpoint_for_test(const storage::FinalizedCommitteeCheckpoint& checkpoint) {
   std::lock_guard<std::mutex> lk(mu_);
   const auto target_epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);

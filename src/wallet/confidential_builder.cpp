@@ -6,6 +6,7 @@
 
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/secure_memory.hpp"
 
 namespace finalis::wallet {
 namespace {
@@ -164,7 +165,13 @@ std::optional<TxV2> build_txv2_transparent_to_confidential(
     return std::nullopt;
   }
   tx.balance_proof.excess_commitment = *excess_commitment;
-  if (!sign_balance_proof(tx, *excess_blind, crypto::sha256d(Bytes{'b', 'a', 'l', 'o'}), err)) return std::nullopt;
+  Hash32 excess_aux{};
+  crypto::ScopedWipe<Hash32> wipe_excess_aux(excess_aux);
+  if (!crypto::secure_random_bytes(excess_aux.data(), excess_aux.size())) {
+    if (err) *err = "failed to generate balance proof auxiliary randomness";
+    return std::nullopt;
+  }
+  if (!sign_balance_proof(tx, *excess_blind, excess_aux, err)) return std::nullopt;
   if (!resign_transparent_input(tx, transparent_owner_private_key_32, 0, err)) return std::nullopt;
   (void)prev_out;
   return tx;

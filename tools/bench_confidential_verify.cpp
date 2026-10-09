@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Measures the CPU cost of the work charged by txv2_confidential_verify_weight, to calibrate
-// kConfidentialSignatureVerifyWeight / kRangeProofBatchVerifyWeight against proof bytes.
+// the kConfidential*VerifyWeight constants (validate.hpp) against proof bytes.
 //
 //   finalis-bench-confidential [iterations] [load_threads]
 //
