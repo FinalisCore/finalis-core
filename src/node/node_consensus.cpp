@@ -1528,8 +1528,31 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     const auto local_vote_key = std::make_pair(msg.height, msg.round);
     const bool local_is_committee_member = is_committee_member_for(local_key_.public_key, msg.height, msg.round);
     const bool local_vote_reserved = local_vote_reservations_.find(local_vote_key) != local_vote_reservations_.end();
-    const bool local_can_vote = local_is_committee_member && !local_vote_reserved &&
-                                can_vote_for_frontier_locked(transition, msg.justify_qc, msg.justify_tc, &vote_reason);
+    bool local_can_vote = local_is_committee_member && !local_vote_reserved &&
+                          can_vote_for_frontier_locked(transition, msg.justify_qc, msg.justify_tc, &vote_reason);
+    if (local_can_vote) {
+      // DATA AVAILABILITY: vote only for a slice whose certified ingress this node holds and has
+      // checked. Every honest voter then holds the records, so any finalized slice can be fetched.
+      std::string ingress_detail;
+      switch (certified_ingress_status_for_vote_locked(*proposal, &ingress_detail)) {
+        case CertifiedIngressStatus::Ready:
+          break;
+        case CertifiedIngressStatus::Missing: {
+          local_can_vote = false;
+          vote_reason = "awaiting-certified-ingress detail=" + ingress_detail;
+          if (deferred_certified_votes_.size() >= kMaxDeferredCertifiedVotes) {
+            deferred_certified_votes_.erase(deferred_certified_votes_.begin());
+          }
+          deferred_certified_votes_[transition_id] = {msg, from_peer_id};
+          request_missing_proposal_ingress_locked(transition, from_peer_id);
+          break;
+        }
+        case CertifiedIngressStatus::Invalid:
+          local_can_vote = false;
+          vote_reason = "certified-ingress-invalid detail=" + ingress_detail;
+          break;
+      }
+    }
     if (local_can_vote) {
       auto sig = crypto::ed25519_sign(vote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
       if (!sig.has_value()) {
@@ -2170,6 +2193,77 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
     return false;
   }
   return true;
+}
+
+Node::CertifiedIngressStatus Node::certified_ingress_status_for_vote_locked(const FrontierProposal& proposal,
+                                                                          std::string* detail) const {
+  const auto& transition = proposal.transition;
+  if (!canonical_state_.has_value()) {
+    if (detail) *detail = "missing-canonical-state";
+    return CertifiedIngressStatus::Invalid;
+  }
+  consensus::CanonicalFrontierRecord record;
+  std::string error;
+  if (!consensus::load_certified_frontier_record_from_storage(db_, transition, &record, &error)) {
+    if (detail) *detail = error;
+    const bool missing = error.rfind("frontier-storage-missing-lane-record", 0) == 0 ||
+                         error.rfind("frontier-storage-missing-ingress-bytes", 0) == 0;
+    return missing ? CertifiedIngressStatus::Missing : CertifiedIngressStatus::Invalid;
+  }
+  // Same certificate checks as finalization and replay (epoch, signatures, committee membership,
+  // lane, sequence, prev lane root, tx hash), without executing the slice again.
+  const auto vctx = special_validation_context_locked(transition.height);
+  consensus::FrontierLaneRoots next_lane_roots{};
+  std::vector<Bytes> certified_slice;
+  if (!consensus::frontier_merge_certified_ingress(transition.prev_vector, transition.next_vector, record.lane_records,
+                                                   canonical_state_->finalized_lane_roots, &next_lane_roots,
+                                                   &certified_slice, &vctx, &error)) {
+    if (detail) *detail = error;
+    return CertifiedIngressStatus::Invalid;
+  }
+  if (certified_slice != proposal.ordered_records) {
+    if (detail) *detail = "certified-ingress-slice-mismatch";
+    return CertifiedIngressStatus::Invalid;
+  }
+  if (consensus::frontier_ingress_commitment(transition.prev_vector, transition.next_vector, next_lane_roots) !=
+      transition.ingress_commitment) {
+    if (detail) *detail = "certified-ingress-commitment-mismatch";
+    return CertifiedIngressStatus::Invalid;
+  }
+  return CertifiedIngressStatus::Ready;
+}
+
+void Node::retry_deferred_certified_votes() {
+  std::vector<std::pair<p2p::ProposeMsg, int>> ready;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (deferred_certified_votes_.empty()) return;
+    const auto local_tips = local_ingress_lane_tips_locked();
+    for (auto it = deferred_certified_votes_.begin(); it != deferred_certified_votes_.end();) {
+      const auto& msg = it->second.first;
+      if (msg.height != finalized_height_ + 1 || msg.round < current_round_) {
+        it = deferred_certified_votes_.erase(it);
+        continue;
+      }
+      // Cheap gate before re-handling: every lane must reach the proposal's next vector.
+      const auto proposal = FrontierProposal::parse(msg.frontier_proposal_bytes);
+      bool complete = proposal.has_value();
+      for (std::size_t lane = 0; complete && lane < INGRESS_LANE_COUNT; ++lane) {
+        complete = local_tips[lane] >= proposal->transition.next_vector.lane_max_seq[lane];
+      }
+      if (!complete) {
+        ++it;
+        continue;
+      }
+      ready.push_back(std::move(it->second));
+      it = deferred_certified_votes_.erase(it);
+    }
+  }
+  for (const auto& [msg, peer_id] : ready) {
+    log_line("proposal-certified-ingress-retry height=" + std::to_string(msg.height) +
+             " round=" + std::to_string(msg.round) + " peer_id=" + std::to_string(peer_id));
+    (void)handle_propose_result(msg, false, peer_id, nullptr);
+  }
 }
 
 bool Node::check_and_record_proposer_equivocation_locked(const FrontierTransition& transition) {

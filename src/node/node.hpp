@@ -251,6 +251,7 @@ class Node {
   bool inject_ingress_range_for_test(const p2p::IngressRangeMsg& msg, int peer_id = 1);
   std::string inject_ingress_range_result_for_test(const p2p::IngressRangeMsg& msg, int peer_id = 1);
   void set_requested_ingress_range_for_test(int peer_id, const p2p::GetIngressRangeMsg& msg);
+  std::size_t deferred_certified_vote_count_for_test() const;
   bool observe_frontier_proposal_for_test(const FrontierProposal& proposal);
   bool inject_frontier_block_for_test(const FrontierProposal& proposal, const std::vector<FinalitySig>& finality_signatures);
   bool inject_tx_for_test(const AnyTx& tx, bool relay);
@@ -311,6 +312,7 @@ class Node {
   enum class ProposeHandlingResult { Accepted, SoftReject, HardReject };
   enum class VoteHandlingResult { Accepted, SoftReject, HardReject };
   enum class TimeoutVoteHandlingResult { Accepted, SoftReject, HardReject };
+  enum class CertifiedIngressStatus { Ready, Missing, Invalid };
 
   // Result of pre-verifying a finality certificate's signatures against its
   // transition. Pure w.r.t. Node state (only cert+transition), so it is
@@ -494,6 +496,13 @@ class Node {
   bool bootstrap_sync_incomplete_locked(int peer_id) const;
   bool check_and_record_proposer_equivocation_locked(const FrontierTransition& transition);
   bool validate_frontier_proposal_locked(const FrontierProposal& proposal, std::string* error = nullptr) const;
+  // Vote precondition: the local certified-ingress store holds every record of the proposal's lane
+  // ranges, the certificates validate, and their round-robin merge is exactly the proposal's slice.
+  CertifiedIngressStatus certified_ingress_status_for_vote_locked(const FrontierProposal& proposal,
+                                                                  std::string* detail) const;
+  void request_missing_proposal_ingress_locked(const FrontierTransition& transition, int preferred_peer_id);
+  // Re-handles deferred proposals whose lane ranges are now fully held locally. Call without mu_.
+  void retry_deferred_certified_votes();
   Hash32 committee_epoch_randomness_for_height_locked(std::uint64_t height) const;
   std::optional<storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoint_for_height_locked(
       std::uint64_t height) const;
@@ -546,6 +555,9 @@ class Node {
   std::array<std::uint64_t, INGRESS_LANE_COUNT> local_ingress_lane_tips_locked() const;
   bool handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& msg);
   bool handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& msg, std::string* error = nullptr);
+  // True while (peer_id, lane) has an unexpired outstanding range request; erases an expired one.
+  bool ingress_range_request_outstanding_locked(int peer_id, std::uint32_t lane);
+  bool send_ingress_range_request_locked(int peer_id, const p2p::GetIngressRangeMsg& req);
   bool maybe_request_forward_sync_block_locked(int preferred_peer_id = 0);
   bool maybe_request_candidate_transition_locked(int peer_id, const Hash32& transition_id);
   bool next_height_requires_repair_locked(std::string* reason = nullptr) const;
@@ -704,6 +716,10 @@ class Node {
   static constexpr std::size_t kMaxBufferedSyncCandidatesPerHeight = 4;
   static constexpr std::size_t kMaxBufferedSyncBytes = 256 * 1024 * 1024;
   std::map<Hash32, FrontierProposal> candidate_frontier_proposals_;
+  // Proposals this node would vote for but cannot yet: some certified ingress records are missing
+  // locally. Keyed by transition id; value is the proposal message and the peer it came from.
+  static constexpr std::size_t kMaxDeferredCertifiedVotes = 16;
+  std::map<Hash32, std::pair<p2p::ProposeMsg, int>> deferred_certified_votes_;
   std::map<std::uint64_t, std::vector<BufferedSyncFrontier>> buffered_sync_frontiers_;
   std::size_t buffered_sync_bytes_{0};
   std::map<std::uint64_t, QuorumCertificate> highest_qc_by_height_;
@@ -839,6 +855,9 @@ class Node {
   std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> send_frontier_by_height_log_state_;
   std::map<int, p2p::IngressTipsMsg> peer_ingress_tips_;
   std::map<std::pair<int, std::uint32_t>, p2p::GetIngressRangeMsg> requested_ingress_ranges_;
+  // Send time of each requested_ingress_ranges_ entry. A peer that lacks a range never answers, so
+  // entries older than kIngressRangeRequestTimeoutMs are dropped instead of blocking (peer, lane).
+  std::map<std::pair<int, std::uint32_t>, std::uint64_t> requested_ingress_range_sent_ms_;
   std::optional<FrontierProposal> last_broadcast_finalized_frontier_;
   std::optional<FinalityCertificate> last_broadcast_finality_certificate_;
   // Finalization broadcasts queued under mu_ and sent by

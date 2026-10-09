@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <array>
@@ -1567,14 +1568,16 @@ void append_live_certified_tx_or_throw(Cluster& cluster, const Tx& tx, const std
 // genesis committee (otherwise init() generates fresh keys and no node can cast its own vote).
 bool restart_cluster_with_seeded_certified_ingress(Cluster* cluster, const std::vector<Bytes>& raw_records,
                                                    bool start_nodes = true, bool pause_nodes = false,
-                                                   bool keep_validator_keys = false) {
+                                                   bool keep_validator_keys = false,
+                                                   const std::set<std::size_t>& unseeded_nodes = {}) {
   if (!cluster) return false;
   for (auto& n : cluster->nodes) {
     if (n) n->stop();
   }
   cluster->nodes.clear();
 
-  for (const auto& cfg : cluster->configs) {
+  for (std::size_t node_index = 0; node_index < cluster->configs.size(); ++node_index) {
+    const auto& cfg = cluster->configs[node_index];
     std::error_code ec;
     std::string saved_key;
     if (keep_validator_keys) {
@@ -1596,7 +1599,7 @@ bool restart_cluster_with_seeded_certified_ingress(Cluster* cluster, const std::
     }
     storage::DB db;
     if (!db.open(cfg.db_path)) return false;
-    if (!persist_certified_ingress_fixture(cfg, db, raw_records)) return false;
+    if (!unseeded_nodes.contains(node_index) && !persist_certified_ingress_fixture(cfg, db, raw_records)) return false;
     db.close();
 
     auto node = std::make_unique<node::Node>(cfg);
@@ -7191,6 +7194,108 @@ TEST(test_only_one_block_can_finalize_per_height_after_vote_locking) {
 
 // Regression: load_state used to drop a next-height vote lock that had no QC, so a validator that
 // voted for A, crashed and restarted could then sign a conflicting payload at the same height.
+// Certified-ingress records for `raw_records`, as persist_certified_ingress_fixture writes them
+// (deterministic signer), built in a scratch database so a running node's records can be replayed.
+std::optional<CertifiedIngressFixture> scratch_certified_ingress_fixture(const node::NodeConfig& base_cfg,
+                                                                         const std::vector<Bytes>& raw_records,
+                                                                         const std::string& scratch_base) {
+  auto cfg = base_cfg;
+  cfg.db_path = unique_test_base(scratch_base) + "/fixture";
+  cfg.disable_p2p = true;
+  cfg.listen = false;
+  cfg.p2p_port = 0;
+  {
+    node::Node seed(cfg);
+    if (!seed.init()) return std::nullopt;
+    seed.stop();
+  }
+  storage::DB db;
+  if (!db.open(cfg.db_path)) return std::nullopt;
+  CertifiedIngressFixture fixture;
+  const bool ok = persist_certified_ingress_fixture(cfg, db, raw_records, &fixture);
+  db.close();
+  if (!ok) return std::nullopt;
+  return fixture;
+}
+
+TEST(test_validator_defers_vote_until_certified_ingress_is_held) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_vote_needs_ingress"), 4, 4, 4);
+  // The target is isolated and unseeded, so it cannot hold the record when the proposal arrives.
+  constexpr std::size_t ti = 3;
+  cluster.configs[ti].disable_p2p = true;
+  cluster.configs[ti].listen = false;
+  cluster.configs[ti].p2p_port = 0;
+  Tx tx = make_fixture_ingress_tx(1, 0x8C);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true, {ti}));
+  const std::uint64_t target_height = cluster.nodes[0]->status().height + 1;
+  auto proposal = build_cluster_frontier_proposal_from_records(cluster, keys, {tx.serialize()}, target_height, 0,
+                                                               "/tmp/finalis_it_vote_needs_ingress_p");
+  ASSERT_TRUE(proposal.has_value());
+  const auto proposal_id = frontier_proposal_id(*proposal);
+  auto& target = *cluster.nodes[ti];
+  ASSERT_TRUE(target.local_is_committee_member_for_test(target_height, 0));
+  ASSERT_TRUE(advance_test_frontier_round(target, target_height, 0));
+
+  // Valid proposal, but the certified record is missing locally: accepted, no vote, deferred.
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+            std::string("accepted"));
+  ASSERT_TRUE(!target.local_vote_recorded_for_test(target_height, 0, proposal_id));
+  ASSERT_EQ(target.deferred_certified_vote_count_for_test(), 1u);
+
+  // The record arrives as a range response; the deferred proposal is re-handled and voted for.
+  const auto fixture = scratch_certified_ingress_fixture(cluster.configs[ti], {tx.serialize()},
+                                                         "/tmp/finalis_it_vote_needs_ingress_f");
+  ASSERT_TRUE(fixture.has_value());
+  const auto lane = consensus::assign_ingress_lane(tx);
+  ASSERT_EQ(fixture->lane_records[lane].size(), 1u);
+  const auto& record = fixture->lane_records[lane].front();
+  p2p::IngressRangeMsg range;
+  range.lane = lane;
+  range.from_seq = 1;
+  range.to_seq = 1;
+  range.records.push_back(p2p::IngressRecordMsg{record.certificate, record.tx_bytes});
+  target.set_requested_ingress_range_for_test(7, p2p::GetIngressRangeMsg{lane, 1, 1});
+  ASSERT_TRUE(target.inject_ingress_range_for_test(range, 7));
+  ASSERT_TRUE(target.local_vote_recorded_for_test(target_height, 0, proposal_id));
+  ASSERT_EQ(target.deferred_certified_vote_count_for_test(), 0u);
+}
+
+TEST(test_validator_refuses_vote_when_slice_differs_from_certified_ingress) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_vote_ingress_mismatch"), 4, 4, 4);
+  Tx held = make_fixture_ingress_tx(1, 0x8D);
+  const auto lane = consensus::assign_ingress_lane(held);
+  // A different tx in the same lane: the proposal claims it at the seq where `held` is certified.
+  std::optional<Tx> claimed;
+  for (int tag = 0x90; tag <= 0xFF && !claimed.has_value(); ++tag) {
+    Tx candidate = make_fixture_ingress_tx(1, static_cast<std::uint8_t>(tag));
+    if (consensus::assign_ingress_lane(candidate) == lane) claimed = candidate;
+  }
+  ASSERT_TRUE(claimed.has_value());
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {held.serialize()}, true, true, true));
+  const std::uint64_t target_height = cluster.nodes[0]->status().height + 1;
+  auto proposal = build_cluster_frontier_proposal_from_records(cluster, keys, {claimed->serialize()}, target_height, 0,
+                                                               "/tmp/finalis_it_vote_ingress_mismatch_p");
+  ASSERT_TRUE(proposal.has_value());
+  const auto proposal_id = frontier_proposal_id(*proposal);
+
+  std::size_t ti = cluster.nodes.size();
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(target_height, 0)) {
+      ti = k;
+      break;
+    }
+  }
+  ASSERT_TRUE(ti < cluster.nodes.size());
+  auto& target = *cluster.nodes[ti];
+  ASSERT_TRUE(advance_test_frontier_round(target, target_height, 0));
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+            std::string("accepted"));
+  ASSERT_TRUE(!target.local_vote_recorded_for_test(target_height, 0, proposal_id));
+  ASSERT_EQ(target.deferred_certified_vote_count_for_test(), 0u);
+}
+
 TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
   const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 4u);

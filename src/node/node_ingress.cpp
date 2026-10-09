@@ -25,6 +25,9 @@ namespace {
 
 constexpr std::size_t kMaxIngressPrevalidationBytes = 512 * 1024;
 constexpr std::size_t kMaxOutstandingIngressRequestsPerPeer = 8;
+constexpr std::uint64_t kIngressRangeRequestTimeoutMs = 10'000;
+// Peers asked for the same missing range of a proposal the local validator wants to vote for.
+constexpr std::size_t kMaxProposalIngressPeersPerLane = 3;
 constexpr std::uint64_t kDefaultPolicyMinRelayFeeUnits = 1'000ULL;
 
 p2p::MisbehaviorReason ingress_fault_reason_for(const std::string& error) {
@@ -135,19 +138,24 @@ void Node::on_ingress_range(int peer_id, const Bytes& payload) {
   log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " lane=" + std::to_string(range->lane) + " range=[" + std::to_string(range->from_seq) + "," +
            std::to_string(range->to_seq) + "] records=" + std::to_string(range->records.size()));
-  std::lock_guard<std::mutex> lk(mu_);
-  std::string ingress_error;
-  if (!handle_ingress_range_locked(peer_id, *range, &ingress_error)) {
-    // ingress-epoch-mismatch is not peer misbehavior: it occurs when the peer
-    // is in a different committee epoch (i.e., they are ahead of us in chain
-    // sync). Scoring them would cause them to be banned before we can catch up.
-    if (ingress_error != "ingress-epoch-mismatch") {
-      const auto reason = ingress_fault_reason_for(ingress_error);
-      const std::string note = ingress_error.empty() ? "invalid-ingress-range" : ingress_error;
-      score_peer_locked(peer_id, reason, note);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string ingress_error;
+    if (!handle_ingress_range_locked(peer_id, *range, &ingress_error)) {
+      // ingress-epoch-mismatch is not peer misbehavior: it occurs when the peer
+      // is in a different committee epoch (i.e., they are ahead of us in chain
+      // sync). Scoring them would cause them to be banned before we can catch up.
+      // unexpected-range is not misbehavior either: it is a late answer to a request that expired
+      // (kIngressRangeRequestTimeoutMs) and is dropped before any record is validated.
+      if (ingress_error != "ingress-epoch-mismatch" && ingress_error != "unexpected-range") {
+        const auto reason = ingress_fault_reason_for(ingress_error);
+        const std::string note = ingress_error.empty() ? "invalid-ingress-range" : ingress_error;
+        score_peer_locked(peer_id, reason, note);
+      }
+      return;
     }
   }
-  return;
+  retry_deferred_certified_votes();
 }
 
 void Node::on_ingress_record(int peer_id, const Bytes& payload) {
@@ -161,21 +169,23 @@ void Node::on_ingress_record(int peer_id, const Bytes& payload) {
            " lane=" + std::to_string(record->certificate.lane) +
            " seq=" + std::to_string(record->certificate.seq) +
            " txid=" + short_hash_hex(record->certificate.txid));
-  std::lock_guard<std::mutex> lk(mu_);
-  std::string ingress_error;
   bool appended = false;
-  if (!handle_ingress_record_locked(peer_id, *record, &appended, &ingress_error)) {
-    // Same epoch-mismatch guard as INGRESS_RANGE: don't penalise a peer
-    // whose certificates belong to a later committee epoch.
-    if (ingress_error != "ingress-epoch-mismatch") {
-      const auto reason = ingress_fault_reason_for(ingress_error);
-      const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
-      score_peer_locked(peer_id, reason, note);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string ingress_error;
+    if (!handle_ingress_record_locked(peer_id, *record, &appended, &ingress_error)) {
+      // Same epoch-mismatch guard as INGRESS_RANGE: don't penalise a peer
+      // whose certificates belong to a later committee epoch.
+      if (ingress_error != "ingress-epoch-mismatch") {
+        const auto reason = ingress_fault_reason_for(ingress_error);
+        const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
+        score_peer_locked(peer_id, reason, note);
+      }
+      return;
     }
-    return;
+    if (appended) broadcast_ingress_record(record->certificate, record->tx_bytes, peer_id);
   }
-  if (appended) broadcast_ingress_record(record->certificate, record->tx_bytes, peer_id);
-  return;
+  if (appended) retry_deferred_certified_votes();
 }
 
 void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id) {
@@ -475,13 +485,14 @@ bool Node::handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& ms
   const auto local_tips = local_ingress_lane_tips_locked();
   bool requested_any = false;
   std::size_t outstanding_for_peer = 0;
-  for (const auto& [key, _] : requested_ingress_ranges_) {
-    if (key.first == peer_id) ++outstanding_for_peer;
+  for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
+    if (ingress_range_request_outstanding_locked(peer_id, lane)) ++outstanding_for_peer;
   }
   for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
     const auto local_tip = local_tips[lane];
     const auto peer_tip = msg.lane_tips[lane];
     if (peer_tip <= local_tip) continue;
+    if (ingress_range_request_outstanding_locked(peer_id, lane)) continue;
     if (outstanding_for_peer >= kMaxOutstandingIngressRequestsPerPeer) {
       log_line("request-ingress-range-skipped peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(lane) +
                " local_tip=" + std::to_string(local_tip) + " peer_tip=" + std::to_string(peer_tip) +
@@ -491,8 +502,7 @@ bool Node::handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& ms
     const std::uint64_t unclamped_to = peer_tip;
     const std::uint64_t max_to = local_tip + static_cast<std::uint64_t>(kMaxIngressRangeRequestRecords);
     const p2p::GetIngressRangeMsg req{lane, local_tip + 1, std::min(unclamped_to, max_to)};
-    requested_ingress_ranges_[{peer_id, lane}] = req;
-    const bool ok = p2p_.send_to(peer_id, p2p::MsgType::GET_INGRESS_RANGE, p2p::ser_get_ingress_range(req), true);
+    const bool ok = send_ingress_range_request_locked(peer_id, req);
     std::ostringstream oss;
     oss << "request-ingress-range peer_id=" << peer_id << " lane=" << lane << " local_tip=" << local_tip
         << " peer_tip=" << peer_tip << " range=[" << req.from_seq << "," << req.to_seq << "] status="
@@ -646,11 +656,60 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
     }
   }
   requested_ingress_ranges_.erase(requested_it);
+  requested_ingress_range_sent_ms_.erase({peer_id, msg.lane});
   const auto local_tip = db_.get_lane_state(msg.lane).value_or(LaneState{}).max_seq;
   log_line("ingress-range-accepted peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
            " range=[" + std::to_string(msg.from_seq) + "," + std::to_string(msg.to_seq) + "] local_tip=" +
            std::to_string(local_tip) + " bytes=" + std::to_string(wire_bytes));
   return true;
+}
+
+
+bool Node::ingress_range_request_outstanding_locked(int peer_id, std::uint32_t lane) {
+  const auto key = std::make_pair(peer_id, lane);
+  if (requested_ingress_ranges_.find(key) == requested_ingress_ranges_.end()) return false;
+  const auto sent_it = requested_ingress_range_sent_ms_.find(key);
+  if (sent_it != requested_ingress_range_sent_ms_.end() && now_ms() < sent_it->second + kIngressRangeRequestTimeoutMs) {
+    return true;
+  }
+  requested_ingress_ranges_.erase(key);
+  requested_ingress_range_sent_ms_.erase(key);
+  return false;
+}
+
+bool Node::send_ingress_range_request_locked(int peer_id, const p2p::GetIngressRangeMsg& req) {
+  requested_ingress_ranges_[{peer_id, req.lane}] = req;
+  requested_ingress_range_sent_ms_[{peer_id, req.lane}] = now_ms();
+  return p2p_.send_to(peer_id, p2p::MsgType::GET_INGRESS_RANGE, p2p::ser_get_ingress_range(req), true);
+}
+
+void Node::request_missing_proposal_ingress_locked(const FrontierTransition& transition, int preferred_peer_id) {
+  const auto local_tips = local_ingress_lane_tips_locked();
+  for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
+    const auto local_tip = local_tips[lane];
+    const auto needed_tip = transition.next_vector.lane_max_seq[lane];
+    if (needed_tip <= local_tip) continue;
+    // Ranges must extend the local lane, so always ask from local_tip + 1.
+    const p2p::GetIngressRangeMsg req{
+        lane, local_tip + 1,
+        std::min<std::uint64_t>(needed_tip, local_tip + static_cast<std::uint64_t>(kMaxIngressRangeRequestRecords))};
+    std::vector<int> peers;
+    if (preferred_peer_id > 0) peers.push_back(preferred_peer_id);
+    for (const auto& [peer_id, tips] : peer_ingress_tips_) {
+      if (peers.size() >= kMaxProposalIngressPeersPerLane) break;
+      if (peer_id == preferred_peer_id || tips.lane_tips[lane] < req.to_seq) continue;
+      peers.push_back(peer_id);
+    }
+    for (const int peer_id : peers) {
+      if (!p2p_.get_peer_info(peer_id).established()) continue;
+      if (ingress_range_request_outstanding_locked(peer_id, lane)) continue;
+      const bool ok = send_ingress_range_request_locked(peer_id, req);
+      log_line("request-proposal-ingress-range peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(lane) +
+               " height=" + std::to_string(transition.height) + " round=" + std::to_string(transition.round) +
+               " range=[" + std::to_string(req.from_seq) + "," + std::to_string(req.to_seq) +
+               "] status=" + (ok ? "ok" : "failed"));
+    }
+  }
 }
 
 }  // namespace finalis::node

@@ -778,6 +778,7 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
     tx_verify_buckets_.erase(peer_id);
     for (auto it = requested_ingress_ranges_.begin(); it != requested_ingress_ranges_.end();) {
       if (it->first.first == peer_id) {
+        requested_ingress_range_sent_ms_.erase(it->first);
         it = requested_ingress_ranges_.erase(it);
       } else {
         ++it;

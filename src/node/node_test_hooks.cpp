@@ -419,21 +419,38 @@ bool Node::inject_ingress_tips_for_test(const p2p::IngressTipsMsg& msg, int peer
   return handle_ingress_tips_locked(peer_id, msg);
 }
 
+// Both range hooks mirror on_ingress_range: handle under mu_, then retry deferred votes without it.
 bool Node::inject_ingress_range_for_test(const p2p::IngressRangeMsg& msg, int peer_id) {
-  std::lock_guard<std::mutex> lk(mu_);
-  return handle_ingress_range_locked(peer_id, msg);
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    ok = handle_ingress_range_locked(peer_id, msg);
+  }
+  if (ok) retry_deferred_certified_votes();
+  return ok;
 }
 
 std::string Node::inject_ingress_range_result_for_test(const p2p::IngressRangeMsg& msg, int peer_id) {
-  std::lock_guard<std::mutex> lk(mu_);
   std::string error;
-  if (handle_ingress_range_locked(peer_id, msg, &error)) return {};
-  return error.empty() ? "unknown" : error;
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    ok = handle_ingress_range_locked(peer_id, msg, &error);
+  }
+  if (!ok) return error.empty() ? "unknown" : error;
+  retry_deferred_certified_votes();
+  return {};
+}
+
+std::size_t Node::deferred_certified_vote_count_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return deferred_certified_votes_.size();
 }
 
 void Node::set_requested_ingress_range_for_test(int peer_id, const p2p::GetIngressRangeMsg& msg) {
   std::lock_guard<std::mutex> lk(mu_);
   requested_ingress_ranges_[{peer_id, msg.lane}] = msg;
+  requested_ingress_range_sent_ms_[{peer_id, msg.lane}] = now_ms();
 }
 
 std::optional<p2p::GetIngressRangeMsg> Node::requested_ingress_range_for_test(int peer_id, std::uint32_t lane) const {

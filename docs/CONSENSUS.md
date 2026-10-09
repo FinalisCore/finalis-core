@@ -101,6 +101,16 @@ Vote acceptance requires:
 - signature verifies over the canonical vote-signing message
 - the vote tracker accepts it under the lock / relock rules
 
+A validator emits its own vote for a proposal only when it also holds, in its
+local certified-ingress store, every record of the proposal's lane ranges, and
+those certificates validate (epoch, signatures, committee membership, lane,
+sequence, lane-root chaining) and merge to exactly the proposal's ordered slice.
+If records are missing it defers the vote, requests the missing ranges from the
+peer that sent the proposal and from peers whose advertised lane tips cover
+them, and re-handles the proposal once they arrive. Because every honest voter
+holds the certified records, any finalized slice can be fetched from at least
+`f + 1` honest validators.
+
 Votes are not over a generic height-only or block-only object. They are bound
 to the exact round and block identifier.
 

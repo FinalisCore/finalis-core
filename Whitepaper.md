@@ -59,6 +59,8 @@ The runtime rejects work outside `H_f + 1` on the live path.
 Rounds advance on timeout. A proposal for round `r > 0` must carry a justification for the same
 height from a lower round: either a QC or a TC.
 
+A validator votes for a proposal only if it holds, in its local store, a valid ingress certificate for every record of the proposed slice; otherwise it defers the vote and fetches the missing records from peers. A QC therefore implies that at least `f + 1` honest validators hold the finalized slice's certified records.
+
 Each validator keeps a durable vote lock `(payload, round)` per height, set when it votes. It may
 vote for a different payload only if the proposal carries a valid QC for that payload from a round
 in `[locked_round, r)`. A TC never releases a lock, and neither does a restart: the lock is persisted
@@ -111,7 +113,7 @@ exists at `r`, and by minimality of `r'` none exists in `(r, r')`.
 
 Finalis executes ordered ingress records into transitions. Each certified ingress record binds a transaction payload to lane and sequence context.
 
-An ingress certificate needs only one valid committee signature; it fixes a record's lane position and attributes it to a committee member. It is not a finality artifact: a record becomes canonical only through a finalized transition.
+An ingress certificate needs only one valid committee signature; it fixes a record's lane position and attributes it to a committee member. It is not a finality artifact: a record becomes canonical only through a finalized transition, and honest validators vote for a transition only after verifying the certificates of all its records (§3).
 
 Ingress validity requires:
 
