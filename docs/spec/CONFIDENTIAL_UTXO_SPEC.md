@@ -688,9 +688,12 @@ cost is bounded by the full-pool pre-filter and peer-level rate limits.
 
 Proposers build frontier slices from certified ingress lanes, not from the mempool
 (`Node::build_frontier_transition_locked`). While merging lanes the proposer stops before a slice
-exceeds `kMaxBlockTxs`, `kMaxBlockBytes`, or `max_block_confidential_verify_weight`, using
+exceeds `kMaxFrontierSliceRecords` (1,000), `kMaxFrontierSliceBytes` (1 MiB), or
+`max_block_confidential_verify_weight`, using
 `consensus::ordered_record_confidential_verify_weight` for each record so the proposer's count
-matches the consensus rule in section 7.1.
+matches the consensus rule in section 7.1. All three bounds are consensus rules: `execute_frontier_slice`
+rejects a slice that exceeds any of them (`frontier-slice-record-count-exceeded`,
+`frontier-slice-bytes-exceeded`, `frontier-confidential-verify-weight-exceeded`).
 
 ## 10. Wallet Patch Plan
 

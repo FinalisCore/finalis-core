@@ -328,6 +328,32 @@ TEST(test_ingress_append_accepts_txv2_payload_when_lane_and_signature_match) {
   ASSERT_TRUE(db.get_ingress_certificate(cert.lane, cert.seq).has_value());
 }
 
+TEST(test_frontier_execution_rejects_slice_over_record_count_or_bytes) {
+  consensus::FrontierExecutionResult result;
+  std::string err;
+
+  // Consensus: limits are checked before any record is parsed, so placeholder bytes suffice.
+  std::vector<Bytes> ordered(consensus::kMaxFrontierSliceRecords + 1, Bytes{0x00});
+  ASSERT_TRUE(!consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err));
+  ASSERT_EQ(err, std::string("frontier-slice-record-count-exceeded"));
+
+  ordered.pop_back();
+  err.clear();
+  (void)consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err);
+  ASSERT_NE(err, std::string("frontier-slice-record-count-exceeded"));
+
+  const std::size_t half = consensus::kMaxFrontierSliceBytes / 2;
+  ordered = {Bytes(half, 0x00), Bytes(half + 1, 0x00)};
+  err.clear();
+  ASSERT_TRUE(!consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err));
+  ASSERT_EQ(err, std::string("frontier-slice-bytes-exceeded"));
+
+  ordered = {Bytes(half, 0x00), Bytes(half, 0x00)};
+  err.clear();
+  (void)consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err);
+  ASSERT_NE(err, std::string("frontier-slice-bytes-exceeded"));
+}
+
 TEST(test_frontier_execution_rejects_slice_over_block_confidential_verify_weight) {
   auto make_tx = [](std::uint8_t tag) {
     TxV2 tx;

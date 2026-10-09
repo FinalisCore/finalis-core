@@ -227,6 +227,8 @@ Consensus bounds on confidential work:
 - a structural verify weight per `TxV2`, computed before any cryptographic verification: 64 per confidential input, range-proof bytes + 256 per confidential output, 64 for a non-identity excess, plus a 256 per-transaction base when any of these apply; the unit is one range-proof byte (about 0.72 µs of verification, calibrated by benchmark)
 - a block-level cap of 2,000,000 verify weight over every parseable `TxV2` in the ordered frontier slice, including transactions later rejected; a slice above the cap is an invalid transition
 
+Independently of confidential work, a frontier slice is an invalid transition above 1,000 records or 1 MiB of raw transaction bytes.
+
 **Proposition 7 (Confidential Turnstile).**  
 The value held in confidential outputs never goes negative in canonical state.
 

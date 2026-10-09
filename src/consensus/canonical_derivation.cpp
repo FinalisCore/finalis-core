@@ -193,14 +193,11 @@ bool verify_frontier_finality_certificate_against_state(const CanonicalDerivatio
     if (error) *error = "missing-canonical-committee";
     return false;
   }
-  const auto legacy_committee = legacy_canonical_committee_for_height_round(cfg, prev, transition.height, transition.round);
-  const bool committee_matches =
-      cert.committee_members == committee || (!legacy_committee.empty() && cert.committee_members == legacy_committee);
-  if (!committee_matches) {
+  if (cert.committee_members != committee) {
     if (error) *error = "certificate-committee-mismatch";
     return false;
   }
-  const auto& effective_committee = (cert.committee_members == committee) ? committee : legacy_committee;
+  const auto& effective_committee = committee;
   std::set<PubKey32> committee_set(effective_committee.begin(), effective_committee.end());
   if (committee_set.size() != effective_committee.size()) {
     if (error) *error = "certificate-committee-duplicates";
@@ -909,17 +906,6 @@ bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const
   out->round = meta_it->second.round;
   out->transition_id = *parent_transition_id;
   out->committee = canonical_committee_for_height_round(cfg, prev, out->height, out->round);
-  const auto all_in = [&](const std::vector<PubKey32>& committee) {
-    std::set<PubKey32> members(committee.begin(), committee.end());
-    for (const auto& sig : signers) {
-      if (members.find(sig.validator_pubkey) == members.end()) return false;
-    }
-    return true;
-  };
-  if (!all_in(out->committee)) {
-    auto legacy = legacy_canonical_committee_for_height_round(cfg, prev, out->height, out->round);
-    if (!legacy.empty() && all_in(legacy)) out->committee = std::move(legacy);
-  }
   if (out->committee.empty()) {
     if (error) *error = "missing-parent-committee";
     return false;
@@ -1042,57 +1028,6 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   return true;
 }
 
-bool populate_frontier_transition_metadata_legacy_for_replay(const CanonicalDerivationConfig& cfg,
-                                                             const CanonicalDerivedState& prev, std::uint64_t height,
-                                                             std::uint32_t round, const PubKey32& leader_pubkey,
-                                                             const std::vector<FinalitySig>& prev_finality_signers,
-                                                             std::uint64_t accepted_fee_units,
-                                                             const UtxoSetV2& post_execution_utxos,
-                                                             FrontierTransition* transition,
-                                                             std::string* error) {
-  if (!transition) {
-    if (error) *error = "missing-transition-output";
-    return false;
-  }
-  if (height != prev.finalized_height + 1) {
-    if (error) *error = "frontier-height-not-sequential";
-    return false;
-  }
-  const auto committee = legacy_canonical_committee_for_height_round(cfg, prev, height, round);
-  if (committee.empty()) {
-    if (error) *error = "missing-canonical-committee";
-    return false;
-  }
-  const auto leader = legacy_canonical_leader_for_height_round(cfg, prev, height, round);
-  if (!leader.has_value()) {
-    if (error) *error = "missing-canonical-leader";
-    return false;
-  }
-  if (*leader != leader_pubkey) {
-    if (error) *error = "frontier-leader-mismatch";
-    return false;
-  }
-  const auto quorum = static_cast<std::uint32_t>(quorum_threshold(committee.size()));
-  std::vector<FinalitySig> canonical_signers;
-  if (!canonicalize_and_verify_prev_finality_signers(cfg, prev, prev_finality_signers, &canonical_signers, error)) {
-    return false;
-  }
-
-  transition->prev_finalized_hash = prev.finalized_identity.id;
-  transition->prev_finality_link_hash = prev.last_finality_certificate_hash;
-  transition->height = height;
-  transition->round = round;
-  transition->leader_pubkey = leader_pubkey;
-  transition->quorum_threshold = quorum;
-  transition->prev_finality_signers = std::move(canonical_signers);
-  transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
-  transition->settlement_commitment = transition->settlement.commitment();
-  UtxoSetV2 settled_utxos = post_execution_utxos;
-  apply_frontier_settlement_to_utxos(*transition, &settled_utxos);
-  transition->next_state_root = frontier_utxo_state_root(settled_utxos);
-  return true;
-}
-
 bool load_certified_frontier_record_from_storage(const storage::DB& db, const FrontierTransition& transition,
                                                  CanonicalFrontierRecord* out, std::string* error) {
   if (!out) {
@@ -1147,16 +1082,6 @@ std::vector<PubKey32> canonical_committee_for_height_round(const CanonicalDeriva
   return checkpoint_committee_for_round(it->second, round);
 }
 
-std::vector<PubKey32> legacy_canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
-                                                                  const CanonicalDerivedState& state,
-                                                                  std::uint64_t height, std::uint32_t round) {
-  if (height == 0) return {};
-  const auto epoch_start = committee_epoch_start(height, cfg.network.committee_epoch_blocks);
-  auto it = state.finalized_committee_checkpoints.find(epoch_start);
-  if (it == state.finalized_committee_checkpoints.end()) return {};
-  return legacy_checkpoint_committee_for_round(it->second, round);
-}
-
 std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
                                                           const CanonicalDerivedState& state, std::uint64_t height,
                                                           std::uint32_t round) {
@@ -1165,21 +1090,6 @@ std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivat
   auto it = state.finalized_committee_checkpoints.find(epoch_start);
   if (it == state.finalized_committee_checkpoints.end()) return std::nullopt;
   if (auto fallback = checkpoint_ticket_pow_fallback_member_for_round(it->second, round); fallback.has_value()) {
-    return fallback;
-  }
-  const auto schedule = proposer_schedule_from_checkpoint(cfg, state, it->second, height);
-  if (schedule.empty()) return std::nullopt;
-  return schedule[static_cast<std::size_t>(round) % schedule.size()];
-}
-
-std::optional<PubKey32> legacy_canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
-                                                                 const CanonicalDerivedState& state,
-                                                                 std::uint64_t height, std::uint32_t round) {
-  if (height == 0) return std::nullopt;
-  const auto epoch_start = committee_epoch_start(height, cfg.network.committee_epoch_blocks);
-  auto it = state.finalized_committee_checkpoints.find(epoch_start);
-  if (it == state.finalized_committee_checkpoints.end()) return std::nullopt;
-  if (auto fallback = legacy_checkpoint_ticket_pow_fallback_member_for_round(it->second, round); fallback.has_value()) {
     return fallback;
   }
   const auto schedule = proposer_schedule_from_checkpoint(cfg, state, it->second, height);
@@ -1270,11 +1180,10 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
 
 std::uint64_t genesis_validator_bond_amount() { return kAdaptiveMinBondFloor; }
 
-bool verify_frontier_record_against_state_with_replay_options(
-  const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-  const CanonicalFrontierRecord& record, bool allow_legacy_ingress_epoch_replay,
-  FrontierExecutionResult* recomputed, std::string* error,
-  std::string* validation_diagnostics) {
+bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                          const CanonicalFrontierRecord& record,
+                                          FrontierExecutionResult* recomputed, std::string* error,
+                                          std::string* validation_diagnostics) {
   auto set_diag = [&](std::string msg) {
     if (validation_diagnostics) *validation_diagnostics = std::move(msg);
   };
@@ -1385,11 +1294,11 @@ bool verify_frontier_record_against_state_with_replay_options(
         << "}";
     *diag = oss.str();
   };
-  const auto reconstruct_legacy_frontier_cursor =
+  const auto reconstruct_frontier_cursor_from_ordered_records =
       [&](const std::vector<Bytes>& ordered_records, FrontierVector* next_vector, FrontierLaneRoots* next_lane_roots,
           std::string* cursor_error) -> bool {
     if (!next_vector || !next_lane_roots) {
-      if (cursor_error) *cursor_error = "missing-legacy-frontier-cursor-output";
+      if (cursor_error) *cursor_error = "missing-frontier-cursor-output";
       return false;
     }
     *next_vector = prev.finalized_frontier_vector;
@@ -1434,7 +1343,6 @@ bool verify_frontier_record_against_state_with_replay_options(
               if (h == prev.finalized_height) return prev.finalized_identity.id;
               return std::nullopt;
             },
-        .allow_legacy_ingress_epoch_replay = allow_legacy_ingress_epoch_replay,
         .confidential_policy = &cfg.confidential_policy,
     };
   };
@@ -1504,7 +1412,7 @@ bool verify_frontier_record_against_state_with_replay_options(
     }
     FrontierVector reconstructed_next_vector{};
     FrontierLaneRoots reconstructed_next_lane_roots{};
-    if (!reconstruct_legacy_frontier_cursor(record.ordered_records, &reconstructed_next_vector, &reconstructed_next_lane_roots,
+    if (!reconstruct_frontier_cursor_from_ordered_records(record.ordered_records, &reconstructed_next_vector, &reconstructed_next_lane_roots,
                                             error)) {
       return false;
     }
@@ -1549,12 +1457,7 @@ bool verify_frontier_record_against_state_with_replay_options(
     const bool have_current_expected = populate_frontier_transition_metadata(
         cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
         record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
-    FrontierTransition legacy_expected_transition = result.transition;
-    std::string legacy_error;
-    const bool have_legacy_expected = populate_frontier_transition_metadata_legacy_for_replay(
-        cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-        record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &legacy_expected_transition,
-        &legacy_error);
+    if (!have_current_expected) return false;
     const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
       return record.transition.quorum_threshold == expected.quorum_threshold &&
              record.transition.prev_finality_signers == expected.prev_finality_signers &&
@@ -1565,59 +1468,50 @@ bool verify_frontier_record_against_state_with_replay_options(
     };
     std::vector<PubKey32> effective_committee = canonical_committee_for_height_round(cfg, prev, record.transition.height,
                                                                                      record.transition.round);
-    if (!have_current_expected || !transition_metadata_matches(expected_transition)) {
-      if (!have_legacy_expected || !transition_metadata_matches(legacy_expected_transition)) {
-        if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
-          return fail_with("frontier-quorum-threshold-mismatch",
-                           "field=quorum_threshold height=" + std::to_string(record.transition.height) +
-                               " round=" + std::to_string(record.transition.round) +
-                               " actual=" + std::to_string(record.transition.quorum_threshold) +
-                               " expected=" + std::to_string(expected_transition.quorum_threshold));
-        } else if (!have_current_expected && !legacy_error.empty()) {
-          return fail_with(legacy_error,
-                           "field=metadata-build height=" + std::to_string(record.transition.height) +
-                               " round=" + std::to_string(record.transition.round) + " legacy_error=" + legacy_error);
-        } else if (record.transition.prev_finality_signers != expected_transition.prev_finality_signers) {
-          return fail_with("frontier-prev-signers-mismatch",
-                           "field=prev_finality_signers height=" + std::to_string(record.transition.height) +
-                               " round=" + std::to_string(record.transition.round) +
-                               " actual_count=" + std::to_string(record.transition.prev_finality_signers.size()) +
-                               " expected_count=" + std::to_string(expected_transition.prev_finality_signers.size()) +
-                               " actual_fingerprint=" + signer_list_fingerprint(record.transition.prev_finality_signers) +
-                               " expected_fingerprint=" + signer_list_fingerprint(expected_transition.prev_finality_signers));
-        } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
-          return fail_with("frontier-settlement-self-commitment-mismatch",
-                           "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
-                               " round=" + std::to_string(record.transition.round) +
-                               " advertised=" + hex_encode32(record.transition.settlement_commitment) +
-                               " computed_from_payload=" + hex_encode32(record.transition.settlement.commitment()));
-        } else if (record.transition.settlement_commitment != expected_transition.settlement_commitment) {
-          std::string diag = "field=settlement_commitment height=" + std::to_string(record.transition.height) +
+    if (!transition_metadata_matches(expected_transition)) {
+      if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
+        return fail_with("frontier-quorum-threshold-mismatch",
+                         "field=quorum_threshold height=" + std::to_string(record.transition.height) +
                              " round=" + std::to_string(record.transition.round) +
-                             " actual=" + hex_encode32(record.transition.settlement_commitment) +
-                             " expected=" + hex_encode32(expected_transition.settlement_commitment);
-          append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
-          return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
-        } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
-          return fail_with("frontier-settlement-mismatch",
-                           "field=settlement_payload height=" + std::to_string(record.transition.height) +
-                               " round=" + std::to_string(record.transition.round) +
-                               " actual_payload_hash=" + hash_of_bytes(record.transition.settlement.serialize()) +
-                               " expected_payload_hash=" + hash_of_bytes(expected_transition.settlement.serialize()));
-        } else if (record.transition.next_state_root != expected_transition.next_state_root) {
-          return fail_with("frontier-next-state-root-mismatch",
-                           "field=next_state_root height=" + std::to_string(record.transition.height) +
-                               " round=" + std::to_string(record.transition.round) +
-                               " actual=" + hex_encode32(record.transition.next_state_root) +
-                               " expected=" + hex_encode32(expected_transition.next_state_root));
-        }
-        return fail_with("frontier-metadata-mismatch",
-                         "field=unknown height=" + std::to_string(record.transition.height) +
-                             " round=" + std::to_string(record.transition.round));
+                             " actual=" + std::to_string(record.transition.quorum_threshold) +
+                             " expected=" + std::to_string(expected_transition.quorum_threshold));
+      } else if (record.transition.prev_finality_signers != expected_transition.prev_finality_signers) {
+        return fail_with("frontier-prev-signers-mismatch",
+                         "field=prev_finality_signers height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual_count=" + std::to_string(record.transition.prev_finality_signers.size()) +
+                             " expected_count=" + std::to_string(expected_transition.prev_finality_signers.size()) +
+                             " actual_fingerprint=" + signer_list_fingerprint(record.transition.prev_finality_signers) +
+                             " expected_fingerprint=" + signer_list_fingerprint(expected_transition.prev_finality_signers));
+      } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
+        return fail_with("frontier-settlement-self-commitment-mismatch",
+                         "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " advertised=" + hex_encode32(record.transition.settlement_commitment) +
+                             " computed_from_payload=" + hex_encode32(record.transition.settlement.commitment()));
+      } else if (record.transition.settlement_commitment != expected_transition.settlement_commitment) {
+        std::string diag = "field=settlement_commitment height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round) +
+                           " actual=" + hex_encode32(record.transition.settlement_commitment) +
+                           " expected=" + hex_encode32(expected_transition.settlement_commitment);
+        append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+        return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
+      } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
+        return fail_with("frontier-settlement-mismatch",
+                         "field=settlement_payload height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual_payload_hash=" + hash_of_bytes(record.transition.settlement.serialize()) +
+                             " expected_payload_hash=" + hash_of_bytes(expected_transition.settlement.serialize()));
+      } else if (record.transition.next_state_root != expected_transition.next_state_root) {
+        return fail_with("frontier-next-state-root-mismatch",
+                         "field=next_state_root height=" + std::to_string(record.transition.height) +
+                             " round=" + std::to_string(record.transition.round) +
+                             " actual=" + hex_encode32(record.transition.next_state_root) +
+                             " expected=" + hex_encode32(expected_transition.next_state_root));
       }
-      expected_transition = std::move(legacy_expected_transition);
-      effective_committee = legacy_canonical_committee_for_height_round(cfg, prev, record.transition.height,
-                                                                        record.transition.round);
+      return fail_with("frontier-metadata-mismatch",
+                       "field=unknown height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round));
     }
     result.transition = expected_transition;
     result.effective_committee = std::move(effective_committee);
@@ -1706,15 +1600,7 @@ bool verify_frontier_record_against_state_with_replay_options(
   const bool have_current_expected = populate_frontier_transition_metadata(
       cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
       record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &expected_transition, error);
-  FrontierTransition legacy_expected_transition = result.transition;
-  std::string legacy_error;
-  const bool have_legacy_expected = populate_frontier_transition_metadata_legacy_for_replay(
-      cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-      record.transition.prev_finality_signers, result.accepted_fee_units, result.next_utxos, &legacy_expected_transition,
-      &legacy_error);
-  if (!have_current_expected && !have_legacy_expected) {
-    return false;
-  }
+  if (!have_current_expected) return false;
   const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
     return record.transition.quorum_threshold == expected.quorum_threshold &&
            record.transition.prev_finality_signers == expected.prev_finality_signers &&
@@ -1725,55 +1611,50 @@ bool verify_frontier_record_against_state_with_replay_options(
   };
   std::vector<PubKey32> effective_committee = canonical_committee_for_height_round(cfg, prev, record.transition.height,
                                                                                    record.transition.round);
-  if (!have_current_expected || !transition_metadata_matches(expected_transition)) {
-    if (!have_legacy_expected || !transition_metadata_matches(legacy_expected_transition)) {
-      if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
-        return fail_with("frontier-quorum-threshold-mismatch",
-                         "field=quorum_threshold height=" + std::to_string(record.transition.height) +
-                             " round=" + std::to_string(record.transition.round) +
-                             " actual=" + std::to_string(record.transition.quorum_threshold) +
-                             " expected=" + std::to_string(expected_transition.quorum_threshold));
-      } else if (record.transition.prev_finality_signers != expected_transition.prev_finality_signers) {
-        return fail_with("frontier-prev-signers-mismatch",
-                         "field=prev_finality_signers height=" + std::to_string(record.transition.height) +
-                             " round=" + std::to_string(record.transition.round) +
-                             " actual_count=" + std::to_string(record.transition.prev_finality_signers.size()) +
-                             " expected_count=" + std::to_string(expected_transition.prev_finality_signers.size()) +
-                             " actual_fingerprint=" + signer_list_fingerprint(record.transition.prev_finality_signers) +
-                             " expected_fingerprint=" + signer_list_fingerprint(expected_transition.prev_finality_signers));
-      } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
-        return fail_with("frontier-settlement-self-commitment-mismatch",
-                         "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
-                             " round=" + std::to_string(record.transition.round) +
-                             " advertised=" + hex_encode32(record.transition.settlement_commitment) +
-                             " computed_from_payload=" + hex_encode32(record.transition.settlement.commitment()));
-      } else if (record.transition.settlement_commitment != expected_transition.settlement_commitment) {
-        std::string diag = "field=settlement_commitment height=" + std::to_string(record.transition.height) +
+  if (!transition_metadata_matches(expected_transition)) {
+    if (record.transition.quorum_threshold != expected_transition.quorum_threshold) {
+      return fail_with("frontier-quorum-threshold-mismatch",
+                       "field=quorum_threshold height=" + std::to_string(record.transition.height) +
                            " round=" + std::to_string(record.transition.round) +
-                           " actual=" + hex_encode32(record.transition.settlement_commitment) +
-                           " expected=" + hex_encode32(expected_transition.settlement_commitment);
-        append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
-        return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
-      } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
-        return fail_with("frontier-settlement-mismatch",
-                         "field=settlement_payload height=" + std::to_string(record.transition.height) +
-                             " round=" + std::to_string(record.transition.round) +
-                             " actual_payload_hash=" + hash_of_bytes(record.transition.settlement.serialize()) +
-                             " expected_payload_hash=" + hash_of_bytes(expected_transition.settlement.serialize()));
-      } else if (record.transition.next_state_root != expected_transition.next_state_root) {
-        return fail_with("frontier-next-state-root-mismatch",
-                         "field=next_state_root height=" + std::to_string(record.transition.height) +
-                             " round=" + std::to_string(record.transition.round) +
-                             " actual=" + hex_encode32(record.transition.next_state_root) +
-                             " expected=" + hex_encode32(expected_transition.next_state_root));
-      }
-      return fail_with("frontier-metadata-mismatch",
-                       "field=unknown height=" + std::to_string(record.transition.height) +
-                           " round=" + std::to_string(record.transition.round));
+                           " actual=" + std::to_string(record.transition.quorum_threshold) +
+                           " expected=" + std::to_string(expected_transition.quorum_threshold));
+    } else if (record.transition.prev_finality_signers != expected_transition.prev_finality_signers) {
+      return fail_with("frontier-prev-signers-mismatch",
+                       "field=prev_finality_signers height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round) +
+                           " actual_count=" + std::to_string(record.transition.prev_finality_signers.size()) +
+                           " expected_count=" + std::to_string(expected_transition.prev_finality_signers.size()) +
+                           " actual_fingerprint=" + signer_list_fingerprint(record.transition.prev_finality_signers) +
+                           " expected_fingerprint=" + signer_list_fingerprint(expected_transition.prev_finality_signers));
+    } else if (record.transition.settlement_commitment != record.transition.settlement.commitment()) {
+      return fail_with("frontier-settlement-self-commitment-mismatch",
+                       "field=settlement_commitment_self height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round) +
+                           " advertised=" + hex_encode32(record.transition.settlement_commitment) +
+                           " computed_from_payload=" + hex_encode32(record.transition.settlement.commitment()));
+    } else if (record.transition.settlement_commitment != expected_transition.settlement_commitment) {
+      std::string diag = "field=settlement_commitment height=" + std::to_string(record.transition.height) +
+                         " round=" + std::to_string(record.transition.round) +
+                         " actual=" + hex_encode32(record.transition.settlement_commitment) +
+                         " expected=" + hex_encode32(expected_transition.settlement_commitment);
+      append_settlement_input_diagnostics(&diag, record.transition, expected_transition);
+      return fail_with("frontier-settlement-commitment-mismatch", std::move(diag));
+    } else if (record.transition.settlement.serialize() != expected_transition.settlement.serialize()) {
+      return fail_with("frontier-settlement-mismatch",
+                       "field=settlement_payload height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round) +
+                           " actual_payload_hash=" + hash_of_bytes(record.transition.settlement.serialize()) +
+                           " expected_payload_hash=" + hash_of_bytes(expected_transition.settlement.serialize()));
+    } else if (record.transition.next_state_root != expected_transition.next_state_root) {
+      return fail_with("frontier-next-state-root-mismatch",
+                       "field=next_state_root height=" + std::to_string(record.transition.height) +
+                           " round=" + std::to_string(record.transition.round) +
+                           " actual=" + hex_encode32(record.transition.next_state_root) +
+                           " expected=" + hex_encode32(expected_transition.next_state_root));
     }
-    expected_transition = std::move(legacy_expected_transition);
-    effective_committee = legacy_canonical_committee_for_height_round(cfg, prev, record.transition.height,
-                                                                      record.transition.round);
+    return fail_with("frontier-metadata-mismatch",
+                     "field=unknown height=" + std::to_string(record.transition.height) +
+                         " round=" + std::to_string(record.transition.round));
   }
   result.transition = expected_transition;
   result.effective_committee = std::move(effective_committee);
@@ -1782,26 +1663,15 @@ bool verify_frontier_record_against_state_with_replay_options(
   return true;
 }
 
-bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                                          const CanonicalFrontierRecord& record,
-                                          FrontierExecutionResult* recomputed, std::string* error,
-                                          std::string* validation_diagnostics) {
-  return verify_frontier_record_against_state_with_replay_options(cfg, prev, record,
-                                                                  false, recomputed, error, validation_diagnostics);
-}
-
 bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                 const CanonicalFrontierRecord& record, bool recompute_state_commitment,
-                                bool allow_legacy_ingress_epoch_replay, CanonicalDerivedState* out,
-                                std::string* error) {
+                                CanonicalDerivedState* out, std::string* error) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
   }
   FrontierExecutionResult recomputed;
-  if (!verify_frontier_record_against_state_with_replay_options(cfg, prev, record,
-                                                                allow_legacy_ingress_epoch_replay,
-                                                                &recomputed, error, nullptr)) {
+  if (!verify_frontier_record_against_state(cfg, prev, record, &recomputed, error)) {
     return false;
   }
 
@@ -1890,7 +1760,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
 
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                            const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error) {
-  return apply_frontier_record_impl(cfg, prev, record, true, false, out, error);
+  return apply_frontier_record_impl(cfg, prev, record, true, out, error);
 }
 
 bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig& cfg,
@@ -1900,7 +1770,7 @@ bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig&
   CanonicalDerivedState state = initial_state;
   for (const auto& record : chain) {
     CanonicalDerivedState next;
-    if (!apply_frontier_record_impl(cfg, state, record, false, false, &next, error)) return false;
+    if (!apply_frontier_record_impl(cfg, state, record, false, &next, error)) return false;
     state = std::move(next);
   }
   state.state_commitment = consensus_state_commitment(cfg, state);
@@ -1967,7 +1837,7 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
     CanonicalFrontierRecord record;
     if (!load_certified_frontier_record_from_storage(db, *transition, &record, error)) return false;
     CanonicalDerivedState next;
-    if (!apply_frontier_record_impl(cfg, state, record, false, true, &next, error)) return false;
+    if (!apply_frontier_record_impl(cfg, state, record, false, &next, error)) return false;
     state = std::move(next);
   }
 
@@ -2579,48 +2449,6 @@ std::optional<PubKey32> checkpoint_ticket_pow_fallback_member_for_round(const st
   const std::size_t selected =
       std::min<std::size_t>(static_cast<std::size_t>(round - committee_size), ranked.size() - 1);
   return checkpoint.ordered_members[ranked[selected]];
-}
-
-std::optional<PubKey32> legacy_checkpoint_ticket_pow_fallback_member_for_round(
-    const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round) {
-  if (checkpoint.ordered_members.empty() || round == 0) return std::nullopt;
-
-  std::vector<std::size_t> ranked(checkpoint.ordered_members.size());
-  for (std::size_t i = 0; i < ranked.size(); ++i) ranked[i] = i;
-
-  const auto ticket_hash_at = [&](std::size_t index) -> Hash32 {
-    if (index < checkpoint.ordered_ticket_hashes.size()) return checkpoint.ordered_ticket_hashes[index];
-    Hash32 worst{};
-    worst.fill(0xff);
-    return worst;
-  };
-  const auto ticket_nonce_at = [&](std::size_t index) -> std::uint64_t {
-    if (index < checkpoint.ordered_ticket_nonces.size()) return checkpoint.ordered_ticket_nonces[index];
-    return std::numeric_limits<std::uint64_t>::max();
-  };
-
-  std::sort(ranked.begin(), ranked.end(), [&](std::size_t a, std::size_t b) {
-    const auto ah = ticket_hash_at(a);
-    const auto bh = ticket_hash_at(b);
-    if (ah != bh) return ah < bh;
-    const auto an = ticket_nonce_at(a);
-    const auto bn = ticket_nonce_at(b);
-    if (an != bn) return an < bn;
-    return checkpoint.ordered_members[a] < checkpoint.ordered_members[b];
-  });
-
-  const std::size_t selected = std::min<std::size_t>(static_cast<std::size_t>(round - 1), ranked.size() - 1);
-  return checkpoint.ordered_members[ranked[selected]];
-}
-
-std::vector<PubKey32> legacy_checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
-                                                            std::uint32_t round) {
-  if (checkpoint.ordered_members.size() >= 2) return checkpoint.ordered_members;
-  if (round == 0) return checkpoint.ordered_members;
-  if (auto fallback = legacy_checkpoint_ticket_pow_fallback_member_for_round(checkpoint, round); fallback.has_value()) {
-    return {*fallback};
-  }
-  return {};
 }
 
 std::vector<PubKey32> checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,

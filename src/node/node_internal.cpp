@@ -730,13 +730,7 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
 
 bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
                                               const storage::FinalizedCommitteeCheckpoint& checkpoint) {
-  if (cert.committee_members == consensus::checkpoint_committee_for_round(checkpoint, cert.round)) return true;
-  if (cert.round == 0) return false;
-  if (auto legacy = consensus::legacy_checkpoint_ticket_pow_fallback_member_for_round(checkpoint, cert.round);
-      legacy.has_value()) {
-    return cert.committee_members.size() == 1 && cert.committee_members.front() == *legacy;
-  }
-  return false;
+  return cert.committee_members == consensus::checkpoint_committee_for_round(checkpoint, cert.round);
 }
 
 Hash32 consensus_payload_id(const FrontierTransition& transition) {

@@ -25,9 +25,6 @@ using namespace detail;
 
 namespace {
 
-constexpr std::size_t kMaxBlockTxs = 1000;
-constexpr std::size_t kMaxBlockBytes = 1 * 1024 * 1024;
-
 constexpr std::size_t kMaxCandidateBlocks = 512;
 constexpr std::size_t kMaxCandidateBlockBytes = 32 * 1024 * 1024;
 constexpr std::uint32_t kProposalRoundWindow = 32;
@@ -2415,8 +2412,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
           return std::nullopt;
         }
         const auto record_verify_weight = consensus::ordered_record_confidential_verify_weight(ingress.tx_bytes);
-        if (selection.ordered_records.size() >= kMaxBlockTxs ||
-            total_bytes + ingress.tx_bytes.size() > kMaxBlockBytes ||
+        if (selection.ordered_records.size() >= consensus::kMaxFrontierSliceRecords ||
+            total_bytes + ingress.tx_bytes.size() > consensus::kMaxFrontierSliceBytes ||
             total_verify_weight + record_verify_weight > confidential_policy_.max_block_confidential_verify_weight) {
           capped = true;
           break;

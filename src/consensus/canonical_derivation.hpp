@@ -145,8 +145,7 @@ struct ParentFinalityContext {
 };
 
 // Resolves the parent (prev.finalized_height) context. The committee is the
-// canonical committee for (parent height, parent round), or the legacy one if
-// every signer pubkey belongs to it instead. Signatures are not checked here.
+// canonical committee for (parent height, parent round). Signatures are not checked here.
 bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                      const std::vector<FinalitySig>& signers, ParentFinalityContext* out,
                                      std::string* error);
@@ -178,12 +177,6 @@ bool load_certified_frontier_record_from_storage(const storage::DB& db, const Fr
 bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                           const CanonicalFrontierRecord& record, FrontierExecutionResult* recomputed,
                                           std::string* error,
-                                          std::string* validation_diagnostics = nullptr);
-bool verify_frontier_record_against_state_with_replay_options(
-                                          const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                                          const CanonicalFrontierRecord& record,
-                                          bool allow_legacy_ingress_epoch_replay,
-                                          FrontierExecutionResult* recomputed, std::string* error,
                                           std::string* validation_diagnostics = nullptr);
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                            const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error);
@@ -259,22 +252,12 @@ bool bootstrap_handoff_complete(const CanonicalDerivedState& state);
 std::optional<PubKey32> checkpoint_ticket_pow_fallback_member(const storage::FinalizedCommitteeCheckpoint& checkpoint);
 std::optional<PubKey32> checkpoint_ticket_pow_fallback_member_for_round(
     const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round);
-std::optional<PubKey32> legacy_checkpoint_ticket_pow_fallback_member_for_round(
-    const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round);
-std::vector<PubKey32> legacy_checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
-                                                            std::uint32_t round);
 std::vector<PubKey32> checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
                                                      std::uint32_t round);
-std::vector<PubKey32> legacy_canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
-                                                                  const CanonicalDerivedState& state,
-                                                                  std::uint64_t height, std::uint32_t round);
 
 std::vector<PubKey32> canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
                                                            const CanonicalDerivedState& state, std::uint64_t height,
                                                            std::uint32_t round);
-std::optional<PubKey32> legacy_canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
-                                                                 const CanonicalDerivedState& state,
-                                                                 std::uint64_t height, std::uint32_t round);
 std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
                                                           const CanonicalDerivedState& state, std::uint64_t height,
                                                           std::uint32_t round);
