@@ -72,6 +72,5 @@ Output goes to `<workdir>/report.md`.
 
 - The two-phase finality design has not had an external review yet
   ([spec/TWO_PHASE_FINALITY.md](spec/TWO_PHASE_FINALITY.md) §8.5).
-- CI runs the checkpoint TLA+ models but not the two-phase finality models.
 - There is no reusable stealth address: receiving is per request (spec §3.2), and a restored
   wallet still needs the txids of received payments (no chain scan yet).
