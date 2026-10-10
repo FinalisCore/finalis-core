@@ -207,10 +207,6 @@ Default ports from the current mainnet config:
 Always verify live endpoint identity with `get_status` before relying on public
 infrastructure.
 
-## Community Help Wanted
-
-Thinking about this. I will write soon.
-
 
 ## Testing
 
