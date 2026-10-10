@@ -336,7 +336,6 @@ using UtxoSetV2 = std::map<OutPoint, UtxoEntryV2>;
 Bytes serialize_utxo_entry_v2(const UtxoEntryV2& entry);
 std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b);
 std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry);
-UtxoSet downgrade_utxo_set_v1(const UtxoSetV2& utxos);
 
 struct ValidatorJoinRequestScriptData {
   PubKey32 validator_pubkey{};
