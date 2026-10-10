@@ -439,6 +439,80 @@ void Node::drop_stale_unfinalized_ingress_locked() {
   }
 }
 
+std::vector<IngressCertificate> Node::load_finalized_lane_certificates(const FrontierTransition& transition) const {
+  std::vector<IngressCertificate> out;
+  for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
+    const std::uint64_t from_seq = transition.prev_vector.lane_max_seq[lane] + 1;
+    const std::uint64_t to_seq = transition.next_vector.lane_max_seq[lane];
+    if (to_seq < from_seq) continue;
+    const auto raw = db_.load_ingress_lane_range(lane, from_seq, to_seq);
+    if (raw.size() != to_seq - from_seq + 1) return {};
+    for (const auto& bytes : raw) {
+      auto cert = IngressCertificate::parse(bytes);
+      if (!cert.has_value()) return {};
+      out.push_back(*cert);
+    }
+  }
+  return out;
+}
+
+bool Node::store_finalized_lane_certificates_locked(const FrontierProposal& proposal,
+                                                    const std::vector<IngressCertificate>& lane_certificates,
+                                                    std::string* error) {
+  const auto& transition = proposal.transition;
+  auto fail = [&](const std::string& reason) {
+    if (error) *error = reason;
+    return false;
+  };
+  if (!canonical_state_.has_value()) return fail("missing-canonical-state");
+  if (transition.height != finalized_height_ + 1) return fail("not-next-height");
+  std::map<std::pair<std::uint32_t, std::uint64_t>, const IngressCertificate*> offered;
+  for (const auto& cert : lane_certificates) offered.emplace(std::make_pair(cert.lane, cert.seq), &cert);
+  std::map<Hash32, const Bytes*> tx_bytes_by_id;
+  for (const auto& raw : proposal.ordered_records) {
+    if (auto tx = parse_any_tx(raw); tx.has_value()) tx_bytes_by_id.emplace(txid_any(*tx), &raw);
+  }
+  const std::uint64_t epoch = consensus::committee_epoch_start(transition.height, cfg_.network.committee_epoch_blocks);
+  const auto committee = ingress_committee_locked(epoch);
+  for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
+    const std::uint64_t from_seq = transition.prev_vector.lane_max_seq[lane] + 1;
+    const std::uint64_t to_seq = transition.next_vector.lane_max_seq[lane];
+    Hash32 lane_root = canonical_state_->finalized_lane_roots[lane];
+    for (std::uint64_t seq = from_seq; seq <= to_seq; ++seq) {
+      const auto where = " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq);
+      const auto offered_it = offered.find({lane, seq});
+      const IngressCertificate* cert = offered_it == offered.end() ? nullptr : offered_it->second;
+      if (auto stored_bytes = db_.get_ingress_certificate(lane, seq); stored_bytes.has_value()) {
+        const auto stored = IngressCertificate::parse(*stored_bytes);
+        if (stored.has_value() && (cert == nullptr || *stored == *cert)) {
+          lane_root = consensus::compute_lane_root_append(lane_root, stored->tx_hash);
+          continue;
+        }
+        if (cert == nullptr) return fail("stored-cert-invalid" + where);
+        // The unfinalized suffix from here conflicts with the certified block (an equivocating
+        // certifier): the block decides the lane, so the suffix is dropped and replaced.
+        const LaneState restored{epoch, lane, seq - 1, lane_root};
+        std::vector<Hash32> dropped;
+        if (!db_.truncate_ingress_lane(lane, seq - 1, restored, &dropped)) return fail("lane-truncate-failed" + where);
+        for (auto it = quarantined_ingress_records_.begin(); it != quarantined_ingress_records_.end();) {
+          it = it->first == lane ? quarantined_ingress_records_.erase(it) : std::next(it);
+        }
+        log_line("ingress-lane-replaced-by-certified-block height=" + std::to_string(transition.height) + where +
+                 " records=" + std::to_string(dropped.size()));
+      }
+      if (cert == nullptr) return fail("missing-lane-certificate" + where);
+      const auto bytes_it = tx_bytes_by_id.find(cert->txid);
+      if (bytes_it == tx_bytes_by_id.end()) return fail("lane-certificate-tx-missing" + where);
+      std::string append_error;
+      if (!consensus::append_validated_ingress_record(db_, *cert, *bytes_it->second, committee, epoch, &append_error)) {
+        return fail("lane-certificate-append-failed" + where + " detail=" + append_error);
+      }
+      lane_root = consensus::compute_lane_root_append(lane_root, cert->tx_hash);
+    }
+  }
+  return true;
+}
+
 void Node::reforward_uncertified_mempool_txs_locked() {
   constexpr std::size_t kMaxPerPass = 256;
   std::size_t count = 0;

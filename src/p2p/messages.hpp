@@ -94,6 +94,9 @@ struct GetTransitionByHeightMsg {
 struct TransitionMsg {
   Bytes frontier_proposal_bytes;
   std::optional<FinalityCertificate> certificate;
+  // Ingress certificates of the transition's lane ranges, in lane then seq order. A syncing node
+  // stores them with the block, so startup replay can rebuild it from local storage.
+  std::vector<IngressCertificate> lane_certificates;
 };
 
 struct EpochTicketMsg {

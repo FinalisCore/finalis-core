@@ -2696,7 +2696,14 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   auto sc = crypto::ed25519_sign(vote_signing_message(vc.height, vc.round, vc.block_id), keys[0].private_key);
   ASSERT_TRUE(sc.has_value());
   vc.signature = *sc;
-  ASSERT_TRUE(!nodes[1]->inject_vote_for_test(vc));
+  // A known equivocator's first vote per round still counts; a conflicting second one does not.
+  ASSERT_TRUE(nodes[1]->inject_vote_for_test(vc));
+  Vote vd = vc;
+  vd.block_id.fill(0xDD);
+  auto sd = crypto::ed25519_sign(vote_signing_message(vd.height, vd.round, vd.block_id), keys[0].private_key);
+  ASSERT_TRUE(sd.has_value());
+  vd.signature = *sd;
+  ASSERT_TRUE(!nodes[1]->inject_vote_for_test(vd));
 }
 
 TEST(test_primary_timeout_falls_back_to_backup_proposer) {
@@ -5411,6 +5418,72 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
                            hex_encode32(sh) + R"("}})";
   const auto resp = ls.handle_rpc_for_test(body);
   ASSERT_TRUE(resp.find("\"value\":10000000000") != std::string::npos);
+}
+
+TEST(test_synced_follower_restarts_from_lane_certificates_delivered_with_blocks) {
+  // A follower that syncs a transfer's block without its ingress gossip gets the lane certificates
+  // only with the TRANSITION, and startup replay rebuilds every block from them.
+  const std::string base = unique_test_base("/tmp/finalis_it_synced_follower_restart_lane_certs");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  auto& leader = *cluster.nodes[0];
+
+  ASSERT_TRUE(wait_for_tip(leader, 33, ci_timeout_seconds(240)));
+  constexpr std::uint64_t kAmount = 10'000'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+  const auto keys = node::Node::deterministic_test_keypairs();
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(leader, keys, kAmount + kFee, 1);
+    return funded.has_value() && !funded->utxos.empty();
+  }, ci_timeout_seconds(120)));
+
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x56);
+  const auto sender_kp = keys[funded->key_index];
+  const auto own_pkh = crypto::h160(Bytes(sender_kp.public_key.begin(), sender_kp.public_key.end()));
+  const auto prev = funded->utxos.front();
+  std::vector<TxOut> outputs;
+  outputs.push_back(TxOut{kAmount, address::p2pkh_script_pubkey(recipient_pkh)});
+  outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
+  std::string build_err;
+  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
+                                               Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()),
+                                               outputs, &build_err);
+  ASSERT_TRUE(tx.has_value());
+  ASSERT_TRUE(leader.inject_tx_for_test(*tx, true));
+  ASSERT_TRUE(wait_for([&]() { return !leader.find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty(); },
+                       ci_timeout_seconds(120)));
+  const auto target = leader.status().height;
+
+  // Blocks arrive only as TRANSITION messages: no network, so no ingress gossip or range sync.
+  auto follower_cfg = cluster.configs[0];
+  follower_cfg.node_id = 1;
+  follower_cfg.disable_p2p = true;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
+  keystore::ValidatorKey follower_key;
+  std::string key_err;
+  ASSERT_TRUE(keystore::create_validator_keystore(follower_cfg.validator_key_file, follower_cfg.validator_passphrase,
+                                                  "mainnet", "sc", deterministic_seed_for_node_id(1), &follower_key,
+                                                  &key_err));
+  auto follower = std::make_unique<node::Node>(follower_cfg);
+  ASSERT_TRUE(follower->init());
+  follower->start();
+  for (std::uint64_t h = 1; h <= target; ++h) {
+    const auto msg = leader.finalized_transition_msg_for_test(h);
+    ASSERT_TRUE(msg.has_value());
+    ASSERT_TRUE(follower->inject_transition_msg_for_test(*msg));
+  }
+  ASSERT_EQ(follower->status().height, target);
+  ASSERT_TRUE(!follower->find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty());
+  follower->stop();
+  follower.reset();
+
+  auto restarted = std::make_unique<node::Node>(follower_cfg);
+  ASSERT_TRUE(restarted->init());
+  ASSERT_EQ(restarted->status().height, target);
+  ASSERT_TRUE(!restarted->find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty());
+  restarted->stop();
 }
 
 TEST(test_restart_repairs_partial_settlement_state) {
@@ -11090,4 +11163,92 @@ TEST(test_rejected_frontier_tx_is_not_reported_credit_safe) {
   }
   ASSERT_TRUE(resp.find("\"status\":\"rejected\"") != std::string::npos);
   ASSERT_TRUE(resp.find("\"finalized\":false") != std::string::npos);
+}
+
+// Precommits form a quorum per round only. In a Byzantine chaos run a round-1 quorum was cast but
+// never assembled after a partition, because each node re-gossiped only its latest (lock) precommit,
+// and the height took 12 rounds. Re-gossip must cover every own precommit at the height and the
+// signatures of the set closest to quorum.
+TEST(test_stalled_height_regossips_old_round_precommits) {
+  auto f = make_two_phase_fixture("/tmp/finalis_it_regossip_old_precommits", 0x94);
+  auto& target = f->target();
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto me = target.local_validator_pubkey_for_test();
+
+  // Round 0: polka, lock and precommit; one other validator's round-0 precommit arrives (2 < quorum).
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+            std::string("accepted"));
+  inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 0, a_id));
+  PubKey32 other{};
+  for (const auto& pub : f->committee) {
+    if (pub != me) {
+      other = pub;
+      break;
+    }
+  }
+  ASSERT_TRUE(target.inject_vote_for_test(make_test_vote(f->keys, f->height, 0, a_id, other)));
+
+  // Round 1: the same value is re-proposed with its round-0 polka; the lock moves to round 1.
+  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
+  const auto leader1 = target.proposer_for_height_round_for_test(f->height, 1);
+  ASSERT_TRUE(leader1.has_value());
+  const auto polka0 = make_test_polka(f->keys, f->committee, f->height, 0, a_id, f->quorum);
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0, polka0, tc0, 1, *leader1)),
+            std::string("accepted"));
+  inject_test_prevotes(target, f->keys, f->committee, f->height, 1, a_id, f->quorum - 1);
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, a_id));
+  ASSERT_EQ(target.local_vote_lock_for_test(f->height)->second, 1u);
+
+  const auto precommits = target.precommits_for_rebroadcast_for_test(f->height);
+  const auto has = [&](std::uint32_t round, const PubKey32& signer) {
+    return std::any_of(precommits.begin(), precommits.end(), [&](const Vote& v) {
+      return v.round == round && v.validator_pubkey == signer && v.frontier_transition_id == a_id;
+    });
+  };
+  ASSERT_TRUE(has(1, me));     // the lock's round, as before
+  ASSERT_TRUE(has(0, me));     // the older own precommit: previously dropped
+  ASSERT_TRUE(has(0, other));  // round 0 is closest to quorum: its other signatures travel too
+}
+
+// A validator caught equivocating still has its votes counted, one per round. Ignoring them left
+// only the honest validators to form quorums: in a Byzantine chaos run with both faulty validators
+// caught, every honest validator was needed for every height and one slow node stalled a height for
+// 10 rounds. Safety does not depend on ignoring them (the rules are safe for f arbitrary voters).
+TEST(test_known_equivocator_votes_still_count_toward_polka) {
+  auto f = make_two_phase_fixture("/tmp/finalis_it_equivocator_votes_count", 0x95);
+  auto& target = f->target();
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto b0_id = frontier_proposal_id(*f->b0);
+  const auto b1_id = frontier_proposal_id(*f->b1);
+  std::vector<PubKey32> others;
+  for (const auto& pub : f->committee) {
+    if (pub != target.local_validator_pubkey_for_test()) others.push_back(pub);
+  }
+  ASSERT_TRUE(others.size() >= 2);
+  const PubKey32 equivocator = others[0];
+  const PubKey32 honest = others[1];
+
+  // Round 0: the equivocator prevotes two different values; the second is evidence, not a vote.
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, a_id, equivocator)),
+            std::string("accepted"));
+  (void)target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, b0_id, equivocator));
+
+  // Round 1: own prevote + the honest one + the equivocator's = quorum 3 -> polka.
+  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, std::nullopt, tc0)),
+            std::string("accepted"));
+  ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, b1_id));
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 1, b1_id, honest)),
+            std::string("accepted"));
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 1, b1_id, equivocator)),
+            std::string("accepted"));
+  const auto polka = target.valid_polka_for_height_for_test(f->height);
+  ASSERT_TRUE(polka.has_value());
+  ASSERT_EQ(polka->round, 1u);
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, b1_id));
 }

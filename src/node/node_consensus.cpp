@@ -828,10 +828,42 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
       out.prevotes.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
     }
   }
-  if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end()) {
+  // Precommits sign (height, round, transition): a quorum forms per round only. A precommit lost in a
+  // partition strands its round even when a quorum was cast there, while later rounds fall short,
+  // so a node that only re-sends its latest one can leave the height stuck for many rounds. Re-send
+  // every own precommit at the height (one per round at most; newest kOwnPrecommitRounds) and every
+  // known signature of the set closest to quorum, so a quorum split across nodes assembles anywhere.
+  // Re-sending a vote already cast decides nothing new.
+  constexpr std::size_t kOwnPrecommitRounds = 32;
+  const auto sets = votes_.vote_sets_for_height(height);
+  std::vector<Vote> own;
+  std::set<std::uint32_t> own_rounds;
+  const consensus::VoteSet* best = nullptr;
+  for (const auto& set : sets) {
+    for (const auto& sig : set.signatures) {
+      if (sig.validator_pubkey != local_key_.public_key) continue;
+      own.push_back(Vote{height, set.round, set.transition_id, sig.validator_pubkey, sig.signature});
+      own_rounds.insert(set.round);
+    }
+    if (!best || set.signatures.size() > best->signatures.size() ||
+        (set.signatures.size() == best->signatures.size() && set.round > best->round)) {
+      best = &set;
+    }
+  }
+  for (std::size_t k = own.size() > kOwnPrecommitRounds ? own.size() - kOwnPrecommitRounds : 0; k < own.size(); ++k) {
+    out.precommits.push_back(own[k]);
+  }
+  if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end() && !own_rounds.count(lock->second.second)) {
+    // The lock's precommit is normally in votes_ already; a reconnect reset may have cleared them.
     const auto& [transition_id, round] = lock->second;
     if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key)) {
       out.precommits.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
+    }
+  }
+  if (best != nullptr) {
+    for (const auto& sig : best->signatures) {
+      if (sig.validator_pubkey == local_key_.public_key) continue;
+      out.precommits.push_back(Vote{height, best->round, best->transition_id, sig.validator_pubkey, sig.signature});
     }
   }
   // The valid value's polka, all signers: a node locked on it refuses every other proposal, so the
@@ -1014,6 +1046,7 @@ void Node::on_get_transition(int peer_id, const Bytes& payload) {
   p2p::TransitionMsg msg;
   msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
   msg.certificate = cert;
+  msg.lane_certificates = load_finalized_lane_certificates(*transition);
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
   log_line("send-frontier peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(transition->height) +
            " hash=" + short_hash_hex(gb->hash) + " status=" + (ok ? "ok" : "failed"));
@@ -1158,6 +1191,7 @@ void Node::on_get_transition_by_height(int peer_id, const Bytes& payload) {
   p2p::TransitionMsg msg;
   msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
   msg.certificate = cert;
+  msg.lane_certificates = load_finalized_lane_certificates(*transition);
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, p2p::ser_transition(msg), true);
   log_frontier_by_height(ok ? "ok" : "failed",
                          " hash=" + short_hash_hex(*bh) +
@@ -1242,7 +1276,7 @@ void Node::on_transition(int peer_id, const Bytes& payload, const Hash32& payloa
     if (!running_) {
       if (b->certificate.has_value() && proposal->transition.height >= finalized_height_ + 1) {
         const auto transition_id = proposal->transition.transition_id();
-        accepted = insert_buffered_sync_frontier_locked(*proposal, *b->certificate, peer_id, cert_check);
+        accepted = insert_buffered_sync_frontier_locked(*proposal, *b->certificate, b->lane_certificates, peer_id, cert_check);
         if (accepted) {
           acceptance_path = "startup-buffered";
           log_line("startup-sync-defer-transition peer_id=" + std::to_string(peer_id) +
@@ -1273,11 +1307,11 @@ void Node::on_transition(int peer_id, const Bytes& payload, const Hash32& payloa
       (void)maybe_request_forward_sync_block_locked();
     } else if (proposal->transition.height > finalized_height_ + 1 && b->certificate.has_value()) {
       acceptance_path = "buffer-forward";
-      accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, peer_id, cert_check);
+      accepted = maybe_buffer_sync_frontier_locked(*proposal, b->certificate, b->lane_certificates, peer_id, cert_check);
       if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
     } else {
       acceptance_path = "handle-next";
-      accepted = handle_frontier_block_locked(*proposal, b->certificate, peer_id, true, cert_check);
+      accepted = handle_frontier_block_locked(*proposal, b->certificate, b->lane_certificates, peer_id, true, cert_check);
       if (accepted) (void)maybe_apply_buffered_sync_frontiers_locked(peer_id);
     }
     if (accepted) accepted_block_payloads_.insert(payload_id);
@@ -1802,13 +1836,12 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
       vote_verify_cache_.insert(vkey);
     }
 
-    // Soft: the vote is validly signed, so the relaying peer did nothing wrong. Penalizing it would
-    // let one equivocating validator get honest peers banned by everyone who relays its votes.
-    if (locally_observed_equivocators_.find(vote.validator_pubkey) != locally_observed_equivocators_.end()) {
-      log_vote_soft_reject("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
-      if (reject_reason) *reject_reason = "known-equivocator";
-      return VoteHandlingResult::SoftReject;
-    }
+    // LIVENESS: a known equivocator's votes still count, one per round like everyone's (the tracker
+    // keeps its first vote and turns a conflicting second into evidence). Ignoring them adds no
+    // safety, since the two-phase rules are safe for up to f validators voting arbitrarily (formal/),
+    // but it leaves only the honest validators to reach quorum: with f equivocators caught, every
+    // honest validator would be needed for every height. Their votes are not relayed (see below).
+    const bool known_equivocator = locally_observed_equivocators_.contains(vote.validator_pubkey);
 
     // INVARIANT: this is the only place (besides the local self-vote in finalize_if_quorum)
     // that inserts into votes_. Every signature reaching this point has just passed
@@ -1842,7 +1875,7 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
     }
     accepted = true;
 
-    relay_vote = from_network && !should_mute_peer_locked(from_peer_id);
+    relay_vote = from_network && !should_mute_peer_locked(from_peer_id) && !known_equivocator;
     if (candidate_frontier_proposals_.find(vote.frontier_transition_id) == candidate_frontier_proposals_.end()) {
       (void)maybe_request_candidate_transition_locked(from_peer_id, vote.frontier_transition_id);
     }
@@ -1911,10 +1944,8 @@ Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from
       }
       prevote_verify_cache_.insert(vkey);
     }
-    // Validly signed: the relayer is not at fault (see handle_vote_result).
-    if (locally_observed_equivocators_.contains(vote.validator_pubkey)) {
-      return soft("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
-    }
+    // A known equivocator's prevotes still count (see handle_vote_result); they are not relayed.
+    const bool known_equivocator = locally_observed_equivocators_.contains(vote.validator_pubkey);
     // INVARIANT: like votes_, every prevote entering prevotes_ passed ed25519_verify above (or is
     // this node's own, or a verified pol signature); verify_polka_locked's skip path relies on it.
     auto tr = prevotes_.add_vote(vote);
@@ -1930,7 +1961,7 @@ Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from
       return soft("duplicate", " validator=" + short_pub_hex(vote.validator_pubkey));
     }
     accepted = true;
-    relay = from_network && !should_mute_peer_locked(from_peer_id);
+    relay = from_network && !should_mute_peer_locked(from_peer_id) && !known_equivocator;
     if (candidate_frontier_proposals_.find(vote.frontier_transition_id) == candidate_frontier_proposals_.end()) {
       (void)maybe_request_candidate_transition_locked(from_peer_id, vote.frontier_transition_id);
     }
@@ -2061,7 +2092,8 @@ bool Node::handle_timeout_vote(const TimeoutVote& vote, bool from_network, int f
 }
 
 bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
-                                        const std::optional<FinalityCertificate>& certificate, int from_peer_id,
+                                        const std::optional<FinalityCertificate>& certificate,
+                                        const std::vector<IngressCertificate>& lane_certificates, int from_peer_id,
                                         bool from_network, const std::optional<CertificateCheck>& cert_check) {
   auto log_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
     log_line("frontier-block-reject height=" + std::to_string(proposal.transition.height) + " round=" +
@@ -2082,7 +2114,7 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
   const auto transition_id = transition.transition_id();
   if (!running_ && from_network) {
     if (certificate.has_value() && transition.height >= finalized_height_ + 1) {
-      const bool buffered = maybe_buffer_sync_frontier_locked(proposal, certificate, from_peer_id, cert_check);
+      const bool buffered = maybe_buffer_sync_frontier_locked(proposal, certificate, lane_certificates, from_peer_id, cert_check);
       if (buffered) {
         log_line("startup-sync-defer-transition path=handle_frontier_block_locked peer_id=" + std::to_string(from_peer_id) +
                  " height=" + std::to_string(transition.height) + " transition=" + short_hash_hex(transition_id));
@@ -2149,7 +2181,23 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       return false;
     }
     const auto& canonical_sigs = cert_check->canonical_sigs;
-    consensus::CanonicalFrontierRecord certified_record{transition, proposal.ordered_records};
+    // The block is applied from its certified lane records, as live finalization and startup replay
+    // do, so they must be in local storage first: replay cannot rebuild a block without them.
+    if (consensus::frontier_ordered_slice_commitment(proposal.ordered_records) != transition.ordered_slice_commitment) {
+      log_reject("ordered-slice-commitment-mismatch");
+      return false;
+    }
+    std::string lane_error;
+    if (!store_finalized_lane_certificates_locked(proposal, lane_certificates, &lane_error)) {
+      log_reject("lane-certificates-unavailable", " detail=" + lane_error);
+      return false;
+    }
+    consensus::CanonicalFrontierRecord certified_record;
+    if (!consensus::load_certified_frontier_record_from_storage(db_, transition, &certified_record, &lane_error)) {
+      log_reject("lane-certificates-unavailable", " detail=" + lane_error);
+      return false;
+    }
+    certified_record.ordered_records = proposal.ordered_records;
     consensus::FrontierExecutionResult recomputed;
     std::string validation_error;
     std::string validation_diagnostics;
@@ -2221,7 +2269,8 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
 }
 
 bool Node::maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
-                                             const std::optional<FinalityCertificate>& certificate, int from_peer_id,
+                                             const std::optional<FinalityCertificate>& certificate,
+                                             const std::vector<IngressCertificate>& lane_certificates, int from_peer_id,
                                              const std::optional<CertificateCheck>& cert_check) {
   if (!certificate.has_value()) {
     if (proposal.transition.height > finalized_height_ + 1) {
@@ -2239,10 +2288,11 @@ bool Node::maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
   }
   if (transition.height == finalized_height_ + 1) return false;
   if (auto existing = db_.get_height_hash(transition.height); existing.has_value()) return *existing == transition_id;
-  return insert_buffered_sync_frontier_locked(proposal, *certificate, from_peer_id, cert_check);
+  return insert_buffered_sync_frontier_locked(proposal, *certificate, lane_certificates, from_peer_id, cert_check);
 }
 
 bool Node::insert_buffered_sync_frontier_locked(const FrontierProposal& proposal, const FinalityCertificate& certificate,
+                                                const std::vector<IngressCertificate>& lane_certificates,
                                                 int from_peer_id, const std::optional<CertificateCheck>& cert_check) {
   const auto& transition = proposal.transition;
   const auto transition_id = transition.transition_id();
@@ -2257,6 +2307,7 @@ bool Node::insert_buffered_sync_frontier_locked(const FrontierProposal& proposal
 
   std::size_t bytes = sizeof(BufferedSyncFrontier);
   for (const auto& rec : proposal.ordered_records) bytes += rec.size();
+  bytes += lane_certificates.size() * sizeof(IngressCertificate);
 
   auto it = buffered_sync_frontiers_.find(transition.height);
   if (it != buffered_sync_frontiers_.end()) {
@@ -2277,7 +2328,7 @@ bool Node::insert_buffered_sync_frontier_locked(const FrontierProposal& proposal
   if (buffered_sync_bytes_ + bytes > kMaxBufferedSyncBytes) return reject("buffer-bytes-full");
 
   buffered_sync_frontiers_[transition.height].push_back(
-      BufferedSyncFrontier{proposal, certificate, from_peer_id, bytes});
+      BufferedSyncFrontier{proposal, certificate, lane_certificates, from_peer_id, bytes});
   buffered_sync_bytes_ += bytes;
   log_line("buffer-sync-transition peer_id=" + std::to_string(from_peer_id) + " height=" +
            std::to_string(transition.height) + " hash=" + short_hash_hex(transition_id) + " prev=" +
@@ -2311,7 +2362,8 @@ bool Node::maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id) {
         cert_check = precheck_finality_certificate(*buffered.certificate, buffered.proposal.transition);
       }
       const int source_peer = buffered.from_peer_id != 0 ? buffered.from_peer_id : preferred_peer_id;
-      if (handle_frontier_block_locked(buffered.proposal, buffered.certificate, source_peer, true, cert_check)) {
+      if (handle_frontier_block_locked(buffered.proposal, buffered.certificate, buffered.lane_certificates, source_peer,
+                                       true, cert_check)) {
         applied = true;
         break;
       }
