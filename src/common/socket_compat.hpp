@@ -87,6 +87,14 @@ inline bool shutdown_socket(SocketHandle fd) {
 #endif
 }
 
+inline bool shutdown_socket_write(SocketHandle fd) {
+#ifdef _WIN32
+  return !valid_socket(fd) || ::shutdown(fd, SD_SEND) == 0;
+#else
+  return !valid_socket(fd) || ::shutdown(fd, SHUT_WR) == 0;
+#endif
+}
+
 inline void set_close_on_exec(SocketHandle fd) {
 #ifdef _WIN32
   (void)fd;
