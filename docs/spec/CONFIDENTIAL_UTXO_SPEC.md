@@ -30,7 +30,7 @@ This specification is written against the current repository layout:
 The design goal is:
 
 - confidential output amounts
-- stealth recipients
+- one-time recipient keys per receive request, recoverable from the account secrets (§3.2)
 - deterministic replay
 - bounded validator cost
 - no trusted setup
@@ -50,8 +50,8 @@ Add:
 
 - [src/crypto/confidential.hpp](../../src/crypto/confidential.hpp)
 - [src/crypto/confidential.cpp](../../src/crypto/confidential.cpp)
-- [src/crypto/stealth_address.hpp](../../src/crypto/stealth_address.hpp)
-- [src/crypto/stealth_address.cpp](../../src/crypto/stealth_address.cpp)
+- [src/wallet/confidential_keys.hpp](../../src/wallet/confidential_keys.hpp)
+- [src/wallet/confidential_keys.cpp](../../src/wallet/confidential_keys.cpp)
 
 Do not introduce separate `pedersen.hpp` and `bulletproof.hpp` public entry
 points in v1. The consensus-facing code should consume one repository-owned
@@ -117,7 +117,7 @@ Modify:
 Add:
 
 - [tests/test_confidential_tx.cpp](../../tests/test_confidential_tx.cpp)
-- `tests/test_stealth_address.cpp` (not written yet; stealth derivation has no dedicated unit tests)
+- [tests/test_wallet_confidential_keys.cpp](../../tests/test_wallet_confidential_keys.cpp)
 - [tests/test_wallet_send_policy.cpp](../../tests/test_wallet_send_policy.cpp)
 - [tests/test_wallet_store.cpp](../../tests/test_wallet_store.cpp)
 - [tests/test_wallet_widgets.cpp](../../tests/test_wallet_widgets.cpp)
@@ -186,43 +186,39 @@ std::size_t range_proof_verify_weight(const ProofBytes& proof);
 }  // namespace finalis::crypto
 ```
 
-### 3.2 File: `src/crypto/stealth_address.hpp`
+### 3.2 Receive keys: `src/wallet/confidential_keys.hpp`
 
-```cpp
-#pragma once
+There is no reusable stealth address. A receiver hands out one **receive request** per payment
+(`scconfreq1:` URI) carrying `one_time_pubkey`, `ephemeral_pubkey`, `scan_tag` and the memo key. The
+keys of request `i` of an account (view secret `v`, spend secret `s`, `S = s*G`) are deterministic:
 
-#include <array>
-#include <optional>
+```text
+t_i              = hash_to_scalar("FINALIS/conf-request/tweak/v1",     v, i)
+one_time_pubkey  = S + t_i*G
+one_time_secret  = s + t_i  (mod n)
+ephemeral_pubkey = hash_to_scalar("FINALIS/conf-request/ephemeral/v1", v, i) * G
+scan_tag         = tagged_hash("FINALIS/conf-request/scan-tag/v1", v, i)[0]
+memo_key         = tagged_hash("FINALIS/conf-request/memo/v1",     v, i)
 
-#include "common/types.hpp"
-
-namespace finalis::crypto {
-
-struct StealthAddress {
-  PubKey33 view_pubkey{};
-  PubKey33 spend_pubkey{};
-  bool operator==(const StealthAddress&) const = default;
-};
-
-struct StealthScanResult {
-  PubKey33 one_time_pubkey{};
-  bool mine{false};
-};
-
-bool stealth_address_is_canonical(const StealthAddress& addr);
-std::optional<StealthScanResult> scan_stealth_output(const PubKey33& ephemeral_pubkey,
-                                                     std::uint8_t scan_tag,
-                                                     const Bytes& wallet_view_key_material);
-
-}  // namespace finalis::crypto
+tagged_hash(tag, v, i, c) = SHA256(SHA256(tag) || SHA256(tag) || v || le32(i) || u8(c)), c = 0
+hash_to_scalar            = tagged_hash with c = 0, 1, ... until the result is in [1, n)
 ```
 
-Implementation note:
+Properties:
 
-- `PubKey33` does not exist today. Add it in [common/types.hpp](../../src/common/types.hpp)
-  as a compressed secp256k1 point type.
-- `PubKey32` must remain untouched because it is already consensus-critical in
-  validator/finality code.
+- **Recovery.** `(v, s)` re-derives every request. The wallet matches an imported `TxV2` against
+  stored requests and, failing that, against derived requests `0 .. next_request_index + 100`, so a
+  wallet restored from its account secrets recognises and can spend coins paid to old requests.
+  Finding the transactions after a restore still needs their txids (no chain scan yet).
+- **Watch-only.** `(v, S)` derives every public part and the memo key: it recognises incoming coins
+  and decrypts their amounts, but cannot spend.
+- **Unlinkability.** Distinct requests have unrelated keys to anyone without `v`. Paying one request
+  twice links those two payments; issue a new request per payment.
+- **Caveat** (non-hardened derivation, as in BIP32): one leaked `one_time_secret` together with `v`
+  yields `s`. One-time secrets are stored and protected like `s`.
+
+Consensus sees only the output fields; the derivation is a wallet convention and can change without
+a protocol change. Known-answer vectors are pinned in `tests/test_wallet_confidential_keys.cpp`.
 
 ## 4. Transaction Types
 
@@ -245,7 +241,6 @@ and mempool paths stay small.
 #include <variant>
 
 #include "crypto/confidential.hpp"
-#include "crypto/stealth_address.hpp"
 #include "utxo/tx.hpp"
 
 namespace finalis {

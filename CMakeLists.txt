@@ -152,7 +152,6 @@ add_library(finalis_core
   src/crypto/secure_memory.cpp
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
-  src/crypto/stealth_address.cpp
   src/common/keystore.cpp
   src/onboarding/validator_onboarding.cpp
   src/genesis/genesis.cpp
@@ -162,6 +161,7 @@ add_library(finalis_core
   src/consensus/availability_retention.cpp
   src/wallet/utxo_selection.cpp
   src/wallet/confidential_builder.cpp
+  src/wallet/confidential_keys.cpp
   src/utxo/tx.cpp
   src/utxo/confidential_tx.cpp
   src/utxo/validate.cpp
@@ -424,6 +424,7 @@ add_executable(finalis-tests
   tests/test_validator_onboarding.cpp
   tests/test_wallet_store.cpp
   tests/test_wallet_confidential_memo.cpp
+  tests/test_wallet_confidential_keys.cpp
   tests/test_wallet_confidential_receive.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp

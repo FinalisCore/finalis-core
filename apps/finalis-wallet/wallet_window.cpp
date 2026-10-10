@@ -73,12 +73,12 @@
 #include "consensus/monetary.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/secure_memory.hpp"
-#include "crypto/stealth_address.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "common/keystore.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
 #include "wallet/confidential_builder.hpp"
+#include "wallet/confidential_keys.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
@@ -4563,26 +4563,26 @@ void WalletWindow::generate_confidential_request() {
                          "No confidential account is configured locally yet.");
     return;
   }
-  Hash32 spend_secret = random_hash32();
-  Hash32 memo_key = random_hash32();
-  Hash32 ephemeral_secret = random_hash32();
-  crypto::ScopedWipe<Hash32, Hash32, Hash32> wipe_secrets(spend_secret, memo_key, ephemeral_secret);
-  auto one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret);
-  if (!one_time_pubkey) {
+  // Request keys derive from the account secrets and the next request index, so backing up the
+  // account secrets recovers every request (wallet/confidential_keys.hpp).
+  auto view_secret = decode_hex32_string(account_it->view_key_material_hex);
+  auto account_spend_secret = decode_hex32_string(account_it->spend_key_material_hex);
+  std::optional<ConfidentialRequestKeys> keys;
+  if (view_secret && account_spend_secret) {
+    keys = derive_confidential_request_keys(*view_secret, *account_spend_secret, account_it->next_request_index);
+  }
+  wipe_optional(view_secret);
+  wipe_optional(account_spend_secret);
+  if (!keys) {
     QMessageBox::warning(this, "Generate Confidential Request", "Failed to derive a one-time confidential receive key.");
     return;
   }
-  auto ephemeral_pubkey = crypto::secp256k1_pubkey_from_scalar(ephemeral_secret);
-  crypto::secure_wipe(ephemeral_secret);  // only the pubkey is ever used
-  if (!ephemeral_pubkey) {
-    QMessageBox::warning(this, "Generate Confidential Request", "Failed to derive an ephemeral request key.");
-    return;
-  }
-  const std::uint8_t scan_tag = random_hash32()[0];
+  const Hash32& spend_secret = keys->one_time_secret;
+  const Hash32& memo_key = keys->pub.memo_key;
   const ConfidentialRecipient recipient{
-      .one_time_pubkey = *one_time_pubkey,
-      .ephemeral_pubkey = *ephemeral_pubkey,
-      .scan_tag = crypto::ScanTag{scan_tag},
+      .one_time_pubkey = keys->pub.one_time_pubkey,
+      .ephemeral_pubkey = keys->pub.ephemeral_pubkey,
+      .scan_tag = keys->pub.scan_tag,
       .memo = {},
   };
   const QString uri = QString::fromStdString(encode_confidential_request_uri(recipient, memo_key));
@@ -4598,7 +4598,9 @@ void WalletWindow::generate_confidential_request() {
       .memo_key_hex = finalis::hex_encode(Bytes(memo_key.begin(), memo_key.end())),
       .consumed = false,
   };
-  if (!store_.upsert_confidential_request(request_record)) {
+  WalletStore::ConfidentialAccountRecord account_record = *account_it;
+  ++account_record.next_request_index;
+  if (!store_.upsert_confidential_request(request_record) || !store_.upsert_confidential_account(account_record)) {
     QMessageBox::warning(this, "Generate Confidential Request", "Failed to persist local confidential request state.");
     return;
   }
@@ -4667,7 +4669,16 @@ void WalletWindow::import_received_confidential_tx() {
   bool imported_any = false;
   for (const auto& match : match_received_confidential_outputs(tx, *txid, state, &already_imported)) {
     if (!store_.upsert_confidential_coin(match.coin)) continue;
-    (void)store_.set_confidential_request_consumed(match.request_id, true);
+    if (!match.request_id.empty()) (void)store_.set_confidential_request_consumed(match.request_id, true);
+    if (match.derived_index) {
+      // Matched a request this wallet holds no record of (e.g. restored from account secrets):
+      // never hand out that index again.
+      for (auto& account : state.confidential_accounts) {
+        if (account.account_id != match.coin.account_id || account.next_request_index > *match.derived_index) continue;
+        account.next_request_index = *match.derived_index + 1;
+        (void)store_.upsert_confidential_account(account);
+      }
+    }
     imported_any = true;
   }
   if (!imported_any) {

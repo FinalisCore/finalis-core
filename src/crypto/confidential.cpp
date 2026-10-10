@@ -294,6 +294,37 @@ std::optional<PubKey33> secp256k1_pubkey_from_scalar(const Hash32& scalar32) {
 #endif
 }
 
+std::optional<PubKey33> secp256k1_pubkey_tweak_add(const PubKey33& pubkey, const Hash32& tweak32) {
+#if defined(SC_HAS_SECP256K1)
+  if (!confidential_crypto_init()) return std::nullopt;
+  secp256k1_pubkey parsed{};
+  if (!parse_pubkey(pubkey, &parsed)) return std::nullopt;
+  if (secp256k1_ec_pubkey_tweak_add(backend().ctx, &parsed, tweak32.data()) != 1) return std::nullopt;
+  return serialize_pubkey(parsed);
+#else
+  (void)pubkey;
+  (void)tweak32;
+  return std::nullopt;
+#endif
+}
+
+std::optional<Hash32> secp256k1_scalar_tweak_add(const Hash32& scalar32, const Hash32& tweak32) {
+#if defined(SC_HAS_SECP256K1)
+  if (!confidential_crypto_init()) return std::nullopt;
+  Hash32 out = scalar32;
+  if (secp256k1_ec_seckey_verify(backend().ctx, out.data()) != 1 ||
+      secp256k1_ec_seckey_tweak_add(backend().ctx, out.data(), tweak32.data()) != 1) {
+    secure_wipe(out);
+    return std::nullopt;
+  }
+  return out;
+#else
+  (void)scalar32;
+  (void)tweak32;
+  return std::nullopt;
+#endif
+}
+
 bool xonly_pubkey32_is_canonical(const PubKey32& pubkey) {
 #if defined(SC_HAS_SECP256K1_ZKP)
   if (!confidential_crypto_init()) return false;
