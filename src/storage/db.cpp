@@ -1319,6 +1319,7 @@ std::string key_confidential_pool_value() { return "CPOOL"; }
 std::string key_validator_onboarding(const PubKey32& pub) { return "VO:" + hex_encode(Bytes(pub.begin(), pub.end())); }
 std::string key_txidx_prefix() { return "X:"; }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
+std::string key_rejected_tx(const Hash32& txid) { return "XR:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_ingress_record_prefix() { return "IR:"; }
 std::string key_ingress_record(std::uint64_t seq) { return "IR:" + hex_encode(u64be_bytes(seq)); }
 std::string key_finalized_ingress_tip() { return "IFTIP"; }
@@ -1500,6 +1501,12 @@ void DB::Batch::put_tx_index(const Hash32& txid, std::uint64_t height, std::uint
   w.u32le(tx_index);
   w.varbytes(tx_bytes);
   put(key_txidx(txid), w.take());
+}
+
+void DB::Batch::put_rejected_tx(const Hash32& txid, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  put(key_rejected_tx(txid), w.take());
 }
 
 void DB::Batch::add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid) {
@@ -2273,6 +2280,21 @@ bool DB::put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx
   w.u32le(tx_index);
   w.varbytes(tx_bytes);
   return put(key_txidx(txid), w.take());
+}
+
+std::optional<std::uint64_t> DB::get_rejected_tx_height(const Hash32& txid) const {
+  auto b = get(key_rejected_tx(txid));
+  if (!b.has_value()) return std::nullopt;
+  std::uint64_t height = 0;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        if (!h) return false;
+        height = *h;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return height;
 }
 
 std::optional<DB::TxLocation> DB::get_tx_index(const Hash32& txid) const {

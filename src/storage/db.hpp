@@ -282,6 +282,9 @@ class DB {
     // Unchecked: thin wrappers reusing the same key/serialization helpers the
     // single-op methods use, so encoding can't drift between the two paths.
     void put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes);
+    // A transaction carried by the finalized slice at `height` but rejected by frontier execution.
+    // It has no tx index entry: it moved no funds.
+    void put_rejected_tx(const Hash32& txid, std::uint64_t height);
     void add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
     void stage_finalized_ingress_tip(std::uint64_t seq);
     void set_tip(const TipState& tip);
@@ -405,6 +408,8 @@ class DB {
   };
   bool put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes);
   std::optional<TxLocation> get_tx_index(const Hash32& txid) const;
+  // Height of the finalized slice that carried and rejected `txid`, if any.
+  std::optional<std::uint64_t> get_rejected_tx_height(const Hash32& txid) const;
 
   bool put_ingress_record(std::uint64_t seq, const Bytes& record_bytes);
   std::optional<Bytes> get_ingress_record(std::uint64_t seq) const;

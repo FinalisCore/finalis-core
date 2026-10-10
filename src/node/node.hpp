@@ -527,7 +527,8 @@ class Node {
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                         storage::DB::Batch& batch, std::string* error = nullptr);
+                                         const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
+                                         std::string* error = nullptr);
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
   // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
   std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {

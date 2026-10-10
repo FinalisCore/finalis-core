@@ -359,8 +359,9 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   }
   consensus::CanonicalDerivedState next_state;
   std::string derivation_error;
+  std::set<Hash32> accepted_txids;
   if (!consensus::apply_frontier_record(canonical_derivation_config_locked(), *canonical_state_, record, &next_state,
-                                        &derivation_error)) {
+                                        &derivation_error, &accepted_txids)) {
     log_line("finalized-state-invariant-violation source=live-frontier-apply height=" +
              std::to_string(record.transition.height) + " detail=" + derivation_error);
     if (error) *error = "apply-frontier-record-failed:" + derivation_error;
@@ -374,7 +375,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   storage::DB::Batch batch(db_);
 
   std::string persist_error;
-  if (!persist_finalized_frontier_record(record, utxos_, batch, &persist_error)) {
+  if (!persist_finalized_frontier_record(record, utxos_, accepted_txids, batch, &persist_error)) {
     if (error) *error = "persist-frontier-record-failed" +
                         (persist_error.empty() ? std::string() : ":" + persist_error);
     return false;

@@ -32,6 +32,7 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
+#include "wallet/confidential_builder.hpp"
 #include "common/keystore.hpp"
 #include "common/merkle.hpp"
 #include "node/node.hpp"
@@ -4861,9 +4862,12 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
   ASSERT_TRUE(direct_balance > 0);
 }
 
-TEST(test_finalized_frontier_txs_are_indexed_for_explorer_queries) {
-  const std::string base = unique_test_base("/tmp/finalis_it_frontier_tx_indexing");
-  Tx tx = make_fixture_ingress_tx(1, 0xA7);
+// A finalized TxV2 (shield: transparent input -> transparent payment + confidential output) is indexed
+// like a Tx: tx index, address history for the spent and paid addresses, and get_tx decodes the
+// transparent output while reporting the confidential one without an amount or address.
+TEST(test_finalized_txv2_is_indexed_with_address_history) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  const std::string base = unique_test_base("/tmp/finalis_it_txv2_indexing");
 
   node::NodeConfig cfg;
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
@@ -4882,27 +4886,84 @@ TEST(test_finalized_frontier_txs_are_indexed_for_explorer_queries) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
-
   keystore::ValidatorKey key;
   std::string kerr;
   ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
                                                   deterministic_seed_for_node_id(0), &key, &kerr));
 
   std::unique_ptr<node::Node> node;
-  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {tx.serialize()}, &node));
-  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 1; }, std::chrono::seconds(10)));
-  node->stop();
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 33; }, ci_timeout_seconds(120)));
 
-  storage::DB db;
-  ASSERT_TRUE(db.open(cfg.db_path));
-  const auto loc = db.get_tx_index(tx.txid());
-  ASSERT_TRUE(loc.has_value());
-  ASSERT_EQ(loc->height, 1u);
-  const auto sh = crypto::sha256(tx.outputs[0].script_pubkey);
-  const auto history = db.get_script_history(sh);
-  ASSERT_TRUE(!history.empty());
-  ASSERT_EQ(history[0].txid, tx.txid());
-  ASSERT_EQ(history[0].height, 1u);
+  const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  auto spendable = node->find_utxos_by_pubkey_hash_for_test(own_pkh);
+  ASSERT_TRUE(!spendable.empty());
+  const auto prev = spendable.front();
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x45);
+  constexpr std::uint64_t kConfidential = 100'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+  ASSERT_TRUE(prev.second.value > kConfidential + kFee);
+  const std::uint64_t transparent_out = prev.second.value - kConfidential - kFee;
+
+  crypto::Blind32 blind{};
+  blind.bytes.fill(0x5B);
+  Hash32 one_time_scalar{};
+  one_time_scalar.fill(0x5C);
+  Hash32 ephemeral_scalar{};
+  ephemeral_scalar.fill(0x5D);
+  Hash32 proof_nonce{};
+  proof_nonce.fill(0x5E);
+  const auto one_time = crypto::secp256k1_pubkey_from_scalar(one_time_scalar);
+  const auto ephemeral = crypto::secp256k1_pubkey_from_scalar(ephemeral_scalar);
+  ASSERT_TRUE(one_time.has_value() && ephemeral.has_value());
+  std::string err;
+  const auto conf_out = wallet::build_confidential_output(
+      wallet::ConfidentialRecipient{.one_time_pubkey = *one_time, .ephemeral_pubkey = *ephemeral, .scan_tag = {}, .memo = {}},
+      crypto::ConfidentialOutputSecrets{.amount = kConfidential, .value_blind = blind}, proof_nonce, &err);
+  ASSERT_TRUE(conf_out.has_value());
+  const auto tx = wallet::build_txv2_transparent_to_confidential(
+      prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), prev.second.value,
+      TransparentTxOutV2{transparent_out, address::p2pkh_script_pubkey(recipient_pkh)}, *conf_out, blind, kConfidential,
+      kFee, &err);
+  if (!tx.has_value()) throw std::runtime_error("shield tx: " + err);
+  ASSERT_TRUE(node->inject_tx_for_test(AnyTx{*tx}, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB probe_db;
+    if (!probe_db.open_readonly(cfg.db_path)) return false;
+    return probe_db.get_tx_index(tx->txid()).has_value();
+  }, ci_timeout_seconds(45)));
+  node->stop();
+  node.reset();
+
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    const auto has_txid = [&](const Hash32& scripthash) {
+      for (const auto& entry : db.get_script_history(scripthash)) {
+        if (entry.txid == tx->txid()) return true;
+      }
+      return false;
+    };
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh))));  // paid
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(own_pkh))));        // spent
+  }
+
+  lightserver::Config lcfg;
+  lcfg.db_path = cfg.db_path;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto status = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":304,"method":"get_tx_status","params":{"txid":")") +
+                                             hex_encode32(tx->txid()) + R"("}})");
+  ASSERT_TRUE(status.find("\"credit_safe\":true") != std::string::npos);
+  const auto got = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":305,"method":"get_tx","params":{"txid":")") +
+                                          hex_encode32(tx->txid()) + R"("}})");
+  ASSERT_TRUE(got.find("\"tx_version\":2") != std::string::npos);
+  ASSERT_TRUE(got.find("\"fee\":" + std::to_string(kFee)) != std::string::npos);
+  ASSERT_TRUE(got.find("\"amount\":" + std::to_string(transparent_out)) != std::string::npos);
+  ASSERT_TRUE(got.find("\"decoded_kind\":\"confidential\"") != std::string::npos);
+  ASSERT_TRUE(got.find(std::to_string(kConfidential)) == std::string::npos);  // hidden amount never appears
 }
 
 TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
@@ -10954,4 +11015,63 @@ TEST(test_frontier_mode_rejects_oversized_or_unexpected_ingress_ranges_from_peer
   storage::DB db;
   ASSERT_TRUE(db.open(cfg.db_path));
   ASSERT_TRUE(!db.get_lane_state(rec.certificate.lane).has_value());
+}
+
+// Finalized slices can contain transactions that frontier execution rejects (here: no inputs, so the
+// output is created from nothing). Such a transaction moved no funds and must not be reported as a
+// finalized, credit-safe transfer, or an exchange polling get_tx_status would credit it.
+TEST(test_rejected_frontier_tx_is_not_reported_credit_safe) {
+  const std::string base = unique_test_base("/tmp/finalis_it_rejected_tx_not_credit_safe");
+  Tx tx = make_fixture_ingress_tx(1, 0xB7);
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.disable_p2p = true;
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {tx.serialize()}, &node));
+  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 1; }, std::chrono::seconds(10)));
+  node->stop();
+  node.reset();
+
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    // Rejected by execution: its output never entered the UTXO set, and nothing is indexed.
+    ASSERT_TRUE(!db.get_utxo_v2(OutPoint{tx.txid(), 0}).has_value());
+    ASSERT_TRUE(!db.get_tx_index(tx.txid()).has_value());
+    ASSERT_TRUE(db.get_script_history(crypto::sha256(tx.outputs[0].script_pubkey)).empty());
+    ASSERT_TRUE(db.get_rejected_tx_height(tx.txid()).has_value());
+  }
+
+  lightserver::Config lcfg;
+  lcfg.db_path = cfg.db_path;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":303,"method":"get_tx_status","params":{"txid":")") +
+                           hex_encode32(tx.txid()) + R"("}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  if (resp.find("\"credit_safe\":true") != std::string::npos) {
+    throw std::runtime_error("rejected tx reported credit-safe: " + resp);
+  }
+  ASSERT_TRUE(resp.find("\"status\":\"rejected\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"finalized\":false") != std::string::npos);
 }

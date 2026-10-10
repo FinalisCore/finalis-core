@@ -1016,7 +1016,11 @@ std::string tx_status_json(const Hash32& txid, const std::optional<storage::DB::
   std::ostringstream oss;
   oss << "{\"txid\":\"" << hex_encode32(txid) << "\"";
   if (!loc.has_value()) {
-    if (db.get_ingress_bytes(txid).has_value()) {
+    if (auto rejected_height = db.get_rejected_tx_height(txid); rejected_height.has_value()) {
+      // Carried by a finalized slice but rejected by execution: final, and it moved no funds.
+      oss << ",\"status\":\"rejected\",\"finalized\":false,\"rejected_height\":" << *rejected_height
+          << ",\"finalized_depth\":0,\"credit_safe\":false}";
+    } else if (db.get_ingress_bytes(txid).has_value()) {
       oss << ",\"status\":\"certified_ingress\",\"finalized\":false,\"finalized_depth\":0,\"credit_safe\":false}";
     } else {
       oss << ",\"status\":\"not_found\",\"finalized\":false,\"finalized_depth\":0,\"credit_safe\":false}";
@@ -2731,12 +2735,28 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (!loc.has_value()) return make_error(id, -32001, "not found");
     std::ostringstream oss;
     oss << "{\"height\":" << loc->height << ",\"tx_hex\":\"" << hex_encode(loc->tx_bytes) << "\"";
-    if (auto parsed = parse_any_tx(loc->tx_bytes); parsed.has_value() && std::holds_alternative<Tx>(*parsed)) {
+    const auto parsed = parse_any_tx(loc->tx_bytes);
+    if (parsed.has_value() && std::holds_alternative<Tx>(*parsed)) {
       const auto& tx = std::get<Tx>(*parsed);
       oss << ",\"decoded_outputs\":[";
       for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
         if (i) oss << ",";
         oss << decoded_tx_output_json(tx.outputs[i], cfg_.network);
+      }
+      oss << "]";
+    } else if (parsed.has_value() && std::holds_alternative<TxV2>(*parsed)) {
+      // Transparent outputs decode as for Tx. Confidential outputs pay a one-time key with a hidden
+      // amount: report them as such, never as an amount or address.
+      const auto& tx = std::get<TxV2>(*parsed);
+      oss << ",\"tx_version\":2,\"fee\":" << tx.fee << ",\"decoded_outputs\":[";
+      for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
+        if (i) oss << ",";
+        if (tx.outputs[i].kind == TxOutputKind::Transparent) {
+          const auto& out = std::get<TransparentTxOutV2>(tx.outputs[i].body);
+          oss << decoded_tx_output_json(TxOut{out.value, out.script_pubkey}, cfg_.network);
+        } else {
+          oss << "{\"amount\":null,\"script_hex\":null,\"address\":null,\"decoded_kind\":\"confidential\"}";
+        }
       }
       oss << "]";
     }
