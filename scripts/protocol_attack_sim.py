@@ -521,13 +521,25 @@ def availability_eligible(status: str, score_ok: bool, bond_ok: bool) -> bool:
     return status == STATUS_ACTIVE and score_ok and bond_ok
 
 
+def fallback_recovery_threshold(min_eligible: int) -> int:
+    """Mirror of consensus::fallback_recovery_threshold (spec §8).
+
+    Leaving FALLBACK needs min + 2; the margin shrinks only for the tiny minimums of the
+    bootstrap regime, which never apply under the live rule min = committee_size + 3.
+    """
+    if min_eligible <= 3:
+        return min_eligible
+    if min_eligible <= 7:
+        return min_eligible + 1
+    return min_eligible + 2
+
+
 def derive_mode_reason(previous_mode: str, eligible_count: int, min_eligible: int) -> tuple[str, str]:
     if previous_mode == MODE_NORMAL:
         if eligible_count < min_eligible:
             return MODE_FALLBACK, REASON_INSUFFICIENT
         return MODE_NORMAL, REASON_NONE
-    # Live rule (spec §8): FALLBACK -> NORMAL needs min + 2; min and min + 1 stay sticky.
-    if eligible_count >= min_eligible + 2:
+    if eligible_count >= fallback_recovery_threshold(min_eligible):
         return MODE_NORMAL, REASON_NONE
     if eligible_count >= min_eligible:
         return MODE_FALLBACK, REASON_STICKY
@@ -627,11 +639,11 @@ def compute_committee_root(committee: Sequence[RankedCandidate]) -> bytes:
     parts = []
     for entry in committee:
         parts.append(varbytes(entry.pubkey + entry.ticket_work_hash + u64le(entry.ticket_nonce)))
-    return sha256d(b"SELFCOIN_COMMITTEE_V1" + b"".join(parts))
+    return sha256d(b"FINALIS_COMMITTEE_V1" + b"".join(parts))
 
 
 def compute_proposer_seed(epoch_anchor: bytes, height: int, committee_root: bytes) -> bytes:
-    return sha256d(b"SELFCOIN_PROPOSER_V1" + epoch_anchor + u64le(height) + committee_root)
+    return sha256d(b"FINALIS_PROPOSER_V1" + epoch_anchor + u64le(height) + committee_root)
 
 
 def proposer_schedule(committee: Sequence[RankedCandidate], epoch_anchor: bytes, height: int) -> list[RankedCandidate]:
@@ -801,7 +813,7 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
             epochs_at_exact_threshold += 1
         if eligible_count < params.min_eligible:
             epochs_below_threshold += 1
-        if eligible_count == params.min_eligible + 2:
+        if eligible_count == fallback_recovery_threshold(params.min_eligible):
             epochs_at_recovery_threshold += 1
         if fallback_sticky and not previous_sticky:
             sticky_fallback_entry_count += 1
@@ -1271,7 +1283,9 @@ def build_availability_griefing_adversary() -> SimulationScenario:
 
 
 def build_sticky_fallback_threshold_manipulator() -> SimulationScenario:
-    protocol = ProtocolParameters(min_eligible=3, committee_size=4)
+    # min 4 -> recovery threshold 5 (fallback_recovery_threshold). Eligible per epoch: 5 (NORMAL),
+    # 2 (FALLBACK, insufficient), 4 = min (FALLBACK, sticky), 5 = threshold (NORMAL).
+    protocol = ProtocolParameters(min_eligible=4, committee_size=4)
     actors = tuple([ActorSpec(actor_id="honest"), ActorSpec(actor_id="coalition", adversarial=True)])
     operators = []
     validators = []
@@ -1279,6 +1293,7 @@ def build_sticky_fallback_threshold_manipulator() -> SimulationScenario:
         "op-h1": {},
         "op-h2": {2: STATUS_WARMUP, 3: STATUS_ACTIVE, 4: STATUS_ACTIVE},
         "op-h3": {2: STATUS_WARMUP, 3: STATUS_WARMUP, 4: STATUS_ACTIVE},
+        "op-h4": {2: STATUS_WARMUP, 3: STATUS_ACTIVE, 4: STATUS_ACTIVE},
         "op-a1": {},
     }
     for operator_id, plan in plans.items():
@@ -1509,7 +1524,7 @@ def build_large_availability_griefing_adversary(
         validator_cooldown_blocks,
     )
     actors = (ActorSpec(actor_id="honest"), ActorSpec(actor_id="coalition", adversarial=True))
-    total_operator_count = min_eligible + 2  # exactly the FALLBACK recovery threshold
+    total_operator_count = fallback_recovery_threshold(min_eligible)
     coalition_operator_count = max(3, committee_size // 8)
     honest_operator_count = total_operator_count - coalition_operator_count
     degraded_epochs_a = {3: STATUS_PROBATION, 4: STATUS_WARMUP, 5: STATUS_ACTIVE}
@@ -1588,7 +1603,7 @@ def build_large_sticky_fallback_threshold_manipulator(
         validator_cooldown_blocks,
     )
     actors = (ActorSpec(actor_id="honest"), ActorSpec(actor_id="coalition", adversarial=True))
-    total_operator_count = min_eligible + 2  # exactly the FALLBACK recovery threshold
+    total_operator_count = fallback_recovery_threshold(min_eligible)
     coalition_operator_count = 1
     honest_operator_count = total_operator_count - coalition_operator_count
     operators: list[OperatorSpec] = []
