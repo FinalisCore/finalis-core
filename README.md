@@ -209,9 +209,7 @@ infrastructure.
 
 ## Community Help Wanted
 
-If you can make a clear, step-by-step installation and launch video (Linux and/or Windows),
-post it publicly and share the link. I can sponsor the best tutorials with enough FLS
-to cover validator registration requirements.
+Thinking about this. I will write soon.
 
 
 ## Testing
