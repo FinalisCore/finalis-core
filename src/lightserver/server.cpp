@@ -124,7 +124,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   if (!needs_canonical_fallback) return verified;
 
   if (history.empty()) {
-    const auto canonical_utxos = db.load_utxos();
+    const auto canonical_utxos = db.load_transparent_utxos();
     std::map<OutPoint, TxOut> canonical_matches;
     for (const auto& [op, entry] : canonical_utxos) {
       if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
@@ -192,7 +192,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   }
   // History does not include frontier settlement credits. Merge canonical UTXOs
   // so settlement outputs remain visible even when history is non-empty.
-  const auto canonical_utxos = db.load_utxos();
+  const auto canonical_utxos = db.load_transparent_utxos();
   for (const auto& [op, entry] : canonical_utxos) {
     if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
     if (canonical_matches.find(op) != canonical_matches.end()) continue;
@@ -2878,7 +2878,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     const Bytes tx_bytes = tx->serialize();
     const Hash32 txid = tx->txid();
-    const auto utxos = live_db.load_utxos();
+    const auto utxos = live_db.load_utxos_v2();  // confidential outputs included
     const auto validators = live_db.load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
@@ -2905,7 +2905,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         },
         .confidential_policy = &confidential_policy,
     };
-    auto vrx = validate_any_tx(AnyTx{*tx}, 1, upgrade_utxo_set_v2(utxos), &ctx);
+    auto vrx = validate_any_tx(AnyTx{*tx}, 1, utxos, &ctx);
     if (!vrx.ok) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "tx_rejected";
@@ -3352,7 +3352,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
                                  std::string("This transaction is already finalized or was previously submitted."),
                                  false, "none", false, std::nullopt));
     }
-    const auto utxos = view->load_utxos();
+    const auto utxos = view->load_utxos_v2();  // confidential outputs included
     const auto validators = view->load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
@@ -3389,7 +3389,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         },
         .confidential_policy = &confidential_policy,
     };
-    auto vrx = validate_any_tx(*tx, 1, upgrade_utxo_set_v2(utxos), &ctx);
+    auto vrx = validate_any_tx(*tx, 1, utxos, &ctx);
     if (!vrx.ok) {
       const auto code = validation_error_code(vrx.error);
       const bool retryable = code == "tx_missing_or_unconfirmed_input";

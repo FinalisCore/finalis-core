@@ -1885,7 +1885,7 @@ std::optional<UtxoEntryV2> DB::get_utxo_v2(const OutPoint& op) const {
   return UtxoEntryV2{*legacy};
 }
 
-std::map<OutPoint, UtxoEntry> DB::load_utxos() const {
+std::map<OutPoint, UtxoEntry> DB::load_transparent_utxos() const {
   std::map<OutPoint, UtxoEntry> out;
   for (const auto& [k, v] : scan_prefix(key_utxo_prefix())) {
     auto op_hex = k.substr(2);

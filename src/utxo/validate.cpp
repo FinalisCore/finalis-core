@@ -844,67 +844,6 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   return {true, "", fee};
 }
 
-BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
-                                         const SpecialValidationContext* ctx,
-                                         const ExpectedCoinbaseOutputsBuilder* expected_coinbase_outputs) {
-  if (block.txs.empty()) return {false, "block has no tx", 0};
-  UtxoSet work = base_utxos;
-
-  std::uint64_t fees = 0;
-  for (size_t i = 0; i < block.txs.size(); ++i) {
-    auto r = validate_tx(block.txs[i], i, work, ctx);
-    if (!r.ok) return {false, "tx invalid at index " + std::to_string(i) + ": " + r.error, 0};
-    fees += r.fee;
-
-    if (i > 0) {
-      for (const auto& in : block.txs[i].inputs) {
-        work.erase(OutPoint{in.prev_txid, in.prev_index});
-      }
-    }
-    const Hash32 txid = block.txs[i].txid();
-    for (std::uint32_t out_i = 0; out_i < block.txs[i].outputs.size(); ++out_i) {
-      work[OutPoint{txid, out_i}] = UtxoEntry{block.txs[i].outputs[out_i]};
-    }
-  }
-
-  (void)block_reward;
-  std::uint64_t coinbase_sum = 0;
-  for (const auto& out : block.txs[0].outputs) coinbase_sum += out.value;
-  if (expected_coinbase_outputs) {
-    const auto expected = (*expected_coinbase_outputs)(fees);
-    std::uint64_t expected_sum = 0;
-    for (const auto& out : expected) expected_sum += out.value;
-    if (coinbase_sum != expected_sum) {
-      return {false, "coinbase sum mismatch", 0};
-    }
-    if (block.txs[0].outputs.size() != expected.size()) return {false, "coinbase payout distribution mismatch", 0};
-    for (std::size_t i = 0; i < expected.size(); ++i) {
-      if (block.txs[0].outputs[i].value != expected[i].value ||
-          block.txs[0].outputs[i].script_pubkey != expected[i].script_pubkey) {
-        return {false, "coinbase payout distribution mismatch", 0};
-      }
-    }
-  } else if (coinbase_sum != fees) {
-    return {false, "coinbase sum mismatch", 0};
-  }
-
-  return {true, "", fees};
-}
-
-void apply_block_to_utxo(const Block& block, UtxoSet& utxos) {
-  for (size_t i = 0; i < block.txs.size(); ++i) {
-    if (i > 0) {
-      for (const auto& in : block.txs[i].inputs) {
-        utxos.erase(OutPoint{in.prev_txid, in.prev_index});
-      }
-    }
-    const Hash32 txid = block.txs[i].txid();
-    for (std::uint32_t out_i = 0; out_i < block.txs[i].outputs.size(); ++out_i) {
-      utxos[OutPoint{txid, out_i}] = UtxoEntry{block.txs[i].outputs[out_i]};
-    }
-  }
-}
-
 AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                      const SpecialValidationContext* ctx) {
   AnyTxValidationResult out;

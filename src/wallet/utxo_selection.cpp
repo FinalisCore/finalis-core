@@ -48,7 +48,7 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
   }
 
   if (history.empty()) {
-    const auto canonical_utxos = db.load_utxos();
+    const auto canonical_utxos = db.load_transparent_utxos();
     out.clear();
     out.reserve(std::max(entries.size(), canonical_utxos.size()));
     std::set<OutPoint> seen;
@@ -112,7 +112,7 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
   }
   // History may be incomplete during index drift/rebuild windows.
   // Canonical UTXOs remain the finalized source of truth for spendability.
-  const auto canonical_utxos = db.load_utxos();
+  const auto canonical_utxos = db.load_transparent_utxos();
   std::map<OutPoint, TxOut> canonical_current;
   for (const auto& [op, entry] : canonical_utxos) {
     if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;

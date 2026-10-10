@@ -4850,7 +4850,7 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
   for (const auto& entry : entries) balance += entry.value;
   ASSERT_TRUE(balance > 0);
 
-  const auto utxos = db.load_utxos();
+  const auto utxos = db.load_transparent_utxos();
   std::uint64_t direct_balance = 0;
   for (const auto& [_, entry] : utxos) {
     std::array<std::uint8_t, 20> got{};
@@ -5313,7 +5313,7 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
 
   storage::DB follower_db;
   ASSERT_TRUE(follower_db.open(cluster.configs[1].db_path));
-  const auto persisted_utxos = follower_db.load_utxos();
+  const auto persisted_utxos = follower_db.load_transparent_utxos();
   bool found_recipient = false;
   for (const auto& [op, entry] : persisted_utxos) {
     (void)op;

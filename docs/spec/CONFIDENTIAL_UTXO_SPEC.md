@@ -470,9 +470,11 @@ struct UtxoEntryV2 {
 using UtxoSetV2 = std::map<OutPoint, UtxoEntryV2>;
 ```
 
-`UtxoSetV2` is the consensus UTXO state. The transparent-only `UtxoSet` still
-appears in some frontier-execution signatures; unifying the two is an open
-cleanup item.
+`UtxoSetV2` is the consensus UTXO state, used by every consensus path (frontier
+execution, canonical derivation, state roots, mempool, lightserver pre-validation).
+The transparent-only `UtxoSet` remains for `Tx` (v1) validation, which can only
+spend transparent outputs, for transparent coin listing (`DB::load_transparent_utxos`)
+and as a convenience overload of the frontier-execution functions used by tests.
 
 Preferred helper API:
 

@@ -348,7 +348,9 @@ class DB {
   bool erase_utxo(const OutPoint& op);
   std::optional<TxOut> get_utxo(const OutPoint& op) const;
   std::optional<UtxoEntryV2> get_utxo_v2(const OutPoint& op) const;
-  std::map<OutPoint, UtxoEntry> load_utxos() const;
+  // Transparent outputs only; confidential outputs are skipped. Use load_utxos_v2() for anything that
+  // validates or spends, or a TxV2 spending a confidential coin looks like a missing input.
+  std::map<OutPoint, UtxoEntry> load_transparent_utxos() const;
   std::map<OutPoint, UtxoEntryV2> load_utxos_v2() const;
 
   bool put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
