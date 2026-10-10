@@ -84,6 +84,7 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   mode_combo_->addItem("Transparent -> Transparent");
   mode_combo_->addItem("Transparent -> Confidential");
   mode_combo_->addItem("Confidential -> Transparent");
+  mode_combo_->addItem("Confidential -> Confidential");
   amount_edit_->setPlaceholderText("0.00");
   form->addRow("Recipient address", address_edit_);
   form->addRow("Send mode", mode_combo_);

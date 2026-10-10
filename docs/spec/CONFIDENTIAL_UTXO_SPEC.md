@@ -220,6 +220,28 @@ Properties:
 Consensus sees only the output fields; the derivation is a wallet convention and can change without
 a protocol change. Known-answer vectors are pinned in `tests/test_wallet_confidential_keys.cpp`.
 
+### 3.3 What is hidden
+
+Confidential outputs hide their amount (Pedersen commitment; the canonical range
+proof reveals only that it is below 2^64) and pay a one-time key instead of an
+address. Nothing else is hidden. What an observer learns depends on the flow:
+
+| Flow | Wallet support | Amounts an observer can compute |
+|---|---|---|
+| transparent -> confidential (shield) | yes | the confidential total (transparent inputs - transparent outputs - fee); the wallet makes one confidential output, so its amount |
+| confidential -> transparent (unshield) | yes | the confidential input total (transparent outputs + fee, no confidential change) |
+| confidential -> confidential | yes | none; only the fee is public |
+
+Always public: the transaction graph (every input names the coin it spends; there
+is no sender anonymity), the fee, every transparent amount and address, and the
+total value held in confidential outputs (the turnstile).
+
+So amount privacy comes from confidential -> confidential transfers only. Value
+entering or leaving the confidential pool is visible at the boundary: shield
+once, transact confidentially, unshield when needed. The wallet sends change of a
+confidential transfer to a fresh derived request key and randomises output order,
+so change is not recognisable by position.
+
 ## 4. Transaction Types
 
 Two transaction formats are valid from genesis. Neither is legacy; there is
@@ -730,6 +752,7 @@ Supported builder subset:
 
 - transparent -> confidential
 - confidential -> transparent
+- confidential -> confidential (several inputs, recipient plus confidential change)
 
 ### 10.3 UI Changes
 
@@ -746,6 +769,7 @@ Send page:
   - transparent -> transparent
   - transparent -> confidential
   - confidential -> transparent
+  - confidential -> confidential
 - import `scconfreq1:` request URIs and legacy `ctxv2:` descriptors
 
 Do not mix transparent and confidential send UX in one hidden checkbox.

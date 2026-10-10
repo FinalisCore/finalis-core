@@ -299,6 +299,7 @@ if(Qt5Widgets_FOUND)
     apps/finalis-wallet/wallet_store.cpp
     apps/finalis-wallet/confidential_memo.cpp
     apps/finalis-wallet/confidential_receive.cpp
+    apps/finalis-wallet/confidential_send.cpp
     apps/finalis-wallet/widgets/activity_page.cpp
     apps/finalis-wallet/widgets/advanced_page.cpp
     apps/finalis-wallet/widgets/overview_page.cpp
@@ -348,6 +349,7 @@ if(Qt5Widgets_FOUND)
     apps/finalis-wallet/wallet_store.cpp
     apps/finalis-wallet/confidential_memo.cpp
     apps/finalis-wallet/confidential_receive.cpp
+    apps/finalis-wallet/confidential_send.cpp
     apps/finalis-wallet/widgets/activity_page.cpp
     apps/finalis-wallet/widgets/advanced_page.cpp
     apps/finalis-wallet/widgets/overview_page.cpp
@@ -392,6 +394,7 @@ add_executable(finalis-tests
   apps/finalis-wallet/wallet_store.cpp
   apps/finalis-wallet/confidential_memo.cpp
   apps/finalis-wallet/confidential_receive.cpp
+  apps/finalis-wallet/confidential_send.cpp
   tests/test_main.cpp
   tests/test_codec.cpp
   tests/test_chain_id.cpp
@@ -425,6 +428,8 @@ add_executable(finalis-tests
   tests/test_wallet_store.cpp
   tests/test_wallet_confidential_memo.cpp
   tests/test_wallet_confidential_keys.cpp
+  tests/test_wallet_confidential_transfer.cpp
+  tests/test_wallet_confidential_send.cpp
   tests/test_wallet_confidential_receive.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp

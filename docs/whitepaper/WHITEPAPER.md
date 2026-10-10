@@ -239,7 +239,7 @@ transparent outputs in `TxV2`.
 
 ### 7.1 Confidential Outputs
 
-Confidential UTXOs are enabled from genesis. A confidential output carries a Pedersen value commitment, a one-time public key derived per receive request, and a range proof. A `TxV2` balances when its commitments, transparent values, and fee sum to an excess commitment, and that excess is authorized by a BIP340 Schnorr signature under the excess blind. Each confidential input is authorized by a Schnorr signature under its one-time spend key.
+Confidential UTXOs are enabled from genesis. A confidential output carries a Pedersen value commitment, a one-time public key derived per receive request, and a range proof. A `TxV2` balances when its commitments, transparent values, and fee sum to an excess commitment, and that excess is authorized by a BIP340 Schnorr signature under the excess blind. Each confidential input is authorized by a Schnorr signature under its one-time spend key. Only amounts are hidden, and only where both sides of a transfer are confidential: the transaction graph, fees and the amounts of shield and unshield transactions remain public.
 
 Consensus bounds on confidential work:
 

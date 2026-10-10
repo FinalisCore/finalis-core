@@ -62,6 +62,7 @@
 
 #include "confidential_memo.hpp"
 #include "confidential_receive.hpp"
+#include "confidential_send.hpp"
 
 #include "common/address.hpp"
 #include "codec/bytes.hpp"
@@ -306,6 +307,7 @@ enum class WalletSendMode : std::uint8_t {
   TransparentToTransparent = 0,
   TransparentToConfidential = 1,
   ConfidentialToTransparent = 2,
+  ConfidentialToConfidential = 3,
 };
 
 WalletSendMode wallet_send_mode_from_combo(const QComboBox* combo) {
@@ -315,6 +317,8 @@ WalletSendMode wallet_send_mode_from_combo(const QComboBox* combo) {
       return WalletSendMode::TransparentToConfidential;
     case 2:
       return WalletSendMode::ConfidentialToTransparent;
+    case 3:
+      return WalletSendMode::ConfidentialToConfidential;
     default:
       return WalletSendMode::TransparentToTransparent;
   }
@@ -328,6 +332,8 @@ QString wallet_send_mode_default_placeholder(WalletSendMode mode) {
       return "ctxv2:<one_time_pubkey_hex>:<ephemeral_pubkey_hex>:<scan_tag_hex>[:memo_hex]";
     case WalletSendMode::ConfidentialToTransparent:
       return "sc...";
+    case WalletSendMode::ConfidentialToConfidential:
+      return "scconfreq1:...";
   }
   return "sc...";
 }
@@ -340,6 +346,8 @@ QString wallet_send_mode_recipient_label(WalletSendMode mode) {
       return "Recipient descriptor";
     case WalletSendMode::ConfidentialToTransparent:
       return "Recipient address";
+    case WalletSendMode::ConfidentialToConfidential:
+      return "Recipient request";
   }
   return "Recipient";
 }
@@ -481,6 +489,31 @@ std::optional<wallet::ConfidentialOwnedCoin> select_exact_confidential_coin(
             .arg(QString::number(total_units));
   }
   return std::nullopt;
+}
+
+// Confidential -> confidential plan for the send form: change goes to the primary confidential account.
+std::optional<wallet::ConfidentialTransferPlan> plan_confidential_send(const wallet::WalletStore::State& state,
+                                                                      const std::set<OutPoint>& reserved,
+                                                                      const QString& recipient_text,
+                                                                      std::uint64_t amount_units, QString* err) {
+  QString recipient_err;
+  auto parsed = parse_confidential_recipient_descriptor(recipient_text, &recipient_err);
+  if (!parsed) {
+    if (err) *err = recipient_err;
+    return std::nullopt;
+  }
+  std::string change_account = state.confidential_primary_account_id.value_or("");
+  if (change_account.empty() && !state.confidential_accounts.empty()) change_account = state.confidential_accounts.front().account_id;
+  if (change_account.empty()) {
+    if (err) *err = "Create or import a confidential account first: change returns to it.";
+    return std::nullopt;
+  }
+  std::string plan_err;
+  auto plan = wallet::plan_confidential_transfer(state, reserved, change_account, parsed->recipient, parsed->memo_key,
+                                                 amount_units, finalis::DEFAULT_WALLET_SEND_FEE_UNITS,
+                                                 [] { return random_hash32(); }, &plan_err);
+  if (!plan && err) *err = QString::fromStdString(plan_err);
+  return plan;
 }
 
 QString elide_middle(const QString& value, int keep = 14) {
@@ -4016,6 +4049,7 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   std::set<std::string> remove_pending;
   std::set<std::string> remove_sent;
   std::vector<OutPoint> spent_confidential_outpoints;
+  std::vector<std::pair<Hash32, Bytes>> finalized_sent_txs;
   std::vector<std::string> released_pending_txids;
   remaining_sent_txids.reserve(request.local_sent_txids.size());
   const std::uint64_t now_ms = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
@@ -4048,6 +4082,12 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
       const auto pending_it = pending_spends.find(txid_hex);
       if (pending_it != pending_spends.end()) {
         spent_confidential_outpoints.insert(spent_confidential_outpoints.end(), pending_it->second.begin(), pending_it->second.end());
+      }
+      if (auto txid = decode_hex32_string(txid_hex); txid.has_value()) {
+        std::string rpc_err;
+        if (auto view = lightserver::rpc_get_tx(active_endpoint.toStdString(), *txid, &rpc_err); view.has_value()) {
+          finalized_sent_txs.emplace_back(*txid, std::move(view->tx_bytes));
+        }
       }
       pending_spends.erase(txid_hex);
       remove_pending.insert(txid_hex);
@@ -4096,6 +4136,7 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   result.remove_pending_txids.assign(remove_pending.begin(), remove_pending.end());
   result.remove_sent_txids.assign(remove_sent.begin(), remove_sent.end());
   result.mark_spent_confidential_outpoints = std::move(spent_confidential_outpoints);
+  result.finalized_sent_txs = std::move(finalized_sent_txs);
   result.released_pending_txids = std::move(released_pending_txids);
   {
     std::lock_guard<std::mutex> lock(state->mu);
@@ -4194,6 +4235,15 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
   }
   for (const auto& outpoint : result.mark_spent_confidential_outpoints) {
     (void)store_.set_confidential_coin_spent(hex_encode32(outpoint.txid), outpoint.index, true);
+  }
+  for (const auto& [txid, tx_bytes] : result.finalized_sent_txs) {
+    const auto any = parse_any_tx(tx_bytes);
+    if (!any || !std::holds_alternative<TxV2>(*any)) continue;
+    std::size_t already = 0;
+    if (import_confidential_outputs(std::get<TxV2>(*any), txid, &already) > 0) {
+      append_local_event(QString("[confidential] imported change of finalized send %1")
+                             .arg(elide_middle(QString::fromStdString(hex_encode32(txid)), 12)));
+    }
   }
   for (const auto& txid : result.remove_pending_txids) {
     (void)store_.remove_pending_spend(txid);
@@ -4611,6 +4661,27 @@ void WalletWindow::generate_confidential_request() {
   statusBar()->showMessage("Confidential request generated and copied to clipboard.", 3000);
 }
 
+std::size_t WalletWindow::import_confidential_outputs(const TxV2& tx, const Hash32& txid, std::size_t* already_imported) {
+  WalletStore::State state;
+  if (!store_.load(&state)) return 0;
+  std::size_t imported = 0;
+  for (const auto& match : match_received_confidential_outputs(tx, txid, state, already_imported)) {
+    if (!store_.upsert_confidential_coin(match.coin)) continue;
+    if (!match.request_id.empty()) (void)store_.set_confidential_request_consumed(match.request_id, true);
+    if (match.derived_index) {
+      // Matched a request this wallet holds no record of (a restore, or change of its own send):
+      // never hand out that index again.
+      for (auto& account : state.confidential_accounts) {
+        if (account.account_id != match.coin.account_id || account.next_request_index > *match.derived_index) continue;
+        account.next_request_index = *match.derived_index + 1;
+        (void)store_.upsert_confidential_account(account);
+      }
+    }
+    ++imported;
+  }
+  return imported;
+}
+
 void WalletWindow::import_received_confidential_tx() {
   if (!ensure_wallet_loaded("Import Received Confidential Tx")) return;
   if (confidential_storage_locked_) {
@@ -4666,21 +4737,7 @@ void WalletWindow::import_received_confidential_tx() {
   }
   const auto& tx = std::get<TxV2>(*any_tx);
   std::size_t already_imported = 0;
-  bool imported_any = false;
-  for (const auto& match : match_received_confidential_outputs(tx, *txid, state, &already_imported)) {
-    if (!store_.upsert_confidential_coin(match.coin)) continue;
-    if (!match.request_id.empty()) (void)store_.set_confidential_request_consumed(match.request_id, true);
-    if (match.derived_index) {
-      // Matched a request this wallet holds no record of (e.g. restored from account secrets):
-      // never hand out that index again.
-      for (auto& account : state.confidential_accounts) {
-        if (account.account_id != match.coin.account_id || account.next_request_index > *match.derived_index) continue;
-        account.next_request_index = *match.derived_index + 1;
-        (void)store_.upsert_confidential_account(account);
-      }
-    }
-    imported_any = true;
-  }
+  const bool imported_any = import_confidential_outputs(tx, *txid, &already_imported) > 0;
   if (!imported_any) {
     if (already_imported > 0) {
       QMessageBox::information(this, "Import Received Confidential Tx",
@@ -4926,6 +4983,40 @@ void WalletWindow::validate_send_form() {
     return;
   }
 
+  if (mode == WalletSendMode::ConfidentialToConfidential) {
+    if (confidential_storage_locked_) {
+      show_send_inline_warning("Unlock confidential state first. This flow needs locally stored confidential spend secrets.");
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    WalletStore::State state;
+    if (!store_.load(&state)) {
+      show_send_inline_warning("Unable to load local confidential wallet state.");
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    QString plan_err;
+    auto plan = plan_confidential_send(state, pending_wallet_reserved_outpoints(), recipient_text, *amount_units, &plan_err);
+    if (!plan) {
+      show_send_inline_warning(plan_err);
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    send_review_recipient_label_->setText(elide_middle(recipient_text, 18));
+    send_review_amount_label_->setText(format_coin_amount(*amount_units));
+    send_review_fee_label_->setText(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS));
+    send_review_total_label_->setText(format_coin_amount(plan->input_total));
+    send_review_change_label_->setText(plan->change > 0
+                                           ? QString("%1 confidential change to your account").arg(format_coin_amount(plan->change))
+                                           : QString("No change."));
+    send_review_inputs_label_->setText(QString::number(plan->spent.size()));
+    send_review_note_label_->setText(
+        "This builds a TxV2 confidential -> confidential transfer. Amounts and change are hidden on chain; only the fee is public.");
+    show_send_inline_status("Review ready");
+    if (send_review_warning_label_) send_review_warning_label_->hide();
+    return;
+  }
+
   if (!finalis::address::decode(recipient_text.toStdString()).has_value()) {
     show_send_inline_warning("Recipient address is invalid.");
     show_send_inline_status("Review unavailable");
@@ -4967,6 +5058,41 @@ void WalletWindow::populate_send_max_amount() {
   if (!ensure_wallet_loaded("Send Max")) return;
   reset_send_review_panel();
   const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
+  if (mode == WalletSendMode::ConfidentialToConfidential) {
+    if (confidential_storage_locked_) {
+      show_send_inline_warning("Unlock confidential state first.");
+      show_send_inline_status("Send max unavailable");
+      return;
+    }
+    WalletStore::State state;
+    if (!store_.load(&state)) {
+      show_send_inline_warning("Unable to load local confidential wallet state.");
+      show_send_inline_status("Send max unavailable");
+      return;
+    }
+    const auto reserved = pending_wallet_reserved_outpoints();
+    std::vector<std::uint64_t> amounts;
+    for (const auto& coin : state.confidential_coins) {
+      if (coin.spent) continue;
+      auto txid = decode_hex32_string(coin.txid_hex);
+      if (!txid || reserved.count(OutPoint{*txid, coin.vout}) != 0) continue;
+      amounts.push_back(coin.amount);
+    }
+    std::sort(amounts.rbegin(), amounts.rend());
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < amounts.size() && i < wallet::kMaxConfidentialTransferInputs; ++i) total += amounts[i];
+    if (total <= finalis::DEFAULT_WALLET_SEND_FEE_UNITS) {
+      show_send_inline_warning("Unlocked confidential coins do not cover the fixed fee.");
+      show_send_inline_status("Send max unavailable");
+      return;
+    }
+    send_amount_edit_->setText(format_coin_input_amount(total - finalis::DEFAULT_WALLET_SEND_FEE_UNITS));
+    show_send_inline_status(QString("Max confidential transfer loaded: %1 after fixed fee %2.")
+                                .arg(format_coin_amount(total - finalis::DEFAULT_WALLET_SEND_FEE_UNITS))
+                                .arg(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS)));
+    if (!send_address_edit_->text().trimmed().isEmpty()) validate_send_form();
+    return;
+  }
   if (mode == WalletSendMode::ConfidentialToTransparent) {
     if (confidential_storage_locked_) {
       show_send_inline_warning("Unlock confidential state first.");
@@ -5082,6 +5208,8 @@ void WalletWindow::submit_send() {
   std::vector<OutPoint> reserved_inputs;
   QString confirm;
   Bytes tx_bytes;
+  // Confidential -> confidential change: (account, request index) to retire once broadcast succeeds.
+  std::optional<std::pair<std::string, std::uint32_t>> change_request_used;
   bool auto_retry_allowed = false;
   bool auto_retry_used = false;
   std::optional<finalis::keystore::ValidatorKey> cached_key;
@@ -5287,6 +5415,42 @@ void WalletWindow::submit_send() {
     reserved_inputs.push_back(selected_prev->first);
     cached_key = *key;
     cached_sender_address = finalis::address::decode(wallet_->address);
+  } else if (mode == WalletSendMode::ConfidentialToConfidential) {
+    if (confidential_storage_locked_) {
+      QMessageBox::warning(this, "Send", "Unlock confidential state first.");
+      return;
+    }
+    WalletStore::State state;
+    if (!store_.load(&state)) {
+      QMessageBox::warning(this, "Send", "Unable to load local confidential wallet state.");
+      return;
+    }
+    QString plan_err;
+    auto plan = plan_confidential_send(state, pending_wallet_reserved_outpoints(), destination, *amount_units, &plan_err);
+    if (!plan) {
+      QMessageBox::warning(this, "Send", plan_err);
+      return;
+    }
+    const QString change_text = plan->change > 0
+                                    ? QString("%1 confidential change to your account").arg(format_coin_amount(plan->change))
+                                    : QString("none");
+    confirm = QString("Send confidential TxV2 (amounts hidden)\n\nRequest: %1\nAmount: %2\nFee: %3\nInputs total: %4\nChange: %5\nInputs selected: %6")
+                  .arg(elide_middle(destination, 18))
+                  .arg(format_coin_amount(*amount_units))
+                  .arg(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS))
+                  .arg(format_coin_amount(plan->input_total))
+                  .arg(change_text)
+                  .arg(plan->spent.size());
+    if (QMessageBox::question(this, "Confirm Send", confirm, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) !=
+        QMessageBox::Yes) {
+      show_send_inline_status("Send cancelled");
+      return;
+    }
+    tx_bytes = plan->tx.serialize();
+    reserved_inputs = plan->spent;
+    if (plan->change_request_index.has_value()) {
+      change_request_used = std::make_pair(plan->change_account_id, *plan->change_request_index);
+    }
   } else {
     auto decoded_to = finalis::address::decode(destination.toStdString());
     if (!decoded_to) {
@@ -5434,6 +5598,17 @@ void WalletWindow::submit_send() {
 
   local_sent_txids_.push_back(result->txid_hex);
   pending_wallet_spends_[result->txid_hex] = reserved_inputs;
+  if (change_request_used.has_value()) {
+    // Never hand this request index out again; the change is imported when the tx finalizes.
+    WalletStore::State state;
+    if (store_.load(&state)) {
+      for (auto& account : state.confidential_accounts) {
+        if (account.account_id != change_request_used->first || account.next_request_index > change_request_used->second) continue;
+        account.next_request_index = change_request_used->second + 1;
+        (void)store_.upsert_confidential_account(account);
+      }
+    }
+  }
   mark_refresh_state_changed();
   (void)store_.add_sent_txid(result->txid_hex);
   (void)store_.upsert_pending_spend(result->txid_hex, reserved_inputs, tip_height_,

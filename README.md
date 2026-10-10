@@ -106,10 +106,16 @@ This repository also contains:
 `broadcast_tx` is a relay-submission surface. Finalized visibility still comes
 from finalized-state lookup.
 
-Confidential transactions use `TxV2` and support a bounded subset:
+Confidential transactions use `TxV2`. The wallet supports:
 
-- transparent -> confidential
-- confidential -> transparent
+- transparent -> confidential (shield)
+- confidential -> confidential (amounts hidden; only the fee is public)
+- confidential -> transparent (unshield)
+
+Amounts are private only in confidential -> confidential transfers: shield and
+unshield amounts can be computed from their public parts, and the transaction
+graph is always public. See
+[CONFIDENTIAL_UTXO_SPEC.md §3.3](docs/spec/CONFIDENTIAL_UTXO_SPEC.md).
 
 Public read surfaces stay finalized-only and do not expose confidential output
 amounts or recipients as if they were transparent fields.

@@ -208,4 +208,86 @@ std::optional<TxV2> build_txv2_confidential_to_transparent(
   return tx;
 }
 
+std::optional<TxV2> build_txv2_confidential_to_confidential(const std::vector<ConfidentialOwnedCoin>& coins,
+                                                            const std::vector<ConfidentialPayment>& outputs,
+                                                            std::uint64_t fee, const Hash32& nonce_seed,
+                                                            std::string* err) {
+  if (coins.empty() || outputs.empty()) {
+    if (err) *err = "confidential transfer needs at least one input and one output";
+    return std::nullopt;
+  }
+  // Exact balance: the excess must commit to zero value (the tally is sum(in) = sum(out) + fee*H + E,
+  // and E is authorized as a pure blinding key).
+  std::uint64_t in_sum = 0;
+  for (const auto& coin : coins) {
+    if (in_sum + coin.amount < in_sum) {
+      if (err) *err = "confidential input sum overflow";
+      return std::nullopt;
+    }
+    in_sum += coin.amount;
+  }
+  std::uint64_t out_sum = fee;
+  for (const auto& out : outputs) {
+    if (out_sum + out.value < out_sum) {
+      if (err) *err = "confidential output sum overflow";
+      return std::nullopt;
+    }
+    out_sum += out.value;
+  }
+  if (in_sum != out_sum) {
+    if (err) *err = "confidential inputs must equal outputs plus fee";
+    return std::nullopt;
+  }
+
+  TxV2 tx;
+  for (const auto& coin : coins) {
+    tx.inputs.push_back(TxInV2{
+        .prev_txid = coin.outpoint.txid,
+        .prev_index = coin.outpoint.index,
+        .sequence = 0xFFFFFFFF,
+        .kind = TxInputKind::Confidential,
+        .witness = ConfidentialInputWitnessV2{coin.one_time_pubkey, Sig64{}},
+    });
+  }
+  for (const auto& out : outputs) tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Confidential, .body = out.output});
+  tx.fee = fee;
+
+  // Excess blind = sum(input blinds) - sum(output blinds).
+  std::vector<crypto::Blind32> blinds;
+  blinds.reserve(coins.size() + outputs.size());
+  for (const auto& coin : coins) blinds.push_back(coin.value_blind);
+  for (const auto& out : outputs) blinds.push_back(out.value_blind);
+  auto excess_blind = crypto::combine_blinds(blinds, coins.size());
+  for (auto& b : blinds) crypto::secure_wipe(b.bytes);
+  if (!excess_blind.has_value()) {
+    if (err) *err = "failed to compute excess blind (blinds cancel; use fresh output blinds)";
+    return std::nullopt;
+  }
+  crypto::ScopedWipe<Hash32> wipe_excess(excess_blind->bytes);
+  const auto excess_commitment = crypto::confidential_amount_commitment(0, *excess_blind);
+  if (!excess_commitment.has_value()) {
+    if (err) *err = "failed to compute excess commitment";
+    return std::nullopt;
+  }
+  tx.balance_proof.excess_commitment = *excess_commitment;
+
+  const auto nonce = [&](std::uint8_t role, std::size_t index) {
+    Bytes preimage(nonce_seed.begin(), nonce_seed.end());
+    preimage.push_back(role);
+    for (int shift = 0; shift < 32; shift += 8) preimage.push_back(static_cast<std::uint8_t>(index >> shift));
+    const Hash32 out = crypto::sha256(preimage);
+    crypto::secure_wipe(preimage);
+    return out;
+  };
+  Hash32 excess_nonce = nonce(0x01, 0);
+  crypto::ScopedWipe<Hash32> wipe_excess_nonce(excess_nonce);
+  if (!sign_balance_proof(tx, *excess_blind, excess_nonce, err)) return std::nullopt;
+  for (std::size_t i = 0; i < coins.size(); ++i) {
+    Hash32 spend_nonce = nonce(0x02, i);
+    crypto::ScopedWipe<Hash32> wipe_spend_nonce(spend_nonce);
+    if (!sign_confidential_input(tx, i, coins[i].spend_secret, spend_nonce, err)) return std::nullopt;
+  }
+  return tx;
+}
+
 }  // namespace finalis::wallet
