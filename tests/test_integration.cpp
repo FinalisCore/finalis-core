@@ -108,6 +108,14 @@ bool wait_for_peer_count(const node::Node& n, std::size_t min_peers, std::chrono
   return wait_for([&]() { return n.status().peers >= min_peers; }, timeout);
 }
 
+// A local precommit is queued and recorded by whichever thread flushes next; a p2p reader or the
+// event loop can take it first, so it may be recorded just after the triggering call returns.
+bool wait_for_local_precommit(const node::Node& n, std::uint64_t height, std::uint32_t round,
+                              const Hash32& transition_id) {
+  return wait_for([&]() { return n.local_vote_recorded_for_test(height, round, transition_id); },
+                  ci_timeout_seconds(5));
+}
+
 bool wait_for_same_tip(const std::vector<std::unique_ptr<node::Node>>& nodes, std::chrono::milliseconds timeout) {
   return wait_for([&]() {
     if (nodes.empty()) return true;
@@ -4130,7 +4138,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   ASSERT_TRUE(!n0.inject_tx_for_test(*onboarding_tx, true));
 
   const auto before_height = n0.status().height;
-  ASSERT_TRUE(wait_for_tip(n0, before_height + 1, std::chrono::seconds(20)));
+  ASSERT_TRUE(wait_for_tip(n0, before_height + 1, ci_timeout_seconds(20)));
   {
     storage::DB verify_db;
     ASSERT_TRUE(verify_db.open_readonly(cluster.base + "/node0"));
@@ -7441,7 +7449,7 @@ TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
             std::string("accepted"));
   ASSERT_TRUE(cluster.nodes[ti]->local_prevote_recorded_for_test(target_height, round0, a0_id));
   inject_test_prevotes(*cluster.nodes[ti], keys, committee0, target_height, round0, a0_id, quorum0 - 1);
-  ASSERT_TRUE(cluster.nodes[ti]->local_vote_recorded_for_test(target_height, round0, a0_id));
+  ASSERT_TRUE(wait_for_local_precommit(*cluster.nodes[ti], target_height, round0, a0_id));
   ASSERT_TRUE(cluster.nodes[ti]->status().height + 1 == target_height);  // one precommit: no finality
   const auto lock_before = cluster.nodes[ti]->local_vote_lock_for_test(target_height);
   ASSERT_TRUE(lock_before.has_value());
@@ -7743,7 +7751,7 @@ TEST(test_valid_value_reproposal_finalizes_same_transition_in_later_round) {
   ASSERT_TRUE(lock.has_value());
   ASSERT_TRUE(lock->first == a_id);
   ASSERT_EQ(lock->second, 1u);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 1, a_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, a_id));
 
   // Round-1 precommits finalize A (transition round 0, certificate round 1).
   std::size_t injected = 0;
@@ -7842,7 +7850,7 @@ TEST(test_polka_before_body_locks_and_precommits_when_body_arrives) {
   const auto lock = target.local_vote_lock_for_test(f->height);
   ASSERT_TRUE(lock.has_value());
   ASSERT_TRUE(lock->first == a_id);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 0, a_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 0, a_id));
 }
 
 // Spec §6.2: prevotes split at round 0 (no polka, no lock); a fresh round-1 proposal finalizes.
@@ -7876,7 +7884,7 @@ TEST(test_split_prevotes_then_fresh_proposal_finalizes) {
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, b1_id));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 1, b1_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, b1_id));
   inject_test_precommits(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
   ASSERT_TRUE(wait_for([&]() { return target.status().height == f->height; }, std::chrono::seconds(5)));
   ASSERT_EQ(target.status().transition_hash, b1_id);
@@ -7943,7 +7951,7 @@ TEST(test_restart_between_prevote_and_precommit) {
             std::string("accepted"));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
   ASSERT_TRUE(target.local_vote_lock_for_test(f->height)->first == a_id);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 0, a_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 0, a_id));
 }
 
 // TLC counterexample (formal/two_phase_finality.tla, before the vote-round floor): a node prevotes A
@@ -7977,7 +7985,7 @@ TEST(test_no_vote_below_highest_voted_round_after_round_reset) {
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 0, b0_id));
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 1, b1_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, b1_id));
 }
 
 TEST(test_restart_committee_deterministic_despite_epoch_ticket_order) {
