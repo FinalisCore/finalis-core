@@ -2,6 +2,7 @@
 
 // Command-line parsing for finalis-node: parse_args() (declared in node.hpp) and its helpers.
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>

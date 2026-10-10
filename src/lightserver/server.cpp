@@ -1907,7 +1907,7 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
 bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
   if (cfg_.tx_relay_override) return cfg_.tx_relay_override(tx_bytes, err);
   constexpr std::uint32_t kRelayHandshakeTimeoutMs = 2000;
-  constexpr std::uint32_t kRelayDrainTimeoutMs = 250;
+  constexpr std::uint32_t kRelayDrainTimeoutMs = 5000;
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
@@ -1982,9 +1982,12 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
     return false;
   }
 
-  // Keep the relay socket open briefly and drain any post-handshake sync traffic.
-  // The node sends FINALIZED_TIP / GET_FINALIZED_TIP as soon as VERACK lands; if
-  // we close immediately after TX, it may disconnect the peer before reading TX.
+  // Half-close and drain until the node closes. Closing with unread node traffic
+  // (post-VERACK sync, broadcasts) sends RST; the node's writer then fails and its
+  // reader stops before consuming TX. The node reads frames in order and closes on
+  // our EOF, so its EOF means TX reached its handler.
+  (void)net::shutdown_socket_write(fd);
+  bool node_closed = false;
   const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRelayDrainTimeoutMs);
   while (std::chrono::steady_clock::now() < drain_deadline) {
     p2p::FrameReadError read_err = p2p::FrameReadError::NONE;
@@ -1992,17 +1995,14 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
                                           cfg_.network.protocol_version, kRelayDrainTimeoutMs,
                                           kRelayDrainTimeoutMs, &read_err);
     if (!frame.has_value()) {
-      if (read_err == p2p::FrameReadError::TIMEOUT_HEADER || read_err == p2p::FrameReadError::TIMEOUT_BODY ||
-          read_err == p2p::FrameReadError::IO_EOF) {
-        break;
-      }
+      node_closed = read_err == p2p::FrameReadError::IO_EOF;
       break;
     }
   }
 
-  net::shutdown_socket(fd);
   net::close_socket(fd);
-  return true;
+  if (!node_closed && err) *err = "relay unconfirmed: peer did not close after TX";
+  return node_closed;
 }
 
 std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface) {

@@ -3,6 +3,7 @@
 // Finalized-state persistence and startup: genesis loading, load_state() (fast-start cache, frontier
 // replay and tail repair, cache verification), frontier record persistence and runtime hydration.
 
+#include <algorithm>
 #include <iostream>
 
 #include "codec/bytes.hpp"
