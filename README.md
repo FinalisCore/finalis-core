@@ -152,9 +152,9 @@ For Windows builds/releases, use:
 - [finalis-core releases](https://github.com/FinalisCore/finalis-core/releases)
 
 ```bash
-apt install -y build-essential cmake ninja-build pkg-config libssl-dev \
+apt install -y build-essential cmake ninja-build pkg-config git libssl-dev \
   qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
-  libsodium-dev librocksdb-dev curl jq
+  libsodium-dev librocksdb-dev nlohmann-json3-dev curl jq
 ```
 ```bash
 git clone https://github.com/FinalisCore/finalis-core.git

@@ -41,6 +41,12 @@ find_package(OpenSSL REQUIRED)
 find_package(Qt5 COMPONENTS Widgets QUIET)
 find_package(ZLIB QUIET)
 
+find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
+if(NOT NLOHMANN_JSON_INCLUDE_DIR)
+  message(FATAL_ERROR "nlohmann/json.hpp not found. Install nlohmann-json3-dev (Debian/Ubuntu) or nlohmann-json.")
+endif()
+include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
+
 # Optional libs: RocksDB and libsodium. Build falls back gracefully if unavailable.
 find_library(SODIUM_LIB sodium)
 find_path(SODIUM_INCLUDE_DIR sodium.h)
