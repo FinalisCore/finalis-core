@@ -18,6 +18,11 @@ Hash32 ingress_lane_anchor(const Tx& tx);
 Hash32 ingress_lane_anchor(const TxV2& tx);
 Hash32 ingress_lane_anchor(const AnyTx& tx);
 std::uint32_t assign_ingress_lane(const Tx& tx);
+// The committee member that certifies `lane` during the epoch starting at `epoch_start`: a per-epoch
+// hash, so a censoring certifier holds a lane for one epoch at most and neighbours in the sorted
+// committee do not get consecutive epochs. Routing only: certificate validity does not depend on it.
+PubKey32 designated_ingress_certifier(const std::vector<PubKey32>& committee, std::uint32_t lane,
+                                      std::uint64_t epoch_start);
 std::uint32_t assign_ingress_lane(const TxV2& tx);
 std::uint32_t assign_ingress_lane(const AnyTx& tx);
 Hash32 compute_lane_root_append(const Hash32& prev_root, const Hash32& tx_hash);

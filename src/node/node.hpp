@@ -462,9 +462,9 @@ class Node {
   // than a prevote already sent, which breaks the cross-round safety argument (found by TLC,
   // formal/two_phase_finality.tla).
   std::uint32_t local_vote_round_floor_locked(std::uint64_t height) const;
-  // This node's own votes at `height` for re-gossip while the height is stalled: timeout votes,
-  // prevotes and the precommit its lock implies, for the latest few rounds. Re-signed; Ed25519 is
-  // deterministic, so these are the messages already sent.
+  // Votes at `height` for re-gossip while the height is stalled: this node's own timeout votes,
+  // prevotes and the precommit its lock implies, for the latest few rounds (re-signed; Ed25519 is
+  // deterministic, so these are the messages already sent), plus every prevote of its valid polka.
   struct LocalVoteRebroadcast {
     std::vector<TimeoutVote> timeouts;
     std::vector<Vote> prevotes;
@@ -514,6 +514,16 @@ class Node {
   void broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate);
   void broadcast_tx(const AnyTx& tx, int skip_peer_id = 0);
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
+  // LIVENESS: a transaction is forwarded to its lane's designated certifier once, on admission, and
+  // silently not at all if that peer is unreachable then. Re-forwards (or certifies, when this node
+  // is now the certifier) mempool transactions that are still uncertified.
+  void reforward_uncertified_mempool_txs_locked();
+  // LIVENESS: a record certified in epoch E but not finalized before E ends can never be finalized
+  // (certificates must match the current epoch), and every later record of its lane chains on it,
+  // so the lane is wedged and every proposal that reaches it fails. Truncates such lanes back to the
+  // finalized cursor; the dropped transactions stay in mempools and are re-certified in the new
+  // epoch by reforward_uncertified_mempool_txs_locked.
+  void drop_stale_unfinalized_ingress_locked();
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
@@ -840,6 +850,13 @@ class Node {
   std::uint32_t tc_no_qc_round_streak_{0};
   std::uint64_t last_finalized_progress_ms_{0};
   std::uint64_t last_consensus_rebroadcast_ms_{0};
+  std::uint64_t last_tx_reforward_ms_{0};
+#ifdef FINALIS_CHAOS_BYZANTINE
+  // CHAOS TEST BUILDS ONLY (scripts/chaos_devnet.py --byzantine): this validator prevotes and
+  // precommits every proposal it sees, ignoring every safety rule, and equivocates as leader.
+  bool chaos_byzantine_{false};
+  std::uint64_t chaos_equivocation_nonce_{0};
+#endif
   std::uint64_t last_finalized_tip_poll_ms_{0};
   std::size_t finalized_tip_poll_cursor_{0};
   std::uint64_t last_missing_next_cert_stall_log_ms_{0};

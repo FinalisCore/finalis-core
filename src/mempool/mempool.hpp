@@ -60,6 +60,8 @@ class Mempool {
   std::size_t size() const;
   std::size_t total_bytes() const;
   bool contains(const Hash32& txid) const;
+  // Up to `max` entries, in txid order.
+  std::vector<MempoolEntry> entries(std::size_t max) const;
   MempoolPolicyStats policy_stats() const;
   void on_finalized_block_timestamp(std::uint64_t ts);
   // Also prunes expired admission PoW txs when ctx.current_height advances.

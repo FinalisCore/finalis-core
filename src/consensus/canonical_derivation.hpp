@@ -46,6 +46,8 @@ struct CanonicalDerivationConfig {
 struct CanonicalGenesisState {
   Hash32 genesis_artifact_id{};
   std::vector<PubKey32> initial_validators;
+  // Parent timestamp of height 1 (unix seconds).
+  std::uint64_t genesis_time_unix{0};
 };
 
 struct CanonicalFrontierRecord {
@@ -96,6 +98,9 @@ struct CanonicalDerivedState {
   FrontierVector finalized_frontier_vector{};
   FrontierLaneRoots finalized_lane_roots{};
   FinalizedIdentity finalized_identity{};
+  // Timestamp (unix seconds) of the finalized tip transition; genesis time at height 0. Each
+  // transition's timestamp must exceed it (frontier-timestamp-not-increasing).
+  std::uint64_t finalized_timestamp{0};
   Hash32 last_finality_certificate_hash{};
   UtxoSetV2 utxos;
   ValidatorRegistry validators;

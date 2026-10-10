@@ -256,6 +256,7 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   consensus::CanonicalDerivedState state;
   state.finalized_height = finalized_height;
   state.finalized_identity = consensus::FinalizedIdentity::transition(finalized_hash);
+  state.finalized_timestamp = transition->timestamp;
   state.finalized_frontier = transition->next_frontier;
   state.finalized_frontier_vector = transition->next_vector;
   state.finalized_lane_roots = consensus::FrontierLaneRoots{};
@@ -402,6 +403,7 @@ bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std:
     std::copy(stored_genesis_artifact->begin(), stored_genesis_artifact->end(), genesis_state.genesis_artifact_id.begin());
   }
   genesis_state.initial_validators = genesis_doc->initial_validators;
+  genesis_state.genesis_time_unix = genesis_doc->genesis_time_unix;
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
@@ -667,6 +669,7 @@ bool Node::init_mainnet_genesis() {
   consensus::CanonicalGenesisState genesis_state;
   genesis_state.genesis_artifact_id = gblock;
   genesis_state.initial_validators = doc->initial_validators;
+  genesis_state.genesis_time_unix = doc->genesis_time_unix;
   consensus::CanonicalDerivedState canonical_genesis_state;
   std::string canonical_error;
   if (!consensus::build_genesis_canonical_state(canonical_derivation_config_locked(), genesis_state,
@@ -727,6 +730,7 @@ bool Node::load_state() {
     std::copy(stored_genesis_artifact->begin(), stored_genesis_artifact->end(), genesis_state.genesis_artifact_id.begin());
   }
   genesis_state.initial_validators = genesis_doc->initial_validators;
+  genesis_state.genesis_time_unix = genesis_doc->genesis_time_unix;
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }

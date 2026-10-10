@@ -324,6 +324,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   consensus::CanonicalGenesisState genesis_state;
   genesis_state.genesis_artifact_id = genesis::block_id(*doc);
   genesis_state.initial_validators = doc->initial_validators;
+  genesis_state.genesis_time_unix = doc->genesis_time_unix;
 
   consensus::CanonicalDerivedState genesis_derived;
   std::string error;
@@ -475,6 +476,7 @@ bool persist_certified_ingress_fixture(const node::NodeConfig& cfg, storage::DB&
   consensus::CanonicalGenesisState genesis_state;
   genesis_state.genesis_artifact_id = genesis::block_id(*doc);
   genesis_state.initial_validators = doc->initial_validators;
+  genesis_state.genesis_time_unix = doc->genesis_time_unix;
 
   consensus::CanonicalDerivedState genesis_derived;
   std::string error;
@@ -560,6 +562,7 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   consensus::CanonicalGenesisState genesis_state;
   genesis_state.genesis_artifact_id = genesis::block_id(*doc);
   genesis_state.initial_validators = doc->initial_validators;
+  genesis_state.genesis_time_unix = doc->genesis_time_unix;
 
   CertifiedIngressFixture fixture;
   std::string error;
@@ -2377,6 +2380,8 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     const auto vote_result = nodes[0]->inject_network_vote_diagnostic_for_test(vote);
     if (vote_result != "accepted") {
       if (vote_result == "soft-reject:stale-finalized-height") break;
+      // The live cluster's own precommit (byte-identical: Ed25519 is deterministic) got there first.
+      if (vote_result == "soft-reject:duplicate") continue;
       throw std::runtime_error("bonded fixture failed to inject live join vote: " + vote_result);
     }
   }

@@ -314,6 +314,7 @@ bool Node::init() {
     highest_tc_by_height_.erase(finalized_height_ + 1);
     local_timeout_vote_reservations_.clear();
     reseed_local_votes_locked(finalized_height_ + 1);
+    drop_stale_unfinalized_ingress_locked();
   }
   if (restart_debug_) {
     log_line("restart-debug startup-state height=" + std::to_string(finalized_height_) + " round=" +
@@ -324,6 +325,12 @@ bool Node::init() {
 
   round_started_ms_ = now_ms();
   last_finalized_progress_ms_ = now_ms();
+#ifdef FINALIS_CHAOS_BYZANTINE
+  if (const char* v = std::getenv("FINALIS_CHAOS_BYZANTINE"); v && std::string_view(v) == "1") {
+    chaos_byzantine_ = true;
+    log_line("CHAOS-BYZANTINE enabled: this validator violates the consensus rules on purpose");
+  }
+#endif
   {
     std::lock_guard<std::mutex> lk(mu_);
     arm_round0_deadline_locked(round_started_ms_);
@@ -1367,6 +1374,10 @@ void Node::event_loop() {
       // reconnect) are never retransmitted, and a TC missing one side's timeout votes never forms, so
       // a healed partition could halt the height for good. While stalled, re-gossip this node's own
       // votes at h.
+      if (now_ms >= last_tx_reforward_ms_ + 5000) {
+        last_tx_reforward_ms_ = now_ms;
+        reforward_uncertified_mempool_txs_locked();
+      }
       if (consensus_stalled && now_ms >= last_consensus_rebroadcast_ms_ + cfg_.network.round_timeout_ms) {
         last_consensus_rebroadcast_ms_ = now_ms;
         votes_to_rebroadcast = local_votes_for_rebroadcast_locked(h);
@@ -1574,8 +1585,41 @@ void Node::event_loop() {
     }
 
     if (propose_to_send.has_value()) {
-      broadcast_propose(*propose_to_send);
-      handle_propose(*propose_to_send, false);
+#ifdef FINALIS_CHAOS_BYZANTINE
+      if (chaos_byzantine_ && !cfg_.disable_p2p) {
+        // Equivocate: a second valid proposal for the same round (different timestamp, so a
+        // different transition id), each sent to half of the peers.
+        auto proposal = FrontierProposal::parse(propose_to_send->frontier_proposal_bytes);
+        if (proposal.has_value()) {
+          p2p::ProposeMsg alt = *propose_to_send;
+          // Still valid: later than the parent and within the honest prevoters' drift bound.
+          proposal->transition.timestamp += 1 + (++chaos_equivocation_nonce_ % 30);
+          alt.frontier_proposal_bytes = proposal->serialize();
+          const std::optional<std::uint32_t> pol_round =
+              alt.pol.has_value() ? std::optional<std::uint32_t>(alt.pol->round) : std::nullopt;
+          if (auto sig = crypto::ed25519_sign(
+                  propose_signing_message(alt.height, alt.round, proposal->transition.transition_id(), pol_round),
+                  local_key_.private_key)) {
+            alt.proposer_signature = *sig;
+            bool flip = false;
+            for (int peer_id : p2p_.peer_ids()) {
+              const auto& m = flip ? alt : *propose_to_send;
+              (void)p2p_.send_to(peer_id, p2p::MsgType::PROPOSE, p2p::ser_propose(m), true);
+              flip = !flip;
+            }
+            log_line("CHAOS-BYZANTINE equivocating-propose height=" + std::to_string(alt.height) +
+                     " round=" + std::to_string(alt.round));
+            handle_propose(*propose_to_send, false);
+            handle_propose(alt, false);
+            propose_to_send.reset();
+          }
+        }
+      }
+#endif
+      if (propose_to_send.has_value()) {
+        broadcast_propose(*propose_to_send);
+        handle_propose(*propose_to_send, false);
+      }
     }
 
     // Backstop for finalizations reached from event-loop paths (sync, repair).

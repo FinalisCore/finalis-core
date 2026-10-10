@@ -37,6 +37,13 @@ p2p::MisbehaviorReason ingress_fault_reason_for(const std::string& error) {
   return p2p::MisbehaviorReason::INVALID_INGRESS;
 }
 
+// Ingress rejections that honest peers cause: a different committee epoch (one side is ahead), a late
+// answer to an expired range request, or a lane view that differs from ours (lag, or the stale-epoch
+// truncation at an epoch boundary has not happened on one side yet). None is penalized.
+bool ingress_error_is_peer_fault(const std::string& error) {
+  return error != "ingress-epoch-mismatch" && error != "unexpected-range" &&
+         error != "ingress-prev-lane-root-mismatch" && error != "ingress-seq-discontinuity";
+}
 }  // namespace
 
 void Node::on_get_ingress_tips(int peer_id, const Bytes& payload) {
@@ -142,12 +149,7 @@ void Node::on_ingress_range(int peer_id, const Bytes& payload) {
     std::lock_guard<std::mutex> lk(mu_);
     std::string ingress_error;
     if (!handle_ingress_range_locked(peer_id, *range, &ingress_error)) {
-      // ingress-epoch-mismatch is not peer misbehavior: it occurs when the peer
-      // is in a different committee epoch (i.e., they are ahead of us in chain
-      // sync). Scoring them would cause them to be banned before we can catch up.
-      // unexpected-range is not misbehavior either: it is a late answer to a request that expired
-      // (kIngressRangeRequestTimeoutMs) and is dropped before any record is validated.
-      if (ingress_error != "ingress-epoch-mismatch" && ingress_error != "unexpected-range") {
+      if (ingress_error_is_peer_fault(ingress_error)) {
         const auto reason = ingress_fault_reason_for(ingress_error);
         const std::string note = ingress_error.empty() ? "invalid-ingress-range" : ingress_error;
         score_peer_locked(peer_id, reason, note);
@@ -174,9 +176,7 @@ void Node::on_ingress_record(int peer_id, const Bytes& payload) {
     std::lock_guard<std::mutex> lk(mu_);
     std::string ingress_error;
     if (!handle_ingress_record_locked(peer_id, *record, &appended, &ingress_error)) {
-      // Same epoch-mismatch guard as INGRESS_RANGE: don't penalise a peer
-      // whose certificates belong to a later committee epoch.
-      if (ingress_error != "ingress-epoch-mismatch") {
+      if (ingress_error_is_peer_fault(ingress_error)) {
         const auto reason = ingress_fault_reason_for(ingress_error);
         const std::string note = ingress_error.empty() ? "invalid-ingress-record" : ingress_error;
         score_peer_locked(peer_id, reason, note);
@@ -201,6 +201,9 @@ void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id) {
     if (accepted_tx_payloads_.contains(payload_id)) return;
   }
   auto tx = parse_any_tx(m->tx_bytes);
+  if (tx.has_value()) {
+    log_line("recv TX peer_id=" + std::to_string(peer_id) + " txid=" + hex_encode32(txid_any(*tx)));
+  }
   if (!tx.has_value()) {
     std::lock_guard<std::mutex> lk(mu_);
     invalid_message_payloads_.insert(payload_id);
@@ -208,9 +211,10 @@ void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id) {
     return;
   }
   if (!handle_tx(*tx, true, peer_id)) {
-    std::lock_guard<std::mutex> lk(mu_);
-    invalid_message_payloads_.insert(payload_id);
-    score_peer_locked(peer_id, p2p::MisbehaviorReason::DUPLICATE_SPAM, "tx-rejected");
+    // Not blacklisted or scored: a mempool rejection is often transient (input not yet seen, rate
+    // limit, conflicting spend) and the same payload can be valid later, e.g. at the certifier after
+    // a restart or a stale-epoch lane truncation. Malformed TX messages are penalized above, and TX
+    // traffic is rate-limited per peer.
   } else {
     std::lock_guard<std::mutex> lk(mu_);
     accepted_tx_payloads_.insert(payload_id);
@@ -228,7 +232,16 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
     verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
     const auto input_count = std::visit([](const auto& value) { return value.inputs.size(); }, tx);
     if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, input_count)), now_ms())) {
+      log_line("tx-reject txid=" + hex_encode32(txid_any(tx)) + " peer_id=" + std::to_string(from_peer_id) +
+               " reason=verify-rate-limited");
       return false;
+    }
+    // Already held: a duplicate, not a rejection. A re-forward of an uncertified transaction lands
+    // here at the designated certifier, so try to certify it.
+    if (mempool_.contains(txid_any(tx))) {
+      std::string ingress_error;
+      (void)maybe_certify_locally_accepted_tx_locked(tx, &ingress_error);
+      return true;
     }
     const auto next_height = finalized_height_ + 1;
     const auto min_bond_amount = effective_validator_min_bond_for_height(next_height);
@@ -238,6 +251,8 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
     std::uint64_t fee = 0;
     const auto min_relay_fee = effective_min_relay_fee_for_height(next_height);
     if (!mempool_.accept_tx(tx, utxos_, &err, min_relay_fee, &fee)) {
+      log_line("tx-reject txid=" + hex_encode32(txid_any(tx)) + " peer_id=" + std::to_string(from_peer_id) +
+               " reason=mempool detail=" + err);
       if (debug_economics_logs_enabled()) {
         PubKey32 reg_pub{};
         std::optional<std::uint64_t> offered_bond;
@@ -262,7 +277,10 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
       }
       return false;
     }
-    if (fee < min_relay_fee) return false;
+    if (fee < min_relay_fee) {
+      log_line("tx-reject txid=" + hex_encode32(txid_any(tx)) + " reason=fee-below-min-relay");
+      return false;
+    }
     txid = txid_any(tx);
     std::string ingress_error;
     if (!maybe_certify_locally_accepted_tx_locked(tx, &ingress_error) && !ingress_error.empty()) {
@@ -342,7 +360,8 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
   }
 
   const std::uint32_t lane = consensus::assign_ingress_lane(tx);
-  const PubKey32& designated_certifier = committee[static_cast<std::size_t>(lane) % committee.size()];
+  const PubKey32 designated_certifier = consensus::designated_ingress_certifier(
+      committee, lane, consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks));
   if (designated_certifier != local_key_.public_key) {
     if (error) *error = "local-not-designated-ingress-certifier";
     return false;
@@ -387,13 +406,63 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
   return true;
 }
 
+void Node::drop_stale_unfinalized_ingress_locked() {
+  if (!canonical_state_.has_value()) return;
+  const std::uint64_t epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
+    const std::uint64_t cursor = canonical_state_->finalized_frontier_vector.lane_max_seq[lane];
+    const auto state = db_.get_lane_state(lane);
+    if (!state.has_value() || state->max_seq <= cursor) continue;
+    const auto cert_bytes = db_.get_ingress_certificate(lane, cursor + 1);
+    const auto cert = cert_bytes.has_value() ? IngressCertificate::parse(*cert_bytes) : std::nullopt;
+    // Only a present record from an earlier epoch is stale. A missing record is fetched from peers,
+    // never dropped. Epochs never decrease along a lane, so a current-epoch first record means
+    // nothing above it is stale either.
+    if (!cert.has_value() || cert->epoch >= epoch) continue;
+    LaneState restored;
+    restored.epoch = epoch;
+    restored.lane = lane;
+    restored.max_seq = cursor;
+    restored.lane_root = canonical_state_->finalized_lane_roots[lane];
+    std::vector<Hash32> dropped;
+    if (!db_.truncate_ingress_lane(lane, cursor, restored, &dropped)) {
+      log_line("ingress-stale-drop-failed lane=" + std::to_string(lane));
+      continue;
+    }
+    for (auto it = quarantined_ingress_records_.begin(); it != quarantined_ingress_records_.end();) {
+      it = it->first == lane ? quarantined_ingress_records_.erase(it) : std::next(it);
+    }
+    log_line("ingress-stale-dropped lane=" + std::to_string(lane) + " from_seq=" + std::to_string(cursor + 1) +
+             " to_seq=" + std::to_string(state->max_seq) + " records=" + std::to_string(dropped.size()) +
+             " epoch=" + std::to_string(epoch) +
+             " stale_epoch=" + std::to_string(cert->epoch));
+  }
+}
+
+void Node::reforward_uncertified_mempool_txs_locked() {
+  constexpr std::size_t kMaxPerPass = 256;
+  std::size_t count = 0;
+  for (const auto& entry : mempool_.entries(kMaxPerPass)) {
+    if (db_.get_ingress_bytes(entry.txid).has_value()) continue;  // certified; waits for a slice
+    std::string error;
+    if (maybe_certify_locally_accepted_tx_locked(entry.tx, &error)) {
+      ++count;
+      continue;
+    }
+    maybe_forward_tx_to_designated_certifier_locked(entry.tx, 0);
+    ++count;
+  }
+  if (count > 0) log_line("tx-reforward-uncertified count=" + std::to_string(count));
+}
+
 void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id) {
   const std::uint64_t next_height = finalized_height_ + 1;
   auto committee = ingress_committee_locked(next_height);
   if (committee.empty()) return;
 
   const std::uint32_t lane = consensus::assign_ingress_lane(tx);
-  const PubKey32& designated_certifier = committee[static_cast<std::size_t>(lane) % committee.size()];
+  const PubKey32 designated_certifier = consensus::designated_ingress_certifier(
+      committee, lane, consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks));
   if (designated_certifier == local_key_.public_key) return;
 
   if (cfg_.disable_p2p) {

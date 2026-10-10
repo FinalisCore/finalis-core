@@ -1024,6 +1024,8 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   // height-0 block-artifact genesis can seed the first frontier transition.
   transition->prev_finalized_hash = prev.finalized_identity.id;
   transition->prev_finality_link_hash = prev.last_finality_certificate_hash;
+  // Timestamps strictly increase; a proposer sets its wall clock before this and keeps it if later.
+  transition->timestamp = std::max(transition->timestamp, prev.finalized_timestamp + 1);
   transition->height = height;
   transition->round = round;
   transition->leader_pubkey = leader_pubkey;
@@ -1119,6 +1121,7 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
   state.finalized_frontier_vector = FrontierVector{};
   state.finalized_lane_roots = FrontierLaneRoots{};
   state.finalized_identity = FinalizedIdentity::genesis(genesis.genesis_artifact_id);
+  state.finalized_timestamp = genesis.genesis_time_unix;
   state.last_finality_certificate_hash = zero_hash();
   state.finalized_randomness = initial_finalized_randomness(cfg.network, cfg.chain_id);
   state.committee_epoch_randomness_cache[1] = state.finalized_randomness;
@@ -1389,6 +1392,10 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
       if (error) *error = "frontier-prev-finality-link-mismatch";
       return false;
     }
+    if (record.transition.timestamp <= prev.finalized_timestamp) {
+      if (error) *error = "frontier-timestamp-not-increasing";
+      return false;
+    }
     if (record.transition.prev_frontier != prev.finalized_frontier) {
       if (error) *error = "frontier-prev-frontier-mismatch";
       return false;
@@ -1547,6 +1554,10 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   }
   if (record.transition.prev_finality_link_hash != prev.last_finality_certificate_hash) {
     if (error) *error = "frontier-prev-finality-link-mismatch";
+    return false;
+  }
+  if (record.transition.timestamp <= prev.finalized_timestamp) {
+    if (error) *error = "frontier-timestamp-not-increasing";
     return false;
   }
   if (record.transition.prev_vector != prev.finalized_frontier_vector) {
@@ -1729,6 +1740,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   next.utxos = std::move(recomputed.next_utxos);
   next.confidential_pool_value = recomputed.next_confidential_pool_value;
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
+  next.finalized_timestamp = record.transition.timestamp;
   next.last_finality_certificate_hash = frontier_finality_link_hash(record.transition);
   next.finalized_randomness = advance_finalized_randomness(prev.finalized_randomness, record.transition);
   // The full signer count of a height is only known once its child records it,

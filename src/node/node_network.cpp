@@ -1020,9 +1020,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     if (bootstrap_sync_msg && info.version_rx && info.version_tx && info.verack_tx) {
       // fall through
     } else {
-      if (msg_type == p2p::MsgType::ADDR || msg_type == p2p::MsgType::GETADDR) {
-        log_line("drop-addr peer_id=" + std::to_string(peer_id) + " reason=pre-handshake");
-      }
+      log_line("recv-drop peer_id=" + std::to_string(peer_id) + " type=" + msg_type_name(msg_type) +
+               " reason=pre-handshake version_rx=" + std::to_string(info.version_rx) +
+               " verack_rx=" + std::to_string(info.verack_rx) + " version_tx=" + std::to_string(info.version_tx) +
+               " verack_tx=" + std::to_string(info.verack_tx));
       {
         std::lock_guard<std::mutex> lk(mu_);
         ++rejected_pre_handshake_;

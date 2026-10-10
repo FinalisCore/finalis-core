@@ -417,6 +417,11 @@ class DB {
   std::optional<Bytes> get_ingress_bytes(const Hash32& txid) const;
   bool put_lane_state(std::uint32_t lane, const LaneState& state);
   std::optional<LaneState> get_lane_state(std::uint32_t lane) const;
+  // Drops the lane's unfinalized records above `keep_through_seq` (certificates and payloads) and
+  // sets the lane state to `restored`. For records that can never be finalized (stale epoch).
+  // Appends the dropped txids to `dropped_txids` when given.
+  bool truncate_ingress_lane(std::uint32_t lane, std::uint64_t keep_through_seq, const LaneState& restored,
+                             std::vector<Hash32>* dropped_txids = nullptr);
   std::vector<Bytes> load_ingress_lane_range(std::uint32_t lane, std::uint64_t from_seq, std::uint64_t to_seq) const;
   bool put_frontier_transition(const Hash32& id, const Bytes& transition_bytes);
   std::optional<Bytes> get_frontier_transition(const Hash32& id) const;

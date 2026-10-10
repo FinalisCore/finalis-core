@@ -528,3 +528,48 @@ TEST(test_ingress_p2p_message_roundtrip) {
   ASSERT_TRUE(tips_roundtrip.has_value());
   ASSERT_EQ(tips_roundtrip->lane_tips[cert.lane], 7u);
 }
+
+// A stale-epoch lane tail is dropped back to the finalized cursor and the lane accepts new records;
+// a payload that a finalized transaction indexes is never erased.
+TEST(test_truncate_ingress_lane_drops_unfinalized_tail_and_reopens_lane) {
+  const std::string path = unique_test_base("/tmp/finalis_test_ingress_truncate");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+
+  const auto from = key_from_byte(1);
+  const auto to = key_from_byte(2);
+  OutPoint op{};
+  op.txid.fill(0x41);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto tx_bytes = signed_spend_tx_bytes(op, prev, from, to.public_key, 9'800);
+  const std::vector<crypto::KeyPair> signers{key_from_byte(21)};
+  const std::vector<PubKey32> committee{signers[0].public_key};
+  const auto stale = signed_ingress_certificate(tx_bytes, 9, 1, zero_hash(), signers);
+  std::string err;
+  ASSERT_TRUE(consensus::append_validated_ingress_record(db, stale, tx_bytes, committee, &err));
+
+  LaneState restored;
+  restored.epoch = 10;
+  restored.lane = stale.lane;
+  restored.max_seq = 0;
+  restored.lane_root = zero_hash();
+  std::vector<Hash32> dropped;
+  ASSERT_TRUE(db.truncate_ingress_lane(stale.lane, 0, restored, &dropped));
+  ASSERT_EQ(dropped.size(), 1u);
+  ASSERT_TRUE(dropped[0] == stale.txid);
+  ASSERT_TRUE(!db.get_ingress_certificate(stale.lane, 1).has_value());
+  ASSERT_TRUE(!db.get_ingress_bytes(stale.txid).has_value());
+  ASSERT_TRUE(db.get_lane_state(stale.lane) == restored);
+
+  // Re-certified in the new epoch at the same seq.
+  const auto fresh = signed_ingress_certificate(tx_bytes, 10, 1, zero_hash(), signers);
+  ASSERT_TRUE(consensus::append_validated_ingress_record(db, fresh, tx_bytes, committee, &err));
+  ASSERT_EQ(db.get_lane_state(fresh.lane)->max_seq, 1u);
+
+  // Finalized payloads survive a truncation.
+  ASSERT_TRUE(db.put_tx_index(fresh.txid, 5, 0, tx_bytes));
+  ASSERT_TRUE(db.truncate_ingress_lane(fresh.lane, 0, restored, nullptr));
+  ASSERT_TRUE(db.get_ingress_bytes(fresh.txid).has_value());
+}

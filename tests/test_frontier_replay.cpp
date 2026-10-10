@@ -1883,6 +1883,34 @@ TEST(test_frontier_apply_rejects_nondeterministic_transition_metadata) {
   ASSERT_TRUE(err == "frontier-quorum-threshold-mismatch" || err == "legacy-frontier-quorum-threshold-mismatch");
 }
 
+// Transition timestamps strictly increase; the applied state carries the tip's timestamp.
+TEST(test_frontier_apply_requires_increasing_timestamp) {
+  const auto cfg = test_cfg();
+  const auto from = key_from_byte(0xA5);
+  const auto to = key_from_byte(0xA6);
+
+  OutPoint op{};
+  op.txid.fill(0xB3);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  auto parent = build_parent_state_with_utxo(cfg, 0, op, prev);
+  parent.finalized_timestamp = 1'000;
+
+  auto record = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)});
+  ASSERT_EQ(record.transition.timestamp, 1'001u);  // populate raises it to parent + 1
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(cfg, parent, record, &out, &err));
+  ASSERT_EQ(out.finalized_timestamp, 1'001u);
+
+  for (const std::uint64_t ts : {std::uint64_t{0}, std::uint64_t{1'000}}) {
+    auto stale = record;
+    stale.transition.timestamp = ts;
+    ASSERT_TRUE(!consensus::apply_frontier_record(cfg, parent, stale, &out, &err));
+    ASSERT_EQ(err, "frontier-timestamp-not-increasing");
+  }
+}
+
 TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
   auto cfg = live_activation_cfg();
   cfg.max_committee = 5;

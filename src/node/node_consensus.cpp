@@ -492,6 +492,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     if (error) *error = "write-batch-commit-failed";
     return false;
   }
+  drop_stale_unfinalized_ingress_locked();
   // Stable, parseable record of every finalization (scripts/chaos_devnet.py compares these across
   // nodes to detect forks and measure rounds per height).
   log_line("finalized height=" + std::to_string(record.transition.height) + " transition=" +
@@ -830,6 +831,16 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
     const auto& [transition_id, round] = lock->second;
     if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key)) {
       out.precommits.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
+    }
+  }
+  // The valid value's polka, all signers: a node locked on it refuses every other proposal, so the
+  // others must learn the polka (and re-propose its value) or the height can stall for many rounds.
+  // Its own votes above stop being re-sent once that round is older than the last kRounds.
+  if (auto polka = valid_polka_by_height_.find(height); polka != valid_polka_by_height_.end()) {
+    for (const auto& sig : polka->second.signatures) {
+      if (sig.validator_pubkey == local_key_.public_key) continue;
+      out.prevotes.push_back(Vote{height, polka->second.round, polka->second.frontier_transition_id,
+                                  sig.validator_pubkey, sig.signature});
     }
   }
   return out;
@@ -1613,6 +1624,20 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       return ProposeHandlingResult::Accepted;
     }
 
+#ifdef FINALIS_CHAOS_BYZANTINE
+    if (chaos_byzantine_ && is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
+      // Vote for everything at both phases: no lock, floor, once-per-round or polka checks, nothing
+      // persisted. Honest validators must stay safe against up to f of these.
+      auto pv = crypto::ed25519_sign(prevote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
+      auto pc = crypto::ed25519_sign(vote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
+      if (pv.has_value()) maybe_vote = Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pv};
+      if (pc.has_value()) {
+        pending_local_precommits_.push_back(Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pc});
+      }
+      log_line("CHAOS-BYZANTINE vote-everything height=" + std::to_string(msg.height) +
+               " round=" + std::to_string(msg.round) + " transition=" + short_hash_hex(transition_id));
+    } else {
+#endif
     std::string vote_reason;
     const auto local_vote_key = std::make_pair(msg.height, msg.round);
     const bool local_is_committee_member = is_committee_member_for(local_key_.public_key, msg.height, msg.round);
@@ -1622,7 +1647,13 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (local_timed_out) vote_reason = "round-already-timed-out";
     const bool below_vote_floor = msg.round < local_vote_round_floor_locked(msg.height);
     if (below_vote_floor) vote_reason = "below-vote-floor";
+    // Timestamps are only bounded below by the chain (strictly increasing); honest validators bound
+    // them above by refusing to prevote a proposal stamped too far in their future.
+    constexpr std::uint64_t kMaxTimestampDriftS = 60;
+    const bool timestamp_in_future = transition.timestamp > now_unix() + kMaxTimestampDriftS;
+    if (timestamp_in_future) vote_reason = "timestamp-in-future";
     bool local_can_vote = local_is_committee_member && !already_prevoted && !local_timed_out && !below_vote_floor &&
+                          !timestamp_in_future &&
                           can_prevote_locked(msg.height, transition_id, pol_round, &vote_reason);
     if (local_can_vote) {
       // DATA AVAILABILITY: prevote only for a slice whose certified ingress this node holds and has
@@ -1674,6 +1705,9 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
                " transition=" + short_hash_hex(transition_id) + " current_round=" + std::to_string(current_round_) +
                " committee_member=" + std::string(local_is_committee_member ? "yes" : "no") + " reason=" + vote_reason);
     }
+#ifdef FINALIS_CHAOS_BYZANTINE
+    }
+#endif
   }
 
   if (maybe_vote.has_value()) {
@@ -1767,10 +1801,12 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
       vote_verify_cache_.insert(vkey);
     }
 
+    // Soft: the vote is validly signed, so the relaying peer did nothing wrong. Penalizing it would
+    // let one equivocating validator get honest peers banned by everyone who relays its votes.
     if (locally_observed_equivocators_.find(vote.validator_pubkey) != locally_observed_equivocators_.end()) {
-      log_vote_hard_reject("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
+      log_vote_soft_reject("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
       if (reject_reason) *reject_reason = "known-equivocator";
-      return VoteHandlingResult::HardReject;
+      return VoteHandlingResult::SoftReject;
     }
 
     // INVARIANT: this is the only place (besides the local self-vote in finalize_if_quorum)
@@ -1791,10 +1827,11 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
 
     if (!tr.accepted) {
       if (!tr.duplicate) {
-        log_vote_hard_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id) +
+        // Soft for the same reason: a conflicting vote is the signer's fault, not the relayer's.
+        log_vote_soft_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id) +
                                                     " validator=" + short_pub_hex(vote.validator_pubkey));
         if (reject_reason) *reject_reason = "tracker-rejected";
-        return VoteHandlingResult::HardReject;
+        return VoteHandlingResult::SoftReject;
       }
       log_vote_soft_reject("duplicate", " transition=" + short_hash_hex(vote.frontier_transition_id) +
                                            " validator=" + short_pub_hex(vote.validator_pubkey) +
@@ -1873,8 +1910,9 @@ Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from
       }
       prevote_verify_cache_.insert(vkey);
     }
+    // Validly signed: the relayer is not at fault (see handle_vote_result).
     if (locally_observed_equivocators_.contains(vote.validator_pubkey)) {
-      return hard("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
+      return soft("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
     }
     // INVARIANT: like votes_, every prevote entering prevotes_ passed ed25519_verify above (or is
     // this node's own, or a verified pol signature); verify_polka_locked's skip path relies on it.
@@ -1887,7 +1925,7 @@ Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from
                " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
     }
     if (!tr.accepted) {
-      if (!tr.duplicate) return hard("tracker-rejected");
+      if (!tr.duplicate) return soft("tracker-rejected");
       return soft("duplicate", " validator=" + short_pub_hex(vote.validator_pubkey));
     }
     accepted = true;
@@ -2642,6 +2680,15 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                    " reason=" + ingress_error);
           return std::nullopt;
         }
+        // A record certified in an earlier epoch can never be finalized: end the lane here rather
+        // than fail the whole build (drop_stale_unfinalized_ingress_locked clears it).
+        if (ingress.certificate.epoch != consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks)) {
+          log_line("frontier-build-lane-stale-epoch height=" + std::to_string(height) + " lane=" +
+                   std::to_string(lane) + " seq=" + std::to_string(seq) +
+                   " cert_epoch=" + std::to_string(ingress.certificate.epoch));
+          lane_blocked[lane] = true;
+          continue;
+        }
         if (ingress.certificate.prev_lane_root != expected_lane_roots[lane]) {
           quarantined_ingress_records_.insert({static_cast<std::uint32_t>(lane), seq});
           log_line("frontier-ingress-quarantine lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
@@ -2698,6 +2745,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       return std::nullopt;
     }
     const auto prev_finality = prev_finality_record_for_next_height_locked();
+    // Wall clock; populate raises it to parent + 1 when the clock is behind the chain.
+    result.transition.timestamp = now_unix();
     if (!consensus::populate_frontier_transition_metadata(canonical_derivation_config_locked(), *canonical_state_, height, round,
                                                           local_key_.public_key, prev_finality.round,
                                                           prev_finality.signers,
