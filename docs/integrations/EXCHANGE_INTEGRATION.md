@@ -41,7 +41,7 @@ Use this with:
 - [PARTNER_API_CHANGELOG.md](PARTNER_API_CHANGELOG.md)
 - [PARTNER_API_DEPRECATIONS.md](PARTNER_API_DEPRECATIONS.md)
 - [PARTNER_SLO.md](PARTNER_SLO.md)
-- [MAINNET.md](MAINNET.md)
+- [MAINNET.md](../MAINNET.md)
 
 ## 1. Authoritative interfaces
 

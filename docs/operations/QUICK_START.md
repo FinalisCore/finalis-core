@@ -1,4 +1,4 @@
-# QUICK STAT
+# Quick Start
 
 ## Purpose
 

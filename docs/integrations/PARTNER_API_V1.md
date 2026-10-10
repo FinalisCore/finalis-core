@@ -5,13 +5,13 @@ This document defines the exchange-facing `v1` contract exposed by `finalis-expl
 Machine-readable OpenAPI contract:
 
 - `openapi/finalis-partner-v1.yaml`
-- `docs/PARTNER_API_REFERENCE.md` (generated)
+- `docs/integrations/PARTNER_API_REFERENCE.md` (generated)
 
 Governance artifacts:
 
-- `docs/PARTNER_API_COMPATIBILITY_POLICY.md`
-- `docs/PARTNER_API_CHANGELOG.md`
-- `docs/PARTNER_API_DEPRECATIONS.md`
+- `docs/integrations/PARTNER_API_COMPATIBILITY_POLICY.md`
+- `docs/integrations/PARTNER_API_CHANGELOG.md`
+- `docs/integrations/PARTNER_API_DEPRECATIONS.md`
 
 Base routes:
 

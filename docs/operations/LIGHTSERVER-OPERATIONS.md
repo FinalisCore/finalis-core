@@ -124,7 +124,7 @@ service definitions do not restart on them.
 
 | State | Signal | Exit | Restart policy |
 |---|---|---|---|
-| Next committee derived by the emergency prior-committee rule ([CHECKPOINT_DERIVATION_SPEC §11.1](spec/CHECKPOINT_DERIVATION_SPEC.md)) and the node was not started with `--acknowledge-emergency-fallback` | `CRITICAL emergency-fallback-committee-active` in the log, stderr explains | `78` | systemd `RestartPreventExitStatus=78` |
+| Next committee derived by the emergency prior-committee rule ([CHECKPOINT_DERIVATION_SPEC §11.1](../spec/CHECKPOINT_DERIVATION_SPEC.md)) and the node was not started with `--acknowledge-emergency-fallback` | `CRITICAL emergency-fallback-committee-active` in the log, stderr explains | `78` | systemd `RestartPreventExitStatus=78` |
 | RocksDB reports corruption on a read or prefix scan | `finalized-state-invariant-violation source=db-read-corruption` (or `db-scan-corruption`) | `SIGABRT` | systemd `RestartPreventExitStatus=SIGABRT` |
 
 Other failures restart after 5 s. systemd stops trying after 5 failed starts in 300 s

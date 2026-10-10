@@ -20,7 +20,7 @@ Use this together with:
 - [GENESIS_VALIDATOR_CEREMONY.md](GENESIS_VALIDATOR_CEREMONY.md)
 - [MAINNET_PLAN.md](MAINNET_PLAN.md)
 - [../docs/MAINNET.md](../docs/MAINNET.md)
-- [../docs/EXCHANGE_INTEGRATION.md](../docs/EXCHANGE_INTEGRATION.md)
+- [../docs/integrations/EXCHANGE_INTEGRATION.md](../docs/integrations/EXCHANGE_INTEGRATION.md)
 
 ## 1. Threat Model
 

@@ -40,5 +40,5 @@ From `/metrics`:
 
 Use with:
 
-- `docs/EXCHANGE_OPERATOR_RUNBOOK.md`
-- `docs/EXCHANGE_CHECKLIST.md`
+- `docs/integrations/EXCHANGE_OPERATOR_RUNBOOK.md`
+- `docs/integrations/EXCHANGE_CHECKLIST.md`

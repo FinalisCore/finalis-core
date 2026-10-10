@@ -12,8 +12,8 @@ from typing import Dict, List, Set, Tuple
 
 
 OPENAPI_PATH = "openapi/finalis-partner-v1.yaml"
-CHANGELOG_PATH = "docs/PARTNER_API_CHANGELOG.md"
-DEPRECATIONS_PATH = "docs/PARTNER_API_DEPRECATIONS.md"
+CHANGELOG_PATH = "docs/integrations/PARTNER_API_CHANGELOG.md"
+DEPRECATIONS_PATH = "docs/integrations/PARTNER_API_DEPRECATIONS.md"
 EXPLORER_MAIN_PATH = "apps/finalis-explorer/main.cpp"
 
 

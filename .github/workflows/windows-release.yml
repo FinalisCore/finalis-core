@@ -223,7 +223,6 @@ jobs:
             "app\scripts\Start-Finalis.ps1",
             "app\WINDOWS-RUN.txt",
             "app\mainnet\SEEDS.json",
-            "app\mainnet\snapshot.bin",
             "installer-assets\finalis-wizard.bmp",
             "installer-assets\finalis-wizard-small.bmp",
             "installer-assets\finalis-app.ico"

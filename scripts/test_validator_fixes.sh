@@ -4,7 +4,7 @@
 # Run targeted validator tests for unbond, withdraw, and join-window fixes
 
 # Navigate to the finalis-core repository root
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 echo "Running targeted validator security tests..."
 echo "============================================"

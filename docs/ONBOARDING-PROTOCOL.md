@@ -276,7 +276,7 @@ Current external surfaces include:
 
 Both reach the node through the lightserver admin Unix socket (`validator_onboarding_start` /
 `validator_onboarding_status`). These methods are never served over TCP. For access rules and the
-procedure, see [LIGHTSERVER-OPERATIONS.md §2](LIGHTSERVER-OPERATIONS.md#2-admin-socket).
+procedure, see [LIGHTSERVER-OPERATIONS.md §2](operations/LIGHTSERVER-OPERATIONS.md#2-admin-socket).
 
 Read-only surfaces:
 
