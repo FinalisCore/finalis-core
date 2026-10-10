@@ -73,16 +73,6 @@ std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry)
   return std::get<UtxoTransparentData>(entry.body).out;
 }
 
-UtxoSet downgrade_utxo_set_v1(const UtxoSetV2& utxos) {
-  UtxoSet out;
-  for (const auto& [op, entry] : utxos) {
-    const auto transparent = transparent_txout_from_utxo_entry(entry);
-    if (!transparent.has_value()) continue;
-    out.emplace(op, UtxoEntry{*transparent});
-  }
-  return out;
-}
-
 Bytes Tx::serialize_without_hashcash() const {
   codec::ByteWriter w;
   w.u32le(version);

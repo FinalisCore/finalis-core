@@ -117,7 +117,7 @@ Modify:
 Add:
 
 - [tests/test_confidential_tx.cpp](../../tests/test_confidential_tx.cpp)
-- [tests/test_stealth_address.cpp](../../tests/test_stealth_address.cpp)
+- `tests/test_stealth_address.cpp` (not written yet; stealth derivation has no dedicated unit tests)
 - [tests/test_wallet_send_policy.cpp](../../tests/test_wallet_send_policy.cpp)
 - [tests/test_wallet_store.cpp](../../tests/test_wallet_store.cpp)
 - [tests/test_wallet_widgets.cpp](../../tests/test_wallet_widgets.cpp)
@@ -226,17 +226,15 @@ Implementation note:
 
 ## 4. Transaction Types
 
-The current live type [Tx](../../src/utxo/tx.hpp) is v1-only and must remain
-byte-stable.
+Two transaction formats are valid from genesis. Neither is legacy; there is
+no earlier chain to stay compatible with.
 
-Do not mutate `Tx` into a variant container. That would create unnecessary
-risk in existing parser, txid, explorer, mempool, and ingress paths.
+- [Tx](../../src/utxo/tx.hpp) (`version = 1`): transparent inputs and outputs.
+- `TxV2` (`version = 2`): adds confidential outputs and the balance proof.
 
-Instead:
-
-- keep `Tx` as the transparent v1 object
-- add a new v2 object alongside it
-- add a small discriminated wrapper for generic parsing where needed
+`AnyTx` is the discriminated wrapper used where either format can appear.
+`Tx` is kept as its own type, not a variant, so the transparent parser, txid
+and mempool paths stay small.
 
 ### 4.1 File: `src/utxo/confidential_tx.hpp`
 
@@ -340,22 +338,14 @@ Hash32 txid_any(const AnyTx& tx);
 
 ### 4.2 Why `AnyTx` Exists
 
-Current code assumes:
-
-- `Tx::parse(raw)`
-- `tx.serialize()`
-- `tx.txid()`
-
-That is too widespread to replace in one unsafe patch.
-
-`AnyTx` gives a narrow migration seam for:
+Code that only handles transparent transactions uses `Tx` directly
+(`Tx::parse`, `serialize`, `txid`). Code that can see either format uses
+`AnyTx`:
 
 - node ingress
 - finalized frontier replay
 - explorer rendering
 - wallet send/receive code
-
-while preserving legacy `Tx` handling intact.
 
 ## 5. Parser and Serializer Signatures
 
@@ -485,10 +475,9 @@ struct UtxoEntryV2 {
 using UtxoSetV2 = std::map<OutPoint, UtxoEntryV2>;
 ```
 
-Migration rule:
-
-- keep legacy `UtxoSet` type during the first patch only if necessary
-- otherwise replace it directly and add helper accessors
+`UtxoSetV2` is the consensus UTXO state. The transparent-only `UtxoSet` still
+appears in some frontier-execution signatures; unifying the two is an open
+cleanup item.
 
 Preferred helper API:
 

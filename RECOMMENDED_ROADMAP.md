@@ -114,7 +114,7 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
     - Testnet `start.sh` should pass `--expected-genesis-hash` (check `EXPECTED_GENESIS_SHA256` uses
       the same `hash_doc` form first).
     - `scripts/start.sh`: default `AUTO_FAST_SYNC=0`.
-    - Remove the tracked `snapshot.bin` from the repo.
+    - ~~Remove the tracked `snapshot.bin` from the repo.~~ Done 2026-10-10 (see item 25).
 
 ## E. Public interface
 
@@ -480,10 +480,14 @@ settlement (item 13).
     `src/consensus/availability_retention.*`.
   - Local (ignored/untracked) cleanup: `ctest_failures.txt`, `finalis-fullsuite.log`,
     `violations_vps_*.log`, `.codex`, all `__pycache__/`.
-  - Remaining (Group B/C, tied to item 6): `snapshot.bin` is still read by `scripts/start.sh:49`,
-    `packaging/windows/Start-Finalis.ps1`, `Stage-WindowsRelease.ps1` and
-    `.github/workflows/windows-release.yml:226`. Move the fast-sync snapshot to a release asset first,
-    then `git rm` it. Shrinking `.git` (92 MB) needs `git filter-repo` + force-push (irreversible).
+  - 2026-10-10: `snapshot.bin` (a snapshot of a pre-launch network on the current genesis) deleted
+    and dropped from the `windows-release.yml` required-payload list. `scripts/start.sh` and the
+    Windows scripts already skip a missing snapshot. Post-launch snapshots go out as release assets.
+    Shrinking `.git` (92 MB) still needs `git filter-repo` + force-push (irreversible).
+  - 2026-10-10: root cleanup. Release notes → `docs/releases/`, Windows build and quick start →
+    `docs/operations/`, validator test report → `docs/reports/`, whitepaper → `docs/whitepaper/`,
+    `Calc_Sybil_Attack.py` and `test_validator_fixes.sh` → `scripts/`. Added `SECURITY.md` and
+    `docs/REVIEWING.md`.
 
 ---
 
@@ -516,7 +520,7 @@ settlement (item 13).
 | 22 | Fresh-genesis devnet scripts | done — devnet boots and finalizes; `.env` fix verified 2026-10-05 |
 | 23 | P0 pacing: round-0 timer anchored to the block interval | [x] Verified on 3-node devnet (2026-10-05) |
 | 24 | `start.sh` systemd hardening + mainnet genesis lock | applied — `bash -n` + unit verify clean; host run pending |
-| 25 | Repository hygiene (Group A) | applied — uncommitted; `snapshot.bin` removal open (item 6) |
+| 25 | Repository hygiene (Group A) | applied; `snapshot.bin` removed, root cleaned (2026-10-10) |
 
 2026-10-04: the full tree (`cmake --build build -j`, including the test binaries) builds clean. That
 verifies the C++ items 1, 3, 4, 8, 9, 10, 12, 13 and 15–21. Item 2 needs a `docker build`, item 7 an

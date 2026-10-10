@@ -4,9 +4,20 @@
 
 # Finalis Core
 
-`finalis-core` is a finalized-state BFT blockchain in which validator lifecycle, operator-native committee formation, adaptive checkpoint derivation, and future committee eligibility are all derived deterministically from finalized history..
+`finalis-core` is a finalized-state BFT blockchain in which validator lifecycle, operator-native committee formation, adaptive checkpoint derivation, and future committee eligibility are all derived deterministically from finalized history.
 
-Current mainnet identity:
+> **Status: pre-launch.** Mainnet has not launched. There is no live chain, no
+> user funds and no legacy state to stay compatible with; confidential UTXOs are
+> enabled from genesis. Genesis is not frozen yet (see
+> [mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md)), so the identity below can
+> still change.
+>
+> **Review wanted.** We are looking for independent review of the consensus
+> safety rules and the confidential transaction cryptography. Start with
+> [docs/REVIEWING.md](docs/REVIEWING.md). Report vulnerabilities privately as
+> described in [SECURITY.md](SECURITY.md).
+
+Current genesis candidate:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -16,8 +27,9 @@ Current mainnet identity:
 In the current codebase it consists of:
 
 - a UTXO ledger
-- versioned transaction handling through `Tx`, `TxV2`, and `AnyTx`
-- versioned UTXO state through `UtxoSetV2`
+- two transaction formats, both valid from genesis: `Tx` (transparent) and
+  `TxV2` (confidential-capable), parsed together as `AnyTx`
+- UTXO state (`UtxoSetV2`) holding transparent and confidential outputs
 - a validator committee
 - quorum finality
 - deterministic epoch-boundary checkpoint derivation
@@ -29,8 +41,8 @@ The live runtime processes only:
 
 There is no live longest-chain fork-choice path in the node runtime.
 
-After the deliberate genesis reset, old chain DBs, old endpoint assumptions,
-and abandoned-chain artifacts are not valid inputs to this live network.
+Databases and artifacts from earlier development networks are not valid inputs
+to mainnet; start from an empty data directory.
 
 ## Repository Components
 
@@ -94,8 +106,7 @@ This repository also contains:
 `broadcast_tx` is a relay-submission surface. Finalized visibility still comes
 from finalized-state lookup.
 
-The current codebase also supports a bounded confidential transaction subset
-through `TxV2`:
+Confidential transactions use `TxV2` and support a bounded subset:
 
 - transparent -> confidential
 - confidential -> transparent
@@ -211,13 +222,15 @@ ctest --test-dir build --output-on-failure
 
 ## Documentation
 
-- General documentation: [docs/](docs/)
+- Security policy: [SECURITY.md](SECURITY.md)
+- Reviewer guide: [docs/REVIEWING.md](docs/REVIEWING.md)
+- Documentation index: [docs/README.md](docs/README.md)
 - Codebase map: [docs/CODEBASE_MAP.md](docs/CODEBASE_MAP.md)
 - Architecture orientation: [docs/ARCHITECTURE_ORIENTATION.md](docs/ARCHITECTURE_ORIENTATION.md)
 - Physical design guidance: [docs/PHYSICAL_DESIGN_GUIDELINES.md](docs/PHYSICAL_DESIGN_GUIDELINES.md)
 - License policy: [docs/LICENSE_POLICY.md](docs/LICENSE_POLICY.md)
 - Contributing guide: [CONTRIBUTING.md](CONTRIBUTING.md)
-- Exchange integration: [docs/EXCHANGE_INTEGRATION.md](docs/EXCHANGE_INTEGRATION.md)
+- Exchange integration: [docs/integrations/EXCHANGE_INTEGRATION.md](docs/integrations/EXCHANGE_INTEGRATION.md)
 - Live protocol: [docs/LIVE_PROTOCOL.md](docs/LIVE_PROTOCOL.md)
 - Consensus overview: [docs/CONSENSUS.md](docs/CONSENSUS.md)
 - Confidential UTXO spec: [docs/spec/CONFIDENTIAL_UTXO_SPEC.md](docs/spec/CONFIDENTIAL_UTXO_SPEC.md)

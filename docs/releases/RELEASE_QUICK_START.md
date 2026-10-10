@@ -52,7 +52,7 @@ git push origin v0.7.1-pow
 2. **Tag version:** `v0.7.1-pow`
 3. **Target:** `pow` branch
 4. **Title:** "Finalis Core v0.7.1 - Validator Onboarding & Enhanced Security"
-5. **Description:** Paste content from `RELEASE_NOTES_POW.md`
+5. **Description:** Paste content from [RELEASE_NOTES_POW.md](RELEASE_NOTES_POW.md)
 6. **Upload files:** Select from `release-artifacts/`
    - `linux-x86_64/finalis-node`
    - `linux-x86_64/finalis-lightserver`

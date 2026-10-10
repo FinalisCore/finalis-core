@@ -73,7 +73,7 @@ def render(ops) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate partner API markdown reference from OpenAPI.")
     parser.add_argument("--spec", default="openapi/finalis-partner-v1.yaml")
-    parser.add_argument("--out", default="docs/PARTNER_API_REFERENCE.md")
+    parser.add_argument("--out", default="docs/integrations/PARTNER_API_REFERENCE.md")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 

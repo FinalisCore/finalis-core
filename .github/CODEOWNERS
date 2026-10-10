@@ -4,4 +4,4 @@
 # Replace @FinalisCore with a specific maintainer user or team if needed.
 
 openapi/ @FinalisCore
-docs/PARTNER_API_* @FinalisCore
+docs/integrations/PARTNER_API_* @FinalisCore

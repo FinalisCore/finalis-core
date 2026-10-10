@@ -7,8 +7,8 @@ the current finalized-only lightserver surface.
 
 Use it with:
 
-- [EXCHANGE_INTEGRATION.md](./EXCHANGE_INTEGRATION.md)
-- [EXCHANGE_API_EXAMPLES.md](./EXCHANGE_API_EXAMPLES.md)
+- [EXCHANGE_INTEGRATION.md](EXCHANGE_INTEGRATION.md)
+- [EXCHANGE_API_EXAMPLES.md](EXCHANGE_API_EXAMPLES.md)
 
 ## Operational rules
 

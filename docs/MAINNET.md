@@ -5,8 +5,8 @@ exchange and operator integrations.
 
 It should be used together with:
 
-- `docs/EXCHANGE_INTEGRATION.md`
-- `docs/EXCHANGE_CHECKLIST.md`
+- `docs/integrations/EXCHANGE_INTEGRATION.md`
+- `docs/integrations/EXCHANGE_CHECKLIST.md`
 - `docs/LIVE_PROTOCOL.md`
 
 ## 1. Network
@@ -173,7 +173,7 @@ For self-hosted exchange infrastructure:
 - cross-check multiple endpoints before production crediting
 - public lightserver rate limits, the loopback exemption (use `--rate-limit-loopback` behind a
   same-host reverse proxy), the admin socket and node fail-stop states are documented in
-  [LIGHTSERVER-OPERATIONS.md](LIGHTSERVER-OPERATIONS.md)
+  [LIGHTSERVER-OPERATIONS.md](operations/LIGHTSERVER-OPERATIONS.md)
 
 Example startup:
 

@@ -125,7 +125,7 @@ Before enabling user deposits and withdrawals, confirm:
 - partner metrics (`/metrics`) are scraped and alerting is active
 - partner API governance gate is active and green:
   - `.github/workflows/partner-api-governance.yml`
-  - `docs/PARTNER_API_CHANGELOG.md`
+  - `docs/integrations/PARTNER_API_CHANGELOG.md`
 
 ## 9. Never build settlement around
 

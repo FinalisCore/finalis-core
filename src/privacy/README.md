@@ -1,20 +1,12 @@
 # Privacy Component
 
-## Purpose
+This directory holds no code. Confidential transaction support lives in:
 
-`src/privacy/` contains confidential transaction support and privacy-preserving primitives integrated into the current protocol subset.
+- `src/crypto/confidential.*`: Pedersen commitments, range proofs and balance
+  proofs (the only wrapper around secp256k1-zkp)
+- `src/crypto/stealth_address.*`: stealth recipient derivation
+- `src/utxo/confidential_tx.*`: `TxV2` and `AnyTx` encoding
+- `src/consensus/confidential_supply.*`: supply accounting
+- `src/wallet/confidential_builder.*`: wallet-side transaction building
 
-## Responsibilities
-
-- Confidential transfer primitives.
-- Privacy-oriented transaction processing support.
-
-## Non-Goals
-
-- Public API rendering decisions.
-- Consensus orchestration ownership.
-
-## Dependency Notes
-
-- Depends on crypto/tx/state primitives.
-- Must preserve deterministic and verifiable behavior.
+Specification: [docs/spec/CONFIDENTIAL_UTXO_SPEC.md](../../docs/spec/CONFIDENTIAL_UTXO_SPEC.md).

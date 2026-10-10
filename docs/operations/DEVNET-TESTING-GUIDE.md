@@ -277,10 +277,10 @@ for different fault schedules; a failing seed reproduces the same schedule.
 
 Targeted checks already exist in:
 
-- [tests/test_committee_schedule.cpp](../tests/test_committee_schedule.cpp)
-- [tests/test_codec.cpp](../tests/test_codec.cpp)
-- [tests/test_integration.cpp](../tests/test_integration.cpp)
-- [tests/test_lightserver.cpp](../tests/test_lightserver.cpp)
+- [tests/test_committee_schedule.cpp](../../tests/test_committee_schedule.cpp)
+- [tests/test_codec.cpp](../../tests/test_codec.cpp)
+- [tests/test_integration.cpp](../../tests/test_integration.cpp)
+- [tests/test_lightserver.cpp](../../tests/test_lightserver.cpp)
 
 Examples include:
 

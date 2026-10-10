@@ -32,9 +32,9 @@ Applies to the exchange-facing contract in:
 ## Documentation Rules
 
 - Every OpenAPI contract change MUST update:
-  - `docs/PARTNER_API_CHANGELOG.md`
+  - `docs/integrations/PARTNER_API_CHANGELOG.md`
 - Breaking changes MUST also update:
-  - `docs/PARTNER_API_DEPRECATIONS.md`
+  - `docs/integrations/PARTNER_API_DEPRECATIONS.md`
 
 ## CI Enforcement
 
