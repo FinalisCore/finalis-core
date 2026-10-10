@@ -219,7 +219,8 @@ DerivedCheckpointFixtureExpected derive_checkpoint_fixture_expected(const consen
 
 void write_text_file(const std::filesystem::path& path, const std::string& text) {
   std::filesystem::create_directories(path.parent_path());
-  std::ofstream out(path, std::ios::trunc);
+  // Binary: LF on every platform, so Windows output can be compared byte for byte with the corpus.
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
   out << text;
 }
 
