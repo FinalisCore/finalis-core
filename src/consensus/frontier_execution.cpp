@@ -349,16 +349,16 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     // accepts such a tx still fails recomputation of its decisions and state root.
     std::uint64_t next_pool_value = confidential_pool_value;
     if (const auto* v2 = std::get_if<TxV2>(&*tx)) {
-      __int128 delta = 0;
+      wide::I128 delta;
       const bool resolved = txv2_confidential_pool_delta(*v2, work, &delta);
-      const __int128 next = static_cast<__int128>(confidential_pool_value) + delta;
-      if (!resolved || next < 0 || next > static_cast<__int128>(std::numeric_limits<std::uint64_t>::max())) {
+      const wide::I128 next = wide::add(wide::i128_from_u64(confidential_pool_value), delta);
+      if (!resolved || !wide::fits_u64(next)) {
         decision.accepted = false;
         decision.reject_reason = FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE;
         decisions.push_back(decision);
         continue;
       }
-      next_pool_value = static_cast<std::uint64_t>(next);
+      next_pool_value = wide::to_u64(next);
     }
     confidential_pool_value = next_pool_value;
 

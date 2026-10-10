@@ -401,6 +401,7 @@ add_executable(finalis-tests
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp
+  tests/test_wide_arith.cpp
   tests/test_committee_schedule.cpp
   tests/test_state_commitment.cpp
   tests/test_smt.cpp

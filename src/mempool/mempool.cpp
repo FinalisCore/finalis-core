@@ -97,9 +97,8 @@ bool meets_full_replacement_margin(const MempoolEntry& incoming, const MempoolEn
 constexpr const char* kMempoolFullNotGoodEnough = "mempool full: not good enough";
 
 // Same bounds execute_frontier_slice applies to the turnstile.
-bool pool_value_admits(std::uint64_t pool_value, __int128 delta) {
-  const __int128 next = static_cast<__int128>(pool_value) + delta;
-  return next >= 0 && next <= static_cast<__int128>(std::numeric_limits<std::uint64_t>::max());
+bool pool_value_admits(std::uint64_t pool_value, wide::I128 delta) {
+  return wide::fits_u64(wide::add(wide::i128_from_u64(pool_value), delta));
 }
 
 // Crypto-free fee estimate, used ONLY to decide whether accept_tx's expensive
@@ -229,9 +228,9 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
   }
 
   // Turnstile pre-check: arithmetic on public values only, against the current committed P.
-  std::optional<__int128> pool_delta;
+  std::optional<wide::I128> pool_delta;
   if (const auto* v2 = std::get_if<TxV2>(&tx)) {
-    __int128 delta = 0;
+    wide::I128 delta;
     if (!consensus::txv2_confidential_pool_delta(*v2, view, &delta) ||
         (confidential_pool_value_.has_value() && !pool_value_admits(*confidential_pool_value_, delta))) {
       if (err) *err = kMempoolConfidentialTurnstile;

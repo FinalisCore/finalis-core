@@ -16,18 +16,18 @@ void mark_unknown(ConfidentialSupplyLedger* ledger) { ledger->known = false; }
 
 }  // namespace
 
-bool txv2_confidential_pool_delta(const TxV2& tx, const UtxoSetV2& utxos, __int128* delta) {
-  __int128 d = 0;
+bool txv2_confidential_pool_delta(const TxV2& tx, const UtxoSetV2& utxos, wide::I128* delta) {
+  wide::I128 d;
   for (const auto& in : tx.inputs) {
     if (in.kind != TxInputKind::Transparent) continue;
     const auto it = utxos.find(OutPoint{in.prev_txid, in.prev_index});
     if (it == utxos.end() || it->second.kind != UtxoOutputKind::Transparent) return false;
-    d += std::get<UtxoTransparentData>(it->second.body).out.value;
+    d = wide::add_u64(d, std::get<UtxoTransparentData>(it->second.body).out.value);
   }
   for (const auto& out : tx.outputs) {
-    if (out.kind == TxOutputKind::Transparent) d -= std::get<TransparentTxOutV2>(out.body).value;
+    if (out.kind == TxOutputKind::Transparent) d = wide::sub_u64(d, std::get<TransparentTxOutV2>(out.body).value);
   }
-  d -= tx.fee;
+  d = wide::sub_u64(d, tx.fee);
   *delta = d;
   return true;
 }
@@ -44,12 +44,12 @@ void account_confidential_supply(const UtxoSetV2& pre_slice_utxos, const std::ve
       continue;
     }
     const auto& tx = std::get<TxV2>(any);
-    __int128 delta = 0;
+    wide::I128 delta;
     for (const auto& in : tx.inputs) {
       if (in.kind != TxInputKind::Transparent) continue;
       const OutPoint op{in.prev_txid, in.prev_index};
       if (auto it = slice_transparent_values.find(op); it != slice_transparent_values.end()) {
-        delta += it->second;
+        delta = wide::add_u64(delta, it->second);
         continue;
       }
       const auto it = pre_slice_utxos.find(op);
@@ -57,23 +57,22 @@ void account_confidential_supply(const UtxoSetV2& pre_slice_utxos, const std::ve
         mark_unknown(ledger);
         return;
       }
-      delta += std::get<UtxoTransparentData>(it->second.body).out.value;
+      delta = wide::add_u64(delta, std::get<UtxoTransparentData>(it->second.body).out.value);
     }
     for (std::uint32_t i = 0; i < tx.outputs.size(); ++i) {
       if (tx.outputs[i].kind != TxOutputKind::Transparent) continue;
       const auto value = std::get<TransparentTxOutV2>(tx.outputs[i].body).value;
-      delta -= value;
+      delta = wide::sub_u64(delta, value);
       slice_transparent_values[OutPoint{txid, i}] = value;
     }
-    delta -= tx.fee;
+    delta = wide::sub_u64(delta, tx.fee);
 
-    const __int128 next = static_cast<__int128>(ledger->pool_value) + delta;
-    if (next > std::numeric_limits<std::int64_t>::max() || next < std::numeric_limits<std::int64_t>::min() ||
-        !crypto::commitment_sum_add(&ledger->excess_sum, tx.balance_proof.excess_commitment)) {
+    const wide::I128 next = wide::add(wide::i128_from_i64(ledger->pool_value), delta);
+    if (!wide::fits_i64(next) || !crypto::commitment_sum_add(&ledger->excess_sum, tx.balance_proof.excess_commitment)) {
       mark_unknown(ledger);
       return;
     }
-    ledger->pool_value = static_cast<std::int64_t>(next);
+    ledger->pool_value = wide::to_i64(next);
     if (ledger->pool_value < 0 && ledger->first_negative_height == 0) ledger->first_negative_height = height;
     ++ledger->txv2_count;
   }
