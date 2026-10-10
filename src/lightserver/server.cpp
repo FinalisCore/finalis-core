@@ -101,6 +101,33 @@ std::optional<std::string> p2pkh_script_to_address(const Bytes& script_pubkey, c
   return std::nullopt;
 }
 
+// The transparent side of a finalized transaction as a Tx, for history and UTXO views that match
+// scripts: every input keeps its outpoint, every output keeps its index, and a confidential output
+// becomes an empty placeholder (value 0, empty script) that matches no address.
+Tx transparent_projection(const AnyTx& any) {
+  if (const auto* v1 = std::get_if<Tx>(&any)) return *v1;
+  const auto& v2 = std::get<TxV2>(any);
+  Tx out;
+  out.version = v2.version;
+  for (const auto& in : v2.inputs) out.inputs.push_back(TxIn{in.prev_txid, in.prev_index, {}, 0xFFFFFFFF});
+  for (const auto& o : v2.outputs) {
+    if (o.kind == TxOutputKind::Transparent) {
+      const auto& t = std::get<TransparentTxOutV2>(o.body);
+      out.outputs.push_back(TxOut{t.value, t.script_pubkey});
+    } else {
+      out.outputs.push_back(TxOut{0, {}});
+    }
+  }
+  return out;
+}
+
+// TxV2 carries its fee explicitly; inputs minus outputs of its projection would count hidden value.
+std::optional<std::uint64_t> explicit_txv2_fee(const Bytes& tx_bytes) {
+  const auto tx = parse_any_tx(tx_bytes);
+  if (!tx.has_value() || !std::holds_alternative<TxV2>(*tx)) return std::nullopt;
+  return std::get<TxV2>(*tx).fee;
+}
+
 std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage::DB& db, const Hash32& scripthash) {
   const auto indexed_entries = db.get_script_utxos(scripthash);
   const auto history = db.get_script_history(scripthash);
@@ -163,9 +190,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
-        parsed = std::get<Tx>(*tx);
-      }
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -395,9 +420,7 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
-        parsed = std::get<Tx>(*tx);
-      }
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -443,7 +466,11 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
         row.recipients.push_back(*addr);
       }
     }
-    if (fee_known && total_in >= row.total_out) row.fee = total_in - row.total_out;
+    if (auto v2_fee = explicit_txv2_fee(loc->tx_bytes); v2_fee.has_value()) {
+      row.fee = *v2_fee;
+    } else if (fee_known && total_in >= row.total_out) {
+      row.fee = total_in - row.total_out;
+    }
 
     if (!input_addresses.empty()) row.primary_sender = *input_addresses.begin();
     if (!output_addresses.empty()) row.primary_recipient = *output_addresses.begin();
@@ -547,9 +574,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
-        parsed = std::get<Tx>(*tx);
-      }
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
     }
     tx_cache.emplace(txid, parsed);
     return parsed;

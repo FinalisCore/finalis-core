@@ -275,7 +275,12 @@ struct TxInputResult {
   std::uint32_t vout{0};
   std::optional<std::string> address;
   std::optional<std::uint64_t> amount;
+  // Spends a confidential output: the amount is hidden, there is no address.
+  bool confidential{false};
 };
+
+// A TxV2 confidential output pays a one-time key with a hidden amount; `amount` is meaningless for it.
+bool is_confidential_output(const struct TxOutputResult& out);
 
 struct TxOutputResult {
   std::uint64_t amount{0};
@@ -288,6 +293,10 @@ struct TxOutputResult {
   std::optional<std::uint64_t> admission_pow_epoch;
   std::optional<std::uint64_t> admission_pow_nonce;
 };
+
+bool is_confidential_output(const TxOutputResult& out) {
+  return out.decoded_kind == std::optional<std::string>{"confidential"};
+}
 
 struct TxResult {
   std::string txid;
@@ -2209,6 +2218,7 @@ finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
     json_put(item, "vout", static_cast<std::uint64_t>(in.vout));
     json_put(item, "address", in.address);
     json_put(item, "amount", in.amount);
+    json_put(item, "confidential", in.confidential);
     inputs.array_value.push_back(std::move(item));
   }
   auto outputs = json_array_value();
@@ -2264,6 +2274,7 @@ std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& o
           static_cast<std::uint32_t>(*vout),
           object_string(&input, "address"),
           object_u64(&input, "amount"),
+          object_bool(&input, "confidential").value_or(false),
       });
     }
   }
@@ -3322,26 +3333,43 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   }
   auto tx_bytes = finalis::hex_decode(*tx_hex);
   auto tx = tx_bytes ? finalis::parse_any_tx(*tx_bytes) : std::nullopt;
-  if (!tx.has_value() || !std::holds_alternative<finalis::Tx>(*tx)) {
+  if (!tx.has_value()) {
     out.error = upstream_error("tx parse failed");
     return out;
   }
-  const auto& tx_v1 = std::get<finalis::Tx>(*tx);
-  std::map<std::string, finalis::Tx> prev_tx_cache;
-  auto fetch_prev_tx = [&](const Hash32& prev_txid) -> std::optional<std::reference_wrapper<const finalis::Tx>> {
+
+  // Transparent outputs of a transaction in either format; nullopt marks a confidential output.
+  using OutputsView = std::vector<std::optional<finalis::TxOut>>;
+  const auto outputs_view = [](const finalis::AnyTx& any) {
+    OutputsView view;
+    if (const auto* v1 = std::get_if<finalis::Tx>(&any)) {
+      for (const auto& o : v1->outputs) view.emplace_back(o);
+    } else {
+      for (const auto& o : std::get<finalis::TxV2>(any).outputs) {
+        if (o.kind == finalis::TxOutputKind::Transparent) {
+          const auto& t = std::get<finalis::TransparentTxOutV2>(o.body);
+          view.emplace_back(finalis::TxOut{t.value, t.script_pubkey});
+        } else {
+          view.emplace_back(std::nullopt);
+        }
+      }
+    }
+    return view;
+  };
+  std::map<std::string, OutputsView> prev_tx_cache;
+  auto fetch_prev_outputs = [&](const Hash32& prev_txid) -> const OutputsView* {
     const std::string prev_txid_hex = finalis::hex_encode32(prev_txid);
     auto it = prev_tx_cache.find(prev_txid_hex);
-    if (it != prev_tx_cache.end()) return std::cref(it->second);
+    if (it != prev_tx_cache.end()) return &it->second;
 
     auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + prev_txid_hex + "\"}");
-    if (!prev_call.result.has_value() || !prev_call.result->is_object()) return std::nullopt;
+    if (!prev_call.result.has_value() || !prev_call.result->is_object()) return nullptr;
     auto prev_hex = object_string(&*prev_call.result, "tx_hex");
-    if (!prev_hex) return std::nullopt;
+    if (!prev_hex) return nullptr;
     auto prev_bytes = finalis::hex_decode(*prev_hex);
     auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
-    if (!prev_tx.has_value() || !std::holds_alternative<finalis::Tx>(*prev_tx)) return std::nullopt;
-    auto inserted = prev_tx_cache.emplace(prev_txid_hex, std::get<finalis::Tx>(*prev_tx));
-    return std::cref(inserted.first->second);
+    if (!prev_tx.has_value()) return nullptr;
+    return &prev_tx_cache.emplace(prev_txid_hex, outputs_view(*prev_tx)).first->second;
   };
 
   std::string network_name = "mainnet";
@@ -3350,32 +3378,31 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
 
   std::uint64_t total_in = 0;
   bool fee_known = true;
-  for (const auto& in : tx_v1.inputs) {
-    TxInputResult input_view{finalis::hex_encode32(in.prev_txid), in.prev_index, std::nullopt, std::nullopt};
-    auto prev_tx_opt = fetch_prev_tx(in.prev_txid);
-    if (!prev_tx_opt.has_value()) {
+  const auto add_transparent_input = [&](const Hash32& prev_txid, std::uint32_t prev_index) {
+    TxInputResult input_view{finalis::hex_encode32(prev_txid), prev_index, std::nullopt, std::nullopt};
+    const auto* prev_outputs = fetch_prev_outputs(prev_txid);
+    if (!prev_outputs || prev_index >= prev_outputs->size() || !(*prev_outputs)[prev_index].has_value()) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
-      continue;
+      return;
     }
-    const auto& prev_tx_v1 = prev_tx_opt->get();
-    if (in.prev_index >= prev_tx_v1.outputs.size()) {
-      result.inputs.push_back(std::move(input_view));
-      fee_known = false;
-      continue;
-    }
-    total_in += prev_tx_v1.outputs[in.prev_index].value;
-    input_view.address = script_to_address(prev_tx_v1.outputs[in.prev_index].script_pubkey, hrp);
-    input_view.amount = prev_tx_v1.outputs[in.prev_index].value;
+    const auto& prev_out = *(*prev_outputs)[prev_index];
+    total_in += prev_out.value;
+    input_view.address = script_to_address(prev_out.script_pubkey, hrp);
+    input_view.amount = prev_out.value;
     result.inputs.push_back(std::move(input_view));
-  }
-
-  for (const auto& tx_out : tx_v1.outputs) {
-    result.total_out += tx_out.value;
+  };
+  const auto add_output = [&](const std::optional<finalis::TxOut>& tx_out) {
+    if (!tx_out.has_value()) {
+      result.outputs.push_back(TxOutputResult{0, std::nullopt, "", std::string("confidential"), std::nullopt, std::nullopt,
+                                              false, std::nullopt, std::nullopt});
+      return;
+    }
+    result.total_out += tx_out->value;
     result.outputs.push_back(TxOutputResult{
-        tx_out.value,
-        script_to_address(tx_out.script_pubkey, hrp),
-        finalis::hex_encode(tx_out.script_pubkey),
+        tx_out->value,
+        script_to_address(tx_out->script_pubkey, hrp),
+        finalis::hex_encode(tx_out->script_pubkey),
         std::nullopt,
         std::nullopt,
         std::nullopt,
@@ -3383,12 +3410,26 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
         std::nullopt,
         std::nullopt,
     });
+  };
+
+  if (const auto* tx_v1 = std::get_if<finalis::Tx>(&*tx)) {
+    for (const auto& in : tx_v1->inputs) add_transparent_input(in.prev_txid, in.prev_index);
+  } else {
+    for (const auto& in : std::get<finalis::TxV2>(*tx).inputs) {
+      if (in.kind == finalis::TxInputKind::Transparent) {
+        add_transparent_input(in.prev_txid, in.prev_index);
+      } else {
+        result.inputs.push_back(
+            TxInputResult{finalis::hex_encode32(in.prev_txid), in.prev_index, std::nullopt, std::nullopt, true});
+      }
+    }
   }
+  for (const auto& tx_out : outputs_view(*tx)) add_output(tx_out);
   if (const auto* decoded_outputs = tx_call.result->get("decoded_outputs"); decoded_outputs && decoded_outputs->is_array()) {
     const auto limit = std::min(decoded_outputs->array_value.size(), result.outputs.size());
     for (std::size_t i = 0; i < limit; ++i) {
       const auto& item = decoded_outputs->array_value[i];
-      if (!item.is_object()) continue;
+      if (!item.is_object() || is_confidential_output(result.outputs[i])) continue;
       result.outputs[i].decoded_kind = object_string(&item, "decoded_kind");
       result.outputs[i].validator_pubkey_hex = object_string(&item, "validator_pubkey_hex");
       result.outputs[i].payout_pubkey_hex = object_string(&item, "payout_pubkey_hex");
@@ -3398,7 +3439,11 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
       if (auto addr = object_string(&item, "address"); addr.has_value()) result.outputs[i].address = *addr;
     }
   }
-  if (fee_known && total_in >= result.total_out) result.fee = total_in - result.total_out;
+  if (const auto* tx_v2 = std::get_if<finalis::TxV2>(&*tx)) {
+    result.fee = tx_v2->fee;  // explicit in TxV2; confidential amounts make it uncomputable from the parts
+  } else if (fee_known && total_in >= result.total_out) {
+    result.fee = total_in - result.total_out;
+  }
   const auto flow = classify_tx_flow(result.inputs, result.outputs);
   result.flow_kind = flow.kind;
   result.flow_summary = flow.summary;
@@ -3900,12 +3945,15 @@ std::string render_tx_json(const TxResult& result) {
       << "\"timestamp\":" << json_u64_or_null(result.timestamp) << ",\"inputs\":[";
   for (std::size_t i = 0; i < result.inputs.size(); ++i) {
     if (i) oss << ",";
-    oss << "{\"prev_txid\":\"" << finalis::minijson::escape(result.inputs[i].prev_txid) << "\",\"vout\":" << result.inputs[i].vout << "}";
+    oss << "{\"prev_txid\":\"" << finalis::minijson::escape(result.inputs[i].prev_txid) << "\",\"vout\":" << result.inputs[i].vout
+        << ",\"confidential\":" << json_bool(result.inputs[i].confidential) << "}";
   }
   oss << "],\"outputs\":[";
   for (std::size_t i = 0; i < result.outputs.size(); ++i) {
     if (i) oss << ",";
-    oss << "{\"amount\":" << result.outputs[i].amount << ",\"address\":"
+    oss << "{\"amount\":"
+        << (is_confidential_output(result.outputs[i]) ? std::string("null") : std::to_string(result.outputs[i].amount))
+        << ",\"address\":"
         << json_string_or_null(result.outputs[i].address) << ",\"script_hex\":\""
         << finalis::minijson::escape(result.outputs[i].script_hex) << "\",\"decoded_kind\":"
         << json_string_or_null(result.outputs[i].decoded_kind)
@@ -4186,10 +4234,12 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
     const auto& in = tx.inputs[i];
     body << "<tr><td>" << i << "</td><td>" << link_tx(in.prev_txid) << "</td><td>" << in.vout
          << "</td><td>";
-    if (in.address.has_value()) body << "<a href=\"/address/" << html_escape(*in.address) << "\"><code>" << html_escape(*in.address) << "</code></a>";
+    if (in.confidential) body << "<span class=\"muted\">confidential output (no address)</span>";
+    else if (in.address.has_value()) body << "<a href=\"/address/" << html_escape(*in.address) << "\"><code>" << html_escape(*in.address) << "</code></a>";
     else body << "<span class=\"muted\">not decoded by explorer</span>";
     body << "</td><td>";
-    if (in.amount.has_value()) body << html_escape(format_amount(*in.amount));
+    if (in.confidential) body << "<span class=\"muted\">hidden</span>";
+    else if (in.amount.has_value()) body << html_escape(format_amount(*in.amount));
     else body << "<span class=\"muted\">n/a</span>";
     body << "</td></tr>";
   }
@@ -4199,6 +4249,11 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   body << "<div class=\"card\"><h2>Outputs</h2><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Amount</th><th>Decoded Destination</th><th>Output Form</th><th>Script</th></tr></thead><tbody>";
   for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
     const auto& out = tx.outputs[i];
+    if (is_confidential_output(out)) {
+      body << "<tr><td>" << i << "</td><td><span class=\"muted\">hidden</span></td>"
+           << "<td><span class=\"muted\">one-time key (no address)</span></td><td>Confidential output</td><td></td></tr>";
+      continue;
+    }
     body << "<tr><td>" << i << "</td><td>" << html_escape(format_amount(out.amount)) << "</td><td>";
     if (out.decoded_kind == std::optional<std::string>{"onboarding_registration"}) {
       body << "<div><strong>validator</strong> <code>" << html_escape(short_hex(out.validator_pubkey_hex.value_or(""))) << "</code></div>";

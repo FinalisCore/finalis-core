@@ -9,6 +9,20 @@ Entry format:
 - heading: `## YYYY-MM-DD - vX.Y.Z [NON-BREAKING|BREAKING]`
 - include changed endpoints/schemas and operational impact
 
+## 2026-10-10 - v1.3.0 [NON-BREAKING]
+
+- `GET /api/v1/tx/{txid}` now serves `TxV2` transactions (previously an
+  upstream "tx parse failed" error):
+  - `TxOutput.amount` is nullable: `null` only for a confidential output
+    (`decoded_kind: "confidential"`), whose amount is hidden. Transparent
+    outputs keep an integer amount. Clients could not receive such an output
+    before, since every `TxV2` request failed.
+  - `TxInput.confidential` (optional boolean): the input spends a
+    confidential output (hidden amount, no address).
+  - `fee` is the explicit `TxV2` fee.
+- Crediting is unchanged: credit only transparent outputs paying your script
+  in `credit_safe` transactions.
+
 ## 2026-04-24 - v1.2.1 [NON-BREAKING]
 
 - Added explicit idempotency replay metadata to `POST /api/v1/withdrawals`

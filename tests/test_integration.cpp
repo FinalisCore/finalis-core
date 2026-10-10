@@ -4963,7 +4963,23 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
   ASSERT_TRUE(got.find("\"fee\":" + std::to_string(kFee)) != std::string::npos);
   ASSERT_TRUE(got.find("\"amount\":" + std::to_string(transparent_out)) != std::string::npos);
   ASSERT_TRUE(got.find("\"decoded_kind\":\"confidential\"") != std::string::npos);
-  ASSERT_TRUE(got.find(std::to_string(kConfidential)) == std::string::npos);  // hidden amount never appears
+  // The hidden amount is never reported as an output amount (token match: a transparent amount may
+  // contain the same digits).
+  ASSERT_TRUE(got.find("\"amount\":" + std::to_string(kConfidential) + ",") == std::string::npos);
+  ASSERT_TRUE(got.find("\"amount\":null") != std::string::npos);
+
+  // Detailed history shows the transparent credit to the recipient; summaries report the explicit fee,
+  // not inputs minus transparent outputs (which would add the hidden shielded amount).
+  const auto detailed = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":306,"method":"get_history_page_detailed","params":{"scripthash_hex":")") +
+      hex_encode32(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh))) + R"(","limit":10}})");
+  ASSERT_TRUE(detailed.find("\"direction\":\"received\"") != std::string::npos);
+  ASSERT_TRUE(detailed.find("\"net_amount\":" + std::to_string(transparent_out)) != std::string::npos);
+  const auto summaries = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":307,"method":"get_tx_summaries","params":{"txids":[")") +
+      hex_encode32(tx->txid()) + R"("]}})");
+  ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kFee)) != std::string::npos);
+  ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kConfidential + kFee)) == std::string::npos);
 }
 
 TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {

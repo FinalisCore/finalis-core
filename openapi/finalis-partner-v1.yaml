@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Finalis Partner API
-  version: 1.2.1
+  version: 1.3.0
   summary: Exchange-facing finalized-state partner API.
 servers:
   - url: https://partner.finalis.example
@@ -275,12 +275,17 @@ components:
       properties:
         prev_txid: {type: string}
         vout: {type: integer}
+        confidential:
+          type: boolean
+          description: Spends a confidential output (hidden amount, no address).
 
     TxOutput:
       type: object
       required: [amount, script_hex, has_admission_pow]
       properties:
-        amount: {type: integer}
+        amount:
+          type: [integer, 'null']
+          description: Null only for a confidential output (decoded_kind "confidential"), whose amount is hidden.
         address: {type: [string, 'null']}
         script_hex: {type: string}
         decoded_kind: {type: [string, 'null']}
