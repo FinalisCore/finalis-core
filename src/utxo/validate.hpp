@@ -88,12 +88,6 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubK
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey);
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out);
 
-struct BlockValidationResult {
-  bool ok{false};
-  std::string error;
-  std::uint64_t total_fees{0};
-};
-
 struct ConfidentialPolicy {
   std::uint32_t max_inputs_per_tx{kTxV2MaxInputs};
   std::uint32_t max_outputs_per_tx{kTxV2MaxOutputs};
@@ -118,13 +112,6 @@ struct AnyTxValidationResult {
   std::string error;
   TxValidationCost cost;
 };
-
-using ExpectedCoinbaseOutputsBuilder = std::function<std::vector<TxOut>(std::uint64_t fees)>;
-
-BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
-                                         const SpecialValidationContext* ctx = nullptr,
-                                         const ExpectedCoinbaseOutputsBuilder* expected_coinbase_outputs = nullptr);
-void apply_block_to_utxo(const Block& block, UtxoSet& utxos);
 
 AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                      const SpecialValidationContext* ctx = nullptr);

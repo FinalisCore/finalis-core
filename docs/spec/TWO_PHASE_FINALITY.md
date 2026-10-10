@@ -194,11 +194,20 @@ Implementation notes beyond §3:
 - A body that arrives after its polka or precommit quorum (proposal or uncertified transition
   delivery) re-runs polka and finality checks for every round from its own to the current one.
 - Re-gossip: while a height is stalled (`2 × round_timeout_ms` without finality), every
-  `round_timeout_ms` a validator re-sends its own timeout votes, prevotes and lock-implied
-  precommit for the latest three rounds at that height (re-signed, byte-identical). Without it a
-  vote lost during a partition is never retransmitted, and a TC that misses one side's timeout
-  votes never forms: a healed no-quorum partition halted the height for good
-  (`scripts/chaos_devnet.py`, first run).
+  `round_timeout_ms` a validator re-sends its own timeout votes and prevotes for the latest three
+  rounds at that height, every precommit it cast at that height (newest 32 rounds), the
+  signatures of the polka it holds and of the precommit set closest to quorum. Without it a vote
+  lost during a partition is never retransmitted, and a TC that misses one side's timeout votes
+  never forms: a healed no-quorum partition halted the height for good
+  (`scripts/chaos_devnet.py`, first run). Precommits count per round only, so re-sending just the
+  latest one stranded a round-1 quorum cast by 6 of 7 validators while later rounds fell short
+  (12 rounds for one height in a Byzantine run).
+- Equivocators: a validator observed sending two conflicting votes (or proposals) in one round
+  keeps having its votes counted, one per round (the tracker keeps the first and records the
+  conflict as evidence; a slashing record is stored). Its votes are not relayed. Ignoring an
+  equivocator adds no safety (the rules are safe for `f` arbitrary voters) but leaves only honest
+  validators to form quorums: with `f` equivocators caught, every honest validator is needed for
+  every height.
 - After a restart or a reconnect reset clears the vote trackers, the node re-adds its own recorded
   prevotes and the precommit its lock implies (Ed25519 is deterministic, so these are the votes
   already sent).

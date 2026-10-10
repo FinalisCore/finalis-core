@@ -1503,9 +1503,10 @@ void Node::flush_pending_finalized_broadcasts() {
 }
 
 void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate) {
+  const auto lane_certificates = load_finalized_lane_certificates(proposal.transition);
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) {
-      spawn_local_bus_task([peer, proposal, certificate]() {
+      spawn_local_bus_task([peer, proposal, certificate, lane_certificates]() {
         // Same hoist-before-lock shape as the live TRANSITION path in handle_message:
         // this local-bus simulation is itself running on its own task per peer, so
         // precheck_finality_certificate here is both correct and exercises the same
@@ -1513,7 +1514,7 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
         const auto cert_check = peer->precheck_finality_certificate(certificate, proposal.transition);
         {
           std::lock_guard<std::mutex> lk(peer->mu_);
-          (void)peer->handle_frontier_block_locked(proposal, certificate, 0, true, cert_check);
+          (void)peer->handle_frontier_block_locked(proposal, certificate, lane_certificates, 0, true, cert_check);
         }
         peer->flush_pending_finalized_broadcasts();
       });
@@ -1522,6 +1523,7 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
     p2p::TransitionMsg msg;
     msg.frontier_proposal_bytes = proposal.serialize();
     msg.certificate = certificate;
+    msg.lane_certificates = lane_certificates;
     p2p_.broadcast(p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
   }
 }

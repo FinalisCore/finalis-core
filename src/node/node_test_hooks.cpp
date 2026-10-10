@@ -88,7 +88,33 @@ std::string Node::inject_network_propose_diagnostic_for_test(const p2p::ProposeM
 bool Node::inject_frontier_transition_for_test(const FrontierProposal& proposal, const FinalityCertificate& certificate) {
   const auto cert_check = precheck_finality_certificate(certificate, proposal.transition);
   std::lock_guard<std::mutex> lk(mu_);
-  return handle_frontier_block_locked(proposal, certificate, 0, false, cert_check);
+  return handle_frontier_block_locked(proposal, certificate, {}, 0, false, cert_check);
+}
+
+std::optional<p2p::TransitionMsg> Node::finalized_transition_msg_for_test(std::uint64_t height) const {
+  const auto transition_id = db_.get_height_hash(height);
+  if (!transition_id.has_value()) return std::nullopt;
+  const auto transition_bytes = db_.get_frontier_transition(*transition_id);
+  if (!transition_bytes.has_value()) return std::nullopt;
+  const auto transition = FrontierTransition::parse(*transition_bytes);
+  if (!transition.has_value()) return std::nullopt;
+  auto ordered_records = db_.load_ingress_slice(transition->prev_frontier, transition->next_frontier);
+  if (ordered_records.size() != transition->next_frontier - transition->prev_frontier) return std::nullopt;
+  auto certificate = db_.get_finality_certificate_by_height(height);
+  if (!certificate.has_value()) return std::nullopt;
+  p2p::TransitionMsg msg;
+  msg.frontier_proposal_bytes = FrontierProposal{*transition, ordered_records}.serialize();
+  msg.certificate = certificate;
+  msg.lane_certificates = load_finalized_lane_certificates(*transition);
+  return msg;
+}
+
+bool Node::inject_transition_msg_for_test(const p2p::TransitionMsg& msg) {
+  const auto proposal = FrontierProposal::parse(msg.frontier_proposal_bytes);
+  if (!proposal.has_value() || !msg.certificate.has_value()) return false;
+  const auto cert_check = precheck_finality_certificate(*msg.certificate, proposal->transition);
+  std::lock_guard<std::mutex> lk(mu_);
+  return handle_frontier_block_locked(*proposal, msg.certificate, msg.lane_certificates, 0, false, cert_check);
 }
 
 bool Node::inject_propose_msg_for_test(const p2p::ProposeMsg& msg) { return handle_propose(msg, false); }
@@ -158,7 +184,7 @@ bool Node::inject_frontier_block_for_test(const FrontierProposal& proposal, cons
   CertificateCheck cert_check;
   cert_check.ok = true;
   cert_check.canonical_sigs = verified_sigs;
-  if (handle_frontier_block_locked(proposal, cert, 0, false, cert_check)) return true;
+  if (handle_frontier_block_locked(proposal, cert, {}, 0, false, cert_check)) return true;
   last_test_hook_error_ = "handle-frontier-block-rejected";
   return false;
 }
@@ -290,6 +316,11 @@ std::optional<std::pair<Hash32, std::uint32_t>> Node::local_vote_lock_for_test(s
   auto it = local_vote_locks_.find(height);
   if (it == local_vote_locks_.end()) return std::nullopt;
   return it->second;
+}
+
+std::vector<Vote> Node::precommits_for_rebroadcast_for_test(std::uint64_t height) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return local_votes_for_rebroadcast_locked(height).precommits;
 }
 
 bool Node::local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const {

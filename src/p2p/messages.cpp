@@ -341,6 +341,8 @@ Bytes ser_transition(const TransitionMsg& m) {
   if (m.certificate.has_value()) {
     w.varbytes(m.certificate->serialize());
   }
+  w.varint(m.lane_certificates.size());
+  for (const auto& cert : m.lane_certificates) w.varbytes(cert.serialize());
   return w.take();
 }
 
@@ -360,6 +362,16 @@ std::optional<TransitionMsg> de_transition(const Bytes& b) {
           m.certificate = *cert;
         } else {
           m.certificate.reset();
+        }
+        auto cert_count = r.varint();
+        if (!cert_count) return false;
+        m.lane_certificates.reserve(std::min<std::uint64_t>(*cert_count, r.remaining()));
+        for (std::uint64_t i = 0; i < *cert_count; ++i) {
+          auto raw = r.varbytes();
+          if (!raw) return false;
+          auto cert = IngressCertificate::parse(*raw);
+          if (!cert.has_value()) return false;
+          m.lane_certificates.push_back(*cert);
         }
         return true;
       })) return std::nullopt;

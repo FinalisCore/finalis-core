@@ -102,6 +102,9 @@ class WalletStore {
     std::string view_key_material_hex;
     std::string spend_key_material_hex;
     bool active{true};
+    // Next receive-request index; request keys derive from the account secrets and this index
+    // (wallet/confidential_keys.hpp), so the account secrets alone recover every request.
+    std::uint32_t next_request_index{0};
 
     ~ConfidentialAccountRecord() { crypto::secure_wipe(view_key_material_hex); crypto::secure_wipe(spend_key_material_hex); }
   };

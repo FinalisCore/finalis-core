@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/network.hpp"
+#include "common/wide_arith.hpp"
 #include "consensus/policy_hashcash.hpp"
 #include "utxo/confidential_tx.hpp"
 #include "utxo/validate.hpp"
@@ -92,7 +93,7 @@ class Mempool {
     std::vector<OutPoint> spent;
     EvictionKey eviction_key;
     // TxV2 only: effect on P. Fixed at admission, since every input is a confirmed UTXO.
-    std::optional<__int128> confidential_pool_delta;
+    std::optional<wide::I128> confidential_pool_delta;
   };
 
   void erase_entry(std::map<Hash32, TxMeta>::iterator it);

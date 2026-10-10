@@ -67,6 +67,17 @@ std::set<PubKey32> VoteTracker::participants_for(std::uint64_t height, std::uint
   return out;
 }
 
+std::vector<VoteSet> VoteTracker::vote_sets_for_height(std::uint64_t height) const {
+  std::vector<VoteSet> out;
+  for (auto it = by_block_.lower_bound(Key{height, 0, Hash32{}}); it != by_block_.end() && it->first.height == height; ++it) {
+    VoteSet set{.round = it->first.round, .transition_id = it->first.transition_id, .signatures = {}};
+    set.signatures.reserve(it->second.size());
+    for (const auto& [pub, sig] : it->second) set.signatures.push_back(FinalitySig{pub, sig});
+    out.push_back(std::move(set));
+  }
+  return out;
+}
+
 void VoteTracker::clear_height(std::uint64_t height) {
   for (auto it = by_block_.begin(); it != by_block_.end();) {
     if (it->first.height == height) {

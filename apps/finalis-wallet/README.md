@@ -130,6 +130,7 @@ The wallet uses resource-backed branding assets from:
 - transparent receive and send flows
 - bounded confidential-capable send/receive flows:
   - transparent -> confidential
+  - confidential -> confidential (multi-coin, confidential change)
   - confidential -> transparent
 - finalized-state activity view
 - local connection settings with multi-endpoint lightserver failover under `Advanced`

@@ -34,6 +34,9 @@ Options:
   --spec <path>         Override the spec path (default: formal/checkpoint_availability.tla)
   --out-dir <path>      Directory for logs and TLC metadirs (default: formal/tlc_runs)
   --keep-metadir        Keep TLC metadirs instead of passing -cleanup
+  --expect-violation <invariant>
+                        Pass only if TLC reports this invariant violated (for reachability
+                        and mutation configs, where a violation is the expected result)
   -h, --help            Show this help
 
 Environment overrides:
@@ -53,6 +56,7 @@ list_configs() {
 SPEC_REL="${DEFAULT_SPEC}"
 OUT_DIR_REL="${TLC_OUT_DIR}"
 declare -a CONFIGS=()
+EXPECT_VIOLATION=""
 declare -a EXTRA_TLC_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -79,6 +83,11 @@ while [[ $# -gt 0 ]]; do
     --keep-metadir)
       TLC_KEEP_META=1
       shift
+      ;;
+    --expect-violation)
+      [[ $# -ge 2 ]] || { echo "error: --expect-violation requires an invariant name" >&2; exit 1; }
+      EXPECT_VIOLATION="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -154,12 +163,28 @@ for cfg_rel in "${CONFIGS[@]}"; do
   echo "    cfg : ${cfg_rel}"
   echo "    log : ${log_path}"
 
+  tlc_status=0
   java "${JVM_OPTS[@]}" -cp "${TLA_JAR}" tlc2.TLC \
     "${TLC_BASE_ARGS[@]}" \
     -metadir "${meta_dir}" \
     -config "${cfg_path}" \
     "${SPEC_PATH}" \
-    "${EXTRA_TLC_ARGS[@]}" | tee "${log_path}"
+    "${EXTRA_TLC_ARGS[@]}" | tee "${log_path}" || tlc_status=$?
+
+  if [[ -z "${EXPECT_VIOLATION}" ]]; then
+    if [[ ${tlc_status} -ne 0 ]]; then
+      echo "error: TLC failed for ${cfg_name} (exit ${tlc_status})" >&2
+      exit "${tlc_status}"
+    fi
+  else
+    # TLC exits 12 on a safety violation. Requiring the named invariant as well keeps a parse error
+    # or an unrelated violation from passing as the expected result.
+    if [[ ${tlc_status} -ne 12 ]] || ! grep -q "Invariant ${EXPECT_VIOLATION} is violated" "${log_path}"; then
+      echo "error: ${cfg_name}: expected invariant ${EXPECT_VIOLATION} to be violated (TLC exit ${tlc_status})" >&2
+      exit 1
+    fi
+    echo "    ok  : ${EXPECT_VIOLATION} violated as expected"
+  fi
 done
 
 echo "TLC suite completed successfully."

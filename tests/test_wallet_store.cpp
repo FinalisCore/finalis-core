@@ -128,6 +128,7 @@ TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {
         .view_key_material_hex = "aa11",
         .spend_key_material_hex = "bb22",
         .active = true,
+        .next_request_index = 42,
     }));
     ASSERT_TRUE(store.set_confidential_primary_account_id(std::string("acct-main")));
     ASSERT_TRUE(store.upsert_confidential_coin(WalletStore::ConfidentialCoinRecord{
@@ -154,6 +155,7 @@ TEST(test_wallet_store_persists_encrypted_confidential_accounts_and_coins) {
   ASSERT_EQ(state.confidential_accounts.size(), 1u);
   ASSERT_EQ(state.confidential_accounts[0].stealth_address, "sc_stealth1example");
   ASSERT_EQ(state.confidential_accounts[0].view_key_material_hex, "aa11");
+  ASSERT_EQ(state.confidential_accounts[0].next_request_index, 42u);
   ASSERT_EQ(state.confidential_coins.size(), 1u);
   ASSERT_EQ(state.confidential_coins[0].account_id, "acct-main");
   ASSERT_EQ(state.confidential_coins[0].amount, 123456789ull);

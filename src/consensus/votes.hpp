@@ -31,6 +31,13 @@ struct TimeoutVoteTallyResult {
   std::size_t votes_for_round{0};
 };
 
+// The precommit signatures for one (round, transition) at a height.
+struct VoteSet {
+  std::uint32_t round{0};
+  Hash32 transition_id{};
+  std::vector<FinalitySig> signatures;
+};
+
 class VoteTracker {
  public:
   struct Limits {
@@ -43,6 +50,8 @@ class VoteTracker {
   VoteTallyResult add_vote(const Vote& vote);
   std::vector<FinalitySig> signatures_for(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
   std::set<PubKey32> participants_for(std::uint64_t height, std::uint32_t round) const;
+  // Every (round, transition) with at least one vote at `height`, in (round, transition) order.
+  std::vector<VoteSet> vote_sets_for_height(std::uint64_t height) const;
   void clear_height(std::uint64_t height);
 
  private:

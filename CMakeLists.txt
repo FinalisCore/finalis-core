@@ -152,7 +152,6 @@ add_library(finalis_core
   src/crypto/secure_memory.cpp
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
-  src/crypto/stealth_address.cpp
   src/common/keystore.cpp
   src/onboarding/validator_onboarding.cpp
   src/genesis/genesis.cpp
@@ -162,6 +161,7 @@ add_library(finalis_core
   src/consensus/availability_retention.cpp
   src/wallet/utxo_selection.cpp
   src/wallet/confidential_builder.cpp
+  src/wallet/confidential_keys.cpp
   src/utxo/tx.cpp
   src/utxo/confidential_tx.cpp
   src/utxo/validate.cpp
@@ -299,6 +299,7 @@ if(Qt5Widgets_FOUND)
     apps/finalis-wallet/wallet_store.cpp
     apps/finalis-wallet/confidential_memo.cpp
     apps/finalis-wallet/confidential_receive.cpp
+    apps/finalis-wallet/confidential_send.cpp
     apps/finalis-wallet/widgets/activity_page.cpp
     apps/finalis-wallet/widgets/advanced_page.cpp
     apps/finalis-wallet/widgets/overview_page.cpp
@@ -348,6 +349,7 @@ if(Qt5Widgets_FOUND)
     apps/finalis-wallet/wallet_store.cpp
     apps/finalis-wallet/confidential_memo.cpp
     apps/finalis-wallet/confidential_receive.cpp
+    apps/finalis-wallet/confidential_send.cpp
     apps/finalis-wallet/widgets/activity_page.cpp
     apps/finalis-wallet/widgets/advanced_page.cpp
     apps/finalis-wallet/widgets/overview_page.cpp
@@ -392,6 +394,7 @@ add_executable(finalis-tests
   apps/finalis-wallet/wallet_store.cpp
   apps/finalis-wallet/confidential_memo.cpp
   apps/finalis-wallet/confidential_receive.cpp
+  apps/finalis-wallet/confidential_send.cpp
   tests/test_main.cpp
   tests/test_codec.cpp
   tests/test_chain_id.cpp
@@ -401,6 +404,7 @@ add_executable(finalis-tests
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp
+  tests/test_wide_arith.cpp
   tests/test_committee_schedule.cpp
   tests/test_state_commitment.cpp
   tests/test_smt.cpp
@@ -423,6 +427,9 @@ add_executable(finalis-tests
   tests/test_validator_onboarding.cpp
   tests/test_wallet_store.cpp
   tests/test_wallet_confidential_memo.cpp
+  tests/test_wallet_confidential_keys.cpp
+  tests/test_wallet_confidential_transfer.cpp
+  tests/test_wallet_confidential_send.cpp
   tests/test_wallet_confidential_receive.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp

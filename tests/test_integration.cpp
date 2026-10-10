@@ -32,6 +32,7 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
+#include "wallet/confidential_builder.hpp"
 #include "common/keystore.hpp"
 #include "common/merkle.hpp"
 #include "node/node.hpp"
@@ -106,6 +107,14 @@ bool wait_for_tip(const node::Node& n, std::uint64_t expected_height, std::chron
 
 bool wait_for_peer_count(const node::Node& n, std::size_t min_peers, std::chrono::milliseconds timeout) {
   return wait_for([&]() { return n.status().peers >= min_peers; }, timeout);
+}
+
+// A local precommit is queued and recorded by whichever thread flushes next; a p2p reader or the
+// event loop can take it first, so it may be recorded just after the triggering call returns.
+bool wait_for_local_precommit(const node::Node& n, std::uint64_t height, std::uint32_t round,
+                              const Hash32& transition_id) {
+  return wait_for([&]() { return n.local_vote_recorded_for_test(height, round, transition_id); },
+                  ci_timeout_seconds(5));
 }
 
 bool wait_for_same_tip(const std::vector<std::unique_ptr<node::Node>>& nodes, std::chrono::milliseconds timeout) {
@@ -2687,7 +2696,14 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   auto sc = crypto::ed25519_sign(vote_signing_message(vc.height, vc.round, vc.block_id), keys[0].private_key);
   ASSERT_TRUE(sc.has_value());
   vc.signature = *sc;
-  ASSERT_TRUE(!nodes[1]->inject_vote_for_test(vc));
+  // A known equivocator's first vote per round still counts; a conflicting second one does not.
+  ASSERT_TRUE(nodes[1]->inject_vote_for_test(vc));
+  Vote vd = vc;
+  vd.block_id.fill(0xDD);
+  auto sd = crypto::ed25519_sign(vote_signing_message(vd.height, vd.round, vd.block_id), keys[0].private_key);
+  ASSERT_TRUE(sd.has_value());
+  vd.signature = *sd;
+  ASSERT_TRUE(!nodes[1]->inject_vote_for_test(vd));
 }
 
 TEST(test_primary_timeout_falls_back_to_backup_proposer) {
@@ -4130,7 +4146,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   ASSERT_TRUE(!n0.inject_tx_for_test(*onboarding_tx, true));
 
   const auto before_height = n0.status().height;
-  ASSERT_TRUE(wait_for_tip(n0, before_height + 1, std::chrono::seconds(20)));
+  ASSERT_TRUE(wait_for_tip(n0, before_height + 1, ci_timeout_seconds(20)));
   {
     storage::DB verify_db;
     ASSERT_TRUE(verify_db.open_readonly(cluster.base + "/node0"));
@@ -4842,7 +4858,7 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
   for (const auto& entry : entries) balance += entry.value;
   ASSERT_TRUE(balance > 0);
 
-  const auto utxos = db.load_utxos();
+  const auto utxos = db.load_transparent_utxos();
   std::uint64_t direct_balance = 0;
   for (const auto& [_, entry] : utxos) {
     std::array<std::uint8_t, 20> got{};
@@ -4853,9 +4869,12 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
   ASSERT_TRUE(direct_balance > 0);
 }
 
-TEST(test_finalized_frontier_txs_are_indexed_for_explorer_queries) {
-  const std::string base = unique_test_base("/tmp/finalis_it_frontier_tx_indexing");
-  Tx tx = make_fixture_ingress_tx(1, 0xA7);
+// A finalized TxV2 (shield: transparent input -> transparent payment + confidential output) is indexed
+// like a Tx: tx index, address history for the spent and paid addresses, and get_tx decodes the
+// transparent output while reporting the confidential one without an amount or address.
+TEST(test_finalized_txv2_is_indexed_with_address_history) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  const std::string base = unique_test_base("/tmp/finalis_it_txv2_indexing");
 
   node::NodeConfig cfg;
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
@@ -4874,27 +4893,100 @@ TEST(test_finalized_frontier_txs_are_indexed_for_explorer_queries) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
-
   keystore::ValidatorKey key;
   std::string kerr;
   ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
                                                   deterministic_seed_for_node_id(0), &key, &kerr));
 
   std::unique_ptr<node::Node> node;
-  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {tx.serialize()}, &node));
-  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 1; }, std::chrono::seconds(10)));
-  node->stop();
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 33; }, ci_timeout_seconds(120)));
 
-  storage::DB db;
-  ASSERT_TRUE(db.open(cfg.db_path));
-  const auto loc = db.get_tx_index(tx.txid());
-  ASSERT_TRUE(loc.has_value());
-  ASSERT_EQ(loc->height, 1u);
-  const auto sh = crypto::sha256(tx.outputs[0].script_pubkey);
-  const auto history = db.get_script_history(sh);
-  ASSERT_TRUE(!history.empty());
-  ASSERT_EQ(history[0].txid, tx.txid());
-  ASSERT_EQ(history[0].height, 1u);
+  const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  auto spendable = node->find_utxos_by_pubkey_hash_for_test(own_pkh);
+  ASSERT_TRUE(!spendable.empty());
+  const auto prev = spendable.front();
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x45);
+  constexpr std::uint64_t kConfidential = 100'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+  ASSERT_TRUE(prev.second.value > kConfidential + kFee);
+  const std::uint64_t transparent_out = prev.second.value - kConfidential - kFee;
+
+  crypto::Blind32 blind{};
+  blind.bytes.fill(0x5B);
+  Hash32 one_time_scalar{};
+  one_time_scalar.fill(0x5C);
+  Hash32 ephemeral_scalar{};
+  ephemeral_scalar.fill(0x5D);
+  Hash32 proof_nonce{};
+  proof_nonce.fill(0x5E);
+  const auto one_time = crypto::secp256k1_pubkey_from_scalar(one_time_scalar);
+  const auto ephemeral = crypto::secp256k1_pubkey_from_scalar(ephemeral_scalar);
+  ASSERT_TRUE(one_time.has_value() && ephemeral.has_value());
+  std::string err;
+  const auto conf_out = wallet::build_confidential_output(
+      wallet::ConfidentialRecipient{.one_time_pubkey = *one_time, .ephemeral_pubkey = *ephemeral, .scan_tag = {}, .memo = {}},
+      crypto::ConfidentialOutputSecrets{.amount = kConfidential, .value_blind = blind}, proof_nonce, &err);
+  ASSERT_TRUE(conf_out.has_value());
+  const auto tx = wallet::build_txv2_transparent_to_confidential(
+      prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), prev.second.value,
+      TransparentTxOutV2{transparent_out, address::p2pkh_script_pubkey(recipient_pkh)}, *conf_out, blind, kConfidential,
+      kFee, &err);
+  if (!tx.has_value()) throw std::runtime_error("shield tx: " + err);
+  ASSERT_TRUE(node->inject_tx_for_test(AnyTx{*tx}, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB probe_db;
+    if (!probe_db.open_readonly(cfg.db_path)) return false;
+    return probe_db.get_tx_index(tx->txid()).has_value();
+  }, ci_timeout_seconds(45)));
+  node->stop();
+  node.reset();
+
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    const auto has_txid = [&](const Hash32& scripthash) {
+      for (const auto& entry : db.get_script_history(scripthash)) {
+        if (entry.txid == tx->txid()) return true;
+      }
+      return false;
+    };
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh))));  // paid
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(own_pkh))));        // spent
+  }
+
+  lightserver::Config lcfg;
+  lcfg.db_path = cfg.db_path;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto status = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":304,"method":"get_tx_status","params":{"txid":")") +
+                                             hex_encode32(tx->txid()) + R"("}})");
+  ASSERT_TRUE(status.find("\"credit_safe\":true") != std::string::npos);
+  const auto got = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":305,"method":"get_tx","params":{"txid":")") +
+                                          hex_encode32(tx->txid()) + R"("}})");
+  ASSERT_TRUE(got.find("\"tx_version\":2") != std::string::npos);
+  ASSERT_TRUE(got.find("\"fee\":" + std::to_string(kFee)) != std::string::npos);
+  ASSERT_TRUE(got.find("\"amount\":" + std::to_string(transparent_out)) != std::string::npos);
+  ASSERT_TRUE(got.find("\"decoded_kind\":\"confidential\"") != std::string::npos);
+  // The hidden amount is never reported as an output amount (token match: a transparent amount may
+  // contain the same digits).
+  ASSERT_TRUE(got.find("\"amount\":" + std::to_string(kConfidential) + ",") == std::string::npos);
+  ASSERT_TRUE(got.find("\"amount\":null") != std::string::npos);
+
+  // Detailed history shows the transparent credit to the recipient; summaries report the explicit fee,
+  // not inputs minus transparent outputs (which would add the hidden shielded amount).
+  const auto detailed = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":306,"method":"get_history_page_detailed","params":{"scripthash_hex":")") +
+      hex_encode32(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh))) + R"(","limit":10}})");
+  ASSERT_TRUE(detailed.find("\"direction\":\"received\"") != std::string::npos);
+  ASSERT_TRUE(detailed.find("\"net_amount\":" + std::to_string(transparent_out)) != std::string::npos);
+  const auto summaries = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":307,"method":"get_tx_summaries","params":{"txids":[")") +
+      hex_encode32(tx->txid()) + R"("]}})");
+  ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kFee)) != std::string::npos);
+  ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kConfidential + kFee)) == std::string::npos);
 }
 
 TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
@@ -5305,7 +5397,7 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
 
   storage::DB follower_db;
   ASSERT_TRUE(follower_db.open(cluster.configs[1].db_path));
-  const auto persisted_utxos = follower_db.load_utxos();
+  const auto persisted_utxos = follower_db.load_transparent_utxos();
   bool found_recipient = false;
   for (const auto& [op, entry] : persisted_utxos) {
     (void)op;
@@ -5326,6 +5418,72 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
                            hex_encode32(sh) + R"("}})";
   const auto resp = ls.handle_rpc_for_test(body);
   ASSERT_TRUE(resp.find("\"value\":10000000000") != std::string::npos);
+}
+
+TEST(test_synced_follower_restarts_from_lane_certificates_delivered_with_blocks) {
+  // A follower that syncs a transfer's block without its ingress gossip gets the lane certificates
+  // only with the TRANSITION, and startup replay rebuilds every block from them.
+  const std::string base = unique_test_base("/tmp/finalis_it_synced_follower_restart_lane_certs");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  auto& leader = *cluster.nodes[0];
+
+  ASSERT_TRUE(wait_for_tip(leader, 33, ci_timeout_seconds(240)));
+  constexpr std::uint64_t kAmount = 10'000'000'000ULL;
+  constexpr std::uint64_t kFee = 10'000ULL;
+  const auto keys = node::Node::deterministic_test_keypairs();
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(leader, keys, kAmount + kFee, 1);
+    return funded.has_value() && !funded->utxos.empty();
+  }, ci_timeout_seconds(120)));
+
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x56);
+  const auto sender_kp = keys[funded->key_index];
+  const auto own_pkh = crypto::h160(Bytes(sender_kp.public_key.begin(), sender_kp.public_key.end()));
+  const auto prev = funded->utxos.front();
+  std::vector<TxOut> outputs;
+  outputs.push_back(TxOut{kAmount, address::p2pkh_script_pubkey(recipient_pkh)});
+  outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
+  std::string build_err;
+  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
+                                               Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()),
+                                               outputs, &build_err);
+  ASSERT_TRUE(tx.has_value());
+  ASSERT_TRUE(leader.inject_tx_for_test(*tx, true));
+  ASSERT_TRUE(wait_for([&]() { return !leader.find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty(); },
+                       ci_timeout_seconds(120)));
+  const auto target = leader.status().height;
+
+  // Blocks arrive only as TRANSITION messages: no network, so no ingress gossip or range sync.
+  auto follower_cfg = cluster.configs[0];
+  follower_cfg.node_id = 1;
+  follower_cfg.disable_p2p = true;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.validator_key_file = follower_cfg.db_path + "/keystore/validator.json";
+  keystore::ValidatorKey follower_key;
+  std::string key_err;
+  ASSERT_TRUE(keystore::create_validator_keystore(follower_cfg.validator_key_file, follower_cfg.validator_passphrase,
+                                                  "mainnet", "sc", deterministic_seed_for_node_id(1), &follower_key,
+                                                  &key_err));
+  auto follower = std::make_unique<node::Node>(follower_cfg);
+  ASSERT_TRUE(follower->init());
+  follower->start();
+  for (std::uint64_t h = 1; h <= target; ++h) {
+    const auto msg = leader.finalized_transition_msg_for_test(h);
+    ASSERT_TRUE(msg.has_value());
+    ASSERT_TRUE(follower->inject_transition_msg_for_test(*msg));
+  }
+  ASSERT_EQ(follower->status().height, target);
+  ASSERT_TRUE(!follower->find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty());
+  follower->stop();
+  follower.reset();
+
+  auto restarted = std::make_unique<node::Node>(follower_cfg);
+  ASSERT_TRUE(restarted->init());
+  ASSERT_EQ(restarted->status().height, target);
+  ASSERT_TRUE(!restarted->find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty());
+  restarted->stop();
 }
 
 TEST(test_restart_repairs_partial_settlement_state) {
@@ -7441,7 +7599,7 @@ TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
             std::string("accepted"));
   ASSERT_TRUE(cluster.nodes[ti]->local_prevote_recorded_for_test(target_height, round0, a0_id));
   inject_test_prevotes(*cluster.nodes[ti], keys, committee0, target_height, round0, a0_id, quorum0 - 1);
-  ASSERT_TRUE(cluster.nodes[ti]->local_vote_recorded_for_test(target_height, round0, a0_id));
+  ASSERT_TRUE(wait_for_local_precommit(*cluster.nodes[ti], target_height, round0, a0_id));
   ASSERT_TRUE(cluster.nodes[ti]->status().height + 1 == target_height);  // one precommit: no finality
   const auto lock_before = cluster.nodes[ti]->local_vote_lock_for_test(target_height);
   ASSERT_TRUE(lock_before.has_value());
@@ -7743,7 +7901,7 @@ TEST(test_valid_value_reproposal_finalizes_same_transition_in_later_round) {
   ASSERT_TRUE(lock.has_value());
   ASSERT_TRUE(lock->first == a_id);
   ASSERT_EQ(lock->second, 1u);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 1, a_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, a_id));
 
   // Round-1 precommits finalize A (transition round 0, certificate round 1).
   std::size_t injected = 0;
@@ -7842,7 +8000,7 @@ TEST(test_polka_before_body_locks_and_precommits_when_body_arrives) {
   const auto lock = target.local_vote_lock_for_test(f->height);
   ASSERT_TRUE(lock.has_value());
   ASSERT_TRUE(lock->first == a_id);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 0, a_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 0, a_id));
 }
 
 // Spec §6.2: prevotes split at round 0 (no polka, no lock); a fresh round-1 proposal finalizes.
@@ -7876,7 +8034,7 @@ TEST(test_split_prevotes_then_fresh_proposal_finalizes) {
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, b1_id));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 1, b1_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, b1_id));
   inject_test_precommits(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
   ASSERT_TRUE(wait_for([&]() { return target.status().height == f->height; }, std::chrono::seconds(5)));
   ASSERT_EQ(target.status().transition_hash, b1_id);
@@ -7943,7 +8101,7 @@ TEST(test_restart_between_prevote_and_precommit) {
             std::string("accepted"));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
   ASSERT_TRUE(target.local_vote_lock_for_test(f->height)->first == a_id);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 0, a_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 0, a_id));
 }
 
 // TLC counterexample (formal/two_phase_finality.tla, before the vote-round floor): a node prevotes A
@@ -7977,7 +8135,7 @@ TEST(test_no_vote_below_highest_voted_round_after_round_reset) {
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 0, b0_id));
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
-  ASSERT_TRUE(target.local_vote_recorded_for_test(f->height, 1, b1_id));
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, b1_id));
 }
 
 TEST(test_restart_committee_deterministic_despite_epoch_ticket_order) {
@@ -10946,4 +11104,151 @@ TEST(test_frontier_mode_rejects_oversized_or_unexpected_ingress_ranges_from_peer
   storage::DB db;
   ASSERT_TRUE(db.open(cfg.db_path));
   ASSERT_TRUE(!db.get_lane_state(rec.certificate.lane).has_value());
+}
+
+// Finalized slices can contain transactions that frontier execution rejects (here: no inputs, so the
+// output is created from nothing). Such a transaction moved no funds and must not be reported as a
+// finalized, credit-safe transfer, or an exchange polling get_tx_status would credit it.
+TEST(test_rejected_frontier_tx_is_not_reported_credit_safe) {
+  const std::string base = unique_test_base("/tmp/finalis_it_rejected_tx_not_credit_safe");
+  Tx tx = make_fixture_ingress_tx(1, 0xB7);
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.disable_p2p = true;
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {tx.serialize()}, &node));
+  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 1; }, std::chrono::seconds(10)));
+  node->stop();
+  node.reset();
+
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    // Rejected by execution: its output never entered the UTXO set, and nothing is indexed.
+    ASSERT_TRUE(!db.get_utxo_v2(OutPoint{tx.txid(), 0}).has_value());
+    ASSERT_TRUE(!db.get_tx_index(tx.txid()).has_value());
+    ASSERT_TRUE(db.get_script_history(crypto::sha256(tx.outputs[0].script_pubkey)).empty());
+    ASSERT_TRUE(db.get_rejected_tx_height(tx.txid()).has_value());
+  }
+
+  lightserver::Config lcfg;
+  lcfg.db_path = cfg.db_path;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":303,"method":"get_tx_status","params":{"txid":")") +
+                           hex_encode32(tx.txid()) + R"("}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  if (resp.find("\"credit_safe\":true") != std::string::npos) {
+    throw std::runtime_error("rejected tx reported credit-safe: " + resp);
+  }
+  ASSERT_TRUE(resp.find("\"status\":\"rejected\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"finalized\":false") != std::string::npos);
+}
+
+// Precommits form a quorum per round only. In a Byzantine chaos run a round-1 quorum was cast but
+// never assembled after a partition, because each node re-gossiped only its latest (lock) precommit,
+// and the height took 12 rounds. Re-gossip must cover every own precommit at the height and the
+// signatures of the set closest to quorum.
+TEST(test_stalled_height_regossips_old_round_precommits) {
+  auto f = make_two_phase_fixture("/tmp/finalis_it_regossip_old_precommits", 0x94);
+  auto& target = f->target();
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto me = target.local_validator_pubkey_for_test();
+
+  // Round 0: polka, lock and precommit; one other validator's round-0 precommit arrives (2 < quorum).
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+            std::string("accepted"));
+  inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 0, a_id));
+  PubKey32 other{};
+  for (const auto& pub : f->committee) {
+    if (pub != me) {
+      other = pub;
+      break;
+    }
+  }
+  ASSERT_TRUE(target.inject_vote_for_test(make_test_vote(f->keys, f->height, 0, a_id, other)));
+
+  // Round 1: the same value is re-proposed with its round-0 polka; the lock moves to round 1.
+  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
+  const auto leader1 = target.proposer_for_height_round_for_test(f->height, 1);
+  ASSERT_TRUE(leader1.has_value());
+  const auto polka0 = make_test_polka(f->keys, f->committee, f->height, 0, a_id, f->quorum);
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0, polka0, tc0, 1, *leader1)),
+            std::string("accepted"));
+  inject_test_prevotes(target, f->keys, f->committee, f->height, 1, a_id, f->quorum - 1);
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, a_id));
+  ASSERT_EQ(target.local_vote_lock_for_test(f->height)->second, 1u);
+
+  const auto precommits = target.precommits_for_rebroadcast_for_test(f->height);
+  const auto has = [&](std::uint32_t round, const PubKey32& signer) {
+    return std::any_of(precommits.begin(), precommits.end(), [&](const Vote& v) {
+      return v.round == round && v.validator_pubkey == signer && v.frontier_transition_id == a_id;
+    });
+  };
+  ASSERT_TRUE(has(1, me));     // the lock's round, as before
+  ASSERT_TRUE(has(0, me));     // the older own precommit: previously dropped
+  ASSERT_TRUE(has(0, other));  // round 0 is closest to quorum: its other signatures travel too
+}
+
+// A validator caught equivocating still has its votes counted, one per round. Ignoring them left
+// only the honest validators to form quorums: in a Byzantine chaos run with both faulty validators
+// caught, every honest validator was needed for every height and one slow node stalled a height for
+// 10 rounds. Safety does not depend on ignoring them (the rules are safe for f arbitrary voters).
+TEST(test_known_equivocator_votes_still_count_toward_polka) {
+  auto f = make_two_phase_fixture("/tmp/finalis_it_equivocator_votes_count", 0x95);
+  auto& target = f->target();
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto b0_id = frontier_proposal_id(*f->b0);
+  const auto b1_id = frontier_proposal_id(*f->b1);
+  std::vector<PubKey32> others;
+  for (const auto& pub : f->committee) {
+    if (pub != target.local_validator_pubkey_for_test()) others.push_back(pub);
+  }
+  ASSERT_TRUE(others.size() >= 2);
+  const PubKey32 equivocator = others[0];
+  const PubKey32 honest = others[1];
+
+  // Round 0: the equivocator prevotes two different values; the second is evidence, not a vote.
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, a_id, equivocator)),
+            std::string("accepted"));
+  (void)target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, b0_id, equivocator));
+
+  // Round 1: own prevote + the honest one + the equivocator's = quorum 3 -> polka.
+  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, std::nullopt, tc0)),
+            std::string("accepted"));
+  ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, b1_id));
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 1, b1_id, honest)),
+            std::string("accepted"));
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 1, b1_id, equivocator)),
+            std::string("accepted"));
+  const auto polka = target.valid_polka_for_height_for_test(f->height);
+  ASSERT_TRUE(polka.has_value());
+  ASSERT_EQ(polka->round, 1u);
+  ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, b1_id));
 }

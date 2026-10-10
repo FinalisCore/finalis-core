@@ -1,0 +1,2 @@
+# Checkpoint fixtures are compared byte for byte across platforms (windows-release.yml).
+tests/fixtures/** text eol=lf

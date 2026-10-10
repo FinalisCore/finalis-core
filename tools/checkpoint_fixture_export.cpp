@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -218,7 +219,8 @@ DerivedCheckpointFixtureExpected derive_checkpoint_fixture_expected(const consen
 
 void write_text_file(const std::filesystem::path& path, const std::string& text) {
   std::filesystem::create_directories(path.parent_path());
-  std::ofstream out(path, std::ios::trunc);
+  // Binary: LF on every platform, so Windows output can be compared byte for byte with the corpus.
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
   out << text;
 }
 
@@ -299,6 +301,12 @@ std::vector<PubKey32> proposer_schedule_for_checkpoint(const consensus::Canonica
   return schedule;
 }
 
+// Bonds on either side of the derived effective minimum bond (1788.8-2828.4 coins for these cases).
+// checkpoint_fixture_json() rejects a case where they stop straddling it, so a bond-schedule
+// change cannot silently turn "meets the minimum" fixtures into "below the minimum" ones.
+constexpr std::uint64_t kFixtureMinBond = 3000ULL * consensus::BASE_UNITS_PER_COIN;
+constexpr std::uint64_t kFixtureLowBond = 1500ULL * consensus::BASE_UNITS_PER_COIN;
+
 std::string checkpoint_fixture_json(const CheckpointFixtureCase& fixture) {
   const std::uint64_t epoch_start_height = 33;
   const auto cfg = make_cfg(fixture.committee_size, fixture.min_eligible);
@@ -306,6 +314,10 @@ std::string checkpoint_fixture_json(const CheckpointFixtureCase& fixture) {
   const auto effective_min_bond = std::max<std::uint64_t>(
       cfg.validator_bond_min_amount, consensus::validator_min_bond_units(cfg.network, epoch_start_height,
                                                                          state.validators.active_sorted(epoch_start_height).size()));
+  if (kFixtureMinBond < effective_min_bond || kFixtureLowBond >= effective_min_bond) {
+    throw std::runtime_error(fixture.name + ": fixture bonds no longer straddle effective_min_bond=" +
+                             std::to_string(effective_min_bond));
+  }
   const auto derived = derive_checkpoint_fixture_expected(cfg, fixture, state, epoch_start_height);
   const auto epoch_seed = consensus::committee_epoch_seed(state.committee_epoch_randomness_cache.at(epoch_start_height),
                                                           epoch_start_height);
@@ -424,8 +436,8 @@ std::string comparator_fixture_json(const ComparatorFixtureCase& fixture) {
 }
 
 std::vector<CheckpointFixtureCase> checkpoint_cases() {
-  const auto min_bond = 250ULL * consensus::BASE_UNITS_PER_COIN;
-  const auto low_bond = 150ULL * consensus::BASE_UNITS_PER_COIN;
+  const auto min_bond = kFixtureMinBond;
+  const auto low_bond = kFixtureLowBond;
   return {
       CheckpointFixtureCase{
           .name = "normal_large_candidates",
@@ -472,18 +484,24 @@ std::vector<CheckpointFixtureCase> checkpoint_cases() {
       CheckpointFixtureCase{
           .name = "sticky_fallback_equal_min",
           .committee_size = 3,
-          .min_eligible = 2,
+          // min 4: the recovery threshold is min + 1 (spec §8), so exactly min eligible stays
+          // HYSTERESIS_RECOVERY_PENDING. With min <= 3 the threshold is min and nothing is sticky.
+          .min_eligible = 4,
           .validators =
               {
                   FixtureValidatorSpec{"v1", pub_fill(0x31), pub_fill(0xC1), min_bond, true, 0, consensus::ValidatorStatus::ACTIVE},
                   FixtureValidatorSpec{"v2", pub_fill(0x32), pub_fill(0xC2), min_bond, true, 0, consensus::ValidatorStatus::ACTIVE},
                   FixtureValidatorSpec{"v3", pub_fill(0x33), pub_fill(0xC3), min_bond, true, 0, consensus::ValidatorStatus::ACTIVE},
+                  FixtureValidatorSpec{"v4", pub_fill(0x34), pub_fill(0xC4), min_bond, true, 0, consensus::ValidatorStatus::ACTIVE},
+                  FixtureValidatorSpec{"v5", pub_fill(0x35), pub_fill(0xC5), min_bond, true, 0, consensus::ValidatorStatus::ACTIVE},
               },
           .availability =
               {
                   FixtureAvailabilitySpec{"o1", pub_fill(0xC1), availability::AvailabilityOperatorStatus::ACTIVE, min_bond, 0, 1},
                   FixtureAvailabilitySpec{"o2", pub_fill(0xC2), availability::AvailabilityOperatorStatus::ACTIVE, min_bond, 0, 1},
-                  FixtureAvailabilitySpec{"o3", pub_fill(0xC3), availability::AvailabilityOperatorStatus::WARMUP, min_bond, 0, 1},
+                  FixtureAvailabilitySpec{"o3", pub_fill(0xC3), availability::AvailabilityOperatorStatus::ACTIVE, min_bond, 0, 1},
+                  FixtureAvailabilitySpec{"o4", pub_fill(0xC4), availability::AvailabilityOperatorStatus::ACTIVE, min_bond, 0, 1},
+                  FixtureAvailabilitySpec{"o5", pub_fill(0xC5), availability::AvailabilityOperatorStatus::WARMUP, min_bond, 0, 1},
               },
           .previous_mode = storage::FinalizedCommitteeDerivationMode::FALLBACK,
           .previous_reason = storage::FinalizedCommitteeFallbackReason::INSUFFICIENT_ELIGIBLE_OPERATORS,
@@ -764,11 +782,16 @@ int main(int argc, char** argv) {
   std::filesystem::create_directories(checkpoint_dir);
   std::filesystem::create_directories(comparator_dir);
 
-  for (const auto& fixture : checkpoint_cases()) {
-    write_text_file(checkpoint_dir / (fixture.name + ".json"), checkpoint_fixture_json(fixture));
-  }
-  for (const auto& fixture : comparator_cases()) {
-    write_text_file(comparator_dir / (fixture.name + ".json"), comparator_fixture_json(fixture));
+  try {
+    for (const auto& fixture : checkpoint_cases()) {
+      write_text_file(checkpoint_dir / (fixture.name + ".json"), checkpoint_fixture_json(fixture));
+    }
+    for (const auto& fixture : comparator_cases()) {
+      write_text_file(comparator_dir / (fixture.name + ".json"), comparator_fixture_json(fixture));
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "checkpoint-fixture-export: " << e.what() << "\n";
+    return 1;
   }
   return 0;
 }

@@ -282,6 +282,9 @@ class DB {
     // Unchecked: thin wrappers reusing the same key/serialization helpers the
     // single-op methods use, so encoding can't drift between the two paths.
     void put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes);
+    // A transaction carried by the finalized slice at `height` but rejected by frontier execution.
+    // It has no tx index entry: it moved no funds.
+    void put_rejected_tx(const Hash32& txid, std::uint64_t height);
     void add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
     void stage_finalized_ingress_tip(std::uint64_t seq);
     void set_tip(const TipState& tip);
@@ -348,7 +351,9 @@ class DB {
   bool erase_utxo(const OutPoint& op);
   std::optional<TxOut> get_utxo(const OutPoint& op) const;
   std::optional<UtxoEntryV2> get_utxo_v2(const OutPoint& op) const;
-  std::map<OutPoint, UtxoEntry> load_utxos() const;
+  // Transparent outputs only; confidential outputs are skipped. Use load_utxos_v2() for anything that
+  // validates or spends, or a TxV2 spending a confidential coin looks like a missing input.
+  std::map<OutPoint, UtxoEntry> load_transparent_utxos() const;
   std::map<OutPoint, UtxoEntryV2> load_utxos_v2() const;
 
   bool put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
@@ -403,6 +408,8 @@ class DB {
   };
   bool put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes);
   std::optional<TxLocation> get_tx_index(const Hash32& txid) const;
+  // Height of the finalized slice that carried and rejected `txid`, if any.
+  std::optional<std::uint64_t> get_rejected_tx_height(const Hash32& txid) const;
 
   bool put_ingress_record(std::uint64_t seq, const Bytes& record_bytes);
   std::optional<Bytes> get_ingress_record(std::uint64_t seq) const;

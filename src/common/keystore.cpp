@@ -66,9 +66,9 @@ bool write_private_file_atomic(const std::string& path, const std::string& body,
       return false;
     }
   }
-  std::error_code ec;
+  std::error_code perm_ec;
   std::filesystem::permissions(tmp, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                               std::filesystem::perm_options::replace, ec);
+                               std::filesystem::perm_options::replace, perm_ec);
 #else
   (void)::unlink(tmp.c_str());
   const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);

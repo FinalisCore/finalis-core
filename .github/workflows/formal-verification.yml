@@ -9,6 +9,7 @@ on:
       - "scripts/run_tlc.sh"
       - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
       - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
+      - "docs/spec/TWO_PHASE_FINALITY.md"
       - "docs/LIVE_PROTOCOL.md"
       - "README.md"
       - ".github/workflows/formal-verification.yml"
@@ -20,6 +21,7 @@ on:
       - "scripts/run_tlc.sh"
       - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
       - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
+      - "docs/spec/TWO_PHASE_FINALITY.md"
       - "docs/LIVE_PROTOCOL.md"
       - "README.md"
       - ".github/workflows/formal-verification.yml"
@@ -45,6 +47,22 @@ jobs:
         run: |
           chmod +x scripts/run_tlc.sh
           ./scripts/run_tlc.sh
+
+      # Two-phase finality voting rules (formal/README.md). The abstract model is checked
+      # exhaustively: Agreement must hold, and the reachability and mutation configs must be
+      # violated, showing finality is reachable and that the lock and vote-floor rules are needed.
+      - name: Run TLC two-phase finality suite
+        run: |
+          spec=formal/two_phase_finality_abstract.tla
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/two_phase_finality_abstract.cfg
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/two_phase_finality_abstract_reach.cfg \
+            --expect-violation NothingFinalizes
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/two_phase_finality_abstract_reach_cross.cfg \
+            --expect-violation NoCrossRoundFinality
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/two_phase_finality_abstract_lock_mutation.cfg \
+            --expect-violation Agreement
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/two_phase_finality_abstract_floor_mutation.cfg \
+            --expect-violation Agreement
 
       - name: Upload TLC artifacts
         if: always()
