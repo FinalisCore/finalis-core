@@ -2406,6 +2406,26 @@ bool DB::put_ingress_certificate(std::uint32_t lane, std::uint64_t seq, const By
   return put(key, cert_bytes);
 }
 
+bool DB::truncate_ingress_lane(std::uint32_t lane, std::uint64_t keep_through_seq, const LaneState& restored,
+                               std::vector<Hash32>* dropped_txids) {
+  const auto state = get_lane_state(lane);
+  const std::uint64_t tip = state.has_value() ? state->max_seq : 0;
+  for (std::uint64_t seq = keep_through_seq + 1; seq <= tip; ++seq) {
+    const auto key = key_ingress_certificate(lane, seq);
+    if (auto bytes = get(key); bytes.has_value()) {
+      if (auto cert = IngressCertificate::parse(*bytes); cert.has_value()) {
+        // Never erase the payload of a finalized transaction.
+        if (!get_tx_index(cert->txid).has_value() && !erase(key_ingress_bytes(cert->txid))) return false;
+        if (dropped_txids) dropped_txids->push_back(cert->txid);
+      }
+      if (!erase(key)) return false;
+    }
+  }
+  // A deliberate rewind: put_lane_state refuses one, so the state is written directly.
+  if (restored.lane != lane || restored.max_seq > tip) return false;
+  return put(key_lane_state(lane), restored.serialize());
+}
+
 std::optional<Bytes> DB::get_ingress_certificate(std::uint32_t lane, std::uint64_t seq) const {
   return get(key_ingress_certificate(lane, seq));
 }

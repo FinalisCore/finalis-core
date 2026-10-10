@@ -449,6 +449,16 @@ std::size_t Mempool::total_bytes() const { return total_bytes_; }
 
 bool Mempool::contains(const Hash32& txid) const { return by_txid_.find(txid) != by_txid_.end(); }
 
+std::vector<MempoolEntry> Mempool::entries(std::size_t max) const {
+  std::vector<MempoolEntry> out;
+  out.reserve(std::min(max, by_txid_.size()));
+  for (const auto& [_, meta] : by_txid_) {
+    if (out.size() >= max) break;
+    out.push_back(meta.entry);
+  }
+  return out;
+}
+
 MempoolPolicyStats Mempool::policy_stats() const {
   MempoolPolicyStats out;
   out.rejected_full_not_good_enough = rejected_full_not_good_enough_;

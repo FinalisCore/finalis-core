@@ -46,6 +46,8 @@ struct CanonicalDerivationConfig {
 struct CanonicalGenesisState {
   Hash32 genesis_artifact_id{};
   std::vector<PubKey32> initial_validators;
+  // Parent timestamp of height 1 (unix seconds).
+  std::uint64_t genesis_time_unix{0};
 };
 
 struct CanonicalFrontierRecord {
@@ -96,6 +98,9 @@ struct CanonicalDerivedState {
   FrontierVector finalized_frontier_vector{};
   FrontierLaneRoots finalized_lane_roots{};
   FinalizedIdentity finalized_identity{};
+  // Timestamp (unix seconds) of the finalized tip transition; genesis time at height 0. Each
+  // transition's timestamp must exceed it (frontier-timestamp-not-increasing).
+  std::uint64_t finalized_timestamp{0};
   Hash32 last_finality_certificate_hash{};
   UtxoSetV2 utxos;
   ValidatorRegistry validators;
@@ -144,19 +149,21 @@ struct ParentFinalityContext {
   std::size_t quorum{0};
 };
 
-// Resolves the parent (prev.finalized_height) context. The committee is the
-// canonical committee for (parent height, parent round), or the legacy one if
-// every signer pubkey belongs to it instead. Signatures are not checked here.
+// Resolves the parent (prev.finalized_height) context at the parent's commit round, which a child
+// names in prev_finality_round and which is never earlier than the parent transition's own round.
+// The committee is the canonical committee for (parent height, commit round). Signatures are not
+// checked here.
 bool resolve_parent_finality_context(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                                     const std::vector<FinalitySig>& signers, ParentFinalityContext* out,
+                                     std::uint32_t parent_commit_round, ParentFinalityContext* out,
                                      std::string* error);
-// Sorts and dedups `signers` by pubkey, then requires: empty iff the parent is
-// genesis; otherwise every signer is a parent committee member with a valid
-// vote signature over (parent height, parent round, parent transition id), and
-// the count is at least the parent quorum.
+// Sorts and dedups `signers` by pubkey, then requires: empty and commit round 0 iff the parent is
+// genesis; otherwise every signer is a parent committee member with a valid precommit signature
+// over (parent height, parent_commit_round, parent transition id), and the count is at least the
+// parent quorum.
 bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConfig& cfg,
                                                    const CanonicalDerivedState& prev,
                                                    const std::vector<FinalitySig>& signers,
+                                                   std::uint32_t parent_commit_round,
                                                    std::vector<FinalitySig>* canonical, std::string* error);
 // Accrues one finalized frontier transition into its epoch's reward state:
 // emission and fees for transition.height, the leader's score, and committee
@@ -169,6 +176,7 @@ void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const Va
                                   const std::vector<PubKey32>& parent_committee);
 bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
+                                           std::uint32_t prev_finality_round,
                                            const std::vector<FinalitySig>& prev_finality_signers,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
@@ -178,12 +186,6 @@ bool load_certified_frontier_record_from_storage(const storage::DB& db, const Fr
 bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                           const CanonicalFrontierRecord& record, FrontierExecutionResult* recomputed,
                                           std::string* error,
-                                          std::string* validation_diagnostics = nullptr);
-bool verify_frontier_record_against_state_with_replay_options(
-                                          const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                                          const CanonicalFrontierRecord& record,
-                                          bool allow_legacy_ingress_epoch_replay,
-                                          FrontierExecutionResult* recomputed, std::string* error,
                                           std::string* validation_diagnostics = nullptr);
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                            const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error);
@@ -259,22 +261,12 @@ bool bootstrap_handoff_complete(const CanonicalDerivedState& state);
 std::optional<PubKey32> checkpoint_ticket_pow_fallback_member(const storage::FinalizedCommitteeCheckpoint& checkpoint);
 std::optional<PubKey32> checkpoint_ticket_pow_fallback_member_for_round(
     const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round);
-std::optional<PubKey32> legacy_checkpoint_ticket_pow_fallback_member_for_round(
-    const storage::FinalizedCommitteeCheckpoint& checkpoint, std::uint32_t round);
-std::vector<PubKey32> legacy_checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
-                                                            std::uint32_t round);
 std::vector<PubKey32> checkpoint_committee_for_round(const storage::FinalizedCommitteeCheckpoint& checkpoint,
                                                      std::uint32_t round);
-std::vector<PubKey32> legacy_canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
-                                                                  const CanonicalDerivedState& state,
-                                                                  std::uint64_t height, std::uint32_t round);
 
 std::vector<PubKey32> canonical_committee_for_height_round(const CanonicalDerivationConfig& cfg,
                                                            const CanonicalDerivedState& state, std::uint64_t height,
                                                            std::uint32_t round);
-std::optional<PubKey32> legacy_canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
-                                                                 const CanonicalDerivedState& state,
-                                                                 std::uint64_t height, std::uint32_t round);
 std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivationConfig& cfg,
                                                           const CanonicalDerivedState& state, std::uint64_t height,
                                                           std::uint32_t round);

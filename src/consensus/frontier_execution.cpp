@@ -91,32 +91,13 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      bool use_certificate_epoch_for_committee = false;
       std::string cert_error;
       if (!validate_ingress_certificate_epoch(record.certificate, expected_ingress_epoch, &cert_error)) {
-        // Replay compatibility for legacy databases:
-        // - some historical builds persisted certificate.epoch as block height
-        // - earliest lane records may carry legacy epoch encodings at seq=1
-        // Only apply legacy bypasses for replay contexts, or when validation context is unavailable.
-        // FIX: Epoch zero is a valid expected epoch, not permission to accept
-        // arbitrary certificate epochs. Legacy replay is explicit in context.
-        const bool allow_legacy_epoch_bypass = ctx && ctx->allow_legacy_ingress_epoch_replay;
-        const bool legacy_epoch_equals_height =
-          allow_legacy_epoch_bypass && ctx && ctx->current_height != 0 &&
-            record.certificate.epoch == ctx->current_height;
-        const bool legacy_first_record_epoch =
-          allow_legacy_epoch_bypass && expected_seq == 1 &&
-            record.certificate.prev_lane_root == zero_hash();
-        if (legacy_epoch_equals_height || legacy_first_record_epoch) {
-          use_certificate_epoch_for_committee = legacy_epoch_equals_height;
-          cert_error.clear();
-        } else {
-          if (error) {
-            *error = "frontier-certified-ingress-epoch-mismatch lane=" + std::to_string(lane) +
-                     " seq=" + std::to_string(expected_seq) + " reason=" + cert_error;
-          }
-          return false;
+        if (error) {
+          *error = "frontier-certified-ingress-epoch-mismatch lane=" + std::to_string(lane) +
+                   " seq=" + std::to_string(expected_seq) + " reason=" + cert_error;
         }
+        return false;
       }
       if (!verify_ingress_certificate(record.certificate, {}, &cert_error)) {
         if (error) {
@@ -126,10 +107,7 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
         return false;
       }
       if (ctx && ctx->is_committee_member) {
-        const auto committee_epoch =
-            use_certificate_epoch_for_committee
-                ? record.certificate.epoch
-                : (expected_ingress_epoch != 0 ? expected_ingress_epoch : record.certificate.epoch);
+        const auto committee_epoch = expected_ingress_epoch != 0 ? expected_ingress_epoch : record.certificate.epoch;
         for (const auto& sig : record.certificate.sigs) {
           if (!ctx->is_committee_member(sig.validator_pubkey, committee_epoch, 0)) {
             if (error) {
@@ -286,6 +264,20 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
   if (!out) {
     if (error) *error = "missing-output";
     return false;
+  }
+
+  // Consensus: bound the slice's record count and raw bytes before parsing anything.
+  if (ordered_records.size() > kMaxFrontierSliceRecords) {
+    if (error) *error = "frontier-slice-record-count-exceeded";
+    return false;
+  }
+  std::size_t total_bytes = 0;
+  for (const auto& raw_record : ordered_records) {
+    total_bytes += raw_record.size();
+    if (total_bytes > kMaxFrontierSliceBytes) {
+      if (error) *error = "frontier-slice-bytes-exceeded";
+      return false;
+    }
   }
 
   // Consensus: bound the transition's confidential verification work before any state

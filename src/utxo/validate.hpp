@@ -36,8 +36,6 @@ struct SpecialValidationContext {
   // Height-indexed finalized identity witness. This remains generic because the
   // anchor may come from legacy block history or frontier transition history.
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
-  // Enables replay-only compatibility for legacy ingress certificate epoch encodings.
-  bool allow_legacy_ingress_epoch_replay{false};
   const struct ConfidentialPolicy* confidential_policy{nullptr};
 };
 
@@ -76,7 +74,14 @@ bool validate_admission_pow(const ValidatorJoinRequestScriptData& req, const std
                             std::uint64_t bond_amount, const SpecialValidationContext& ctx, std::string* err = nullptr);
 bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& req, const SpecialValidationContext& ctx,
                                        std::string* err = nullptr);
+// Precommit: a quorum of these for one (height, round, transition_id) is finality.
 Bytes vote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
+// Prevote: a quorum of these (a polka) lets a validator lock on transition_id and precommit it.
+Bytes prevote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
+// Signed by the leader of (height, round). pol_round is the round of the attached prevote quorum
+// when the leader re-proposes its valid value.
+Bytes propose_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
+                              std::optional<std::uint32_t> pol_round);
 Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);
 bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubKey32* out_pub = nullptr);

@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -10,6 +11,11 @@
 #include "utxo/validate.hpp"
 
 namespace finalis::consensus {
+
+// Consensus bounds on one frontier slice (ordered records of a transition). Proposers stop before
+// either is exceeded; execute_frontier_slice rejects a slice that exceeds them.
+inline constexpr std::size_t kMaxFrontierSliceRecords = 1000;
+inline constexpr std::size_t kMaxFrontierSliceBytes = 1 * 1024 * 1024;
 
 struct CertifiedIngressRecord {
   IngressCertificate certificate;

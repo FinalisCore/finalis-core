@@ -260,6 +260,9 @@ bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
 void PeerManager::broadcast(std::uint16_t msg_type, const Bytes& payload) {
   const bool low_priority = (msg_type == MsgType::TX);
   for (int id : peer_ids()) {
+    // Only to established peers: a peer still in its handshake counts anything else as
+    // pre-handshake traffic and penalizes the (honest) sender.
+    if (!get_peer_info(id).established()) continue;
     (void)send_to(id, msg_type, payload, low_priority);
   }
 }

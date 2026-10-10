@@ -215,11 +215,11 @@ src/node/
 | Validation / equivocation | `validate_frontier_proposal_locked`, `check_and_record_proposer_equivocation_locked` | 8557–8647 |
 | Finalization | `finalize_if_quorum`, `apply_finalized_frontier_effects_locked`, `canonicalize_finality_signatures_locked` | 8834–8953, 4572–4737, 4502–4515 |
 | Proposal building | `build_frontier_transition_locked` | 8955–9112 |
-| Certificates | `verify_quorum/timeout_certificate_locked`, `verify_finality_certificate_for_frontier_locked`, `precheck_finality_certificate`, `quorum_certificate_payload_id_locked`, `highest_qc/tc_for_height_locked`, `maybe_record_quorum/timeout_certificate_locked` | 4976–5172 |
+| Certificates | `verify_polka_locked`, `verify_timeout_certificate_locked`, `verify_finality_certificate_for_frontier_locked`, `precheck_finality_certificate`, `valid_polka_for_height_locked`, `highest_tc_for_height_locked`, `on_prevotes_changed_locked`, `maybe_record_timeout_certificate_locked` | 4976–5172 |
 | Vote locks / safety state | `can_vote_for_frontier_locked`, `can_accept_frontier_with_lock_locked`, `update_local_vote_lock_locked`, `prev_finality_signers_for_next_height_locked`, `record_late_finalized_vote_locked`, `persist/clear_consensus_safety_state_locked` | 5174–5330 |
 | Round / repair | `consensus_state_locked`, `next_height_requires_repair_locked`, `maybe_repair_next_height_locked`, `arm_round0_deadline_locked`, `prune_caches_locked` | 3963–4106, 4562–4570, 11756–11790 |
 | Extracted message cases | `on_transition`, `on_get_transition`, `on_get_transition_by_height`, `on_propose`, `on_vote`, `on_timeout_vote` | from 7062–7606 |
-| Anon helpers | `justify_summary`, `signer_set_summary`, `make_finality_certificate`, `make_quorum_certificate`, `consensus_payload_id`, `key_consensus_safety_state`, `serialize/parse_consensus_safety_state`, `vote_equivocation_record_id`, `make_vote/proposer_equivocation_record`, `certificate_matches_checkpoint_committee`, `inspect_frontier_ordered_record_supported` | 1379–1399, 1921–1932, 2322–2528 |
+| Anon helpers | `justify_summary`, `signer_set_summary`, `make_finality_certificate`, `make_quorum_certificate`, `key_consensus_safety_state`, `serialize/parse_consensus_safety_state`, `vote_equivocation_record_id`, `make_vote/proposer_equivocation_record`, `certificate_matches_checkpoint_committee`, `inspect_frontier_ordered_record_supported` | 1379–1399, 1921–1932, 2322–2528 |
 
 ### 4.3 `node_ingress.cpp` — transaction admission and ingress lanes (~660 LOC)
 
@@ -321,7 +321,7 @@ std::string short_hash_hex(const Hash32& h);
 | network + validator_ops | `epoch_committee_snapshot_from_checkpoint`, `same_epoch_committee_snapshot`, `endpoint_to_ip` |
 | network + node / args | `endpoint_fingerprint_safe`, `parse_endpoint_list`, `is_local_only_bind`, `advertised_endpoint_likely_public`, `network_id_hex`, `token_value`, `ascii_lower`, `kFinalizedTipFreshnessFloorMs` |
 | node + validator_ops | `availability_status_name`, `checkpoint_derivation_mode_name`, `checkpoint_fallback_reason_name`, `zero_outpoint` |
-| several | `debug_economics_logs_enabled`, `debug_finality_logs_enabled`, `consensus_payload_id`, `consensus_rules_fingerprint`, `make_finality_certificate`, `finalized_identity_for_runtime_tip`, `g_local_bus_mu`, `g_local_bus_nodes` |
+| several | `debug_economics_logs_enabled`, `debug_finality_logs_enabled`, `consensus_rules_fingerprint`, `make_finality_certificate`, `finalized_identity_for_runtime_tip`, `g_local_bus_mu`, `g_local_bus_nodes` |
 
 Only trivial one-liners should be `inline` in the header; everything else is declared in the
 header and defined in `node_internal.cpp` (avoids ODR issues and header bloat).

@@ -271,6 +271,12 @@ consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::Canoni
   return lane_records;
 }
 
+// Commit round of the parent in these fixtures: the parent's own round (no re-proposals). 0 for genesis.
+std::uint32_t fixture_parent_commit_round(const consensus::CanonicalDerivedState& parent_state) {
+  auto it = parent_state.finalized_block_metadata.find(parent_state.finalized_height);
+  return it == parent_state.finalized_block_metadata.end() ? 0 : it->second.round;
+}
+
 // Signs the parent's finalized transition with the single-member test committee
 // key (key_from_byte(90)) to form a valid prev_finality_signers record. Empty
 // when the parent is genesis.
@@ -278,7 +284,11 @@ std::vector<FinalitySig> default_prev_finality_signers(const consensus::Canonica
                                                        const consensus::CanonicalDerivedState& parent_state) {
   consensus::ParentFinalityContext parent;
   std::string err;
-  if (!consensus::resolve_parent_finality_context(cfg, parent_state, {}, &parent, &err) || !parent.has_parent) return {};
+  if (!consensus::resolve_parent_finality_context(cfg, parent_state, fixture_parent_commit_round(parent_state), &parent,
+                                                  &err) ||
+      !parent.has_parent) {
+    return {};
+  }
   const auto signer = key_from_byte(90);
   std::vector<FinalitySig> out;
   for (const auto& member : parent.committee) {
@@ -308,7 +318,8 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   const auto leader = consensus::canonical_leader_for_height_round(cfg, parent_state, height, round);
   if (!leader.has_value()) throw std::runtime_error("missing canonical leader");
   const auto signers = prev_signers.empty() ? default_prev_finality_signers(cfg, parent_state) : prev_signers;
-  if (!consensus::populate_frontier_transition_metadata(cfg, parent_state, height, round, *leader, signers,
+  if (!consensus::populate_frontier_transition_metadata(cfg, parent_state, height, round, *leader,
+                                                        fixture_parent_commit_round(parent_state), signers,
                                                         result.accepted_fee_units, result.next_utxos, &result.transition,
                                                         &err)) {
     throw std::runtime_error("frontier metadata population failed: " + err);
@@ -1870,6 +1881,34 @@ TEST(test_frontier_apply_rejects_nondeterministic_transition_metadata) {
   std::string err;
   ASSERT_TRUE(!consensus::apply_frontier_record(cfg, parent, record, &out, &err));
   ASSERT_TRUE(err == "frontier-quorum-threshold-mismatch" || err == "legacy-frontier-quorum-threshold-mismatch");
+}
+
+// Transition timestamps strictly increase; the applied state carries the tip's timestamp.
+TEST(test_frontier_apply_requires_increasing_timestamp) {
+  const auto cfg = test_cfg();
+  const auto from = key_from_byte(0xA5);
+  const auto to = key_from_byte(0xA6);
+
+  OutPoint op{};
+  op.txid.fill(0xB3);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  auto parent = build_parent_state_with_utxo(cfg, 0, op, prev);
+  parent.finalized_timestamp = 1'000;
+
+  auto record = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)});
+  ASSERT_EQ(record.transition.timestamp, 1'001u);  // populate raises it to parent + 1
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(cfg, parent, record, &out, &err));
+  ASSERT_EQ(out.finalized_timestamp, 1'001u);
+
+  for (const std::uint64_t ts : {std::uint64_t{0}, std::uint64_t{1'000}}) {
+    auto stale = record;
+    stale.transition.timestamp = ts;
+    ASSERT_TRUE(!consensus::apply_frontier_record(cfg, parent, stale, &out, &err));
+    ASSERT_EQ(err, "frontier-timestamp-not-increasing");
+  }
 }
 
 TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {

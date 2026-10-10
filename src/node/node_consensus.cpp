@@ -25,9 +25,6 @@ using namespace detail;
 
 namespace {
 
-constexpr std::size_t kMaxBlockTxs = 1000;
-constexpr std::size_t kMaxBlockBytes = 1 * 1024 * 1024;
-
 constexpr std::size_t kMaxCandidateBlocks = 512;
 constexpr std::size_t kMaxCandidateBlockBytes = 32 * 1024 * 1024;
 constexpr std::uint32_t kProposalRoundWindow = 32;
@@ -55,7 +52,7 @@ bool inspect_frontier_ordered_record_supported(const Bytes& raw_record, std::siz
 
 std::string justify_summary(const std::optional<QuorumCertificate>& qc, const std::optional<TimeoutCertificate>& tc) {
   if (qc.has_value()) {
-    return "qc(height=" + std::to_string(qc->height) + ",round=" + std::to_string(qc->round) +
+    return "pol(height=" + std::to_string(qc->height) + ",round=" + std::to_string(qc->round) +
            ",transition=" + short_hash_hex(qc->frontier_transition_id) + ")";
   }
   if (tc.has_value()) {
@@ -76,26 +73,29 @@ std::string signer_set_summary(const std::vector<FinalitySig>& sigs) {
 }
 
 Bytes serialize_consensus_safety_state(const std::optional<std::pair<Hash32, std::uint32_t>>& lock_state,
-                                       const std::optional<QuorumCertificate>& qc_state,
-                                       const std::optional<Hash32>& qc_payload_id) {
+                                       const std::optional<QuorumCertificate>& valid_polka,
+                                       const std::map<std::uint32_t, Hash32>& prevotes) {
   codec::ByteWriter w;
   w.u8(lock_state.has_value() ? 1 : 0);
   if (lock_state.has_value()) {
     w.bytes_fixed(lock_state->first);
     w.u32le(lock_state->second);
   }
-  w.u8(qc_state.has_value() ? 1 : 0);
-  if (qc_state.has_value()) {
-    w.u64le(qc_state->height);
-    w.u32le(qc_state->round);
-    w.bytes_fixed(qc_state->frontier_transition_id);
-    w.u8(qc_payload_id.has_value() ? 1 : 0);
-    if (qc_payload_id.has_value()) w.bytes_fixed(*qc_payload_id);
-    w.varint(qc_state->signatures.size());
-    for (const auto& sig : qc_state->signatures) {
+  w.u8(valid_polka.has_value() ? 1 : 0);
+  if (valid_polka.has_value()) {
+    w.u64le(valid_polka->height);
+    w.u32le(valid_polka->round);
+    w.bytes_fixed(valid_polka->frontier_transition_id);
+    w.varint(valid_polka->signatures.size());
+    for (const auto& sig : valid_polka->signatures) {
       w.bytes_fixed(sig.validator_pubkey);
       w.bytes_fixed(sig.signature);
     }
+  }
+  w.varint(prevotes.size());
+  for (const auto& [round, transition_id] : prevotes) {
+    w.u32le(round);
+    w.bytes_fixed(transition_id);
   }
   return w.take();
 }
@@ -330,13 +330,14 @@ void Node::arm_round0_deadline_locked(std::uint64_t now_ms) {
 }
 
 bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFrontierRecord& record,
+                                                   std::uint32_t commit_round,
                                                    std::vector<FinalitySig> finality_signatures,
                                                    bool clear_requested_sync,
                                                    const std::vector<PubKey32>* effective_committee,
                                                    std::string* error) {
   const std::uint64_t previous_finalized_height = finalized_height_;
   const auto committee =
-      effective_committee != nullptr ? *effective_committee : committee_for_height_round(record.transition.height, record.transition.round);
+      effective_committee != nullptr ? *effective_committee : committee_for_height_round(record.transition.height, commit_round);
   if (committee.empty()) {
     if (error) *error = "empty-committee";
     return false;
@@ -349,7 +350,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   }
 
   const auto transition_id = record.transition.transition_id();
-  const FinalityCertificate certificate = make_finality_certificate(record.transition.height, record.transition.round,
+  const FinalityCertificate certificate = make_finality_certificate(record.transition.height, commit_round,
                                                                     transition_id, quorum, committee, canonical_sigs);
 
   if (!canonical_state_.has_value()) {
@@ -388,11 +389,6 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
       next_state.confidential_supply.txv2_count != canonical_state_->confidential_supply.txv2_count ||
       next_state.confidential_supply.known != canonical_state_->confidential_supply.known;
 
-  highest_qc_by_height_[record.transition.height] =
-      make_quorum_certificate(record.transition.height, record.transition.round, transition_id, canonical_sigs);
-  highest_qc_payload_by_height_[record.transition.height] = consensus_payload_id(record.transition);
-  persist_consensus_safety_state_locked(record.transition.height, batch);
-
   std::vector<Hash32> confirmed_txids;
   for (const auto& raw : record.ordered_records) {
     auto tx = parse_any_tx(raw);
@@ -429,7 +425,10 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
         ++it;
       }
     }
+    local_timed_out_rounds_.erase(local_timed_out_rounds_.begin(),
+                                  local_timed_out_rounds_.lower_bound({finalized_height_ + 1, 0}));
     votes_.clear_height(finalized_height_ + 1);
+    prevotes_.clear_height(finalized_height_ + 1);
     timeout_votes_.clear_height(finalized_height_ + 1);
     log_line("round-state-reset height=" + std::to_string(finalized_height_ + 1) +
              " round=0 reason=finalized-advance previous_height=" + std::to_string(previous_finalized_height) +
@@ -469,24 +468,19 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   // participation of this height.
   finalized_tip_votes_ = FinalizedTipVotes{};
   finalized_tip_votes_.height = record.transition.height;
-  finalized_tip_votes_.round = record.transition.round;
+  finalized_tip_votes_.round = commit_round;
   finalized_tip_votes_.transition_id = transition_id;
   finalized_tip_votes_.committee.insert(committee.begin(), committee.end());
-  for (const auto& sig : votes_.signatures_for(record.transition.height, record.transition.round, transition_id)) {
+  for (const auto& sig : votes_.signatures_for(record.transition.height, commit_round, transition_id)) {
     if (finalized_tip_votes_.committee.count(sig.validator_pubkey) != 0) {
       finalized_tip_votes_.sigs.emplace(sig.validator_pubkey, sig.signature);
     }
   }
   for (const auto& sig : canonical_sigs) finalized_tip_votes_.sigs.emplace(sig.validator_pubkey, sig.signature);
   votes_.clear_height(record.transition.height);
+  prevotes_.clear_height(record.transition.height);
   timeout_votes_.clear_height(record.transition.height);
-  if (finalized_height_ > 0) {
-    clear_consensus_safety_state_locked(finalized_height_, batch);
-    local_vote_locks_.erase(finalized_height_);
-    highest_qc_by_height_.erase(finalized_height_);
-    highest_qc_payload_by_height_.erase(finalized_height_);
-    highest_tc_by_height_.erase(finalized_height_);
-  }
+  if (finalized_height_ > 0) clear_consensus_safety_state_locked(finalized_height_, batch);
   // Epoch-committee closeout only fires at epoch boundaries (not every
   // block) and owns its own checkpoint/telemetry persistence; left on its
   // existing immediate-write path rather than folded into this batch.
@@ -498,11 +492,18 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     if (error) *error = "write-batch-commit-failed";
     return false;
   }
+  drop_stale_unfinalized_ingress_locked();
+  // Stable, parseable record of every finalization (scripts/chaos_devnet.py compares these across
+  // nodes to detect forks and measure rounds per height).
+  log_line("finalized height=" + std::to_string(record.transition.height) + " transition=" +
+           hex_encode32(transition_id) + " round=" + std::to_string(record.transition.round) +
+           " commit_round=" + std::to_string(commit_round) + " source=" +
+           (clear_requested_sync ? "delivered" : "quorum"));
   if (error) error->clear();
   return true;
 }
-bool Node::verify_quorum_certificate_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered,
-                                            std::string* error, bool skip_signature_crypto) const {
+bool Node::verify_polka_locked(const QuorumCertificate& qc, std::vector<FinalitySig>* filtered, std::string* error,
+                               bool skip_signature_crypto) const {
   const auto committee = committee_for_height_round(qc.height, qc.round);
   if (committee.empty()) {
     if (error) *error = "empty-committee";
@@ -513,12 +514,12 @@ bool Node::verify_quorum_certificate_locked(const QuorumCertificate& qc, std::ve
   std::set<PubKey32> seen;
   std::vector<FinalitySig> valid;
   valid.reserve(qc.signatures.size());
-  const auto msg = vote_signing_message(qc.height, qc.round, qc.frontier_transition_id);
+  const auto msg = prevote_signing_message(qc.height, qc.round, qc.frontier_transition_id);
   for (const auto& sig : qc.signatures) {
     if (committee_set.find(sig.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(sig.validator_pubkey).second) continue;
     // See the skip_signature_crypto comment on this method's declaration: only safe when
-    // qc.signatures is already-verified votes_-sourced data, never for network-supplied QCs.
+    // qc.signatures is already-verified prevotes_-sourced data, never for a network-supplied pol.
     if (!skip_signature_crypto && !crypto::ed25519_verify(msg, sig.signature, sig.validator_pubkey)) continue;
     valid.push_back(sig);
   }
@@ -567,7 +568,8 @@ bool Node::verify_finality_certificate_for_frontier_locked(const FinalityCertifi
     if (error) *error = "certificate-height-mismatch";
     return false;
   }
-  if (cert.round != transition.round) {
+  // A transition re-proposed as the valid value can be precommitted in a later round.
+  if (cert.round < transition.round) {
     if (error) *error = "certificate-round-mismatch";
     return false;
   }
@@ -629,21 +631,9 @@ Node::CertificateCheck Node::precheck_finality_certificate(const FinalityCertifi
   return r;
 }
 
-std::optional<Hash32> Node::quorum_certificate_payload_id_locked(const QuorumCertificate& qc) const {
-  auto it = highest_qc_by_height_.find(qc.height);
-  if (it != highest_qc_by_height_.end() && it->second.round == qc.round &&
-      it->second.frontier_transition_id == qc.frontier_transition_id) {
-    auto pit = highest_qc_payload_by_height_.find(qc.height);
-    if (pit != highest_qc_payload_by_height_.end()) return pit->second;
-  }
-  auto frontier_it = candidate_frontier_proposals_.find(qc.frontier_transition_id);
-  if (frontier_it != candidate_frontier_proposals_.end()) return consensus_payload_id(frontier_it->second.transition);
-  return std::nullopt;
-}
-
-std::optional<QuorumCertificate> Node::highest_qc_for_height_locked(std::uint64_t height) const {
-  auto it = highest_qc_by_height_.find(height);
-  if (it == highest_qc_by_height_.end()) return std::nullopt;
+std::optional<QuorumCertificate> Node::valid_polka_for_height_locked(std::uint64_t height) const {
+  auto it = valid_polka_by_height_.find(height);
+  if (it == valid_polka_by_height_.end()) return std::nullopt;
   return it->second;
 }
 
@@ -653,27 +643,73 @@ std::optional<TimeoutCertificate> Node::highest_tc_for_height_locked(std::uint64
   return it->second;
 }
 
-void Node::maybe_record_quorum_certificate_locked(const Hash32& transition_id, std::uint64_t height, std::uint32_t round) {
-  QuorumCertificate qc =
-      make_quorum_certificate(height, round, transition_id, votes_.signatures_for(height, round, transition_id));
+std::optional<Vote> Node::on_prevotes_changed_locked(const Hash32& transition_id, std::uint64_t height,
+                                                     std::uint32_t round) {
+  QuorumCertificate polka =
+      make_quorum_certificate(height, round, transition_id, prevotes_.signatures_for(height, round, transition_id));
   std::vector<FinalitySig> filtered;
-  // qc.signatures == votes_.signatures_for(...) above: every signature already passed
-  // crypto::ed25519_verify in handle_vote_result before being accepted into votes_ (see the
-  // invariant comment at that call site). Safe to skip the redundant re-verify here --
-  // O(k^2) -> O(k) crypto work across a quorum's accumulation. Do not copy this to a call
-  // site whose qc came from the network (e.g. ProposeMsg::justify_qc); see
-  // verify_quorum_certificate_locked's declaration comment.
-  if (!verify_quorum_certificate_locked(qc, &filtered, nullptr, /*skip_signature_crypto=*/true)) return;
-  qc.signatures = std::move(filtered);
-  auto frontier_it = candidate_frontier_proposals_.find(transition_id);
-  if (frontier_it == candidate_frontier_proposals_.end()) return;
-  const auto payload_id = consensus_payload_id(frontier_it->second.transition);
-  auto it = highest_qc_by_height_.find(height);
-  if (it == highest_qc_by_height_.end() || qc.round > it->second.round ||
-      (qc.round == it->second.round && qc.frontier_transition_id != it->second.frontier_transition_id)) {
-    highest_qc_by_height_[height] = std::move(qc);
-    highest_qc_payload_by_height_[height] = payload_id;
-    persist_consensus_safety_state_locked(height);
+  // polka.signatures == prevotes_.signatures_for(...): each passed ed25519_verify in
+  // handle_prevote_result (or is this node's own prevote) before entering prevotes_.
+  if (!verify_polka_locked(polka, &filtered, nullptr, /*skip_signature_crypto=*/true)) return std::nullopt;
+  polka.signatures = std::move(filtered);
+  auto proposal_it = candidate_frontier_proposals_.find(transition_id);
+  if (proposal_it == candidate_frontier_proposals_.end()) return std::nullopt;  // retried when the body arrives
+  const FrontierProposal proposal = proposal_it->second;
+
+  // Valid value: the highest-round polka (Tendermint validValue / validRound).
+  auto valid_it = valid_polka_by_height_.find(height);
+  if (valid_it == valid_polka_by_height_.end() || round > valid_it->second.round) {
+    valid_polka_by_height_[height] = polka;
+    storage::DB::Batch batch(db_);
+    persist_consensus_safety_state_locked(height, batch);
+    batch.put(key_consensus_locked_proposal(height), proposal.serialize());
+    (void)db_.write_batch_durable(batch);
+    log_line("polka-valid-value height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(transition_id));
+  }
+
+  // Lock and precommit: only in the current round, once per round.
+  const auto key = std::make_pair(height, round);
+  if (height != finalized_height_ + 1 || round != current_round_) return std::nullopt;
+  if (local_vote_reservations_.contains(key) || local_timed_out_rounds_.contains(key)) return std::nullopt;
+  if (round < local_vote_round_floor_locked(height)) {
+    log_line("precommit-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(transition_id) + " reason=below-vote-floor");
+    return std::nullopt;
+  }
+  if (abstaining_at_height_locked(height) || !is_committee_member_for(local_key_.public_key, height, round)) {
+    return std::nullopt;
+  }
+  // DATA AVAILABILITY: precommit only with the slice's certified ingress held and checked.
+  std::string ingress_detail;
+  if (certified_ingress_status_for_vote_locked(proposal, &ingress_detail) != CertifiedIngressStatus::Ready) {
+    log_line("precommit-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(transition_id) + " reason=certified-ingress detail=" + ingress_detail);
+    return std::nullopt;
+  }
+  auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key);
+  if (!sig.has_value()) return std::nullopt;
+  // SAFETY: the lock is durable before the precommit leaves this process.
+  if (!lock_on_polka_locked(height, round, proposal)) {
+    log_line("precommit-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(transition_id) + " reason=lock-persist-failed");
+    return std::nullopt;
+  }
+  local_vote_reservations_.insert(key);
+  log_line("local-precommit-emit height=" + std::to_string(height) + " round=" + std::to_string(round) +
+           " transition=" + short_hash_hex(transition_id));
+  return Vote{height, round, transition_id, local_key_.public_key, *sig};
+}
+
+void Node::on_candidate_body_locked(const FrontierTransition& transition) {
+  const auto transition_id = transition.transition_id();
+  const auto height = transition.height;
+  for (std::uint32_t r = transition.round; r <= current_round_ && finalized_height_ < height; ++r) {
+    if (height != finalized_height_ + 1) return;
+    if (auto precommit = on_prevotes_changed_locked(transition_id, height, r); precommit.has_value()) {
+      pending_local_precommits_.push_back(*precommit);
+    }
+    (void)finalize_if_quorum(transition_id, height, r);
   }
 }
 
@@ -723,124 +759,157 @@ bool Node::abstaining_at_height_locked(std::uint64_t height) const {
   return abstain_heights_.find(height) != abstain_heights_.end();
 }
 
-bool Node::can_vote_for_frontier_locked(const FrontierTransition& transition,
-                                        const std::optional<QuorumCertificate>& justify_qc,
-                                        const std::optional<TimeoutCertificate>& justify_tc,
-                                        std::string* reason) const {
-  const auto payload_id = consensus_payload_id(transition);
-  const auto height = transition.height;
-  const auto round = transition.round;
+bool Node::can_prevote_locked(std::uint64_t height, const Hash32& transition_id,
+                              std::optional<std::uint32_t> pol_round, std::string* reason) const {
   // SAFETY: this node's vote history at `height` was lost (unreadable safety state), so any
-  // vote here could contradict one already broadcast. Checked before the normal lock rules.
+  // vote here could contradict one already broadcast. Checked before the lock rule.
   if (abstaining_at_height_locked(height)) {
     if (reason) *reason = "abstain-corrupt-safety-state";
     return false;
   }
   auto it = local_vote_locks_.find(height);
   if (it == local_vote_locks_.end()) return true;
-  const auto& [locked_payload_id, locked_round] = it->second;
-  if (payload_id == locked_payload_id) return true;
-  if (justify_tc.has_value()) {
-    if (reason) *reason = "tc-cannot-unlock";
-    return false;
-  }
-  if (!justify_qc.has_value()) {
-    if (reason) *reason = "missing-qc";
-    return false;
-  }
-  std::vector<FinalitySig> filtered;
-  std::string qc_error;
-  if (!verify_quorum_certificate_locked(*justify_qc, &filtered, &qc_error)) {
-    if (reason) *reason = "invalid-qc detail=" + qc_error;
-    return false;
-  }
-  if (justify_qc->height != height) {
-    if (reason) *reason = "wrong-qc-height";
-    return false;
-  }
-  if (justify_qc->round >= round) {
-    if (reason) *reason = "non-lower-qc-round";
-    return false;
-  }
-  if (justify_qc->round < locked_round) {
-    if (reason) *reason = "stale-qc";
-    return false;
-  }
-  auto qc_payload_id = quorum_certificate_payload_id_locked(*justify_qc);
-  if (!qc_payload_id.has_value()) {
-    if (reason) *reason = "unknown-qc-transition";
-    return false;
-  }
-  if (*qc_payload_id != payload_id) {
-    if (reason) *reason = "qc-mismatch";
-    return false;
-  }
-  return true;
-}
-
-bool Node::can_accept_frontier_with_lock_locked(const FrontierTransition& transition, std::string* reason) const {
-  const auto payload_id = consensus_payload_id(transition);
-  auto it = local_vote_locks_.find(transition.height);
-  if (it == local_vote_locks_.end()) return true;
-  const auto& [locked_payload_id, locked_round] = it->second;
-  if (payload_id == locked_payload_id) return true;
-  if (transition.round < locked_round) {
-    if (reason) *reason = "lock-round-regression";
-    return false;
-  }
+  const auto& [locked_id, locked_round] = it->second;
+  if (locked_id == transition_id) return true;
+  // A polka for this transition at a round >= the lock round safely moves the lock: had the locked
+  // transition finalized, no later polka for anything else could exist.
+  if (pol_round.has_value() && locked_round <= *pol_round) return true;
+  if (reason) *reason = pol_round.has_value() ? "locked-pol-older-than-lock" : "locked-on-other-transition";
   return false;
 }
 
-// Returns false only if the lock changed and could not be made durable.
-//
-// SAFETY INVARIANT: once this node has signed a vote for payload P at height h, the lock (P, round)
-// is durable and is released only when h finalizes (clear_consensus_safety_state_locked from the
-// finalization batch). It may move to another payload only through can_vote_for_frontier_locked,
-// i.e. a valid QC for that payload from a round in [locked_round, proposal_round). Neither a TC nor
-// a restart releases it. The proposal body is persisted alongside so that, after a restart, this
-// node can still re-propose P in a TC-driven round instead of deadlocking on a payload it cannot
-// reconstruct.
-bool Node::update_local_vote_lock_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal) {
-  const auto payload_id = consensus_payload_id(proposal.transition);
+// SAFETY INVARIANT: this node precommits transition T at (h, r) only after seeing T's polka at r,
+// and only after this lock (T, r) is durable. The lock moves only to a newer polka (r' > r) and is
+// released when h finalizes. The proposal is persisted alongside so the node can still re-propose
+// its valid value after a restart.
+bool Node::lock_on_polka_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal) {
+  const auto transition_id = proposal.transition.transition_id();
   auto it = local_vote_locks_.find(height);
-  if (it != local_vote_locks_.end() && it->second.first == payload_id && it->second.second == round) return true;
-  if (it == local_vote_locks_.end() || round >= it->second.second) {
-    local_vote_locks_[height] = {payload_id, round};
-    storage::DB::Batch batch(db_);
-    persist_consensus_safety_state_locked(height, batch);
-    batch.put(key_consensus_locked_proposal(height), proposal.serialize());
-    return db_.write_batch_durable(batch);
-  }
-  return true;
+  if (it != local_vote_locks_.end() && it->second.first == transition_id && it->second.second == round) return true;
+  // One polka per round: a second lock at the same round would mean two precommits in it.
+  if (it != local_vote_locks_.end() && round <= it->second.second) return false;
+  local_vote_locks_[height] = {transition_id, round};
+  storage::DB::Batch batch(db_);
+  persist_consensus_safety_state_locked(height, batch);
+  return db_.write_batch_durable(batch);
 }
 
-std::vector<FinalitySig> Node::prev_finality_signers_for_next_height_locked() const {
+std::uint32_t Node::local_vote_round_floor_locked(std::uint64_t height) const {
+  std::uint32_t floor = 0;
+  if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end()) floor = lock->second.second;
+  if (auto it = local_prevotes_.lower_bound({height + 1, 0}); it != local_prevotes_.begin()) {
+    --it;
+    if (it->first.first == height) floor = std::max(floor, it->first.second);
+  }
+  return floor;
+}
+
+Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_t height) const {
+  constexpr std::size_t kRounds = 3;  // latest rounds only: older ones cannot complete a useful TC or polka
+  LocalVoteRebroadcast out;
+  std::vector<std::uint32_t> timed_out;
+  for (auto it = local_timed_out_rounds_.lower_bound({height, 0});
+       it != local_timed_out_rounds_.end() && it->first == height; ++it) {
+    timed_out.push_back(it->second);
+  }
+  for (std::size_t k = timed_out.size() > kRounds ? timed_out.size() - kRounds : 0; k < timed_out.size(); ++k) {
+    if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(height, timed_out[k]), local_key_.private_key)) {
+      out.timeouts.push_back(TimeoutVote{height, timed_out[k], local_key_.public_key, *sig});
+    }
+  }
+  std::vector<std::pair<std::uint32_t, Hash32>> prevotes;
+  for (auto it = local_prevotes_.lower_bound({height, 0}); it != local_prevotes_.end() && it->first.first == height; ++it) {
+    prevotes.emplace_back(it->first.second, it->second);
+  }
+  for (std::size_t k = prevotes.size() > kRounds ? prevotes.size() - kRounds : 0; k < prevotes.size(); ++k) {
+    const auto& [round, transition_id] = prevotes[k];
+    if (auto sig = crypto::ed25519_sign(prevote_signing_message(height, round, transition_id), local_key_.private_key)) {
+      out.prevotes.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
+    }
+  }
+  if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end()) {
+    const auto& [transition_id, round] = lock->second;
+    if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key)) {
+      out.precommits.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
+    }
+  }
+  // The valid value's polka, all signers: a node locked on it refuses every other proposal, so the
+  // others must learn the polka (and re-propose its value) or the height can stall for many rounds.
+  // Its own votes above stop being re-sent once that round is older than the last kRounds.
+  if (auto polka = valid_polka_by_height_.find(height); polka != valid_polka_by_height_.end()) {
+    for (const auto& sig : polka->second.signatures) {
+      if (sig.validator_pubkey == local_key_.public_key) continue;
+      out.prevotes.push_back(Vote{height, polka->second.round, polka->second.frontier_transition_id,
+                                  sig.validator_pubkey, sig.signature});
+    }
+  }
+  return out;
+}
+
+void Node::reseed_local_votes_locked(std::uint64_t height) {
+  for (auto it = local_prevotes_.lower_bound({height, 0}); it != local_prevotes_.end() && it->first.first == height; ++it) {
+    const auto round = it->first.second;
+    if (auto sig = crypto::ed25519_sign(prevote_signing_message(height, round, it->second), local_key_.private_key)) {
+      (void)prevotes_.add_vote(Vote{height, round, it->second, local_key_.public_key, *sig});
+    }
+  }
+  if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end()) {
+    const auto& [transition_id, round] = lock->second;
+    if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key)) {
+      (void)votes_.add_vote(Vote{height, round, transition_id, local_key_.public_key, *sig});
+      local_vote_reservations_.insert({height, round});
+    }
+  }
+}
+
+bool Node::record_local_prevote_locked(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) {
+  local_prevotes_[{height, round}] = transition_id;
+  storage::DB::Batch batch(db_);
+  persist_consensus_safety_state_locked(height, batch);
+  return db_.write_batch_durable(batch);
+}
+
+Node::PrevFinalityRecord Node::prev_finality_record_for_next_height_locked() const {
   if (!canonical_state_.has_value()) return {};
+  const auto parent_height = canonical_state_->finalized_height;
+  const auto parent_id = canonical_state_->finalized_identity.transition_id();
+  if (parent_height == 0 || !parent_id.has_value()) return {};
+  // The commit round is the round of the precommits that finalized the parent here: the tip votes
+  // when this node finalized it live, otherwise the persisted certificate.
+  const auto cert = db_.get_finality_certificate_by_height(parent_height);
+  std::optional<std::uint32_t> commit_round;
+  if (finalized_tip_votes_.height == parent_height && finalized_tip_votes_.transition_id == *parent_id) {
+    commit_round = finalized_tip_votes_.round;
+  } else if (cert.has_value() && cert->frontier_transition_id == *parent_id) {
+    commit_round = cert->round;
+  }
+  if (!commit_round.has_value()) return {};
   const auto derivation_cfg = canonical_derivation_config_locked();
   consensus::ParentFinalityContext parent;
   std::string err;
-  if (!consensus::resolve_parent_finality_context(derivation_cfg, *canonical_state_, {}, &parent, &err) ||
+  if (!consensus::resolve_parent_finality_context(derivation_cfg, *canonical_state_, *commit_round, &parent, &err) ||
       !parent.has_parent) {
     return {};
   }
   std::map<PubKey32, Sig64> candidates;
-  if (finalized_tip_votes_.height == parent.height && finalized_tip_votes_.transition_id == parent.transition_id) {
+  if (finalized_tip_votes_.height == parent.height && finalized_tip_votes_.transition_id == parent.transition_id &&
+      finalized_tip_votes_.round == parent.round) {
     candidates = finalized_tip_votes_.sigs;
   }
   // The persisted certificate always holds at least a quorum, which covers a
   // restart or a tip finalized from a delivered certificate.
-  if (auto cert = db_.get_finality_certificate_by_height(parent.height);
-      cert.has_value() && cert->frontier_transition_id == parent.transition_id) {
+  if (cert.has_value() && cert->frontier_transition_id == parent.transition_id && cert->round == parent.round) {
     for (const auto& sig : cert->signatures) candidates.emplace(sig.validator_pubkey, sig.signature);
   }
   const std::set<PubKey32> committee(parent.committee.begin(), parent.committee.end());
   const auto msg = vote_signing_message(parent.height, parent.round, parent.transition_id);
-  std::vector<FinalitySig> out;
-  out.reserve(candidates.size());
+  PrevFinalityRecord out;
+  out.round = parent.round;
+  out.signers.reserve(candidates.size());
   for (const auto& [pub, sig] : candidates) {  // std::map order == pubkey order
     if (committee.count(pub) == 0) continue;
     if (!crypto::ed25519_verify(msg, sig, pub)) continue;
-    out.push_back(FinalitySig{pub, sig});
+    out.signers.push_back(FinalitySig{pub, sig});
   }
   return out;
 }
@@ -859,18 +928,20 @@ bool Node::record_late_finalized_vote_locked(const Vote& vote) {
 void Node::persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch) {
   std::optional<std::pair<Hash32, std::uint32_t>> lock_state;
   if (auto it = local_vote_locks_.find(height); it != local_vote_locks_.end()) lock_state = it->second;
-  std::optional<QuorumCertificate> qc_state;
-  if (auto it = highest_qc_by_height_.find(height); it != highest_qc_by_height_.end()) qc_state = it->second;
-  std::optional<Hash32> qc_payload_id;
-  if (auto it = highest_qc_payload_by_height_.find(height); it != highest_qc_payload_by_height_.end()) qc_payload_id = it->second;
-  if (!lock_state.has_value() && !qc_state.has_value()) {
+  std::optional<QuorumCertificate> valid_polka;
+  if (auto it = valid_polka_by_height_.find(height); it != valid_polka_by_height_.end()) valid_polka = it->second;
+  std::map<std::uint32_t, Hash32> prevotes;
+  for (auto it = local_prevotes_.lower_bound({height, 0}); it != local_prevotes_.end() && it->first.first == height; ++it) {
+    prevotes.emplace(it->first.second, it->second);
+  }
+  if (!lock_state.has_value() && !valid_polka.has_value() && prevotes.empty()) {
     batch.erase(key_consensus_safety_state(height));
     batch.erase(key_consensus_safety_mirror(height));
     return;
   }
   // Primary and mirror go in the same atomic batch; load_state falls back to the mirror when the
   // primary is unreadable and abstains only if both are.
-  const Bytes inner = serialize_consensus_safety_state(lock_state, qc_state, qc_payload_id);
+  const Bytes inner = serialize_consensus_safety_state(lock_state, valid_polka, prevotes);
   batch.put(key_consensus_safety_state(height), seal_consensus_safety_row(inner, false));
   batch.put(key_consensus_safety_mirror(height), seal_consensus_safety_row(inner, true));
 }
@@ -887,8 +958,8 @@ bool Node::persist_consensus_safety_state_locked(std::uint64_t height) {
 // finalized; calling it for an open height lets this node sign a conflicting payload there.
 void Node::clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch) {
   local_vote_locks_.erase(height);
-  highest_qc_by_height_.erase(height);
-  highest_qc_payload_by_height_.erase(height);
+  valid_polka_by_height_.erase(height);
+  local_prevotes_.erase(local_prevotes_.lower_bound({height, 0}), local_prevotes_.lower_bound({height + 1, 0}));
   highest_tc_by_height_.erase(height);
   for (auto it = local_timeout_vote_reservations_.begin(); it != local_timeout_vote_reservations_.end();) {
     if (it->first == height) {
@@ -1304,6 +1375,31 @@ void Node::on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id) 
   return;
 }
 
+void Node::on_prevote(int peer_id, const Bytes& payload, const Hash32& payload_id) {
+  auto v = p2p::de_prevote(payload);
+  if (!v.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-prevote-msg");
+    return;
+  }
+  log_line("recv PREVOTE peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(v->vote.height) +
+           " round=" + std::to_string(v->vote.round) + " transition=" + short_hash_hex(v->vote.frontier_transition_id));
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bootstrap_sync_incomplete_locked(peer_id)) {
+      log_line("defer-consensus peer_id=" + std::to_string(peer_id) + " type=PREVOTE reason=bootstrap-sync-incomplete" +
+               " local_height=" + std::to_string(finalized_height_));
+      return;
+    }
+  }
+  if (handle_prevote_result(v->vote, true, peer_id) == VoteHandlingResult::HardReject) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-prevote");
+  }
+}
+
 void Node::on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id) {
   constexpr std::uint16_t msg_type = p2p::MsgType::TIMEOUT_VOTE;
   auto v = p2p::de_timeout_vote(payload);
@@ -1337,7 +1433,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
                                                         std::string* reject_reason) {
   const FinalizedBroadcastFlushGuard flush_guard{this};  // destroyed last, after any mu_ scope
   if (from_network && !running_) return ProposeHandlingResult::SoftReject;
-  std::optional<Vote> maybe_vote;
+  std::optional<Vote> maybe_vote;  // this node's prevote
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto set_reject_reason = [&](const std::string& reason) {
@@ -1362,11 +1458,9 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       log_propose_hard_reject("unexpected-height", " local_next=" + std::to_string(finalized_height_ + 1));
       return ProposeHandlingResult::HardReject;
     }
-    const bool allow_late_round0_after_first_timeout =
-        from_network && msg.round == 0 && current_round_ == 1 && msg.height == finalized_height_ + 1;
-    if (msg.round < current_round_ && !allow_late_round0_after_first_timeout) {
+    if (msg.round < current_round_) {
       log_propose_soft_reject("stale-round", " local_round=" + std::to_string(current_round_) +
-                                                 " justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
+                                                 " justify=" + justify_summary(msg.pol, msg.justify_tc));
       return ProposeHandlingResult::SoftReject;
     }
     if (msg.prev_finalized_hash != finalized_identity_.id) {
@@ -1381,13 +1475,29 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       return ProposeHandlingResult::HardReject;
     }
     const auto& transition = proposal->transition;
-    if (transition.height != msg.height || transition.round != msg.round) {
+    // Two shapes: a fresh proposal built in this round (no pol), or the leader's valid value
+    // re-proposed unchanged with its polka (built in an earlier round, transition.round <= pol round).
+    const std::optional<std::uint32_t> pol_round =
+        msg.pol.has_value() ? std::optional<std::uint32_t>(msg.pol->round) : std::nullopt;
+    const bool shape_ok = pol_round.has_value() ? (transition.round <= *pol_round && *pol_round < msg.round)
+                                                : transition.round == msg.round;
+    if (transition.height != msg.height || !shape_ok) {
       log_propose_hard_reject("header-mismatch", " transition_height=" + std::to_string(transition.height) +
-                                                     " transition_round=" + std::to_string(transition.round));
+                                                     " transition_round=" + std::to_string(transition.round) +
+                                                     " justify=" + justify_summary(msg.pol, msg.justify_tc));
       return ProposeHandlingResult::HardReject;
     }
     if (transition.prev_finalized_hash != msg.prev_finalized_hash) {
       log_propose_hard_reject("prev-hash-mismatch");
+      return ProposeHandlingResult::HardReject;
+    }
+    const auto transition_id = transition.transition_id();
+    // The leader of (height, round) signs the proposal, re-proposals included.
+    const auto round_leader = leader_for_height_round(msg.height, msg.round);
+    if (!round_leader.has_value() ||
+        !crypto::ed25519_verify(propose_signing_message(msg.height, msg.round, transition_id, pol_round),
+                                msg.proposer_signature, *round_leader)) {
+      log_propose_hard_reject("invalid-proposer-signature");
       return ProposeHandlingResult::HardReject;
     }
     if (from_network && from_peer_id > 0 && is_validator_) {
@@ -1396,15 +1506,9 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
         bool allow_fallback = false;
         std::string fallback_detail = " detail=missing-validator-pubkey";
         const auto info = p2p_.get_peer_info(from_peer_id);
-        if (info.established()) {
-          if (auto expected_leader = leader_for_height_round(msg.height, msg.round); expected_leader.has_value()) {
-            if (transition.leader_pubkey == *expected_leader &&
-                validators_.is_active_for_height(*expected_leader, msg.height)) {
-              allow_fallback = true;
-              fallback_detail = " detail=established-session-leader-fallback validator=" +
-                                short_hash_hex(*expected_leader);
-            }
-          }
+        if (info.established() && validators_.is_active_for_height(*round_leader, msg.height)) {
+          allow_fallback = true;
+          fallback_detail = " detail=established-session-leader-fallback validator=" + short_hash_hex(*round_leader);
         }
         if (!allow_fallback) {
           log_propose_hard_reject("peer-not-active-validator",
@@ -1422,9 +1526,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
         return ProposeHandlingResult::HardReject;
       }
     }
-    const auto transition_id = transition.transition_id();
     const bool local_cached_proposal =
-        !from_network && transition.leader_pubkey == local_key_.public_key &&
+        !from_network && *round_leader == local_key_.public_key &&
         candidate_frontier_proposals_.find(transition_id) != candidate_frontier_proposals_.end();
 
     std::string validation_error;
@@ -1453,33 +1556,24 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     }
     const auto justify_committee = committee_for_height_round(msg.height, msg.round);
     const bool singleton_fallback_round = msg.round > 0 && justify_committee.size() == 1;
-    if (msg.round > 0 && !singleton_fallback_round && !msg.justify_qc.has_value() && !msg.justify_tc.has_value()) {
+    if (msg.round > 0 && !singleton_fallback_round && !msg.pol.has_value() && !msg.justify_tc.has_value()) {
       log_propose_hard_reject("missing-justify", " local_round=" + std::to_string(current_round_) +
-                                                   " justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
+                                                   " justify=" + justify_summary(msg.pol, msg.justify_tc));
       return ProposeHandlingResult::HardReject;
     }
-    if (msg.justify_qc.has_value()) {
-      std::vector<FinalitySig> filtered_qc;
-      std::string qc_error;
-      if (!verify_quorum_certificate_locked(*msg.justify_qc, &filtered_qc, &qc_error)) {
-        log_propose_hard_reject("invalid-qc", " detail=" + qc_error);
+    std::vector<FinalitySig> pol_prevotes;
+    if (msg.pol.has_value()) {
+      std::string pol_error;
+      if (!verify_polka_locked(*msg.pol, &pol_prevotes, &pol_error)) {
+        log_propose_hard_reject("invalid-pol", " detail=" + pol_error);
         return ProposeHandlingResult::HardReject;
       }
-      if (msg.justify_qc->height != msg.height) {
-        log_propose_hard_reject("wrong-qc-height");
+      if (msg.pol->height != msg.height) {
+        log_propose_hard_reject("wrong-pol-height");
         return ProposeHandlingResult::HardReject;
       }
-      if (msg.justify_qc->round >= msg.round) {
-        log_propose_hard_reject("non-lower-qc-round");
-        return ProposeHandlingResult::HardReject;
-      }
-      auto qc_payload_id = quorum_certificate_payload_id_locked(*msg.justify_qc);
-      if (!qc_payload_id.has_value()) {
-        log_propose_hard_reject("unknown-qc-transition");
-        return ProposeHandlingResult::HardReject;
-      }
-      if (*qc_payload_id != consensus_payload_id(transition)) {
-        log_propose_hard_reject("qc-mismatch");
+      if (msg.pol->frontier_transition_id != transition_id) {
+        log_propose_hard_reject("pol-mismatch");
         return ProposeHandlingResult::HardReject;
       }
     }
@@ -1502,7 +1596,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (msg.round > current_round_) {
       log_line("round-catchup height=" + std::to_string(msg.height) + " old_round=" + std::to_string(current_round_) +
                " new_round=" + std::to_string(msg.round) +
-               " reason=justified-propose justify=" + justify_summary(msg.justify_qc, msg.justify_tc));
+               " reason=justified-propose justify=" + justify_summary(msg.pol, msg.justify_tc));
       current_round_ = msg.round;
     }
 
@@ -1517,61 +1611,108 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       candidate_block_sizes_[transition_id] = sz;
     }
     candidate_frontier_proposals_[transition_id] = *proposal;
+    // The pol's prevotes are verified prevotes: record them like received ones (valid value).
+    for (const auto& sig : pol_prevotes) {
+      (void)prevotes_.add_vote(Vote{msg.height, *pol_round, transition_id, sig.validator_pubkey, sig.signature});
+    }
     prune_caches_locked(msg.height, msg.round);
-    (void)finalize_if_quorum(transition_id, msg.height, msg.round);
+    // Prevotes (the pol's included) and precommits may have arrived before the body.
+    on_candidate_body_locked(transition);
     if (finalized_height_ >= msg.height) {
-      // Votes already present (or the quorum-1 self-vote) finalized this proposal; a local
-      // vote now would be stale and must not turn a valid proposal into a peer penalty.
       log_line("proposal-local-vote-skip height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
                " transition=" + short_hash_hex(transition_id) + " reason=already-finalized");
       return ProposeHandlingResult::Accepted;
     }
 
+#ifdef FINALIS_CHAOS_BYZANTINE
+    if (chaos_byzantine_ && is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
+      // Vote for everything at both phases: no lock, floor, once-per-round or polka checks, nothing
+      // persisted. Honest validators must stay safe against up to f of these.
+      auto pv = crypto::ed25519_sign(prevote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
+      auto pc = crypto::ed25519_sign(vote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
+      if (pv.has_value()) maybe_vote = Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pv};
+      if (pc.has_value()) {
+        pending_local_precommits_.push_back(Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pc});
+      }
+      log_line("CHAOS-BYZANTINE vote-everything height=" + std::to_string(msg.height) +
+               " round=" + std::to_string(msg.round) + " transition=" + short_hash_hex(transition_id));
+    } else {
+#endif
     std::string vote_reason;
     const auto local_vote_key = std::make_pair(msg.height, msg.round);
     const bool local_is_committee_member = is_committee_member_for(local_key_.public_key, msg.height, msg.round);
-    const bool local_vote_reserved = local_vote_reservations_.find(local_vote_key) != local_vote_reservations_.end();
-    const bool local_can_vote = local_is_committee_member && !local_vote_reserved &&
-                                can_vote_for_frontier_locked(transition, msg.justify_qc, msg.justify_tc, &vote_reason);
+    const bool already_prevoted = local_prevotes_.contains(local_vote_key);
+    // A validator never votes in a round it timed out of.
+    const bool local_timed_out = local_timed_out_rounds_.contains(local_vote_key);
+    if (local_timed_out) vote_reason = "round-already-timed-out";
+    const bool below_vote_floor = msg.round < local_vote_round_floor_locked(msg.height);
+    if (below_vote_floor) vote_reason = "below-vote-floor";
+    // Timestamps are only bounded below by the chain (strictly increasing); honest validators bound
+    // them above by refusing to prevote a proposal stamped too far in their future.
+    constexpr std::uint64_t kMaxTimestampDriftS = 60;
+    const bool timestamp_in_future = transition.timestamp > now_unix() + kMaxTimestampDriftS;
+    if (timestamp_in_future) vote_reason = "timestamp-in-future";
+    bool local_can_vote = local_is_committee_member && !already_prevoted && !local_timed_out && !below_vote_floor &&
+                          !timestamp_in_future &&
+                          can_prevote_locked(msg.height, transition_id, pol_round, &vote_reason);
     if (local_can_vote) {
-      auto sig = crypto::ed25519_sign(vote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
+      // DATA AVAILABILITY: prevote only for a slice whose certified ingress this node holds and has
+      // checked. Every honest voter then holds the records, so any finalized slice can be fetched.
+      std::string ingress_detail;
+      switch (certified_ingress_status_for_vote_locked(*proposal, &ingress_detail)) {
+        case CertifiedIngressStatus::Ready:
+          break;
+        case CertifiedIngressStatus::Missing: {
+          local_can_vote = false;
+          vote_reason = "awaiting-certified-ingress detail=" + ingress_detail;
+          if (deferred_certified_votes_.size() >= kMaxDeferredCertifiedVotes) {
+            deferred_certified_votes_.erase(deferred_certified_votes_.begin());
+          }
+          deferred_certified_votes_[transition_id] = {msg, from_peer_id};
+          request_missing_proposal_ingress_locked(transition, from_peer_id);
+          break;
+        }
+        case CertifiedIngressStatus::Invalid:
+          local_can_vote = false;
+          vote_reason = "certified-ingress-invalid detail=" + ingress_detail;
+          break;
+      }
+    }
+    if (local_can_vote) {
+      auto sig =
+          crypto::ed25519_sign(prevote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
       if (!sig.has_value()) {
-        log_propose_hard_reject("local-vote-sign-failed");
+        log_propose_hard_reject("local-prevote-sign-failed");
         return ProposeHandlingResult::HardReject;
       }
-      // SAFETY: the lock must be durable before the vote can leave this process.
-      // Otherwise a crash after broadcast loses it and, on restart, this node
-      // could sign a conflicting payload at the same (height, round).
-      if (!update_local_vote_lock_locked(msg.height, msg.round, *proposal)) {
-        log_propose_hard_reject("local-vote-lock-persist-failed");
-        return ProposeHandlingResult::HardReject;
+      // SAFETY: the prevote is durable before it leaves this process, so a restart cannot prevote
+      // a different transition in the same round.
+      if (!record_local_prevote_locked(msg.height, msg.round, transition_id)) {
+        log_line("proposal-local-vote-skip height=" + std::to_string(msg.height) + " round=" +
+                 std::to_string(msg.round) + " transition=" + short_hash_hex(transition_id) +
+                 " reason=prevote-persist-failed");
+      } else {
+        log_line("local-prevote-emit height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+                 " transition=" + short_hash_hex(transition_id) + " pol_round=" +
+                 (pol_round.has_value() ? std::to_string(*pol_round) : std::string("none")));
+        maybe_vote = Vote{msg.height, msg.round, transition_id, local_key_.public_key, *sig};
       }
-      local_vote_reservations_.insert(local_vote_key);
-      log_line("local-vote-emit height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
-               " transition=" + short_hash_hex(transition_id) + " current_round=" + std::to_string(current_round_) +
-               " committee_member=yes");
-      maybe_vote = Vote{msg.height, msg.round, transition_id, local_key_.public_key, *sig};
     } else {
       if (!local_is_committee_member) vote_reason = "not-committee-member";
-      else if (local_vote_reserved) vote_reason = "vote-already-reserved";
+      else if (already_prevoted) vote_reason = "already-prevoted";
       else if (vote_reason.empty()) vote_reason = "not-votable";
       log_line("proposal-local-vote-skip height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
                " transition=" + short_hash_hex(transition_id) + " current_round=" + std::to_string(current_round_) +
-               " committee_member=" + std::string(local_is_committee_member ? "yes" : "no") +
-               " reserved=" + std::string(local_vote_reserved ? "yes" : "no") + " reason=" + vote_reason);
+               " committee_member=" + std::string(local_is_committee_member ? "yes" : "no") + " reason=" + vote_reason);
     }
+#ifdef FINALIS_CHAOS_BYZANTINE
+    }
+#endif
   }
 
-propose_done:
-
   if (maybe_vote.has_value()) {
-    broadcast_vote(*maybe_vote);
-    const bool ok = handle_vote(*maybe_vote, false, 0);
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      local_vote_reservations_.erase(std::make_pair(maybe_vote->height, maybe_vote->round));
-    }
-    return ok ? ProposeHandlingResult::Accepted : ProposeHandlingResult::HardReject;
+    broadcast_prevote(*maybe_vote);
+    (void)handle_prevote(*maybe_vote, false, 0);
   }
   return ProposeHandlingResult::Accepted;
 }
@@ -1660,10 +1801,12 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
       vote_verify_cache_.insert(vkey);
     }
 
+    // Soft: the vote is validly signed, so the relaying peer did nothing wrong. Penalizing it would
+    // let one equivocating validator get honest peers banned by everyone who relays its votes.
     if (locally_observed_equivocators_.find(vote.validator_pubkey) != locally_observed_equivocators_.end()) {
-      log_vote_hard_reject("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
+      log_vote_soft_reject("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
       if (reject_reason) *reject_reason = "known-equivocator";
-      return VoteHandlingResult::HardReject;
+      return VoteHandlingResult::SoftReject;
     }
 
     // INVARIANT: this is the only place (besides the local self-vote in finalize_if_quorum)
@@ -1684,10 +1827,11 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
 
     if (!tr.accepted) {
       if (!tr.duplicate) {
-        log_vote_hard_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id) +
+        // Soft for the same reason: a conflicting vote is the signer's fault, not the relayer's.
+        log_vote_soft_reject("tracker-rejected", " transition=" + short_hash_hex(vote.frontier_transition_id) +
                                                     " validator=" + short_pub_hex(vote.validator_pubkey));
         if (reject_reason) *reject_reason = "tracker-rejected";
-        return VoteHandlingResult::HardReject;
+        return VoteHandlingResult::SoftReject;
       }
       log_vote_soft_reject("duplicate", " transition=" + short_hash_hex(vote.frontier_transition_id) +
                                            " validator=" + short_pub_hex(vote.validator_pubkey) +
@@ -1697,17 +1841,10 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
     }
     accepted = true;
 
-    if (vote.validator_pubkey == local_key_.public_key) {
-      auto frontier_it = candidate_frontier_proposals_.find(vote.frontier_transition_id);
-      if (frontier_it != candidate_frontier_proposals_.end()) {
-        update_local_vote_lock_locked(vote.height, vote.round, frontier_it->second);
-      }
-    }
     relay_vote = from_network && !should_mute_peer_locked(from_peer_id);
     if (candidate_frontier_proposals_.find(vote.frontier_transition_id) == candidate_frontier_proposals_.end()) {
       (void)maybe_request_candidate_transition_locked(from_peer_id, vote.frontier_transition_id);
     }
-    maybe_record_quorum_certificate_locked(vote.frontier_transition_id, vote.height, vote.round);
     finalize_ok = finalize_if_quorum(vote.frontier_transition_id, vote.height, vote.round);
     if (!finalize_ok) {
       log_line("vote-accepted-waiting height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
@@ -1725,6 +1862,89 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
 
 bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id) {
   return handle_vote_result(vote, from_network, from_peer_id) == VoteHandlingResult::Accepted;
+}
+
+Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from_network, int from_peer_id,
+                                                     std::string* reject_reason) {
+  const FinalizedBroadcastFlushGuard flush_guard{this};  // destroyed last, after any mu_ scope
+  if (from_network && !running_) {
+    if (reject_reason) *reject_reason = "not-running";
+    return VoteHandlingResult::SoftReject;
+  }
+  bool relay = false;
+  bool accepted = false;
+  std::optional<Vote> precommit;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto soft = [&](const std::string& reason, const std::string& extra = std::string()) {
+      log_line("prevote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
+               " reason=" + reason + extra);
+      if (reject_reason) *reject_reason = reason;
+      return VoteHandlingResult::SoftReject;
+    };
+    auto hard = [&](const std::string& reason, const std::string& extra = std::string()) {
+      log_line("prevote-hard-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
+               " reason=" + reason + extra);
+      if (reject_reason) *reject_reason = reason;
+      return VoteHandlingResult::HardReject;
+    };
+    if (vote.height != finalized_height_ + 1) {
+      return soft(vote.height <= finalized_height_ ? "stale-finalized-height" : "future-height");
+    }
+    if (vote.round > current_round_) return soft("future-round", " local_round=" + std::to_string(current_round_));
+    if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) {
+      return hard("non-member", " validator=" + short_pub_hex(vote.validator_pubkey));
+    }
+    auto& verify_bucket = vote_verify_buckets_[from_peer_id];
+    verify_bucket.configure(cfg_.vote_verify_capacity, cfg_.vote_verify_refill);
+    if (from_network && !verify_bucket.consume(1.0, now_ms())) {
+      return soft("rate-limited", " peer_id=" + std::to_string(from_peer_id));
+    }
+    const p2p::VoteVerifyCache::Key vkey{vote.height, vote.round, vote.frontier_transition_id, vote.validator_pubkey};
+    if (invalid_prevote_verify_cache_.contains(vkey)) return hard("cached-invalid-signature");
+    if (!prevote_verify_cache_.contains(vkey)) {
+      const auto msg = prevote_signing_message(vote.height, vote.round, vote.frontier_transition_id);
+      if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) {
+        invalid_prevote_verify_cache_.insert(vkey);
+        return hard("invalid-signature", " validator=" + short_pub_hex(vote.validator_pubkey));
+      }
+      prevote_verify_cache_.insert(vkey);
+    }
+    // Validly signed: the relayer is not at fault (see handle_vote_result).
+    if (locally_observed_equivocators_.contains(vote.validator_pubkey)) {
+      return soft("known-equivocator", " validator=" + short_pub_hex(vote.validator_pubkey));
+    }
+    // INVARIANT: like votes_, every prevote entering prevotes_ passed ed25519_verify above (or is
+    // this node's own, or a verified pol signature); verify_polka_locked's skip path relies on it.
+    auto tr = prevotes_.add_vote(vote);
+    if (tr.equivocation) {
+      // Two prevotes in one round. Not turned into a slashing record: that format carries
+      // precommit evidence.
+      locally_observed_equivocators_.insert(vote.validator_pubkey);
+      log_line("prevote-equivocation-observed validator=" + short_pub_hex(vote.validator_pubkey) +
+               " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
+    }
+    if (!tr.accepted) {
+      if (!tr.duplicate) return soft("tracker-rejected");
+      return soft("duplicate", " validator=" + short_pub_hex(vote.validator_pubkey));
+    }
+    accepted = true;
+    relay = from_network && !should_mute_peer_locked(from_peer_id);
+    if (candidate_frontier_proposals_.find(vote.frontier_transition_id) == candidate_frontier_proposals_.end()) {
+      (void)maybe_request_candidate_transition_locked(from_peer_id, vote.frontier_transition_id);
+    }
+    precommit = on_prevotes_changed_locked(vote.frontier_transition_id, vote.height, vote.round);
+  }
+  if (relay) broadcast_prevote(vote);
+  if (precommit.has_value()) {
+    broadcast_vote(*precommit);
+    (void)handle_vote(*precommit, false, 0);
+  }
+  return accepted ? VoteHandlingResult::Accepted : VoteHandlingResult::SoftReject;
+}
+
+bool Node::handle_prevote(const Vote& vote, bool from_network, int from_peer_id) {
+  return handle_prevote_result(vote, from_network, from_peer_id) == VoteHandlingResult::Accepted;
 }
 
 Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVote& vote, bool from_network, int from_peer_id) {
@@ -1951,7 +2171,9 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       }
       return false;
     }
-    std::vector<PubKey32> expected_committee = recomputed.effective_committee;
+    // The committee that precommitted: the certificate's round, which can follow the transition's.
+    std::vector<PubKey32> expected_committee = consensus::canonical_committee_for_height_round(
+        canonical_derivation_config_locked(), *canonical_state_, transition.height, certificate->round);
     std::size_t expected_quorum = consensus::quorum_threshold(expected_committee.size());
     if (certificate->committee_members != expected_committee || certificate->quorum_threshold != expected_quorum) {
       log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
@@ -1960,7 +2182,8 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
       return false;
     }
     std::string apply_error;
-    if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, true, &expected_committee,
+    if (!apply_finalized_frontier_effects_locked(certified_record, certificate->round, canonical_sigs, true,
+                                                 &expected_committee,
                                                  &apply_error)) {
       log_reject("apply-finalized-frontier-effects-failed",
                  apply_error.empty() ? std::string() : " detail=" + apply_error);
@@ -1988,18 +2211,11 @@ bool Node::handle_frontier_block_locked(const FrontierProposal& proposal,
     }
     return false;
   }
-  std::string lock_error;
-  if (!can_accept_frontier_with_lock_locked(transition, &lock_error)) {
-    log_line("frontier-block-reject height=" + std::to_string(transition.height) + " round=" +
-             std::to_string(transition.round) + " transition=" + short_hash_hex(transition_id) +
-             " reason=" + lock_error);
-    return false;
-  }
   candidate_frontier_proposals_[transition_id] = proposal;
   candidate_block_sizes_[transition_id] = proposal.serialize().size();
   clear_sync_request_for_height(transition.height);
 
-  (void)finalize_if_quorum(transition_id, transition.height, transition.round);
+  on_candidate_body_locked(transition);
   return true;
 }
 
@@ -2175,6 +2391,77 @@ bool Node::validate_frontier_proposal_locked(const FrontierProposal& proposal, s
   return true;
 }
 
+Node::CertifiedIngressStatus Node::certified_ingress_status_for_vote_locked(const FrontierProposal& proposal,
+                                                                          std::string* detail) const {
+  const auto& transition = proposal.transition;
+  if (!canonical_state_.has_value()) {
+    if (detail) *detail = "missing-canonical-state";
+    return CertifiedIngressStatus::Invalid;
+  }
+  consensus::CanonicalFrontierRecord record;
+  std::string error;
+  if (!consensus::load_certified_frontier_record_from_storage(db_, transition, &record, &error)) {
+    if (detail) *detail = error;
+    const bool missing = error.rfind("frontier-storage-missing-lane-record", 0) == 0 ||
+                         error.rfind("frontier-storage-missing-ingress-bytes", 0) == 0;
+    return missing ? CertifiedIngressStatus::Missing : CertifiedIngressStatus::Invalid;
+  }
+  // Same certificate checks as finalization and replay (epoch, signatures, committee membership,
+  // lane, sequence, prev lane root, tx hash), without executing the slice again.
+  const auto vctx = special_validation_context_locked(transition.height);
+  consensus::FrontierLaneRoots next_lane_roots{};
+  std::vector<Bytes> certified_slice;
+  if (!consensus::frontier_merge_certified_ingress(transition.prev_vector, transition.next_vector, record.lane_records,
+                                                   canonical_state_->finalized_lane_roots, &next_lane_roots,
+                                                   &certified_slice, &vctx, &error)) {
+    if (detail) *detail = error;
+    return CertifiedIngressStatus::Invalid;
+  }
+  if (certified_slice != proposal.ordered_records) {
+    if (detail) *detail = "certified-ingress-slice-mismatch";
+    return CertifiedIngressStatus::Invalid;
+  }
+  if (consensus::frontier_ingress_commitment(transition.prev_vector, transition.next_vector, next_lane_roots) !=
+      transition.ingress_commitment) {
+    if (detail) *detail = "certified-ingress-commitment-mismatch";
+    return CertifiedIngressStatus::Invalid;
+  }
+  return CertifiedIngressStatus::Ready;
+}
+
+void Node::retry_deferred_certified_votes() {
+  std::vector<std::pair<p2p::ProposeMsg, int>> ready;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (deferred_certified_votes_.empty()) return;
+    const auto local_tips = local_ingress_lane_tips_locked();
+    for (auto it = deferred_certified_votes_.begin(); it != deferred_certified_votes_.end();) {
+      const auto& msg = it->second.first;
+      if (msg.height != finalized_height_ + 1 || msg.round < current_round_) {
+        it = deferred_certified_votes_.erase(it);
+        continue;
+      }
+      // Cheap gate before re-handling: every lane must reach the proposal's next vector.
+      const auto proposal = FrontierProposal::parse(msg.frontier_proposal_bytes);
+      bool complete = proposal.has_value();
+      for (std::size_t lane = 0; complete && lane < INGRESS_LANE_COUNT; ++lane) {
+        complete = local_tips[lane] >= proposal->transition.next_vector.lane_max_seq[lane];
+      }
+      if (!complete) {
+        ++it;
+        continue;
+      }
+      ready.push_back(std::move(it->second));
+      it = deferred_certified_votes_.erase(it);
+    }
+  }
+  for (const auto& [msg, peer_id] : ready) {
+    log_line("proposal-certified-ingress-retry height=" + std::to_string(msg.height) +
+             " round=" + std::to_string(msg.round) + " peer_id=" + std::to_string(peer_id));
+    (void)handle_propose_result(msg, false, peer_id, nullptr);
+  }
+}
+
 bool Node::check_and_record_proposer_equivocation_locked(const FrontierTransition& transition) {
   constexpr std::uint64_t kObservedProposalRetentionDepth = 512;
   const std::uint64_t min_height_to_keep =
@@ -2218,12 +2505,6 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   }
   FrontierProposal finalized_proposal = proposal_it->second;
 
-  std::string lock_error;
-  if (!can_accept_frontier_with_lock_locked(proposal_it->second.transition, &lock_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(block_id) + " reason=" + lock_error);
-    return false;
-  }
   consensus::CanonicalFrontierRecord certified_record;
   std::string frontier_record_error;
   if (!consensus::load_certified_frontier_record_from_storage(db_, finalized_proposal.transition, &certified_record,
@@ -2247,7 +2528,9 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
              " transition=" + short_hash_hex(block_id) + " reason=" + validation_error);
     return false;
   }
-  const auto expected_committee = recomputed.effective_committee;
+  // The committee that precommitted in `round`, which can follow the transition's own round.
+  const auto expected_committee = consensus::canonical_committee_for_height_round(
+      canonical_derivation_config_locked(), *canonical_state_, height, round);
   if (expected_committee.empty()) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=empty-effective-committee");
@@ -2312,7 +2595,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   const auto canonical_sigs = canonicalize_finality_signatures_locked(filtered, expected_quorum);
 
   std::string apply_error;
-  if (!apply_finalized_frontier_effects_locked(certified_record, canonical_sigs, false, &expected_committee,
+  if (!apply_finalized_frontier_effects_locked(certified_record, round, canonical_sigs, false, &expected_committee,
                                                &apply_error)) {
     log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=apply-failed" +
@@ -2397,6 +2680,15 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                    " reason=" + ingress_error);
           return std::nullopt;
         }
+        // A record certified in an earlier epoch can never be finalized: end the lane here rather
+        // than fail the whole build (drop_stale_unfinalized_ingress_locked clears it).
+        if (ingress.certificate.epoch != consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks)) {
+          log_line("frontier-build-lane-stale-epoch height=" + std::to_string(height) + " lane=" +
+                   std::to_string(lane) + " seq=" + std::to_string(seq) +
+                   " cert_epoch=" + std::to_string(ingress.certificate.epoch));
+          lane_blocked[lane] = true;
+          continue;
+        }
         if (ingress.certificate.prev_lane_root != expected_lane_roots[lane]) {
           quarantined_ingress_records_.insert({static_cast<std::uint32_t>(lane), seq});
           log_line("frontier-ingress-quarantine lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
@@ -2415,8 +2707,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
           return std::nullopt;
         }
         const auto record_verify_weight = consensus::ordered_record_confidential_verify_weight(ingress.tx_bytes);
-        if (selection.ordered_records.size() >= kMaxBlockTxs ||
-            total_bytes + ingress.tx_bytes.size() > kMaxBlockBytes ||
+        if (selection.ordered_records.size() >= consensus::kMaxFrontierSliceRecords ||
+            total_bytes + ingress.tx_bytes.size() > consensus::kMaxFrontierSliceBytes ||
             total_verify_weight + record_verify_weight > confidential_policy_.max_block_confidential_verify_weight) {
           capped = true;
           break;
@@ -2452,9 +2744,12 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       last_test_hook_error_ = "frontier-build-execution-failed:" + validation_error;
       return std::nullopt;
     }
+    const auto prev_finality = prev_finality_record_for_next_height_locked();
+    // Wall clock; populate raises it to parent + 1 when the clock is behind the chain.
+    result.transition.timestamp = now_unix();
     if (!consensus::populate_frontier_transition_metadata(canonical_derivation_config_locked(), *canonical_state_, height, round,
-                                                          local_key_.public_key,
-                                                          prev_finality_signers_for_next_height_locked(),
+                                                          local_key_.public_key, prev_finality.round,
+                                                          prev_finality.signers,
                                                           result.accepted_fee_units,
                                                           result.next_utxos, &result.transition, &validation_error)) {
       last_test_hook_error_ = "frontier-build-metadata-failed:" + validation_error;

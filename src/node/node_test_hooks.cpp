@@ -35,6 +35,18 @@ std::string Node::inject_network_vote_result_for_test(const Vote& vote) {
   return "unknown";
 }
 
+std::string Node::inject_network_prevote_result_for_test(const Vote& vote) {
+  switch (handle_prevote_result(vote, true, 1)) {
+    case VoteHandlingResult::Accepted:
+      return "accepted";
+    case VoteHandlingResult::SoftReject:
+      return "soft-reject";
+    case VoteHandlingResult::HardReject:
+      return "hard-reject";
+  }
+  return "unknown";
+}
+
 std::string Node::inject_network_vote_diagnostic_for_test(const Vote& vote) {
   std::string reject_reason;
   switch (handle_vote_result(vote, true, 1, &reject_reason)) {
@@ -113,11 +125,6 @@ bool Node::inject_frontier_block_for_test(const FrontierProposal& proposal, cons
   std::string validation_error;
   if (!validate_frontier_proposal_locked(proposal, &validation_error)) {
     last_test_hook_error_ = "validate-frontier-proposal-failed:" + validation_error;
-    return false;
-  }
-  std::string lock_error;
-  if (!can_accept_frontier_with_lock_locked(proposal.transition, &lock_error)) {
-    last_test_hook_error_ = "frontier-lock-reject:" + lock_error;
     return false;
   }
   std::vector<FinalitySig> verified_sigs;
@@ -268,9 +275,9 @@ std::optional<PubKey32> Node::proposer_for_height_round_for_test(std::uint64_t h
   return leader_for_height_round(height, round);
 }
 
-std::optional<QuorumCertificate> Node::highest_qc_for_height_for_test(std::uint64_t height) const {
+std::optional<QuorumCertificate> Node::valid_polka_for_height_for_test(std::uint64_t height) const {
   std::lock_guard<std::mutex> lk(mu_);
-  return highest_qc_for_height_locked(height);
+  return valid_polka_for_height_locked(height);
 }
 
 std::optional<TimeoutCertificate> Node::highest_tc_for_height_for_test(std::uint64_t height) const {
@@ -291,6 +298,12 @@ bool Node::local_vote_recorded_for_test(std::uint64_t height, std::uint32_t roun
     if (sig.validator_pubkey == local_key_.public_key) return true;
   }
   return false;
+}
+
+bool Node::local_prevote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = local_prevotes_.find({height, round});
+  return it != local_prevotes_.end() && it->second == transition_id;
 }
 
 bool Node::has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const {
@@ -419,21 +432,45 @@ bool Node::inject_ingress_tips_for_test(const p2p::IngressTipsMsg& msg, int peer
   return handle_ingress_tips_locked(peer_id, msg);
 }
 
+// Both range hooks mirror on_ingress_range: handle under mu_, then retry deferred votes without it.
 bool Node::inject_ingress_range_for_test(const p2p::IngressRangeMsg& msg, int peer_id) {
-  std::lock_guard<std::mutex> lk(mu_);
-  return handle_ingress_range_locked(peer_id, msg);
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    ok = handle_ingress_range_locked(peer_id, msg);
+  }
+  if (ok) retry_deferred_certified_votes();
+  return ok;
 }
 
 std::string Node::inject_ingress_range_result_for_test(const p2p::IngressRangeMsg& msg, int peer_id) {
-  std::lock_guard<std::mutex> lk(mu_);
   std::string error;
-  if (handle_ingress_range_locked(peer_id, msg, &error)) return {};
-  return error.empty() ? "unknown" : error;
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    ok = handle_ingress_range_locked(peer_id, msg, &error);
+  }
+  if (!ok) return error.empty() ? "unknown" : error;
+  retry_deferred_certified_votes();
+  return {};
+}
+
+std::size_t Node::deferred_certified_vote_count_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return deferred_certified_votes_.size();
+}
+
+// Same bookkeeping the round-timeout path does when it signs a timeout vote.
+void Node::mark_local_round_timed_out_for_test(std::uint64_t height, std::uint32_t round) {
+  std::lock_guard<std::mutex> lk(mu_);
+  local_timeout_vote_reservations_.insert({height, round});
+  local_timed_out_rounds_.insert({height, round});
 }
 
 void Node::set_requested_ingress_range_for_test(int peer_id, const p2p::GetIngressRangeMsg& msg) {
   std::lock_guard<std::mutex> lk(mu_);
   requested_ingress_ranges_[{peer_id, msg.lane}] = msg;
+  requested_ingress_range_sent_ms_[{peer_id, msg.lane}] = now_ms();
 }
 
 std::optional<p2p::GetIngressRangeMsg> Node::requested_ingress_range_for_test(int peer_id, std::uint32_t lane) const {

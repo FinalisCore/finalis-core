@@ -17,7 +17,7 @@ A live-protocol-faithful adversarial/economic simulator for committee concentrat
 ## Finality
 
 - The chain advances only at `finalized_height + 1`.
-- Finality requires `floor(2N/3) + 1` valid signatures over the exact `(height, round, block_id)` payload.
+- Finality is two-phase (prevote, precommit; see [CONSENSUS.md](CONSENSUS.md)): `floor(2N/3) + 1` valid precommits over one exact `(height, round, transition_id)`, each cast only after a prevote quorum for it in that round.
 - The active committee for a height comes from the finalized checkpoint for that height's epoch.
 - Epochs are fixed-width and currently `32` blocks on mainnet unless a test fixture overrides that network setting.
 - Proposer order is deterministic from the finalized epoch checkpoint.

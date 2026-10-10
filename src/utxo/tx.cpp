@@ -554,6 +554,7 @@ Bytes FrontierTransition::serialize() const {
   w.bytes_fixed(ordered_slice_commitment);
   w.bytes_fixed(decisions_commitment);
   w.u32le(quorum_threshold);
+  w.u32le(prev_finality_round);
   w.varint(prev_finality_signers.size());
   for (const auto& sig : prev_finality_signers) {
     w.bytes_fixed(sig.validator_pubkey);
@@ -583,10 +584,11 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
         auto ordered = r.bytes_fixed<32>();
         auto decisions = r.bytes_fixed<32>();
         auto quorum = r.u32le();
+        auto prev_finality_round = r.u32le();
         auto signer_count = r.varint();
         if (!prev_finalized || !prev_finality_link || !height || !timestamp || !round || !leader ||
             !prev_vector_bytes || !next_vector_bytes || !ingress_commitment || !prev || !next || !prev_root ||
-            !next_root || !ordered || !decisions || !quorum || !signer_count) {
+            !next_root || !ordered || !decisions || !quorum || !prev_finality_round || !signer_count) {
           return false;
         }
         auto prev_vector = FrontierVector::parse(*prev_vector_bytes);
@@ -608,6 +610,7 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
         out.ordered_slice_commitment = *ordered;
         out.decisions_commitment = *decisions;
         out.quorum_threshold = *quorum;
+        out.prev_finality_round = *prev_finality_round;
         if (*signer_count > MAX_COMMITTEE) return false;
         out.prev_finality_signers.clear();
         out.prev_finality_signers.reserve(static_cast<std::size_t>(*signer_count));

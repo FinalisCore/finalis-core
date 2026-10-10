@@ -512,8 +512,8 @@ struct ConfidentialPolicy {
   std::uint32_t max_confidential_inputs_per_tx{16};
   std::uint32_t max_confidential_outputs_per_tx{12};
   std::uint32_t max_memo_bytes{128};
-  std::uint32_t max_range_proof_bytes{1024};
-  std::uint32_t max_total_proof_bytes_per_tx{16384};
+  std::uint32_t max_range_proof_bytes{5134};
+  std::uint32_t max_total_proof_bytes_per_tx{65536};
   std::uint64_t max_fee{MAX_MONEY};
   std::uint64_t max_block_confidential_verify_weight{2'000'000};
 };
@@ -637,16 +637,12 @@ Patch these specific seams first:
 
 These are the places currently assuming `Tx::parse`.
 
-## 9. Mempool Scoring Patch Plan
+## 9. Mempool Scoring
 
-Current mempool admission and eviction are fee-per-byte only.
-
-That is insufficient for confidential transactions because proof verification
-cost is not proportional to raw size alone.
+Mempool admission and eviction score transactions by fee per score weight, not fee per byte, because
+confidential verification cost is not proportional to raw size.
 
 ### 9.1 `src/mempool/mempool.hpp`
-
-Extend `MempoolEntry`:
 
 ```cpp
 struct MempoolEntry {
@@ -654,94 +650,50 @@ struct MempoolEntry {
   Hash32 txid;
   std::uint64_t fee{0};
   std::size_t size_bytes{0};
+  std::uint64_t score_weight{0};
   std::uint64_t confidential_verify_weight{0};
-  std::uint64_t mempool_score_weight{0};
 };
 ```
 
-Add to `MempoolPolicyStats`:
-
-```cpp
-std::optional<double> min_score_rate_to_enter_when_full;
-std::uint64_t total_confidential_verify_weight{0};
-```
-
-Add pool-wide limit:
-
-```cpp
-static constexpr std::uint64_t kMaxPoolConfidentialVerifyWeight = 20'000'000;
-```
+Pool limits: `kMaxTxCount = 10'000`, `kMaxPoolBytes = 10 MiB`, `kMaxTxBytes = 100 KiB`.
 
 ### 9.2 Scoring Formula
 
-Define:
-
 ```cpp
-mempool_score_weight(tx) =
-    serialized_size
-  + (32 * confidential_input_count)
-  + (64 * confidential_output_count)
-  + (4 * total_range_proof_bytes)
-  + confidential_verify_weight;
+score_weight(tx) = max(1, serialized_size) + 4 * confidential_verify_weight(tx)
 ```
 
-Define score rate:
+`confidential_verify_weight` is the consensus weight from section 7.1. Entries are ordered by
+`fee / score_weight` (compared by cross-multiplication, no floating point), then by fee, then by txid.
 
-```cpp
-score_rate = fee / max<uint64_t>(1, mempool_score_weight)
-```
+### 9.3 Admission (`Mempool::accept_tx`)
 
-Use score rate, not pure byte rate, in:
+1. parse `AnyTx`; reject double-spends of pooled inputs
+2. if the pool is full, run a cheap pre-filter before any cryptography: estimate the fee rate with
+   `score_weight = serialized_size` (an overestimate of the true rate) and reject with
+   `mempool full: not good enough` if even that cannot beat the worst entry
+3. `validate_any_tx` (full verification, paid once per admitted transaction)
+4. reject `TxV2` whose confidential pool delta would drive the turnstile negative against the
+   committed pool value (`confidential-turnstile-would-go-negative`)
+5. if the pool is full, evict the worst entry only when the incoming entry beats it by
+   `full_replacement_margin_bps` (default 1,000 bps) on score rate
 
-- admission replacement checks
-- eviction ordering
-- block template selection preference
-
-### 9.3 `src/mempool/mempool.cpp`
-
-Replace:
-
-- `compare_fee_rate(...)`
-
-with:
-
-- `compare_score_rate(fee_a, weight_a, fee_b, weight_b)`
-
-Update:
-
-- `compare_entry_score`
-- `EvictionKey`
-- `meets_full_replacement_margin`
-
-Admission rules:
-
-1. parse `AnyTx`
-2. validate via `validate_any_tx`
-3. reject if pool-wide confidential verify weight would exceed cap
-4. score and evict based on score weight
+Pooled entries are not re-verified. After each finalized block the mempool removes confirmed
+transactions, prunes entries whose inputs no longer exist, and drops entries the new committed pool
+value no longer admits. None of these steps repeats cryptographic verification, so there is no
+pool-wide confidential verify-weight cap: the weight held in the pool costs no CPU, and admission
+cost is bounded by the full-pool pre-filter and peer-level rate limits.
 
 ### 9.4 Block Selection
 
-Current selection path:
-
-```cpp
-select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view, ...)
-```
-
-Change to:
-
-```cpp
-select_for_block(std::size_t max_txs, std::size_t max_bytes,
-                 std::uint64_t max_confidential_verify_weight,
-                 const UtxoSetV2& view, ...)
-```
-
-Track:
-
-- cumulative serialized bytes
-- cumulative confidential verify weight
-
-Skip any tx that would overflow either bound.
+Proposers build frontier slices from certified ingress lanes, not from the mempool
+(`Node::build_frontier_transition_locked`). While merging lanes the proposer stops before a slice
+exceeds `kMaxFrontierSliceRecords` (1,000), `kMaxFrontierSliceBytes` (1 MiB), or
+`max_block_confidential_verify_weight`, using
+`consensus::ordered_record_confidential_verify_weight` for each record so the proposer's count
+matches the consensus rule in section 7.1. All three bounds are consensus rules: `execute_frontier_slice`
+rejects a slice that exceeds any of them (`frontier-slice-record-count-exceeded`,
+`frontier-slice-bytes-exceeded`, `frontier-confidential-verify-weight-exceeded`).
 
 ## 10. Wallet Patch Plan
 
@@ -856,8 +808,8 @@ struct ConfidentialPolicy {
   std::uint32_t max_confidential_inputs_per_tx{16};
   std::uint32_t max_confidential_outputs_per_tx{12};
   std::uint32_t max_memo_bytes{128};
-  std::uint32_t max_range_proof_bytes{1024};
-  std::uint32_t max_total_proof_bytes_per_tx{16384};
+  std::uint32_t max_range_proof_bytes{5134};
+  std::uint32_t max_total_proof_bytes_per_tx{65536};
   std::uint64_t max_fee{MAX_MONEY};
   std::uint64_t max_block_confidential_verify_weight{2'000'000};
 };

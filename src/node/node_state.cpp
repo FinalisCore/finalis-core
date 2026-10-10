@@ -256,6 +256,7 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   consensus::CanonicalDerivedState state;
   state.finalized_height = finalized_height;
   state.finalized_identity = consensus::FinalizedIdentity::transition(finalized_hash);
+  state.finalized_timestamp = transition->timestamp;
   state.finalized_frontier = transition->next_frontier;
   state.finalized_frontier_vector = transition->next_vector;
   state.finalized_lane_roots = consensus::FrontierLaneRoots{};
@@ -402,6 +403,7 @@ bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std:
     std::copy(stored_genesis_artifact->begin(), stored_genesis_artifact->end(), genesis_state.genesis_artifact_id.begin());
   }
   genesis_state.initial_validators = genesis_doc->initial_validators;
+  genesis_state.genesis_time_unix = genesis_doc->genesis_time_unix;
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
@@ -667,6 +669,7 @@ bool Node::init_mainnet_genesis() {
   consensus::CanonicalGenesisState genesis_state;
   genesis_state.genesis_artifact_id = gblock;
   genesis_state.initial_validators = doc->initial_validators;
+  genesis_state.genesis_time_unix = doc->genesis_time_unix;
   consensus::CanonicalDerivedState canonical_genesis_state;
   std::string canonical_error;
   if (!consensus::build_genesis_canonical_state(canonical_derivation_config_locked(), genesis_state,
@@ -727,6 +730,7 @@ bool Node::load_state() {
     std::copy(stored_genesis_artifact->begin(), stored_genesis_artifact->end(), genesis_state.genesis_artifact_id.begin());
   }
   genesis_state.initial_validators = genesis_doc->initial_validators;
+  genesis_state.genesis_time_unix = genesis_doc->genesis_time_unix;
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
@@ -1048,8 +1052,8 @@ bool Node::load_state() {
 
   local_epoch_tickets_.clear();
   local_vote_locks_.clear();
-  highest_qc_by_height_.clear();
-  highest_qc_payload_by_height_.clear();
+  valid_polka_by_height_.clear();
+  local_prevotes_.clear();
   highest_tc_by_height_.clear();
   std::set<std::uint64_t> rebuild_epochs;
   for (const auto epoch : db_.load_epoch_ticket_epochs()) rebuild_epochs.insert(epoch);
@@ -1119,23 +1123,20 @@ bool Node::load_state() {
     const auto primary_row = db_.get(key_consensus_safety_state(height));
     const auto mirror_row = db_.get(key_consensus_safety_mirror(height));
     std::optional<std::pair<Hash32, std::uint32_t>> lock_state;
-    std::optional<QuorumCertificate> qc_state;
-    std::optional<Hash32> qc_payload_id;
+    std::optional<QuorumCertificate> valid_polka;
+    std::map<std::uint32_t, Hash32> prevotes;
     auto decode = [&](const std::optional<Bytes>& row, bool mirror) {
       if (!row.has_value()) return false;
       const auto inner = unseal_consensus_safety_row(*row, mirror);
       if (!inner.has_value()) return false;
-      lock_state.reset();
-      qc_state.reset();
-      qc_payload_id.reset();
-      return parse_consensus_safety_state(*inner, &lock_state, &qc_state, &qc_payload_id);
+      return parse_consensus_safety_state(*inner, &lock_state, &valid_polka, &prevotes);
     };
     const bool primary_ok = decode(primary_row, false);
     const bool mirror_ok = !primary_ok && decode(mirror_row, true);
     if (!primary_ok && !mirror_ok) {
-      // Both copies unreadable: the lock (if any) is lost.
+      // Both copies unreadable: the lock and prevote record (if any) are lost.
       // A node outside a multi-member committee for this height cannot have voted here, so the
-      // row could only have held an observed QC and is safe to drop. Committees of size < 2 use
+      // row could only have held an observed polka and is safe to drop. Committees of size < 2 use
       // per-round fallback members, so membership is not knowable for every round: quarantine.
       if (height == finalized_height_ + 1) {
         const auto committee = committee_for_height_round(height, 0);
@@ -1166,28 +1167,22 @@ bool Node::load_state() {
     if (mirror_ok) {
       log_line("consensus-safety-primary-repaired height=" + std::to_string(height) + " source=mirror");
     }
-    bool qc_valid = true;
-    if (qc_state.has_value()) {
-      if (qc_state->height != height || !qc_payload_id.has_value()) {
-        qc_valid = false;
-      } else {
-        std::vector<FinalitySig> filtered;
-        qc_valid = verify_quorum_certificate_locked(*qc_state, &filtered, nullptr);
-      }
-    } else if (qc_payload_id.has_value()) {
-      qc_valid = false;
+    bool polka_valid = true;
+    if (valid_polka.has_value()) {
+      std::vector<FinalitySig> filtered;
+      polka_valid = valid_polka->height == height && verify_polka_locked(*valid_polka, &filtered, nullptr);
     }
     if (lock_state.has_value()) local_vote_locks_[height] = *lock_state;
-    if (qc_valid) {
-      if (qc_state.has_value()) highest_qc_by_height_[height] = *qc_state;
-      if (qc_payload_id.has_value()) highest_qc_payload_by_height_[height] = *qc_payload_id;
+    for (const auto& [round, transition_id] : prevotes) local_prevotes_[{height, round}] = transition_id;
+    if (polka_valid) {
+      if (valid_polka.has_value()) valid_polka_by_height_[height] = *valid_polka;
     } else {
-      // Drop only the unverifiable QC; the lock is kept.
-      log_line("consensus-safety-qc-dropped height=" + std::to_string(height) + " reason=invalid-persisted-qc" +
+      // Drop only the unverifiable polka (it is evidence, not a vote); lock and prevotes are kept.
+      log_line("consensus-safety-polka-dropped height=" + std::to_string(height) + " reason=invalid-persisted-polka" +
                " lock=" + std::string(lock_state.has_value() ? "kept" : "none"));
     }
-    // Rewrite both sealed copies when the primary was bad, legacy-format, or the mirror is missing.
-    const bool needs_rewrite = !qc_valid || mirror_ok || !mirror_row.has_value() ||
+    // Rewrite both sealed copies when the primary was bad or the mirror is missing.
+    const bool needs_rewrite = !polka_valid || mirror_ok || !mirror_row.has_value() ||
                                !unseal_consensus_safety_row(*mirror_row, true).has_value();
     if (needs_rewrite && !persist_consensus_safety_state_locked(height)) return false;
   }
@@ -1228,31 +1223,25 @@ bool Node::load_state() {
     // Restore the locked proposal as a candidate so the TC-round re-proposal path in the
     // proposer loop can rebuild it; without it a lock held across a network-wide restart can
     // never be satisfied (the deadlock that previously motivated dropping the lock here).
-    const auto lock_it = local_vote_locks_.find(*height);
+    const auto valid_it = valid_polka_by_height_.find(*height);
     auto proposal = FrontierProposal::parse(value);
-    if (lock_it == local_vote_locks_.end() || !proposal.has_value() || proposal->transition.height != *height ||
-        consensus_payload_id(proposal->transition) != lock_it->second.first) {
-      log_line("consensus-locked-proposal-ignored height=" + std::to_string(*height) +
-               " reason=" + std::string(lock_it == local_vote_locks_.end() ? "no-lock"
-                                        : !proposal.has_value()             ? "parse-failed"
-                                                                            : "payload-mismatch"));
+    if (valid_it == valid_polka_by_height_.end() || !proposal.has_value() || proposal->transition.height != *height ||
+        proposal->transition.transition_id() != valid_it->second.frontier_transition_id) {
+      log_line("consensus-valid-proposal-ignored height=" + std::to_string(*height) +
+               " reason=" + std::string(valid_it == valid_polka_by_height_.end() ? "no-valid-polka"
+                                        : !proposal.has_value()                   ? "parse-failed"
+                                                                                  : "transition-mismatch"));
       continue;
     }
     const auto transition_id = proposal->transition.transition_id();
     candidate_block_sizes_[transition_id] = value.size();
     candidate_frontier_proposals_[transition_id] = std::move(*proposal);
-    log_line("consensus-locked-proposal-restored height=" + std::to_string(*height) +
-             " round=" + std::to_string(lock_it->second.second) + " payload=" + short_hash_hex(lock_it->second.first));
+    log_line("consensus-valid-proposal-restored height=" + std::to_string(*height) +
+             " round=" + std::to_string(valid_it->second.round) + " transition=" + short_hash_hex(transition_id));
   }
   for (const auto& [height, lock] : local_vote_locks_) {
-    const bool has_body = std::any_of(candidate_frontier_proposals_.begin(), candidate_frontier_proposals_.end(),
-                                      [&](const auto& kv) {
-                                        return kv.second.transition.height == height &&
-                                               consensus_payload_id(kv.second.transition) == lock.first;
-                                      });
     log_line("consensus-safety-lock-restored height=" + std::to_string(height) + " round=" +
-             std::to_string(lock.second) + " payload=" + short_hash_hex(lock.first) +
-             " proposal=" + std::string(has_body ? "restored" : "missing"));
+             std::to_string(lock.second) + " transition=" + short_hash_hex(lock.first));
   }
   log_line("startup-progress phase=load-state-done");
   last_open_epoch_ticket_epoch_ = current_epoch_ticket_epoch_locked();

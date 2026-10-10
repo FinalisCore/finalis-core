@@ -309,9 +309,12 @@ bool Node::init() {
     proposed_in_round_.clear();
     logged_committee_rounds_.clear();
     votes_.clear_height(finalized_height_ + 1);
+    prevotes_.clear_height(finalized_height_ + 1);
     timeout_votes_.clear_height(finalized_height_ + 1);
     highest_tc_by_height_.erase(finalized_height_ + 1);
     local_timeout_vote_reservations_.clear();
+    reseed_local_votes_locked(finalized_height_ + 1);
+    drop_stale_unfinalized_ingress_locked();
   }
   if (restart_debug_) {
     log_line("restart-debug startup-state height=" + std::to_string(finalized_height_) + " round=" +
@@ -322,6 +325,12 @@ bool Node::init() {
 
   round_started_ms_ = now_ms();
   last_finalized_progress_ms_ = now_ms();
+#ifdef FINALIS_CHAOS_BYZANTINE
+  if (const char* v = std::getenv("FINALIS_CHAOS_BYZANTINE"); v && std::string_view(v) == "1") {
+    chaos_byzantine_ = true;
+    log_line("CHAOS-BYZANTINE enabled: this validator violates the consensus rules on purpose");
+  }
+#endif
   {
     std::lock_guard<std::mutex> lk(mu_);
     arm_round0_deadline_locked(round_started_ms_);
@@ -1079,8 +1088,9 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
 void Node::event_loop() {
   while (running_) {
     (void)reap_lightserver_child(true);
-    std::optional<FrontierProposal> frontier_to_propose;
+    std::optional<p2p::ProposeMsg> propose_to_send;
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
+    LocalVoteRebroadcast votes_to_rebroadcast;
     std::vector<int> keepalive_peers;
     std::vector<int> finalized_tip_poll_peers;
     bool should_build_proposal = false;
@@ -1316,7 +1326,7 @@ void Node::event_loop() {
 
       bool can_propose = false;
       const auto leader = leader_for_height_round(h, current_round_);
-      const auto highest_qc = highest_qc_for_height_locked(h);
+      const auto valid_polka = valid_polka_for_height_locked(h);
       const auto highest_tc = highest_tc_for_height_locked(h);
       std::set<PubKey32> established_active_validator_pubkeys;
       for (const auto& [peer_id, pub] : peer_validator_pubkeys_) {
@@ -1332,10 +1342,10 @@ void Node::event_loop() {
       const bool ticket_pow_fallback_round = current_round_ > 0 && committee.size() == 1;
       const bool tc_driven_round = highest_tc.has_value() && highest_tc->round < current_round_;
       const bool round_justification_ready =
-          ticket_pow_fallback_round || highest_qc.has_value() ||
+          ticket_pow_fallback_round || valid_polka.has_value() ||
           (highest_tc.has_value() && highest_tc->round < current_round_) || current_round_ == 0;
       can_propose = leader.has_value() && *leader == local_key_.public_key;
-      if (highest_tc.has_value() && !highest_qc.has_value()) {
+      if (highest_tc.has_value() && !valid_polka.has_value()) {
         if (tc_no_qc_height_ != h) {
           tc_no_qc_height_ = h;
           tc_no_qc_last_round_ = current_round_;
@@ -1360,6 +1370,18 @@ void Node::event_loop() {
       }
       const std::uint64_t stale_ms = cfg_.network.round_timeout_ms * 2ULL;
       const bool consensus_stalled = now_ms > last_finalized_progress_ms_ + stale_ms;
+      // LIVENESS: a vote is otherwise sent once. Votes lost while peers were unreachable (partition,
+      // reconnect) are never retransmitted, and a TC missing one side's timeout votes never forms, so
+      // a healed partition could halt the height for good. While stalled, re-gossip this node's own
+      // votes at h.
+      if (now_ms >= last_tx_reforward_ms_ + 5000) {
+        last_tx_reforward_ms_ = now_ms;
+        reforward_uncertified_mempool_txs_locked();
+      }
+      if (consensus_stalled && now_ms >= last_consensus_rebroadcast_ms_ + cfg_.network.round_timeout_ms) {
+        last_consensus_rebroadcast_ms_ = now_ms;
+        votes_to_rebroadcast = local_votes_for_rebroadcast_locked(h);
+      }
       const std::uint64_t current_round_timeout_ms = round_timeout_ms_for_round(cfg_.network, current_round_);
       const bool emit_liveness_debug = debug_liveness_logs_enabled() || consensus_stalled;
       if (emit_liveness_debug && now_ms >= last_liveness_log_ms_ + 5000) {
@@ -1384,7 +1406,7 @@ void Node::event_loop() {
             << " ticket_window_elapsed=" << (ticket_window_elapsed ? "yes" : "no")
             << " round_timeout_elapsed=" << (timeout_elapsed ? "yes" : "no")
             << " round_justification_ready=" << (round_justification_ready ? "yes" : "no")
-            << " has_qc=" << (highest_qc.has_value() ? "yes" : "no")
+            << " has_qc=" << (valid_polka.has_value() ? "yes" : "no")
             << " has_tc=" << (highest_tc.has_value() ? "yes" : "no")
             << " established_active_validators=" << established_active_validators
             << " required_active_validators=" << required_active_validators
@@ -1397,7 +1419,7 @@ void Node::event_loop() {
       }
       const bool round_timeout_elapsed = now_ms > round_started_ms_ + current_round_timeout_ms;
       if (!repair_mode_ && !pause_proposals_.load() && current_round_ == 0 && can_propose && committee_ready &&
-          block_interval_elapsed && ticket_window_elapsed && round_timeout_elapsed && !highest_qc.has_value() &&
+          block_interval_elapsed && ticket_window_elapsed && round_timeout_elapsed && !valid_polka.has_value() &&
           !highest_tc.has_value() && !quorum_validator_connectivity_ready &&
           now_ms >= last_round0_no_quorum_log_ms_ + 5000) {
         log_line("deadlock-break-debug height=" + std::to_string(h) + " round=0" +
@@ -1438,7 +1460,7 @@ void Node::event_loop() {
       const bool round0_grace_elapsed = current_round_ > 0 || now_ms >= round0_deadline_ms_;
       bool advanced_round_this_tick = false;
       if (!repair_mode_ && !pause_proposals_.load() && !should_build_proposal && round_timeout_elapsed &&
-          round0_grace_elapsed && consensus_stalled && can_propose && !highest_qc.has_value() && !highest_tc.has_value() &&
+          round0_grace_elapsed && consensus_stalled && can_propose && !valid_polka.has_value() && !highest_tc.has_value() &&
           committee.size() == 1) {
         const auto old_round = current_round_;
         current_round_ = old_round + 1;
@@ -1466,6 +1488,7 @@ void Node::event_loop() {
           if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(h, timeout_round), local_key_.private_key);
               sig.has_value()) {
             local_timeout_vote_reservations_.insert(timeout_vote_key);
+            local_timed_out_rounds_.insert(timeout_vote_key);
             timeout_vote_to_broadcast = TimeoutVote{h, timeout_round, local_key_.public_key, *sig};
             timeout_evidence_progressed = true;
             log_line("round-timeout-vote height=" + std::to_string(h) + " round=" + std::to_string(timeout_round));
@@ -1506,68 +1529,54 @@ void Node::event_loop() {
     if (should_build_proposal) {
       std::optional<FrontierProposal> built;
       std::optional<FrontierProposal> reproposal;
+      std::optional<QuorumCertificate> reproposal_pol;
       std::string build_error;
       {
         std::lock_guard<std::mutex> lk(mu_);
-        const auto highest_tc = highest_tc_for_height_locked(build_height);
-        const bool tc_driven_round = highest_tc.has_value() && highest_tc->round < build_round && build_round > 0;
-        if (tc_driven_round) {
-          std::optional<Hash32> preferred_payload;
-          if (auto lock_it = local_vote_locks_.find(build_height); lock_it != local_vote_locks_.end()) {
-            preferred_payload = lock_it->second.first;
-          } else if (auto qc_it = highest_qc_payload_by_height_.find(build_height); qc_it != highest_qc_payload_by_height_.end()) {
-            preferred_payload = qc_it->second;
-          }
-          if (preferred_payload.has_value()) {
-            for (const auto& [_, candidate] : candidate_frontier_proposals_) {
-              if (candidate.transition.height != build_height) continue;
-              if (consensus_payload_id(candidate.transition) != *preferred_payload) continue;
-              reproposal = candidate;
-              break;
-            }
-          }
-          if (reproposal.has_value()) {
-            const auto committee = committee_for_height_round(build_height, build_round);
-            reproposal->transition.round = build_round;
-            reproposal->transition.leader_pubkey = local_key_.public_key;
-            reproposal->transition.quorum_threshold = static_cast<std::uint32_t>(consensus::quorum_threshold(committee.size()));
-            reproposal->transition.prev_finality_signers = prev_finality_signers_for_next_height_locked();
-            if (!validate_frontier_proposal_locked(*reproposal, &build_error)) {
-              reproposal.reset();
-            } else {
-              log_line("proposal-lock-reproposal height=" + std::to_string(build_height) +
-                       " round=" + std::to_string(build_round) +
-                       " payload=" + short_hash_hex(*preferred_payload) +
-                       " tc_round=" + std::to_string(highest_tc->round));
-            }
+        // Tendermint: re-propose the valid value unchanged, with its polka; otherwise build fresh.
+        if (auto polka = valid_polka_for_height_locked(build_height); polka.has_value() && polka->round < build_round) {
+          if (auto it = candidate_frontier_proposals_.find(polka->frontier_transition_id);
+              it != candidate_frontier_proposals_.end()) {
+            reproposal = it->second;
+            reproposal_pol = std::move(polka);
+            log_line("proposal-valid-value-reproposal height=" + std::to_string(build_height) +
+                     " round=" + std::to_string(build_round) + " transition=" +
+                     short_hash_hex(reproposal_pol->frontier_transition_id) +
+                     " pol_round=" + std::to_string(reproposal_pol->round));
+          } else {
+            log_line("proposal-valid-value-missing height=" + std::to_string(build_height) +
+                     " round=" + std::to_string(build_round) + " transition=" +
+                     short_hash_hex(polka->frontier_transition_id) + " fallback=fresh-build");
           }
         }
         if (!reproposal.has_value()) {
           built = build_frontier_transition_locked(build_height, build_round);
           build_error = last_test_hook_error_;
-          if (tc_driven_round && local_vote_locks_.find(build_height) != local_vote_locks_.end() && built.has_value()) {
-            const auto built_payload = consensus_payload_id(built->transition);
-            const auto locked_payload = local_vote_locks_[build_height].first;
-            if (built_payload != locked_payload) {
-              log_line("proposal-build-skip height=" + std::to_string(build_height) +
-                       " round=" + std::to_string(build_round) +
-                       " reason=tc-round-locked-payload-mismatch built_payload=" + short_hash_hex(built_payload) +
-                       " locked_payload=" + short_hash_hex(locked_payload));
-              built.reset();
-            }
-          }
         }
       }
       const auto& selected = reproposal.has_value() ? reproposal : built;
       if (selected.has_value()) {
         std::lock_guard<std::mutex> lk(mu_);
         const auto key = std::make_pair(build_height, build_round);
-        if (finalized_height_ + 1 == build_height && current_round_ == build_round &&
+        const auto transition_id = selected->transition.transition_id();
+        const std::optional<std::uint32_t> pol_round =
+            reproposal_pol.has_value() ? std::optional<std::uint32_t>(reproposal_pol->round) : std::nullopt;
+        auto sig = crypto::ed25519_sign(propose_signing_message(build_height, build_round, transition_id, pol_round),
+                                        local_key_.private_key);
+        if (finalized_height_ + 1 == build_height && current_round_ == build_round && sig.has_value() &&
             proposed_in_round_.find(key) == proposed_in_round_.end()) {
           proposed_in_round_[key] = true;
-          candidate_frontier_proposals_[selected->transition.transition_id()] = *selected;
-          candidate_block_sizes_[selected->transition.transition_id()] = selected->serialize().size();
-          frontier_to_propose = *selected;
+          candidate_frontier_proposals_[transition_id] = *selected;
+          candidate_block_sizes_[transition_id] = selected->serialize().size();
+          p2p::ProposeMsg msg;
+          msg.height = build_height;
+          msg.round = build_round;
+          msg.prev_finalized_hash = selected->transition.prev_finalized_hash;
+          msg.frontier_proposal_bytes = selected->serialize();
+          msg.pol = reproposal_pol;
+          if (build_round > 0) msg.justify_tc = highest_tc_for_height_locked(build_height);
+          msg.proposer_signature = *sig;
+          propose_to_send = std::move(msg);
         }
       } else {
         log_line("proposal-build-skip height=" + std::to_string(build_height) + " round=" + std::to_string(build_round) +
@@ -1575,30 +1584,56 @@ void Node::event_loop() {
       }
     }
 
-    if (frontier_to_propose.has_value()) {
-      std::optional<QuorumCertificate> justify_qc;
-      std::optional<TimeoutCertificate> justify_tc;
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (frontier_to_propose->transition.round > 0) {
-          justify_qc = highest_qc_for_height_locked(frontier_to_propose->transition.height);
-          if (!justify_qc.has_value()) justify_tc = highest_tc_for_height_locked(frontier_to_propose->transition.height);
+    if (propose_to_send.has_value()) {
+#ifdef FINALIS_CHAOS_BYZANTINE
+      if (chaos_byzantine_ && !cfg_.disable_p2p) {
+        // Equivocate: a second valid proposal for the same round (different timestamp, so a
+        // different transition id), each sent to half of the peers.
+        auto proposal = FrontierProposal::parse(propose_to_send->frontier_proposal_bytes);
+        if (proposal.has_value()) {
+          p2p::ProposeMsg alt = *propose_to_send;
+          // Still valid: later than the parent and within the honest prevoters' drift bound.
+          proposal->transition.timestamp += 1 + (++chaos_equivocation_nonce_ % 30);
+          alt.frontier_proposal_bytes = proposal->serialize();
+          const std::optional<std::uint32_t> pol_round =
+              alt.pol.has_value() ? std::optional<std::uint32_t>(alt.pol->round) : std::nullopt;
+          if (auto sig = crypto::ed25519_sign(
+                  propose_signing_message(alt.height, alt.round, proposal->transition.transition_id(), pol_round),
+                  local_key_.private_key)) {
+            alt.proposer_signature = *sig;
+            bool flip = false;
+            for (int peer_id : p2p_.peer_ids()) {
+              const auto& m = flip ? alt : *propose_to_send;
+              (void)p2p_.send_to(peer_id, p2p::MsgType::PROPOSE, p2p::ser_propose(m), true);
+              flip = !flip;
+            }
+            log_line("CHAOS-BYZANTINE equivocating-propose height=" + std::to_string(alt.height) +
+                     " round=" + std::to_string(alt.round));
+            handle_propose(*propose_to_send, false);
+            handle_propose(alt, false);
+            propose_to_send.reset();
+          }
         }
       }
-      p2p::ProposeMsg local_msg;
-      local_msg.height = frontier_to_propose->transition.height;
-      local_msg.round = frontier_to_propose->transition.round;
-      local_msg.prev_finalized_hash = frontier_to_propose->transition.prev_finalized_hash;
-      local_msg.frontier_proposal_bytes = frontier_to_propose->serialize();
-      local_msg.justify_qc = justify_qc;
-      local_msg.justify_tc = justify_tc;
-      broadcast_propose(*frontier_to_propose, justify_qc, justify_tc);
-      handle_propose(local_msg, false);
+#endif
+      if (propose_to_send.has_value()) {
+        broadcast_propose(*propose_to_send);
+        handle_propose(*propose_to_send, false);
+      }
     }
 
     // Backstop for finalizations reached from event-loop paths (sync, repair).
     flush_pending_finalized_broadcasts();
 
+    for (const auto& v : votes_to_rebroadcast.timeouts) broadcast_timeout_vote(v);
+    for (const auto& v : votes_to_rebroadcast.prevotes) broadcast_prevote(v);
+    for (const auto& v : votes_to_rebroadcast.precommits) broadcast_vote(v);
+    if (!votes_to_rebroadcast.timeouts.empty() || !votes_to_rebroadcast.prevotes.empty() ||
+        !votes_to_rebroadcast.precommits.empty()) {
+      log_line("consensus-rebroadcast timeouts=" + std::to_string(votes_to_rebroadcast.timeouts.size()) +
+               " prevotes=" + std::to_string(votes_to_rebroadcast.prevotes.size()) +
+               " precommits=" + std::to_string(votes_to_rebroadcast.precommits.size()));
+    }
     if (timeout_vote_to_broadcast.has_value()) {
       broadcast_timeout_vote(*timeout_vote_to_broadcast);
       const bool ok = handle_timeout_vote(*timeout_vote_to_broadcast, false, 0);
