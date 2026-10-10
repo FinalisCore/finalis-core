@@ -140,6 +140,8 @@ Ingress validity requires:
 - lane assignment recomputes and matches certificate lane
 - strict sequence continuity and `prev_lane_root` chaining
 
+One committee member certifies each lane per epoch, chosen by `sha256d(epoch_start ‖ lane)` modulo the committee size, so a single writer extends each lane. The choice is routing only (a certificate from any committee member is valid), and it changes every epoch, so a certifier that censors its lanes holds them for at most one epoch. Validators re-forward uncertified mempool transactions to the current certifier.
+
 Stale-epoch ingress is rejected. Equivocation at fixed `(epoch, lane, seq)` is rejected and persisted as deterministic evidence. Re-delivery of a record whose certificate is identical to the one already stored (for example, a record first received by gossip and then again in a range-sync response) is an idempotent no-op, not a sequence violation; genuine gaps remain rejected.
 
 **Proposition 4 (Ingress Epoch Freshness).**  

@@ -14,10 +14,20 @@ healed windows. Each healed window must show progress (a new height finalized) w
 Safety: every "finalized height=H transition=T" log line from every node is compared; two
 transitions at one height is a fork and stops the run (exit 3).
 
+--byzantine K makes the first K validators Byzantine (needs a build configured with
+-DFINALIS_CHAOS_BYZANTINE=ON): they prevote and precommit every proposal they see, ignoring every
+rule, and send two different proposals to different peers when they lead. Honest validators must
+stay safe and live with K <= f. Byzantine nodes are never crashed; crashes take at most
+max(1, f - K) honest nodes.
+
+--tx-interval S sends a payment every S seconds (after the first reward settlement funds the
+validators) through a random running node's lightserver and tracks it to finality.
+
 Liveness: stalls (exit 2), recovery times, rounds per height, catch-up lag at the end.
 
 Usage:
   scripts/chaos_devnet.py --nodes 7 --duration 900 --seed 1
+  scripts/chaos_devnet.py --nodes 7 --byzantine 2 --build-dir build-chaos --tx-interval 1
 Output: <workdir>/report.json, <workdir>/report.md, <workdir>/node<i>.log
 """
 
@@ -83,13 +93,19 @@ class Network:
             for j in range(self.n):
                 if i == j:
                     continue
+                # Listens on node j's address 127.0.0.<10+j>: node i sees each outbound peer under its
+                # own IP too.
                 server = await asyncio.start_server(
-                    lambda r, w, i=i, j=j: self._accept(i, j, r, w), "127.0.0.1", 0)
+                    lambda r, w, i=i, j=j: self._accept(i, j, r, w), self.ip(j), 0)
                 self.servers.append(server)
                 self.proxy_port[(i, j)] = server.sockets[0].getsockname()[1]
 
+    @staticmethod
+    def ip(i: int) -> str:
+        return f"127.0.0.{10 + i}"
+
     def peers_for(self, i: int) -> str:
-        return ",".join(f"127.0.0.1:{self.proxy_port[(i, j)]}" for j in range(self.n) if j != i)
+        return ",".join(f"{self.ip(j)}:{self.proxy_port[(i, j)]}" for j in range(self.n) if j != i)
 
     async def _accept(self, i: int, j: int, reader, writer) -> None:
         key = frozenset((i, j))
@@ -97,7 +113,10 @@ class Network:
             writer.close()
             return
         try:
-            up_reader, up_writer = await asyncio.open_connection("127.0.0.1", self.node_port[j])
+            # Source address 127.0.0.<10+i>: node j sees each peer under its own IP, as on a real
+            # network, so an IP ban hits only that peer.
+            up_reader, up_writer = await asyncio.open_connection(
+                "127.0.0.1", self.node_port[j], local_addr=(self.ip(i), 0))
         except OSError:
             writer.close()
             return
@@ -145,6 +164,8 @@ class Nodes:
         self.net = net
         self.workdir = workdir
         self.procs: dict[int, subprocess.Popen | None] = {i: None for i in range(net.n)}
+        self.rpc_port = {i: free_port() for i in range(net.n)}
+        self.hard_kills: list[tuple[int, float]] = []  # (node, time)
 
     def cmd(self, i: int) -> list[str]:
         a = self.args
@@ -160,25 +181,39 @@ class Nodes:
             "--min-block-interval-ms", str(a.block_ms),
             "--round-timeout-ms", str(a.round_timeout_ms),
             "--max-round-timeout-ms", str(a.max_round_timeout_ms),
+            "--with-lightserver", "--lightserver-bind", "127.0.0.1", "--lightserver-port", str(self.rpc_port[i]),
         ]
+
+    def rpc_url(self, i: int) -> str:
+        return f"http://127.0.0.1:{self.rpc_port[i]}/rpc"
 
     def start(self, i: int) -> None:
         env = dict(os.environ, FINALIS_VALIDATOR_PASSPHRASE=PASSPHRASE)
+        if i < self.args.byzantine:
+            env["FINALIS_CHAOS_BYZANTINE"] = "1"
         logf = open(self.workdir / f"node{i}.log", "ab")
-        self.procs[i] = subprocess.Popen(self.cmd(i), stdout=logf, stderr=subprocess.STDOUT, env=env)
+        # Own process group: the lightserver child dies with the node, also on SIGKILL.
+        self.procs[i] = subprocess.Popen(self.cmd(i), stdout=logf, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True)
         logf.close()
 
     def stop(self, i: int, hard: bool) -> None:
         p = self.procs[i]
         if p is None:
             return
+        if hard:
+            self.hard_kills.append((i, time.monotonic()))
         if p.poll() is None:
-            p.send_signal(signal.SIGKILL if hard else signal.SIGTERM)
+            os.killpg(p.pid, signal.SIGKILL if hard else signal.SIGTERM)
             try:
                 p.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                p.kill()
+                os.killpg(p.pid, signal.SIGKILL)
                 p.wait()
+        try:
+            os.killpg(p.pid, signal.SIGKILL)  # lightserver child, if it outlived the node
+        except ProcessLookupError:
+            pass
         self.procs[i] = None
 
     def running(self) -> list[int]:
@@ -244,8 +279,9 @@ class Chaos:
         self.stalls: list[dict] = []
 
     async def crash_restart(self, hard: bool) -> str:
-        count = self.rng.randint(1, max(1, self.f)) if hard else 1
-        victims = self.rng.sample(range(self.n), count)
+        honest = list(range(self.args.byzantine, self.n))
+        count = self.rng.randint(1, max(1, self.f - self.args.byzantine)) if hard else 1
+        victims = self.rng.sample(honest, count)
         for v in victims:
             self.nodes.stop(v, hard)
         await asyncio.sleep(self.rng.uniform(2, self.args.max_fault_s))
@@ -284,7 +320,7 @@ class Chaos:
         return f"latency links={len(links)} max_ms={hi}"
 
     async def crash_and_partition(self) -> str:
-        v = self.rng.randrange(self.n)
+        v = self.rng.randrange(self.args.byzantine, self.n)
         self.nodes.stop(v, True)
         desc = await self.partition()
         self.nodes.start(v)
@@ -335,6 +371,112 @@ class Chaos:
             await asyncio.sleep(max(0.0, calm - (time.monotonic() - healed_at)))
 
 
+# --- transaction traffic -------------------------------------------------------------------------
+
+class Traffic:
+    """Payments between validators through random running nodes' lightservers, tracked to finality."""
+
+    def __init__(self, args, genesis_dir: Path, nodes: Nodes, workdir: Path, rng: random.Random):
+        self.args, self.genesis_dir, self.nodes, self.rng = args, genesis_dir, nodes, rng
+        manifest = dict(line.split("=", 1) for line in (genesis_dir / "manifest.env").read_text().splitlines()
+                        if "=" in line and not line.startswith("#"))
+        self.addresses = [manifest[f"VALIDATOR_{i + 1}_ADDRESS"] for i in range(args.nodes)]
+        self.wallet_dir = workdir / "wallets"
+        self.sent = 0
+        self.rejected = 0
+        self.pending: dict[str, float] = {}   # txid -> submit time
+        self.pending_sender: dict[str, int] = {}
+        self.via: dict[str, tuple[int, float]] = {}  # txid -> (accepting node, submit time)
+        self.finalized: dict[str, float] = {}  # txid -> latency s
+        self.lost: list[str] = []              # accepted, not finalized within --tx-lost-s
+        self.busy: set[int] = set()
+
+    async def _rpc(self, url: str, method: str, params: dict) -> dict | None:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-m", "3", "-X", "POST", "-H", "Content-Type: application/json", "-d", body, url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        try:
+            return json.loads(out).get("result")
+        except (ValueError, AttributeError):
+            return None
+
+    async def _send(self, sender: int) -> None:
+        self.busy.add(sender)
+        try:
+            running = self.nodes.running()
+            if not running:
+                self.busy.discard(sender)
+                return
+            via = self.rng.choice(running)
+            to = self.rng.choice([i for i in range(self.args.nodes) if i != sender])
+            wallet = self.wallet_dir / f"w{sender}"
+            wallet.mkdir(parents=True, exist_ok=True)
+            proc = await asyncio.create_subprocess_exec(
+                str(self.args.build_dir / "finalis-cli"), "send", "--to", self.addresses[to],
+                "--amount-units", str(self.rng.randint(1000, 50000)), "--rpc", self.nodes.rpc_url(via),
+                "--file", str(self.genesis_dir / "keys" / f"validator-{sender + 1}.json"), "--pass", PASSPHRASE,
+                "--db", str(wallet), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await proc.communicate()
+            text = out.decode(errors="replace")
+            m = re.search(r"txid=([0-9a-f]{64})", text)
+            if proc.returncode == 0 and m and "accepted=yes" in text:
+                self.sent += 1
+                self.pending[m[1]] = time.monotonic()
+                self.via[m[1]] = (via, time.monotonic())
+                # One payment in flight per sender: the wallet selects finalized UTXOs, so a second
+                # payment before the first finalizes would double-spend its input.
+                self.pending_sender[m[1]] = sender
+                return
+            self.rejected += 1
+        except BaseException:
+            self.busy.discard(sender)
+            raise
+        self.busy.discard(sender)
+
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(self.args.tx_interval)
+            idle = [i for i in range(self.args.nodes) if i not in self.busy]
+            if idle:
+                asyncio.create_task(self._send(self.rng.choice(idle)))
+
+    async def track(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await asyncio.sleep(2)
+            await self.check_pending()
+
+    async def check_pending(self) -> None:
+        running = self.nodes.running()
+        if not running:
+            return
+        now = time.monotonic()
+        for txid, t0 in list(self.pending.items()):
+            if now - t0 > self.args.tx_lost_s:
+                del self.pending[txid]
+                self.lost.append(txid)
+                self.busy.discard(self.pending_sender.pop(txid, -1))
+        for txid in list(self.pending)[:50]:
+            res = await self._rpc(self.nodes.rpc_url(self.rng.choice(running)), "get_tx_status", {"txid": txid})
+            if res and res.get("finalized"):
+                start = self.pending.pop(txid, None)  # the tracker and the final check can race
+                if start is not None:
+                    self.finalized[txid] = time.monotonic() - start
+                    self.busy.discard(self.pending_sender.pop(txid, -1))
+
+    def summary(self) -> dict:
+        lat = list(self.finalized.values())
+        # Lost payments whose accepting node was crash-killed within 30 s: its mempool (and any log
+        # lines not yet flushed) died with it. Submission is fire-and-forget; wallets must re-submit.
+        crashed = sum(1 for t in self.lost if any(
+            n == self.via[t][0] and 0 <= k - self.via[t][1] <= 30 for n, k in self.nodes.hard_kills))
+        return {"lost_accepting_node_crashed_within_30s": crashed,"accepted": self.sent, "rejected_or_failed": self.rejected, "finalized": len(self.finalized),
+                "pending": len(self.pending), "lost": len(self.lost), "lost_txids": self.lost[:10],
+                "finality_latency_s": {"p50": percentile(lat, 0.5), "p95": percentile(lat, 0.95),
+                                       "max": max(lat, default=None)}}
+
+
 # --- main ----------------------------------------------------------------------------------------
 
 def make_genesis(args, workdir: Path) -> Path:
@@ -353,11 +495,12 @@ def percentile(xs: list[float], p: float) -> float | None:
     return xs[min(len(xs) - 1, int(round(p * (len(xs) - 1))))]
 
 
-def write_report(args, workdir: Path, mon: Monitor, chaos: Chaos, nodes: Nodes, final: dict) -> dict:
+def write_report(args, workdir: Path, mon: Monitor, chaos: Chaos, nodes: Nodes, final: dict,
+                 traffic: Traffic | None) -> dict:
     rec = [w["recovery_s"] for w in chaos.windows if w["recovery_s"] is not None]
     rounds = list(mon.commit_round.values())
     report = {
-        "nodes": args.nodes, "seed": args.seed, "duration_s": args.duration,
+        "nodes": args.nodes, "byzantine": args.byzantine, "seed": args.seed, "duration_s": args.duration,
         "timing_ms": {"block": args.block_ms, "round_timeout": args.round_timeout_ms,
                       "max_round_timeout": args.max_round_timeout_ms},
         "heights_finalized": mon.max_height(),
@@ -368,13 +511,15 @@ def write_report(args, workdir: Path, mon: Monitor, chaos: Chaos, nodes: Nodes, 
         "commit_round_histogram": {str(r): rounds.count(r) for r in sorted(set(rounds))},
         "finalization_sources": mon.sources,
         "final": final,
+        "transactions": traffic.summary() if traffic else None,
         "unexpected_exits": nodes.exited_unexpectedly(),
         "windows": chaos.windows,
     }
     (workdir / "report.json").write_text(json.dumps(report, indent=2))
     lines = [
         "# Chaos devnet report", "",
-        f"- nodes: {args.nodes} (f = {(args.nodes - 1) // 3}), seed {args.seed}, duration {args.duration}s",
+        f"- nodes: {args.nodes} (f = {(args.nodes - 1) // 3}), byzantine {args.byzantine}, seed {args.seed}, "
+        f"duration {args.duration}s",
         f"- timing: block {args.block_ms} ms, round timeout {args.round_timeout_ms} ms (max {args.max_round_timeout_ms} ms)",
         f"- heights finalized: {report['heights_finalized']}",
         f"- forks: {len(mon.forks)}",
@@ -383,6 +528,7 @@ def write_report(args, workdir: Path, mon: Monitor, chaos: Chaos, nodes: Nodes, 
         f"max {report['recovery_s']['max']}s",
         f"- commit rounds: {report['commit_round_histogram']}",
         f"- final: {final}",
+        f"- transactions: {report['transactions']}",
         "", "| fault | fault s | progress during | recovery s |", "|---|---|---|---|",
     ]
     for w in chaos.windows:
@@ -414,6 +560,11 @@ async def amain(args) -> int:
     for i in range(args.nodes):
         nodes.start(i)
     final: dict = {}
+    traffic = Traffic(args, genesis_dir, nodes, workdir, rng) if args.tx_interval > 0 else None
+    stop_traffic = asyncio.Event()
+    traffic_tasks = []
+    if traffic:
+        traffic_tasks = [asyncio.create_task(traffic.run(stop_traffic)), asyncio.create_task(traffic.track(stop_traffic))]
     try:
         warm_deadline = time.monotonic() + args.recovery_deadline * 2
         while mon.max_height() < args.warmup_heights and time.monotonic() < warm_deadline:
@@ -438,15 +589,25 @@ async def amain(args) -> int:
                 break
         final = {"target_height": target, "node_heights": {str(i): mon.node_height.get(i, 0) for i in range(args.nodes)},
                  "converged": all(mon.node_height.get(i, 0) >= target for i in range(args.nodes))}
+        if traffic:
+            stop_traffic.set()
+            # Give in-flight payments time to finalize on the healed network.
+            end = time.monotonic() + args.recovery_deadline
+            while traffic.pending and time.monotonic() < end:
+                await traffic.check_pending()
+                await asyncio.sleep(2)
     finally:
         mon.poll()
+        stop_traffic.set()
+        for t in traffic_tasks:
+            t.cancel()
         for i in range(args.nodes):
             nodes.stop(i, hard=False)
         mon_task.cancel()
-        report = write_report(args, workdir, mon, chaos, nodes, final)
+        report = write_report(args, workdir, mon, chaos, nodes, final, traffic)
         log(f"report: {workdir / 'report.md'}")
         log(f"heights={report['heights_finalized']} forks={len(report['forks'])} stalls={len(report['stalls'])} "
-            f"recovery_p95={report['recovery_s']['p95']}s final={final}")
+            f"recovery_p95={report['recovery_s']['p95']}s final={final} tx={report['transactions']}")
     if mon.forks:
         return 3
     if chaos.stalls or not final.get("converged", False):
@@ -470,9 +631,16 @@ def main() -> int:
     ap.add_argument("--recovery-deadline", type=float, default=60, help="seconds after heal to finalize a new height")
     ap.add_argument("--warmup-heights", type=int, default=3)
     ap.add_argument("--stop-on-stall", action="store_true")
+    ap.add_argument("--byzantine", type=int, default=0, help="first K validators are Byzantine (chaos build)")
+    ap.add_argument("--tx-interval", type=float, default=0, help="seconds between payments (0: no traffic)")
+    ap.add_argument("--tx-lost-s", type=float, default=120, help="an accepted payment not finalized by then is lost")
     args = ap.parse_args()
     if args.nodes < 4:
         ap.error("--nodes must be >= 4")
+    if args.byzantine > (args.nodes - 1) // 3:
+        ap.error("--byzantine must be <= f = (nodes - 1) // 3")
+    if args.byzantine and b"CHAOS-BYZANTINE" not in (args.build_dir / "finalis-node").read_bytes():
+        ap.error(f"{args.build_dir}/finalis-node is not a -DFINALIS_CHAOS_BYZANTINE=ON build")
     return asyncio.run(amain(args))
 
 

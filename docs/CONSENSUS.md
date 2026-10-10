@@ -220,6 +220,25 @@ Finalized execution remains validator-signature-driven even when confidential
 transactions are present; `TxV2` does not change the validator-key consensus
 model.
 
+## Transition Timestamp
+
+`FrontierTransition.timestamp` is unix seconds and part of the transition id.
+
+- canonical rule (replay): strictly greater than the parent's timestamp; the genesis time is the
+  parent of height 1 (`frontier-timestamp-not-increasing`)
+- the proposer sets `max(wall clock, parent + 1)`; a re-proposed valid value keeps its timestamp
+- honest validators do not prevote a proposal stamped more than 60 s past their own clock
+
+It feeds finalized-chain time: mempool hashcash stamp checks and explorer block times.
+
+## Ingress Certifier Per Lane
+
+Each lane has one designated certifier per epoch: committee member
+`sha256d("SC-INGRESS-CERTIFIER-V1" || epoch_start || lane) mod committee_size`. Routing only (any
+committee signature makes a valid certificate); it keeps one writer per lane and rotates every
+epoch, which bounds censorship by a certifier to one epoch. Uncertified mempool transactions are
+re-forwarded to the current certifier every 5 s.
+
 ## `PROPOSE` And Finalized Transition Delivery
 
 `PROPOSE` is the live current-round proposal path.
