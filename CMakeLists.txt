@@ -40,6 +40,10 @@ option(FINALIS_NGINX_BUILD_IN_ALL "Include local Nginx bootstrap target in the d
 
 find_package(OpenSSL REQUIRED)
 find_package(Qt5 COMPONENTS Widgets QUIET)
+if(MSVC AND TARGET Qt5::Core)
+  set_property(TARGET Qt5::Core APPEND PROPERTY INTERFACE_COMPILE_OPTIONS
+    "/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_qt5_stdext_compat.h")
+endif()
 find_package(ZLIB QUIET)
 
 find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
