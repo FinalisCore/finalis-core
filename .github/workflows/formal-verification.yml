@@ -26,11 +26,14 @@ on:
       - "README.md"
       - ".github/workflows/formal-verification.yml"
 
+permissions:
+  contents: read
+
 jobs:
   tlc-suite:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Java and curl
         run: |
@@ -38,10 +41,14 @@ jobs:
           sudo apt-get install -y default-jre curl
 
       - name: Install tla2tools.jar
+        env:
+          TLA_VERSION: v1.7.4
+          TLA_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
         run: |
           mkdir -p "$HOME/tools/tla"
-          curl -L -o "$HOME/tools/tla/tla2tools.jar" \
-            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+          curl -fsSL -o "$HOME/tools/tla/tla2tools.jar" \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_VERSION}/tla2tools.jar"
+          echo "${TLA_SHA256}  $HOME/tools/tla/tla2tools.jar" | sha256sum -c -
 
       - name: Run TLC suite
         run: |
@@ -66,7 +73,7 @@ jobs:
 
       - name: Upload TLC artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: formal-tlc-runs
           path: formal/tlc_runs/**
