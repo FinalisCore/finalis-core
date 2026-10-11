@@ -541,11 +541,17 @@ bool Node::start_lightserver_child() {
       "127.0.0.1",
       "--relay-port",
       std::to_string(cfg_.p2p_port),
-      // Pin the child's admin socket to the path clients (CLI/wallet kDefaultAdminRpcUrl) dial.
-      // Two args: the lightserver parser does not accept --admin-socket=<path>.
-      "--admin-socket",
-      lightserver::kDefaultAdminSocketPath,
   };
+  static_assert(std::string_view(lightserver::kDefaultAdminSocketPath) == "/var/run/finalis/admin.sock",
+                "NodeConfig::lightserver_admin_socket default must match");
+  // Pin the child's admin socket (default: the path clients' kDefaultAdminRpcUrl dials).
+  // Two args: the lightserver parser does not accept --admin-socket=<path>.
+  if (cfg_.lightserver_admin_socket.empty()) {
+    args.push_back("--no-admin-socket");
+  } else {
+    args.push_back("--admin-socket");
+    args.push_back(cfg_.lightserver_admin_socket);
+  }
 
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);
@@ -1503,18 +1509,18 @@ void Node::event_loop() {
           log_line("round-timeout-vote-skip height=" + std::to_string(h) + " round=" + std::to_string(timeout_round) +
                    " reason=abstain-corrupt-safety-state");
         }
-        const bool allow_timeout_round_advance =
-            !timeout_committee.empty() &&
-            (timeout_committee.size() == 1 ||
-             (highest_tc.has_value() && highest_tc->round < timeout_round));
+        // LIVENESS: with more than one member a round ends only on its TC (maybe_record_timeout_
+        // certificate_locked) or an f+1 catch-up. Advancing on the local timer once any earlier TC
+        // existed let nodes drift apart: in crash runs all 7 ended in 7 different rounds, a quorum
+        // never shared one, and the height never finalized. TC-only keeps the highest node within a
+        // round of the quorum, and the f+1 rule pulls the rest up.
+        const bool allow_timeout_round_advance = timeout_committee.size() == 1;
         if (allow_timeout_round_advance) {
           const auto old_round = current_round_;
           current_round_ = timeout_round + 1;
           round_started_ms_ = now_ms;
           const auto new_leader = leader_for_height_round(h, current_round_);
-          const std::string reason = timeout_committee.size() == 1
-                                         ? "ticket-pow-fallback-timeout"
-                                         : "tc-driven-timeout-advance";
+          const std::string reason = "ticket-pow-fallback-timeout";
           log_line("round-catchup height=" + std::to_string(h) + " old_round=" + std::to_string(old_round) +
                    " new_round=" + std::to_string(current_round_) + " reason=" + reason +
                    " leader=" + (new_leader.has_value() ? short_pub_hex(*new_leader) : std::string("none")));

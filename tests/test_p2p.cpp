@@ -417,6 +417,11 @@ TEST(test_peer_manager_refuses_oversized_payload_without_dropping_peer) {
     ASSERT_TRUE(cv.wait_for(lk, std::chrono::seconds(2), [&]() { return connected_peer_id != 0; }));
   }
 
+  // Before the handshake only handshake frames leave: anything else counts against an honest sender.
+  ASSERT_TRUE(!dialer.send_to(connected_peer_id, p2p::MsgType::PING, p2p::ser_ping(p2p::PingMsg{6})));
+  ASSERT_TRUE(dialer.mark_handshake_tx(connected_peer_id, true, true));
+  ASSERT_TRUE(dialer.mark_handshake_rx(connected_peer_id, true, true));
+
   ASSERT_TRUE(!dialer.send_to(connected_peer_id, p2p::MsgType::TRANSITION, Bytes(max_payload + 1, 0xAB)));
   ASSERT_TRUE(dialer.send_to(connected_peer_id, p2p::MsgType::PING, p2p::ser_ping(p2p::PingMsg{7})));
   {

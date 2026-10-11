@@ -26,6 +26,7 @@ enum class SlashingRecordKind : std::uint8_t {
   VOTE_EQUIVOCATION = 1,
   PROPOSER_EQUIVOCATION = 2,
   ONCHAIN_SLASH = 3,
+  PREVOTE_EQUIVOCATION = 4,
 };
 
 struct SlashingRecord {

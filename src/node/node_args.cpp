@@ -170,6 +170,10 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.lightserver_port = parse_port_arg(*v);
+    } else if (a == "--lightserver-admin-socket") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.lightserver_admin_socket = *v;
     } else if (a == "--bind") {
       auto v = next(a);
       if (!v) return std::nullopt;

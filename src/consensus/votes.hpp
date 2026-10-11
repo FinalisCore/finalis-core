@@ -83,7 +83,14 @@ class TimeoutVoteTracker {
   TimeoutVoteTracker() = default;
   explicit TimeoutVoteTracker(Limits limits) : limits_(limits) {}
   TimeoutVoteTallyResult add_vote(const TimeoutVote& vote);
+  // Raises the validator's latest round at the vote's height without storing the vote (rounds too
+  // far ahead to bucket: a flood of new rounds would evict the current round's signatures). Counts
+  // only toward round_reached_by. The caller verifies membership and signature first.
+  void note_latest_round(const TimeoutVote& vote);
   std::vector<FinalitySig> signatures_for(std::uint64_t height, std::uint32_t round) const;
+  // Highest round R such that at least `count` validators sent a timeout vote at `height` for a
+  // round >= R (each validator's latest vote); nullopt with fewer than `count` voters.
+  std::optional<std::uint32_t> round_reached_by(std::uint64_t height, std::size_t count) const;
   void clear_height(std::uint64_t height);
 
  private:

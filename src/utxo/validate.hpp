@@ -40,6 +40,7 @@ struct SpecialValidationContext {
 };
 
 struct SlashEvidence {
+  SlashVoteKind kind{SlashVoteKind::Precommit};
   Vote a;
   Vote b;
   Bytes raw_blob;

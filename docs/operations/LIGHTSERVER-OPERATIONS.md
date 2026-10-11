@@ -35,7 +35,7 @@ validator keystore with a passphrase, which is why they are never served over th
 | systemd (`packaging/linux/finalis-node.service`, `scripts/start.sh`) | `/run/finalis/admin.sock` | `RuntimeDirectory=finalis` creates `/run/finalis` (0700, owned by the service user) on each start. `/var/run` is a symlink to `/run`. |
 | Docker image | `/run/finalis/admin.sock` inside the container | The image pre-creates `/run/finalis` for the `finalis` user. Use it with `docker exec`. |
 | Windows | none | Unix sockets are not supported. Admin RPC is unavailable (see 2.4). |
-| Several nodes on one host | first one only | `--with-lightserver` does not pass `--admin-socket`, so every child tries the default path and only the first one gets it. Start `finalis-lightserver` yourself with a distinct `--admin-socket` for each extra node. |
+| Several nodes on one host | `--lightserver-admin-socket <path>` per node | `--with-lightserver` passes the default path unless the node gets `--lightserver-admin-socket <path>` (empty disables it); without it only the first child binds the socket. Point clients at the matching path with `--admin-rpc unix://<path>`. |
 
 `--no-admin-socket` disables the admin surface on purpose.
 

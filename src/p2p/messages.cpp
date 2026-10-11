@@ -177,7 +177,7 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
         auto prev = r.bytes_fixed<32>();
         auto blk = r.varbytes();
         auto has_qc = r.u8();
-        if (!h || !round || !prev || !blk || !has_qc) return false;
+        if (!h || !round || !prev || !blk || !has_qc || *has_qc > 1) return false;
         if (blk->size() > kMaxProposalBytes) return false;
         m.height = *h;
         m.round = *round;
@@ -210,7 +210,7 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
           m.pol.reset();
         }
         auto has_tc = r.u8();
-        if (!has_tc) return false;
+        if (!has_tc || *has_tc > 1) return false;
         if (*has_tc != 0) {
           TimeoutCertificate tc;
           auto tc_height = r.u64le();
@@ -351,7 +351,7 @@ std::optional<TransitionMsg> de_transition(const Bytes& b) {
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
         auto blk = r.varbytes();
         auto has_cert = r.u8();
-        if (!blk || !has_cert) return false;
+        if (!blk || !has_cert || *has_cert > 1) return false;
         if (blk->size() > kMaxBlockMessageBytes) return false;
         m.frontier_proposal_bytes = *blk;
         if (*has_cert != 0) {
@@ -456,7 +456,7 @@ std::optional<EpochTicketsMsg> de_epoch_tickets(const Bytes& b) {
         auto epoch = r.u64le();
         auto closed = r.u8();
         auto count = r.varint();
-        if (!epoch || !closed || !count || *count > kMaxEpochTicketResponseEntries) return false;
+        if (!epoch || !closed || *closed > 1 || !count || *count > kMaxEpochTicketResponseEntries) return false;
         m.epoch = *epoch;
         m.epoch_closed = (*closed != 0);
         m.tickets.clear();

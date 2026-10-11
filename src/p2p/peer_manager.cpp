@@ -223,6 +223,15 @@ bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
     auto it = peers_.find(peer_id);
     if (it == peers_.end()) return false;
     p = it->second;
+    // A peer still in its handshake scores anything else as pre-handshake traffic (20 points, ban
+    // at 100), so honest validators that reconnect often end up banning each other. Send only what
+    // the receiver accepts at this stage: the handshake, then (after both VERSIONs and our VERACK)
+    // the bootstrap sync requests and replies.
+    if (!p->info.established() && msg_type != MsgType::VERSION && msg_type != MsgType::VERACK) {
+      if (!is_bootstrap_sync_msg(msg_type) || !(p->info.version_rx && p->info.version_tx && p->info.verack_tx)) {
+        return false;
+      }
+    }
   }
 
   // Peers drop frames above max_payload_len (and score the sender), so never emit one; callers

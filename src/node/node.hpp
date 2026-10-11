@@ -75,6 +75,8 @@ struct NodeConfig {
   std::uint32_t upnp_igd_lease_seconds{1200};
   std::string lightserver_bind{"127.0.0.1"};
   std::uint16_t lightserver_port{19444};
+  // Admin socket of the spawned lightserver; empty disables it. Hosts running several give each its own.
+  std::string lightserver_admin_socket{"/var/run/finalis/admin.sock"};  // lightserver::kDefaultAdminSocketPath
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};
@@ -463,6 +465,7 @@ class Node {
   // any round from its own to the current one, take effect now (precommits queue for the flush).
   void on_candidate_body_locked(const FrontierTransition& transition);
   void maybe_record_timeout_certificate_locked(std::uint64_t height, std::uint32_t round);
+  void maybe_catch_up_round_from_timeout_votes_locked(std::uint64_t height);
   // Prevote rule for a proposal of `transition_id` at `height` carrying a polka at `pol_round`:
   // allowed iff unlocked, locked on the same transition, or locked at a round <= pol_round.
   bool can_prevote_locked(std::uint64_t height, const Hash32& transition_id, std::optional<std::uint32_t> pol_round,

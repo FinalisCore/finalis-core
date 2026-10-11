@@ -574,6 +574,17 @@ Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round) {
   return Bytes(msg.begin(), msg.end());
 }
 
+namespace {
+
+// Both votes of slash evidence are in one signing domain: an honest validator may prevote one
+// transition and precommit another in the same round, so mixed pairs prove nothing.
+Bytes slash_vote_signing_message(SlashVoteKind kind, const Vote& v) {
+  return kind == SlashVoteKind::Prevote ? prevote_signing_message(v.height, v.round, v.frontier_transition_id)
+                                        : vote_signing_message(v.height, v.round, v.frontier_transition_id);
+}
+
+}  // namespace
+
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
   static const Bytes marker{'S', 'C', 'S', 'L', 'A', 'S', 'H'};
   if (script_sig.size() < marker.size()) return false;
@@ -590,9 +601,13 @@ bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
     return false;
   }
 
+  SlashVoteKind kind{};
   Vote a;
   Vote b;
   if (!codec::parse_exact(blob, [&](codec::ByteReader& r) {
+        auto k = r.u8();
+        if (!k || *k > static_cast<std::uint8_t>(SlashVoteKind::Prevote)) return false;
+        kind = static_cast<SlashVoteKind>(*k);
         auto v1 = read_vote_fixed(r);
         auto v2 = read_vote_fixed(r);
         if (!v1 || !v2) return false;
@@ -604,6 +619,7 @@ bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
   }
 
   if (out) {
+    out->kind = kind;
     out->a = a;
     out->b = b;
     out->raw_blob = blob;
@@ -708,10 +724,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != bond_pub) return {false, "evidence pubkey must match bond", 0};
 
-        const auto a_msg =
-            vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
-        const auto b_msg =
-            vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        const auto a_msg = slash_vote_signing_message(evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
@@ -777,10 +791,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         }
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != unbond_pub) return {false, "evidence pubkey must match unbond output", 0};
-        const auto a_msg =
-            vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
-        const auto b_msg =
-            vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        const auto a_msg = slash_vote_signing_message(evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {

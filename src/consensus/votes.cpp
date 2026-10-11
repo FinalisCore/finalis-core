@@ -2,6 +2,9 @@
 
 #include "consensus/votes.hpp"
 
+#include <algorithm>
+#include <functional>
+
 namespace finalis::consensus {
 
 VoteTallyResult VoteTracker::add_vote(const Vote& vote) {
@@ -137,6 +140,23 @@ TimeoutVoteTallyResult TimeoutVoteTracker::add_vote(const TimeoutVote& vote) {
   out.accepted = true;
   out.votes_for_round = by_round_[key].size();
   return out;
+}
+
+void TimeoutVoteTracker::note_latest_round(const TimeoutVote& vote) {
+  auto& seen = last_vote_by_validator_[vote.height];
+  const auto it = seen.find(vote.validator_pubkey);
+  if (it == seen.end() || vote.round > it->second.round) seen[vote.validator_pubkey] = vote;
+}
+
+std::optional<std::uint32_t> TimeoutVoteTracker::round_reached_by(std::uint64_t height, std::size_t count) const {
+  const auto it = last_vote_by_validator_.find(height);
+  if (count == 0 || it == last_vote_by_validator_.end() || it->second.size() < count) return std::nullopt;
+  std::vector<std::uint32_t> rounds;
+  rounds.reserve(it->second.size());
+  for (const auto& [_, vote] : it->second) rounds.push_back(vote.round);
+  std::nth_element(rounds.begin(), rounds.begin() + static_cast<std::ptrdiff_t>(count - 1), rounds.end(),
+                   std::greater<>());
+  return rounds[count - 1];
 }
 
 std::vector<FinalitySig> TimeoutVoteTracker::signatures_for(std::uint64_t height, std::uint32_t round) const {

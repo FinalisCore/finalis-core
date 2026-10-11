@@ -433,6 +433,23 @@ TEST(test_timeout_tracker_window_soft_rejects_round_older_than_window) {
   ASSERT_TRUE(res.stale);
 }
 
+TEST(test_timeout_tracker_round_reached_by_counts_latest_vote_per_validator) {
+  consensus::TimeoutVoteTracker tracker;
+  const auto a = key_from_byte(0x55).public_key;
+  const auto b = key_from_byte(0x56).public_key;
+  const auto c = key_from_byte(0x57).public_key;
+  ASSERT_TRUE(!tracker.round_reached_by(7, 1).has_value());
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, 3, a, Sig64{}}).accepted);
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, 90, a, Sig64{}}).accepted);  // a's latest: 90
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, 40, b, Sig64{}}).accepted);
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{7, 5, c, Sig64{}}).accepted);
+  ASSERT_TRUE(tracker.add_vote(TimeoutVote{8, 500, c, Sig64{}}).accepted);  // other height
+  ASSERT_EQ(*tracker.round_reached_by(7, 1), 90u);
+  ASSERT_EQ(*tracker.round_reached_by(7, 2), 40u);
+  ASSERT_EQ(*tracker.round_reached_by(7, 3), 5u);
+  ASSERT_TRUE(!tracker.round_reached_by(7, 4).has_value());
+}
+
 TEST(test_timeout_tracker_window_is_per_height) {
   consensus::TimeoutVoteTracker tracker(consensus::TimeoutVoteTracker::Limits{.max_rounds_per_height = 1});
   const auto v = key_from_byte(0x54).public_key;

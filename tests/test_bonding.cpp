@@ -781,6 +781,67 @@ TEST(test_slash_evidence_parsing_and_validation) {
   ASSERT_TRUE(r.ok);
 }
 
+// Prevote equivocation is slashable with prevote-domain evidence; the declared kind must match the
+// signatures' domain in both directions.
+TEST(test_prevote_slash_evidence_validation) {
+  const auto kp = key_from_byte(16);
+  OutPoint bond_op{};
+  bond_op.txid.fill(0xC3);
+  bond_op.index = 0;
+
+  UtxoSet view;
+  view[bond_op] = UtxoEntry{TxOut{BOND_AMOUNT, reg_script(kp.public_key)}};
+
+  auto signed_pair = [&](bool prevote) {
+    auto sign = [&](const Vote& v) {
+      const auto msg = prevote ? prevote_signing_message(v.height, v.round, v.block_id)
+                               : vote_signing_message(v.height, v.round, v.block_id);
+      return *crypto::ed25519_sign(msg, kp.private_key);
+    };
+    Vote a;
+    a.height = 300;
+    a.round = 4;
+    a.block_id.fill(0x41);
+    a.validator_pubkey = kp.public_key;
+    a.signature = sign(a);
+    Vote b = a;
+    b.block_id.fill(0x42);
+    b.signature = sign(b);
+    return std::make_pair(a, b);
+  };
+
+  consensus::ValidatorRegistry vr;
+  vr.register_bond(kp.public_key, bond_op, 10);
+  vr.advance_height(400);
+  SpecialValidationContext ctx{
+      .validators = &vr,
+      .current_height = 400,
+      .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
+  };
+
+  const auto [pa, pb] = signed_pair(true);
+  auto tx = build_slash_tx(bond_op, BOND_AMOUNT, pa, pb, 0, nullptr, SlashVoteKind::Prevote);
+  ASSERT_TRUE(tx.has_value());
+  SlashEvidence e;
+  ASSERT_TRUE(parse_slash_script_sig(tx->inputs[0].script_sig, &e));
+  ASSERT_TRUE(e.kind == SlashVoteKind::Prevote);
+  ASSERT_TRUE(validate_tx(*tx, 1, view, &ctx).ok);
+
+  // Prevote signatures declared as precommits, and precommit signatures declared as prevotes.
+  auto wrong = build_slash_tx(bond_op, BOND_AMOUNT, pa, pb, 0, nullptr, SlashVoteKind::Precommit);
+  ASSERT_TRUE(wrong.has_value());
+  ASSERT_TRUE(!validate_tx(*wrong, 1, view, &ctx).ok);
+  const auto [ca, cb] = signed_pair(false);
+  wrong = build_slash_tx(bond_op, BOND_AMOUNT, ca, cb, 0, nullptr, SlashVoteKind::Prevote);
+  ASSERT_TRUE(wrong.has_value());
+  ASSERT_TRUE(!validate_tx(*wrong, 1, view, &ctx).ok);
+
+  // Unknown kind byte: not parsed as slash evidence.
+  Bytes script_sig = tx->inputs[0].script_sig;
+  script_sig[script_sig.size() - 1 - 2 * (8 + 4 + 32 + 32 + 64)] = 2;  // kind byte precedes the two votes
+  ASSERT_TRUE(!parse_slash_script_sig(script_sig, nullptr));
+}
+
 TEST(test_scvalunb_slash_evidence_validation) {
   const auto kp = key_from_byte(15);
   OutPoint unb_op{};

@@ -1008,11 +1008,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   const auto info = p2p_.get_peer_info(peer_id);
   if (!info.established()) {
-    const bool bootstrap_sync_msg =
-        msg_type == p2p::MsgType::GET_FINALIZED_TIP || msg_type == p2p::MsgType::FINALIZED_TIP ||
-        msg_type == p2p::MsgType::GET_TRANSITION || msg_type == p2p::MsgType::TRANSITION ||
-        msg_type == p2p::MsgType::GET_INGRESS_TIPS || msg_type == p2p::MsgType::INGRESS_TIPS ||
-        msg_type == p2p::MsgType::GET_INGRESS_RANGE || msg_type == p2p::MsgType::INGRESS_RANGE;
+    const bool bootstrap_sync_msg = p2p::is_bootstrap_sync_msg(msg_type);
     // After VERSION exchange and our VERACK transmit, the peer may already start
     // sync bootstrap traffic before we have observed its VERACK locally. Allow
     // these messages through instead of misclassifying them as pre-handshake

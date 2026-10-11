@@ -5134,6 +5134,56 @@ TEST(test_local_bus_multi_node_delivers_frontiers_and_forwards_tx_to_designated_
   for (auto& n : nodes) n->stop();
 }
 
+// Line topology 0-1-2-3 over real P2P. A tx injected locally (no broadcast) at an end node that has
+// no connection to the lane's designated certifier must still reach it, relayed by other validators.
+TEST(test_tx_forward_relays_via_validators_when_certifier_unreachable) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_certifier_relay"), 4, 4, MAX_COMMITTEE,
+                              [](node::NodeConfig& cfg) {
+                                if (cfg.peers.size() > 1) cfg.peers = {cfg.peers.back()};
+                              });
+  auto& nodes = cluster.nodes;
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 3) return false;
+    }
+    funded = find_funded_test_wallet(*nodes[0], keys, 1'000'000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
+
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  const auto& prev = funded->utxos.front();
+  std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
+                             TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
+  std::string err;
+  const auto tx = build_signed_p2pkh_tx_single_input(
+      prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  const std::uint64_t next_height = nodes[0]->status().height + 1;
+  const auto committee = nodes[0]->committee_for_height_round_for_test(next_height, 0);
+  const auto certifier_pub = consensus::designated_ingress_certifier(
+      committee, consensus::assign_ingress_lane(AnyTx{*tx}),
+      consensus::committee_epoch_start(next_height, cluster.configs[0].network.committee_epoch_blocks));
+  int certifier = -1;
+  for (int i = 0; i < 4; ++i) {
+    if (nodes[i]->local_validator_pubkey_for_test() == certifier_pub) certifier = i;
+  }
+  ASSERT_TRUE(certifier >= 0);
+  // An end node two or more hops from the certifier: its only peer is not the certifier.
+  const int submitter = certifier >= 2 ? 0 : 3;
+  ASSERT_EQ(nodes[submitter]->status().peers, 1u);
+
+  ASSERT_TRUE(nodes[submitter]->inject_tx_for_test(*tx, true));
+  ASSERT_TRUE(wait_for([&]() { return nodes[certifier]->mempool_contains_for_test(tx->txid()); },
+                       ci_timeout_seconds(30)));
+}
+
 TEST(test_tx_status_reports_certified_ingress_before_finalization) {
   const std::string base = unique_test_base("/tmp/finalis_it_tx_status_certified_ingress");
 
@@ -7646,6 +7696,34 @@ TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
   auto repropose = make_test_frontier_propose_msg(*proposal_a0, *polka_after, tc0, round1, *leader1);
   ASSERT_EQ(target->inject_network_propose_result_for_test(repropose), std::string("accepted"));
   ASSERT_TRUE(target->local_prevote_recorded_for_test(target_height, round1, a0_id));
+}
+
+// A node far behind in rounds (a restart resets it to round 0) jumps to the round f+1 committee
+// members have timed out of, however far ahead; one far-ahead voter alone (possibly Byzantine)
+// moves it nowhere.
+TEST(test_round_catch_up_needs_f_plus_one_timeout_votes) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_f_plus_one_round_skip"), 4, 4, 4);
+  auto& nodes = cluster.nodes;
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 2; }, ci_timeout_seconds(60)));
+  for (int i = 1; i < 4; ++i) nodes[i]->stop();  // no quorum left: no finality, no TC
+
+  auto& target = nodes[0];
+  const std::uint64_t h = target->status().height + 1;
+  const auto committee = target->committee_for_height_round_for_test(h, 0);
+  ASSERT_EQ(committee.size(), 4u);
+  std::vector<PubKey32> others;
+  for (const auto& pub : committee) {
+    if (pub != target->local_validator_pubkey_for_test()) others.push_back(pub);
+  }
+  const std::uint32_t base = target->status().round;
+  const std::uint32_t far = base + 100;  // beyond the single-vote catch-up window (32)
+
+  // Beyond the window the votes are not stored (soft reject), only their rounds are noted.
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(keys, h, far + 10, others[0]));
+  ASSERT_TRUE(target->status().round < far);
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(keys, h, far, others[1]));
+  ASSERT_EQ(target->status().round, far);  // the second-highest: f + 1 = 2 validators reached it
 }
 
 TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {

@@ -2478,8 +2478,9 @@ std::optional<PubKey32> checkpoint_ticket_pow_fallback_member_for_round(const st
     return checkpoint.ordered_members[a] < checkpoint.ordered_members[b];
   });
 
-  const std::size_t selected =
-      std::min<std::size_t>(static_cast<std::size_t>(round - committee_size), ranked.size() - 1);
+  // LIVENESS: keep rotating by ticket rank. Clamping to the last rank pinned one leader for every
+  // round >= 2n - 1; with it down or its proposals out of step, the height never finalized.
+  const std::size_t selected = static_cast<std::size_t>(round - committee_size) % ranked.size();
   return checkpoint.ordered_members[ranked[selected]];
 }
 

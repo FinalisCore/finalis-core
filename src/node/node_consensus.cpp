@@ -123,10 +123,12 @@ Hash32 vote_equivocation_record_id(const EquivocationEvidence& ev) {
   return crypto::sha256d(w.data());
 }
 
-storage::SlashingRecord make_vote_equivocation_record(const EquivocationEvidence& ev, std::uint64_t observed_height) {
+// The evidence ids differ across kinds: the signatures are over different signing domains.
+storage::SlashingRecord make_vote_equivocation_record(const EquivocationEvidence& ev, std::uint64_t observed_height,
+                                                      storage::SlashingRecordKind kind) {
   storage::SlashingRecord rec;
   rec.record_id = vote_equivocation_record_id(ev);
-  rec.kind = storage::SlashingRecordKind::VOTE_EQUIVOCATION;
+  rec.kind = kind;
   rec.validator_pubkey = ev.a.validator_pubkey;
   rec.height = ev.a.height;
   rec.round = ev.a.round;
@@ -734,6 +736,26 @@ void Node::maybe_record_timeout_certificate_locked(std::uint64_t height, std::ui
                " new_round=" + std::to_string(current_round_) + " reason=timeout-certificate");
     }
   }
+}
+
+// LIVENESS (Tendermint's f+1 round skip): when f+1 committee members have timed out of rounds >= R,
+// at least one honest validator is past R, so move to R. Unlike the observed-timeout-vote jump this
+// is unbounded: a restarted node is back at round 0 and may be any number of rounds behind. Without
+// it, honest nodes split between a low and a high round never share a round with a quorum, and
+// timeout votes alone never form the TC that would align them (a crash run halted for good).
+// Safe: the lock rule and the vote-round floor do not depend on the current round.
+void Node::maybe_catch_up_round_from_timeout_votes_locked(std::uint64_t height) {
+  if (height != finalized_height_ + 1 || repair_mode_ || pause_proposals_.load()) return;
+  const auto committee = committee_for_height_round(height, current_round_);
+  if (committee.size() < 2) return;
+  const std::size_t f_plus_one = committee.size() - consensus::quorum_threshold(committee.size()) + 1;
+  const auto reached = timeout_votes_.round_reached_by(height, f_plus_one);
+  if (!reached.has_value() || *reached <= current_round_) return;
+  const auto old_round = current_round_;
+  current_round_ = *reached;
+  round_started_ms_ = now_ms();
+  log_line("round-catchup height=" + std::to_string(height) + " old_round=" + std::to_string(old_round) +
+           " new_round=" + std::to_string(current_round_) + " reason=f-plus-one-timeout-votes");
 }
 
 void Node::run_confidential_supply_audit_locked(const char* trigger) {
@@ -1490,8 +1512,9 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
         log_propose_soft_reject("future-height", " local_next=" + std::to_string(finalized_height_ + 1));
         return ProposeHandlingResult::SoftReject;
       }
-      log_propose_hard_reject("unexpected-height", " local_next=" + std::to_string(finalized_height_ + 1));
-      return ProposeHandlingResult::HardReject;
+      // A peer one height behind (restarted, or re-gossiping a stalled round) is stale, not invalid.
+      log_propose_soft_reject("stale-height", " local_next=" + std::to_string(finalized_height_ + 1));
+      return ProposeHandlingResult::SoftReject;
     }
     if (msg.round < current_round_) {
       log_propose_soft_reject("stale-round", " local_round=" + std::to_string(current_round_) +
@@ -1640,8 +1663,9 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       std::size_t total = 0;
       for (const auto& [_, s] : candidate_block_sizes_) total += s;
       if (candidate_frontier_proposals_.size() >= kMaxCandidateBlocks || total + sz > kMaxCandidateBlockBytes) {
-        log_propose_hard_reject("candidate-cache-full");
-        return ProposeHandlingResult::HardReject;
+        // Local condition: neither the peer's fault nor a reason to mark the proposal invalid.
+        log_propose_soft_reject("candidate-cache-full");
+        return ProposeHandlingResult::SoftReject;
       }
       candidate_block_sizes_[transition_id] = sz;
     }
@@ -1717,8 +1741,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       auto sig =
           crypto::ed25519_sign(prevote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
       if (!sig.has_value()) {
-        log_propose_hard_reject("local-prevote-sign-failed");
-        return ProposeHandlingResult::HardReject;
+        log_propose_soft_reject("local-prevote-sign-failed");  // local condition, see candidate-cache-full
+        return ProposeHandlingResult::SoftReject;
       }
       // SAFETY: the prevote is durable before it leaves this process, so a restart cannot prevote
       // a different transition in the same round.
@@ -1853,7 +1877,8 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
     auto tr = votes_.add_vote(vote);
     if (tr.equivocation && tr.evidence.has_value()) {
       locally_observed_equivocators_.insert(vote.validator_pubkey);
-      (void)db_.put_slashing_record(make_vote_equivocation_record(*tr.evidence, finalized_height_));
+      (void)db_.put_slashing_record(
+          make_vote_equivocation_record(*tr.evidence, finalized_height_, storage::SlashingRecordKind::VOTE_EQUIVOCATION));
       log_line("equivocation-observed validator=" +
                hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
                " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
@@ -1950,9 +1975,12 @@ Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from
     // this node's own, or a verified pol signature); verify_polka_locked's skip path relies on it.
     auto tr = prevotes_.add_vote(vote);
     if (tr.equivocation) {
-      // Two prevotes in one round. Not turned into a slashing record: that format carries
-      // precommit evidence.
+      // Two prevotes in one round: slashable with SlashVoteKind::Prevote evidence.
       locally_observed_equivocators_.insert(vote.validator_pubkey);
+      if (tr.evidence.has_value()) {
+        (void)db_.put_slashing_record(make_vote_equivocation_record(*tr.evidence, finalized_height_,
+                                                                    storage::SlashingRecordKind::PREVOTE_EQUIVOCATION));
+      }
       log_line("prevote-equivocation-observed validator=" + short_pub_hex(vote.validator_pubkey) +
                " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
     }
@@ -2012,12 +2040,6 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
       }
       return TimeoutVoteHandlingResult::SoftReject;
     }
-    if (vote.round > current_round_ + kProposalRoundWindow) {
-      log_timeout_soft_reject("future-round",
-                              " local_round=" + std::to_string(current_round_) +
-                                  " validator=" + short_pub_hex(vote.validator_pubkey));
-      return TimeoutVoteHandlingResult::SoftReject;
-    }
     if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) {
       log_timeout_hard_reject("non-member", " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::HardReject;
@@ -2026,6 +2048,16 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
     if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) {
       log_timeout_hard_reject("invalid-signature", " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::HardReject;
+    }
+    if (vote.round > current_round_ + kProposalRoundWindow) {
+      // Too far ahead to store or relay, but it still says where its signer is: f+1 of these
+      // move a node that fell behind (a restart resets it to round 0) to their round.
+      timeout_votes_.note_latest_round(vote);
+      maybe_catch_up_round_from_timeout_votes_locked(vote.height);
+      log_timeout_soft_reject("future-round",
+                              " local_round=" + std::to_string(current_round_) +
+                                  " validator=" + short_pub_hex(vote.validator_pubkey));
+      return TimeoutVoteHandlingResult::SoftReject;
     }
     if (from_network) {
       const auto dedup_key = std::make_tuple(vote.height, vote.round, vote.validator_pubkey, vote.signature);
@@ -2082,6 +2114,7 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
     accepted = true;
     relay_vote = from_network && !should_mute_peer_locked(from_peer_id);
     maybe_record_timeout_certificate_locked(vote.height, vote.round);
+    maybe_catch_up_round_from_timeout_votes_locked(vote.height);
   }
   if (relay_vote) broadcast_timeout_vote(vote);
   return accepted ? TimeoutVoteHandlingResult::Accepted : TimeoutVoteHandlingResult::SoftReject;

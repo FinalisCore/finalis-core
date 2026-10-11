@@ -564,8 +564,21 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int 
     const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TX, payload, true);
     log_line("tx-forward-designated peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(lane) +
              " designated=" + short_pub_hex(designated_certifier) + " status=" + (ok ? "ok" : "failed"));
-    return;
+    if (ok) return;
+    break;
   }
+
+  // The certifier is not reachable from here: relay through the other validators, which forward
+  // to it themselves (and re-forward every few seconds while the tx stays uncertified).
+  // One session per validator: inbound and outbound connections to the same one both appear here.
+  std::set<PubKey32> relayed;
+  for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
+    if (peer_id == skip_peer_id || peer_pub == designated_certifier || relayed.contains(peer_pub)) continue;
+    if (!p2p_.get_peer_info(peer_id).established()) continue;
+    if (p2p_.send_to(peer_id, p2p::MsgType::TX, payload, true)) relayed.insert(peer_pub);
+  }
+  log_line("tx-forward-designated-unreachable lane=" + std::to_string(lane) +
+           " designated=" + short_pub_hex(designated_certifier) + " relayed_via=" + std::to_string(relayed.size()));
 }
 
 std::uint64_t Node::effective_min_relay_fee_for_height(std::uint64_t height) const {

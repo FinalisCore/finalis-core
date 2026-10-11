@@ -77,6 +77,7 @@ std::optional<Tx> build_onboarding_registration_tx(const std::vector<std::pair<O
                                                    std::string* err = nullptr,
                                                    const ValidatorJoinAdmissionPowBuildContext* pow_ctx = nullptr);
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
-                                 const Vote& vote_b, std::uint64_t fee = 0, std::string* err = nullptr);
+                                 const Vote& vote_b, std::uint64_t fee = 0, std::string* err = nullptr,
+                                 SlashVoteKind kind = SlashVoteKind::Precommit);
 
 }  // namespace finalis
