@@ -2684,6 +2684,9 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
     throw std::runtime_error(oss.str());
   }
 
+  // keys[0] is node0's own key: pause so node0 cannot already have voted at vc's height/round.
+  for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
   Vote vc;
   vc.validator_pubkey = keys[0].public_key;
   vc.height = nodes[1]->status().height + 1;
@@ -3765,7 +3768,10 @@ TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) 
 TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_duplicate_onboarding_registration_tx");
-  auto cluster = make_cluster(base, 1, 1, 1);
+  auto cluster = make_cluster(base, 1, 1, 1, [](node::NodeConfig& cfg) {
+    // Mainnet's 20-bit onboarding PoW mines slower than the two-epoch validity window under sanitizers.
+    cfg.network.onboarding_admission_pow_difficulty_bits = 8;
+  });
   auto& n0 = *cluster.nodes[0];
   ASSERT_TRUE(wait_for_tip(n0, 5, ci_timeout_seconds(40)));
 
@@ -3783,7 +3789,7 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
   ASSERT_TRUE(db0.open_readonly(base + "/node0"));
   const auto chain_id = ChainId::from_config_and_db(mainnet_network(), db0);
   ValidatorJoinAdmissionPowBuildContext pow_ctx0{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
@@ -3809,7 +3815,7 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
   const auto& sender1 = keys[funded1->key_index];
   const auto sender1_pkh = crypto::h160(Bytes(sender1.public_key.begin(), sender1.public_key.end()));
   ValidatorJoinAdmissionPowBuildContext pow_ctx1{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
@@ -4073,7 +4079,10 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
 }
 
 TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
-  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_banned_onboarding_reentry"), 1, 1, 1);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_banned_onboarding_reentry"), 1, 1, 1, [](node::NodeConfig& cfg) {
+    // Mainnet's 20-bit onboarding PoW mines slower than the two-epoch validity window under sanitizers.
+    cfg.network.onboarding_admission_pow_difficulty_bits = 8;
+  });
   auto& n0 = *cluster.nodes[0];
   const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(wait_for([&]() { return n0.status().height >= 6; }, ci_timeout_seconds(60)));
@@ -4129,7 +4138,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   ASSERT_TRUE(db.open_readonly(cluster.base + "/node0"));
   const auto chain_id = ChainId::from_config_and_db(mainnet_network(), db);
   ValidatorJoinAdmissionPowBuildContext pow_ctx{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
@@ -4140,9 +4149,9 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
   ASSERT_TRUE(onboarding_tx.has_value());
   ASSERT_TRUE(!n0.inject_tx_for_test(*onboarding_tx, true));
-
-  const auto before_height = n0.status().height;
-  ASSERT_TRUE(wait_for_tip(n0, before_height + 1, ci_timeout_seconds(20)));
+  // keys[0] is the cluster's only validator, so the chain halts once its ban applies; check the
+  // rejected tx never reached the mempool instead of waiting for a block.
+  ASSERT_TRUE(!n0.mempool_contains_for_test(onboarding_tx->txid()));
   {
     storage::DB verify_db;
     ASSERT_TRUE(verify_db.open_readonly(cluster.base + "/node0"));
