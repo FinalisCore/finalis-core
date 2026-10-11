@@ -2640,16 +2640,38 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
     return min_h > before_pause_h;
   }, std::chrono::seconds(30)));
 
+  // keys[0] is node0's own key, and a proposal still in flight when proposals paused may already
+  // carry node0's real precommit. Move every node to a round past it: no proposal exists there.
+  const auto enter_fresh_round = [&](std::uint64_t* height, std::uint32_t* round) {
+    for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
+    ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
+    ASSERT_TRUE(wait_for([&]() {
+      const auto h = nodes[0]->status().height;
+      std::uint32_t r = 0;
+      for (const auto& n : nodes) {
+        const auto si = n->status();
+        if (si.height != h) return false;
+        r = std::max(r, si.round);
+      }
+      for (auto& n : nodes) {
+        if (!n->advance_round_for_test(h + 1, r + 1)) return false;
+      }
+      *height = h + 1;
+      *round = r + 1;
+      return true;
+    }, ci_timeout_seconds(30)));
+  };
+
   // Equivocation injection for validator 0.
-  for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
-  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
-  const std::uint64_t min_before = nodes[0]->status().height;
-  const std::uint64_t equivocation_height = min_before + 1;
+  std::uint64_t equivocation_height = 0;
+  std::uint32_t equivocation_round = 0;
+  enter_fresh_round(&equivocation_height, &equivocation_round);
+  const std::uint64_t min_before = equivocation_height - 1;
 
   for (auto& n : nodes) {
     Vote va;
     va.height = equivocation_height;
-    va.round = 0;
+    va.round = equivocation_round;
     va.block_id.fill(0xAA);
     va.validator_pubkey = keys[0].public_key;
     auto sa = crypto::ed25519_sign(vote_signing_message(va.height, va.round, va.block_id), keys[0].private_key);
@@ -2662,7 +2684,9 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
     ASSERT_TRUE(sb.has_value());
     vb.signature = *sb;
 
-    ASSERT_TRUE(n->inject_vote_for_test(va));
+    // va reaches later nodes by gossip from earlier ones, so "duplicate" also means it counted.
+    const auto ra = n->inject_network_vote_diagnostic_for_test(va);
+    if (ra != "accepted" && ra != "soft-reject:duplicate") throw std::runtime_error("va rejected: " + ra);
     ASSERT_TRUE(!n->inject_vote_for_test(vb));
   }
   for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(false));
@@ -2684,19 +2708,17 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
     throw std::runtime_error(oss.str());
   }
 
-  // keys[0] is node0's own key: pause so node0 cannot already have voted at vc's height/round.
-  for (auto& n : nodes) ASSERT_TRUE(n->pause_proposals_for_test(true));
-  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
   Vote vc;
   vc.validator_pubkey = keys[0].public_key;
-  vc.height = nodes[1]->status().height + 1;
-  vc.round = 0;
+  enter_fresh_round(&vc.height, &vc.round);
   vc.block_id.fill(0xCC);
   auto sc = crypto::ed25519_sign(vote_signing_message(vc.height, vc.round, vc.block_id), keys[0].private_key);
   ASSERT_TRUE(sc.has_value());
   vc.signature = *sc;
   // A known equivocator's first vote per round still counts; a conflicting second one does not.
-  ASSERT_TRUE(nodes[1]->inject_vote_for_test(vc));
+  if (const auto rc = nodes[1]->inject_network_vote_diagnostic_for_test(vc); rc != "accepted") {
+    throw std::runtime_error("vc rejected: " + rc);
+  }
   Vote vd = vc;
   vd.block_id.fill(0xDD);
   auto sd = crypto::ed25519_sign(vote_signing_message(vd.height, vd.round, vd.block_id), keys[0].private_key);
