@@ -6,7 +6,7 @@ Current mainnet identity reference:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 It is intentionally narrow:
 
@@ -517,11 +517,10 @@ Ticket PoW observability:
   bond and BFT finality
 - the mainnet begins directly on the live bounded-search policy
 
-Fresh-genesis boundary:
+Network identity boundary:
 
 - if an explorer endpoint reports a different `network_id` or `genesis_hash`,
   treat it as a different network immediately
-- abandoned-chain explorer data must not be interpreted as current mainnet data
 
 ## Exchange Integration
 

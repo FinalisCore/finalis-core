@@ -4,7 +4,7 @@ Current mainnet identity context:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 ## Checkpoint / Availability Model
 
@@ -48,10 +48,6 @@ The abstraction preserves the properties that matter here:
 - hysteresis correctness
 - evidence isolation
 - ordering independence
-
-This formal layer is about the restarted live checkpoint regime, not the
-abandoned pre-reset chain. Old-chain DBs or old genesis assumptions are outside
-the model’s intended deployment context.
 
 ## Run TLC
 

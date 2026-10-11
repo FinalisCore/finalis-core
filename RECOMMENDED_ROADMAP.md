@@ -11,10 +11,11 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
 ## A. Network & deployment blockers
 
 - [x] **1. Commit real bootstrap seeds into the binary**
-  - `src/common/network.cpp`: `.default_seeds = {"85.217.171.168:19440", "64.23.244.126:19440"}`
+  - `src/common/network.cpp`: `.default_seeds`. Superseded (2026-10-11): the old mainnet deployment was
+    removed; mainnet seeds are empty until launch, testnet seeds are in `testnet/SEEDS.json`.
   - Status: **applied — builds clean (2026-10-04)**; tests not run
   - Follow-ups:
-    - Reconcile `mainnet/SEEDS.md` (still lists `212.58.103.170`, `seed1.gotdns.ch`) with `SEEDS.json`.
+    - Reconcile `mainnet/SEEDS.md` with `SEEDS.json`. Done (2026-10-11): both empty until launch.
     - Move to DNS seeds operated by ≥2 independent organizations before public launch.
     - Default seeds are used whenever `--seeds` is empty (even with `--no-dns-seeds`), so
       in-process tests and the `docker-compose.yml` devnet will now also dial these hosts
@@ -24,8 +25,8 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
   - `Dockerfile` CMD: added `--allow-unsafe-genesis-override` (required by `parse_args` when `--genesis` is set).
   - Status: **applied — pending build verification**
   - Follow-ups:
-    - Alternative: drop `--genesis` entirely; the embedded genesis has the same hash
-      (`eaae655a…b78a`) and avoids the "unsafe" flag.
+    - Alternative: drop `--genesis` entirely once mainnet launches and its genesis is embedded; that
+      avoids the "unsafe" flag.
     - Runtime image does not contain `finalis-lightserver`, yet CMD passes `--with-lightserver`.
 
 ## B. Consensus parameter correctness
@@ -385,12 +386,12 @@ settlement (item 13).
 
 - [x] **21. Test nodes dialed the public mainnet seeds**
   - Status: **applied — builds clean (2026-10-04)**; tests not run.
-  - Problem: `Node::init` appends `network.default_seeds` (`85.217.171.168`, `64.23.244.126`) whenever
+  - Problem: `Node::init` appends `network.default_seeds` whenever
     `cfg.seeds` is empty; `dns_seeds = false` does not stop it. Every loopback test cluster also dialed
     the internet (85 attempts in one devnet run).
   - Fix: `test_integration.cpp` clears `network.default_seeds` on every P2P-enabled config (cluster
-    builders, joiner/bootstrap/follower configs, handshake tests). Kept for
-    `test_unseeded_bootstrap_template_ignores_default_network_seeds`, which needs them present.
+    builders, joiner/bootstrap/follower configs, handshake tests).
+    `test_unseeded_bootstrap_template_ignores_default_network_seeds` sets its own (unroutable) seed.
   - Note: the production fallback is unchanged; operators who want no public seeds must pass `--seeds`.
 
 - [ ] **22. Fresh-genesis devnet automation**
@@ -442,8 +443,7 @@ settlement (item 13).
     now defaults to `0`. `enforce_genesis_safety_lock()` runs first in `main`, before the build step.
     - mainnet: fails if `ALLOW_UNSAFE_GENESIS_OVERRIDE != 0`, `GENESIS_PATH` is set, or `NODE_EXTRA_ARGS`
       contains `--genesis`/`--allow-unsafe-genesis-override`. No `--genesis` is passed, so the node uses
-      the embedded genesis checked against `MAINNET_GENESIS_HASH`. That hash (`eaae655a…b78a`) equals
-      sha256d(`mainnet/genesis.bin`), so existing databases still pass the stored-hash check.
+      the embedded genesis checked against `MAINNET_GENESIS_HASH` (none is embedded until launch).
     - testnet: requires `GENESIS_PATH` and a matching `EXPECTED_GENESIS_SHA256`, then enables the override.
   - Unit: `KillSignal=SIGINT`, `KillMode=mixed`, `TimeoutStopSec=${SERVICE_TIMEOUT_STOP_SEC:-300}`;
     `UMask=0077`, `ProtectSystem=strict`, `ProtectHome=read-only` + `ReadWritePaths=${DB_DIR}`,

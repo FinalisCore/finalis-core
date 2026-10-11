@@ -27,7 +27,7 @@ Current mainnet identity for onboarding cross-checks:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 - `magic = 0x499602D2`
 
 Use this with:
@@ -149,8 +149,7 @@ If two endpoints report the same finalized height but different
 `finalized_transition_hash`, stop automated settlement and investigate.
 
 If any endpoint reports a different `network_id` or `genesis_hash`, treat it
-as a different network immediately, even if hostnames or ports look familiar
-from the abandoned pre-reset chain.
+as a different network immediately, even if hostnames or ports look familiar.
 
 ## 5. Deposit model
 

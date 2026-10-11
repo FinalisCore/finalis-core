@@ -1,10 +1,10 @@
 # Committee Selection
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 ## Source Of Truth
 
@@ -23,10 +23,6 @@ Checkpoint fields:
 - `ordered_ticket_nonces`
 
 `ordered_members` is the live committee member list for that epoch.
-
-After the fresh-genesis reset, committee checkpoints from the abandoned chain
-are irrelevant. Only checkpoints derived from the current finalized history and
-current genesis identity are valid inputs.
 
 ## Candidate Construction
 

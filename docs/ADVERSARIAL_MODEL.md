@@ -4,11 +4,11 @@
 
 This document defines the adversarial model for Finalis Core consensus as currently implemented.
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 * `network_name = mainnet`
 * `network_id = fe561911730912cced1e83bc273fab13`
-* `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+* `genesis_hash`: published at launch (mainnet has not launched)
 
 It covers:
 
@@ -53,10 +53,6 @@ Authoritative replay input is strictly:
 * the finalized frontier transition sequence
 * one canonical finality certificate per finalized height
 * finalized ingress certificates/bytes and lane state needed to verify frontier transitions
-
-After the fresh-genesis reset, DB contents or endpoint assumptions from the
-abandoned chain are outside this authoritative replay input and must not be
-treated as valid inputs to the current network.
 
 Post-activation binding rule:
 

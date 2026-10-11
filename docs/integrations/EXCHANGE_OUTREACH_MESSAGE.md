@@ -12,8 +12,7 @@ finalized visibility only, and withdrawals are completed from finalized
 visibility only. Relay admission is not treated as settlement.
 
 The current network identity should always be confirmed from live `get_status`
-fields (`network_id`, `genesis_hash`) before operational onboarding, especially
-after a fresh-genesis relaunch.
+fields (`network_id`, `genesis_hash`) before operational onboarding.
 
 The current exchange integration documents are:
 

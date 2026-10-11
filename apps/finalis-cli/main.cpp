@@ -37,7 +37,7 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/secure_memory.hpp"
-#include "genesis/embedded_mainnet.hpp"
+#include "genesis/embedded.hpp"
 #include "genesis/genesis.hpp"
 #include "common/keystore.hpp"
 #include "lightserver/client.hpp"
@@ -51,6 +51,21 @@
 #include "wallet/utxo_selection.hpp"
 
 namespace {
+
+// The network every command works on: mainnet, or testnet with --testnet anywhere on the command line.
+const finalis::NetworkConfig* g_cli_network = &finalis::mainnet_network();
+
+const finalis::NetworkConfig& cli_network() { return *g_cli_network; }
+
+// The selected network's embedded genesis hash; zero when this build embeds none.
+finalis::Hash32 embedded_genesis_hash_or_zero() {
+  const auto embedded = finalis::genesis::embedded_genesis_for(cli_network().name);
+  return embedded.has_value() ? embedded->hash : finalis::zero_hash();
+}
+
+std::string default_rpc_url() {
+  return "http://127.0.0.1:" + std::to_string(cli_network().lightserver_default_port) + "/rpc";
+}
 
 std::string short_pub_hex(const finalis::PubKey32& pub) {
   return finalis::hex_encode(finalis::Bytes(pub.begin(), pub.begin() + 4));
@@ -417,7 +432,7 @@ std::string validator_onboarding_broadcast_outcome_name(
 
 void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecord& record, bool as_json,
                              const std::string& status_source = "") {
-  const auto& net = finalis::mainnet_network();
+  const auto& net = cli_network();
   const std::uint64_t activation_epoch_start =
       record.activation_height == 0 ? 0
                                     : finalis::consensus::committee_epoch_start(
@@ -551,8 +566,6 @@ struct SpendableView {
   std::optional<finalis::OutPoint> largest_outpoint;
 };
 
-constexpr const char* kDefaultMainnetDbPath = "~/.finalis/mainnet";
-constexpr const char* kDefaultMainnetValidatorKeyPath = "~/.finalis/mainnet/keystore/validator.json";
 
 std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> spendable_utxos_for_pubkey_hash(
     const finalis::storage::DB& db, const std::array<std::uint8_t, 20>& pkh) {
@@ -688,29 +701,25 @@ void print_section(const std::string& title) {
   std::cout << "\n== " << title << " ==\n";
 }
 
-std::string default_mainnet_db_path() {
+std::string default_db_path() {
 #ifdef _WIN32
   if (const char* appdata = std::getenv("APPDATA")) {
     const std::string root(appdata);
-    if (!root.empty()) return (std::filesystem::path(root) / ".finalis" / "mainnet").string();
+    if (!root.empty()) return (std::filesystem::path(root) / ".finalis" / cli_network().name).string();
   }
 #endif
-  return expand_user(kDefaultMainnetDbPath);
+  return expand_user("~/.finalis/" + cli_network().name);
 }
 
-std::string default_mainnet_validator_key_path() {
-#ifdef _WIN32
-  return (std::filesystem::path(default_mainnet_db_path()) / "keystore" / "validator.json").string();
-#else
-  return expand_user(kDefaultMainnetValidatorKeyPath);
-#endif
+std::string default_validator_key_path() {
+  return (std::filesystem::path(default_db_path()) / "keystore" / "validator.json").string();
 }
 
 std::string platform_default_db_path_note() {
 #ifdef _WIN32
-  return "Windows default --db: %APPDATA%\\.finalis\\mainnet";
+  return "Windows default --db: %APPDATA%\\.finalis\\" + cli_network().name;
 #else
-  return "Linux default --db: ~/.finalis/mainnet";
+  return "Linux default --db: ~/.finalis/" + cli_network().name;
 #endif
 }
 
@@ -1227,7 +1236,7 @@ int run_validator_doctor_command(const std::string& db_path, const std::string& 
       .db_path = resolved_db.string(),
       .key_file = resolved_key.string(),
       .passphrase = passphrase,
-      .rpc_url = rpc_url.empty() ? "http://127.0.0.1:19444/rpc" : rpc_url,
+      .rpc_url = rpc_url.empty() ? default_rpc_url() : rpc_url,
       .fee = 10'000,
       .wait_for_sync = true,
   };
@@ -1445,6 +1454,18 @@ void print_cli_help(std::ostream& os, const std::string& mode) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // --testnet applies to every command; drop it so no command's own parser sees it.
+  std::vector<char*> args(argv, argv + argc);
+  if (const auto it = std::find_if(args.begin() + 1, args.end(),
+                                   [](const char* a) { return std::string_view(a) == "--testnet"; });
+      it != args.end()) {
+    g_cli_network = &finalis::testnet_network();
+    args.erase(it);
+  }
+  argc = static_cast<int>(args.size());
+  args.push_back(nullptr);
+  argv = args.data();
+
   if (argc >= 2) {
     const std::string arg1 = argv[1];
     if (arg1 == "--version" || arg1 == "version") {
@@ -1466,7 +1487,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (cmd == "--print-logs" || cmd == "print_logs") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     std::string service_name = "finalis";
     std::size_t tail = 20;
     for (int i = 2; i < argc; ++i) {
@@ -1503,7 +1524,7 @@ int main(int argc, char** argv) {
           std::cout << "finality_signatures=" << cert->signatures.size() << "\n";
           std::cout << "committee_members=" << cert->committee_members.size() << "\n";
         }
-        const auto net = finalis::mainnet_network();
+        const auto net = cli_network();
         const auto epoch_start =
             finalis::consensus::committee_epoch_start(tip->height + 1, net.committee_epoch_blocks);
         const auto checkpoint = db.get_finalized_committee_checkpoint(epoch_start);
@@ -1660,7 +1681,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "confidential_supply_audit") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
@@ -1697,7 +1718,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "--reindex" || cmd == "reindex") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
@@ -1715,7 +1736,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "repair_state" || cmd == "--repair_state" || cmd == "full_reindex" || cmd == "--full_reindex") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     bool force = false;
     bool dry_run = false;
     for (int i = 2; i < argc; ++i) {
@@ -1728,7 +1749,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "sync_doctor") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     std::size_t tail = 400;
     bool as_json = false;
     for (int i = 2; i < argc; ++i) {
@@ -1741,10 +1762,10 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "validator_doctor" || cmd == "operator_doctor") {
-    std::string db_path = default_mainnet_db_path();
-    std::string key_file = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string key_file = default_validator_key_path();
     std::string passphrase;
-    std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    std::string rpc_url = default_rpc_url();
     bool as_json = false;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -1758,7 +1779,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "slash_records") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     std::size_t tail = 20;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -1798,7 +1819,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "epoch_tickets" || cmd == "epoch_best" || cmd == "epoch_committee" || cmd == "epoch_state") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     std::optional<std::uint64_t> epoch;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -1859,7 +1880,7 @@ int main(int argc, char** argv) {
       std::uint64_t current_epoch = 0;
       bool closed = false;
       if (auto tip = db.get_tip(); tip.has_value()) {
-        const auto net = finalis::mainnet_network();
+        const auto net = cli_network();
         current_epoch = finalis::consensus::committee_epoch_start(tip->height + 1, net.committee_epoch_blocks);
         closed = (*epoch < current_epoch);
       }
@@ -1881,7 +1902,7 @@ int main(int argc, char** argv) {
       const auto best = db.load_best_epoch_tickets(*epoch);
       if (!best.empty()) {
         finalis::Hash32 anchor = best.begin()->second.challenge_anchor;
-        const auto net = finalis::mainnet_network();
+        const auto net = cli_network();
         snapshot = finalis::consensus::derive_epoch_committee_snapshot(*epoch, anchor, best, finalis::MAX_COMMITTEE,
                                                                        nullptr, false);
       }
@@ -1895,7 +1916,7 @@ int main(int argc, char** argv) {
     std::cout << "epoch=" << snapshot->epoch << "\n";
     std::cout << "challenge_anchor=" << finalis::hex_encode32(snapshot->challenge_anchor) << "\n";
     if (auto tip = db.get_tip(); tip.has_value()) {
-      const auto net = finalis::mainnet_network();
+      const auto net = cli_network();
       const auto current_epoch = finalis::consensus::committee_epoch_start(tip->height + 1, net.committee_epoch_blocks);
       std::cout << "closed=" << (snapshot->epoch < current_epoch ? "yes" : "no") << "\n";
     }
@@ -1913,7 +1934,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "tip") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
@@ -1934,7 +1955,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "snapshot_export") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     std::string out_path;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -1973,9 +1994,9 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "snapshot_import") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     std::string in_path;
-    finalis::Hash32 expected_genesis = finalis::genesis::MAINNET_GENESIS_HASH;
+    finalis::Hash32 expected_genesis = embedded_genesis_hash_or_zero();
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
@@ -2000,6 +2021,10 @@ int main(int argc, char** argv) {
     }
     finalis::storage::SnapshotManifest manifest;
     std::string err;
+    if (expected_genesis == finalis::zero_hash()) {
+      std::cerr << "no embedded " << cli_network().name << " genesis; pass --expected-genesis-hash\n";
+      return 1;
+    }
     if (!finalis::storage::import_snapshot_bundle(db, in_path, expected_genesis, &manifest, &err)) {
       std::cerr << "error: snapshot_import failed: " << err << "\n";
       return 1;
@@ -2012,11 +2037,11 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "fast_sync") {
-    std::string db_path = default_mainnet_db_path();
+    std::string db_path = default_db_path();
     std::string snapshot_path;
     bool force = false;
     bool dry_run = false;
-    finalis::Hash32 expected_genesis = finalis::genesis::MAINNET_GENESIS_HASH;
+    finalis::Hash32 expected_genesis = embedded_genesis_hash_or_zero();
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
@@ -2031,6 +2056,10 @@ int main(int argc, char** argv) {
         }
         expected_genesis = *h;
       }
+    }
+    if (expected_genesis == finalis::zero_hash()) {
+      std::cerr << "no embedded " << cli_network().name << " genesis; pass --expected-genesis-hash\n";
+      return 1;
     }
     return run_fast_sync_command(db_path, snapshot_path, force, dry_run, expected_genesis);
   }
@@ -2053,7 +2082,7 @@ int main(int argc, char** argv) {
       std::cerr << "failed to load genesis json: " << err << "\n";
       return 1;
     }
-    if (!finalis::genesis::validate_document(*doc, finalis::mainnet_network(), &err, 0)) {
+    if (!finalis::genesis::validate_document(*doc, finalis::network_by_name(doc->network_name), &err, 0)) {
       std::cerr << "genesis validation failed: " << err << "\n";
       return 1;
     }
@@ -2121,7 +2150,7 @@ int main(int argc, char** argv) {
       std::cerr << "failed to load genesis json: " << err << "\n";
       return 1;
     }
-    if (!finalis::genesis::validate_document(*doc, finalis::mainnet_network(), &err, 0)) {
+    if (!finalis::genesis::validate_document(*doc, finalis::network_by_name(doc->network_name), &err, 0)) {
       std::cerr << "genesis validation failed: " << err << "\n";
       return 1;
     }
@@ -2144,9 +2173,14 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "genesis_print_embedded") {
-    std::cout << "embedded_mainnet_genesis_len=" << finalis::genesis::MAINNET_GENESIS_BIN_LEN << "\n";
-    std::cout << "embedded_mainnet_genesis_hash=" << finalis::hex_encode32(finalis::genesis::MAINNET_GENESIS_HASH)
-              << "\n";
+    const std::string& name = cli_network().name;
+    const auto embedded = finalis::genesis::embedded_genesis_for(name);
+    if (!embedded.has_value()) {
+      std::cout << "embedded_" << name << "_genesis=none\n";
+      return 0;
+    }
+    std::cout << "embedded_" << name << "_genesis_len=" << embedded->len << "\n";
+    std::cout << "embedded_" << name << "_genesis_hash=" << finalis::hex_encode32(embedded->hash) << "\n";
     return 0;
   }
 
@@ -2612,7 +2646,7 @@ int main(int argc, char** argv) {
   if (cmd == "wallet_create") {
     std::string out_path;
     std::string passphrase;
-    std::string network_name = "mainnet";
+    std::string network_name = cli_network().name;
     std::string seed_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -2625,8 +2659,8 @@ int main(int argc, char** argv) {
       std::cerr << "--out is required\n";
       return 1;
     }
-    if (network_name != "mainnet") {
-      std::cerr << "only --network mainnet is supported\n";
+    if (network_name != "mainnet" && network_name != "testnet") {
+      std::cerr << "--network must be mainnet or testnet\n";
       return 1;
     }
     std::optional<std::array<std::uint8_t, 32>> seed_override;
@@ -2707,7 +2741,7 @@ int main(int argc, char** argv) {
       if (a == "--file" && i + 1 < argc) file_path = argv[++i];
       else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
     }
-    if (file_path.empty()) file_path = default_mainnet_validator_key_path();
+    if (file_path.empty()) file_path = default_validator_key_path();
     finalis::keystore::ValidatorKey vk;
     std::string err;
     if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
@@ -2722,8 +2756,8 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "validator_status") {
-    std::string db_path = default_mainnet_db_path();
-    std::string file_path = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
     std::string passphrase;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -2756,7 +2790,7 @@ int main(int argc, char** argv) {
     }
     const auto it = validators.find(vk.pubkey);
     const auto join_req = find_join_request_for_pubkey(reqs, vk.pubkey);
-    const auto& net = finalis::mainnet_network();
+    const auto& net = cli_network();
     const std::uint64_t finalized_height = tip ? tip->height : 0;
     const auto runtime = db.get_node_runtime_status_snapshot();
 
@@ -2827,8 +2861,8 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "getBalance") {
-    std::string db_path = default_mainnet_db_path();
-    std::string file_path = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
     std::string passphrase;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -2864,8 +2898,8 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "economics_status") {
-    std::string db_path = default_mainnet_db_path();
-    std::string file_path = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
     std::string passphrase;
     bool as_json = false;
     std::optional<std::uint64_t> inspect_height;
@@ -2890,7 +2924,7 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    const auto& net = finalis::mainnet_network();
+    const auto& net = cli_network();
     const auto tip = db.get_tip();
     const auto validators = db.load_validators();
     const std::uint64_t finalized_height = tip ? tip->height : 0;
@@ -3192,10 +3226,10 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "validator-register" || cmd == "validator-register-status" || cmd == "validator-register-cancel") {
-    std::string db_path = default_mainnet_db_path();
-    std::string file_path = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
     std::string passphrase;
-    std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    std::string rpc_url = default_rpc_url();
     // Onboarding status/start are admin RPCs, served only on the lightserver admin Unix socket.
     std::string admin_rpc_url = finalis::lightserver::kDefaultAdminRpcUrl;
     std::uint64_t fee = 10'000;
@@ -3229,7 +3263,7 @@ int main(int argc, char** argv) {
         .key_file = file_path,
         .passphrase = passphrase,
         .rpc_url = rpc_url,
-        .network = finalis::mainnet_network(),
+        .network = cli_network(),
         .fee = fee,
         .wait_for_sync = wait_for_sync,
     };
@@ -3366,8 +3400,8 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "getUTXO") {
-    std::string db_path = default_mainnet_db_path();
-    std::string file_path = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
     std::string passphrase;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -3409,10 +3443,10 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "send") {
-    std::string db_path = default_mainnet_db_path();
-    std::string file_path = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
     std::string passphrase;
-    std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    std::string rpc_url = default_rpc_url();
     std::string to_addr;
     std::string amount_text;
     std::uint64_t amount_units = 0;
@@ -3586,11 +3620,11 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "onboarding-register") {
-    std::string db_path = default_mainnet_db_path();
-    std::string file_path = default_mainnet_validator_key_path();
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
     std::string validator_file_path;
     std::string passphrase;
-    std::string rpc_url = "http://127.0.0.1:19444/rpc";
+    std::string rpc_url = default_rpc_url();
     std::uint64_t fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
 
     for (int i = 2; i < argc; ++i) {
@@ -3726,7 +3760,7 @@ int main(int argc, char** argv) {
   if (cmd == "wallet_import") {
     std::string out_path;
     std::string passphrase;
-    std::string network_name = "mainnet";
+    std::string network_name = cli_network().name;
     std::string privkey_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -3740,8 +3774,8 @@ int main(int argc, char** argv) {
       std::cerr << "--out and --privkey(32-byte hex) are required\n";
       return 1;
     }
-    if (network_name != "mainnet") {
-      std::cerr << "only --network mainnet is supported\n";
+    if (network_name != "mainnet" && network_name != "testnet") {
+      std::cerr << "--network must be mainnet or testnet\n";
       return 1;
     }
     finalis::keystore::ValidatorKey vk;
@@ -3951,7 +3985,7 @@ int main(int argc, char** argv) {
 
   if (cmd == "hashcash_stamp_tx") {
     std::string tx_hex;
-    std::string network_name = "mainnet";
+    std::string network_name = cli_network().name;
     std::uint32_t bits = 18;
     std::uint64_t epoch_seconds = 60;
     std::uint64_t now_unix = static_cast<std::uint64_t>(std::time(nullptr));
@@ -3969,8 +4003,8 @@ int main(int argc, char** argv) {
       std::cerr << "hashcash_stamp_tx requires --tx-hex\n";
       return 1;
     }
-    if (network_name != "mainnet") {
-      std::cerr << "only mainnet network is currently supported\n";
+    if (network_name != "mainnet" && network_name != "testnet") {
+      std::cerr << "--network must be mainnet or testnet\n";
       return 1;
     }
     auto raw = finalis::hex_decode(tx_hex);
@@ -3989,7 +4023,7 @@ int main(int argc, char** argv) {
     cfg.max_bits = bits;
     cfg.epoch_seconds = std::max<std::uint64_t>(1, epoch_seconds);
     std::string err;
-    if (!finalis::policy::apply_hashcash_stamp(&*tx, finalis::mainnet_network(), cfg, bits, now_unix, max_nonce, &err)) {
+    if (!finalis::policy::apply_hashcash_stamp(&*tx, finalis::network_by_name(network_name), cfg, bits, now_unix, max_nonce, &err)) {
       std::cerr << "hashcash stamping failed: " << err << "\n";
       return 1;
     }
@@ -4105,7 +4139,7 @@ int main(int argc, char** argv) {
   if (cmd == "broadcast_tx") {
     std::string rpc_url;
     std::string host = "127.0.0.1";
-    std::uint16_t port = 19444;
+    std::uint16_t port = cli_network().lightserver_default_port;
     std::string tx_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];

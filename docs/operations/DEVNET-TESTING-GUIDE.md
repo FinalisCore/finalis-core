@@ -5,7 +5,7 @@ deployments:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 ## Purpose
 
@@ -22,9 +22,6 @@ Use it to test:
 - QC and lock safety behavior
 - supported confidential `TxV2` execution on a fresh network
 - wallet / explorer local-first behavior across restart
-
-Do not mix abandoned-chain DBs or stale embedded-genesis binaries into these
-tests if the goal is to simulate the current mainnet.
 
 ## Basic Commands
 

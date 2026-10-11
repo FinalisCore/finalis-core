@@ -17,11 +17,11 @@
 > [docs/REVIEWING.md](docs/REVIEWING.md). Report vulnerabilities privately as
 > described in [SECURITY.md](SECURITY.md).
 
-Current genesis candidate:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 - `magic = 0x499602D2`
 
 In the current codebase it consists of:
@@ -195,11 +195,9 @@ Dependency notes:
 
 Before first startup on the mainnet:
 
-- wipe old chain DBs
 - ensure your local validator key is actually present in the intended genesis
   validator set
 - ensure your binaries embed the same canonical `genesis.bin` used for launch
-
 
 ```
 SYNC_TURBO_MODE=extreme ./scripts/start.sh
@@ -212,7 +210,6 @@ Default ports from the current mainnet config:
 
 Always verify live endpoint identity with `get_status` before relying on public
 infrastructure.
-
 
 ## Testing
 

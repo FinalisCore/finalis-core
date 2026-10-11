@@ -2,11 +2,11 @@
 
 `finalis-core` is a finalized-state BFT chain.
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 - `magic = 0x499602D2`
 
 Normative checkpoint derivation semantics are defined in [docs/spec/CHECKPOINT_DERIVATION_SPEC.md](spec/CHECKPOINT_DERIVATION_SPEC.md).
@@ -101,10 +101,6 @@ Replay authority is:
 - finalized frontier transitions in height order
 - one canonical finality certificate per finalized height
 - committed finalized ingress/state storage needed to verify those transitions
-
-After the deliberate genesis reset, old chain DB contents, frontier caches, and
-endpoint assumptions are outside this replay authority and must not be reused
-as if they belonged to the current network.
 
 ## Adaptive Observability
 

@@ -1,10 +1,10 @@
 # Ticket PoW And Difficulty
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 `docs/ECONOMICS.md` is the economics source of truth. This document describes
 the live Ticket PoW behavior that remains consensus-adjacent but secondary.
@@ -20,10 +20,6 @@ Its role is:
 - bounded extra pressure on participation
 - bounded secondary modifier on committee ranking
 - deterministic tie pressure within the operator-weighted model
-
-Ticket PoW state must be interpreted relative to the current finalized history
-only. Old-chain difficulty or ticket observations from the abandoned network do
-not carry over after the genesis reset.
 
 Boundary rule:
 

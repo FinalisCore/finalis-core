@@ -216,6 +216,3 @@ Terminology note:
 
 Genesis-reset note:
 
-- if the network was relaunched from a fresh genesis, any txids, heights, or
-  explorer links from the abandoned chain are irrelevant to current settlement
-  operations

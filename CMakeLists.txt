@@ -155,7 +155,9 @@ add_library(finalis_core
   src/common/keystore.cpp
   src/onboarding/validator_onboarding.cpp
   src/genesis/genesis.cpp
+  src/genesis/embedded.cpp
   src/genesis/embedded_mainnet.cpp
+  src/genesis/embedded_testnet.cpp
   src/common/merkle.cpp
   src/common/address.cpp
   src/consensus/availability_retention.cpp

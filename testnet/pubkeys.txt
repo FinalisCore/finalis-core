@@ -1,0 +1,3 @@
+# testnet-1 genesis validators: one pubkey_hex per line (finalis-cli --testnet wallet_create)
+150cf9f36fe2077090b562bfd80f66c3ad13d6412695096b0058f14c21fcfc24  # bootstrap validator
+# 8936a7a703afc08f28e4d4db2f3d214be1f0ac3d5d21d5a61a10e33892cb130c  joins later via validator-register

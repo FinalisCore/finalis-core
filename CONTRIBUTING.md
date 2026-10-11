@@ -2,6 +2,44 @@
 
 This guide focuses on codebase readability, discoverability, and safe changes.
 
+## Your First Hour
+
+You do not need to understand the whole codebase to contribute. In about an hour on Linux:
+
+1. Build (needs a C++20 compiler, CMake, Ninja):
+
+   ```bash
+   cmake -S . -B build -G Ninja && cmake --build build -j
+   ```
+
+2. Run one test, then list the rest. The suite is one binary; `--run` takes an exact test name and
+   `FINALIS_TEST_FILTER` a substring:
+
+   ```bash
+   ./build/finalis-tests --run test_prevote_slash_evidence_validation
+   ./build/finalis-tests --list
+   FINALIS_TEST_FILTER=slash ./build/finalis-tests
+   ```
+
+3. Watch the network survive faults. The chaos harness starts a local network, crashes, partitions
+   and slows nodes, sends payments, and reports forks, stalls and lost payments. This 4-node,
+   5-minute run needs no special build:
+
+   ```bash
+   python3 scripts/chaos_devnet.py --nodes 4 --duration 300 --tx-interval 2 --build-dir "$PWD/build"
+   ```
+
+   It prints the path of `report.md`; each node's log is next to it. Exit code 0 means no fork, no
+   stall, and every node converged. (Byzantine nodes need the `-DFINALIS_CHAOS_BYZANTINE=ON`
+   build; see the header of `scripts/chaos_devnet.py`.)
+
+4. Pick an issue labelled `good first issue`. Each one names the files involved and how to check
+   the result. Ask in the issue before starting anything larger; a short plan saves a long review.
+
+You can verify a pull request yourself with the full suite (`ctest --test-dir build
+--output-on-failure`, about 15 minutes) and, for consensus or networking changes, a chaos run.
+Paste the chaos summary line in the pull request.
+
 ## Principles
 
 - Keep behavior changes and structure changes in separate pull requests when possible.

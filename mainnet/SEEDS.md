@@ -1,32 +1,18 @@
 # Finalis Mainnet Seeds
 
-Initial placeholders:
-- `212.58.103.170:19440` (temporary raw IP seed)
-- `seed1.gotdns.ch:19440` (active dynamic DNS seed)
-- `seed1.mainnet.finalis.example:19440`
-- `seed2.mainnet.finalis.example:19440`
-- format to publish: `seedX.domain:19440`
+Mainnet has not launched, so there are no mainnet seeds. At launch they are published in
+[SEEDS.json](SEEDS.json) and compiled into the release (`default_seeds` in
+`src/common/network.cpp`); changing them afterwards needs a new release.
 
-Operator expectations:
-- at least 2 independent organizations
-- static DNS + health monitoring
-- public uptime targets and incident contact
+Seed requirements:
+- P2P endpoints (`host:19440`), not lightserver HTTP (`19444`)
+- plain nodes, not validators, so validator addresses stay private
+- DNS names where possible, so a seed can move without a release
+- at least 2, run by independent operators, with health monitoring
 
 Operator run example:
 ```bash
 ./build/finalis-node --public
 ```
 
-Default data dir:
-- `~/.finalis/mainnet`
-
-Transition note:
-- the restarted network is branded as `Finalis` with ticker `FLS`
-- binaries now use the `finalis-*` prefix
-- old-network peers will correctly fail handshake with
-  `genesis-fingerprint-mismatch` and must not be treated as healthy seeds
-
-Port sanity:
-- Seeds must be P2P endpoints (`19440`), not lightserver HTTP (`19444`).
-- Publish lightservers separately as RPC URLs (`http://host:19444/rpc`).
-- Do not place TLS/HTTP reverse proxies in front of the P2P port.
+Default data dir: `~/.finalis/mainnet`. Testnet seeds: [../testnet/SEEDS.json](../testnet/SEEDS.json).

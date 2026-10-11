@@ -22,13 +22,42 @@ Use this together with:
 - [../docs/MAINNET.md](../docs/MAINNET.md)
 - [../docs/integrations/EXCHANGE_INTEGRATION.md](../docs/integrations/EXCHANGE_INTEGRATION.md)
 
+## 0. Consensus Readiness Gate
+
+Everything below checks that a launch is wired correctly. This gate checks that the protocol is
+ready to be launched at all. It comes first: until it passes, the network is a testnet, and public
+material must not call it a live mainnet.
+
+Pass conditions:
+
+- External review: at least one reviewer independent of the maintainer has reviewed
+  [../docs/spec/TWO_PHASE_FINALITY.md](../docs/spec/TWO_PHASE_FINALITY.md), the TLA+ model in
+  [../formal/](../formal/) and the node's consensus implementation. The review and the response
+  to every finding are published.
+- Model check: the TLA+ finality model passes at the bounds stated in the spec.
+- Chaos campaign on the release binaries (`scripts/chaos_devnet.py`, 7 nodes, 30 min per seed):
+  - at least 10 seeds with `--byzantine 2` and 5 seeds with `--byzantine 0 --fault-mix crash`
+  - 0 forks, 0 runs that fail to converge (exit 0 on every seed)
+  - 0 lost payments classified `dropped` that are not explained by a rejection at submission
+  - reports archived with the release
+- Fuzzing: `fuzz_p2p_frame`, `fuzz_tx_parse` and `fuzz_consensus_msgs` run clean under
+  ASan/UBSan on the release commit.
+- Independent genesis validators: the genesis set is selected per
+  [GENESIS_VALIDATOR_CEREMONY.md](GENESIS_VALIDATOR_CEREMONY.md), with operators other than the
+  maintainer able to form a quorum without the maintainer's keys.
+
+Launch blocker:
+
+- any fork or non-converging chaos seed on the release binaries
+- an unresolved consensus finding from the external review
+- a genesis set in which one operator controls more than `f` validators
+
 ## 1. Threat Model
 
 The current bootstrap threat surface is:
 
 - genesis mismatch between published artifacts and embedded mainnet bytes
 - node DB reuse across incompatible genesis histories
-- operator rollout with stale DBs from the abandoned pre-reset chain
 - seed / peer divergence at the same finalized height
 - stale client assumptions about finalized identity fields
 - wallet local-state drift after finalized transaction inclusion
@@ -67,7 +96,6 @@ Pass condition:
 Reset gate:
 
 - old mainnet DBs are wiped before first startup on the new genesis
-- no node attempts to reuse frontier / finalized state from the abandoned chain
 
 Then verify that embedded mainnet bytes match the canonical binary:
 
@@ -290,6 +318,9 @@ Exchange pass condition:
 
 Mark every item before calling bootstrap launch healthy:
 
+- [ ] consensus readiness gate (section 0) passes: external review published with findings
+      resolved, chaos campaign clean on the release binaries, fuzz targets clean
+- [ ] genesis validators selected by the ceremony; no operator controls more than `f` of them
 - [ ] `mainnet/genesis.json` and `mainnet/genesis.bin` reproduce cleanly
 - [ ] embedded genesis was regenerated from the canonical binary before the
       release build

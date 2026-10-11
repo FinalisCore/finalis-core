@@ -6197,8 +6197,8 @@ TEST(test_load_persisted_peers_splits_legacy_comma_joined_lines) {
   {
     std::ofstream out(db_path / "peers.dat", std::ios::trunc);
     ASSERT_TRUE(out.good());
-    out << "212.58.103.170:19440\n";
-    out << "85.217.171.168:19440,212.58.103.170:19440\n";
+    out << "198.51.100.20:19440\n";
+    out << "203.0.113.10:19440,198.51.100.20:19440\n";
   }
 
   node::NodeConfig cfg;
@@ -6219,8 +6219,8 @@ TEST(test_load_persisted_peers_splits_legacy_comma_joined_lines) {
 
   const auto persisted = read_nonempty_lines(db_path / "peers.dat");
   ASSERT_EQ(persisted.size(), 2u);
-  ASSERT_EQ(persisted[0], "212.58.103.170:19440");
-  ASSERT_EQ(persisted[1], "85.217.171.168:19440");
+  ASSERT_EQ(persisted[0], "198.51.100.20:19440");
+  ASSERT_EQ(persisted[1], "203.0.113.10:19440");
 }
 
 TEST(test_same_block_different_signature_superset_same_payout) {
@@ -6810,6 +6810,8 @@ TEST(test_unseeded_bootstrap_template_ignores_default_network_seeds) {
   cfg.allow_unsafe_genesis_override = true;
   cfg.network.min_block_interval_ms = 100;
   cfg.network.round_timeout_ms = 200;
+  // Compiled-in default seeds alone must not stop a bootstrap node (unroutable test address).
+  cfg.network.default_seeds = {"192.0.2.1:19440"};
 
   node::Node n(cfg);
   ASSERT_TRUE(n.init());

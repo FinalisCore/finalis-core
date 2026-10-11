@@ -739,8 +739,9 @@ void Node::maybe_record_timeout_certificate_locked(std::uint64_t height, std::ui
 }
 
 // LIVENESS (Tendermint's f+1 round skip): when f+1 committee members have timed out of rounds >= R,
-// at least one honest validator is past R, so move to R. Unlike the observed-timeout-vote jump this
-// is unbounded: a restarted node is back at round 0 and may be any number of rounds behind. Without
+// at least one honest validator is past R, so move to R. This is the only timeout-vote round jump (a
+// single vote cannot move a node: it may come from a Byzantine validator). It is unbounded: a
+// restarted node is back at round 0 and may be any number of rounds behind. Without
 // it, honest nodes split between a low and a high round never share a round with a quorum, and
 // timeout votes alone never form the TC that would align them (a crash run halted for good).
 // Safe: the lock rule and the vote-round floor do not depend on the current round.
@@ -2072,23 +2073,6 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
       } else {
         seen_timeout_vote_messages_ms_.emplace(dedup_key, now_ms);
       }
-    }
-    // Conservative liveness catchup: allow a bounded round jump from a valid
-    // higher-round timeout vote when this node is visibly stalled at the same height.
-    const std::uint64_t stall_ms = cfg_.network.round_timeout_ms * 2ULL;
-    const bool consensus_stalled = now_ms > last_finalized_progress_ms_ + stall_ms;
-    if (from_network && !repair_mode_ && !pause_proposals_.load() && vote.height == finalized_height_ + 1 &&
-        vote.round > current_round_ && vote.round <= current_round_ + kProposalRoundWindow &&
-        consensus_stalled) {
-      const auto old_round = current_round_;
-      current_round_ = vote.round;
-      round_started_ms_ = now_ms;
-      const auto leader = leader_for_height_round(vote.height, current_round_);
-      log_line("round-catchup height=" + std::to_string(vote.height) + " old_round=" + std::to_string(old_round) +
-               " new_round=" + std::to_string(current_round_) +
-               " reason=observed-timeout-vote leader=" +
-               (leader.has_value() ? short_pub_hex(*leader) : std::string("none")) +
-               " validator=" + short_pub_hex(vote.validator_pubkey));
     }
     // INVARIANT: see the matching comment at votes_.add_vote in handle_vote_result.
     // Everything reaching timeout_votes_.add_vote here has already passed

@@ -16,7 +16,7 @@ The current live deployment context after the genesis reset is:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 ## Live Rules Modeled
 
@@ -55,9 +55,6 @@ The simulator is faithful at the checkpoint-policy layer, but it is still an ana
 - byte-level checkpoint serialization and state commitments
 
 The simulator does not prove the live implementation. It measures protocol behavior under bounded, reproducible adversarial scenarios.
-
-It must not be used as if it were replay input for the abandoned pre-reset
-chain; the current deployment context is the mainnet identity above.
 
 The committed fixture bridge constrains simulator drift:
 

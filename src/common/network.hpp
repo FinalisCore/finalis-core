@@ -74,8 +74,10 @@ struct NetworkConfig {
 };
 
 const NetworkConfig& mainnet_network();
+const NetworkConfig& testnet_network();
+bool is_testnet_name(const std::string& name);  // "testnet" or its address prefix "tsc"
 std::uint64_t round_timeout_ms_for_round(const NetworkConfig& network, std::uint32_t round);
-const NetworkConfig& network_by_name(const std::string& name);  // mainnet only
+const NetworkConfig& network_by_name(const std::string& name);  // testnet for "testnet"/"tsc", else mainnet
 const std::vector<EconomicsConfig>& economics_policies(const NetworkConfig& network);
 const EconomicsConfig& active_economics_policy(const NetworkConfig& network, std::uint64_t height);
 bool finality_binding_active_at_height(const NetworkConfig& network, std::uint64_t height);
