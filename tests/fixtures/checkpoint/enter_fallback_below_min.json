@@ -5,7 +5,7 @@
     "epoch_start_height": 33,
     "committee_size": 3,
     "min_eligible": 3,
-    "effective_min_bond": 23094000000,
+    "effective_min_bond": 230940000000,
     "ticket_difficulty_bits": 8,
     "ticket_bonus_cap_bps": 1000,
     "max_effective_bond_multiple": 10,
@@ -19,20 +19,20 @@
     "ticket_difficulty_bits": 8
   },
   "validators": [
-    {"validator_pubkey":"2121212121212121212121212121212121212121212121212121212121212121","operator_id":"b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
-    {"validator_pubkey":"2222222222222222222222222222222222222222222222222222222222222222","operator_id":"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
-    {"validator_pubkey":"2323232323232323232323232323232323232323232323232323232323232323","operator_id":"b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true}
+    {"validator_pubkey":"2121212121212121212121212121212121212121212121212121212121212121","operator_id":"b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1","join_source":"GENESIS","bonded_amount":300000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"2222222222222222222222222222222222222222222222222222222222222222","operator_id":"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2","join_source":"GENESIS","bonded_amount":300000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"2323232323232323232323232323232323232323232323232323232323232323","operator_id":"b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3","join_source":"GENESIS","bonded_amount":300000000000,"has_bond":true,"lifecycle_active":true}
   ],
   "availability": [
-    {"operator_id":"b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
-    {"operator_id":"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2","state":"WARMUP","bond":25000000000,"service_score":0,"retained_prefix_count":1},
-    {"operator_id":"b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3","state":"PROBATION","bond":25000000000,"service_score":0,"retained_prefix_count":1}
+    {"operator_id":"b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1","state":"ACTIVE","bond":300000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2","state":"WARMUP","bond":300000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3","state":"PROBATION","bond":300000000000,"service_score":0,"retained_prefix_count":1}
   ],
   "expected": {
     "eligible_operator_count": 1,
     "derivation_mode": "FALLBACK",
     "fallback_reason": "INSUFFICIENT_ELIGIBLE_OPERATORS",
     "committee": ["2222222222222222222222222222222222222222222222222222222222222222","2323232323232323232323232323232323232323232323232323232323232323","2121212121212121212121212121212121212121212121212121212121212121"],
-    "proposer_schedule": ["2323232323232323232323232323232323232323232323232323232323232323","2121212121212121212121212121212121212121212121212121212121212121","2222222222222222222222222222222222222222222222222222222222222222"]
+    "proposer_schedule": ["2222222222222222222222222222222222222222222222222222222222222222","2121212121212121212121212121212121212121212121212121212121212121","2323232323232323232323232323232323232323232323232323232323232323"]
   }
 }

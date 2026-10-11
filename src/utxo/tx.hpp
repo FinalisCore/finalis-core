@@ -278,6 +278,12 @@ struct EquivocationEvidence {
   Vote b;
 };
 
+// Signing domain of the two conflicting votes in slash evidence (first byte of the evidence blob).
+enum class SlashVoteKind : std::uint8_t {
+  Precommit = 0,
+  Prevote = 1,
+};
+
 struct OutPoint {
   Hash32 txid;
   std::uint32_t index{0};

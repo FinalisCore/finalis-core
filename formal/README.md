@@ -154,6 +154,10 @@ the counterexample that led to `local_vote_round_floor_locked` (see
 [two_phase_finality_floor_mutation.cfg](two_phase_finality_floor_mutation.cfg)).
 
 Run: `./scripts/run_tlc.sh --spec formal/two_phase_finality_abstract.tla --config formal/two_phase_finality_abstract.cfg`
+(about 3 minutes with one TLC worker). For the reachability and mutation configs add
+`--expect-violation <invariant>`, which passes only if TLC reports that invariant violated. CI
+(`.github/workflows/formal-verification.yml`) runs all five abstract configs this way; the detailed
+model is too large for CI.
 
 It models the voting rules of [docs/spec/TWO_PHASE_FINALITY.md](../docs/spec/TWO_PHASE_FINALITY.md) at
 one height as implemented in `src/node/node_consensus.cpp`: 4 validators (1 Byzantine, quorum 3),

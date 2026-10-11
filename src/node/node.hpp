@@ -75,6 +75,8 @@ struct NodeConfig {
   std::uint32_t upnp_igd_lease_seconds{1200};
   std::string lightserver_bind{"127.0.0.1"};
   std::uint16_t lightserver_port{19444};
+  // Admin socket of the spawned lightserver; empty disables it. Hosts running several give each its own.
+  std::string lightserver_admin_socket{"/var/run/finalis/admin.sock"};  // lightserver::kDefaultAdminSocketPath
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};
@@ -246,6 +248,9 @@ class Node {
   std::string inject_network_propose_result_for_test(const p2p::ProposeMsg& msg);
   std::string inject_network_propose_diagnostic_for_test(const p2p::ProposeMsg& msg);
   bool inject_frontier_transition_for_test(const FrontierProposal& proposal, const FinalityCertificate& certificate);
+  // The TRANSITION this node serves for a finalized height, and delivery of one as sync would.
+  std::optional<p2p::TransitionMsg> finalized_transition_msg_for_test(std::uint64_t height) const;
+  bool inject_transition_msg_for_test(const p2p::TransitionMsg& msg);
   bool inject_propose_msg_for_test(const p2p::ProposeMsg& msg);
   bool inject_ingress_tips_for_test(const p2p::IngressTipsMsg& msg, int peer_id = 1);
   bool inject_ingress_range_for_test(const p2p::IngressRangeMsg& msg, int peer_id = 1);
@@ -277,6 +282,7 @@ class Node {
   std::optional<std::pair<Hash32, std::uint32_t>> local_vote_lock_for_test(std::uint64_t height) const;
   // Precommit signed by this node.
   bool local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
+  std::vector<Vote> precommits_for_rebroadcast_for_test(std::uint64_t height) const;
   bool local_prevote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
   std::string inject_network_prevote_result_for_test(const Vote& vote);
   bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
@@ -404,13 +410,25 @@ class Node {
   // computed by the caller BEFORE mu_ was locked (this function always runs with mu_ held). Passing
   // std::nullopt here when `certificate` has a value is a caller bug, not a valid "skip" state --
   // every call site must precheck first. See precheck_finality_certificate's comment for why this is safe.
+  // `lane_certificates` are the ingress certificates a TRANSITION carries for the slice; a certified
+  // block's missing ones are stored before it is applied (store_finalized_lane_certificates_locked).
   bool handle_frontier_block_locked(const FrontierProposal& proposal, const std::optional<FinalityCertificate>& certificate,
-                                    int from_peer_id, bool from_network, const std::optional<CertificateCheck>& cert_check);
+                                    const std::vector<IngressCertificate>& lane_certificates, int from_peer_id,
+                                    bool from_network, const std::optional<CertificateCheck>& cert_check);
   bool maybe_buffer_sync_frontier_locked(const FrontierProposal& proposal,
-                                         const std::optional<FinalityCertificate>& certificate, int from_peer_id,
+                                         const std::optional<FinalityCertificate>& certificate,
+                                         const std::vector<IngressCertificate>& lane_certificates, int from_peer_id,
                                          const std::optional<CertificateCheck>& cert_check);
   bool insert_buffered_sync_frontier_locked(const FrontierProposal& proposal, const FinalityCertificate& certificate,
+                                            const std::vector<IngressCertificate>& lane_certificates,
                                             int from_peer_id, const std::optional<CertificateCheck>& cert_check);
+  // The stored ingress certificates of a finalized transition's lane ranges (empty if any is missing).
+  std::vector<IngressCertificate> load_finalized_lane_certificates(const FrontierTransition& transition) const;
+  // Appends the certificates of a certified next-height transition that local storage lacks, replacing
+  // a conflicting unfinalized lane suffix: the certified block decides the lane contents.
+  bool store_finalized_lane_certificates_locked(const FrontierProposal& proposal,
+                                                const std::vector<IngressCertificate>& lane_certificates,
+                                                std::string* error);
   bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
   bool handle_tx(const AnyTx& tx, bool from_network, int from_peer_id = 0);
   bool maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error = nullptr);
@@ -447,6 +465,7 @@ class Node {
   // any round from its own to the current one, take effect now (precommits queue for the flush).
   void on_candidate_body_locked(const FrontierTransition& transition);
   void maybe_record_timeout_certificate_locked(std::uint64_t height, std::uint32_t round);
+  void maybe_catch_up_round_from_timeout_votes_locked(std::uint64_t height);
   // Prevote rule for a proposal of `transition_id` at `height` carrying a polka at `pol_round`:
   // allowed iff unlocked, locked on the same transition, or locked at a round <= pol_round.
   bool can_prevote_locked(std::uint64_t height, const Hash32& transition_id, std::optional<std::uint32_t> pol_round,
@@ -527,7 +546,8 @@ class Node {
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                         storage::DB::Batch& batch, std::string* error = nullptr);
+                                         const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
+                                         std::string* error = nullptr);
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
   // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
   std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {
@@ -759,6 +779,7 @@ class Node {
   struct BufferedSyncFrontier {
     FrontierProposal proposal;
     std::optional<FinalityCertificate> certificate;
+    std::vector<IngressCertificate> lane_certificates;
     int from_peer_id{0};
     std::size_t bytes{0};
   };

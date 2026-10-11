@@ -35,6 +35,7 @@
 #include "storage/snapshot.hpp"
 #include "crypto/smt.hpp"
 #include "utxo/signing.hpp"
+#include "wallet/confidential_builder.hpp"
 #include "wallet/utxo_selection.hpp"
 
 using namespace finalis;
@@ -2187,4 +2188,76 @@ TEST(test_lightserver_admin_methods_only_on_admin_surface) {
   ASSERT_TRUE(lightserver::is_admin_rpc_method("validator_onboarding_status"));
   ASSERT_TRUE(!lightserver::is_admin_rpc_method("broadcast_tx"));
   ASSERT_TRUE(!lightserver::is_admin_rpc_method("get_tip"));
+}
+
+// broadcast_tx pre-validates against the finalized UTXO set; that set must include confidential
+// outputs, or every spend of a confidential coin is rejected as a missing input.
+TEST(test_lightserver_broadcast_accepts_txv2_spending_confidential_output) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_confidential_spend");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  crypto::Blind32 spend_secret{};
+  spend_secret.bytes.fill(0x72);
+  crypto::Blind32 value_blind{};
+  value_blind.bytes.fill(0x73);
+  const auto one_time_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret.bytes);
+  const auto commitment = crypto::confidential_amount_commitment(10'000, value_blind);
+  Hash32 ephemeral_scalar{};
+  ephemeral_scalar.fill(0x77);
+  const auto ephemeral_pubkey = crypto::secp256k1_pubkey_from_scalar(ephemeral_scalar);
+  ASSERT_TRUE(one_time_pubkey.has_value() && commitment.has_value() && ephemeral_pubkey.has_value());
+
+  OutPoint op{};
+  op.txid.fill(0x74);
+  op.index = 0;
+  UtxoEntryV2 entry;
+  entry.kind = UtxoOutputKind::Confidential;
+  entry.body = UtxoConfidentialData{
+      .value_commitment = *commitment,
+      .one_time_pubkey = *one_time_pubkey,
+      .ephemeral_pubkey = *ephemeral_pubkey,
+      .scan_tag = crypto::ScanTag{0x78},
+      .memo = {},
+  };
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x95;
+  ASSERT_TRUE(db.set_tip(storage::TipState{8, tip_hash}));
+  ASSERT_TRUE(db.put_utxo_v2(op, entry));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto recipient_spk =
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())));
+  Hash32 nonce_a{};
+  nonce_a.fill(0x75);
+  Hash32 nonce_b{};
+  nonce_b.fill(0x76);
+  const wallet::ConfidentialOwnedCoin coin{
+      .outpoint = op,
+      .amount = 10'000,
+      .spend_secret = spend_secret,
+      .value_blind = value_blind,
+      .value_commitment = *commitment,
+      .one_time_pubkey = *one_time_pubkey,
+  };
+  std::string err;
+  const auto tx = wallet::build_txv2_confidential_to_transparent(coin, TransparentTxOutV2{9'000, recipient_spk}, 1'000,
+                                                                 nonce_a, nonce_b, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lcfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":405,"method":"broadcast_tx","params":{"tx_hex":")") +
+                           hex_encode(tx->serialize()) + R"("}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  if (resp.find("\"accepted\":true") == std::string::npos) throw std::runtime_error("broadcast rejected: " + resp);
+  ASSERT_TRUE(resp.find("\"status\":\"accepted_for_relay\"") != std::string::npos);
 }

@@ -5,7 +5,7 @@
     "epoch_start_height": 33,
     "committee_size": 3,
     "min_eligible": 2,
-    "effective_min_bond": 20000000000,
+    "effective_min_bond": 200000000000,
     "ticket_difficulty_bits": 8,
     "ticket_bonus_cap_bps": 1000,
     "max_effective_bond_multiple": 10,
@@ -19,16 +19,16 @@
     "ticket_difficulty_bits": 8
   },
   "validators": [
-    {"validator_pubkey":"6969696969696969696969696969696969696969696969696969696969696969","operator_id":"e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
-    {"validator_pubkey":"6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a","operator_id":"eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
-    {"validator_pubkey":"6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b","operator_id":"ebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebeb","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true},
-    {"validator_pubkey":"6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c","operator_id":"ecececececececececececececececececececececececececececececececec","join_source":"GENESIS","bonded_amount":25000000000,"has_bond":true,"lifecycle_active":true}
+    {"validator_pubkey":"6969696969696969696969696969696969696969696969696969696969696969","operator_id":"e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9","join_source":"GENESIS","bonded_amount":300000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a","operator_id":"eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea","join_source":"GENESIS","bonded_amount":300000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b","operator_id":"ebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebeb","join_source":"GENESIS","bonded_amount":300000000000,"has_bond":true,"lifecycle_active":true},
+    {"validator_pubkey":"6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c","operator_id":"ecececececececececececececececececececececececececececececececec","join_source":"GENESIS","bonded_amount":300000000000,"has_bond":true,"lifecycle_active":true}
   ],
   "availability": [
-    {"operator_id":"e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
-    {"operator_id":"eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea","state":"ACTIVE","bond":25000000000,"service_score":0,"retained_prefix_count":1},
-    {"operator_id":"ebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebeb","state":"EJECTED","bond":25000000000,"service_score":-20,"retained_prefix_count":1},
-    {"operator_id":"ecececececececececececececececececececececececececececececececec","state":"WARMUP","bond":25000000000,"service_score":0,"retained_prefix_count":1}
+    {"operator_id":"e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9","state":"ACTIVE","bond":300000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea","state":"ACTIVE","bond":300000000000,"service_score":0,"retained_prefix_count":1},
+    {"operator_id":"ebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebeb","state":"EJECTED","bond":300000000000,"service_score":-20,"retained_prefix_count":1},
+    {"operator_id":"ecececececececececececececececececececececececececececececececec","state":"WARMUP","bond":300000000000,"service_score":0,"retained_prefix_count":1}
   ],
   "expected": {
     "eligible_operator_count": 2,

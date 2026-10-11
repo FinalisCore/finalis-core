@@ -115,6 +115,23 @@ Example finalized response:
 }
 ```
 
+Example rejected response (carried by a finalized slice, rejected by execution, moved no funds):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "txid": "<txid>",
+    "status": "rejected",
+    "finalized": false,
+    "rejected_height": 123,
+    "finalized_depth": 0,
+    "credit_safe": false
+  }
+}
+```
+
 Example missing response:
 
 ```json

@@ -25,6 +25,7 @@
 #include "node/node.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
+#include "wallet/confidential_builder.hpp"
 
 #define main finalis_explorer_program_main
 #include "../apps/finalis-explorer/main.cpp"
@@ -2073,3 +2074,107 @@ TEST(test_explorer_homepage_shows_stale_banner_when_cached_surfaces_fallback_aft
 }
 
 }  // namespace
+
+namespace {
+
+crypto::Blind32 explorer_blind(std::uint8_t b) {
+  crypto::Blind32 out{};
+  out.bytes.fill(b);
+  return out;
+}
+
+PubKey33 explorer_point(std::uint8_t b) {
+  Hash32 scalar{};
+  scalar.fill(b);
+  const auto pk = crypto::secp256k1_pubkey_from_scalar(scalar);
+  ASSERT_TRUE(pk.has_value());
+  return *pk;
+}
+
+}  // namespace
+
+// TxV2 pages: transparent parts decode like a Tx, confidential parts show as hidden (never an amount
+// or address), and the fee is the explicit TxV2 fee.
+TEST(test_explorer_renders_txv2_with_hidden_confidential_parts) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  ExplorerFixture fx;
+  const auto known = address::decode(fx.known_address);
+  ASSERT_TRUE(known.has_value());
+  const auto known_spk = address::p2pkh_script_pubkey(known->pubkey_hash);
+  const auto owner = node::Node::deterministic_test_keypairs()[0];
+
+  // Shield: spends the fixture tx output (123456789) into 100000000 transparent + 23446789 hidden + 10000 fee.
+  constexpr std::uint64_t kShieldTransparent = 100'000'000ULL;
+  constexpr std::uint64_t kShieldFee = 10'000ULL;
+  const std::uint64_t kShieldHidden = fx.tx.outputs[0].value - kShieldTransparent - kShieldFee;
+  std::string err;
+  const auto conf_out = wallet::build_confidential_output(
+      wallet::ConfidentialRecipient{.one_time_pubkey = explorer_point(0x61), .ephemeral_pubkey = explorer_point(0x62),
+                                    .scan_tag = {}, .memo = {}},
+      crypto::ConfidentialOutputSecrets{.amount = kShieldHidden, .value_blind = explorer_blind(0x63)},
+      explorer_blind(0x64).bytes, &err);
+  ASSERT_TRUE(conf_out.has_value());
+  const auto shield = wallet::build_txv2_transparent_to_confidential(
+      OutPoint{fx.tx.txid(), 0}, fx.tx.outputs[0], Bytes(owner.private_key.begin(), owner.private_key.end()),
+      fx.tx.outputs[0].value, TransparentTxOutV2{kShieldTransparent, known_spk}, *conf_out, explorer_blind(0x63),
+      kShieldHidden, kShieldFee, &err);
+  if (!shield.has_value()) throw std::runtime_error("shield: " + err);
+
+  // Unshield: spends a confidential coin (hidden 50000) to 45000 transparent + 5000 fee.
+  const auto unshield_secret = explorer_blind(0x71);
+  const auto unshield_commitment = crypto::confidential_amount_commitment(50'000, explorer_blind(0x72));
+  ASSERT_TRUE(unshield_commitment.has_value());
+  const auto unshield_one_time = crypto::secp256k1_pubkey_from_scalar(unshield_secret.bytes);
+  ASSERT_TRUE(unshield_one_time.has_value());
+  const wallet::ConfidentialOwnedCoin coin{
+      .outpoint = OutPoint{shield->txid(), 1},
+      .amount = 50'000,
+      .spend_secret = unshield_secret,
+      .value_blind = explorer_blind(0x72),
+      .value_commitment = *unshield_commitment,
+      .one_time_pubkey = *unshield_one_time,
+  };
+  const auto unshield = wallet::build_txv2_confidential_to_transparent(
+      coin, TransparentTxOutV2{45'000, known_spk}, 5'000, explorer_blind(0x73).bytes, explorer_blind(0x74).bytes, &err);
+  if (!unshield.has_value()) throw std::runtime_error("unshield: " + err);
+
+  const std::string shield_txid = hex_encode32(shield->txid());
+  const std::string unshield_txid = hex_encode32(unshield->txid());
+  ScopedRpcHook hook([&](const std::string& body) {
+    for (const auto* tx_any : {&*shield, &*unshield}) {
+      const std::string id = hex_encode32(tx_any->txid());
+      if (body.find(id) == std::string::npos) continue;
+      if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) {
+        return rpc_result(std::string("{\"status\":\"finalized\",\"finalized\":true,\"height\":8,\"finalized_depth\":3,") +
+                          "\"credit_safe\":true,\"transition_hash\":\"" + fx.transition_hash + "\"}");
+      }
+      if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+        return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(tx_any->serialize()) + "\"}");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+
+  const auto shield_api = handle_request(cfg, make_http_get("/api/tx/" + shield_txid));
+  ASSERT_EQ(shield_api.status, 200);
+  ASSERT_TRUE(shield_api.body.find("\"amount\":" + std::to_string(kShieldTransparent)) != std::string::npos);
+  ASSERT_TRUE(shield_api.body.find("\"amount\":null") != std::string::npos);
+  ASSERT_TRUE(shield_api.body.find("\"decoded_kind\":\"confidential\"") != std::string::npos);
+  ASSERT_TRUE(shield_api.body.find("\"fee\":" + std::to_string(kShieldFee)) != std::string::npos);
+  ASSERT_TRUE(shield_api.body.find("\"amount\":" + std::to_string(kShieldHidden)) == std::string::npos);
+
+  const auto unshield_api = handle_request(cfg, make_http_get("/api/tx/" + unshield_txid));
+  ASSERT_EQ(unshield_api.status, 200);
+  ASSERT_TRUE(unshield_api.body.find("\"confidential\":true") != std::string::npos);
+  ASSERT_TRUE(unshield_api.body.find("\"amount\":45000") != std::string::npos);
+  ASSERT_TRUE(unshield_api.body.find("\"fee\":5000") != std::string::npos);
+
+  const auto shield_page = handle_request(cfg, make_http_get("/tx/" + shield_txid));
+  ASSERT_EQ(shield_page.status, 200);
+  ASSERT_TRUE(shield_page.body.find("Confidential output") != std::string::npos);
+  ASSERT_TRUE(shield_page.body.find("one-time key (no address)") != std::string::npos);
+  const auto unshield_page = handle_request(cfg, make_http_get("/tx/" + unshield_txid));
+  ASSERT_EQ(unshield_page.status, 200);
+  ASSERT_TRUE(unshield_page.body.find("confidential output (no address)") != std::string::npos);
+}

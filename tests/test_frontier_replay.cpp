@@ -2586,6 +2586,10 @@ TEST(test_ticket_pow_fallback_begins_after_normal_proposer_rounds_are_exhausted)
   const auto leader4 = consensus::checkpoint_ticket_pow_fallback_member_for_round(checkpoint, 4);
   ASSERT_TRUE(leader4.has_value());
   ASSERT_EQ(*leader4, b);
+  // Keeps rotating in ticket order instead of settling on the worst-ranked member.
+  ASSERT_EQ(*consensus::checkpoint_ticket_pow_fallback_member_for_round(checkpoint, 5), a);
+  ASSERT_EQ(*consensus::checkpoint_ticket_pow_fallback_member_for_round(checkpoint, 6), c);
+  ASSERT_EQ(*consensus::checkpoint_ticket_pow_fallback_member_for_round(checkpoint, 1000), b);  // rank (1000 - 3) % 3
 }
 
 TEST(test_live_validator_exit_mid_epoch_is_removed_only_at_next_epoch_checkpoint) {

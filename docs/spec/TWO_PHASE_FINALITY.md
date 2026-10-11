@@ -182,7 +182,9 @@ whitepaper §2–3 (restore a cross-round safety proposition with this proof).
    `(h, r, id, valid_round)`, re-proposals included. Safety does not depend on it, liveness does.
 2. Round changes use TC, no nil prevotes / precommits. The liveness argument assumes TC formation
    after `Δ`.
-3. One `round_timeout_ms` per round; no separate propose / prevote / precommit timeouts.
+3. One `round_timeout_ms` per round; no separate propose / prevote / precommit timeouts. The timeout
+   vote is cast when it expires in any step, after precommitting too, so it doubles as Tendermint's
+   precommit timeout (a split precommit round moves on through the TC).
 4. Certified-ingress gate on both prevote and precommit: keeps "finality certificate ⇒ `f + 1`
    honest holders of the slice's records".
 5. Open: external BFT review before mainnet. Bounded model check done:
@@ -194,11 +196,35 @@ Implementation notes beyond §3:
 - A body that arrives after its polka or precommit quorum (proposal or uncertified transition
   delivery) re-runs polka and finality checks for every round from its own to the current one.
 - Re-gossip: while a height is stalled (`2 × round_timeout_ms` without finality), every
-  `round_timeout_ms` a validator re-sends its own timeout votes, prevotes and lock-implied
-  precommit for the latest three rounds at that height (re-signed, byte-identical). Without it a
-  vote lost during a partition is never retransmitted, and a TC that misses one side's timeout
-  votes never forms: a healed no-quorum partition halted the height for good
-  (`scripts/chaos_devnet.py`, first run).
+  `round_timeout_ms` a validator re-sends its own timeout votes and prevotes for the latest three
+  rounds at that height, every precommit it cast at that height (newest 32 rounds), the
+  signatures of the polka it holds and of the precommit set closest to quorum. Without it a vote
+  lost during a partition is never retransmitted, and a TC that misses one side's timeout votes
+  never forms: a healed no-quorum partition halted the height for good
+  (`scripts/chaos_devnet.py`, first run). Precommits count per round only, so re-sending just the
+  latest one stranded a round-1 quorum cast by 6 of 7 validators while later rounds fell short
+  (12 rounds for one height in a Byzantine run).
+- Equivocators: a validator observed sending two conflicting votes (or proposals) in one round
+  keeps having its votes counted, one per round (the tracker keeps the first and records the
+  conflict as evidence; a slashing record is stored). Its votes are not relayed. Ignoring an
+  equivocator adds no safety (the rules are safe for `f` arbitrary voters) but leaves only honest
+  validators to form quorums: with `f` equivocators caught, every honest validator is needed for
+  every height.
+- Round catch-up (Tendermint's f+1 rule): when `f + 1` committee members (`n - Q + 1`) have sent
+  timeout votes for rounds `>= R` (each one's latest), a node behind `R` moves to `R`, however far.
+  Votes more than 32 rounds ahead are verified and only their round is noted (not stored or
+  relayed: a flood of new rounds would evict the current round's TC signatures). Without it, a
+  restarted node (back at round 0) never rejoined honest nodes dozens of rounds ahead; split 4/3,
+  no round had a quorum and a crash run halted for good.
+- Rounds advance only on a TC for the current round (or the f+1 catch-up), never on the local
+  timer alone (a single-member committee excepted). Timer-driven advance after any earlier TC let
+  nodes drift into different rounds; in crash runs a quorum never shared one again.
+- Leader for rounds `>= n` (ticket-pow fallback) keeps rotating in ticket rank order
+  (`(r - n) mod n`); it used to stop at the worst-ranked member for every round `>= 2n - 1`.
+- Slashing: two prevotes or two precommits in one round are both slashable. Slash evidence starts
+  with a kind byte (0 precommit, 1 prevote) that selects the signing domain of both votes; a
+  prevote and a precommit for different transitions in one round are not evidence (an honest
+  validator can prevote one and precommit another's polka).
 - After a restart or a reconnect reset clears the vote trackers, the node re-adds its own recorded
   prevotes and the precommit its lock implies (Ed25519 is deterministic, so these are the votes
   already sent).

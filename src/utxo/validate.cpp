@@ -574,6 +574,17 @@ Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round) {
   return Bytes(msg.begin(), msg.end());
 }
 
+namespace {
+
+// Both votes of slash evidence are in one signing domain: an honest validator may prevote one
+// transition and precommit another in the same round, so mixed pairs prove nothing.
+Bytes slash_vote_signing_message(SlashVoteKind kind, const Vote& v) {
+  return kind == SlashVoteKind::Prevote ? prevote_signing_message(v.height, v.round, v.frontier_transition_id)
+                                        : vote_signing_message(v.height, v.round, v.frontier_transition_id);
+}
+
+}  // namespace
+
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
   static const Bytes marker{'S', 'C', 'S', 'L', 'A', 'S', 'H'};
   if (script_sig.size() < marker.size()) return false;
@@ -590,9 +601,13 @@ bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
     return false;
   }
 
+  SlashVoteKind kind{};
   Vote a;
   Vote b;
   if (!codec::parse_exact(blob, [&](codec::ByteReader& r) {
+        auto k = r.u8();
+        if (!k || *k > static_cast<std::uint8_t>(SlashVoteKind::Prevote)) return false;
+        kind = static_cast<SlashVoteKind>(*k);
         auto v1 = read_vote_fixed(r);
         auto v2 = read_vote_fixed(r);
         if (!v1 || !v2) return false;
@@ -604,6 +619,7 @@ bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
   }
 
   if (out) {
+    out->kind = kind;
     out->a = a;
     out->b = b;
     out->raw_blob = blob;
@@ -708,10 +724,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != bond_pub) return {false, "evidence pubkey must match bond", 0};
 
-        const auto a_msg =
-            vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
-        const auto b_msg =
-            vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        const auto a_msg = slash_vote_signing_message(evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
@@ -777,10 +791,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         }
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != unbond_pub) return {false, "evidence pubkey must match unbond output", 0};
-        const auto a_msg =
-            vote_signing_message(evidence.a.height, evidence.a.round, evidence.a.frontier_transition_id);
-        const auto b_msg =
-            vote_signing_message(evidence.b.height, evidence.b.round, evidence.b.frontier_transition_id);
+        const auto a_msg = slash_vote_signing_message(evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
@@ -842,67 +854,6 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     return {false, "fee too large", 0};
   }
   return {true, "", fee};
-}
-
-BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
-                                         const SpecialValidationContext* ctx,
-                                         const ExpectedCoinbaseOutputsBuilder* expected_coinbase_outputs) {
-  if (block.txs.empty()) return {false, "block has no tx", 0};
-  UtxoSet work = base_utxos;
-
-  std::uint64_t fees = 0;
-  for (size_t i = 0; i < block.txs.size(); ++i) {
-    auto r = validate_tx(block.txs[i], i, work, ctx);
-    if (!r.ok) return {false, "tx invalid at index " + std::to_string(i) + ": " + r.error, 0};
-    fees += r.fee;
-
-    if (i > 0) {
-      for (const auto& in : block.txs[i].inputs) {
-        work.erase(OutPoint{in.prev_txid, in.prev_index});
-      }
-    }
-    const Hash32 txid = block.txs[i].txid();
-    for (std::uint32_t out_i = 0; out_i < block.txs[i].outputs.size(); ++out_i) {
-      work[OutPoint{txid, out_i}] = UtxoEntry{block.txs[i].outputs[out_i]};
-    }
-  }
-
-  (void)block_reward;
-  std::uint64_t coinbase_sum = 0;
-  for (const auto& out : block.txs[0].outputs) coinbase_sum += out.value;
-  if (expected_coinbase_outputs) {
-    const auto expected = (*expected_coinbase_outputs)(fees);
-    std::uint64_t expected_sum = 0;
-    for (const auto& out : expected) expected_sum += out.value;
-    if (coinbase_sum != expected_sum) {
-      return {false, "coinbase sum mismatch", 0};
-    }
-    if (block.txs[0].outputs.size() != expected.size()) return {false, "coinbase payout distribution mismatch", 0};
-    for (std::size_t i = 0; i < expected.size(); ++i) {
-      if (block.txs[0].outputs[i].value != expected[i].value ||
-          block.txs[0].outputs[i].script_pubkey != expected[i].script_pubkey) {
-        return {false, "coinbase payout distribution mismatch", 0};
-      }
-    }
-  } else if (coinbase_sum != fees) {
-    return {false, "coinbase sum mismatch", 0};
-  }
-
-  return {true, "", fees};
-}
-
-void apply_block_to_utxo(const Block& block, UtxoSet& utxos) {
-  for (size_t i = 0; i < block.txs.size(); ++i) {
-    if (i > 0) {
-      for (const auto& in : block.txs[i].inputs) {
-        utxos.erase(OutPoint{in.prev_txid, in.prev_index});
-      }
-    }
-    const Hash32 txid = block.txs[i].txid();
-    for (std::uint32_t out_i = 0; out_i < block.txs[i].outputs.size(); ++out_i) {
-      utxos[OutPoint{txid, out_i}] = UtxoEntry{block.txs[i].outputs[out_i]};
-    }
-  }
 }
 
 AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,

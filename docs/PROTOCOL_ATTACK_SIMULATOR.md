@@ -36,8 +36,9 @@ The current live deployment context after the genesis reset is:
   - deterministic adaptive checkpoint minimum bond
 - live hysteresis:
   - `NORMAL -> FALLBACK` if eligible `< min`
-  - `FALLBACK -> NORMAL` only if eligible `>= min + 2`
-  - sticky fallback at `min` and `min + 1`
+  - `FALLBACK -> NORMAL` only if eligible `>= fallback_recovery_threshold(min)`: `min + 2`
+    under the live rule (`min >= 19`), sticky at `min` and `min + 1`; `min + 1` for
+    `4 <= min <= 7`; `min` for `min <= 3` (no stickiness)
 - deterministic committee selection and proposer ordering via the live-faithful
   local mirror in [scripts/protocol_attack_sim.py](../scripts/protocol_attack_sim.py)
 - non-consensus evidence excluded from derivation

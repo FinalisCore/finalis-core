@@ -181,9 +181,25 @@ Do not credit from:
 - `broadcast_tx` output
 - mempool admission
 
-For confidential deposits or withdrawals, the exchange must still apply the
-same finalized-only rule. Public RPC confirms finalized presence and tx
-identity, not confidential output amounts.
+A finalized slice can carry transactions that execution rejects (invalid
+spend, double spend). They move no funds. `get_tx_status` reports them as
+`"status": "rejected"` with `credit_safe: false`, and they never appear in
+address history or `get_tx`. Never credit anything but `credit_safe: true`.
+
+### Transparent deposits only
+
+Accept deposits to transparent addresses only. A confidential output pays a
+one-time key with a hidden amount: recognising it needs the receiver's wallet
+keys and the encrypted memo, and no exchange-facing API exposes that. A user
+cannot send confidential value to a transparent address by mistake, so ask
+users to unshield (confidential -> transparent) to their deposit address.
+
+An unshield deposit is a `TxV2` paying a transparent output. It is credited
+exactly like a `Tx`: it appears in `get_history_page`, `get_utxos` and
+`get_tx_status`, and `get_tx` returns `"tx_version": 2`, the public `fee` and
+`decoded_outputs`, where confidential outputs read
+`"decoded_kind": "confidential"` with null amount and address. Validate the
+transparent output that pays your script, exactly as for a `Tx`.
 
 ## 6. Withdrawal model
 

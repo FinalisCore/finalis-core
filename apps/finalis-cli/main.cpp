@@ -376,6 +376,8 @@ std::string slashing_kind_name(finalis::storage::SlashingRecordKind kind) {
       return "proposer-equivocation";
     case finalis::storage::SlashingRecordKind::ONCHAIN_SLASH:
       return "onchain-slash";
+    case finalis::storage::SlashingRecordKind::PREVOTE_EQUIVOCATION:
+      return "prevote-equivocation";
   }
   return "unknown";
 }
@@ -1402,7 +1404,7 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli confidential_supply_audit [--db <dir>]   (exit 0=ok 2=unavailable 3=FAILED)\n"
      << "  finalis-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
      << "  finalis-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
-     << "  finalis-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-transition <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-transition <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
+     << "  finalis-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-transition <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-transition <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>] [--kind precommit|prevote]\n"
      << "  finalis-cli slash_records [--db <dir>] [--tail <n>]\n"
      << "  finalis-cli epoch_tickets [--db <dir>] --epoch <n>\n"
      << "  finalis-cli epoch_best [--db <dir>] --epoch <n>\n"
@@ -3557,6 +3559,9 @@ int main(int argc, char** argv) {
     std::cout << "fee=" << plan->applied_fee_units << "\n";
     std::cout << "change=" << plan->change_units << "\n";
     std::cout << "inputs_selected=" << plan->selected_prevs.size() << "\n";
+    for (const auto& [op, _] : plan->selected_prevs) {
+      std::cout << "input=" << finalis::hex_encode32(op.txid) << ":" << op.index << "\n";
+    }
     std::cout << "rpc_url=" << rpc_url << "\n";
     std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
 
@@ -4039,10 +4044,19 @@ int main(int argc, char** argv) {
     finalis::Vote a, b;
     std::string a_transition_hex, a_pub_hex, a_sig_hex, b_transition_hex, b_pub_hex, b_sig_hex;
     std::uint64_t fee = 0;
+    auto kind = finalis::SlashVoteKind::Precommit;
 
     for (int i = 2; i < argc; ++i) {
       std::string k = argv[i];
       if (k == "--bond-txid" && i + 1 < argc) bond_txid_hex = argv[++i];
+      else if (k == "--kind" && i + 1 < argc) {
+        const std::string v = argv[++i];
+        if (v == "prevote") kind = finalis::SlashVoteKind::Prevote;
+        else if (v != "precommit") {
+          std::cerr << "--kind must be precommit or prevote\n";
+          return 1;
+        }
+      }
       else if (k == "--bond-index" && i + 1 < argc) bond_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
       else if (k == "--bond-value" && i + 1 < argc) bond_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (k == "--a-height" && i + 1 < argc) a.height = static_cast<std::uint64_t>(std::stoull(argv[++i]));
@@ -4078,7 +4092,7 @@ int main(int argc, char** argv) {
 
     finalis::OutPoint op{*bond_txid, bond_index};
     std::string err;
-    auto tx = finalis::build_slash_tx(op, bond_value, a, b, fee, &err);
+    auto tx = finalis::build_slash_tx(op, bond_value, a, b, fee, &err, kind);
     if (!tx) {
       std::cerr << "create slash tx failed: " << err << "\n";
       return 1;

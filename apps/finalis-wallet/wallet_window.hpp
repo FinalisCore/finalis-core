@@ -260,6 +260,9 @@ class WalletWindow final : public QMainWindow {
     std::vector<std::string> remove_pending_txids;
     std::vector<std::string> remove_sent_txids;
     std::vector<OutPoint> mark_spent_confidential_outpoints;
+    // Bytes of this wallet's sends that finalized, so confidential change paying our own derived
+    // request keys is imported without a manual "Import Received Confidential Tx".
+    std::vector<std::pair<Hash32, Bytes>> finalized_sent_txs;
     std::vector<std::string> released_pending_txids;
     std::vector<EndpointProbeResult> probe_results;
   };
@@ -315,6 +318,8 @@ class WalletWindow final : public QMainWindow {
   void import_confidential_account();
   void generate_confidential_request();
   void import_received_confidential_tx();
+  // Stores the confidential outputs of finalized `tx` that pay this wallet; returns how many were new.
+  std::size_t import_confidential_outputs(const TxV2& tx, const Hash32& txid, std::size_t* already_imported);
   void import_confidential_request();
   void export_wallet_secret();
   void show_about();

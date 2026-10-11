@@ -216,9 +216,10 @@ Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, c
   const std::uint64_t reward = validator_reward_units(height);
   out.total = reward + fees_units;
 
-  std::sort(participants.begin(), participants.end(), [](const WeightedParticipant& a, const WeightedParticipant& b) {
-    return a.pubkey < b.pubkey;
-  });
+  // stable_sort: duplicates of one pubkey keep the caller's order, so std::unique keeps the same entry
+  // under every standard library (std::sort may order equal elements differently).
+  std::stable_sort(participants.begin(), participants.end(),
+                   [](const WeightedParticipant& a, const WeightedParticipant& b) { return a.pubkey < b.pubkey; });
   participants.erase(std::unique(participants.begin(), participants.end(),
                                  [](const WeightedParticipant& a, const WeightedParticipant& b) {
                                    return a.pubkey == b.pubkey;

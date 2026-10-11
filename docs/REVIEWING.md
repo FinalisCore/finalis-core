@@ -14,7 +14,7 @@ so a finding can still change the protocol itself.
 | C1 | At most one transition finalizes per height, with `f < n/3` Byzantine committee members and an asynchronous network | [spec/TWO_PHASE_FINALITY.md](spec/TWO_PHASE_FINALITY.md) §2–4 | `src/node/node_consensus.cpp`, `src/consensus/canonical_derivation.*` |
 | C2 | Progress after GST with an honest leader | [spec/TWO_PHASE_FINALITY.md](spec/TWO_PHASE_FINALITY.md) §4 | same |
 | C3 | Confidential transactions cannot create value (commitment balance, range proofs, excess authorization) | [spec/CONFIDENTIAL_UTXO_SPEC.md](spec/CONFIDENTIAL_UTXO_SPEC.md) §3, §4, §7, §15 | `src/crypto/confidential.*`, `src/utxo/validate.*`, `src/consensus/confidential_supply.*` |
-| C4 | Confidential outputs hide amount and recipient; stealth addresses are unlinkable | [spec/CONFIDENTIAL_UTXO_SPEC.md](spec/CONFIDENTIAL_UTXO_SPEC.md) §3.2, §15 | `src/crypto/stealth_address.*`, `src/wallet/confidential_builder.*` |
+| C4 | Confidential outputs hide amount and recipient (amount privacy holds for confidential -> confidential transfers; spec §3.3); one-time keys of distinct receive requests are unlinkable, and the account secrets recover them all | [spec/CONFIDENTIAL_UTXO_SPEC.md](spec/CONFIDENTIAL_UTXO_SPEC.md) §3.2, §15 | `src/wallet/confidential_keys.*`, `src/wallet/confidential_builder.*` |
 | C5 | Every honest node derives the same state, committee and rewards from finalized history | [spec/CHECKPOINT_DERIVATION_SPEC.md](spec/CHECKPOINT_DERIVATION_SPEC.md), [COMMITTEE-SELECTION.md](COMMITTEE-SELECTION.md), [ECONOMICS.md](ECONOMICS.md) | `src/consensus/`, `src/storage/` |
 | C6 | A remote peer cannot crash a node or isolate honest validators | [ADVERSARIAL_MODEL.md](ADVERSARIAL_MODEL.md) §4.2 | `src/p2p/`, `src/node/node_network.cpp` |
 
@@ -72,6 +72,5 @@ Output goes to `<workdir>/report.md`.
 
 - The two-phase finality design has not had an external review yet
   ([spec/TWO_PHASE_FINALITY.md](spec/TWO_PHASE_FINALITY.md) §8.5).
-- CI runs the checkpoint TLA+ models but not the two-phase finality models.
-- Stealth address derivation (`src/crypto/stealth_address.*`) has no dedicated
-  unit tests yet.
+- There is no reusable stealth address: receiving is per request (spec §3.2), and a restored
+  wallet still needs the txids of received payments (no chain scan yet).

@@ -101,6 +101,33 @@ std::optional<std::string> p2pkh_script_to_address(const Bytes& script_pubkey, c
   return std::nullopt;
 }
 
+// The transparent side of a finalized transaction as a Tx, for history and UTXO views that match
+// scripts: every input keeps its outpoint, every output keeps its index, and a confidential output
+// becomes an empty placeholder (value 0, empty script) that matches no address.
+Tx transparent_projection(const AnyTx& any) {
+  if (const auto* v1 = std::get_if<Tx>(&any)) return *v1;
+  const auto& v2 = std::get<TxV2>(any);
+  Tx out;
+  out.version = v2.version;
+  for (const auto& in : v2.inputs) out.inputs.push_back(TxIn{in.prev_txid, in.prev_index, {}, 0xFFFFFFFF});
+  for (const auto& o : v2.outputs) {
+    if (o.kind == TxOutputKind::Transparent) {
+      const auto& t = std::get<TransparentTxOutV2>(o.body);
+      out.outputs.push_back(TxOut{t.value, t.script_pubkey});
+    } else {
+      out.outputs.push_back(TxOut{0, {}});
+    }
+  }
+  return out;
+}
+
+// TxV2 carries its fee explicitly; inputs minus outputs of its projection would count hidden value.
+std::optional<std::uint64_t> explicit_txv2_fee(const Bytes& tx_bytes) {
+  const auto tx = parse_any_tx(tx_bytes);
+  if (!tx.has_value() || !std::holds_alternative<TxV2>(*tx)) return std::nullopt;
+  return std::get<TxV2>(*tx).fee;
+}
+
 std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage::DB& db, const Hash32& scripthash) {
   const auto indexed_entries = db.get_script_utxos(scripthash);
   const auto history = db.get_script_history(scripthash);
@@ -124,7 +151,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   if (!needs_canonical_fallback) return verified;
 
   if (history.empty()) {
-    const auto canonical_utxos = db.load_utxos();
+    const auto canonical_utxos = db.load_transparent_utxos();
     std::map<OutPoint, TxOut> canonical_matches;
     for (const auto& [op, entry] : canonical_utxos) {
       if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
@@ -163,9 +190,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
-        parsed = std::get<Tx>(*tx);
-      }
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -192,7 +217,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   }
   // History does not include frontier settlement credits. Merge canonical UTXOs
   // so settlement outputs remain visible even when history is non-empty.
-  const auto canonical_utxos = db.load_utxos();
+  const auto canonical_utxos = db.load_transparent_utxos();
   for (const auto& [op, entry] : canonical_utxos) {
     if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
     if (canonical_matches.find(op) != canonical_matches.end()) continue;
@@ -395,9 +420,7 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
-        parsed = std::get<Tx>(*tx);
-      }
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -443,7 +466,11 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
         row.recipients.push_back(*addr);
       }
     }
-    if (fee_known && total_in >= row.total_out) row.fee = total_in - row.total_out;
+    if (auto v2_fee = explicit_txv2_fee(loc->tx_bytes); v2_fee.has_value()) {
+      row.fee = *v2_fee;
+    } else if (fee_known && total_in >= row.total_out) {
+      row.fee = total_in - row.total_out;
+    }
 
     if (!input_addresses.empty()) row.primary_sender = *input_addresses.begin();
     if (!output_addresses.empty()) row.primary_recipient = *output_addresses.begin();
@@ -547,9 +574,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
     if (it != tx_cache.end()) return it->second;
     std::optional<Tx> parsed;
     if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value() && std::holds_alternative<Tx>(*tx)) {
-        parsed = std::get<Tx>(*tx);
-      }
+      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
     }
     tx_cache.emplace(txid, parsed);
     return parsed;
@@ -1016,7 +1041,11 @@ std::string tx_status_json(const Hash32& txid, const std::optional<storage::DB::
   std::ostringstream oss;
   oss << "{\"txid\":\"" << hex_encode32(txid) << "\"";
   if (!loc.has_value()) {
-    if (db.get_ingress_bytes(txid).has_value()) {
+    if (auto rejected_height = db.get_rejected_tx_height(txid); rejected_height.has_value()) {
+      // Carried by a finalized slice but rejected by execution: final, and it moved no funds.
+      oss << ",\"status\":\"rejected\",\"finalized\":false,\"rejected_height\":" << *rejected_height
+          << ",\"finalized_depth\":0,\"credit_safe\":false}";
+    } else if (db.get_ingress_bytes(txid).has_value()) {
       oss << ",\"status\":\"certified_ingress\",\"finalized\":false,\"finalized_depth\":0,\"credit_safe\":false}";
     } else {
       oss << ",\"status\":\"not_found\",\"finalized\":false,\"finalized_depth\":0,\"credit_safe\":false}";
@@ -2731,12 +2760,28 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (!loc.has_value()) return make_error(id, -32001, "not found");
     std::ostringstream oss;
     oss << "{\"height\":" << loc->height << ",\"tx_hex\":\"" << hex_encode(loc->tx_bytes) << "\"";
-    if (auto parsed = parse_any_tx(loc->tx_bytes); parsed.has_value() && std::holds_alternative<Tx>(*parsed)) {
+    const auto parsed = parse_any_tx(loc->tx_bytes);
+    if (parsed.has_value() && std::holds_alternative<Tx>(*parsed)) {
       const auto& tx = std::get<Tx>(*parsed);
       oss << ",\"decoded_outputs\":[";
       for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
         if (i) oss << ",";
         oss << decoded_tx_output_json(tx.outputs[i], cfg_.network);
+      }
+      oss << "]";
+    } else if (parsed.has_value() && std::holds_alternative<TxV2>(*parsed)) {
+      // Transparent outputs decode as for Tx. Confidential outputs pay a one-time key with a hidden
+      // amount: report them as such, never as an amount or address.
+      const auto& tx = std::get<TxV2>(*parsed);
+      oss << ",\"tx_version\":2,\"fee\":" << tx.fee << ",\"decoded_outputs\":[";
+      for (std::size_t i = 0; i < tx.outputs.size(); ++i) {
+        if (i) oss << ",";
+        if (tx.outputs[i].kind == TxOutputKind::Transparent) {
+          const auto& out = std::get<TransparentTxOutV2>(tx.outputs[i].body);
+          oss << decoded_tx_output_json(TxOut{out.value, out.script_pubkey}, cfg_.network);
+        } else {
+          oss << "{\"amount\":null,\"script_hex\":null,\"address\":null,\"decoded_kind\":\"confidential\"}";
+        }
       }
       oss << "]";
     }
@@ -2878,7 +2923,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     const Bytes tx_bytes = tx->serialize();
     const Hash32 txid = tx->txid();
-    const auto utxos = live_db.load_utxos();
+    const auto utxos = live_db.load_utxos_v2();  // confidential outputs included
     const auto validators = live_db.load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
@@ -2905,7 +2950,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         },
         .confidential_policy = &confidential_policy,
     };
-    auto vrx = validate_any_tx(AnyTx{*tx}, 1, upgrade_utxo_set_v2(utxos), &ctx);
+    auto vrx = validate_any_tx(AnyTx{*tx}, 1, utxos, &ctx);
     if (!vrx.ok) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
       record->last_error_code = "tx_rejected";
@@ -3352,7 +3397,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
                                  std::string("This transaction is already finalized or was previously submitted."),
                                  false, "none", false, std::nullopt));
     }
-    const auto utxos = view->load_utxos();
+    const auto utxos = view->load_utxos_v2();  // confidential outputs included
     const auto validators = view->load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
@@ -3389,7 +3434,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         },
         .confidential_policy = &confidential_policy,
     };
-    auto vrx = validate_any_tx(*tx, 1, upgrade_utxo_set_v2(utxos), &ctx);
+    auto vrx = validate_any_tx(*tx, 1, utxos, &ctx);
     if (!vrx.ok) {
       const auto code = validation_error_code(vrx.error);
       const bool retryable = code == "tx_missing_or_unconfirmed_input";

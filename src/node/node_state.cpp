@@ -440,7 +440,8 @@ bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std:
 }
 
 bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                             storage::DB::Batch& batch, std::string* error) {
+                                             const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
+                                             std::string* error) {
   auto fail = [&](const std::string& reason) {
     if (error) *error = reason;
     return false;
@@ -464,20 +465,35 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       return fail("ordered-record-tx-parse-failed seq=" + std::to_string(seq));
     }
     const Hash32 txid = txid_any(*tx);
+    // Only executed transactions are finalized transfers. A rejected one moved no funds: no tx index
+    // and no address history, or get_tx_status would report it finalized and credit-safe.
+    if (!accepted_txids.contains(txid)) {
+      batch.put_rejected_tx(txid, record.transition.height);
+      continue;
+    }
     batch.put_tx_index(txid, record.transition.height, tx_index++, ordered_record);
-    if (std::holds_alternative<Tx>(*tx)) {
-      const auto& legacy = std::get<Tx>(*tx);
-      for (const auto& input : legacy.inputs) {
-        const auto prev_it = prev_utxos.find(OutPoint{input.prev_txid, input.prev_index});
-        if (prev_it == prev_utxos.end()) continue;
-        const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
-        if (!spent_out.has_value()) continue;
-        const auto spent_scripthash = crypto::sha256(spent_out->script_pubkey);
-        batch.add_script_history(spent_scripthash, record.transition.height, txid);
+    // Address history covers the transparent side of both formats; confidential outputs pay
+    // one-time keys, not addresses.
+    const auto add_spent = [&](const Hash32& prev_txid, std::uint32_t prev_index) {
+      const auto prev_it = prev_utxos.find(OutPoint{prev_txid, prev_index});
+      if (prev_it == prev_utxos.end()) return;
+      const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
+      if (!spent_out.has_value()) return;
+      batch.add_script_history(crypto::sha256(spent_out->script_pubkey), record.transition.height, txid);
+    };
+    if (const auto* legacy = std::get_if<Tx>(&*tx)) {
+      for (const auto& input : legacy->inputs) add_spent(input.prev_txid, input.prev_index);
+      for (const auto& output : legacy->outputs) {
+        batch.add_script_history(crypto::sha256(output.script_pubkey), record.transition.height, txid);
       }
-      for (const auto& output : legacy.outputs) {
-        const auto received_scripthash = crypto::sha256(output.script_pubkey);
-        batch.add_script_history(received_scripthash, record.transition.height, txid);
+    } else if (const auto* v2 = std::get_if<TxV2>(&*tx)) {
+      for (const auto& input : v2->inputs) {
+        if (input.kind == TxInputKind::Transparent) add_spent(input.prev_txid, input.prev_index);
+      }
+      for (const auto& output : v2->outputs) {
+        if (output.kind != TxOutputKind::Transparent) continue;
+        const auto& out = std::get<TransparentTxOutV2>(output.body);
+        batch.add_script_history(crypto::sha256(out.script_pubkey), record.transition.height, txid);
       }
     }
   }

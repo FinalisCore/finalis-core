@@ -1690,7 +1690,8 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
 
 bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                 const CanonicalFrontierRecord& record, bool recompute_state_commitment,
-                                CanonicalDerivedState* out, std::string* error) {
+                                CanonicalDerivedState* out, std::string* error,
+                                std::set<Hash32>* accepted_txids = nullptr) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
@@ -1730,6 +1731,10 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, parent.committee,
                                                        parent_participants);
   const UtxoSetV2 pre_utxos = next.utxos;
+  if (accepted_txids) {
+    accepted_txids->clear();
+    for (const auto& tx : recomputed.accepted_txs) accepted_txids->insert(txid_any(tx));
+  }
   apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos,
                                          record.transition.height);
   account_confidential_supply(pre_utxos, recomputed.accepted_txs, record.transition.height, &next.confidential_supply);
@@ -1785,8 +1790,9 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
 }
 
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                           const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error) {
-  return apply_frontier_record_impl(cfg, prev, record, true, out, error);
+                           const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error,
+                           std::set<Hash32>* accepted_txids) {
+  return apply_frontier_record_impl(cfg, prev, record, true, out, error, accepted_txids);
 }
 
 bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig& cfg,
@@ -2472,8 +2478,9 @@ std::optional<PubKey32> checkpoint_ticket_pow_fallback_member_for_round(const st
     return checkpoint.ordered_members[a] < checkpoint.ordered_members[b];
   });
 
-  const std::size_t selected =
-      std::min<std::size_t>(static_cast<std::size_t>(round - committee_size), ranked.size() - 1);
+  // LIVENESS: keep rotating by ticket rank. Clamping to the last rank pinned one leader for every
+  // round >= 2n - 1; with it down or its proposals out of step, the height never finalized.
+  const std::size_t selected = static_cast<std::size_t>(round - committee_size) % ranked.size();
   return checkpoint.ordered_members[ranked[selected]];
 }
 

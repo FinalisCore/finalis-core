@@ -4,6 +4,7 @@
 
 #include "apps/finalis-wallet/confidential_memo.hpp"
 #include "apps/finalis-wallet/confidential_receive.hpp"
+#include "wallet/confidential_keys.hpp"
 
 using namespace finalis;
 using finalis::wallet::WalletStore;
@@ -142,4 +143,72 @@ TEST(test_confidential_receive_ignores_foreign_outputs_and_bad_memos) {
   std::size_t already = 0;
   ASSERT_TRUE(wallet::match_received_confidential_outputs(tx, filled(0xD1), state, &already).empty());
   ASSERT_EQ(already, 0u);
+}
+
+namespace {
+
+WalletStore::ConfidentialAccountRecord derived_account(std::uint32_t next_request_index) {
+  WalletStore::ConfidentialAccountRecord account;
+  account.account_id = "acct-derived";
+  account.view_key_material_hex = hex_encode32(filled(0x21));
+  account.spend_key_material_hex = hex_encode32(filled(0x22));
+  account.next_request_index = next_request_index;
+  return account;
+}
+
+// A payment to request `index` of derived_account(), as a sender builds it from the request URI.
+TxOutV2 derived_payment(std::uint32_t index, std::uint64_t amount) {
+  const auto keys = wallet::derive_confidential_request_keys(filled(0x21), filled(0x22), index);
+  ASSERT_TRUE(keys.has_value());
+  crypto::Blind32 blind{};
+  blind.bytes.fill(0x33);
+  auto memo = wallet::encrypt_confidential_recovery_memo(amount, blind, keys->pub.memo_key, keys->pub.one_time_pubkey,
+                                                         keys->pub.ephemeral_pubkey);
+  ASSERT_TRUE(memo.has_value());
+  ConfidentialTxOutV2 out;
+  out.one_time_pubkey = keys->pub.one_time_pubkey;
+  out.ephemeral_pubkey = keys->pub.ephemeral_pubkey;
+  out.scan_tag = keys->pub.scan_tag;
+  out.memo = *memo;
+  return TxOutV2{.kind = TxOutputKind::Confidential, .body = out};
+}
+
+}  // namespace
+
+// Restore from backup: the wallet holds only the account secrets, no request records, and must still
+// find a payment to one of its earlier requests, with the spend secret that spends it.
+TEST(test_confidential_receive_recovers_payment_from_account_secrets_alone) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  WalletStore::State state;
+  state.confidential_accounts.push_back(derived_account(/*next_request_index=*/0));
+  const auto tx = tx_with({derived_payment(37, 125'000)});
+
+  const auto matches = wallet::match_received_confidential_outputs(tx, filled(0xE1), state);
+  ASSERT_EQ(matches.size(), 1u);
+  ASSERT_TRUE(matches[0].derived_index.has_value() && *matches[0].derived_index == 37u);
+  ASSERT_TRUE(matches[0].request_id.empty());
+  ASSERT_EQ(matches[0].coin.account_id, std::string("acct-derived"));
+  ASSERT_EQ(matches[0].coin.amount, 125'000ULL);
+  const auto keys = wallet::derive_confidential_request_keys(filled(0x21), filled(0x22), 37);
+  ASSERT_TRUE(keys.has_value());
+  ASSERT_EQ(matches[0].coin.spend_secret_hex, hex_encode32(keys->one_time_secret));
+
+  // Re-import after storing the coin: recognised, not duplicated.
+  state.confidential_coins.push_back(matches[0].coin);
+  std::size_t already = 0;
+  ASSERT_TRUE(wallet::match_received_confidential_outputs(tx, filled(0xE1), state, &already).empty());
+  ASSERT_EQ(already, 1u);
+}
+
+TEST(test_confidential_receive_derived_matching_stops_at_gap_window) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  WalletStore::State state;
+  state.confidential_accounts.push_back(derived_account(/*next_request_index=*/0));
+  const std::uint32_t beyond = wallet::kConfidentialRequestGap;
+  ASSERT_TRUE(wallet::match_received_confidential_outputs(tx_with({derived_payment(beyond, 1)}), filled(0xE2), state).empty());
+  // Advancing next_request_index widens the window.
+  state.confidential_accounts.front().next_request_index = 1;
+  const auto matches = wallet::match_received_confidential_outputs(tx_with({derived_payment(beyond, 1)}), filled(0xE2), state);
+  ASSERT_EQ(matches.size(), 1u);
+  ASSERT_TRUE(matches[0].derived_index.has_value() && *matches[0].derived_index == beyond);
 }

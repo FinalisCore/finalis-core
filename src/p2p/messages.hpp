@@ -38,6 +38,14 @@ enum MsgType : std::uint16_t {
   PREVOTE = 24,
 };
 
+// Sync requests and replies a peer accepts once both VERSIONs and the sender's VERACK are
+// exchanged, before the session is fully established. Everything else must wait.
+inline bool is_bootstrap_sync_msg(std::uint16_t msg_type) {
+  return msg_type == GET_FINALIZED_TIP || msg_type == FINALIZED_TIP || msg_type == GET_TRANSITION ||
+         msg_type == TRANSITION || msg_type == GET_INGRESS_TIPS || msg_type == INGRESS_TIPS ||
+         msg_type == GET_INGRESS_RANGE || msg_type == INGRESS_RANGE;
+}
+
 struct VersionMsg {
   std::uint32_t proto_version{PROTOCOL_VERSION};
   std::array<std::uint8_t, 16> network_id{};
@@ -94,6 +102,9 @@ struct GetTransitionByHeightMsg {
 struct TransitionMsg {
   Bytes frontier_proposal_bytes;
   std::optional<FinalityCertificate> certificate;
+  // Ingress certificates of the transition's lane ranges, in lane then seq order. A syncing node
+  // stores them with the block, so startup replay can rebuild it from local storage.
+  std::vector<IngressCertificate> lane_certificates;
 };
 
 struct EpochTicketMsg {

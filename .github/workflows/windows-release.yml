@@ -112,12 +112,37 @@ jobs:
       - name: Build (with tests)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
         shell: pwsh
-        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-wallet finalis-tests
+        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-wallet finalis-tests checkpoint-fixture-export
 
       - name: Build (without tests)
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.run_tests }}
         shell: pwsh
-        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-wallet
+        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-wallet checkpoint-fixture-export
+
+      # Determinism gate: committee derivation on MSVC must match the Linux-generated corpus byte
+      # for byte. A mismatch means Windows and Linux validators would derive different committees.
+      - name: Check checkpoint fixtures match Linux
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "fixtures"
+          & "${{ github.workspace }}\build\windows-release\checkpoint-fixture-export.exe" $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $committed = Resolve-Path "tests\fixtures"
+          $rel = { param($root, $file) [IO.Path]::GetRelativePath($root, $file) }
+          $names = (@(Get-ChildItem -Recurse -File $committed | ForEach-Object { & $rel $committed $_.FullName }) +
+                    @(Get-ChildItem -Recurse -File $out | ForEach-Object { & $rel $out $_.FullName })) | Sort-Object -Unique
+          $bad = 0
+          foreach ($name in $names) {
+            $a = Join-Path $committed $name
+            $b = Join-Path $out $name
+            if (-not (Test-Path $a) -or -not (Test-Path $b) -or (Get-FileHash $a).Hash -ne (Get-FileHash $b).Hash) {
+              Write-Host "::error::checkpoint fixture differs on Windows: $name"
+              if ((Test-Path $a) -and (Test-Path $b)) { git --no-pager diff --no-index -- $a $b }
+              $bad++
+            }
+          }
+          if ($bad -ne 0) { exit 1 }
+          Write-Host "All $($names.Count) checkpoint/comparator fixtures match the Linux corpus."
 
       - name: Import code signing certificate
         if: ${{ env.WINDOWS_SIGN_PFX_BASE64 != '' && env.WINDOWS_SIGN_PFX_PASSWORD != '' }}

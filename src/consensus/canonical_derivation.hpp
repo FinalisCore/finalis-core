@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -187,8 +188,11 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
                                           const CanonicalFrontierRecord& record, FrontierExecutionResult* recomputed,
                                           std::string* error,
                                           std::string* validation_diagnostics = nullptr);
+// accepted_txids (optional): txids of the slice's transactions that execution accepted. A finalized
+// slice may also carry rejected transactions, which moved no funds and must not be indexed as transfers.
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                           const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error);
+                           const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error,
+                           std::set<Hash32>* accepted_txids = nullptr);
 bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig& cfg,
                                                 const CanonicalDerivedState& initial_state,
                                                 const std::vector<CanonicalFrontierRecord>& chain,

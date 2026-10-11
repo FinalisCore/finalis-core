@@ -37,7 +37,7 @@ Highest priority:
 | Area | What we care about | Where |
 |---|---|---|
 | BFT consensus safety | two conflicting finalized transitions at one height with ≤ f Byzantine validators; lock / proof-of-lock / round rules | [docs/spec/TWO_PHASE_FINALITY.md](docs/spec/TWO_PHASE_FINALITY.md), [formal/](formal/), `src/consensus/`, `src/node/node_consensus.cpp` |
-| Confidential transactions | inflation via commitments or range proofs, balance-proof forgery, amount or recipient leakage, stealth-address linkability | [docs/spec/CONFIDENTIAL_UTXO_SPEC.md](docs/spec/CONFIDENTIAL_UTXO_SPEC.md), `src/crypto/confidential.*`, `src/crypto/stealth_address.*`, `src/utxo/validate.*` |
+| Confidential transactions | inflation via commitments or range proofs, balance-proof forgery, amount or recipient leakage, linkability of receive-request keys | [docs/spec/CONFIDENTIAL_UTXO_SPEC.md](docs/spec/CONFIDENTIAL_UTXO_SPEC.md), `src/crypto/confidential.*`, `src/wallet/confidential_keys.*`, `src/utxo/validate.*` |
 | Transaction and state validation | double spends, signature bypass, non-deterministic validation between nodes, state-root mismatch | `src/utxo/`, `src/consensus/`, `src/storage/` |
 | Committee and economics | committee-selection bias, validator-lifecycle bypass, supply cap or reward-settlement errors | [docs/COMMITTEE-SELECTION.md](docs/COMMITTEE-SELECTION.md), [docs/ECONOMICS.md](docs/ECONOMICS.md) |
 | P2P | remote crash, memory exhaustion, peer-scoring abuse that isolates honest validators | `src/p2p/`, `src/node/node_network.cpp` |

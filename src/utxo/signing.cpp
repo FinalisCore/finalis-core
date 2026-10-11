@@ -421,13 +421,14 @@ std::optional<Tx> build_onboarding_registration_tx(const std::vector<std::pair<O
 }
 
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
-                                 const Vote& vote_b, std::uint64_t fee, std::string* err) {
+                                 const Vote& vote_b, std::uint64_t fee, std::string* err, SlashVoteKind kind) {
   if (bond_value < fee) {
     if (err) *err = "fee exceeds bond value";
     return std::nullopt;
   }
 
   codec::ByteWriter ev;
+  ev.u8(static_cast<std::uint8_t>(kind));
   ev.u64le(vote_a.height);
   ev.u32le(vote_a.round);
   ev.bytes_fixed(vote_a.frontier_transition_id);

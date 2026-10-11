@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "common/wide_arith.hpp"
 #include "crypto/confidential.hpp"
 #include "utxo/confidential_tx.hpp"
 
@@ -46,7 +47,7 @@ struct ConfidentialSupplyLedger {
 // Consensus turnstile: change in the confidential pool caused by `tx`, i.e. transparent inputs minus
 // transparent outputs minus fee, resolving inputs against `utxos` (the set the tx spends from).
 // False if a transparent input is missing from `utxos`.
-bool txv2_confidential_pool_delta(const TxV2& tx, const UtxoSetV2& utxos, __int128* delta);
+bool txv2_confidential_pool_delta(const TxV2& tx, const UtxoSetV2& utxos, wide::I128* delta);
 
 // Accounts the accepted transactions of one finalized slice, in order. `pre_slice_utxos` is the UTXO
 // set before the slice; outputs created earlier in the same slice are resolved from `accepted_txs`.

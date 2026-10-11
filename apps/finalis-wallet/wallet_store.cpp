@@ -451,6 +451,7 @@ Bytes serialize_confidential_account_plain(const WalletStore::ConfidentialAccoun
   write_secret(w, record.view_key_material_hex);
   write_secret(w, record.spend_key_material_hex);
   w.u8(record.active ? 1 : 0);
+  w.u32le(record.next_request_index);
   return w.take();
 }
 
@@ -464,7 +465,9 @@ std::optional<WalletStore::ConfidentialAccountRecord> parse_confidential_account
         auto view_key_material = r.varbytes();
         auto spend_key_material = r.varbytes();
         auto active = r.u8();
-        if (!version || !account_id || !label || !stealth_address || !view_key_material || !spend_key_material || !active) {
+        auto next_request_index = r.u32le();
+        if (!version || !account_id || !label || !stealth_address || !view_key_material || !spend_key_material || !active ||
+            !next_request_index) {
           return false;
         }
         if (*version != kConfidentialWalletRecordVersion) return false;
@@ -474,6 +477,7 @@ std::optional<WalletStore::ConfidentialAccountRecord> parse_confidential_account
         out.view_key_material_hex = take_secret(view_key_material);
         out.spend_key_material_hex = take_secret(spend_key_material);
         out.active = (*active != 0);
+        out.next_request_index = *next_request_index;
         return true;
       })) {
     return std::nullopt;

@@ -182,6 +182,7 @@ class Nodes:
             "--round-timeout-ms", str(a.round_timeout_ms),
             "--max-round-timeout-ms", str(a.max_round_timeout_ms),
             "--with-lightserver", "--lightserver-bind", "127.0.0.1", "--lightserver-port", str(self.rpc_port[i]),
+            "--lightserver-admin-socket", str(self.workdir / f"db{i}" / "admin.sock"),
         ]
 
     def rpc_url(self, i: int) -> str:
@@ -327,13 +328,15 @@ class Chaos:
         return f"crash node={v} + {desc}"
 
     async def run(self, deadline: float) -> None:
+        # "crash": mostly hard kills of up to f honest nodes, which then restart and sync.
+        crash = self.args.fault_mix == "crash"
         faults = [
-            (lambda: self.crash_restart(True), 3),
-            (lambda: self.crash_restart(False), 2),
-            (self.partition, 3),
-            (self.flap, 3),
-            (self.latency, 2),
-            (self.crash_and_partition, 1),
+            (lambda: self.crash_restart(True), 8 if crash else 3),
+            (lambda: self.crash_restart(False), 3 if crash else 2),
+            (self.partition, 1 if crash else 3),
+            (self.flap, 1 if crash else 3),
+            (self.latency, 1 if crash else 2),
+            (self.crash_and_partition, 2 if crash else 1),
         ]
         weights = [w for _, w in faults]
         while time.monotonic() < deadline and not self.mon.forks:
@@ -389,6 +392,8 @@ class Traffic:
         self.via: dict[str, tuple[int, float]] = {}  # txid -> (accepting node, submit time)
         self.finalized: dict[str, float] = {}  # txid -> latency s
         self.lost: list[str] = []              # accepted, not finalized within --tx-lost-s
+        self.inputs: dict[str, list[tuple[str, int]]] = {}  # txid -> spent outpoints
+        self.lost_class: dict[str, str] = {}   # lost/pending txid -> finalized_late | conflicting_spend | dropped
         self.busy: set[int] = set()
 
     async def _rpc(self, url: str, method: str, params: dict) -> dict | None:
@@ -425,6 +430,7 @@ class Traffic:
                 self.sent += 1
                 self.pending[m[1]] = time.monotonic()
                 self.via[m[1]] = (via, time.monotonic())
+                self.inputs[m[1]] = [(t, int(v)) for t, v in re.findall(r"^input=([0-9a-f]{64}):(\d+)$", text, re.M)]
                 # One payment in flight per sender: the wallet selects finalized UTXOs, so a second
                 # payment before the first finalizes would double-spend its input.
                 self.pending_sender[m[1]] = sender
@@ -465,6 +471,33 @@ class Traffic:
                     self.finalized[txid] = time.monotonic() - start
                     self.busy.discard(self.pending_sender.pop(txid, -1))
 
+    async def classify_lost(self, mon: "Monitor") -> None:
+        """Split lost payments: finalized after the deadline, conflicting spend (another of our payments
+        uses the same input, or an input is spent at the tip: the wallet built it from a lagging
+        node's stale UTXO set), or dropped."""
+        running = self.nodes.running()
+        if not running:
+            return
+        url = self.nodes.rpc_url(max(running, key=lambda i: mon.node_height.get(i, 0)))
+        for txid in self.lost + list(self.pending):
+            res = await self._rpc(url, "get_tx_status", {"txid": txid})
+            if res and res.get("finalized"):
+                self.lost_class[txid] = "finalized_late"
+                continue
+            cls = "dropped"
+            # Another payment of ours spends the same input: the node refuses whichever arrives
+            # second ("double spend in mempool"), even when the first never finalizes either.
+            mine = set(self.inputs.get(txid, []))
+            if any(other != txid and mine & set(ins) for other, ins in self.inputs.items()):
+                self.lost_class[txid] = "conflicting_spend"
+                continue
+            for t, v in self.inputs.get(txid, []):
+                proof = await self._rpc(url, "get_utxo_proof", {"txid": t, "vout": v})
+                if proof is not None and proof.get("value_hex") is None:
+                    cls = "conflicting_spend"
+                    break
+            self.lost_class[txid] = cls
+
     def summary(self) -> dict:
         lat = list(self.finalized.values())
         # Lost payments whose accepting node was crash-killed within 30 s: its mempool (and any log
@@ -472,7 +505,12 @@ class Traffic:
         crashed = sum(1 for t in self.lost if any(
             n == self.via[t][0] and 0 <= k - self.via[t][1] <= 30 for n, k in self.nodes.hard_kills))
         return {"lost_accepting_node_crashed_within_30s": crashed,"accepted": self.sent, "rejected_or_failed": self.rejected, "finalized": len(self.finalized),
-                "pending": len(self.pending), "lost": len(self.lost), "lost_txids": self.lost[:10],
+                "pending": len(self.pending), "lost": len(self.lost),
+                "lost_by_class": {c: sum(1 for t in self.lost if self.lost_class.get(t) == c)
+                                  for c in ("finalized_late", "conflicting_spend", "dropped")},
+                "lost_dropped_txids": [t for t in self.lost if self.lost_class.get(t, "dropped") == "dropped"][:10],
+                "pending_by_class": {c: sum(1 for t in self.pending if self.lost_class.get(t) == c)
+                                     for c in ("finalized_late", "conflicting_spend", "dropped")},
                 "finality_latency_s": {"p50": percentile(lat, 0.5), "p95": percentile(lat, 0.95),
                                        "max": max(lat, default=None)}}
 
@@ -596,6 +634,7 @@ async def amain(args) -> int:
             while traffic.pending and time.monotonic() < end:
                 await traffic.check_pending()
                 await asyncio.sleep(2)
+            await traffic.classify_lost(mon)
     finally:
         mon.poll()
         stop_traffic.set()
@@ -633,6 +672,8 @@ def main() -> int:
     ap.add_argument("--stop-on-stall", action="store_true")
     ap.add_argument("--byzantine", type=int, default=0, help="first K validators are Byzantine (chaos build)")
     ap.add_argument("--tx-interval", type=float, default=0, help="seconds between payments (0: no traffic)")
+    ap.add_argument("--fault-mix", choices=["default", "crash"], default="default",
+                    help="fault weights; crash: mostly hard crash/restart")
     ap.add_argument("--tx-lost-s", type=float, default=120, help="an accepted payment not finalized by then is lost")
     args = ap.parse_args()
     if args.nodes < 4:

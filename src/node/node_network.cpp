@@ -1008,11 +1008,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   const auto info = p2p_.get_peer_info(peer_id);
   if (!info.established()) {
-    const bool bootstrap_sync_msg =
-        msg_type == p2p::MsgType::GET_FINALIZED_TIP || msg_type == p2p::MsgType::FINALIZED_TIP ||
-        msg_type == p2p::MsgType::GET_TRANSITION || msg_type == p2p::MsgType::TRANSITION ||
-        msg_type == p2p::MsgType::GET_INGRESS_TIPS || msg_type == p2p::MsgType::INGRESS_TIPS ||
-        msg_type == p2p::MsgType::GET_INGRESS_RANGE || msg_type == p2p::MsgType::INGRESS_RANGE;
+    const bool bootstrap_sync_msg = p2p::is_bootstrap_sync_msg(msg_type);
     // After VERSION exchange and our VERACK transmit, the peer may already start
     // sync bootstrap traffic before we have observed its VERACK locally. Allow
     // these messages through instead of misclassifying them as pre-handshake
@@ -1503,9 +1499,10 @@ void Node::flush_pending_finalized_broadcasts() {
 }
 
 void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate) {
+  const auto lane_certificates = load_finalized_lane_certificates(proposal.transition);
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) {
-      spawn_local_bus_task([peer, proposal, certificate]() {
+      spawn_local_bus_task([peer, proposal, certificate, lane_certificates]() {
         // Same hoist-before-lock shape as the live TRANSITION path in handle_message:
         // this local-bus simulation is itself running on its own task per peer, so
         // precheck_finality_certificate here is both correct and exercises the same
@@ -1513,7 +1510,7 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
         const auto cert_check = peer->precheck_finality_certificate(certificate, proposal.transition);
         {
           std::lock_guard<std::mutex> lk(peer->mu_);
-          (void)peer->handle_frontier_block_locked(proposal, certificate, 0, true, cert_check);
+          (void)peer->handle_frontier_block_locked(proposal, certificate, lane_certificates, 0, true, cert_check);
         }
         peer->flush_pending_finalized_broadcasts();
       });
@@ -1522,6 +1519,7 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
     p2p::TransitionMsg msg;
     msg.frontier_proposal_bytes = proposal.serialize();
     msg.certificate = certificate;
+    msg.lane_certificates = lane_certificates;
     p2p_.broadcast(p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
   }
 }
