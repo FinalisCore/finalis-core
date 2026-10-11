@@ -337,3 +337,15 @@ Mark every item before calling bootstrap launch healthy:
 - [ ] no trusted endpoint in production monitoring reports `chain_id_ok=false`
 
 If any item above fails, do not call the bootstrap launch healthy.
+
+## 11. Launch-Period Follow-Ups
+
+These do not block launch. Track them during the launch period:
+
+- [ ] OSS-Fuzz application submitted (`projects/finalis-core/` with `project.yaml`, `Dockerfile`,
+      `build.sh` in google/oss-fuzz). Before applying:
+  - fuzz targets are libFuzzer entry points (`LLVMFuzzerTestOneInput`), not random-byte loops
+  - targets cover confidential tx and proof verification, block/certificate decoding and sync
+    `TRANSITION` decoding, in addition to the existing three
+  - `project.yaml` security contact matches [../SECURITY.md](../SECURITY.md)
+  - maintainers can fix reported bugs within the 90-day public disclosure window
