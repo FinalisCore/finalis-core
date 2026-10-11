@@ -1177,6 +1177,7 @@ void Node::on_version(int peer_id, const Bytes& payload) {
     if (b && b->size() == 32) {
       PubKey32 pub{};
       std::copy(b->begin(), b->end(), pub.begin());
+      std::lock_guard<std::mutex> lk(mu_);
       (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap");
     }
   }
@@ -1190,6 +1191,7 @@ void Node::on_version(int peer_id, const Bytes& payload) {
         peer_validator_pubkeys_[peer_id] = pub;
       }
       if (!peer_bootstrap.has_value()) {
+        std::lock_guard<std::mutex> lk(mu_);
         (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-validator-fallback");
       }
       if (pub == local_key_.public_key) {
@@ -1768,6 +1770,8 @@ void Node::send_ingress_tips(int peer_id) {
 }
 
 void Node::request_finalized_tip(int peer_id) {
+  std::uint64_t local_height = 0;
+  Hash32 local_transition{};
   {
     std::lock_guard<std::mutex> lk(mu_);
     const std::uint64_t now = now_ms();
@@ -1777,9 +1781,11 @@ void Node::request_finalized_tip(int peer_id) {
       return;
     }
     peer_last_finalized_tip_request_ms_[peer_id] = now;
+    local_height = finalized_height_;
+    local_transition = finalized_identity_.id;
   }
-  log_line("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(finalized_height_) +
-           " local_transition=" + short_hash_hex(finalized_identity_.id));
+  log_line("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(local_height) +
+           " local_transition=" + short_hash_hex(local_transition));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP, Bytes{}, true);
 }
 
@@ -1787,7 +1793,11 @@ void Node::send_finalized_tip(int peer_id) {
   // FINALIZED_TIP stays type-erased on the wire for compatibility; peers
   // exchange only the finalized identity value and reconstruct semantics
   // from mode/context locally.
-  p2p::FinalizedTipMsg tip{finalized_height_, finalized_identity_.id};
+  p2p::FinalizedTipMsg tip;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    tip = p2p::FinalizedTipMsg{finalized_height_, finalized_identity_.id};
+  }
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
   log_line("send-finalized-tip peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(tip.height) +
            " transition=" + short_hash_hex(tip.hash) + " status=" + (ok ? "ok" : "failed"));

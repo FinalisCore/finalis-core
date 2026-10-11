@@ -1,0 +1,123 @@
+name: chaos-nightly
+
+# Nightly chaos campaign (scripts/chaos_devnet.py) on a -DFINALIS_CHAOS_BYZANTINE=ON build.
+# Seeds rotate with the run number, so every night covers new fault schedules; a failing seed is
+# reproduced locally with the same --seed and flags. Exit 2 = stall, 3 = fork.
+# The release campaign of mainnet/THREAT_MODEL_AND_LAUNCH_CHECKLIST.md section 0 is separate.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Seconds of chaos per seed"
+        type: number
+        default: 1200
+      seed_base:
+        description: "First seed (default: run number * 100)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-nightly
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
+            libssl-dev libsodium-dev librocksdb-dev nlohmann-json3-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-chaos -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DFINALIS_CHAOS_BYZANTINE=ON
+          -DFINALIS_BUILD_NGINX=OFF
+          -DFINALIS_GENERATE_NGINX_CONFIG=OFF
+          -DFINALIS_BUILD_FUZZ=OFF
+
+      - name: Build
+        run: cmake --build build-chaos --target finalis-node finalis-lightserver finalis-cli -j"$(nproc)"
+
+      - name: Upload chaos binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chaos-binaries
+          path: |
+            build-chaos/finalis-node
+            build-chaos/finalis-lightserver
+            build-chaos/finalis-cli
+          retention-days: 3
+
+  campaign:
+    needs: build
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "byzantine-2 #1", offset: 0, flags: "--byzantine 2 --tx-interval 1" }
+          - { name: "byzantine-2 #2", offset: 1, flags: "--byzantine 2 --tx-interval 1" }
+          - { name: "byzantine-2 #3", offset: 2, flags: "--byzantine 2 --tx-interval 1" }
+          - { name: "crash #1", offset: 3, flags: "--byzantine 0 --fault-mix crash --tx-interval 1" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y librocksdb8.9
+
+      - name: Download chaos binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: chaos-binaries
+          path: build-chaos
+
+      - name: Run chaos campaign
+        env:
+          DURATION: ${{ inputs.duration || 1200 }}
+          SEED_BASE: ${{ inputs.seed_base }}
+          FLAGS: ${{ matrix.flags }}
+          OFFSET: ${{ matrix.offset }}
+        run: |
+          chmod +x build-chaos/*
+          base="${SEED_BASE:-$(( GITHUB_RUN_NUMBER * 100 ))}"
+          seed=$(( base + OFFSET ))
+          echo "### seed $seed: \`scripts/chaos_devnet.py --nodes 7 --duration $DURATION --seed $seed $FLAGS\`" >> "$GITHUB_STEP_SUMMARY"
+          # shellcheck disable=SC2086
+          python3 scripts/chaos_devnet.py --nodes 7 --duration "$DURATION" --seed "$seed" \
+            --build-dir build-chaos --workdir "$RUNNER_TEMP/chaos" $FLAGS
+
+      - name: Report
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/chaos/report.md" ]]; then
+            cat "$RUNNER_TEMP/chaos/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report and node logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chaos-${{ matrix.offset }}
+          path: |
+            ${{ runner.temp }}/chaos/report.json
+            ${{ runner.temp }}/chaos/report.md
+            ${{ runner.temp }}/chaos/node*.log
+          if-no-files-found: warn
+          retention-days: 14

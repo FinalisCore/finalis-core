@@ -110,7 +110,7 @@ class PeerManager {
     std::shared_ptr<std::atomic<bool>> done;
   };
 
-  void accept_loop();
+  void accept_loop(net::SocketHandle listen_fd);
   void start_peer(net::SocketHandle fd, const std::string& endpoint, const std::string& ip, bool inbound);
   void read_loop(const std::shared_ptr<PeerConn>& p);
   void write_loop(const std::shared_ptr<PeerConn>& p);

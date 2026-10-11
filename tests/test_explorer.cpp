@@ -858,11 +858,10 @@ TEST(test_explorer_partner_webhook_retries_until_success) {
   std::string reg_err;
   ASSERT_TRUE(load_partner_registry(cfg, &reg_err));
 
-  int webhook_calls = 0;
+  std::atomic<int> webhook_calls{0};
   const auto prev_post = g_partner_webhook_post_json;
   g_partner_webhook_post_json = [&](const std::string&, const std::string&, std::string*) -> std::optional<std::string> {
-    ++webhook_calls;
-    if (webhook_calls == 1) return std::nullopt;
+    if (++webhook_calls == 1) return std::nullopt;
     return std::optional<std::string>("{}");
   };
 
