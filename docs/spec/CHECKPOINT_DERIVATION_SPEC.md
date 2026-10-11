@@ -1,10 +1,10 @@
 # CHECKPOINT_DERIVATION_SPEC
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 ## 1. Scope
 
@@ -26,10 +26,6 @@ This specification is normative for the live checkpoint derivation path.
 Availability state completeness, persistence, and replay equivalence for the live checkpoint inputs are specified in [AVAILABILITY_STATE_COMPLETENESS.md](AVAILABILITY_STATE_COMPLETENESS.md).
 A bounded formal model for determinism, replay equivalence, hysteresis, evidence isolation, and ordering independence is provided in [../../formal/checkpoint_availability.tla](../../formal/checkpoint_availability.tla), with reproducible TLC suite configurations under [../../formal/](../../formal/).
 Adaptive regime observability is exposed operationally through node/lightserver status and persisted epoch telemetry, but those observability fields are not additional derivation inputs.
-
-After the deliberate genesis reset, checkpoints or replay artifacts from the
-abandoned chain are outside this specification’s canonical input domain for the
-current deployment.
 
 ## 2. Primitive Types
 

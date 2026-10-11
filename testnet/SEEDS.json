@@ -1,0 +1,15 @@
+{
+  "network": "testnet",
+  "seeds_p2p": [
+    "85.217.171.168:19540",
+    "64.23.244.126:19540"
+  ],
+  "lightservers_rpc": [
+    "http://85.217.171.168:19544/rpc",
+    "http://64.23.244.126:19544/rpc"
+  ],
+  "notes": [
+    "Public testnet. Coins have no value; addresses start with tsc1.",
+    "Seeds are plain nodes, not validators."
+  ]
+}

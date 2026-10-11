@@ -148,7 +148,8 @@ bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port)
   }
 
   running_ = true;
-  accept_thread_ = std::thread([this]() { accept_loop(); });
+  // The accept thread gets its own copy: stop() resets listen_fd_ while accept() is blocked on it.
+  accept_thread_ = std::thread([this, fd = listen_fd_]() { accept_loop(fd); });
   return true;
 }
 
@@ -403,11 +404,11 @@ bool PeerManager::set_peer_handshake_meta(int peer_id, std::uint32_t proto_versi
   return true;
 }
 
-void PeerManager::accept_loop() {
+void PeerManager::accept_loop(net::SocketHandle listen_fd) {
   while (running_) {
     sockaddr_storage addr{};
     socklen_t len = sizeof(addr);
-    net::SocketHandle fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    net::SocketHandle fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
     if (!net::valid_socket(fd)) {
       if (!running_) break;
       continue;

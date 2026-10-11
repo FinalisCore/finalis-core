@@ -212,6 +212,7 @@ Implementation notes beyond §3:
   every height.
 - Round catch-up (Tendermint's f+1 rule): when `f + 1` committee members (`n - Q + 1`) have sent
   timeout votes for rounds `>= R` (each one's latest), a node behind `R` moves to `R`, however far.
+  A single higher-round timeout vote moves nothing (it may be Byzantine).
   Votes more than 32 rounds ahead are verified and only their round is noted (not stored or
   relayed: a flood of new rounds would evict the current round's TC signatures). Without it, a
   restarted node (back at round 0) never rejoined honest nodes dozens of rounds ahead; split 4/3,

@@ -1,10 +1,10 @@
 # Reward Settlement
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 `docs/ECONOMICS.md` is the source of truth for economics policy. This document
 describes how finalized transition accrual and epoch settlement consume the
@@ -39,10 +39,6 @@ Fees and issuance are separated.
 
 This remains necessary because the final QC signer set is only known after the
 transition is finalized.
-
-After the fresh-genesis reset, settlement rows, reward accrual expectations,
-and reserve accounting from the abandoned chain are not valid inputs to the
-current mainnet.
 
 ## Per-Transition Accrual
 

@@ -6,8 +6,10 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "common/paths.hpp"
+#include "genesis/embedded.hpp"
 #include "node.hpp"
 #include "node_internal.hpp"
 
@@ -28,7 +30,9 @@ static std::uint16_t parse_port_arg(const std::string& s) {
 static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std::string* current_flag) {
   NodeConfig cfg;
   cfg.listen = false;  // safe CLI default: outbound-only unless --listen is set
-  cfg.network = mainnet_network();
+  // --testnet picks the network before anything defaults from it (ports, data directory).
+  const bool testnet = std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string_view(a) == "--testnet"; });
+  cfg.network = testnet ? testnet_network() : mainnet_network();
   cfg.p2p_port = cfg.network.p2p_default_port;
   cfg.lightserver_port = cfg.network.lightserver_default_port;
   cfg.max_committee = cfg.network.max_committee;
@@ -36,9 +40,9 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
   bool bind_explicit = false;
   bool db_explicit = false;
   std::string validator_passphrase_env;
-  // Flags that change consensus-derived state or validator rules. Every mainnet
-  // node must use the canonical NetworkConfig values, so these are rejected there.
-  static constexpr std::array<std::string_view, 11> kMainnetLockedConsensusFlags{
+  // Flags that change consensus-derived state or validator rules. Every node of a public network
+  // (mainnet, testnet) must use its canonical NetworkConfig values, so these are rejected there.
+  static constexpr std::array<std::string_view, 11> kLockedConsensusFlags{
       "--max-committee",
       "--validator-min-bond",
       "--validator-warmup-blocks",
@@ -51,18 +55,16 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       "--suspend-duration-blocks",
       "--deferred-exit-activation-height",
   };
-  const bool mainnet_consensus_locked = cfg.network.name == "mainnet";
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     *current_flag = a;
-    if (mainnet_consensus_locked &&
-        (a == "--deferred-exit-activation-epoch-start" ||
-         std::find(kMainnetLockedConsensusFlags.begin(), kMainnetLockedConsensusFlags.end(), a) !=
-             kMainnetLockedConsensusFlags.end())) {
+    if (a == "--deferred-exit-activation-epoch-start" ||
+        std::find(kLockedConsensusFlags.begin(), kLockedConsensusFlags.end(), a) !=
+            kLockedConsensusFlags.end()) {
       std::cerr << "error: " << a
-                << " overrides a consensus parameter and is not allowed on mainnet; "
-                   "all mainnet nodes must use the canonical network values\n";
+                << " overrides a consensus parameter and is not allowed on " << cfg.network.name
+                << "; all its nodes must use the canonical network values\n";
       return std::nullopt;
     }
     auto next = [&](const std::string& name) -> std::optional<std::string> {
@@ -74,8 +76,10 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
     };
 
     if (a == "--mainnet") {
-      std::cerr << "--mainnet is not needed in mainnet-only build; remove this flag\n";
+      std::cerr << "--mainnet is the default; remove this flag\n";
       return std::nullopt;
+    } else if (a == "--testnet") {
+      // Handled before the loop.
     } else if (a == "--node-id") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -399,8 +403,11 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
     }
   }
 
-  if (!cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override) {
-    std::cerr << "--genesis override on mainnet requires --allow-unsafe-genesis-override\n";
+  // Overriding a genesis compiled into the binary is unsafe; a network with none embedded yet
+  // (testnet before its genesis is frozen) needs --genesis.
+  if (!cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override &&
+      genesis::embedded_genesis_for(cfg.network.name).has_value()) {
+    std::cerr << "--genesis override on " << cfg.network.name << " requires --allow-unsafe-genesis-override\n";
     return std::nullopt;
   }
   if (!cfg.external_endpoint.empty()) {

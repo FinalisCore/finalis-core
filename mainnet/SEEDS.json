@@ -1,16 +1,8 @@
 {
   "network": "mainnet",
-  "seeds_p2p": [
-    "85.217.171.168:19440",
-    "64.23.244.126:19440"
-  ],
-  "lightservers_rpc": [
-    "http://85.217.171.168:19444/rpc",
-    "http://64.23.244.126:19444/rpc"
-  ],
+  "seeds_p2p": [],
+  "lightservers_rpc": [],
   "notes": [
-    "Private bootstrap for this deployment.",
-    "These endpoints are deployment-specific for the current fresh-genesis network identity.",
-    "Any endpoint serving the abandoned chain is invalid even if the host is reused."
+    "Mainnet has not launched. Seeds are published here, and compiled into the release, at launch."
   ]
 }

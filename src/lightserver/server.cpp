@@ -3477,7 +3477,9 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
 
 std::optional<Config> parse_args(int argc, char** argv) {
   Config cfg;
-  cfg.network = mainnet_network();
+  // --testnet picks the network before anything defaults from it (ports, data directory).
+  const bool testnet = std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string_view(a) == "--testnet"; });
+  cfg.network = testnet ? testnet_network() : mainnet_network();
   cfg.db_path = default_db_dir_for_network(cfg.network.name);
   cfg.port = cfg.network.lightserver_default_port;
   cfg.tx_relay_port = cfg.network.p2p_default_port;
@@ -3511,8 +3513,10 @@ std::optional<Config> parse_args(int argc, char** argv) {
       if (!v) return std::nullopt;
       cfg.tx_relay_port = static_cast<std::uint16_t>(std::stoul(*v));
     } else if (a == "--mainnet") {
-      std::cerr << "--mainnet is not needed in mainnet-only build; remove this flag\n";
+      std::cerr << "--mainnet is the default; remove this flag\n";
       return std::nullopt;
+    } else if (a == "--testnet") {
+      // Handled before the loop.
     } else if (a == "--max-committee") {
       auto v = next();
       if (!v) return std::nullopt;

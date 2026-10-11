@@ -49,7 +49,6 @@
 #include "crypto/hash.hpp"
 #include "crypto/secure_memory.hpp"
 #include "crypto/smt.hpp"
-#include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
 #include "lightserver/server.hpp"
 #include "common/keystore.hpp"
@@ -542,6 +541,7 @@ bool Node::start_lightserver_child() {
       "--relay-port",
       std::to_string(cfg_.p2p_port),
   };
+  if (is_testnet_name(cfg_.network.name)) args.push_back("--testnet");
   static_assert(std::string_view(lightserver::kDefaultAdminSocketPath) == "/var/run/finalis/admin.sock",
                 "NodeConfig::lightserver_admin_socket default must match");
   // Pin the child's admin socket (default: the path clients' kDefaultAdminRpcUrl dials).

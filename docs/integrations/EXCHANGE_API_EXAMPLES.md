@@ -50,7 +50,7 @@ Example response shape:
   "result": {
     "network_name": "mainnet",
     "network_id": "fe561911730912cced1e83bc273fab13",
-    "genesis_hash": "eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a",
+    "genesis_hash": "<genesis hash published at launch>",
     "tip": {
       "height": 123,
       "transition_hash": "<finalized_transition_hash>"
@@ -85,7 +85,7 @@ Exchange use:
 - finalized identity monitoring
 - endpoint agreement
 - sync health
-- confirming the fresh-genesis network identity after a relaunch
+- confirming the network identity (`network_id`, `genesis_hash`)
 
 ### 1.2 `get_tx_status`
 
@@ -283,9 +283,8 @@ Example response:
 ### 1.7 `broadcast_tx`
 
 All numeric heights and hashes in this document are illustrative placeholders.
-For fresh-genesis deployments, always confirm the live `network_id`,
-`genesis_hash`, and finalized identity from `get_status` before operational
-use.
+Always confirm the live `network_id`, `genesis_hash`, and finalized identity from
+`get_status` before operational use.
 
 Request:
 

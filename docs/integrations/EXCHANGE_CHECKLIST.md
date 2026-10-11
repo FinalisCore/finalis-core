@@ -35,9 +35,6 @@ Pass condition:
 
 Genesis-reset operational note:
 
-- if this is a restarted network from fresh genesis, old endpoints or old DBs
-  from the abandoned chain must not be reused for automated settlement
-
 ## 3. Verify endpoint agreement
 
 - operate at least two monitored lightserver endpoints

@@ -4,20 +4,20 @@
 
 #include <algorithm>
 
-#include "genesis/embedded_mainnet.hpp"
+#include "genesis/embedded.hpp"
 
 namespace finalis {
 namespace {
 
 std::optional<Hash32> expected_genesis_hash(const NetworkConfig& cfg, const std::optional<genesis::Document>& doc) {
   if (doc.has_value()) return genesis::hash_doc(*doc);
-  if (cfg.name == "mainnet") return genesis::MAINNET_GENESIS_HASH;
+  if (auto embedded = genesis::embedded_genesis_for(cfg.name)) return embedded->hash;
   return std::nullopt;
 }
 
 std::string default_genesis_source(const NetworkConfig& cfg, const std::optional<genesis::Document>& doc) {
   if (doc.has_value()) return "file";
-  if (cfg.name == "mainnet") return "embedded";
+  if (genesis::embedded_genesis_for(cfg.name).has_value()) return "embedded";
   return "file";
 }
 

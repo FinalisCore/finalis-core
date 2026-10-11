@@ -4,12 +4,10 @@
   "protocol_version": 1,
   "network_id_hex": "fe561911730912cced1e83bc273fab13",
   "magic": 1234567890,
-  "genesis_time_unix": 1777000000,
+  "genesis_time_unix": 0,
   "initial_height": 0,
-  "initial_validators": [
-    "577cb8a74175a4d96d1f9c94499f1f1ecfd03febcecf7cb7c05327958bb941cb"
-  ],
-  "initial_active_set_size": 1,
+  "initial_validators": [],
+  "initial_active_set_size": 0,
   "initial_committee_params": {
     "min_committee": 1,
     "max_committee": 128,
@@ -18,5 +16,5 @@
   },
   "monetary_params_ref": "monetary-policy-7m-hard-cap",
   "seeds": [],
-  "note": "Canonical Finalis mainnet genesis with bootstrap validator 577cb8a74175a4d96d1f9c94499f1f1ecfd03febcecf7cb7c05327958bb941cb"
+  "note": "Parameter template, not a genesis. Mainnet has not launched; validators and genesis time are set at launch."
 }

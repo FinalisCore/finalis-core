@@ -7,14 +7,12 @@ For exchanges, the model is narrow:
 - use finalized state only
 - do not use mempool state for accounting
 - do not implement confirmation-count settlement rules
-- treat a fresh-genesis relaunch as a new network identity, not an extension of
-  the abandoned chain
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 - `magic = 0x499602D2`
 
 ## What the exchange runs

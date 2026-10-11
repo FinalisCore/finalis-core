@@ -1,10 +1,10 @@
 # Availability State Completeness
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 ## Scope
 
@@ -12,10 +12,6 @@ This document defines which live availability fields are consensus-relevant for 
 
 It is normative for the live availability-gated checkpoint path together with [CHECKPOINT_DERIVATION_SPEC.md](CHECKPOINT_DERIVATION_SPEC.md).
 A bounded formal model for replay-equivalent availability projection and evidence isolation is provided in [../../formal/checkpoint_availability.tla](../../formal/checkpoint_availability.tla), with reproducible TLC suite configurations under [../../formal/](../../formal/).
-
-Availability snapshots or retained-prefix state from the abandoned chain are
-not valid inputs to the mainnet. Only availability state derived from
-the current genesis identity and current finalized history is admissible.
 
 ## Consensus-relevant availability fields
 

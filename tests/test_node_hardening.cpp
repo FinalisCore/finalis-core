@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_genesis.hpp"
 #include "support/test_paths.hpp"
 
 #include <atomic>
@@ -30,6 +31,8 @@ node::NodeConfig make_cfg(const std::string& db_path) {
   cfg.disable_p2p = true;
   cfg.dns_seeds = false;
   cfg.db_path = db_path;
+  cfg.genesis_path = db_path + ".genesis.json";
+  (void)finalis::test::write_test_genesis_file(cfg.genesis_path);
   cfg.validator_passphrase = "test-pass";
   return cfg;
 }
@@ -38,11 +41,11 @@ node::NodeConfig make_cfg(const std::string& db_path) {
 
 TEST(test_node_rate_limit_does_not_score_single_bootstrap_peer_during_sync) {
   auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_rate_limit_bootstrap_guard"));
-  cfg.seeds = {"64.23.244.126:19440"};
+  cfg.seeds = {"192.0.2.30:19440"};
   node::Node n(cfg);
   ASSERT_TRUE(n.init());
 
-  const std::string ip = "64.23.244.126";
+  const std::string ip = "192.0.2.30";
   n.set_peer_ip_for_test(7, ip);
   for (int i = 0; i < 25; ++i) {
     n.score_peer_for_test(7, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");

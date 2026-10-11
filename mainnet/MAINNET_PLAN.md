@@ -12,10 +12,11 @@ lives in [THREAT_MODEL_AND_LAUNCH_CHECKLIST.md](THREAT_MODEL_AND_LAUNCH_CHECKLIS
 
 ## Milestones
 
+- [ ] Pass the consensus readiness gate (section 0 of the checklist): external BFT review, chaos
+      campaign and fuzzing on the release binaries. Until then the network is a testnet.
 - [ ] Freeze `mainnet/genesis.json` and publish the intended `genesis_hash`.
 - [ ] Rebuild `mainnet/genesis.bin` and regenerate `src/genesis/embedded_mainnet.cpp`.
 - [ ] Rebuild release binaries from the same canonical genesis artifacts.
-- [ ] Wipe old chain DBs before first startup on the fresh-genesis network.
 - [ ] Run validator ceremony and publish the initial validator list.
 - [ ] Start bootstrap validator and verify:
       - `chain_id_ok=true`

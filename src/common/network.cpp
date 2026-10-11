@@ -11,6 +11,7 @@ namespace finalis {
 namespace {
 
 constexpr std::uint64_t kEconomicsV2ActivationHeight = 0;
+constexpr std::uint32_t kTestnetMagic = 0x54534331;  // "TSC1"
 constexpr std::uint64_t kCoin = 100'000'000ULL;
 
 constexpr std::uint64_t kTargetValidators = 16;
@@ -80,7 +81,7 @@ const NetworkConfig kMainnet{
     .deferred_exit_activation_height = 0,
     .bootstrap_penalty_exit_protection_activation_height = 0,
     .empty_active_set_epoch_escape_activation_height = 0,
-    .default_seeds = {"85.217.171.168:19440", "64.23.244.126:19440"},
+    .default_seeds = {},  // set at launch (mainnet/SEEDS.json)
     .economics_policies =
         {
             EconomicsConfig{
@@ -98,9 +99,28 @@ const NetworkConfig kMainnet{
         },
 };
 
+// Public testnet: mainnet's consensus and economic parameters, so it rehearses mainnet, with its own
+// identity (network id, magic, ports, "tsc" addresses). Transactions sign over the chain identity,
+// so nothing moves between the two networks, and the P2P magic keeps their peers apart.
+NetworkConfig make_testnet() {
+  NetworkConfig net = kMainnet;
+  net.name = "testnet";
+  net.network_id = network_id_for_name("testnet");
+  net.magic = kTestnetMagic;
+  net.p2p_default_port = 19540;
+  net.lightserver_default_port = 19544;
+  net.default_seeds = {"85.217.171.168:19540", "64.23.244.126:19540"};
+  return net;
+}
+
 }  // namespace
 
 const NetworkConfig& mainnet_network() { return kMainnet; }
+
+const NetworkConfig& testnet_network() {
+  static const NetworkConfig net = make_testnet();
+  return net;
+}
 
 std::uint64_t round_timeout_ms_for_round(const NetworkConfig& network, std::uint32_t round) {
   const std::uint64_t base = std::max<std::uint64_t>(1, network.round_timeout_ms);
@@ -117,7 +137,11 @@ std::uint64_t round_timeout_ms_for_round(const NetworkConfig& network, std::uint
   return std::min(timeout, cap);
 }
 
-const NetworkConfig& network_by_name(const std::string&) { return kMainnet; }
+const NetworkConfig& network_by_name(const std::string& name) {
+  return is_testnet_name(name) ? testnet_network() : kMainnet;
+}
+
+bool is_testnet_name(const std::string& name) { return name == "testnet" || name == "tsc"; }
 
 const std::vector<EconomicsConfig>& economics_policies(const NetworkConfig& network) { return network.economics_policies; }
 

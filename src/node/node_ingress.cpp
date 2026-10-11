@@ -541,7 +541,8 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int 
 
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) {
-      if (peer->local_validator_pubkey_for_test() != designated_certifier) return false;
+      // local_key_ is fixed after init(); taking the peer's mu_ here (while holding ours) inverts lock order.
+      if (peer->local_key_.public_key != designated_certifier) return false;
       spawn_local_bus_task([peer, tx]() { (void)peer->handle_tx(tx, true); });
       log_line("tx-forward-designated lane=" + std::to_string(lane) +
                " designated=" + short_pub_hex(designated_certifier) + " transport=local-bus");

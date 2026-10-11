@@ -1243,11 +1243,11 @@ struct HttpStubServer {
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bl) != 0) return false;
     port = ntohs(bound.sin_port);
     running = true;
-    th = std::thread([this]() {
+    th = std::thread([this, lfd = fd]() {
       while (running) {
         sockaddr_in caddr{};
         socklen_t len = sizeof(caddr);
-        auto cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+        auto cfd = ::accept(lfd, reinterpret_cast<sockaddr*>(&caddr), &len);
         if (!finalis::net::valid_socket(cfd)) continue;
         const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         (void)::send(cfd, kResp, static_cast<int>(sizeof(kResp) - 1), 0);
@@ -1991,7 +1991,7 @@ struct OutOfOrderBlockSyncServer {
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bl) != 0) return false;
     port = ntohs(bound.sin_port);
     running = true;
-    th = std::thread([this]() { run(); });
+    th = std::thread([this, lfd = fd]() { run(lfd); });
     return true;
   }
 
@@ -2002,14 +2002,10 @@ struct OutOfOrderBlockSyncServer {
       finalis::net::close_socket(fd);
       fd = finalis::net::kInvalidSocket;
     }
-    std::vector<finalis::net::SocketHandle> clients;
     {
+      // Shutdown unblocks run()'s reads; run() closes the fd, so it is never closed twice.
       std::lock_guard<std::mutex> lk(client_mu);
-      clients.assign(client_fds.begin(), client_fds.end());
-    }
-    for (auto cfd : clients) {
-      finalis::net::shutdown_socket(cfd);
-      finalis::net::close_socket(cfd);
+      for (auto cfd : client_fds) finalis::net::shutdown_socket(cfd);
     }
     if (th.joinable()) th.join();
   }
@@ -2019,11 +2015,11 @@ struct OutOfOrderBlockSyncServer {
     return requested_hashes;
   }
 
-  void run() {
+  void run(finalis::net::SocketHandle lfd) {
     while (running) {
       sockaddr_in caddr{};
       socklen_t len = sizeof(caddr);
-      const auto cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+      const auto cfd = ::accept(lfd, reinterpret_cast<sockaddr*>(&caddr), &len);
       if (!finalis::net::valid_socket(cfd)) return;
       {
         std::lock_guard<std::mutex> lk(client_mu);
@@ -2131,12 +2127,12 @@ struct OutOfOrderBlockSyncServer {
         }
       }
 
-      finalis::net::shutdown_socket(cfd);
-      finalis::net::close_socket(cfd);
       {
         std::lock_guard<std::mutex> lk(client_mu);
         client_fds.erase(cfd);
       }
+      finalis::net::shutdown_socket(cfd);
+      finalis::net::close_socket(cfd);
     }
   }
 };
@@ -6197,8 +6193,8 @@ TEST(test_load_persisted_peers_splits_legacy_comma_joined_lines) {
   {
     std::ofstream out(db_path / "peers.dat", std::ios::trunc);
     ASSERT_TRUE(out.good());
-    out << "212.58.103.170:19440\n";
-    out << "85.217.171.168:19440,212.58.103.170:19440\n";
+    out << "198.51.100.20:19440\n";
+    out << "203.0.113.10:19440,198.51.100.20:19440\n";
   }
 
   node::NodeConfig cfg;
@@ -6219,8 +6215,8 @@ TEST(test_load_persisted_peers_splits_legacy_comma_joined_lines) {
 
   const auto persisted = read_nonempty_lines(db_path / "peers.dat");
   ASSERT_EQ(persisted.size(), 2u);
-  ASSERT_EQ(persisted[0], "212.58.103.170:19440");
-  ASSERT_EQ(persisted[1], "85.217.171.168:19440");
+  ASSERT_EQ(persisted[0], "198.51.100.20:19440");
+  ASSERT_EQ(persisted[1], "203.0.113.10:19440");
 }
 
 TEST(test_same_block_different_signature_superset_same_payout) {
@@ -6343,6 +6339,9 @@ TEST(test_reject_cross_network_version_handshake) {
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
   cfg.p2p_port = 0;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   node::Node n(cfg);
@@ -6505,6 +6504,9 @@ TEST(test_skip_exact_self_endpoint_before_dial) {
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = port;
   cfg.dns_seeds = false;
@@ -6536,6 +6538,9 @@ TEST(test_skip_resolved_localhost_self_endpoint_before_dial) {
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = port;
   cfg.dns_seeds = false;
@@ -6564,6 +6569,9 @@ TEST(test_reject_self_identity_in_version_handshake) {
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = 0;
   cfg.dns_seeds = false;
@@ -6607,6 +6615,9 @@ TEST(test_self_endpoint_retry_suppression_persists_for_process_lifetime) {
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
   cfg.bind_ip = "127.0.0.1";
   cfg.p2p_port = port;
   cfg.dns_seeds = false;
@@ -6637,6 +6648,9 @@ TEST(test_reject_magic_mismatch_frame_before_handshake) {
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
   cfg.p2p_port = 0;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   node::Node n(cfg);
@@ -6670,6 +6684,9 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
   cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
         cfg.node_id = 0;
   cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
   cfg.p2p_port = 0;
   cfg.network.default_seeds.clear();  // keep test nodes off the public mainnet seeds
   node::Node n(cfg);
@@ -6707,6 +6724,9 @@ TEST(test_normal_peer_connection_unaffected_by_self_peer_filtering) {
   cfg0.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg0.node_id = 0;
   cfg0.db_path = base + "/node0";
+  cfg0.genesis_path = cfg0.db_path + "/genesis.json";
+  cfg0.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg0.genesis_path, 1));
   cfg0.bind_ip = "127.0.0.1";
   cfg0.p2p_port = port0;
   cfg0.dns_seeds = false;
@@ -6716,6 +6736,9 @@ TEST(test_normal_peer_connection_unaffected_by_self_peer_filtering) {
   cfg1.allow_unencrypted_keystore = true;  // test fixture: no passphrase
   cfg1.node_id = 1;
   cfg1.db_path = base + "/node1";
+  cfg1.genesis_path = cfg1.db_path + "/genesis.json";
+  cfg1.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg1.genesis_path, 1));
   cfg1.bind_ip = "127.0.0.1";
   cfg1.p2p_port = port1;
   cfg1.dns_seeds = false;
@@ -6810,6 +6833,8 @@ TEST(test_unseeded_bootstrap_template_ignores_default_network_seeds) {
   cfg.allow_unsafe_genesis_override = true;
   cfg.network.min_block_interval_ms = 100;
   cfg.network.round_timeout_ms = 200;
+  // Compiled-in default seeds alone must not stop a bootstrap node (unroutable test address).
+  cfg.network.default_seeds = {"192.0.2.1:19440"};
 
   node::Node n(cfg);
   ASSERT_TRUE(n.init());

@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MIT
+# ThreadSanitizer suppressions for the linux-ci TSan job.
+# System librocksdb is not TSan-instrumented, so its internal synchronization (background
+# compaction/flush threads) is invisible and reported as races. Our own locking around
+# storage::DB calls is still checked.
+race:librocksdb.so

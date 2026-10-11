@@ -14,7 +14,7 @@ It should be used together with:
 - network name: `mainnet`
 - address HRP: `sc`
 - network id: `fe561911730912cced1e83bc273fab13`
-- genesis hash: `eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- genesis hash: published at launch (mainnet has not launched)
 - magic: `0x499602D2` (`1234567890`)
 - default p2p port: `19440`
 - default lightserver RPC port: `19444`
@@ -31,13 +31,6 @@ integrators.
 If multiple public endpoints are available, exchanges should compare them for
 agreement on finalized height and finalized transition hash before relying on a
 newly added endpoint.
-
-Fresh-genesis note:
-
-- if the network has been relaunched from a new genesis, all published RPC
-  endpoints must be revalidated against the new `network_id` and
-  `genesis_hash`; old-chain endpoints are irrelevant even if the hostname or IP
-  is reused
 
 ## 3. Expected RPC behavior
 

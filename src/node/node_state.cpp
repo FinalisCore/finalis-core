@@ -9,7 +9,7 @@
 #include "codec/bytes.hpp"
 #include "common/wide_arith.hpp"
 #include "crypto/hash.hpp"
-#include "genesis/embedded_mainnet.hpp"
+#include "genesis/embedded.hpp"
 #include "node.hpp"
 #include "node_internal.hpp"
 
@@ -561,11 +561,16 @@ void Node::hydrate_runtime_from_canonical_state_locked(const consensus::Canonica
 
 bool Node::init_mainnet_genesis() {
   const bool use_embedded = cfg_.genesis_path.empty();
+  const auto embedded = genesis::embedded_genesis_for(cfg_.network.name);
+  if (use_embedded && !embedded.has_value()) {
+    std::cerr << "this build embeds no " << cfg_.network.name << " genesis; pass --genesis <genesis.bin|json>\n";
+    return false;
+  }
   std::string err;
   std::optional<genesis::Document> doc;
   Hash32 ghash{};
   if (use_embedded) {
-    const Bytes bin(genesis::MAINNET_GENESIS_BIN, genesis::MAINNET_GENESIS_BIN + genesis::MAINNET_GENESIS_BIN_LEN);
+    const Bytes bin(embedded->data, embedded->data + embedded->len);
     doc = genesis::decode_bin(bin, &err);
     if (doc.has_value()) ghash = genesis::hash_bin(bin);
   } else {
@@ -581,7 +586,7 @@ bool Node::init_mainnet_genesis() {
     std::cerr << "genesis validation failed: " << err << "\n";
     return false;
   }
-  if (use_embedded && ghash != genesis::MAINNET_GENESIS_HASH) {
+  if (use_embedded && ghash != embedded->hash) {
     std::cerr << "embedded genesis hash mismatch; binary may be corrupted\n";
     return false;
   }

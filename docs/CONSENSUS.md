@@ -1,10 +1,10 @@
 # Consensus
 
-Current mainnet identity:
+Mainnet identity (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 This document describes the live finalized-tip BFT path at a high level.
 
@@ -28,10 +28,6 @@ That means:
 Relevant implementation:
 
 - [src/node/node.cpp](../src/node/node.cpp)
-
-After the fresh-genesis reset, consensus artifacts from the abandoned chain are
-not valid inputs to the current live path. Only the current genesis identity
-and current finalized history are authoritative.
 
 Consensus execution is version-aware:
 

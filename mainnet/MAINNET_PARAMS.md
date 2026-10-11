@@ -27,12 +27,10 @@ Monetary alignment note:
   declining issuance horizon and deterministic reserve accrual schedule.
 
 Parser/runtime note:
-- the current node and lightserver parsers already default to this mainnet profile
-- `--mainnet` is not needed for the node in this build
+- node, lightserver and CLI default to this mainnet profile; `--testnet` selects the testnet
 
-Fresh-genesis note:
-- these values are the current post-reset mainnet identity and must stay aligned
-  with:
+Alignment rule:
+- these values are the mainnet identity and must stay aligned, at launch, with:
   - `mainnet/genesis.json`
   - `mainnet/genesis.bin`
   - `src/genesis/embedded_mainnet.cpp`

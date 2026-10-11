@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_genesis.hpp"
 #include "support/test_paths.hpp"
 
 #include <cstdlib>
@@ -46,8 +47,10 @@ TEST(test_node_default_db_path_uses_home_by_network) {
   ::setenv("HOME", home.c_str(), 1);
 #endif
 
+  const std::string genesis_path = home + "/genesis.json";
+  ASSERT_TRUE(finalis::test::write_test_genesis_file(genesis_path));
   std::vector<std::string> args = {"finalis-node", "--node-id", "0", "--disable-p2p", "--validator-passphrase",
-                                   "test-passphrase"};
+                                   "test-passphrase", "--genesis", genesis_path};
   auto argv = make_argv(args);
   auto cfg = node::parse_args(static_cast<int>(argv.size()), argv.data());
   ASSERT_TRUE(cfg.has_value());
@@ -70,7 +73,7 @@ TEST(test_parse_args_unescapes_comma_separated_peers_and_seeds) {
       "--validator-passphrase",
       "test-passphrase",
       "--peers",
-      "85.217.171.168:19440\\,212.58.103.170:19440",
+      "203.0.113.10:19440\\,198.51.100.20:19440",
       "--seeds",
       "1.2.3.4:19440\\,5.6.7.8:19440",
   };
@@ -78,7 +81,7 @@ TEST(test_parse_args_unescapes_comma_separated_peers_and_seeds) {
   auto cfg = node::parse_args(static_cast<int>(argv.size()), argv.data());
   ASSERT_TRUE(cfg.has_value());
   ASSERT_EQ(cfg->peers.size(), 1u);
-  ASSERT_EQ(cfg->peers[0], "85.217.171.168:19440,212.58.103.170:19440");
+  ASSERT_EQ(cfg->peers[0], "203.0.113.10:19440,198.51.100.20:19440");
   ASSERT_EQ(cfg->seeds.size(), 1u);
   ASSERT_EQ(cfg->seeds[0], "1.2.3.4:19440,5.6.7.8:19440");
 }

@@ -74,7 +74,7 @@
 #include "consensus/monetary.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/secure_memory.hpp"
-#include "genesis/embedded_mainnet.hpp"
+#include "genesis/embedded.hpp"
 #include "common/keystore.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
@@ -581,8 +581,8 @@ std::string network_id_hex_for_wallet_network(const std::string& network_name) {
 }
 
 std::optional<std::string> expected_genesis_hash_hex_for_wallet_network(const std::string& network_name) {
-  if (network_name == "mainnet") {
-    return finalis::hex_encode32(finalis::genesis::MAINNET_GENESIS_HASH);
+  if (const auto embedded = finalis::genesis::embedded_genesis_for(network_name)) {
+    return finalis::hex_encode32(embedded->hash);
   }
   return std::nullopt;
 }

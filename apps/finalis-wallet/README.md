@@ -6,7 +6,7 @@ Current mainnet identity reference:
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
-- `genesis_hash = eaae655a1eec3c876bd2e66d899fc8da93d205a5df36a2665f736387aa3cb78a`
+- `genesis_hash`: published at launch (mainnet has not launched)
 
 ## Build and run
 
@@ -109,12 +109,10 @@ This is an informational confidence signal only. It does not verify the chain, d
 Adaptive regime diagnostics are also informational only. They are rendered from
 canonical lightserver status and do not influence wallet behavior or consensus.
 
-Fresh-genesis boundary:
+Network identity boundary:
 
 - if a configured endpoint reports a different `network_id` or `genesis_hash`,
   it is not the same network
-- abandoned-chain DBs or stale wallet assumptions must not be reused as if they
-  belonged to the mainnet
 
 ## Branding assets
 
