@@ -17,6 +17,7 @@
 #include "consensus/ingress.hpp"
 #include "consensus/validator_registry.hpp"
 #include "crypto/ed25519.hpp"
+#include "crypto/vrf.hpp"
 #include "crypto/hash.hpp"
 #include "utxo/confidential_tx.hpp"
 
@@ -517,7 +518,7 @@ bool Node::verify_polka_locked(const QuorumCertificate& qc, std::vector<Finality
   std::set<PubKey32> seen;
   std::vector<FinalitySig> valid;
   valid.reserve(qc.signatures.size());
-  const auto msg = prevote_signing_message(qc.height, qc.round, qc.frontier_transition_id);
+  const auto msg = prevote_signing_message(consensus_domain_, qc.height, qc.round, qc.frontier_transition_id);
   for (const auto& sig : qc.signatures) {
     if (committee_set.find(sig.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(sig.validator_pubkey).second) continue;
@@ -546,7 +547,7 @@ bool Node::verify_timeout_certificate_locked(const TimeoutCertificate& tc, std::
   std::set<PubKey32> seen;
   std::vector<FinalitySig> valid;
   valid.reserve(tc.signatures.size());
-  const auto msg = timeout_vote_signing_message(tc.height, tc.round);
+  const auto msg = timeout_vote_signing_message(consensus_domain_, tc.height, tc.round);
   for (const auto& sig : tc.signatures) {
     if (committee_set.find(sig.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(sig.validator_pubkey).second) continue;
@@ -600,7 +601,7 @@ bool Node::verify_finality_certificate_for_frontier_locked(const FinalityCertifi
   std::set<PubKey32> seen;
   std::vector<FinalitySig> valid;
   valid.reserve(cert.signatures.size());
-  const auto msg = vote_signing_message(cert.height, cert.round, cert.frontier_transition_id);
+  const auto msg = vote_signing_message(consensus_domain_, cert.height, cert.round, cert.frontier_transition_id);
   for (const auto& sig : cert.signatures) {
     if (committee_set.find(sig.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(sig.validator_pubkey).second) continue;
@@ -690,7 +691,7 @@ std::optional<Vote> Node::on_prevotes_changed_locked(const Hash32& transition_id
              " transition=" + short_hash_hex(transition_id) + " reason=certified-ingress detail=" + ingress_detail);
     return std::nullopt;
   }
-  auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key);
+  auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key);
   if (!sig.has_value()) return std::nullopt;
   // SAFETY: the lock is durable before the precommit leaves this process.
   if (!lock_on_polka_locked(height, round, proposal)) {
@@ -837,7 +838,7 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
     timed_out.push_back(it->second);
   }
   for (std::size_t k = timed_out.size() > kRounds ? timed_out.size() - kRounds : 0; k < timed_out.size(); ++k) {
-    if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(height, timed_out[k]), local_key_.private_key)) {
+    if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(consensus_domain_, height, timed_out[k]), local_key_.private_key)) {
       out.timeouts.push_back(TimeoutVote{height, timed_out[k], local_key_.public_key, *sig});
     }
   }
@@ -847,7 +848,7 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
   }
   for (std::size_t k = prevotes.size() > kRounds ? prevotes.size() - kRounds : 0; k < prevotes.size(); ++k) {
     const auto& [round, transition_id] = prevotes[k];
-    if (auto sig = crypto::ed25519_sign(prevote_signing_message(height, round, transition_id), local_key_.private_key)) {
+    if (auto sig = crypto::ed25519_sign(prevote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key)) {
       out.prevotes.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
     }
   }
@@ -879,7 +880,7 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
   if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end() && !own_rounds.count(lock->second.second)) {
     // The lock's precommit is normally in votes_ already; a reconnect reset may have cleared them.
     const auto& [transition_id, round] = lock->second;
-    if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key)) {
+    if (auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key)) {
       out.precommits.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
     }
   }
@@ -905,13 +906,13 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
 void Node::reseed_local_votes_locked(std::uint64_t height) {
   for (auto it = local_prevotes_.lower_bound({height, 0}); it != local_prevotes_.end() && it->first.first == height; ++it) {
     const auto round = it->first.second;
-    if (auto sig = crypto::ed25519_sign(prevote_signing_message(height, round, it->second), local_key_.private_key)) {
+    if (auto sig = crypto::ed25519_sign(prevote_signing_message(consensus_domain_, height, round, it->second), local_key_.private_key)) {
       (void)prevotes_.add_vote(Vote{height, round, it->second, local_key_.public_key, *sig});
     }
   }
   if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end()) {
     const auto& [transition_id, round] = lock->second;
-    if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, transition_id), local_key_.private_key)) {
+    if (auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key)) {
       (void)votes_.add_vote(Vote{height, round, transition_id, local_key_.public_key, *sig});
       local_vote_reservations_.insert({height, round});
     }
@@ -958,7 +959,7 @@ Node::PrevFinalityRecord Node::prev_finality_record_for_next_height_locked() con
     for (const auto& sig : cert->signatures) candidates.emplace(sig.validator_pubkey, sig.signature);
   }
   const std::set<PubKey32> committee(parent.committee.begin(), parent.committee.end());
-  const auto msg = vote_signing_message(parent.height, parent.round, parent.transition_id);
+  const auto msg = vote_signing_message(consensus_domain_, parent.height, parent.round, parent.transition_id);
   PrevFinalityRecord out;
   out.round = parent.round;
   out.signers.reserve(candidates.size());
@@ -975,7 +976,7 @@ bool Node::record_late_finalized_vote_locked(const Vote& vote) {
   if (vote.round != finalized_tip_votes_.round || vote.frontier_transition_id != finalized_tip_votes_.transition_id) return false;
   if (finalized_tip_votes_.committee.count(vote.validator_pubkey) == 0) return false;
   if (finalized_tip_votes_.sigs.count(vote.validator_pubkey) != 0) return false;
-  const auto msg = vote_signing_message(vote.height, vote.round, vote.frontier_transition_id);
+  const auto msg = vote_signing_message(consensus_domain_, vote.height, vote.round, vote.frontier_transition_id);
   if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) return false;
   finalized_tip_votes_.sigs.emplace(vote.validator_pubkey, vote.signature);
   return true;
@@ -1554,7 +1555,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     // The leader of (height, round) signs the proposal, re-proposals included.
     const auto round_leader = leader_for_height_round(msg.height, msg.round);
     if (!round_leader.has_value() ||
-        !crypto::ed25519_verify(propose_signing_message(msg.height, msg.round, transition_id, pol_round),
+        !crypto::ed25519_verify(propose_signing_message(consensus_domain_, msg.height, msg.round, transition_id, pol_round),
                                 msg.proposer_signature, *round_leader)) {
       log_propose_hard_reject("invalid-proposer-signature");
       return ProposeHandlingResult::HardReject;
@@ -1688,8 +1689,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (chaos_byzantine_ && is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
       // Vote for everything at both phases: no lock, floor, once-per-round or polka checks, nothing
       // persisted. Honest validators must stay safe against up to f of these.
-      auto pv = crypto::ed25519_sign(prevote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
-      auto pc = crypto::ed25519_sign(vote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
+      auto pv = crypto::ed25519_sign(prevote_signing_message(consensus_domain_, msg.height, msg.round, transition_id), local_key_.private_key);
+      auto pc = crypto::ed25519_sign(vote_signing_message(consensus_domain_, msg.height, msg.round, transition_id), local_key_.private_key);
       if (pv.has_value()) maybe_vote = Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pv};
       if (pc.has_value()) {
         pending_local_precommits_.push_back(Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pc});
@@ -1740,7 +1741,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     }
     if (local_can_vote) {
       auto sig =
-          crypto::ed25519_sign(prevote_signing_message(msg.height, msg.round, transition_id), local_key_.private_key);
+          crypto::ed25519_sign(prevote_signing_message(consensus_domain_, msg.height, msg.round, transition_id), local_key_.private_key);
       if (!sig.has_value()) {
         log_propose_soft_reject("local-prevote-sign-failed");  // local condition, see candidate-cache-full
         return ProposeHandlingResult::SoftReject;
@@ -1851,7 +1852,7 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
       return VoteHandlingResult::HardReject;
     }
     if (!vote_verify_cache_.contains(vkey)) {
-      const auto msg = vote_signing_message(vote.height, vote.round, vote.frontier_transition_id);
+      const auto msg = vote_signing_message(consensus_domain_, vote.height, vote.round, vote.frontier_transition_id);
       if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) {
         log_vote_hard_reject("invalid-signature", " validator=" + short_pub_hex(vote.validator_pubkey));
         invalid_vote_verify_cache_.insert(vkey);
@@ -1963,7 +1964,7 @@ Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from
     const p2p::VoteVerifyCache::Key vkey{vote.height, vote.round, vote.frontier_transition_id, vote.validator_pubkey};
     if (invalid_prevote_verify_cache_.contains(vkey)) return hard("cached-invalid-signature");
     if (!prevote_verify_cache_.contains(vkey)) {
-      const auto msg = prevote_signing_message(vote.height, vote.round, vote.frontier_transition_id);
+      const auto msg = prevote_signing_message(consensus_domain_, vote.height, vote.round, vote.frontier_transition_id);
       if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) {
         invalid_prevote_verify_cache_.insert(vkey);
         return hard("invalid-signature", " validator=" + short_pub_hex(vote.validator_pubkey));
@@ -2045,7 +2046,7 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
       log_timeout_hard_reject("non-member", " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::HardReject;
     }
-    const auto msg = timeout_vote_signing_message(vote.height, vote.round);
+    const auto msg = timeout_vote_signing_message(consensus_domain_, vote.height, vote.round);
     if (!crypto::ed25519_verify(msg, vote.signature, vote.validator_pubkey)) {
       log_timeout_hard_reject("invalid-signature", " validator=" + short_pub_hex(vote.validator_pubkey));
       return TimeoutVoteHandlingResult::HardReject;
@@ -2613,7 +2614,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   // abstention must be enforced here as well.
   if (sigs.empty() && expected_quorum == 1 && expected_committee.size() == 1 &&
       expected_committee.front() == local_key_.public_key && !abstaining_at_height_locked(height)) {
-    if (auto sig = crypto::ed25519_sign(vote_signing_message(height, round, block_id), local_key_.private_key);
+    if (auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, block_id), local_key_.private_key);
         sig.has_value()) {
       const Vote local_vote{height, round, block_id, local_key_.public_key, *sig};
       // INVARIANT: this is the other insertion path into votes_ (see the matching comment
@@ -2825,6 +2826,13 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       last_test_hook_error_ = "frontier-build-metadata-failed:" + validation_error;
       return std::nullopt;
     }
+    const auto vrf_proof =
+        crypto::vrf_prove(local_key_.private_key, consensus::leader_vrf_alpha(canonical_state_->finalized_randomness, height));
+    if (!vrf_proof) {
+      last_test_hook_error_ = "frontier-build-vrf-failed";
+      return std::nullopt;
+    }
+    result.transition.leader_vrf_proof = *vrf_proof;
     if (height == finalized_height_ + 1) {
       log_line("frontier-build-summary height=" + std::to_string(height) + " round=" + std::to_string(round) +
                " transition=" + short_hash_hex(result.transition.transition_id()) +

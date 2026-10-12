@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
 
 #include <chrono>
@@ -375,6 +376,10 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
                                                         &exec_result.transition, &error)) {
     return false;
   }
+  if (!test::attach_test_leader_vrf(&exec_result.transition, genesis_derived.finalized_randomness,
+                                    node::Node::deterministic_test_keypairs())) {
+    return false;
+  }
 
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     for (const auto& ingress : lane_records[lane]) {
@@ -411,7 +416,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   cert.frontier_transition_id = stored_transition_id;
   cert.quorum_threshold = static_cast<std::uint32_t>(quorum);
   cert.committee_members = committee;
-  const auto msg = vote_signing_message(cert.height, cert.round, cert.frontier_transition_id);
+  const auto msg = vote_signing_message(consensus_chain_domain(derivation_cfg.network, derivation_cfg.chain_id), cert.height, cert.round, cert.frontier_transition_id);
   const auto keys = node::Node::deterministic_test_keypairs();
   for (std::size_t i = 0; i < quorum; ++i) {
     const auto& signer_pub = committee[i];
@@ -591,6 +596,10 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   if (!consensus::populate_frontier_transition_metadata(derivation_cfg, fixture.parent, height, round, *leader, 0, {},
                                                         exec_result.accepted_fee_units, exec_result.next_utxos,
                                                         &exec_result.transition, &error)) {
+    return false;
+  }
+  if (!test::attach_test_leader_vrf(&exec_result.transition, fixture.parent.finalized_randomness,
+                                    node::Node::deterministic_test_keypairs())) {
     return false;
   }
 
@@ -906,14 +915,14 @@ std::optional<FundedTestWallet> find_funded_test_wallet(node::Node& node, const 
   return std::nullopt;
 }
 
-QuorumCertificate make_test_qc(const std::vector<crypto::KeyPair>& keys, const std::vector<PubKey32>& committee,
+QuorumCertificate make_test_qc(const Hash32& chain_domain, const std::vector<crypto::KeyPair>& keys, const std::vector<PubKey32>& committee,
                                std::uint64_t height, std::uint32_t round, const Hash32& block_id,
                                std::size_t signer_count) {
   QuorumCertificate qc;
   qc.height = height;
   qc.round = round;
   qc.block_id = block_id;
-  const auto msg = vote_signing_message(height, round, block_id);
+  const auto msg = vote_signing_message(chain_domain, height, round, block_id);
   const std::size_t take = std::min(signer_count, committee.size());
   for (std::size_t i = 0; i < take; ++i) {
     const int signer_id = node_for_pub(keys, committee[i]);
@@ -977,7 +986,7 @@ std::optional<crypto::KeyPair> test_keypair_for_pub(const PubKey32& pub) {
 
 // Signs the proposal as `signer` (default: the transition's leader). Pass `round` and `pol` to
 // re-propose a valid value in a later round; the signer must then be that round's leader.
-p2p::ProposeMsg make_test_frontier_propose_msg(const FrontierProposal& proposal,
+p2p::ProposeMsg make_test_frontier_propose_msg(const Hash32& chain_domain, const FrontierProposal& proposal,
                                                const std::optional<QuorumCertificate>& pol = std::nullopt,
                                                const std::optional<TimeoutCertificate>& justify_tc = std::nullopt,
                                                std::optional<std::uint32_t> round = std::nullopt,
@@ -994,13 +1003,13 @@ p2p::ProposeMsg make_test_frontier_propose_msg(const FrontierProposal& proposal,
   const std::optional<std::uint32_t> pol_round =
       pol.has_value() ? std::optional<std::uint32_t>(pol->round) : std::nullopt;
   auto sig = crypto::ed25519_sign(
-      propose_signing_message(msg.height, msg.round, proposal.transition.transition_id(), pol_round), kp->private_key);
+      propose_signing_message(chain_domain, msg.height, msg.round, proposal.transition.transition_id(), pol_round), kp->private_key);
   if (!sig.has_value()) throw std::runtime_error("failed to sign proposal");
   msg.proposer_signature = *sig;
   return msg;
 }
 
-Vote make_test_vote(const std::vector<crypto::KeyPair>& keys, std::uint64_t height, std::uint32_t round,
+Vote make_test_vote(const Hash32& chain_domain, const std::vector<crypto::KeyPair>& keys, std::uint64_t height, std::uint32_t round,
                     const Hash32& block_id, const PubKey32& signer_pubkey) {
   Vote vote;
   vote.height = height;
@@ -1009,25 +1018,25 @@ Vote make_test_vote(const std::vector<crypto::KeyPair>& keys, std::uint64_t heig
   vote.validator_pubkey = signer_pubkey;
   const int signer_id = node_for_pub(keys, signer_pubkey);
   if (signer_id < 0) throw std::runtime_error("unknown signer pubkey");
-  auto sig = crypto::ed25519_sign(vote_signing_message(height, round, block_id),
+  auto sig = crypto::ed25519_sign(vote_signing_message(chain_domain, height, round, block_id),
                                   keys[static_cast<std::size_t>(signer_id)].private_key);
   if (!sig.has_value()) throw std::runtime_error("failed to sign vote");
   vote.signature = *sig;
   return vote;
 }
 
-Vote make_test_prevote(const std::vector<crypto::KeyPair>& keys, std::uint64_t height, std::uint32_t round,
+Vote make_test_prevote(const Hash32& chain_domain, const std::vector<crypto::KeyPair>& keys, std::uint64_t height, std::uint32_t round,
                        const Hash32& transition_id, const PubKey32& signer_pubkey) {
   const int signer_id = node_for_pub(keys, signer_pubkey);
   if (signer_id < 0) throw std::runtime_error("unknown prevote signer pubkey");
-  auto sig = crypto::ed25519_sign(prevote_signing_message(height, round, transition_id),
+  auto sig = crypto::ed25519_sign(prevote_signing_message(chain_domain, height, round, transition_id),
                                   keys[static_cast<std::size_t>(signer_id)].private_key);
   if (!sig.has_value()) throw std::runtime_error("failed to sign prevote");
   return Vote{height, round, transition_id, signer_pubkey, *sig};
 }
 
 // A polka: the first `signer_count` committee members' prevotes for (height, round, transition_id).
-QuorumCertificate make_test_polka(const std::vector<crypto::KeyPair>& keys, const std::vector<PubKey32>& committee,
+QuorumCertificate make_test_polka(const Hash32& chain_domain, const std::vector<crypto::KeyPair>& keys, const std::vector<PubKey32>& committee,
                                   std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
                                   std::size_t signer_count) {
   QuorumCertificate polka;
@@ -1035,7 +1044,7 @@ QuorumCertificate make_test_polka(const std::vector<crypto::KeyPair>& keys, cons
   polka.round = round;
   polka.frontier_transition_id = transition_id;
   for (std::size_t i = 0; i < std::min(signer_count, committee.size()); ++i) {
-    const auto v = make_test_prevote(keys, height, round, transition_id, committee[i]);
+    const auto v = make_test_prevote(chain_domain, keys, height, round, transition_id, committee[i]);
     polka.signatures.push_back(FinalitySig{v.validator_pubkey, v.signature});
   }
   return polka;
@@ -1049,14 +1058,14 @@ void inject_test_prevotes(node::Node& target, const std::vector<crypto::KeyPair>
   for (const auto& pub : committee) {
     if (injected == count) break;
     if (pub == target.local_validator_pubkey_for_test()) continue;
-    const auto r = target.inject_network_prevote_result_for_test(make_test_prevote(keys, height, round, transition_id, pub));
+    const auto r = target.inject_network_prevote_result_for_test(make_test_prevote(target.consensus_domain_for_test(), keys, height, round, transition_id, pub));
     if (r != "accepted") throw std::runtime_error("prevote not accepted: " + r);
     ++injected;
   }
   if (injected != count) throw std::runtime_error("not enough prevoters");
 }
 
-TimeoutVote make_test_timeout_vote(const std::vector<crypto::KeyPair>& keys, std::uint64_t height, std::uint32_t round,
+TimeoutVote make_test_timeout_vote(const Hash32& chain_domain, const std::vector<crypto::KeyPair>& keys, std::uint64_t height, std::uint32_t round,
                                    const PubKey32& signer_pubkey) {
   TimeoutVote vote;
   vote.height = height;
@@ -1065,19 +1074,19 @@ TimeoutVote make_test_timeout_vote(const std::vector<crypto::KeyPair>& keys, std
   const int signer_id = node_for_pub(keys, signer_pubkey);
   if (signer_id < 0) throw std::runtime_error("unknown timeout signer pubkey");
   auto sig =
-      crypto::ed25519_sign(timeout_vote_signing_message(height, round), keys[static_cast<std::size_t>(signer_id)].private_key);
+      crypto::ed25519_sign(timeout_vote_signing_message(chain_domain, height, round), keys[static_cast<std::size_t>(signer_id)].private_key);
   if (!sig.has_value()) throw std::runtime_error("failed to sign timeout vote");
   vote.signature = *sig;
   return vote;
 }
 
-TimeoutCertificate make_test_timeout_certificate(const std::vector<crypto::KeyPair>& keys,
+TimeoutCertificate make_test_timeout_certificate(const Hash32& chain_domain, const std::vector<crypto::KeyPair>& keys,
                                                  const std::vector<PubKey32>& committee, std::uint64_t height,
                                                  std::uint32_t round, std::size_t signer_count) {
   TimeoutCertificate tc;
   tc.height = height;
   tc.round = round;
-  const auto msg = timeout_vote_signing_message(height, round);
+  const auto msg = timeout_vote_signing_message(chain_domain, height, round);
   const std::size_t take = std::min(signer_count, committee.size());
   for (std::size_t i = 0; i < take; ++i) {
     const int signer_id = node_for_pub(keys, committee[i]);
@@ -1107,9 +1116,9 @@ std::optional<FrontierProposal> build_test_frontier_proposal_at_round(node::Node
   return build_test_frontier_proposal(n, height, round);
 }
 
-QuorumCertificate make_test_frontier_qc(const std::vector<crypto::KeyPair>& keys, const std::vector<PubKey32>& committee,
+QuorumCertificate make_test_frontier_qc(const Hash32& chain_domain, const std::vector<crypto::KeyPair>& keys, const std::vector<PubKey32>& committee,
                                         const FrontierProposal& proposal, std::size_t signer_count) {
-  return make_test_qc(keys, committee, proposal.transition.height, proposal.transition.round, frontier_proposal_id(proposal),
+  return make_test_qc(chain_domain, keys, committee, proposal.transition.height, proposal.transition.round, frontier_proposal_id(proposal),
                       signer_count);
 }
 
@@ -1173,7 +1182,7 @@ std::optional<FrontierProposal> build_live_cluster_frontier_proposal_from_record
 
   auto proposal = build_cluster_frontier_proposal(cluster.nodes, keys, target_height, 0);
   if (proposal.has_value()) {
-    const auto msg = make_test_frontier_propose_msg(*proposal);
+    const auto msg = make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal);
     for (std::size_t i = 0; i < cluster.nodes.size(); ++i) {
       const auto result = cluster.nodes[i]->inject_network_propose_result_for_test(msg);
       if (result != "accepted") {
@@ -2381,7 +2390,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
     const int signer_id = node_for_pub(keys, member);
     if (signer_id < 0) continue;
     const auto vote =
-        make_test_vote(keys, proposal->transition.height, proposal->transition.round, frontier_proposal_id(*proposal), member);
+        make_test_vote(nodes[0]->consensus_domain_for_test(), keys, proposal->transition.height, proposal->transition.round, frontier_proposal_id(*proposal), member);
     const auto vote_result = nodes[0]->inject_network_vote_diagnostic_for_test(vote);
     if (vote_result != "accepted") {
       if (vote_result == "soft-reject:stale-finalized-height") break;
@@ -2532,7 +2541,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
   for (const auto& member : committee) {
     const int signer_id = node_for_pub(default_keys, member);
     if (signer_id < 0) continue;
-    const auto vote = make_test_vote(default_keys, proposal->transition.height, proposal->transition.round,
+    const auto vote = make_test_vote(nodes[0]->consensus_domain_for_test(), default_keys, proposal->transition.height, proposal->transition.round,
                                      frontier_proposal_id(*proposal), member);
     const auto vote_result = nodes[0]->inject_network_vote_diagnostic_for_test(vote);
     if (vote_result != "accepted" && vote_result != "soft-reject:stale-finalized-height") {
@@ -2674,13 +2683,13 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
     va.round = equivocation_round;
     va.block_id.fill(0xAA);
     va.validator_pubkey = keys[0].public_key;
-    auto sa = crypto::ed25519_sign(vote_signing_message(va.height, va.round, va.block_id), keys[0].private_key);
+    auto sa = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), va.height, va.round, va.block_id), keys[0].private_key);
     ASSERT_TRUE(sa.has_value());
     va.signature = *sa;
 
     Vote vb = va;
     vb.block_id.fill(0xBB);
-    auto sb = crypto::ed25519_sign(vote_signing_message(vb.height, vb.round, vb.block_id), keys[0].private_key);
+    auto sb = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), vb.height, vb.round, vb.block_id), keys[0].private_key);
     ASSERT_TRUE(sb.has_value());
     vb.signature = *sb;
 
@@ -2712,7 +2721,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   vc.validator_pubkey = keys[0].public_key;
   enter_fresh_round(&vc.height, &vc.round);
   vc.block_id.fill(0xCC);
-  auto sc = crypto::ed25519_sign(vote_signing_message(vc.height, vc.round, vc.block_id), keys[0].private_key);
+  auto sc = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), vc.height, vc.round, vc.block_id), keys[0].private_key);
   ASSERT_TRUE(sc.has_value());
   vc.signature = *sc;
   // A known equivocator's first vote per round still counts; a conflicting second one does not.
@@ -2721,7 +2730,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   }
   Vote vd = vc;
   vd.block_id.fill(0xDD);
-  auto sd = crypto::ed25519_sign(vote_signing_message(vd.height, vd.round, vd.block_id), keys[0].private_key);
+  auto sd = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), vd.height, vd.round, vd.block_id), keys[0].private_key);
   ASSERT_TRUE(sd.has_value());
   vd.signature = *sd;
   ASSERT_TRUE(!nodes[1]->inject_vote_for_test(vd));
@@ -2927,7 +2936,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
           oss << " build_probe={leader_node=" << leader_id << ",proposal=" << (proposal.has_value() ? "yes" : "no")
               << ",error=" << nodes[static_cast<std::size_t>(leader_id)]->last_test_hook_error_for_test();
           if (proposal.has_value()) {
-            auto msg = make_test_frontier_propose_msg(*proposal);
+            auto msg = make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal);
             oss << ",inject=[";
             for (std::size_t i = 0; i < nodes.size(); ++i) {
               if (i) oss << ",";
@@ -2968,7 +2977,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
           oss << " build_probe={leader_node=" << leader_id << ",proposal=" << (proposal.has_value() ? "yes" : "no")
               << ",error=" << nodes[static_cast<std::size_t>(leader_id)]->last_test_hook_error_for_test();
           if (proposal.has_value()) {
-            auto msg = make_test_frontier_propose_msg(*proposal);
+            auto msg = make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal);
             oss << ",inject=[";
             for (std::size_t i = 0; i < nodes.size(); ++i) {
               if (i) oss << ",";
@@ -3585,7 +3594,7 @@ TEST(test_follower_peer_loss_stalls_and_recovers_after_reconnect) {
         probe_has_proposal = proposal.has_value();
         probe_build_error = leader_node->last_test_hook_error_for_test();
         if (proposal.has_value()) {
-          auto msg = make_test_frontier_propose_msg(*proposal);
+          auto msg = make_test_frontier_propose_msg(bootstrap.consensus_domain_for_test(), *proposal);
           const bool leader_ok = leader_node->inject_propose_msg_for_test(msg);
           const auto bootstrap_result = bootstrap_restarted.inject_network_propose_result_for_test(msg);
           const auto follower_result = follower.inject_network_propose_result_for_test(msg);
@@ -4056,13 +4065,13 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   a.round = 0;
   a.block_id.fill(0x31);
   a.validator_pubkey = slash_pub;
-  auto sa = crypto::ed25519_sign(vote_signing_message(a.height, a.round, a.block_id), keys[0].private_key);
+  auto sa = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), a.height, a.round, a.block_id), keys[0].private_key);
   ASSERT_TRUE(sa.has_value());
   a.signature = *sa;
 
   Vote b = a;
   b.block_id.fill(0x41);
-  auto sb = crypto::ed25519_sign(vote_signing_message(b.height, b.round, b.block_id), keys[0].private_key);
+  auto sb = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), b.height, b.round, b.block_id), keys[0].private_key);
   ASSERT_TRUE(sb.has_value());
   b.signature = *sb;
 
@@ -4134,13 +4143,13 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   a.round = 0;
   a.block_id.fill(0x51);
   a.validator_pubkey = banned_pub;
-  auto sa = crypto::ed25519_sign(vote_signing_message(a.height, a.round, a.block_id), keys[0].private_key);
+  auto sa = crypto::ed25519_sign(vote_signing_message(cluster.nodes[0]->consensus_domain_for_test(), a.height, a.round, a.block_id), keys[0].private_key);
   ASSERT_TRUE(sa.has_value());
   a.signature = *sa;
 
   Vote b = a;
   b.block_id.fill(0x61);
-  auto sb = crypto::ed25519_sign(vote_signing_message(b.height, b.round, b.block_id), keys[0].private_key);
+  auto sb = crypto::ed25519_sign(vote_signing_message(cluster.nodes[0]->consensus_domain_for_test(), b.height, b.round, b.block_id), keys[0].private_key);
   ASSERT_TRUE(sb.has_value());
   b.signature = *sb;
 
@@ -4286,7 +4295,7 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
   bad_vote.block_id.fill(0xA5);
   bad_vote.validator_pubkey = non_member;
   auto bad_sig =
-      crypto::ed25519_sign(vote_signing_message(bad_vote.height, bad_vote.round, bad_vote.block_id), keys[non_member_id].private_key);
+      crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), bad_vote.height, bad_vote.round, bad_vote.block_id), keys[non_member_id].private_key);
   ASSERT_TRUE(bad_sig.has_value());
   bad_vote.signature = *bad_sig;
   ASSERT_TRUE(!nodes[0]->inject_vote_for_test(bad_vote));
@@ -4730,7 +4739,8 @@ TEST(test_block_path_applies_settlement_same_as_quorum_path) {
   const std::uint32_t round = before.round;
   auto proposal = direct_node->build_frontier_proposal_for_test(target_height, round);
   ASSERT_TRUE(proposal.has_value());
-  auto sig = crypto::ed25519_sign(vote_signing_message(target_height, round, frontier_proposal_id(*proposal)),
+  auto sig = crypto::ed25519_sign(vote_signing_message(direct_node->consensus_domain_for_test(), target_height, round,
+                                                       frontier_proposal_id(*proposal)),
                                   keys[0].private_key);
   ASSERT_TRUE(sig.has_value());
   FinalityCertificate cert;
@@ -4780,10 +4790,10 @@ TEST(test_block_path_applies_settlement_same_as_quorum_path) {
     oss << ",committee_size=" << committee.size();
     throw std::runtime_error(oss.str());
   }
-  auto quorum_msg = make_test_frontier_propose_msg(*quorum_proposal);
+  auto quorum_msg = make_test_frontier_propose_msg(quorum_node->consensus_domain_for_test(), *quorum_proposal);
   ASSERT_TRUE(quorum_node->inject_propose_msg_for_test(quorum_msg));
   auto quorum_vote =
-      make_test_vote(keys, quorum_target_height, quorum_round, frontier_proposal_id(*quorum_proposal), keys[0].public_key);
+      make_test_vote(quorum_node->consensus_domain_for_test(), keys, quorum_target_height, quorum_round, frontier_proposal_id(*quorum_proposal), keys[0].public_key);
   const auto quorum_vote_result = quorum_node->inject_network_vote_diagnostic_for_test(quorum_vote);
   if (quorum_vote_result != "accepted" && quorum_vote_result != "soft-reject:stale-finalized-height") {
     throw std::runtime_error("quorum vote rejected: " + quorum_vote_result);
@@ -5898,7 +5908,7 @@ TEST(test_safety_state_mirror_recovers_corrupted_primary) {
   }
   ASSERT_TRUE(ti < cluster.nodes.size());
   ASSERT_TRUE(advance_test_frontier_round(*cluster.nodes[ti], h, 0));
-  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal)),
             std::string("accepted"));
   // A polka for the proposal: the node locks on it (and precommits).
   const auto committee = cluster.nodes[ti]->committee_for_height_round_for_test(h, 0);
@@ -6001,7 +6011,7 @@ TEST(test_canonical_signature_subset_produces_identical_rewards) {
 
   const auto committee = nodes[0]->committee_for_height_round_for_test(target_height, round);
   const auto quorum = consensus::quorum_threshold(committee.size());
-  auto qc = make_test_qc(keys, committee, target_height, round, frontier_proposal_id(*proposal), committee.size());
+  auto qc = make_test_qc(nodes[0]->consensus_domain_for_test(), keys, committee, target_height, round, frontier_proposal_id(*proposal), committee.size());
   ASSERT_TRUE(qc.signatures.size() >= quorum);
 
   auto sigs_a = qc.signatures;
@@ -6067,7 +6077,7 @@ TEST(test_delayed_finalized_vote_soft_reject_keeps_peer_alive_and_chain_continue
   delayed_vote.block_id = frontier_proposal_id(finalized_artifact->proposal);
   delayed_vote.validator_pubkey = signer->public_key;
   auto sig = crypto::ed25519_sign(
-      vote_signing_message(delayed_vote.height, delayed_vote.round, delayed_vote.block_id), signer->private_key);
+      vote_signing_message(nodes[0]->consensus_domain_for_test(), delayed_vote.height, delayed_vote.round, delayed_vote.block_id), signer->private_key);
   ASSERT_TRUE(sig.has_value());
   delayed_vote.signature = *sig;
 
@@ -6102,7 +6112,7 @@ TEST(test_future_height_vote_soft_rejects_without_penalizing_honest_ahead_peer) 
   ASSERT_TRUE(signer.has_value());
   future_vote.validator_pubkey = signer->public_key;
   auto sig = crypto::ed25519_sign(
-      vote_signing_message(future_vote.height, future_vote.round, future_vote.block_id), signer->private_key);
+      vote_signing_message(nodes[0]->consensus_domain_for_test(), future_vote.height, future_vote.round, future_vote.block_id), signer->private_key);
   ASSERT_TRUE(sig.has_value());
   future_vote.signature = *sig;
 
@@ -6268,8 +6278,8 @@ TEST(test_same_block_different_signature_superset_same_payout) {
   auto committee = nodes[0]->committee_for_height_round_for_test(target_height, round);
   std::sort(committee.begin(), committee.end());
   const auto quorum = consensus::quorum_threshold(committee.size());
-  auto quorum_qc = make_test_qc(keys, committee, target_height, round, frontier_proposal_id(*proposal), quorum);
-  auto full_qc = make_test_qc(keys, committee, target_height, round, frontier_proposal_id(*proposal), committee.size());
+  auto quorum_qc = make_test_qc(nodes[0]->consensus_domain_for_test(), keys, committee, target_height, round, frontier_proposal_id(*proposal), quorum);
+  auto full_qc = make_test_qc(nodes[0]->consensus_domain_for_test(), keys, committee, target_height, round, frontier_proposal_id(*proposal), committee.size());
   ASSERT_TRUE(quorum_qc.signatures.size() >= quorum);
   ASSERT_TRUE(full_qc.signatures.size() >= quorum);
 
@@ -6322,10 +6332,10 @@ TEST(test_quorum_subset_independence_for_settlement_accounting) {
   const auto quorum = consensus::quorum_threshold(committee.size());
   ASSERT_TRUE(committee.size() >= quorum + 1);
 
-  auto qc_a = make_test_qc(keys, committee, target_height, round, frontier_proposal_id(*proposal), quorum);
+  auto qc_a = make_test_qc(nodes[0]->consensus_domain_for_test(), keys, committee, target_height, round, frontier_proposal_id(*proposal), quorum);
   std::vector<PubKey32> rotated_committee = committee;
   std::rotate(rotated_committee.begin(), rotated_committee.begin() + 1, rotated_committee.end());
-  auto qc_b = make_test_qc(keys, rotated_committee, target_height, round, frontier_proposal_id(*proposal), quorum);
+  auto qc_b = make_test_qc(nodes[0]->consensus_domain_for_test(), keys, rotated_committee, target_height, round, frontier_proposal_id(*proposal), quorum);
   ASSERT_EQ(qc_a.signatures.size(), quorum);
   ASSERT_EQ(qc_b.signatures.size(), quorum);
   ASSERT_TRUE(!same_finality_sig_vector(qc_a.signatures, qc_b.signatures));
@@ -7117,7 +7127,7 @@ TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up
         oss << ",proposal=" << (proposal.has_value() ? "yes" : "no")
             << ",build_error=" << leader_node->last_test_hook_error_for_test();
         if (proposal.has_value()) {
-          auto msg = make_test_frontier_propose_msg(*proposal);
+          auto msg = make_test_frontier_propose_msg(bootstrap.consensus_domain_for_test(), *proposal);
           oss << ",inject=[" << bootstrap.inject_network_propose_result_for_test(msg) << ","
               << follower.inject_network_propose_result_for_test(msg) << "]";
         }
@@ -7387,7 +7397,7 @@ TEST(test_future_round_proposal_rejected_before_timeout) {
   auto future = build_cluster_frontier_proposal_from_records(
       cluster, keys, {tx.serialize()}, target_height, 1, "/tmp/finalis_it_future_round_reject_builder");
   ASSERT_TRUE(future.has_value());
-  ASSERT_TRUE(!nodes[0]->inject_propose_msg_for_test(make_test_frontier_propose_msg(*future)));
+  ASSERT_TRUE(!nodes[0]->inject_propose_msg_for_test(make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *future)));
   ASSERT_EQ(nodes[0]->status().height + 1, target_height);
 }
 
@@ -7413,7 +7423,7 @@ TEST(test_future_round_proposal_does_not_advance_round_without_valid_justificati
   ASSERT_TRUE(future.has_value());
 
   // Signed by the round leader, but carries neither a TC nor a pol.
-  const auto msg = make_test_frontier_propose_msg(*future);
+  const auto msg = make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *future);
 
   ASSERT_EQ(nodes[0]->inject_network_propose_result_for_test(msg), std::string("hard-reject"));
   const auto after = nodes[0]->status();
@@ -7450,7 +7460,7 @@ TEST(test_future_round_vote_does_not_advance_round_prematurely) {
   vote.round = future_round;
   vote.block_id.fill(0x7C);
   vote.validator_pubkey = signer_pub;
-  auto sig = crypto::ed25519_sign(vote_signing_message(vote.height, vote.round, vote.block_id),
+  auto sig = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), vote.height, vote.round, vote.block_id),
                                   keys[static_cast<std::size_t>(signer_id)].private_key);
   ASSERT_TRUE(sig.has_value());
   vote.signature = *sig;
@@ -7487,7 +7497,7 @@ TEST(test_only_one_block_can_finalize_per_height_after_vote_locking) {
   auto proposal_a = build_cluster_frontier_proposal_from_records(
       cluster, keys, {tx.serialize()}, target_height, round0, "/tmp/finalis_it_single_finalization_lock_round0_builder");
   ASSERT_TRUE(proposal_a.has_value());
-  ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_a)),
+  ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal_a)),
             std::string("accepted"));
 
   auto proposal_b = build_cluster_frontier_proposal_from_records(
@@ -7502,14 +7512,14 @@ TEST(test_only_one_block_can_finalize_per_height_after_vote_locking) {
   for (const auto& pub : committee) {
     if (pub == target->local_validator_pubkey_for_test()) continue;
     (void)target->inject_vote_for_test(
-        make_test_vote(keys, target_height, round0, frontier_proposal_id(*proposal_a), pub));
+        make_test_vote(nodes[0]->consensus_domain_for_test(), keys, target_height, round0, frontier_proposal_id(*proposal_a), pub));
     ++injected;
     if (injected == quorum) break;
   }
 
   ASSERT_TRUE(wait_for([&]() { return target->status().height == target_height; }, std::chrono::seconds(5)));
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_a));
-  ASSERT_TRUE(!target->inject_propose_msg_for_test(make_test_frontier_propose_msg(*proposal_b)));
+  ASSERT_TRUE(!target->inject_propose_msg_for_test(make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal_b)));
   ASSERT_EQ(target->status().transition_hash, frontier_proposal_id(*proposal_a));
 }
 
@@ -7559,7 +7569,7 @@ TEST(test_validator_defers_vote_until_certified_ingress_is_held) {
   ASSERT_TRUE(advance_test_frontier_round(target, target_height, 0));
 
   // Valid proposal, but the certified record is missing locally: accepted, no vote, deferred.
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal)),
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(target_height, 0, proposal_id));
   ASSERT_EQ(target.deferred_certified_vote_count_for_test(), 1u);
@@ -7611,7 +7621,7 @@ TEST(test_validator_refuses_vote_when_slice_differs_from_certified_ingress) {
   ASSERT_TRUE(ti < cluster.nodes.size());
   auto& target = *cluster.nodes[ti];
   ASSERT_TRUE(advance_test_frontier_round(target, target_height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal)),
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(target_height, 0, proposal_id));
   ASSERT_EQ(target.deferred_certified_vote_count_for_test(), 0u);
@@ -7642,14 +7652,14 @@ TEST(test_validator_never_votes_in_a_round_it_timed_out_of) {
   // Timed out of round 0, then the late round-0 proposal arrives (same height, still round 0 here).
   ASSERT_TRUE(advance_test_frontier_round(timed_out, target_height, 0));
   timed_out.mark_local_round_timed_out_for_test(target_height, 0);
-  ASSERT_EQ(timed_out.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+  ASSERT_EQ(timed_out.inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal)),
             std::string("accepted"));
   ASSERT_TRUE(!timed_out.local_prevote_recorded_for_test(target_height, 0, proposal_id));
   ASSERT_TRUE(!timed_out.local_vote_lock_for_test(target_height).has_value());
 
   // A member that did not time out still votes for the same proposal.
   ASSERT_TRUE(advance_test_frontier_round(control, target_height, 0));
-  ASSERT_EQ(control.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)),
+  ASSERT_EQ(control.inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal)),
             std::string("accepted"));
   ASSERT_TRUE(control.local_prevote_recorded_for_test(target_height, 0, proposal_id));
 }
@@ -7701,7 +7711,7 @@ TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
 
   // 1. Prevote A at (h, 0); a polka for A follows, so the node locks on A and precommits it.
   ASSERT_TRUE(advance_test_frontier_round(*cluster.nodes[ti], target_height, round0));
-  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_a0)),
+  ASSERT_EQ(cluster.nodes[ti]->inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal_a0)),
             std::string("accepted"));
   ASSERT_TRUE(cluster.nodes[ti]->local_prevote_recorded_for_test(target_height, round0, a0_id));
   inject_test_prevotes(*cluster.nodes[ti], keys, committee0, target_height, round0, a0_id, quorum0 - 1);
@@ -7736,20 +7746,20 @@ TEST(test_vote_lock_survives_restart_and_blocks_conflicting_vote) {
 
   // 3a. Conflicting proposal at the same (h, 0): already prevoted there, no second prevote.
   ASSERT_TRUE(advance_test_frontier_round(*target, target_height, round0));
-  (void)target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_b0));
+  (void)target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal_b0));
   ASSERT_TRUE(!target->local_prevote_recorded_for_test(target_height, round0, b0_id));
 
   // 3b. Fresh conflicting proposal at (h, 1) justified only by a TC: the lock blocks the prevote.
-  const auto tc0 = make_test_timeout_certificate(keys, committee0, target_height, round0, quorum0);
+  const auto tc0 = make_test_timeout_certificate(cluster.nodes[0]->consensus_domain_for_test(), keys, committee0, target_height, round0, quorum0);
   ASSERT_TRUE(tc0.signatures.size() >= quorum0);
-  (void)target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_b1, std::nullopt, tc0));
+  (void)target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal_b1, std::nullopt, tc0));
   ASSERT_TRUE(!target->local_prevote_recorded_for_test(target_height, round1, b1_id));
   ASSERT_TRUE(target->local_vote_lock_for_test(target_height)->first == a0_id);
 
   // 4. Liveness: the round-1 leader re-proposes A unchanged with its round-0 polka; still votable.
   const auto leader1 = target->proposer_for_height_round_for_test(target_height, round1);
   ASSERT_TRUE(leader1.has_value());
-  auto repropose = make_test_frontier_propose_msg(*proposal_a0, *polka_after, tc0, round1, *leader1);
+  auto repropose = make_test_frontier_propose_msg(cluster.nodes[0]->consensus_domain_for_test(), *proposal_a0, *polka_after, tc0, round1, *leader1);
   ASSERT_EQ(target->inject_network_propose_result_for_test(repropose), std::string("accepted"));
   ASSERT_TRUE(target->local_prevote_recorded_for_test(target_height, round1, a0_id));
 }
@@ -7776,9 +7786,9 @@ TEST(test_round_catch_up_needs_f_plus_one_timeout_votes) {
   const std::uint32_t far = base + 100;  // beyond the single-vote catch-up window (32)
 
   // Beyond the window the votes are not stored (soft reject), only their rounds are noted.
-  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(keys, h, far + 10, others[0]));
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far + 10, others[0]));
   ASSERT_TRUE(target->status().round < far);
-  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(keys, h, far, others[1]));
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far, others[1]));
   ASSERT_EQ(target->status().round, far);  // the second-highest: f + 1 = 2 validators reached it
 }
 
@@ -7798,7 +7808,7 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
   auto proposal_round0 = build_cluster_frontier_proposal_from_records(
       cluster, keys, {tx.serialize()}, target_height, round0, "/tmp/finalis_it_fork_choice_round0_builder");
   ASSERT_TRUE(proposal_round0.has_value());
-  ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal_round0)),
+  ASSERT_EQ(target->inject_network_propose_result_for_test(make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal_round0)),
             std::string("accepted"));
 
   const auto committee0 = target->committee_for_height_round_for_test(target_height, round0);
@@ -7811,7 +7821,7 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
   for (const auto& pub : committee0) {
     if (pub == target->local_validator_pubkey_for_test()) continue;
     (void)target->inject_vote_for_test(
-        make_test_vote(keys, target_height, round0, frontier_proposal_id(*proposal_round0), pub));
+        make_test_vote(nodes[0]->consensus_domain_for_test(), keys, target_height, round0, frontier_proposal_id(*proposal_round0), pub));
     ++low_view_votes;
     if (low_view_votes + 1 >= quorum0) break;  // keep this below quorum including local vote
   }
@@ -7819,7 +7829,7 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
 
   // Advance view with a valid timeout certificate at round0.
   for (std::size_t i = 0; i < quorum0; ++i) {
-    ASSERT_TRUE(target->inject_timeout_vote_for_test(make_test_timeout_vote(keys, target_height, round0, committee0[i])));
+    ASSERT_TRUE(target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, target_height, round0, committee0[i])));
   }
   ASSERT_TRUE(wait_for([&]() { return target->status().round >= round1; }, std::chrono::seconds(5)));
   const std::uint32_t effective_round = std::max<std::uint32_t>(round1, target->status().round);
@@ -7827,9 +7837,9 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
   auto proposal_round1 = build_cluster_frontier_proposal_from_records(
       cluster, keys, {tx.serialize()}, target_height, effective_round, "/tmp/finalis_it_fork_choice_round1_builder");
   ASSERT_TRUE(proposal_round1.has_value());
-  auto tc0 = make_test_timeout_certificate(keys, committee0, target_height, round0, quorum0);
+  auto tc0 = make_test_timeout_certificate(nodes[0]->consensus_domain_for_test(), keys, committee0, target_height, round0, quorum0);
   ASSERT_TRUE(tc0.signatures.size() >= quorum0);
-  auto repropose_msg = make_test_frontier_propose_msg(*proposal_round1);
+  auto repropose_msg = make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal_round1);
   repropose_msg.justify_tc = tc0;
   ASSERT_EQ(target->inject_network_propose_result_for_test(repropose_msg), std::string("accepted"));
 
@@ -7839,7 +7849,7 @@ TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
   for (const auto& pub : committee1) {
     if (pub == target->local_validator_pubkey_for_test()) continue;
     (void)target->inject_vote_for_test(
-        make_test_vote(keys, target_height, effective_round, frontier_proposal_id(*proposal_round1), pub));
+        make_test_vote(nodes[0]->consensus_domain_for_test(), keys, target_height, effective_round, frontier_proposal_id(*proposal_round1), pub));
     ++high_view_votes;
     if (high_view_votes >= quorum1) break;
   }
@@ -7870,7 +7880,7 @@ TEST(test_equivocation_evidence_changes_fork_choice_deterministically) {
 
   // Inject an accepted proposal everywhere first so vote processing is anchored to a known candidate.
   for (auto& n : nodes) {
-    ASSERT_EQ(n->inject_network_propose_result_for_test(make_test_frontier_propose_msg(*proposal)), std::string("accepted"));
+    ASSERT_EQ(n->inject_network_propose_result_for_test(make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal)), std::string("accepted"));
   }
 
   const auto committee = nodes[0]->committee_for_height_round_for_test(target_height, target_round);
@@ -7878,10 +7888,10 @@ TEST(test_equivocation_evidence_changes_fork_choice_deterministically) {
   ASSERT_TRUE(quorum > 0);
 
   // Validator[0] equivocates: first vote accepted, conflicting vote rejected on all nodes.
-  Vote equiv_a = make_test_vote(keys, target_height, target_round, canonical_transition_id, keys[0].public_key);
+  Vote equiv_a = make_test_vote(nodes[0]->consensus_domain_for_test(), keys, target_height, target_round, canonical_transition_id, keys[0].public_key);
   Vote equiv_b = equiv_a;
   equiv_b.block_id.fill(0xEE);
-  auto equiv_b_sig = crypto::ed25519_sign(vote_signing_message(equiv_b.height, equiv_b.round, equiv_b.block_id),
+  auto equiv_b_sig = crypto::ed25519_sign(vote_signing_message(nodes[0]->consensus_domain_for_test(), equiv_b.height, equiv_b.round, equiv_b.block_id),
                                           keys[0].private_key);
   ASSERT_TRUE(equiv_b_sig.has_value());
   equiv_b.signature = *equiv_b_sig;
@@ -7894,7 +7904,7 @@ TEST(test_equivocation_evidence_changes_fork_choice_deterministically) {
   std::size_t votes_added = 1;  // equiv_a above
   for (const auto& pub : committee) {
     if (pub == keys[0].public_key) continue;
-    const auto vote = make_test_vote(keys, target_height, target_round, canonical_transition_id, pub);
+    const auto vote = make_test_vote(nodes[0]->consensus_domain_for_test(), keys, target_height, target_round, canonical_transition_id, pub);
     for (auto& n : nodes) {
       // Nodes also gossip their own votes for the injected proposal, so one may finalize first.
       const auto res = n->inject_network_vote_diagnostic_for_test(vote);
@@ -7971,23 +7981,23 @@ TEST(test_pol_must_be_a_valid_lower_round_polka_for_the_proposal) {
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
 
   // Polka for A attached to B: mismatch.
-  const auto polka_a = make_test_polka(f->keys, f->committee, f->height, 0, a_id, f->quorum);
+  const auto polka_a = make_test_polka(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, a_id, f->quorum);
   ASSERT_EQ(target.inject_network_propose_result_for_test(
-                make_test_frontier_propose_msg(*f->b0, polka_a, std::nullopt, 1, *leader1)),
+                make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b0, polka_a, std::nullopt, 1, *leader1)),
             std::string("hard-reject"));
   // Precommit signatures presented as a polka (forged pol).
-  auto forged = make_test_qc(f->keys, f->committee, f->height, 0, a_id, f->quorum);
+  auto forged = make_test_qc(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, a_id, f->quorum);
   ASSERT_EQ(target.inject_network_propose_result_for_test(
-                make_test_frontier_propose_msg(*f->a0, forged, std::nullopt, 1, *leader1)),
+                make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0, forged, std::nullopt, 1, *leader1)),
             std::string("hard-reject"));
   // Below quorum.
-  const auto thin = make_test_polka(f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
+  const auto thin = make_test_polka(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
   ASSERT_EQ(target.inject_network_propose_result_for_test(
-                make_test_frontier_propose_msg(*f->a0, thin, std::nullopt, 1, *leader1)),
+                make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0, thin, std::nullopt, 1, *leader1)),
             std::string("hard-reject"));
   // Pol from the proposal's own round.
-  const auto same_round = make_test_polka(f->keys, f->committee, f->height, 1, frontier_proposal_id(*f->b1), f->quorum);
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, same_round)),
+  const auto same_round = make_test_polka(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 1, frontier_proposal_id(*f->b1), f->quorum);
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b1, same_round)),
             std::string("hard-reject"));
   // Signed by someone other than the round leader.
   PubKey32 not_leader{};
@@ -7995,12 +8005,12 @@ TEST(test_pol_must_be_a_valid_lower_round_polka_for_the_proposal) {
     if (pub != *leader1) not_leader = pub;
   }
   ASSERT_EQ(target.inject_network_propose_result_for_test(
-                make_test_frontier_propose_msg(*f->a0, polka_a, std::nullopt, 1, not_leader)),
+                make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0, polka_a, std::nullopt, 1, not_leader)),
             std::string("hard-reject"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 1, a_id));
   // The well-formed re-proposal is accepted and prevoted.
   ASSERT_EQ(target.inject_network_propose_result_for_test(
-                make_test_frontier_propose_msg(*f->a0, polka_a, std::nullopt, 1, *leader1)),
+                make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0, polka_a, std::nullopt, 1, *leader1)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, a_id));
 }
@@ -8012,19 +8022,19 @@ TEST(test_valid_value_reproposal_finalizes_same_transition_in_later_round) {
   auto& target = f->target();
   const auto a_id = frontier_proposal_id(*f->a0);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 0, a_id));
   // No polka reaches the target in round 0: it neither locks nor precommits.
   ASSERT_TRUE(!target.local_vote_lock_for_test(f->height).has_value());
 
-  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  const auto tc0 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
   const auto leader1 = target.proposer_for_height_round_for_test(f->height, 1);
   ASSERT_TRUE(leader1.has_value());
-  const auto polka0 = make_test_polka(f->keys, f->committee, f->height, 0, a_id, f->quorum);
+  const auto polka0 = make_test_polka(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, a_id, f->quorum);
   ASSERT_EQ(target.inject_network_propose_result_for_test(
-                make_test_frontier_propose_msg(*f->a0, polka0, tc0, 1, *leader1)),
+                make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0, polka0, tc0, 1, *leader1)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, a_id));
   ASSERT_EQ(target.valid_polka_for_height_for_test(f->height)->round, 0u);
@@ -8042,7 +8052,7 @@ TEST(test_valid_value_reproposal_finalizes_same_transition_in_later_round) {
   for (const auto& pub : f->committee) {
     if (injected + 1 == f->quorum) break;
     if (pub == target.local_validator_pubkey_for_test()) continue;
-    (void)target.inject_vote_for_test(make_test_vote(f->keys, f->height, 1, a_id, pub));
+    (void)target.inject_vote_for_test(make_test_vote(f->target().consensus_domain_for_test(), f->keys, f->height, 1, a_id, pub));
     ++injected;
   }
   ASSERT_TRUE(wait_for([&]() { return target.status().height == f->height; }, std::chrono::seconds(5)));
@@ -8057,15 +8067,15 @@ TEST(test_newer_polka_moves_the_lock) {
   const auto a_id = frontier_proposal_id(*f->a0);
   const auto b1_id = frontier_proposal_id(*f->b1);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
   ASSERT_TRUE(target.local_vote_lock_for_test(f->height)->first == a_id);
 
   // Round 1: fresh B with only a TC; locked on A, so no prevote.
-  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  const auto tc0 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, std::nullopt, tc0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b1, std::nullopt, tc0)),
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 1, b1_id));
   // The others prevote B at round 1: a polka the target sees moves its lock and valid value.
@@ -8077,13 +8087,13 @@ TEST(test_newer_polka_moves_the_lock) {
   ASSERT_TRUE(target.valid_polka_for_height_for_test(f->height)->frontier_transition_id == b1_id);
 
   // Round 2: re-proposing A with its older round-0 polka cannot move the lock back.
-  const auto tc1 = make_test_timeout_certificate(f->keys, f->committee, f->height, 1, f->quorum);
+  const auto tc1 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 1, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 2));
   const auto leader2 = target.proposer_for_height_round_for_test(f->height, 2);
   ASSERT_TRUE(leader2.has_value());
-  const auto polka_a0 = make_test_polka(f->keys, f->committee, f->height, 0, a_id, f->quorum);
+  const auto polka_a0 = make_test_polka(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, a_id, f->quorum);
   ASSERT_EQ(target.inject_network_propose_result_for_test(
-                make_test_frontier_propose_msg(*f->a0, polka_a0, tc1, 2, *leader2)),
+                make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0, polka_a0, tc1, 2, *leader2)),
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 2, a_id));
   ASSERT_TRUE(target.local_vote_lock_for_test(f->height)->first == b1_id);
@@ -8096,7 +8106,7 @@ TEST(test_late_polka_after_timeout_records_valid_value_without_precommit) {
   auto& target = f->target();
   const auto a_id = frontier_proposal_id(*f->a0);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   // The round-0 polka completes only after the target timed out of round 0.
   target.mark_local_round_timed_out_for_test(f->height, 0);
@@ -8114,7 +8124,7 @@ void inject_test_precommits(node::Node& target, const std::vector<crypto::KeyPai
   for (const auto& pub : committee) {
     if (injected == count) break;
     if (pub == target.local_validator_pubkey_for_test()) continue;
-    (void)target.inject_vote_for_test(make_test_vote(keys, height, round, transition_id, pub));
+    (void)target.inject_vote_for_test(make_test_vote(target.consensus_domain_for_test(), keys, height, round, transition_id, pub));
     ++injected;
   }
   if (injected != count) throw std::runtime_error("not enough precommitters");
@@ -8128,7 +8138,7 @@ TEST(test_polka_before_body_locks_and_precommits_when_body_arrives) {
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum);
   ASSERT_TRUE(!target.local_vote_lock_for_test(f->height).has_value());
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   ASSERT_TRUE(target.valid_polka_for_height_for_test(f->height).has_value());
   const auto lock = target.local_vote_lock_for_test(f->height);
@@ -8145,7 +8155,7 @@ TEST(test_split_prevotes_then_fresh_proposal_finalizes) {
   const auto b0_id = frontier_proposal_id(*f->b0);
   const auto b1_id = frontier_proposal_id(*f->b1);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 0, a_id));
   // Others split: one prevotes A, the rest B0. Neither side reaches quorum with the target's prevote.
@@ -8153,18 +8163,18 @@ TEST(test_split_prevotes_then_fresh_proposal_finalizes) {
   for (const auto& pub : f->committee) {
     if (pub != target.local_validator_pubkey_for_test()) others.push_back(pub);
   }
-  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, a_id, others[0])),
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->target().consensus_domain_for_test(), f->keys, f->height, 0, a_id, others[0])),
             std::string("accepted"));
   for (std::size_t i = 1; i < others.size(); ++i) {
-    ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, b0_id, others[i])),
+    ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->target().consensus_domain_for_test(), f->keys, f->height, 0, b0_id, others[i])),
               std::string("accepted"));
   }
   ASSERT_TRUE(!target.valid_polka_for_height_for_test(f->height).has_value());
   ASSERT_TRUE(!target.local_vote_lock_for_test(f->height).has_value());
 
-  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  const auto tc0 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, std::nullopt, tc0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b1, std::nullopt, tc0)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, b1_id));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
@@ -8183,14 +8193,14 @@ TEST(test_locked_node_refuses_conflict_and_late_round0_finality_completes) {
   const auto a_id = frontier_proposal_id(*f->a0);
   const auto b1_id = frontier_proposal_id(*f->b1);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
   ASSERT_TRUE(target.local_vote_lock_for_test(f->height)->first == a_id);
 
-  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  const auto tc0 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, std::nullopt, tc0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b1, std::nullopt, tc0)),
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 1, b1_id));
   const std::size_t f_faults = f->committee.size() - f->quorum;  // n - Q = f
@@ -8210,7 +8220,7 @@ TEST(test_restart_between_prevote_and_precommit) {
   const auto a_id = frontier_proposal_id(*f->a0);
   const auto b0_id = frontier_proposal_id(*f->b0);
   ASSERT_TRUE(advance_test_frontier_round(f->target(), f->height, 0));
-  ASSERT_EQ(f->target().inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(f->target().inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   ASSERT_TRUE(f->target().local_prevote_recorded_for_test(f->height, 0, a_id));
 
@@ -8228,10 +8238,10 @@ TEST(test_restart_between_prevote_and_precommit) {
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 0, a_id));
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
 
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b0)),
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 0, b0_id));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
   ASSERT_TRUE(target.local_vote_lock_for_test(f->height)->first == a_id);
@@ -8250,12 +8260,12 @@ TEST(test_no_vote_below_highest_voted_round_after_round_reset) {
   const auto b0_id = frontier_proposal_id(*f->b0);
   const auto b1_id = frontier_proposal_id(*f->b1);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 0, a_id));
-  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  const auto tc0 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, std::nullopt, tc0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b1, std::nullopt, tc0)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, b1_id));
 
@@ -8265,7 +8275,7 @@ TEST(test_no_vote_below_highest_voted_round_after_round_reset) {
   ASSERT_TRUE(!target.local_vote_recorded_for_test(f->height, 0, a_id));
   ASSERT_TRUE(!target.local_vote_lock_for_test(f->height).has_value());
   // Round 0 stays closed to new prevotes; voting resumes once the node is back at round 1.
-  (void)target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b0));
+  (void)target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b0));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(f->height, 0, b0_id));
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 1, b1_id, f->quorum - 1);
@@ -8492,7 +8502,8 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
       if (member == joiner_kp.public_key) private_key = &joiner_kp.private_key;
       if (!private_key) continue;
       auto sig =
-          crypto::ed25519_sign(vote_signing_message(proposal->transition.height, proposal->transition.round,
+          crypto::ed25519_sign(vote_signing_message(n0.consensus_domain_for_test(), proposal->transition.height,
+                                                    proposal->transition.round,
                                                     frontier_proposal_id(*proposal)),
                                *private_key);
       ASSERT_TRUE(sig.has_value());
@@ -8728,12 +8739,12 @@ TEST(test_synced_follower_finalizes_from_propose_and_vote_without_block_redelive
   auto proposal = build_cluster_frontier_proposal_from_records(
       cluster, keys, {tx.serialize()}, next_height, round, "/tmp/finalis_it_propose_vote_finalize_builder");
   ASSERT_TRUE(proposal.has_value());
-  ASSERT_TRUE(follower.inject_propose_msg_for_test(make_test_frontier_propose_msg(*proposal)));
+  ASSERT_TRUE(follower.inject_propose_msg_for_test(make_test_frontier_propose_msg(nodes[0]->consensus_domain_for_test(), *proposal)));
 
   Vote vote =
-      make_test_vote(keys, next_height, round, frontier_proposal_id(*proposal), keys[static_cast<std::size_t>(proposer_id)].public_key);
+      make_test_vote(nodes[0]->consensus_domain_for_test(), keys, next_height, round, frontier_proposal_id(*proposal), keys[static_cast<std::size_t>(proposer_id)].public_key);
   Vote local_vote =
-      make_test_vote(keys, next_height, round, frontier_proposal_id(*proposal), keys[static_cast<std::size_t>(follower_id)].public_key);
+      make_test_vote(nodes[0]->consensus_domain_for_test(), keys, next_height, round, frontier_proposal_id(*proposal), keys[static_cast<std::size_t>(follower_id)].public_key);
   ASSERT_TRUE(follower.inject_vote_for_test(local_vote));
   ASSERT_TRUE(follower.inject_vote_for_test(vote));
   ASSERT_TRUE(wait_for([&]() {
@@ -8758,7 +8769,7 @@ TEST(test_redelivered_finalized_block_is_ignored) {
 
   const auto committee = nodes[0]->committee_for_height_round_for_test(next_height, round);
   const auto quorum = consensus::quorum_threshold(committee.size());
-  auto qc = make_test_frontier_qc(keys, committee, *proposal, quorum);
+  auto qc = make_test_frontier_qc(nodes[0]->consensus_domain_for_test(), keys, committee, *proposal, quorum);
   ASSERT_TRUE(qc.signatures.size() >= quorum);
   FinalityCertificate cert;
   cert.height = next_height;
@@ -10604,7 +10615,7 @@ TEST(test_frontier_mode_validation_accepts_valid_proposal_against_certified_ingr
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
 
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
 }
 
@@ -10622,7 +10633,7 @@ TEST(test_frontier_mode_validation_rejects_bad_ingress_commitment) {
   db.close();
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
 }
 
@@ -10640,7 +10651,7 @@ TEST(test_frontier_mode_validation_rejects_bad_decisions_commitment) {
   db.close();
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
 }
 
@@ -10658,7 +10669,7 @@ TEST(test_frontier_mode_validation_rejects_bad_settlement_commitment) {
   db.close();
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
 }
 
@@ -10676,7 +10687,7 @@ TEST(test_frontier_mode_validation_rejects_bad_next_state_root) {
   db.close();
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
 }
 
@@ -10696,7 +10707,7 @@ TEST(test_frontier_mode_validation_accepts_proposal_without_local_certified_lane
   db.close();
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
 }
 
@@ -10716,7 +10727,7 @@ TEST(test_frontier_mode_validation_accepts_proposal_without_local_ingress_bytes)
   db.close();
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
 }
 
@@ -10742,7 +10753,7 @@ TEST(test_frontier_mode_validation_rejects_non_monotone_vector) {
   db.close();
   node::Node target(cfg);
   ASSERT_TRUE(target.init());
-  const auto msg = make_test_frontier_propose_msg(proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(!target.inject_propose_msg_for_test(msg));
 }
 
@@ -10909,7 +10920,7 @@ TEST(test_frontier_mode_built_proposal_is_accepted_by_existing_validation) {
   auto proposal = build_test_frontier_proposal(target, 1, 0);
   ASSERT_TRUE(proposal.has_value());
 
-  const auto msg = make_test_frontier_propose_msg(*proposal);
+  const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), *proposal);
   ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
 }
 
@@ -11311,7 +11322,7 @@ TEST(test_stalled_height_regossips_old_round_precommits) {
 
   // Round 0: polka, lock and precommit; one other validator's round-0 precommit arrives (2 < quorum).
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0)),
             std::string("accepted"));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 0, a_id, f->quorum - 1);
   ASSERT_TRUE(wait_for_local_precommit(target, f->height, 0, a_id));
@@ -11322,15 +11333,15 @@ TEST(test_stalled_height_regossips_old_round_precommits) {
       break;
     }
   }
-  ASSERT_TRUE(target.inject_vote_for_test(make_test_vote(f->keys, f->height, 0, a_id, other)));
+  ASSERT_TRUE(target.inject_vote_for_test(make_test_vote(f->target().consensus_domain_for_test(), f->keys, f->height, 0, a_id, other)));
 
   // Round 1: the same value is re-proposed with its round-0 polka; the lock moves to round 1.
-  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  const auto tc0 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
   const auto leader1 = target.proposer_for_height_round_for_test(f->height, 1);
   ASSERT_TRUE(leader1.has_value());
-  const auto polka0 = make_test_polka(f->keys, f->committee, f->height, 0, a_id, f->quorum);
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->a0, polka0, tc0, 1, *leader1)),
+  const auto polka0 = make_test_polka(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, a_id, f->quorum);
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->a0, polka0, tc0, 1, *leader1)),
             std::string("accepted"));
   inject_test_prevotes(target, f->keys, f->committee, f->height, 1, a_id, f->quorum - 1);
   ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, a_id));
@@ -11367,19 +11378,19 @@ TEST(test_known_equivocator_votes_still_count_toward_polka) {
 
   // Round 0: the equivocator prevotes two different values; the second is evidence, not a vote.
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 0));
-  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, a_id, equivocator)),
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->target().consensus_domain_for_test(), f->keys, f->height, 0, a_id, equivocator)),
             std::string("accepted"));
-  (void)target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 0, b0_id, equivocator));
+  (void)target.inject_network_prevote_result_for_test(make_test_prevote(f->target().consensus_domain_for_test(), f->keys, f->height, 0, b0_id, equivocator));
 
   // Round 1: own prevote + the honest one + the equivocator's = quorum 3 -> polka.
-  const auto tc0 = make_test_timeout_certificate(f->keys, f->committee, f->height, 0, f->quorum);
+  const auto tc0 = make_test_timeout_certificate(f->target().consensus_domain_for_test(), f->keys, f->committee, f->height, 0, f->quorum);
   ASSERT_TRUE(advance_test_frontier_round(target, f->height, 1));
-  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(*f->b1, std::nullopt, tc0)),
+  ASSERT_EQ(target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(f->target().consensus_domain_for_test(), *f->b1, std::nullopt, tc0)),
             std::string("accepted"));
   ASSERT_TRUE(target.local_prevote_recorded_for_test(f->height, 1, b1_id));
-  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 1, b1_id, honest)),
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->target().consensus_domain_for_test(), f->keys, f->height, 1, b1_id, honest)),
             std::string("accepted"));
-  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->keys, f->height, 1, b1_id, equivocator)),
+  ASSERT_EQ(target.inject_network_prevote_result_for_test(make_test_prevote(f->target().consensus_domain_for_test(), f->keys, f->height, 1, b1_id, equivocator)),
             std::string("accepted"));
   const auto polka = target.valid_polka_for_height_for_test(f->height);
   ASSERT_TRUE(polka.has_value());

@@ -64,7 +64,7 @@ export class FinalisWallet {
 
   // Not available against the current lightserver: there is no header RPC that
   // binds a utxo_root to a finality certificate, and validators sign
-  // vote_signing_message(height, round, transition_id), not a raw block hash.
+  // vote_signing_message(chain_domain, height, round, transition_id), not a raw block hash.
   // Fails closed rather than returning an unverified balance.
   async getBalanceTrustless(_address: string): Promise<bigint> {
     throw new Error('TRUSTLESS_NOT_SUPPORTED');

@@ -77,7 +77,9 @@ A proposal (`PROPOSE`) consists of:
 - optional `pol`: a polka for the proposed transition at `pol.round < round`
 - optional `justify_tc`
 - `proposer_signature` by the leader of `(height, round)` over
-  `sha256d("SC-PROPOSE-V1" || height || round || id || pol_round)`
+  `sha256d("SC-PROPOSE-V1" || D || height || round || id || pol_round)`, where
+  `D = sha256d("SC-CHAIN-DOMAIN-V1" || network_id || genesis_hash)` binds every consensus
+  signature (propose, prevote, precommit, timeout) to this chain
 
 Two shapes are valid:
 
@@ -90,7 +92,8 @@ The node accepts a proposal only if:
 - `height == finalized_height + 1` and `round >= current_round`
 - `prev_finalized_hash` matches the current finalized tip hash
 - the proposer signature is valid for the leader of `(height, round)`
-- the transition validates against canonical state (its own leader and round)
+- the transition validates against canonical state (its own leader and round), including the
+  leader's VRF proof over `(parent randomness, height)`
 - `round > 0` carries a `pol` or a TC (except the singleton fallback)
 - a `pol`, if present, verifies as a polka for exactly this transition
 
@@ -106,7 +109,7 @@ Important boundary:
 ## Prevote
 
 `PREVOTE` carries `(height, round, id)` signed over
-`sha256d("SC-PREVOTE-V1" || height || round || id)`.
+`sha256d("SC-PREVOTE-V1" || D || height || round || id)`.
 
 A validator prevotes once per round, for the round's proposal, only if:
 
@@ -125,8 +128,8 @@ the certified records, any finalized slice can be fetched from at least
 
 ## Precommit
 
-The precommit is the existing `VOTE` over `(height, round, id)` (domain
-`SC-VOTE-V1`). On a polka for `(H, r, id)` with the proposal known:
+The precommit is the existing `VOTE` over `(height, round, id)`, signed as
+`sha256d("SC-VOTE-V1" || D || height || round || id)`. On a polka for `(H, r, id)` with the proposal known:
 
 - any round: the polka becomes the **valid value** if `r` is the highest polka
   round seen at `H`; its proposal is persisted
@@ -248,7 +251,7 @@ That unified path:
 - canonicalizes signatures
 - persists the finalized frontier transition and the height-indexed finality
   certificate
-- updates finalized tip and randomness
+- updates finalized tip and randomness (from the leader's verified VRF output only)
 - applies deterministic state transition
 - updates validator and availability state
 - rebuilds the next epoch checkpoint when the epoch boundary is crossed

@@ -131,7 +131,7 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
   - `FinalisWallet.getBalanceTrustless` depended on `getHeaderRange`, so it was broken at runtime.
     It now **fails closed** with `TRUSTLESS_NOT_SUPPORTED`. It could not simply be pointed at a renamed method:
     - The SDK's `verifyFinalityProof` checks Ed25519 signatures over a raw 32-byte block hash.
-      Validators sign `vote_signing_message(height, round, transition_id)` (`src/utxo/validate.hpp:79`).
+      Validators sign `vote_signing_message(chain_domain, height, round, transition_id)` (`src/utxo/validate.hpp`).
     - `get_finality_certificate` returns no `utxo_root`, and `get_roots` is not bound to the signed transition.
   - `test/lightserver-e2e-tamper.test.ts` was rewritten to assert the fail-closed behavior. SMT and finality
     tamper cases remain covered by `smt-proof.test.ts` and `finality-proof.test.ts`. README method list updated.

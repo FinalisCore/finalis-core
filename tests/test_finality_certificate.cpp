@@ -72,8 +72,12 @@ std::string build_finality_vectors_json() {
   const Hash32 t2 = tag_hash("finality-vector-transition-2");
   const std::uint64_t h1 = 12345;
   const std::uint64_t h_big = (1ULL << 53) + 11;  // beyond JS Number.MAX_SAFE_INTEGER
-  const Bytes m1 = vote_signing_message(h1, 2, t1);
-  const Bytes m_big = vote_signing_message(h_big, 0, t2);
+  // Stands in for consensus_chain_domain(network, chain_id); the SDK takes it as an input.
+  const Hash32 domain = tag_hash("finality-vector-chain-domain");
+  const Hash32 other_domain = tag_hash("finality-vector-other-chain-domain");
+  const Bytes m1 = vote_signing_message(domain, h1, 2, t1);
+  const Bytes m_big = vote_signing_message(domain, h_big, 0, t2);
+  const Bytes m_other_chain = vote_signing_message(other_domain, h1, 2, t1);
   const Bytes raw_t1(t1.begin(), t1.end());
   const std::vector<Case> cases{
       {"quorum_3_of_4", h1, 2, t1, {{0, m1}, {1, m1}, {2, m1}}},
@@ -85,17 +89,32 @@ std::string build_finality_vectors_json() {
       {"duplicate_signer", h1, 2, t1, {{0, m1}, {0, m1}, {1, m1}}},
       {"non_committee_signer", h1, 2, t1, {{0, m1}, {1, m1}, {4, m1}}},
       {"height_above_2_pow_53", h_big, 0, t2, {{0, m_big}, {1, m_big}, {2, m_big}}},
+      {"signed_for_another_chain", h1, 2, t1, {{0, m_other_chain}, {1, m_other_chain}, {2, m_other_chain}}},
   };
 
   std::ostringstream oss;
-  oss << "{\n  \"message_format\": \"sha256d('SC-VOTE-V1' || u64le(height) || u32le(round) || transition_hash)\",\n";
+  oss << "{\n  \"message_format\": \"sha256d('SC-VOTE-V1' || chain_domain || u64le(height) || u32le(round) || "
+         "transition_hash)\",\n";
+  oss << "  \"chain_domain\": \"" << hex_encode(Bytes(domain.begin(), domain.end())) << "\",\n";
+  {
+    // consensus_chain_domain worked example, so the SDK's derivation is pinned too.
+    NetworkConfig net = mainnet_network();
+    for (std::size_t i = 0; i < net.network_id.size(); ++i) net.network_id[i] = static_cast<std::uint8_t>(i);
+    ChainId chain_id;
+    chain_id.genesis_hash_hex = hex_encode32(tag_hash("finality-vector-genesis"));
+    const Hash32 example = consensus_chain_domain(net, chain_id);
+    oss << "  \"chain_domain_example\": {\"network_id\": \""
+        << hex_encode(Bytes(net.network_id.begin(), net.network_id.end())) << "\", \"genesis_hash\": \""
+        << chain_id.genesis_hash_hex << "\", \"chain_domain\": \"" << hex_encode(Bytes(example.begin(), example.end()))
+        << "\"},\n";
+  }
   oss << "  \"committee\": [";
   for (std::size_t i = 0; i < committee_idx.size(); ++i) oss << (i ? ", " : "") << "\"" << pub_hex(committee_idx[i]) << "\"";
   oss << "],\n  \"cases\": [\n";
   const auto quorum = consensus::quorum_threshold(committee_idx.size());
   for (std::size_t c = 0; c < cases.size(); ++c) {
     const auto& tc = cases[c];
-    const Bytes expected_msg = vote_signing_message(tc.height, tc.round, tc.transition);
+    const Bytes expected_msg = vote_signing_message(domain, tc.height, tc.round, tc.transition);
     std::set<std::size_t> valid_signers;
     oss << "    {\"name\": \"" << tc.name << "\", \"height\": \"" << tc.height << "\", \"round\": " << tc.round
         << ", \"transition_hash\": \"" << hex_encode(Bytes(tc.transition.begin(), tc.transition.end()))

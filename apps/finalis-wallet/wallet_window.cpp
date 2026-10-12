@@ -5360,16 +5360,21 @@ void WalletWindow::submit_send() {
                           .arg(elide_middle(QString::fromStdString(wallet_->address)));
       }
     }
-    crypto::ConfidentialOutputSecrets secrets{
-        .amount = *amount_units,
-        .value_blind = crypto::Blind32{random_hash32()},
-    };
-    Hash32 rangeproof_nonce = random_hash32();
-    crypto::ScopedWipe<Hash32, Hash32> wipe_secrets(secrets.value_blind.bytes, rangeproof_nonce);
     auto recipient = parsed_recipient->recipient;
+    Hash32 blind_seed = random_hash32();
+    Hash32 rangeproof_nonce = random_hash32();
+    crypto::ConfidentialOutputSecrets secrets{.amount = *amount_units};
+    crypto::ScopedWipe<Hash32, Hash32, Hash32> wipe_secrets(blind_seed, secrets.value_blind.bytes, rangeproof_nonce);
+    if (auto blind = finalis::wallet::derive_output_value_blind(blind_seed, recipient.one_time_pubkey)) {
+      secrets.value_blind = *blind;
+      crypto::secure_wipe(blind->bytes);
+    } else {
+      QMessageBox::warning(this, "Send", "Failed to derive confidential output blind.");
+      return;
+    }
     if (parsed_recipient->memo_key.has_value()) {
       auto recovery_memo =
-          encrypt_confidential_recovery_memo(*amount_units, secrets.value_blind, *parsed_recipient->memo_key,
+          encrypt_confidential_recovery_memo(*amount_units, blind_seed, *parsed_recipient->memo_key,
                                              recipient.one_time_pubkey, recipient.ephemeral_pubkey);
       if (!recovery_memo) {
         QMessageBox::warning(this, "Send", "Failed to encrypt confidential recovery memo.");

@@ -263,6 +263,11 @@ bool Node::has_utxo_for_test(const OutPoint& op, TxOut* out) const {
   return true;
 }
 
+const Hash32& Node::consensus_domain_for_test() const {
+  if (consensus_domain_ == Hash32{}) throw std::logic_error("consensus domain read before init");
+  return consensus_domain_;
+}
+
 std::string Node::proposer_path_for_next_height_for_test() const {
   return "finalized-checkpoint-proposer-schedule";
 }

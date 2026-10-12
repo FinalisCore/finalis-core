@@ -220,6 +220,22 @@ Properties:
 Consensus sees only the output fields; the derivation is a wallet convention and can change without
 a protocol change. Known-answer vectors are pinned in `tests/test_wallet_confidential_keys.cpp`.
 
+**Output blinds and the recovery memo.** Value blinds are derived, never sampled directly. The
+sender draws a fresh 32-byte `blind_seed` per output and uses
+
+```text
+blind = hash_to_scalar("FINALIS/conf-output/blind/v1", blind_seed || one_time_pubkey)
+```
+
+The recovery memo (version 2, `nonce[12] || AES-256-GCM(le32 version || le64 amount ||
+blind_seed) || tag[16]`, AAD `one_time_pubkey || ephemeral_pubkey`) carries the seed; the
+receiver re-derives the blind and imports the coin only if `(amount, blind)` opens
+`value_commitment`, because the memo is written by the sender. Since every blind is a hash output,
+`(blind_seed, amount)` is a switch-binding opening: someone who can take discrete logs must still
+find a hash preimage to open a commitment to a second amount. A future post-quantum spend rule can
+require this opening without expiring coins. The seed stays recoverable from the chain with the
+memo key.
+
 ### 3.3 What is hidden
 
 Confidential outputs hide their amount (Pedersen commitment; the canonical range

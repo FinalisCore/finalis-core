@@ -21,6 +21,7 @@
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/vrf.hpp"
 #include "crypto/smt.hpp"
 #include "common/merkle.hpp"
 #include "utxo/validate.hpp"
@@ -205,7 +206,8 @@ bool verify_frontier_finality_certificate_against_state(const CanonicalDerivatio
     return false;
   }
   const std::size_t quorum = quorum_threshold(effective_committee.size());
-  const auto msg = vote_signing_message(cert.height, cert.round, cert.frontier_transition_id);
+  const auto msg = vote_signing_message(consensus_chain_domain(cfg.network, cfg.chain_id), cert.height, cert.round,
+                                        cert.frontier_transition_id);
   std::set<PubKey32> seen;
   std::vector<FinalitySig> valid;
   for (const auto& sig : cert.signatures) {
@@ -941,7 +943,8 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
     return true;
   }
   std::set<PubKey32> committee_set(parent.committee.begin(), parent.committee.end());
-  const auto msg = vote_signing_message(parent.height, parent.round, parent.transition_id);
+  const auto msg = vote_signing_message(consensus_chain_domain(cfg.network, cfg.chain_id), parent.height, parent.round,
+                                        parent.transition_id);
   for (const auto& sig : sorted) {
     if (committee_set.find(sig.validator_pubkey) == committee_set.end()) {
       if (error) *error = "frontier-prev-signer-non-committee";
@@ -1366,6 +1369,12 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
       has_lane_records = true;
       break;
     }
+  }
+  // The leader's only say in finalized randomness is its VRF output for (parent randomness, height).
+  if (!crypto::vrf_verify(record.transition.leader_pubkey, record.transition.leader_vrf_proof,
+                          leader_vrf_alpha(prev.finalized_randomness, record.transition.height))) {
+    if (error) *error = "frontier-leader-vrf-invalid";
+    return false;
   }
   if (!has_lane_records) {
     if (record.ordered_records.size() !=

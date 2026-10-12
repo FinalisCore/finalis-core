@@ -4,6 +4,7 @@
 
 #include "apps/finalis-wallet/confidential_memo.hpp"
 #include "apps/finalis-wallet/confidential_receive.hpp"
+#include "crypto/confidential.hpp"
 #include "wallet/confidential_keys.hpp"
 
 using namespace finalis;
@@ -45,12 +46,19 @@ struct Request {
   }
 
   // A payment to this request: what a sender's wallet builds from the request URI.
-  TxOutV2 payment(std::uint64_t amount, std::uint8_t blind_seed) const {
-    crypto::Blind32 blind{};
-    blind.bytes.fill(blind_seed);
-    auto memo = wallet::encrypt_confidential_recovery_memo(amount, blind, memo_key, one_time, ephemeral);
+  TxOutV2 payment(std::uint64_t amount, std::uint8_t blind_seed) const { return payment(amount, amount, blind_seed); }
+
+  // `memo_amount` is what the memo claims; `committed_amount` is what the output commits to.
+  TxOutV2 payment(std::uint64_t committed_amount, std::uint64_t memo_amount, std::uint8_t seed_byte) const {
+    const Hash32 seed = filled(seed_byte);
+    const auto blind = wallet::derive_output_value_blind(seed, one_time);
+    ASSERT_TRUE(blind.has_value());
+    auto memo = wallet::encrypt_confidential_recovery_memo(memo_amount, seed, memo_key, one_time, ephemeral);
     ASSERT_TRUE(memo.has_value());
+    const auto commitment = crypto::confidential_amount_commitment(committed_amount, *blind);
+    ASSERT_TRUE(commitment.has_value());
     ConfidentialTxOutV2 out;
+    out.value_commitment = *commitment;
     out.one_time_pubkey = one_time;
     out.ephemeral_pubkey = ephemeral;
     out.scan_tag = crypto::ScanTag{scan_tag};
@@ -145,6 +153,21 @@ TEST(test_confidential_receive_ignores_foreign_outputs_and_bad_memos) {
   ASSERT_EQ(already, 0u);
 }
 
+// The memo is sender-written. A memo claiming more than the output commits to must not be
+// imported: the wallet would show coins that can never be spent.
+TEST(test_confidential_receive_rejects_memo_that_does_not_open_commitment) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  const Request req;
+  WalletStore::State state;
+  state.confidential_requests.push_back(req.record(false));
+
+  const auto tx = tx_with({req.payment(/*committed_amount=*/1, /*memo_amount=*/1000, 0x61), req.payment(250, 0x62)});
+  const auto matches = wallet::match_received_confidential_outputs(tx, filled(0xE1), state);
+  ASSERT_EQ(matches.size(), 1u);
+  ASSERT_EQ(matches[0].coin.vout, 1u);
+  ASSERT_EQ(matches[0].coin.amount, 250u);
+}
+
 namespace {
 
 WalletStore::ConfidentialAccountRecord derived_account(std::uint32_t next_request_index) {
@@ -160,12 +183,16 @@ WalletStore::ConfidentialAccountRecord derived_account(std::uint32_t next_reques
 TxOutV2 derived_payment(std::uint32_t index, std::uint64_t amount) {
   const auto keys = wallet::derive_confidential_request_keys(filled(0x21), filled(0x22), index);
   ASSERT_TRUE(keys.has_value());
-  crypto::Blind32 blind{};
-  blind.bytes.fill(0x33);
-  auto memo = wallet::encrypt_confidential_recovery_memo(amount, blind, keys->pub.memo_key, keys->pub.one_time_pubkey,
+  const Hash32 seed = filled(0x33);
+  const auto blind = wallet::derive_output_value_blind(seed, keys->pub.one_time_pubkey);
+  ASSERT_TRUE(blind.has_value());
+  auto memo = wallet::encrypt_confidential_recovery_memo(amount, seed, keys->pub.memo_key, keys->pub.one_time_pubkey,
                                                          keys->pub.ephemeral_pubkey);
   ASSERT_TRUE(memo.has_value());
+  const auto commitment = crypto::confidential_amount_commitment(amount, *blind);
+  ASSERT_TRUE(commitment.has_value());
   ConfidentialTxOutV2 out;
+  out.value_commitment = *commitment;
   out.one_time_pubkey = keys->pub.one_time_pubkey;
   out.ephemeral_pubkey = keys->pub.ephemeral_pubkey;
   out.scan_tag = keys->pub.scan_tag;

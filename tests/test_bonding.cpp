@@ -86,6 +86,14 @@ ChainId sample_chain_id(const NetworkConfig& net) {
   };
 }
 
+// Chain identity the slash tests validate under; evidence counts only if signed in its domain.
+const ChainId& slash_test_chain_id() {
+  static const ChainId id = sample_chain_id(mainnet_network());
+  return id;
+}
+
+Hash32 slash_test_domain() { return consensus_chain_domain(mainnet_network(), slash_test_chain_id()); }
+
 SpecialValidationContext join_pow_ctx(const NetworkConfig& net, const ChainId& chain_id, std::uint64_t current_height,
                                       const Hash32& anchor) {
   return SpecialValidationContext{
@@ -751,13 +759,13 @@ TEST(test_slash_evidence_parsing_and_validation) {
   a.round = 2;
   a.block_id.fill(0x11);
   a.validator_pubkey = kp.public_key;
-  auto siga = crypto::ed25519_sign(vote_signing_message(a.height, a.round, a.block_id), kp.private_key);
+  auto siga = crypto::ed25519_sign(vote_signing_message(slash_test_domain(), a.height, a.round, a.block_id), kp.private_key);
   ASSERT_TRUE(siga.has_value());
   a.signature = *siga;
 
   Vote b = a;
   b.block_id.fill(0x22);
-  auto sigb = crypto::ed25519_sign(vote_signing_message(b.height, b.round, b.block_id), kp.private_key);
+  auto sigb = crypto::ed25519_sign(vote_signing_message(slash_test_domain(), b.height, b.round, b.block_id), kp.private_key);
   ASSERT_TRUE(sigb.has_value());
   b.signature = *sigb;
 
@@ -772,6 +780,8 @@ TEST(test_slash_evidence_parsing_and_validation) {
   vr.register_bond(kp.public_key, bond_op, 10);
   vr.advance_height(200);
   SpecialValidationContext ctx{
+      .network = &mainnet_network(),
+      .chain_id = &slash_test_chain_id(),
       .validators = &vr,
       .current_height = 200,
       .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
@@ -779,6 +789,60 @@ TEST(test_slash_evidence_parsing_and_validation) {
 
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
+}
+
+// A key reused on another network signs there under that network's chain domain. Two such votes are
+// not equivocation evidence here, and here-domain evidence needs the chain identity to check.
+TEST(test_slash_evidence_from_another_chain_is_rejected) {
+  const auto kp = key_from_byte(17);
+  OutPoint bond_op{};
+  bond_op.txid.fill(0xC4);
+  bond_op.index = 0;
+  UtxoSet view;
+  view[bond_op] = UtxoEntry{TxOut{BOND_AMOUNT, reg_script(kp.public_key)}};
+
+  ChainId other = slash_test_chain_id();
+  other.genesis_hash_hex = "2222222222222222222222222222222222222222222222222222222222222222";
+  const Hash32 other_domain = consensus_chain_domain(mainnet_network(), other);
+  ASSERT_TRUE(other_domain != slash_test_domain());
+  ASSERT_TRUE(consensus_chain_domain(testnet_network(), slash_test_chain_id()) != slash_test_domain());
+
+  auto signed_vote = [&](const Hash32& domain, std::uint8_t id_byte) {
+    Vote v;
+    v.height = 500;
+    v.round = 1;
+    v.block_id.fill(id_byte);
+    v.validator_pubkey = kp.public_key;
+    v.signature = *crypto::ed25519_sign(vote_signing_message(domain, v.height, v.round, v.block_id), kp.private_key);
+    return v;
+  };
+
+  consensus::ValidatorRegistry vr;
+  vr.register_bond(kp.public_key, bond_op, 10);
+  vr.advance_height(600);
+  SpecialValidationContext ctx{
+      .network = &mainnet_network(),
+      .chain_id = &slash_test_chain_id(),
+      .validators = &vr,
+      .current_height = 600,
+      .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
+  };
+
+  auto foreign = build_slash_tx(bond_op, BOND_AMOUNT, signed_vote(other_domain, 0x51), signed_vote(other_domain, 0x52), 0);
+  ASSERT_TRUE(foreign.has_value());
+  ASSERT_TRUE(!validate_tx(*foreign, 1, view, &ctx).ok);
+  auto mixed = build_slash_tx(bond_op, BOND_AMOUNT, signed_vote(slash_test_domain(), 0x51),
+                              signed_vote(other_domain, 0x52), 0);
+  ASSERT_TRUE(mixed.has_value());
+  ASSERT_TRUE(!validate_tx(*mixed, 1, view, &ctx).ok);
+
+  auto local = build_slash_tx(bond_op, BOND_AMOUNT, signed_vote(slash_test_domain(), 0x51),
+                              signed_vote(slash_test_domain(), 0x52), 0);
+  ASSERT_TRUE(local.has_value());
+  ASSERT_TRUE(validate_tx(*local, 1, view, &ctx).ok);
+  SpecialValidationContext no_identity = ctx;
+  no_identity.chain_id = nullptr;
+  ASSERT_TRUE(!validate_tx(*local, 1, view, &no_identity).ok);
 }
 
 // Prevote equivocation is slashable with prevote-domain evidence; the declared kind must match the
@@ -794,8 +858,8 @@ TEST(test_prevote_slash_evidence_validation) {
 
   auto signed_pair = [&](bool prevote) {
     auto sign = [&](const Vote& v) {
-      const auto msg = prevote ? prevote_signing_message(v.height, v.round, v.block_id)
-                               : vote_signing_message(v.height, v.round, v.block_id);
+      const auto msg = prevote ? prevote_signing_message(slash_test_domain(), v.height, v.round, v.block_id)
+                               : vote_signing_message(slash_test_domain(), v.height, v.round, v.block_id);
       return *crypto::ed25519_sign(msg, kp.private_key);
     };
     Vote a;
@@ -814,6 +878,8 @@ TEST(test_prevote_slash_evidence_validation) {
   vr.register_bond(kp.public_key, bond_op, 10);
   vr.advance_height(400);
   SpecialValidationContext ctx{
+      .network = &mainnet_network(),
+      .chain_id = &slash_test_chain_id(),
       .validators = &vr,
       .current_height = 400,
       .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
@@ -856,13 +922,13 @@ TEST(test_scvalunb_slash_evidence_validation) {
   a.round = 1;
   a.block_id.fill(0x31);
   a.validator_pubkey = kp.public_key;
-  auto siga = crypto::ed25519_sign(vote_signing_message(a.height, a.round, a.block_id), kp.private_key);
+  auto siga = crypto::ed25519_sign(vote_signing_message(slash_test_domain(), a.height, a.round, a.block_id), kp.private_key);
   ASSERT_TRUE(siga.has_value());
   a.signature = *siga;
 
   Vote b = a;
   b.block_id.fill(0x32);
-  auto sigb = crypto::ed25519_sign(vote_signing_message(b.height, b.round, b.block_id), kp.private_key);
+  auto sigb = crypto::ed25519_sign(vote_signing_message(slash_test_domain(), b.height, b.round, b.block_id), kp.private_key);
   ASSERT_TRUE(sigb.has_value());
   b.signature = *sigb;
 
@@ -878,6 +944,8 @@ TEST(test_scvalunb_slash_evidence_validation) {
   ASSERT_TRUE(vr.request_unbond(kp.public_key, 50));
 
   SpecialValidationContext ctx{
+      .network = &mainnet_network(),
+      .chain_id = &slash_test_chain_id(),
       .validators = &vr,
       .current_height = 200,
       .unbond_delay_blocks = UNBOND_DELAY_BLOCKS,

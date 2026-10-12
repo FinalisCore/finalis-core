@@ -6,6 +6,7 @@
 
 #include "codec/bytes.hpp"
 #include "crypto/secure_memory.hpp"
+#include "wallet/confidential_keys.hpp"
 
 namespace finalis::wallet {
 namespace {
@@ -60,13 +61,13 @@ bool aes_gcm_decrypt(const Hash32& key, const std::uint8_t* nonce, const Bytes& 
 
 }  // namespace
 
-std::optional<Bytes> encrypt_confidential_recovery_memo(std::uint64_t amount, const crypto::Blind32& blind,
+std::optional<Bytes> encrypt_confidential_recovery_memo(std::uint64_t amount, const Hash32& blind_seed,
                                                         const Hash32& memo_key, const PubKey33& one_time_pubkey,
                                                         const PubKey33& ephemeral_pubkey) {
   codec::ByteWriter w;
   w.u32le(kConfidentialRecoveryMemoVersion);
   w.u64le(amount);
-  w.bytes_fixed(blind.bytes);
+  w.bytes_fixed(blind_seed);
   Bytes plain = w.take();
   crypto::ScopedWipe<Bytes> wipe_plain(plain);
 
@@ -98,17 +99,24 @@ std::optional<ConfidentialRecoveryPayload> decrypt_confidential_recovery_memo(co
   if (!codec::parse_exact(plain, [&](codec::ByteReader& r) {
         auto version = r.u32le();
         auto amount = r.u64le();
-        auto blind = r.bytes_fixed<32>();
-        if (!version || !amount || !blind) return false;
+        auto seed = r.bytes_fixed<32>();
+        if (!version || !amount || !seed) return false;
         if (*version != kConfidentialRecoveryMemoVersion) return false;
         out.amount = *amount;
-        std::copy(blind->begin(), blind->end(), out.blind.bytes.begin());
-        crypto::secure_wipe(*blind);
+        std::copy(seed->begin(), seed->end(), out.blind_seed.begin());
+        crypto::secure_wipe(*seed);
         return true;
       })) {
-    crypto::secure_wipe(out.blind.bytes);
+    crypto::secure_wipe(out.blind_seed);
     return std::nullopt;
   }
+  auto blind = derive_output_value_blind(out.blind_seed, one_time_pubkey);
+  if (!blind) {
+    crypto::secure_wipe(out.blind_seed);
+    return std::nullopt;
+  }
+  out.blind = *blind;
+  crypto::secure_wipe(blind->bytes);
   return out;
 }
 

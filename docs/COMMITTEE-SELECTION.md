@@ -71,7 +71,9 @@ The result is one committee candidate per operator.
 
 Committee ranking uses:
 
-- `epoch_seed`
+- `epoch_seed` (from finalized randomness at the epoch boundary; each height mixes in only its
+  leader's VRF output, so the boundary leader cannot grind the seed through the transition's
+  contents; see `docs/PROTOCOL-SPEC.md`, Epoch Structure)
 - `selection_id`
 - candidate strength
 
