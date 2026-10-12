@@ -265,6 +265,7 @@ bool Node::init() {
   }
   chain_id_ =
       ChainId::from_config_and_db(cfg_.network, db_, std::nullopt, genesis_source_hint_, expected_genesis_hash_);
+  consensus_domain_ = consensus_chain_domain(cfg_.network, chain_id_);
   if (!load_state()) {
     std::cerr << "load_state failed\n";
     return false;
@@ -1491,7 +1492,7 @@ void Node::event_loop() {
         // Timeout votes are blocked too while abstaining (conservative: no signatures at all at h).
         const bool abstaining = abstaining_at_height_locked(h);
         if (local_timeout_member && !local_timeout_reserved && !abstaining) {
-          if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(h, timeout_round), local_key_.private_key);
+          if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(consensus_domain_, h, timeout_round), local_key_.private_key);
               sig.has_value()) {
             local_timeout_vote_reservations_.insert(timeout_vote_key);
             local_timed_out_rounds_.insert(timeout_vote_key);
@@ -1567,7 +1568,7 @@ void Node::event_loop() {
         const auto transition_id = selected->transition.transition_id();
         const std::optional<std::uint32_t> pol_round =
             reproposal_pol.has_value() ? std::optional<std::uint32_t>(reproposal_pol->round) : std::nullopt;
-        auto sig = crypto::ed25519_sign(propose_signing_message(build_height, build_round, transition_id, pol_round),
+        auto sig = crypto::ed25519_sign(propose_signing_message(consensus_domain_, build_height, build_round, transition_id, pol_round),
                                         local_key_.private_key);
         if (finalized_height_ + 1 == build_height && current_round_ == build_round && sig.has_value() &&
             proposed_in_round_.find(key) == proposed_in_round_.end()) {
@@ -1604,7 +1605,7 @@ void Node::event_loop() {
           const std::optional<std::uint32_t> pol_round =
               alt.pol.has_value() ? std::optional<std::uint32_t>(alt.pol->round) : std::nullopt;
           if (auto sig = crypto::ed25519_sign(
-                  propose_signing_message(alt.height, alt.round, proposal->transition.transition_id(), pol_round),
+                  propose_signing_message(consensus_domain_, alt.height, alt.round, proposal->transition.transition_id(), pol_round),
                   local_key_.private_key)) {
             alt.proposer_signature = *sig;
             bool flip = false;

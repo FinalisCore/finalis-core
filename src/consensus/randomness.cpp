@@ -4,6 +4,7 @@
 
 #include "codec/bytes.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/vrf.hpp"
 
 namespace finalis::consensus {
 
@@ -27,14 +28,20 @@ Hash32 advance_finalized_randomness(const Hash32& prev_randomness, const BlockHe
   return crypto::sha256d(w.data());
 }
 
+Bytes leader_vrf_alpha(const Hash32& prev_randomness, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'R', 'A', 'N', 'D', '-', 'V', 'R', 'F', '-', 'V', '1'});
+  w.bytes_fixed(prev_randomness);
+  w.u64le(height);
+  return w.take();
+}
+
 Hash32 advance_finalized_randomness(const Hash32& prev_randomness, const FrontierTransition& transition) {
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'R', 'A', 'N', 'D', '-', 'F', 'R', 'O', 'N', 'T', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'R', 'A', 'N', 'D', '-', 'F', 'R', 'O', 'N', 'T', '-', 'V', '2'});
   w.bytes_fixed(prev_randomness);
-  w.bytes_fixed(transition.transition_id());
-  w.bytes_fixed(transition.leader_pubkey);
+  w.bytes_fixed(crypto::vrf_proof_to_output(transition.leader_vrf_proof));
   w.u64le(transition.height);
-  w.u32le(transition.round);
   return crypto::sha256d(w.data());
 }
 

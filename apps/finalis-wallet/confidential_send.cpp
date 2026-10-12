@@ -47,12 +47,20 @@ std::optional<ConfidentialOwnedCoin> owned_coin(const WalletStore::ConfidentialC
 std::optional<ConfidentialPayment> make_payment(const ConfidentialRecipient& recipient, std::uint64_t value,
                                                 const std::optional<Hash32>& memo_key,
                                                 const std::function<Hash32()>& random, std::string* err) {
-  crypto::ConfidentialOutputSecrets secrets{.amount = value, .value_blind = crypto::Blind32{random()}};
+  Hash32 blind_seed = random();
   Hash32 proof_nonce = random();
-  crypto::ScopedWipe<Hash32, Hash32> wipe(secrets.value_blind.bytes, proof_nonce);
+  crypto::ConfidentialOutputSecrets secrets{.amount = value};
+  crypto::ScopedWipe<Hash32, Hash32, Hash32> wipe(blind_seed, secrets.value_blind.bytes, proof_nonce);
+  auto blind = derive_output_value_blind(blind_seed, recipient.one_time_pubkey);
+  if (!blind) {
+    if (err) *err = "failed to derive confidential output blind";
+    return std::nullopt;
+  }
+  secrets.value_blind = *blind;
+  crypto::secure_wipe(blind->bytes);
   ConfidentialRecipient to = recipient;
   if (memo_key.has_value()) {
-    auto memo = encrypt_confidential_recovery_memo(value, secrets.value_blind, *memo_key, to.one_time_pubkey,
+    auto memo = encrypt_confidential_recovery_memo(value, blind_seed, *memo_key, to.one_time_pubkey,
                                                    to.ephemeral_pubkey);
     if (!memo) {
       if (err) *err = "failed to encrypt confidential recovery memo";

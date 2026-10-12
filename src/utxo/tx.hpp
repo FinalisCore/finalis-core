@@ -184,6 +184,10 @@ struct FrontierTransition {
   std::uint64_t timestamp{0};
   std::uint32_t round{0};
   PubKey32 leader_pubkey{};
+  // Leader's VRF proof over consensus::leader_vrf_alpha(parent randomness, height). Its output is the
+  // leader's only input to finalized randomness, so the leader cannot steer the seed by choosing
+  // the transition's contents; it can only decline to propose.
+  VrfProof80 leader_vrf_proof{};
   FrontierVector prev_vector{};
   FrontierVector next_vector{};
   Hash32 ingress_commitment{};

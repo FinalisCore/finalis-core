@@ -15,6 +15,8 @@ using Hash32 = std::array<std::uint8_t, 32>;
 using PubKey32 = std::array<std::uint8_t, 32>;
 using PubKey33 = std::array<std::uint8_t, 33>;
 using Sig64 = std::array<std::uint8_t, 64>;
+// ECVRF proof (crypto/vrf.hpp): Gamma[32] || c[16] || s[32].
+using VrfProof80 = std::array<std::uint8_t, 80>;
 
 constexpr std::uint32_t MAGIC = 0x499602D2;
 constexpr std::uint16_t PROTOCOL_VERSION = 1;

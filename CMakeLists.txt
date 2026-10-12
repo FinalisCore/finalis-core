@@ -52,13 +52,20 @@ if(NOT NLOHMANN_JSON_INCLUDE_DIR)
 endif()
 include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
 
-# Optional libs: RocksDB and libsodium. Build falls back gracefully if unavailable.
-find_library(SODIUM_LIB sodium)
+# libsodium is required: consensus verifies the leader's VRF (src/crypto/vrf.cpp) with it.
+find_library(SODIUM_LIB NAMES sodium libsodium)
 find_path(SODIUM_INCLUDE_DIR sodium.h)
-if(SODIUM_LIB AND SODIUM_INCLUDE_DIR)
-  message(STATUS "Using libsodium")
-  add_compile_definitions(SC_HAS_LIBSODIUM=1)
+if(NOT SODIUM_LIB OR NOT SODIUM_INCLUDE_DIR)
+  message(FATAL_ERROR "libsodium not found. Install libsodium-dev (Debian/Ubuntu), libsodium (brew/vcpkg).")
 endif()
+file(STRINGS "${SODIUM_INCLUDE_DIR}/sodium/version.h" FINALIS_SODIUM_VERSION_LINE
+     REGEX "^#define SODIUM_VERSION_STRING \"[0-9.]+\"")
+string(REGEX REPLACE ".*\"([0-9.]+)\".*" "\\1" FINALIS_SODIUM_VERSION "${FINALIS_SODIUM_VERSION_LINE}")
+if(FINALIS_SODIUM_VERSION VERSION_LESS "1.0.18")
+  message(FATAL_ERROR "libsodium >= 1.0.18 required (found ${FINALIS_SODIUM_VERSION}).")
+endif()
+message(STATUS "Using libsodium ${FINALIS_SODIUM_VERSION}")
+add_compile_definitions(SC_HAS_LIBSODIUM=1)
 
 set(FINALIS_SECP256K1_TARGET "")
 set(FINALIS_SECP256K1_INCLUDE_DIR "")
@@ -154,6 +161,7 @@ add_library(finalis_core
   src/codec/varint.cpp
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
+  src/crypto/vrf.cpp
   src/crypto/secure_memory.cpp
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
@@ -210,10 +218,8 @@ add_library(finalis_core
 
 target_include_directories(finalis_core PUBLIC src)
 target_link_libraries(finalis_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-if(SODIUM_LIB AND SODIUM_INCLUDE_DIR)
-  target_include_directories(finalis_core PUBLIC ${SODIUM_INCLUDE_DIR})
-  target_link_libraries(finalis_core PUBLIC ${SODIUM_LIB})
-endif()
+target_include_directories(finalis_core PUBLIC ${SODIUM_INCLUDE_DIR})
+target_link_libraries(finalis_core PUBLIC ${SODIUM_LIB})
 if(FINALIS_SECP256K1_INCLUDE_DIR)
   target_include_directories(finalis_core PUBLIC ${FINALIS_SECP256K1_INCLUDE_DIR})
 endif()
@@ -422,6 +428,7 @@ add_executable(finalis-tests
   tests/test_smt.cpp
   tests/test_bonding.cpp
   tests/test_finality_certificate.cpp
+  tests/test_vrf.cpp
   tests/test_availability.cpp
   tests/test_snapshot.cpp
   tests/test_validator_lifecycle.cpp

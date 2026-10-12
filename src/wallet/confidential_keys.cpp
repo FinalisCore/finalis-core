@@ -13,6 +13,7 @@ constexpr std::string_view kTweakTag = "FINALIS/conf-request/tweak/v1";
 constexpr std::string_view kEphemeralTag = "FINALIS/conf-request/ephemeral/v1";
 constexpr std::string_view kScanTagTag = "FINALIS/conf-request/scan-tag/v1";
 constexpr std::string_view kMemoTag = "FINALIS/conf-request/memo/v1";
+constexpr std::string_view kOutputBlindTag = "FINALIS/conf-output/blind/v1";
 
 // BIP340-style tagged hash: SHA256(SHA256(tag) || SHA256(tag) || v || le32(index) || counter).
 Hash32 tagged_hash(std::string_view tag, const Hash32& view_secret, std::uint32_t index, std::uint8_t counter) {
@@ -84,6 +85,28 @@ std::optional<ConfidentialRequestKeys> derive_confidential_request_keys(const Ha
   out.one_time_secret = *one_time_secret;
   crypto::secure_wipe(*one_time_secret);
   return out;
+}
+
+std::optional<crypto::Blind32> derive_output_value_blind(const Hash32& blind_seed, const PubKey33& one_time_pubkey) {
+  const Hash32 tag_hash = crypto::sha256(Bytes(kOutputBlindTag.begin(), kOutputBlindTag.end()));
+  for (unsigned counter = 0; counter < 256; ++counter) {
+    Bytes preimage;
+    preimage.reserve(32 + 32 + 32 + 33 + 1);
+    preimage.insert(preimage.end(), tag_hash.begin(), tag_hash.end());
+    preimage.insert(preimage.end(), tag_hash.begin(), tag_hash.end());
+    preimage.insert(preimage.end(), blind_seed.begin(), blind_seed.end());
+    preimage.insert(preimage.end(), one_time_pubkey.begin(), one_time_pubkey.end());
+    preimage.push_back(static_cast<std::uint8_t>(counter));
+    Hash32 candidate = crypto::sha256(preimage);
+    crypto::secure_wipe(preimage);
+    if (crypto::secp256k1_pubkey_from_scalar(candidate).has_value()) {
+      crypto::Blind32 out{candidate};
+      crypto::secure_wipe(candidate);
+      return out;
+    }
+    crypto::secure_wipe(candidate);
+  }
+  return std::nullopt;
 }
 
 }  // namespace finalis::wallet

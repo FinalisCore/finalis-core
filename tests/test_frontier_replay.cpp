@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
 
 #include <algorithm>
@@ -293,7 +294,8 @@ std::vector<FinalitySig> default_prev_finality_signers(const consensus::Canonica
   std::vector<FinalitySig> out;
   for (const auto& member : parent.committee) {
     if (member != signer.public_key) continue;
-    auto sig = crypto::ed25519_sign(vote_signing_message(parent.height, parent.round, parent.transition_id),
+    auto sig = crypto::ed25519_sign(vote_signing_message(consensus_chain_domain(cfg.network, cfg.chain_id), parent.height, parent.round,
+                                                         parent.transition_id),
                                     signer.private_key);
     if (sig.has_value()) out.push_back(FinalitySig{member, *sig});
   }
@@ -324,6 +326,9 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
                                                         &err)) {
     throw std::runtime_error("frontier metadata population failed: " + err);
   }
+  if (!test::attach_test_leader_vrf(&result.transition, parent_state.finalized_randomness, {key_from_byte(90)})) {
+    throw std::runtime_error("leader vrf: leader is not the fixture validator");
+  }
   return consensus::CanonicalFrontierRecord{result.transition, lane_records};
 }
 
@@ -343,7 +348,8 @@ void persist_frontier_record_with_certificate(const consensus::CanonicalDerivati
   ASSERT_EQ(committee.size(), 1u);
   const auto signer = key_from_byte(90);
   ASSERT_EQ(committee.front(), signer.public_key);
-  auto sig = crypto::ed25519_sign(vote_signing_message(record.transition.height, record.transition.round,
+  auto sig = crypto::ed25519_sign(vote_signing_message(consensus_chain_domain(cfg.network, cfg.chain_id), record.transition.height,
+                                                       record.transition.round,
                                                        record.transition.transition_id()),
                                   signer.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -1131,6 +1137,57 @@ TEST(test_frontier_replay_rejects_tampered_ingress_commitment) {
   ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {record}, &out, &err));
 }
 
+// The leader's VRF proof over (parent randomness, height) is checked on every transition, and it is
+// the leader's only input to finalized randomness: a different timestamp or slice moves the
+// transition id but not the randomness the next committee seed is drawn from.
+TEST(test_frontier_leader_vrf_is_checked_and_is_the_only_leader_input_to_randomness) {
+  const auto cfg = test_cfg();
+  const auto from = key_from_byte(31);
+  const auto to = key_from_byte(32);
+  OutPoint op{};
+  op.txid.fill(0x95);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto parent = build_parent_state_with_utxo(cfg, 63, op, prev);
+
+  const auto with_spend = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)});
+  const auto empty = make_frontier_record(parent, {});
+  ASSERT_TRUE(with_spend.transition.transition_id() != empty.transition.transition_id());
+  ASSERT_TRUE(with_spend.transition.leader_vrf_proof == empty.transition.leader_vrf_proof);
+
+  consensus::CanonicalDerivedState a, b;
+  std::string err;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {with_spend}, &a, &err));
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {empty}, &b, &err));
+  ASSERT_TRUE(a.finalized_randomness == b.finalized_randomness);
+  ASSERT_TRUE(a.finalized_randomness != parent.finalized_randomness);
+
+  auto later = empty;
+  later.transition.timestamp += 7;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {later}, &b, &err));
+  ASSERT_TRUE(a.finalized_randomness == b.finalized_randomness);
+
+  auto tampered = empty;
+  tampered.transition.leader_vrf_proof[50] ^= 0x01;
+  ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {tampered}, &b, &err));
+  ASSERT_EQ(err, std::string("frontier-leader-vrf-invalid"));
+
+  // A proof by another key, or for another height, does not count either.
+  auto other_key = empty;
+  ASSERT_TRUE(test::attach_test_leader_vrf(&other_key.transition, parent.finalized_randomness, {key_from_byte(90)}));
+  other_key.transition.leader_vrf_proof =
+      *crypto::vrf_prove(key_from_byte(91).private_key,
+                         consensus::leader_vrf_alpha(parent.finalized_randomness, other_key.transition.height));
+  ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {other_key}, &b, &err));
+  ASSERT_EQ(err, std::string("frontier-leader-vrf-invalid"));
+  auto other_height = empty;
+  other_height.transition.leader_vrf_proof =
+      *crypto::vrf_prove(key_from_byte(90).private_key,
+                         consensus::leader_vrf_alpha(parent.finalized_randomness, other_height.transition.height + 1));
+  ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {other_height}, &b, &err));
+  ASSERT_EQ(err, std::string("frontier-leader-vrf-invalid"));
+}
+
 TEST(test_frontier_replay_advances_finalized_metadata_deterministically) {
   const auto cfg = test_cfg();
   const auto from = key_from_byte(29);
@@ -1463,7 +1520,8 @@ TEST(test_finality_rejects_quorum_below_threshold_exact_boundary) {
   const auto quorum = consensus::quorum_threshold(committee.size());
   ASSERT_TRUE(quorum >= 2);
 
-  const auto msg = vote_signing_message(chain_record.transition.height, chain_record.transition.round,
+  const auto msg = vote_signing_message(consensus_chain_domain(cfg.network, cfg.chain_id), chain_record.transition.height,
+                                        chain_record.transition.round,
                                         chain_record.transition.transition_id());
   auto sig = crypto::ed25519_sign(msg, v0.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -1673,7 +1731,8 @@ TEST(test_frontier_storage_replay_rejects_tampered_quorum_threshold_metadata) {
   cert.quorum_threshold = chain_record.transition.quorum_threshold;
   cert.committee_members = {signer.public_key};
   auto sig = crypto::ed25519_sign(
-      vote_signing_message(chain_record.transition.height, chain_record.transition.round, chain_record.transition.transition_id()),
+      vote_signing_message(consensus_chain_domain(cfg.network, cfg.chain_id), chain_record.transition.height,
+                           chain_record.transition.round, chain_record.transition.transition_id()),
       signer.private_key);
   ASSERT_TRUE(sig.has_value());
   cert.signatures = {FinalitySig{signer.public_key, *sig}};

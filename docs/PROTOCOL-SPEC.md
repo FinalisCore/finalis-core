@@ -209,7 +209,12 @@ Epoch boundaries are determined by `committee_epoch_blocks` in network config.
 
 For each epoch:
 
-- finalized randomness advances block by block
+- finalized randomness advances block by block, from the leader's VRF only:
+  `R_h = sha256d("SC-RAND-FRONT-V2" || R_{h-1} || VRF_out(leader, alpha_h) || h)` with
+  `alpha_h = "SC-RAND-VRF-V1" || R_{h-1} || h`; each transition carries the leader's proof
+  (`leader_vrf_proof`, checked against `leader_pubkey`, construction in `src/crypto/vrf.hpp`).
+  A leader cannot move `R_h` through the transition's timestamp, slice or round; it can only
+  decline to propose, which hands the slot to the next round's leader.
 - a finalized committee checkpoint is built at epoch start
 - Ticket PoW difficulty is derived deterministically for the epoch
 - reward accrual is tracked across finalized transitions

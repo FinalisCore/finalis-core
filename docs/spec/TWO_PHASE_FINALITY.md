@@ -44,10 +44,14 @@ Algorithm 1), adapted. Round changes keep the existing timeout votes and TC inst
 
 | Message | Signed bytes | Notes |
 |---|---|---|
-| `PROPOSE(h, r, proposal, valid_round, pol)` | proposer signs `sha256d("SC-PROPOSE-V1" ‖ h ‖ r ‖ id ‖ valid_round)` | `pol` = prevote quorum for `id` at `valid_round` when `valid_round ≥ 0` |
-| `PREVOTE(h, r, id)` | `sha256d("SC-PREVOTE-V1" ‖ h ‖ r ‖ id)` | new |
-| `PRECOMMIT(h, r, id)` | `sha256d("SC-VOTE-V1" ‖ h ‖ r ‖ id)` | the existing `Vote`, unchanged on the wire |
-| `TIMEOUT(h, r)` | unchanged | quorum = TC, advances the round |
+| `PROPOSE(h, r, proposal, valid_round, pol)` | proposer signs `sha256d("SC-PROPOSE-V1" ‖ D ‖ h ‖ r ‖ id ‖ valid_round)` | `pol` = prevote quorum for `id` at `valid_round` when `valid_round ≥ 0` |
+| `PREVOTE(h, r, id)` | `sha256d("SC-PREVOTE-V1" ‖ D ‖ h ‖ r ‖ id)` | new |
+| `PRECOMMIT(h, r, id)` | `sha256d("SC-VOTE-V1" ‖ D ‖ h ‖ r ‖ id)` | the existing `Vote`, unchanged on the wire |
+| `TIMEOUT(h, r)` | `sha256d("SC-TIMEOUT-V1" ‖ D ‖ h ‖ r)` | quorum = TC, advances the round |
+
+`D = sha256d("SC-CHAIN-DOMAIN-V1" ‖ network_id ‖ genesis_hash)` (`consensus_chain_domain`). A key
+reused on another network signs different bytes there, so its votes cannot be replayed here and two
+of them are not equivocation evidence here.
 
 A **polka** for `(h, r, id)` is `Q` distinct committee prevotes for it. A **finality certificate**
 is `Q` distinct committee precommits for one `(h, r, id)`: the existing `FinalityCertificate`.

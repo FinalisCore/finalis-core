@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "confidential_memo.hpp"
+#include "crypto/confidential.hpp"
 #include "crypto/secure_memory.hpp"
 #include "wallet/confidential_keys.hpp"
 
@@ -133,6 +134,13 @@ std::vector<ConfidentialReceiveMatch> match_received_confidential_outputs(const 
         decrypt_confidential_recovery_memo(confidential.memo, *memo_key, confidential.one_time_pubkey, confidential.ephemeral_pubkey);
     crypto::secure_wipe(*memo_key);
     if (!recovery) {
+      crypto::secure_wipe(spend_secret_hex);
+      continue;
+    }
+    // The memo is sender-written: accept only an (amount, blind) that opens the on-chain commitment.
+    const auto opened = crypto::confidential_amount_commitment(recovery->amount, recovery->blind);
+    if (!opened || *opened != confidential.value_commitment) {
+      crypto::secure_wipe(recovery->blind.bytes);
       crypto::secure_wipe(spend_secret_hex);
       continue;
     }

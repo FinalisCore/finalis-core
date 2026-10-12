@@ -269,6 +269,8 @@ class Node {
   std::vector<std::pair<OutPoint, TxOut>> find_utxos_by_pubkey_hash_for_test(
       const std::array<std::uint8_t, 20>& pkh) const;
   bool has_utxo_for_test(const OutPoint& op, TxOut* out = nullptr) const;
+  // Chain domain this node signs consensus messages under (consensus_chain_domain). Throws before init().
+  const Hash32& consensus_domain_for_test() const;
   std::string proposer_path_for_next_height_for_test() const;
   std::string committee_path_for_next_height_for_test() const;
   std::string vote_path_for_next_height_for_test() const;
@@ -925,6 +927,7 @@ class Node {
   std::uint64_t last_peer_discipline_decay_unix_{0};
   p2p::AddrMan addrman_{10'000};
   ChainId chain_id_{};
+  Hash32 consensus_domain_{};  // consensus_chain_domain(cfg_.network, chain_id_), signed into every vote
   std::optional<Hash32> expected_genesis_hash_;
   std::string genesis_source_hint_{"embedded"};
   std::set<int> getaddr_requested_peers_;

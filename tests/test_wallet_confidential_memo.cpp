@@ -6,6 +6,7 @@
 
 #include "apps/finalis-wallet/confidential_memo.hpp"
 #include "utxo/confidential_tx.hpp"
+#include "wallet/confidential_keys.hpp"
 
 using namespace finalis;
 
@@ -13,14 +14,14 @@ namespace {
 
 struct MemoFixture {
   Hash32 memo_key{};
-  crypto::Blind32 blind{};
+  Hash32 blind_seed{};
   PubKey33 one_time{};
   PubKey33 ephemeral{};
 
   MemoFixture() {
     ASSERT_TRUE(crypto::confidential_crypto_init());
     memo_key.fill(0x11);
-    blind.bytes.fill(0x22);
+    blind_seed.fill(0x22);
     Hash32 s1{};
     s1.fill(0x33);
     Hash32 s2{};
@@ -38,8 +39,8 @@ struct MemoFixture {
 // Paying the same request URI twice reuses memo_key; each memo must carry its own nonce.
 TEST(test_confidential_memo_fresh_nonce_per_encryption) {
   MemoFixture f;
-  auto m1 = wallet::encrypt_confidential_recovery_memo(500, f.blind, f.memo_key, f.one_time, f.ephemeral);
-  auto m2 = wallet::encrypt_confidential_recovery_memo(500, f.blind, f.memo_key, f.one_time, f.ephemeral);
+  auto m1 = wallet::encrypt_confidential_recovery_memo(500, f.blind_seed, f.memo_key, f.one_time, f.ephemeral);
+  auto m2 = wallet::encrypt_confidential_recovery_memo(500, f.blind_seed, f.memo_key, f.one_time, f.ephemeral);
   ASSERT_TRUE(m1.has_value() && m2.has_value());
   ASSERT_TRUE(m1->size() <= kTxV2MaxMemoBytes);
   ASSERT_TRUE(!std::equal(m1->begin(), m1->begin() + wallet::kConfidentialMemoNonceLen, m2->begin()));
@@ -48,15 +49,36 @@ TEST(test_confidential_memo_fresh_nonce_per_encryption) {
   auto r1 = wallet::decrypt_confidential_recovery_memo(*m1, f.memo_key, f.one_time, f.ephemeral);
   auto r2 = wallet::decrypt_confidential_recovery_memo(*m2, f.memo_key, f.one_time, f.ephemeral);
   ASSERT_TRUE(r1.has_value() && r2.has_value());
+  const auto blind = wallet::derive_output_value_blind(f.blind_seed, f.one_time);
+  ASSERT_TRUE(blind.has_value());
   ASSERT_EQ(r1->amount, 500u);
-  ASSERT_TRUE(r1->blind == f.blind);
+  ASSERT_TRUE(r1->blind_seed == f.blind_seed);
+  ASSERT_TRUE(r1->blind == *blind);
   ASSERT_EQ(r2->amount, 500u);
-  ASSERT_TRUE(r2->blind == f.blind);
+  ASSERT_TRUE(r2->blind == *blind);
+}
+
+// Blinds are a deterministic function of (seed, one_time_pubkey): same inputs, same valid scalar;
+// a different seed or a different output key gives a different blind.
+TEST(test_confidential_output_blind_is_derived_from_seed_and_output_key) {
+  MemoFixture f;
+  const auto a = wallet::derive_output_value_blind(f.blind_seed, f.one_time);
+  const auto b = wallet::derive_output_value_blind(f.blind_seed, f.one_time);
+  ASSERT_TRUE(a.has_value() && b.has_value());
+  ASSERT_TRUE(*a == *b);
+  ASSERT_TRUE(crypto::secp256k1_pubkey_from_scalar(a->bytes).has_value());
+  Hash32 other_seed = f.blind_seed;
+  other_seed[0] ^= 0x01;
+  const auto c = wallet::derive_output_value_blind(other_seed, f.one_time);
+  const auto d = wallet::derive_output_value_blind(f.blind_seed, f.ephemeral);
+  ASSERT_TRUE(c.has_value() && d.has_value());
+  ASSERT_TRUE(!(*a == *c));
+  ASSERT_TRUE(!(*a == *d));
 }
 
 TEST(test_confidential_memo_rejects_tamper_wrong_key_and_foreign_output) {
   MemoFixture f;
-  auto m = wallet::encrypt_confidential_recovery_memo(7, f.blind, f.memo_key, f.one_time, f.ephemeral);
+  auto m = wallet::encrypt_confidential_recovery_memo(7, f.blind_seed, f.memo_key, f.one_time, f.ephemeral);
   ASSERT_TRUE(m.has_value());
 
   for (std::size_t i : {std::size_t{0}, wallet::kConfidentialMemoNonceLen, m->size() - 1}) {

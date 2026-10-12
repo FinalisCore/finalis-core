@@ -532,9 +532,23 @@ bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& r
   return true;
 }
 
-Bytes vote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) {
+Hash32 consensus_chain_domain(const NetworkConfig& network, const ChainId& chain_id) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'C', 'H', 'A', 'I', 'N', '-', 'D', 'O', 'M', 'A', 'I', 'N', '-', 'V', '1'});
+  w.bytes_fixed(network.network_id);
+  Hash32 genesis_hash{};
+  if (const auto gh = hex_decode(chain_id.genesis_hash_hex); gh && gh->size() == 32) {
+    std::copy(gh->begin(), gh->end(), genesis_hash.begin());
+  }
+  w.bytes_fixed(genesis_hash);
+  return crypto::sha256d(w.data());
+}
+
+Bytes vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
+                           const Hash32& transition_id) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'V', 'O', 'T', 'E', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
   w.u64le(height);
   w.u32le(round);
   w.bytes_fixed(transition_id);
@@ -542,9 +556,11 @@ Bytes vote_signing_message(std::uint64_t height, std::uint32_t round, const Hash
   return Bytes(msg.begin(), msg.end());
 }
 
-Bytes prevote_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) {
+Bytes prevote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
+                              const Hash32& transition_id) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'P', 'R', 'E', 'V', 'O', 'T', 'E', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
   w.u64le(height);
   w.u32le(round);
   w.bytes_fixed(transition_id);
@@ -552,10 +568,11 @@ Bytes prevote_signing_message(std::uint64_t height, std::uint32_t round, const H
   return Bytes(msg.begin(), msg.end());
 }
 
-Bytes propose_signing_message(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
-                              std::optional<std::uint32_t> pol_round) {
+Bytes propose_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
+                              const Hash32& transition_id, std::optional<std::uint32_t> pol_round) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'P', 'R', 'O', 'P', 'O', 'S', 'E', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
   w.u64le(height);
   w.u32le(round);
   w.bytes_fixed(transition_id);
@@ -565,9 +582,10 @@ Bytes propose_signing_message(std::uint64_t height, std::uint32_t round, const H
   return Bytes(msg.begin(), msg.end());
 }
 
-Bytes timeout_vote_signing_message(std::uint64_t height, std::uint32_t round) {
+Bytes timeout_vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'O', 'U', 'T', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
   w.u64le(height);
   w.u32le(round);
   const Hash32 msg = crypto::sha256d(w.data());
@@ -578,9 +596,10 @@ namespace {
 
 // Both votes of slash evidence are in one signing domain: an honest validator may prevote one
 // transition and precommit another in the same round, so mixed pairs prove nothing.
-Bytes slash_vote_signing_message(SlashVoteKind kind, const Vote& v) {
-  return kind == SlashVoteKind::Prevote ? prevote_signing_message(v.height, v.round, v.frontier_transition_id)
-                                        : vote_signing_message(v.height, v.round, v.frontier_transition_id);
+Bytes slash_vote_signing_message(const Hash32& chain_domain, SlashVoteKind kind, const Vote& v) {
+  return kind == SlashVoteKind::Prevote
+             ? prevote_signing_message(chain_domain, v.height, v.round, v.frontier_transition_id)
+             : vote_signing_message(chain_domain, v.height, v.round, v.frontier_transition_id);
 }
 
 }  // namespace
@@ -724,8 +743,10 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != bond_pub) return {false, "evidence pubkey must match bond", 0};
 
-        const auto a_msg = slash_vote_signing_message(evidence.kind, evidence.a);
-        const auto b_msg = slash_vote_signing_message(evidence.kind, evidence.b);
+        if (!ctx->network || !ctx->chain_id) return {false, "slash evidence requires chain identity", 0};
+        const Hash32 chain_domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
+        const auto a_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
@@ -791,8 +812,10 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         }
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != unbond_pub) return {false, "evidence pubkey must match unbond output", 0};
-        const auto a_msg = slash_vote_signing_message(evidence.kind, evidence.a);
-        const auto b_msg = slash_vote_signing_message(evidence.kind, evidence.b);
+        if (!ctx->network || !ctx->chain_id) return {false, "slash evidence requires chain identity", 0};
+        const Hash32 chain_domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
+        const auto a_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {

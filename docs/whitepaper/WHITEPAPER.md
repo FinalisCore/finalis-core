@@ -31,8 +31,9 @@ Let:
 - `C(h, r)` be canonical committee for height `h`, round `r`.
 - `N = |C(h, r)|` and `Q = floor(2N/3) + 1`.
 
-A vote signs `sha256d("SC-VOTE-V1" || h || r || id(T_h))`. A timeout vote signs
-`sha256d("SC-TIMEOUT-V1" || h || r)`; `Q` timeout votes for `(h, r)` form a timeout certificate
+A vote signs `sha256d("SC-VOTE-V1" || D || h || r || id(T_h))`. A timeout vote signs
+`sha256d("SC-TIMEOUT-V1" || D || h || r)`, where `D = sha256d("SC-CHAIN-DOMAIN-V1" || network_id ||
+genesis_hash)` binds the signature to this chain; `Q` timeout votes for `(h, r)` form a timeout certificate
 `TC(h, r)`. Validator signatures are Ed25519.
 
 The committee is taken from the finalized checkpoint for the epoch containing `h` (mainnet epochs

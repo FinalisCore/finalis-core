@@ -52,4 +52,15 @@ std::optional<ConfidentialRequestKeys> derive_confidential_request_keys(const Ha
                                                                         const Hash32& spend_secret,
                                                                         std::uint32_t index);
 
+// Value blind of a confidential output. Blinds are derived from a fresh sender-chosen seed instead of
+// sampled directly:
+//
+//   blind = hash_to_scalar("FINALIS/conf-output/blind/v1", blind_seed, one_time_pubkey)
+//
+// The recovery memo carries blind_seed, so the receiver re-derives the blind. Because every blind is a
+// hash output, (blind_seed, amount) is a switch-binding opening of the Pedersen commitment: an
+// adversary who can take discrete logs still needs a hash preimage to open a commitment to a second
+// amount. A future post-quantum spend rule can require that opening without expiring coins.
+std::optional<crypto::Blind32> derive_output_value_blind(const Hash32& blind_seed, const PubKey33& one_time_pubkey);
+
 }  // namespace finalis::wallet
