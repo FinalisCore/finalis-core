@@ -70,9 +70,8 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
   - Not locked: `--round-timeout-ms`, `--min-block-interval-ms`. These only set local
     proposer/round pacing and don't affect block validity.
   - Follow-ups:
-    - `scripts/start.sh:821-838` auto-injects `--deferred-exit-activation-height` when
-      `SYNC_TURBO_MODE=extreme` and `AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME=1`; nodes launched that way
-      now fail to start. Remove that block.
+    - ~~`scripts/start.sh` auto-injects `--deferred-exit-activation-height`.~~ Removed 2026-10-13
+      (with `AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME`).
     - `finalis-lightserver` has its own `--max-committee` flag; review whether it needs the same lock.
     - Override paths in `Node::init` (lines ~3122-3143) stay for tests that set `NodeConfig` directly.
 
@@ -466,8 +465,7 @@ settlement (item 13).
       still lack the hardening block and `TimeoutStopSec`/`KillSignal`.
     - `apps/finalis-node/main.cpp`: SIGINT/SIGTERM handlers are installed after `node.init()`, so a
       stop during DB open/reindex terminates without `node.stop()`. Move them before `init()`.
-    - Item 4 follow-up still applies: remove the `--deferred-exit-activation-height` auto-injection
-      (`AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME`), which the mainnet consensus-flag lock now rejects.
+    - ~~Item 4 follow-up: remove the `--deferred-exit-activation-height` auto-injection.~~ Done 2026-10-13.
 
 - [ ] **25. Repository hygiene (Group A)**
   - Status: **applied 2026-10-05 — not committed; no build impact (docs, CI paths, data files only)**

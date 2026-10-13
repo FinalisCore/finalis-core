@@ -109,7 +109,7 @@ NetworkConfig make_testnet() {
   net.magic = kTestnetMagic;
   net.p2p_default_port = 19540;
   net.lightserver_default_port = 19544;
-  net.default_seeds = {"85.217.171.168:19540", "64.23.244.126:19540"};
+  net.default_seeds = {"130.61.126.39:19540"};
   return net;
 }
 
