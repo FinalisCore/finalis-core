@@ -17,7 +17,7 @@ Consensus/limits (unchanged rules):
 - `MAX_PAYLOAD_LEN`: `8 MiB`
 - `BOND_AMOUNT`: `5,000,000,000` units
 - `WARMUP_BLOCKS`: `100`
-- `UNBOND_DELAY_BLOCKS`: `100`
+- `UNBOND_DELAY_BLOCKS`: `3360` (7 days at 180 s per block; slash evidence can still ban an exiting validator, which forfeits its bond)
 - `COMMITTEE_EPOCH_BLOCKS`: finalized-artifact epoch window used for persisted committee snapshots
 - hardened networking defaults remain identical to current node defaults.
 

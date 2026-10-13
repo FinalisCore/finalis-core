@@ -112,8 +112,8 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
     - Forged state: the genesis hash is public, so this blocks wrong-chain imports, not forged
       UTXO/validator state. Pin a trusted `(finalized_height, finalized_hash)` (CLI flag or
       `NetworkConfig` checkpoint) and recompute the UTXO/validator roots from the imported entries.
-    - Testnet `start.sh` should pass `--expected-genesis-hash` (check `EXPECTED_GENESIS_SHA256` uses
-      the same `hash_doc` form first).
+    - ~~Testnet `start.sh` should pass `--expected-genesis-hash`.~~ Obsolete 2026-10-13: testnet
+      genesis is embedded and pinned like mainnet; `start.sh` passes `--testnet`.
     - `scripts/start.sh`: default `AUTO_FAST_SYNC=0`.
     - ~~Remove the tracked `snapshot.bin` from the repo.~~ Done 2026-10-10 (see item 25).
 
@@ -444,7 +444,8 @@ settlement (item 13).
     - mainnet: fails if `ALLOW_UNSAFE_GENESIS_OVERRIDE != 0`, `GENESIS_PATH` is set, or `NODE_EXTRA_ARGS`
       contains `--genesis`/`--allow-unsafe-genesis-override`. No `--genesis` is passed, so the node uses
       the embedded genesis checked against `MAINNET_GENESIS_HASH` (none is embedded until launch).
-    - testnet: requires `GENESIS_PATH` and a matching `EXPECTED_GENESIS_SHA256`, then enables the override.
+    - testnet (2026-10-13): same lock as mainnet; the embedded testnet genesis is used and `start.sh`
+      passes `--testnet`. Ports, `DB_DIR` and `SEEDS.json` default from `FINALIS_NETWORK`.
   - Unit: `KillSignal=SIGINT`, `KillMode=mixed`, `TimeoutStopSec=${SERVICE_TIMEOUT_STOP_SEC:-300}`;
     `UMask=0077`, `ProtectSystem=strict`, `ProtectHome=read-only` + `ReadWritePaths=${DB_DIR}`,
     `PrivateTmp`, `PrivateDevices`, `NoNewPrivileges`, empty capability set, `@system-service`
