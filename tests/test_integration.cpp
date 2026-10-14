@@ -7866,13 +7866,13 @@ TEST(test_round_catch_up_needs_f_plus_one_timeout_votes) {
     if (pub != target->local_validator_pubkey_for_test()) others.push_back(pub);
   }
   const std::uint32_t base = target->status().round;
-  const std::uint32_t far = base + 100;  // beyond the single-vote catch-up window (32)
+  const std::uint32_t far_round = base + 100;  // beyond the single-vote catch-up window (32)
 
   // Beyond the window the votes are not stored (soft reject), only their rounds are noted.
-  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far + 10, others[0]));
-  ASSERT_TRUE(target->status().round < far);
-  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far, others[1]));
-  ASSERT_EQ(target->status().round, far);  // the second-highest: f + 1 = 2 validators reached it
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far_round + 10, others[0]));
+  ASSERT_TRUE(target->status().round < far_round);
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far_round, others[1]));
+  ASSERT_EQ(target->status().round, far_round);  // the second-highest: f + 1 = 2 validators reached it
 }
 
 TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {
