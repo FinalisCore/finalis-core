@@ -40,7 +40,7 @@ Pass conditions:
   - 0 forks, 0 runs that fail to converge (exit 0 on every seed)
   - 0 lost payments classified `dropped` that are not explained by a rejection at submission
   - reports archived with the release
-- Fuzzing: `fuzz_p2p_frame`, `fuzz_tx_parse` and `fuzz_consensus_msgs` run clean under
+- Fuzzing: `fuzz_p2p_frame`, `fuzz_tx_parse`, `fuzz_consensus_msgs` and `fuzz_consensus_node` run clean under
   ASan/UBSan on the release commit.
 - Independent genesis validators: the genesis set is selected per
   [GENESIS_VALIDATOR_CEREMONY.md](GENESIS_VALIDATOR_CEREMONY.md), with operators other than the

@@ -47,6 +47,7 @@ jobs:
           ./build/fuzz_p2p_frame
           ./build/fuzz_tx_parse
           ./build/fuzz_consensus_msgs
+          ./build/fuzz_consensus_node
 
   sanitize:
     name: ASan/UBSan shard ${{ matrix.shard }}/4
@@ -73,7 +74,7 @@ jobs:
       - name: Configure
         run: cmake -S . -B build $CMAKE_COMMON_FLAGS -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFINALIS_SANITIZE=ON
       - name: Build
-        run: cmake --build build --target finalis-tests fuzz_p2p_frame fuzz_tx_parse fuzz_consensus_msgs -j"$(nproc)"
+        run: cmake --build build --target finalis-tests fuzz_p2p_frame fuzz_tx_parse fuzz_consensus_msgs fuzz_consensus_node -j"$(nproc)"
       - name: Test
         run: ./build/finalis-tests
       - name: Fuzz smoke
@@ -82,6 +83,7 @@ jobs:
           ./build/fuzz_p2p_frame
           ./build/fuzz_tx_parse
           ./build/fuzz_consensus_msgs
+          ./build/fuzz_consensus_node
 
   tsan:
     name: TSan shard ${{ matrix.shard }}/4
