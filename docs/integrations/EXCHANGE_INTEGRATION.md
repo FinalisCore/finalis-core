@@ -223,6 +223,11 @@ Interpretation of `broadcast_tx`:
   `tx_conflict_in_mempool`, or `tx_missing_or_unconfirmed_input` while the node syncs)
 - `error_code=relay_unavailable` means no verdict was received; resubmitting the same
   signed transaction is safe
+
+Explorer `GET /api/v1/tx/<txid>` answers 404 until the transaction is finalized. The error
+code says why: `not_final` (certified for ordering, submitted but not final), `rejected`
+(final, rejected at execution, moved no funds) or `not_found`. The batch status endpoint
+reports the same values in `status`.
 - `finalized` in the broadcast result is always `false`
 - completion still comes from finalized lookup
 

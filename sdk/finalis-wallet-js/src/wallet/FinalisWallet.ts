@@ -123,11 +123,15 @@ export class FinalisWallet {
     };
   }
 
-  async sendTransaction(params: BuildTxParams): Promise<{ txid: string; txHex: string }> {
+  // Resolves once a node's mempool accepted the transaction: submitted, not final. It is paid only
+  // after waitForFinality (or getTxStatus) reports it finalized.
+  async sendTransaction(
+    params: BuildTxParams,
+  ): Promise<{ txid: string; txHex: string; status: 'submitted_not_final'; finalized: false }> {
     const built = await this.buildTransaction(params);
     const b = await this.client.broadcastTx(built.txHex);
-    if (!b.accepted) throw new Error(b.error ?? 'broadcast rejected');
-    return { txid: b.txid ?? built.txid, txHex: built.txHex };
+    if (!b.accepted) throw new Error(b.error ?? b.errorCode ?? 'broadcast rejected');
+    return { txid: b.txid ?? built.txid, txHex: built.txHex, status: 'submitted_not_final', finalized: false };
   }
 
   async waitForFinality(txid: string, options: WaitForFinalityOptions = {}): Promise<{ height: bigint; txHex: string }> {
@@ -137,6 +141,11 @@ export class FinalisWallet {
     while (Date.now() - start < timeoutMs) {
       const tx = await this.client.getTx(txid);
       if (tx) return { height: tx.height, txHex: tx.tx_hex };
+      const status = await this.client.getTxStatus(txid);
+      if (status.status === 'rejected') {
+        // Final: ordered but rejected at execution, so it will never be paid.
+        throw new Error(`transaction rejected at finality (height ${status.rejectedHeight ?? 'unknown'}); it moved no funds`);
+      }
       await new Promise((r) => setTimeout(r, pollMs));
     }
     throw new Error('waitForFinality timeout');

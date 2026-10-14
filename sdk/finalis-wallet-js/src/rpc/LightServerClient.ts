@@ -5,6 +5,8 @@ import type {
   Status,
   Tip,
   TxLookup,
+  TxStatus,
+  TxStatusName,
   UtxoProof,
   ValidatorProof,
 } from '../types/index.js';
@@ -224,11 +226,42 @@ export class LightServerClient {
   }
 
   async broadcastTx(txHex: string): Promise<BroadcastResult> {
-    const r = await this.callWithRetry<BroadcastResult>(this.urls[0], 'broadcast_tx', { tx_hex: txHex.toLowerCase() });
+    const r = await this.callWithRetry<{
+      accepted: boolean;
+      txid?: string;
+      status?: string;
+      error?: string;
+      error_message?: string;
+      error_code?: string;
+      retryable?: boolean;
+    }>(this.urls[0], 'broadcast_tx', { tx_hex: txHex.toLowerCase() });
     return {
       accepted: r.accepted,
-      txid: r.txid?.toLowerCase(),
-      error: r.error,
+      finalized: false,
+      txid: r.txid ? r.txid.toLowerCase() : undefined,
+      status: r.status,
+      error: r.error_message ?? r.error,
+      errorCode: r.error_code ?? undefined,
+      retryable: r.retryable,
+    };
+  }
+
+  async getTxStatus(txid: string): Promise<TxStatus> {
+    const r = await this.callWithRetry<{
+      txid: string;
+      status: TxStatusName;
+      finalized: boolean;
+      credit_safe: boolean;
+      height?: number;
+      rejected_height?: number;
+    }>(this.urls[0], 'get_tx_status', { txid: txid.toLowerCase() });
+    return {
+      txid: r.txid.toLowerCase(),
+      status: r.status,
+      finalized: r.finalized,
+      creditSafe: r.credit_safe,
+      height: r.height !== undefined ? BigInt(r.height) : undefined,
+      rejectedHeight: r.rejected_height !== undefined ? BigInt(r.rejected_height) : undefined,
     };
   }
 }

@@ -807,7 +807,7 @@ QString local_history_reference(const QString& line) {
 }
 
 QString local_history_state(const QString& line) {
-  if (line.startsWith("[pending]")) return "local relay accepted";
+  if (line.startsWith("[pending]")) return "submitted, not final";
   if (line.startsWith("[finalized]")) return "local note";
   if (line.startsWith("[onboarding]")) return "local tracking";
   return "local event";
@@ -860,7 +860,7 @@ QString badge_text(const QString& status) {
 QString title_case_status(const QString& status) {
   const QString upper = status.trimmed().toUpper();
   if (upper == "FINALIZED") return "Finalized";
-  if (upper == "PENDING") return "Pending";
+  if (upper == "PENDING") return "Submitted, not final";
   if (upper == "FAILED") return "Failed";
   if (upper == "REJECTED") return "Rejected";
   if (upper == "INFO") return "Info";
@@ -911,7 +911,9 @@ void restore_table_sort(QTableWidget* table, QSettings& settings, const QString&
 }
 
 QColor status_background(const QString& status) {
-  const QString upper = status.trimmed().toUpper();
+  // Raw status or its display text (PENDING shows as "Submitted, not final").
+  QString upper = status.trimmed().toUpper();
+  if (upper == "SUBMITTED, NOT FINAL") upper = "PENDING";
   const bool dark = qApp && qApp->palette().color(QPalette::Window).lightness() < 128;
   if (dark) {
     if (upper == "FINALIZED") return QColor(46, 46, 46);
@@ -934,7 +936,8 @@ QColor amount_foreground(bool positive) {
 void apply_amount_item_style(QTableWidgetItem* item, const QString& kind, const QString& status) {
   if (!item) return;
   const QString upper_kind = kind.trimmed().toUpper();
-  const QString upper_status = status.trimmed().toUpper();
+  QString upper_status = status.trimmed().toUpper();
+  if (upper_status == "SUBMITTED, NOT FINAL") upper_status = "PENDING";
   if (upper_kind == "RECEIVED") {
     item->setForeground(QBrush(amount_foreground(true)));
     return;
@@ -2771,11 +2774,11 @@ void WalletWindow::start_onboarding_registration_clicked() {
                                   validator_key.pubkey.begin(), validator_key.pubkey.end()))), 12))
                          .arg(QString::fromStdString(funding_key->address))
                          .arg(used_endpoint.isEmpty() ? rpc_url : used_endpoint));
-  statusBar()->showMessage("Onboarding registration submitted for relay.", 4000);
+  statusBar()->showMessage("Onboarding registration submitted, not final.", 4000);
   refresh_chain_state(false);
   refresh_validator_readiness_panel(false);
   QMessageBox::information(this, "Register Onboarding Operator",
-                           QString("Onboarding registration accepted for relay.\n\nTxid: %1")
+                           QString("Onboarding registration submitted, not final. It counts once finalized.\n\nTxid: %1")
                                .arg(QString::fromStdString(finalis::hex_encode32(tx->txid()))));
 }
 
@@ -4120,11 +4123,11 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
     chain_records.push_back(ChainRecord{
         "PENDING",
         "SENT",
-        "accepted for relay",
+        "submitted, not final",
         txid_q,
         "awaiting finalized inclusion",
         txid_q,
-        QString("Transaction: %1\nState: accepted for relay, awaiting finalized inclusion\nLocal reservation: selected finalized inputs remain reserved until this transaction finalizes or is superseded.")
+        QString("Transaction: %1\nState: submitted, not final (awaiting finalized inclusion)\nLocal reservation: selected finalized inputs remain reserved until this transaction finalizes or is superseded.")
             .arg(txid_q),
     });
   }
@@ -5286,7 +5289,7 @@ void WalletWindow::submit_send() {
       const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
       if (!reservation_breakdown.isEmpty()) confirm += "\n" + reservation_breakdown;
     }
-    confirm += "\n\nAccepted for relay by lightserver is not finality.";
+    confirm += "\n\nA submitted payment is not final until it is finalized.";
     if (QMessageBox::question(this, "Confirm Send", confirm, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) !=
         QMessageBox::Yes) {
       show_send_inline_status("Send cancelled");
@@ -5578,8 +5581,8 @@ void WalletWindow::submit_send() {
                   const QString retry_note = retry_endpoint.isEmpty()
                                                  ? QString{}
                                                  : QString(" via %1").arg(display_lightserver_endpoint(retry_endpoint));
-                  show_send_inline_status(QString("Accepted for relay%1 after auto-refresh.").arg(retry_note));
-                  statusBar()->showMessage(QString("Transaction accepted for relay%1.").arg(retry_note), 3000);
+                  show_send_inline_status(QString("Submitted, not final%1 after auto-refresh.").arg(retry_note));
+                  statusBar()->showMessage(QString("Transaction submitted, not final%1.").arg(retry_note), 3000);
                   return;
                 }
               }
@@ -5625,9 +5628,9 @@ void WalletWindow::submit_send() {
                          .arg(elide_middle(QString::fromStdString(result->txid_hex), 12)));
   refresh_chain_state(false);
   const QString endpoint_note = used_endpoint.isEmpty() ? QString{} : QString(" via %1").arg(display_lightserver_endpoint(used_endpoint));
-  show_send_inline_status(QString("Accepted for relay%1. Inputs stay reserved locally until finalized inclusion.")
+  show_send_inline_status(QString("Submitted, not final%1. Not paid until finalized; inputs stay reserved until then.")
                               .arg(endpoint_note));
-  statusBar()->showMessage(QString("Transaction accepted for relay%1.").arg(endpoint_note), 3000);
+  statusBar()->showMessage(QString("Transaction submitted, not final%1.").arg(endpoint_note), 3000);
 }
 
 void WalletWindow::show_selected_history_detail() {

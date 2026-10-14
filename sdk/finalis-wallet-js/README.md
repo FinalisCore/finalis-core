@@ -12,7 +12,7 @@ Features:
 - non-custodial key management (Ed25519 seed/private key)
 - address derivation matching core (`sc` / `tsc`)
 - P2PKH script + single-SHA256 scripthash helpers
-- lightserver JSON-RPC client (`get_status`, `get_tip`, `get_tx`, `get_utxos`, `get_committee`, `get_roots`, `get_utxo_proof`, `get_validator_proof`, `broadcast_tx`)
+- lightserver JSON-RPC client (`get_status`, `get_tip`, `get_tx`, `get_tx_status`, `get_utxos`, `get_committee`, `get_roots`, `get_utxo_proof`, `get_validator_proof`, `broadcast_tx`)
 - `getBalanceTrustless` currently fails closed with `TRUSTLESS_NOT_SUPPORTED` (no finality-bound `utxo_root` RPC yet)
 - deterministic UTXO discovery, balance, coin selection, tx build/sign/broadcast/finality wait
 - optional multi-server tip quorum cross-check mode
@@ -70,6 +70,7 @@ const address = FinalisWallet.deriveAddress(keypair.pubkeyHex, 'tsc');
 
 const balance = await wallet.getBalance(address);
 
+// Resolves with status 'submitted_not_final': a node's mempool accepted it, nothing is paid yet.
 const { txid } = await wallet.sendTransaction({
   fromPrivkeyHex: keypair.privkeyHex,
   toAddress: 'tsc1...',
@@ -78,5 +79,9 @@ const { txid } = await wallet.sendTransaction({
   hrp: 'tsc',
 });
 
+// Paid only once this resolves. Throws if the transaction was rejected at finality.
 await wallet.waitForFinality(txid);
+
+// Or poll: finalized | certified_ingress (submitted, not final) | rejected | not_found
+const status = await client.getTxStatus(txid);
 ```

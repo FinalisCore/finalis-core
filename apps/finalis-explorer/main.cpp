@@ -2723,6 +2723,21 @@ ApiError not_found_error(const std::string& message = "not found in finalized st
   return make_error(404, "not_found", message);
 }
 
+// A transaction the network has seen but that is not (or not successfully) finalized. 404 like
+// not_found: nothing here is settlement; the code says why.
+ApiError not_final_error() {
+  return make_error(404, "not_final",
+                    "submitted, not final: the transaction is certified for ordering but not finalized yet; "
+                    "do not treat it as paid");
+}
+
+ApiError rejected_at_finality_error(std::optional<std::uint64_t> height) {
+  return make_error(404, "rejected",
+                    "final and rejected: the transaction was ordered" +
+                        (height.has_value() ? " at height " + std::to_string(*height) : std::string()) +
+                        " but rejected at execution; it moved no funds");
+}
+
 std::string search_classification_name(SearchClassification c) {
   switch (c) {
     case SearchClassification::TransitionHeight:
@@ -3307,7 +3322,14 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   const auto status_text = object_string(&status, "status").value_or("unknown");
   const bool finalized = object_bool(&status, "finalized").value_or(false);
   if (!finalized) {
-    out.error = not_found_error();
+    if (status_text == "certified_ingress") {
+      out.error = not_final_error();
+    } else if (status_text == "rejected") {
+      out.error = rejected_at_finality_error(object_u64(&status, "rejected_height"));
+    } else {
+      out.error = not_found_error(
+          "not found in finalized state; a transaction submitted moments ago is not final yet");
+    }
     return out;
   }
 
@@ -3611,6 +3633,11 @@ LookupResult<SearchResult> fetch_search_result(const Config& cfg, const std::str
     }
     if (tx.error.has_value() && tx.error->http_status != 404) {
       out.error = tx.error;
+      return out;
+    }
+    if (tx.error.has_value() && (tx.error->code == "not_final" || tx.error->code == "rejected")) {
+      result.target = "/tx/" + query;  // known txid, not finalized: the tx page says why
+      out.value = std::move(result);
       return out;
     }
     result.classification = SearchClassification::TransitionHash;
@@ -4162,7 +4189,12 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   body << "<h1>Transaction</h1>";
   auto lookup = fetch_tx_result(cfg, txid_hex);
   if (!lookup.value.has_value()) {
-    body << "<div class=\"card\"><div class=\"note\">Lookup failed: "
+    const std::string code = lookup.error ? lookup.error->code : "";
+    const std::string state = code == "not_final" ? "Submitted, not final"
+                              : code == "rejected" ? "Rejected (final)"
+                              : code == "not_found" ? "Not found in finalized state"
+                                                    : "Lookup failed";
+    body << "<div class=\"card\"><div class=\"note\"><strong>" << state << "</strong>: "
          << html_escape(lookup.error ? lookup.error->message : "unknown error") << "</div></div>";
     return page_layout("Transaction", body.str(), "tx");
   }
@@ -5112,6 +5144,17 @@ void upsert_partner_withdrawal(const Config& cfg, const PartnerWithdrawal& withd
 PartnerWithdrawal refresh_partner_withdrawal_state(const Config& cfg, PartnerWithdrawal withdrawal) {
   if (withdrawal.state == "finalized" || withdrawal.state == "rejected") return withdrawal;
   auto tx = fetch_tx_result(cfg, withdrawal.txid);
+  if (!tx.value.has_value() && tx.error.has_value() && tx.error->code == "rejected") {
+    // Ordered but rejected at execution: final, so the withdrawal can never settle.
+    withdrawal.state = "rejected";
+    withdrawal.error_code = "tx_rejected_at_finality";
+    withdrawal.error_message = tx.error->message;
+    withdrawal.retryable = false;
+    withdrawal.retry_class = "none";
+    withdrawal.updated_unix_ms = now_unix_ms();
+    upsert_partner_withdrawal(cfg, withdrawal);
+    return withdrawal;
+  }
   if (tx.value.has_value() && tx.value->finalized && tx.value->credit_safe) {
     withdrawal.state = "finalized";
     withdrawal.finalized_height = tx.value->finalized_height;
@@ -5595,8 +5638,10 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
       if (!first) oss << ",";
       first = false;
       if (!tx_lookup.value.has_value()) {
+        const bool known = tx_lookup.error.has_value() &&
+                           (tx_lookup.error->code == "not_final" || tx_lookup.error->code == "rejected");
         oss << "{\"txid\":\"" << finalis::minijson::escape(item.string_value)
-            << "\",\"status\":\"not_found\",\"finalized\":false,\"credit_safe\":false,\"finalized_depth\":0,"
+            << "\",\"status\":\"" << (known ? tx_lookup.error->code : std::string("not_found")) << "\",\"finalized\":false,\"credit_safe\":false,\"finalized_depth\":0,"
             << "\"height\":null,\"transition_hash\":null}";
       } else {
         const auto& tx = *tx_lookup.value;

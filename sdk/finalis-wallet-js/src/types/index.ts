@@ -62,10 +62,29 @@ export interface RpcUtxo {
   script_pubkey_hex: Hex;
 }
 
+// accepted=true means a node's mempool took the transaction: submitted, not final. Only a
+// finalized status (getTxStatus / waitForFinality) means paid.
 export interface BroadcastResult {
   accepted: boolean;
+  finalized: false;
   txid?: Hex;
+  status?: string;
   error?: string;
+  errorCode?: string;
+  retryable?: boolean;
+}
+
+// get_tx_status: finalized (paid), certified_ingress (submitted, not final), rejected (final, moved
+// no funds), not_found (unknown to the node; a just-submitted tx may still be pending).
+export type TxStatusName = 'finalized' | 'certified_ingress' | 'rejected' | 'not_found';
+
+export interface TxStatus {
+  txid: Hex;
+  status: TxStatusName;
+  finalized: boolean;
+  creditSafe: boolean;
+  height?: bigint;
+  rejectedHeight?: bigint;
 }
 
 export interface Keypair {
