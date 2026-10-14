@@ -5098,6 +5098,89 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   ASSERT_TRUE(loc->height >= 34u);
 }
 
+// The lightserver relays over a real P2P socket and reports the node's mempool verdict (TX_RESULT).
+// A second spend of the same input passes the lightserver's finalized-state check but the node
+// refuses it; the client must see that rejection rather than accepted_for_relay.
+TEST(test_lightserver_relay_reports_node_mempool_verdict) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const std::string base = unique_test_base("/tmp/finalis_it_relay_node_verdict");
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();
+  cfg.outbound_target = 0;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = reserve_test_port();
+  if (cfg.p2p_port == 0) return;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  ASSERT_TRUE(wait_for([&]() {
+    return node->status().height >= 33 && !node->find_utxos_by_pubkey_hash_for_test(own_pkh).empty();
+  }, ci_timeout_seconds(120)));
+  ASSERT_TRUE(node->pause_proposals_for_test(true));  // hold the tip: both spends meet the same state
+  const auto prev = node->find_utxos_by_pubkey_hash_for_test(own_pkh).front();
+
+  constexpr std::uint64_t kFee = 10'000ULL;
+  const auto spend_to = [&](std::uint8_t fill) {
+    std::array<std::uint8_t, 20> recipient_pkh{};
+    recipient_pkh.fill(fill);
+    std::vector<TxOut> outputs{TxOut{prev.second.value - kFee, address::p2pkh_script_pubkey(recipient_pkh)}};
+    std::string err;
+    auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()),
+                                                 outputs, &err);
+    if (!tx.has_value()) throw std::runtime_error("build tx: " + err);
+    return *tx;
+  };
+  const Tx first = spend_to(0x61);
+  const Tx second = spend_to(0x62);
+
+  lightserver::Config lcfg;
+  lcfg.network = cfg.network;
+  lcfg.db_path = cfg.db_path;
+  lcfg.tx_relay_port = cfg.p2p_port;
+  lcfg.admin_socket_path.clear();
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto broadcast = [&](const Tx& tx) {
+    return ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":1,"method":"broadcast_tx","params":{"tx_hex":")") +
+                                  hex_encode(tx.serialize()) + R"("}})");
+  };
+
+  const auto accepted = broadcast(first);
+  ASSERT_TRUE(accepted.find("\"accepted\":true") != std::string::npos);
+  ASSERT_TRUE(node->mempool_contains_for_test(first.txid()));
+
+  const auto conflict = broadcast(second);
+  ASSERT_TRUE(conflict.find("\"accepted\":false") != std::string::npos);
+  ASSERT_TRUE(conflict.find("\"error_code\":\"tx_conflict_in_mempool\"") != std::string::npos);
+  ASSERT_TRUE(!node->mempool_contains_for_test(second.txid()));
+
+  // Resubmitting a transaction the node already holds is not a rejection.
+  ASSERT_TRUE(broadcast(first).find("\"accepted\":true") != std::string::npos);
+
+  ASSERT_TRUE(node->pause_proposals_for_test(false));
+  node->stop();
+}
+
 // Three disable_p2p nodes on the in-process local bus (no sockets): node0 is the only validator, node1 and
 // node2 follow it. Covers Node::for_each_local_bus_peer with multiple peers: finalized-frontier delivery,
 // the designated-certifier forward (bool early exit) and the certifier's TX re-broadcast to every peer.

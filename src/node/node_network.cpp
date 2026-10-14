@@ -1066,6 +1066,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       return on_timeout_vote(peer_id, payload, payload_id);
     case p2p::MsgType::TX:
       return on_tx(peer_id, payload, payload_id);
+    case p2p::MsgType::SUBMIT_TX:
+      return on_tx(peer_id, payload, payload_id, true);
+    case p2p::MsgType::TX_RESULT:
+      return;  // only lightserver relays expect one
     case p2p::MsgType::GETADDR:
       return on_getaddr(peer_id, payload);
     case p2p::MsgType::ADDR:
@@ -2594,7 +2598,10 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
   const auto nms = now_ms();
   switch (msg_type) {
     case p2p::MsgType::TX:
-      return get(msg_type, cfg_.tx_rate_capacity, cfg_.tx_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::SUBMIT_TX:
+      return get(p2p::MsgType::TX, cfg_.tx_rate_capacity, cfg_.tx_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::TX_RESULT:
+      return get(msg_type, 4.0, 1.0).consume(1.0, nms);
     case p2p::MsgType::PROPOSE:
       return get(msg_type, cfg_.propose_rate_capacity, cfg_.propose_rate_refill).consume(1.0, nms);
     case p2p::MsgType::VOTE:

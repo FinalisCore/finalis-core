@@ -216,7 +216,13 @@ Recommended withdrawal flow:
 
 Interpretation of `broadcast_tx`:
 
-- `accepted=true` and `status="accepted_for_relay"` means relay submission only
+- `accepted=true` and `status="accepted_for_relay"` means the serving node's mempool
+  accepted the transaction; it is not finalized yet
+- `accepted=false` with a tx error code is that node's mempool verdict, which can be
+  stricter than the lightserver's own finalized-state check (for example
+  `tx_conflict_in_mempool`, or `tx_missing_or_unconfirmed_input` while the node syncs)
+- `error_code=relay_unavailable` means no verdict was received; resubmitting the same
+  signed transaction is safe
 - `finalized` in the broadcast result is always `false`
 - completion still comes from finalized lookup
 

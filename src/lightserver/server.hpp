@@ -65,6 +65,13 @@ class RateLimiter {
   std::map<std::string, IpState> per_ip_;
 };
 
+// The local node's verdict on a relayed transaction.
+struct TxRelayResult {
+  enum class Outcome { Accepted, Rejected, Unavailable };
+  Outcome outcome{Outcome::Unavailable};
+  std::string detail;  // node reject reason, or the transport error
+};
+
 struct Config {
   NetworkConfig network{mainnet_network()};
   std::string bind_ip{"127.0.0.1"};
@@ -73,7 +80,7 @@ struct Config {
   std::size_t max_committee{MAX_COMMITTEE};
   std::string tx_relay_host{"127.0.0.1"};
   std::uint16_t tx_relay_port{0};
-  std::function<bool(const Bytes&, std::string*)> tx_relay_override;
+  std::function<TxRelayResult(const Bytes&)> tx_relay_override;
   // Empty disables the admin surface. Not supported on Windows.
   std::string admin_socket_path{kDefaultAdminSocketPath};
   std::size_t worker_threads{0};  // 0 = clamp(hardware_concurrency, 4, 8)
@@ -113,7 +120,7 @@ class Server {
   std::string make_result(const std::string& id_token, const std::string& result_json) const;
 
   std::optional<std::vector<PubKey32>> committee_for_height(std::uint64_t height);
-  bool relay_tx_to_peer(const Bytes& tx_bytes, std::string* err);
+  TxRelayResult relay_tx_to_peer(const Bytes& tx_bytes);
 
   Config cfg_;
   storage::DB db_;

@@ -54,6 +54,10 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "TRANSITION";
     case p2p::MsgType::TX:
       return "TX";
+    case p2p::MsgType::SUBMIT_TX:
+      return "SUBMIT_TX";
+    case p2p::MsgType::TX_RESULT:
+      return "TX_RESULT";
     case p2p::MsgType::GETADDR:
       return "GETADDR";
     case p2p::MsgType::ADDR:

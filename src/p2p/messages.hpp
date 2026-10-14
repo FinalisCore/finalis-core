@@ -36,6 +36,9 @@ enum MsgType : std::uint16_t {
   GET_INGRESS_TIPS = 21,
   INGRESS_TIPS = 22,
   PREVOTE = 24,
+  // Client submission (lightserver relay): the node processes it like TX and answers TX_RESULT.
+  SUBMIT_TX = 25,
+  TX_RESULT = 26,
 };
 
 // Sync requests and replies a peer accepts once both VERSIONs and the sender's VERACK are
@@ -126,6 +129,13 @@ struct TxMsg {
   Bytes tx_bytes;
 };
 
+// The node's mempool verdict on a SUBMIT_TX. reason is empty when accepted.
+struct TxResultMsg {
+  Hash32 txid{};
+  bool accepted{false};
+  std::string reason;
+};
+
 struct IngressRecordMsg {
   IngressCertificate certificate;
   Bytes tx_bytes;
@@ -195,6 +205,8 @@ Bytes ser_epoch_tickets(const EpochTicketsMsg& m);
 std::optional<EpochTicketsMsg> de_epoch_tickets(const Bytes& b);
 Bytes ser_tx(const TxMsg& m);
 std::optional<TxMsg> de_tx(const Bytes& b);
+Bytes ser_tx_result(const TxResultMsg& m);
+std::optional<TxResultMsg> de_tx_result(const Bytes& b);
 Bytes ser_ingress_record(const IngressRecordMsg& m);
 std::optional<IngressRecordMsg> de_ingress_record(const Bytes& b);
 Bytes ser_get_ingress_range(const GetIngressRangeMsg& m);

@@ -274,6 +274,27 @@ TEST(test_tx_message_rejects_oversized_payload) {
   ASSERT_TRUE(!p2p::de_tx(w.take()).has_value());
 }
 
+TEST(test_tx_result_message_roundtrip_and_bounds) {
+  p2p::TxResultMsg m;
+  m.txid.fill(0x42);
+  m.accepted = false;
+  m.reason = "double spend in mempool";
+  const Bytes enc = p2p::ser_tx_result(m);
+  const auto back = p2p::de_tx_result(enc);
+  ASSERT_TRUE(back.has_value());
+  ASSERT_TRUE(back->txid == m.txid && !back->accepted && back->reason == m.reason);
+
+  Bytes bad_flag = enc;
+  bad_flag[32] = 2;  // accepted is 0 or 1
+  ASSERT_TRUE(!p2p::de_tx_result(bad_flag).has_value());
+
+  codec::ByteWriter w;
+  w.bytes_fixed(m.txid);
+  w.u8(0);
+  w.varbytes(Bytes(257, 'x'));
+  ASSERT_TRUE(!p2p::de_tx_result(w.take()).has_value());
+}
+
 TEST(test_write_frame_fd_timed_times_out_against_nonreading_peer) {
 #ifdef _WIN32
   return;
