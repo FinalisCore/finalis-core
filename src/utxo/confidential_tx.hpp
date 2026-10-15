@@ -105,4 +105,10 @@ std::optional<AnyTx> parse_any_tx(const Bytes& b);
 Bytes serialize_any_tx(const AnyTx& tx);
 Hash32 txid_any(const AnyTx& tx);
 
+// Address-history key of a confidential one-time key: SHA256("FINALIS/conf-history/v1" || one_time_pubkey).
+// Finalized outputs paying the key and confidential inputs spending it are indexed under it, so a
+// wallet that derives its request keys from its account secrets finds its coins without stored records.
+// The domain prefix keeps it apart from transparent scripthashes (SHA256(script_pubkey)).
+Hash32 confidential_history_key(const PubKey33& one_time_pubkey);
+
 }  // namespace finalis

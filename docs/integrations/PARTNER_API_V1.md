@@ -44,6 +44,10 @@ Transition rules:
 - `submitted -> accepted_for_relay`
 - `submitted -> rejected`
 - `accepted_for_relay -> finalized`
+- `accepted_for_relay -> rejected` (ordered but rejected at execution:
+  `error_code=tx_rejected_at_finality`; it moved no funds)
+
+`accepted_for_relay` means submitted, not final. It is never settlement.
 
 `finalized` and `rejected` are terminal.
 

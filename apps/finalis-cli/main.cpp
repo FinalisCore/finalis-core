@@ -697,6 +697,13 @@ bool contains_any(const std::string& s, const std::vector<std::string>& needles)
   return false;
 }
 
+// accepted=yes means a node's mempool took the transaction, not that it is paid.
+void print_submitted_not_final(const finalis::Hash32& txid) {
+  std::cout << "finalized=no\n";
+  std::cout << "note=submitted, not final: not paid until get_tx_status " << finalis::hex_encode32(txid)
+            << " reports finalized\n";
+}
+
 void print_section(const std::string& title) {
   std::cout << "\n== " << title << " ==\n";
 }
@@ -3616,6 +3623,7 @@ int main(int argc, char** argv) {
 
     std::cout << "accepted=yes\n";
     std::cout << "status=accepted_for_relay\n";
+    print_submitted_not_final(tx->txid());
     return 0;
   }
 
@@ -3754,6 +3762,7 @@ int main(int argc, char** argv) {
 
     std::cout << "accepted=yes\n";
     std::cout << "status=accepted_for_relay\n";
+    print_submitted_not_final(tx->txid());
     return 0;
   }
 
@@ -4173,6 +4182,9 @@ int main(int argc, char** argv) {
     std::cout << "retry_class=" << result.retry_class << "\n";
     if (result.min_fee_rate_to_enter_when_full.has_value()) {
       std::cout << "min_fee_rate_to_enter_when_full=" << *result.min_fee_rate_to_enter_when_full << "\n";
+    }
+    if (result.outcome == finalis::lightserver::BroadcastOutcome::Sent) {
+      if (auto tx = finalis::Tx::parse(*raw); tx.has_value()) print_submitted_not_final(tx->txid());
     }
     if (!err.empty()) std::cout << "rpc_error=" << err << "\n";
     return result.outcome == finalis::lightserver::BroadcastOutcome::Sent ? 0 : 1;

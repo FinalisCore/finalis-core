@@ -245,6 +245,18 @@ This is what exchanges should use with:
 - `get_history_page`
 - `get_utxos`
 
+Confidential outputs pay one-time keys, not scripts. A finalized confidential output and any
+confidential input spending it are indexed under:
+
+```text
+history_key = SHA256("FINALIS/conf-history/v1" || one_time_pubkey)
+```
+
+`get_confidential_history_page` takes up to 1024 such keys (`history_keys_hex`), merges their
+finalized history, and pages it like `get_history_page`. Wallets derive their request keys from the
+account secrets (`src/wallet/confidential_keys.hpp`) and scan with them, so the account secrets
+alone restore every received coin. The lightserver learns which one-time keys a wallet queries.
+
 ## 12. What Is Not In The Live Address Model
 
 The current live model does not provide:

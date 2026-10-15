@@ -38,6 +38,7 @@ void run_one(const Bytes& in) {
   check_roundtrip(in, p2p::de_prevote, p2p::ser_prevote, "prevote");
   check_roundtrip(in, p2p::de_timeout_vote, p2p::ser_timeout_vote, "timeout_vote");
   check_roundtrip(in, p2p::de_propose, p2p::ser_propose, "propose");
+  check_roundtrip(in, p2p::de_tx_result, p2p::ser_tx_result, "tx_result");
   if (auto p = p2p::de_propose(in); p.has_value()) {
     if (auto fp = FrontierProposal::parse(p->frontier_proposal_bytes); fp.has_value()) {
       (void)FrontierProposal::parse(fp->serialize());
@@ -115,6 +116,12 @@ Bytes mutate(std::mt19937_64& rng, Bytes b) {
 
 }  // namespace
 
+extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
+  run_one(Bytes(data, data + size));
+  return 0;
+}
+
+#ifndef FINALIS_LIBFUZZER
 int main(int argc, char** argv) {
   if (argc > 1) {
     for (int i = 1; i < argc; ++i) {
@@ -139,3 +146,4 @@ int main(int argc, char** argv) {
   std::cout << "fuzz_consensus_msgs done accepted=" << g_accepted << "\n";
   return 0;
 }
+#endif

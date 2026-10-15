@@ -69,6 +69,10 @@ supported subset:
 - imported confidential coin tracking
 - reservation / pending-send visibility
 - cached pending-tx status and inline inspection surfaces
+- chain scan of confidential receipts: each refresh queries `get_confidential_history_page` with the
+  one-time keys derived from every account (requests `0 .. next_request_index + 100`), imports matching
+  outputs and marks spent coins. Importing an account (view + spend secret) scans from height 0, so a
+  wallet restored from its keys recovers its confidential coins without the original wallet file.
 
 ## Lightserver failover
 

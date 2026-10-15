@@ -7,6 +7,7 @@
 
 #include "confidential_memo.hpp"
 #include "crypto/confidential.hpp"
+#include "crypto/hash.hpp"
 #include "crypto/secure_memory.hpp"
 #include "wallet/confidential_keys.hpp"
 
@@ -176,6 +177,44 @@ std::vector<ConfidentialReceiveMatch> match_received_confidential_outputs(const 
     });
     crypto::secure_wipe(spend_secret_hex);
     crypto::secure_wipe(blind_hex);
+  }
+  return out;
+}
+
+std::vector<Hash32> confidential_scan_history_keys(const WalletStore::State& state) {
+  std::vector<Hash32> keys;
+  const auto add_hex = [&](const std::string& pubkey_hex) {
+    auto bytes = hex_decode(pubkey_hex);
+    if (!bytes || bytes->size() != 33) return;
+    PubKey33 pubkey{};
+    std::copy(bytes->begin(), bytes->end(), pubkey.begin());
+    keys.push_back(confidential_history_key(pubkey));
+  };
+  for (const auto& request : state.confidential_requests) add_hex(request.one_time_pubkey_hex);
+  for (const auto& coin : state.confidential_coins) add_hex(coin.one_time_pubkey_hex);
+  for (const auto& derived : derive_account_requests(state)) keys.push_back(confidential_history_key(derived.keys.one_time_pubkey));
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+  return keys;
+}
+
+std::string confidential_scan_key_set_fingerprint(const std::vector<Hash32>& sorted_history_keys) {
+  Bytes data;
+  data.reserve(sorted_history_keys.size() * 32);
+  for (const auto& key : sorted_history_keys) data.insert(data.end(), key.begin(), key.end());
+  return hex_encode32(crypto::sha256(data));
+}
+
+std::vector<OutPoint> confidential_coins_spent_by(const TxV2& tx, const WalletStore::State& state) {
+  std::vector<OutPoint> out;
+  for (const auto& input : tx.inputs) {
+    if (input.kind != TxInputKind::Confidential) continue;
+    const std::string txid_hex = hex_encode32(input.prev_txid);
+    const bool owned = std::any_of(state.confidential_coins.begin(), state.confidential_coins.end(),
+                                   [&](const WalletStore::ConfidentialCoinRecord& coin) {
+                                     return !coin.spent && coin.txid_hex == txid_hex && coin.vout == input.prev_index;
+                                   });
+    if (owned) out.push_back(OutPoint{input.prev_txid, input.prev_index});
   }
   return out;
 }

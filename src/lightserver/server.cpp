@@ -35,6 +35,7 @@
 #include "genesis/genesis.hpp"
 #include "common/keystore.hpp"
 #include "onboarding/validator_onboarding.hpp"
+#include "mempool/mempool.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "utxo/confidential_tx.hpp"
@@ -55,6 +56,8 @@ constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
 constexpr std::uint32_t kHttpRequestDeadlineMs = 10'000;
 constexpr std::uint64_t kDefaultPageLimit = 200;
 constexpr std::uint64_t kMaxPageLimit = 1000;
+// Keys per get_confidential_history_page call: a wallet's derived request keys (next index + gap).
+constexpr std::size_t kMaxConfidentialHistoryKeys = 1024;
 constexpr std::uint32_t kRelayValidationRulesVersion = 7;
 
 std::string server_hrp_for_network(const NetworkConfig& network);
@@ -1161,6 +1164,15 @@ std::string validation_error_message(const std::string& err) {
   return "Transaction rejected.";
 }
 
+// The node's mempool reject reason (TX_RESULT) as a broadcast error code.
+std::string node_reject_error_code(const std::string& reason) {
+  if (reason == "verify rate limited" || reason == "node not running") return "relay_unavailable";
+  if (reason == "double spend in mempool") return "tx_conflict_in_mempool";
+  if (reason == "fee below min relay fee") return "tx_fee_below_min_relay";
+  if (reason == mempool::kMempoolFullNotGoodEnough) return "mempool_full_not_good_enough";
+  return validation_error_code(reason);
+}
+
 std::string retry_class_for_error_code(const std::string& error_code) {
   if (error_code == "tx_invalid" || error_code == "tx_duplicate" || error_code == "tx_conflict_in_mempool") return "none";
   if (error_code == "tx_missing_or_unconfirmed_input") return "after_state_change";
@@ -1933,17 +1945,23 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
   return std::nullopt;
 }
 
-bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
-  if (cfg_.tx_relay_override) return cfg_.tx_relay_override(tx_bytes, err);
+TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
+  if (cfg_.tx_relay_override) return cfg_.tx_relay_override(tx_bytes);
+  auto unavailable = [](std::string detail) {
+    return TxRelayResult{TxRelayResult::Outcome::Unavailable, std::move(detail)};
+  };
+  const auto parsed = parse_any_tx(tx_bytes);
+  if (!parsed.has_value()) return TxRelayResult{TxRelayResult::Outcome::Rejected, "tx parse failed"};
+  const Hash32 txid = txid_any(*parsed);
   constexpr std::uint32_t kRelayHandshakeTimeoutMs = 2000;
-  constexpr std::uint32_t kRelayDrainTimeoutMs = 5000;
+  constexpr std::uint32_t kRelayVerdictTimeoutMs = 5000;
+  constexpr std::uint32_t kRelayDrainTimeoutMs = 1000;
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
   if (getaddrinfo(cfg_.tx_relay_host.c_str(), std::to_string(cfg_.tx_relay_port).c_str(), &hints, &res) != 0) {
-    if (err) *err = "getaddrinfo failed";
-    return false;
+    return unavailable("getaddrinfo failed");
   }
   net::SocketHandle fd = net::kInvalidSocket;
   for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
@@ -1955,8 +1973,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
   }
   freeaddrinfo(res);
   if (!net::valid_socket(fd)) {
-    if (err) *err = "connect relay peer failed";
-    return false;
+    return unavailable("connect relay peer failed");
   }
 
   auto tip = db_.get_tip();
@@ -1972,8 +1989,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
     net::close_socket(fd);
-    if (err) *err = "send VERSION failed";
-    return false;
+    return unavailable("send VERSION failed");
   }
 
   bool saw_version = false;
@@ -1985,16 +2001,14 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
                                           kRelayHandshakeTimeoutMs, &read_err);
     if (!frame.has_value()) {
       net::close_socket(fd);
-      if (err) *err = "relay handshake failed: " + p2p::frame_read_error_string(read_err);
-      return false;
+      return unavailable("relay handshake failed: " + p2p::frame_read_error_string(read_err));
     }
     if (frame->msg_type == p2p::MsgType::VERSION) {
       saw_version = true;
       if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}}, cfg_.network.magic,
                                cfg_.network.protocol_version)) {
         net::close_socket(fd);
-        if (err) *err = "send VERACK failed";
-        return false;
+        return unavailable("send VERACK failed");
       }
       continue;
     }
@@ -2004,34 +2018,46 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
     }
   }
 
-  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::TX, p2p::ser_tx(p2p::TxMsg{tx_bytes})}, cfg_.network.magic,
-                          cfg_.network.protocol_version)) {
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::SUBMIT_TX, p2p::ser_tx(p2p::TxMsg{tx_bytes})},
+                           cfg_.network.magic, cfg_.network.protocol_version)) {
     net::close_socket(fd);
-    if (err) *err = "send TX failed";
-    return false;
+    return unavailable("send SUBMIT_TX failed");
   }
 
-  // Half-close and drain until the node closes. Closing with unread node traffic
-  // (post-VERACK sync, broadcasts) sends RST; the node's writer then fails and its
-  // reader stops before consuming TX. The node reads frames in order and closes on
-  // our EOF, so its EOF means TX reached its handler.
+  // Wait for the node's TX_RESULT, skipping its post-VERACK traffic. Keep the write side open:
+  // on our EOF the node discards its send queue, verdict included.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRelayVerdictTimeoutMs);
+  std::optional<TxRelayResult> verdict;
+  while (!verdict.has_value()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) break;
+    const auto left_ms =
+        static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count()) + 1;
+    p2p::FrameReadError read_err = p2p::FrameReadError::NONE;
+    auto frame = p2p::read_frame_fd_timed(fd, cfg_.network.max_payload_len, cfg_.network.magic,
+                                          cfg_.network.protocol_version, left_ms, left_ms, &read_err);
+    if (!frame.has_value()) break;
+    if (frame->msg_type != p2p::MsgType::TX_RESULT) continue;
+    auto result = p2p::de_tx_result(frame->payload);
+    if (!result.has_value()) break;
+    if (result->txid != txid && !(result->txid == zero_hash() && !result->accepted)) continue;
+    verdict = result->accepted ? TxRelayResult{TxRelayResult::Outcome::Accepted, ""}
+                               : TxRelayResult{TxRelayResult::Outcome::Rejected, result->reason};
+  }
+  // Close gracefully: half-close and drain until the node closes. Closing with unread node traffic
+  // sends RST, which the node logs as a broken frame.
   (void)net::shutdown_socket_write(fd);
-  bool node_closed = false;
   const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRelayDrainTimeoutMs);
   while (std::chrono::steady_clock::now() < drain_deadline) {
     p2p::FrameReadError read_err = p2p::FrameReadError::NONE;
-    auto frame = p2p::read_frame_fd_timed(fd, cfg_.network.max_payload_len, cfg_.network.magic,
-                                          cfg_.network.protocol_version, kRelayDrainTimeoutMs,
-                                          kRelayDrainTimeoutMs, &read_err);
-    if (!frame.has_value()) {
-      node_closed = read_err == p2p::FrameReadError::IO_EOF;
+    if (!p2p::read_frame_fd_timed(fd, cfg_.network.max_payload_len, cfg_.network.magic, cfg_.network.protocol_version,
+                                  kRelayDrainTimeoutMs, kRelayDrainTimeoutMs, &read_err)) {
       break;
     }
   }
-
   net::close_socket(fd);
-  if (!node_closed && err) *err = "relay unconfirmed: peer did not close after TX";
-  return node_closed;
+  if (!verdict.has_value()) return unavailable("relay unconfirmed: no verdict from node");
+  return *verdict;
 }
 
 std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface) {
@@ -2959,11 +2985,12 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       record->txid_hex = hex_encode32(txid);
       return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
-    if (!relay_tx_to_peer(tx_bytes, &err)) {
+    if (const auto relay = relay_tx_to_peer(tx_bytes); relay.outcome != TxRelayResult::Outcome::Accepted) {
       record->state = onboarding::ValidatorOnboardingState::FAILED;
-      record->last_error_code = "tx_rejected";
-      record->last_error_message = err;
-      map_rejoin_policy_error(err, &*record);
+      record->last_error_code =
+          relay.outcome == TxRelayResult::Outcome::Unavailable ? "relay_unavailable" : "tx_rejected";
+      record->last_error_message = relay.detail;
+      map_rejoin_policy_error(relay.detail, &*record);
       record->txid_hex = hex_encode32(txid);
       return make_result(id, onboarding_record_json_for_rpc(cfg_.network, db_, *record));
     }
@@ -3090,6 +3117,53 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
 
     const auto history = view->get_script_history(*sh);
+    std::optional<ScriptHistoryCursor> start_after;
+    if (start_after_height.has_value()) start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
+    return make_result(id, paged_history_json(history, limit, from_height, start_after));
+  }
+
+  // History of several confidential one-time keys (confidential_history_key), merged and deduplicated,
+  // paged like get_history_page.
+  if (*method == "get_confidential_history_page") {
+    const auto* keys_value = params ? params->get("history_keys_hex") : nullptr;
+    if (!keys_value || !keys_value->is_array() || keys_value->array_value.empty()) {
+      return make_error(id, -32602, "missing history_keys_hex");
+    }
+    if (keys_value->array_value.size() > kMaxConfidentialHistoryKeys) return make_error(id, -32602, "too many history keys");
+    std::set<Hash32> keys;
+    for (const auto& item : keys_value->array_value) {
+      if (!item.is_string()) return make_error(id, -32602, "bad history_keys_hex");
+      auto key = parse_hex32(item.string_value);
+      if (!key.has_value()) return make_error(id, -32602, "bad history_keys_hex");
+      keys.insert(*key);
+    }
+    const auto limit = field_u64(params, "limit").value_or(kDefaultPageLimit);
+    if (limit == 0 || limit > kMaxPageLimit) return make_error(id, -32602, "bad limit");
+    const auto from_height = field_u64(params, "from_height").value_or(0);
+    const auto start_after_obj = field_object(params, "start_after");
+    auto start_after_height = field_u64(start_after_obj, "height");
+    auto start_after_txid_hex = field_string(start_after_obj, "txid");
+    std::optional<Hash32> start_after_txid;
+    if (start_after_txid_hex.has_value()) {
+      start_after_txid = parse_hex32(*start_after_txid_hex);
+      if (!start_after_txid.has_value()) return make_error(id, -32602, "bad start_after.txid");
+    }
+    if (start_after_height.has_value() != start_after_txid.has_value()) {
+      return make_error(id, -32602, "start_after requires height and txid");
+    }
+
+    std::vector<storage::DB::ScriptHistoryEntry> history;
+    for (const auto& key : keys) {
+      auto entries = view->get_script_history(key);
+      history.insert(history.end(), entries.begin(), entries.end());
+    }
+    std::sort(history.begin(), history.end(), [](const auto& a, const auto& b) {
+      if (a.height != b.height) return a.height < b.height;
+      return a.txid < b.txid;
+    });
+    history.erase(std::unique(history.begin(), history.end(),
+                              [](const auto& a, const auto& b) { return a.height == b.height && a.txid == b.txid; }),
+                  history.end());
     std::optional<ScriptHistoryCursor> start_after;
     if (start_after_height.has_value()) start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
     return make_result(id, paged_history_json(history, limit, from_height, start_after));
@@ -3459,10 +3533,15 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
                                  true, retry_class_for_error_code("mempool_full_not_good_enough"), true,
                                  runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte));
     }
-    std::string err;
-    if (!relay_tx_to_peer(*tx_bytes, &err)) {
-      return make_result(id, broadcast_result_json(false, txid_hex, "rejected", "", std::string("relay_unavailable"), err,
-                                                   true, retry_class_for_error_code("relay_unavailable"), false,
+    if (const auto relay = relay_tx_to_peer(*tx_bytes); relay.outcome != TxRelayResult::Outcome::Accepted) {
+      // Rejected: the node's mempool refused it (its state can differ from this view, e.g. while
+      // it syncs). Unavailable: no verdict, so the transaction may or may not be in the mempool.
+      const std::string code = relay.outcome == TxRelayResult::Outcome::Unavailable
+                                   ? std::string("relay_unavailable")
+                                   : node_reject_error_code(relay.detail);
+      return make_result(id, broadcast_result_json(false, txid_hex, "rejected", "", code, relay.detail,
+                                                   retry_class_for_error_code(code) != "none",
+                                                   retry_class_for_error_code(code), false,
                                                    runtime.has_value() ? runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte
                                                                        : std::nullopt));
     }

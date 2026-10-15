@@ -40,8 +40,10 @@ Pass conditions:
   - 0 forks, 0 runs that fail to converge (exit 0 on every seed)
   - 0 lost payments classified `dropped` that are not explained by a rejection at submission
   - reports archived with the release
-- Fuzzing: `fuzz_p2p_frame`, `fuzz_tx_parse` and `fuzz_consensus_msgs` run clean under
-  ASan/UBSan on the release commit.
+- Fuzzing: `fuzz_p2p_frame`, `fuzz_tx_parse`, `fuzz_consensus_msgs` and `fuzz_consensus_node` run clean under
+  ASan/UBSan on the release commit, both as smoke binaries (linux-ci) and as libFuzzer targets in
+  ClusterFuzzLite (`.clusterfuzzlite/`, workflows `cflite-pr` and `cflite-batch`), with no open
+  ClusterFuzzLite crash.
 - Independent genesis validators: the genesis set is selected per
   [GENESIS_VALIDATOR_CEREMONY.md](GENESIS_VALIDATOR_CEREMONY.md), with operators other than the
   maintainer able to form a quorum without the maintainer's keys.
@@ -345,6 +347,7 @@ These do not block launch. Track them during the launch period:
 - [ ] OSS-Fuzz application submitted (`projects/finalis-core/` with `project.yaml`, `Dockerfile`,
       `build.sh` in google/oss-fuzz). Before applying:
   - fuzz targets are libFuzzer entry points (`LLVMFuzzerTestOneInput`), not random-byte loops
+    (done: every target in `fuzz/`; `.clusterfuzzlite/build.sh` is the OSS-Fuzz build script)
   - targets cover confidential tx and proof verification, block/certificate decoding and sync
     `TRANSITION` decoding, in addition to the existing three
   - `project.yaml` security contact matches [../SECURITY.md](../SECURITY.md)

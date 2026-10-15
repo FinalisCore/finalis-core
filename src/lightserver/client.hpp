@@ -146,6 +146,11 @@ std::optional<std::vector<HistoryEntry>> rpc_get_history(const std::string& rpc_
                                                          std::string* err);
 std::optional<HistoryPageView> rpc_get_history_page(const std::string& rpc_url, const Hash32& scripthash, std::uint64_t limit,
                                                     const std::optional<HistoryCursor>& start_after, std::string* err);
+// History of confidential one-time keys (confidential_history_key), merged; at most 1024 keys per call.
+std::optional<HistoryPageView> rpc_get_confidential_history_page(const std::string& rpc_url,
+                                                                 const std::vector<Hash32>& history_keys, std::uint64_t limit,
+                                                                 const std::optional<HistoryCursor>& start_after,
+                                                                 std::string* err);
 std::optional<DetailedHistoryPageView> rpc_get_history_page_detailed(const std::string& rpc_url, const Hash32& scripthash,
                                                                      std::uint64_t limit,
                                                                      const std::optional<HistoryCursor>& start_after,

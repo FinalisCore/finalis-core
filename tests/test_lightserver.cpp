@@ -1330,9 +1330,8 @@ TEST(test_lightserver_broadcast_returns_relay_unavailable_code_when_relay_path_f
 
   lightserver::Config lcfg;
   lcfg.db_path = base;
-  lcfg.tx_relay_override = [](const Bytes&, std::string* err) {
-    if (err) *err = "connect relay peer failed";
-    return false;
+  lcfg.tx_relay_override = [](const Bytes&) {
+    return lightserver::TxRelayResult{lightserver::TxRelayResult::Outcome::Unavailable, "connect relay peer failed"};
   };
   lightserver::Server ls(lcfg);
   ASSERT_TRUE(ls.init());
@@ -1344,6 +1343,55 @@ TEST(test_lightserver_broadcast_returns_relay_unavailable_code_when_relay_path_f
   ASSERT_TRUE(resp.find("\"error_code\":\"relay_unavailable\"") != std::string::npos);
   ASSERT_TRUE(resp.find("\"retryable\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"retry_class\":\"transport\"") != std::string::npos);
+}
+
+TEST(test_lightserver_broadcast_reports_node_mempool_rejection) {
+  // The lightserver's view accepts the spend, but the node's mempool does not (e.g. it is syncing
+  // and has the input spent, or holds a conflicting spend). The node's verdict must reach the client.
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_node_reject");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  const auto keys = node::Node::deterministic_test_keypairs();
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x96;
+  ASSERT_TRUE(db.set_tip(storage::TipState{8, tip_hash}));
+
+  OutPoint op{};
+  op.txid.fill(0x59);
+  op.index = 0;
+  TxOut prev{10'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end())))};
+  ASSERT_TRUE(db.put_utxo(op, prev));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  auto tx = build_signed_p2pkh_tx_single_input(
+      op, prev, keys[0].private_key,
+      std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
+  ASSERT_TRUE(tx.has_value());
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":405,"method":"broadcast_tx","params":{"tx_hex":")") +
+                           hex_encode(tx->serialize()) + R"("}})";
+
+  const std::vector<std::tuple<std::string, std::string, std::string>> cases = {
+      {"input depends on unconfirmed or missing utxo", "tx_missing_or_unconfirmed_input", "after_state_change"},
+      {"double spend in mempool", "tx_conflict_in_mempool", "none"},
+      {"verify rate limited", "relay_unavailable", "transport"},
+  };
+  for (const auto& [reason, code, retry_class] : cases) {
+    lightserver::Config lcfg;
+    lcfg.db_path = base;
+    lcfg.tx_relay_override = [reason = reason](const Bytes&) {
+      return lightserver::TxRelayResult{lightserver::TxRelayResult::Outcome::Rejected, reason};
+    };
+    lightserver::Server ls(lcfg);
+    ASSERT_TRUE(ls.init());
+    const auto resp = ls.handle_rpc_for_test(body);
+    ASSERT_TRUE(resp.find("\"accepted\":false") != std::string::npos);
+    ASSERT_TRUE(resp.find("\"error_code\":\"" + code + "\"") != std::string::npos);
+    ASSERT_TRUE(resp.find("\"retry_class\":\"" + retry_class + "\"") != std::string::npos);
+  }
 }
 
 TEST(test_lightserver_broadcast_returns_structured_success_when_relaying_to_live_node) {
@@ -1373,7 +1421,7 @@ TEST(test_lightserver_broadcast_returns_structured_success_when_relaying_to_live
 
   lightserver::Config lcfg;
   lcfg.db_path = base;
-  lcfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
+  lcfg.tx_relay_override = [](const Bytes&) { return lightserver::TxRelayResult{lightserver::TxRelayResult::Outcome::Accepted, ""}; };
   lightserver::Server ls(lcfg);
   ASSERT_TRUE(ls.init());
 
@@ -1585,6 +1633,94 @@ TEST(test_lightserver_history_page_is_deterministic) {
   ASSERT_TRUE(resp2.find(txid1_hex) == std::string::npos);
   ASSERT_TRUE(resp2.find(txid2_hex) == std::string::npos);
   ASSERT_TRUE(resp2.find(txid3_hex) != std::string::npos);
+}
+
+TEST(test_lightserver_confidential_history_page_merges_keys) {
+  const std::string base = unique_test_base("/tmp/finalis_light_conf_history_page");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-conf-history-page";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
+
+  Hash32 key_a{};
+  Hash32 key_b{};
+  Hash32 key_other{};
+  key_a.fill(0xA1);
+  key_b.fill(0xB2);
+  key_other.fill(0xC3);
+  Hash32 txid1{};
+  Hash32 txid2{};
+  Hash32 txid3{};
+  Hash32 txid4{};
+  txid1[31] = 0x01;
+  txid2[31] = 0x02;
+  txid3[31] = 0x03;
+  txid4[31] = 0x04;
+  ASSERT_TRUE(db.add_script_history(key_a, 5, txid1));
+  ASSERT_TRUE(db.add_script_history(key_b, 5, txid1));  // one tx touching both keys: listed once
+  ASSERT_TRUE(db.add_script_history(key_b, 6, txid2));
+  ASSERT_TRUE(db.add_script_history(key_a, 9, txid3));
+  ASSERT_TRUE(db.add_script_history(key_other, 7, txid4));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const auto query = [&](const std::string& extra) {
+    return ls.handle_rpc_for_test(
+        std::string(R"({"jsonrpc":"2.0","id":141,"method":"get_confidential_history_page","params":{"history_keys_hex":[")") +
+        hex_encode32(key_a) + R"(",")" + hex_encode32(key_b) + R"("])" + extra + "}}");
+  };
+  const auto txid1_hex = hex_encode32(txid1);
+  const auto txid2_hex = hex_encode32(txid2);
+  const auto txid3_hex = hex_encode32(txid3);
+  const auto all = query("");
+  ASSERT_TRUE(all.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(all.find(txid1_hex) != std::string::npos);
+  ASSERT_TRUE(all.find(txid1_hex, all.find(txid1_hex) + 1) == std::string::npos);
+  ASSERT_TRUE(all.find(txid1_hex) < all.find(txid2_hex));
+  ASSERT_TRUE(all.find(txid2_hex) < all.find(txid3_hex));
+  ASSERT_TRUE(all.find(hex_encode32(txid4)) == std::string::npos);
+
+  const auto page1 = query(R"(,"limit":2)");
+  ASSERT_TRUE(page1.find("\"has_more\":true") != std::string::npos);
+  ASSERT_TRUE(page1.find(txid3_hex) == std::string::npos);
+  ASSERT_TRUE(page1.find("\"next_start_after\":{\"height\":6,\"txid\":\"" + txid2_hex + "\"}") != std::string::npos);
+  const auto page2 = query(R"(,"limit":2,"start_after":{"height":6,"txid":")" + txid2_hex + R"("})");
+  ASSERT_TRUE(page2.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(page2.find(txid2_hex) == std::string::npos);
+  ASSERT_TRUE(page2.find(txid3_hex) != std::string::npos);
+
+  ASSERT_TRUE(ls.handle_rpc_for_test(
+                    R"({"jsonrpc":"2.0","id":142,"method":"get_confidential_history_page","params":{"history_keys_hex":[]}})")
+                  .find("missing history_keys_hex") != std::string::npos);
+  std::string too_many = R"({"jsonrpc":"2.0","id":143,"method":"get_confidential_history_page","params":{"history_keys_hex":[)";
+  for (int i = 0; i < 1025; ++i) too_many += std::string(i ? "," : "") + "\"" + hex_encode32(key_a) + "\"";
+  too_many += "]}}";
+  ASSERT_TRUE(ls.handle_rpc_for_test(too_many).find("too many history keys") != std::string::npos);
 }
 
 TEST(test_lightserver_get_utxos_supports_paged_response) {
@@ -2047,7 +2183,7 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   cfg.db_path = base;
   cfg.network.onboarding_admission_pow_difficulty_bits = 0;
   cfg.network.validator_join_admission_pow_difficulty_bits = 0;
-  cfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
+  cfg.tx_relay_override = [](const Bytes&) { return lightserver::TxRelayResult{lightserver::TxRelayResult::Outcome::Accepted, ""}; };
 
   storage::EpochRewardSettlementState settlement;
   settlement.epoch_start_height =
@@ -2252,7 +2388,7 @@ TEST(test_lightserver_broadcast_accepts_txv2_spending_confidential_output) {
 
   lightserver::Config lcfg;
   lcfg.db_path = base;
-  lcfg.tx_relay_override = [](const Bytes&, std::string*) { return true; };
+  lcfg.tx_relay_override = [](const Bytes&) { return lightserver::TxRelayResult{lightserver::TxRelayResult::Outcome::Accepted, ""}; };
   lightserver::Server ls(lcfg);
   ASSERT_TRUE(ls.init());
   const std::string body = std::string(R"({"jsonrpc":"2.0","id":405,"method":"broadcast_tx","params":{"tx_hex":")") +

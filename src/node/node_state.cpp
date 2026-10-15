@@ -472,8 +472,8 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       continue;
     }
     batch.put_tx_index(txid, record.transition.height, tx_index++, ordered_record);
-    // Address history covers the transparent side of both formats; confidential outputs pay
-    // one-time keys, not addresses.
+    // Address history covers the transparent side of both formats; confidential outputs and the
+    // inputs spending them are indexed under confidential_history_key(one_time_pubkey).
     const auto add_spent = [&](const Hash32& prev_txid, std::uint32_t prev_index) {
       const auto prev_it = prev_utxos.find(OutPoint{prev_txid, prev_index});
       if (prev_it == prev_utxos.end()) return;
@@ -488,12 +488,21 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       }
     } else if (const auto* v2 = std::get_if<TxV2>(&*tx)) {
       for (const auto& input : v2->inputs) {
-        if (input.kind == TxInputKind::Transparent) add_spent(input.prev_txid, input.prev_index);
+        if (input.kind == TxInputKind::Transparent) {
+          add_spent(input.prev_txid, input.prev_index);
+        } else {
+          const auto& witness = std::get<ConfidentialInputWitnessV2>(input.witness);
+          batch.add_script_history(confidential_history_key(witness.one_time_pubkey), record.transition.height, txid);
+        }
       }
       for (const auto& output : v2->outputs) {
-        if (output.kind != TxOutputKind::Transparent) continue;
-        const auto& out = std::get<TransparentTxOutV2>(output.body);
-        batch.add_script_history(crypto::sha256(out.script_pubkey), record.transition.height, txid);
+        if (output.kind == TxOutputKind::Transparent) {
+          const auto& out = std::get<TransparentTxOutV2>(output.body);
+          batch.add_script_history(crypto::sha256(out.script_pubkey), record.transition.height, txid);
+        } else {
+          const auto& out = std::get<ConfidentialTxOutV2>(output.body);
+          batch.add_script_history(confidential_history_key(out.one_time_pubkey), record.transition.height, txid);
+        }
       }
     }
   }

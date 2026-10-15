@@ -188,53 +188,72 @@ void Node::on_ingress_record(int peer_id, const Bytes& payload) {
   if (appended) retry_deferred_certified_votes();
 }
 
-void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id) {
-  auto m = p2p::de_tx(payload);
-  if (!m.has_value()) {
-    std::lock_guard<std::mutex> lk(mu_);
-    invalid_message_payloads_.insert(payload_id);
-    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-msg");
-    return;
-  }
-  {
+void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bool reply) {
+  // A SUBMIT_TX sender (lightserver relay) waits for the verdict, so a rejection is never silent.
+  auto send_result = [&](const Hash32& txid, bool accepted, const std::string& reason) {
+    if (!reply) return;
+    (void)p2p_.send_to(peer_id, p2p::MsgType::TX_RESULT, p2p::ser_tx_result(p2p::TxResultMsg{txid, accepted, reason}));
+  };
+  if (!reply) {
     std::lock_guard<std::mutex> lk(mu_);
     if (accepted_tx_payloads_.contains(payload_id)) return;
   }
-  auto tx = parse_any_tx(m->tx_bytes);
-  if (tx.has_value()) {
-    log_line("recv TX peer_id=" + std::to_string(peer_id) + " txid=" + hex_encode32(txid_any(*tx)));
-  }
-  if (!tx.has_value()) {
-    std::lock_guard<std::mutex> lk(mu_);
-    invalid_message_payloads_.insert(payload_id);
-    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-parse");
+  auto m = p2p::de_tx(payload);
+  if (!m.has_value()) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      invalid_message_payloads_.insert(payload_id);
+      score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-msg");
+    }
+    send_result(zero_hash(), false, "bad tx message");
     return;
   }
-  if (!handle_tx(*tx, true, peer_id)) {
+  auto tx = parse_any_tx(m->tx_bytes);
+  if (!tx.has_value()) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      invalid_message_payloads_.insert(payload_id);
+      score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-parse");
+    }
+    send_result(zero_hash(), false, "tx parse failed");
+    return;
+  }
+  const Hash32 txid = txid_any(*tx);
+  log_line("recv " + std::string(reply ? "SUBMIT_TX" : "TX") + " peer_id=" + std::to_string(peer_id) +
+           " txid=" + hex_encode32(txid));
+  std::string reason;
+  if (!handle_tx(*tx, true, peer_id, &reason)) {
     // Not blacklisted or scored: a mempool rejection is often transient (input not yet seen, rate
     // limit, conflicting spend) and the same payload can be valid later, e.g. at the certifier after
     // a restart or a stale-epoch lane truncation. Malformed TX messages are penalized above, and TX
     // traffic is rate-limited per peer.
+    send_result(txid, false, reason);
   } else {
-    std::lock_guard<std::mutex> lk(mu_);
-    accepted_tx_payloads_.insert(payload_id);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      accepted_tx_payloads_.insert(payload_id);
+    }
+    send_result(txid, true, "");
   }
-  return;
 }
 
-bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
-  if (from_network && !running_) return false;
+bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id, std::string* reject_reason) {
+  auto reject = [&](const std::string& reason) {
+    if (reject_reason) *reject_reason = reason;
+    return false;
+  };
+  if (from_network && !running_) return reject("node not running");
   Hash32 txid{};
   {
     std::lock_guard<std::mutex> lk(mu_);
-    if (from_network && !running_) return false;
+    if (from_network && !running_) return reject("node not running");
     auto& verify_bucket = tx_verify_buckets_[from_peer_id];
     verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
     const auto input_count = std::visit([](const auto& value) { return value.inputs.size(); }, tx);
     if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, input_count)), now_ms())) {
       log_line("tx-reject txid=" + hex_encode32(txid_any(tx)) + " peer_id=" + std::to_string(from_peer_id) +
                " reason=verify-rate-limited");
-      return false;
+      return reject("verify rate limited");
     }
     // Already held: a duplicate, not a rejection. A re-forward of an uncertified transaction lands
     // here at the designated certifier, so try to certify it.
@@ -275,11 +294,11 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id) {
           log_line(oss.str());
         }
       }
-      return false;
+      return reject(err);
     }
     if (fee < min_relay_fee) {
       log_line("tx-reject txid=" + hex_encode32(txid_any(tx)) + " reason=fee-below-min-relay");
-      return false;
+      return reject("fee below min relay fee");
     }
     txid = txid_any(tx);
     std::string ingress_error;

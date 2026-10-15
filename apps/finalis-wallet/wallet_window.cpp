@@ -807,7 +807,7 @@ QString local_history_reference(const QString& line) {
 }
 
 QString local_history_state(const QString& line) {
-  if (line.startsWith("[pending]")) return "local relay accepted";
+  if (line.startsWith("[pending]")) return "submitted, not final";
   if (line.startsWith("[finalized]")) return "local note";
   if (line.startsWith("[onboarding]")) return "local tracking";
   return "local event";
@@ -860,7 +860,7 @@ QString badge_text(const QString& status) {
 QString title_case_status(const QString& status) {
   const QString upper = status.trimmed().toUpper();
   if (upper == "FINALIZED") return "Finalized";
-  if (upper == "PENDING") return "Pending";
+  if (upper == "PENDING") return "Submitted, not final";
   if (upper == "FAILED") return "Failed";
   if (upper == "REJECTED") return "Rejected";
   if (upper == "INFO") return "Info";
@@ -911,7 +911,9 @@ void restore_table_sort(QTableWidget* table, QSettings& settings, const QString&
 }
 
 QColor status_background(const QString& status) {
-  const QString upper = status.trimmed().toUpper();
+  // Raw status or its display text (PENDING shows as "Submitted, not final").
+  QString upper = status.trimmed().toUpper();
+  if (upper == "SUBMITTED, NOT FINAL") upper = "PENDING";
   const bool dark = qApp && qApp->palette().color(QPalette::Window).lightness() < 128;
   if (dark) {
     if (upper == "FINALIZED") return QColor(46, 46, 46);
@@ -934,7 +936,8 @@ QColor amount_foreground(bool positive) {
 void apply_amount_item_style(QTableWidgetItem* item, const QString& kind, const QString& status) {
   if (!item) return;
   const QString upper_kind = kind.trimmed().toUpper();
-  const QString upper_status = status.trimmed().toUpper();
+  QString upper_status = status.trimmed().toUpper();
+  if (upper_status == "SUBMITTED, NOT FINAL") upper_status = "PENDING";
   if (upper_kind == "RECEIVED") {
     item->setForeground(QBrush(amount_foreground(true)));
     return;
@@ -2771,11 +2774,11 @@ void WalletWindow::start_onboarding_registration_clicked() {
                                   validator_key.pubkey.begin(), validator_key.pubkey.end()))), 12))
                          .arg(QString::fromStdString(funding_key->address))
                          .arg(used_endpoint.isEmpty() ? rpc_url : used_endpoint));
-  statusBar()->showMessage("Onboarding registration submitted for relay.", 4000);
+  statusBar()->showMessage("Onboarding registration submitted, not final.", 4000);
   refresh_chain_state(false);
   refresh_validator_readiness_panel(false);
   QMessageBox::information(this, "Register Onboarding Operator",
-                           QString("Onboarding registration accepted for relay.\n\nTxid: %1")
+                           QString("Onboarding registration submitted, not final. It counts once finalized.\n\nTxid: %1")
                                .arg(QString::fromStdString(finalis::hex_encode32(tx->txid()))));
 }
 
@@ -3676,6 +3679,48 @@ bool WalletWindow::refresh_finalized_send_state(QString* err) {
 
 void WalletWindow::mark_refresh_state_changed() { ++refresh_state_version_; }
 
+namespace {
+
+// Finalized txs in (from_height, through_height] touching any of `keys`, in (height, txid) order.
+bool scan_confidential_history(const std::string& endpoint, const std::vector<Hash32>& keys, std::uint64_t from_height,
+                               std::uint64_t through_height, std::vector<std::pair<Hash32, Bytes>>* txs, std::string* err) {
+  constexpr std::size_t kKeysPerCall = 1024;  // lightserver kMaxConfidentialHistoryKeys
+  std::set<std::pair<std::uint64_t, Hash32>> found;
+  for (std::size_t begin = 0; begin < keys.size(); begin += kKeysPerCall) {
+    const std::vector<Hash32> chunk(keys.begin() + static_cast<std::ptrdiff_t>(begin),
+                                    keys.begin() + static_cast<std::ptrdiff_t>(std::min(keys.size(), begin + kKeysPerCall)));
+    std::optional<lightserver::HistoryCursor> cursor;
+    if (from_height > 0) cursor = lightserver::HistoryCursor{from_height - 1, Hash32{}};
+    while (true) {
+      auto page = lightserver::rpc_get_confidential_history_page(endpoint, chunk, 200, cursor, err);
+      if (!page) return false;
+      bool past_end = false;
+      for (const auto& item : page->items) {
+        if (item.height > through_height) {
+          past_end = true;
+          break;
+        }
+        if (item.height >= from_height) found.emplace(item.height, item.txid);
+      }
+      if (past_end || !page->has_more) break;
+      if (!page->next_start_after.has_value()) {
+        if (err) *err = "confidential history pagination cursor was missing";
+        return false;
+      }
+      cursor = page->next_start_after;
+    }
+  }
+  for (const auto& [height, txid] : found) {
+    (void)height;
+    auto view = lightserver::rpc_get_tx(endpoint, txid, err);
+    if (!view) return false;
+    txs->emplace_back(txid, std::move(view->tx_bytes));
+  }
+  return true;
+}
+
+}  // namespace
+
 WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequest& request, BackgroundThreads& threads) {
   RefreshResult result;
   std::optional<lightserver::RpcStatusView> status;
@@ -4120,13 +4165,29 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
     chain_records.push_back(ChainRecord{
         "PENDING",
         "SENT",
-        "accepted for relay",
+        "submitted, not final",
         txid_q,
         "awaiting finalized inclusion",
         txid_q,
-        QString("Transaction: %1\nState: accepted for relay, awaiting finalized inclusion\nLocal reservation: selected finalized inputs remain reserved until this transaction finalizes or is superseded.")
+        QString("Transaction: %1\nState: submitted, not final (awaiting finalized inclusion)\nLocal reservation: selected finalized inputs remain reserved until this transaction finalizes or is superseded.")
             .arg(txid_q),
     });
+  }
+
+  if (!request.confidential_history_keys.empty()) {
+    const std::uint64_t from_height =
+        request.confidential_scanned_through_height ? *request.confidential_scanned_through_height + 1 : 0;
+    std::vector<std::pair<Hash32, Bytes>> scan_txs;
+    std::string scan_err;
+    if (from_height > status->tip_height) {
+      result.confidential_scan_cursor =
+          WalletStore::ConfidentialScanCursor{request.confidential_key_set_fingerprint, status->tip_height};
+    } else if (scan_confidential_history(active_endpoint.toStdString(), request.confidential_history_keys, from_height,
+                                         status->tip_height, &scan_txs, &scan_err)) {
+      result.confidential_scan_txs = std::move(scan_txs);
+      result.confidential_scan_cursor =
+          WalletStore::ConfidentialScanCursor{request.confidential_key_set_fingerprint, status->tip_height};
+    }
   }
 
   result.chain_records = normalize_chain_records_for_display(chain_records);
@@ -4245,6 +4306,33 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
                              .arg(elide_middle(QString::fromStdString(hex_encode32(txid)), 12)));
     }
   }
+  bool rescan_needed = false;
+  if (result.confidential_scan_cursor.has_value()) {
+    std::size_t imported = 0;
+    std::size_t spent = 0;
+    for (const auto& [txid, tx_bytes] : result.confidential_scan_txs) {
+      const auto any = parse_any_tx(tx_bytes);
+      if (!any || !std::holds_alternative<TxV2>(*any)) continue;
+      const auto& tx = std::get<TxV2>(*any);
+      std::size_t already = 0;
+      imported += import_confidential_outputs(tx, txid, &already);
+      WalletStore::State state;
+      if (!store_.load(&state)) continue;
+      for (const auto& outpoint : confidential_coins_spent_by(tx, state)) {
+        if (store_.set_confidential_coin_spent(hex_encode32(outpoint.txid), outpoint.index, true)) ++spent;
+      }
+    }
+    if (imported > 0 || spent > 0) {
+      append_local_event(QString("[confidential] chain scan: %1 coin(s) found, %2 marked spent").arg(imported).arg(spent));
+    }
+    (void)store_.set_confidential_scan_cursor(*result.confidential_scan_cursor);
+    // An import past the old request window derives new keys: scan again, from height 0, with them.
+    WalletStore::State state;
+    if (store_.load(&state)) {
+      rescan_needed = confidential_scan_key_set_fingerprint(confidential_scan_history_keys(state)) !=
+                      result.confidential_scan_cursor->key_set_fingerprint;
+    }
+  }
   for (const auto& txid : result.remove_pending_txids) {
     (void)store_.remove_pending_spend(txid);
     (void)store_.remove_pending_tx_status(txid);
@@ -4270,6 +4358,12 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
             : QString("Wallet state refreshed from %1.")
                   .arg(display_lightserver_endpoint(last_successful_lightserver_endpoint_));
     statusBar()->showMessage(message, 3000);
+  }
+  if (rescan_needed) {
+    QPointer<WalletWindow> self(this);
+    QTimer::singleShot(0, this, [self]() {
+      if (self) self->refresh_chain_state(false);
+    });
   }
 }
 
@@ -4301,7 +4395,15 @@ void WalletWindow::refresh_chain_state(bool interactive) {
   request.pending_wallet_spends = pending_wallet_spends_;
   if (wallet_) {
     WalletStore::State local_state;
-    if (store_.load(&local_state)) request.pending_spend_records = std::move(local_state.pending_spends);
+    if (store_.load(&local_state)) {
+      request.pending_spend_records = std::move(local_state.pending_spends);
+      if (!confidential_storage_locked_) request.confidential_history_keys = confidential_scan_history_keys(local_state);
+      request.confidential_key_set_fingerprint = confidential_scan_key_set_fingerprint(request.confidential_history_keys);
+      if (local_state.confidential_scan_cursor.has_value() &&
+          local_state.confidential_scan_cursor->key_set_fingerprint == request.confidential_key_set_fingerprint) {
+        request.confidential_scanned_through_height = local_state.confidential_scan_cursor->scanned_through_height;
+      }
+    }
   }
   request.finalized_history_cursor_height = finalized_history_cursor_height_;
   request.finalized_history_cursor_txid = finalized_history_cursor_txid_;
@@ -4586,7 +4688,8 @@ void WalletWindow::import_confidential_account() {
   update_wallet_views();
   append_local_event(QString("[confidential] imported account %1")
                          .arg(QString::fromStdString(record.label)));
-  statusBar()->showMessage("Confidential account imported.", 3000);
+  statusBar()->showMessage("Confidential account imported. Scanning the chain for its coins.", 3000);
+  refresh_chain_state(false);
 }
 
 void WalletWindow::generate_confidential_request() {
@@ -5286,7 +5389,7 @@ void WalletWindow::submit_send() {
       const QString reservation_breakdown = send_reservation_note(pending_reserved_excluded, onboarding_reserved_excluded);
       if (!reservation_breakdown.isEmpty()) confirm += "\n" + reservation_breakdown;
     }
-    confirm += "\n\nAccepted for relay by lightserver is not finality.";
+    confirm += "\n\nA submitted payment is not final until it is finalized.";
     if (QMessageBox::question(this, "Confirm Send", confirm, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) !=
         QMessageBox::Yes) {
       show_send_inline_status("Send cancelled");
@@ -5578,8 +5681,8 @@ void WalletWindow::submit_send() {
                   const QString retry_note = retry_endpoint.isEmpty()
                                                  ? QString{}
                                                  : QString(" via %1").arg(display_lightserver_endpoint(retry_endpoint));
-                  show_send_inline_status(QString("Accepted for relay%1 after auto-refresh.").arg(retry_note));
-                  statusBar()->showMessage(QString("Transaction accepted for relay%1.").arg(retry_note), 3000);
+                  show_send_inline_status(QString("Submitted, not final%1 after auto-refresh.").arg(retry_note));
+                  statusBar()->showMessage(QString("Transaction submitted, not final%1.").arg(retry_note), 3000);
                   return;
                 }
               }
@@ -5625,9 +5728,9 @@ void WalletWindow::submit_send() {
                          .arg(elide_middle(QString::fromStdString(result->txid_hex), 12)));
   refresh_chain_state(false);
   const QString endpoint_note = used_endpoint.isEmpty() ? QString{} : QString(" via %1").arg(display_lightserver_endpoint(used_endpoint));
-  show_send_inline_status(QString("Accepted for relay%1. Inputs stay reserved locally until finalized inclusion.")
+  show_send_inline_status(QString("Submitted, not final%1. Not paid until finalized; inputs stay reserved until then.")
                               .arg(endpoint_note));
-  statusBar()->showMessage(QString("Transaction accepted for relay%1.").arg(endpoint_note), 3000);
+  statusBar()->showMessage(QString("Transaction submitted, not final%1.").arg(endpoint_note), 3000);
 }
 
 void WalletWindow::show_selected_history_detail() {

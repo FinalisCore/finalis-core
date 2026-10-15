@@ -39,7 +39,23 @@ Action:
 1. check `get_status`
 2. verify node and relay service health
 3. retry later or use another relay-capable node
-4. do not mark the withdrawal failed on-chain from this result alone
+4. do not mark the withdrawal failed on-chain from this result alone: no verdict was
+   received, so the transaction may still be in the node's mempool; resubmitting the
+   same signed transaction is safe
+
+### Node mempool rejected the transaction
+
+Symptoms:
+
+- `accepted=false` with `error_code=tx_conflict_in_mempool` or
+  `tx_missing_or_unconfirmed_input`
+
+The lightserver accepted the transaction against its finalized view, but the node's
+mempool refused it. Typical causes: an input already spent by another pending
+transaction, or a node still catching up. Action:
+
+1. refresh finalized UTXOs from a synced endpoint (`get_status`: no finalized lag)
+2. rebuild and re-sign from the refreshed inputs; do not rebroadcast the rejected bytes
 
 ### Withdrawal accepted for relay but not yet finalized
 

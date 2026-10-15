@@ -94,7 +94,6 @@ bool meets_full_replacement_margin(const MempoolEntry& incoming, const MempoolEn
 // further down accept_tx -- both reject for the same underlying reason
 // (incoming tx isn't good enough to justify evicting the pool's worst entry),
 // so they must report it identically rather than risk drifting apart.
-constexpr const char* kMempoolFullNotGoodEnough = "mempool full: not good enough";
 
 // Same bounds execute_frontier_slice applies to the turnstile.
 bool pool_value_admits(std::uint64_t pool_value, wide::I128 delta) {

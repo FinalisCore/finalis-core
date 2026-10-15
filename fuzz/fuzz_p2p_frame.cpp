@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -13,15 +14,26 @@ using namespace finalis;
 
 namespace {
 
+// An accepted frame must re-encode to bytes that decode back to the same encoding.
 void run_one(const Bytes& in) {
   auto f = p2p::decode_frame(in);
   if (!f.has_value()) return;
   const Bytes enc = p2p::encode_frame(*f);
-  (void)p2p::decode_frame(enc);
+  auto again = p2p::decode_frame(enc);
+  if (!again.has_value() || p2p::encode_frame(*again) != enc) {
+    std::cerr << "fuzz_p2p_frame: frame round trip size=" << in.size() << "\n";
+    std::abort();
+  }
 }
 
 }  // namespace
 
+extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
+  run_one(Bytes(data, data + size));
+  return 0;
+}
+
+#ifndef FINALIS_LIBFUZZER
 int main(int argc, char** argv) {
   if (argc > 1) {
     for (int i = 1; i < argc; ++i) {
@@ -44,3 +56,4 @@ int main(int argc, char** argv) {
   std::cout << "fuzz_p2p_frame done\n";
   return 0;
 }
+#endif

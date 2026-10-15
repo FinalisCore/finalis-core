@@ -1,0 +1,38 @@
+name: cflite-batch
+
+# Nightly ClusterFuzzLite batch fuzzing of the fuzz/ targets (.clusterfuzzlite/). Grows the corpora
+# that cflite-pr starts from (kept as workflow artifacts) and reports crashes as run failures with
+# the reproducer attached.
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions: read-all
+
+concurrency:
+  group: cflite-batch
+  cancel-in-progress: false
+
+jobs:
+  batch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: c++
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 3600
+          mode: batch
+          sanitizer: ${{ matrix.sanitizer }}

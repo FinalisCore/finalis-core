@@ -18,6 +18,7 @@
 
 namespace finalis::mempool {
 
+inline constexpr const char* kMempoolFullNotGoodEnough = "mempool full: not good enough";
 inline constexpr const char* kMempoolConfidentialTurnstile = "confidential-turnstile-would-go-negative";
 
 using UtxoView = UtxoSetV2;

@@ -4908,7 +4908,8 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
 
 // A finalized TxV2 (shield: transparent input -> transparent payment + confidential output) is indexed
 // like a Tx: tx index, address history for the spent and paid addresses, and get_tx decodes the
-// transparent output while reporting the confidential one without an amount or address.
+// transparent output while reporting the confidential one without an amount or address. The
+// confidential output and the later unshield spending it are indexed under its one-time key.
 TEST(test_finalized_txv2_is_indexed_with_address_history) {
   ASSERT_TRUE(crypto::confidential_crypto_init());
   const std::string base = unique_test_base("/tmp/finalis_it_txv2_indexing");
@@ -4978,20 +4979,53 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
     if (!probe_db.open_readonly(cfg.db_path)) return false;
     return probe_db.get_tx_index(tx->txid()).has_value();
   }, ci_timeout_seconds(45)));
+
+  // Unshield the confidential coin: the spend is indexed under the same one-time key.
+  std::optional<std::uint32_t> conf_vout;
+  for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
+    if (tx->outputs[i].kind == TxOutputKind::Confidential) conf_vout = static_cast<std::uint32_t>(i);
+  }
+  ASSERT_TRUE(conf_vout.has_value());
+  wallet::ConfidentialOwnedCoin coin{
+      .outpoint = OutPoint{tx->txid(), *conf_vout},
+      .amount = kConfidential,
+      .spend_secret = crypto::Blind32{one_time_scalar},
+      .value_blind = blind,
+      .value_commitment = conf_out->value_commitment,
+      .one_time_pubkey = *one_time,
+  };
+  Hash32 spend_nonce{};
+  spend_nonce.fill(0x5F);
+  Hash32 excess_nonce{};
+  excess_nonce.fill(0x60);
+  const auto unshield = wallet::build_txv2_confidential_to_transparent(
+      coin, TransparentTxOutV2{kConfidential - kFee, address::p2pkh_script_pubkey(recipient_pkh)}, kFee, spend_nonce,
+      excess_nonce, &err);
+  if (!unshield.has_value()) throw std::runtime_error("unshield tx: " + err);
+  ASSERT_TRUE(node->inject_tx_for_test(AnyTx{*unshield}, true));
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB probe_db;
+    if (!probe_db.open_readonly(cfg.db_path)) return false;
+    return probe_db.get_tx_index(unshield->txid()).has_value();
+  }, ci_timeout_seconds(45)));
   node->stop();
   node.reset();
 
+  const Hash32 conf_key = confidential_history_key(*one_time);
   {
     storage::DB db;
     ASSERT_TRUE(db.open(cfg.db_path));
-    const auto has_txid = [&](const Hash32& scripthash) {
+    const auto has_txid = [&](const Hash32& scripthash, const Hash32& txid) {
       for (const auto& entry : db.get_script_history(scripthash)) {
-        if (entry.txid == tx->txid()) return true;
+        if (entry.txid == txid) return true;
       }
       return false;
     };
-    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh))));  // paid
-    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(own_pkh))));        // spent
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh)), tx->txid()));  // paid
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(own_pkh)), tx->txid()));        // spent
+    ASSERT_TRUE(has_txid(conf_key, tx->txid()));                                                     // confidential paid
+    ASSERT_TRUE(has_txid(conf_key, unshield->txid()));                                               // confidential spent
+    ASSERT_EQ(db.get_script_history(conf_key).size(), 2u);
   }
 
   lightserver::Config lcfg;
@@ -5024,6 +5058,16 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
       hex_encode32(tx->txid()) + R"("]}})");
   ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kFee)) != std::string::npos);
   ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kConfidential + kFee)) == std::string::npos);
+
+  // A restoring wallet finds both through its derived one-time key.
+  Hash32 unrelated_key{};
+  unrelated_key.fill(0x61);
+  const auto conf_history = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":308,"method":"get_confidential_history_page","params":{"history_keys_hex":[")") +
+      hex_encode32(unrelated_key) + R"(",")" + hex_encode32(conf_key) + R"("],"limit":10}})");
+  ASSERT_TRUE(conf_history.find(hex_encode32(tx->txid())) != std::string::npos);
+  ASSERT_TRUE(conf_history.find(hex_encode32(unshield->txid())) != std::string::npos);
+  ASSERT_TRUE(conf_history.find("\"has_more\":false") != std::string::npos);
 }
 
 TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
@@ -5096,6 +5140,89 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   const auto loc = db.get_tx_index(tx->txid());
   ASSERT_TRUE(loc.has_value());
   ASSERT_TRUE(loc->height >= 34u);
+}
+
+// The lightserver relays over a real P2P socket and reports the node's mempool verdict (TX_RESULT).
+// A second spend of the same input passes the lightserver's finalized-state check but the node
+// refuses it; the client must see that rejection rather than accepted_for_relay.
+TEST(test_lightserver_relay_reports_node_mempool_verdict) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const std::string base = unique_test_base("/tmp/finalis_it_relay_node_verdict");
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();
+  cfg.outbound_target = 0;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = reserve_test_port();
+  if (cfg.p2p_port == 0) return;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  ASSERT_TRUE(wait_for([&]() {
+    return node->status().height >= 33 && !node->find_utxos_by_pubkey_hash_for_test(own_pkh).empty();
+  }, ci_timeout_seconds(120)));
+  ASSERT_TRUE(node->pause_proposals_for_test(true));  // hold the tip: both spends meet the same state
+  const auto prev = node->find_utxos_by_pubkey_hash_for_test(own_pkh).front();
+
+  constexpr std::uint64_t kFee = 10'000ULL;
+  const auto spend_to = [&](std::uint8_t fill) {
+    std::array<std::uint8_t, 20> recipient_pkh{};
+    recipient_pkh.fill(fill);
+    std::vector<TxOut> outputs{TxOut{prev.second.value - kFee, address::p2pkh_script_pubkey(recipient_pkh)}};
+    std::string err;
+    auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()),
+                                                 outputs, &err);
+    if (!tx.has_value()) throw std::runtime_error("build tx: " + err);
+    return *tx;
+  };
+  const Tx first = spend_to(0x61);
+  const Tx second = spend_to(0x62);
+
+  lightserver::Config lcfg;
+  lcfg.network = cfg.network;
+  lcfg.db_path = cfg.db_path;
+  lcfg.tx_relay_port = cfg.p2p_port;
+  lcfg.admin_socket_path.clear();
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto broadcast = [&](const Tx& tx) {
+    return ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":1,"method":"broadcast_tx","params":{"tx_hex":")") +
+                                  hex_encode(tx.serialize()) + R"("}})");
+  };
+
+  const auto accepted = broadcast(first);
+  ASSERT_TRUE(accepted.find("\"accepted\":true") != std::string::npos);
+  ASSERT_TRUE(node->mempool_contains_for_test(first.txid()));
+
+  const auto conflict = broadcast(second);
+  ASSERT_TRUE(conflict.find("\"accepted\":false") != std::string::npos);
+  ASSERT_TRUE(conflict.find("\"error_code\":\"tx_conflict_in_mempool\"") != std::string::npos);
+  ASSERT_TRUE(!node->mempool_contains_for_test(second.txid()));
+
+  // Resubmitting a transaction the node already holds is not a rejection.
+  ASSERT_TRUE(broadcast(first).find("\"accepted\":true") != std::string::npos);
+
+  ASSERT_TRUE(node->pause_proposals_for_test(false));
+  node->stop();
 }
 
 // Three disable_p2p nodes on the in-process local bus (no sockets): node0 is the only validator, node1 and
@@ -7783,13 +7910,13 @@ TEST(test_round_catch_up_needs_f_plus_one_timeout_votes) {
     if (pub != target->local_validator_pubkey_for_test()) others.push_back(pub);
   }
   const std::uint32_t base = target->status().round;
-  const std::uint32_t far = base + 100;  // beyond the single-vote catch-up window (32)
+  const std::uint32_t far_round = base + 100;  // beyond the single-vote catch-up window (32)
 
   // Beyond the window the votes are not stored (soft reject), only their rounds are noted.
-  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far + 10, others[0]));
-  ASSERT_TRUE(target->status().round < far);
-  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far, others[1]));
-  ASSERT_EQ(target->status().round, far);  // the second-highest: f + 1 = 2 validators reached it
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far_round + 10, others[0]));
+  ASSERT_TRUE(target->status().round < far_round);
+  (void)target->inject_timeout_vote_for_test(make_test_timeout_vote(nodes[0]->consensus_domain_for_test(), keys, h, far_round, others[1]));
+  ASSERT_EQ(target->status().round, far_round);  // the second-highest: f + 1 = 2 validators reached it
 }
 
 TEST(test_fork_choice_prefers_highest_finalized_view_then_weight) {

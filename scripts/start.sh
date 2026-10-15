@@ -16,9 +16,15 @@ SETUP_NODE_SERVICE="${SETUP_NODE_SERVICE:-1}"
 OPEN_FIREWALL_PORTS="${OPEN_FIREWALL_PORTS:-1}"
 SERVICE_NAME="${SERVICE_NAME:-finalis}"
 SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
-DB_DIR="${DB_DIR:-$HOME/.finalis/mainnet}"
-P2P_PORT="${P2P_PORT:-19440}"
-LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-19444}"
+FINALIS_NETWORK="${FINALIS_NETWORK:-mainnet}"
+case "${FINALIS_NETWORK}" in
+  testnet) DEFAULT_P2P_PORT=19540; DEFAULT_LIGHTSERVER_PORT=19544 ;;
+  *) DEFAULT_P2P_PORT=19440; DEFAULT_LIGHTSERVER_PORT=19444 ;;
+esac
+SEEDS_FILE="${ROOT_DIR}/${FINALIS_NETWORK}/SEEDS.json"
+DB_DIR="${DB_DIR:-$HOME/.finalis/${FINALIS_NETWORK}}"
+P2P_PORT="${P2P_PORT:-${DEFAULT_P2P_PORT}}"
+LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-${DEFAULT_LIGHTSERVER_PORT}}"
 LIGHTSERVER_BIND="${LIGHTSERVER_BIND:-0.0.0.0}"
 WITH_LIGHTSERVER="${WITH_LIGHTSERVER:-1}"
 WITH_EXPLORER="${WITH_EXPLORER:-1}"
@@ -34,9 +40,7 @@ NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
 USE_SEEDS_JSON="${USE_SEEDS_JSON:-1}"
 GENESIS_BIN="${GENESIS_BIN:-}"
 GENESIS_PATH="${GENESIS_PATH:-${GENESIS_BIN}}"
-FINALIS_NETWORK="${FINALIS_NETWORK:-mainnet}"
 ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-0}"
-EXPECTED_GENESIS_SHA256="${EXPECTED_GENESIS_SHA256:-}"
 SERVICE_TIMEOUT_STOP_SEC="${SERVICE_TIMEOUT_STOP_SEC:-300}"
 SERVICE_MEMORY_HIGH="${SERVICE_MEMORY_HIGH:-}"
 SERVICE_MEMORY_MAX="${SERVICE_MEMORY_MAX:-infinity}"
@@ -52,7 +56,6 @@ SYNC_TURBO_MODE="${SYNC_TURBO_MODE:-0}"
 SYNC_TARGET_UTIL_PCT="${SYNC_TARGET_UTIL_PCT:-70}"
 FAST_SYNC_PRELOAD_CACHE="${FAST_SYNC_PRELOAD_CACHE:-0}"
 NO_REINDEX_ON_START="${NO_REINDEX_ON_START:-1}"
-AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME="${AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME:-0}"
 
 log() { printf '[start] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -429,7 +432,7 @@ configure_and_build() {
 }
 
 read_seed_list() {
-  local seeds_file="${ROOT_DIR}/mainnet/SEEDS.json"
+  local seeds_file="${SEEDS_FILE}"
   if [[ ! -f "${seeds_file}" ]]; then
     return 0
   fi
@@ -450,7 +453,7 @@ PY
 
 set_single_seed_endpoint() {
   local endpoint="$1"
-  local seeds_file="${ROOT_DIR}/mainnet/SEEDS.json"
+  local seeds_file="${SEEDS_FILE}"
   if [[ -z "${endpoint}" ]]; then
     log "TRUSTED_BOOTSTRAP_PEER is empty; cannot rewrite SEEDS.json"
     return 1
@@ -473,7 +476,7 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PY
-  log "Pinned mainnet/SEEDS.json to trusted bootstrap peer: ${endpoint}"
+  log "Pinned ${SEEDS_FILE} to trusted bootstrap peer: ${endpoint}"
 }
 
 recover_peer_discovery_state_if_requested() {
@@ -494,7 +497,7 @@ recover_peer_discovery_state_if_requested() {
   if [[ -n "${TRUSTED_BOOTSTRAP_PEER}" ]]; then
     set_single_seed_endpoint "${TRUSTED_BOOTSTRAP_PEER}"
   else
-    log "TRUSTED_BOOTSTRAP_PEER not set; leaving mainnet/SEEDS.json unchanged"
+    log "TRUSTED_BOOTSTRAP_PEER not set; leaving ${SEEDS_FILE} unchanged"
   fi
 
   if systemd_available; then
@@ -578,23 +581,8 @@ detect_mode() {
 }
 
 resolve_genesis_source() {
-  if [[ "${FINALIS_NETWORK}" == "mainnet" ]]; then
-    # Embedded genesis; the node verifies it against MAINNET_GENESIS_HASH.
-    echo ""
-    return
-  fi
-  local default_genesis_bin="${ROOT_DIR}/mainnet/genesis.bin"
-  local default_genesis_json="${ROOT_DIR}/mainnet/genesis.json"
-  if [[ -n "${GENESIS_PATH}" ]]; then
-    echo "${GENESIS_PATH}"
-  elif [[ -f "${default_genesis_bin}" ]]; then
-    echo "${default_genesis_bin}"
-  elif [[ -f "${default_genesis_json}" ]]; then
-    echo "${default_genesis_json}"
-  else
-    log "No genesis artifact found. Set GENESIS_PATH or provide mainnet/genesis.bin."
-    exit 1
-  fi
+  # Mainnet and testnet both use the genesis compiled into the binary; the node pins its hash.
+  echo ""
 }
 
 sha256_file() {
@@ -612,32 +600,15 @@ sha256_file() {
 
 enforce_genesis_safety_lock() {
   case "${FINALIS_NETWORK}" in
-    mainnet)
+    mainnet|testnet)
       if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" != "0" || -n "${GENESIS_PATH}" ]]; then
-        log "MAINNET LOCK: ALLOW_UNSAFE_GENESIS_OVERRIDE/GENESIS_PATH are forbidden; mainnet uses the embedded, hash-pinned genesis."
+        log "GENESIS LOCK: ALLOW_UNSAFE_GENESIS_OVERRIDE/GENESIS_PATH are forbidden; ${FINALIS_NETWORK} uses the embedded, hash-pinned genesis."
         exit 1
       fi
       if grep -Eq -- '(^|[[:space:]])--(allow-unsafe-genesis-override|genesis)([[:space:]=]|$)' <<<"${NODE_EXTRA_ARGS}"; then
-        log "MAINNET LOCK: NODE_EXTRA_ARGS may not carry --genesis or --allow-unsafe-genesis-override."
+        log "GENESIS LOCK: NODE_EXTRA_ARGS may not carry --genesis or --allow-unsafe-genesis-override."
         exit 1
       fi
-      ;;
-    testnet)
-      if [[ -z "${GENESIS_PATH}" || ! -f "${GENESIS_PATH}" ]]; then
-        log "FINALIS_NETWORK=testnet requires GENESIS_PATH pointing to an existing genesis artifact."
-        exit 1
-      fi
-      if [[ -z "${EXPECTED_GENESIS_SHA256}" ]]; then
-        log "FINALIS_NETWORK=testnet requires EXPECTED_GENESIS_SHA256."
-        exit 1
-      fi
-      local actual
-      actual="$(sha256_file "${GENESIS_PATH}")"
-      if [[ "${actual}" != "${EXPECTED_GENESIS_SHA256}" ]]; then
-        log "Testnet genesis sha256 mismatch: got ${actual}, want ${EXPECTED_GENESIS_SHA256}"
-        exit 1
-      fi
-      ALLOW_UNSAFE_GENESIS_OVERRIDE=1
       ;;
     *)
       log "Unsupported FINALIS_NETWORK=${FINALIS_NETWORK}. Use mainnet or testnet."
@@ -845,11 +816,15 @@ auto_fast_sync_if_requested() {
 
 build_node_command() {
   local node_bin="${ROOT_DIR}/${BUILD_DIR}/finalis-node"
-  local cli_bin="${ROOT_DIR}/${BUILD_DIR}/finalis-cli"
   local genesis_path="$1"
   local mode="$2"
   local -a args=(
     "${node_bin}"
+  )
+  if [[ "${FINALIS_NETWORK}" == "testnet" ]]; then
+    args+=("--testnet")
+  fi
+  args+=(
     "--db" "${DB_DIR}"
     "--port" "${P2P_PORT}"
     "--handshake-timeout-ms" "${HANDSHAKE_TIMEOUT_MS}"
@@ -865,30 +840,6 @@ build_node_command() {
   fi
   if [[ "${SYNC_TURBO_MODE}" == "extreme" ]]; then
     args+=("--fast-start")
-  fi
-
-  if [[ "${SYNC_TURBO_MODE}" == "extreme" && "${AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME}" == "1" ]]; then
-    local has_manual_activation=0
-    if [[ -n "${NODE_EXTRA_ARGS}" ]]; then
-      if grep -Eq -- '(^|[[:space:]])--deferred-exit-activation-(height|epoch-start)($|[[:space:]])' <<<"${NODE_EXTRA_ARGS}"; then
-        has_manual_activation=1
-      fi
-    fi
-    if (( has_manual_activation == 0 )) && [[ -x "${cli_bin}" ]]; then
-      local height_line height next_epoch_start
-      height_line="$("${cli_bin}" print_logs 2>/dev/null | awk -F= '/^height=/ {print $2; exit}')"
-      if [[ -n "${height_line}" ]] && [[ "${height_line}" =~ ^[0-9]+$ ]] && (( height_line >= 1 )); then
-        # committee_epoch_start(h) = floor((h-1)/32)*32 + 1; next epoch start adds 32
-        next_epoch_start=$(( (((height_line - 1) / 32) + 1) * 32 + 1 ))
-        args+=("--deferred-exit-activation-height" "${next_epoch_start}")
-        log "SYNC_TURBO_MODE=extreme: auto-set deferred-exit activation to next epoch start ${next_epoch_start} (from height=${height_line})" >&2
-      fi
-    fi
-  fi
-
-  if [[ "${FINALIS_NETWORK}" == "testnet" && "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
-    log "WARNING: enabling --allow-unsafe-genesis-override (testnet only)" >&2
-    args+=("--allow-unsafe-genesis-override")
   fi
 
   if [[ "${PUBLIC_NODE}" == "1" ]]; then
@@ -913,7 +864,7 @@ build_node_command() {
     local peers
     peers="$(seed_csv)"
     if [[ -z "${peers}" ]]; then
-      log "Joiner mode requires one or more peers in mainnet/SEEDS.json."
+      log "Joiner mode requires one or more peers in ${SEEDS_FILE}."
       exit 1
     fi
     args+=(

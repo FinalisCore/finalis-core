@@ -13,6 +13,7 @@ constexpr std::size_t kMaxSoftwareVersionBytes = 512;
 constexpr std::size_t kMaxProposalBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxBlockMessageBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxTxMessageBytes = 256 * 1024;
+constexpr std::size_t kMaxTxResultReasonBytes = 256;
 constexpr std::size_t kMaxIngressRecordBytes = 256 * 1024;
 constexpr std::uint64_t kMaxIngressRangeEntries = 4096;
 constexpr std::uint64_t kMaxAddrEntries = 256;
@@ -33,6 +34,8 @@ bool is_known_message_type(std::uint16_t msg_type) {
     case MsgType::GET_TRANSITION:
     case MsgType::TRANSITION:
     case MsgType::TX:
+    case MsgType::SUBMIT_TX:
+    case MsgType::TX_RESULT:
     case MsgType::GETADDR:
     case MsgType::ADDR:
     case MsgType::PING:
@@ -498,6 +501,31 @@ std::optional<TxMsg> de_tx(const Bytes& b) {
         if (!tx) return false;
         if (tx->size() > kMaxTxMessageBytes) return false;
         m.tx_bytes = *tx;
+        return true;
+      })) return std::nullopt;
+  return m;
+}
+
+Bytes ser_tx_result(const TxResultMsg& m) {
+  codec::ByteWriter w;
+  w.bytes_fixed(m.txid);
+  w.u8(m.accepted ? 1 : 0);
+  const std::string reason = m.reason.substr(0, kMaxTxResultReasonBytes);
+  w.varbytes(Bytes(reason.begin(), reason.end()));
+  return w.take();
+}
+
+std::optional<TxResultMsg> de_tx_result(const Bytes& b) {
+  TxResultMsg m;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto txid = r.bytes_fixed<32>();
+        auto accepted = r.u8();
+        auto reason = r.varbytes();
+        if (!txid || !accepted || !reason) return false;
+        if (*accepted > 1 || reason->size() > kMaxTxResultReasonBytes) return false;
+        m.txid = *txid;
+        m.accepted = *accepted == 1;
+        m.reason.assign(reason->begin(), reason->end());
         return true;
       })) return std::nullopt;
   return m;

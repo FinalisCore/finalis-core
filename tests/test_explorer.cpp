@@ -425,6 +425,56 @@ TEST(test_explorer_tx_page_makes_credit_decision_explicit) {
   ASSERT_TRUE(tx_page.body.find("confirm") == std::string::npos);
 }
 
+TEST(test_explorer_shows_submitted_not_final_and_rejected_transactions) {
+  ExplorerFixture fx;
+  std::string pending_txid;
+  std::string rejected_txid;
+  for (int i = 0; i < 32; ++i) {
+    pending_txid += "e1";
+    rejected_txid += "f2";
+  }
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) {
+      if (body.find(pending_txid) != std::string::npos) {
+        return rpc_result(R"({"status":"certified_ingress","finalized":false,"finalized_depth":0,"credit_safe":false})");
+      }
+      if (body.find(rejected_txid) != std::string::npos) {
+        return rpc_result(R"({"status":"rejected","finalized":false,"rejected_height":9,"finalized_depth":0,"credit_safe":false})");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+
+  const auto pending_api = handle_request(cfg, make_http_get("/api/tx/" + pending_txid));
+  ASSERT_EQ(pending_api.status, 404);
+  ASSERT_TRUE(pending_api.body.find("\"code\":\"not_final\"") != std::string::npos);
+  const auto pending_page = handle_request(cfg, make_http_get("/tx/" + pending_txid));
+  ASSERT_TRUE(pending_page.body.find("Submitted, not final") != std::string::npos);
+  ASSERT_TRUE(pending_page.body.find("do not treat it as paid") != std::string::npos);
+
+  const auto rejected_page = handle_request(cfg, make_http_get("/tx/" + rejected_txid));
+  ASSERT_TRUE(rejected_page.body.find("Rejected (final)") != std::string::npos);
+  ASSERT_TRUE(rejected_page.body.find("at height 9") != std::string::npos);
+  ASSERT_TRUE(rejected_page.body.find("moved no funds") != std::string::npos);
+
+  const auto unknown_page = handle_request(cfg, make_http_get("/tx/" + fx.unknown_txid));
+  ASSERT_TRUE(unknown_page.body.find("Not found in finalized state") != std::string::npos);
+
+  // Search sends a known but unfinalized txid to its tx page instead of "not found".
+  const auto search = handle_request(cfg, make_http_get("/api/search?q=" + pending_txid));
+  ASSERT_EQ(search.status, 200);
+  ASSERT_TRUE(search.body.find("/tx/" + pending_txid) != std::string::npos);
+
+  const std::string batch_body =
+      std::string("{\"txids\":[\"") + pending_txid + "\",\"" + rejected_txid + "\",\"" + fx.unknown_txid + "\"]}";
+  const auto batch = handle_request(cfg, make_http_request("POST", "/api/v1/transactions/status:batch", {}, batch_body));
+  ASSERT_EQ(batch.status, 200);
+  ASSERT_TRUE(batch.body.find("\"txid\":\"" + pending_txid + "\",\"status\":\"not_final\"") != std::string::npos);
+  ASSERT_TRUE(batch.body.find("\"txid\":\"" + rejected_txid + "\",\"status\":\"rejected\"") != std::string::npos);
+  ASSERT_TRUE(batch.body.find("\"txid\":\"" + fx.unknown_txid + "\",\"status\":\"not_found\"") != std::string::npos);
+}
+
 TEST(test_explorer_api_v1_alias_and_batch_status_contract) {
   ExplorerFixture fx;
   ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });

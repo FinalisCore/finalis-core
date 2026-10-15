@@ -646,6 +646,7 @@ bool WalletStore::load(State* out) const {
   out->confidential_coins.clear();
   out->confidential_requests.clear();
   out->confidential_primary_account_id.reset();
+  out->confidential_scan_cursor.reset();
   out->wallet_snapshot.reset();
   out->wallet_view_snapshot.reset();
   out->pending_tx_statuses.clear();
@@ -676,6 +677,11 @@ bool WalletStore::load(State* out) const {
   out->history_cursor_height = get_u64(key_meta("history_cursor_height"));
   out->history_cursor_txid = get_string(key_meta("history_cursor_txid"));
   out->confidential_primary_account_id = get_string(key_meta("confidential_primary_account_id"));
+  auto scan_fingerprint = get_string(key_meta("confidential_scan_fingerprint"));
+  auto scan_height = get_u64(key_meta("confidential_scan_height"));
+  if (scan_fingerprint.has_value() && scan_height.has_value()) {
+    out->confidential_scan_cursor = ConfidentialScanCursor{std::move(*scan_fingerprint), *scan_height};
+  }
   if (const auto snapshot = db_.get(key_snapshot()); snapshot.has_value()) {
     out->wallet_snapshot = parse_wallet_snapshot(*snapshot);
   }
@@ -770,6 +776,11 @@ bool WalletStore::set_history_cursor(const std::optional<std::uint64_t>& height,
     return db_.erase(key_meta("history_cursor_height")) && db_.erase(key_meta("history_cursor_txid"));
   }
   return set_u64(key_meta("history_cursor_height"), *height) && set_string(key_meta("history_cursor_txid"), *txid);
+}
+
+bool WalletStore::set_confidential_scan_cursor(const ConfidentialScanCursor& cursor) {
+  return set_string(key_meta("confidential_scan_fingerprint"), cursor.key_set_fingerprint) &&
+         set_u64(key_meta("confidential_scan_height"), cursor.scanned_through_height);
 }
 
 bool WalletStore::set_wallet_snapshot(const WalletSnapshot& snapshot) {

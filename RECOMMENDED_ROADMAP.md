@@ -70,9 +70,8 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
   - Not locked: `--round-timeout-ms`, `--min-block-interval-ms`. These only set local
     proposer/round pacing and don't affect block validity.
   - Follow-ups:
-    - `scripts/start.sh:821-838` auto-injects `--deferred-exit-activation-height` when
-      `SYNC_TURBO_MODE=extreme` and `AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME=1`; nodes launched that way
-      now fail to start. Remove that block.
+    - ~~`scripts/start.sh` auto-injects `--deferred-exit-activation-height`.~~ Removed 2026-10-13
+      (with `AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME`).
     - `finalis-lightserver` has its own `--max-committee` flag; review whether it needs the same lock.
     - Override paths in `Node::init` (lines ~3122-3143) stay for tests that set `NodeConfig` directly.
 
@@ -112,8 +111,8 @@ applied but not yet build-verified is marked `[ ]` with status `applied — pend
     - Forged state: the genesis hash is public, so this blocks wrong-chain imports, not forged
       UTXO/validator state. Pin a trusted `(finalized_height, finalized_hash)` (CLI flag or
       `NetworkConfig` checkpoint) and recompute the UTXO/validator roots from the imported entries.
-    - Testnet `start.sh` should pass `--expected-genesis-hash` (check `EXPECTED_GENESIS_SHA256` uses
-      the same `hash_doc` form first).
+    - ~~Testnet `start.sh` should pass `--expected-genesis-hash`.~~ Obsolete 2026-10-13: testnet
+      genesis is embedded and pinned like mainnet; `start.sh` passes `--testnet`.
     - `scripts/start.sh`: default `AUTO_FAST_SYNC=0`.
     - ~~Remove the tracked `snapshot.bin` from the repo.~~ Done 2026-10-10 (see item 25).
 
@@ -444,7 +443,8 @@ settlement (item 13).
     - mainnet: fails if `ALLOW_UNSAFE_GENESIS_OVERRIDE != 0`, `GENESIS_PATH` is set, or `NODE_EXTRA_ARGS`
       contains `--genesis`/`--allow-unsafe-genesis-override`. No `--genesis` is passed, so the node uses
       the embedded genesis checked against `MAINNET_GENESIS_HASH` (none is embedded until launch).
-    - testnet: requires `GENESIS_PATH` and a matching `EXPECTED_GENESIS_SHA256`, then enables the override.
+    - testnet (2026-10-13): same lock as mainnet; the embedded testnet genesis is used and `start.sh`
+      passes `--testnet`. Ports, `DB_DIR` and `SEEDS.json` default from `FINALIS_NETWORK`.
   - Unit: `KillSignal=SIGINT`, `KillMode=mixed`, `TimeoutStopSec=${SERVICE_TIMEOUT_STOP_SEC:-300}`;
     `UMask=0077`, `ProtectSystem=strict`, `ProtectHome=read-only` + `ReadWritePaths=${DB_DIR}`,
     `PrivateTmp`, `PrivateDevices`, `NoNewPrivileges`, empty capability set, `@system-service`
@@ -465,8 +465,7 @@ settlement (item 13).
       still lack the hardening block and `TimeoutStopSec`/`KillSignal`.
     - `apps/finalis-node/main.cpp`: SIGINT/SIGTERM handlers are installed after `node.init()`, so a
       stop during DB open/reindex terminates without `node.stop()`. Move them before `init()`.
-    - Item 4 follow-up still applies: remove the `--deferred-exit-activation-height` auto-injection
-      (`AUTO_DEFERRED_EXIT_ACTIVATION_EXTREME`), which the mainnet consensus-flag lock now rejects.
+    - ~~Item 4 follow-up: remove the `--deferred-exit-activation-height` auto-injection.~~ Done 2026-10-13.
 
 - [ ] **25. Repository hygiene (Group A)**
   - Status: **applied 2026-10-05 — not committed; no build impact (docs, CI paths, data files only)**

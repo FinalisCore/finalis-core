@@ -361,7 +361,8 @@ class Node {
   void on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_prevote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
-  void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  // reply: a SUBMIT_TX; answer the sender with TX_RESULT.
+  void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bool reply = false);
   void on_getaddr(int peer_id, const Bytes& payload);
   void on_addr(int peer_id, const Bytes& payload);
   void on_ping(int peer_id, const Bytes& payload);
@@ -432,7 +433,7 @@ class Node {
                                                 const std::vector<IngressCertificate>& lane_certificates,
                                                 std::string* error);
   bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
-  bool handle_tx(const AnyTx& tx, bool from_network, int from_peer_id = 0);
+  bool handle_tx(const AnyTx& tx, bool from_network, int from_peer_id = 0, std::string* reject_reason = nullptr);
   bool maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error = nullptr);
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
                                     std::string* error = nullptr);
