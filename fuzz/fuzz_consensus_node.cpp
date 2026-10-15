@@ -8,6 +8,9 @@
 //
 // Oracle: besides sanitizer findings, the node must never prevote or precommit two different
 // transitions at the same (height, round).
+//
+// Built as a libFuzzer target with -DFINALIS_LIBFUZZER (see .clusterfuzzlite/); otherwise a
+// standalone smoke binary.
 
 #include <array>
 #include <cstdint>
@@ -396,8 +399,47 @@ Bytes random_script(std::mt19937_64& rng) {
   return b;
 }
 
+// libFuzzer: one node for the whole process, so state carries across inputs (as in the standalone
+// loop). A crash input reproduces against a fresh node only if it does not depend on earlier ones.
+struct LibFuzzerState {
+  std::unique_ptr<Fixture> fx;
+  std::unique_ptr<Runner> runner;
+
+  LibFuzzerState() = default;
+  LibFuzzerState(LibFuzzerState&&) = default;
+
+  // Built inside the static's initializer, so its destructor is registered after the atexit
+  // handlers of the libraries the fixture initializes (OpenSSL) and runs first: the node stops
+  // before OpenSSL is torn down under its threads.
+  static LibFuzzerState make() {
+    LibFuzzerState state;
+    state.fx = make_fixture();
+    if (!state.fx) {
+      std::cerr << "fuzz_consensus_node: fixture setup failed\n";
+      std::abort();
+    }
+    state.runner = std::make_unique<Runner>(*state.fx);
+    return state;
+  }
+
+  ~LibFuzzerState() {
+    runner.reset();
+    if (!fx) return;
+    fx->node->stop();
+    std::error_code ec;
+    std::filesystem::remove_all(fx->base, ec);
+  }
+};
+
 }  // namespace
 
+extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
+  static LibFuzzerState state = LibFuzzerState::make();
+  state.runner->run(Bytes(data, data + size));
+  return 0;
+}
+
+#ifndef FINALIS_LIBFUZZER
 int main(int argc, char** argv) {
   auto fx = make_fixture();
   if (!fx) {
@@ -428,3 +470,4 @@ int main(int argc, char** argv) {
   std::filesystem::remove_all(fx->base, ec);
   return 0;
 }
+#endif
