@@ -1,4 +1,5 @@
 #!/bin/bash -eu
+# SPDX-License-Identifier: MIT
 # ClusterFuzzLite / OSS-Fuzz build. CC, CXX, CFLAGS, CXXFLAGS (sanitizer and coverage flags) and
 # LIB_FUZZING_ENGINE come from the base-builder image. libsodium and OpenSSL are linked statically:
 # the runner image does not ship them. RocksDB is left out (storage falls back to its file backend).
