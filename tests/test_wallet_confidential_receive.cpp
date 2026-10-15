@@ -239,3 +239,55 @@ TEST(test_confidential_receive_derived_matching_stops_at_gap_window) {
   ASSERT_EQ(matches.size(), 1u);
   ASSERT_TRUE(matches[0].derived_index.has_value() && *matches[0].derived_index == beyond);
 }
+
+// Chain scan keys cover every derived request in the gap window, stored requests and coins, and
+// change when the window moves, so a stale scan cursor is not reused.
+TEST(test_confidential_scan_history_keys_cover_derived_window) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  WalletStore::State state;
+  state.confidential_accounts.push_back(derived_account(/*next_request_index=*/0));
+  const auto keys = wallet::confidential_scan_history_keys(state);
+  ASSERT_EQ(keys.size(), static_cast<std::size_t>(wallet::kConfidentialRequestGap));
+  ASSERT_TRUE(std::is_sorted(keys.begin(), keys.end()));
+  const auto has = [&](const std::vector<Hash32>& set, const PubKey33& pk) {
+    return std::binary_search(set.begin(), set.end(), confidential_history_key(pk));
+  };
+  const auto last = wallet::derive_confidential_request_keys(filled(0x21), filled(0x22), wallet::kConfidentialRequestGap - 1);
+  const auto beyond = wallet::derive_confidential_request_keys(filled(0x21), filled(0x22), wallet::kConfidentialRequestGap);
+  ASSERT_TRUE(last.has_value() && beyond.has_value());
+  ASSERT_TRUE(has(keys, last->pub.one_time_pubkey));
+  ASSERT_TRUE(!has(keys, beyond->pub.one_time_pubkey));
+
+  Request request;
+  state.confidential_requests.push_back(request.record(false));
+  const auto with_request = wallet::confidential_scan_history_keys(state);
+  ASSERT_TRUE(has(with_request, request.one_time));
+  ASSERT_TRUE(wallet::confidential_scan_key_set_fingerprint(with_request) != wallet::confidential_scan_key_set_fingerprint(keys));
+
+  state.confidential_accounts.front().next_request_index = 1;
+  const auto widened = wallet::confidential_scan_history_keys(state);
+  ASSERT_TRUE(has(widened, beyond->pub.one_time_pubkey));
+  ASSERT_TRUE(wallet::confidential_scan_key_set_fingerprint(widened) != wallet::confidential_scan_key_set_fingerprint(with_request));
+}
+
+TEST(test_confidential_coins_spent_by_reports_owned_unspent_inputs) {
+  WalletStore::State state;
+  const Hash32 funding = filled(0xF1);
+  state.confidential_coins.push_back(WalletStore::ConfidentialCoinRecord{.txid_hex = hex_encode32(funding), .vout = 0});
+  state.confidential_coins.push_back(
+      WalletStore::ConfidentialCoinRecord{.txid_hex = hex_encode32(funding), .vout = 1, .spent = true});
+  TxV2 tx;
+  const auto confidential_input = [&](std::uint32_t vout) {
+    return TxInV2{.prev_txid = funding,
+                  .prev_index = vout,
+                  .kind = TxInputKind::Confidential,
+                  .witness = ConfidentialInputWitnessV2{}};
+  };
+  tx.inputs.push_back(confidential_input(0));
+  tx.inputs.push_back(confidential_input(1));  // already spent
+  tx.inputs.push_back(confidential_input(2));  // not ours
+  tx.inputs.push_back(TxInV2{.prev_txid = funding, .prev_index = 0});  // transparent
+  const auto spent = wallet::confidential_coins_spent_by(tx, state);
+  ASSERT_EQ(spent.size(), 1u);
+  ASSERT_TRUE(spent[0].txid == funding && spent[0].index == 0u);
+}

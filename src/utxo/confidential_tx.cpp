@@ -2,6 +2,8 @@
 
 #include "utxo/confidential_tx.hpp"
 
+#include <string_view>
+
 #include "codec/bytes.hpp"
 #include "crypto/hash.hpp"
 
@@ -195,6 +197,13 @@ Bytes serialize_any_tx(const AnyTx& tx) {
 
 Hash32 txid_any(const AnyTx& tx) {
   return std::visit([](const auto& value) { return value.txid(); }, tx);
+}
+
+Hash32 confidential_history_key(const PubKey33& one_time_pubkey) {
+  static constexpr std::string_view kDomain = "FINALIS/conf-history/v1";
+  Bytes data(kDomain.begin(), kDomain.end());
+  data.insert(data.end(), one_time_pubkey.begin(), one_time_pubkey.end());
+  return crypto::sha256(data);
 }
 
 }  // namespace finalis

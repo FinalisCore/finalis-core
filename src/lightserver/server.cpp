@@ -56,6 +56,8 @@ constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
 constexpr std::uint32_t kHttpRequestDeadlineMs = 10'000;
 constexpr std::uint64_t kDefaultPageLimit = 200;
 constexpr std::uint64_t kMaxPageLimit = 1000;
+// Keys per get_confidential_history_page call: a wallet's derived request keys (next index + gap).
+constexpr std::size_t kMaxConfidentialHistoryKeys = 1024;
 constexpr std::uint32_t kRelayValidationRulesVersion = 7;
 
 std::string server_hrp_for_network(const NetworkConfig& network);
@@ -3115,6 +3117,53 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
 
     const auto history = view->get_script_history(*sh);
+    std::optional<ScriptHistoryCursor> start_after;
+    if (start_after_height.has_value()) start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
+    return make_result(id, paged_history_json(history, limit, from_height, start_after));
+  }
+
+  // History of several confidential one-time keys (confidential_history_key), merged and deduplicated,
+  // paged like get_history_page.
+  if (*method == "get_confidential_history_page") {
+    const auto* keys_value = params ? params->get("history_keys_hex") : nullptr;
+    if (!keys_value || !keys_value->is_array() || keys_value->array_value.empty()) {
+      return make_error(id, -32602, "missing history_keys_hex");
+    }
+    if (keys_value->array_value.size() > kMaxConfidentialHistoryKeys) return make_error(id, -32602, "too many history keys");
+    std::set<Hash32> keys;
+    for (const auto& item : keys_value->array_value) {
+      if (!item.is_string()) return make_error(id, -32602, "bad history_keys_hex");
+      auto key = parse_hex32(item.string_value);
+      if (!key.has_value()) return make_error(id, -32602, "bad history_keys_hex");
+      keys.insert(*key);
+    }
+    const auto limit = field_u64(params, "limit").value_or(kDefaultPageLimit);
+    if (limit == 0 || limit > kMaxPageLimit) return make_error(id, -32602, "bad limit");
+    const auto from_height = field_u64(params, "from_height").value_or(0);
+    const auto start_after_obj = field_object(params, "start_after");
+    auto start_after_height = field_u64(start_after_obj, "height");
+    auto start_after_txid_hex = field_string(start_after_obj, "txid");
+    std::optional<Hash32> start_after_txid;
+    if (start_after_txid_hex.has_value()) {
+      start_after_txid = parse_hex32(*start_after_txid_hex);
+      if (!start_after_txid.has_value()) return make_error(id, -32602, "bad start_after.txid");
+    }
+    if (start_after_height.has_value() != start_after_txid.has_value()) {
+      return make_error(id, -32602, "start_after requires height and txid");
+    }
+
+    std::vector<storage::DB::ScriptHistoryEntry> history;
+    for (const auto& key : keys) {
+      auto entries = view->get_script_history(key);
+      history.insert(history.end(), entries.begin(), entries.end());
+    }
+    std::sort(history.begin(), history.end(), [](const auto& a, const auto& b) {
+      if (a.height != b.height) return a.height < b.height;
+      return a.txid < b.txid;
+    });
+    history.erase(std::unique(history.begin(), history.end(),
+                              [](const auto& a, const auto& b) { return a.height == b.height && a.txid == b.txid; }),
+                  history.end());
     std::optional<ScriptHistoryCursor> start_after;
     if (start_after_height.has_value()) start_after = ScriptHistoryCursor{*start_after_height, *start_after_txid};
     return make_result(id, paged_history_json(history, limit, from_height, start_after));

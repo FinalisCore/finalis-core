@@ -1635,6 +1635,94 @@ TEST(test_lightserver_history_page_is_deterministic) {
   ASSERT_TRUE(resp2.find(txid3_hex) != std::string::npos);
 }
 
+TEST(test_lightserver_confidential_history_page_merges_keys) {
+  const std::string base = unique_test_base("/tmp/finalis_light_conf_history_page");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-conf-history-page";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
+
+  Hash32 key_a{};
+  Hash32 key_b{};
+  Hash32 key_other{};
+  key_a.fill(0xA1);
+  key_b.fill(0xB2);
+  key_other.fill(0xC3);
+  Hash32 txid1{};
+  Hash32 txid2{};
+  Hash32 txid3{};
+  Hash32 txid4{};
+  txid1[31] = 0x01;
+  txid2[31] = 0x02;
+  txid3[31] = 0x03;
+  txid4[31] = 0x04;
+  ASSERT_TRUE(db.add_script_history(key_a, 5, txid1));
+  ASSERT_TRUE(db.add_script_history(key_b, 5, txid1));  // one tx touching both keys: listed once
+  ASSERT_TRUE(db.add_script_history(key_b, 6, txid2));
+  ASSERT_TRUE(db.add_script_history(key_a, 9, txid3));
+  ASSERT_TRUE(db.add_script_history(key_other, 7, txid4));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const auto query = [&](const std::string& extra) {
+    return ls.handle_rpc_for_test(
+        std::string(R"({"jsonrpc":"2.0","id":141,"method":"get_confidential_history_page","params":{"history_keys_hex":[")") +
+        hex_encode32(key_a) + R"(",")" + hex_encode32(key_b) + R"("])" + extra + "}}");
+  };
+  const auto txid1_hex = hex_encode32(txid1);
+  const auto txid2_hex = hex_encode32(txid2);
+  const auto txid3_hex = hex_encode32(txid3);
+  const auto all = query("");
+  ASSERT_TRUE(all.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(all.find(txid1_hex) != std::string::npos);
+  ASSERT_TRUE(all.find(txid1_hex, all.find(txid1_hex) + 1) == std::string::npos);
+  ASSERT_TRUE(all.find(txid1_hex) < all.find(txid2_hex));
+  ASSERT_TRUE(all.find(txid2_hex) < all.find(txid3_hex));
+  ASSERT_TRUE(all.find(hex_encode32(txid4)) == std::string::npos);
+
+  const auto page1 = query(R"(,"limit":2)");
+  ASSERT_TRUE(page1.find("\"has_more\":true") != std::string::npos);
+  ASSERT_TRUE(page1.find(txid3_hex) == std::string::npos);
+  ASSERT_TRUE(page1.find("\"next_start_after\":{\"height\":6,\"txid\":\"" + txid2_hex + "\"}") != std::string::npos);
+  const auto page2 = query(R"(,"limit":2,"start_after":{"height":6,"txid":")" + txid2_hex + R"("})");
+  ASSERT_TRUE(page2.find("\"has_more\":false") != std::string::npos);
+  ASSERT_TRUE(page2.find(txid2_hex) == std::string::npos);
+  ASSERT_TRUE(page2.find(txid3_hex) != std::string::npos);
+
+  ASSERT_TRUE(ls.handle_rpc_for_test(
+                    R"({"jsonrpc":"2.0","id":142,"method":"get_confidential_history_page","params":{"history_keys_hex":[]}})")
+                  .find("missing history_keys_hex") != std::string::npos);
+  std::string too_many = R"({"jsonrpc":"2.0","id":143,"method":"get_confidential_history_page","params":{"history_keys_hex":[)";
+  for (int i = 0; i < 1025; ++i) too_many += std::string(i ? "," : "") + "\"" + hex_encode32(key_a) + "\"";
+  too_many += "]}}";
+  ASSERT_TRUE(ls.handle_rpc_for_test(too_many).find("too many history keys") != std::string::npos);
+}
+
 TEST(test_lightserver_get_utxos_supports_paged_response) {
   const std::string base = unique_test_base("/tmp/finalis_light_utxos_paged");
   std::filesystem::remove_all(base);

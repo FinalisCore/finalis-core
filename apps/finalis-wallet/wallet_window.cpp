@@ -3679,6 +3679,48 @@ bool WalletWindow::refresh_finalized_send_state(QString* err) {
 
 void WalletWindow::mark_refresh_state_changed() { ++refresh_state_version_; }
 
+namespace {
+
+// Finalized txs in (from_height, through_height] touching any of `keys`, in (height, txid) order.
+bool scan_confidential_history(const std::string& endpoint, const std::vector<Hash32>& keys, std::uint64_t from_height,
+                               std::uint64_t through_height, std::vector<std::pair<Hash32, Bytes>>* txs, std::string* err) {
+  constexpr std::size_t kKeysPerCall = 1024;  // lightserver kMaxConfidentialHistoryKeys
+  std::set<std::pair<std::uint64_t, Hash32>> found;
+  for (std::size_t begin = 0; begin < keys.size(); begin += kKeysPerCall) {
+    const std::vector<Hash32> chunk(keys.begin() + static_cast<std::ptrdiff_t>(begin),
+                                    keys.begin() + static_cast<std::ptrdiff_t>(std::min(keys.size(), begin + kKeysPerCall)));
+    std::optional<lightserver::HistoryCursor> cursor;
+    if (from_height > 0) cursor = lightserver::HistoryCursor{from_height - 1, Hash32{}};
+    while (true) {
+      auto page = lightserver::rpc_get_confidential_history_page(endpoint, chunk, 200, cursor, err);
+      if (!page) return false;
+      bool past_end = false;
+      for (const auto& item : page->items) {
+        if (item.height > through_height) {
+          past_end = true;
+          break;
+        }
+        if (item.height >= from_height) found.emplace(item.height, item.txid);
+      }
+      if (past_end || !page->has_more) break;
+      if (!page->next_start_after.has_value()) {
+        if (err) *err = "confidential history pagination cursor was missing";
+        return false;
+      }
+      cursor = page->next_start_after;
+    }
+  }
+  for (const auto& [height, txid] : found) {
+    (void)height;
+    auto view = lightserver::rpc_get_tx(endpoint, txid, err);
+    if (!view) return false;
+    txs->emplace_back(txid, std::move(view->tx_bytes));
+  }
+  return true;
+}
+
+}  // namespace
+
 WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequest& request, BackgroundThreads& threads) {
   RefreshResult result;
   std::optional<lightserver::RpcStatusView> status;
@@ -4132,6 +4174,22 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
     });
   }
 
+  if (!request.confidential_history_keys.empty()) {
+    const std::uint64_t from_height =
+        request.confidential_scanned_through_height ? *request.confidential_scanned_through_height + 1 : 0;
+    std::vector<std::pair<Hash32, Bytes>> scan_txs;
+    std::string scan_err;
+    if (from_height > status->tip_height) {
+      result.confidential_scan_cursor =
+          WalletStore::ConfidentialScanCursor{request.confidential_key_set_fingerprint, status->tip_height};
+    } else if (scan_confidential_history(active_endpoint.toStdString(), request.confidential_history_keys, from_height,
+                                         status->tip_height, &scan_txs, &scan_err)) {
+      result.confidential_scan_txs = std::move(scan_txs);
+      result.confidential_scan_cursor =
+          WalletStore::ConfidentialScanCursor{request.confidential_key_set_fingerprint, status->tip_height};
+    }
+  }
+
   result.chain_records = normalize_chain_records_for_display(chain_records);
   result.finalized_tx_summary_cache = std::move(next_summary_cache);
   result.pending_wallet_spends = std::move(pending_spends);
@@ -4248,6 +4306,33 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
                              .arg(elide_middle(QString::fromStdString(hex_encode32(txid)), 12)));
     }
   }
+  bool rescan_needed = false;
+  if (result.confidential_scan_cursor.has_value()) {
+    std::size_t imported = 0;
+    std::size_t spent = 0;
+    for (const auto& [txid, tx_bytes] : result.confidential_scan_txs) {
+      const auto any = parse_any_tx(tx_bytes);
+      if (!any || !std::holds_alternative<TxV2>(*any)) continue;
+      const auto& tx = std::get<TxV2>(*any);
+      std::size_t already = 0;
+      imported += import_confidential_outputs(tx, txid, &already);
+      WalletStore::State state;
+      if (!store_.load(&state)) continue;
+      for (const auto& outpoint : confidential_coins_spent_by(tx, state)) {
+        if (store_.set_confidential_coin_spent(hex_encode32(outpoint.txid), outpoint.index, true)) ++spent;
+      }
+    }
+    if (imported > 0 || spent > 0) {
+      append_local_event(QString("[confidential] chain scan: %1 coin(s) found, %2 marked spent").arg(imported).arg(spent));
+    }
+    (void)store_.set_confidential_scan_cursor(*result.confidential_scan_cursor);
+    // An import past the old request window derives new keys: scan again, from height 0, with them.
+    WalletStore::State state;
+    if (store_.load(&state)) {
+      rescan_needed = confidential_scan_key_set_fingerprint(confidential_scan_history_keys(state)) !=
+                      result.confidential_scan_cursor->key_set_fingerprint;
+    }
+  }
   for (const auto& txid : result.remove_pending_txids) {
     (void)store_.remove_pending_spend(txid);
     (void)store_.remove_pending_tx_status(txid);
@@ -4273,6 +4358,12 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
             : QString("Wallet state refreshed from %1.")
                   .arg(display_lightserver_endpoint(last_successful_lightserver_endpoint_));
     statusBar()->showMessage(message, 3000);
+  }
+  if (rescan_needed) {
+    QPointer<WalletWindow> self(this);
+    QTimer::singleShot(0, this, [self]() {
+      if (self) self->refresh_chain_state(false);
+    });
   }
 }
 
@@ -4304,7 +4395,15 @@ void WalletWindow::refresh_chain_state(bool interactive) {
   request.pending_wallet_spends = pending_wallet_spends_;
   if (wallet_) {
     WalletStore::State local_state;
-    if (store_.load(&local_state)) request.pending_spend_records = std::move(local_state.pending_spends);
+    if (store_.load(&local_state)) {
+      request.pending_spend_records = std::move(local_state.pending_spends);
+      if (!confidential_storage_locked_) request.confidential_history_keys = confidential_scan_history_keys(local_state);
+      request.confidential_key_set_fingerprint = confidential_scan_key_set_fingerprint(request.confidential_history_keys);
+      if (local_state.confidential_scan_cursor.has_value() &&
+          local_state.confidential_scan_cursor->key_set_fingerprint == request.confidential_key_set_fingerprint) {
+        request.confidential_scanned_through_height = local_state.confidential_scan_cursor->scanned_through_height;
+      }
+    }
   }
   request.finalized_history_cursor_height = finalized_history_cursor_height_;
   request.finalized_history_cursor_txid = finalized_history_cursor_txid_;
@@ -4589,7 +4688,8 @@ void WalletWindow::import_confidential_account() {
   update_wallet_views();
   append_local_event(QString("[confidential] imported account %1")
                          .arg(QString::fromStdString(record.label)));
-  statusBar()->showMessage("Confidential account imported.", 3000);
+  statusBar()->showMessage("Confidential account imported. Scanning the chain for its coins.", 3000);
+  refresh_chain_state(false);
 }
 
 void WalletWindow::generate_confidential_request() {

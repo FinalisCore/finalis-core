@@ -137,6 +137,14 @@ class WalletStore {
     ~ConfidentialRequestRecord() { crypto::secure_wipe(spend_secret_hex); crypto::secure_wipe(memo_key_hex); }
   };
 
+  // Progress of the confidential chain scan: finalized heights up to scanned_through_height were scanned
+  // for the key set whose fingerprint is stored. A different key set (new account, advanced request
+  // index) rescans from height 0.
+  struct ConfidentialScanCursor {
+    std::string key_set_fingerprint;
+    std::uint64_t scanned_through_height{0};
+  };
+
   struct State {
     std::vector<std::string> sent_txids;
     std::vector<std::string> local_events;
@@ -148,6 +156,7 @@ class WalletStore {
     std::vector<ConfidentialCoinRecord> confidential_coins;
     std::vector<ConfidentialRequestRecord> confidential_requests;
     std::optional<std::string> confidential_primary_account_id;
+    std::optional<ConfidentialScanCursor> confidential_scan_cursor;
     std::optional<WalletSnapshot> wallet_snapshot;
     std::optional<WalletViewSnapshot> wallet_view_snapshot;
     std::vector<PendingTxStatusRecord> pending_tx_statuses;
@@ -164,6 +173,7 @@ class WalletStore {
   bool replace_finalized_history(const std::vector<FinalizedHistoryRecord>& records);
   bool append_finalized_history(const std::vector<FinalizedHistoryRecord>& records);
   bool set_history_cursor(const std::optional<std::uint64_t>& height, const std::optional<std::string>& txid);
+  bool set_confidential_scan_cursor(const ConfidentialScanCursor& cursor);
   bool set_wallet_snapshot(const WalletSnapshot& snapshot);
   bool clear_wallet_snapshot();
   bool set_wallet_view_snapshot(const WalletViewSnapshot& snapshot);

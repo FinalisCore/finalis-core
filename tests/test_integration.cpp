@@ -4908,7 +4908,8 @@ TEST(test_settled_rewards_are_visible_in_wallet_script_index) {
 
 // A finalized TxV2 (shield: transparent input -> transparent payment + confidential output) is indexed
 // like a Tx: tx index, address history for the spent and paid addresses, and get_tx decodes the
-// transparent output while reporting the confidential one without an amount or address.
+// transparent output while reporting the confidential one without an amount or address. The
+// confidential output and the later unshield spending it are indexed under its one-time key.
 TEST(test_finalized_txv2_is_indexed_with_address_history) {
   ASSERT_TRUE(crypto::confidential_crypto_init());
   const std::string base = unique_test_base("/tmp/finalis_it_txv2_indexing");
@@ -4978,20 +4979,53 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
     if (!probe_db.open_readonly(cfg.db_path)) return false;
     return probe_db.get_tx_index(tx->txid()).has_value();
   }, ci_timeout_seconds(45)));
+
+  // Unshield the confidential coin: the spend is indexed under the same one-time key.
+  std::optional<std::uint32_t> conf_vout;
+  for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
+    if (tx->outputs[i].kind == TxOutputKind::Confidential) conf_vout = static_cast<std::uint32_t>(i);
+  }
+  ASSERT_TRUE(conf_vout.has_value());
+  wallet::ConfidentialOwnedCoin coin{
+      .outpoint = OutPoint{tx->txid(), *conf_vout},
+      .amount = kConfidential,
+      .spend_secret = crypto::Blind32{one_time_scalar},
+      .value_blind = blind,
+      .value_commitment = conf_out->value_commitment,
+      .one_time_pubkey = *one_time,
+  };
+  Hash32 spend_nonce{};
+  spend_nonce.fill(0x5F);
+  Hash32 excess_nonce{};
+  excess_nonce.fill(0x60);
+  const auto unshield = wallet::build_txv2_confidential_to_transparent(
+      coin, TransparentTxOutV2{kConfidential - kFee, address::p2pkh_script_pubkey(recipient_pkh)}, kFee, spend_nonce,
+      excess_nonce, &err);
+  if (!unshield.has_value()) throw std::runtime_error("unshield tx: " + err);
+  ASSERT_TRUE(node->inject_tx_for_test(AnyTx{*unshield}, true));
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB probe_db;
+    if (!probe_db.open_readonly(cfg.db_path)) return false;
+    return probe_db.get_tx_index(unshield->txid()).has_value();
+  }, ci_timeout_seconds(45)));
   node->stop();
   node.reset();
 
+  const Hash32 conf_key = confidential_history_key(*one_time);
   {
     storage::DB db;
     ASSERT_TRUE(db.open(cfg.db_path));
-    const auto has_txid = [&](const Hash32& scripthash) {
+    const auto has_txid = [&](const Hash32& scripthash, const Hash32& txid) {
       for (const auto& entry : db.get_script_history(scripthash)) {
-        if (entry.txid == tx->txid()) return true;
+        if (entry.txid == txid) return true;
       }
       return false;
     };
-    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh))));  // paid
-    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(own_pkh))));        // spent
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(recipient_pkh)), tx->txid()));  // paid
+    ASSERT_TRUE(has_txid(crypto::sha256(address::p2pkh_script_pubkey(own_pkh)), tx->txid()));        // spent
+    ASSERT_TRUE(has_txid(conf_key, tx->txid()));                                                     // confidential paid
+    ASSERT_TRUE(has_txid(conf_key, unshield->txid()));                                               // confidential spent
+    ASSERT_EQ(db.get_script_history(conf_key).size(), 2u);
   }
 
   lightserver::Config lcfg;
@@ -5024,6 +5058,16 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
       hex_encode32(tx->txid()) + R"("]}})");
   ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kFee)) != std::string::npos);
   ASSERT_TRUE(summaries.find("\"fee\":" + std::to_string(kConfidential + kFee)) == std::string::npos);
+
+  // A restoring wallet finds both through its derived one-time key.
+  Hash32 unrelated_key{};
+  unrelated_key.fill(0x61);
+  const auto conf_history = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":308,"method":"get_confidential_history_page","params":{"history_keys_hex":[")") +
+      hex_encode32(unrelated_key) + R"(",")" + hex_encode32(conf_key) + R"("],"limit":10}})");
+  ASSERT_TRUE(conf_history.find(hex_encode32(tx->txid())) != std::string::npos);
+  ASSERT_TRUE(conf_history.find(hex_encode32(unshield->txid())) != std::string::npos);
+  ASSERT_TRUE(conf_history.find("\"has_more\":false") != std::string::npos);
 }
 
 TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {

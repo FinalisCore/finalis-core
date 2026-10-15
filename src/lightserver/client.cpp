@@ -618,17 +618,20 @@ std::optional<std::vector<HistoryEntry>> rpc_get_history(const std::string& rpc_
   return out;
 }
 
-std::optional<HistoryPageView> rpc_get_history_page(const std::string& rpc_url, const Hash32& scripthash, std::uint64_t limit,
-                                                    const std::optional<HistoryCursor>& start_after, std::string* err) {
-  std::ostringstream body_json;
-  body_json << R"({"jsonrpc":"2.0","id":33,"method":"get_history_page","params":{"scripthash_hex":")"
-            << hex_encode32(scripthash) << R"(","limit":)" << limit;
+namespace {
+
+void append_history_page_params(std::ostringstream& body_json, std::uint64_t limit,
+                                const std::optional<HistoryCursor>& start_after) {
+  body_json << R"(,"limit":)" << limit;
   if (start_after.has_value()) {
     body_json << R"(,"start_after":{"height":)" << start_after->height << R"(,"txid":")" << hex_encode32(start_after->txid)
               << R"("})";
   }
   body_json << "}}";
-  auto body = http_post_json(rpc_url, body_json.str(), err);
+}
+
+std::optional<HistoryPageView> post_history_page(const std::string& rpc_url, const std::string& body_json, std::string* err) {
+  auto body = http_post_json(rpc_url, body_json, err);
   if (!body) return std::nullopt;
   auto root = minijson::parse(*body);
   if (!root.has_value()) {
@@ -671,6 +674,32 @@ std::optional<HistoryPageView> rpc_get_history_page(const std::string& rpc_url, 
   }
   out.next_start_after = HistoryCursor{*next_height, *next_txid};
   return out;
+}
+
+}  // namespace
+
+std::optional<HistoryPageView> rpc_get_history_page(const std::string& rpc_url, const Hash32& scripthash, std::uint64_t limit,
+                                                    const std::optional<HistoryCursor>& start_after, std::string* err) {
+  std::ostringstream body_json;
+  body_json << R"({"jsonrpc":"2.0","id":33,"method":"get_history_page","params":{"scripthash_hex":")"
+            << hex_encode32(scripthash) << R"(")";
+  append_history_page_params(body_json, limit, start_after);
+  return post_history_page(rpc_url, body_json.str(), err);
+}
+
+std::optional<HistoryPageView> rpc_get_confidential_history_page(const std::string& rpc_url,
+                                                                 const std::vector<Hash32>& history_keys, std::uint64_t limit,
+                                                                 const std::optional<HistoryCursor>& start_after,
+                                                                 std::string* err) {
+  std::ostringstream body_json;
+  body_json << R"({"jsonrpc":"2.0","id":37,"method":"get_confidential_history_page","params":{"history_keys_hex":[)";
+  for (std::size_t i = 0; i < history_keys.size(); ++i) {
+    if (i) body_json << ",";
+    body_json << "\"" << hex_encode32(history_keys[i]) << "\"";
+  }
+  body_json << "]";
+  append_history_page_params(body_json, limit, start_after);
+  return post_history_page(rpc_url, body_json.str(), err);
 }
 
 std::optional<DetailedHistoryPageView> rpc_get_history_page_detailed(const std::string& rpc_url, const Hash32& scripthash,

@@ -228,6 +228,10 @@ class WalletWindow final : public QMainWindow {
     std::optional<std::uint64_t> finalized_history_cursor_height;
     std::optional<std::string> finalized_history_cursor_txid;
     std::map<std::string, std::pair<QString, QString>> finalized_tx_summary_cache;
+    // Confidential chain scan (empty keys: no accounts, or confidential state locked).
+    std::vector<Hash32> confidential_history_keys;
+    std::string confidential_key_set_fingerprint;
+    std::optional<std::uint64_t> confidential_scanned_through_height;
   };
 
   struct EndpointProbeResult {
@@ -264,6 +268,10 @@ class WalletWindow final : public QMainWindow {
     // request keys is imported without a manual "Import Received Confidential Tx".
     std::vector<std::pair<Hash32, Bytes>> finalized_sent_txs;
     std::vector<std::string> released_pending_txids;
+    // Finalized txs touching the wallet's confidential keys, in (height, txid) order, and the cursor
+    // to store once they are imported. Unset when no scan ran or it failed.
+    std::vector<std::pair<Hash32, Bytes>> confidential_scan_txs;
+    std::optional<WalletStore::ConfidentialScanCursor> confidential_scan_cursor;
     std::vector<EndpointProbeResult> probe_results;
   };
 
