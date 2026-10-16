@@ -97,6 +97,16 @@ std::string launch_mode_name(LightserverLaunchMode mode) {
   }
 }
 
+// FINALIS_LOG_TIMESTAMPS=1 prefixes each text log line with "[<unix ms>] " (chaos runs: ordering
+// consensus events across nodes).
+bool log_timestamps_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("FINALIS_LOG_TIMESTAMPS");
+    return v && std::string_view(v) == "1";
+  }();
+  return enabled;
+}
+
 bool runtime_logs_enabled() {
   if (debug_economics_logs_enabled() || debug_finality_logs_enabled()) return true;
   const char* quiet = std::getenv("FINALIS_TEST_QUIET_LOGS");
@@ -1794,7 +1804,14 @@ void Node::log_line(const std::string& s) const {
     std::cout << "{\"type\":\"log\",\"node_id\":" << cfg_.node_id << ",\"network\":\"" << cfg_.network.name
               << "\",\"msg\":\"" << s << "\"}\n";
   } else {
-    std::cout << "[node " << cfg_.node_id << "] " << s << "\n";
+    std::ostringstream line;
+    if (log_timestamps_enabled()) {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch()).count();
+      line << "[" << ms << "] ";
+    }
+    line << "[node " << cfg_.node_id << "] " << s << "\n";
+    std::cout << line.str();
   }
   // Throttled flush instead of std::ios::unitbuf's per-call flush (removed
   // from Node::init()): most log_line calls happen with mu_ held on the

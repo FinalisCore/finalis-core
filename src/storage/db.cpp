@@ -41,28 +41,30 @@ std::uint64_t env_u64_or_default(const char* key, std::uint64_t def, std::uint64
 }
 
 #ifdef SC_HAS_ROCKSDB
+// RocksDB 11 dropped the DB** overloads of Open/OpenForReadOnly; older releases (Ubuntu 22.04/24.04)
+// have only those. Use the unique_ptr overload where it exists. Templated so the requires-check is a
+// substitution test rather than a hard error.
+template <typename DBT>
+rocksdb::Status open_rocksdb_impl(bool read_only, const rocksdb::Options& options, const std::string& path,
+                                  std::unique_ptr<DBT>* out) {
+  if constexpr (requires { DBT::Open(options, path, out); }) {
+    return read_only ? DBT::OpenForReadOnly(options, path, out) : DBT::Open(options, path, out);
+  } else {
+    DBT* raw = nullptr;
+    auto status = read_only ? DBT::OpenForReadOnly(options, path, &raw) : DBT::Open(options, path, &raw);
+    if (status.ok()) out->reset(raw);
+    return status;
+  }
+}
+
 rocksdb::Status open_rocksdb_rw(const rocksdb::Options& options, const std::string& path,
                                 std::unique_ptr<rocksdb::DB>* out) {
-#ifdef _WIN32
-  return rocksdb::DB::Open(options, path, out);
-#else
-  rocksdb::DB* raw = nullptr;
-  auto status = rocksdb::DB::Open(options, path, &raw);
-  if (status.ok()) out->reset(raw);
-  return status;
-#endif
+  return open_rocksdb_impl(/*read_only=*/false, options, path, out);
 }
 
 rocksdb::Status open_rocksdb_ro(const rocksdb::Options& options, const std::string& path,
                                 std::unique_ptr<rocksdb::DB>* out) {
-#ifdef _WIN32
-  return rocksdb::DB::OpenForReadOnly(options, path, out);
-#else
-  rocksdb::DB* raw = nullptr;
-  auto status = rocksdb::DB::OpenForReadOnly(options, path, &raw);
-  if (status.ok()) out->reset(raw);
-  return status;
-#endif
+  return open_rocksdb_impl(/*read_only=*/true, options, path, out);
 }
 
 // Shared literal constants for the two places (build_rocksdb_options() and
