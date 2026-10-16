@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 
+#include <algorithm>
+
 #include "test_framework.hpp"
 
 #include "apps/finalis-wallet/confidential_memo.hpp"
@@ -225,6 +227,38 @@ TEST(test_confidential_receive_recovers_payment_from_account_secrets_alone) {
   std::size_t already = 0;
   ASSERT_TRUE(wallet::match_received_confidential_outputs(tx, filled(0xE1), state, &already).empty());
   ASSERT_EQ(already, 1u);
+}
+
+// Account secrets come from the wallet key seed alone: deterministic, distinct per account and per
+// role, never the seed itself. The vector pins the derivation, since restore depends on it.
+TEST(test_confidential_account_secrets_derive_from_wallet_seed) {
+  ASSERT_TRUE(crypto::confidential_crypto_init());
+  const Hash32 seed = filled(0x5A);
+  const auto a0 = wallet::derive_confidential_account_secrets(seed, 0);
+  const auto a0_again = wallet::derive_confidential_account_secrets(seed, 0);
+  const auto a1 = wallet::derive_confidential_account_secrets(seed, 1);
+  const auto other = wallet::derive_confidential_account_secrets(filled(0x5B), 0);
+  ASSERT_TRUE(a0 && a0_again && a1 && other);
+  ASSERT_EQ(hex_encode32(a0->view_secret), hex_encode32(a0_again->view_secret));
+  ASSERT_EQ(hex_encode32(a0->spend_secret), hex_encode32(a0_again->spend_secret));
+  ASSERT_TRUE(a0->view_secret != a0->spend_secret);
+  ASSERT_TRUE(a0->view_secret != seed && a0->spend_secret != seed);
+  ASSERT_TRUE(a0->view_secret != a1->view_secret && a0->spend_secret != a1->spend_secret);
+  ASSERT_TRUE(a0->view_secret != other->view_secret && a0->spend_secret != other->spend_secret);
+  ASSERT_EQ(hex_encode32(a0->view_secret), std::string("d4b5e2d46de085653736634d6d6a4c1eec31f8b211422b436b20dca9a2937f5e"));
+  ASSERT_EQ(hex_encode32(a0->spend_secret), std::string("0f766bb78aee0add8fe3f218d7075d45bb275d63e43a484598500af28f43b0d9"));
+
+  // A payment to a request of the derived account is found by an account rebuilt from the seed.
+  const auto keys = wallet::derive_confidential_request_keys(a0->view_secret, a0->spend_secret, 5);
+  ASSERT_TRUE(keys.has_value());
+  WalletStore::State state;
+  WalletStore::ConfidentialAccountRecord account;
+  account.account_id = "acct-seed";
+  account.view_key_material_hex = hex_encode32(a0_again->view_secret);
+  account.spend_key_material_hex = hex_encode32(a0_again->spend_secret);
+  state.confidential_accounts.push_back(account);
+  const auto scan_keys = wallet::confidential_scan_history_keys(state);
+  ASSERT_TRUE(std::binary_search(scan_keys.begin(), scan_keys.end(), confidential_history_key(keys->pub.one_time_pubkey)));
 }
 
 TEST(test_confidential_receive_derived_matching_stops_at_gap_window) {

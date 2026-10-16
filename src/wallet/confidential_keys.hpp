@@ -25,6 +25,28 @@ namespace finalis::wallet {
 // Caveat of this (BIP32-style non-hardened) construction: one leaked one_time_secret together with
 // v reveals s. One-time secrets must be protected exactly like s.
 
+// Confidential account secrets derived from the wallet's 32-byte key seed (the keystore seed that
+// Import Wallet takes). Account a:
+//
+//   view_secret  = hash_to_scalar("FINALIS/conf-account/view/v1",  seed, a)
+//   spend_secret = hash_to_scalar("FINALIS/conf-account/spend/v1", seed, a)
+//
+// Hardened: each account depends on the seed only through a hash, so one account's secrets reveal
+// nothing about the seed or other accounts. Backing up the wallet key recovers every derived account.
+struct ConfidentialAccountSecrets {
+  Hash32 view_secret{};
+  Hash32 spend_secret{};
+
+  ~ConfidentialAccountSecrets() {
+    crypto::secure_wipe(view_secret);
+    crypto::secure_wipe(spend_secret);
+  }
+};
+
+// Nullopt only if hashing never yields a valid scalar (probability about 2^-32768).
+std::optional<ConfidentialAccountSecrets> derive_confidential_account_secrets(const Hash32& wallet_seed,
+                                                                              std::uint32_t account_index);
+
 struct ConfidentialRequestPublicKeys {
   PubKey33 one_time_pubkey{};
   PubKey33 ephemeral_pubkey{};

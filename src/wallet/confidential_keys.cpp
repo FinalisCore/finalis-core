@@ -14,6 +14,8 @@ constexpr std::string_view kEphemeralTag = "FINALIS/conf-request/ephemeral/v1";
 constexpr std::string_view kScanTagTag = "FINALIS/conf-request/scan-tag/v1";
 constexpr std::string_view kMemoTag = "FINALIS/conf-request/memo/v1";
 constexpr std::string_view kOutputBlindTag = "FINALIS/conf-output/blind/v1";
+constexpr std::string_view kAccountViewTag = "FINALIS/conf-account/view/v1";
+constexpr std::string_view kAccountSpendTag = "FINALIS/conf-account/spend/v1";
 
 // BIP340-style tagged hash: SHA256(SHA256(tag) || SHA256(tag) || v || le32(index) || counter).
 Hash32 tagged_hash(std::string_view tag, const Hash32& view_secret, std::uint32_t index, std::uint8_t counter) {
@@ -42,6 +44,21 @@ std::optional<Hash32> hash_to_scalar(std::string_view tag, const Hash32& view_se
 }
 
 }  // namespace
+
+std::optional<ConfidentialAccountSecrets> derive_confidential_account_secrets(const Hash32& wallet_seed,
+                                                                              std::uint32_t account_index) {
+  auto view = hash_to_scalar(kAccountViewTag, wallet_seed, account_index);
+  auto spend = hash_to_scalar(kAccountSpendTag, wallet_seed, account_index);
+  std::optional<ConfidentialAccountSecrets> out;
+  if (view && spend) {
+    out.emplace();
+    out->view_secret = *view;
+    out->spend_secret = *spend;
+  }
+  if (view) crypto::secure_wipe(*view);
+  if (spend) crypto::secure_wipe(*spend);
+  return out;
+}
 
 std::optional<ConfidentialRequestPublicKeys> derive_confidential_request_public_keys(const Hash32& view_secret,
                                                                                     const PubKey33& spend_pubkey,

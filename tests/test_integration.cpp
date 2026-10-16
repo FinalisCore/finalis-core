@@ -4,6 +4,7 @@
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cerrno>

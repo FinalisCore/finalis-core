@@ -73,6 +73,10 @@ supported subset:
   one-time keys derived from every account (requests `0 .. next_request_index + 100`), imports matching
   outputs and marks spent coins. Importing an account (view + spend secret) scans from height 0, so a
   wallet restored from its keys recovers its confidential coins without the original wallet file.
+- created confidential accounts derive their secrets from the wallet key (account 0, 1, ...), so the
+  exported private key is the whole backup. Import Wallet restores account 0 and scans for it;
+  creating accounts again restores 1, 2, ... in order. Accounts imported from a raw view + spend
+  secret need that pair backed up separately.
 
 ## Lightserver failover
 

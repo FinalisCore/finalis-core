@@ -4560,10 +4560,16 @@ void WalletWindow::import_wallet() {
   loaded.pubkey_hex = finalis::hex_encode(finalis::Bytes(key.pubkey.begin(), key.pubkey.end()));
   wallet_ = loaded;
   (void)open_wallet_store();
+  // Restore: the first derived confidential account comes back with the key; the refresh below scans
+  // the chain for its coins. Further accounts return by creating them again.
+  std::string conf_err;
+  const bool restored_confidential = store_.can_persist_confidential_secrets() &&
+                                     add_derived_confidential_account("Primary confidential account", &conf_err);
   load_wallet_local_state();
   update_wallet_views();
   render_history_view();
   append_local_event("Imported wallet into " + path);
+  if (restored_confidential) append_local_event("[confidential] restored derived account 0");
   refresh_chain_state(false);
   statusBar()->showMessage("Wallet imported.", 3000);
 }
@@ -4601,34 +4607,55 @@ void WalletWindow::create_confidential_account() {
       this, "New Confidential Account", "Account label", QLineEdit::Normal, "Primary confidential account", &ok);
   if (!ok) return;
 
-  Hash32 view_secret = random_hash32();
-  Hash32 spend_secret = random_hash32();
-  crypto::ScopedWipe<Hash32, Hash32> wipe_secrets(view_secret, spend_secret);
-  auto view_pubkey = crypto::secp256k1_pubkey_from_scalar(view_secret);
-  auto spend_pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret);
-  if (!view_pubkey || !spend_pubkey) {
-    QMessageBox::warning(this, "Create Confidential Account", "Failed to derive confidential account pubkeys.");
-    return;
-  }
-
-  const Hash32 account_seed = random_hash32();
-  WalletStore::ConfidentialAccountRecord record{
-      .account_id = finalis::hex_encode32(account_seed),
-      .label = label.trimmed().isEmpty() ? "Confidential account" : label.trimmed().toStdString(),
-      .stealth_address = encode_local_stealth_address(*view_pubkey, *spend_pubkey),
-      .view_key_material_hex = finalis::hex_encode(Bytes(view_secret.begin(), view_secret.end())),
-      .spend_key_material_hex = finalis::hex_encode(Bytes(spend_secret.begin(), spend_secret.end())),
-      .active = true,
-  };
-  if (!store_.upsert_confidential_account(record) || !store_.set_confidential_primary_account_id(record.account_id)) {
-    QMessageBox::warning(this, "Create Confidential Account", "Failed to persist confidential account state.");
+  std::string err;
+  const auto created = add_derived_confidential_account(
+      label.trimmed().isEmpty() ? "Confidential account" : label.trimmed().toStdString(), &err);
+  if (!created) {
+    QMessageBox::warning(this, "Create Confidential Account", QString::fromStdString(err));
     return;
   }
   load_wallet_local_state();
   update_wallet_views();
-  append_local_event(QString("[confidential] created account %1")
-                         .arg(QString::fromStdString(record.label)));
-  statusBar()->showMessage("Confidential account created.", 3000);
+  append_local_event(QString("[confidential] created account %1").arg(QString::fromStdString(*created)));
+  statusBar()->showMessage("Confidential account created. Scanning the chain for its coins.", 3000);
+  refresh_chain_state(false);
+}
+
+std::optional<std::string> WalletWindow::add_derived_confidential_account(const std::string& label, std::string* err) {
+  auto key = load_wallet_key(err);
+  if (!key) return std::nullopt;
+  WalletStore::State state;
+  if (!store_.load(&state)) {
+    if (err) *err = "Unable to load local confidential wallet state.";
+    return std::nullopt;
+  }
+  // Re-creating after a restore walks the same indices, so the accounts come back in order.
+  for (std::uint32_t index = 0; index < 1024; ++index) {
+    auto secrets = derive_confidential_account_secrets(key->privkey, index);
+    if (!secrets) continue;
+    const auto view_pubkey = crypto::secp256k1_pubkey_from_scalar(secrets->view_secret);
+    const auto spend_pubkey = crypto::secp256k1_pubkey_from_scalar(secrets->spend_secret);
+    if (!view_pubkey || !spend_pubkey) continue;
+    const std::string stealth_address = encode_local_stealth_address(*view_pubkey, *spend_pubkey);
+    const bool present = std::any_of(state.confidential_accounts.begin(), state.confidential_accounts.end(),
+                                     [&](const auto& a) { return a.stealth_address == stealth_address; });
+    if (present) continue;
+    WalletStore::ConfidentialAccountRecord record{
+        .account_id = finalis::hex_encode32(random_hash32()),
+        .label = label,
+        .stealth_address = stealth_address,
+        .view_key_material_hex = finalis::hex_encode(Bytes(secrets->view_secret.begin(), secrets->view_secret.end())),
+        .spend_key_material_hex = finalis::hex_encode(Bytes(secrets->spend_secret.begin(), secrets->spend_secret.end())),
+        .active = true,
+    };
+    if (!store_.upsert_confidential_account(record) || !store_.set_confidential_primary_account_id(record.account_id)) {
+      if (err) *err = "Failed to persist confidential account state.";
+      return std::nullopt;
+    }
+    return record.label;
+  }
+  if (err) *err = "No free derived confidential account index.";
+  return std::nullopt;
 }
 
 void WalletWindow::import_confidential_account() {
@@ -4901,6 +4928,8 @@ void WalletWindow::export_wallet_secret() {
   QMessageBox::information(
       this, "Export Backup",
       "Store this private key offline.\n\nPrivate key:\n" + privkey_hex +
+          "\n\nIt also restores the confidential accounts this wallet created. Accounts imported from a "
+          "view + spend secret need that pair backed up separately."
           "\n\nThe wallet does not show it during normal use unless you explicitly export it.");
   append_local_event("Exported backup material for " + QString::fromStdString(wallet_->file_path));
 }
