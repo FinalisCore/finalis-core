@@ -187,9 +187,13 @@ cmake -S . -B build -G Ninja && cmake --build build -j
 
 Dependency notes:
 - If `third_party/secp256k1-zkp` is missing, CMake will auto-fetch it (network required).
-- To force offline builds, disable auto-fetch and provide the vendored tree:
-  `cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF`
-  `git submodule update --init --recursive`
+- To force offline builds, provide the vendored tree at the pinned commit and disable auto-fetch:
+  `git clone https://github.com/ElementsProject/secp256k1-zkp.git third_party/secp256k1-zkp`
+  `git -C third_party/secp256k1-zkp checkout 08d1cd0c9c35a5a151ba80c226d49ea949e90374`
+  `cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF -DFINALIS_BUILD_NGINX=OFF`
+- On Linux the default build also downloads and compiles a local Nginx (reverse proxy for public
+  RPC/explorer hosts). Validators and offline builds can skip it with `-DFINALIS_BUILD_NGINX=OFF`.
+- `./scripts/bootstrap_deps.sh` installs the dependencies on apt, dnf and pacman systems.
 
 ## Run
 

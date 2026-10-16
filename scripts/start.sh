@@ -15,7 +15,7 @@ RESET_CHAIN_DATA="${RESET_CHAIN_DATA:-0}"
 SETUP_NODE_SERVICE="${SETUP_NODE_SERVICE:-1}"
 OPEN_FIREWALL_PORTS="${OPEN_FIREWALL_PORTS:-1}"
 SERVICE_NAME="${SERVICE_NAME:-finalis}"
-SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
+SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-${USER:-$(id -un)}}}"
 FINALIS_NETWORK="${FINALIS_NETWORK:-mainnet}"
 case "${FINALIS_NETWORK}" in
   testnet) DEFAULT_P2P_PORT=19540; DEFAULT_LIGHTSERVER_PORT=19544 ;;
@@ -106,9 +106,11 @@ log_validator_key_identity() {
 APT_BUILD_PACKAGES=(
   build-essential
   cmake
+  git
   ninja-build
   pkg-config
   libssl-dev
+  nlohmann-json3-dev
   qtbase5-dev
   qtchooser
   qt5-qmake
@@ -352,15 +354,15 @@ install_apt() {
 install_dnf() {
   local s; s="$(need_sudo)"
   ${s} dnf install -y \
-    gcc-c++ make cmake pkgconf-pkg-config ninja-build \
-    openssl-devel libsodium-devel rocksdb-devel python3
+    gcc-c++ make cmake git pkgconf-pkg-config ninja-build \
+    openssl-devel json-devel libsodium-devel rocksdb-devel python3
 }
 
 install_pacman() {
   local s; s="$(need_sudo)"
   ${s} pacman -Sy --noconfirm \
-    base-devel cmake pkgconf ninja \
-    openssl libsodium rocksdb python
+    base-devel cmake git pkgconf ninja \
+    openssl nlohmann-json libsodium rocksdb python
 }
 
 install_brew() {
@@ -368,7 +370,7 @@ install_brew() {
     log "Homebrew not found. Install Homebrew first: https://brew.sh"
     exit 1
   fi
-  brew install cmake pkg-config ninja openssl libsodium rocksdb
+  brew install cmake pkg-config ninja openssl nlohmann-json libsodium rocksdb
 }
 
 install_deps() {
@@ -391,7 +393,7 @@ install_deps() {
         install_pacman
       else
         log "Unsupported Linux package manager. Install manually:"
-        log "  C++20 compiler, cmake>=3.20, pkg-config, OpenSSL dev, libsodium dev, RocksDB dev (optional)"
+        log "  C++20 compiler, cmake>=3.22, git, pkg-config, OpenSSL dev, nlohmann-json, libsodium dev, RocksDB dev (optional)"
         exit 1
       fi
       ;;
@@ -419,6 +421,9 @@ configure_and_build() {
   configure_cmake "${args[@]}"
 
   local -a targets=(finalis-node finalis-lightserver finalis-explorer finalis-cli)
+  if [[ "${RUN_TESTS}" == "1" ]]; then
+    targets+=(finalis-tests)
+  fi
   log "Build command: cmake --build ${BUILD_DIR} -j${jobs} --target ${targets[*]}"
   if ! cmake --build "${BUILD_DIR}" -j"${jobs}" --target "${targets[@]}"; then
     log "Build failed."
@@ -427,7 +432,7 @@ configure_and_build() {
   fi
 
   if [[ "${RUN_TESTS}" == "1" ]]; then
-    ctest --test-dir "${BUILD_DIR}" --output-on-failure
+    ctest --test-dir "${BUILD_DIR}" --output-on-failure -R '^finalis-tests$'
   fi
 }
 

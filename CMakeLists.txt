@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.22)
 project(finalis_core LANGUAGES CXX)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -52,6 +52,26 @@ find_package(ZLIB QUIET)
 find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
 if(NOT NLOHMANN_JSON_INCLUDE_DIR)
   message(FATAL_ERROR "nlohmann/json.hpp not found. Install nlohmann-json3-dev (Debian/Ubuntu) or nlohmann-json.")
+endif()
+# ordered_json (keystore.cpp) arrived in 3.9. The version macros sit in json.hpp up to 3.10 and in
+# detail/abi_macros.hpp from 3.11.
+set(FINALIS_NLOHMANN_VERSION_LINES "")
+foreach(_finalis_json_hdr nlohmann/json.hpp nlohmann/detail/abi_macros.hpp)
+  if(EXISTS "${NLOHMANN_JSON_INCLUDE_DIR}/${_finalis_json_hdr}")
+    file(STRINGS "${NLOHMANN_JSON_INCLUDE_DIR}/${_finalis_json_hdr}" _finalis_json_lines
+         REGEX "^#define NLOHMANN_JSON_VERSION_(MAJOR|MINOR) +[0-9]+")
+    list(APPEND FINALIS_NLOHMANN_VERSION_LINES ${_finalis_json_lines})
+  endif()
+endforeach()
+if(FINALIS_NLOHMANN_VERSION_LINES MATCHES "MAJOR +([0-9]+)")
+  set(FINALIS_NLOHMANN_VERSION "${CMAKE_MATCH_1}")
+  if(FINALIS_NLOHMANN_VERSION_LINES MATCHES "MINOR +([0-9]+)")
+    string(APPEND FINALIS_NLOHMANN_VERSION ".${CMAKE_MATCH_1}")
+  endif()
+  if(FINALIS_NLOHMANN_VERSION VERSION_LESS "3.9")
+    message(FATAL_ERROR "nlohmann-json >= 3.9 required (found ${FINALIS_NLOHMANN_VERSION}).")
+  endif()
+  message(STATUS "Using nlohmann-json ${FINALIS_NLOHMANN_VERSION}")
 endif()
 include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
 
@@ -549,9 +569,15 @@ if(FINALIS_BUILD_NGINX)
   set(FINALIS_NGINX_URL "https://github.com/nginx/nginx/archive/refs/tags/release-${FINALIS_NGINX_VERSION}.tar.gz" CACHE STRING "Nginx source tarball URL.")
   set(FINALIS_NGINX_PREFIX "${CMAKE_BINARY_DIR}/third_party/nginx/install" CACHE PATH "Local install prefix for built Nginx.")
 
+  # DOWNLOAD_EXTRACT_TIMESTAMP exists from CMake 3.24; older versions read it as a second URL and fail
+  # to configure ("At least one entry of URL is a path").
+  set(_finalis_nginx_download_args)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+    list(APPEND _finalis_nginx_download_args DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  endif()
   ExternalProject_Add(finalis_nginx_build
     URL ${FINALIS_NGINX_URL}
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    ${_finalis_nginx_download_args}
     PREFIX ${CMAKE_BINARY_DIR}/third_party/nginx
     EXCLUDE_FROM_ALL TRUE
     BUILD_IN_SOURCE TRUE
