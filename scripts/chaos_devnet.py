@@ -189,7 +189,7 @@ class Nodes:
         return f"http://127.0.0.1:{self.rpc_port[i]}/rpc"
 
     def start(self, i: int) -> None:
-        env = dict(os.environ, FINALIS_VALIDATOR_PASSPHRASE=PASSPHRASE)
+        env = dict(os.environ, FINALIS_VALIDATOR_PASSPHRASE=PASSPHRASE, FINALIS_LOG_TIMESTAMPS="1")
         if i < self.args.byzantine:
             env["FINALIS_CHAOS_BYZANTINE"] = "1"
         logf = open(self.workdir / f"node{i}.log", "ab")

@@ -204,12 +204,26 @@ tagged_hash(tag, v, i, c) = SHA256(SHA256(tag) || SHA256(tag) || v || le32(i) ||
 hash_to_scalar            = tagged_hash with c = 0, 1, ... until the result is in [1, n)
 ```
 
+Wallet-created accounts take `(v, s)` from the wallet's 32-byte key seed, so backing up that key
+recovers every created account. Account `a`:
+
+```text
+v = hash_to_scalar("FINALIS/conf-account/view/v1",  seed, a)
+s = hash_to_scalar("FINALIS/conf-account/spend/v1", seed, a)
+```
+
+This is hardened: the seed enters only through a hash, so one account's secrets reveal neither the
+seed nor any other account. Creating an account takes the lowest `a` not yet in the wallet, and
+importing the wallet key adds account 0 and scans for it, so re-creating after a restore brings back
+accounts in order. Accounts imported from raw `(v, s)` stay outside this scheme and need their own
+backup.
+
 Properties:
 
 - **Recovery.** `(v, s)` re-derives every request. The wallet matches an imported `TxV2` against
   stored requests and, failing that, against derived requests `0 .. next_request_index + 100`, so a
   wallet restored from its account secrets recognises and can spend coins paid to old requests.
-  Finding the transactions after a restore still needs their txids (no chain scan yet).
+  The wallet finds them by chain scan (`get_confidential_history_page`).
 - **Watch-only.** `(v, S)` derives every public part and the memo key: it recognises incoming coins
   and decrypts their amounts, but cannot spend.
 - **Unlinkability.** Distinct requests have unrelated keys to anyone without `v`. Paying one request

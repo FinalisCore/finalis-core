@@ -323,6 +323,9 @@ class WalletWindow final : public QMainWindow {
   void import_wallet();
   void unlock_confidential_state();
   void create_confidential_account();
+  // Adds the lowest-index account derived from the wallet key (derive_confidential_account_secrets)
+  // that is not in the wallet yet and makes it primary. Returns its label, or nullopt with *err.
+  std::optional<std::string> add_derived_confidential_account(const std::string& label, std::string* err);
   void import_confidential_account();
   void generate_confidential_request();
   void import_received_confidential_tx();

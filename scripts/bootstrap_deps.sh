@@ -27,6 +27,7 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+SUDO=()
 need_sudo() {
   if [[ "${EUID}" -eq 0 ]]; then
     return 0
@@ -35,6 +36,7 @@ need_sudo() {
     log "sudo is required to install packages."
     exit 1
   fi
+  SUDO=(sudo)
 }
 
 pkg_missing_deb() {
@@ -68,10 +70,12 @@ install_apt() {
   local packages=(
     build-essential
     cmake
+    git
     pkg-config
     ninja-build
     python3
     libssl-dev
+    nlohmann-json3-dev
     libsodium-dev
     librocksdb-dev
   )
@@ -87,8 +91,8 @@ install_apt() {
 
   need_sudo
   log "Installing missing APT packages: ${missing[*]}"
-  sudo apt-get update
-  sudo apt-get install -y "${missing[@]}"
+  "${SUDO[@]}" apt-get update
+  "${SUDO[@]}" apt-get install -y "${missing[@]}"
 }
 
 install_dnf() {
@@ -96,10 +100,12 @@ install_dnf() {
     gcc-c++
     make
     cmake
+    git
     pkgconf-pkg-config
     ninja-build
     python3
     openssl-devel
+    json-devel
     libsodium-devel
     rocksdb-devel
   )
@@ -115,17 +121,19 @@ install_dnf() {
 
   need_sudo
   log "Installing missing DNF packages: ${missing[*]}"
-  sudo dnf install -y "${missing[@]}"
+  "${SUDO[@]}" dnf install -y "${missing[@]}"
 }
 
 install_pacman() {
   local packages=(
     base-devel
     cmake
+    git
     pkgconf
     ninja
     python
     openssl
+    nlohmann-json
     libsodium
     rocksdb
   )
@@ -141,7 +149,7 @@ install_pacman() {
 
   need_sudo
   log "Installing missing pacman packages: ${missing[*]}"
-  sudo pacman -Sy --noconfirm "${missing[@]}"
+  "${SUDO[@]}" pacman -Sy --noconfirm "${missing[@]}"
 }
 
 main() {
@@ -175,13 +183,13 @@ main() {
         install_pacman
       else
         log "Unsupported Linux package manager."
-        log "Install a C++20 toolchain, CMake >= 3.20, pkg-config, OpenSSL dev, libsodium dev, RocksDB dev, and Qt5 Widgets dev."
+        log "Install a C++20 toolchain, CMake >= 3.22, git, pkg-config, OpenSSL dev, nlohmann-json, libsodium dev, RocksDB dev, and Qt5 Widgets dev."
         exit 1
       fi
       ;;
     *)
       log "Unsupported OS: ${os}"
-      log "Install a C++20 toolchain, CMake >= 3.20, pkg-config, OpenSSL dev, libsodium dev, RocksDB dev, and Qt5 Widgets dev."
+      log "Install a C++20 toolchain, CMake >= 3.22, git, pkg-config, OpenSSL dev, nlohmann-json, libsodium dev, RocksDB dev, and Qt5 Widgets dev."
       exit 1
       ;;
   esac

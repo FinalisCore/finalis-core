@@ -2574,6 +2574,34 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
              (in_flight ? "candidate-pending" : "missing-candidate"));
     return false;
   }
+  // LIVENESS: count votes before re-executing the transition below. That re-execution costs
+  // hundreds of ms under mu_, and this runs for every accepted precommit and for every round from
+  // the transition's round up when its body arrives. Doing it first stalled prevotes by seconds per
+  // round in crash runs (proposal received, prevote 4-7 s later), so rounds timed out just before
+  // their polka. Only a certain miss returns here: the count is the committee/dedup filter applied
+  // below, so a quorum it lets through is still checked in full. The quorum-1 self-vote path signs
+  // below and is left alone.
+  if (canonical_state_.has_value()) {
+    const auto committee = consensus::canonical_committee_for_height_round(canonical_derivation_config_locked(),
+                                                                           *canonical_state_, height, round);
+    if (!committee.empty()) {
+      const std::size_t quorum = consensus::quorum_threshold(committee.size());
+      const bool self_vote_path = quorum == 1 && committee.size() == 1 && committee.front() == local_key_.public_key;
+      const std::set<PubKey32> members(committee.begin(), committee.end());
+      const auto sigs = votes_.signatures_for(height, round, block_id);
+      std::set<PubKey32> counted;
+      for (const auto& s : sigs) {
+        if (members.contains(s.validator_pubkey)) counted.insert(s.validator_pubkey);
+      }
+      if (!self_vote_path && counted.size() < quorum) {
+        log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+                 " transition=" + short_hash_hex(block_id) + " reason=insufficient-votes votes=" +
+                 std::to_string(counted.size()) + " quorum=" + std::to_string(quorum) +
+                 " signers=" + signer_set_summary(sigs));
+        return false;
+      }
+    }
+  }
   FrontierProposal finalized_proposal = proposal_it->second;
 
   consensus::CanonicalFrontierRecord certified_record;
