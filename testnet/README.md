@@ -11,11 +11,11 @@ rehearse mainnet without being mistaken for it:
 | data directory | `~/.finalis/mainnet` | `~/.finalis/testnet` |
 | network id, magic | see `mainnet/genesis.json` | `sha256("finalis:testnet")[:16]`, `0x54534331` |
 
-Transactions sign over the network identity, so a transaction signed for one network is invalid
-on the other, and the different P2P magic keeps their nodes from connecting. Consensus messages
-(votes, proposals, timeout votes) do not yet commit to the network, so never use a testnet
-validator key on mainnet: its public testnet votes would count as equivocation evidence there.
-Testnet coins have no value.
+Every signature commits to the chain domain `sha256d("SC-CHAIN-DOMAIN-V1" || network_id ||
+genesis_hash)`: transaction inputs, unbonds, confidential spends and balance proofs, as well as votes,
+proposals and timeout votes. A transaction or vote signed for one network is therefore invalid on
+every other one, and the different P2P magic keeps their nodes from connecting. Still, keep testnet
+and mainnet keys separate. Testnet coins have no value.
 
 ## Genesis (testnet-1)
 

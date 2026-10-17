@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_paths.hpp"
 
@@ -64,7 +65,7 @@ TxOut p2pkh_out_for_pub(const PubKey32& pub, std::uint64_t value) {
 Bytes signed_spend_tx_bytes(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& from, const PubKey32& to_pub,
                             std::uint64_t value_out) {
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), 
       op, prev, from.private_key, std::vector<TxOut>{TxOut{value_out, address::p2pkh_script_pubkey(to_pkh)}});
   if (!tx.has_value()) throw std::runtime_error("failed to build tx");
   return tx->serialize();

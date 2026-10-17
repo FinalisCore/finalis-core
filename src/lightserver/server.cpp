@@ -2938,7 +2938,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         },
     };
     auto tx = build_validator_join_request_tx(
-        prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
+        consensus_chain_domain(cfg_.network, chain_id_), prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
         Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey, record->bond_amount, record->fee,
         address::p2pkh_script_pubkey(own_address->pubkey_hash), &err, &pow_ctx);
     if (!tx.has_value()) {

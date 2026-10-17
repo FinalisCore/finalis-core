@@ -32,6 +32,17 @@ using namespace finalis;
 
 namespace {
 
+// Any fixed chain identity: the benchmark signs and validates on the same one.
+const ChainId& bench_chain_id() {
+  static const ChainId id = [] {
+    ChainId c;
+    c.genesis_hash_hex = std::string(64, 'b');
+    return c;
+  }();
+  return id;
+}
+Hash32 bench_chain_domain() { return consensus_chain_domain(mainnet_network(), bench_chain_id()); }
+
 crypto::Blind32 blind_from(std::uint32_t seed) {
   crypto::Blind32 out;
   const Bytes pre{'b', static_cast<std::uint8_t>(seed), static_cast<std::uint8_t>(seed >> 8)};
@@ -72,7 +83,7 @@ void sign_balance(TxV2& tx, const crypto::Blind32& excess_blind) {
   if (!pub) throw std::runtime_error("excess pubkey");
   tx.balance_proof.excess_pubkey = *pub;
   tx.balance_proof.excess_sig.fill(0);
-  auto msg = balance_proof_message_v2(tx);
+  auto msg = balance_proof_message_v2(bench_chain_domain(), tx);
   auto sig = crypto::sign_excess_authorization(*msg, excess_blind, nonce_from(0xEE));
   if (!sig) throw std::runtime_error("excess sig");
   tx.balance_proof.excess_sig = *sig;
@@ -116,7 +127,7 @@ Fixture make_t_to_c(std::size_t n_outputs) {
   auto excess = crypto::confidential_amount_commitment(0, *excess_blind);
   f.tx.balance_proof.excess_commitment = *excess;
   sign_balance(f.tx, *excess_blind);
-  auto msg = signing_message_for_input_v2(f.tx, 0);
+  auto msg = signing_message_for_input_v2(bench_chain_domain(), f.tx, 0);
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   std::get<TransparentInputWitnessV2>(f.tx.inputs[0].witness).script_sig = p2pkh_script_sig(*sig, from.public_key);
   return f;
@@ -158,7 +169,7 @@ Fixture make_c_to_t(std::size_t n_inputs) {
   f.tx.balance_proof.excess_commitment = *crypto::confidential_amount_commitment(0, *excess_blind);
   sign_balance(f.tx, *excess_blind);
   for (std::size_t i = 0; i < n_inputs; ++i) {
-    auto msg = signing_message_for_input_v2(f.tx, static_cast<std::uint32_t>(i));
+    auto msg = signing_message_for_input_v2(bench_chain_domain(), f.tx, static_cast<std::uint32_t>(i));
     Hash32 msg32{};
     std::copy(msg->begin(), msg->end(), msg32.begin());
     auto sig = crypto::sign_schnorr_authorization(msg32, spend_secrets[i], nonce_from(0x400 + static_cast<std::uint32_t>(i)));
@@ -205,6 +216,8 @@ int main(int argc, char** argv) {
 
   ConfidentialPolicy policy;
   SpecialValidationContext ctx;
+  ctx.network = &mainnet_network();
+  ctx.chain_id = &bench_chain_id();
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
 

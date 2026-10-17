@@ -282,7 +282,7 @@ bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
          is_burn_script(script_pubkey, nullptr);
 }
 
-std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index) {
+std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index) {
   if (input_index >= tx.inputs.size()) return std::nullopt;
   Tx signing = tx;
   for (auto& in : signing.inputs) {
@@ -291,14 +291,15 @@ std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input
   const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '0'});
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
   w.u32le(input_index);
   w.bytes_fixed(txh);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
 
-std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index) {
+std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index) {
   if (input_index >= tx.inputs.size()) return std::nullopt;
   Tx signing = tx;
   for (auto& in : signing.inputs) {
@@ -307,14 +308,16 @@ std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_
   const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '0'});
+  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
   w.bytes_fixed(txh);
   w.u32le(input_index);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
 
-std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t input_index) {
+std::optional<Bytes> signing_message_for_input_v2(const Hash32& chain_domain, const TxV2& tx,
+                                                  std::uint32_t input_index) {
   if (input_index >= tx.inputs.size()) return std::nullopt;
   TxV2 signing = tx;
   for (auto& in : signing.inputs) {
@@ -326,14 +329,15 @@ std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t 
   }
   const Hash32 txh = crypto::sha256d(signing.serialize());
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '2'});
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '3'});
+  w.bytes_fixed(chain_domain);
   w.u32le(input_index);
   w.bytes_fixed(txh);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
 
-std::optional<Hash32> balance_proof_message_v2(const TxV2& tx) {
+std::optional<Hash32> balance_proof_message_v2(const Hash32& chain_domain, const TxV2& tx) {
   TxV2 signing = tx;
   for (auto& in : signing.inputs) {
     if (in.kind == TxInputKind::Transparent) {
@@ -344,7 +348,8 @@ std::optional<Hash32> balance_proof_message_v2(const TxV2& tx) {
   }
   signing.balance_proof.excess_sig.fill(0);
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'B', 'A', 'L', '-', 'V', '2'});
+  w.bytes(Bytes{'S', 'C', '-', 'B', 'A', 'L', '-', 'V', '3'});
+  w.bytes_fixed(chain_domain);
   w.bytes(signing.serialize());
   return crypto::sha256d(w.data());
 }
@@ -532,16 +537,36 @@ bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& r
   return true;
 }
 
-Hash32 consensus_chain_domain(const NetworkConfig& network, const ChainId& chain_id) {
+Hash32 chain_domain_from_ids(const std::array<std::uint8_t, 16>& network_id, const Hash32& genesis_hash) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'C', 'H', 'A', 'I', 'N', '-', 'D', 'O', 'M', 'A', 'I', 'N', '-', 'V', '1'});
-  w.bytes_fixed(network.network_id);
+  w.bytes_fixed(network_id);
+  w.bytes_fixed(genesis_hash);
+  return crypto::sha256d(w.data());
+}
+
+Hash32 consensus_chain_domain(const NetworkConfig& network, const ChainId& chain_id) {
   Hash32 genesis_hash{};
   if (const auto gh = hex_decode(chain_id.genesis_hash_hex); gh && gh->size() == 32) {
     std::copy(gh->begin(), gh->end(), genesis_hash.begin());
   }
-  w.bytes_fixed(genesis_hash);
-  return crypto::sha256d(w.data());
+  return chain_domain_from_ids(network.network_id, genesis_hash);
+}
+
+std::optional<Hash32> chain_domain_from_hex(const std::string& network_id_hex, const std::string& genesis_hash_hex) {
+  const auto nid = hex_decode(network_id_hex);
+  const auto gh = hex_decode(genesis_hash_hex);
+  if (!nid || nid->size() != 16 || !gh || gh->size() != 32) return std::nullopt;
+  std::array<std::uint8_t, 16> network_id{};
+  Hash32 genesis_hash{};
+  std::copy(nid->begin(), nid->end(), network_id.begin());
+  std::copy(gh->begin(), gh->end(), genesis_hash.begin());
+  return chain_domain_from_ids(network_id, genesis_hash);
+}
+
+std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx) {
+  if (!ctx || !ctx->network || !ctx->chain_id) return std::nullopt;
+  return consensus_chain_domain(*ctx->network, *ctx->chain_id);
 }
 
 Bytes vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
@@ -648,6 +673,8 @@ bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
 
 TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
                                const SpecialValidationContext* ctx) {
+  const auto chain_domain = tx_chain_domain(ctx);
+  if (!chain_domain) return {false, "tx validation requires chain identity", 0};
   if (tx.version != 1) return {false, "unsupported tx version", 0};
   if (tx.lock_time != 0) return {false, "lock_time must be 0 in v0", 0};
   if (tx.inputs.empty() || tx.outputs.empty()) return {false, "tx inputs/outputs empty", 0};
@@ -710,7 +737,7 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         return {false, "pubkey hash mismatch", 0};
       }
 
-      const auto msg = signing_message_for_input(tx, i);
+      const auto msg = signing_message_for_input(*chain_domain, tx, i);
       if (!msg.has_value()) return {false, "sighash failed", 0};
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -743,10 +770,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != bond_pub) return {false, "evidence pubkey must match bond", 0};
 
-        if (!ctx->network || !ctx->chain_id) return {false, "slash evidence requires chain identity", 0};
-        const Hash32 chain_domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
-        const auto a_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.a);
-        const auto b_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.b);
+        const auto a_msg = slash_vote_signing_message(*chain_domain, evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(*chain_domain, evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
@@ -779,7 +804,7 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         PubKey32 pub{};
         if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond auth script_sig", 0};
         if (pub != bond_pub) return {false, "unbond auth pubkey mismatch", 0};
-        const auto msg = unbond_message_for_input(tx, i);
+        const auto msg = unbond_message_for_input(*chain_domain, tx, i);
         if (!msg.has_value()) return {false, "unbond sighash failed", 0};
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -812,10 +837,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         }
         if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
         if (evidence.a.validator_pubkey != unbond_pub) return {false, "evidence pubkey must match unbond output", 0};
-        if (!ctx->network || !ctx->chain_id) return {false, "slash evidence requires chain identity", 0};
-        const Hash32 chain_domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
-        const auto a_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.a);
-        const auto b_msg = slash_vote_signing_message(chain_domain, evidence.kind, evidence.b);
+        const auto a_msg = slash_vote_signing_message(*chain_domain, evidence.kind, evidence.a);
+        const auto b_msg = slash_vote_signing_message(*chain_domain, evidence.kind, evidence.b);
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 2, &budget_error)) return {false, budget_error, 0};
         if (!crypto::ed25519_verify(a_msg, evidence.a.signature, evidence.a.validator_pubkey)) {
@@ -844,7 +867,7 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       PubKey32 pub{};
       if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond-spend script_sig", 0};
       if (pub != unbond_pub) return {false, "unbond-spend pubkey mismatch", 0};
-      const auto msg = signing_message_for_input(tx, i);
+      const auto msg = signing_message_for_input(*chain_domain, tx, i);
       if (!msg.has_value()) return {false, "unbond-spend sighash failed", 0};
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -887,6 +910,11 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
 
   if (!ctx || !ctx->confidential_policy) {
     out.error = "missing confidential policy context";
+    return out;
+  }
+  const auto chain_domain = tx_chain_domain(ctx);
+  if (!chain_domain) {
+    out.error = "tx validation requires chain identity";
     return out;
   }
   const auto& policy = *ctx->confidential_policy;
@@ -988,7 +1016,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
         out.error = "confidential input one_time_pubkey mismatch";
         return out;
       }
-      const auto msg = signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+      const auto msg = signing_message_for_input_v2(*chain_domain, tx, static_cast<std::uint32_t>(input_index));
       if (!msg.has_value()) {
         out.error = "sighash failed";
         return out;
@@ -1029,7 +1057,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "pubkey hash mismatch";
       return out;
     }
-    const auto msg = signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+    const auto msg = signing_message_for_input_v2(*chain_domain, tx, static_cast<std::uint32_t>(input_index));
     if (!msg.has_value()) {
       out.error = "sighash failed";
       return out;
@@ -1165,7 +1193,7 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
       out.error = "invalid excess pubkey";
       return out;
     }
-    const auto msg = balance_proof_message_v2(tx);
+    const auto msg = balance_proof_message_v2(*chain_domain, tx);
     if (!msg.has_value()) {
       out.error = "balance proof sighash failed";
       return out;

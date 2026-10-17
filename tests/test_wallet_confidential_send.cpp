@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
 #include <memory>
@@ -106,7 +107,7 @@ struct Fixture {
 
 bool validates(const TxV2& tx, const UtxoSetV2& view) {
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
   const auto r = validate_tx_v2(tx, 1, view, &ctx);
@@ -122,7 +123,7 @@ TEST(test_confidential_transfer_plan_pays_recipient_and_recovers_change) {
   ASSERT_TRUE(crypto::confidential_crypto_init());
   Fixture f;
   std::string err;
-  const auto plan = wallet::plan_confidential_transfer(f.sender, {}, "sender", f.to, f.to_memo_key, 7'000, 1'000,
+  const auto plan = wallet::plan_confidential_transfer(finalis::test::test_chain_domain(), f.sender, {}, "sender", f.to, f.to_memo_key, 7'000, 1'000,
                                                        counter_random(0x01), &err);
   if (!plan) throw std::runtime_error("plan: " + err);
   ASSERT_EQ(plan->input_total, 10'000ULL);
@@ -152,7 +153,7 @@ TEST(test_confidential_transfer_plan_randomises_change_position) {
   std::set<std::size_t> change_positions;
   for (std::uint8_t seed = 1; seed <= 16 && change_positions.size() < 2; ++seed) {
     std::string err;
-    const auto plan = wallet::plan_confidential_transfer(f.sender, {}, "sender", f.to, f.to_memo_key, 7'000, 1'000,
+    const auto plan = wallet::plan_confidential_transfer(finalis::test::test_chain_domain(), f.sender, {}, "sender", f.to, f.to_memo_key, 7'000, 1'000,
                                                          counter_random(seed), &err);
     ASSERT_TRUE(plan.has_value());
     for (std::size_t i = 0; i < plan->tx.outputs.size(); ++i) {
@@ -168,7 +169,7 @@ TEST(test_confidential_transfer_plan_exact_amount_has_no_change_and_skips_reserv
   Fixture f;
   std::string err;
   // 6000 coin exactly covers 5000 + 1000: one output, no change.
-  const auto exact = wallet::plan_confidential_transfer(f.sender, {}, "sender", f.to, f.to_memo_key, 5'000, 1'000,
+  const auto exact = wallet::plan_confidential_transfer(finalis::test::test_chain_domain(), f.sender, {}, "sender", f.to, f.to_memo_key, 5'000, 1'000,
                                                         counter_random(0x02), &err);
   ASSERT_TRUE(exact.has_value());
   ASSERT_EQ(exact->change, 0ULL);
@@ -178,7 +179,7 @@ TEST(test_confidential_transfer_plan_exact_amount_has_no_change_and_skips_reserv
 
   // With the 6000 coin reserved by a pending send, 4000 alone cannot cover 7000 + 1000.
   const std::set<OutPoint> reserved{outpoint_of(f.sender.confidential_coins[0])};
-  ASSERT_TRUE(!wallet::plan_confidential_transfer(f.sender, reserved, "sender", f.to, f.to_memo_key, 7'000, 1'000,
+  ASSERT_TRUE(!wallet::plan_confidential_transfer(finalis::test::test_chain_domain(), f.sender, reserved, "sender", f.to, f.to_memo_key, 7'000, 1'000,
                                                   counter_random(0x03), &err)
                    .has_value());
 }

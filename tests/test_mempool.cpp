@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
 #include <ctime>
@@ -24,6 +25,7 @@ Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub);
 
 TEST(test_mempool_rejects_nonexistent_utxo) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(84);
@@ -42,6 +44,7 @@ TEST(test_mempool_rejects_nonexistent_utxo) {
 }
 TEST(test_mempool_rejects_invalid_fee_values) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(82);
@@ -71,6 +74,7 @@ TEST(test_mempool_rejects_invalid_fee_values) {
 }
 TEST(test_mempool_accepts_edge_case_fee_values) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(80);
@@ -100,6 +104,7 @@ TEST(test_mempool_accepts_edge_case_fee_values) {
 }
 TEST(test_mempool_rejects_double_spend_across_transactions) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(70);
@@ -125,6 +130,7 @@ TEST(test_mempool_rejects_double_spend_across_transactions) {
 }
 TEST(test_mempool_rejects_invalid_signature_and_malformed_tx) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(60);
@@ -177,7 +183,7 @@ std::optional<Tx> spend_one(const OutPoint& op, const TxOut& prev, const crypto:
   std::vector<TxOut> outs;
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
   outs.push_back(TxOut{value_out, address::p2pkh_script_pubkey(to_pkh)});
-  return build_signed_p2pkh_tx_single_input(op, prev, from.private_key, outs);
+  return build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), op, prev, from.private_key, outs);
 }
 
 Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
@@ -215,7 +221,7 @@ TxV2 make_transparent_only_v2_tx(const OutPoint& op, const crypto::KeyPair& from
   tx.balance_proof.excess_commitment = crypto::Commitment33{};
   tx.balance_proof.excess_pubkey.fill(0);
   tx.balance_proof.excess_sig.fill(0);
-  auto msg = signing_message_for_input_v2(tx, 0);
+  auto msg = signing_message_for_input_v2(finalis::test::test_chain_domain(), tx, 0);
   if (!msg.has_value()) throw std::runtime_error("v2 sighash failed");
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   if (!sig.has_value()) throw std::runtime_error("v2 sign failed");
@@ -246,6 +252,7 @@ std::vector<Tx> fill_pool_to_count_limit(mempool::Mempool& mp, mempool::UtxoView
 
 TEST(test_mempool_accept_reject_rules) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(1);
@@ -289,6 +296,7 @@ TEST(test_mempool_accept_reject_rules) {
 
 TEST(test_mempool_selection_order_fee_rate_then_absolute_fee_then_txid) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(10);
@@ -340,6 +348,7 @@ TEST(test_mempool_selection_order_fee_rate_then_absolute_fee_then_txid) {
 
 TEST(test_mempool_full_rejects_equal_or_worse_and_evicts_one_better_tx) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(40);
@@ -403,6 +412,7 @@ TEST(test_mempool_full_rejects_equal_or_worse_and_evicts_one_better_tx) {
 
 TEST(test_mempool_block_selection_prefers_fee_rate_and_nonfitting_entries_remain) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(50);
@@ -417,7 +427,7 @@ TEST(test_mempool_block_selection_prefers_fee_rate_and_nonfitting_entries_remain
     std::vector<TxOut> outs;
     const auto to_pkh = crypto::h160(Bytes(k2.public_key.begin(), k2.public_key.end()));
     for (auto out_value : outputs) outs.push_back(TxOut{out_value, address::p2pkh_script_pubkey(to_pkh)});
-    auto tx = build_signed_p2pkh_tx_single_input(op, prev, k1.private_key, outs);
+    auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), op, prev, k1.private_key, outs);
     ASSERT_TRUE(tx.has_value());
     std::string err;
     ASSERT_TRUE(mp.accept_tx(*tx, view, &err));
@@ -441,6 +451,7 @@ TEST(test_mempool_block_selection_prefers_fee_rate_and_nonfitting_entries_remain
 
 TEST(test_mempool_confirmed_and_pruned_removal_behaviour_remains_intact) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
 
   const auto k1 = key_from_byte(60);
@@ -480,6 +491,7 @@ TEST(test_mempool_confirmed_and_pruned_removal_behaviour_remains_intact) {
 
 TEST(test_mempool_hashcash_policy_requires_stamp_for_low_fee_txs) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mp.set_network(mainnet_network());
   mp.set_hashcash_config(policy::HashcashConfig{
       .enabled = true,
@@ -540,6 +552,7 @@ TEST(test_mempool_hashcash_policy_requires_stamp_for_low_fee_txs) {
 // TxV2 is valid from genesis: no activation height gates it.
 TEST(test_mempool_accepts_txv2_at_height_1_when_variant_validation_succeeds) {
   mempool::Mempool mp;
+  mp.set_validation_context(finalis::test::with_test_chain_identity());
   mempool::UtxoView view;
   const auto k1 = key_from_byte(72);
   const auto k2 = key_from_byte(73);
@@ -551,7 +564,7 @@ TEST(test_mempool_accepts_txv2_at_height_1_when_variant_validation_succeeds) {
   view[op] = UtxoEntry{prev};
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.confidential_policy = &policy;
   ctx.current_height = 1;
   mp.set_validation_context(ctx);
@@ -614,14 +627,14 @@ TxV2 make_pool_withdrawal_v2_tx(mempool::UtxoView& view, std::uint8_t seed, cons
   tx.balance_proof.excess_commitment = *excess;
   tx.balance_proof.excess_pubkey = *excess_pubkey;
   tx.balance_proof.excess_sig.fill(0);
-  const auto balance_msg = balance_proof_message_v2(tx);
+  const auto balance_msg = balance_proof_message_v2(finalis::test::test_chain_domain(), tx);
   Hash32 aux{};
   aux.fill(0x5A);
   const auto excess_sig = crypto::sign_excess_authorization(*balance_msg, value_blind, aux);
   if (!excess_sig) throw std::runtime_error("excess signature failed");
   tx.balance_proof.excess_sig = *excess_sig;
 
-  const auto input_msg = signing_message_for_input_v2(tx, 0);
+  const auto input_msg = signing_message_for_input_v2(finalis::test::test_chain_domain(), tx, 0);
   Hash32 msg32{};
   std::copy(input_msg->begin(), input_msg->end(), msg32.begin());
   const auto spend_sig = crypto::sign_schnorr_authorization(msg32, spend_secret, aux);
@@ -637,7 +650,7 @@ struct TurnstileFixture {
   crypto::KeyPair recipient = key_from_byte(0x91);
 
   TurnstileFixture() {
-    SpecialValidationContext ctx;
+    SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
     ctx.confidential_policy = &policy;
     ctx.current_height = 10;
     mp.set_validation_context(ctx);

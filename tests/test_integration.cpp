@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
@@ -49,6 +50,10 @@
 using namespace finalis;
 
 namespace {
+
+// The chain domain a node validates transaction signatures under: sign with it to submit to that node.
+Hash32 node_chain_domain(const node::Node& n) { return n.consensus_domain_for_test(); }
+Hash32 node_chain_domain(const std::unique_ptr<node::Node>& n) { return n->consensus_domain_for_test(); }
 
 std::chrono::seconds ci_timeout_seconds(int base_seconds) {
   int scale = 1;
@@ -748,7 +753,7 @@ std::optional<Tx> create_bond_tx_from_validator0(node::Node& node0, const crypto
   tx.outputs = outs;
 
   for (std::size_t i = 0; i < selected.size(); ++i) {
-    auto msg = signing_message_for_input(tx, static_cast<std::uint32_t>(i));
+    auto msg = signing_message_for_input(node_chain_domain(node0), tx, static_cast<std::uint32_t>(i));
     if (!msg.has_value()) return std::nullopt;
     auto sig = crypto::ed25519_sign(*msg, validator0.private_key);
     if (!sig.has_value()) return std::nullopt;
@@ -795,7 +800,7 @@ std::optional<Tx> create_join_request_tx_from_validator0(node::Node& node0, cons
   const std::uint64_t change = in_sum - bond_amount - fee;
   if (change > 0) outputs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
 
-  return build_signed_p2pkh_tx_multi_input(selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
+  return build_signed_p2pkh_tx_multi_input(node_chain_domain(node0), selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
                                            outputs);
 }
 
@@ -823,7 +828,7 @@ std::optional<Tx> create_onboarding_registration_tx_from_validator0(node::Node& 
   }
   if (in_sum < fee) return std::nullopt;
 
-  return build_onboarding_registration_tx(
+  return build_onboarding_registration_tx(node_chain_domain(node0), 
       selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()), new_validator.public_key,
       Bytes(new_validator.private_key.begin(), new_validator.private_key.end()), payout_pubkey, fee,
       address::p2pkh_script_pubkey(sender_pkh));
@@ -863,7 +868,7 @@ std::optional<Tx> create_join_request_tx_from_validator0_with_payout(node::Node&
   const std::uint64_t change = in_sum - bond_amount - fee;
   if (change > 0) outputs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
 
-  return build_signed_p2pkh_tx_multi_input(selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
+  return build_signed_p2pkh_tx_multi_input(node_chain_domain(node0), selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
                                            outputs);
 }
 
@@ -889,7 +894,7 @@ std::optional<Tx> create_self_transfer_tx(node::Node& node, const crypto::KeyPai
   const std::uint64_t change = in_sum - amount - fee;
   if (change > 0) outputs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
 
-  return build_signed_p2pkh_tx_multi_input(selected, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs);
+  return build_signed_p2pkh_tx_multi_input(node_chain_domain(node), selected, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs);
 }
 
 struct FundedTestWallet {
@@ -2375,7 +2380,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
       .current_height = nodes[0]->status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
   };
-  auto request_tx = build_validator_join_request_tx(
+  auto request_tx = build_validator_join_request_tx(node_chain_domain(nodes[0]), 
       funded->utxos, Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()), fixture.joiner_kp.public_key,
       Bytes(fixture.joiner_kp.private_key.begin(), fixture.joiner_kp.private_key.end()), fixture.joiner_kp.public_key,
       bond_amount, 0, address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -2531,7 +2536,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
       .current_height = nodes[0]->status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
   };
-  auto request_tx = build_validator_join_request_tx(
+  auto request_tx = build_validator_join_request_tx(node_chain_domain(nodes[0]), 
       funded->utxos, Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()), fixture.joiner_kp.public_key,
       Bytes(fixture.joiner_kp.private_key.begin(), fixture.joiner_kp.private_key.end()), fixture.joiner_kp.public_key,
       bond_amount, 0, address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -2852,7 +2857,7 @@ TEST(test_tx_finalized_and_visible_on_all_nodes) {
   std::vector<TxOut> outputs{TxOut{amount, address::p2pkh_script_pubkey(recipient_pkh)}};
 
   std::string err;
-  auto tx = build_signed_p2pkh_tx_single_input(spend_op, spend_out, keys[sender_index].private_key, outputs, &err);
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), spend_op, spend_out, keys[sender_index].private_key, outputs, &err);
   ASSERT_TRUE(tx.has_value());
   const Hash32 txid = tx->txid();
   const auto height_before = nodes[0]->status().height;
@@ -2902,7 +2907,7 @@ TEST(test_epoch_ticket_challenge_anchor_ignores_pending_mempool_state) {
   const auto recipient_index = (sender_index + 1) % keys.size();
   const auto recipient_pkh = crypto::h160(Bytes(keys[recipient_index].public_key.begin(), keys[recipient_index].public_key.end()));
   std::string err;
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), 
       spend_op, spend_out, keys[sender_index].private_key,
       std::vector<TxOut>{TxOut{spend_out.value - 1000, address::p2pkh_script_pubkey(recipient_pkh)}}, &err);
   ASSERT_TRUE(tx.has_value());
@@ -3167,7 +3172,7 @@ TEST(test_wallet_send_over_one_coin_multi_input_finalizes_and_chain_continues) {
     const std::uint64_t second_half = remainder - first_half;
     ASSERT_TRUE(first_half > 0 && second_half > 0);
     std::string split_err;
-    auto split_tx = build_signed_p2pkh_tx_single_input(
+    auto split_tx = build_signed_p2pkh_tx_single_input(node_chain_domain(n), 
         split_op, split_prev, keys[sender_index].private_key,
         std::vector<TxOut>{TxOut{first_half, address::p2pkh_script_pubkey(sender_pkh)},
                            TxOut{second_half, address::p2pkh_script_pubkey(sender_pkh)}},
@@ -3211,7 +3216,7 @@ TEST(test_wallet_send_over_one_coin_multi_input_finalizes_and_chain_continues) {
   ASSERT_TRUE(plan.has_value());
   ASSERT_TRUE(plan->selected_prevs.size() >= 2u);
 
-  auto tx = build_signed_p2pkh_tx_multi_input(plan->selected_prevs,
+  auto tx = build_signed_p2pkh_tx_multi_input(node_chain_domain(n), plan->selected_prevs,
                                               Bytes(keys[sender_index].private_key.begin(), keys[sender_index].private_key.end()),
                                               plan->outputs, &err);
   ASSERT_TRUE(tx.has_value());
@@ -3785,7 +3790,7 @@ TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) 
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
   };
-  auto tx = build_onboarding_registration_tx(
+  auto tx = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -3836,7 +3841,7 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
   };
-  auto tx0 = build_onboarding_registration_tx(
+  auto tx0 = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded0->utxos, Bytes(sender0.private_key.begin(), sender0.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender0_pkh), nullptr, &pow_ctx0);
@@ -3862,7 +3867,7 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
   };
-  auto tx1 = build_onboarding_registration_tx(
+  auto tx1 = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded1->utxos, Bytes(sender1.private_key.begin(), sender1.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender1_pkh), nullptr, &pow_ctx1);
@@ -3906,7 +3911,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return onboarding_db.get_height_hash(height); },
   };
-  auto onboarding_tx = build_onboarding_registration_tx(
+  auto onboarding_tx = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &onboarding_pow_ctx);
@@ -3937,7 +3942,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return join_db.get_height_hash(height); },
   };
-  auto join_tx = build_validator_join_request_tx(
+  auto join_tx = build_validator_join_request_tx(node_chain_domain(n0), 
       funded_after_onboarding->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, bond_amount, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &join_pow_ctx);
@@ -4008,7 +4013,7 @@ TEST(test_unbond_finalization_moves_validator_to_exiting) {
   const auto before_height = nodes[0]->status().height;
 
   std::string err;
-  auto unbond_tx = build_unbond_tx(before->bond_outpoint, fixture.joiner_kp.public_key, before->bonded_amount, 1000,
+  auto unbond_tx = build_unbond_tx(node_chain_domain(nodes[0]), before->bond_outpoint, fixture.joiner_kp.public_key, before->bonded_amount, 1000,
                                    fixture.joiner_kp.private_key, &err);
   ASSERT_TRUE(unbond_tx.has_value());
   const Hash32 unbond_txid = unbond_tx->txid();
@@ -4185,7 +4190,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
   };
-  auto onboarding_tx = build_onboarding_registration_tx(
+  auto onboarding_tx = build_onboarding_registration_tx(node_chain_domain(cluster.nodes[0]), 
       funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), banned_pub,
       Bytes(keys[0].private_key.begin(), keys[0].private_key.end()), banned_pub, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -4978,7 +4983,7 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
       wallet::ConfidentialRecipient{.one_time_pubkey = *one_time, .ephemeral_pubkey = *ephemeral, .scan_tag = {}, .memo = {}},
       crypto::ConfidentialOutputSecrets{.amount = kConfidential, .value_blind = blind}, proof_nonce, &err);
   ASSERT_TRUE(conf_out.has_value());
-  const auto tx = wallet::build_txv2_transparent_to_confidential(
+  const auto tx = wallet::build_txv2_transparent_to_confidential(node_chain_domain(node), 
       prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), prev.second.value,
       TransparentTxOutV2{transparent_out, address::p2pkh_script_pubkey(recipient_pkh)}, *conf_out, blind, kConfidential,
       kFee, &err);
@@ -5009,7 +5014,7 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
   spend_nonce.fill(0x5F);
   Hash32 excess_nonce{};
   excess_nonce.fill(0x60);
-  const auto unshield = wallet::build_txv2_confidential_to_transparent(
+  const auto unshield = wallet::build_txv2_confidential_to_transparent(node_chain_domain(node), 
       coin, TransparentTxOutV2{kConfidential - kFee, address::p2pkh_script_pubkey(recipient_pkh)}, kFee, spend_nonce,
       excess_nonce, &err);
   if (!unshield.has_value()) throw std::runtime_error("unshield tx: " + err);
@@ -5127,7 +5132,7 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
 
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
                                                &build_err);
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(node->inject_tx_for_test(*tx, true));
@@ -5200,7 +5205,7 @@ TEST(test_lightserver_relay_reports_node_mempool_verdict) {
     recipient_pkh.fill(fill);
     std::vector<TxOut> outputs{TxOut{prev.second.value - kFee, address::p2pkh_script_pubkey(recipient_pkh)}};
     std::string err;
-    auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()),
+    auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()),
                                                  outputs, &err);
     if (!tx.has_value()) throw std::runtime_error("build tx: " + err);
     return *tx;
@@ -5291,7 +5296,7 @@ TEST(test_local_bus_multi_node_delivers_frontiers_and_forwards_tx_to_designated_
   std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
                              TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
   std::string err;
-  const auto tx = build_signed_p2pkh_tx_single_input(
+  const auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), 
       prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
   ASSERT_TRUE(tx.has_value());
 
@@ -5336,7 +5341,7 @@ TEST(test_tx_forward_relays_via_validators_when_certifier_unreachable) {
   std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
                              TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
   std::string err;
-  const auto tx = build_signed_p2pkh_tx_single_input(
+  const auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), 
       prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
   ASSERT_TRUE(tx.has_value());
 
@@ -5407,7 +5412,7 @@ TEST(test_tx_status_reports_certified_ingress_before_finalization) {
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
 
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
                                                &build_err);
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(node->inject_tx_for_test(*tx, true));
@@ -5548,7 +5553,7 @@ TEST(test_ingress_record_propagates_to_follower_before_finalization) {
 
   const auto kp = node::Node::deterministic_test_keypairs()[static_cast<std::size_t>(sender_idx)];
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(kp.private_key.begin(), kp.private_key.end()),
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(n0), prev.first, prev.second, Bytes(kp.private_key.begin(), kp.private_key.end()),
                                                outputs, &build_err);
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(cluster.nodes[static_cast<std::size_t>(sender_idx)]->inject_tx_for_test(*tx, true));
@@ -5599,7 +5604,7 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
 
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(leader), prev.first, prev.second,
                                                Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()),
                                                outputs, &build_err);
   ASSERT_TRUE(tx.has_value());
@@ -5671,7 +5676,7 @@ TEST(test_synced_follower_restarts_from_lane_certificates_delivered_with_blocks)
   outputs.push_back(TxOut{kAmount, address::p2pkh_script_pubkey(recipient_pkh)});
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(leader), prev.first, prev.second,
                                                Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()),
                                                outputs, &build_err);
   ASSERT_TRUE(tx.has_value());
@@ -8602,7 +8607,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
         .current_height = n0.status().height + 1,
         .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
     };
-    request_tx = build_validator_join_request_tx(
+    request_tx = build_validator_join_request_tx(node_chain_domain(n0), 
         n0.find_utxos_by_pubkey_hash_for_test(sender_pkh), Bytes(leader_kp.private_key.begin(), leader_kp.private_key.end()),
         joiner_kp.public_key, Bytes(joiner_kp.private_key.begin(), joiner_kp.private_key.end()), joiner_kp.public_key, 1, 0,
         address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);

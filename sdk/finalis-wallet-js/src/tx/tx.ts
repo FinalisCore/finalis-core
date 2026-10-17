@@ -50,8 +50,13 @@ export function txidHex(tx: Tx): string {
   return bytesToHex(sha256dBytes(serializeTx(tx)));
 }
 
-export function signingMessageForInput(tx: Tx, inputIndex: number): Uint8Array {
+// sha256d("SC-SIG-V1" || chain_domain || u32le(input_index) || sha256d(tx without script_sigs)). The
+// chain domain (consensusChainDomain(network_id, genesis_hash)) makes a transaction signed for one
+// network invalid on every other one. Must match signing_message_for_input in src/utxo/validate.cpp.
+export function signingMessageForInput(tx: Tx, inputIndex: number, chainDomainHex: string): Uint8Array {
   if (inputIndex < 0 || inputIndex >= tx.inputs.length) throw new Error('input index out of range');
+  const chainDomain = hexToBytes(chainDomainHex);
+  if (chainDomain.length !== 32) throw new Error('chain domain must be 32 bytes hex');
   const txCopy: Tx = {
     version: tx.version,
     lockTime: tx.lockTime,
@@ -59,7 +64,7 @@ export function signingMessageForInput(tx: Tx, inputIndex: number): Uint8Array {
     inputs: tx.inputs.map((i) => ({ ...i, scriptSigHex: '' })),
   };
   const txHash = sha256dBytes(serializeTx(txCopy));
-  const msgPreimage = concatBytes(utf8Bytes('SC-SIG-V0'), new Uint8Array([
+  const msgPreimage = concatBytes(utf8Bytes('SC-SIG-V1'), chainDomain, new Uint8Array([
     inputIndex & 0xff,
     (inputIndex >>> 8) & 0xff,
     (inputIndex >>> 16) & 0xff,
@@ -68,8 +73,14 @@ export function signingMessageForInput(tx: Tx, inputIndex: number): Uint8Array {
   return sha256dBytes(msgPreimage);
 }
 
-export function signInputP2PKH(tx: Tx, inputIndex: number, privkeyHex: string, pubkeyHex: string): void {
-  const sig = signEd25519(signingMessageForInput(tx, inputIndex), privkeyHex);
+export function signInputP2PKH(
+  tx: Tx,
+  inputIndex: number,
+  privkeyHex: string,
+  pubkeyHex: string,
+  chainDomainHex: string,
+): void {
+  const sig = signEd25519(signingMessageForInput(tx, inputIndex, chainDomainHex), privkeyHex);
   const pub = hexToBytes(pubkeyHex);
   if (pub.length !== 32) throw new Error('pubkey must be 32 bytes hex');
   const scriptSig = new Writer().u8(0x40).bytes(sig).u8(0x20).bytes(pub).finish();
@@ -82,6 +93,7 @@ export function createSignedP2PKHTransaction(args: {
   privkeyHex: string;
   pubkeyHex: string;
   outputs: TxOutput[];
+  chainDomainHex: string;
 }): { tx: Tx; txHex: string; txid: string } {
   const tx: Tx = {
     version: 1,
@@ -97,7 +109,7 @@ export function createSignedP2PKHTransaction(args: {
     outputs: args.outputs,
   };
 
-  signInputP2PKH(tx, 0, args.privkeyHex, args.pubkeyHex);
+  signInputP2PKH(tx, 0, args.privkeyHex, args.pubkeyHex, args.chainDomainHex);
   const bytes = serializeTx(tx);
   return { tx, txHex: bytesToHex(bytes), txid: bytesToHex(sha256dBytes(bytes)) };
 }

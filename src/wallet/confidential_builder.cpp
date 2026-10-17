@@ -20,7 +20,7 @@ Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
   return ss;
 }
 
-bool resign_transparent_input(TxV2& tx, const Bytes& private_key_32, std::size_t input_index, std::string* err) {
+bool resign_transparent_input(const Hash32& chain_domain, TxV2& tx, const Bytes& private_key_32, std::size_t input_index, std::string* err) {
   if (private_key_32.size() != 32) {
     if (err) *err = "transparent private key must be 32 bytes";
     return false;
@@ -33,7 +33,7 @@ bool resign_transparent_input(TxV2& tx, const Bytes& private_key_32, std::size_t
     if (err) *err = "failed to derive transparent input keypair";
     return false;
   }
-  auto msg = signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+  auto msg = signing_message_for_input_v2(chain_domain, tx, static_cast<std::uint32_t>(input_index));
   if (!msg.has_value()) {
     if (err) *err = "failed to derive transparent input sighash";
     return false;
@@ -48,7 +48,7 @@ bool resign_transparent_input(TxV2& tx, const Bytes& private_key_32, std::size_t
   return true;
 }
 
-bool sign_balance_proof(TxV2& tx, const crypto::Blind32& excess_blind, const Hash32& aux_nonce, std::string* err) {
+bool sign_balance_proof(const Hash32& chain_domain, TxV2& tx, const crypto::Blind32& excess_blind, const Hash32& aux_nonce, std::string* err) {
   const auto pubkey = crypto::excess_xonly_pubkey_from_scalar(excess_blind);
   if (!pubkey.has_value()) {
     if (err) *err = "failed to derive excess pubkey";
@@ -56,7 +56,7 @@ bool sign_balance_proof(TxV2& tx, const crypto::Blind32& excess_blind, const Has
   }
   tx.balance_proof.excess_pubkey = *pubkey;
   tx.balance_proof.excess_sig.fill(0);
-  const auto msg = balance_proof_message_v2(tx);
+  const auto msg = balance_proof_message_v2(chain_domain, tx);
   if (!msg.has_value()) {
     if (err) *err = "failed to derive balance proof message";
     return false;
@@ -70,7 +70,7 @@ bool sign_balance_proof(TxV2& tx, const crypto::Blind32& excess_blind, const Has
   return true;
 }
 
-bool sign_confidential_input(TxV2& tx, std::size_t input_index, const crypto::Blind32& spend_secret, const Hash32& aux_nonce,
+bool sign_confidential_input(const Hash32& chain_domain, TxV2& tx, std::size_t input_index, const crypto::Blind32& spend_secret, const Hash32& aux_nonce,
                              std::string* err) {
   const auto pubkey = crypto::secp256k1_pubkey_from_scalar(spend_secret.bytes);
   if (!pubkey.has_value()) {
@@ -80,7 +80,7 @@ bool sign_confidential_input(TxV2& tx, std::size_t input_index, const crypto::Bl
   auto& witness = std::get<ConfidentialInputWitnessV2>(tx.inputs.at(input_index).witness);
   witness.one_time_pubkey = *pubkey;
   witness.spend_sig.fill(0);
-  const auto msg = signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+  const auto msg = signing_message_for_input_v2(chain_domain, tx, static_cast<std::uint32_t>(input_index));
   if (!msg.has_value()) {
     if (err) *err = "failed to derive confidential input sighash";
     return false;
@@ -122,7 +122,7 @@ std::optional<ConfidentialTxOutV2> build_confidential_output(
   };
 }
 
-std::optional<TxV2> build_txv2_transparent_to_confidential(
+std::optional<TxV2> build_txv2_transparent_to_confidential(const Hash32& chain_domain, 
     const OutPoint& prev_outpoint, const TxOut& prev_out, const Bytes& transparent_owner_private_key_32,
     std::uint64_t transparent_input_value, std::optional<TransparentTxOutV2> transparent_output,
     const ConfidentialTxOutV2& confidential_output, const crypto::Blind32& confidential_output_blind,
@@ -171,13 +171,13 @@ std::optional<TxV2> build_txv2_transparent_to_confidential(
     if (err) *err = "failed to generate balance proof auxiliary randomness";
     return std::nullopt;
   }
-  if (!sign_balance_proof(tx, *excess_blind, excess_aux, err)) return std::nullopt;
-  if (!resign_transparent_input(tx, transparent_owner_private_key_32, 0, err)) return std::nullopt;
+  if (!sign_balance_proof(chain_domain, tx, *excess_blind, excess_aux, err)) return std::nullopt;
+  if (!resign_transparent_input(chain_domain, tx, transparent_owner_private_key_32, 0, err)) return std::nullopt;
   (void)prev_out;
   return tx;
 }
 
-std::optional<TxV2> build_txv2_confidential_to_transparent(
+std::optional<TxV2> build_txv2_confidential_to_transparent(const Hash32& chain_domain, 
     const ConfidentialOwnedCoin& coin, const TransparentTxOutV2& transparent_output, std::uint64_t fee,
     const Hash32& spend_authorization_nonce, const Hash32& excess_authorization_nonce, std::string* err) {
   if (coin.amount < transparent_output.value + fee) {
@@ -203,12 +203,12 @@ std::optional<TxV2> build_txv2_confidential_to_transparent(
     return std::nullopt;
   }
   tx.balance_proof.excess_commitment = *excess_commitment;
-  if (!sign_balance_proof(tx, coin.value_blind, excess_authorization_nonce, err)) return std::nullopt;
-  if (!sign_confidential_input(tx, 0, coin.spend_secret, spend_authorization_nonce, err)) return std::nullopt;
+  if (!sign_balance_proof(chain_domain, tx, coin.value_blind, excess_authorization_nonce, err)) return std::nullopt;
+  if (!sign_confidential_input(chain_domain, tx, 0, coin.spend_secret, spend_authorization_nonce, err)) return std::nullopt;
   return tx;
 }
 
-std::optional<TxV2> build_txv2_confidential_to_confidential(const std::vector<ConfidentialOwnedCoin>& coins,
+std::optional<TxV2> build_txv2_confidential_to_confidential(const Hash32& chain_domain, const std::vector<ConfidentialOwnedCoin>& coins,
                                                             const std::vector<ConfidentialPayment>& outputs,
                                                             std::uint64_t fee, const Hash32& nonce_seed,
                                                             std::string* err) {
@@ -281,11 +281,11 @@ std::optional<TxV2> build_txv2_confidential_to_confidential(const std::vector<Co
   };
   Hash32 excess_nonce = nonce(0x01, 0);
   crypto::ScopedWipe<Hash32> wipe_excess_nonce(excess_nonce);
-  if (!sign_balance_proof(tx, *excess_blind, excess_nonce, err)) return std::nullopt;
+  if (!sign_balance_proof(chain_domain, tx, *excess_blind, excess_nonce, err)) return std::nullopt;
   for (std::size_t i = 0; i < coins.size(); ++i) {
     Hash32 spend_nonce = nonce(0x02, i);
     crypto::ScopedWipe<Hash32> wipe_spend_nonce(spend_nonce);
-    if (!sign_confidential_input(tx, i, coins[i].spend_secret, spend_nonce, err)) return std::nullopt;
+    if (!sign_confidential_input(chain_domain, tx, i, coins[i].spend_secret, spend_nonce, err)) return std::nullopt;
   }
   return tx;
 }

@@ -57,7 +57,7 @@ npm run test:integration
 ## Usage
 
 ```ts
-import { FinalisWallet, LightServerClient } from 'finalis-wallet-js';
+import { FinalisWallet, LightServerClient, bytesToHex, consensusChainDomain } from 'finalis-wallet-js';
 
 const client = new LightServerClient(['http://127.0.0.1:19444'], {
   quorumMode: 'cross-check-tip',
@@ -70,6 +70,10 @@ const address = FinalisWallet.deriveAddress(keypair.pubkeyHex, 'tsc');
 
 const balance = await wallet.getBalance(address);
 
+// Transactions are signed for one chain. Pin the network id and genesis hash you expect (the
+// testnet's are in testnet/README.md); do not take them from the server you send to.
+const chainDomainHex = bytesToHex(consensusChainDomain(NETWORK_ID_HEX, GENESIS_HASH_HEX));
+
 // Resolves with status 'submitted_not_final': a node's mempool accepted it, nothing is paid yet.
 const { txid } = await wallet.sendTransaction({
   fromPrivkeyHex: keypair.privkeyHex,
@@ -77,6 +81,7 @@ const { txid } = await wallet.sendTransaction({
   amountUnits: 1000n,
   feeUnits: 1000n,
   hrp: 'tsc',
+  chainDomainHex,
 });
 
 // Paid only once this resolves. Throws if the transaction was rejected at finality.

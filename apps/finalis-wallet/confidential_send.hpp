@@ -36,7 +36,7 @@ struct ConfidentialTransferPlan {
 // `recipient_memo_key` is known (scconfreq1 URIs carry it). Output order is randomised so change is not
 // recognisable by position. `random` supplies blinds, nonces and the order bit.
 std::optional<ConfidentialTransferPlan> plan_confidential_transfer(
-    const WalletStore::State& state, const std::set<OutPoint>& reserved, const std::string& change_account_id,
+    const Hash32& chain_domain, const WalletStore::State& state, const std::set<OutPoint>& reserved, const std::string& change_account_id,
     const ConfidentialRecipient& recipient, const std::optional<Hash32>& recipient_memo_key, std::uint64_t amount,
     std::uint64_t fee, const std::function<Hash32()>& random, std::string* err);
 

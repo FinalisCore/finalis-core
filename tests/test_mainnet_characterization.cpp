@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_paths.hpp"
 
@@ -204,7 +205,7 @@ TEST(test_characterize_mainnet_runtime_is_deterministic_routing_with_current_val
   pub[0] = 42;
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 1, valreg_script(pub)});
 
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.enforce_variable_bond_range = true;
   ctx.min_bond_amount = BOND_AMOUNT;
   ctx.max_bond_amount = BOND_AMOUNT * 100;

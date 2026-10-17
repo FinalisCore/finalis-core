@@ -492,7 +492,8 @@ std::optional<wallet::ConfidentialOwnedCoin> select_exact_confidential_coin(
 }
 
 // Confidential -> confidential plan for the send form: change goes to the primary confidential account.
-std::optional<wallet::ConfidentialTransferPlan> plan_confidential_send(const wallet::WalletStore::State& state,
+std::optional<wallet::ConfidentialTransferPlan> plan_confidential_send(const Hash32& chain_domain,
+                                                                      const wallet::WalletStore::State& state,
                                                                       const std::set<OutPoint>& reserved,
                                                                       const QString& recipient_text,
                                                                       std::uint64_t amount_units, QString* err) {
@@ -509,7 +510,7 @@ std::optional<wallet::ConfidentialTransferPlan> plan_confidential_send(const wal
     return std::nullopt;
   }
   std::string plan_err;
-  auto plan = wallet::plan_confidential_transfer(state, reserved, change_account, parsed->recipient, parsed->memo_key,
+  auto plan = wallet::plan_confidential_transfer(chain_domain, state, reserved, change_account, parsed->recipient, parsed->memo_key,
                                                  amount_units, finalis::DEFAULT_WALLET_SEND_FEE_UNITS,
                                                  [] { return random_hash32(); }, &plan_err);
   if (!plan && err) *err = QString::fromStdString(plan_err);
@@ -1055,6 +1056,10 @@ WalletWindow::~WalletWindow() {
   // Workers post results with queued invokeMethod to a QPointer; joining here (before any member
   // or QObject teardown) guarantees none touches the window after it is gone.
   background_threads_.shutdown_and_join();
+}
+
+std::optional<Hash32> WalletWindow::signing_chain_domain() const {
+  return chain_domain_from_hex(current_network_id_.toStdString(), current_genesis_hash_.toStdString());
 }
 
 WalletWindow::WalletWindow() {
@@ -2747,7 +2752,7 @@ void WalletWindow::start_onboarding_registration_clicked() {
   }
 
   auto tx = finalis::build_onboarding_registration_tx(
-      selected_prevs, key_bytes(funding_key->privkey).bytes, validator_key.pubkey,
+      finalis::consensus_chain_domain(network, chain_id), selected_prevs, key_bytes(funding_key->privkey).bytes, validator_key.pubkey,
       key_bytes(validator_key.privkey).bytes, funding_key->pubkey, options.fee,
       finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), &err, &pow_ctx);
   if (!tx.has_value()) {
@@ -5127,8 +5132,14 @@ void WalletWindow::validate_send_form() {
       show_send_inline_status("Review unavailable");
       return;
     }
+    const auto chain_domain = signing_chain_domain();
+    if (!chain_domain) {
+      show_send_inline_warning("Not connected to a verified endpoint: transactions are signed for its chain. Wait for the connection, then retry.");
+      show_send_inline_status("Review unavailable");
+      return;
+    }
     QString plan_err;
-    auto plan = plan_confidential_send(state, pending_wallet_reserved_outpoints(), recipient_text, *amount_units, &plan_err);
+    auto plan = plan_confidential_send(*chain_domain, state, pending_wallet_reserved_outpoints(), recipient_text, *amount_units, &plan_err);
     if (!plan) {
       show_send_inline_warning(plan_err);
       show_send_inline_status("Review unavailable");
@@ -5425,8 +5436,13 @@ void WalletWindow::submit_send() {
       return;
     }
 
+    const auto chain_domain = signing_chain_domain();
+    if (!chain_domain) {
+      QMessageBox::warning(this, "Send", "Not connected to a verified endpoint: transactions are signed for its chain. Wait for the connection, then retry.");
+      return;
+    }
     auto tx = finalis::build_signed_p2pkh_tx_multi_input(
-        plan->selected_prevs, key_bytes(key->privkey).bytes, plan->outputs, &err);
+        *chain_domain, plan->selected_prevs, key_bytes(key->privkey).bytes, plan->outputs, &err);
     if (!tx) {
       QMessageBox::warning(this, "Send", QString::fromStdString(err));
       return;
@@ -5519,8 +5535,13 @@ void WalletWindow::submit_send() {
       QMessageBox::warning(this, "Send", QString::fromStdString(err));
       return;
     }
+    const auto chain_domain = signing_chain_domain();
+    if (!chain_domain) {
+      QMessageBox::warning(this, "Send", "Not connected to a verified endpoint: transactions are signed for its chain. Wait for the connection, then retry.");
+      return;
+    }
     auto tx = build_txv2_transparent_to_confidential(
-        selected_prev->first, selected_prev->second, key_bytes(key->privkey).bytes,
+        *chain_domain, selected_prev->first, selected_prev->second, key_bytes(key->privkey).bytes,
         selected_prev->second.value, change_output, *confidential_out, secrets.value_blind, *amount_units,
         applied_fee_units, &err);
     if (!tx) {
@@ -5562,8 +5583,13 @@ void WalletWindow::submit_send() {
       QMessageBox::warning(this, "Send", "Unable to load local confidential wallet state.");
       return;
     }
+    const auto chain_domain = signing_chain_domain();
+    if (!chain_domain) {
+      QMessageBox::warning(this, "Send", "Not connected to a verified endpoint: transactions are signed for its chain. Wait for the connection, then retry.");
+      return;
+    }
     QString plan_err;
-    auto plan = plan_confidential_send(state, pending_wallet_reserved_outpoints(), destination, *amount_units, &plan_err);
+    auto plan = plan_confidential_send(*chain_domain, state, pending_wallet_reserved_outpoints(), destination, *amount_units, &plan_err);
     if (!plan) {
       QMessageBox::warning(this, "Send", plan_err);
       return;
@@ -5614,8 +5640,13 @@ void WalletWindow::submit_send() {
     Hash32 spend_auth_nonce = random_hash32();
     Hash32 excess_auth_nonce = random_hash32();
     crypto::ScopedWipe<Hash32, Hash32> wipe_nonces(spend_auth_nonce, excess_auth_nonce);
+    const auto chain_domain = signing_chain_domain();
+    if (!chain_domain) {
+      QMessageBox::warning(this, "Send", "Not connected to a verified endpoint: transactions are signed for its chain. Wait for the connection, then retry.");
+      return;
+    }
     auto tx = build_txv2_confidential_to_transparent(
-        *coin,
+        *chain_domain, *coin,
         TransparentTxOutV2{
             *amount_units,
             finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
@@ -5682,9 +5713,10 @@ void WalletWindow::submit_send() {
                 *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
                 finalis::address::p2pkh_script_pubkey(cached_sender_address->pubkey_hash), *amount_units,
                 finalis::DEFAULT_WALLET_SEND_FEE_UNITS, finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
-            if (retry_plan) {
+            const auto retry_domain = signing_chain_domain();
+            if (retry_plan && retry_domain) {
               auto retry_tx = finalis::build_signed_p2pkh_tx_multi_input(
-                  retry_plan->selected_prevs,
+                  *retry_domain, retry_plan->selected_prevs,
                   key_bytes(cached_key->privkey).bytes,
                   retry_plan->outputs, &err);
               if (retry_tx) {

@@ -137,6 +137,20 @@ The current live codebase is version-aware:
 - confidential-capable transactions use `TxV2`
 - runtime dispatch uses `AnyTx`
 
+Signatures bind the chain. Every transaction signature covers the chain domain
+`D = sha256d("SC-CHAIN-DOMAIN-V1" || network_id || genesis_hash)`, the same value consensus
+signatures cover:
+
+- `Tx` input: `sha256d("SC-SIG-V1" || D || u32le(input_index) || sha256d(tx without script_sigs))`
+- `Tx` unbond: the same with tag `SC-UNBOND-V1`
+- `TxV2` input (transparent or confidential): tag `SC-SIG-V3`
+- `TxV2` balance proof: `sha256d("SC-BAL-V3" || D || tx without signatures)`
+
+A transaction signed for one network fails validation on every other one, even when it spends an
+outpoint that exists on both (genesis validator bonds). Validation without a chain identity fails
+closed. Wallets take `D` from their network and its pinned genesis (`finalis-cli`: embedded genesis
+or `--genesis-hash`; JS SDK: `chainDomainHex`).
+
 Mainnet identity (pre-launch):
 
 - `network_name = mainnet`

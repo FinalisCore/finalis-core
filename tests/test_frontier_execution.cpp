@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_paths.hpp"
 
@@ -42,7 +43,7 @@ Bytes raw_signed_spend(const OutPoint& op, const TxOut& prev, const crypto::KeyP
                        std::uint64_t value_out) {
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
   std::vector<TxOut> outputs{TxOut{value_out, address::p2pkh_script_pubkey(to_pkh)}};
-  auto tx = build_signed_p2pkh_tx_single_input(op, prev, from.private_key, outputs);
+  auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), op, prev, from.private_key, outputs);
   if (!tx.has_value()) throw std::runtime_error("failed to build spend");
   return tx->serialize();
 }
@@ -82,7 +83,7 @@ Bytes raw_signed_spend_v2(const OutPoint& op, const crypto::KeyPair& from, const
   tx.balance_proof.excess_commitment = crypto::Commitment33{};
   tx.balance_proof.excess_pubkey.fill(0);
   tx.balance_proof.excess_sig.fill(0);
-  auto msg = signing_message_for_input_v2(tx, 0);
+  auto msg = signing_message_for_input_v2(finalis::test::test_chain_domain(), tx, 0);
   if (!msg.has_value()) throw std::runtime_error("failed to build v2 sighash");
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   if (!sig.has_value()) throw std::runtime_error("failed to sign v2 spend");
@@ -115,7 +116,7 @@ TEST(test_frontier_execution_accepts_independent_valid_transactions) {
 
   consensus::FrontierExecutionResult result;
   std::string err;
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 7, ordered, nullptr, &result, &err));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 7, ordered, finalis::test::test_validation_ctx(), &result, &err));
   ASSERT_EQ(result.transition.prev_frontier, 7u);
   ASSERT_EQ(result.transition.next_frontier, 9u);
   ASSERT_EQ(result.decisions.size(), 2u);
@@ -141,7 +142,7 @@ TEST(test_frontier_execution_first_conflicting_valid_spend_wins) {
   };
 
   consensus::FrontierExecutionResult result;
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, nullptr, &result));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, finalis::test::test_validation_ctx(), &result));
   ASSERT_EQ(result.decisions.size(), 2u);
   ASSERT_TRUE(result.decisions[0].accepted);
   ASSERT_TRUE(!result.decisions[1].accepted);
@@ -171,7 +172,7 @@ TEST(test_frontier_execution_invalid_then_later_valid_same_domain_can_accept) {
   };
 
   consensus::FrontierExecutionResult result;
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 10, ordered, nullptr, &result));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 10, ordered, finalis::test::test_validation_ctx(), &result));
   ASSERT_EQ(result.decisions.size(), 2u);
   ASSERT_TRUE(!result.decisions[0].accepted);
   ASSERT_EQ(result.decisions[0].reject_reason, FrontierRejectReason::TX_INVALID);
@@ -201,8 +202,8 @@ TEST(test_frontier_execution_is_deterministic_for_same_parent_and_slice) {
 
   consensus::FrontierExecutionResult a;
   consensus::FrontierExecutionResult b;
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 3, ordered, nullptr, &a));
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 3, ordered, nullptr, &b));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 3, ordered, finalis::test::test_validation_ctx(), &a));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 3, ordered, finalis::test::test_validation_ctx(), &b));
   ASSERT_EQ(a.transition.serialize(), b.transition.serialize());
   ASSERT_EQ(a.result_id(), b.result_id());
   ASSERT_EQ(a.decisions.size(), b.decisions.size());
@@ -232,8 +233,8 @@ TEST(test_frontier_transition_hash_is_stable_and_order_sensitive) {
 
   consensus::FrontierExecutionResult ab;
   consensus::FrontierExecutionResult ba;
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, {tx_a, tx_b}, nullptr, &ab));
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, {tx_b, tx_a}, nullptr, &ba));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, {tx_a, tx_b}, finalis::test::test_validation_ctx(), &ab));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, {tx_b, tx_a}, finalis::test::test_validation_ctx(), &ba));
 
   ASSERT_EQ(ab.transition.transition_id(), ab.transition.transition_id());
   ASSERT_TRUE(ab.transition.transition_id() != ba.transition.transition_id());
@@ -253,7 +254,7 @@ TEST(test_frontier_execution_accepts_supported_txv2_ordered_record_with_activati
 
   std::vector<Bytes> ordered{raw_signed_spend_v2(op, from, to.public_key, 10'000, 9'800)};
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
 
@@ -279,13 +280,13 @@ TEST(test_frontier_execution_rejects_special_script_tx_without_context) {
   Bytes reg_script{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
   reg_script.insert(reg_script.end(), validator.public_key.begin(), validator.public_key.end());
 
-  auto tx = build_signed_p2pkh_tx_single_input(op, parent[op].out, from.private_key,
+  auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), op, parent[op].out, from.private_key,
                                                std::vector<TxOut>{TxOut{9'800, reg_script}});
   ASSERT_TRUE(tx.has_value());
 
   std::vector<Bytes> ordered{tx->serialize()};
   consensus::FrontierExecutionResult result;
-  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, nullptr, &result));
+  ASSERT_TRUE(consensus::execute_frontier_slice(parent, 0, ordered, finalis::test::test_validation_ctx(), &result));
   ASSERT_EQ(result.decisions.size(), 1u);
   ASSERT_TRUE(!result.decisions[0].accepted);
   ASSERT_EQ(result.decisions[0].reject_reason, FrontierRejectReason::TX_INVALID);
@@ -334,23 +335,23 @@ TEST(test_frontier_execution_rejects_slice_over_record_count_or_bytes) {
 
   // Consensus: limits are checked before any record is parsed, so placeholder bytes suffice.
   std::vector<Bytes> ordered(consensus::kMaxFrontierSliceRecords + 1, Bytes{0x00});
-  ASSERT_TRUE(!consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err));
+  ASSERT_TRUE(!consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, finalis::test::test_validation_ctx(), &result, &err));
   ASSERT_EQ(err, std::string("frontier-slice-record-count-exceeded"));
 
   ordered.pop_back();
   err.clear();
-  (void)consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err);
+  (void)consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, finalis::test::test_validation_ctx(), &result, &err);
   ASSERT_NE(err, std::string("frontier-slice-record-count-exceeded"));
 
   const std::size_t half = consensus::kMaxFrontierSliceBytes / 2;
   ordered = {Bytes(half, 0x00), Bytes(half + 1, 0x00)};
   err.clear();
-  ASSERT_TRUE(!consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err));
+  ASSERT_TRUE(!consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, finalis::test::test_validation_ctx(), &result, &err));
   ASSERT_EQ(err, std::string("frontier-slice-bytes-exceeded"));
 
   ordered = {Bytes(half, 0x00), Bytes(half, 0x00)};
   err.clear();
-  (void)consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, nullptr, &result, &err);
+  (void)consensus::execute_frontier_slice(UtxoSet{}, 0, ordered, finalis::test::test_validation_ctx(), &result, &err);
   ASSERT_NE(err, std::string("frontier-slice-bytes-exceeded"));
 }
 
@@ -379,7 +380,7 @@ TEST(test_frontier_execution_rejects_slice_over_block_confidential_verify_weight
 
   const std::vector<Bytes> ordered{a.serialize(), b.serialize()};
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.confidential_policy = &policy;
 
   // Consensus: the whole transition is invalid when the slice's summed weight exceeds the cap,

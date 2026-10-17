@@ -476,6 +476,9 @@ class WalletWindow final : public QMainWindow {
   QString current_transition_hash_;
   QString current_network_id_;
   QString current_genesis_hash_;
+  // Chain domain of the connected endpoint's chain (network id + genesis hash); transactions are signed
+  // under it. Empty until an endpoint's identity is known.
+  std::optional<Hash32> signing_chain_domain() const;
   QString current_binary_version_;
   QString current_wallet_api_version_;
   std::optional<lightserver::RpcStatusView> current_lightserver_status_;

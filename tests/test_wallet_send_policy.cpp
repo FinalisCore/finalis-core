@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
 #include <algorithm>
@@ -217,7 +218,7 @@ TEST(test_wallet_confidential_builder_creates_valid_transparent_to_confidential_
   auto confidential_out = finalis::wallet::build_confidential_output(recipient, secrets, nonce_from_byte(0x65), &err);
   ASSERT_TRUE(confidential_out.has_value());
 
-  auto tx = finalis::wallet::build_txv2_transparent_to_confidential(
+  auto tx = finalis::wallet::build_txv2_transparent_to_confidential(finalis::test::test_chain_domain(), 
       prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), prev.second.value, std::nullopt,
       *confidential_out, secrets.value_blind, secrets.amount, 1'000, &err);
   ASSERT_TRUE(tx.has_value());
@@ -225,7 +226,7 @@ TEST(test_wallet_confidential_builder_creates_valid_transparent_to_confidential_
   UtxoSetV2 view;
   view[prev.first] = UtxoEntryV2{prev.second};
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
 
@@ -258,7 +259,7 @@ TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_
       address::p2pkh_script_pubkey(crypto::h160(Bytes(recipient.public_key.begin(), recipient.public_key.end())));
 
   std::string err;
-  auto tx = finalis::wallet::build_txv2_confidential_to_transparent(
+  auto tx = finalis::wallet::build_txv2_confidential_to_transparent(finalis::test::test_chain_domain(), 
       coin, TransparentTxOutV2{9'000, recipient_spk}, 1'000, nonce_from_byte(0x75), nonce_from_byte(0x76), &err);
   ASSERT_TRUE(tx.has_value());
 
@@ -274,7 +275,7 @@ TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_
   };
   view[op] = confidential_entry;
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
 

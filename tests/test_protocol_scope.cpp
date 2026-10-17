@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
 #include <limits>
@@ -34,14 +35,14 @@ TEST(test_protocol_scope_rejects_duplicate_inputs) {
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
   tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
   tx.inputs[1].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
 
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("duplicate input outpoint") != std::string::npos);
 }
@@ -63,13 +64,13 @@ TEST(test_protocol_scope_rejects_input_output_sum_mismatch) {
   // Output sum greater than input sum
   tx.outputs.push_back(TxOut{11'000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
   tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
 
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("negative fee") != std::string::npos);
 }
@@ -98,8 +99,8 @@ TEST(test_protocol_scope_rejects_fee_overflow_u64_boundary) {
   tx.inputs.push_back(TxIn{op1.txid, op1.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg0 = signing_message_for_input(tx, 0);
-  auto msg1 = signing_message_for_input(tx, 1);
+  auto msg0 = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg1 = signing_message_for_input(finalis::test::test_chain_domain(), tx, 1);
   ASSERT_TRUE(msg0.has_value() && msg1.has_value());
   auto sig0 = crypto::ed25519_sign(*msg0, kp.private_key);
   auto sig1 = crypto::ed25519_sign(*msg1, kp.private_key);
@@ -107,7 +108,7 @@ TEST(test_protocol_scope_rejects_fee_overflow_u64_boundary) {
   tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig0, kp.public_key);
   tx.inputs[1].script_sig = make_p2pkh_script_sig(*sig1, kp.public_key);
 
-  const auto r = validate_tx(tx, 1, view, nullptr);
+  const auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("input sum overflow") != std::string::npos);
 }
@@ -129,13 +130,13 @@ TEST(test_protocol_scope_rejects_value_overflow_total_output_sum) {
   tx.outputs.push_back(TxOut{std::numeric_limits<std::uint64_t>::max(), address::p2pkh_script_pubkey(pkh)});
   tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
   tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
 
-  const auto r = validate_tx(tx, 1, view, nullptr);
+  const auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("output sum overflow") != std::string::npos);
 }
@@ -154,13 +155,13 @@ TEST(test_protocol_scope_rejects_missing_utxo) {
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
   tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, kp.public_key);
 
-  auto r = validate_tx(tx, 1, UtxoSet{}, nullptr);
+  auto r = validate_tx(tx, 1, UtxoSet{}, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("missing utxo") != std::string::npos);
 }
@@ -186,7 +187,7 @@ TEST(test_protocol_scope_rejects_invalid_signature) {
   fake_sig.fill(0xAB);
   tx.inputs[0].script_sig = make_p2pkh_script_sig(fake_sig, kp.public_key);
 
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("signature invalid") != std::string::npos);
 }
@@ -208,7 +209,7 @@ TEST(test_protocol_scope_rejects_unsupported_input_script) {
   tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(pkh)});
 
   // Script sig can be empty, as script_pubkey is not supported
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("unsupported prev script_pubkey") != std::string::npos);
 }
@@ -264,7 +265,7 @@ Tx make_spend_tx(const OutPoint& op, const TxOut& prev_out, const crypto::KeyPai
   tx.lock_time = 0;
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs = outputs;
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   if (!msg.has_value()) throw std::runtime_error("sighash failed");
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   if (!sig.has_value()) throw std::runtime_error("sign failed");
@@ -281,7 +282,7 @@ TEST(test_protocol_scope_rejects_non_v1_tx) {
   tx.lock_time = 0;
   tx.inputs.push_back(TxIn{zero_hash(), 0xFFFFFFFF, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{1, Bytes{0x51}});
-  auto r = validate_tx(tx, 0, {});
+  auto r = validate_tx(tx, 0, {}, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
 }
 
@@ -297,7 +298,7 @@ TEST(test_protocol_scope_rejects_nonzero_lock_time) {
 
   auto tx = make_spend_tx(op, prev_out, kp, {TxOut{49'000, address::p2pkh_script_pubkey(pkh)}});
   tx.lock_time = 1;
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
 }
 
@@ -312,7 +313,7 @@ TEST(test_protocol_scope_rejects_unsupported_output_script) {
   view[op] = UtxoEntry{prev_out};
 
   auto tx = make_spend_tx(op, prev_out, kp, {TxOut{49'000, Bytes{0x51}}});
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("unsupported script_pubkey") != std::string::npos);
 }
@@ -347,7 +348,7 @@ TEST(test_protocol_scope_rejects_legacy_mint_deposit_output) {
   legacy_mint_deposit.insert(legacy_mint_deposit.end(), pkh.begin(), pkh.end());
   ASSERT_TRUE(!is_supported_base_layer_output_script(legacy_mint_deposit));
   auto tx = make_spend_tx(op, prev_out, kp, {TxOut{49'000, legacy_mint_deposit}});
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("unsupported script_pubkey"));
 }
@@ -367,7 +368,7 @@ TEST(test_protocol_scope_rejects_tx_with_too_many_inputs) {
   const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
 
-  auto r = validate_tx(tx, 1, {}, nullptr);
+  auto r = validate_tx(tx, 1, {}, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("too many inputs") != std::string::npos);
 }
@@ -397,13 +398,13 @@ TEST(test_protocol_scope_rejects_tx_when_verify_budget_exceeded_by_join_request_
     tx.outputs.push_back(TxOut{0, join_request_script(validator.public_key, payout.public_key, pop)});
   }
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, sponsor.private_key);
   ASSERT_TRUE(sig.has_value());
   tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, sponsor.public_key);
 
-  auto r = validate_tx(tx, 1, view, nullptr);
+  auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(!r.error.empty());
 }
@@ -445,7 +446,7 @@ TEST(test_protocol_scope_verify_budget_exact_limit_accepts_limit_plus_one_reject
     tx.balance_proof.excess_sig.fill(0);
 
     for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
-      auto msg = signing_message_for_input_v2(tx, i);
+      auto msg = signing_message_for_input_v2(finalis::test::test_chain_domain(), tx, i);
       ASSERT_TRUE(msg.has_value());
       auto sig = crypto::ed25519_sign(*msg, kp.private_key);
       ASSERT_TRUE(sig.has_value());
@@ -457,7 +458,7 @@ TEST(test_protocol_scope_verify_budget_exact_limit_accepts_limit_plus_one_reject
   ConfidentialPolicy policy;
   policy.max_inputs_per_tx = static_cast<std::uint32_t>(kMaxTxEd25519Verifies + 16);
   policy.max_outputs_per_tx = 8;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
 

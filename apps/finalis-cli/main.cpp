@@ -63,6 +63,40 @@ finalis::Hash32 embedded_genesis_hash_or_zero() {
   return embedded.has_value() ? embedded->hash : finalis::zero_hash();
 }
 
+// Chain domain an offline-built transaction is signed under (validate.hpp): the selected network
+// and the genesis hash from --genesis-hash, else the network's embedded genesis.
+std::optional<finalis::Hash32> offline_chain_domain(const std::string& genesis_hash_hex) {
+  finalis::Hash32 genesis_hash = embedded_genesis_hash_or_zero();
+  if (!genesis_hash_hex.empty()) {
+    const auto parsed = finalis::hex_decode(genesis_hash_hex);
+    if (!parsed || parsed->size() != 32) {
+      std::cerr << "--genesis-hash must be 32-byte hex\n";
+      return std::nullopt;
+    }
+    std::copy(parsed->begin(), parsed->end(), genesis_hash.begin());
+  }
+  if (genesis_hash == finalis::zero_hash()) {
+    std::cerr << "no embedded " << cli_network().name << " genesis in this build: pass --genesis-hash <hex>\n";
+    return std::nullopt;
+  }
+  return finalis::chain_domain_from_ids(cli_network().network_id, genesis_hash);
+}
+
+// Chain domain of the chain a lightserver serves; refuses a server on another network than the
+// selected one.
+std::optional<finalis::Hash32> rpc_chain_domain(const std::string& rpc_url, std::string* err) {
+  const auto status = finalis::lightserver::rpc_get_status(rpc_url, err);
+  if (!status.has_value()) return std::nullopt;
+  const auto& net = cli_network();
+  if (status->chain.network_id_hex != finalis::hex_encode(finalis::Bytes(net.network_id.begin(), net.network_id.end()))) {
+    if (err) *err = "rpc endpoint serves network " + status->chain.network_name + ", not " + net.name;
+    return std::nullopt;
+  }
+  const auto domain = finalis::chain_domain_from_hex(status->chain.network_id_hex, status->chain.genesis_hash_hex);
+  if (!domain.has_value() && err) *err = "rpc endpoint reported a malformed chain identity";
+  return domain;
+}
+
 std::string default_rpc_url() {
   return "http://127.0.0.1:" + std::to_string(cli_network().lightserver_default_port) + "/rpc";
 }
@@ -1395,8 +1429,8 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli wallet_address --file <path> [--pass <pass>]\n"
      << "  finalis-cli wallet_export --file <path> [--pass <pass>]\n"
      << "  finalis-cli address_from_pubkey --hrp <sc> --pubkey <hex32>\n"
-     << "  finalis-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
-     << "  finalis-cli build_p2pkh_multi_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> [--prev-txid ...] --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
+     << "  finalis-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>] [--genesis-hash <hex32>]\n"
+     << "  finalis-cli build_p2pkh_multi_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> [--prev-txid ...] --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>] [--genesis-hash <hex32>]\n"
      << "\nUse `finalis-cli help dev` for protocol/admin commands.\n";
 }
 
@@ -1419,7 +1453,7 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
      << "  finalis-cli confidential_supply_audit [--db <dir>]   (exit 0=ok 2=unavailable 3=FAILED)\n"
      << "  finalis-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
-     << "  finalis-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
+     << "  finalis-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>] [--genesis-hash <hex32>]\n"
      << "  finalis-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-transition <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-transition <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>] [--kind precommit|prevote]\n"
      << "  finalis-cli slash_records [--db <dir>] [--tail <n>]\n"
      << "  finalis-cli epoch_tickets [--db <dir>] --epoch <n>\n"
@@ -3584,8 +3618,13 @@ int main(int argc, char** argv) {
       return 1;
     }
 
+    const auto chain_domain = rpc_chain_domain(rpc_url, &err);
+    if (!chain_domain.has_value()) {
+      std::cerr << "send failed to load chain identity: " << err << "\n";
+      return 1;
+    }
     auto tx = finalis::build_signed_p2pkh_tx_multi_input(
-        plan->selected_prevs, finalis::Bytes(vk.privkey.begin(), vk.privkey.end()), plan->outputs, &err);
+        *chain_domain, plan->selected_prevs, finalis::Bytes(vk.privkey.begin(), vk.privkey.end()), plan->outputs, &err);
     if (!tx.has_value()) {
       std::cerr << "send build failed: " << err << "\n";
       return 1;
@@ -3723,7 +3762,7 @@ int main(int argc, char** argv) {
     }
 
     auto tx = finalis::build_onboarding_registration_tx(
-        selected_prevs, finalis::Bytes(funding_key.privkey.begin(), funding_key.privkey.end()),
+        finalis::consensus_chain_domain(network, chain_id), selected_prevs, finalis::Bytes(funding_key.privkey.begin(), funding_key.privkey.end()),
         validator_key.pubkey, finalis::Bytes(validator_key.privkey.begin(), validator_key.privkey.end()),
         funding_key.pubkey, fee, finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), &err, &pow_ctx);
     if (!tx.has_value()) {
@@ -3841,9 +3880,11 @@ int main(int argc, char** argv) {
     std::uint64_t amount = 0;
     std::uint64_t fee = 0;
 
+    std::string genesis_hash_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
+      if (a == "--genesis-hash" && i + 1 < argc) genesis_hash_hex = argv[++i];
+      else if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
       else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
       else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (a == "--from-privkey" && i + 1 < argc) from_priv_hex = argv[++i];
@@ -3893,7 +3934,9 @@ int main(int argc, char** argv) {
     }
 
     std::string err;
-    auto tx = finalis::build_signed_p2pkh_tx_single_input(op, prev_out, finalis::Bytes(priv->begin(), priv->end()), outputs, &err);
+    const auto chain_domain = offline_chain_domain(genesis_hash_hex);
+    if (!chain_domain.has_value()) return 1;
+    auto tx = finalis::build_signed_p2pkh_tx_single_input(*chain_domain, op, prev_out, finalis::Bytes(priv->begin(), priv->end()), outputs, &err);
     if (!tx.has_value()) {
       std::cerr << "build tx failed: " << err << "\n";
       return 1;
@@ -3914,9 +3957,11 @@ int main(int argc, char** argv) {
     std::uint64_t amount = 0;
     std::uint64_t fee = 0;
 
+    std::string genesis_hash_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hexes.push_back(argv[++i]);
+      if (a == "--genesis-hash" && i + 1 < argc) genesis_hash_hex = argv[++i];
+      else if (a == "--prev-txid" && i + 1 < argc) prev_txid_hexes.push_back(argv[++i]);
       else if (a == "--prev-index" && i + 1 < argc) prev_indexes.push_back(static_cast<std::uint32_t>(std::stoul(argv[++i])));
       else if (a == "--prev-value" && i + 1 < argc) prev_values.push_back(static_cast<std::uint64_t>(std::stoull(argv[++i])));
       else if (a == "--from-privkey" && i + 1 < argc) from_priv_hex = argv[++i];
@@ -3981,7 +4026,9 @@ int main(int argc, char** argv) {
     }
 
     std::string err;
-    auto tx = finalis::build_signed_p2pkh_tx_multi_input(prevs, finalis::Bytes(priv->begin(), priv->end()), outputs, &err);
+    const auto chain_domain = offline_chain_domain(genesis_hash_hex);
+    if (!chain_domain.has_value()) return 1;
+    auto tx = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, prevs, finalis::Bytes(priv->begin(), priv->end()), outputs, &err);
     if (!tx.has_value()) {
       std::cerr << "build tx failed: " << err << "\n";
       return 1;
@@ -4051,9 +4098,11 @@ int main(int argc, char** argv) {
     std::string validator_pub_hex;
     std::string validator_priv_hex;
     std::uint64_t fee = 0;
+    std::string genesis_hash_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--bond-txid" && i + 1 < argc) bond_txid_hex = argv[++i];
+      if (a == "--genesis-hash" && i + 1 < argc) genesis_hash_hex = argv[++i];
+      else if (a == "--bond-txid" && i + 1 < argc) bond_txid_hex = argv[++i];
       else if (a == "--bond-index" && i + 1 < argc) bond_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
       else if (a == "--bond-value" && i + 1 < argc) bond_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (a == "--validator-pubkey" && i + 1 < argc) validator_pub_hex = argv[++i];
@@ -4070,7 +4119,9 @@ int main(int argc, char** argv) {
 
     finalis::OutPoint op{*bond_txid, bond_index};
     std::string err;
-    auto tx = finalis::build_unbond_tx(op, *pub, bond_value, fee, finalis::Bytes(priv->begin(), priv->end()), &err);
+    const auto chain_domain = offline_chain_domain(genesis_hash_hex);
+    if (!chain_domain.has_value()) return 1;
+    auto tx = finalis::build_unbond_tx(*chain_domain, op, *pub, bond_value, fee, finalis::Bytes(priv->begin(), priv->end()), &err);
     if (!tx) {
       std::cerr << "create unbond tx failed: " << err << "\n";
       return 1;

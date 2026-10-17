@@ -914,7 +914,7 @@ std::optional<ValidatorOnboardingRecord> ValidatorOnboardingService::advance(con
             },
         };
         auto tx = build_validator_join_request_tx(
-            prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
+            consensus_chain_domain(options.network, chain_id), prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
             Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey, record.bond_amount, record.fee,
             address::p2pkh_script_pubkey(own_address->pubkey_hash), &build_err, &pow_ctx);
         if (!tx.has_value()) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
@@ -28,6 +29,8 @@ using namespace finalis;
 
 namespace {
 
+Hash32 replay_chain_domain();
+
 using finalis::test::unique_test_base;
 
 crypto::KeyPair key_from_byte(std::uint8_t base) {
@@ -47,7 +50,7 @@ Bytes raw_signed_spend(const OutPoint& op, const TxOut& prev, const crypto::KeyP
                        std::uint64_t value_out) {
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
   std::vector<TxOut> outputs{TxOut{value_out, address::p2pkh_script_pubkey(to_pkh)}};
-  auto tx = build_signed_p2pkh_tx_single_input(op, prev, from.private_key, outputs);
+  auto tx = build_signed_p2pkh_tx_single_input(replay_chain_domain(), op, prev, from.private_key, outputs);
   if (!tx.has_value()) throw std::runtime_error("failed to build spend");
   return tx->serialize();
 }
@@ -84,7 +87,7 @@ Bytes raw_signed_spend_v2_with_outputs(const OutPoint& op, const crypto::KeyPair
   tx.balance_proof.excess_commitment = crypto::Commitment33{};
   tx.balance_proof.excess_pubkey.fill(0);
   tx.balance_proof.excess_sig.fill(0);
-  auto msg = signing_message_for_input_v2(tx, 0);
+  auto msg = signing_message_for_input_v2(replay_chain_domain(), tx, 0);
   if (!msg.has_value()) throw std::runtime_error("failed to build v2 sighash");
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   if (!sig.has_value()) throw std::runtime_error("failed to sign v2 spend");
@@ -102,6 +105,12 @@ consensus::CanonicalDerivationConfig test_cfg() {
   cfg.chain_id.genesis_hash_hex = "frontier-test";
   cfg.chain_id.genesis_source = "test";
   return cfg;
+}
+
+// Fixture transactions are signed for test_cfg()'s chain, which replay validates them under.
+Hash32 replay_chain_domain() {
+  const auto cfg = test_cfg();
+  return consensus_chain_domain(cfg.network, cfg.chain_id);
 }
 
 consensus::CanonicalDerivationConfig live_activation_cfg() {
@@ -310,6 +319,11 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
                                                         const SpecialValidationContext* vctx = nullptr) {
   FrontierVector next_vector;
   auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector, cfg.network.committee_epoch_blocks);
+  // Without an explicit context, validate under the fixture chain identity, as replay does.
+  SpecialValidationContext identity_ctx;
+  identity_ctx.network = &cfg.network;
+  identity_ctx.chain_id = &cfg.chain_id;
+  if (!vctx) vctx = &identity_ctx;
   consensus::FrontierExecutionResult result;
   std::string err;
   if (!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.confidential_pool_value, parent_state.finalized_frontier_vector, next_vector,
@@ -1943,6 +1957,7 @@ TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
 
   SpecialValidationContext vctx;
   vctx.network = &cfg.network;
+  vctx.chain_id = &cfg.chain_id;
   vctx.current_height = 1;
   vctx.confidential_policy = &cfg.confidential_policy;
 
@@ -2812,7 +2827,7 @@ Bytes make_shield(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& 
   coin->commitment = out->value_commitment;
   std::optional<TransparentTxOutV2> change;
   if (change_value > 0) change = TransparentTxOutV2{change_value, prev.script_pubkey};
-  const auto tx = wallet::build_txv2_transparent_to_confidential(op, prev, owner.private_key, prev.value, change, *out,
+  const auto tx = wallet::build_txv2_transparent_to_confidential(replay_chain_domain(), op, prev, owner.private_key, prev.value, change, *out,
                                                                  coin->value_blind, conf_value, fee, &err);
   if (!tx) throw std::runtime_error("shield tx: " + err);
   coin->op = OutPoint{tx->txid(), change_value > 0 ? 1u : 0u};
@@ -2822,7 +2837,7 @@ Bytes make_shield(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& 
 // Spends a whole confidential coin to a transparent output (amount = value_out + fee).
 Bytes make_unshield(const TestShieldedCoin& coin, const PubKey32& to_pub, std::uint64_t fee, std::uint8_t seed) {
   std::string err;
-  const auto tx = wallet::build_txv2_confidential_to_transparent(
+  const auto tx = wallet::build_txv2_confidential_to_transparent(replay_chain_domain(), 
       wallet::ConfidentialOwnedCoin{.outpoint = coin.op,
                                     .amount = coin.amount,
                                     .spend_secret = coin.spend_secret,

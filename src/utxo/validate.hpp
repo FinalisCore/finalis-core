@@ -51,10 +51,16 @@ inline constexpr std::size_t kMaxTxEd25519Verifies = 1024;
 
 TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
                                const SpecialValidationContext* ctx = nullptr);
-std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index);
-std::optional<Bytes> signing_message_for_input_v2(const TxV2& tx, std::uint32_t input_index);
-std::optional<Hash32> balance_proof_message_v2(const TxV2& tx);
-std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index);
+// Transaction signatures cover the chain domain (consensus_chain_domain: network id and genesis
+// hash), like consensus signatures, so a transaction signed for one network is invalid on every other
+// one even when it spends an outpoint that exists on both (genesis bonds).
+std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index);
+std::optional<Bytes> signing_message_for_input_v2(const Hash32& chain_domain, const TxV2& tx,
+                                                  std::uint32_t input_index);
+std::optional<Hash32> balance_proof_message_v2(const Hash32& chain_domain, const TxV2& tx);
+std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index);
+// The chain domain transaction signatures are checked under; empty when ctx lacks chain identity.
+std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx);
 Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id);
@@ -79,6 +85,9 @@ bool validate_onboarding_admission_pow(const OnboardingRegistrationScriptData& r
 // genesis_hash). A key reused on another network (testnet, a devnet) signs different bytes there, so
 // its votes can neither be replayed onto this chain nor used as slash evidence on it.
 Hash32 consensus_chain_domain(const NetworkConfig& network, const ChainId& chain_id);
+Hash32 chain_domain_from_ids(const std::array<std::uint8_t, 16>& network_id, const Hash32& genesis_hash);
+// From the hex ids a lightserver reports (get_status network_id, genesis_hash); empty if malformed.
+std::optional<Hash32> chain_domain_from_hex(const std::string& network_id_hex, const std::string& genesis_hash_hex);
 // Precommit: a quorum of these for one (height, round, transition_id) is finality.
 Bytes vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
                            const Hash32& transition_id);

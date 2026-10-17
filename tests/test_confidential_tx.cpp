@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
 #include <stdexcept>
@@ -73,7 +74,7 @@ Bytes validator_join_request_script(const PubKey32& validator_pub, const PubKey3
 }
 
 void resign_input0(TxV2& tx, const crypto::KeyPair& from) {
-  auto msg = finalis::signing_message_for_input_v2(tx, 0);
+  auto msg = finalis::signing_message_for_input_v2(finalis::test::test_chain_domain(), tx, 0);
   if (!msg.has_value()) throw std::runtime_error("sighash failed");
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   if (!sig.has_value()) throw std::runtime_error("sign failed");
@@ -85,7 +86,7 @@ void sign_balance_proof(TxV2& tx, const crypto::Blind32& excess_blind, std::uint
   if (!pubkey.has_value()) throw std::runtime_error("excess pubkey derivation failed");
   tx.balance_proof.excess_pubkey = *pubkey;
   tx.balance_proof.excess_sig.fill(0);
-  const auto msg = finalis::balance_proof_message_v2(tx);
+  const auto msg = finalis::balance_proof_message_v2(finalis::test::test_chain_domain(), tx);
   if (!msg.has_value()) throw std::runtime_error("balance proof sighash failed");
   const auto sig = crypto::sign_excess_authorization(*msg, excess_blind, nonce_from_byte(aux_seed));
   if (!sig.has_value()) throw std::runtime_error("excess signature failed");
@@ -98,7 +99,7 @@ void sign_confidential_input(TxV2& tx, std::size_t input_index, const crypto::Bl
   auto& witness = std::get<ConfidentialInputWitnessV2>(tx.inputs.at(input_index).witness);
   witness.one_time_pubkey = *pubkey;
   witness.spend_sig.fill(0);
-  const auto msg = finalis::signing_message_for_input_v2(tx, static_cast<std::uint32_t>(input_index));
+  const auto msg = finalis::signing_message_for_input_v2(finalis::test::test_chain_domain(), tx, static_cast<std::uint32_t>(input_index));
   if (!msg.has_value()) throw std::runtime_error("confidential input sighash failed");
   Hash32 msg32{};
   std::copy(msg->begin(), msg->end(), msg32.begin());
@@ -354,13 +355,13 @@ TEST(test_validate_any_tx_dispatches_v1_against_utxoset_v2) {
   tx.version = 1;
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(to.public_key.begin(), to.public_key.end())))});
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   ASSERT_TRUE(sig.has_value());
   tx.inputs[0].script_sig = make_p2pkh_script_sig(*sig, from.public_key);
 
-  const auto result = validate_any_tx(AnyTx{tx}, 1, view, nullptr);
+  const auto result = validate_any_tx(AnyTx{tx}, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(result.ok);
   ASSERT_EQ(result.cost.fee, 1'000u);
   ASSERT_EQ(result.cost.confidential_verify_weight, 0u);
@@ -379,7 +380,7 @@ TEST(test_validate_tx_v2_accepts_transparent_only) {
 
   auto tx = make_transparent_only_v2_tx(op, from, to.public_key, 10'000, 9'250);
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
 
@@ -413,7 +414,7 @@ TEST(test_validate_tx_v2_accepts_transparent_input_with_confidential_output) {
   auto tx = make_confidential_output_v2_tx(op, from, 10'000, 500, 9'000, valid_blind, confidential_out, 500);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
 
@@ -471,7 +472,7 @@ TEST(test_validate_tx_v2_accepts_confidential_input_with_transparent_output) {
   auto tx = make_confidential_input_v2_tx(op, spend_secret, input_blind, recipient.public_key, 10'000, 9'500);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 300;
   ctx.confidential_policy = &policy;
 
@@ -555,7 +556,7 @@ TEST(test_validate_tx_v2_rejects_duplicate_nullifier_like_confidential_spend_id)
   sign_confidential_input(tx, 1, shared_one_time_secret, 0x3C);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
 
@@ -596,7 +597,7 @@ TEST(test_validate_tx_v2_rejects_invalid_confidential_input_authorization) {
   std::get<ConfidentialInputWitnessV2>(tx.inputs[0].witness).spend_sig[0] ^= 0x01;
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 300;
   ctx.confidential_policy = &policy;
 
@@ -631,7 +632,7 @@ TEST(test_validate_tx_v2_rejects_bad_confidential_commitment_or_keys) {
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
 
@@ -673,7 +674,7 @@ TEST(test_validate_tx_v2_rejects_confidential_range_proof_or_memo_bounds) {
   ConfidentialPolicy policy;
   policy.max_range_proof_bytes = 2;
   policy.max_memo_bytes = 2;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
 
@@ -719,7 +720,7 @@ TEST(test_validate_tx_v2_rejects_commitment_balance_mismatch) {
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
 
@@ -756,7 +757,7 @@ TEST(test_validate_tx_v2_rejects_invalid_excess_authorization) {
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 200;
   ctx.confidential_policy = &policy;
 
@@ -804,7 +805,7 @@ TEST(test_validate_tx_v2_rejects_validator_join_request_without_matching_registe
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
 
@@ -854,7 +855,7 @@ TEST(test_validate_tx_v2_accepts_matching_validator_register_and_join_request_ou
   resign_input0(tx, from);
 
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
 
@@ -909,7 +910,7 @@ struct ShieldFixture {
 // Applies a validated tx at `height` the way apply_frontier_record does: account, then apply.
 void apply_validated(ShieldFixture* f, const TxV2& tx, std::uint64_t height) {
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = height;
   ctx.confidential_policy = &policy;
   const auto result = validate_tx_v2(tx, 1, f->utxos, &ctx);
@@ -1053,7 +1054,7 @@ TEST(test_range_proof_correct_shape_accepted) {
   const auto out = only_confidential_output(tx);
   ASSERT_TRUE(crypto::range_proof_has_canonical_shape(out.range_proof));
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
@@ -1075,7 +1076,7 @@ TEST(test_range_proof_wrong_shape_rejected) {
     ASSERT_TRUE(crypto::verify_output_range_proof(out.value_commitment, out.range_proof));
     ASSERT_TRUE(!crypto::range_proof_has_canonical_shape(out.range_proof));
     ConfidentialPolicy policy;
-    SpecialValidationContext ctx;
+    SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
     ctx.current_height = 1;
     ctx.confidential_policy = &policy;
     const auto result = validate_tx_v2(tx, 1, view, &ctx);
@@ -1097,7 +1098,7 @@ TEST(test_validate_tx_v2_checks_tally_before_range_proofs) {
   }
   resign_input0(tx, key_from_byte(0x71));
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
   const auto result = validate_tx_v2(tx, 1, view, &ctx);
@@ -1180,7 +1181,7 @@ TEST(test_validate_tx_v2_confidential_output_limit_is_12) {
   op.txid.fill(0x49);
   UtxoSetV2 view;
   view[op] = UtxoEntryV2(TxOut{100'000, address::p2pkh_script_pubkey(from_pkh)});
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 100;
   ctx.confidential_policy = &policy;
 

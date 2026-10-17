@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_paths.hpp"
 
@@ -1994,7 +1995,7 @@ TEST(test_explorer_tx_page_and_json_surface_decoded_onboarding_registration_fiel
   prev.index = 0;
   const auto funding_pkh = crypto::h160(Bytes(funding.public_key.begin(), funding.public_key.end()));
   const TxOut prev_out{1'000'000, address::p2pkh_script_pubkey(funding_pkh)};
-  auto tx = build_onboarding_registration_tx(prev, prev_out, funding.private_key, validator.public_key, validator.private_key,
+  auto tx = build_onboarding_registration_tx(finalis::test::test_chain_domain(), prev, prev_out, funding.private_key, validator.public_key, validator.private_key,
                                              payout.public_key, 1'000, prev_out.script_pubkey);
   ASSERT_TRUE(tx.has_value());
   FrontierTransition transition = make_test_transition(7);
@@ -2163,7 +2164,7 @@ TEST(test_explorer_renders_txv2_with_hidden_confidential_parts) {
       crypto::ConfidentialOutputSecrets{.amount = kShieldHidden, .value_blind = explorer_blind(0x63)},
       explorer_blind(0x64).bytes, &err);
   ASSERT_TRUE(conf_out.has_value());
-  const auto shield = wallet::build_txv2_transparent_to_confidential(
+  const auto shield = wallet::build_txv2_transparent_to_confidential(finalis::test::test_chain_domain(), 
       OutPoint{fx.tx.txid(), 0}, fx.tx.outputs[0], Bytes(owner.private_key.begin(), owner.private_key.end()),
       fx.tx.outputs[0].value, TransparentTxOutV2{kShieldTransparent, known_spk}, *conf_out, explorer_blind(0x63),
       kShieldHidden, kShieldFee, &err);
@@ -2183,7 +2184,7 @@ TEST(test_explorer_renders_txv2_with_hidden_confidential_parts) {
       .value_commitment = *unshield_commitment,
       .one_time_pubkey = *unshield_one_time,
   };
-  const auto unshield = wallet::build_txv2_confidential_to_transparent(
+  const auto unshield = wallet::build_txv2_confidential_to_transparent(finalis::test::test_chain_domain(), 
       coin, TransparentTxOutV2{45'000, known_spk}, 5'000, explorer_blind(0x73).bytes, explorer_blind(0x74).bytes, &err);
   if (!unshield.has_value()) throw std::runtime_error("unshield: " + err);
 
