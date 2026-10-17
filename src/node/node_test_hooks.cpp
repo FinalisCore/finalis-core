@@ -435,6 +435,11 @@ Hash32 Node::canonical_state_commitment_for_test() const {
   return canonical_state_->state_commitment;
 }
 
+std::string Node::fast_start_result_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return fast_start_result_;
+}
+
 std::uint64_t Node::canonical_state_height_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   if (!canonical_state_.has_value()) return 0;

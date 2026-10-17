@@ -68,6 +68,40 @@ Important boundary:
 - obsolete block-era storage must fail closed rather than being interpreted as
   live frontier state
 
+## State Commitments
+
+Each frontier transition commits to the state it produces:
+
+- `next_state_root`: sparse Merkle root of the UTXO set after the transition
+  (the leaves `utxo_commitment_key(op) -> utxo_commitment_value(entry)`).
+- `next_state_commitment`: the post-state commitment
+  `sha256d("SC-POST-STATE-V1" || height || frontier || utxo_root || validator_root ||
+  finalized_randomness || reward_root || reserve || checkpoint_root || availability epoch ||
+  availability_operator_root || availability_prefix_root || join window || liveness window ||
+  confidential_pool_value)` (`consensus_post_state_commitment`).
+
+The post-state leaves out the two values derived from the transition itself
+(its id and its finality link hash), so a transition can sign it. Nothing else
+in the post-state depends on the transition id; the availability audit seed in
+particular is `availability_audit_seed(finalized_randomness, epoch)`, which the
+leader cannot grind.
+
+The full state commitment is
+`sha256d("SC-CANON-STATE-V3" || finalized_identity || finality_link_hash || post_state_commitment)`.
+
+Every node checks `next_state_commitment` before it prevotes or precommits, and
+again whenever it applies the transition (finalization, sync, replay), so a
+finalized chain never carries a wrong value.
+
+Startup (fast start, on by default; `--no-fast-start` disables it) loads the
+finalized state from the database and accepts it only if its post-state
+commitment equals the tip transition's `next_state_commitment`, its lane
+roots match the tip's `ingress_commitment`, and the tip's finality certificate
+verifies against the committee in the loaded (verified) checkpoints. It never
+re-derives committee checkpoints. Any mismatch falls back to a full replay from
+genesis. The same check lets a future state sync verify a
+downloaded state against one quorum-signed transition.
+
 ## Certified Ingress Rules
 
 Ingress is consensus-critical input to frontier transitions and is now epoch

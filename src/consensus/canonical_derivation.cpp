@@ -60,21 +60,21 @@ std::map<PubKey32, std::uint64_t> availability_operator_bonds(const ValidatorReg
   return operator_bonds;
 }
 
-void refresh_availability_operator_state(const CanonicalDerivationConfig& cfg, const FinalizedIdentity& finalized_identity,
+void refresh_availability_operator_state(const CanonicalDerivationConfig& cfg, const Hash32& finalized_randomness,
                                          const ValidatorRegistry& validators, bool advance_epoch,
                                          availability::AvailabilityPersistentState* state) {
   if (!state) return;
   const auto operator_bonds = availability_operator_bonds(validators);
-  availability::refresh_live_availability_state(finalized_identity.id, operator_bonds, advance_epoch, state, cfg.availability,
+  availability::refresh_live_availability_state(finalized_randomness, operator_bonds, advance_epoch, state, cfg.availability,
                                                 cfg.network.availability_recovery_activation_height);
 }
 
-void advance_availability_epoch(const CanonicalDerivationConfig& cfg, const FinalizedIdentity& finalized_identity,
+void advance_availability_epoch(const CanonicalDerivationConfig& cfg, const Hash32& finalized_randomness,
                                 const ValidatorRegistry& validators, std::uint64_t epoch,
                                 availability::AvailabilityPersistentState* state) {
   if (!state) return;
   const auto operator_bonds = availability_operator_bonds(validators);
-  availability::advance_live_availability_epoch(finalized_identity.id, operator_bonds, epoch, state, cfg.availability,
+  availability::advance_live_availability_epoch(finalized_randomness, operator_bonds, epoch, state, cfg.availability,
                                                 cfg.network.availability_recovery_activation_height);
 }
 
@@ -1144,7 +1144,7 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
     state.validators.upsert(pub, vi);
   }
   state.availability_state.current_epoch = committee_epoch_start(1, cfg.network.committee_epoch_blocks);
-  refresh_availability_operator_state(cfg, state.finalized_identity, state.validators, false, &state.availability_state);
+  refresh_availability_operator_state(cfg, state.finalized_randomness, state.validators, false, &state.availability_state);
   const auto difficulty_bits = ticket_difficulty_bits_for_epoch(cfg, state, 1, state.validators.active_sorted(1).size());
   AvailabilityCommitteeDecision genesis_decision;
   const auto genesis_active = finalized_committee_candidates_for_height(cfg, state, 1, difficulty_bits, &genesis_decision);
@@ -1697,10 +1697,11 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   return true;
 }
 
+// check_next_state_commitment is false only for a proposer computing the value it is about to sign.
 bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
-                                const CanonicalFrontierRecord& record, bool recompute_state_commitment,
+                                const CanonicalFrontierRecord& record, bool check_next_state_commitment,
                                 CanonicalDerivedState* out, std::string* error,
-                                std::set<Hash32>* accepted_txids = nullptr) {
+                                std::set<Hash32>* accepted_txids = nullptr, Hash32* post_state_out = nullptr) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
@@ -1774,7 +1775,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   update_availability_from_frontier(cfg, record, &next.availability_state);
   const auto next_epoch = committee_epoch_start(next.finalized_height + 1, cfg.network.committee_epoch_blocks);
   if (next.availability_state.current_epoch == 0) next.availability_state.current_epoch = next_epoch;
-  advance_availability_epoch(cfg, next.finalized_identity, next.validators, next_epoch, &next.availability_state);
+  advance_availability_epoch(cfg, next.finalized_randomness, next.validators, next_epoch, &next.availability_state);
   availability::normalize_availability_persistent_state(&next.availability_state);
   if (!availability::validate_availability_persistent_state_for_live_derivation(next.availability_state, cfg.availability,
                                                                                 error)) {
@@ -1793,7 +1794,19 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
     }
     next.finalized_committee_checkpoints[next_epoch_start] = checkpoint;
   }
-  if (recompute_state_commitment) next.state_commitment = consensus_state_commitment(cfg, next);
+  // verify_frontier_record_against_state checked next_state_root against the settled UTXO set,
+  // which is next.utxos.
+  const auto post_state = consensus_post_state_commitment(cfg, next, &record.transition.next_state_root);
+  if (check_next_state_commitment && post_state != record.transition.next_state_commitment) {
+    if (error) {
+      *error = "frontier-next-state-commitment-mismatch height=" + std::to_string(record.transition.height) +
+               " actual=" + hex_encode32(record.transition.next_state_commitment) +
+               " expected=" + hex_encode32(post_state);
+    }
+    return false;
+  }
+  next.state_commitment = consensus_state_commitment_from_post_state(next, post_state);
+  if (post_state_out) *post_state_out = post_state;
   *out = std::move(next);
   return true;
 }
@@ -1804,6 +1817,18 @@ bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const Canonical
   return apply_frontier_record_impl(cfg, prev, record, true, out, error, accepted_txids);
 }
 
+bool verify_frontier_finality_certificate(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                          const FrontierTransition& transition, const FinalityCertificate& cert,
+                                          std::string* error) {
+  return verify_frontier_finality_certificate_against_state(cfg, state, transition, cert, error);
+}
+
+bool derive_frontier_next_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                           const CanonicalFrontierRecord& record, Hash32* out, std::string* error) {
+  CanonicalDerivedState next;
+  return apply_frontier_record_impl(cfg, prev, record, false, &next, error, nullptr, out);
+}
+
 bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig& cfg,
                                                 const CanonicalDerivedState& initial_state,
                                                 const std::vector<CanonicalFrontierRecord>& chain,
@@ -1811,7 +1836,7 @@ bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig&
   CanonicalDerivedState state = initial_state;
   for (const auto& record : chain) {
     CanonicalDerivedState next;
-    if (!apply_frontier_record_impl(cfg, state, record, false, &next, error)) return false;
+    if (!apply_frontier_record_impl(cfg, state, record, true, &next, error)) return false;
     state = std::move(next);
   }
   state.state_commitment = consensus_state_commitment(cfg, state);
@@ -1878,7 +1903,7 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
     CanonicalFrontierRecord record;
     if (!load_certified_frontier_record_from_storage(db, *transition, &record, error)) return false;
     CanonicalDerivedState next;
-    if (!apply_frontier_record_impl(cfg, state, record, false, &next, error)) return false;
+    if (!apply_frontier_record_impl(cfg, state, record, true, &next, error)) return false;
     state = std::move(next);
   }
 
@@ -1887,18 +1912,26 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
   return true;
 }
 
-Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state) {
-  std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
-  utxo_leaves.reserve(state.utxos.size());
-  for (const auto& [op, ue] : state.utxos) {
-    utxo_leaves.push_back({utxo_commitment_key(op), utxo_commitment_value(ue)});
+Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                       const Hash32* known_utxo_root) {
+  // known_utxo_root lets a caller that already verified frontier_utxo_state_root(state.utxos) skip
+  // the most expensive tree; both use the same leaves.
+  Hash32 utxo_root{};
+  if (known_utxo_root) {
+    utxo_root = *known_utxo_root;
+  } else {
+    std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
+    utxo_leaves.reserve(state.utxos.size());
+    for (const auto& [op, ue] : state.utxos) {
+      utxo_leaves.push_back({utxo_commitment_key(op), utxo_commitment_value(ue)});
+    }
+    utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
   }
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
   validator_leaves.reserve(state.validators.all().size());
   for (const auto& [pub, info] : state.validators.all()) {
     validator_leaves.push_back({validator_commitment_key(pub), validator_commitment_value(info, cfg.validation_rules_version)});
   }
-  const auto utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
   const auto validator_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
 
   std::vector<std::pair<Hash32, Bytes>> reward_leaves;
@@ -2017,14 +2050,9 @@ Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const Ca
   const auto availability_prefix_root = crypto::SparseMerkleTree::compute_root_from_leaves(availability_prefix_leaves);
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'C', 'A', 'N', 'O', 'N', '-', 'S', 'T', 'A', 'T', 'E', '-', 'V', '2'});
+  w.bytes(Bytes{'S', 'C', '-', 'P', 'O', 'S', 'T', '-', 'S', 'T', 'A', 'T', 'E', '-', 'V', '1'});
   w.u64le(state.finalized_height);
   w.u64le(state.finalized_frontier);
-  // The canonical state commitment intentionally binds only the finalized
-  // identity value. Artifact kind remains a compatibility-sensitive concern at
-  // storage/runtime boundaries, not part of this commitment format.
-  w.bytes_fixed(state.finalized_identity.id);
-  w.bytes_fixed(state.last_finality_certificate_hash);
   w.bytes_fixed(utxo_root);
   w.bytes_fixed(validator_root);
   w.bytes_fixed(state.finalized_randomness);
@@ -2042,6 +2070,22 @@ Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const Ca
   w.u32le(state.validator_join_count_in_window);
   w.u64le(state.validator_liveness_window_start_height);
   w.u64le(state.confidential_pool_value);
+  return crypto::sha256d(w.data());
+}
+
+Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state) {
+  return consensus_state_commitment_from_post_state(state, consensus_post_state_commitment(cfg, state));
+}
+
+Hash32 consensus_state_commitment_from_post_state(const CanonicalDerivedState& state, const Hash32& post_state_commitment) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'C', 'A', 'N', 'O', 'N', '-', 'S', 'T', 'A', 'T', 'E', '-', 'V', '3'});
+  // The canonical state commitment intentionally binds only the finalized
+  // identity value. Artifact kind remains a compatibility-sensitive concern at
+  // storage/runtime boundaries, not part of this commitment format.
+  w.bytes_fixed(state.finalized_identity.id);
+  w.bytes_fixed(state.last_finality_certificate_hash);
+  w.bytes_fixed(post_state_commitment);
   return crypto::sha256d(w.data());
 }
 

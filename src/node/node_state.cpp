@@ -228,8 +228,7 @@ bool replay_mode_is_frontier(const Bytes& bytes) { return std::string(bytes.begi
 bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDerivationConfig& cfg, storage::DB& db,
                                                 std::uint64_t finalized_height, const Hash32& finalized_hash,
                                                 consensus::CanonicalDerivedState* out, std::string* error,
-                                                bool trust_lane_state_roots = false,
-                                                bool allow_commitment_cache_mismatch = false) {
+                                                bool trust_lane_state_roots = false) {
   if (!out) {
     if (error) *error = "null-output";
     return false;
@@ -273,7 +272,20 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
         }
         return false;
       }
-      state.finalized_lane_roots[lane] = lane_state.has_value() ? lane_state->lane_root : zero_hash();
+      if (lane_tip == max_seq) {
+        state.finalized_lane_roots[lane] = lane_state.has_value() ? lane_state->lane_root : zero_hash();
+        continue;
+      }
+      // Certified records past the finalized vector: the first one chains from the finalized root.
+      // (The ingress_commitment check below verifies the value.)
+      const auto next_cert_bytes = db.get_ingress_certificate(lane, max_seq + 1);
+      const auto next_cert =
+          next_cert_bytes.has_value() ? IngressCertificate::parse(*next_cert_bytes) : std::optional<IngressCertificate>{};
+      if (!next_cert.has_value()) {
+        if (error) *error = "checkpoint-lane-next-certificate-missing lane=" + std::to_string(lane);
+        return false;
+      }
+      state.finalized_lane_roots[lane] = next_cert->prev_lane_root;
       continue;
     }
     Hash32 lane_root = zero_hash();
@@ -367,15 +379,38 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
     });
   }
 
-  state.state_commitment = consensus::consensus_state_commitment(cfg, state);
-  if (auto persisted = db.get_consensus_state_commitment_cache(); persisted.has_value()) {
-    if (persisted->height != state.finalized_height || persisted->hash != state.finalized_identity.id ||
-        persisted->commitment != state.state_commitment) {
-      if (!allow_commitment_cache_mismatch) {
-        if (error) *error = "checkpoint-commitment-cache-mismatch";
-        return false;
-      }
+  // Trust nothing loaded above until it matches the tip transition: the lane roots its
+  // ingress_commitment, everything else its next_state_commitment; then the tip's finality
+  // certificate must verify. Any mismatch -> full replay.
+  if (consensus::frontier_ingress_commitment(transition->prev_vector, transition->next_vector,
+                                             state.finalized_lane_roots) != transition->ingress_commitment) {
+    if (error) *error = "checkpoint-lane-roots-mismatch";
+    return false;
+  }
+  const auto post_state = consensus::consensus_post_state_commitment(cfg, state);
+  if (post_state != transition->next_state_commitment) {
+    if (error) {
+      *error = "checkpoint-post-state-commitment-mismatch stored=" + short_hash_hex(post_state) +
+               " signed=" + short_hash_hex(transition->next_state_commitment);
     }
+    return false;
+  }
+  // The tip's committee is in the (now verified) checkpoints; its certificate must hold a quorum.
+  const auto tip_cert = db.get_finality_certificate_by_height(finalized_height);
+  if (!tip_cert.has_value()) {
+    if (error) *error = "checkpoint-tip-finality-certificate-missing";
+    return false;
+  }
+  if (std::string cert_error;
+      !consensus::verify_frontier_finality_certificate(cfg, state, *transition, *tip_cert, &cert_error)) {
+    if (error) *error = "checkpoint-tip-finality-certificate-invalid:" + cert_error;
+    return false;
+  }
+  state.state_commitment = consensus::consensus_state_commitment_from_post_state(state, post_state);
+  // Uncommitted, but read when the next height starts an epoch (re-validating its checkpoint):
+  // set it as apply does at an epoch's last height. Other epochs' entries are never read again.
+  if (consensus::committee_epoch_start(finalized_height + 1, cfg.network.committee_epoch_blocks) == finalized_height + 1) {
+    state.committee_epoch_randomness_cache[finalized_height + 1] = state.finalized_randomness;
   }
 
   *out = std::move(state);
@@ -791,7 +826,7 @@ bool Node::load_state() {
     consensus::CanonicalDerivedState fast_state;
     std::string fast_error;
     if (load_trusted_runtime_checkpoint_from_cache(derivation_cfg, db_, finalized_height_, finalized_identity_.id,
-                                                   &fast_state, &fast_error, true, true)) {
+                                                   &fast_state, &fast_error, true)) {
       {
         PubKey32 reactivated{};
         if (maybe_reactivate_single_exiting_validator_for_startup_migration(cfg_.network, &fast_state, &reactivated)) {
@@ -801,53 +836,19 @@ bool Node::load_state() {
                    " pub=" + short_pub_hex(reactivated));
         }
       }
-      const std::uint64_t next_height = finalized_height_ + 1;
-      const auto next_epoch_start = consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks);
+      // The checkpoint for the next height's epoch is part of the verified post-state (apply derives it
+      // at every epoch boundary). Never re-derive it here: re-derivation needs the per-epoch randomness
+      // cache, which fast start does not restore, and would replace a correct checkpoint.
+      const auto next_epoch_start =
+          consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
       const auto next_checkpoint_it = fast_state.finalized_committee_checkpoints.find(next_epoch_start);
       if (next_checkpoint_it == fast_state.finalized_committee_checkpoints.end() ||
           next_checkpoint_it->second.ordered_members.empty()) {
-        storage::FinalizedCommitteeCheckpoint repaired_checkpoint;
-        std::string checkpoint_error;
-        if (consensus::derive_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
-                                                               &repaired_checkpoint, &checkpoint_error) &&
-            !repaired_checkpoint.ordered_members.empty() &&
-            consensus::validate_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
-                                                                 repaired_checkpoint, &checkpoint_error) &&
-            consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state, repaired_checkpoint,
-                                                               next_height, &checkpoint_error)) {
-          fast_state.finalized_committee_checkpoints[next_epoch_start] = std::move(repaired_checkpoint);
-          log_line("startup-fast-start checkpoint-repair status=ok epoch=" + std::to_string(next_epoch_start) +
-                   " reason=missing-finalized-committee-checkpoint");
-        } else {
-          fast_error = checkpoint_error.empty() ? "missing-finalized-committee-checkpoint" : checkpoint_error;
-        }
-      } else {
-        std::string checkpoint_error;
-        if (!consensus::validate_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
-                                                                  next_checkpoint_it->second, &checkpoint_error) ||
-            !consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state,
-                                                                next_checkpoint_it->second, next_height,
-                                                                &checkpoint_error)) {
-          storage::FinalizedCommitteeCheckpoint repaired_checkpoint;
-          if (consensus::derive_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
-                                                                 &repaired_checkpoint, &checkpoint_error) &&
-              !repaired_checkpoint.ordered_members.empty() &&
-              consensus::validate_next_epoch_checkpoint_from_state(derivation_cfg, fast_state, next_epoch_start,
-                                                                   repaired_checkpoint, &checkpoint_error) &&
-              consensus::validate_checkpoint_schedule_for_height(derivation_cfg, fast_state, repaired_checkpoint,
-                                                                 next_height, &checkpoint_error)) {
-            fast_state.finalized_committee_checkpoints[next_epoch_start] = std::move(repaired_checkpoint);
-            log_line("startup-fast-start checkpoint-repair status=ok epoch=" + std::to_string(next_epoch_start) +
-                     " reason=checkpoint-recomputation-mismatch");
-          } else {
-            fast_error = checkpoint_error.empty() ? "checkpoint-recomputation-mismatch" : checkpoint_error;
-          }
-        }
+        fast_error = "missing-finalized-committee-checkpoint";
       }
     }
     if (fast_error.empty()) {
-      // Fast-start checkpoint self-repair can mutate canonical state fields that
-      // are committed; refresh commitment before verification/persist.
+      // The startup migration above can change validator status; refresh before verification/persist.
       fast_state.state_commitment = consensus::consensus_state_commitment(derivation_cfg, fast_state);
       // The supply ledger is history-derived: restore it only if it was persisted for this exact tip.
       fast_state.confidential_supply.known = false;
@@ -869,11 +870,13 @@ bool Node::load_state() {
       log_line("startup-fast-start status=ok finalized_height=" + std::to_string(finalized_height_) +
                " transition=" + short_hash_hex(finalized_identity_.id));
       log_line("startup-progress phase=fast-start-done");
+      fast_start_result_ = "ok";
       derived_state = std::move(fast_state);
       have_derived_state = true;
     }
     if (!have_derived_state) {
       log_line("startup-fast-start status=fallback reason=" + fast_error);
+      fast_start_result_ = "fallback:" + fast_error;
       log_line("startup-progress phase=fast-start-fallback");
     }
   }

@@ -221,6 +221,8 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       cfg.acknowledge_emergency_fallback = true;
     } else if (a == "--fast-start") {
       cfg.fast_start = true;
+    } else if (a == "--no-fast-start") {
+      cfg.fast_start = false;
     } else if (a == "--no-reindex") {
       cfg.reindex_on_start = false;
     } else if (a == "--seeds") {

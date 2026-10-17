@@ -193,11 +193,11 @@ bool validate_availability_persistent_state_for_live_derivation(const Availabili
                                                                 std::string* error = nullptr);
 AvailabilityPersistentState consensus_relevant_availability_state(const AvailabilityPersistentState& state);
 std::uint64_t count_eligible_operators(const AvailabilityPersistentState& state, const AvailabilityConfig& cfg = {});
-void refresh_live_availability_state(const Hash32& finalized_identity_id,
+void refresh_live_availability_state(const Hash32& audit_randomness,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, bool advance_epoch,
                                      AvailabilityPersistentState* state, const AvailabilityConfig& cfg = {},
                                      std::uint64_t recovery_activation_height = std::numeric_limits<std::uint64_t>::max());
-void advance_live_availability_epoch(const Hash32& finalized_identity_id,
+void advance_live_availability_epoch(const Hash32& audit_randomness,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, std::uint64_t epoch,
                                      AvailabilityPersistentState* state, const AvailabilityConfig& cfg = {},
                                      std::uint64_t recovery_activation_height = std::numeric_limits<std::uint64_t>::max());
@@ -533,9 +533,11 @@ bool is_operator_assigned_to_prefix(const Hash32& epoch_seed, const RetainedPref
                                     const std::vector<PubKey32>& operators,
                                     std::size_t replication_factor = kReplicationFactor);
 
-Hash32 availability_audit_seed(const Hash32& finalized_transition_id, std::uint64_t epoch);
+// audit_randomness is the finalized randomness (VRF-derived), never a transition id: a transition id
+// is grindable by its leader and would make the post-state depend on the transition itself.
+Hash32 availability_audit_seed(const Hash32& audit_randomness, std::uint64_t epoch);
 std::vector<AvailabilityAuditChallenge> build_audit_challenges_for_operator(
-    const PubKey32& operator_pubkey, const std::vector<RetainedPrefix>& assigned_prefixes, const Hash32& finalized_transition_id,
+    const PubKey32& operator_pubkey, const std::vector<RetainedPrefix>& assigned_prefixes, const Hash32& audit_randomness,
     std::uint64_t epoch, std::uint64_t issued_slot, const AvailabilityConfig& cfg = {});
 Hash32 availability_audit_response_signing_hash(const AvailabilityAuditResponse& response);
 std::optional<AvailabilityAuditResponse> make_audit_response(const AvailabilityAuditChallenge& challenge,
