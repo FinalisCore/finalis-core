@@ -381,6 +381,11 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
                                     node::Node::deterministic_test_keypairs())) {
     return false;
   }
+  {
+    consensus::CanonicalFrontierRecord record{exec_result.transition, lane_records};
+    if (!test::attach_test_next_state_commitment(derivation_cfg, genesis_derived, &record)) return false;
+    exec_result.transition = record.transition;
+  }
 
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     for (const auto& ingress : lane_records[lane]) {
@@ -602,6 +607,11 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   if (!test::attach_test_leader_vrf(&exec_result.transition, fixture.parent.finalized_randomness,
                                     node::Node::deterministic_test_keypairs())) {
     return false;
+  }
+  {
+    consensus::CanonicalFrontierRecord record{exec_result.transition, fixture.lane_records};
+    if (!test::attach_test_next_state_commitment(derivation_cfg, fixture.parent, &record)) return false;
+    exec_result.transition = record.transition;
   }
 
   *proposal_out = FrontierProposal{exec_result.transition, ordered_records};
@@ -10408,6 +10418,98 @@ TEST(test_restart_replay_is_independent_of_validator_reward_and_checkpoint_cache
   ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
 }
 
+TEST(test_fast_start_restores_state_verified_against_signed_tip) {
+  const auto base = unique_test_base("/tmp/finalis_it_fast_start_verified");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  const node::NodeConfig cfg = single_node_cfg(base, 1);
+  ASSERT_TRUE(cfg.fast_start);
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 4, std::chrono::seconds(20)));
+  const auto before = cluster.nodes[0]->status();
+  const auto before_commitment = cluster.nodes[0]->canonical_state_commitment_for_test();
+  cluster.nodes[0]->stop();
+  cluster.nodes.clear();
+
+  {
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_EQ(restarted.fast_start_result_for_test(), std::string("ok"));
+    ASSERT_EQ(restarted.status().transition_hash, before.transition_hash);
+    ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
+    restarted.stop();
+  }
+
+  // A certified record beyond the finalized vector moves the stored lane tip and root ahead of the
+  // finalized ones; fast start takes the finalized root from that record's prev_lane_root.
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    const std::uint32_t lane = 0;
+    const auto lane_state = db.get_lane_state(lane);
+    LaneState ahead = lane_state.value_or(LaneState{0, lane, 0, zero_hash()});
+    IngressCertificate cert;
+    cert.epoch = ahead.epoch;
+    cert.lane = lane;
+    cert.seq = ahead.max_seq + 1;
+    cert.txid.fill(0xA1);
+    cert.tx_hash.fill(0xA2);
+    cert.prev_lane_root = ahead.lane_root;
+    cert.sigs = {FinalitySig{node::Node::deterministic_test_keypairs()[0].public_key, Sig64{}}};
+    ASSERT_TRUE(db.put_ingress_bytes(cert.txid, Bytes{0x01}));
+    ASSERT_TRUE(db.put_ingress_certificate(lane, cert.seq, cert.serialize()));
+    ahead.max_seq = cert.seq;
+    ahead.lane_root = consensus::compute_lane_root_append(ahead.lane_root, cert.tx_hash);
+    ASSERT_TRUE(db.put_lane_state(lane, ahead));
+    db.close();
+
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_EQ(restarted.fast_start_result_for_test(), std::string("ok"));
+    ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
+    restarted.stop();
+  }
+
+  // A stored state that no longer matches the tip's signed next_state_commitment is not trusted:
+  // startup falls back to replay and rebuilds the same state.
+  storage::DB db;
+  ASSERT_TRUE(db.open(cfg.db_path));
+  const auto validators = db.scan_prefix(storage::key_validator_prefix());
+  ASSERT_TRUE(!validators.empty());
+  ASSERT_TRUE(db.erase(validators.begin()->first));
+  db.close();
+
+  node::Node replayed(cfg);
+  ASSERT_TRUE(replayed.init());
+  ASSERT_TRUE(replayed.fast_start_result_for_test().rfind("fallback:checkpoint-post-state-commitment-mismatch", 0) == 0);
+  ASSERT_EQ(replayed.status().transition_hash, before.transition_hash);
+  ASSERT_EQ(replayed.canonical_state_commitment_for_test(), before_commitment);
+}
+
+TEST(test_fast_start_at_last_height_of_an_epoch_keeps_next_committee) {
+  // At an epoch's last height the node re-validates the next epoch's checkpoint, which reads the
+  // epoch randomness that fast start must restore. Short epochs make such stops frequent.
+  const auto base = unique_test_base("/tmp/finalis_it_fast_start_epoch_boundary");
+  const auto configure = [](node::NodeConfig& c) { c.network.committee_epoch_blocks = 2; };
+  auto cluster = make_cluster(base, 1, 1, 1, configure);
+  const node::NodeConfig cfg = cluster.configs[0];
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 3, std::chrono::seconds(20)));
+  cluster.nodes[0]->stop();
+  cluster.nodes.clear();
+
+  bool hit_boundary = false;
+  for (int attempt = 0; attempt < 12 && !hit_boundary; ++attempt) {
+    node::Node n(cfg);
+    ASSERT_TRUE(n.init());
+    ASSERT_EQ(n.fast_start_result_for_test(), std::string("ok"));
+    const auto height = n.status().height;
+    ASSERT_TRUE(!n.committee_for_next_height_for_test().empty());
+    hit_boundary = consensus::committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks) == height + 1;
+    n.start();
+    ASSERT_TRUE(wait_for_tip(n, height + 1 + static_cast<std::uint64_t>(attempt % 2), std::chrono::seconds(20)));
+    n.stop();
+  }
+  ASSERT_TRUE(hit_boundary);
+}
+
 TEST(test_startup_can_replay_persisted_frontier_storage_when_selected) {
   const auto base = unique_test_base("/tmp/finalis_it_frontier_startup_replay");
   const node::NodeConfig legacy_cfg = single_node_cfg(base, 1);
@@ -10745,6 +10847,35 @@ TEST(test_frontier_mode_validation_accepts_valid_proposal_against_certified_ingr
 
   const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
+}
+
+TEST(test_no_prevote_for_proposal_with_wrong_next_state_commitment) {
+  const auto base = unique_test_base("/tmp/finalis_it_frontier_bad_post_state");
+  auto cfg = single_node_cfg(base, 1);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  ASSERT_TRUE(create_test_validator_keystore(cfg, 0));
+
+  {
+    node::Node n(cfg);
+    ASSERT_TRUE(n.init());
+    n.stop();
+  }
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(cfg.db_path));
+  FrontierProposal good;
+  ASSERT_TRUE(build_test_frontier_proposal_with_certified_ingress(cfg, db, &good));
+  db.close();
+  auto bad = good;
+  bad.transition.next_state_commitment[7] ^= 0x40;
+
+  node::Node target(cfg);
+  ASSERT_TRUE(target.init());
+  // Everything else about the proposal is valid, so it is accepted as a candidate, but not voted for.
+  (void)target.inject_propose_msg_for_test(make_test_frontier_propose_msg(target.consensus_domain_for_test(), bad));
+  ASSERT_TRUE(!target.local_prevote_recorded_for_test(1, 0, bad.transition.transition_id()));
+  ASSERT_TRUE(target.inject_propose_msg_for_test(make_test_frontier_propose_msg(target.consensus_domain_for_test(), good)));
+  ASSERT_TRUE(target.local_prevote_recorded_for_test(1, 0, good.transition.transition_id()));
 }
 
 TEST(test_frontier_mode_validation_rejects_bad_ingress_commitment) {

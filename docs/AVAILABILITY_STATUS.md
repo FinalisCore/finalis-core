@@ -32,7 +32,9 @@ on availability scores, seat budgets or "retained history" as a security propert
 Per epoch, `advance_live_availability_epoch` → `refresh_live_availability_state` does the following
 for every operator in the bonded set:
 
-1. Compute `epoch_seed = availability_audit_seed(finalized_identity_id, epoch)`.
+1. Compute `epoch_seed = availability_audit_seed(finalized_randomness, epoch)`. The seed is the
+   VRF-derived finalized randomness, not the transition id: a leader could grind its transition id,
+   and the post-state that the transition signs must not depend on that id.
 2. For each retained prefix, assign it to the `kReplicationFactor = 3` operators with the lowest
    `H(epoch_seed, prefix_id, operator_pubkey)`; `retained_count` = prefixes assigned to the operator.
 3. Outcomes come from `live_epoch_audit_outcomes`, **not** from network evidence:

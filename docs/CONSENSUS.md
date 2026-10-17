@@ -119,6 +119,9 @@ A validator prevotes once per round, for the round's proposal, only if:
   proposal's lane ranges, and those certificates validate (epoch, signatures,
   committee membership, lane, sequence, lane-root chaining) and merge to exactly
   the proposal's ordered slice
+- applying the slice to its finalized state yields exactly the transition's
+  signed `next_state_commitment` (checked once per transition, see
+  `docs/PROTOCOL-SPEC.md` "State Commitments")
 
 If records are missing it defers, requests the missing ranges from the peer
 that sent the proposal and from peers whose advertised lane tips cover them,

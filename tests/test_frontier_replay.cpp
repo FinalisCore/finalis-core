@@ -329,7 +329,10 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   if (!test::attach_test_leader_vrf(&result.transition, parent_state.finalized_randomness, {key_from_byte(90)})) {
     throw std::runtime_error("leader vrf: leader is not the fixture validator");
   }
-  return consensus::CanonicalFrontierRecord{result.transition, lane_records};
+  consensus::CanonicalFrontierRecord record{result.transition, lane_records};
+  // Some tests build records that must not apply; those keep a zero commitment and fail elsewhere.
+  (void)test::attach_test_next_state_commitment(cfg, parent_state, &record);
+  return record;
 }
 
 void persist_frontier_record(storage::DB& db, std::uint64_t height, const consensus::CanonicalFrontierRecord& record) {
@@ -1241,6 +1244,37 @@ TEST(test_frontier_replay_rejects_block_artifact_parent_kind_after_genesis) {
   std::string err;
   ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {record}, &out, &err));
   ASSERT_EQ(err, "frontier-parent-identity-kind-mismatch");
+}
+
+TEST(test_frontier_replay_rejects_wrong_next_state_commitment) {
+  const auto cfg = test_cfg();
+  const auto from = key_from_byte(31);
+  const auto to = key_from_byte(32);
+
+  OutPoint op{};
+  op.txid.fill(0x96);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto parent = build_parent_state_with_utxo(cfg, 62, op, prev);
+  const auto record = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)});
+
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {record}, &out, &err));
+  // The signed value is the post-state part of the full commitment.
+  ASSERT_EQ(consensus::consensus_post_state_commitment(cfg, out), record.transition.next_state_commitment);
+  ASSERT_EQ(consensus::consensus_state_commitment_from_post_state(out, record.transition.next_state_commitment),
+            out.state_commitment);
+
+  auto tampered = record;
+  tampered.transition.next_state_commitment[0] ^= 0x01;
+  ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {tampered}, &out, &err));
+  ASSERT_TRUE(err.rfind("frontier-next-state-commitment-mismatch", 0) == 0);
+
+  // The proposer helper recomputes the right value from a record carrying any commitment.
+  Hash32 derived{};
+  ASSERT_TRUE(consensus::derive_frontier_next_state_commitment(cfg, parent, tampered, &derived, &err));
+  ASSERT_EQ(derived, record.transition.next_state_commitment);
 }
 
 TEST(test_consensus_state_commitment_intentionally_ignores_finalized_identity_kind) {

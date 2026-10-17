@@ -197,6 +197,10 @@ struct FrontierTransition {
   std::uint64_t next_frontier{0};
   Hash32 prev_state_root{};
   Hash32 next_state_root{};
+  // consensus::consensus_post_state_commitment of the state after applying this transition: the full
+  // committed consensus state minus the identity fields derived from the transition itself. Signed with
+  // the transition, so a node can check a stored state against the finalized tip without replay.
+  Hash32 next_state_commitment{};
   // Compatibility field retained temporarily while the local/live proposal
   // path still carries ordered slices. Replay-side frontier authority should
   // use ingress_commitment instead.

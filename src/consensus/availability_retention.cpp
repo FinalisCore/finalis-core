@@ -805,21 +805,21 @@ bool is_operator_assigned_to_prefix(const Hash32& epoch_seed, const RetainedPref
   return std::find(assigned.begin(), assigned.end(), operator_pubkey) != assigned.end();
 }
 
-Hash32 availability_audit_seed(const Hash32& finalized_transition_id, std::uint64_t epoch) {
+Hash32 availability_audit_seed(const Hash32& audit_randomness, std::uint64_t epoch) {
   return domain_hash(Bytes{'f', 'i', 'n', 'a', 'l', 'i', 's', '.', 'a', 'u', 'd', 'i', 't', '.', 's', 'e', 'e', 'd', '.', 'v',
                            '1'},
                      [&](ByteWriter& w) {
-                       w.bytes_fixed(finalized_transition_id);
+                       w.bytes_fixed(audit_randomness);
                        w.u64le(epoch);
                      });
 }
 
 std::vector<AvailabilityAuditChallenge> build_audit_challenges_for_operator(
-    const PubKey32& operator_pubkey, const std::vector<RetainedPrefix>& assigned_prefixes, const Hash32& finalized_transition_id,
+    const PubKey32& operator_pubkey, const std::vector<RetainedPrefix>& assigned_prefixes, const Hash32& audit_randomness,
     std::uint64_t epoch, std::uint64_t issued_slot, const AvailabilityConfig& cfg) {
   std::vector<AvailabilityAuditChallenge> out;
   if (assigned_prefixes.empty()) return out;
-  const auto seed = availability_audit_seed(finalized_transition_id, epoch);
+  const auto seed = availability_audit_seed(audit_randomness, epoch);
   out.reserve(cfg.audits_per_operator_per_epoch);
   for (std::size_t draw = 0; draw < cfg.audits_per_operator_per_epoch; ++draw) {
     const auto selector = domain_hash(Bytes{'f', 'i', 'n', 'a', 'l', 'i', 's', '.', 'a', 'u', 'd', 'i', 't', '.', 'd', 'r', 'a',
@@ -1913,7 +1913,7 @@ std::uint64_t count_eligible_operators(const AvailabilityPersistentState& state,
   return out;
 }
 
-void refresh_live_availability_state(const Hash32& finalized_identity_id,
+void refresh_live_availability_state(const Hash32& audit_randomness,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, bool advance_epoch,
                                      AvailabilityPersistentState* state, const AvailabilityConfig& cfg,
                                      std::uint64_t recovery_activation_height) {
@@ -1922,7 +1922,7 @@ void refresh_live_availability_state(const Hash32& finalized_identity_id,
   operator_ids.reserve(operator_bonds.size());
   for (const auto& [operator_id, _] : operator_bonds) operator_ids.push_back(operator_id);
 
-  const auto epoch_seed = availability_audit_seed(finalized_identity_id, state->current_epoch);
+  const auto epoch_seed = availability_audit_seed(audit_randomness, state->current_epoch);
   std::map<PubKey32, std::uint64_t> assigned_prefix_counts;
   for (const auto& prefix : state->retained_prefixes) {
     for (const auto& operator_id : assigned_operators_for_prefix(epoch_seed, prefix, operator_ids, cfg.replication_factor)) {
@@ -1962,21 +1962,21 @@ void refresh_live_availability_state(const Hash32& finalized_identity_id,
   normalize_availability_persistent_state(state);
 }
 
-void advance_live_availability_epoch(const Hash32& finalized_identity_id,
+void advance_live_availability_epoch(const Hash32& audit_randomness,
                                      const std::map<PubKey32, std::uint64_t>& operator_bonds, std::uint64_t epoch,
                                      AvailabilityPersistentState* state, const AvailabilityConfig& cfg,
                                      std::uint64_t recovery_activation_height) {
   if (!state) return;
   if (epoch < state->current_epoch) return;
   if (state->current_epoch == 0 && epoch == 0) {
-    refresh_live_availability_state(finalized_identity_id, operator_bonds, false, state, cfg, recovery_activation_height);
+    refresh_live_availability_state(audit_randomness, operator_bonds, false, state, cfg, recovery_activation_height);
     return;
   }
   while (state->current_epoch < epoch) {
     ++state->current_epoch;
     state->retained_prefixes = expire_retained_prefixes(state->retained_prefixes, state->current_epoch,
                                                         cfg.retention_window_min_epochs);
-    refresh_live_availability_state(finalized_identity_id, operator_bonds, true, state, cfg, recovery_activation_height);
+    refresh_live_availability_state(audit_randomness, operator_bonds, true, state, cfg, recovery_activation_height);
   }
 }
 
