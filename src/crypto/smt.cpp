@@ -3,7 +3,9 @@
 #include "crypto/smt.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 
 #include "codec/bytes.hpp"
@@ -56,11 +58,16 @@ Hash32 SparseMerkleTree::empty_leaf_hash() {
 }
 
 Hash32 SparseMerkleTree::node_hash(const Hash32& left, const Hash32& right) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'S', 'M', 'T', '-', 'N', 'O', 'D', 'E', '-', 'V', '0'});
-  w.bytes_fixed(left);
-  w.bytes_fixed(right);
-  return crypto::sha256(w.data());
+  static constexpr char kTag[] = "SC-SMT-NODE-V0";
+  constexpr std::size_t kTagLen = sizeof(kTag) - 1;
+  thread_local Bytes buf = [] {
+    Bytes b(kTagLen + 64);
+    std::memcpy(b.data(), kTag, kTagLen);
+    return b;
+  }();
+  std::memcpy(buf.data() + kTagLen, left.data(), 32);
+  std::memcpy(buf.data() + kTagLen + 32, right.data(), 32);
+  return crypto::sha256(buf);
 }
 
 std::array<Hash32, 257> SparseMerkleTree::empty_hashes() {
@@ -171,35 +178,82 @@ bool SparseMerkleTree::verify_proof(const Hash32& root, const Hash32& key, const
   return cur == root;
 }
 
+namespace {
+
+struct SortedLeaf {
+  Hash32 key{};
+  Hash32 hash{};
+};
+
+// Memo of single-leaf paths: the hash of the subtree at `depth` that holds only this leaf. Keyed by the
+// leaf hash, which binds key and value, so an entry is a pure function of its key; it is never stale.
+// A leaf's branching depth changes only when a neighbour with a long shared prefix comes or goes, so
+// recomputing a large, slowly changing set (the UTXO set every block) costs O(1) hashes per leaf
+// instead of 256.
+struct LeafPathMemo {
+  std::uint16_t depth{256};
+  Hash32 hash{};
+};
+constexpr std::size_t kLeafPathMemoMaxEntries = std::size_t{1} << 21;
+
+struct Hash32Hasher {
+  std::size_t operator()(const Hash32& h) const {
+    std::size_t out = 0;
+    std::memcpy(&out, h.data(), sizeof(out));
+    return out;
+  }
+};
+
+}  // namespace
+
 Hash32 SparseMerkleTree::compute_root_from_leaves(const std::vector<std::pair<Hash32, Bytes>>& leaves_in) {
-  const auto empties = empty_hashes();
+  static const auto empties = empty_hashes();
   if (leaves_in.empty()) return empties[0];
 
-  std::vector<std::pair<Hash32, Bytes>> leaves = leaves_in;
-  std::sort(leaves.begin(), leaves.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-  leaves.erase(std::unique(leaves.begin(), leaves.end(),
-                           [](const auto& a, const auto& b) { return a.first == b.first; }),
-               leaves.end());
-
-  std::vector<LevelMap> levels(257);
-  for (const auto& [k, v] : leaves) levels[256][path_prefix(k, 256)] = leaf_hash(k, v);
-  for (int depth = 256; depth > 0; --depth) {
-    LevelMap parents;
-    for (const auto& [p, _] : levels[depth]) {
-      const std::string parent = p.substr(0, depth - 1);
-      if (parents.find(parent) != parents.end()) continue;
-      const std::string l = parent + "0";
-      const std::string r = parent + "1";
-      const auto li = levels[depth].find(l);
-      const auto ri = levels[depth].find(r);
-      const Hash32 lh = (li != levels[depth].end()) ? li->second : empties[depth];
-      const Hash32 rh = (ri != levels[depth].end()) ? ri->second : empties[depth];
-      parents[parent] = node_hash(lh, rh);
-    }
-    levels[depth - 1] = std::move(parents);
+  // Callers pass unique keys; on a duplicate the first in input order wins.
+  std::vector<std::size_t> order(leaves_in.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](std::size_t a, std::size_t b) { return leaves_in[a].first < leaves_in[b].first; });
+  std::vector<SortedLeaf> leaves;
+  leaves.reserve(order.size());
+  for (const auto i : order) {
+    if (!leaves.empty() && leaves.back().key == leaves_in[i].first) continue;
+    leaves.push_back(SortedLeaf{leaves_in[i].first, leaf_hash(leaves_in[i].first, leaves_in[i].second)});
   }
-  auto it = levels[0].find("");
-  return (it == levels[0].end()) ? empties[0] : it->second;
+
+  // One process-wide memo, so the node's threads share it; roots are computed one at a time.
+  static std::mutex memo_mu;
+  static std::unordered_map<Hash32, LeafPathMemo, Hash32Hasher> memo;
+  std::lock_guard<std::mutex> lock(memo_mu);
+  if (memo.size() > kLeafPathMemoMaxEntries) memo.clear();
+
+  // Hash of the subtree at `depth` holding only `leaf`: climb from the leaf with empty siblings.
+  const auto single_leaf = [&](const SortedLeaf& leaf, std::size_t depth) {
+    auto& m = memo[leaf.hash];
+    if (m.depth < depth) m = LeafPathMemo{};  // memo is above this depth; restart from the leaf
+    std::size_t d = m.depth;
+    Hash32 cur = d == 256 ? leaf.hash : m.hash;
+    for (; d > depth; --d) {
+      cur = bit_at(leaf.key, d - 1) ? node_hash(empties[d], cur) : node_hash(cur, empties[d]);
+    }
+    m.depth = static_cast<std::uint16_t>(depth);
+    m.hash = cur;
+    return cur;
+  };
+
+  // leaves[lo, hi) share their first `depth` bits; returns the hash of that subtree.
+  const auto subtree = [&](const auto& self, std::size_t depth, std::size_t lo, std::size_t hi) -> Hash32 {
+    if (lo == hi) return empties[depth];
+    if (hi - lo == 1) return single_leaf(leaves[lo], depth);
+    // Keys are unique, so two leaves always split before depth 256.
+    const auto split = static_cast<std::size_t>(
+        std::partition_point(leaves.begin() + static_cast<std::ptrdiff_t>(lo), leaves.begin() + static_cast<std::ptrdiff_t>(hi),
+                             [&](const SortedLeaf& l) { return !bit_at(l.key, depth); }) -
+        leaves.begin());
+    return node_hash(self(self, depth + 1, lo, split), self(self, depth + 1, split, hi));
+  };
+  return subtree(subtree, 0, 0, leaves.size());
 }
 
 }  // namespace finalis::crypto

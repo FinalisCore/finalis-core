@@ -10,12 +10,15 @@
 #define getpid _getpid
 #endif
 
+#include <array>
 #include <atomic>
+#include <map>
 #include <chrono>
 
 #include <filesystem>
 #include <fstream>
 
+#include "crypto/hash.hpp"
 #include "crypto/smt.hpp"
 
 using namespace finalis;
@@ -211,4 +214,82 @@ TEST(test_smt_shared_vectors_match_ts) {
     ++parsed;
   }
   ASSERT_TRUE(parsed >= 3);
+}
+
+namespace {
+
+// The original level-by-level construction (every level of all 256 materialized), kept as the
+// reference for the fast recursive root.
+Hash32 reference_smt_root(const std::vector<std::pair<Hash32, Bytes>>& leaves_in) {
+  const auto tagged = [](const std::string& tag, const Bytes& payload) {
+    Bytes in(tag.begin(), tag.end());
+    in.insert(in.end(), payload.begin(), payload.end());
+    return crypto::sha256(in);
+  };
+  const auto node = [&](const Hash32& l, const Hash32& r) {
+    Bytes p(l.begin(), l.end());
+    p.insert(p.end(), r.begin(), r.end());
+    return tagged("SC-SMT-NODE-V0", p);
+  };
+  const auto bits = [](const Hash32& k, std::size_t n) {
+    std::string out;
+    for (std::size_t i = 0; i < n; ++i) out.push_back(((k[i / 8] >> (7 - i % 8)) & 1) ? '1' : '0');
+    return out;
+  };
+  std::array<Hash32, 257> empties{};
+  empties[256] = tagged("SC-SMT-EMPTY-V0", {});
+  for (int d = 255; d >= 0; --d) empties[d] = node(empties[d + 1], empties[d + 1]);
+  std::map<std::string, Hash32> level;
+  for (const auto& [k, val] : leaves_in) {
+    Bytes p(k.begin(), k.end());
+    const auto vh = crypto::sha256(val);
+    p.insert(p.end(), vh.begin(), vh.end());
+    level.emplace(bits(k, 256), tagged("SC-SMT-LEAF-V0", p));
+  }
+  if (level.empty()) return empties[0];
+  for (int depth = 256; depth > 0; --depth) {
+    std::map<std::string, Hash32> parents;
+    for (const auto& [prefix, _] : level) {
+      const auto parent = prefix.substr(0, depth - 1);
+      if (parents.count(parent)) continue;
+      const auto li = level.find(parent + "0");
+      const auto ri = level.find(parent + "1");
+      parents[parent] = node(li == level.end() ? empties[depth] : li->second,
+                             ri == level.end() ? empties[depth] : ri->second);
+    }
+    level = std::move(parents);
+  }
+  return level.begin()->second;
+}
+
+}  // namespace
+
+TEST(test_smt_fast_root_matches_reference_as_set_changes) {
+  // Keys sharing long prefixes force the leaf-path memo to move a leaf deeper and back up.
+  const auto key = [](std::uint32_t i, std::size_t shared_prefix_bytes) {
+    Hash32 k = crypto::sha256(Bytes{static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(i >> 8), 0x5a});
+    for (std::size_t b = 0; b < shared_prefix_bytes; ++b) k[b] = 0xC3;
+    return k;
+  };
+  std::vector<std::pair<Hash32, Bytes>> leaves;
+  ASSERT_EQ(crypto::SparseMerkleTree::compute_root_from_leaves(leaves), reference_smt_root(leaves));
+  for (std::uint32_t i = 0; i < 40; ++i) {
+    leaves.push_back({key(i, i % 4 == 0 ? 31 : (i % 3 == 0 ? 3 : 0)), v(static_cast<std::uint8_t>(i), 1 + i % 7)});
+    ASSERT_EQ(crypto::SparseMerkleTree::compute_root_from_leaves(leaves), reference_smt_root(leaves));
+  }
+  // Removals raise remaining leaves' branching depth; value changes give new leaf hashes.
+  for (std::size_t i = 0; i < 20; ++i) {
+    leaves.erase(leaves.begin() + static_cast<std::ptrdiff_t>((i * 7) % leaves.size()));
+    if (i % 2 == 0 && !leaves.empty()) leaves[i % leaves.size()].second.push_back(0xEE);
+    ASSERT_EQ(crypto::SparseMerkleTree::compute_root_from_leaves(leaves), reference_smt_root(leaves));
+  }
+  // A single leaf, then a pair differing only in the last bit.
+  Hash32 a = key(1000, 0);
+  Hash32 b = a;
+  b[31] ^= 0x01;
+  ASSERT_EQ(crypto::SparseMerkleTree::compute_root_from_leaves({{a, v(1)}}), reference_smt_root({{a, v(1)}}));
+  ASSERT_EQ(crypto::SparseMerkleTree::compute_root_from_leaves({{a, v(1)}, {b, v(2)}}),
+            reference_smt_root({{a, v(1)}, {b, v(2)}}));
+  ASSERT_EQ(crypto::SparseMerkleTree::compute_root_from_leaves({{b, v(2)}, {a, v(1)}}),
+            reference_smt_root({{a, v(1)}, {b, v(2)}}));
 }
