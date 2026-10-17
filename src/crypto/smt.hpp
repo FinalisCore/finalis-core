@@ -40,6 +40,13 @@ class SparseMerkleTree {
   storage::DB& db_;
   std::string tree_id_;
 
+  struct LeafRef {
+    Hash32 key{};
+    Hash32 hash{};  // leaf_hash(key, value)
+  };
+  // Root of `leaves` (sorted by key, keys unique); with `proof_key`, also the siblings on its path.
+  static Hash32 hash_sorted_leaves(const std::vector<LeafRef>& leaves, const Hash32* proof_key, SmtProof* proof);
+
   static Hash32 leaf_hash(const Hash32& key, const Bytes& value);
   static Hash32 empty_leaf_hash();
   static Hash32 node_hash(const Hash32& left, const Hash32& right);

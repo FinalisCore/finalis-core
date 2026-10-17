@@ -121,36 +121,10 @@ std::optional<Bytes> SparseMerkleTree::get_value(const Hash32& key) const {
 }
 
 SmtProof SparseMerkleTree::get_proof(const Hash32& key) const {
+  std::vector<LeafRef> leaves;
+  for (const auto& [k, v] : load_leaves(db_, leaf_key_prefix())) leaves.push_back(LeafRef{k, leaf_hash(k, v)});
   SmtProof proof;
-  proof.siblings.reserve(256);
-  const auto empties = empty_hashes();
-  const auto leaves = load_leaves(db_, leaf_key_prefix());
-  std::vector<LevelMap> levels(257);
-  for (const auto& [k, v] : leaves) levels[256][path_prefix(k, 256)] = leaf_hash(k, v);
-  for (int depth = 256; depth > 0; --depth) {
-    LevelMap parents;
-    for (const auto& [p, _] : levels[depth]) {
-      const std::string parent = p.substr(0, depth - 1);
-      if (parents.find(parent) != parents.end()) continue;
-      const std::string l = parent + "0";
-      const std::string r = parent + "1";
-      const auto li = levels[depth].find(l);
-      const auto ri = levels[depth].find(r);
-      const Hash32 lh = (li != levels[depth].end()) ? li->second : empties[depth];
-      const Hash32 rh = (ri != levels[depth].end()) ? ri->second : empties[depth];
-      parents[parent] = node_hash(lh, rh);
-    }
-    levels[depth - 1] = std::move(parents);
-  }
-
-  for (int depth = 256; depth > 0; --depth) {
-    const std::size_t bit_index = static_cast<std::size_t>(depth - 1);
-    const bool bit = bit_at(key, bit_index);
-    const std::string parent = path_prefix(key, bit_index);
-    const std::string sib = parent + (bit ? "0" : "1");
-    const auto it = levels[depth].find(sib);
-    proof.siblings.push_back((it != levels[depth].end()) ? it->second : empties[depth]);
-  }
+  (void)hash_sorted_leaves(leaves, &key, &proof);
   return proof;
 }
 
@@ -180,11 +154,6 @@ bool SparseMerkleTree::verify_proof(const Hash32& root, const Hash32& key, const
 
 namespace {
 
-struct SortedLeaf {
-  Hash32 key{};
-  Hash32 hash{};
-};
-
 // Memo of single-leaf paths: the hash of the subtree at `depth` that holds only this leaf. Keyed by the
 // leaf hash, which binds key and value, so an entry is a pure function of its key; it is never stale.
 // A leaf's branching depth changes only when a neighbour with a long shared prefix comes or goes, so
@@ -207,20 +176,23 @@ struct Hash32Hasher {
 }  // namespace
 
 Hash32 SparseMerkleTree::compute_root_from_leaves(const std::vector<std::pair<Hash32, Bytes>>& leaves_in) {
-  static const auto empties = empty_hashes();
-  if (leaves_in.empty()) return empties[0];
-
   // Callers pass unique keys; on a duplicate the first in input order wins.
   std::vector<std::size_t> order(leaves_in.size());
   for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
   std::stable_sort(order.begin(), order.end(),
                    [&](std::size_t a, std::size_t b) { return leaves_in[a].first < leaves_in[b].first; });
-  std::vector<SortedLeaf> leaves;
+  std::vector<LeafRef> leaves;
   leaves.reserve(order.size());
   for (const auto i : order) {
     if (!leaves.empty() && leaves.back().key == leaves_in[i].first) continue;
-    leaves.push_back(SortedLeaf{leaves_in[i].first, leaf_hash(leaves_in[i].first, leaves_in[i].second)});
+    leaves.push_back(LeafRef{leaves_in[i].first, leaf_hash(leaves_in[i].first, leaves_in[i].second)});
   }
+  return hash_sorted_leaves(leaves, nullptr, nullptr);
+}
+
+Hash32 SparseMerkleTree::hash_sorted_leaves(const std::vector<LeafRef>& leaves, const Hash32* proof_key, SmtProof* proof) {
+  static const auto empties = empty_hashes();
+  if (proof) proof->siblings.assign(256, Hash32{});
 
   // One process-wide memo, so the node's threads share it; roots are computed one at a time.
   static std::mutex memo_mu;
@@ -229,7 +201,7 @@ Hash32 SparseMerkleTree::compute_root_from_leaves(const std::vector<std::pair<Ha
   if (memo.size() > kLeafPathMemoMaxEntries) memo.clear();
 
   // Hash of the subtree at `depth` holding only `leaf`: climb from the leaf with empty siblings.
-  const auto single_leaf = [&](const SortedLeaf& leaf, std::size_t depth) {
+  const auto single_leaf = [&](const LeafRef& leaf, std::size_t depth) {
     auto& m = memo[leaf.hash];
     if (m.depth < depth) m = LeafPathMemo{};  // memo is above this depth; restart from the leaf
     std::size_t d = m.depth;
@@ -241,18 +213,34 @@ Hash32 SparseMerkleTree::compute_root_from_leaves(const std::vector<std::pair<Ha
     m.hash = cur;
     return cur;
   };
-
+  // First index in [lo, hi) whose key has bit `depth` set (the range shares its first `depth` bits).
+  const auto split_at = [&](std::size_t depth, std::size_t lo, std::size_t hi) {
+    return static_cast<std::size_t>(
+        std::partition_point(leaves.begin() + static_cast<std::ptrdiff_t>(lo), leaves.begin() + static_cast<std::ptrdiff_t>(hi),
+                             [&](const LeafRef& l) { return !bit_at(l.key, depth); }) -
+        leaves.begin());
+  };
   // leaves[lo, hi) share their first `depth` bits; returns the hash of that subtree.
   const auto subtree = [&](const auto& self, std::size_t depth, std::size_t lo, std::size_t hi) -> Hash32 {
     if (lo == hi) return empties[depth];
     if (hi - lo == 1) return single_leaf(leaves[lo], depth);
     // Keys are unique, so two leaves always split before depth 256.
-    const auto split = static_cast<std::size_t>(
-        std::partition_point(leaves.begin() + static_cast<std::ptrdiff_t>(lo), leaves.begin() + static_cast<std::ptrdiff_t>(hi),
-                             [&](const SortedLeaf& l) { return !bit_at(l.key, depth); }) -
-        leaves.begin());
+    const auto split = split_at(depth, lo, hi);
     return node_hash(self(self, depth + 1, lo, split), self(self, depth + 1, split, hi));
   };
+
+  if (proof && proof_key) {
+    // Walk down the key's path; at each depth the sibling is the subtree on the other side.
+    std::size_t lo = 0;
+    std::size_t hi = leaves.size();
+    for (std::size_t depth = 0; depth < 256; ++depth) {
+      const auto split = split_at(depth, lo, hi);
+      const bool right = bit_at(*proof_key, depth);
+      const auto sibling = right ? subtree(subtree, depth + 1, lo, split) : subtree(subtree, depth + 1, split, hi);
+      proof->siblings[255 - depth] = sibling;  // leaf -> root order
+      if (right) lo = split; else hi = split;
+    }
+  }
   return subtree(subtree, 0, 0, leaves.size());
 }
 

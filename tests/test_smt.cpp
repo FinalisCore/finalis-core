@@ -293,3 +293,30 @@ TEST(test_smt_fast_root_matches_reference_as_set_changes) {
   ASSERT_EQ(crypto::SparseMerkleTree::compute_root_from_leaves({{b, v(2)}, {a, v(1)}}),
             reference_smt_root({{a, v(1)}, {b, v(2)}}));
 }
+
+TEST(test_smt_fast_proofs_verify_for_members_and_non_members) {
+  const std::string dir = unique_test_base("/tmp/finalis_test_smt_fast_proofs");
+  std::filesystem::remove_all(dir);
+  storage::DB db;
+  ASSERT_TRUE(db.open(dir));
+  crypto::SparseMerkleTree smt(db, "utxo");
+  std::vector<std::pair<Hash32, Bytes>> leaves;
+  for (std::uint32_t i = 0; i < 64; ++i) {
+    Hash32 k = crypto::sha256(Bytes{static_cast<std::uint8_t>(i), 0x33});
+    if (i % 5 == 0) for (std::size_t b = 0; b < 30; ++b) k[b] = 0x5A;  // long shared prefixes
+    leaves.push_back({k, v(static_cast<std::uint8_t>(i), 1 + i % 4)});
+  }
+  std::vector<crypto::SmtUpdate> updates;
+  for (const auto& [k, val] : leaves) updates.push_back(crypto::SmtUpdate{k, val});
+  smt.apply_updates(updates);
+  const auto root = smt.root();
+  ASSERT_EQ(root, reference_smt_root(leaves));
+  for (const auto& [k, val] : leaves) {
+    ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, k, val, smt.get_proof(k)));
+  }
+  for (std::uint8_t i = 0; i < 8; ++i) {
+    Hash32 absent = crypto::sha256(Bytes{i, 0x44});
+    if (i % 2 == 0) for (std::size_t b = 0; b < 30; ++b) absent[b] = 0x5A;
+    ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, absent, std::nullopt, smt.get_proof(absent)));
+  }
+}

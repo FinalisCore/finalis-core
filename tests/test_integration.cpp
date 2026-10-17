@@ -10515,6 +10515,47 @@ TEST(test_fast_start_at_last_height_of_an_epoch_keeps_next_committee) {
   ASSERT_TRUE(hit_boundary);
 }
 
+TEST(test_consensus_history_is_pruned_and_fast_start_rebuilds_the_retained_window) {
+  // 2-block epochs and a 4-block unbond delay: checkpoints keep max(2 + 2, 8) = 8 epochs, block metadata
+  // 8 epochs, so both windows are passed within a few dozen heights.
+  const auto base = unique_test_base("/tmp/finalis_it_history_pruning");
+  const auto configure = [](node::NodeConfig& c) {
+    c.network.committee_epoch_blocks = 2;
+    c.network.unbond_delay_blocks = 4;
+  };
+  auto cluster = make_cluster(base, 1, 1, 1, configure);
+  node::NodeConfig cfg = cluster.configs[0];
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 44, std::chrono::seconds(60)));
+  cluster.nodes[0]->stop();
+  const auto before_hash = cluster.nodes[0]->status().transition_hash;
+  const auto before_commitment = cluster.nodes[0]->canonical_state_commitment_for_test();
+  const auto sizes = cluster.nodes[0]->consensus_history_sizes_for_test();
+  cluster.nodes.clear();
+  // Bounded: at most 8 retained epochs (+ the next epoch's checkpoint), 8 epochs of metadata (+ the
+  // tip when it opens an epoch), and reward states for the current and previous epochs only.
+  ASSERT_TRUE(sizes[0] <= 9);
+  ASSERT_TRUE(sizes[1] <= 17);
+  ASSERT_TRUE(sizes[2] <= 3);
+
+  {
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_EQ(restarted.fast_start_result_for_test(), std::string("ok"));
+    ASSERT_EQ(restarted.status().transition_hash, before_hash);
+    ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
+    restarted.stop();
+  }
+  cfg.fast_start = false;
+  node::Node replayed(cfg);
+  ASSERT_TRUE(replayed.init());
+  ASSERT_EQ(replayed.canonical_state_commitment_for_test(), before_commitment);
+  // History rows below the window stay in the database for queries.
+  replayed.stop();
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly(cfg.db_path));
+  ASSERT_TRUE(db.load_finalized_committee_checkpoints().size() > sizes[0]);
+}
+
 TEST(test_startup_can_replay_persisted_frontier_storage_when_selected) {
   const auto base = unique_test_base("/tmp/finalis_it_frontier_startup_replay");
   const node::NodeConfig legacy_cfg = single_node_cfg(base, 1);

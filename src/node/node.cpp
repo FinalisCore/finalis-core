@@ -1732,8 +1732,9 @@ consensus::CanonicalDerivationConfig Node::canonical_derivation_config_locked() 
 }
 
 bool Node::verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state,
-                                                                storage::DB::Batch& batch) {
-  const auto commitment = consensus::consensus_state_commitment(canonical_derivation_config_locked(), state);
+                                                                storage::DB::Batch& batch, bool recompute) {
+  const auto commitment =
+      recompute ? consensus::consensus_state_commitment(canonical_derivation_config_locked(), state) : state.state_commitment;
   if (commitment != state.state_commitment) {
     std::cerr << "consensus state commitment recomputation mismatch\n";
     return false;

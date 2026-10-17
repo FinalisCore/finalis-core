@@ -210,6 +210,24 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
                                                   const CanonicalDerivedState& initial_state,
                                                   const storage::DB& db,
                                                   CanonicalDerivedState* out, std::string* error);
+// History the consensus state keeps (and commits to), counted back from the epoch of the next height:
+// - committee checkpoints: the unbond delay plus 2 epochs, so equivocation evidence can be checked
+//   against its height's committee for as long as the bond can still be slashed; this also covers the
+//   ticket difficulty / adaptive lookbacks (at most 6 epochs);
+// - block metadata and per-epoch randomness: kRetainedMetadataEpochs (ticket difficulty reads 6);
+// - reward states: unsettled ones, and settled ones for one more epoch.
+// Older entries are dropped from the state by prune_consensus_history at every height, so the state
+// and the work per block stay bounded. The database keeps its history rows for queries.
+inline constexpr std::uint64_t kRetainedMetadataEpochs = 8;
+std::uint64_t retained_checkpoint_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
+std::uint64_t retained_metadata_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
+void prune_consensus_history(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state);
+// The ticket difficulty checkpoint derivation uses for `epoch_start_height`, from finalized state (the
+// same rule and inputs the next checkpoint will be derived with).
+std::uint8_t ticket_difficulty_bits_for_epoch_from_state(const CanonicalDerivationConfig& cfg,
+                                                         const CanonicalDerivedState& state,
+                                                         std::uint64_t epoch_start_height);
+
 // Commitment to the post-state of a finalized transition: everything consensus_state_commitment covers
 // except finalized_identity and last_finality_certificate_hash, which are derived from the transition
 // itself. A FrontierTransition signs it as next_state_commitment. known_utxo_root, when given, must equal

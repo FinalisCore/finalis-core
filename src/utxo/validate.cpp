@@ -59,11 +59,15 @@ std::vector<OutPoint> txv2_input_outpoints(const TxV2& tx) {
   return out;
 }
 
-UtxoSet legacy_transparent_view(const UtxoSetV2& utxos) {
+// The transparent outputs `tx` spends: validate_tx only looks up its own inputs, so this is
+// equivalent to converting the whole set, without copying it per transaction.
+UtxoSet legacy_transparent_view(const UtxoSetV2& utxos, const Tx& tx) {
   UtxoSet out;
-  for (const auto& [op, entry] : utxos) {
-    if (entry.kind != UtxoOutputKind::Transparent) continue;
-    out.emplace(op, UtxoEntry{std::get<UtxoTransparentData>(entry.body).out});
+  for (const auto& in : tx.inputs) {
+    const OutPoint op{in.prev_txid, in.prev_index};
+    const auto it = utxos.find(op);
+    if (it == utxos.end() || it->second.kind != UtxoOutputKind::Transparent) continue;
+    out.emplace(op, UtxoEntry{std::get<UtxoTransparentData>(it->second.body).out});
   }
   return out;
 }
@@ -1245,7 +1249,7 @@ AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block,
       [&](const auto& value) -> AnyTxValidationResult {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, Tx>) {
-          const auto vr = validate_tx(value, tx_index_in_block, legacy_transparent_view(utxos), ctx);
+          const auto vr = validate_tx(value, tx_index_in_block, legacy_transparent_view(utxos, value), ctx);
           return AnyTxValidationResult{
               .ok = vr.ok,
               .error = vr.error,

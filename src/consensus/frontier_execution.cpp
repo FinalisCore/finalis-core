@@ -260,7 +260,8 @@ std::uint64_t ordered_record_confidential_verify_weight(const Bytes& raw_record)
 
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_confidential_pool_value,
                             std::uint64_t prev_frontier, const std::vector<Bytes>& ordered_records,
-                            const SpecialValidationContext* ctx, FrontierExecutionResult* out, std::string* error) {
+                            const SpecialValidationContext* ctx, FrontierExecutionResult* out, std::string* error,
+                            bool compute_next_state_root) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
@@ -375,7 +376,7 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
   result.transition.prev_frontier = prev_frontier;
   result.transition.next_frontier = prev_frontier + ordered_records.size();
   result.transition.prev_state_root = frontier_utxo_state_root(parent_utxos);
-  result.transition.next_state_root = frontier_utxo_state_root(work);
+  if (compute_next_state_root) result.transition.next_state_root = frontier_utxo_state_root(work);
   result.transition.ordered_slice_commitment = frontier_ordered_slice_commitment(ordered_records);
   result.transition.decisions_commitment = frontier_decisions_commitment(decisions);
   result.decisions = std::move(decisions);
@@ -398,7 +399,7 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
                                   const FrontierVector& prev_vector, const FrontierVector& next_vector,
                                   const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
-                                  FrontierExecutionResult* out, std::string* error) {
+                                  FrontierExecutionResult* out, std::string* error, bool compute_next_state_root) {
   FrontierLaneRoots recomputed_lane_roots{};
   std::vector<Bytes> ordered_records;
   if (!frontier_merge_certified_ingress(prev_vector, next_vector, lane_records, prev_lane_roots, &recomputed_lane_roots,
@@ -426,7 +427,7 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
 
   FrontierExecutionResult result;
   if (!execute_frontier_slice(parent_utxos, parent_confidential_pool_value, prev_vector.total_count(), ordered_records, ctx,
-                              &result, error)) {
+                              &result, error, compute_next_state_root)) {
     return false;
   }
   result.transition.prev_vector = prev_vector;

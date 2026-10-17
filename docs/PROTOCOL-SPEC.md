@@ -78,13 +78,30 @@ Each frontier transition commits to the state it produces:
   `sha256d("SC-POST-STATE-V1" || height || frontier || utxo_root || validator_root ||
   finalized_randomness || reward_root || reserve || checkpoint_root || availability epoch ||
   availability_operator_root || availability_prefix_root || join window || liveness window ||
-  confidential_pool_value)` (`consensus_post_state_commitment`).
+  confidential_pool_value || block_metadata_root)` (`consensus_post_state_commitment`).
+  `block_metadata_root` covers each retained height's `(transition round, quorum, signer count)`,
+  which ticket difficulty is derived from.
 
 The post-state leaves out the two values derived from the transition itself
 (its id and its finality link hash), so a transition can sign it. Nothing else
 in the post-state depends on the transition id; the availability audit seed in
 particular is `availability_audit_seed(finalized_randomness, epoch)`, which the
 leader cannot grind.
+
+History in the committed state is bounded (`prune_consensus_history`, applied at every height,
+counted back from the epoch of the next height):
+
+- committee checkpoints: the unbond delay plus 2 epochs (at least 8), so equivocation evidence can
+  be checked against its height's committee for as long as the bond can be slashed;
+- block metadata and per-epoch randomness: 8 epochs (ticket difficulty reads 6);
+- epoch reward states: unsettled ones, and settled ones for one more epoch.
+
+Nodes keep the full history in their database for queries; only the committed state is bounded, so
+the work per block does not grow with the age of the chain.
+
+An exiting validator whose bond is the outpoint `(zero_hash, 0)` (genesis bonds, which are not
+UTXOs and so cannot be spent by an unbond) is withdrawn by consensus once its unbond delay has
+passed (genesis validators while bootstrap penalty-exit protection is active).
 
 The full state commitment is
 `sha256d("SC-CANON-STATE-V3" || finalized_identity || finality_link_hash || post_state_commitment)`.

@@ -66,10 +66,12 @@ std::uint64_t ordered_record_confidential_verify_weight(const Bytes& raw_record)
 // `parent_confidential_pool_value` is the committed turnstile P of the parent state. Every consensus
 // caller must pass the parent's value; a TxV2 that would make P negative is rejected
 // (FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE).
+// compute_next_state_root = false leaves result.transition.next_state_root zero: callers that go on to
+// populate_frontier_transition_metadata (which sets the post-settlement root) skip hashing the UTXO set.
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_confidential_pool_value,
                             std::uint64_t prev_frontier, const std::vector<Bytes>& ordered_records,
                             const SpecialValidationContext* ctx, FrontierExecutionResult* out,
-                            std::string* error = nullptr);
+                            std::string* error = nullptr, bool compute_next_state_root = true);
 bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
                             FrontierExecutionResult* out, std::string* error = nullptr);
@@ -77,7 +79,8 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
                                   const FrontierVector& prev_vector, const FrontierVector& next_vector,
                                   const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
-                                  FrontierExecutionResult* out, std::string* error = nullptr);
+                                  FrontierExecutionResult* out, std::string* error = nullptr,
+                                  bool compute_next_state_root = true);
 bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVector& prev_vector,
                                   const FrontierVector& next_vector, const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,

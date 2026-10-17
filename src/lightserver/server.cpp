@@ -51,6 +51,21 @@
 namespace finalis::lightserver {
 namespace {
 
+// The outputs `tx` spends, from the finalized UTXO table. Transaction validation looks up only its own
+// inputs, so loading the whole set per request (an unauthenticated RPC) is never needed.
+UtxoSetV2 spent_utxos_for(const storage::DB& db, const AnyTx& tx) {
+  UtxoSetV2 out;
+  std::visit(
+      [&](const auto& value) {
+        for (const auto& in : value.inputs) {
+          const OutPoint op{in.prev_txid, in.prev_index};
+          if (auto entry = db.get_utxo_v2(op); entry.has_value()) out.emplace(op, *entry);
+        }
+      },
+      tx);
+  return out;
+}
+
 constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
 constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
 constexpr std::uint32_t kHttpRequestDeadlineMs = 10'000;
@@ -2949,7 +2964,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     const Bytes tx_bytes = tx->serialize();
     const Hash32 txid = tx->txid();
-    const auto utxos = live_db.load_utxos_v2();  // confidential outputs included
+    const auto utxos = spent_utxos_for(live_db, AnyTx{*tx});  // confidential outputs included
     const auto validators = live_db.load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
@@ -3471,7 +3486,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
                                  std::string("This transaction is already finalized or was previously submitted."),
                                  false, "none", false, std::nullopt));
     }
-    const auto utxos = view->load_utxos_v2();  // confidential outputs included
+    const auto utxos = spent_utxos_for(*view, *tx);  // confidential outputs included
     const auto validators = view->load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);

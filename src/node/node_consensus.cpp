@@ -395,6 +395,11 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   }
   batch.put(kConfidentialSupplyLedgerKey,
             consensus::serialize_confidential_supply_ledger(next_state.confidential_supply, record.transition.height));
+  // Before hydrate replaces canonical_state_ with next_state.
+  if (!persist_canonical_cache_delta(batch, *canonical_state_, next_state, record.transition.next_state_root)) {
+    if (error) *error = "persist-canonical-cache-rows-failed";
+    return false;
+  }
   const bool block_had_txv2 =
       next_state.confidential_supply.txv2_count != canonical_state_->confidential_supply.txv2_count ||
       next_state.confidential_supply.known != canonical_state_->confidential_supply.known;
@@ -450,15 +455,13 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     last_finalized_progress_ms_ = now;
   }
 
-  if (!persist_canonical_cache_rows(db_, batch, next_state)) {
-    if (error) *error = "persist-canonical-cache-rows-failed";
-    return false;
-  }
-  if (!verify_and_persist_consensus_state_commitment_locked(next_state, batch)) {
+  // apply_frontier_record computed next_state.state_commitment; recomputing it here would hash the whole
+  // UTXO set again.
+  if (!verify_and_persist_consensus_state_commitment_locked(next_state, batch, /*recompute=*/false)) {
     if (error) *error = "persist-consensus-state-commitment-failed";
     return false;
   }
-  (void)persist_state_roots(db_, batch, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
+  persist_validator_roots(db_, batch, finalized_height_, validators_, kFixedValidationRulesVersion);
 
   if (clear_requested_sync) {
     requested_sync_artifacts_.erase(transition_id);
@@ -1118,6 +1121,7 @@ void Node::on_get_transition_by_height(int peer_id, const Bytes& payload) {
   bool throttled_rate_limit = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    bound_throttle_map(get_transition_by_height_last_req_ms_);
     auto& last_req = get_transition_by_height_last_req_ms_[{peer_id, gbh->height}];
     if (last_req != 0 && tms < last_req + kGetTransitionByHeightPerPeerHeightMinIntervalMs) {
       throttled_rate_limit = true;
@@ -2849,7 +2853,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
     if (!consensus::execute_frontier_lane_prefix(canonical_state_->utxos, canonical_state_->confidential_pool_value,
                                                  canonical_state_->finalized_frontier_vector,
                                                  selection.next_vector, selection.lane_records,
-                                                 canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error)) {
+                                                 canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error,
+                                                 /*compute_next_state_root=*/false)) {
       if (attempt == 0 &&
           (validation_error.find("frontier-certified-ingress-prev-root-mismatch") != std::string::npos ||
            validation_error.find("frontier-certified-ingress-prev-root-state-mismatch") != std::string::npos)) {

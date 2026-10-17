@@ -1260,6 +1260,44 @@ TEST(test_frontier_replay_rejects_block_artifact_parent_kind_after_genesis) {
   ASSERT_EQ(err, "frontier-parent-identity-kind-mismatch");
 }
 
+// A genesis bond is not a UTXO, so no unbond spend can complete its exit: consensus withdraws it once
+// the unbond delay has passed, identically on every node (it changes the committed validator set).
+TEST(test_genesis_bond_exit_is_finalized_by_consensus_after_unbond_delay) {
+  auto cfg = test_cfg();
+  cfg.network.unbond_delay_blocks = 0;
+  const auto from = key_from_byte(31);
+  const auto to = key_from_byte(32);
+  OutPoint op{};
+  op.txid.fill(0x97);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  auto parent = build_parent_state_with_utxo(cfg, 62, op, prev);
+
+  const auto genesis_exit = [&](std::uint8_t b, std::uint64_t unbond_height) {
+    const auto pub = key_from_byte(b).public_key;
+    consensus::ValidatorInfo info;
+    info.status = consensus::ValidatorStatus::EXITING;
+    info.joined_height = 0;
+    info.has_bond = true;
+    info.bonded_amount = consensus::genesis_validator_bond_amount();
+    info.bond_outpoint = OutPoint{zero_hash(), 0};
+    info.operator_id = pub;
+    info.unbond_height = unbond_height;
+    parent.validators.upsert(pub, info);
+    return pub;
+  };
+  const auto matured = genesis_exit(0x61, 1);   // height 1 >= 1 + 0
+  const auto pending = genesis_exit(0x62, 2);   // height 1 < 2 + 0
+  parent.state_commitment = consensus::consensus_state_commitment(cfg, parent);
+
+  const auto record = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)}, cfg);
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {record}, &out, &err));
+  ASSERT_TRUE(!out.validators.get(matured)->has_bond);
+  ASSERT_TRUE(out.validators.get(pending)->has_bond);
+}
+
 TEST(test_frontier_replay_rejects_wrong_next_state_commitment) {
   const auto cfg = test_cfg();
   const auto from = key_from_byte(31);

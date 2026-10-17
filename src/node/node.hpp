@@ -305,6 +305,8 @@ class Node {
   Hash32 canonical_state_commitment_for_test() const;
   // Last startup's fast-start outcome: "ok", "fallback:<reason>", or empty when not attempted.
   std::string fast_start_result_for_test() const;
+  // Sizes of the canonical state's history maps: checkpoints, block metadata, reward states.
+  std::array<std::size_t, 3> consensus_history_sizes_for_test() const;
   std::uint64_t canonical_state_height_for_test() const;
   std::uint16_t p2p_port_for_test() const;
   bool endpoint_is_obvious_self_for_test(const std::string& host, std::uint16_t port) const;
@@ -563,7 +565,7 @@ class Node {
   }
   consensus::CanonicalDerivationConfig canonical_derivation_config_locked() const;
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state,
-                                                            storage::DB::Batch& batch);
+                                                       storage::DB::Batch& batch, bool recompute = true);
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state);
   bool init_local_validator_key();
   bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator);
@@ -764,6 +766,13 @@ class Node {
   std::map<int, std::uint64_t> peer_last_finalized_tip_request_ms_;
   std::map<int, std::uint64_t> peer_tx_relay_backoff_until_ms_;
   std::map<std::uint64_t, std::size_t> sync_height_rr_cursor_;
+  // Log/request throttles keyed by peer-supplied values (IPs, epochs, heights): cleared when they reach
+  // this size so a peer cannot grow them without bound. Clearing only loses throttle state.
+  static constexpr std::size_t kMaxThrottleEntries = 4096;
+  template <typename Map>
+  static void bound_throttle_map(Map& map) {
+    if (map.size() >= kMaxThrottleEntries) map.clear();
+  }
   std::map<std::string, std::uint64_t> invalid_frame_log_ms_;
   std::map<std::string, std::uint64_t> addr_drop_log_ms_;
   std::uint64_t rejected_network_id_{0};

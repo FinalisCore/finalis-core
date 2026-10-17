@@ -835,6 +835,7 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
     bool should_log = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
+      bound_throttle_map(invalid_frame_log_ms_);
       auto& last = invalid_frame_log_ms_[ip];
       if (tms > last + 10'000) {
         should_log = true;
@@ -1384,6 +1385,7 @@ void Node::on_addr(int peer_id, const Bytes& payload) {
                                  : (reject == p2p::AddrRejectReason::UNROUTABLE_IP) ? "unroutable"
                                                                                      : "invalid";
       const std::string log_key = reason + ":" + na.ip;
+      bound_throttle_map(addr_drop_log_ms_);
       auto& last = addr_drop_log_ms_[log_key];
       const std::uint64_t now = now_ms();
       if (now > last + 10'000) {
