@@ -73,7 +73,7 @@ TEST(test_tx_and_blockheader_roundtrip) {
   ASSERT_EQ(hparsed->prev_finality_cert_hash, h.prev_finality_cert_hash);
 }
 
-TEST(test_blockheader_canonical_reserialization_always_includes_prev_finality_cert_hash) {
+TEST(test_blockheader_has_one_encoding_with_prev_finality_cert_hash) {
   BlockHeader h;
   h.prev_finalized_hash.fill(0x11);
   h.prev_finality_cert_hash = zero_hash();
@@ -101,12 +101,8 @@ TEST(test_blockheader_canonical_reserialization_always_includes_prev_finality_ce
   const auto legacy_bytes = legacy.take();
   ASSERT_EQ(legacy_bytes.size(), static_cast<std::size_t>(32 + 8 + 8 + 32 + 32 + 4 + 64));
 
-  auto parsed_legacy = BlockHeader::parse(legacy_bytes);
-  ASSERT_TRUE(parsed_legacy.has_value());
-  ASSERT_EQ(parsed_legacy->prev_finality_cert_hash, zero_hash());
-  const auto reserialized = parsed_legacy->serialize();
-  ASSERT_EQ(reserialized.size(), canonical.size());
-  ASSERT_TRUE(reserialized != legacy_bytes);
+  // One encoding per header: the layout without prev_finality_cert_hash is rejected.
+  ASSERT_TRUE(!BlockHeader::parse(legacy_bytes).has_value());
 }
 
 TEST(test_slashing_record_db_roundtrip) {

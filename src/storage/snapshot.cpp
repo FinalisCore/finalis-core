@@ -462,7 +462,8 @@ std::optional<SnapshotBundle> SnapshotBundle::parse(const Bytes& b) {
         bundle.manifest = *manifest;
 
         bundle.entries.clear();
-        bundle.entries.reserve(static_cast<std::size_t>(bundle.manifest.entry_count));
+        // entry_count is untrusted; every entry takes at least two length bytes.
+        bundle.entries.reserve(std::min<std::uint64_t>(bundle.manifest.entry_count, r.remaining() / 2));
         for (std::uint64_t i = 0; i < bundle.manifest.entry_count; ++i) {
           auto key = r.varbytes();
           auto value = r.varbytes();
