@@ -11447,6 +11447,18 @@ TEST(test_frontier_mode_accepts_ingress_range_overlapping_held_records) {
   ASSERT_EQ(target.inject_ingress_range_result_for_test(same, 5), std::string{});
   ASSERT_EQ(target.lane_state_for_test(lane)->max_seq, 1u);
 
+  // A reply covering only a prefix of the request (the responder caps reply bytes) is accepted; one
+  // reaching past the request is not.
+  target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 3});
+  ASSERT_EQ(target.inject_ingress_range_result_for_test(same, 5), std::string{});
+  target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 1});
+  p2p::IngressRangeMsg past;
+  past.lane = lane;
+  past.from_seq = 1;
+  past.to_seq = 2;
+  past.records = {rec_a, rec_b};
+  ASSERT_EQ(target.inject_ingress_range_result_for_test(past, 5), std::string("unexpected-range"));
+
   // Held prefix plus a new record: the new one appends on top of the held tip.
   target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 2});
   p2p::IngressRangeMsg overlap;

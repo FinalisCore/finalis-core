@@ -188,6 +188,11 @@ bool write_exact_timed(net::SocketHandle fd, const std::uint8_t* src, std::size_
 
 }  // namespace
 
+std::uint32_t transfer_deadline_ms(std::uint32_t base_ms, std::size_t bytes) {
+  const std::uint64_t extra = static_cast<std::uint64_t>(bytes) * 1000 / kMinTransferBytesPerSecond;
+  return static_cast<std::uint32_t>(std::min<std::uint64_t>(kMaxTransferMs, base_ms + extra));
+}
+
 std::optional<Frame> read_frame_fd(net::SocketHandle fd, std::size_t max_payload_len, std::uint32_t expected_magic,
                                    std::uint16_t expected_proto_version) {
   return read_frame_fd_timed(fd, max_payload_len, expected_magic, expected_proto_version, 120000, 3000, nullptr, nullptr);
@@ -261,10 +266,14 @@ std::optional<Frame> read_frame_fd_timed(net::SocketHandle fd, std::size_t max_p
   bool body_eof = false;
   bool body_ok = true;
   const auto body_start = std::chrono::steady_clock::now();
+  // The body has a size-proportional budget, and each chunk must arrive within body_timeout_ms plus its
+  // own share: a slow link is fine, a stalled one is not.
+  const std::uint32_t body_budget_ms = transfer_deadline_ms(body_timeout_ms, *len);
+  const std::uint32_t chunk_timeout_ms = transfer_deadline_ms(body_timeout_ms, kBodyChunk);
   while (payload.size() < *len) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
                                                                                body_start).count();
-    if (elapsed >= static_cast<long long>(body_timeout_ms)) {
+    if (elapsed >= static_cast<long long>(body_budget_ms)) {
       body_ok = false;
       break;
     }
@@ -272,8 +281,8 @@ std::optional<Frame> read_frame_fd_timed(net::SocketHandle fd, std::size_t max_p
     const std::size_t want = std::min<std::size_t>(kBodyChunk, *len - off);
     payload.resize(off + want);
     std::size_t got = 0;
-    if (!read_exact_timed(fd, payload.data() + off, want,
-                          static_cast<std::uint32_t>(body_timeout_ms - elapsed), &got, &body_eof)) {
+    const auto chunk_ms = std::min<std::uint32_t>(chunk_timeout_ms, static_cast<std::uint32_t>(body_budget_ms - elapsed));
+    if (!read_exact_timed(fd, payload.data() + off, want, chunk_ms, &got, &body_eof)) {
       body_read = off + got;
       body_ok = false;
       break;
@@ -317,7 +326,7 @@ bool write_frame_fd(net::SocketHandle fd, const Frame& f, std::uint32_t magic, s
 }
 
 bool write_all_timed(net::SocketHandle fd, const std::uint8_t* src, std::size_t n, std::uint32_t timeout_ms) {
-  return write_exact_timed(fd, src, n, timeout_ms);
+  return write_exact_timed(fd, src, n, transfer_deadline_ms(timeout_ms, n));
 }
 
 bool write_frame_fd_timed(net::SocketHandle fd, const Frame& f, std::uint32_t timeout_ms, std::uint32_t magic,

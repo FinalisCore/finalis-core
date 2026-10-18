@@ -454,3 +454,53 @@ TEST(test_peer_manager_refuses_oversized_payload_without_dropping_peer) {
   listener.stop();
   dialer.stop();
 }
+
+// A frame body gets a size-proportional budget (base + 1 Mbit/s floor), with a per-chunk stall limit:
+// a slow but steady sender is read in full, a stalled one fails at the stall limit.
+TEST(test_read_frame_body_budget_scales_with_size_and_detects_stalls) {
+#ifdef _WIN32
+  return;
+#else
+  constexpr std::uint32_t kMagic = 0x11223344;
+  constexpr std::uint16_t kVersion = 1;
+  constexpr std::uint32_t kBaseMs = 200;
+  p2p::Frame frame;
+  frame.msg_type = p2p::MsgType::TRANSITION;
+  frame.payload.assign(256 * 1024, 0x5A);
+  const Bytes raw = p2p::encode_frame(frame, kMagic, kVersion);
+  ASSERT_TRUE(p2p::transfer_deadline_ms(kBaseMs, frame.payload.size()) == kBaseMs + 2000);
+
+  const auto run = [&](bool stall) {
+    int fds[2]{-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return std::make_pair(false, std::int64_t{0});
+    std::thread writer([&]() {
+      // Header plus the first chunk at once, then 64 KiB every 300 ms (> kBaseMs per chunk overall).
+      std::size_t off = std::min<std::size_t>(raw.size(), 12 + 64 * 1024);
+      (void)::send(fds[0], raw.data(), off, MSG_NOSIGNAL);
+      while (off < raw.size()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(stall ? 1500 : 300));
+        if (stall) break;
+        std::size_t n = std::min<std::size_t>(64 * 1024, raw.size() - off);
+        if (raw.size() - off - n < 64) n = raw.size() - off;  // the checksum travels with the last chunk
+        if (::send(fds[0], raw.data() + off, n, MSG_NOSIGNAL) <= 0) break;
+        off += n;
+      }
+    });
+    const auto start = std::chrono::steady_clock::now();
+    p2p::FrameReadError err = p2p::FrameReadError::NONE;
+    const auto got = p2p::read_frame_fd_timed(fds[1], 8 * 1024 * 1024, kMagic, kVersion, 1000, kBaseMs, &err, nullptr);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    ::shutdown(fds[0], SHUT_RDWR);
+    writer.join();
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return std::make_pair(got.has_value() && got->payload == frame.payload, static_cast<std::int64_t>(ms));
+  };
+  const auto [slow_ok, slow_ms] = run(false);
+  ASSERT_TRUE(slow_ok);
+  ASSERT_TRUE(slow_ms > kBaseMs);  // the old whole-frame deadline would have failed this read
+  const auto [stall_ok, stall_ms] = run(true);
+  ASSERT_TRUE(!stall_ok);
+  ASSERT_TRUE(stall_ms < 1400);  // per-chunk stall limit (kBaseMs + 0.5 s), not the full 2.2 s budget
+#endif
+}

@@ -872,10 +872,11 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
       log_line("bootstrap-timeout peer_id=" + std::to_string(peer_id) + " ip=" + ip + " note=timeout");
       return;
     }
-    score_peer(peer_id, type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT
-                            ? p2p::MisbehaviorReason::HANDSHAKE_TIMEOUT
-                            : p2p::MisbehaviorReason::INVALID_FRAME,
-               type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake-timeout" : "timeout");
+    // A slow or stalled link is not misbehaviour: the connection is dropped (the peer manager closes it)
+    // without misbehaviour points, which would otherwise ban honest peers on modest links.
+    if (type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT) {
+      score_peer(peer_id, p2p::MisbehaviorReason::HANDSHAKE_TIMEOUT, "handshake-timeout");
+    }
   } else if (type == p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW) {
     score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
   } else if (type == p2p::PeerManager::PeerEventType::MESSAGE_RX) {
@@ -1528,7 +1529,27 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
     msg.frontier_proposal_bytes = proposal.serialize();
     msg.certificate = certificate;
     msg.lane_certificates = lane_certificates;
-    p2p_.broadcast(p2p::MsgType::TRANSITION, p2p::ser_transition(msg));
+    // Peers that announced a validator key in this height's committee already hold the proposal and
+    // collect the precommits themselves; they get only FINALIZED_TIP (flush_pending_finalized_broadcasts)
+    // and pull the block with GET_TRANSITION if they still lack it. Everyone else (followers,
+    // lightservers) gets the block pushed and relays it on. Pushing every block to every peer was the
+    // largest bandwidth cost per height. A peer's announced key is unauthenticated; a false claim only
+    // turns its push into a pull.
+    std::set<int> committee_peers;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      const auto committee = committee_for_height_round(proposal.transition.height, certificate.round);
+      const std::set<PubKey32> members(committee.begin(), committee.end());
+      for (const auto& [peer_id, pub] : peer_validator_pubkeys_) {
+        if (members.contains(pub)) committee_peers.insert(peer_id);
+      }
+    }
+    const Bytes payload = p2p::ser_transition(msg);
+    for (int peer_id : p2p_.peer_ids()) {
+      if (committee_peers.contains(peer_id)) continue;
+      if (!p2p_.get_peer_info(peer_id).established()) continue;
+      (void)p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, payload);
+    }
   }
 }
 

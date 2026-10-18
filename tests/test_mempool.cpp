@@ -294,58 +294,6 @@ TEST(test_mempool_accept_reject_rules) {
   ASSERT_TRUE(!mp.accept_tx(big, view, &err));
 }
 
-TEST(test_mempool_selection_order_fee_rate_then_absolute_fee_then_txid) {
-  mempool::Mempool mp;
-  mp.set_validation_context(finalis::test::with_test_chain_identity());
-  mempool::UtxoView view;
-
-  const auto k1 = key_from_byte(10);
-  const auto k2 = key_from_byte(20);
-
-  OutPoint op_a{};
-  op_a.txid.fill(0xA1);
-  op_a.index = 0;
-  OutPoint op_b{};
-  op_b.txid.fill(0xB1);
-  op_b.index = 0;
-  OutPoint op_c{};
-  op_c.txid.fill(0xC1);
-  op_c.index = 0;
-
-  TxOut prev_a = p2pkh_out_for_pub(k1.public_key, 10000);
-  TxOut prev_b = p2pkh_out_for_pub(k1.public_key, 10000);
-  TxOut prev_c = p2pkh_out_for_pub(k1.public_key, 10000);
-
-  view[op_a] = UtxoEntry{prev_a};
-  view[op_b] = UtxoEntry{prev_b};
-  view[op_c] = UtxoEntry{prev_c};
-
-  auto tx1 = spend_one(op_a, prev_a, k1, k2.public_key, 9800);  // fee 200
-  auto tx2 = spend_one(op_b, prev_b, k1, k2.public_key, 9700);  // fee 300
-  auto tx3 = spend_one(op_c, prev_c, k1, k2.public_key, 9800);  // fee 200
-  ASSERT_TRUE(tx1 && tx2 && tx3);
-
-  std::string err;
-  ASSERT_TRUE(mp.accept_tx(*tx1, view, &err));
-  ASSERT_TRUE(mp.accept_tx(*tx2, view, &err));
-  ASSERT_TRUE(mp.accept_tx(*tx3, view, &err));
-
-  auto selected = mp.select_for_block(10, 1024 * 1024, view);
-  ASSERT_EQ(selected.size(), 3u);
-
-  ASSERT_EQ(txid_any(selected[0]), tx2->txid());
-
-  const Hash32 t1 = tx1->txid();
-  const Hash32 t3 = tx3->txid();
-  if (t1 < t3) {
-    ASSERT_EQ(txid_any(selected[1]), t1);
-    ASSERT_EQ(txid_any(selected[2]), t3);
-  } else {
-    ASSERT_EQ(txid_any(selected[1]), t3);
-    ASSERT_EQ(txid_any(selected[2]), t1);
-  }
-}
-
 TEST(test_mempool_full_rejects_equal_or_worse_and_evicts_one_better_tx) {
   mempool::Mempool mp;
   mp.set_validation_context(finalis::test::with_test_chain_identity());
@@ -408,45 +356,6 @@ TEST(test_mempool_full_rejects_equal_or_worse_and_evicts_one_better_tx) {
   ASSERT_TRUE(!mp.contains(worst_txid));
   ASSERT_EQ(mp.policy_stats().evicted_for_better_incoming, before_stats.evicted_for_better_incoming + 1);
   ASSERT_EQ(mp.total_bytes(), bytes_before - worst_size + better_tx->serialize().size());
-}
-
-TEST(test_mempool_block_selection_prefers_fee_rate_and_nonfitting_entries_remain) {
-  mempool::Mempool mp;
-  mp.set_validation_context(finalis::test::with_test_chain_identity());
-  mempool::UtxoView view;
-
-  const auto k1 = key_from_byte(50);
-  const auto k2 = key_from_byte(51);
-
-  auto add_tx = [&](std::uint8_t tag, std::uint64_t value_in, const std::vector<std::uint64_t>& outputs) -> Tx {
-    OutPoint op{};
-    op.txid.fill(tag);
-    op.index = 0;
-    TxOut prev = p2pkh_out_for_pub(k1.public_key, value_in);
-    view[op] = UtxoEntry{prev};
-    std::vector<TxOut> outs;
-    const auto to_pkh = crypto::h160(Bytes(k2.public_key.begin(), k2.public_key.end()));
-    for (auto out_value : outputs) outs.push_back(TxOut{out_value, address::p2pkh_script_pubkey(to_pkh)});
-    auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), op, prev, k1.private_key, outs);
-    ASSERT_TRUE(tx.has_value());
-    std::string err;
-    ASSERT_TRUE(mp.accept_tx(*tx, view, &err));
-    return *tx;
-  };
-
-  const auto high_rate = add_tx(0x10, 10'000, {9'850});                       // fee 150, smaller tx
-  const auto low_rate_high_fee = add_tx(0x11, 20'000, {3'960, 3'960, 3'960, 3'960, 3'960});  // fee 200, larger tx
-
-  auto selected = mp.select_for_block(10, 1024 * 1024, view);
-  ASSERT_EQ(selected.size(), 2u);
-  ASSERT_EQ(txid_any(selected[0]), high_rate.txid());
-  ASSERT_EQ(txid_any(selected[1]), low_rate_high_fee.txid());
-
-  const auto fit_one = mp.select_for_block(10, high_rate.serialize().size() + 1, view);
-  ASSERT_EQ(fit_one.size(), 1u);
-  ASSERT_EQ(txid_any(fit_one[0]), high_rate.txid());
-  ASSERT_TRUE(mp.contains(high_rate.txid()));
-  ASSERT_TRUE(mp.contains(low_rate_high_fee.txid()));
 }
 
 TEST(test_mempool_confirmed_and_pruned_removal_behaviour_remains_intact) {

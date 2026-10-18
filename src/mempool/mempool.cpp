@@ -43,8 +43,8 @@ std::vector<std::pair<std::uint64_t, const Bytes*>> transparent_outputs(const An
   return out;
 }
 
-// Same admission PoW checks validate_any_tx applies in select_for_block, so a tx dropped here is
-// exactly one block selection would skip forever.
+// Same admission PoW checks validate_any_tx applies at execution, so a tx dropped here is exactly one
+// no block could include any more.
 bool admission_pow_invalid(const AnyTx& tx, const SpecialValidationContext& ctx) {
   const auto outputs = transparent_outputs(tx);
   for (const auto& [value, script] : outputs) {
@@ -328,46 +328,6 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
 void Mempool::on_finalized_block_timestamp(std::uint64_t ts) {
   // CLEANSLATE: Mempool policy derives time solely from finalized chain state.
   last_finalized_timestamp_ = ts;
-}
-
-std::vector<AnyTx> Mempool::select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view,
-                                             std::vector<std::string>* diagnostics) const {
-  std::vector<const TxMeta*> candidates;
-  candidates.reserve(by_txid_.size());
-  for (const auto& [_, meta] : by_txid_) {
-    candidates.push_back(&meta);
-  }
-
-  std::sort(candidates.begin(), candidates.end(), [](const TxMeta* a, const TxMeta* b) {
-    return compare_entry_score(a->entry, b->entry) > 0;
-  });
-
-  std::vector<AnyTx> out;
-  out.reserve(std::min(max_txs, candidates.size()));
-  std::size_t used_bytes = 0;
-  UtxoSetV2 work = view;
-
-  for (const TxMeta* m : candidates) {
-    if (out.size() >= max_txs) break;
-    if (used_bytes + m->entry.size_bytes > max_bytes) {
-      if (diagnostics) {
-        diagnostics->push_back("skip txid=" + hex_encode32(m->entry.txid) + " reason=max-bytes");
-      }
-      continue;
-    }
-
-    const auto vr = validate_any_tx(m->entry.tx, 1, work, ctx_ ? &*ctx_ : nullptr);
-    if (!vr.ok) {
-      if (diagnostics) {
-        diagnostics->push_back("skip txid=" + hex_encode32(m->entry.txid) + " reason=" + vr.error);
-      }
-      continue;
-    }
-    apply_any_tx_to_utxo(m->entry.tx, work);
-    out.push_back(m->entry.tx);
-    used_bytes += m->entry.size_bytes;
-  }
-  return out;
 }
 
 void Mempool::remove_confirmed(const std::vector<Hash32>& txids) {

@@ -98,39 +98,38 @@ void Node::on_get_ingress_range(int peer_id, const Bytes& payload) {
   msg.lane = req->lane;
   msg.from_seq = req->from_seq;
   msg.to_seq = req->to_seq;
-  bool complete = true;
   for (std::uint64_t seq = req->from_seq; seq <= req->to_seq; ++seq) {
     auto cert_bytes = db_.get_ingress_certificate(req->lane, seq);
     if (!cert_bytes.has_value()) {
-      complete = false;
-      break;
+      break;  // send what precedes the gap, if anything
     }
     auto cert = IngressCertificate::parse(*cert_bytes);
     if (!cert.has_value()) {
-      complete = false;
-      break;
+      break;  // send what precedes the gap, if anything
     }
     auto tx_bytes = db_.get_ingress_bytes(cert->txid);
     if (!tx_bytes.has_value()) {
-      complete = false;
-      break;
+      break;  // send what precedes the gap, if anything
     }
     msg.records.push_back(p2p::IngressRecordMsg{*cert, *tx_bytes});
     if (msg.records.size() > kMaxIngressRangeResponseRecords ||
         ingress_range_wire_size(msg) > kMaxIngressRangeResponseBytes) {
-      complete = false;
+      // Send the prefix that fits; the requester asks again from where it ends. (Sending nothing left
+      // a lane of large records, e.g. confidential txs, unsyncable: the same range was re-requested forever.)
+      msg.records.pop_back();
       break;
     }
   }
-  if (!complete) {
+  if (msg.records.empty()) {
     log_line("ingress-range-response-skipped peer_id=" + std::to_string(peer_id) + " lane=" +
              std::to_string(req->lane) + " range=[" + std::to_string(req->from_seq) + "," +
              std::to_string(req->to_seq) + "] reason=incomplete-local-range");
     return;
   }
+  msg.to_seq = msg.from_seq + msg.records.size() - 1;
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::INGRESS_RANGE, p2p::ser_ingress_range(msg), true);
   log_line("send-ingress-range peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(req->lane) +
-           " range=[" + std::to_string(req->from_seq) + "," + std::to_string(req->to_seq) +
+           " range=[" + std::to_string(msg.from_seq) + "," + std::to_string(msg.to_seq) +
            "] status=" + (ok ? "ok" : "failed"));
   return;
 }
@@ -702,8 +701,9 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
     return false;
   }
   const auto requested_it = requested_ingress_ranges_.find({peer_id, msg.lane});
+  // A reply may cover a prefix of the request (the responder caps reply bytes); the rest is asked for next.
   if (requested_it == requested_ingress_ranges_.end() || requested_it->second.from_seq != msg.from_seq ||
-      requested_it->second.to_seq != msg.to_seq) {
+      msg.to_seq > requested_it->second.to_seq) {
     if (error) *error = "unexpected-range";
     log_line("ingress-range-reject peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(msg.lane) +
              " range=[" + std::to_string(msg.from_seq) + "," + std::to_string(msg.to_seq) + "] reason=unexpected-range");
