@@ -1449,11 +1449,11 @@ void Node::event_loop() {
         force_validator_redial = true;
       }
       const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
-      // The lowest timestamp this proposal may carry (parent + 1) must be one honest validators
-      // prevote, and the quorum-1 self-vote finalizes without that check (before genesis time,
-      // a lone validator would otherwise finalize future-stamped transitions).
+      // No proposal before genesis time: height 1 would carry genesis + 1, and the quorum-1 self-vote
+      // finalizes without the prevote timestamp bound, so a lone validator would start the chain early.
+      // (Later heights stay unbounded here: test chains run blocks faster than one per second.)
       const bool proposal_clock_ready =
-          !canonical_state_.has_value() ||
+          !canonical_state_.has_value() || canonical_state_->finalized_height != 0 ||
           canonical_state_->finalized_timestamp + 1 <= now_unix() + consensus::kMaxTransitionTimestampDriftS;
       // SAFETY: an abstaining node may already have proposed at this height before losing its
       // safety state; proposing again could be a different payload (proposer equivocation).
