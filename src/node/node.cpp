@@ -1449,10 +1449,16 @@ void Node::event_loop() {
         force_validator_redial = true;
       }
       const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
+      // The lowest timestamp this proposal may carry (parent + 1) must be one honest validators
+      // prevote, and the quorum-1 self-vote finalizes without that check (before genesis time,
+      // a lone validator would otherwise finalize future-stamped transitions).
+      const bool proposal_clock_ready =
+          !canonical_state_.has_value() ||
+          canonical_state_->finalized_timestamp + 1 <= now_unix() + consensus::kMaxTransitionTimestampDriftS;
       // SAFETY: an abstaining node may already have proposed at this height before losing its
       // safety state; proposing again could be a different payload (proposer equivocation).
-      if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready && ticket_window_elapsed &&
-          !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready &&
+      if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready && proposal_clock_ready &&
+          ticket_window_elapsed && !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready &&
           !abstaining_at_height_locked(h)) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {

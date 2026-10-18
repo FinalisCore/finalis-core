@@ -1718,10 +1718,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (local_timed_out) vote_reason = "round-already-timed-out";
     const bool below_vote_floor = msg.round < local_vote_round_floor_locked(msg.height);
     if (below_vote_floor) vote_reason = "below-vote-floor";
-    // Timestamps are only bounded below by the chain (strictly increasing); honest validators bound
-    // them above by refusing to prevote a proposal stamped too far in their future.
-    constexpr std::uint64_t kMaxTimestampDriftS = 60;
-    const bool timestamp_in_future = transition.timestamp > now_unix() + kMaxTimestampDriftS;
+    const bool timestamp_in_future = transition.timestamp > now_unix() + consensus::kMaxTransitionTimestampDriftS;
     if (timestamp_in_future) vote_reason = "timestamp-in-future";
     bool local_can_vote = local_is_committee_member && !already_prevoted && !local_timed_out && !below_vote_floor &&
                           !timestamp_in_future &&
