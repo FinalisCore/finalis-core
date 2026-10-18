@@ -40,7 +40,8 @@ Pass conditions:
   - 0 forks, 0 runs that fail to converge (exit 0 on every seed)
   - 0 lost payments classified `dropped` that are not explained by a rejection at submission
   - reports archived with the release
-- Fuzzing: `fuzz_p2p_frame`, `fuzz_tx_parse`, `fuzz_consensus_msgs` and `fuzz_consensus_node` run clean under
+- Fuzzing: `fuzz_p2p_frame`, `fuzz_tx_parse`, `fuzz_consensus_msgs`, `fuzz_consensus_node`, `fuzz_smt`,
+  `fuzz_confidential` and `fuzz_wire_codecs` run clean under
   ASan/UBSan on the release commit, both as smoke binaries (linux-ci) and as libFuzzer targets in
   ClusterFuzzLite (`.clusterfuzzlite/`, workflows `cflite-pr` and `cflite-batch`), with no open
   ClusterFuzzLite crash.

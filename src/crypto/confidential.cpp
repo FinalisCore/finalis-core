@@ -497,6 +497,8 @@ std::optional<Blind32> combine_blinds(std::span<const Blind32> blinds, std::size
 #if defined(SC_HAS_SECP256K1_ZKP)
   if (!confidential_crypto_init()) return std::nullopt;
   if (!backend().status.rangeproof_backend_available) return std::nullopt;
+  // secp256k1-zkp aborts on a null blinds array, which an empty vector may give.
+  if (blinds.empty()) return std::nullopt;
   std::vector<const unsigned char*> ptrs;
   ptrs.reserve(blinds.size());
   for (const auto& blind : blinds) ptrs.push_back(blind.bytes.data());
@@ -588,8 +590,10 @@ bool verify_commitment_tally(std::span<const Commitment33> positives, std::span<
   }
   for (const auto& parsed : neg_storage) neg_ptrs.push_back(&parsed);
 
-  return secp256k1_pedersen_verify_tally(backend().ctx, pos_ptrs.data(), pos_ptrs.size(), neg_ptrs.data(),
-                                         neg_ptrs.size()) == 1;
+  // Both arrays are declared nonnull even when empty; an empty vector's data() may be null.
+  const secp256k1_pedersen_commitment* const none = nullptr;
+  return secp256k1_pedersen_verify_tally(backend().ctx, pos_ptrs.empty() ? &none : pos_ptrs.data(), pos_ptrs.size(),
+                                         neg_ptrs.empty() ? &none : neg_ptrs.data(), neg_ptrs.size()) == 1;
 #else
   (void)positives;
   (void)negatives;
@@ -636,6 +640,8 @@ std::optional<CommitmentSum> commitment_sum_of_value(std::uint64_t value) {
 bool verify_output_range_proof(const Commitment33& commitment, const ProofBytes& proof) {
 #if defined(SC_HAS_SECP256K1_ZKP)
   if (!confidential_backend_status().confidential_outputs_supported) return false;
+  // secp256k1-zkp aborts on a null proof pointer, which an empty vector may give.
+  if (proof.bytes.empty()) return false;
   secp256k1_pedersen_commitment parsed{};
   if (!parse_pedersen_commitment(commitment, &parsed)) return false;
   std::uint64_t min_value = 0;

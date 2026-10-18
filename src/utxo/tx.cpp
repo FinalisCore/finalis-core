@@ -215,15 +215,9 @@ std::optional<BlockHeader> BlockHeader::parse(const Bytes& b) {
     if (!prev) return std::nullopt;
     h.prev_finalized_hash = *prev;
 
-    const std::size_t legacy_suffix = 8 + 8 + 32 + 32 + 4 + 64;
-    const std::size_t extended_suffix = 32 + legacy_suffix;
-    if (r.remaining() == extended_suffix) {
-      auto prev_cert = r.bytes_fixed<32>();
-      if (!prev_cert) return std::nullopt;
-      h.prev_finality_cert_hash = *prev_cert;
-    } else if (r.remaining() != legacy_suffix) {
-      return std::nullopt;
-    }
+    auto prev_cert = r.bytes_fixed<32>();
+    if (!prev_cert) return std::nullopt;
+    h.prev_finality_cert_hash = *prev_cert;
 
     auto height = r.u64le();
     auto ts = r.u64le();
@@ -422,6 +416,8 @@ std::optional<FrontierDecision> FrontierDecision::parse(const Bytes& b) {
         auto accepted = r.u8();
         auto reject = r.u8();
         if (!record || !accepted || !reject) return false;
+        if (*accepted > 1) return false;
+        if (*reject > static_cast<std::uint8_t>(FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE)) return false;
         out.record_id = *record;
         out.accepted = (*accepted != 0);
         out.reject_reason = static_cast<FrontierRejectReason>(*reject);
@@ -465,26 +461,17 @@ std::optional<FrontierSettlement> FrontierSettlement::parse(const Bytes& b) {
         }
         auto total = r.u64le();
         auto current_fees = r.u64le();
-        if (!total || !current_fees) return false;
-        out.total = *total;
-        out.current_fees = *current_fees;
-        if (r.remaining() == 8) {
-          auto settled_epoch_rewards = r.u64le();
-          if (!settled_epoch_rewards || !r.eof()) return false;
-          out.settled_epoch_rewards = *settled_epoch_rewards;
-          return true;
-        }
         auto settled_epoch_fees = r.u64le();
         auto settled_epoch_rewards = r.u64le();
-        if (!settled_epoch_fees || !settled_epoch_rewards) return false;
+        auto reserve_subsidy_units = r.u64le();
+        if (!total || !current_fees || !settled_epoch_fees || !settled_epoch_rewards || !reserve_subsidy_units) {
+          return false;
+        }
+        out.total = *total;
+        out.current_fees = *current_fees;
         out.settled_epoch_fees = *settled_epoch_fees;
         out.settled_epoch_rewards = *settled_epoch_rewards;
-        if (r.remaining()) {
-          auto reserve_subsidy_units = r.u64le();
-          if (!reserve_subsidy_units || !r.eof()) return false;
-          out.reserve_subsidy_units = *reserve_subsidy_units;
-          return true;
-        }
+        out.reserve_subsidy_units = *reserve_subsidy_units;
         return r.eof();
       })) {
     return std::nullopt;

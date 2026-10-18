@@ -208,7 +208,7 @@ void serialize_operator_state(ByteWriter& w, const AvailabilityOperatorState& st
   w.u32le(state.recovery_consecutive_success_epochs);
 }
 
-std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader& r, std::uint32_t version) {
+std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader& r) {
   AvailabilityOperatorState state;
   const auto pub = r.bytes_fixed<32>();
   const auto bond = r.u64le();
@@ -220,10 +220,14 @@ std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader&
   const auto invalid = r.u64le();
   const auto warmup = r.u64le();
   const auto retained = r.u64le();
-  if (!pub || !bond || !status || !score || !successful || !late || !missed || !invalid || !warmup || !retained) {
+  const auto was_ever_active = r.u8();
+  const auto recovery_consecutive_success_epochs = r.u32le();
+  if (!pub || !bond || !status || !score || !successful || !late || !missed || !invalid || !warmup || !retained ||
+      !was_ever_active || !recovery_consecutive_success_epochs) {
     return std::nullopt;
   }
   if (*status > static_cast<std::uint8_t>(AvailabilityOperatorStatus::EJECTED)) return std::nullopt;
+  if (*was_ever_active > 1) return std::nullopt;
   state.operator_pubkey = *pub;
   state.bond = *bond;
   state.status = static_cast<AvailabilityOperatorStatus>(*status);
@@ -234,18 +238,8 @@ std::optional<AvailabilityOperatorState> parse_operator_state(codec::ByteReader&
   state.invalid_audits = *invalid;
   state.warmup_epochs = *warmup;
   state.retained_prefix_count = *retained;
-  if (version >= 2) {
-    const auto was_ever_active = r.u8();
-    const auto recovery_consecutive_success_epochs = r.u32le();
-    // FIX: false and zero are valid serialized values; only absent reads are malformed.
-    if (!was_ever_active.has_value() || !recovery_consecutive_success_epochs.has_value()) return std::nullopt;
-    state.was_ever_active = (*was_ever_active != 0);
-    state.recovery_consecutive_success_epochs = *recovery_consecutive_success_epochs;
-  } else {
-    state.was_ever_active = (state.status == AvailabilityOperatorStatus::ACTIVE ||
-                             state.status == AvailabilityOperatorStatus::PROBATION);
-    state.recovery_consecutive_success_epochs = 0;
-  }
+  state.was_ever_active = (*was_ever_active != 0);
+  state.recovery_consecutive_success_epochs = *recovery_consecutive_success_epochs;
   return state;
 }
 
@@ -1823,26 +1817,47 @@ std::vector<RetainedPrefix> expire_retained_prefixes(const std::vector<RetainedP
   return out;
 }
 
+namespace {
+
+// Sorts by `less`, breaking ties between entries with equal keys by their encoding, then drops exact
+// duplicates. The result depends only on the set of entries, not their input order.
+template <class T, class Less, class Ser>
+void sort_unique_total(std::vector<T>* v, Less less, Ser ser) {
+  std::vector<std::pair<Bytes, T>> keyed;
+  keyed.reserve(v->size());
+  for (auto& e : *v) {
+    ByteWriter w;
+    ser(w, e);
+    keyed.push_back({w.take(), std::move(e)});
+  }
+  std::sort(keyed.begin(), keyed.end(), [&](const auto& a, const auto& b) {
+    if (less(a.second, b.second)) return true;
+    if (less(b.second, a.second)) return false;
+    return a.first < b.first;
+  });
+  keyed.erase(std::unique(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) { return a.first == b.first; }),
+              keyed.end());
+  v->clear();
+  for (auto& [_, e] : keyed) v->push_back(std::move(e));
+}
+
+}  // namespace
+
 void normalize_availability_consensus_state(AvailabilityPersistentState* state) {
   if (!state) return;
-
-  std::sort(state->operators.begin(), state->operators.end(), [](const AvailabilityOperatorState& a,
-                                                                 const AvailabilityOperatorState& b) {
-    return a.operator_pubkey < b.operator_pubkey;
-  });
-  state->operators.erase(std::unique(state->operators.begin(), state->operators.end()), state->operators.end());
-
-  std::sort(state->retained_prefixes.begin(), state->retained_prefixes.end(), retained_prefix_less);
-  state->retained_prefixes.erase(std::unique(state->retained_prefixes.begin(), state->retained_prefixes.end()),
-                                 state->retained_prefixes.end());
+  sort_unique_total(
+      &state->operators,
+      [](const AvailabilityOperatorState& a, const AvailabilityOperatorState& b) {
+        return a.operator_pubkey < b.operator_pubkey;
+      },
+      serialize_operator_state);
+  sort_unique_total(&state->retained_prefixes, retained_prefix_less, serialize_retained_prefix);
 }
 
 void normalize_availability_persistent_state(AvailabilityPersistentState* state) {
   if (!state) return;
   normalize_availability_consensus_state(state);
-
-  std::sort(state->evidence.begin(), state->evidence.end(), invalid_evidence_less);
-  state->evidence.erase(std::unique(state->evidence.begin(), state->evidence.end()), state->evidence.end());
+  sort_unique_total(&state->evidence, invalid_evidence_less, serialize_invalid_evidence);
 }
 
 bool validate_availability_persistent_state_for_live_derivation(const AvailabilityPersistentState& state,
@@ -2008,7 +2023,7 @@ std::optional<AvailabilityPersistentState> AvailabilityPersistentState::parse(co
         auto current_epoch = r.u64le();
         if (!magic || !version || !current_epoch) return false;
         if (*magic != kAvailabilityPersistentStateMagic) return false;
-        if (*version != 1 && *version != kAvailabilityPersistentStateVersion) return false;
+        if (*version != kAvailabilityPersistentStateVersion) return false;
         state.version = *version;
         state.current_epoch = *current_epoch;
 
@@ -2016,7 +2031,7 @@ std::optional<AvailabilityPersistentState> AvailabilityPersistentState::parse(co
         if (!operator_count) return false;
         state.operators.reserve(std::min<std::uint64_t>(*operator_count, r.remaining()));
         for (std::uint64_t i = 0; i < *operator_count; ++i) {
-          auto operator_state = parse_operator_state(r, state.version);
+          auto operator_state = parse_operator_state(r);
           if (!operator_state) return false;
           state.operators.push_back(*operator_state);
         }
