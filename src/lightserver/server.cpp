@@ -51,6 +51,21 @@
 namespace finalis::lightserver {
 namespace {
 
+// The outputs `tx` spends, from the finalized UTXO table. Transaction validation looks up only its own
+// inputs, so loading the whole set per request (an unauthenticated RPC) is never needed.
+UtxoSetV2 spent_utxos_for(const storage::DB& db, const AnyTx& tx) {
+  UtxoSetV2 out;
+  std::visit(
+      [&](const auto& value) {
+        for (const auto& in : value.inputs) {
+          const OutPoint op{in.prev_txid, in.prev_index};
+          if (auto entry = db.get_utxo_v2(op); entry.has_value()) out.emplace(op, *entry);
+        }
+      },
+      tx);
+  return out;
+}
+
 constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
 constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
 constexpr std::uint32_t kHttpRequestDeadlineMs = 10'000;
@@ -1945,6 +1960,46 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
   return std::nullopt;
 }
 
+std::optional<crypto::SmtProof> Server::utxo_proof_at(std::uint64_t height, const Hash32& expected_root,
+                                                      const Hash32& key) {
+  std::lock_guard<std::mutex> lk(utxo_tree_mu_);
+  const auto rebuild = [&]() {
+    std::vector<std::pair<Hash32, Hash32>> leaves;
+    const std::string prefix = storage::key_smt_leaf_prefix("utxo");
+    for (const auto& [k, v] : db_.scan_prefix(prefix)) {
+      if (v.empty()) continue;
+      const auto kb = hex_decode(k.substr(prefix.size()));
+      if (!kb.has_value() || kb->size() != 32) continue;
+      Hash32 leaf_key{};
+      std::copy(kb->begin(), kb->end(), leaf_key.begin());
+      leaves.push_back({leaf_key, crypto::SparseMerkleTree::leaf_hash(leaf_key, v)});
+    }
+    utxo_tree_ = crypto::PersistentSmt::from_leaf_hashes(std::move(leaves));
+    utxo_tree_height_ = height;
+  };
+  // Catch up from the per-height change rows; any gap (or a reorg-free restart) falls back to a rebuild.
+  bool caught_up = utxo_tree_.has_value() && utxo_tree_height_ <= height;
+  if (caught_up) {
+    auto tree = *utxo_tree_;
+    for (std::uint64_t h = utxo_tree_height_ + 1; h <= height && caught_up; ++h) {
+      const auto raw = db_.get(storage::key_smt_delta("utxo", h));
+      const auto changes = raw.has_value() ? crypto::decode_smt_delta(*raw) : std::nullopt;
+      if (!changes.has_value()) {
+        caught_up = false;
+        break;
+      }
+      tree = tree.updated(*changes);
+    }
+    if (caught_up) {
+      utxo_tree_ = std::move(tree);
+      utxo_tree_height_ = height;
+    }
+  }
+  if (!caught_up || utxo_tree_->root() != expected_root) rebuild();
+  if (utxo_tree_->root() != expected_root) return std::nullopt;  // leaves and root row disagree (mid-write)
+  return utxo_tree_->proof(key);
+}
+
 TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   if (cfg_.tx_relay_override) return cfg_.tx_relay_override(tx_bytes);
   auto unavailable = [](std::string detail) {
@@ -2938,7 +2993,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         },
     };
     auto tx = build_validator_join_request_tx(
-        prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
+        consensus_chain_domain(cfg_.network, chain_id_), prevs, Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey,
         Bytes(key->privkey.begin(), key->privkey.end()), key->pubkey, record->bond_amount, record->fee,
         address::p2pkh_script_pubkey(own_address->pubkey_hash), &err, &pow_ctx);
     if (!tx.has_value()) {
@@ -2949,7 +3004,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     const Bytes tx_bytes = tx->serialize();
     const Hash32 txid = tx->txid();
-    const auto utxos = live_db.load_utxos_v2();  // confidential outputs included
+    const auto utxos = spent_utxos_for(live_db, AnyTx{*tx});  // confidential outputs included
     const auto validators = live_db.load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
@@ -3384,11 +3439,13 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const Hash32 key = consensus::utxo_commitment_key(op);
     crypto::SparseMerkleTree tree(db_, "utxo");
     const auto value = tree.get_value(key);
-    const auto proof = tree.get_proof(key);
     auto ur = db_.get(storage::key_root_index("UTXO", h));
     if (!ur.has_value() || ur->size() != 32) return make_error(id, -32001, "utxo_root unavailable");
     Hash32 root{};
     std::copy(ur->begin(), ur->end(), root.begin());
+    const auto proof_opt = utxo_proof_at(h, root, key);
+    if (!proof_opt.has_value()) return make_error(id, -32001, "utxo proof unavailable");
+    const auto& proof = *proof_opt;
 
     std::ostringstream oss;
     oss << "{\"proof_format\":\"smt_v0\",\"height\":" << h << ",\"key_hex\":\"" << hex_encode32(key)
@@ -3471,7 +3528,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
                                  std::string("This transaction is already finalized or was previously submitted."),
                                  false, "none", false, std::nullopt));
     }
-    const auto utxos = view->load_utxos_v2();  // confidential outputs included
+    const auto utxos = spent_utxos_for(*view, *tx);  // confidential outputs included
     const auto validators = view->load_validators();
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);

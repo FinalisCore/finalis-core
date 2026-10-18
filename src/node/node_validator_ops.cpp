@@ -281,54 +281,17 @@ std::optional<storage::FinalizedCommitteeCheckpoint> Node::finalized_committee_c
 }
 
 std::uint8_t Node::ticket_difficulty_bits_for_epoch_locked(std::uint64_t epoch_start_height,
-                                                           std::size_t active_validator_count) const {
-  std::uint8_t previous_bits = consensus::DEFAULT_TICKET_DIFFICULTY_BITS;
-  const auto epoch_blocks = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
-  const auto& econ = active_economics_policy(cfg_.network, epoch_start_height);
-  if (epoch_start_height > 1) {
-    const auto previous_epoch_start = epoch_start_height > epoch_blocks ? (epoch_start_height - epoch_blocks) : 1;
-    if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(previous_epoch_start); checkpoint.has_value()) {
-      previous_bits = checkpoint->ticket_difficulty_bits;
-    }
+                                                           std::size_t /*active_validator_count*/) const {
+  // One rule with consensus: the epoch's checkpoint records the difficulty it was derived with; before
+  // that, the value checkpoint derivation will compute from finalized state. (A separate node-side
+  // computation from finality certificates used different rounds and signer counts, so nodes could
+  // disagree on which tickets are valid, and hence on onboarding scores and settlement.)
+  if (auto checkpoint = finalized_committee_checkpoint_for_height_locked(epoch_start_height); checkpoint.has_value()) {
+    return checkpoint->ticket_difficulty_bits;
   }
-
-  constexpr std::size_t kWindowEpochs = 6;
-  std::size_t consecutive_healthy_epochs = 0;
-  std::size_t consecutive_unhealthy_epochs = 0;
-  std::size_t inspected_epochs = 0;
-  for (std::uint64_t epoch = epoch_start_height; epoch > 1 && inspected_epochs < kWindowEpochs;) {
-    if (epoch <= epoch_blocks) break;
-    epoch -= epoch_blocks;
-    ++inspected_epochs;
-    std::uint64_t blocks = 0;
-    std::uint64_t total_round_x1000 = 0;
-    std::uint64_t total_participation_bps = 0;
-    for (std::uint64_t h = epoch; h < epoch + epoch_blocks && h <= finalized_height_; ++h) {
-      auto cert = db_.get_finality_certificate_by_height(h);
-      if (!cert.has_value()) continue;
-      ++blocks;
-      total_round_x1000 += static_cast<std::uint64_t>(cert->round) * 1000ULL;
-      total_participation_bps +=
-          consensus::quorum_relative_participation_bps(cert->signatures.size(), cert->quorum_threshold);
-    }
-    const std::uint32_t average_round_x1000 =
-        blocks == 0 ? 0U : static_cast<std::uint32_t>(total_round_x1000 / blocks);
-    const std::uint32_t average_participation_bps =
-        blocks == 0 ? 10'000U : static_cast<std::uint32_t>(total_participation_bps / blocks);
-    const bool healthy = consensus::ticket_difficulty_epoch_is_healthy(active_validator_count, cfg_.max_committee,
-                                                                       average_round_x1000, average_participation_bps);
-    const bool unhealthy =
-        consensus::ticket_difficulty_epoch_is_unhealthy(average_round_x1000, average_participation_bps);
-    if (healthy && consecutive_unhealthy_epochs == 0) {
-      ++consecutive_healthy_epochs;
-    } else if (unhealthy && consecutive_healthy_epochs == 0) {
-      ++consecutive_unhealthy_epochs;
-    } else {
-      break;
-    }
-  }
-  return consensus::adjust_bounded_ticket_difficulty_bits(previous_bits, active_validator_count, cfg_.max_committee,
-                                                          consecutive_healthy_epochs, consecutive_unhealthy_epochs);
+  if (!canonical_state_.has_value()) return consensus::DEFAULT_TICKET_DIFFICULTY_BITS;
+  return consensus::ticket_difficulty_bits_for_epoch_from_state(canonical_derivation_config_locked(), *canonical_state_,
+                                                                epoch_start_height);
 }
 
 std::optional<std::uint64_t> Node::settlement_epoch_for_block_height_locked(std::uint64_t height) const {
@@ -413,16 +376,6 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
     (void)db_.put_epoch_reward_settlement(reward_state);
   }
 
-  if (canonical_state_.has_value()) {
-    auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
-    canonical_reward_state.epoch_start_height = *settlement_epoch;
-    const bool canonical_updated = canonical_reward_state.onboarding_score_units != onboarding_scores;
-    if (canonical_updated) canonical_reward_state.onboarding_score_units = onboarding_scores;
-    if (canonical_updated) {
-      canonical_state_->state_commitment =
-          consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
-    }
-  }
 
   return true;
 }
@@ -507,7 +460,7 @@ void Node::refresh_availability_operator_state_locked(bool advance_epoch) {
   for (const auto& [validator_pubkey, info] : validators_.all()) {
     operator_bonds[consensus::canonical_operator_id(validator_pubkey, info)] += info.bonded_amount;
   }
-  availability::refresh_live_availability_state(finalized_identity_.id, operator_bonds, advance_epoch, &availability_state_,
+  availability::refresh_live_availability_state(finalized_randomness_, operator_bonds, advance_epoch, &availability_state_,
                                                 cfg_.availability, cfg_.network.availability_recovery_activation_height);
   (void)validate_availability_state_locked(advance_epoch ? "availability-advance-epoch" : "availability-refresh");
 }
@@ -517,7 +470,7 @@ void Node::advance_availability_epoch_locked(std::uint64_t epoch) {
   for (const auto& [validator_pubkey, info] : validators_.all()) {
     operator_bonds[consensus::canonical_operator_id(validator_pubkey, info)] += info.bonded_amount;
   }
-  availability::advance_live_availability_epoch(finalized_identity_.id, operator_bonds, epoch, &availability_state_,
+  availability::advance_live_availability_epoch(finalized_randomness_, operator_bonds, epoch, &availability_state_,
                                                 cfg_.availability, cfg_.network.availability_recovery_activation_height);
   (void)validate_availability_state_locked("availability-advance-epoch");
 }
@@ -839,6 +792,7 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
       auto key = std::make_pair(peer_id, epoch);
       auto it = epoch_ticket_request_ms_.find(key);
       if (it != epoch_ticket_request_ms_.end() && now_ms < it->second + interval) continue;
+      bound_throttle_map(epoch_ticket_request_ms_);
       epoch_ticket_request_ms_[key] = now_ms;
       request_epoch_tickets(peer_id, epoch, kEpochReconcileRequestMaxTickets);
     }
@@ -974,13 +928,6 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
     auto& reward_state = epoch_reward_states_[stored.epoch];
     reward_state.epoch_start_height = stored.epoch;
     reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
-    if (canonical_state_.has_value()) {
-      auto& canonical_reward_state = canonical_state_->epoch_reward_states[stored.epoch];
-      canonical_reward_state.epoch_start_height = stored.epoch;
-      canonical_reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
-      canonical_state_->state_commitment =
-          consensus::consensus_state_commitment(canonical_derivation_config_locked(), *canonical_state_);
-    }
   }
   if (!closed_epoch_reconcile_read_only) {
     auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,
@@ -1135,6 +1082,7 @@ void Node::on_epoch_tickets(int peer_id, const Bytes& payload) {
   if (resp->epoch_closed) {
     std::lock_guard<std::mutex> lk(mu_);
 #ifdef _WIN32
+    bound_throttle_map(windows_settlement_epoch_reconcile_ms_);
     windows_settlement_epoch_reconcile_ms_[resp->epoch] = now_ms();
 #endif
     const bool already_frozen = epoch_committee_frozen_locked(resp->epoch);
@@ -1148,6 +1096,7 @@ void Node::on_epoch_tickets(int peer_id, const Bytes& payload) {
     }();
     if (already_frozen && already_verified_snapshot) {
       const std::uint64_t tms = now_ms();
+      bound_throttle_map(epoch_reconcile_closed_rebuild_log_state_);
       auto& state = epoch_reconcile_closed_rebuild_log_state_[resp->epoch];
       if (state.first != 0 && tms < state.first + kEpochReconcileClosedRebuildLogIntervalMs) {
         ++state.second;
@@ -1170,6 +1119,7 @@ void Node::on_epoch_tickets(int peer_id, const Bytes& payload) {
   if (repetitive_full_reject) {
     const std::uint64_t tms = now_ms();
     std::lock_guard<std::mutex> lk(mu_);
+    bound_throttle_map(epoch_reconcile_reject_log_state_);
     auto& state = epoch_reconcile_reject_log_state_[std::make_pair(peer_id, resp->epoch)];
     if (state.first != 0 && tms < state.first + kEpochReconcileRejectLogIntervalMs) {
       ++state.second;

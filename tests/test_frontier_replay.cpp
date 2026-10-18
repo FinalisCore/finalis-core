@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
@@ -28,6 +29,8 @@ using namespace finalis;
 
 namespace {
 
+Hash32 replay_chain_domain();
+
 using finalis::test::unique_test_base;
 
 crypto::KeyPair key_from_byte(std::uint8_t base) {
@@ -47,7 +50,7 @@ Bytes raw_signed_spend(const OutPoint& op, const TxOut& prev, const crypto::KeyP
                        std::uint64_t value_out) {
   const auto to_pkh = crypto::h160(Bytes(to_pub.begin(), to_pub.end()));
   std::vector<TxOut> outputs{TxOut{value_out, address::p2pkh_script_pubkey(to_pkh)}};
-  auto tx = build_signed_p2pkh_tx_single_input(op, prev, from.private_key, outputs);
+  auto tx = build_signed_p2pkh_tx_single_input(replay_chain_domain(), op, prev, from.private_key, outputs);
   if (!tx.has_value()) throw std::runtime_error("failed to build spend");
   return tx->serialize();
 }
@@ -84,7 +87,7 @@ Bytes raw_signed_spend_v2_with_outputs(const OutPoint& op, const crypto::KeyPair
   tx.balance_proof.excess_commitment = crypto::Commitment33{};
   tx.balance_proof.excess_pubkey.fill(0);
   tx.balance_proof.excess_sig.fill(0);
-  auto msg = signing_message_for_input_v2(tx, 0);
+  auto msg = signing_message_for_input_v2(replay_chain_domain(), tx, 0);
   if (!msg.has_value()) throw std::runtime_error("failed to build v2 sighash");
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   if (!sig.has_value()) throw std::runtime_error("failed to sign v2 spend");
@@ -102,6 +105,12 @@ consensus::CanonicalDerivationConfig test_cfg() {
   cfg.chain_id.genesis_hash_hex = "frontier-test";
   cfg.chain_id.genesis_source = "test";
   return cfg;
+}
+
+// Fixture transactions are signed for test_cfg()'s chain, which replay validates them under.
+Hash32 replay_chain_domain() {
+  const auto cfg = test_cfg();
+  return consensus_chain_domain(cfg.network, cfg.chain_id);
 }
 
 consensus::CanonicalDerivationConfig live_activation_cfg() {
@@ -310,6 +319,11 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
                                                         const SpecialValidationContext* vctx = nullptr) {
   FrontierVector next_vector;
   auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector, cfg.network.committee_epoch_blocks);
+  // Without an explicit context, validate under the fixture chain identity, as replay does.
+  SpecialValidationContext identity_ctx;
+  identity_ctx.network = &cfg.network;
+  identity_ctx.chain_id = &cfg.chain_id;
+  if (!vctx) vctx = &identity_ctx;
   consensus::FrontierExecutionResult result;
   std::string err;
   if (!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.confidential_pool_value, parent_state.finalized_frontier_vector, next_vector,
@@ -329,7 +343,10 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   if (!test::attach_test_leader_vrf(&result.transition, parent_state.finalized_randomness, {key_from_byte(90)})) {
     throw std::runtime_error("leader vrf: leader is not the fixture validator");
   }
-  return consensus::CanonicalFrontierRecord{result.transition, lane_records};
+  consensus::CanonicalFrontierRecord record{result.transition, lane_records};
+  // Some tests build records that must not apply; those keep a zero commitment and fail elsewhere.
+  (void)test::attach_test_next_state_commitment(cfg, parent_state, &record);
+  return record;
 }
 
 void persist_frontier_record(storage::DB& db, std::uint64_t height, const consensus::CanonicalFrontierRecord& record) {
@@ -1243,6 +1260,75 @@ TEST(test_frontier_replay_rejects_block_artifact_parent_kind_after_genesis) {
   ASSERT_EQ(err, "frontier-parent-identity-kind-mismatch");
 }
 
+// A genesis bond is not a UTXO, so no unbond spend can complete its exit: consensus withdraws it once
+// the unbond delay has passed, identically on every node (it changes the committed validator set).
+TEST(test_genesis_bond_exit_is_finalized_by_consensus_after_unbond_delay) {
+  auto cfg = test_cfg();
+  cfg.network.unbond_delay_blocks = 0;
+  const auto from = key_from_byte(31);
+  const auto to = key_from_byte(32);
+  OutPoint op{};
+  op.txid.fill(0x97);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  auto parent = build_parent_state_with_utxo(cfg, 62, op, prev);
+
+  const auto genesis_exit = [&](std::uint8_t b, std::uint64_t unbond_height) {
+    const auto pub = key_from_byte(b).public_key;
+    consensus::ValidatorInfo info;
+    info.status = consensus::ValidatorStatus::EXITING;
+    info.joined_height = 0;
+    info.has_bond = true;
+    info.bonded_amount = consensus::genesis_validator_bond_amount();
+    info.bond_outpoint = OutPoint{zero_hash(), 0};
+    info.operator_id = pub;
+    info.unbond_height = unbond_height;
+    parent.validators.upsert(pub, info);
+    return pub;
+  };
+  const auto matured = genesis_exit(0x61, 1);   // height 1 >= 1 + 0
+  const auto pending = genesis_exit(0x62, 2);   // height 1 < 2 + 0
+  parent.state_commitment = consensus::consensus_state_commitment(cfg, parent);
+
+  const auto record = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)}, cfg);
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {record}, &out, &err));
+  ASSERT_TRUE(!out.validators.get(matured)->has_bond);
+  ASSERT_TRUE(out.validators.get(pending)->has_bond);
+}
+
+TEST(test_frontier_replay_rejects_wrong_next_state_commitment) {
+  const auto cfg = test_cfg();
+  const auto from = key_from_byte(31);
+  const auto to = key_from_byte(32);
+
+  OutPoint op{};
+  op.txid.fill(0x96);
+  op.index = 0;
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto parent = build_parent_state_with_utxo(cfg, 62, op, prev);
+  const auto record = make_frontier_record(parent, {raw_signed_spend(op, prev, from, to.public_key, 9'900)});
+
+  consensus::CanonicalDerivedState out;
+  std::string err;
+  ASSERT_TRUE(consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {record}, &out, &err));
+  // The signed value is the post-state part of the full commitment.
+  ASSERT_EQ(consensus::consensus_post_state_commitment(cfg, out), record.transition.next_state_commitment);
+  ASSERT_EQ(consensus::consensus_state_commitment_from_post_state(out, record.transition.next_state_commitment),
+            out.state_commitment);
+
+  auto tampered = record;
+  tampered.transition.next_state_commitment[0] ^= 0x01;
+  ASSERT_TRUE(!consensus::derive_canonical_state_from_frontier_chain(cfg, parent, {tampered}, &out, &err));
+  ASSERT_TRUE(err.rfind("frontier-next-state-commitment-mismatch", 0) == 0);
+
+  // The proposer helper recomputes the right value from a record carrying any commitment.
+  Hash32 derived{};
+  ASSERT_TRUE(consensus::derive_frontier_next_state_commitment(cfg, parent, tampered, &derived, &err));
+  ASSERT_EQ(derived, record.transition.next_state_commitment);
+}
+
 TEST(test_consensus_state_commitment_intentionally_ignores_finalized_identity_kind) {
   const auto cfg = test_cfg();
   const auto owner = key_from_byte(33);
@@ -1909,6 +1995,7 @@ TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
 
   SpecialValidationContext vctx;
   vctx.network = &cfg.network;
+  vctx.chain_id = &cfg.chain_id;
   vctx.current_height = 1;
   vctx.confidential_policy = &cfg.confidential_policy;
 
@@ -2778,7 +2865,7 @@ Bytes make_shield(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& 
   coin->commitment = out->value_commitment;
   std::optional<TransparentTxOutV2> change;
   if (change_value > 0) change = TransparentTxOutV2{change_value, prev.script_pubkey};
-  const auto tx = wallet::build_txv2_transparent_to_confidential(op, prev, owner.private_key, prev.value, change, *out,
+  const auto tx = wallet::build_txv2_transparent_to_confidential(replay_chain_domain(), op, prev, owner.private_key, prev.value, change, *out,
                                                                  coin->value_blind, conf_value, fee, &err);
   if (!tx) throw std::runtime_error("shield tx: " + err);
   coin->op = OutPoint{tx->txid(), change_value > 0 ? 1u : 0u};
@@ -2788,7 +2875,7 @@ Bytes make_shield(const OutPoint& op, const TxOut& prev, const crypto::KeyPair& 
 // Spends a whole confidential coin to a transparent output (amount = value_out + fee).
 Bytes make_unshield(const TestShieldedCoin& coin, const PubKey32& to_pub, std::uint64_t fee, std::uint8_t seed) {
   std::string err;
-  const auto tx = wallet::build_txv2_confidential_to_transparent(
+  const auto tx = wallet::build_txv2_confidential_to_transparent(replay_chain_domain(), 
       wallet::ConfidentialOwnedCoin{.outpoint = coin.op,
                                     .amount = coin.amount,
                                     .spend_secret = coin.spend_secret,

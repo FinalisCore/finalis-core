@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_framework.hpp"
+#include "consensus/frontier_execution.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -76,6 +77,8 @@ int usage_error(const std::string& message) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Every incrementally maintained UTXO root is checked against a full recomputation in tests.
+  finalis::consensus::set_utxo_tree_crosscheck(true);
 #ifdef _WIN32
   if (std::getenv("FINALIS_TEST_QUIET_LOGS") == nullptr) {
     _putenv_s("FINALIS_TEST_QUIET_LOGS", "1");

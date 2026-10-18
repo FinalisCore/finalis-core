@@ -106,3 +106,24 @@ TEST(test_operator_id_from_payout_pubkey_persists_through_registry_and_db) {
   ASSERT_EQ(it->second.operator_id, payout->public_key);
   db.close();
 }
+
+// A database used after close() (e.g. by a thread still running at shutdown) reports failure instead
+// of dereferencing the released handle.
+TEST(test_db_access_after_close_fails_without_crashing) {
+  const std::string dir = unique_test_base("/tmp/finalis_test_db_after_close");
+  std::filesystem::remove_all(dir);
+  storage::DB db;
+  ASSERT_TRUE(db.open(dir));
+  ASSERT_TRUE(db.put("k", Bytes{1, 2, 3}));
+  ASSERT_TRUE(db.get("k").has_value());
+  db.close();
+
+  ASSERT_TRUE(!db.get("k").has_value());
+  ASSERT_TRUE(!db.put("k", Bytes{4}));
+  ASSERT_TRUE(!db.erase("k"));
+  ASSERT_TRUE(db.scan_prefix("").empty());
+  ASSERT_TRUE(!db.flush());
+  storage::DB::Batch batch(db);
+  batch.put("k2", Bytes{5});
+  ASSERT_TRUE(!db.write_batch(batch));
+}

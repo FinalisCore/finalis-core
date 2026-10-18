@@ -53,6 +53,13 @@ PrefixKind classify_prefix(const Bytes& prefix);
 std::string prefix_kind_string(PrefixKind k);
 
 Bytes encode_frame(const Frame& f, std::uint32_t magic = MAGIC, std::uint16_t proto_version = PROTOCOL_VERSION);
+// Time budget for moving `bytes` over a link: base_ms plus the bytes at a 1 Mbit/s floor
+// (kMinTransferBytesPerSecond). A whole-frame deadline equal to base_ms would demand ~3-6 Mbit/s per
+// link for a full block and disconnect slower, honest peers. Capped at kMaxTransferMs.
+inline constexpr std::uint64_t kMinTransferBytesPerSecond = 128 * 1024;
+inline constexpr std::uint64_t kMaxTransferMs = 120'000;
+std::uint32_t transfer_deadline_ms(std::uint32_t base_ms, std::size_t bytes);
+
 std::optional<Frame> decode_frame(const Bytes& b, std::size_t max_payload_len = 8 * 1024 * 1024,
                                   std::uint32_t magic = MAGIC, std::uint16_t proto_version = PROTOCOL_VERSION);
 

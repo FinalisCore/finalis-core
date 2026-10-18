@@ -76,7 +76,7 @@ std::optional<ConfidentialPayment> make_payment(const ConfidentialRecipient& rec
 }  // namespace
 
 std::optional<ConfidentialTransferPlan> plan_confidential_transfer(
-    const WalletStore::State& state, const std::set<OutPoint>& reserved, const std::string& change_account_id,
+    const Hash32& chain_domain, const WalletStore::State& state, const std::set<OutPoint>& reserved, const std::string& change_account_id,
     const ConfidentialRecipient& recipient, const std::optional<Hash32>& recipient_memo_key, std::uint64_t amount,
     std::uint64_t fee, const std::function<Hash32()>& random, std::string* err) {
   if (amount == 0) {
@@ -153,7 +153,7 @@ std::optional<ConfidentialTransferPlan> plan_confidential_transfer(
 
   Hash32 nonce_seed = random();
   crypto::ScopedWipe<Hash32> wipe_seed(nonce_seed);
-  auto tx = build_txv2_confidential_to_confidential(selected, outputs, fee, nonce_seed, err);
+  auto tx = build_txv2_confidential_to_confidential(chain_domain, selected, outputs, fee, nonce_seed, err);
   if (!tx) return std::nullopt;
   plan.tx = std::move(*tx);
   for (const auto& coin : selected) plan.spent.push_back(coin.outpoint);

@@ -1362,6 +1362,11 @@ std::string key_smt_root(const std::string& tree_id, std::uint64_t height) {
   w.u64le(height);
   return key_smt_root_prefix(tree_id) + hex_encode(w.data());
 }
+std::string key_smt_delta(const std::string& tree_id, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return "SMTD:" + tree_id + ":" + hex_encode(w.data());
+}
 std::string key_script_utxo_prefix(const Hash32& scripthash) {
   return "SU:" + hex_encode(Bytes(scripthash.begin(), scripthash.end())) + ":";
 }
@@ -1575,6 +1580,7 @@ bool DB::write_batch(Batch& batch, bool disable_wal) {
   if (readonly_) return false;
   if (batch.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   rocksdb::WriteOptions opts;
   opts.disableWAL = disable_wal;
   return rocks_->db->Write(opts, &batch.impl_->wb).ok();
@@ -1590,6 +1596,7 @@ bool DB::write_batch_durable(Batch& batch) {
   if (readonly_) return false;
   if (batch.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   rocksdb::WriteOptions opts;
   opts.sync = true;
   return rocks_->db->Write(opts, &batch.impl_->wb).ok();
@@ -1663,6 +1670,7 @@ bool DB::open_readonly(const std::string& path, std::string* error) {
 bool DB::put(const std::string& key, const Bytes& value) {
   if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Put(rocksdb::WriteOptions(), key, rocksdb::Slice(reinterpret_cast<const char*>(value.data()), value.size()));
   return s.ok();
 #else
@@ -1675,6 +1683,7 @@ bool DB::put_many(const std::vector<std::pair<std::string, Bytes>>& entries, boo
   if (readonly_) return false;
   if (entries.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   rocksdb::WriteBatch batch;
   for (const auto& [key, value] : entries) {
     const auto status =
@@ -1771,6 +1780,7 @@ bool DB::set_bootstrap_ingest_mode(bool enabled) {
 
 std::optional<Bytes> DB::get(const std::string& key) const {
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return std::nullopt;  // closed or never opened
   std::string v;
   auto s = rocks_->db->Get(rocksdb::ReadOptions(), key, &v);
   // SECURITY: a corrupted record must not read as "missing" (e.g. an absent UTXO or checkpoint),
@@ -1791,6 +1801,7 @@ std::optional<Bytes> DB::get(const std::string& key) const {
 bool DB::erase(const std::string& key) {
   if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key);
   return s.ok();
 #else
@@ -1802,6 +1813,7 @@ bool DB::erase(const std::string& key) {
 std::map<std::string, Bytes> DB::scan_prefix(const std::string& prefix) const {
   std::map<std::string, Bytes> out;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return {};  // closed or never opened
   std::unique_ptr<rocksdb::Iterator> it(rocks_->db->NewIterator(rocksdb::ReadOptions()));
   for (it->Seek(prefix); it->Valid(); it->Next()) {
     std::string k = it->key().ToString();
@@ -1871,6 +1883,7 @@ bool DB::put_utxo_v2(const OutPoint& op, const UtxoEntryV2& entry) { return put(
 bool DB::erase_utxo(const OutPoint& op) {
   if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_utxo(op));
   return s.ok();
 #else
@@ -2148,6 +2161,7 @@ bool DB::clear_best_epoch_tickets(std::uint64_t epoch) {
   if (readonly_) return false;
   const std::string prefix = "EB:" + key_epoch_prefix(epoch) + ":";
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   std::vector<std::string> keys;
   for (const auto& [k, _] : scan_prefix(prefix)) keys.push_back(k);
   for (const auto& k : keys) {
@@ -2572,6 +2586,7 @@ bool DB::put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxO
 bool DB::erase_script_utxo(const Hash32& scripthash, const OutPoint& op) {
   if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_script_utxo(scripthash, op));
   return s.ok();
 #else

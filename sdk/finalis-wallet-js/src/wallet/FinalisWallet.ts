@@ -110,7 +110,7 @@ export class FinalisWallet {
     }
 
     for (let i = 0; i < tx.inputs.length; i++) {
-      signInputP2PKH(tx, i, kp.privkeyHex, kp.pubkeyHex);
+      signInputP2PKH(tx, i, kp.privkeyHex, kp.pubkeyHex, params.chainDomainHex);
     }
 
     const txHex = bytesToHex(serializeTx(tx));

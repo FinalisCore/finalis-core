@@ -106,13 +106,6 @@ bool same_validator_maps(const std::map<PubKey32, consensus::ValidatorInfo>& a,
                          const std::map<PubKey32, consensus::ValidatorInfo>& b);
 bool maybe_reactivate_single_exiting_validator_for_startup_migration(
     const NetworkConfig& network, consensus::CanonicalDerivedState* state, PubKey32* reactivated_pubkey);
-bool is_non_genesis_zero_bond_outpoint(const consensus::ValidatorInfo& info);
-std::size_t repair_invalid_exiting_zero_bond_outpoints(consensus::ValidatorRegistry* validators, std::uint64_t height,
-                                                       std::uint64_t unbond_delay_blocks,
-                                                       const std::function<void(const std::string&)>& log_fn);
-std::size_t repair_matured_bootstrap_exiting_records(const NetworkConfig& network, consensus::ValidatorRegistry* validators,
-                                                     std::uint64_t height, std::uint64_t unbond_delay_blocks,
-                                                     const std::function<void(const std::string&)>& log_fn);
 std::string validator_info_debug_string(const consensus::ValidatorInfo& info);
 std::string validator_map_mismatch_reason(const std::map<PubKey32, consensus::ValidatorInfo>& a,
                                           const std::map<PubKey32, consensus::ValidatorInfo>& b);
@@ -134,6 +127,17 @@ FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_
                                               const std::vector<FinalitySig>& signatures);
 bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state);
 bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDerivedState& state);
+void stage_canonical_scalars(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state);
+// Per-finalized-block persistence: stages only the rows that differ between consecutive states (the
+// full rewrite above is for startup and repair).
+// Per-height UTXO tree change rows kept for readers (lightserver) catching up their in-memory tree.
+inline constexpr std::uint64_t kRetainedSmtDeltaHeights = 4096;
+// Also stages the UTXO SMT leaf changes, the height's tree change row and the UTXO root rows (next_utxo_root: the transition's
+// verified next_state_root).
+bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& prev,
+                                   const consensus::CanonicalDerivedState& next, const Hash32& next_utxo_root);
+void persist_validator_roots(storage::DB& db, storage::DB::Batch& batch, std::uint64_t height,
+                             const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version);
 bool certificate_matches_checkpoint_committee(const FinalityCertificate& cert,
                                               const storage::FinalizedCommitteeCheckpoint& checkpoint);
 // Inverse of serialize_consensus_safety_state: (locked id, locked round), the valid polka, and this

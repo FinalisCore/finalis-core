@@ -467,54 +467,6 @@ bool maybe_reactivate_single_exiting_validator_for_startup_migration(
   return true;
 }
 
-bool is_non_genesis_zero_bond_outpoint(const consensus::ValidatorInfo& info) {
-  return info.has_bond && zero_outpoint(info.bond_outpoint) && info.joined_height != 0;
-}
-
-std::size_t repair_invalid_exiting_zero_bond_outpoints(consensus::ValidatorRegistry* validators, std::uint64_t height,
-                                                       std::uint64_t unbond_delay_blocks,
-                                                       const std::function<void(const std::string&)>& log_fn) {
-  if (validators == nullptr) return 0;
-  std::size_t repaired = 0;
-  for (auto& [pub, info] : validators->mutable_all()) {
-    if (info.status != consensus::ValidatorStatus::EXITING) continue;
-    if (!is_non_genesis_zero_bond_outpoint(info)) continue;
-    if (info.unbond_height == 0) continue;
-    if (info.unbond_height > std::numeric_limits<std::uint64_t>::max() - unbond_delay_blocks) continue;
-    if (height < info.unbond_height + unbond_delay_blocks) continue;
-    if (validators->finalize_withdrawal(pub)) {
-      ++repaired;
-      log_fn("validator-exit-repair source=auto height=" + std::to_string(height) + " pub=" + short_pub_hex(pub) +
-             " reason=non-genesis-zero-bond-outpoint-matured-unbond");
-    }
-  }
-  return repaired;
-}
-
-std::size_t repair_matured_bootstrap_exiting_records(const NetworkConfig& network, consensus::ValidatorRegistry* validators,
-                                                     std::uint64_t height, std::uint64_t unbond_delay_blocks,
-                                                     const std::function<void(const std::string&)>& log_fn) {
-  if (validators == nullptr) return 0;
-  const std::uint64_t gate_height = height == std::numeric_limits<std::uint64_t>::max() ? height : (height + 1);
-  if (!bootstrap_penalty_exit_protection_active_at_height(network, gate_height)) return 0;
-  std::size_t repaired = 0;
-  for (auto& [pub, info] : validators->mutable_all()) {
-    const bool bootstrap_record =
-        info.joined_height == 0 && info.has_bond && info.bond_outpoint.txid == zero_hash() && info.bond_outpoint.index == 0;
-    if (!bootstrap_record) continue;
-    if (info.status != consensus::ValidatorStatus::EXITING) continue;
-    if (info.unbond_height == 0) continue;
-    if (info.unbond_height > std::numeric_limits<std::uint64_t>::max() - unbond_delay_blocks) continue;
-    if (height < info.unbond_height + unbond_delay_blocks) continue;
-    if (validators->finalize_withdrawal(pub)) {
-      ++repaired;
-      log_fn("validator-bootstrap-exit-repair source=auto height=" + std::to_string(height) + " pub=" + short_pub_hex(pub) +
-             " reason=bootstrap-exiting-matured-unbond");
-    }
-  }
-  return repaired;
-}
-
 std::string validator_info_debug_string(const consensus::ValidatorInfo& info) {
   std::ostringstream oss;
   oss << "{status=" << static_cast<int>(info.status) << ",joined=" << info.joined_height
@@ -646,6 +598,19 @@ FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_
 // Core: all reads (scan_prefix, to diff stale rows) stay against `db`'s
 // committed state, exactly as before; every write stages into `batch`
 // instead of hitting the WAL immediately.
+void stage_canonical_scalars(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state) {
+  batch.put(kFinalizedRandomnessKey, Bytes(state.finalized_randomness.begin(), state.finalized_randomness.end()));
+  codec::ByteWriter w_start;
+  w_start.u64le(state.validator_join_window_start_height);
+  batch.put(kValidatorJoinWindowStartKey, w_start.take());
+  codec::ByteWriter w_count;
+  w_count.u32le(state.validator_join_count_in_window);
+  batch.put(kValidatorJoinWindowCountKey, w_count.take());
+  codec::ByteWriter w_liveness;
+  w_liveness.u64le(state.validator_liveness_window_start_height);
+  batch.put(kValidatorLivenessWindowStartKey, w_liveness.take());
+}
+
 bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state) {
   const std::string utxo_prefix = storage::key_utxo_prefix();
   std::set<std::string> desired_utxos;
@@ -670,16 +635,21 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
     desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
   }
   std::vector<std::string> script_utxos_to_erase;
+  std::set<std::string> existing_script_utxos;
   for (const auto& [key, _] : db.scan_prefix(script_utxo_prefix)) {
     if (desired_script_utxos.find(key) == desired_script_utxos.end()) {
       script_utxos_to_erase.push_back(key);
+    } else {
+      existing_script_utxos.insert(key);
     }
   }
   for (const auto& key : script_utxos_to_erase) batch.erase(key);
+  // Existing rows keep the height they were written at (the output's finalization height).
   for (const auto& [op, entry] : state.utxos) {
     const auto transparent = transparent_txout_from_utxo_entry(entry);
     if (!transparent.has_value()) continue;
     const auto scripthash = crypto::sha256(transparent->script_pubkey);
+    if (existing_script_utxos.contains(storage::key_script_utxo(scripthash, op))) continue;
     batch.put_script_utxo(scripthash, op, *transparent, state.finalized_height);
   }
 
@@ -704,7 +674,10 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
     }
     codec::ByteReader r(*epoch_bytes);
     const auto epoch = r.u64le();
-    if (!epoch.has_value() || desired_checkpoint_epochs.find(*epoch) == desired_checkpoint_epochs.end()) {
+    // Rows below the state's oldest retained checkpoint are history the state pruned: keep them.
+    const bool below_retained =
+        epoch.has_value() && (desired_checkpoint_epochs.empty() || *epoch < *desired_checkpoint_epochs.begin());
+    if (!epoch.has_value() || (!below_retained && desired_checkpoint_epochs.find(*epoch) == desired_checkpoint_epochs.end())) {
       checkpoint_keys_to_erase.push_back(key);
     }
   }
@@ -713,16 +686,76 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
     (void)epoch;
     batch.put_finalized_committee_checkpoint(checkpoint);
   }
-  batch.put(kFinalizedRandomnessKey, Bytes(state.finalized_randomness.begin(), state.finalized_randomness.end()));
-  codec::ByteWriter w_start;
-  w_start.u64le(state.validator_join_window_start_height);
-  batch.put(kValidatorJoinWindowStartKey, w_start.take());
-  codec::ByteWriter w_count;
-  w_count.u32le(state.validator_join_count_in_window);
-  batch.put(kValidatorJoinWindowCountKey, w_count.take());
-  codec::ByteWriter w_liveness;
-  w_liveness.u64le(state.validator_liveness_window_start_height);
-  batch.put(kValidatorLivenessWindowStartKey, w_liveness.take());
+  stage_canonical_scalars(batch, state);
+  return true;
+}
+
+bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& prev,
+                                   const consensus::CanonicalDerivedState& next, const Hash32& next_utxo_root) {
+  std::vector<crypto::SmtChange> tree_changes;  // published per height for readers' in-memory trees
+  const auto stage_put = [&](const OutPoint& op, const UtxoEntryV2& entry) {
+    batch.put_utxo_v2(op, entry);
+    const auto key = consensus::utxo_commitment_key(op);
+    const auto value = consensus::utxo_commitment_value(entry);
+    batch.put(storage::key_smt_leaf(kSmtTreeUtxo, key), value);
+    tree_changes.push_back({key, crypto::SparseMerkleTree::leaf_hash(key, value)});
+    if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
+      batch.put_script_utxo(crypto::sha256(transparent->script_pubkey), op, *transparent, next.finalized_height);
+    }
+  };
+  const auto stage_erase = [&](const OutPoint& op, const UtxoEntryV2& entry) {
+    batch.erase(storage::key_utxo(op));
+    batch.erase(storage::key_smt_leaf(kSmtTreeUtxo, consensus::utxo_commitment_key(op)));
+    tree_changes.push_back({consensus::utxo_commitment_key(op), std::nullopt});
+    if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
+      batch.erase(storage::key_script_utxo(crypto::sha256(transparent->script_pubkey), op));
+    }
+  };
+  // Ordered merge of the two UTXO sets: only spent, created or changed outputs touch storage.
+  auto a = prev.utxos.begin();
+  auto b = next.utxos.begin();
+  while (a != prev.utxos.end() || b != next.utxos.end()) {
+    if (b == next.utxos.end() || (a != prev.utxos.end() && a->first < b->first)) {
+      stage_erase(a->first, a->second);
+      ++a;
+    } else if (a == prev.utxos.end() || b->first < a->first) {
+      stage_put(b->first, b->second);
+      ++b;
+    } else {
+      if (!(a->second == b->second)) {
+        stage_erase(a->first, a->second);
+        stage_put(b->first, b->second);
+      }
+      ++a;
+      ++b;
+    }
+  }
+
+  for (const auto& [pub, info] : next.validators.all()) batch.put_validator(pub, info);
+  for (const auto& [txid, req] : next.validator_join_requests) {
+    if (!prev.validator_join_requests.contains(txid)) batch.put_validator_join_request(txid, req);
+  }
+  // Both maps are bounded by prune_consensus_history; pruned entries keep their history rows.
+  for (const auto& [epoch, reward_state] : next.epoch_reward_states) {
+    (void)epoch;
+    batch.put_epoch_reward_settlement(reward_state);
+  }
+  for (const auto& [epoch, checkpoint] : next.finalized_committee_checkpoints) {
+    const auto it = prev.finalized_committee_checkpoints.find(epoch);
+    if (it == prev.finalized_committee_checkpoints.end() || !consensus::canonical_checkpoints_equal(it->second, checkpoint)) {
+      batch.put_finalized_committee_checkpoint(checkpoint);
+    }
+  }
+  batch.put_protocol_reserve_balance(next.protocol_reserve_balance_units);
+  batch.put_confidential_pool_value(next.confidential_pool_value);
+  stage_canonical_scalars(batch, next);
+  batch.put(storage::key_smt_delta(kSmtTreeUtxo, next.finalized_height), crypto::encode_smt_delta(tree_changes));
+  if (next.finalized_height > kRetainedSmtDeltaHeights) {
+    batch.erase(storage::key_smt_delta(kSmtTreeUtxo, next.finalized_height - kRetainedSmtDeltaHeights));
+  }
+  // The UTXO root was verified against the transition when the state was applied.
+  batch.put(storage::key_smt_root(kSmtTreeUtxo, next.finalized_height), Bytes(next_utxo_root.begin(), next_utxo_root.end()));
+  batch.put(storage::key_root_index("UTXO", next.finalized_height), Bytes(next_utxo_root.begin(), next_utxo_root.end()));
   return true;
 }
 
@@ -872,9 +905,24 @@ void sync_smt_tree(storage::DB& db, storage::DB::Batch& batch, const std::string
   desired.clear();
   for (const auto& [k, _] : leaves) desired.insert(storage::key_smt_leaf(tree_id, k));
   for (const auto& [k, _] : db.scan_prefix(prefix)) {
-    if (desired.find(k) == desired.end()) batch.put(k, {});
+    // Delete, not an empty tombstone: tombstones would keep a row for every leaf ever removed.
+    if (desired.find(k) == desired.end()) batch.erase(k);
   }
   for (const auto& [k, v] : leaves) batch.put(storage::key_smt_leaf(tree_id, k), v);
+}
+
+void persist_validator_roots(storage::DB& db, storage::DB::Batch& batch, std::uint64_t height,
+                             const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version) {
+  std::vector<std::pair<Hash32, Bytes>> validator_leaves;
+  validator_leaves.reserve(validators.all().size());
+  for (const auto& [pub, info] : validators.all()) {
+    validator_leaves.push_back(
+        {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, validation_rules_version)});
+  }
+  sync_smt_tree(db, batch, kSmtTreeValidators, validator_leaves);
+  const auto root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
+  batch.put(storage::key_smt_root(kSmtTreeValidators, height), Bytes(root.begin(), root.end()));
+  batch.put(storage::key_root_index("VAL", height), Bytes(root.begin(), root.end()));
 }
 
 // Core: stages every root/leaf write into `batch` instead of writing immediately.

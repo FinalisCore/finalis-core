@@ -84,7 +84,9 @@ struct NodeConfig {
   bool disable_p2p{false};
   // Operator consent to run while the committee comes from the emergency prior-committee rule.
   bool acknowledge_emergency_fallback{false};
-  bool fast_start{false};
+  // Restore the finalized state from the database when it matches the signed tip transition's
+  // next_state_commitment; otherwise replay from genesis. --no-fast-start always replays.
+  bool fast_start{true};
   bool reindex_on_start{true};
   std::uint64_t startup_frontier_repair_max_rollback{10'000};
   std::uint32_t startup_frontier_repair_adaptive_percent{5};
@@ -301,6 +303,10 @@ class Node {
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
   bool seed_bonded_validator_for_test(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t bond_amount);
   Hash32 canonical_state_commitment_for_test() const;
+  // Last startup's fast-start outcome: "ok", "fallback:<reason>", or empty when not attempted.
+  std::string fast_start_result_for_test() const;
+  // Sizes of the canonical state's history maps: checkpoints, block metadata, reward states.
+  std::array<std::size_t, 3> consensus_history_sizes_for_test() const;
   std::uint64_t canonical_state_height_for_test() const;
   std::uint16_t p2p_port_for_test() const;
   bool endpoint_is_obvious_self_for_test(const std::string& host, std::uint16_t port) const;
@@ -552,6 +558,8 @@ class Node {
                                          const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
                                          std::string* error = nullptr);
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
+  // Same, taking ownership: saves copying the state (its UTXO set) once per finalized block.
+  void hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& state);
   // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
   std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {
     if (!canonical_state_) return std::nullopt;
@@ -559,7 +567,7 @@ class Node {
   }
   consensus::CanonicalDerivationConfig canonical_derivation_config_locked() const;
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state,
-                                                            storage::DB::Batch& batch);
+                                                       storage::DB::Batch& batch, bool recompute = true);
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state);
   bool init_local_validator_key();
   bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator);
@@ -571,6 +579,7 @@ class Node {
   bool validate_frontier_proposal_locked(const FrontierProposal& proposal, std::string* error = nullptr) const;
   // Vote precondition: the local certified-ingress store holds every record of the proposal's lane
   // ranges, the certificates validate, and their round-robin merge is exactly the proposal's slice.
+  // It also applies the slice once per transition and requires the signed next_state_commitment.
   CertifiedIngressStatus certified_ingress_status_for_vote_locked(const FrontierProposal& proposal,
                                                                   std::string* detail) const;
   void request_missing_proposal_ingress_locked(const FrontierTransition& transition, int preferred_peer_id);
@@ -759,6 +768,13 @@ class Node {
   std::map<int, std::uint64_t> peer_last_finalized_tip_request_ms_;
   std::map<int, std::uint64_t> peer_tx_relay_backoff_until_ms_;
   std::map<std::uint64_t, std::size_t> sync_height_rr_cursor_;
+  // Log/request throttles keyed by peer-supplied values (IPs, epochs, heights): cleared when they reach
+  // this size so a peer cannot grow them without bound. Clearing only loses throttle state.
+  static constexpr std::size_t kMaxThrottleEntries = 4096;
+  template <typename Map>
+  static void bound_throttle_map(Map& map) {
+    if (map.size() >= kMaxThrottleEntries) map.clear();
+  }
   std::map<std::string, std::uint64_t> invalid_frame_log_ms_;
   std::map<std::string, std::uint64_t> addr_drop_log_ms_;
   std::uint64_t rejected_network_id_{0};
@@ -797,6 +813,19 @@ class Node {
   // locally. Keyed by transition id; value is the proposal message and the peer it came from.
   static constexpr std::size_t kMaxDeferredCertifiedVotes = 16;
   std::map<Hash32, std::pair<p2p::ProposeMsg, int>> deferred_certified_votes_;
+  // Transitions whose next_state_commitment this node recomputed and matched, with their height. A
+  // transition names its parent, so a match stays valid; entries at finalized heights are dropped.
+  mutable std::map<Hash32, std::uint64_t> post_state_verified_transitions_;
+  // The state produced by the most recently verified transition, reused when that transition
+  // finalizes on the same parent instead of executing it a second time.
+  struct VerifiedNextState {
+    Hash32 parent_id{};
+    Hash32 transition_id{};
+    consensus::CanonicalDerivedState state;
+    std::set<Hash32> accepted_txids;
+  };
+  mutable std::optional<VerifiedNextState> verified_next_state_;
+  std::string fast_start_result_;
   std::map<std::uint64_t, std::vector<BufferedSyncFrontier>> buffered_sync_frontiers_;
   std::size_t buffered_sync_bytes_{0};
   // Valid value per height: the highest-round polka (prevote quorum). Its proposal is kept in

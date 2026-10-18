@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_paths.hpp"
 
@@ -41,6 +42,14 @@
 using namespace finalis;
 
 namespace {
+
+// The chain domain a lightserver on the database at `db_path` validates transaction signatures under
+// (its chain_id_).
+Hash32 db_chain_domain(const std::string& db_path, const NetworkConfig& net = mainnet_network()) {
+  storage::DB db;
+  if (!db.open_readonly(db_path)) throw std::runtime_error("cannot open " + db_path);
+  return consensus_chain_domain(net, ChainId::from_config_and_db(net, db));
+}
 
 constexpr auto kClusterFinalizationTimeout = std::chrono::seconds(120);
 
@@ -293,7 +302,7 @@ TEST(test_lightserver_indexing_after_finalization) {
   const auto recipient_index = std::size_t{1};
   const auto recipient_pkh = crypto::h160(Bytes(keys[recipient_index].public_key.begin(), keys[recipient_index].public_key.end()));
   std::vector<TxOut> outs{TxOut{spend_out.value - fee, address::p2pkh_script_pubkey(recipient_pkh)}};
-  auto tx = build_signed_p2pkh_tx_single_input(spend_op, spend_out, keys[sender_index].private_key, outs);
+  auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), spend_op, spend_out, keys[sender_index].private_key, outs);
   ASSERT_TRUE(tx.has_value());
   const Hash32 txid = tx->txid();
   ASSERT_TRUE(db.put_tx_index(txid, 7, 0, tx->serialize()));
@@ -561,7 +570,7 @@ TEST(test_lightserver_get_tx_decodes_onboarding_registration_output_and_pow_fiel
   prev.index = 0;
   const auto funding_pkh = crypto::h160(Bytes(funding.public_key.begin(), funding.public_key.end()));
   const TxOut prev_out{1'000'000, address::p2pkh_script_pubkey(funding_pkh)};
-  auto tx = build_onboarding_registration_tx(prev, prev_out, funding.private_key, validator.public_key, validator.private_key,
+  auto tx = build_onboarding_registration_tx(finalis::test::test_chain_domain(), prev, prev_out, funding.private_key, validator.public_key, validator.private_key,
                                              payout.public_key, 1'000, prev_out.script_pubkey);
   ASSERT_TRUE(tx.has_value());
   const Hash32 txid = tx->txid();
@@ -829,7 +838,7 @@ TEST(test_lightserver_exposes_persisted_ingress_visibility_endpoints) {
   op.txid.fill(0x91);
   op.index = 0;
   TxOut prev{10'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end())))};
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), 
       op, prev, keys[0].private_key,
       std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
   ASSERT_TRUE(tx.has_value());
@@ -878,7 +887,7 @@ TEST(test_lightserver_verify_ingress_slice_fails_closed_on_missing_or_corrupt_re
   op.txid.fill(0xA1);
   op.index = 0;
   TxOut prev{10'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end())))};
-  auto tx_a = build_signed_p2pkh_tx_single_input(
+  auto tx_a = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), 
       op, prev, keys[0].private_key,
       std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
   ASSERT_TRUE(tx_a.has_value());
@@ -1197,7 +1206,7 @@ TEST(test_lightserver_broadcast_returns_structured_duplicate_code_for_finalized_
   op.index = 0;
   TxOut prev{10'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end())))};
   ASSERT_TRUE(db.put_utxo(op, prev));
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), 
       op, prev, keys[0].private_key,
       std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
   ASSERT_TRUE(tx.has_value());
@@ -1282,7 +1291,7 @@ TEST(test_lightserver_broadcast_returns_mempool_pressure_rejection_from_runtime_
   ASSERT_TRUE(db.flush());
   db.close();
 
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(db_chain_domain(base), 
       op, prev, keys[0].private_key,
       std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
   ASSERT_TRUE(tx.has_value());
@@ -1323,7 +1332,7 @@ TEST(test_lightserver_broadcast_returns_relay_unavailable_code_when_relay_path_f
   ASSERT_TRUE(db.flush());
   db.close();
 
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(db_chain_domain(base), 
       op, prev, keys[0].private_key,
       std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
   ASSERT_TRUE(tx.has_value());
@@ -1367,7 +1376,7 @@ TEST(test_lightserver_broadcast_reports_node_mempool_rejection) {
   ASSERT_TRUE(db.flush());
   db.close();
 
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(db_chain_domain(base), 
       op, prev, keys[0].private_key,
       std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
   ASSERT_TRUE(tx.has_value());
@@ -1414,7 +1423,7 @@ TEST(test_lightserver_broadcast_returns_structured_success_when_relaying_to_live
   ASSERT_TRUE(db.flush());
   db.close();
 
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(db_chain_domain(base), 
       op, prev, keys[0].private_key,
       std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
   ASSERT_TRUE(tx.has_value());
@@ -2382,7 +2391,7 @@ TEST(test_lightserver_broadcast_accepts_txv2_spending_confidential_output) {
       .one_time_pubkey = *one_time_pubkey,
   };
   std::string err;
-  const auto tx = wallet::build_txv2_confidential_to_transparent(coin, TransparentTxOutV2{9'000, recipient_spk}, 1'000,
+  const auto tx = wallet::build_txv2_confidential_to_transparent(db_chain_domain(base), coin, TransparentTxOutV2{9'000, recipient_spk}, 1'000,
                                                                  nonce_a, nonce_b, &err);
   ASSERT_TRUE(tx.has_value());
 

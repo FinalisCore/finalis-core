@@ -101,7 +101,7 @@ std::optional<WalletSendPlan> plan_wallet_p2pkh_send(const std::vector<std::pair
   return plan;
 }
 
-std::optional<Tx> build_signed_p2pkh_tx_single_input(const OutPoint& prev_outpoint, const TxOut& prev_out,
+std::optional<Tx> build_signed_p2pkh_tx_single_input(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,
                                                       const Bytes& private_key_32,
                                                       const std::vector<TxOut>& outputs,
                                                       std::string* err) {
@@ -127,7 +127,7 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const OutPoint& prev_outpoi
   tx.inputs.push_back(TxIn{prev_outpoint.txid, prev_outpoint.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs = outputs;
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(chain_domain, tx, 0);
   if (!msg.has_value()) {
     if (err) *err = "failed to build sighash";
     return std::nullopt;
@@ -149,7 +149,7 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const OutPoint& prev_outpoi
   return tx;
 }
 
-std::optional<Tx> build_signed_p2pkh_tx_multi_input(const std::vector<std::pair<OutPoint, TxOut>>& prevs,
+std::optional<Tx> build_signed_p2pkh_tx_multi_input(const Hash32& chain_domain, const std::vector<std::pair<OutPoint, TxOut>>& prevs,
                                                     const Bytes& private_key_32,
                                                     const std::vector<TxOut>& outputs,
                                                     std::string* err) {
@@ -186,7 +186,7 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const std::vector<std::pair<
   }
 
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
-    auto msg = signing_message_for_input(tx, i);
+    auto msg = signing_message_for_input(chain_domain, tx, i);
     if (!msg.has_value()) {
       if (err) *err = "failed to build sighash";
       return std::nullopt;
@@ -208,7 +208,7 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const std::vector<std::pair<
   return tx;
 }
 
-std::optional<Tx> build_unbond_tx(const OutPoint& bond_outpoint, const PubKey32& validator_pubkey,
+std::optional<Tx> build_unbond_tx(const Hash32& chain_domain, const OutPoint& bond_outpoint, const PubKey32& validator_pubkey,
                                   std::uint64_t bond_value, std::uint64_t fee,
                                   const Bytes& validator_privkey_32, std::string* err) {
   if (bond_value < fee) {
@@ -233,7 +233,7 @@ std::optional<Tx> build_unbond_tx(const OutPoint& bond_outpoint, const PubKey32&
   spk.insert(spk.end(), validator_pubkey.begin(), validator_pubkey.end());
   tx.outputs.push_back(TxOut{bond_value - fee, spk});
 
-  auto msg = unbond_message_for_input(tx, 0);
+  auto msg = unbond_message_for_input(chain_domain, tx, 0);
   if (!msg.has_value()) {
     if (err) *err = "unbond sighash failed";
     return std::nullopt;
@@ -254,18 +254,18 @@ std::optional<Tx> build_unbond_tx(const OutPoint& bond_outpoint, const PubKey32&
   return tx;
 }
 
-std::optional<Tx> build_validator_join_request_tx(const OutPoint& prev_outpoint, const TxOut& prev_out,
+std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,
                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
                                                   std::uint64_t bond_amount, std::uint64_t fee,
                                                   const Bytes& change_script_pubkey, std::string* err,
                                                   const ValidatorJoinAdmissionPowBuildContext* pow_ctx) {
   return build_validator_join_request_tx(
-      std::vector<std::pair<OutPoint, TxOut>>{{prev_outpoint, prev_out}}, funding_privkey_32, validator_pubkey,
+      chain_domain, std::vector<std::pair<OutPoint, TxOut>>{{prev_outpoint, prev_out}}, funding_privkey_32, validator_pubkey,
       validator_privkey_32, payout_pubkey, bond_amount, fee, change_script_pubkey, err, pow_ctx);
 }
 
-std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<OutPoint, TxOut>>& prevs,
+std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, const std::vector<std::pair<OutPoint, TxOut>>& prevs,
                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
                                                   std::uint64_t bond_amount, std::uint64_t fee,
@@ -339,21 +339,21 @@ std::optional<Tx> build_validator_join_request_tx(const std::vector<std::pair<Ou
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
   const std::uint64_t change = total_prev - required;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
-  return build_signed_p2pkh_tx_multi_input(prevs, funding_privkey_32, outputs, err);
+  return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);
 }
 
-std::optional<Tx> build_onboarding_registration_tx(const OutPoint& prev_outpoint, const TxOut& prev_out,
+std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,
                                                    const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
                                                    const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
                                                    std::uint64_t fee, const Bytes& change_script_pubkey,
                                                    std::string* err,
                                                    const ValidatorJoinAdmissionPowBuildContext* pow_ctx) {
-  return build_onboarding_registration_tx(std::vector<std::pair<OutPoint, TxOut>>{{prev_outpoint, prev_out}},
+  return build_onboarding_registration_tx(chain_domain, std::vector<std::pair<OutPoint, TxOut>>{{prev_outpoint, prev_out}},
                                           funding_privkey_32, validator_pubkey, validator_privkey_32, payout_pubkey,
                                           fee, change_script_pubkey, err, pow_ctx);
 }
 
-std::optional<Tx> build_onboarding_registration_tx(const std::vector<std::pair<OutPoint, TxOut>>& prevs,
+std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, const std::vector<std::pair<OutPoint, TxOut>>& prevs,
                                                    const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
                                                    const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
                                                    std::uint64_t fee, const Bytes& change_script_pubkey,
@@ -417,7 +417,7 @@ std::optional<Tx> build_onboarding_registration_tx(const std::vector<std::pair<O
   std::vector<TxOut> outputs{TxOut{0, req_spk}};
   const std::uint64_t change = total_prev - fee;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
-  return build_signed_p2pkh_tx_multi_input(prevs, funding_privkey_32, outputs, err);
+  return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);
 }
 
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,

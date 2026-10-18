@@ -11,11 +11,11 @@ rehearse mainnet without being mistaken for it:
 | data directory | `~/.finalis/mainnet` | `~/.finalis/testnet` |
 | network id, magic | see `mainnet/genesis.json` | `sha256("finalis:testnet")[:16]`, `0x54534331` |
 
-Transactions sign over the network identity, so a transaction signed for one network is invalid
-on the other, and the different P2P magic keeps their nodes from connecting. Consensus messages
-(votes, proposals, timeout votes) do not yet commit to the network, so never use a testnet
-validator key on mainnet: its public testnet votes would count as equivocation evidence there.
-Testnet coins have no value.
+Every signature commits to the chain domain `sha256d("SC-CHAIN-DOMAIN-V1" || network_id ||
+genesis_hash)`: transaction inputs, unbonds, confidential spends and balance proofs, as well as votes,
+proposals and timeout votes. A transaction or vote signed for one network is therefore invalid on
+every other one, and the different P2P magic keeps their nodes from connecting. Still, keep testnet
+and mainnet keys separate. Testnet coins have no value.
 
 ## Genesis (testnet-1)
 
@@ -53,8 +53,9 @@ scripts/genesis_to_cpp.py --network testnet --in testnet/genesis.bin --out src/g
 Commit `pubkeys.txt`, `genesis.json`, `genesis.bin` and `embedded_testnet.cpp` together, tag the
 commit, and publish the `genesis_hash`. Anyone can reproduce it from the committed files.
 
-testnet-1 is embedded (`genesis_hash` `358d09d637194c673fe85b1fc5a6b06089915793327595c0b6d1b1a12696418b`,
-check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--genesis` flag.
+testnet-1 is embedded (`genesis_hash` `5cabf22be344bd39a37a3a434e7a00dfa2caaba8f148de88cdcef706a103f7a0`,
+check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--genesis` flag. Its
+`genesis_time_unix` is 1792400400 (2026-10-19 09:00 UTC); the code freeze is commit 3519f84.
 
 ### 3. Seeds
 

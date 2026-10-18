@@ -123,7 +123,12 @@ struct CanonicalDerivedState {
   // Derived supply-audit accumulators; deliberately not part of state_commitment.
   ConfidentialSupplyLedger confidential_supply;
   Hash32 state_commitment{};
+  // Commitment tree of `utxos` (root = frontier_utxo_state_root(utxos)), maintained by apply. Use
+  // utxo_tree_for(): a state whose tree does not match its UTXO set (e.g. built by hand) gets a fresh one.
+  crypto::PersistentSmt utxo_tree;
 };
+
+crypto::PersistentSmt utxo_tree_for(const CanonicalDerivedState& state);
 
 struct AdaptiveCheckpointParameters {
   std::uint64_t qualified_depth{0};
@@ -181,7 +186,9 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
                                            const std::vector<FinalitySig>& prev_finality_signers,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
-                                           std::string* error);
+                                           std::string* error,
+                                           const crypto::PersistentSmt* post_execution_tree = nullptr,
+                                           crypto::PersistentSmt* settled_tree_out = nullptr);
 bool load_certified_frontier_record_from_storage(const storage::DB& db, const FrontierTransition& transition,
                                                  CanonicalFrontierRecord* out, std::string* error);
 bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
@@ -193,6 +200,15 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                            const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error,
                            std::set<Hash32>* accepted_txids = nullptr);
+// Checks `cert` finalizes `transition` with a quorum of valid precommits from the committee that
+// `state`'s checkpoints give for (transition.height, cert.round).
+bool verify_frontier_finality_certificate(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                          const FrontierTransition& transition, const FinalityCertificate& cert,
+                                          std::string* error);
+// For a proposer: applies `record` without checking its next_state_commitment and returns the value
+// that field must hold. Everything else is verified as in apply_frontier_record.
+bool derive_frontier_next_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                           const CanonicalFrontierRecord& record, Hash32* out, std::string* error);
 bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig& cfg,
                                                 const CanonicalDerivedState& initial_state,
                                                 const std::vector<CanonicalFrontierRecord>& chain,
@@ -201,7 +217,33 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
                                                   const CanonicalDerivedState& initial_state,
                                                   const storage::DB& db,
                                                   CanonicalDerivedState* out, std::string* error);
+// History the consensus state keeps (and commits to), counted back from the epoch of the next height:
+// - committee checkpoints: the unbond delay plus 2 epochs, so equivocation evidence can be checked
+//   against its height's committee for as long as the bond can still be slashed; this also covers the
+//   ticket difficulty / adaptive lookbacks (at most 6 epochs);
+// - block metadata and per-epoch randomness: kRetainedMetadataEpochs (ticket difficulty reads 6);
+// - reward states: unsettled ones, and settled ones for one more epoch.
+// Older entries are dropped from the state by prune_consensus_history at every height, so the state
+// and the work per block stay bounded. The database keeps its history rows for queries.
+inline constexpr std::uint64_t kRetainedMetadataEpochs = 8;
+std::uint64_t retained_checkpoint_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
+std::uint64_t retained_metadata_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
+void prune_consensus_history(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state);
+// The ticket difficulty checkpoint derivation uses for `epoch_start_height`, from finalized state (the
+// same rule and inputs the next checkpoint will be derived with).
+std::uint8_t ticket_difficulty_bits_for_epoch_from_state(const CanonicalDerivationConfig& cfg,
+                                                         const CanonicalDerivedState& state,
+                                                         std::uint64_t epoch_start_height);
+
+// Commitment to the post-state of a finalized transition: everything consensus_state_commitment covers
+// except finalized_identity and last_finality_certificate_hash, which are derived from the transition
+// itself. A FrontierTransition signs it as next_state_commitment. known_utxo_root, when given, must equal
+// frontier_utxo_state_root(state.utxos).
+Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                       const Hash32* known_utxo_root = nullptr);
+// sha256d("SC-CANON-STATE-V3" || finalized_identity.id || last_finality_certificate_hash || post-state commitment).
 Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state);
+Hash32 consensus_state_commitment_from_post_state(const CanonicalDerivedState& state, const Hash32& post_state_commitment);
 std::uint64_t qualified_depth_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,
                                             std::uint64_t effective_min_bond,
                                             const availability::AvailabilityPersistentState& availability_state,

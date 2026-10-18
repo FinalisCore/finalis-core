@@ -17,6 +17,7 @@
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "common/socket_compat.hpp"
+#include "crypto/smt.hpp"
 #include "storage/db.hpp"
 
 namespace finalis::lightserver {
@@ -121,6 +122,10 @@ class Server {
 
   std::optional<std::vector<PubKey32>> committee_for_height(std::uint64_t height);
   TxRelayResult relay_tx_to_peer(const Bytes& tx_bytes);
+  // Proof for `key` from an in-memory UTXO commitment tree kept at `height` (the finalized tip) by
+  // applying the node's per-height change rows; rebuilt from the stored leaves when it cannot catch up.
+  // Empty if the tree's root does not match `expected_root`.
+  std::optional<crypto::SmtProof> utxo_proof_at(std::uint64_t height, const Hash32& expected_root, const Hash32& key);
 
   Config cfg_;
   storage::DB db_;
@@ -138,6 +143,9 @@ class Server {
   RateLimiter rate_limiter_;
   std::uint64_t started_at_unix_{0};
   ChainId chain_id_{};
+  std::mutex utxo_tree_mu_;
+  std::optional<crypto::PersistentSmt> utxo_tree_;
+  std::uint64_t utxo_tree_height_{0};
 };
 
 std::optional<Config> parse_args(int argc, char** argv);

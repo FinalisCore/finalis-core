@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
 #include "common/address.hpp"
@@ -96,7 +97,7 @@ Hash32 slash_test_domain() { return consensus_chain_domain(mainnet_network(), sl
 
 SpecialValidationContext join_pow_ctx(const NetworkConfig& net, const ChainId& chain_id, std::uint64_t current_height,
                                       const Hash32& anchor) {
-  return SpecialValidationContext{
+  return finalis::test::with_test_chain_identity(SpecialValidationContext{
       .network = &net,
       .chain_id = &chain_id,
       .current_height = current_height,
@@ -107,7 +108,7 @@ SpecialValidationContext join_pow_ctx(const NetworkConfig& net, const ChainId& c
         if (height == 0) return zero_hash();
         return anchor;
       },
-  };
+  });
 }
 
 SpecialValidationContext join_pow_ctx_with_validators(const NetworkConfig& net, const ChainId& chain_id,
@@ -126,7 +127,7 @@ std::optional<Tx> build_manual_join_tx(const OutPoint& prev_outpoint, const TxOu
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_script}};
   const auto change = prev_out.value - bond_amount - fee;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
-  return build_signed_p2pkh_tx_single_input(prev_outpoint, prev_out, funding_privkey, outputs, err);
+  return build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), prev_outpoint, prev_out, funding_privkey, outputs, err);
 }
 
 }  // namespace
@@ -185,13 +186,13 @@ TEST(test_sconbreg_tx_validates_with_zero_value_output_and_valid_pop) {
       1'000'000,
       address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
   std::string err;
-  auto tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto tx = build_onboarding_registration_tx(finalis::test::test_chain_domain(), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                              validator.private_key, payout.public_key, 1000,
                                              prev_out.script_pubkey, &err);
   ASSERT_TRUE(tx.has_value());
   UtxoSet utxos;
   utxos.emplace(spend_op, UtxoEntry{prev_out});
-  auto r = validate_tx(*tx, 1, utxos, nullptr);
+  auto r = validate_tx(*tx, 1, utxos, finalis::test::test_validation_ctx());
   ASSERT_TRUE(r.ok);
 }
 
@@ -216,11 +217,11 @@ TEST(test_sconbreg_tx_rejects_join_request_mixing) {
   };
   const auto change = prev_out.value - BOND_AMOUNT - 1000;
   if (change > 0) outputs.push_back(TxOut{change, prev_out.script_pubkey});
-  auto tx = build_signed_p2pkh_tx_single_input(spend_op, prev_out, sponsor.private_key, outputs);
+  auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), spend_op, prev_out, sponsor.private_key, outputs);
   ASSERT_TRUE(tx.has_value());
   UtxoSet utxos;
   utxos.emplace(spend_op, UtxoEntry{prev_out});
-  auto r = validate_tx(*tx, 1, utxos, nullptr);
+  auto r = validate_tx(*tx, 1, utxos, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("SCONBREG may not appear with validator join outputs"));
 }
@@ -233,15 +234,15 @@ TEST(test_sconbreg_rejects_duplicate_and_banned_validator_pubkey_when_registry_c
   const TxOut prev_out{
       1'000'000,
       address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  auto net = mainnet_network();
+  const auto chain_id = sample_chain_id(net);
   std::string err;
-  auto tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto tx = build_onboarding_registration_tx(consensus_chain_domain(net, chain_id), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                              validator.private_key, payout.public_key, 1000, prev_out.script_pubkey);
   ASSERT_TRUE(tx.has_value());
   UtxoSet utxos;
   utxos.emplace(spend_op, UtxoEntry{prev_out});
 
-  auto net = mainnet_network();
-  const auto chain_id = sample_chain_id(net);
   Hash32 anchor{};
   anchor.fill(0x31);
   consensus::ValidatorRegistry vr;
@@ -281,7 +282,7 @@ TEST(test_sconbreg_admission_pow_valid_nonce_is_accepted_and_disabled_mode_prese
       },
   };
   std::string err;
-  auto tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto tx = build_onboarding_registration_tx(consensus_chain_domain(net, chain_id), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                              validator.private_key, payout.public_key, 1000, prev_out.script_pubkey,
                                              &err, &pow_ctx);
   ASSERT_TRUE(tx.has_value());
@@ -294,7 +295,7 @@ TEST(test_sconbreg_admission_pow_valid_nonce_is_accepted_and_disabled_mode_prese
   auto disabled_net = net;
   disabled_net.onboarding_admission_pow_difficulty_bits = 0;
   auto disabled_ctx = join_pow_ctx(disabled_net, chain_id, 33, anchor);
-  auto legacy_tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto legacy_tx = build_onboarding_registration_tx(consensus_chain_domain(net, chain_id), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                                     validator.private_key, payout.public_key, 1000,
                                                     prev_out.script_pubkey, &err, nullptr);
   ASSERT_TRUE(legacy_tx.has_value());
@@ -326,7 +327,7 @@ TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_ancho
       },
   };
   std::string err;
-  auto valid_tx = build_onboarding_registration_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto valid_tx = build_onboarding_registration_tx(consensus_chain_domain(net, chain_id), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                                    validator.private_key, payout.public_key, 1000,
                                                    prev_out.script_pubkey, &err, &pow_ctx);
   ASSERT_TRUE(valid_tx.has_value());
@@ -351,7 +352,7 @@ TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_ancho
   }
   auto bad_nonce_script = onboarding_registration_script_with_pow(
       validator.public_key, payout.public_key, parsed.pop, parsed.admission_pow_epoch, bad_nonce);
-  auto bad_nonce_tx = build_signed_p2pkh_tx_single_input(
+  auto bad_nonce_tx = build_signed_p2pkh_tx_single_input(consensus_chain_domain(net, chain_id), 
       spend_op, prev_out, sponsor.private_key,
       std::vector<TxOut>{TxOut{0, bad_nonce_script}, TxOut{prev_out.value - 1000, prev_out.script_pubkey}});
   ASSERT_TRUE(bad_nonce_tx.has_value());
@@ -379,7 +380,7 @@ TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_ancho
   auto wrong_payout_script = onboarding_registration_script_with_pow(
       validator.public_key, other_payout.public_key, wrong_payout_pop, parsed.admission_pow_epoch,
       parsed.admission_pow_nonce);
-  auto wrong_payout_tx = build_signed_p2pkh_tx_single_input(
+  auto wrong_payout_tx = build_signed_p2pkh_tx_single_input(consensus_chain_domain(net, chain_id), 
       spend_op, prev_out, sponsor.private_key,
       std::vector<TxOut>{TxOut{0, wrong_payout_script}, TxOut{prev_out.value - 1000, prev_out.script_pubkey}});
   ASSERT_TRUE(wrong_payout_tx.has_value());
@@ -455,7 +456,7 @@ TEST(test_validator_join_admission_pow_valid_nonce_is_accepted_and_disabled_mode
       },
   };
   std::string err;
-  auto tx = build_validator_join_request_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto tx = build_validator_join_request_tx(consensus_chain_domain(net, chain_id), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                             validator.private_key, payout.public_key, BOND_AMOUNT, 1'000, change_spk, &err,
                                             &pow_ctx);
   ASSERT_TRUE(tx.has_value());
@@ -464,7 +465,7 @@ TEST(test_validator_join_admission_pow_valid_nonce_is_accepted_and_disabled_mode
 
   auto disabled_net = net;
   disabled_net.validator_join_admission_pow_difficulty_bits = 0;
-  auto legacy_tx = build_validator_join_request_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto legacy_tx = build_validator_join_request_tx(consensus_chain_domain(net, chain_id), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                                    validator.private_key, payout.public_key, BOND_AMOUNT, 1'000, change_spk,
                                                    &err, nullptr);
   ASSERT_TRUE(legacy_tx.has_value());
@@ -501,7 +502,7 @@ TEST(test_validator_join_admission_pow_rejects_invalid_nonce_expired_epoch_wrong
       },
   };
   std::string err;
-  auto valid_tx = build_validator_join_request_tx(spend_op, prev_out, sponsor.private_key, validator.public_key,
+  auto valid_tx = build_validator_join_request_tx(consensus_chain_domain(net, chain_id), spend_op, prev_out, sponsor.private_key, validator.public_key,
                                                   validator.private_key, payout.public_key, BOND_AMOUNT, 1'000, change_spk,
                                                   &err, &pow_ctx);
   ASSERT_TRUE(valid_tx.has_value());
@@ -555,16 +556,58 @@ TEST(test_unbond_signature_and_rule_validation) {
   vr.advance_height(WARMUP_BLOCKS + 2);
 
   std::string err;
-  auto tx = build_unbond_tx(bond_op, kp.public_key, BOND_AMOUNT, 1000, kp.private_key, &err);
+  auto tx = build_unbond_tx(finalis::test::test_chain_domain(), bond_op, kp.public_key, BOND_AMOUNT, 1000, kp.private_key, &err);
   ASSERT_TRUE(tx.has_value());
 
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .validators = &vr,
       .current_height = WARMUP_BLOCKS + 5,
       .is_committee_member = {},
-  };
+  });
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
+}
+
+// A genesis validator's bond outpoint is (zero_hash, 0) on every network, so only the chain domain
+// in the signature keeps an unbond signed on one chain (testnet) from being valid on another.
+TEST(test_unbond_and_spend_signed_for_one_chain_are_invalid_on_another) {
+  const auto kp = key_from_byte(10);
+  const OutPoint bond_op{zero_hash(), 0};
+  UtxoSet view;
+  view[bond_op] = UtxoEntry{TxOut{BOND_AMOUNT, reg_script(kp.public_key)}};
+  consensus::ValidatorRegistry vr;
+  vr.register_bond(kp.public_key, bond_op, 1);
+  vr.advance_height(WARMUP_BLOCKS + 2);
+
+  ChainId other_chain = finalis::test::test_chain_id();
+  other_chain.genesis_hash_hex = std::string(64, 'b');
+  const auto other_domain = consensus_chain_domain(finalis::test::test_network(), other_chain);
+  ASSERT_TRUE(other_domain != finalis::test::test_chain_domain());
+
+  const auto ctx = finalis::test::with_test_chain_identity(
+      SpecialValidationContext{.validators = &vr, .current_height = WARMUP_BLOCKS + 5});
+  std::string err;
+  const auto here = build_unbond_tx(finalis::test::test_chain_domain(), bond_op, kp.public_key, BOND_AMOUNT, 1000,
+                                    kp.private_key, &err);
+  const auto elsewhere = build_unbond_tx(other_domain, bond_op, kp.public_key, BOND_AMOUNT, 1000, kp.private_key, &err);
+  ASSERT_TRUE(here.has_value() && elsewhere.has_value());
+  ASSERT_TRUE(validate_tx(*here, 1, view, &ctx).ok);
+  ASSERT_EQ(validate_tx(*elsewhere, 1, view, &ctx).error, std::string("unbond signature invalid"));
+
+  // Plain spends: same rule; and no chain identity at all fails closed.
+  const OutPoint coin_op{Hash32{0x77}, 0};
+  const TxOut coin{50'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end())))};
+  UtxoSet coins;
+  coins.emplace(coin_op, UtxoEntry{coin});
+  const std::vector<TxOut> outs{TxOut{49'000, coin.script_pubkey}};
+  const auto spend_elsewhere = build_signed_p2pkh_tx_single_input(other_domain, coin_op, coin, kp.private_key, outs);
+  const auto spend_here =
+      build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), coin_op, coin, kp.private_key, outs);
+  ASSERT_TRUE(spend_here.has_value() && spend_elsewhere.has_value());
+  ASSERT_TRUE(validate_tx(*spend_here, 1, coins, finalis::test::test_validation_ctx()).ok);
+  ASSERT_EQ(validate_tx(*spend_elsewhere, 1, coins, finalis::test::test_validation_ctx()).error,
+            std::string("signature invalid"));
+  ASSERT_EQ(validate_tx(*spend_here, 1, coins, nullptr).error, std::string("tx validation requires chain identity"));
 }
 
 TEST(test_scvalreg_requires_matching_join_request) {
@@ -585,7 +628,7 @@ TEST(test_scvalreg_requires_matching_join_request) {
   tx.inputs.push_back(TxIn{spend_op.txid, spend_op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{BOND_AMOUNT, reg_script(kp.public_key)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, sponsor.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -597,10 +640,10 @@ TEST(test_scvalreg_requires_matching_join_request) {
   tx.inputs[0].script_sig = ss;
 
   consensus::ValidatorRegistry vr;
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .validators = &vr,
       .current_height = 1,
-  };
+  });
   auto r = validate_tx(tx, 1, view, &ctx);
   ASSERT_TRUE(!r.ok);
 }
@@ -628,7 +671,7 @@ TEST(test_unbond_delay_enforced) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 2000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -639,11 +682,11 @@ TEST(test_unbond_delay_enforced) {
   ss.insert(ss.end(), kp.public_key.begin(), kp.public_key.end());
   tx.inputs[0].script_sig = ss;
 
-  SpecialValidationContext early{.validators = &vr, .current_height = 50 + UNBOND_DELAY_BLOCKS - 1};
+  SpecialValidationContext early = finalis::test::with_test_chain_identity(SpecialValidationContext{.validators = &vr, .current_height = 50 + UNBOND_DELAY_BLOCKS - 1});
   auto r1 = validate_tx(tx, 1, view, &early);
   ASSERT_TRUE(!r1.ok);
 
-  SpecialValidationContext late{.validators = &vr, .current_height = 50 + UNBOND_DELAY_BLOCKS};
+  SpecialValidationContext late = finalis::test::with_test_chain_identity(SpecialValidationContext{.validators = &vr, .current_height = 50 + UNBOND_DELAY_BLOCKS});
   auto r2 = validate_tx(tx, 1, view, &late);
   ASSERT_TRUE(r2.ok);
 }
@@ -671,7 +714,7 @@ TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 2000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -682,11 +725,11 @@ TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {
   ss.insert(ss.end(), kp.public_key.begin(), kp.public_key.end());
   tx.inputs[0].script_sig = ss;
 
-  SpecialValidationContext post_fork{
+  SpecialValidationContext post_fork = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .validators = &vr,
       // CLEANSLATE: Validator economics are active at genesis.
       .current_height = UNBOND_DELAY_BLOCKS + 50,
-  };
+  });
   auto r = validate_tx(tx, 1, view, &post_fork);
   ASSERT_TRUE(r.ok);
 }
@@ -732,15 +775,15 @@ TEST(test_banned_validator_cannot_unbond_scvalreg) {
   vr.ban(kp.public_key, 10);
 
   std::string err;
-  auto tx = build_unbond_tx(bond_op, kp.public_key, BOND_AMOUNT, 1000, kp.private_key, &err);
+  auto tx = build_unbond_tx(finalis::test::test_chain_domain(), bond_op, kp.public_key, BOND_AMOUNT, 1000, kp.private_key, &err);
   ASSERT_TRUE(tx.has_value());
 
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .validators = &vr,
       .current_height = 20,
       .unbond_delay_blocks = UNBOND_DELAY_BLOCKS,
       .is_committee_member = {},
-  };
+  });
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(!r.ok);
 }
@@ -779,13 +822,13 @@ TEST(test_slash_evidence_parsing_and_validation) {
   consensus::ValidatorRegistry vr;
   vr.register_bond(kp.public_key, bond_op, 10);
   vr.advance_height(200);
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .network = &mainnet_network(),
       .chain_id = &slash_test_chain_id(),
       .validators = &vr,
       .current_height = 200,
       .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
-  };
+  });
 
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
@@ -820,13 +863,13 @@ TEST(test_slash_evidence_from_another_chain_is_rejected) {
   consensus::ValidatorRegistry vr;
   vr.register_bond(kp.public_key, bond_op, 10);
   vr.advance_height(600);
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .network = &mainnet_network(),
       .chain_id = &slash_test_chain_id(),
       .validators = &vr,
       .current_height = 600,
       .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
-  };
+  });
 
   auto foreign = build_slash_tx(bond_op, BOND_AMOUNT, signed_vote(other_domain, 0x51), signed_vote(other_domain, 0x52), 0);
   ASSERT_TRUE(foreign.has_value());
@@ -877,13 +920,13 @@ TEST(test_prevote_slash_evidence_validation) {
   consensus::ValidatorRegistry vr;
   vr.register_bond(kp.public_key, bond_op, 10);
   vr.advance_height(400);
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .network = &mainnet_network(),
       .chain_id = &slash_test_chain_id(),
       .validators = &vr,
       .current_height = 400,
       .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
-  };
+  });
 
   const auto [pa, pb] = signed_pair(true);
   auto tx = build_slash_tx(bond_op, BOND_AMOUNT, pa, pb, 0, nullptr, SlashVoteKind::Prevote);
@@ -943,14 +986,14 @@ TEST(test_scvalunb_slash_evidence_validation) {
   vr.register_bond(kp.public_key, bond_op, 10);
   ASSERT_TRUE(vr.request_unbond(kp.public_key, 50));
 
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .network = &mainnet_network(),
       .chain_id = &slash_test_chain_id(),
       .validators = &vr,
       .current_height = 200,
       .unbond_delay_blocks = UNBOND_DELAY_BLOCKS,
       .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
-  };
+  });
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
 }
@@ -971,7 +1014,7 @@ TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 1000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -984,11 +1027,11 @@ TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
 
   consensus::ValidatorRegistry vr;
   vr.register_bond(kp.public_key, bond_op, 1);
-  SpecialValidationContext ctx{
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
       .validators = &vr,
       .current_height = 10,
       .is_committee_member = {},
-  };
+  });
 
   auto r = validate_tx(tx, 1, view, &ctx);
   ASSERT_TRUE(!r.ok);

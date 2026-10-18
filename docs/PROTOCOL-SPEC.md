@@ -68,6 +68,57 @@ Important boundary:
 - obsolete block-era storage must fail closed rather than being interpreted as
   live frontier state
 
+## State Commitments
+
+Each frontier transition commits to the state it produces:
+
+- `next_state_root`: sparse Merkle root of the UTXO set after the transition
+  (the leaves `utxo_commitment_key(op) -> utxo_commitment_value(entry)`).
+- `next_state_commitment`: the post-state commitment
+  `sha256d("SC-POST-STATE-V1" || height || frontier || utxo_root || validator_root ||
+  finalized_randomness || reward_root || reserve || checkpoint_root || availability epoch ||
+  availability_operator_root || availability_prefix_root || join window || liveness window ||
+  confidential_pool_value || block_metadata_root)` (`consensus_post_state_commitment`).
+  `block_metadata_root` covers each retained height's `(transition round, quorum, signer count)`,
+  which ticket difficulty is derived from.
+
+The post-state leaves out the two values derived from the transition itself
+(its id and its finality link hash), so a transition can sign it. Nothing else
+in the post-state depends on the transition id; the availability audit seed in
+particular is `availability_audit_seed(finalized_randomness, epoch)`, which the
+leader cannot grind.
+
+History in the committed state is bounded (`prune_consensus_history`, applied at every height,
+counted back from the epoch of the next height):
+
+- committee checkpoints: the unbond delay plus 2 epochs (at least 8), so equivocation evidence can
+  be checked against its height's committee for as long as the bond can be slashed;
+- block metadata and per-epoch randomness: 8 epochs (ticket difficulty reads 6);
+- epoch reward states: unsettled ones, and settled ones for one more epoch.
+
+Nodes keep the full history in their database for queries; only the committed state is bounded, so
+the work per block does not grow with the age of the chain.
+
+An exiting validator whose bond is the outpoint `(zero_hash, 0)` (genesis bonds, which are not
+UTXOs and so cannot be spent by an unbond) is withdrawn by consensus once its unbond delay has
+passed (genesis validators while bootstrap penalty-exit protection is active).
+
+The full state commitment is
+`sha256d("SC-CANON-STATE-V3" || finalized_identity || finality_link_hash || post_state_commitment)`.
+
+Every node checks `next_state_commitment` before it prevotes or precommits, and
+again whenever it applies the transition (finalization, sync, replay), so a
+finalized chain never carries a wrong value.
+
+Startup (fast start, on by default; `--no-fast-start` disables it) loads the
+finalized state from the database and accepts it only if its post-state
+commitment equals the tip transition's `next_state_commitment`, its lane
+roots match the tip's `ingress_commitment`, and the tip's finality certificate
+verifies against the committee in the loaded (verified) checkpoints. It never
+re-derives committee checkpoints. Any mismatch falls back to a full replay from
+genesis. The same check lets a future state sync verify a
+downloaded state against one quorum-signed transition.
+
 ## Certified Ingress Rules
 
 Ingress is consensus-critical input to frontier transitions and is now epoch
@@ -102,6 +153,20 @@ The current live codebase is version-aware:
 - legacy transparent transactions use `Tx`
 - confidential-capable transactions use `TxV2`
 - runtime dispatch uses `AnyTx`
+
+Signatures bind the chain. Every transaction signature covers the chain domain
+`D = sha256d("SC-CHAIN-DOMAIN-V1" || network_id || genesis_hash)`, the same value consensus
+signatures cover:
+
+- `Tx` input: `sha256d("SC-SIG-V1" || D || u32le(input_index) || sha256d(tx without script_sigs))`
+- `Tx` unbond: the same with tag `SC-UNBOND-V1`
+- `TxV2` input (transparent or confidential): tag `SC-SIG-V3`
+- `TxV2` balance proof: `sha256d("SC-BAL-V3" || D || tx without signatures)`
+
+A transaction signed for one network fails validation on every other one, even when it spends an
+outpoint that exists on both (genesis validator bonds). Validation without a chain identity fails
+closed. Wallets take `D` from their network and its pinned genesis (`finalis-cli`: embedded genesis
+or `--genesis-hash`; JS SDK: `chainDomainHex`).
 
 Mainnet identity (pre-launch):
 

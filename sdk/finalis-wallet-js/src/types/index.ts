@@ -108,6 +108,9 @@ export interface BuildTxParams {
   changeAddress?: string;
   hrp?: 'sc' | 'tsc';
   dustThresholdUnits?: bigint;
+  // Chain the transaction is signed for: bytesToHex(consensusChainDomain(networkIdHex, genesisHashHex)).
+  // Pin the network's values; a transaction signed for another chain is rejected.
+  chainDomainHex: Hex;
 }
 
 export interface BuildTxResult {

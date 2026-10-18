@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
 #include "utxo/validate.hpp"
@@ -67,7 +68,7 @@ AnyTxValidationResult validate(const TxV2& tx, const std::vector<Coin>& coins) {
   UtxoSetV2 view;
   for (const auto& c : coins) view[c.owned.outpoint] = c.entry;
   ConfidentialPolicy policy;
-  SpecialValidationContext ctx;
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity();
   ctx.current_height = 1;
   ctx.confidential_policy = &policy;
   return validate_tx_v2(tx, 1, view, &ctx);
@@ -82,7 +83,7 @@ TEST(test_confidential_to_confidential_transfer_validates) {
   std::vector<wallet::ConfidentialOwnedCoin> owned{coins[0].owned, coins[1].owned};
   const std::vector<wallet::ConfidentialPayment> outputs{make_payment(0x31, 7'000, 7'000), make_payment(0x41, 2'000, 2'000)};
   std::string err;
-  const auto tx = wallet::build_txv2_confidential_to_confidential(owned, outputs, 1'000, blind_of(0x51).bytes, &err);
+  const auto tx = wallet::build_txv2_confidential_to_confidential(finalis::test::test_chain_domain(), owned, outputs, 1'000, blind_of(0x51).bytes, &err);
   if (!tx.has_value()) throw std::runtime_error("build: " + err);
   ASSERT_EQ(tx->inputs.size(), 2u);
   ASSERT_EQ(tx->outputs.size(), 2u);
@@ -95,7 +96,7 @@ TEST(test_confidential_to_confidential_builder_requires_exact_balance) {
   ASSERT_TRUE(crypto::confidential_crypto_init());
   const auto coin = make_coin(0x12, 5'000);
   std::string err;
-  const auto tx = wallet::build_txv2_confidential_to_confidential({coin.owned}, {make_payment(0x32, 3'000, 3'000)}, 1'000,
+  const auto tx = wallet::build_txv2_confidential_to_confidential(finalis::test::test_chain_domain(), {coin.owned}, {make_payment(0x32, 3'000, 3'000)}, 1'000,
                                                                   blind_of(0x52).bytes, &err);
   ASSERT_TRUE(!tx.has_value());
   ASSERT_EQ(err, std::string("confidential inputs must equal outputs plus fee"));
@@ -107,7 +108,7 @@ TEST(test_confidential_to_confidential_inflation_is_rejected_by_consensus) {
   ASSERT_TRUE(crypto::confidential_crypto_init());
   const std::vector<Coin> coins{make_coin(0x13, 5'000)};
   std::string err;
-  const auto tx = wallet::build_txv2_confidential_to_confidential(
+  const auto tx = wallet::build_txv2_confidential_to_confidential(finalis::test::test_chain_domain(), 
       {coins[0].owned}, {make_payment(0x33, 4'000, 900'000)}, 1'000, blind_of(0x53).bytes, &err);
   ASSERT_TRUE(tx.has_value());
   const auto result = validate(*tx, coins);
@@ -119,7 +120,7 @@ TEST(test_confidential_to_confidential_input_signatures_are_checked) {
   ASSERT_TRUE(crypto::confidential_crypto_init());
   const std::vector<Coin> coins{make_coin(0x14, 3'000), make_coin(0x24, 3'000)};
   std::string err;
-  auto tx = wallet::build_txv2_confidential_to_confidential({coins[0].owned, coins[1].owned},
+  auto tx = wallet::build_txv2_confidential_to_confidential(finalis::test::test_chain_domain(), {coins[0].owned, coins[1].owned},
                                                             {make_payment(0x34, 5'000, 5'000)}, 1'000,
                                                             blind_of(0x54).bytes, &err);
   ASSERT_TRUE(tx.has_value());

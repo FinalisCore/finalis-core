@@ -363,8 +363,14 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   consensus::CanonicalDerivedState next_state;
   std::string derivation_error;
   std::set<Hash32> accepted_txids;
-  if (!consensus::apply_frontier_record(canonical_derivation_config_locked(), *canonical_state_, record, &next_state,
-                                        &derivation_error, &accepted_txids)) {
+  if (verified_next_state_.has_value() && verified_next_state_->transition_id == transition_id &&
+      verified_next_state_->parent_id == canonical_state_->finalized_identity.id) {
+    // Applied (and its next_state_commitment checked) by the vote gate on this same parent.
+    next_state = std::move(verified_next_state_->state);
+    accepted_txids = std::move(verified_next_state_->accepted_txids);
+    verified_next_state_.reset();
+  } else if (!consensus::apply_frontier_record(canonical_derivation_config_locked(), *canonical_state_, record,
+                                               &next_state, &derivation_error, &accepted_txids)) {
     log_line("finalized-state-invariant-violation source=live-frontier-apply height=" +
              std::to_string(record.transition.height) + " detail=" + derivation_error);
     if (error) *error = "apply-frontier-record-failed:" + derivation_error;
@@ -389,6 +395,11 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   }
   batch.put(kConfidentialSupplyLedgerKey,
             consensus::serialize_confidential_supply_ledger(next_state.confidential_supply, record.transition.height));
+  // Before hydrate replaces canonical_state_ with next_state.
+  if (!persist_canonical_cache_delta(batch, *canonical_state_, next_state, record.transition.next_state_root)) {
+    if (error) *error = "persist-canonical-cache-rows-failed";
+    return false;
+  }
   const bool block_had_txv2 =
       next_state.confidential_supply.txv2_count != canonical_state_->confidential_supply.txv2_count ||
       next_state.confidential_supply.known != canonical_state_->confidential_supply.known;
@@ -402,10 +413,10 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     mempool_.on_finalized_block_timestamp(record.transition.timestamp);
   }
   mempool_.remove_confirmed(confirmed_txids);
-  hydrate_runtime_from_canonical_state_locked(next_state);
+  hydrate_runtime_from_canonical_state_locked(std::move(next_state));
   if (block_had_txv2) run_confidential_supply_audit_locked("finalized-block");
   mempool_.prune_against_utxo(utxos_);
-  (void)mempool_.set_confidential_pool_value(next_state.confidential_pool_value);
+  (void)mempool_.set_confidential_pool_value(canonical_state_->confidential_pool_value);
   const auto now = now_ms();
   if (finalized_height_ > previous_finalized_height) {
     current_round_ = 0;
@@ -444,15 +455,13 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     last_finalized_progress_ms_ = now;
   }
 
-  if (!persist_canonical_cache_rows(db_, batch, next_state)) {
-    if (error) *error = "persist-canonical-cache-rows-failed";
-    return false;
-  }
-  if (!verify_and_persist_consensus_state_commitment_locked(next_state, batch)) {
+  // apply_frontier_record computed next_state.state_commitment; recomputing it here would hash the whole
+  // UTXO set again.
+  if (!verify_and_persist_consensus_state_commitment_locked(*canonical_state_, batch, /*recompute=*/false)) {
     if (error) *error = "persist-consensus-state-commitment-failed";
     return false;
   }
-  (void)persist_state_roots(db_, batch, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
+  persist_validator_roots(db_, batch, finalized_height_, validators_, kFixedValidationRulesVersion);
 
   if (clear_requested_sync) {
     requested_sync_artifacts_.erase(transition_id);
@@ -1112,6 +1121,7 @@ void Node::on_get_transition_by_height(int peer_id, const Bytes& payload) {
   bool throttled_rate_limit = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    bound_throttle_map(get_transition_by_height_last_req_ms_);
     auto& last_req = get_transition_by_height_last_req_ms_[{peer_id, gbh->height}];
     if (last_req != 0 && tms < last_req + kGetTransitionByHeightPerPeerHeightMinIntervalMs) {
       throttled_rate_limit = true;
@@ -2497,6 +2507,21 @@ Node::CertifiedIngressStatus Node::certified_ingress_status_for_vote_locked(cons
     if (detail) *detail = "certified-ingress-commitment-mismatch";
     return CertifiedIngressStatus::Invalid;
   }
+  // A finalized transition with a wrong next_state_commitment would fail every later replay and
+  // fast start, so no vote goes to one: apply the slice and compare (once per transition).
+  const auto transition_id = transition.transition_id();
+  if (!post_state_verified_transitions_.contains(transition_id)) {
+    VerifiedNextState verified{canonical_state_->finalized_identity.id, transition_id, {}, {}};
+    if (!consensus::apply_frontier_record(canonical_derivation_config_locked(), *canonical_state_, record,
+                                          &verified.state, &error, &verified.accepted_txids)) {
+      if (detail) *detail = error;
+      return CertifiedIngressStatus::Invalid;
+    }
+    std::erase_if(post_state_verified_transitions_,
+                  [&](const auto& entry) { return entry.second <= finalized_height_; });
+    post_state_verified_transitions_[transition_id] = transition.height;
+    verified_next_state_ = std::move(verified);
+  }
   return CertifiedIngressStatus::Ready;
 }
 
@@ -2825,10 +2850,12 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
 
     consensus::FrontierExecutionResult result;
     std::string validation_error;
+    const auto parent_tree = consensus::utxo_tree_for(*canonical_state_);
     if (!consensus::execute_frontier_lane_prefix(canonical_state_->utxos, canonical_state_->confidential_pool_value,
                                                  canonical_state_->finalized_frontier_vector,
                                                  selection.next_vector, selection.lane_records,
-                                                 canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error)) {
+                                                 canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error,
+                                                 /*compute_next_state_root=*/false, &parent_tree)) {
       if (attempt == 0 &&
           (validation_error.find("frontier-certified-ingress-prev-root-mismatch") != std::string::npos ||
            validation_error.find("frontier-certified-ingress-prev-root-state-mismatch") != std::string::npos)) {
@@ -2850,7 +2877,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                                                           local_key_.public_key, prev_finality.round,
                                                           prev_finality.signers,
                                                           result.accepted_fee_units,
-                                                          result.next_utxos, &result.transition, &validation_error)) {
+                                                          result.next_utxos, &result.transition, &validation_error,
+                                                          result.has_next_utxo_tree ? &result.next_utxo_tree : nullptr)) {
       last_test_hook_error_ = "frontier-build-metadata-failed:" + validation_error;
       return std::nullopt;
     }
@@ -2861,6 +2889,16 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       return std::nullopt;
     }
     result.transition.leader_vrf_proof = *vrf_proof;
+    // Last: the post-state depends on the VRF output (finalized randomness) and on every field above.
+    if (!consensus::derive_frontier_next_state_commitment(
+            canonical_derivation_config_locked(), *canonical_state_,
+            consensus::CanonicalFrontierRecord{result.transition, selection.lane_records},
+            &result.transition.next_state_commitment, &validation_error)) {
+      last_test_hook_error_ = "frontier-build-post-state-failed:" + validation_error;
+      log_line("frontier-build-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
+               " reason=post-state:" + validation_error);
+      return std::nullopt;
+    }
     if (height == finalized_height_ + 1) {
       log_line("frontier-build-summary height=" + std::to_string(height) + " round=" + std::to_string(round) +
                " transition=" + short_hash_hex(result.transition.transition_id()) +

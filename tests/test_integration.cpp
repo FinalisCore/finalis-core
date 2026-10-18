@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
@@ -49,6 +50,10 @@
 using namespace finalis;
 
 namespace {
+
+// The chain domain a node validates transaction signatures under: sign with it to submit to that node.
+Hash32 node_chain_domain(const node::Node& n) { return n.consensus_domain_for_test(); }
+Hash32 node_chain_domain(const std::unique_ptr<node::Node>& n) { return n->consensus_domain_for_test(); }
 
 std::chrono::seconds ci_timeout_seconds(int base_seconds) {
   int scale = 1;
@@ -381,6 +386,11 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
                                     node::Node::deterministic_test_keypairs())) {
     return false;
   }
+  {
+    consensus::CanonicalFrontierRecord record{exec_result.transition, lane_records};
+    if (!test::attach_test_next_state_commitment(derivation_cfg, genesis_derived, &record)) return false;
+    exec_result.transition = record.transition;
+  }
 
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     for (const auto& ingress : lane_records[lane]) {
@@ -603,6 +613,11 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
                                     node::Node::deterministic_test_keypairs())) {
     return false;
   }
+  {
+    consensus::CanonicalFrontierRecord record{exec_result.transition, fixture.lane_records};
+    if (!test::attach_test_next_state_commitment(derivation_cfg, fixture.parent, &record)) return false;
+    exec_result.transition = record.transition;
+  }
 
   *proposal_out = FrontierProposal{exec_result.transition, ordered_records};
   if (parent_out) *parent_out = fixture.parent;
@@ -738,7 +753,7 @@ std::optional<Tx> create_bond_tx_from_validator0(node::Node& node0, const crypto
   tx.outputs = outs;
 
   for (std::size_t i = 0; i < selected.size(); ++i) {
-    auto msg = signing_message_for_input(tx, static_cast<std::uint32_t>(i));
+    auto msg = signing_message_for_input(node_chain_domain(node0), tx, static_cast<std::uint32_t>(i));
     if (!msg.has_value()) return std::nullopt;
     auto sig = crypto::ed25519_sign(*msg, validator0.private_key);
     if (!sig.has_value()) return std::nullopt;
@@ -785,7 +800,7 @@ std::optional<Tx> create_join_request_tx_from_validator0(node::Node& node0, cons
   const std::uint64_t change = in_sum - bond_amount - fee;
   if (change > 0) outputs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
 
-  return build_signed_p2pkh_tx_multi_input(selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
+  return build_signed_p2pkh_tx_multi_input(node_chain_domain(node0), selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
                                            outputs);
 }
 
@@ -813,7 +828,7 @@ std::optional<Tx> create_onboarding_registration_tx_from_validator0(node::Node& 
   }
   if (in_sum < fee) return std::nullopt;
 
-  return build_onboarding_registration_tx(
+  return build_onboarding_registration_tx(node_chain_domain(node0), 
       selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()), new_validator.public_key,
       Bytes(new_validator.private_key.begin(), new_validator.private_key.end()), payout_pubkey, fee,
       address::p2pkh_script_pubkey(sender_pkh));
@@ -853,7 +868,7 @@ std::optional<Tx> create_join_request_tx_from_validator0_with_payout(node::Node&
   const std::uint64_t change = in_sum - bond_amount - fee;
   if (change > 0) outputs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
 
-  return build_signed_p2pkh_tx_multi_input(selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
+  return build_signed_p2pkh_tx_multi_input(node_chain_domain(node0), selected, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
                                            outputs);
 }
 
@@ -879,7 +894,7 @@ std::optional<Tx> create_self_transfer_tx(node::Node& node, const crypto::KeyPai
   const std::uint64_t change = in_sum - amount - fee;
   if (change > 0) outputs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
 
-  return build_signed_p2pkh_tx_multi_input(selected, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs);
+  return build_signed_p2pkh_tx_multi_input(node_chain_domain(node), selected, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs);
 }
 
 struct FundedTestWallet {
@@ -2365,7 +2380,7 @@ JoinedValidatorFixture make_bonded_joined_validator_fixture(const std::string& b
       .current_height = nodes[0]->status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
   };
-  auto request_tx = build_validator_join_request_tx(
+  auto request_tx = build_validator_join_request_tx(node_chain_domain(nodes[0]), 
       funded->utxos, Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()), fixture.joiner_kp.public_key,
       Bytes(fixture.joiner_kp.private_key.begin(), fixture.joiner_kp.private_key.end()), fixture.joiner_kp.public_key,
       bond_amount, 0, address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -2521,7 +2536,7 @@ JoinedValidatorFixture make_bonded_live_joiner_fixture(const std::string& base, 
       .current_height = nodes[0]->status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
   };
-  auto request_tx = build_validator_join_request_tx(
+  auto request_tx = build_validator_join_request_tx(node_chain_domain(nodes[0]), 
       funded->utxos, Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()), fixture.joiner_kp.public_key,
       Bytes(fixture.joiner_kp.private_key.begin(), fixture.joiner_kp.private_key.end()), fixture.joiner_kp.public_key,
       bond_amount, 0, address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -2842,7 +2857,7 @@ TEST(test_tx_finalized_and_visible_on_all_nodes) {
   std::vector<TxOut> outputs{TxOut{amount, address::p2pkh_script_pubkey(recipient_pkh)}};
 
   std::string err;
-  auto tx = build_signed_p2pkh_tx_single_input(spend_op, spend_out, keys[sender_index].private_key, outputs, &err);
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), spend_op, spend_out, keys[sender_index].private_key, outputs, &err);
   ASSERT_TRUE(tx.has_value());
   const Hash32 txid = tx->txid();
   const auto height_before = nodes[0]->status().height;
@@ -2892,7 +2907,7 @@ TEST(test_epoch_ticket_challenge_anchor_ignores_pending_mempool_state) {
   const auto recipient_index = (sender_index + 1) % keys.size();
   const auto recipient_pkh = crypto::h160(Bytes(keys[recipient_index].public_key.begin(), keys[recipient_index].public_key.end()));
   std::string err;
-  auto tx = build_signed_p2pkh_tx_single_input(
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), 
       spend_op, spend_out, keys[sender_index].private_key,
       std::vector<TxOut>{TxOut{spend_out.value - 1000, address::p2pkh_script_pubkey(recipient_pkh)}}, &err);
   ASSERT_TRUE(tx.has_value());
@@ -3157,7 +3172,7 @@ TEST(test_wallet_send_over_one_coin_multi_input_finalizes_and_chain_continues) {
     const std::uint64_t second_half = remainder - first_half;
     ASSERT_TRUE(first_half > 0 && second_half > 0);
     std::string split_err;
-    auto split_tx = build_signed_p2pkh_tx_single_input(
+    auto split_tx = build_signed_p2pkh_tx_single_input(node_chain_domain(n), 
         split_op, split_prev, keys[sender_index].private_key,
         std::vector<TxOut>{TxOut{first_half, address::p2pkh_script_pubkey(sender_pkh)},
                            TxOut{second_half, address::p2pkh_script_pubkey(sender_pkh)}},
@@ -3201,7 +3216,7 @@ TEST(test_wallet_send_over_one_coin_multi_input_finalizes_and_chain_continues) {
   ASSERT_TRUE(plan.has_value());
   ASSERT_TRUE(plan->selected_prevs.size() >= 2u);
 
-  auto tx = build_signed_p2pkh_tx_multi_input(plan->selected_prevs,
+  auto tx = build_signed_p2pkh_tx_multi_input(node_chain_domain(n), plan->selected_prevs,
                                               Bytes(keys[sender_index].private_key.begin(), keys[sender_index].private_key.end()),
                                               plan->outputs, &err);
   ASSERT_TRUE(tx.has_value());
@@ -3775,7 +3790,7 @@ TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) 
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
   };
-  auto tx = build_onboarding_registration_tx(
+  auto tx = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -3826,7 +3841,7 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
   };
-  auto tx0 = build_onboarding_registration_tx(
+  auto tx0 = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded0->utxos, Bytes(sender0.private_key.begin(), sender0.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender0_pkh), nullptr, &pow_ctx0);
@@ -3852,7 +3867,7 @@ TEST(test_duplicate_onboarding_registration_tx_is_rejected_after_finalization) {
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
   };
-  auto tx1 = build_onboarding_registration_tx(
+  auto tx1 = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded1->utxos, Bytes(sender1.private_key.begin(), sender1.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender1_pkh), nullptr, &pow_ctx1);
@@ -3896,7 +3911,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return onboarding_db.get_height_hash(height); },
   };
-  auto onboarding_tx = build_onboarding_registration_tx(
+  auto onboarding_tx = build_onboarding_registration_tx(node_chain_domain(n0), 
       funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &onboarding_pow_ctx);
@@ -3927,7 +3942,7 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return join_db.get_height_hash(height); },
   };
-  auto join_tx = build_validator_join_request_tx(
+  auto join_tx = build_validator_join_request_tx(node_chain_domain(n0), 
       funded_after_onboarding->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), new_validator->public_key,
       Bytes(new_validator->private_key.begin(), new_validator->private_key.end()), new_validator->public_key, bond_amount, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &join_pow_ctx);
@@ -3998,7 +4013,7 @@ TEST(test_unbond_finalization_moves_validator_to_exiting) {
   const auto before_height = nodes[0]->status().height;
 
   std::string err;
-  auto unbond_tx = build_unbond_tx(before->bond_outpoint, fixture.joiner_kp.public_key, before->bonded_amount, 1000,
+  auto unbond_tx = build_unbond_tx(node_chain_domain(nodes[0]), before->bond_outpoint, fixture.joiner_kp.public_key, before->bonded_amount, 1000,
                                    fixture.joiner_kp.private_key, &err);
   ASSERT_TRUE(unbond_tx.has_value());
   const Hash32 unbond_txid = unbond_tx->txid();
@@ -4175,7 +4190,7 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
   };
-  auto onboarding_tx = build_onboarding_registration_tx(
+  auto onboarding_tx = build_onboarding_registration_tx(node_chain_domain(cluster.nodes[0]), 
       funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()), banned_pub,
       Bytes(keys[0].private_key.begin(), keys[0].private_key.end()), banned_pub, 1000,
       address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -4968,7 +4983,7 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
       wallet::ConfidentialRecipient{.one_time_pubkey = *one_time, .ephemeral_pubkey = *ephemeral, .scan_tag = {}, .memo = {}},
       crypto::ConfidentialOutputSecrets{.amount = kConfidential, .value_blind = blind}, proof_nonce, &err);
   ASSERT_TRUE(conf_out.has_value());
-  const auto tx = wallet::build_txv2_transparent_to_confidential(
+  const auto tx = wallet::build_txv2_transparent_to_confidential(node_chain_domain(node), 
       prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), prev.second.value,
       TransparentTxOutV2{transparent_out, address::p2pkh_script_pubkey(recipient_pkh)}, *conf_out, blind, kConfidential,
       kFee, &err);
@@ -4999,7 +5014,7 @@ TEST(test_finalized_txv2_is_indexed_with_address_history) {
   spend_nonce.fill(0x5F);
   Hash32 excess_nonce{};
   excess_nonce.fill(0x60);
-  const auto unshield = wallet::build_txv2_confidential_to_transparent(
+  const auto unshield = wallet::build_txv2_confidential_to_transparent(node_chain_domain(node), 
       coin, TransparentTxOutV2{kConfidential - kFee, address::p2pkh_script_pubkey(recipient_pkh)}, kFee, spend_nonce,
       excess_nonce, &err);
   if (!unshield.has_value()) throw std::runtime_error("unshield tx: " + err);
@@ -5117,7 +5132,7 @@ TEST(test_locally_relayed_wallet_tx_enters_certified_ingress_and_finalizes) {
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
 
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
                                                &build_err);
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(node->inject_tx_for_test(*tx, true));
@@ -5190,7 +5205,7 @@ TEST(test_lightserver_relay_reports_node_mempool_verdict) {
     recipient_pkh.fill(fill);
     std::vector<TxOut> outputs{TxOut{prev.second.value - kFee, address::p2pkh_script_pubkey(recipient_pkh)}};
     std::string err;
-    auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()),
+    auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()),
                                                  outputs, &err);
     if (!tx.has_value()) throw std::runtime_error("build tx: " + err);
     return *tx;
@@ -5281,7 +5296,7 @@ TEST(test_local_bus_multi_node_delivers_frontiers_and_forwards_tx_to_designated_
   std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
                              TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
   std::string err;
-  const auto tx = build_signed_p2pkh_tx_single_input(
+  const auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), 
       prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
   ASSERT_TRUE(tx.has_value());
 
@@ -5326,7 +5341,7 @@ TEST(test_tx_forward_relays_via_validators_when_certifier_unreachable) {
   std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
                              TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
   std::string err;
-  const auto tx = build_signed_p2pkh_tx_single_input(
+  const auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), 
       prev.first, prev.second, Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
   ASSERT_TRUE(tx.has_value());
 
@@ -5397,7 +5412,7 @@ TEST(test_tx_status_reports_certified_ingress_before_finalization) {
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
 
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second, Bytes(key.privkey.begin(), key.privkey.end()), outputs,
                                                &build_err);
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(node->inject_tx_for_test(*tx, true));
@@ -5538,7 +5553,7 @@ TEST(test_ingress_record_propagates_to_follower_before_finalization) {
 
   const auto kp = node::Node::deterministic_test_keypairs()[static_cast<std::size_t>(sender_idx)];
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second, Bytes(kp.private_key.begin(), kp.private_key.end()),
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(n0), prev.first, prev.second, Bytes(kp.private_key.begin(), kp.private_key.end()),
                                                outputs, &build_err);
   ASSERT_TRUE(tx.has_value());
   ASSERT_TRUE(cluster.nodes[static_cast<std::size_t>(sender_idx)]->inject_tx_for_test(*tx, true));
@@ -5589,7 +5604,7 @@ TEST(test_synced_follower_materializes_recipient_utxos_for_finalized_transfer) {
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
 
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(leader), prev.first, prev.second,
                                                Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()),
                                                outputs, &build_err);
   ASSERT_TRUE(tx.has_value());
@@ -5661,7 +5676,7 @@ TEST(test_synced_follower_restarts_from_lane_certificates_delivered_with_blocks)
   outputs.push_back(TxOut{kAmount, address::p2pkh_script_pubkey(recipient_pkh)});
   outputs.push_back(TxOut{prev.second.value - kAmount - kFee, address::p2pkh_script_pubkey(own_pkh)});
   std::string build_err;
-  auto tx = build_signed_p2pkh_tx_single_input(prev.first, prev.second,
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(leader), prev.first, prev.second,
                                                Bytes(sender_kp.private_key.begin(), sender_kp.private_key.end()),
                                                outputs, &build_err);
   ASSERT_TRUE(tx.has_value());
@@ -8592,7 +8607,7 @@ TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
         .current_height = n0.status().height + 1,
         .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
     };
-    request_tx = build_validator_join_request_tx(
+    request_tx = build_validator_join_request_tx(node_chain_domain(n0), 
         n0.find_utxos_by_pubkey_hash_for_test(sender_pkh), Bytes(leader_kp.private_key.begin(), leader_kp.private_key.end()),
         joiner_kp.public_key, Bytes(joiner_kp.private_key.begin(), joiner_kp.private_key.end()), joiner_kp.public_key, 1, 0,
         address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
@@ -10408,6 +10423,139 @@ TEST(test_restart_replay_is_independent_of_validator_reward_and_checkpoint_cache
   ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
 }
 
+TEST(test_fast_start_restores_state_verified_against_signed_tip) {
+  const auto base = unique_test_base("/tmp/finalis_it_fast_start_verified");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  const node::NodeConfig cfg = single_node_cfg(base, 1);
+  ASSERT_TRUE(cfg.fast_start);
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 4, std::chrono::seconds(20)));
+  const auto before = cluster.nodes[0]->status();
+  const auto before_commitment = cluster.nodes[0]->canonical_state_commitment_for_test();
+  cluster.nodes[0]->stop();
+  cluster.nodes.clear();
+
+  {
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_EQ(restarted.fast_start_result_for_test(), std::string("ok"));
+    ASSERT_EQ(restarted.status().transition_hash, before.transition_hash);
+    ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
+    restarted.stop();
+  }
+
+  // A certified record beyond the finalized vector moves the stored lane tip and root ahead of the
+  // finalized ones; fast start takes the finalized root from that record's prev_lane_root.
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    const std::uint32_t lane = 0;
+    const auto lane_state = db.get_lane_state(lane);
+    LaneState ahead = lane_state.value_or(LaneState{0, lane, 0, zero_hash()});
+    IngressCertificate cert;
+    cert.epoch = ahead.epoch;
+    cert.lane = lane;
+    cert.seq = ahead.max_seq + 1;
+    cert.txid.fill(0xA1);
+    cert.tx_hash.fill(0xA2);
+    cert.prev_lane_root = ahead.lane_root;
+    cert.sigs = {FinalitySig{node::Node::deterministic_test_keypairs()[0].public_key, Sig64{}}};
+    ASSERT_TRUE(db.put_ingress_bytes(cert.txid, Bytes{0x01}));
+    ASSERT_TRUE(db.put_ingress_certificate(lane, cert.seq, cert.serialize()));
+    ahead.max_seq = cert.seq;
+    ahead.lane_root = consensus::compute_lane_root_append(ahead.lane_root, cert.tx_hash);
+    ASSERT_TRUE(db.put_lane_state(lane, ahead));
+    db.close();
+
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_EQ(restarted.fast_start_result_for_test(), std::string("ok"));
+    ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
+    restarted.stop();
+  }
+
+  // A stored state that no longer matches the tip's signed next_state_commitment is not trusted:
+  // startup falls back to replay and rebuilds the same state.
+  storage::DB db;
+  ASSERT_TRUE(db.open(cfg.db_path));
+  const auto validators = db.scan_prefix(storage::key_validator_prefix());
+  ASSERT_TRUE(!validators.empty());
+  ASSERT_TRUE(db.erase(validators.begin()->first));
+  db.close();
+
+  node::Node replayed(cfg);
+  ASSERT_TRUE(replayed.init());
+  ASSERT_TRUE(replayed.fast_start_result_for_test().rfind("fallback:checkpoint-post-state-commitment-mismatch", 0) == 0);
+  ASSERT_EQ(replayed.status().transition_hash, before.transition_hash);
+  ASSERT_EQ(replayed.canonical_state_commitment_for_test(), before_commitment);
+}
+
+TEST(test_fast_start_at_last_height_of_an_epoch_keeps_next_committee) {
+  // At an epoch's last height the node re-validates the next epoch's checkpoint, which reads the
+  // epoch randomness that fast start must restore. Short epochs make such stops frequent.
+  const auto base = unique_test_base("/tmp/finalis_it_fast_start_epoch_boundary");
+  const auto configure = [](node::NodeConfig& c) { c.network.committee_epoch_blocks = 2; };
+  auto cluster = make_cluster(base, 1, 1, 1, configure);
+  const node::NodeConfig cfg = cluster.configs[0];
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 3, std::chrono::seconds(20)));
+  cluster.nodes[0]->stop();
+  cluster.nodes.clear();
+
+  bool hit_boundary = false;
+  for (int attempt = 0; attempt < 12 && !hit_boundary; ++attempt) {
+    node::Node n(cfg);
+    ASSERT_TRUE(n.init());
+    ASSERT_EQ(n.fast_start_result_for_test(), std::string("ok"));
+    const auto height = n.status().height;
+    ASSERT_TRUE(!n.committee_for_next_height_for_test().empty());
+    hit_boundary = consensus::committee_epoch_start(height + 1, cfg.network.committee_epoch_blocks) == height + 1;
+    n.start();
+    ASSERT_TRUE(wait_for_tip(n, height + 1 + static_cast<std::uint64_t>(attempt % 2), std::chrono::seconds(20)));
+    n.stop();
+  }
+  ASSERT_TRUE(hit_boundary);
+}
+
+TEST(test_consensus_history_is_pruned_and_fast_start_rebuilds_the_retained_window) {
+  // 2-block epochs and a 4-block unbond delay: checkpoints keep max(2 + 2, 8) = 8 epochs, block metadata
+  // 8 epochs, so both windows are passed within a few dozen heights.
+  const auto base = unique_test_base("/tmp/finalis_it_history_pruning");
+  const auto configure = [](node::NodeConfig& c) {
+    c.network.committee_epoch_blocks = 2;
+    c.network.unbond_delay_blocks = 4;
+  };
+  auto cluster = make_cluster(base, 1, 1, 1, configure);
+  node::NodeConfig cfg = cluster.configs[0];
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 44, std::chrono::seconds(60)));
+  cluster.nodes[0]->stop();
+  const auto before_hash = cluster.nodes[0]->status().transition_hash;
+  const auto before_commitment = cluster.nodes[0]->canonical_state_commitment_for_test();
+  const auto sizes = cluster.nodes[0]->consensus_history_sizes_for_test();
+  cluster.nodes.clear();
+  // Bounded: at most 8 retained epochs (+ the next epoch's checkpoint), 8 epochs of metadata (+ the
+  // tip when it opens an epoch), and reward states for the current and previous epochs only.
+  ASSERT_TRUE(sizes[0] <= 9);
+  ASSERT_TRUE(sizes[1] <= 17);
+  ASSERT_TRUE(sizes[2] <= 3);
+
+  {
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    ASSERT_EQ(restarted.fast_start_result_for_test(), std::string("ok"));
+    ASSERT_EQ(restarted.status().transition_hash, before_hash);
+    ASSERT_EQ(restarted.canonical_state_commitment_for_test(), before_commitment);
+    restarted.stop();
+  }
+  cfg.fast_start = false;
+  node::Node replayed(cfg);
+  ASSERT_TRUE(replayed.init());
+  ASSERT_EQ(replayed.canonical_state_commitment_for_test(), before_commitment);
+  // History rows below the window stay in the database for queries.
+  replayed.stop();
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly(cfg.db_path));
+  ASSERT_TRUE(db.load_finalized_committee_checkpoints().size() > sizes[0]);
+}
+
 TEST(test_startup_can_replay_persisted_frontier_storage_when_selected) {
   const auto base = unique_test_base("/tmp/finalis_it_frontier_startup_replay");
   const node::NodeConfig legacy_cfg = single_node_cfg(base, 1);
@@ -10745,6 +10893,35 @@ TEST(test_frontier_mode_validation_accepts_valid_proposal_against_certified_ingr
 
   const auto msg = make_test_frontier_propose_msg(target.consensus_domain_for_test(), proposal);
   ASSERT_TRUE(target.inject_propose_msg_for_test(msg));
+}
+
+TEST(test_no_prevote_for_proposal_with_wrong_next_state_commitment) {
+  const auto base = unique_test_base("/tmp/finalis_it_frontier_bad_post_state");
+  auto cfg = single_node_cfg(base, 1);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  ASSERT_TRUE(create_test_validator_keystore(cfg, 0));
+
+  {
+    node::Node n(cfg);
+    ASSERT_TRUE(n.init());
+    n.stop();
+  }
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(cfg.db_path));
+  FrontierProposal good;
+  ASSERT_TRUE(build_test_frontier_proposal_with_certified_ingress(cfg, db, &good));
+  db.close();
+  auto bad = good;
+  bad.transition.next_state_commitment[7] ^= 0x40;
+
+  node::Node target(cfg);
+  ASSERT_TRUE(target.init());
+  // Everything else about the proposal is valid, so it is accepted as a candidate, but not voted for.
+  (void)target.inject_propose_msg_for_test(make_test_frontier_propose_msg(target.consensus_domain_for_test(), bad));
+  ASSERT_TRUE(!target.local_prevote_recorded_for_test(1, 0, bad.transition.transition_id()));
+  ASSERT_TRUE(target.inject_propose_msg_for_test(make_test_frontier_propose_msg(target.consensus_domain_for_test(), good)));
+  ASSERT_TRUE(target.local_prevote_recorded_for_test(1, 0, good.transition.transition_id()));
 }
 
 TEST(test_frontier_mode_validation_rejects_bad_ingress_commitment) {
@@ -11269,6 +11446,18 @@ TEST(test_frontier_mode_accepts_ingress_range_overlapping_held_records) {
   same.records.push_back(rec_a);
   ASSERT_EQ(target.inject_ingress_range_result_for_test(same, 5), std::string{});
   ASSERT_EQ(target.lane_state_for_test(lane)->max_seq, 1u);
+
+  // A reply covering only a prefix of the request (the responder caps reply bytes) is accepted; one
+  // reaching past the request is not.
+  target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 3});
+  ASSERT_EQ(target.inject_ingress_range_result_for_test(same, 5), std::string{});
+  target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 1});
+  p2p::IngressRangeMsg past;
+  past.lane = lane;
+  past.from_seq = 1;
+  past.to_seq = 2;
+  past.records = {rec_a, rec_b};
+  ASSERT_EQ(target.inject_ingress_range_result_for_test(past, 5), std::string("unexpected-range"));
 
   // Held prefix plus a new record: the new one appends on top of the held tip.
   target.set_requested_ingress_range_for_test(5, p2p::GetIngressRangeMsg{lane, 1, 2});
