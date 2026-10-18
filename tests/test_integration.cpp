@@ -289,7 +289,8 @@ std::string csafe_mirror_db_key(std::uint64_t height) { return "CSAFE_MIRROR:" +
 std::string csafe_quarantine_db_key(std::uint64_t height) { return "CSAFE_QUARANTINE:" + csafe_height_suffix(height); }
 
 std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id);
-bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators = 4,
+                                std::uint64_t genesis_time_unix = 1735689600ULL);
 
 node::NodeConfig single_node_cfg(const std::string& base, std::size_t max_committee = MAX_COMMITTEE) {
   node::NodeConfig cfg;
@@ -707,7 +708,7 @@ bool create_test_validator_keystore(const node::NodeConfig& cfg, int node_id) {
                                              deterministic_seed_for_node_id(node_id), &out_key, &kerr);
 }
 
-bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators, std::uint64_t genesis_time_unix);
 
 std::unique_ptr<node::Node> start_single_test_node(const std::string& base, std::uint64_t activation_height,
                                                    std::size_t max_committee = 1) {
@@ -1294,7 +1295,7 @@ struct HttpStubServer {
   }
 };
 
-bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators, std::uint64_t genesis_time_unix);
 
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
                      std::size_t max_committee = MAX_COMMITTEE,
@@ -2162,7 +2163,7 @@ struct OutOfOrderBlockSyncServer {
   }
 };
 
-bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators = 4) {
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators, std::uint64_t genesis_time_unix) {
   const auto keys = node::Node::deterministic_test_keypairs();
   if (keys.size() < n_validators) return false;
 
@@ -2172,7 +2173,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
   d.magic = mainnet_network().magic;
-  d.genesis_time_unix = 1735689600ULL;
+  d.genesis_time_unix = genesis_time_unix;
   d.initial_height = 0;
   d.initial_active_set_size = static_cast<std::uint32_t>(n_validators);
   d.initial_committee_params.min_committee = static_cast<std::uint32_t>(n_validators);
@@ -4867,6 +4868,43 @@ TEST(test_single_validator_respects_min_block_interval_after_finalization) {
   ASSERT_EQ(node->status().height, first_height);
 
   ASSERT_TRUE(wait_for([&]() { return node->status().height >= first_height + 1; }, std::chrono::seconds(5)));
+  node->stop();
+}
+
+// A lone validator finalizes through the quorum-1 self-vote, which skips the prevote timestamp
+// bound; before genesis time it must not propose at all (it would stamp genesis + 1).
+TEST(test_single_validator_does_not_finalize_before_genesis_time) {
+  const std::string base = unique_test_base("/tmp/finalis_it_no_finalize_before_genesis_time");
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.disable_p2p = true;
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.network.min_block_interval_ms = 200;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const auto now = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1, now + 3600));
+
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+  ASSERT_EQ(node->status().height, 0u);
   node->stop();
 }
 
