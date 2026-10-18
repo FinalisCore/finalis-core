@@ -404,7 +404,10 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
     if (error) *error = "checkpoint-lane-roots-mismatch";
     return false;
   }
-  const auto post_state = consensus::consensus_post_state_commitment(cfg, state);
+  // Build the UTXO commitment tree once: its root serves the check, and apply then maintains it.
+  state.utxo_tree = consensus::utxo_tree_from(state.utxos);
+  const auto utxo_root = state.utxo_tree.root();
+  const auto post_state = consensus::consensus_post_state_commitment(cfg, state, &utxo_root);
   if (post_state != transition->next_state_commitment) {
     if (error) {
       *error = "checkpoint-post-state-commitment-mismatch stored=" + short_hash_hex(post_state) +
@@ -588,7 +591,12 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
 }
 
 void Node::hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state) {
-  canonical_state_ = state;
+  hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState(state));
+}
+
+void Node::hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& owned) {
+  canonical_state_ = std::move(owned);
+  const auto& state = *canonical_state_;
   finalized_height_ = state.finalized_height;
   finalized_identity_ = state.finalized_identity;
   utxos_ = state.utxos;

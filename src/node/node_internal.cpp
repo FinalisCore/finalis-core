@@ -692,9 +692,13 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
 
 bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& prev,
                                    const consensus::CanonicalDerivedState& next, const Hash32& next_utxo_root) {
+  std::vector<crypto::SmtChange> tree_changes;  // published per height for readers' in-memory trees
   const auto stage_put = [&](const OutPoint& op, const UtxoEntryV2& entry) {
     batch.put_utxo_v2(op, entry);
-    batch.put(storage::key_smt_leaf(kSmtTreeUtxo, consensus::utxo_commitment_key(op)), consensus::utxo_commitment_value(entry));
+    const auto key = consensus::utxo_commitment_key(op);
+    const auto value = consensus::utxo_commitment_value(entry);
+    batch.put(storage::key_smt_leaf(kSmtTreeUtxo, key), value);
+    tree_changes.push_back({key, crypto::SparseMerkleTree::leaf_hash(key, value)});
     if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
       batch.put_script_utxo(crypto::sha256(transparent->script_pubkey), op, *transparent, next.finalized_height);
     }
@@ -702,6 +706,7 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
   const auto stage_erase = [&](const OutPoint& op, const UtxoEntryV2& entry) {
     batch.erase(storage::key_utxo(op));
     batch.erase(storage::key_smt_leaf(kSmtTreeUtxo, consensus::utxo_commitment_key(op)));
+    tree_changes.push_back({consensus::utxo_commitment_key(op), std::nullopt});
     if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
       batch.erase(storage::key_script_utxo(crypto::sha256(transparent->script_pubkey), op));
     }
@@ -744,6 +749,10 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
   batch.put_protocol_reserve_balance(next.protocol_reserve_balance_units);
   batch.put_confidential_pool_value(next.confidential_pool_value);
   stage_canonical_scalars(batch, next);
+  batch.put(storage::key_smt_delta(kSmtTreeUtxo, next.finalized_height), crypto::encode_smt_delta(tree_changes));
+  if (next.finalized_height > kRetainedSmtDeltaHeights) {
+    batch.erase(storage::key_smt_delta(kSmtTreeUtxo, next.finalized_height - kRetainedSmtDeltaHeights));
+  }
   // The UTXO root was verified against the transition when the state was applied.
   batch.put(storage::key_smt_root(kSmtTreeUtxo, next.finalized_height), Bytes(next_utxo_root.begin(), next_utxo_root.end()));
   batch.put(storage::key_root_index("UTXO", next.finalized_height), Bytes(next_utxo_root.begin(), next_utxo_root.end()));

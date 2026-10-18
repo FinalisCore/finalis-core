@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <map>
 #include <chrono>
 
@@ -20,6 +21,7 @@
 
 #include "crypto/hash.hpp"
 #include "crypto/smt.hpp"
+#include "storage/db.hpp"
 
 using namespace finalis;
 
@@ -319,4 +321,85 @@ TEST(test_smt_fast_proofs_verify_for_members_and_non_members) {
     if (i % 2 == 0) for (std::size_t b = 0; b < 30; ++b) absent[b] = 0x5A;
     ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, absent, std::nullopt, smt.get_proof(absent)));
   }
+}
+
+TEST(test_persistent_smt_matches_reference_and_keeps_old_versions) {
+  std::map<Hash32, Bytes> model;
+  const auto leaves_of = [&]() {
+    std::vector<std::pair<Hash32, Bytes>> out(model.begin(), model.end());
+    return out;
+  };
+  crypto::PersistentSmt tree;
+  ASSERT_EQ(tree.root(), reference_smt_root({}));
+  std::uint64_t rng = 0x9e3779b97f4a7c15ULL;
+  const auto next = [&]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  std::vector<std::pair<crypto::PersistentSmt, Hash32>> versions;
+  for (int step = 0; step < 300; ++step) {
+    std::vector<std::pair<Hash32, std::optional<Hash32>>> changes;
+    const int n = 1 + static_cast<int>(next() % 4);
+    for (int i = 0; i < n; ++i) {
+      Hash32 k = crypto::sha256(Bytes{static_cast<std::uint8_t>(next() % 97), 0x21});
+      if (next() % 3 == 0) for (std::size_t b = 0; b < 31; ++b) k[b] = 0xA5;  // long shared prefixes
+      if (!model.empty() && next() % 3 == 0) {
+        model.erase(k);
+        changes.push_back({k, std::nullopt});
+      } else {
+        const Bytes val = v(static_cast<std::uint8_t>(next()), 1 + next() % 5);
+        model[k] = val;
+        changes.push_back({k, crypto::SparseMerkleTree::leaf_hash(k, val)});
+      }
+    }
+    tree = tree.updated(changes);
+    const auto expected = reference_smt_root(leaves_of());
+    ASSERT_EQ(tree.root(), expected);
+    ASSERT_EQ(tree.size(), model.size());
+    if (step % 50 == 0) versions.push_back({tree, expected});
+  }
+  for (const auto& [old, root] : versions) ASSERT_EQ(old.root(), root);  // structure sharing kept them intact
+
+  std::vector<std::pair<Hash32, Hash32>> hashes;
+  for (const auto& [k, val] : model) hashes.push_back({k, crypto::SparseMerkleTree::leaf_hash(k, val)});
+  ASSERT_EQ(crypto::PersistentSmt::from_leaf_hashes(hashes).root(), tree.root());
+}
+
+TEST(test_persistent_smt_proofs_verify_and_delta_codec_round_trips) {
+  std::vector<std::pair<Hash32, Hash32>> leaves;
+  std::vector<std::pair<Hash32, Bytes>> values;
+  for (std::uint32_t i = 0; i < 80; ++i) {
+    Hash32 k = crypto::sha256(Bytes{static_cast<std::uint8_t>(i), 0x55});
+    if (i % 4 == 0) for (std::size_t b = 0; b < 31; ++b) k[b] = 0x3C;
+    if (std::any_of(values.begin(), values.end(), [&](const auto& e) { return e.first == k; })) continue;
+    const Bytes val = v(static_cast<std::uint8_t>(i), 2);
+    values.push_back({k, val});
+    leaves.push_back({k, crypto::SparseMerkleTree::leaf_hash(k, val)});
+  }
+  const auto tree = crypto::PersistentSmt::from_leaf_hashes(leaves);
+  const auto root = tree.root();
+  ASSERT_EQ(root, reference_smt_root(values));
+  for (const auto& [k, val] : values) {
+    ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, k, val, tree.proof(k)));
+  }
+  // A repeated key keeps its last value.
+  auto repeated = leaves;
+  repeated.push_back({leaves[0].first, crypto::SparseMerkleTree::leaf_hash(leaves[0].first, values[1].second)});
+  std::vector<std::pair<Hash32, Bytes>> repeated_values = values;
+  repeated_values[0].second = values[1].second;
+  ASSERT_EQ(crypto::PersistentSmt::from_leaf_hashes(repeated).root(), reference_smt_root(repeated_values));
+  for (std::uint8_t i = 0; i < 12; ++i) {
+    Hash32 absent = crypto::sha256(Bytes{i, 0x66});
+    if (i % 2 == 0) for (std::size_t b = 0; b < 31; ++b) absent[b] = 0x3C;
+    ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, absent, std::nullopt, tree.proof(absent)));
+  }
+  ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(crypto::PersistentSmt{}.root(), leaves[0].first, std::nullopt,
+                                                     crypto::PersistentSmt{}.proof(leaves[0].first)));
+
+  const std::vector<crypto::SmtChange> changes{{leaves[0].first, leaves[1].second}, {leaves[2].first, std::nullopt}};
+  const auto decoded = crypto::decode_smt_delta(crypto::encode_smt_delta(changes));
+  ASSERT_TRUE(decoded.has_value() && *decoded == changes);
+  ASSERT_TRUE(!crypto::decode_smt_delta(Bytes{0x05, 0x01}).has_value());
 }

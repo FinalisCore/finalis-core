@@ -1362,6 +1362,11 @@ std::string key_smt_root(const std::string& tree_id, std::uint64_t height) {
   w.u64le(height);
   return key_smt_root_prefix(tree_id) + hex_encode(w.data());
 }
+std::string key_smt_delta(const std::string& tree_id, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return "SMTD:" + tree_id + ":" + hex_encode(w.data());
+}
 std::string key_script_utxo_prefix(const Hash32& scripthash) {
   return "SU:" + hex_encode(Bytes(scripthash.begin(), scripthash.end())) + ":";
 }

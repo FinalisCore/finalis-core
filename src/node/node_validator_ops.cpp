@@ -376,13 +376,6 @@ bool Node::ensure_settlement_onboarding_scores_loaded_locked(std::uint64_t heigh
     (void)db_.put_epoch_reward_settlement(reward_state);
   }
 
-  if (canonical_state_.has_value()) {
-    auto& canonical_reward_state = canonical_state_->epoch_reward_states[*settlement_epoch];
-    canonical_reward_state.epoch_start_height = *settlement_epoch;
-    const bool canonical_updated = canonical_reward_state.onboarding_score_units != onboarding_scores;
-    // onboarding_score_units is not part of the state commitment, so the commitment is unchanged.
-    if (canonical_updated) canonical_reward_state.onboarding_score_units = onboarding_scores;
-  }
 
   return true;
 }
@@ -935,12 +928,6 @@ bool Node::handle_epoch_ticket_locked(const consensus::EpochTicket& ticket, bool
     auto& reward_state = epoch_reward_states_[stored.epoch];
     reward_state.epoch_start_height = stored.epoch;
     reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
-    if (canonical_state_.has_value()) {
-      auto& canonical_reward_state = canonical_state_->epoch_reward_states[stored.epoch];
-      canonical_reward_state.epoch_start_height = stored.epoch;
-      // Not part of the state commitment: no recomputation (it would hash the whole UTXO set per ticket).
-      canonical_reward_state.onboarding_score_units[stored.participant_pubkey] = onboarding_score;
-    }
   }
   if (!closed_epoch_reconcile_read_only) {
     auto snapshot = consensus::derive_epoch_committee_snapshot(stored.epoch, stored.challenge_anchor, best,

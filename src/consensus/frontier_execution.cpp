@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 
+#include <atomic>
+#include <cstdio>
 #include "consensus/frontier_execution.hpp"
 
 #include <limits>
@@ -258,10 +260,53 @@ std::uint64_t ordered_record_confidential_verify_weight(const Bytes& raw_record)
   return tx.has_value() ? any_tx_confidential_verify_weight(*tx) : 0;
 }
 
+namespace {
+std::atomic<bool> g_utxo_tree_crosscheck{false};
+}  // namespace
+
+void set_utxo_tree_crosscheck(bool enabled) { g_utxo_tree_crosscheck = enabled; }
+bool utxo_tree_crosscheck() { return g_utxo_tree_crosscheck; }
+
+void check_utxo_tree_against(const crypto::PersistentSmt& tree, const UtxoSetV2& utxos, const char* where) {
+  if (!utxo_tree_crosscheck()) return;
+  if (tree.size() != utxos.size() || tree.root() != frontier_utxo_state_root(utxos)) {
+    std::fprintf(stderr, "utxo-tree-crosscheck-failed where=%s tree_size=%zu utxos=%zu\n", where, tree.size(),
+                 utxos.size());
+    std::abort();
+  }
+}
+
+std::pair<Hash32, Hash32> utxo_tree_leaf(const OutPoint& op, const UtxoEntryV2& entry) {
+  const auto key = utxo_commitment_key(op);
+  return {key, crypto::SparseMerkleTree::leaf_hash(key, utxo_commitment_value(entry))};
+}
+
+crypto::PersistentSmt utxo_tree_from(const UtxoSetV2& utxos) {
+  std::vector<std::pair<Hash32, Hash32>> leaves;
+  leaves.reserve(utxos.size());
+  for (const auto& [op, entry] : utxos) leaves.push_back(utxo_tree_leaf(op, entry));
+  return crypto::PersistentSmt::from_leaf_hashes(std::move(leaves));
+}
+
+crypto::PersistentSmt utxo_tree_with(const crypto::PersistentSmt& base, const UtxoSetV2& utxos,
+                                     const std::vector<OutPoint>& touched) {
+  std::vector<std::pair<Hash32, std::optional<Hash32>>> changes;
+  changes.reserve(touched.size());
+  for (const auto& op : touched) {
+    if (const auto it = utxos.find(op); it != utxos.end()) {
+      const auto [key, leaf] = utxo_tree_leaf(op, it->second);
+      changes.push_back({key, leaf});
+    } else {
+      changes.push_back({utxo_commitment_key(op), std::nullopt});
+    }
+  }
+  return base.updated(changes);
+}
+
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_confidential_pool_value,
                             std::uint64_t prev_frontier, const std::vector<Bytes>& ordered_records,
                             const SpecialValidationContext* ctx, FrontierExecutionResult* out, std::string* error,
-                            bool compute_next_state_root) {
+                            bool compute_next_state_root, const crypto::PersistentSmt* parent_utxo_tree) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
@@ -301,6 +346,7 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
   std::vector<FrontierDecision> decisions;
   decisions.reserve(ordered_records.size());
   std::vector<AnyTx> accepted_txs;
+  std::vector<OutPoint> touched;  // outpoints accepted transactions spent or created
   std::uint64_t accepted_fee_units = 0;
   std::uint64_t confidential_pool_value = parent_confidential_pool_value;
 
@@ -365,6 +411,13 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
 
     for (const auto& domain : domains) consumed_domains.insert(domain);
     apply_accepted_tx_to_utxos(*tx, &work);
+    std::visit(
+        [&](const auto& value) {
+          for (const auto& in : value.inputs) touched.push_back(OutPoint{in.prev_txid, in.prev_index});
+          const Hash32 txid = value.txid();
+          for (std::uint32_t i = 0; i < value.outputs.size(); ++i) touched.push_back(OutPoint{txid, i});
+        },
+        *tx);
     accepted_txs.push_back(*tx);
     accepted_fee_units += validation.cost.fee;
     decision.accepted = true;
@@ -375,8 +428,17 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
   FrontierExecutionResult result;
   result.transition.prev_frontier = prev_frontier;
   result.transition.next_frontier = prev_frontier + ordered_records.size();
-  result.transition.prev_state_root = frontier_utxo_state_root(parent_utxos);
-  if (compute_next_state_root) result.transition.next_state_root = frontier_utxo_state_root(work);
+  if (parent_utxo_tree != nullptr) {
+    check_utxo_tree_against(*parent_utxo_tree, parent_utxos, "execution-parent");
+    result.transition.prev_state_root = parent_utxo_tree->root();
+    result.next_utxo_tree = utxo_tree_with(*parent_utxo_tree, work, touched);
+    result.has_next_utxo_tree = true;
+    check_utxo_tree_against(result.next_utxo_tree, work, "execution-next");
+    if (compute_next_state_root) result.transition.next_state_root = result.next_utxo_tree.root();
+  } else {
+    result.transition.prev_state_root = frontier_utxo_state_root(parent_utxos);
+    if (compute_next_state_root) result.transition.next_state_root = frontier_utxo_state_root(work);
+  }
   result.transition.ordered_slice_commitment = frontier_ordered_slice_commitment(ordered_records);
   result.transition.decisions_commitment = frontier_decisions_commitment(decisions);
   result.decisions = std::move(decisions);
@@ -399,7 +461,8 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
                                   const FrontierVector& prev_vector, const FrontierVector& next_vector,
                                   const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
-                                  FrontierExecutionResult* out, std::string* error, bool compute_next_state_root) {
+                                  FrontierExecutionResult* out, std::string* error, bool compute_next_state_root,
+                                  const crypto::PersistentSmt* parent_utxo_tree) {
   FrontierLaneRoots recomputed_lane_roots{};
   std::vector<Bytes> ordered_records;
   if (!frontier_merge_certified_ingress(prev_vector, next_vector, lane_records, prev_lane_roots, &recomputed_lane_roots,
@@ -427,7 +490,7 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
 
   FrontierExecutionResult result;
   if (!execute_frontier_slice(parent_utxos, parent_confidential_pool_value, prev_vector.total_count(), ordered_records, ctx,
-                              &result, error, compute_next_state_root)) {
+                              &result, error, compute_next_state_root, parent_utxo_tree)) {
     return false;
   }
   result.transition.prev_vector = prev_vector;

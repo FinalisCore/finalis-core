@@ -558,6 +558,8 @@ class Node {
                                          const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
                                          std::string* error = nullptr);
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
+  // Same, taking ownership: saves copying the state (its UTXO set) once per finalized block.
+  void hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& state);
   // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
   std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {
     if (!canonical_state_) return std::nullopt;

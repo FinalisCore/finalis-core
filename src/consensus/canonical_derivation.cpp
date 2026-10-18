@@ -250,27 +250,6 @@ std::optional<std::uint64_t> settlement_epoch_for_height(const CanonicalDerivati
   return epoch_start - epoch_blocks;
 }
 
-std::map<PubKey32, std::uint64_t> onboarding_score_units_from_epoch_tickets(const storage::DB& db,
-                                                                             std::uint64_t epoch_start) {
-  std::map<PubKey32, std::uint64_t> out;
-  const auto tickets = db.load_epoch_tickets(epoch_start);
-  const auto best_tickets = best_epoch_tickets_by_pubkey(tickets);
-  for (const auto& [pub, ticket] : best_tickets) {
-    const auto score = static_cast<std::uint64_t>(std::max<std::uint8_t>(1, leading_zero_bits(ticket.work_hash)));
-    out[pub] = score;
-  }
-  return out;
-}
-
-std::map<PubKey32, std::uint64_t> onboarding_score_units_for_replay(const storage::DB& db,
-                                                                    std::uint64_t epoch_start) {
-  if (auto state = db.get_epoch_reward_settlement(epoch_start); state.has_value() &&
-      !state->onboarding_score_units.empty()) {
-    return state->onboarding_score_units;
-  }
-  return onboarding_score_units_from_epoch_tickets(db, epoch_start);
-}
-
 std::map<PubKey32, std::uint64_t> checkpoint_onboarding_scores(
     const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
     std::uint64_t epoch_start, std::uint64_t epoch_blocks) {
@@ -992,7 +971,9 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
                                            const std::vector<FinalitySig>& prev_finality_signers,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
-                                           std::string* error) {
+                                           std::string* error,
+                                           const crypto::PersistentSmt* post_execution_tree,
+                                           crypto::PersistentSmt* settled_tree_out) {
   if (!transition) {
     if (error) *error = "missing-transition-output";
     return false;
@@ -1037,6 +1018,22 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   transition->prev_finality_signers = std::move(canonical_signers);
   transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
   transition->settlement_commitment = transition->settlement.commitment();
+  if (post_execution_tree != nullptr) {
+    // Settlement only adds its own outputs: update the tree with those instead of copying the set.
+    UtxoSetV2 settlement_outputs;
+    apply_frontier_settlement_to_utxos(*transition, &settlement_outputs);
+    std::vector<OutPoint> touched;
+    for (const auto& [op, _] : settlement_outputs) touched.push_back(op);
+    auto settled = utxo_tree_with(*post_execution_tree, settlement_outputs, touched);
+    transition->next_state_root = settled.root();
+    if (utxo_tree_crosscheck()) {
+      UtxoSetV2 settled_utxos = post_execution_utxos;
+      apply_frontier_settlement_to_utxos(*transition, &settled_utxos);
+      check_utxo_tree_against(settled, settled_utxos, "populate-settled");
+    }
+    if (settled_tree_out) *settled_tree_out = std::move(settled);
+    return true;
+  }
   UtxoSetV2 settled_utxos = post_execution_utxos;
   apply_frontier_settlement_to_utxos(*transition, &settled_utxos);
   transition->next_state_root = frontier_utxo_state_root(settled_utxos);
@@ -1590,10 +1587,11 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   // prev_state_root is checked against execution's recomputation below.
   auto vctx = build_validation_context(record.transition.height);
   FrontierExecutionResult result;
+  const auto parent_tree = utxo_tree_for(prev);
   if (!execute_frontier_lane_prefix(prev.utxos, prev.confidential_pool_value, prev.finalized_frontier_vector,
                                     record.transition.next_vector,
                                     record.lane_records, prev.finalized_lane_roots, &vctx, &result, error,
-                                    /*compute_next_state_root=*/false)) {
+                                    /*compute_next_state_root=*/false, &parent_tree)) {
     if (error && error->empty()) *error = "frontier-execution-failed";
     return false;
   }
@@ -1622,11 +1620,14 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     return false;
   }
   FrontierTransition expected_transition = result.transition;
+  crypto::PersistentSmt settled_tree;
   const bool have_current_expected = populate_frontier_transition_metadata(
       cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
       record.transition.prev_finality_round, record.transition.prev_finality_signers, result.accepted_fee_units,
-      result.next_utxos, &expected_transition, error);
+      result.next_utxos, &expected_transition, error, result.has_next_utxo_tree ? &result.next_utxo_tree : nullptr,
+      &settled_tree);
   if (!have_current_expected) return false;
+  if (result.has_next_utxo_tree) result.next_utxo_tree = std::move(settled_tree);
   const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
     return record.transition.quorum_threshold == expected.quorum_threshold &&
            record.transition.prev_finality_round == expected.prev_finality_round &&
@@ -1702,6 +1703,16 @@ std::uint8_t ticket_difficulty_bits_for_epoch_from_state(const CanonicalDerivati
                                           state.validators.active_sorted(epoch_start_height).size());
 }
 
+crypto::PersistentSmt utxo_tree_for(const CanonicalDerivedState& state) {
+  // apply keeps the tree in step with the UTXO set; a state assembled any other way (genesis, fast
+  // start, test fixtures) gets a tree built from its set.
+  if (state.utxo_tree.size() == state.utxos.size() && (state.utxos.empty() || state.utxo_tree.size() != 0)) {
+    check_utxo_tree_against(state.utxo_tree, state.utxos, "state");
+    return state.utxo_tree;
+  }
+  return utxo_tree_from(state.utxos);
+}
+
 static void finalize_matured_unspendable_bond_exits(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state) {
   const std::uint64_t height = state->finalized_height;
   const std::uint64_t delay = cfg.network.unbond_delay_blocks;
@@ -1775,6 +1786,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   next.finalized_frontier_vector = recomputed.transition.next_vector;
   next.finalized_lane_roots = recomputed.next_lane_roots;
   next.utxos = std::move(recomputed.next_utxos);
+  next.utxo_tree = recomputed.has_next_utxo_tree ? std::move(recomputed.next_utxo_tree) : crypto::PersistentSmt{};
   next.confidential_pool_value = recomputed.next_confidential_pool_value;
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
   next.finalized_timestamp = record.transition.timestamp;
@@ -1901,19 +1913,6 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
                           " expected=" + hex_encode32(*transition_id) +
                           " actual=" + hex_encode32(transition->transition_id());
       return false;
-    }
-
-    if (auto settlement_epoch = settlement_epoch_for_height(cfg, height); settlement_epoch.has_value()) {
-      auto& reward_state = state.epoch_reward_states[*settlement_epoch];
-      reward_state.epoch_start_height = *settlement_epoch;
-      if (reward_state.onboarding_score_units.empty()) {
-        const auto expected_with_empty =
-            derive_frontier_settlement_from_state(cfg, state, height, transition->leader_pubkey,
-                                                  transition->settlement.current_fees);
-        if (expected_with_empty.serialize() != transition->settlement.serialize()) {
-          reward_state.onboarding_score_units = onboarding_score_units_for_replay(db, *settlement_epoch);
-        }
-      }
     }
 
     const auto cert = db.get_finality_certificate_by_height(height);

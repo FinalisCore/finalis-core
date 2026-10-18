@@ -1960,6 +1960,46 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
   return std::nullopt;
 }
 
+std::optional<crypto::SmtProof> Server::utxo_proof_at(std::uint64_t height, const Hash32& expected_root,
+                                                      const Hash32& key) {
+  std::lock_guard<std::mutex> lk(utxo_tree_mu_);
+  const auto rebuild = [&]() {
+    std::vector<std::pair<Hash32, Hash32>> leaves;
+    const std::string prefix = storage::key_smt_leaf_prefix("utxo");
+    for (const auto& [k, v] : db_.scan_prefix(prefix)) {
+      if (v.empty()) continue;
+      const auto kb = hex_decode(k.substr(prefix.size()));
+      if (!kb.has_value() || kb->size() != 32) continue;
+      Hash32 leaf_key{};
+      std::copy(kb->begin(), kb->end(), leaf_key.begin());
+      leaves.push_back({leaf_key, crypto::SparseMerkleTree::leaf_hash(leaf_key, v)});
+    }
+    utxo_tree_ = crypto::PersistentSmt::from_leaf_hashes(std::move(leaves));
+    utxo_tree_height_ = height;
+  };
+  // Catch up from the per-height change rows; any gap (or a reorg-free restart) falls back to a rebuild.
+  bool caught_up = utxo_tree_.has_value() && utxo_tree_height_ <= height;
+  if (caught_up) {
+    auto tree = *utxo_tree_;
+    for (std::uint64_t h = utxo_tree_height_ + 1; h <= height && caught_up; ++h) {
+      const auto raw = db_.get(storage::key_smt_delta("utxo", h));
+      const auto changes = raw.has_value() ? crypto::decode_smt_delta(*raw) : std::nullopt;
+      if (!changes.has_value()) {
+        caught_up = false;
+        break;
+      }
+      tree = tree.updated(*changes);
+    }
+    if (caught_up) {
+      utxo_tree_ = std::move(tree);
+      utxo_tree_height_ = height;
+    }
+  }
+  if (!caught_up || utxo_tree_->root() != expected_root) rebuild();
+  if (utxo_tree_->root() != expected_root) return std::nullopt;  // leaves and root row disagree (mid-write)
+  return utxo_tree_->proof(key);
+}
+
 TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   if (cfg_.tx_relay_override) return cfg_.tx_relay_override(tx_bytes);
   auto unavailable = [](std::string detail) {
@@ -3399,11 +3439,13 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const Hash32 key = consensus::utxo_commitment_key(op);
     crypto::SparseMerkleTree tree(db_, "utxo");
     const auto value = tree.get_value(key);
-    const auto proof = tree.get_proof(key);
     auto ur = db_.get(storage::key_root_index("UTXO", h));
     if (!ur.has_value() || ur->size() != 32) return make_error(id, -32001, "utxo_root unavailable");
     Hash32 root{};
     std::copy(ur->begin(), ur->end(), root.begin());
+    const auto proof_opt = utxo_proof_at(h, root, key);
+    if (!proof_opt.has_value()) return make_error(id, -32001, "utxo proof unavailable");
+    const auto& proof = *proof_opt;
 
     std::ostringstream oss;
     oss << "{\"proof_format\":\"smt_v0\",\"height\":" << h << ",\"key_hex\":\"" << hex_encode32(key)

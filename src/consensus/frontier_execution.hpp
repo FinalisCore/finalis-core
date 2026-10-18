@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "crypto/smt.hpp"
 #include "utxo/tx.hpp"
 #include "utxo/validate.hpp"
 
@@ -37,9 +38,26 @@ struct FrontierExecutionResult {
   // Confidential turnstile value after this slice (see CanonicalDerivedState::confidential_pool_value).
   std::uint64_t next_confidential_pool_value{0};
   std::vector<PubKey32> effective_committee;
+  // The UTXO commitment tree of next_utxos, maintained incrementally when execution was given the
+  // parent's tree (after populate_frontier_transition_metadata: including settlement outputs).
+  crypto::PersistentSmt next_utxo_tree;
+  bool has_next_utxo_tree{false};
 
   Hash32 result_id() const;
 };
+
+// The UTXO commitment tree: the sparse Merkle tree whose root is frontier_utxo_state_root, held as a
+// crypto::PersistentSmt so a block updates only the leaves it touched.
+std::pair<Hash32, Hash32> utxo_tree_leaf(const OutPoint& op, const UtxoEntryV2& entry);
+crypto::PersistentSmt utxo_tree_from(const UtxoSetV2& utxos);
+// `base` with each outpoint in `touched` set to its entry in `utxos`, or removed if absent there.
+crypto::PersistentSmt utxo_tree_with(const crypto::PersistentSmt& base, const UtxoSetV2& utxos,
+                                     const std::vector<OutPoint>& touched);
+// When enabled (tests), every incrementally maintained root is checked against a full recomputation
+// and a mismatch aborts.
+void set_utxo_tree_crosscheck(bool enabled);
+bool utxo_tree_crosscheck();
+void check_utxo_tree_against(const crypto::PersistentSmt& tree, const UtxoSetV2& utxos, const char* where);
 
 std::vector<OutPoint> frontier_conflict_domains_for_tx(const AnyTx& tx);
 Hash32 frontier_ordered_slice_commitment(const std::vector<Bytes>& ordered_records);
@@ -71,7 +89,8 @@ std::uint64_t ordered_record_confidential_verify_weight(const Bytes& raw_record)
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_confidential_pool_value,
                             std::uint64_t prev_frontier, const std::vector<Bytes>& ordered_records,
                             const SpecialValidationContext* ctx, FrontierExecutionResult* out,
-                            std::string* error = nullptr, bool compute_next_state_root = true);
+                            std::string* error = nullptr, bool compute_next_state_root = true,
+                            const crypto::PersistentSmt* parent_utxo_tree = nullptr);
 bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
                             FrontierExecutionResult* out, std::string* error = nullptr);
@@ -80,7 +99,8 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
                                   const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
                                   FrontierExecutionResult* out, std::string* error = nullptr,
-                                  bool compute_next_state_root = true);
+                                  bool compute_next_state_root = true,
+                                  const crypto::PersistentSmt* parent_utxo_tree = nullptr);
 bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVector& prev_vector,
                                   const FrontierVector& next_vector, const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,

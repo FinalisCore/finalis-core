@@ -492,6 +492,9 @@ std::string key_smt_leaf_prefix(const std::string& tree_id);
 std::string key_smt_leaf(const std::string& tree_id, const Hash32& key);
 std::string key_smt_root_prefix(const std::string& tree_id);
 std::string key_smt_root(const std::string& tree_id, std::uint64_t height);
+// Leaves of the UTXO commitment tree that changed at `height` (see encode_smt_delta), so readers can
+// keep an in-memory tree current without rescanning every leaf.
+std::string key_smt_delta(const std::string& tree_id, std::uint64_t height);
 std::string key_script_utxo_prefix(const Hash32& scripthash);
 std::string key_script_utxo(const Hash32& scripthash, const OutPoint& op);
 std::string key_script_history_prefix(const Hash32& scripthash);

@@ -130,7 +130,9 @@ bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDer
 void stage_canonical_scalars(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state);
 // Per-finalized-block persistence: stages only the rows that differ between consecutive states (the
 // full rewrite above is for startup and repair).
-// Also stages the UTXO SMT leaf changes and the UTXO root rows (next_utxo_root: the transition's
+// Per-height UTXO tree change rows kept for readers (lightserver) catching up their in-memory tree.
+inline constexpr std::uint64_t kRetainedSmtDeltaHeights = 4096;
+// Also stages the UTXO SMT leaf changes, the height's tree change row and the UTXO root rows (next_utxo_root: the transition's
 // verified next_state_root).
 bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& prev,
                                    const consensus::CanonicalDerivedState& next, const Hash32& next_utxo_root);

@@ -413,10 +413,10 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     mempool_.on_finalized_block_timestamp(record.transition.timestamp);
   }
   mempool_.remove_confirmed(confirmed_txids);
-  hydrate_runtime_from_canonical_state_locked(next_state);
+  hydrate_runtime_from_canonical_state_locked(std::move(next_state));
   if (block_had_txv2) run_confidential_supply_audit_locked("finalized-block");
   mempool_.prune_against_utxo(utxos_);
-  (void)mempool_.set_confidential_pool_value(next_state.confidential_pool_value);
+  (void)mempool_.set_confidential_pool_value(canonical_state_->confidential_pool_value);
   const auto now = now_ms();
   if (finalized_height_ > previous_finalized_height) {
     current_round_ = 0;
@@ -457,7 +457,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
 
   // apply_frontier_record computed next_state.state_commitment; recomputing it here would hash the whole
   // UTXO set again.
-  if (!verify_and_persist_consensus_state_commitment_locked(next_state, batch, /*recompute=*/false)) {
+  if (!verify_and_persist_consensus_state_commitment_locked(*canonical_state_, batch, /*recompute=*/false)) {
     if (error) *error = "persist-consensus-state-commitment-failed";
     return false;
   }
@@ -2850,11 +2850,12 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
 
     consensus::FrontierExecutionResult result;
     std::string validation_error;
+    const auto parent_tree = consensus::utxo_tree_for(*canonical_state_);
     if (!consensus::execute_frontier_lane_prefix(canonical_state_->utxos, canonical_state_->confidential_pool_value,
                                                  canonical_state_->finalized_frontier_vector,
                                                  selection.next_vector, selection.lane_records,
                                                  canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error,
-                                                 /*compute_next_state_root=*/false)) {
+                                                 /*compute_next_state_root=*/false, &parent_tree)) {
       if (attempt == 0 &&
           (validation_error.find("frontier-certified-ingress-prev-root-mismatch") != std::string::npos ||
            validation_error.find("frontier-certified-ingress-prev-root-state-mismatch") != std::string::npos)) {
@@ -2876,7 +2877,8 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                                                           local_key_.public_key, prev_finality.round,
                                                           prev_finality.signers,
                                                           result.accepted_fee_units,
-                                                          result.next_utxos, &result.transition, &validation_error)) {
+                                                          result.next_utxos, &result.transition, &validation_error,
+                                                          result.has_next_utxo_tree ? &result.next_utxo_tree : nullptr)) {
       last_test_hook_error_ = "frontier-build-metadata-failed:" + validation_error;
       return std::nullopt;
     }

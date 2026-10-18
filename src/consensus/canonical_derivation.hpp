@@ -123,7 +123,12 @@ struct CanonicalDerivedState {
   // Derived supply-audit accumulators; deliberately not part of state_commitment.
   ConfidentialSupplyLedger confidential_supply;
   Hash32 state_commitment{};
+  // Commitment tree of `utxos` (root = frontier_utxo_state_root(utxos)), maintained by apply. Use
+  // utxo_tree_for(): a state whose tree does not match its UTXO set (e.g. built by hand) gets a fresh one.
+  crypto::PersistentSmt utxo_tree;
 };
+
+crypto::PersistentSmt utxo_tree_for(const CanonicalDerivedState& state);
 
 struct AdaptiveCheckpointParameters {
   std::uint64_t qualified_depth{0};
@@ -181,7 +186,9 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
                                            const std::vector<FinalitySig>& prev_finality_signers,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
-                                           std::string* error);
+                                           std::string* error,
+                                           const crypto::PersistentSmt* post_execution_tree = nullptr,
+                                           crypto::PersistentSmt* settled_tree_out = nullptr);
 bool load_certified_frontier_record_from_storage(const storage::DB& db, const FrontierTransition& transition,
                                                  CanonicalFrontierRecord* out, std::string* error);
 bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
