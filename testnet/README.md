@@ -53,8 +53,9 @@ scripts/genesis_to_cpp.py --network testnet --in testnet/genesis.bin --out src/g
 Commit `pubkeys.txt`, `genesis.json`, `genesis.bin` and `embedded_testnet.cpp` together, tag the
 commit, and publish the `genesis_hash`. Anyone can reproduce it from the committed files.
 
-testnet-1 is embedded (`genesis_hash` `358d09d637194c673fe85b1fc5a6b06089915793327595c0b6d1b1a12696418b`,
-check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--genesis` flag.
+testnet-1 is embedded (`genesis_hash` `5cabf22be344bd39a37a3a434e7a00dfa2caaba8f148de88cdcef706a103f7a0`,
+check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--genesis` flag. Its
+`genesis_time_unix` is 1792400400 (2026-10-19 09:00 UTC); the code freeze is commit 3519f84.
 
 ### 3. Seeds
 
