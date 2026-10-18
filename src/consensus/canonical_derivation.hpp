@@ -24,7 +24,7 @@ namespace finalis::consensus {
 
 // Transition timestamps are bounded below by the chain (strictly increasing) and above by honest
 // validators, which refuse to prevote one stamped more than this far past their wall clock. A leader
-// does not propose while the lowest timestamp it may use is past that bound (e.g. before genesis time).
+// does not propose height 1 until genesis time is within this bound.
 inline constexpr std::uint64_t kMaxTransitionTimestampDriftS = 60;
 
 struct CanonicalDerivationConfig {
