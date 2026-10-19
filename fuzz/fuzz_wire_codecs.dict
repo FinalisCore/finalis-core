@@ -1,0 +1,6 @@
+# libFuzzer dictionary for fuzz_wire_codecs: magics and format versions the decoders check.
+snapshot_magic="SCSNAP01"
+snapshot_version_le="\x02\x00\x00\x00"
+availability_magic="FINALIS_AVAIL_STATE_V1"
+availability_version_le="\x02\x00\x00\x00"
+testnet_magic_le="\x31\x43\x53\x54"
