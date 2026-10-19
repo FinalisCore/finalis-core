@@ -718,6 +718,85 @@ TEST(test_lightserver_get_utxos_ignores_stale_or_missing_script_index_entries) {
   ASSERT_TRUE(resp.find(hex_encode32(stale_op.txid)) == std::string::npos);
 }
 
+// An address with tx history that also holds settlement (reward) credits: the credits have no tx
+// index, so their height must come from the script-utxo index, not default to 0.
+TEST(test_lightserver_get_utxos_keeps_settlement_credit_height_when_history_exists) {
+  const std::string base = unique_test_base("/tmp/finalis_light_utxos_settlement_height");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-settlement-height";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
+
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const auto script_pubkey = address::p2pkh_script_pubkey(pkh);
+  const Hash32 sh = crypto::sha256(script_pubkey);
+
+  // Settlement credit finalized at height 33: canonical utxo + script index, no tx index.
+  OutPoint reward_op{};
+  reward_op.txid[31] = 0x33;
+  reward_op.index = 0;
+  ASSERT_TRUE(db.put_utxo(reward_op, TxOut{24711886570ULL, script_pubkey}));
+  ASSERT_TRUE(db.put_script_utxo(sh, reward_op, TxOut{24711886570ULL, script_pubkey}, 33));
+
+  // A spent settlement credit whose script-index row is still present forces the history fallback.
+  OutPoint spent_reward_op{};
+  spent_reward_op.txid[31] = 0x97;
+  spent_reward_op.index = 0;
+  ASSERT_TRUE(db.put_script_utxo(sh, spent_reward_op, TxOut{24711886570ULL, script_pubkey}, 97));
+
+  // Ordinary history: a finalized receive at height 161.
+  Tx receive_tx;
+  receive_tx.inputs.push_back(TxIn{zero_hash(), 0, Bytes{}, 0xFFFFFFFF});
+  receive_tx.outputs.push_back(TxOut{10000, script_pubkey});
+  const Hash32 receive_txid = receive_tx.txid();
+  const OutPoint receive_op{receive_txid, 0};
+  ASSERT_TRUE(db.put_tx_index(receive_txid, 161, 0, receive_tx.serialize()));
+  ASSERT_TRUE(db.add_script_history(sh, 161, receive_txid));
+  ASSERT_TRUE(db.put_utxo(receive_op, TxOut{10000, script_pubkey}));
+  ASSERT_TRUE(db.put_script_utxo(sh, receive_op, TxOut{10000, script_pubkey}, 161));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":105,"method":"get_utxos","params":{"scripthash_hex":")") +
+                           hex_encode32(sh) + R"("}})";
+  const auto resp = ls.handle_rpc_for_test(body);
+  const std::string reward_json = std::string("{\"txid\":\"") + hex_encode32(reward_op.txid) +
+                                  "\",\"vout\":0,\"value\":24711886570,\"height\":33,";
+  ASSERT_TRUE(resp.find(reward_json) != std::string::npos);
+  const std::string receive_json = std::string("{\"txid\":\"") + hex_encode32(receive_txid) +
+                                   "\",\"vout\":0,\"value\":10000,\"height\":161,";
+  ASSERT_TRUE(resp.find(receive_json) != std::string::npos);
+  ASSERT_TRUE(resp.find(hex_encode32(spent_reward_op.txid)) == std::string::npos);
+  ASSERT_TRUE(resp.find("\"height\":0") == std::string::npos);
+}
+
 TEST(test_wallet_spendable_utxos_reconcile_script_index_with_canonical_set) {
   const std::string base = unique_test_base("/tmp/finalis_wallet_spendable_reconcile");
   std::filesystem::remove_all(base);

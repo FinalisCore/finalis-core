@@ -253,7 +253,10 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     const auto canonical_it = canonical_matches.find(entry.outpoint);
     if (canonical_it == canonical_matches.end()) continue;
     if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
-    out.push_back(canonical_it->second);
+    storage::DB::ScriptUtxoEntry merged = canonical_it->second;
+    // Settlement credits have no tx index, so only the script-utxo index knows their finalization height.
+    if (merged.height == 0) merged.height = entry.height;
+    out.push_back(std::move(merged));
     seen.insert(entry.outpoint);
   }
   for (const auto& [op, prevout] : canonical_matches) {
