@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "wallet_store.hpp"
+#include "wallet_network.hpp"
 
 #include <cstdio>
 #include <algorithm>
@@ -626,8 +627,8 @@ std::optional<Bytes> decrypt_secret_payload(const std::string& passphrase, const
 
 }  // namespace
 
-bool WalletStore::open(const std::string& wallet_file_path, const std::string& passphrase) {
-  path_ = wallet_file_path + ".walletdb";
+bool WalletStore::open(const std::string& wallet_file_path, const std::string& passphrase, const std::string& network) {
+  path_ = wallet_store_path(wallet_file_path, network);
   crypto::secure_wipe(passphrase_);
   passphrase_ = passphrase;
   std::filesystem::create_directories(path_);

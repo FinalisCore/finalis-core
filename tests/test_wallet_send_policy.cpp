@@ -9,6 +9,7 @@
 #include "common/address.hpp"
 #include "apps/finalis-wallet/history_merge.hpp"
 #include "apps/finalis-wallet/refresh_gate.hpp"
+#include "apps/finalis-wallet/wallet_network.hpp"
 #include "consensus/monetary.hpp"
 #include "crypto/confidential.hpp"
 #include "crypto/ed25519.hpp"
@@ -282,4 +283,32 @@ TEST(test_wallet_confidential_builder_creates_valid_confidential_to_transparent_
   const auto result = validate_tx_v2(*tx, 1, view, &ctx);
   if (!result.ok) throw std::runtime_error("wallet confidential->transparent builder error: " + result.error);
   ASSERT_TRUE(result.ok);
+}
+
+TEST(test_wallet_network_helpers_separate_mainnet_and_testnet) {
+  ASSERT_EQ(wallet::normalize_wallet_network("testnet"), std::string("testnet"));
+  ASSERT_EQ(wallet::normalize_wallet_network("tsc"), std::string("testnet"));
+  ASSERT_EQ(wallet::normalize_wallet_network("bogus"), std::string("mainnet"));
+  ASSERT_EQ(wallet::wallet_settings_key("mainnet", "lightserver_endpoints"), std::string("lightserver_endpoints"));
+  ASSERT_EQ(wallet::wallet_settings_key("testnet", "lightserver_endpoints"), std::string("testnet/lightserver_endpoints"));
+  ASSERT_EQ(wallet::default_local_rpc_url("mainnet"), std::string("http://127.0.0.1:19444/rpc"));
+  ASSERT_EQ(wallet::default_local_rpc_url("testnet"), std::string("http://127.0.0.1:19544/rpc"));
+  ASSERT_EQ(wallet::default_lightserver_endpoints("testnet").front(), std::string("http://130.61.126.39:19544/rpc"));
+  ASSERT_EQ(wallet::wallet_store_path("/w/a.json", "mainnet"), std::string("/w/a.json.walletdb"));
+  ASSERT_EQ(wallet::wallet_store_path("/w/a.json", "testnet"), std::string("/w/a.json.testnet.walletdb"));
+
+  const auto kp = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{1});
+  ASSERT_TRUE(kp.has_value());
+  const std::string pub_hex = hex_encode(Bytes(kp->public_key.begin(), kp->public_key.end()));
+  const auto main_addr = wallet::address_for_network(pub_hex, "mainnet");
+  const auto test_addr = wallet::address_for_network(pub_hex, "testnet");
+  ASSERT_TRUE(main_addr.has_value() && test_addr.has_value());
+  ASSERT_EQ(main_addr->rfind("sc1", 0), 0u);
+  ASSERT_EQ(test_addr->rfind("tsc1", 0), 0u);
+  // Same key, same pubkey hash: only the prefix differs.
+  ASSERT_EQ(address::decode(*main_addr)->pubkey_hash, address::decode(*test_addr)->pubkey_hash);
+  ASSERT_TRUE(wallet::address_matches_network(*main_addr, "mainnet"));
+  ASSERT_TRUE(!wallet::address_matches_network(*main_addr, "testnet"));
+  ASSERT_TRUE(wallet::address_matches_network(*test_addr, "testnet"));
+  ASSERT_TRUE(!wallet::address_for_network("zz", "testnet").has_value());
 }

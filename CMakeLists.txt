@@ -336,6 +336,7 @@ if(Qt5Widgets_FOUND)
     apps/finalis-wallet/main.cpp
     apps/finalis-wallet/history_merge.cpp
     apps/finalis-wallet/refresh_gate.cpp
+    apps/finalis-wallet/wallet_network.cpp
     apps/finalis-wallet/wallet_window.cpp
     apps/finalis-wallet/wallet_store.cpp
     apps/finalis-wallet/confidential_memo.cpp
@@ -386,6 +387,7 @@ if(Qt5Widgets_FOUND)
     tests/test_wallet_widgets.cpp
     apps/finalis-wallet/history_merge.cpp
     apps/finalis-wallet/refresh_gate.cpp
+    apps/finalis-wallet/wallet_network.cpp
     apps/finalis-wallet/wallet_window.cpp
     apps/finalis-wallet/wallet_store.cpp
     apps/finalis-wallet/confidential_memo.cpp
@@ -432,6 +434,7 @@ endif()
 add_executable(finalis-tests
   apps/finalis-wallet/history_merge.cpp
   apps/finalis-wallet/refresh_gate.cpp
+  apps/finalis-wallet/wallet_network.cpp
   apps/finalis-wallet/wallet_store.cpp
   apps/finalis-wallet/confidential_memo.cpp
   apps/finalis-wallet/confidential_receive.cpp

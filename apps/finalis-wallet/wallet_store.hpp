@@ -162,7 +162,8 @@ class WalletStore {
     std::vector<PendingTxStatusRecord> pending_tx_statuses;
   };
 
-  bool open(const std::string& wallet_file_path, const std::string& passphrase = {});
+  // Local state of `wallet_file_path` on `network`; each network keeps its own.
+  bool open(const std::string& wallet_file_path, const std::string& passphrase = {}, const std::string& network = "mainnet");
   bool load(State* out) const;
 
   bool add_sent_txid(const std::string& txid);

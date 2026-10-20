@@ -278,6 +278,14 @@ class WalletWindow final : public QMainWindow {
   void build_ui();
   void load_settings();
   void save_settings() const;
+  // Endpoints, validator paths and the explorer URL are kept per network.
+  void load_network_settings();
+  QString network_settings_key(const QString& key) const;
+  // Moves the open wallet (same key, that network's address) and all chain views to `network`.
+  void switch_network(const std::string& network);
+  void bind_wallet_to_active_network(LoadedWallet& wallet) const;
+  void apply_network_chrome();
+  std::optional<QString> recipient_address_error(const QString& address) const;
   void apply_selected_theme();
   void update_wallet_views();
   void update_connection_views();
@@ -373,6 +381,9 @@ class WalletWindow final : public QMainWindow {
   QLabel* header_logo_label_{nullptr};
   QLabel* header_title_label_{nullptr};
   QLabel* header_network_label_{nullptr};
+  QComboBox* network_combo_{nullptr};
+  QLabel* testnet_banner_label_{nullptr};
+  std::string active_network_{"mainnet"};
   QLabel* header_tip_label_{nullptr};
   QLabel* header_connection_label_{nullptr};
   QLabel* header_crosscheck_label_{nullptr};
