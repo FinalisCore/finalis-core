@@ -1545,10 +1545,6 @@ std::string server_hrp_for_network(const NetworkConfig& network) {
   return network.name == "mainnet" ? "sc" : "tsc";
 }
 
-bool open_fresh_readonly_db(const std::string& db_path, storage::DB* db) {
-  return db->open_readonly(db_path);
-}
-
 // SECURITY: bounded parsing + a whole-request deadline. The accept loop is single-threaded, so a
 // per-recv timeout alone lets one client trickle bytes and hold the server indefinitely.
 bool parse_content_length(const std::string& headers, std::size_t* out) {
@@ -1632,7 +1628,8 @@ Server::~Server() { stop(); }
 
 bool Server::init() {
   cfg_.db_path = expand_user_home(cfg_.db_path);
-  if (!db_.open_readonly(cfg_.db_path)) return false;
+  if (cfg_.secondary_path.empty()) cfg_.secondary_path = (std::filesystem::path(cfg_.db_path) / "lightserver-secondary").string();
+  if (!db_.open_secondary(cfg_.db_path, cfg_.secondary_path)) return false;
   chain_id_ = ChainId::from_config_and_db(cfg_.network, db_);
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
   if (cfg_.tx_relay_port == 0) cfg_.tx_relay_port = cfg_.network.p2p_default_port;
@@ -2130,9 +2127,13 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
   // Admin methods do not exist on the public (TCP) surface.
   if (surface != RpcSurface::Admin && is_admin_rpc_method(*method)) return make_error(id, -32601, "method not found");
   const minijson::Value* params = params_object(*root);
-  storage::DB live_db;
+  // Follow the node's writes, then hold the view steady for the rest of this request.
+  {
+    std::unique_lock<std::shared_mutex> catch_up(view_mu_);
+    (void)db_.catch_up_with_primary();
+  }
+  std::shared_lock<std::shared_mutex> view_lock(view_mu_);
   const storage::DB* view = &db_;
-  if (open_fresh_readonly_db(cfg_.db_path, &live_db)) view = &live_db;
   if (*method == "get_tip") {
     auto tip = view->get_tip();
     if (!tip.has_value()) return make_error(id, -32000, "tip unavailable");
@@ -2915,11 +2916,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     std::string err;
     auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
     if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
-    storage::DB live_db;
-    if (!open_fresh_readonly_db(cfg_.db_path, &live_db)) {
-      return make_result(
-          id, std::string("{\"state\":\"failed\",\"last_error_message\":\"failed to open db\"}"));
-    }
+    storage::DB& live_db = db_;
     auto record =
         onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, tracked_txid_hex, &err);
     if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
@@ -2935,11 +2932,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     std::string err;
     auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
     if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
-    storage::DB live_db;
-    if (!open_fresh_readonly_db(cfg_.db_path, &live_db)) {
-      return make_result(
-          id, std::string("{\"state\":\"failed\",\"last_error_message\":\"failed to open db\"}"));
-    }
+    storage::DB& live_db = db_;
     auto record = onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, "", &err);
     if (!record.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
     const bool stale_only_wait_for_sync =

@@ -34,6 +34,24 @@ using namespace detail;
 
 namespace {
 
+// A router without UPnP/NAT-PMP (every VPS) fails the same way forever: back off to an hour, and log
+// the 1st, 2nd, 4th, 8th ... failure.
+std::uint64_t port_mapping_retry_ms(std::uint32_t consecutive_failures, std::uint32_t base_interval_ms) {
+  constexpr std::uint64_t kMaxRetryMs = 3'600'000;
+  const std::uint64_t base = std::max<std::uint32_t>(10'000, base_interval_ms);
+  const std::uint32_t shift = std::min<std::uint32_t>(consecutive_failures > 0 ? consecutive_failures - 1 : 0, 16);
+  return std::min<std::uint64_t>(kMaxRetryMs, base << shift);
+}
+
+std::uint64_t wall_clock_ms() {
+  using namespace std::chrono;
+  return static_cast<std::uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+bool should_log_port_mapping_failure(std::uint32_t consecutive_failures) {
+  return consecutive_failures != 0 && (consecutive_failures & (consecutive_failures - 1)) == 0;
+}
+
 constexpr std::uint64_t kForwardSyncWindow = 64;
 
 constexpr std::uint64_t kTxRelayPeerBackoffMs = 60'000;
@@ -2302,8 +2320,12 @@ void Node::maybe_refresh_nat_pmp_external_endpoint(std::uint64_t now_ms) {
     nat_pmp_last_attempt_ms_ = now_ms;
     nat_pmp_last_success_ = false;
     nat_pmp_last_error_code_ = "nat_pmp_gateway_not_found";
-    nat_pmp_next_refresh_ms_ = now_ms + std::max<std::uint32_t>(10'000, cfg_.stun_refresh_interval_ms);
-    log_line("nat-pmp-refresh status=failed reason=gateway-not-found");
+    const auto retry_ms = port_mapping_retry_ms(++nat_pmp_consecutive_failures_, cfg_.stun_refresh_interval_ms);
+    nat_pmp_next_refresh_ms_ = now_ms + retry_ms;
+    if (should_log_port_mapping_failure(nat_pmp_consecutive_failures_)) {
+      log_line("nat-pmp-refresh status=failed reason=gateway-not-found failures=" +
+               std::to_string(nat_pmp_consecutive_failures_) + " next_retry_s=" + std::to_string(retry_ms / 1000));
+    }
     return;
   }
 
@@ -2315,10 +2337,15 @@ void Node::maybe_refresh_nat_pmp_external_endpoint(std::uint64_t now_ms) {
   if (!mapped.has_value()) {
     nat_pmp_last_success_ = false;
     nat_pmp_last_error_code_ = error.empty() ? "nat_pmp_map_failed" : error;
-    nat_pmp_next_refresh_ms_ = now_ms + std::max<std::uint32_t>(10'000, cfg_.stun_refresh_interval_ms);
-    log_line("nat-pmp-refresh status=failed gateway=" + *gateway + " reason=" + nat_pmp_last_error_code_);
+    const auto retry_ms = port_mapping_retry_ms(++nat_pmp_consecutive_failures_, cfg_.stun_refresh_interval_ms);
+    nat_pmp_next_refresh_ms_ = now_ms + retry_ms;
+    if (should_log_port_mapping_failure(nat_pmp_consecutive_failures_)) {
+      log_line("nat-pmp-refresh status=failed gateway=" + *gateway + " reason=" + nat_pmp_last_error_code_ +
+               " failures=" + std::to_string(nat_pmp_consecutive_failures_) + " next_retry_s=" + std::to_string(retry_ms / 1000));
+    }
     return;
   }
+  nat_pmp_consecutive_failures_ = 0;
   nat_pmp_external_endpoint_ = *mapped;
   nat_pmp_last_success_ = true;
   nat_pmp_last_error_code_.clear();
@@ -2353,10 +2380,15 @@ void Node::maybe_refresh_upnp_igd_external_endpoint(std::uint64_t now_ms) {
   if (!mapped.has_value()) {
     upnp_igd_last_success_ = false;
     upnp_igd_last_error_code_ = error.empty() ? "upnp_igd_map_failed" : error;
-    upnp_igd_next_refresh_ms_ = now_ms + std::max<std::uint32_t>(10'000, cfg_.stun_refresh_interval_ms);
-    log_line("upnp-igd-refresh status=failed reason=" + upnp_igd_last_error_code_);
+    const auto retry_ms = port_mapping_retry_ms(++upnp_igd_consecutive_failures_, cfg_.stun_refresh_interval_ms);
+    upnp_igd_next_refresh_ms_ = now_ms + retry_ms;
+    if (should_log_port_mapping_failure(upnp_igd_consecutive_failures_)) {
+      log_line("upnp-igd-refresh status=failed reason=" + upnp_igd_last_error_code_ + " failures=" +
+               std::to_string(upnp_igd_consecutive_failures_) + " next_retry_s=" + std::to_string(retry_ms / 1000));
+    }
     return;
   }
+  upnp_igd_consecutive_failures_ = 0;
   upnp_igd_external_endpoint_ = *mapped;
   upnp_igd_last_success_ = true;
   upnp_igd_last_error_code_.clear();
@@ -2423,6 +2455,10 @@ void Node::maybe_refresh_stun_external_endpoint(std::uint64_t now_ms) {
       stun_last_success_ = true;
       stun_last_success_ms_ = now_ms;
       stun_backoff_until_ms_ = now_ms + refresh_ms;
+      const std::uint64_t wall_ms = wall_clock_ms();
+      stun_last_attempt_unix_ms_ = wall_ms;
+      stun_last_success_unix_ms_ = wall_ms;
+      stun_backoff_until_unix_ms_ = wall_ms + refresh_ms;
 
       const std::string discovered = mapped->key();
       if (!stun_external_endpoint_.has_value()) {
@@ -2492,6 +2528,9 @@ void Node::maybe_refresh_stun_external_endpoint(std::uint64_t now_ms) {
     stun_last_error_code_ = last_error;
   }
   stun_backoff_until_ms_ = earliest_next_allowed;
+  const std::uint64_t wall_ms = wall_clock_ms();
+  stun_last_attempt_unix_ms_ = wall_ms;
+  stun_backoff_until_unix_ms_ = earliest_next_allowed > now_ms ? wall_ms + (earliest_next_allowed - now_ms) : wall_ms;
 }
 
 bool Node::has_peer_endpoint(const std::string& host, std::uint16_t port) const {

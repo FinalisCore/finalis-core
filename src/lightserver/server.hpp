@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -78,6 +79,8 @@ struct Config {
   std::string bind_ip{"127.0.0.1"};
   std::uint16_t port{0};
   std::string db_path{"~/.finalis/mainnet"};
+  // The lightserver reads db_path as a RocksDB secondary; its own files go here. Empty: db_path/lightserver-secondary.
+  std::string secondary_path;
   std::size_t max_committee{MAX_COMMITTEE};
   std::string tx_relay_host{"127.0.0.1"};
   std::uint16_t tx_relay_port{0};
@@ -129,6 +132,8 @@ class Server {
 
   Config cfg_;
   storage::DB db_;
+  // Exclusive while db_ catches up with the node, shared while a request reads it.
+  std::shared_mutex view_mu_;
   net::SocketHandle listen_fd_{net::kInvalidSocket};
   net::SocketHandle admin_fd_{net::kInvalidSocket};
   std::string admin_socket_bound_path_;

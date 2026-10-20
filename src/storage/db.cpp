@@ -57,6 +57,19 @@ rocksdb::Status open_rocksdb_impl(bool read_only, const rocksdb::Options& option
   }
 }
 
+template <typename DBT>
+rocksdb::Status open_rocksdb_secondary(const rocksdb::Options& options, const std::string& path,
+                                       const std::string& secondary_path, std::unique_ptr<DBT>* out) {
+  if constexpr (requires { DBT::OpenAsSecondary(options, path, secondary_path, out); }) {
+    return DBT::OpenAsSecondary(options, path, secondary_path, out);
+  } else {
+    DBT* raw = nullptr;
+    auto status = DBT::OpenAsSecondary(options, path, secondary_path, &raw);
+    if (status.ok()) out->reset(raw);
+    return status;
+  }
+}
+
 rocksdb::Status open_rocksdb_rw(const rocksdb::Options& options, const std::string& path,
                                 std::unique_ptr<rocksdb::DB>* out) {
   return open_rocksdb_impl(/*read_only=*/false, options, path, out);
@@ -1667,6 +1680,43 @@ bool DB::open_readonly(const std::string& path, std::string* error) {
 #endif
 }
 
+bool DB::open_secondary(const std::string& path, const std::string& secondary_path, std::string* error) {
+#ifdef SC_HAS_ROCKSDB
+  path_ = expand_user_home(path);
+  readonly_ = true;
+  const std::string secondary = expand_user_home(secondary_path);
+  std::error_code ec;
+  std::filesystem::create_directories(secondary, ec);
+  (void)ensure_private_dir(secondary);
+  rocks_ = std::make_unique<RocksImpl>();
+  rocksdb::Options options = build_rocksdb_options();
+  options.create_if_missing = false;
+  options.max_open_files = -1;  // required by secondary instances
+  std::unique_ptr<rocksdb::DB> raw;
+  auto s = open_rocksdb_secondary(options, path_, secondary, &raw);
+  if (s.ok()) rocks_->db = std::move(raw);
+  if (!s.ok()) {
+    rocks_.reset();
+    if (error) *error = s.ToString();
+    return false;
+  }
+  secondary_ = true;
+  return true;
+#else
+  (void)secondary_path;
+  return open_readonly(path, error);
+#endif
+}
+
+bool DB::catch_up_with_primary() {
+#ifdef SC_HAS_ROCKSDB
+  if (!secondary_ || !rocks_ || !rocks_->db) return false;
+  return rocks_->db->TryCatchUpWithPrimary().ok();
+#else
+  return load_file();
+#endif
+}
+
 bool DB::put(const std::string& key, const Bytes& value) {
   if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
@@ -2645,6 +2695,7 @@ bool DB::flush() {
 }
 
 void DB::close() {
+  secondary_ = false;
 #ifdef SC_HAS_ROCKSDB
   rocks_.reset();
 #else

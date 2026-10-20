@@ -196,6 +196,8 @@ struct NodeRuntimeStatusSnapshot {
   std::uint64_t availability_local_retained_prefix_count{0};
   std::int64_t availability_local_eligibility_score{0};
   std::uint32_t availability_local_seat_budget{0};
+
+  bool operator==(const NodeRuntimeStatusSnapshot&) const = default;
 };
 
 struct AdaptiveEpochTelemetry {
@@ -326,6 +328,10 @@ class DB {
   // existing call sites across the codebase need to change.
   bool open(const std::string& path, std::string* error = nullptr);
   bool open_readonly(const std::string& path, std::string* error = nullptr);
+  // Read-only follower of a DB another process has open for writing. Reads see the state as of
+  // the last catch_up_with_primary(); `secondary_path` holds the follower's own info log.
+  bool open_secondary(const std::string& path, const std::string& secondary_path, std::string* error = nullptr);
+  bool catch_up_with_primary();
   bool flush();
   void close();
 
@@ -458,6 +464,7 @@ class DB {
  private:
   std::string path_;
   bool readonly_{false};
+  bool secondary_{false};
 
 #ifdef SC_HAS_ROCKSDB
   class RocksImpl;

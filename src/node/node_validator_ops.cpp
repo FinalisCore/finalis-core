@@ -811,8 +811,14 @@ std::optional<consensus::EpochTicket> Node::mine_local_epoch_ticket_locked(std::
     }
     participant = consensus::canonical_operator_id(local_key_.public_key, *local_info);
   }
-  auto ticket = consensus::best_epoch_ticket_for_operator_id(epoch, anchor, participant, height);
+  if (!local_ticket_search_ || local_ticket_search_->epoch != epoch || local_ticket_search_->anchor != anchor ||
+      local_ticket_search_->participant != participant) {
+    local_ticket_search_ = LocalTicketSearch{epoch, anchor, participant,
+                                             consensus::best_epoch_ticket_for_operator_id(epoch, anchor, participant, height)};
+  }
+  auto ticket = local_ticket_search_->best;
   if (!ticket.has_value()) return std::nullopt;
+  ticket->source_height = height;
   const auto difficulty_bits = ticket_difficulty_bits_for_epoch_locked(epoch, validators_.active_sorted(height).size());
   if (!consensus::epoch_ticket_meets_difficulty(*ticket, difficulty_bits)) return std::nullopt;
   return ticket;

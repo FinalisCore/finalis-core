@@ -861,6 +861,14 @@ class Node {
       timeout_vote_soft_reject_log_counts_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
   std::map<std::uint64_t, consensus::EpochBestTicket> local_epoch_tickets_;
+  // The event loop asks for the local ticket every tick; its nonce search depends only on these inputs.
+  struct LocalTicketSearch {
+    std::uint64_t epoch{0};
+    Hash32 anchor{};
+    PubKey32 participant{};
+    std::optional<consensus::EpochBestTicket> best;
+  };
+  mutable std::optional<LocalTicketSearch> local_ticket_search_;
   std::optional<consensus::CanonicalDerivedState> canonical_state_;
   consensus::ConfidentialSupplyAuditResult last_confidential_supply_audit_;
   std::uint64_t last_open_epoch_ticket_epoch_{0};
@@ -915,6 +923,9 @@ class Node {
   std::uint64_t last_missing_next_cert_stall_log_ms_{0};
   std::uint32_t registration_ready_streak_{0};
   std::uint64_t last_runtime_status_persist_ms_{0};
+  // Last snapshot written to the DB, and when: unchanged snapshots are rewritten only to stay fresh.
+  std::optional<storage::NodeRuntimeStatusSnapshot> last_persisted_runtime_status_;
+  std::uint64_t last_runtime_status_write_ms_{0};
   std::uint64_t last_validators_addrman_persist_height_{0};
   std::optional<p2p::NetAddress> stun_external_endpoint_;
   std::optional<p2p::NetAddress> stun_candidate_endpoint_;
@@ -934,6 +945,10 @@ class Node {
   bool stun_last_success_{false};
   std::uint64_t stun_last_attempt_ms_{0};
   std::uint64_t stun_last_success_ms_{0};
+  // Wall-clock copies of the steady-clock STUN times above, for the runtime status snapshot.
+  std::uint64_t stun_last_attempt_unix_ms_{0};
+  std::uint64_t stun_last_success_unix_ms_{0};
+  std::uint64_t stun_backoff_until_unix_ms_{0};
   std::optional<p2p::NetAddress> nat_pmp_external_endpoint_;
   bool nat_pmp_last_success_{false};
   std::string nat_pmp_last_error_code_;
@@ -941,6 +956,7 @@ class Node {
   std::uint64_t nat_pmp_last_success_ms_{0};
   std::uint64_t nat_pmp_mapping_expires_ms_{0};
   std::uint64_t nat_pmp_next_refresh_ms_{0};
+  std::uint32_t nat_pmp_consecutive_failures_{0};
   std::optional<p2p::NetAddress> upnp_igd_external_endpoint_;
   bool upnp_igd_last_success_{false};
   std::string upnp_igd_last_error_code_;
@@ -948,6 +964,7 @@ class Node {
   std::uint64_t upnp_igd_last_success_ms_{0};
   std::uint64_t upnp_igd_mapping_expires_ms_{0};
   std::uint64_t upnp_igd_next_refresh_ms_{0};
+  std::uint32_t upnp_igd_consecutive_failures_{0};
   std::vector<std::string> bootstrap_peers_;
   std::vector<std::string> validators_bootstrap_peers_;
   bool prefer_validators_addrman_{false};
