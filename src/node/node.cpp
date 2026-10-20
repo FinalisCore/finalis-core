@@ -64,6 +64,7 @@ namespace {
 constexpr std::size_t kAdaptiveTelemetryWindowEpochs = 16;
 
 constexpr std::uint64_t kValidatorsAddrmanPersistIntervalBlocks = 3;
+constexpr std::uint64_t kRuntimeStatusRefreshMs = 30'000;
 
 bool restart_debug_enabled() {
   const char* v = std::getenv("FINALIS_RESTART_DEBUG");
@@ -904,11 +905,11 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   snapshot.stun_enabled = cfg_.listen && cfg_.public_mode && !cfg_.disable_p2p && cfg_.external_endpoint.empty() &&
                           !cfg_.stun_servers.empty();
   snapshot.stun_last_success = stun_last_success_;
-  snapshot.stun_last_attempt_unix_ms = stun_last_attempt_ms_;
-  snapshot.stun_last_success_unix_ms = stun_last_success_ms_;
+  snapshot.stun_last_attempt_unix_ms = stun_last_attempt_unix_ms_;
+  snapshot.stun_last_success_unix_ms = stun_last_success_unix_ms_;
   snapshot.stun_last_server = stun_last_server_;
   snapshot.stun_last_error_code = stun_last_error_code_;
-  snapshot.stun_backoff_until_unix_ms = stun_backoff_until_ms_;
+  snapshot.stun_backoff_until_unix_ms = stun_backoff_until_unix_ms_;
   snapshot.stun_endpoint_change_pending = stun_endpoint_change_pending_;
   snapshot.stun_endpoint_change_hits = stun_candidate_hits_;
   snapshot.stun_endpoint_change_required_hits = std::max<std::uint32_t>(2, cfg_.stun_hysteresis_samples);
@@ -1125,7 +1126,19 @@ void Node::event_loop() {
       const std::uint64_t now_unix_ms = now_unix() * 1000;
       if (now_ms >= last_runtime_status_persist_ms_ + 1000) {
         auto runtime = build_runtime_status_snapshot_locked(now_unix_ms);
-        (void)db_.put_node_runtime_status_snapshot(runtime);
+        bool changed = !last_persisted_runtime_status_.has_value();
+        if (!changed) {
+          auto unstamped = runtime;
+          unstamped.captured_at_unix_ms = last_persisted_runtime_status_->captured_at_unix_ms;
+          changed = unstamped != *last_persisted_runtime_status_;
+        }
+        // Readers treat a snapshot older than kOnboardingReadinessFreshnessMs (90 s) as stale.
+        if (changed || now_ms >= last_runtime_status_write_ms_ + kRuntimeStatusRefreshMs) {
+          if (db_.put_node_runtime_status_snapshot(runtime)) {
+            last_persisted_runtime_status_ = std::move(runtime);
+            last_runtime_status_write_ms_ = now_ms;
+          }
+        }
         last_runtime_status_persist_ms_ = now_ms;
       }
       if (!cfg_.disable_p2p && finalized_height_ >= last_validators_addrman_persist_height_ + kValidatorsAddrmanPersistIntervalBlocks) {
@@ -1139,14 +1152,22 @@ void Node::event_loop() {
       const bool ticket_window_elapsed = now_ms >= last_finalized_progress_ms_ + ticket_window_ms;
       const bool block_interval_elapsed =
           now_ms >= last_finalized_progress_ms_ + min_block_interval_ms;
+      // No proposal before genesis time: height 1 would carry genesis + 1, and the quorum-1 self-vote
+      // finalizes without the prevote timestamp bound, so a lone validator would start the chain early.
+      // (Later heights stay unbounded here: test chains run blocks faster than one per second.)
+      const bool proposal_clock_ready =
+          !canonical_state_.has_value() || canonical_state_->finalized_height != 0 ||
+          canonical_state_->finalized_timestamp + 1 <= now_unix() + consensus::kMaxTransitionTimestampDriftS;
       // Round 0 cannot use the TC bypass, so its leader may only propose once
       // both the ticket window and the block interval have elapsed. Start the
       // round-0 timer (and its timeout-vote grace) at that point, so round 0
       // gets its full timeout after proposing becomes legal instead of timing
       // out while still gated.
       if (current_round_ == 0) {
-        const std::uint64_t round0_start =
+        std::uint64_t round0_start =
             last_finalized_progress_ms_ + std::max<std::uint64_t>(ticket_window_ms, min_block_interval_ms);
+        // Before genesis time the clock gate holds every proposal: keep round 0's timer from running.
+        if (!proposal_clock_ready) round0_start = std::max(round0_start, now_ms);
         if (round_started_ms_ < round0_start) {
           round_started_ms_ = round0_start;
           arm_round0_deadline_locked(round0_start);
@@ -1385,8 +1406,10 @@ void Node::event_loop() {
         tc_no_qc_last_round_ = current_round_;
         tc_no_qc_round_streak_ = 0;
       }
-      const std::uint64_t stale_ms = cfg_.network.round_timeout_ms * 2ULL;
-      const bool consensus_stalled = now_ms > last_finalized_progress_ms_ + stale_ms;
+      // Stalled: no finalization within two round timeouts of the time a proposal became legal.
+      // Waiting out the block interval, or for genesis time, is not a stall.
+      const std::uint64_t stale_ms = min_block_interval_ms + cfg_.network.round_timeout_ms * 2ULL;
+      const bool consensus_stalled = proposal_clock_ready && now_ms > last_finalized_progress_ms_ + stale_ms;
       // LIVENESS: a vote is otherwise sent once. Votes lost while peers were unreachable (partition,
       // reconnect) are never retransmitted, and a TC missing one side's timeout votes never forms, so
       // a healed partition could halt the height for good. While stalled, re-gossip this node's own
@@ -1449,12 +1472,6 @@ void Node::event_loop() {
         force_validator_redial = true;
       }
       const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
-      // No proposal before genesis time: height 1 would carry genesis + 1, and the quorum-1 self-vote
-      // finalizes without the prevote timestamp bound, so a lone validator would start the chain early.
-      // (Later heights stay unbounded here: test chains run blocks faster than one per second.)
-      const bool proposal_clock_ready =
-          !canonical_state_.has_value() || canonical_state_->finalized_height != 0 ||
-          canonical_state_->finalized_timestamp + 1 <= now_unix() + consensus::kMaxTransitionTimestampDriftS;
       // SAFETY: an abstaining node may already have proposed at this height before losing its
       // safety state; proposing again could be a different payload (proposer equivocation).
       if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready && proposal_clock_ready &&

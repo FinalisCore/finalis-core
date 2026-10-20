@@ -548,6 +548,58 @@ TEST(test_lightserver_get_tx_status_direct) {
   ASSERT_TRUE(missing_resp.find("\"credit_safe\":false") != std::string::npos);
 }
 
+// The node keeps writing while the lightserver runs: every RPC must read the node's latest finalized
+// state, not what was on disk when the lightserver started.
+TEST(test_lightserver_reads_state_written_after_init) {
+  const std::string base = unique_test_base("/tmp/finalis_light_live_view");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  const auto put_height = [&](std::uint64_t h) {
+    Hash32 transition{};
+    transition[0] = static_cast<std::uint8_t>(h);
+    Hash32 utxo_root{};
+    utxo_root[1] = static_cast<std::uint8_t>(h);
+    Hash32 val_root{};
+    val_root[2] = static_cast<std::uint8_t>(h);
+    FinalityCertificate cert;
+    cert.height = h;
+    cert.frontier_transition_id = transition;
+    cert.quorum_threshold = 1;
+    cert.committee_members = {node::Node::deterministic_test_keypairs()[0].public_key};
+    ASSERT_TRUE(db.put_finality_certificate(cert));
+    ASSERT_TRUE(db.put(storage::key_root_index("UTXO", h), Bytes(utxo_root.begin(), utxo_root.end())));
+    ASSERT_TRUE(db.put(storage::key_root_index("VAL", h), Bytes(val_root.begin(), val_root.end())));
+    ASSERT_TRUE(db.set_height_hash(h, transition));
+    ASSERT_TRUE(db.set_tip(storage::TipState{h, transition}));
+  };
+  put_height(1);
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  // Written by the still-running node after the lightserver opened its view.
+  put_height(2);
+  Hash32 transition2{};
+  transition2[0] = 2;
+  Hash32 utxo_root2{};
+  utxo_root2[1] = 2;
+
+  const auto cert = ls.handle_rpc_for_test(R"({"jsonrpc":"2.0","id":1,"method":"get_finality_certificate","params":{"height":2}})");
+  ASSERT_TRUE(cert.find("\"transition_hash\":\"" + hex_encode32(transition2) + "\"") != std::string::npos);
+  const auto tip_cert = ls.handle_rpc_for_test(R"({"jsonrpc":"2.0","id":2,"method":"get_finality_certificate","params":{}})");
+  ASSERT_TRUE(tip_cert.find("\"transition_hash\":\"" + hex_encode32(transition2) + "\"") != std::string::npos);
+  const auto roots = ls.handle_rpc_for_test(R"({"jsonrpc":"2.0","id":3,"method":"get_roots","params":{"height":2}})");
+  ASSERT_TRUE(roots.find("\"utxo_root\":\"" + hex_encode32(utxo_root2) + "\"") != std::string::npos);
+  const auto tip = ls.handle_rpc_for_test(R"({"jsonrpc":"2.0","id":4,"method":"get_tip","params":{}})");
+  ASSERT_TRUE(tip.find("\"height\":2") != std::string::npos);
+  db.close();
+}
+
 TEST(test_lightserver_get_tx_decodes_onboarding_registration_output_and_pow_fields) {
   const std::string base = unique_test_base("/tmp/finalis_light_get_tx_onboarding_decode");
   std::filesystem::remove_all(base);

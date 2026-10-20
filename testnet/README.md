@@ -59,12 +59,17 @@ check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--
 
 ### 3. Seeds
 
-[SEEDS.json](SEEDS.json): two plain nodes (not validators) on the VPS hosts, so validator
-addresses are never published. Each runs:
+[SEEDS.json](SEEDS.json). Seeds are meant to be plain nodes (not validators), so validator addresses
+are never published. Each runs:
 
 ```bash
 finalis-node --testnet --public --with-lightserver --lightserver-bind 0.0.0.0
 ```
+
+A node loads `<data dir>/keystore/validator.json` whenever that file exists, with or without
+`--validator-key-file`, so a seed must not have one. testnet-1 launched with a single host,
+130.61.126.39, which is both the seed and the bootstrap validator; a separate plain seed replaces it
+in SEEDS.json before more validators join.
 
 ### 4. Launch
 
