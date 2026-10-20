@@ -3,8 +3,10 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QComboBox>
+#include <QDir>
 #include <QDateTime>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
 #include <QTabWidget>
@@ -18,6 +20,7 @@
 #include <string>
 
 #include "apps/finalis-wallet/widgets/activity_page.hpp"
+#include "apps/finalis-wallet/wallet_network.hpp"
 #include "apps/finalis-wallet/widgets/advanced_page.hpp"
 
 #define private public
@@ -306,6 +309,52 @@ void test_wallet_window_defaults_to_lightserver_rpc_port() {
           std::string("wallet default endpoint mismatch: ") + endpoints.front().toStdString());
 }
 
+void test_wallet_window_network_switch_rebinds_wallet_and_keeps_settings_per_network() {
+  QSettings settings(kSettingsOrg, kSettingsApp);
+  settings.clear();
+  // A dead local port: the refresh after a switch must not reach the public testnet.
+  settings.setValue("testnet/lightserver_endpoints", QStringList{"http://127.0.0.1:1/rpc"});
+  settings.sync();
+
+  finalis::wallet::WalletWindow window;
+  require(window.active_network_ == "mainnet", "wallet must default to mainnet");
+  require(window.testnet_banner_label_->isHidden(), "mainnet must not show the testnet banner");
+  window.set_lightserver_endpoints({"http://127.0.0.1:2/rpc"});
+
+  // Any 32-byte public key: the wallet opens on mainnet with its sc1 address.
+  const std::string pubkey_hex = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
+  const auto mainnet_address = finalis::wallet::address_for_network(pubkey_hex, "mainnet");
+  require(mainnet_address.has_value() && mainnet_address->rfind("sc1", 0) == 0, "mainnet address prefix");
+  finalis::wallet::WalletWindow::LoadedWallet loaded;
+  loaded.file_path = (QDir::homePath() + "/switch-wallet.json").toStdString();
+  loaded.network_name = "mainnet";
+  loaded.address = *mainnet_address;
+  loaded.pubkey_hex = pubkey_hex;
+  window.wallet_ = loaded;
+
+  window.switch_network("testnet");
+  require(window.active_network_ == "testnet", "switch must select testnet");
+  require(window.wallet_->network_name == "testnet", "wallet must move to testnet");
+  require(window.wallet_->address.rfind("tsc1", 0) == 0, "testnet address prefix: " + window.wallet_->address);
+  require(!window.testnet_banner_label_->isHidden(), "testnet banner must show");
+  require(window.windowTitle().contains("Testnet"), "window title must name testnet");
+  require(window.configured_lightserver_endpoints() == QStringList{"http://127.0.0.1:1/rpc"},
+          "testnet endpoints must come from testnet settings");
+  require(window.validator_rpc_url_edit_->text() == "http://127.0.0.1:19544/rpc", "testnet local rpc port");
+  require(window.recipient_address_error(QString::fromStdString(*mainnet_address)).has_value(),
+          "a mainnet recipient must be refused on testnet");
+  require(!window.recipient_address_error(QString::fromStdString(window.wallet_->address)).has_value(),
+          "a testnet recipient must be accepted on testnet");
+  require(QSettings(kSettingsOrg, kSettingsApp).value("network").toString() == "testnet", "network must persist");
+
+  window.switch_network("mainnet");
+  require(window.wallet_->address == *mainnet_address, "switching back restores the mainnet address");
+  require(window.configured_lightserver_endpoints() == QStringList{"http://127.0.0.1:2/rpc"},
+          "mainnet endpoints must survive a testnet round trip");
+  require(window.testnet_banner_label_->isHidden(), "banner hides again on mainnet");
+  window.wallet_.reset();
+}
+
 void test_wallet_history_flow_classification_uses_net_wallet_effect() {
   auto received = finalis::wallet::classify_wallet_history_flow(100000000ULL, 0);
   require(received.kind.toStdString() == "received", "received classification kind mismatch");
@@ -381,6 +430,9 @@ int main(int argc, char** argv) {
     std::cout << "Starting test 8: test_wallet_window_defaults_to_lightserver_rpc_port" << std::endl;
     test_wallet_window_defaults_to_lightserver_rpc_port();
     std::cout << "Completed test 8" << std::endl;
+    std::cout << "Starting test 8b: test_wallet_window_network_switch_rebinds_wallet_and_keeps_settings_per_network" << std::endl;
+    test_wallet_window_network_switch_rebinds_wallet_and_keeps_settings_per_network();
+    std::cout << "Completed test 8b" << std::endl;
     std::cout << "Starting test 9: test_wallet_history_flow_classification_uses_net_wallet_effect" << std::endl;
     test_wallet_history_flow_classification_uses_net_wallet_effect();
     std::cout << "Completed test 9" << std::endl;

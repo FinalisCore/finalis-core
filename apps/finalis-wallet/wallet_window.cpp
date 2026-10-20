@@ -28,6 +28,7 @@
 #include <QClipboard>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QSignalBlocker>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
@@ -68,6 +69,7 @@
 #include "codec/bytes.hpp"
 #include "history_merge.hpp"
 #include "refresh_gate.hpp"
+#include "wallet_network.hpp"
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "common/types.hpp"
@@ -162,7 +164,8 @@ QString wallet_stylesheet(ThemeMode mode) {
         "QFrame[role='headerCard'] { background: #161616; border: 0; border-bottom: 1px solid #2f2f2f; border-radius: 0; }"
         "QLabel[role='muted'] { color: #c2c2c2; }"
         "QLabel[role='metric'] { font-size: 16px; font-weight: 600; }"
-        "QLabel[role='chip'] { background: #262626; border: 1px solid #4b4b4b; border-radius: 9px; padding: 3px 8px; }");
+        "QLabel[role='chip'] { background: #262626; border: 1px solid #4b4b4b; border-radius: 9px; padding: 3px 8px; }"
+        "QLabel[role='testnetBanner'] { background: #4a3500; color: #ffd66b; border: 1px solid #7a5a00; border-radius: 4px; padding: 4px 8px; }");
   }
 
   return QString(
@@ -185,7 +188,8 @@ QString wallet_stylesheet(ThemeMode mode) {
       "QFrame[role='headerCard'] { background: transparent; border: 0; border-bottom: 1px solid #dadada; border-radius: 0; }"
       "QLabel[role='muted'] { color: #4f4f4f; }"
       "QLabel[role='metric'] { font-size: 16px; font-weight: 600; }"
-      "QLabel[role='chip'] { background: #f3f3f3; border: 1px solid #d2d2d2; border-radius: 9px; padding: 3px 8px; }");
+      "QLabel[role='chip'] { background: #f3f3f3; border: 1px solid #d2d2d2; border-radius: 9px; padding: 3px 8px; }"
+      "QLabel[role='testnetBanner'] { background: #fff4d6; color: #6b4a00; border: 1px solid #e8c766; border-radius: 4px; padding: 4px 8px; }");
 }
 
 QLabel* make_brand_image(const QString& resource_path, const QSize& size, QWidget* parent, const QString& fallback = {}) {
@@ -1147,10 +1151,16 @@ void WalletWindow::build_ui() {
   auto* header_status = new QGridLayout();
   header_status->setHorizontalSpacing(6);
   header_status->setVerticalSpacing(4);
-  header_network_label_ = new QLabel("Network: mainnet", header_card);
-  header_network_label_->setProperty("role", "chip");
-  header_network_label_->setWordWrap(true);
-  header_network_label_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+  network_combo_ = new QComboBox(header_card);
+  for (const auto& name : finalis::wallet::wallet_network_names()) {
+    network_combo_->addItem(QString::fromStdString(finalis::wallet::wallet_network_display_name(name)),
+                            QString::fromStdString(name));
+  }
+  network_combo_->setToolTip("Network. The open wallet keeps its key and moves to that network's address.");
+  connect(network_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+    if (index < 0) return;
+    switch_network(network_combo_->itemData(index).toString().toStdString());
+  });
   header_tip_label_ = new QLabel("Finalized tip: unavailable", header_card);
   header_tip_label_->setProperty("role", "chip");
   header_tip_label_->setWordWrap(true);
@@ -1163,12 +1173,17 @@ void WalletWindow::build_ui() {
   header_crosscheck_label_->setProperty("role", "chip");
   header_crosscheck_label_->setWordWrap(true);
   header_crosscheck_label_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
-  header_status->addWidget(header_network_label_, 0, 0, Qt::AlignRight);
+  header_status->addWidget(network_combo_, 0, 0, Qt::AlignRight);
   header_status->addWidget(header_tip_label_, 0, 1, Qt::AlignRight);
   header_status->addWidget(header_connection_label_, 1, 0, Qt::AlignRight);
   header_status->addWidget(header_crosscheck_label_, 1, 1, Qt::AlignRight);
   header_layout->addLayout(header_status, 0);
   root->addWidget(header_card);
+  testnet_banner_label_ = new QLabel("Testnet: coins have no value. Addresses start with tsc1.", this);
+  testnet_banner_label_->setProperty("role", "testnetBanner");
+  testnet_banner_label_->setWordWrap(true);
+  testnet_banner_label_->hide();
+  root->addWidget(testnet_banner_label_);
 
   auto* top_actions = new QHBoxLayout();
   top_actions->setContentsMargins(0, 2, 0, 2);
@@ -1533,23 +1548,8 @@ void WalletWindow::load_settings() {
     return legacy.value(key, fallback);
   };
 
-  QStringList endpoints;
-  const QVariant endpoints_value = load_value("lightserver_endpoints", QVariant{});
-  if (endpoints_value.isValid()) {
-    endpoints = endpoints_value.toStringList();
-  }
-  if (endpoints.isEmpty()) {
-    const QString single =
-        normalize_lightserver_endpoint(load_value("lightserver_url", "http://127.0.0.1:19444/rpc").toString());
-    if (!single.isEmpty()) endpoints.push_back(single);
-  }
-  set_lightserver_endpoints(endpoints);
-  pin_lightserver_endpoint_checkbox_->setChecked(load_value("lightserver_pin_first", false).toBool());
-  last_successful_lightserver_endpoint_ =
-      normalize_lightserver_endpoint(load_value("lightserver_last_good", QString{}).toString());
-  validator_db_path_edit_->setText(load_value("validator/db_path", default_mainnet_db_path()).toString());
-  validator_key_path_edit_->setText(load_value("validator/key_path", default_mainnet_validator_key_path()).toString());
-  validator_rpc_url_edit_->setText(load_value("validator/rpc_url", "http://127.0.0.1:19444/rpc").toString());
+  active_network_ = finalis::wallet::normalize_wallet_network(settings.value("network", "mainnet").toString().toStdString());
+  load_network_settings();
   const QString theme_name = load_value("theme", "Light").toString();
   const int theme_idx = theme_combo_->findText(theme_name, Qt::MatchFixedString);
   if (theme_idx >= 0) theme_combo_->setCurrentIndex(theme_idx);
@@ -1561,17 +1561,130 @@ void WalletWindow::load_settings() {
   restore_table_sort(history_view_, settings.contains("history_table_sort_column") ? settings : legacy, "history_table", 4);
 }
 
+QString WalletWindow::network_settings_key(const QString& key) const {
+  return QString::fromStdString(finalis::wallet::wallet_settings_key(active_network_, key.toStdString()));
+}
+
+void WalletWindow::load_network_settings() {
+  QSettings settings(kSettingsOrg, kSettingsApp);
+  QSettings legacy(kSettingsOrg, kLegacySettingsApp);
+  const bool mainnet = !finalis::wallet::wallet_network_is_testnet(active_network_);
+  // Settings from before the network switch existed are mainnet's.
+  auto load_value = [&](const QString& key, const QVariant& fallback) {
+    const QString k = network_settings_key(key);
+    if (settings.contains(k)) return settings.value(k, fallback);
+    return mainnet ? legacy.value(k, fallback) : fallback;
+  };
+
+  QStringList endpoints;
+  const QVariant endpoints_value = load_value("lightserver_endpoints", QVariant{});
+  if (endpoints_value.isValid()) {
+    endpoints = endpoints_value.toStringList();
+  }
+  if (endpoints.isEmpty()) {
+    const QString single = normalize_lightserver_endpoint(load_value("lightserver_url", QString{}).toString());
+    if (!single.isEmpty()) endpoints.push_back(single);
+  }
+  if (endpoints.isEmpty()) {
+    for (const auto& endpoint : finalis::wallet::default_lightserver_endpoints(active_network_)) {
+      endpoints.push_back(QString::fromStdString(endpoint));
+    }
+  }
+  set_lightserver_endpoints(endpoints);
+  pin_lightserver_endpoint_checkbox_->setChecked(load_value("lightserver_pin_first", false).toBool());
+  last_successful_lightserver_endpoint_ =
+      normalize_lightserver_endpoint(load_value("lightserver_last_good", QString{}).toString());
+  const QString node_dir =
+      QDir(default_finalis_root_path()).filePath(QString::fromStdString(finalis::wallet::default_node_db_dir_name(active_network_)));
+  validator_db_path_edit_->setText(load_value("validator/db_path", node_dir).toString());
+  validator_key_path_edit_->setText(
+      load_value("validator/key_path", QDir(node_dir).filePath("keystore/validator.json")).toString());
+  validator_rpc_url_edit_->setText(
+      load_value("validator/rpc_url", QString::fromStdString(finalis::wallet::default_local_rpc_url(active_network_))).toString());
+  apply_network_chrome();
+}
+
+void WalletWindow::apply_network_chrome() {
+  const bool testnet = finalis::wallet::wallet_network_is_testnet(active_network_);
+  if (network_combo_) {
+    const int idx = network_combo_->findData(QString::fromStdString(active_network_));
+    if (idx >= 0 && idx != network_combo_->currentIndex()) {
+      const QSignalBlocker block(network_combo_);
+      network_combo_->setCurrentIndex(idx);
+    }
+  }
+  if (testnet_banner_label_) testnet_banner_label_->setVisible(testnet);
+  setWindowTitle(testnet ? "Finalis Wallet (Testnet)" : "Finalis Wallet");
+}
+
+void WalletWindow::bind_wallet_to_active_network(LoadedWallet& wallet) const {
+  // Signatures commit to the chain, so one key is safe on both networks; only the address prefix differs.
+  if (auto address = finalis::wallet::address_for_network(wallet.pubkey_hex, active_network_)) {
+    wallet.network_name = active_network_;
+    wallet.address = *address;
+  }
+}
+
+std::optional<QString> WalletWindow::recipient_address_error(const QString& address) const {
+  const std::string text = address.trimmed().toStdString();
+  if (!finalis::address::decode(text).has_value()) return QString("Recipient address is invalid.");
+  if (!finalis::wallet::address_matches_network(text, active_network_)) {
+    return QString("Recipient address belongs to another network. On %1, addresses start with %2.")
+        .arg(QString::fromStdString(finalis::wallet::wallet_network_display_name(active_network_)),
+             QString::fromStdString(finalis::keystore::hrp_for_network(active_network_)) + "1");
+  }
+  return std::nullopt;
+}
+
+void WalletWindow::switch_network(const std::string& network) {
+  const std::string target = finalis::wallet::normalize_wallet_network(network);
+  if (target == active_network_) return;
+  save_settings();  // the current network's endpoints and paths
+  active_network_ = target;
+  {
+    QSettings settings(kSettingsOrg, kSettingsApp);
+    settings.setValue("network", QString::fromStdString(active_network_));
+  }
+  // Results still in flight belong to the old network.
+  ++refresh_generation_;
+  ++tip_poll_generation_;
+  ++pending_tx_status_generation_;
+  ++validator_refresh_generation_;
+  refresh_in_flight_ = false;
+  tip_height_ = 0;
+  last_refresh_endpoint_.clear();
+  load_network_settings();
+  if (send_address_edit_) send_address_edit_->clear();
+  reset_send_review_panel();
+  if (wallet_) {
+    bind_wallet_to_active_network(*wallet_);
+    (void)open_wallet_store();
+    load_wallet_local_state();
+  }
+  update_wallet_views();
+  update_connection_views();
+  render_history_view();
+  if (wallet_) {
+    append_local_event(QString("Switched to %1").arg(QString::fromStdString(finalis::wallet::wallet_network_display_name(active_network_))));
+    refresh_chain_state(false);
+  }
+  statusBar()->showMessage(
+      QString("Network: %1").arg(QString::fromStdString(finalis::wallet::wallet_network_display_name(active_network_))), 3000);
+}
+
 void WalletWindow::save_settings() const {
   QSettings settings(kSettingsOrg, kSettingsApp);
+  settings.setValue("network", QString::fromStdString(active_network_));
+  const auto key = [this](const QString& k) { return network_settings_key(k); };
   const QStringList endpoints = configured_lightserver_endpoints();
-  settings.setValue("lightserver_endpoints", endpoints);
-  settings.setValue("lightserver_url", endpoints.isEmpty() ? QString{} : endpoints.front());
-  settings.setValue("lightserver_pin_first", pin_lightserver_endpoint_checkbox_ &&
-                                                 pin_lightserver_endpoint_checkbox_->isChecked());
-  settings.setValue("lightserver_last_good", last_successful_lightserver_endpoint_);
-  settings.setValue("validator/db_path", validator_db_path_edit_ ? validator_db_path_edit_->text().trimmed() : QString{});
-  settings.setValue("validator/key_path", validator_key_path_edit_ ? validator_key_path_edit_->text().trimmed() : QString{});
-  settings.setValue("validator/rpc_url", validator_rpc_url_edit_ ? validator_rpc_url_edit_->text().trimmed() : QString{});
+  settings.setValue(key("lightserver_endpoints"), endpoints);
+  settings.setValue(key("lightserver_url"), endpoints.isEmpty() ? QString{} : endpoints.front());
+  settings.setValue(key("lightserver_pin_first"), pin_lightserver_endpoint_checkbox_ &&
+                                                      pin_lightserver_endpoint_checkbox_->isChecked());
+  settings.setValue(key("lightserver_last_good"), last_successful_lightserver_endpoint_);
+  settings.setValue(key("validator/db_path"), validator_db_path_edit_ ? validator_db_path_edit_->text().trimmed() : QString{});
+  settings.setValue(key("validator/key_path"), validator_key_path_edit_ ? validator_key_path_edit_->text().trimmed() : QString{});
+  settings.setValue(key("validator/rpc_url"), validator_rpc_url_edit_ ? validator_rpc_url_edit_->text().trimmed() : QString{});
   settings.setValue("theme", theme_combo_->currentText());
   settings.setValue("history_filter", history_filter_combo_->currentText());
   settings.setValue("history_table_sort_column", history_view_->horizontalHeader()->sortIndicatorSection());
@@ -1581,8 +1694,10 @@ void WalletWindow::save_settings() const {
 QUrl WalletWindow::explorer_home_url() const {
   QSettings settings(kSettingsOrg, kSettingsApp);
   QSettings legacy(kSettingsOrg, kLegacySettingsApp);
-  QString explorer = settings.value("explorer_url").toString().trimmed();
-  if (explorer.isEmpty()) explorer = legacy.value("explorer_url").toString().trimmed();
+  QString explorer = settings.value(network_settings_key("explorer_url")).toString().trimmed();
+  if (explorer.isEmpty() && !finalis::wallet::wallet_network_is_testnet(active_network_)) {
+    explorer = legacy.value("explorer_url").toString().trimmed();
+  }
   if (explorer.isEmpty()) explorer = "http://127.0.0.1:18080";
   QUrl url = QUrl::fromUserInput(explorer);
   if (url.isValid() && url.path().isEmpty()) url.setPath("/");
@@ -1858,7 +1973,7 @@ void WalletWindow::update_wallet_views() {
     wallet_status_label_->setText("No wallet open");
     wallet_file_label_->setText("-");
     wallet_file_label_->setToolTip({});
-    network_label_->setText("mainnet");
+    network_label_->setText(QString::fromStdString(active_network_));
     receive_address_home_label_->setText("-");
     receive_address_home_label_->setToolTip({});
     receive_address_label_->setText("-");
@@ -1886,7 +2001,7 @@ void WalletWindow::update_wallet_views() {
     current_bootstrap_sync_incomplete_ = false;
     tip_status_label_->setText("not refreshed");
     if (overview_connection_status_label_) overview_connection_status_label_->setText("No healthy endpoint");
-    if (header_network_label_) header_network_label_->setText("Network: mainnet");
+    if (header_network_label_) header_network_label_->setText(QString("Network: %1").arg(QString::fromStdString(active_network_)));
     if (header_tip_label_) header_tip_label_->setText("Finalized tip: unavailable");
     if (header_connection_label_) header_connection_label_->setText("Lightserver: unavailable");
     update_crosscheck_summary({});
@@ -3376,7 +3491,7 @@ void WalletWindow::load_wallet_local_state() {
 
 bool WalletWindow::open_wallet_store() {
   if (!wallet_) return false;
-  return store_.open(wallet_->file_path, wallet_->passphrase);
+  return store_.open(wallet_->file_path, wallet_->passphrase, wallet_->network_name);
 }
 
 void WalletWindow::append_local_event(const QString& line) {
@@ -4443,6 +4558,7 @@ std::optional<WalletWindow::LoadedWallet> WalletWindow::load_wallet_file(const Q
   loaded.network_name = key.network_name;
   loaded.address = key.address;
   loaded.pubkey_hex = finalis::hex_encode(finalis::Bytes(key.pubkey.begin(), key.pubkey.end()));
+  bind_wallet_to_active_network(loaded);
   return loaded;
 }
 
@@ -4493,8 +4609,8 @@ void WalletWindow::create_wallet() {
 
   finalis::keystore::ValidatorKey key;
   std::string err;
-  if (!finalis::keystore::create_validator_keystore(path.toStdString(), passphrase->toStdString(), "mainnet",
-                                                      finalis::keystore::hrp_for_network("mainnet"), std::nullopt, &key,
+  if (!finalis::keystore::create_validator_keystore(path.toStdString(), passphrase->toStdString(), active_network_,
+                                                      finalis::keystore::hrp_for_network(active_network_), std::nullopt, &key,
                                                       &err)) {
     QMessageBox::warning(this, "Create Wallet", QString::fromStdString(err));
     return;
@@ -4551,8 +4667,8 @@ void WalletWindow::import_wallet() {
 
   finalis::keystore::ValidatorKey key;
   std::string err;
-  if (!finalis::keystore::create_validator_keystore(path.toStdString(), passphrase->toStdString(), "mainnet",
-                                                      finalis::keystore::hrp_for_network("mainnet"), *seed, &key, &err)) {
+  if (!finalis::keystore::create_validator_keystore(path.toStdString(), passphrase->toStdString(), active_network_,
+                                                      finalis::keystore::hrp_for_network(active_network_), *seed, &key, &err)) {
     QMessageBox::warning(this, "Import Wallet", QString::fromStdString(err));
     return;
   }
@@ -4990,8 +5106,8 @@ void WalletWindow::validate_send_form() {
     return;
   }
   if (mode == WalletSendMode::TransparentToTransparent) {
-    if (!finalis::address::decode(recipient_text.toStdString()).has_value()) {
-      show_send_inline_warning("Recipient address is invalid.");
+    if (const auto recipient_err = recipient_address_error(recipient_text)) {
+      show_send_inline_warning(*recipient_err);
       show_send_inline_status("Review unavailable");
       return;
     }
@@ -5160,8 +5276,8 @@ void WalletWindow::validate_send_form() {
     return;
   }
 
-  if (!finalis::address::decode(recipient_text.toStdString()).has_value()) {
-    show_send_inline_warning("Recipient address is invalid.");
+  if (const auto recipient_err = recipient_address_error(recipient_text)) {
+    show_send_inline_warning(*recipient_err);
     show_send_inline_status("Review unavailable");
     return;
   }
@@ -5359,6 +5475,10 @@ void WalletWindow::submit_send() {
   std::optional<finalis::address::DecodedAddress> cached_sender_address;
 
   if (mode == WalletSendMode::TransparentToTransparent) {
+    if (const auto recipient_err = recipient_address_error(destination)) {
+      QMessageBox::warning(this, "Send", *recipient_err);
+      return;
+    }
     auto decoded_to = finalis::address::decode(destination.toStdString());
     if (!decoded_to) {
       QMessageBox::warning(this, "Send", "Destination address is invalid.");
@@ -5615,6 +5735,10 @@ void WalletWindow::submit_send() {
       change_request_used = std::make_pair(plan->change_account_id, *plan->change_request_index);
     }
   } else {
+    if (const auto recipient_err = recipient_address_error(destination)) {
+      QMessageBox::warning(this, "Send", *recipient_err);
+      return;
+    }
     auto decoded_to = finalis::address::decode(destination.toStdString());
     if (!decoded_to) {
       QMessageBox::warning(this, "Send", "Destination address is invalid.");

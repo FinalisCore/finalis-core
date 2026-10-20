@@ -18,6 +18,23 @@ cmake --build build --target finalis-wallet -j"$(nproc)"
 ./build/finalis-wallet
 ```
 
+## Mainnet and testnet
+
+The selector in the header switches the wallet between `Mainnet` and `Testnet` (as in finalis-mobile).
+The choice is remembered.
+
+- The open wallet keeps its key and shows that network's address (`sc1…` on mainnet, `tsc1…` on
+  testnet). Every signature commits to its chain, so a transaction signed for one network is invalid
+  on the other.
+- Lightserver endpoints, validator paths and the explorer URL are kept per network. Testnet defaults to
+  the public lightserver in [testnet/SEEDS.json](../../testnet/SEEDS.json), mainnet to a local node
+  (`http://127.0.0.1:19444/rpc`).
+- Local wallet state (history, pending transactions, confidential accounts and coins) is kept per
+  network: `<wallet>.json.walletdb` for mainnet, `<wallet>.json.testnet.walletdb` for testnet.
+- Create and Import write the keystore for the selected network.
+- Sends refuse a recipient address of the other network.
+- Testnet shows a banner: testnet coins have no value.
+
 ## Connected services
 
 - Lightserver: finalized-state reads and transaction broadcast
