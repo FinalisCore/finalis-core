@@ -620,6 +620,14 @@ LookupResult<CommitteeResult> parse_committee_result_object(const finalis::minij
 volatile std::sig_atomic_t g_stop = 0;
 std::atomic<std::size_t> g_active_clients{0};
 constexpr std::size_t kMaxConcurrentClients = 64;
+// One address may not take every slot: without this a single client holding 64 slow connections
+// makes the explorer answer "busy" to everyone.
+constexpr std::size_t kMaxConcurrentClientsPerIp = 8;
+std::mutex g_active_by_ip_mu;
+std::unordered_map<std::string, std::size_t> g_active_by_ip;
+// The whole request must arrive within this. A per-recv timeout alone lets a client that trickles
+// bytes keep a slot forever (slowloris).
+constexpr std::uint32_t kHttpRequestReadDeadlineMs = 10'000;
 thread_local std::string g_current_request_path;
 
 void on_signal(int) { g_stop = 1; }
@@ -3487,6 +3495,13 @@ LookupResult<AddressResult> fetch_address_result(const Config& cfg, const std::s
     out.error = make_error(400, "invalid_address", "malformed address");
     return out;
   }
+  // A mainnet address on a testnet explorer (or the reverse) names no account on this chain.
+  if (auto status = fetch_status_result(cfg);
+      status.value.has_value() && decoded->hrp != hrp_for_network_name(status.value->network)) {
+    out.error = make_error(400, "wrong_network_address",
+                           decoded->hrp + "1 address; this explorer serves " + status.value->network);
+    return out;
+  }
   AddressResult result;
   result.address = addr;
   const Bytes script_pubkey = finalis::address::p2pkh_script_pubkey(decoded->pubkey_hash);
@@ -4496,8 +4511,16 @@ bool write_all(finalis::net::SocketHandle fd, const std::string& data) {
 std::optional<std::string> read_http_request(finalis::net::SocketHandle fd) {
   std::string req;
   std::array<char, 4096> buf{};
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHttpRequestReadDeadlineMs);
+  auto recv_before_deadline = [&]() -> ssize_t {
+    const auto left =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) return -1;
+    (void)finalis::net::set_socket_timeouts(fd, static_cast<std::uint32_t>(left));
+    return ::recv(fd, buf.data(), buf.size(), 0);
+  };
   while (req.find("\r\n\r\n") == std::string::npos) {
-    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    const ssize_t n = recv_before_deadline();
     if (n <= 0) return std::nullopt;
     req.append(buf.data(), static_cast<std::size_t>(n));
     if (req.size() > kMaxHttpHeaderBytes) return std::nullopt;
@@ -4516,7 +4539,7 @@ std::optional<std::string> read_http_request(finalis::net::SocketHandle fd) {
   }
   if (content_len > kMaxHttpBodyBytes) return std::nullopt;
   while (req.size() < hdr_end + 4 + content_len) {
-    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    const ssize_t n = recv_before_deadline();
     if (n <= 0) return std::nullopt;
     req.append(buf.data(), static_cast<std::size_t>(n));
   }
@@ -5043,12 +5066,14 @@ std::optional<ApiError> verify_partner_auth(const Config& cfg, const HttpRequest
 }
 
 std::optional<ApiError> enforce_partner_rate_limit(const Config& cfg, const HttpRequest& req, const PartnerPrincipal& principal,
-                                                   Response* out_response) {
+                                                   const std::string& client_ip, Response* out_response) {
   const std::string path = path_from_target(req.target);
   if (!partner_auth_needed(path)) return std::nullopt;
   const std::string scope = partner_required_scope(req.method, path).value_or("read");
   const std::string partner_id = principal.partner_id.empty() ? "default" : principal.partner_id;
-  const std::string bucket = partner_id + "|" + scope;
+  // Anonymous callers (partner auth off) each get their own window; one shared "default" window let a
+  // single client exhaust the limit for everyone.
+  const std::string bucket = (principal.authenticated ? partner_id : "ip:" + client_ip) + "|" + scope;
   const std::uint64_t now_ms = now_unix_ms();
   std::uint64_t retry_after_s = 0;
   std::uint64_t limit = principal.rate_limit_per_minute == 0 ? cfg.partner_rate_limit_per_minute : principal.rate_limit_per_minute;
@@ -5058,6 +5083,12 @@ std::optional<ApiError> enforce_partner_rate_limit(const Config& cfg, const Http
   if (limit == 0) return std::nullopt;
   {
     std::lock_guard<std::mutex> guard(g_partner_mu);
+    // Per-IP windows would otherwise accumulate one entry per address ever seen.
+    if (g_partner_rate_windows_ms.size() > 4096) {
+      for (auto it = g_partner_rate_windows_ms.begin(); it != g_partner_rate_windows_ms.end();) {
+        it = (it->second.empty() || it->second.back() + 60'000 <= now_ms) ? g_partner_rate_windows_ms.erase(it) : std::next(it);
+      }
+    }
     auto& window = g_partner_rate_windows_ms[bucket];
     while (!window.empty() && window.front() + 60'000 <= now_ms) window.pop_front();
     if (window.size() >= limit) {
@@ -5070,7 +5101,7 @@ std::optional<ApiError> enforce_partner_rate_limit(const Config& cfg, const Http
     std::lock_guard<std::mutex> guard(g_metrics_mu);
     ++g_metrics_partner_rate_limited_total;
     ++g_metrics_partner_rate_limited_by_scope_total[scope];
-    ++g_metrics_partner_rate_limited_by_partner_scope_total[bucket];
+    ++g_metrics_partner_rate_limited_by_partner_scope_total[partner_id + "|" + scope];  // never label by client IP
     if (out_response) out_response->headers.push_back({"Retry-After", std::to_string(retry_after_s)});
     if (out_response) out_response->headers.push_back({"X-Finalis-RateLimit-Scope", scope});
     return make_error(429, "rate_limited", "partner rate limit exceeded");
@@ -5481,12 +5512,17 @@ void partner_webhook_worker(const Config cfg) {
 
 void handle_client_session(Config cfg, finalis::net::SocketHandle fd, const std::string client_ip) {
   struct ActiveGuard {
-    ~ActiveGuard() { --g_active_clients; }
-  } guard;
+    const std::string& ip;
+    ~ActiveGuard() {
+      --g_active_clients;
+      std::lock_guard<std::mutex> lk(g_active_by_ip_mu);
+      if (auto it = g_active_by_ip.find(ip); it != g_active_by_ip.end() && --it->second == 0) g_active_by_ip.erase(it);
+    }
+  } guard{client_ip};
 
   const auto started = std::chrono::steady_clock::now();
-  (void)finalis::net::set_socket_timeouts(fd, 15'000);
   auto req = read_http_request(fd);
+  (void)finalis::net::set_socket_timeouts(fd, 15'000);  // the read left the remaining deadline; give the write its own
   Response resp_obj =
       req.has_value() ? handle_request(cfg, *req, client_ip)
                       : html_response(400, page_layout("Bad Request", "<h1>Bad Request</h1>"));
@@ -5562,7 +5598,7 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     return json_error_response(*auth_err);
   }
   Response rate_limited_response;
-  if (auto rl_err = enforce_partner_rate_limit(cfg, *parsed_req, principal, &rate_limited_response); rl_err.has_value()) {
+  if (auto rl_err = enforce_partner_rate_limit(cfg, *parsed_req, principal, client_ip, &rate_limited_response); rl_err.has_value()) {
     rate_limited_response.status = rl_err->http_status;
     rate_limited_response.content_type = "application/json; charset=utf-8";
     rate_limited_response.body = error_json(*rl_err);
@@ -5572,6 +5608,12 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     const auto needed_scope = partner_required_scope(method, path);
     if (needed_scope.has_value() && !principal_has_scope(principal, *needed_scope)) {
       return json_error_response(make_error(403, "auth_scope_denied", "partner scope does not permit this operation"));
+    }
+    // Without partner auth every caller is the anonymous "default" partner: submitting withdrawals or
+    // managing webhooks would only let strangers store state on this server.
+    if (!cfg.partner_auth_required && (needed_scope == "withdraw_submit" || needed_scope == "webhook_manage")) {
+      return json_error_response(make_error(403, "partner_api_disabled",
+                                            "partner withdrawals and webhooks require --partner-auth-required"));
     }
   }
 
@@ -5674,6 +5716,11 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
     const auto idem_key = header_value(*parsed_req, "idempotency-key");
     if (!idem_key.has_value() || idem_key->empty()) {
       return json_error_response(make_error(400, "missing_idempotency_key", "Idempotency-Key header is required"));
+    }
+    // Both ids are stored (and persisted) for the idempotency TTL; unbounded ones let a caller grow that state at will.
+    constexpr std::size_t kMaxPartnerIdBytes = 128;
+    if (client_id->size() > kMaxPartnerIdBytes || idem_key->size() > kMaxPartnerIdBytes) {
+      return json_error_response(make_error(400, "id_too_long", "client_withdrawal_id and Idempotency-Key are limited to 128 bytes"));
     }
     const std::string partner_id = principal.partner_id.empty() ? "default" : principal.partner_id;
     const std::string scoped_idem = partner_scoped_id(partner_id, *idem_key);
@@ -6135,8 +6182,22 @@ int main(int argc, char** argv) {
       if (g_stop) break;
       continue;
     }
-    const std::size_t active = g_active_clients.load();
-    if (active >= kMaxConcurrentClients) {
+    char ipbuf[INET_ADDRSTRLEN] = {0};
+    std::string client_ip = "0.0.0.0";
+    if (::inet_ntop(AF_INET, &client.sin_addr, ipbuf, sizeof(ipbuf))) client_ip = ipbuf;
+    bool admitted = false;
+    {
+      std::lock_guard<std::mutex> lk(g_active_by_ip_mu);
+      auto& per_ip = g_active_by_ip[client_ip];
+      if (g_active_clients.load() < kMaxConcurrentClients && per_ip < kMaxConcurrentClientsPerIp) {
+        ++per_ip;
+        ++g_active_clients;
+        admitted = true;
+      } else if (per_ip == 0) {
+        g_active_by_ip.erase(client_ip);
+      }
+    }
+    if (!admitted) {
       const std::string resp = http_response(
           html_response(503, page_layout("Busy", "<div class=\"card\"><div class=\"note\">Explorer is busy. Retry shortly.</div></div>")));
       (void)write_all(fd, resp);
@@ -6144,10 +6205,6 @@ int main(int argc, char** argv) {
       finalis::net::close_socket(fd);
       continue;
     }
-    ++g_active_clients;
-    char ipbuf[INET_ADDRSTRLEN] = {0};
-    std::string client_ip = "0.0.0.0";
-    if (::inet_ntop(AF_INET, &client.sin_addr, ipbuf, sizeof(ipbuf))) client_ip = ipbuf;
     std::thread(handle_client_session, *cfg, fd, client_ip).detach();
   }
 
