@@ -37,6 +37,7 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
   cfg.lightserver_port = cfg.network.lightserver_default_port;
   cfg.max_committee = cfg.network.max_committee;
   cfg.db_path = default_db_dir_for_network(cfg.network.name);
+  cfg.lightserver_admin_socket = default_admin_socket_path(cfg.network.name);
   bool bind_explicit = false;
   bool db_explicit = false;
   std::string validator_passphrase_env;

@@ -2370,7 +2370,7 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
       options.wait_for_sync = true;
       std::string err;
       result.record = finalis::lightserver::rpc_validator_onboarding_status(
-          finalis::lightserver::kDefaultAdminRpcUrl, options, request.tracked_txid.toStdString(), &err);
+          finalis::lightserver::default_admin_rpc_url(options.network.name), options, request.tracked_txid.toStdString(), &err);
       if (!result.record.has_value() && !err.empty()) result.onboarding_error = QString::fromStdString(err);
     }
 
@@ -2791,7 +2791,7 @@ void WalletWindow::start_onboarding_registration_clicked() {
     return;
   }
 
-  auto preview = finalis::lightserver::rpc_validator_onboarding_status(finalis::lightserver::kDefaultAdminRpcUrl, options, "", &err);
+  auto preview = finalis::lightserver::rpc_validator_onboarding_status(finalis::lightserver::default_admin_rpc_url(options.network.name), options, "", &err);
   if (!preview && !err.empty()) {
     QMessageBox::warning(this, "Register Onboarding Operator", QString::fromStdString(err));
     persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));
@@ -2947,7 +2947,7 @@ void WalletWindow::start_validator_onboarding_clicked() {
   options.wait_for_sync = true;
 
   std::string err;
-  auto preview = finalis::lightserver::rpc_validator_onboarding_status(finalis::lightserver::kDefaultAdminRpcUrl, options, "", &err);
+  auto preview = finalis::lightserver::rpc_validator_onboarding_status(finalis::lightserver::default_admin_rpc_url(options.network.name), options, "", &err);
   if (!preview && !err.empty()) {
     QMessageBox::warning(this, "Start Validator Onboarding", QString::fromStdString(err));
     persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));
@@ -2976,7 +2976,7 @@ void WalletWindow::start_validator_onboarding_clicked() {
   }
 
   save_settings();
-  auto record = finalis::lightserver::rpc_validator_onboarding_start(finalis::lightserver::kDefaultAdminRpcUrl, options, &err);
+  auto record = finalis::lightserver::rpc_validator_onboarding_start(finalis::lightserver::default_admin_rpc_url(options.network.name), options, &err);
   if (!record) {
     QMessageBox::warning(this, "Start Validator Onboarding", QString::fromStdString(err));
     persist_validator_onboarding_ui_state(std::nullopt, QString::fromStdString(err));

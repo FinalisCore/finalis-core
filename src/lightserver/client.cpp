@@ -9,6 +9,7 @@
 
 #include "codec/bytes.hpp"
 #include "common/minijson.hpp"
+#include "common/paths.hpp"
 #include "common/socket_compat.hpp"
 
 #ifndef _WIN32
@@ -863,6 +864,10 @@ BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_byt
   }
   if (out.error.empty() && !out.error_message.empty()) out.error = out.error_message;
   return out;
+}
+
+std::string default_admin_rpc_url(const std::string& network_name) {
+  return "unix://" + default_admin_socket_path(network_name);
 }
 
 std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_status(

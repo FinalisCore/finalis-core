@@ -1037,8 +1037,9 @@ UMask=0077
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=${DB_DIR}
-# Lightserver admin RPC socket: /run/finalis/admin.sock (owner-only)
-RuntimeDirectory=finalis
+# Lightserver admin RPC socket: /run/finalis/${FINALIS_NETWORK}/admin.sock (owner-only); one directory per
+# network, so stopping a mainnet or testnet service never removes the other's socket.
+RuntimeDirectory=finalis/${FINALIS_NETWORK}
 RuntimeDirectoryMode=0700
 PrivateTmp=true
 PrivateDevices=true

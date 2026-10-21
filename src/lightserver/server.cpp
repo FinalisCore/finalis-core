@@ -3615,6 +3615,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
   cfg.db_path = default_db_dir_for_network(cfg.network.name);
   cfg.port = cfg.network.lightserver_default_port;
   cfg.tx_relay_port = cfg.network.p2p_default_port;
+  cfg.admin_socket_path = default_admin_socket_path(cfg.network.name);
   cfg.max_committee = cfg.network.max_committee;
   bool db_explicit = false;
   for (int i = 1; i < argc; ++i) {

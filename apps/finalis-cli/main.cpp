@@ -3290,7 +3290,7 @@ int main(int argc, char** argv) {
     std::string passphrase;
     std::string rpc_url = default_rpc_url();
     // Onboarding status/start are admin RPCs, served only on the lightserver admin Unix socket.
-    std::string admin_rpc_url = finalis::lightserver::kDefaultAdminRpcUrl;
+    std::string admin_rpc_url = finalis::lightserver::default_admin_rpc_url(cli_network().name);
     std::uint64_t fee = 10'000;
     bool wait_for_sync = true;
     bool watch = true;

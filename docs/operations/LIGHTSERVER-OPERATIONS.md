@@ -1,4 +1,4 @@
-# Lightserver and Node Operations
+| Several nodes of one network on one host | `--lightserver-admin-socket <path>` per node | Mainnet and testnet already use separate default paths. `--with-lightserver` passes the network's default path unless| Docker image | `/run/finalis/<network>/admin.sock` inside the container | The image pre-creates `/run/finalis` for the `finalis` user; the lightserver creates `<network>` under it.| `/run/finalis/<network>/admin.sock` | `RuntimeDirectory=finalis/<network>` creates `/run/finalis/<network>` (0700, owned by the service user) on each start and removes only that directory on stop, so a mainnet and a testnet service on one host keep separate sockets. `/var/run` is a symlink to `/run`. |# Lightserver and Node Operations
 
 Operator reference for the lightserver RPC surfaces (public TCP and admin Unix socket), its rate
 limits, and the node's fail-stop states. Applies to `finalis-lightserver` whether started
@@ -9,7 +9,7 @@ standalone or as the `finalis-node --with-lightserver` child process.
 | Surface | Listener | Methods |
 |---|---|---|
 | Public | TCP `--bind <ipv4>` / `--port` (default 19444) | read methods, `broadcast_tx` |
-| Admin | Unix socket `--admin-socket <path>` (default `/var/run/finalis/admin.sock`) | everything above, plus `validator_onboarding_start`, `validator_onboarding_status` |
+| Admin | Unix socket `--admin-socket <path>` (default `/var/run/finalis/<network>/admin.sock`, `<network>` = `mainnet` or `testnet`) | everything above| everything above, plus `validator_onboarding_start`, `validator_onboarding_status` |
 
 Admin methods called over TCP return JSON-RPC `-32601 method not found`. They unlock the
 validator keystore with a passphrase, which is why they are never served over the network.
@@ -32,10 +32,10 @@ validator keystore with a passphrase, which is why they are never served over th
 
 | Deployment | Socket | Notes |
 |---|---|---|
-| systemd (`packaging/linux/finalis-node.service`, `scripts/start.sh`) | `/run/finalis/admin.sock` | `RuntimeDirectory=finalis` creates `/run/finalis` (0700, owned by the service user) on each start. `/var/run` is a symlink to `/run`. |
-| Docker image | `/run/finalis/admin.sock` inside the container | The image pre-creates `/run/finalis` for the `finalis` user. Use it with `docker exec`. |
+| systemd (`packaging/linux/finalis-node.service`, `scripts/start.sh`) | `/run/finalis/<network>/admin.sock` | `RuntimeDirectory=finalis/<network>` creates `/run/finalis/<network>` (0700, owned by the service user) on each start and removes only that directory on stop, so a mainnet and a testnet service on one host keep separate sockets. `/var/run` is a symlink to `/run`. |
+| Docker image | `/run/finalis/<network>/admin.sock` inside the container | The image pre-creates `/run/finalis` for the `finalis` user; the lightserver creates `<network>` under it. Use it with `docker exec`. |
 | Windows | none | Unix sockets are not supported. Admin RPC is unavailable (see 2.4). |
-| Several nodes on one host | `--lightserver-admin-socket <path>` per node | `--with-lightserver` passes the default path unless the node gets `--lightserver-admin-socket <path>` (empty disables it); without it only the first child binds the socket. Point clients at the matching path with `--admin-rpc unix://<path>`. |
+| Several nodes of one network on one host | `--lightserver-admin-socket <path>` per node | Mainnet and testnet already use separate default paths. `--with-lightserver` passes the network's default path unless the node gets `--lightserver-admin-socket <path>` (empty disables it); without it only the first child binds the socket. Point clients at the matching path with `--admin-rpc unix://<path>`. |
 
 `--no-admin-socket` disables the admin surface on purpose.
 
@@ -47,7 +47,7 @@ Run the CLI as the service user so the uid check passes:
 sudo -u finalis finalis-cli validator-register \
   --db /var/lib/finalis/mainnet \
   --file /var/lib/finalis/mainnet/keystore/validator.json \
-  --admin-rpc unix:///run/finalis/admin.sock
+  --admin-rpc unix:///run/finalis/mainnet/admin.sock
 ```
 
 Notes:
@@ -63,13 +63,13 @@ Docker:
 ```bash
 docker exec -it finalis-node1 finalis-cli validator-register \
   --db /var/lib/finalis/db --file /var/lib/finalis/keystore/validator.json \
-  --admin-rpc unix:///run/finalis/admin.sock
+  --admin-rpc unix:///run/finalis/mainnet/admin.sock
 ```
 
 ### 2.4 Known limitation: desktop wallet
 
-The desktop wallet always connects to `unix:///var/run/finalis/admin.sock` for validator
-onboarding. It only works when the wallet runs as the same user as the lightserver (or as root),
+The desktop wallet always connects to `unix:///var/run/finalis/<network>/admin.sock` (the
+network it is switched to) for validator onboarding. It only works when the wallet runs as the same user as the lightserver (or as root),
 on Linux or macOS. It does not work on Windows, or when the wallet user differs from a systemd
 `finalis` service user. Use the CLI procedure in 2.3 in those cases.
 
