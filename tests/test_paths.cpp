@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "common/paths.hpp"
+#include "lightserver/client.hpp"
+#include "lightserver/server.hpp"
 #include "node/node.hpp"
 
 using namespace finalis;
@@ -35,6 +37,30 @@ TEST(test_paths_default_db_dir_and_expand_home) {
   ::setenv("HOME", fake_home.c_str(), 1);
 #endif
   ASSERT_EQ(expand_user_home("~/.finalis/mainnet"), fake_home + "/.finalis/mainnet");
+}
+
+TEST(test_admin_socket_default_is_per_network) {
+  ASSERT_EQ(default_admin_socket_path("mainnet"), "/var/run/finalis/mainnet/admin.sock");
+  ASSERT_EQ(default_admin_socket_path("testnet"), "/var/run/finalis/testnet/admin.sock");
+  ASSERT_EQ(lightserver::default_admin_rpc_url("testnet"), "unix:///var/run/finalis/testnet/admin.sock");
+
+  std::vector<std::string> node_args = {"finalis-node", "--testnet", "--disable-p2p"};
+  auto node_argv = make_argv(node_args);
+  auto node_cfg = node::parse_args(static_cast<int>(node_argv.size()), node_argv.data());
+  ASSERT_TRUE(node_cfg.has_value());
+  ASSERT_EQ(node_cfg->lightserver_admin_socket, "/var/run/finalis/testnet/admin.sock");
+
+  std::vector<std::string> ls_args = {"finalis-lightserver", "--testnet"};
+  auto ls_argv = make_argv(ls_args);
+  auto ls_cfg = lightserver::parse_args(static_cast<int>(ls_argv.size()), ls_argv.data());
+  ASSERT_TRUE(ls_cfg.has_value());
+  ASSERT_EQ(ls_cfg->admin_socket_path, "/var/run/finalis/testnet/admin.sock");
+
+  std::vector<std::string> ls_main_args = {"finalis-lightserver"};
+  auto ls_main_argv = make_argv(ls_main_args);
+  auto ls_main_cfg = lightserver::parse_args(static_cast<int>(ls_main_argv.size()), ls_main_argv.data());
+  ASSERT_TRUE(ls_main_cfg.has_value());
+  ASSERT_EQ(ls_main_cfg->admin_socket_path, "/var/run/finalis/mainnet/admin.sock");
 }
 
 TEST(test_node_default_db_path_uses_home_by_network) {

@@ -17,14 +17,12 @@
 
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
+#include "common/paths.hpp"
 #include "common/socket_compat.hpp"
 #include "crypto/smt.hpp"
 #include "storage/db.hpp"
 
 namespace finalis::lightserver {
-
-// Admin RPC (keystore unlock / validator onboarding) is served only on this Unix socket, never TCP.
-inline constexpr const char* kDefaultAdminSocketPath = "/var/run/finalis/admin.sock";
 
 // Public TCP rate limits (token buckets, per minute).
 inline constexpr std::uint32_t kPublicReadRequestsPerMinutePerIp = 100;
@@ -85,8 +83,9 @@ struct Config {
   std::string tx_relay_host{"127.0.0.1"};
   std::uint16_t tx_relay_port{0};
   std::function<TxRelayResult(const Bytes&)> tx_relay_override;
+  // Admin RPC (keystore unlock / validator onboarding) is served only on this Unix socket, never TCP.
   // Empty disables the admin surface. Not supported on Windows.
-  std::string admin_socket_path{kDefaultAdminSocketPath};
+  std::string admin_socket_path{default_admin_socket_path("mainnet")};
   std::size_t worker_threads{0};  // 0 = clamp(hardware_concurrency, 4, 8)
   std::size_t max_queued_connections{64};
   // Loopback peers (explorer, local wallet) skip the public rate limits. Set false

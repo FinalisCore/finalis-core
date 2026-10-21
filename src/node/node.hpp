@@ -30,6 +30,7 @@
 #include "p2p/peer_manager.hpp"
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
+#include "common/paths.hpp"
 #include "p2p/hardening.hpp"
 #include "storage/db.hpp"
 #include "utxo/validate.hpp"
@@ -76,7 +77,7 @@ struct NodeConfig {
   std::string lightserver_bind{"127.0.0.1"};
   std::uint16_t lightserver_port{19444};
   // Admin socket of the spawned lightserver; empty disables it. Hosts running several give each its own.
-  std::string lightserver_admin_socket{"/var/run/finalis/admin.sock"};  // lightserver::kDefaultAdminSocketPath
+  std::string lightserver_admin_socket{default_admin_socket_path("mainnet")};
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};

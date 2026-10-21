@@ -49,6 +49,10 @@ std::string default_db_dir_for_network(const std::string& network_name) {
   return "~/.finalis/" + network_name;
 }
 
+std::string default_admin_socket_path(const std::string& network_name) {
+  return "/var/run/finalis/" + network_name + "/admin.sock";
+}
+
 bool ensure_private_dir(const std::string& path) {
   std::error_code ec;
   if (!std::filesystem::exists(path, ec)) {

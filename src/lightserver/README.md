@@ -12,10 +12,10 @@
 ## RPC Surfaces
 
 - TCP (`--bind`/`--port`): public read methods and `broadcast_tx`.
-- Admin Unix socket (`--admin-socket`, default `/var/run/finalis/admin.sock`, mode 0600, peer uid
+- Admin Unix socket (`--admin-socket`, default `/var/run/finalis/<network>/admin.sock`, mode 0600, peer uid
   checked on Linux): additionally `validator_onboarding_status` / `validator_onboarding_start`
   (keystore unlock). On TCP these answer `method not found`. `--no-admin-socket` disables it.
-  Clients use `unix:///var/run/finalis/admin.sock` (`lightserver::kDefaultAdminRpcUrl`).
+  Clients use `unix:///var/run/finalis/<network>/admin.sock` (`lightserver::default_admin_rpc_url(network)`).
 - Connections are served by a bounded worker pool (4-8 threads, queue of 64); a full queue gets
   HTTP 503 with `Retry-After`.
 - Public rate limits (token buckets): 100 req/min per IP, `broadcast_tx` 10/min per IP, 1000/min

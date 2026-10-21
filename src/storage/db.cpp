@@ -17,6 +17,7 @@
 #ifdef SC_HAS_ROCKSDB
 #include <rocksdb/cache.h>
 #include <rocksdb/db.h>
+#include <rocksdb/env.h>
 #include <rocksdb/rate_limiter.h>
 #include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
@@ -74,6 +75,14 @@ rocksdb::Status open_rocksdb_rw(const rocksdb::Options& options, const std::stri
                                 std::unique_ptr<rocksdb::DB>* out) {
   return open_rocksdb_impl(/*read_only=*/false, options, path, out);
 }
+
+// A read-only open shares the directory of the node that owns the DB. Without its own logger RocksDB
+// renames that node's info LOG to LOG.old.* and starts a new one on every open.
+class DiscardingRocksLogger final : public rocksdb::Logger {
+ public:
+  using rocksdb::Logger::Logv;
+  void Logv(const char*, va_list) override {}
+};
 
 rocksdb::Status open_rocksdb_ro(const rocksdb::Options& options, const std::string& path,
                                 std::unique_ptr<rocksdb::DB>* out) {
@@ -1661,6 +1670,7 @@ bool DB::open_readonly(const std::string& path, std::string* error) {
   rocks_ = std::make_unique<RocksImpl>();
   rocksdb::Options options = build_rocksdb_options();
   options.create_if_missing = false;
+  options.info_log = std::make_shared<DiscardingRocksLogger>();
   std::unique_ptr<rocksdb::DB> raw;
   auto s = open_rocksdb_ro(options, path_, &raw);
   if (!s.ok()) {

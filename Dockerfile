@@ -65,8 +65,9 @@ ENV FINALIS_DB_PARALLELISM=4 \
     FINALIS_DB_RATE_LIMITER_BYTES_S=67108864 \
     FINALIS_DB_DELAYED_WRITE_RATE_BYTES_S=33554432
 
-# /run/finalis holds the lightserver admin socket (default /var/run/finalis/admin.sock, and
-# /var/run -> /run); the non-root runtime user cannot create it itself.
+# /run/finalis holds the per-network lightserver admin socket (default
+# /var/run/finalis/<network>/admin.sock, and /var/run -> /run); the non-root runtime user cannot
+# create /run/finalis itself, but creates the <network> directory under it.
 RUN mkdir -p /var/lib/finalis/keystore /var/lib/finalis/logs /run/finalis \
     && chown -R finalis:finalis /var/lib/finalis /opt/finalis-core /run/finalis \
     && chmod 0700 /run/finalis

@@ -8,6 +8,7 @@
 #include <ctime>
 #include <deque>
 #include <regex>
+#include <stdexcept>
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -95,6 +96,21 @@ std::optional<finalis::Hash32> rpc_chain_domain(const std::string& rpc_url, std:
   const auto domain = finalis::chain_domain_from_hex(status->chain.network_id_hex, status->chain.genesis_hash_hex);
   if (!domain.has_value() && err) *err = "rpc endpoint reported a malformed chain identity";
   return domain;
+}
+
+// An address of the selected network; refuses one of the other network (sc1 vs tsc1).
+std::optional<finalis::address::DecodedAddress> decode_network_address(const std::string& addr, const std::string& flag) {
+  auto decoded = finalis::address::decode(addr);
+  if (!decoded.has_value()) {
+    std::cerr << "invalid " << flag << " address\n";
+    return std::nullopt;
+  }
+  const auto hrp = finalis::keystore::hrp_for_network(cli_network().name);
+  if (decoded->hrp != hrp) {
+    std::cerr << flag << " is a " << decoded->hrp << "1 address; " << cli_network().name << " uses " << hrp << "1\n";
+    return std::nullopt;
+  }
+  return decoded;
 }
 
 std::string default_rpc_url() {
@@ -318,20 +334,26 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
   return http_post_json(url, body, "", err);
 }
 
-std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
-  auto parsed = parse_http_url(url);
-  if (!parsed || parsed->path != "/rpc") {
-    if (err) *err = "url must be http://host:port/rpc";
-    return std::nullopt;
-  }
-  return http_post_json(url, body, err);
-}
-
 std::optional<std::string> find_json_string(const std::string& json, const std::string& key) {
   std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
   std::smatch m;
   if (!std::regex_search(json, m, re)) return std::nullopt;
   return m[1].str();
+}
+
+std::optional<std::string> rpc_http_post(const std::string& url, const std::string& request, std::string* err) {
+  auto parsed = parse_http_url(url);
+  if (!parsed || parsed->path != "/rpc") {
+    if (err) *err = "url must be http://host:port/rpc";
+    return std::nullopt;
+  }
+  auto body = http_post_json(url, request, err);
+  // A JSON-RPC error object: report the server's message instead of leaving callers to misparse it.
+  if (body.has_value() && std::regex_search(*body, std::regex("\"error\"\\s*:\\s*\\{"))) {
+    if (err) *err = "rpc error: " + find_json_string(*body, "message").value_or("unknown");
+    return std::nullopt;
+  }
+  return body;
 }
 
 std::optional<std::uint64_t> find_json_u64(const std::string& json, const std::string& key) {
@@ -830,6 +852,16 @@ int run_repair_state_command(const std::string& db_path, bool force, bool dry_ru
         << "repair_state: destructive command refused without --force.\n"
         << "Use: finalis-cli repair_state --db <dir> --force\n";
     return 2;
+  }
+
+  // Deleting files under a running node corrupts its state; RocksDB's lock tells whether one holds the DB.
+  if (std::filesystem::exists(target / "LOCK", ec)) {
+    finalis::storage::DB probe;
+    std::string open_err;
+    if (!probe.open(target.string(), &open_err) && open_err.find("lock") != std::string::npos) {
+      std::cerr << "repair_state: the database is in use (stop finalis-node first): " << open_err << "\n";
+      return 1;
+    }
   }
 
   for (const auto& p : erase_entries) {
@@ -1409,23 +1441,24 @@ int run_validator_doctor_command(const std::string& db_path, const std::string& 
 }
 
 void print_user_cli_help(std::ostream& os) {
+  const std::string net = cli_network().name;
   os << "finalis-cli user/validator commands:\n"
      << "  " << platform_default_db_path_note() << "\n"
-     << "  Cross-platform defaults: Linux ~/.finalis/mainnet | Windows %APPDATA%\\.finalis\\mainnet\n"
+     << "  Cross-platform defaults: Linux ~/.finalis/" << net << " | Windows %APPDATA%\\.finalis\\" << net << "\n"
      << "  finalis-cli help [user|dev|all]\n"
      << "  finalis-cli --version\n"
-     << "  finalis-cli getWallet [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
-     << "  finalis-cli getBalance [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
-     << "  finalis-cli getUTXO [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
-     << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
-     << "  finalis-cli onboarding-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
-     << "  finalis-cli validator_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>]\n"
-     << "  finalis-cli economics_status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
-     << "  finalis-cli validator-register [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync] [--rpc-only]\n"
-     << "  finalis-cli validator-register-status [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--json] [--rpc-only]\n"
-     << "  finalis-cli validator-register-cancel [--db ~/.finalis/mainnet] [--file ~/.finalis/mainnet/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--rpc-only]  # cancel attempt before broadcast; detach local tracking after broadcast\n"
-     << "  finalis-cli wallet_create --out <path> [--pass <pass>] [--network mainnet] [--seed-hex <32b-hex>]\n"
-     << "  finalis-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network mainnet]\n"
+     << "  finalis-cli getWallet [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli getUTXO [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
+     << "  finalis-cli validator_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli economics_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
+     << "  finalis-cli validator-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync] [--rpc-only]\n"
+     << "  finalis-cli validator-register-status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--json] [--rpc-only]\n"
+     << "  finalis-cli validator-register-cancel [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--rpc-only]  # cancel attempt before broadcast; detach local tracking after broadcast\n"
+     << "  finalis-cli wallet_create --out <path> [--pass <pass>] [--network " << net << "] [--seed-hex <32b-hex>]\n"
+     << "  finalis-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network " << net << "]\n"
      << "  finalis-cli wallet_address --file <path> [--pass <pass>]\n"
      << "  finalis-cli wallet_export --file <path> [--pass <pass>]\n"
      << "  finalis-cli address_from_pubkey --hrp <sc> --pubkey <hex32>\n"
@@ -1435,9 +1468,11 @@ void print_user_cli_help(std::ostream& os) {
 }
 
 void print_dev_cli_help(std::ostream& os) {
+  const std::string net = cli_network().name;
+  const std::string port = std::to_string(cli_network().lightserver_default_port);
   os << "finalis-cli developer/protocol commands:\n"
      << "  " << platform_default_db_path_note() << "\n"
-     << "  Cross-platform defaults: Linux ~/.finalis/mainnet | Windows %APPDATA%\\.finalis\\mainnet\n"
+     << "  Cross-platform defaults: Linux ~/.finalis/" << net << " | Windows %APPDATA%\\.finalis\\" << net << "\n"
      << "  finalis-cli tip --db <dir>\n"
      << "  finalis-cli reindex [--db <dir>] [--file <path>]  # clear consensus cache so startup can rebuild\n"
      << "  finalis-cli repair_state [--db <dir>] [--force] [--dry-run]  # wipe local chain state, preserve keystore/logs\n"
@@ -1449,10 +1484,10 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli --print-logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli print_logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
-     << "  finalis-cli snapshot_import --db <dir> --in <snapshot.bin> [--expected-genesis-hash <hex32>]  # default: mainnet genesis\n"
-     << "  finalis-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
+     << "  finalis-cli snapshot_import --db <dir> --in <snapshot.bin> [--expected-genesis-hash <hex32>]  # default: " << net << " genesis\n"
+     << "  finalis-cli create_keypair [--seed-hex <32b-hex>] [--hrp " << finalis::keystore::hrp_for_network(net) << "]\n"
      << "  finalis-cli confidential_supply_audit [--db <dir>]   (exit 0=ok 2=unavailable 3=FAILED)\n"
-     << "  finalis-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
+     << "  finalis-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network " << net << "] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
      << "  finalis-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>] [--genesis-hash <hex32>]\n"
      << "  finalis-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-transition <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-transition <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>] [--kind precommit|prevote]\n"
      << "  finalis-cli slash_records [--db <dir>] [--tail <n>]\n"
@@ -1474,7 +1509,7 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli ingress_record --url http://host:port/rpc --lane <n> --seq <n>\n"
      << "  finalis-cli ingress_range --url http://host:port/rpc --lane <n> --from <n> --to <n>\n"
      << "  finalis-cli ingress_verify_range --url http://host:port/rpc --lane <n> --from <n> --to <n>\n"
-     << "  finalis-cli rpc_compare --urls http://a:19444/rpc,http://b:19444/rpc\n"
+     << "  finalis-cli rpc_compare --urls http://a:" << port << "/rpc,http://b:" << port << "/rpc\n"
      << "  finalis-cli broadcast_tx [--url http://host:port/rpc | --host <ip> --port <p>] --tx-hex <hex>\n";
 }
 
@@ -1494,14 +1529,13 @@ void print_cli_help(std::ostream& os, const std::string& mode) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run_cli(int argc, char** argv) {
   // --testnet applies to every command; drop it so no command's own parser sees it.
   std::vector<char*> args(argv, argv + argc);
-  if (const auto it = std::find_if(args.begin() + 1, args.end(),
-                                   [](const char* a) { return std::string_view(a) == "--testnet"; });
-      it != args.end()) {
+  const auto testnet_flag = [](const char* a) { return std::string_view(a) == "--testnet"; };
+  if (std::find_if(args.begin() + 1, args.end(), testnet_flag) != args.end()) {
     g_cli_network = &finalis::testnet_network();
-    args.erase(it);
+    args.erase(std::remove_if(args.begin() + 1, args.end(), testnet_flag), args.end());
   }
   argc = static_cast<int>(args.size());
   args.push_back(nullptr);
@@ -1982,7 +2016,7 @@ int main(int argc, char** argv) {
     }
 
     finalis::storage::DB db;
-    if (!db.open(db_path)) {
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
       std::cerr << "failed to open db\n";
       return 1;
     }
@@ -2648,7 +2682,7 @@ int main(int argc, char** argv) {
 
   if (cmd == "create_keypair") {
     std::string seed_hex;
-    std::string hrp = "sc";
+    std::string hrp = finalis::keystore::hrp_for_network(cli_network().name);
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--seed-hex" && i + 1 < argc) seed_hex = argv[++i];
@@ -2712,6 +2746,12 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+    // Overwriting a keystore destroys the key it held (and the funds or validator seat behind it).
+    std::error_code exists_ec;
+    if (std::filesystem::exists(out_path, exists_ec)) {
+      std::cerr << "wallet_create failed: " << out_path << " already exists; refusing to overwrite a keystore\n";
+      return 1;
+    }
     finalis::keystore::ValidatorKey vk;
     std::string err;
     if (!finalis::keystore::create_validator_keystore(out_path, passphrase, network_name,
@@ -2720,6 +2760,7 @@ int main(int argc, char** argv) {
       std::cerr << "wallet_create failed: " << err << "\n";
       return 1;
     }
+    if (passphrase.empty()) std::cerr << "warning: no --pass given; the private key is stored unencrypted\n";
     std::cout << "file=" << out_path << "\n";
     std::cout << "network=" << vk.network_name << "\n";
     std::cout << "pubkey_hex=" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
@@ -3272,7 +3313,7 @@ int main(int argc, char** argv) {
     std::string passphrase;
     std::string rpc_url = default_rpc_url();
     // Onboarding status/start are admin RPCs, served only on the lightserver admin Unix socket.
-    std::string admin_rpc_url = finalis::lightserver::kDefaultAdminRpcUrl;
+    std::string admin_rpc_url = finalis::lightserver::default_admin_rpc_url(cli_network().name);
     std::uint64_t fee = 10'000;
     bool wait_for_sync = true;
     bool watch = true;
@@ -3517,10 +3558,7 @@ int main(int argc, char** argv) {
       std::cerr << "--to is required\n";
       return 1;
     }
-    if (!finalis::address::decode(to_addr).has_value()) {
-      std::cerr << "invalid --to address\n";
-      return 1;
-    }
+    if (!decode_network_address(to_addr, "--to").has_value()) return 1;
     const int amount_modes = (!amount_text.empty() ? 1 : 0) + (amount_units_set ? 1 : 0) + (send_max ? 1 : 0);
     if (amount_modes != 1) {
       std::cerr << "choose exactly one of --amount, --amount-units, or --max\n";
@@ -3826,6 +3864,12 @@ int main(int argc, char** argv) {
       std::cerr << "--network must be mainnet or testnet\n";
       return 1;
     }
+    // Overwriting a keystore destroys the key it held (and the funds or validator seat behind it).
+    std::error_code exists_ec;
+    if (std::filesystem::exists(out_path, exists_ec)) {
+      std::cerr << "wallet_import failed: " << out_path << " already exists; refusing to overwrite a keystore\n";
+      return 1;
+    }
     finalis::keystore::ValidatorKey vk;
     std::string err;
     const std::optional<std::array<std::uint8_t, 32>> seed_override = *priv;
@@ -3835,6 +3879,7 @@ int main(int argc, char** argv) {
       std::cerr << "wallet_import failed: " << err << "\n";
       return 1;
     }
+    if (passphrase.empty()) std::cerr << "warning: no --pass given; the private key is stored unencrypted\n";
     std::cout << "file=" << out_path << "\n";
     std::cout << "network=" << vk.network_name << "\n";
     std::cout << "pubkey_hex=" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
@@ -3843,7 +3888,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "address_from_pubkey" || cmd == "addr") {
-    std::string hrp = "sc";
+    std::string hrp = finalis::keystore::hrp_for_network(cli_network().name);
     std::string pub_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -3896,12 +3941,12 @@ int main(int argc, char** argv) {
 
     auto prev_txid = decode_hex32(prev_txid_hex);
     auto priv = decode_hex32(from_priv_hex);
-    auto to = finalis::address::decode(to_addr);
+    auto to = decode_network_address(to_addr, "--to-address");
     if (!prev_txid.has_value() || !priv.has_value() || !to.has_value()) {
       std::cerr << "invalid required args\n";
       return 1;
     }
-    if (prev_value < amount + fee) {
+    if (amount > prev_value || fee > prev_value - amount) {
       std::cerr << "insufficient prev output value\n";
       return 1;
     }
@@ -3922,11 +3967,8 @@ int main(int argc, char** argv) {
     const std::uint64_t change = prev_value - amount - fee;
     if (change > 0) {
       if (!change_addr.empty()) {
-        auto ch = finalis::address::decode(change_addr);
-        if (!ch.has_value()) {
-          std::cerr << "invalid --change-address\n";
-          return 1;
-        }
+        auto ch = decode_network_address(change_addr, "--change-address");
+        if (!ch.has_value()) return 1;
         outputs.push_back(finalis::TxOut{change, finalis::address::p2pkh_script_pubkey(ch->pubkey_hash)});
       } else {
         outputs.push_back(finalis::TxOut{change, finalis::address::p2pkh_script_pubkey(from_pkh)});
@@ -3976,7 +4018,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     auto priv = decode_hex32(from_priv_hex);
-    auto to = finalis::address::decode(to_addr);
+    auto to = decode_network_address(to_addr, "--to-address");
     if (!priv.has_value() || !to.has_value()) {
       std::cerr << "invalid required args\n";
       return 1;
@@ -4002,9 +4044,13 @@ int main(int argc, char** argv) {
           finalis::OutPoint{*prev_txid, prev_indexes[i]},
           finalis::TxOut{prev_values[i], finalis::address::p2pkh_script_pubkey(from_pkh)},
       });
+      if (prev_values[i] > UINT64_MAX - total_prev_value) {
+        std::cerr << "prev output values overflow\n";
+        return 1;
+      }
       total_prev_value += prev_values[i];
     }
-    if (total_prev_value < amount + fee) {
+    if (amount > total_prev_value || fee > total_prev_value - amount) {
       std::cerr << "insufficient prev output value\n";
       return 1;
     }
@@ -4014,11 +4060,8 @@ int main(int argc, char** argv) {
     const std::uint64_t change = total_prev_value - amount - fee;
     if (change > 0) {
       if (!change_addr.empty()) {
-        auto ch = finalis::address::decode(change_addr);
-        if (!ch.has_value()) {
-          std::cerr << "invalid --change-address\n";
-          return 1;
-        }
+        auto ch = decode_network_address(change_addr, "--change-address");
+        if (!ch.has_value()) return 1;
         outputs.push_back(finalis::TxOut{change, finalis::address::p2pkh_script_pubkey(ch->pubkey_hash)});
       } else {
         outputs.push_back(finalis::TxOut{change, finalis::address::p2pkh_script_pubkey(from_pkh)});
@@ -4242,5 +4285,17 @@ int main(int argc, char** argv) {
   }
 
   std::cerr << "unknown command\n";
+  return 1;
+}
+
+int main(int argc, char** argv) {
+  // Option values are parsed with std::stoul/std::stoull; a malformed one is a usage error, not a crash.
+  try {
+    return run_cli(argc, argv);
+  } catch (const std::invalid_argument&) {
+    std::cerr << "error: an option that takes a number got a non-numeric value\n";
+  } catch (const std::out_of_range&) {
+    std::cerr << "error: a numeric option value is out of range\n";
+  }
   return 1;
 }

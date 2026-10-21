@@ -781,9 +781,15 @@ void Node::maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms
   const std::size_t start = epoch_reconcile_peer_cursor_ % eligible_peer_ids.size();
   epoch_reconcile_peer_cursor_ = (start + fanout) % eligible_peer_ids.size();
   const std::uint64_t interval = std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
+  // handle_epoch_ticket_locked accepts open-epoch tickets only from active validators.
+  auto peer_can_source_open_epoch = [&](int peer_id) {
+    auto it = peer_validator_pubkeys_.find(peer_id);
+    return it != peer_validator_pubkeys_.end() && validators_.is_active_for_height(it->second, open_epoch);
+  };
   for (std::size_t index = 0; index < fanout; ++index) {
     const int peer_id = eligible_peer_ids[(start + index) % eligible_peer_ids.size()];
     for (const auto epoch : epochs) {
+      if (epoch == open_epoch && !peer_can_source_open_epoch(peer_id)) continue;
       // Skip closed/frozen epochs after local checkpoint snapshot is available.
       if (epoch != open_epoch && epoch_committee_frozen_locked(epoch) && db_.get_epoch_committee_snapshot(epoch).has_value()) {
         auto snapshot = db_.get_epoch_committee_snapshot(epoch);
@@ -977,7 +983,8 @@ bool Node::handle_epoch_ticket(const consensus::EpochTicket& ticket, bool from_n
     }
     bool should_log = true;
     std::string suffix;
-    if (from_network && reject_reason == "not-best") {
+    if (from_network && (reject_reason == "not-best" || reject_reason == "untrusted-open-epoch-source" ||
+                         reject_reason == "non-validator-open-epoch-source")) {
       const std::uint64_t tms = now_ms();
       auto& state = epoch_ticket_reject_log_state_[std::make_tuple(from_peer_id, ticket.epoch, reject_reason)];
       if (state.first != 0 && tms < state.first + kEpochTicketRejectLogIntervalMs) {

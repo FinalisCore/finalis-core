@@ -50,8 +50,8 @@ UMask=0077
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/finalis
-# Lightserver admin RPC socket: /run/finalis/admin.sock (owner-only). /var/run -> /run.
-RuntimeDirectory=finalis
+# Lightserver admin RPC socket: /run/finalis/mainnet/admin.sock (owner-only). /var/run -> /run.
+RuntimeDirectory=finalis/mainnet
 RuntimeDirectoryMode=0700
 PrivateTmp=true
 PrivateDevices=true

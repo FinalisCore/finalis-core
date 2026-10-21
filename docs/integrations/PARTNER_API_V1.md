@@ -68,6 +68,12 @@ Rules:
 
 ## Partner auth
 
+Partner auth is enabled with `--partner-auth-required 1` (or `FINALIS_PARTNER_AUTH_REQUIRED=1`) plus a
+key (`--partner-api-key` / `--partner-api-secret`) or a `--partner-registry` file. Without it, the
+read routes stay open to everyone, but `POST /api/v1/withdrawals` and the webhook routes
+(`/api/v1/webhooks/dlq`, `/api/v1/webhooks/dlq/replay`, `/api/v1/audit/auth`) answer
+`403 partner_api_disabled`.
+
 When enabled, protected partner routes require:
 
 - `X-Finalis-Api-Key`

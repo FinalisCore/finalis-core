@@ -56,6 +56,23 @@ std::string make_http_request(const std::string& method, const std::string& path
   return oss.str();
 }
 
+// A request signed with cfg's single partner key, as a partner would send it with partner auth on.
+std::string make_signed_partner_request(const Config& cfg, const std::string& method, const std::string& target,
+                                        std::vector<std::pair<std::string, std::string>> headers = {},
+                                        const std::string& body = {}) {
+  static int nonce_counter = 0;
+  const std::string path = target.substr(0, target.find('?'));
+  const std::string ts = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const std::string nonce = "signed-" + std::to_string(++nonce_counter);
+  const auto sig =
+      hmac_sha256_hex(cfg.partner_api_secret, method + "\n" + path + "\n" + ts + "\n" + nonce + "\n" + sha256_hex_text(body));
+  headers.push_back({"X-Finalis-Api-Key", cfg.partner_api_key});
+  headers.push_back({"X-Finalis-Timestamp", ts});
+  headers.push_back({"X-Finalis-Nonce", nonce});
+  headers.push_back({"X-Finalis-Signature", sig.value_or("")});
+  return make_http_request(method, target, headers, body);
+}
+
 std::string read_file_text(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) return {};
@@ -763,7 +780,9 @@ TEST(test_explorer_partner_idempotency_conflict_and_ttl_reuse_contract) {
   });
 
   Config cfg = test_config();
-  cfg.partner_auth_required = false;
+  cfg.partner_auth_required = true;
+  cfg.partner_api_key = "partner-key";
+  cfg.partner_api_secret = "partner-secret";
   cfg.partner_idempotency_ttl_seconds = 1;
   const auto cache_path = unique_test_cache_path("finalis-idem-ttl-cache");
   cfg.cache_path = cache_path.string();
@@ -775,12 +794,12 @@ TEST(test_explorer_partner_idempotency_conflict_and_ttl_reuse_contract) {
   const std::string body_b =
       std::string("{\"client_withdrawal_id\":\"idem-b\",\"tx_hex\":\"") + finalis::hex_encode(tx_b.serialize()) + "\"}";
 
-  const auto first = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_a));
+  const auto first = handle_request(cfg, make_signed_partner_request(cfg, "POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_a));
   ASSERT_TRUE(first.status == 200 || first.status == 201 || first.status == 202);
   ASSERT_TRUE(first.body.find("\"status\":\"created\"") != std::string::npos);
   ASSERT_EQ(broadcast_calls, 1);
 
-  const auto conflict = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
+  const auto conflict = handle_request(cfg, make_signed_partner_request(cfg, "POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
   ASSERT_EQ(conflict.status, 409);
   ASSERT_TRUE(conflict.body.find("\"idempotency_conflict\"") != std::string::npos);
   ASSERT_EQ(broadcast_calls, 1);
@@ -789,7 +808,7 @@ TEST(test_explorer_partner_idempotency_conflict_and_ttl_reuse_contract) {
   clear_runtime_caches();
   load_persisted_explorer_snapshot(cfg);
 
-  const auto reused = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
+  const auto reused = handle_request(cfg, make_signed_partner_request(cfg, "POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-ttl-1"}}, body_b));
   ASSERT_TRUE(reused.status == 200 || reused.status == 201 || reused.status == 202);
   ASSERT_TRUE(reused.body.find("\"status\":\"created\"") != std::string::npos);
   ASSERT_TRUE(reused.body.find("\"request_hash\":\"" + sha256_hex_text(body_b) + "\"") != std::string::npos);
@@ -797,6 +816,33 @@ TEST(test_explorer_partner_idempotency_conflict_and_ttl_reuse_contract) {
 
   std::error_code ec;
   std::filesystem::remove(cache_path, ec);
+}
+
+TEST(test_explorer_partner_writes_disabled_without_auth) {
+  ExplorerFixture fx;
+  int broadcast_calls = 0;
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"broadcast_tx\"") != std::string::npos) ++broadcast_calls;
+    return default_rpc_handler(fx, body);
+  });
+  Config cfg = test_config();
+  cfg.partner_auth_required = false;
+
+  const std::string body = std::string("{\"client_withdrawal_id\":\"w-anon\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
+  const auto withdrawal = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "anon-1"}}, body));
+  ASSERT_EQ(withdrawal.status, 403);
+  ASSERT_TRUE(withdrawal.body.find("\"code\":\"partner_api_disabled\"") != std::string::npos);
+  ASSERT_EQ(broadcast_calls, 0);
+
+  const auto dlq = handle_request(cfg, make_http_get("/api/v1/webhooks/dlq"));
+  ASSERT_EQ(dlq.status, 403);
+  const auto replay = handle_request(cfg, make_http_request("POST", "/api/v1/webhooks/dlq/replay", {}, "{\"sequence\":1}"));
+  ASSERT_EQ(replay.status, 403);
+
+  const auto status = handle_request(cfg, make_http_get("/api/v1/status"));
+  ASSERT_EQ(status.status, 200);
+  const auto recent = handle_request(cfg, make_http_get("/api/v1/recent-tx"));
+  ASSERT_EQ(recent.status, 200);
 }
 
 TEST(test_explorer_partner_events_finalized_feed_contract) {
@@ -809,17 +855,19 @@ TEST(test_explorer_partner_events_finalized_feed_contract) {
     return default_rpc_handler(fx, body);
   });
   Config cfg = test_config();
-  cfg.partner_auth_required = false;
+  cfg.partner_auth_required = true;
+  cfg.partner_api_key = "partner-key";
+  cfg.partner_api_secret = "partner-secret";
 
   const std::string body = std::string("{\"client_withdrawal_id\":\"w2\",\"tx_hex\":\"") + finalis::hex_encode(fx.tx.serialize()) + "\"}";
-  const auto created = handle_request(cfg, make_http_request("POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-2"}}, body));
+  const auto created = handle_request(cfg, make_signed_partner_request(cfg, "POST", "/api/v1/withdrawals", {{"Idempotency-Key", "idem-2"}}, body));
   ASSERT_TRUE(created.status == 201 || created.status == 200 || created.status == 202);
 
-  const auto fetched = handle_request(cfg, make_http_get("/api/v1/withdrawals/w2"));
+  const auto fetched = handle_request(cfg, make_signed_partner_request(cfg, "GET", "/api/v1/withdrawals/w2"));
   ASSERT_EQ(fetched.status, 200);
   ASSERT_TRUE(fetched.body.find("\"state\":\"finalized\"") != std::string::npos);
 
-  const auto events = handle_request(cfg, make_http_get("/api/v1/events/finalized?from_sequence=1"));
+  const auto events = handle_request(cfg, make_signed_partner_request(cfg, "GET", "/api/v1/events/finalized?from_sequence=1"));
   ASSERT_EQ(events.status, 200);
   ASSERT_TRUE(events.body.find("\"items\":[") != std::string::npos);
   ASSERT_TRUE(events.body.find("\"state\":\"finalized\"") != std::string::npos);

@@ -9,6 +9,7 @@
 
 #include "codec/bytes.hpp"
 #include "common/minijson.hpp"
+#include "common/paths.hpp"
 #include "common/socket_compat.hpp"
 
 #ifndef _WIN32
@@ -320,7 +321,9 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
   auto pubkey_hex = object_string(result, "validator_pubkey_hex");
   auto state_name = object_string(result, "state");
   if (!pubkey_hex || !state_name) {
-    if (err) *err = "missing onboarding fields";
+    // A server-side failure before the key is resolved carries only state and last_error_message.
+    auto server_error = object_string(result, "last_error_message");
+    if (err) *err = server_error ? *server_error : "missing onboarding fields";
     return std::nullopt;
   }
   auto pubkey = parse_hex32_field(*pubkey_hex);
@@ -861,6 +864,10 @@ BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_byt
   }
   if (out.error.empty() && !out.error_message.empty()) out.error = out.error_message;
   return out;
+}
+
+std::string default_admin_rpc_url(const std::string& network_name) {
+  return "unix://" + default_admin_socket_path(network_name);
 }
 
 std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_status(

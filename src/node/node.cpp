@@ -554,9 +554,7 @@ bool Node::start_lightserver_child() {
       std::to_string(cfg_.p2p_port),
   };
   if (is_testnet_name(cfg_.network.name)) args.push_back("--testnet");
-  static_assert(std::string_view(lightserver::kDefaultAdminSocketPath) == "/var/run/finalis/admin.sock",
-                "NodeConfig::lightserver_admin_socket default must match");
-  // Pin the child's admin socket (default: the path clients' kDefaultAdminRpcUrl dials).
+  // Pin the child's admin socket (default: the path clients' default_admin_rpc_url dials).
   // Two args: the lightserver parser does not accept --admin-socket=<path>.
   if (cfg_.lightserver_admin_socket.empty()) {
     args.push_back("--no-admin-socket");
