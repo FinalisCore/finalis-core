@@ -8,6 +8,7 @@
 #include <ctime>
 #include <deque>
 #include <regex>
+#include <stdexcept>
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -333,20 +334,26 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
   return http_post_json(url, body, "", err);
 }
 
-std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
-  auto parsed = parse_http_url(url);
-  if (!parsed || parsed->path != "/rpc") {
-    if (err) *err = "url must be http://host:port/rpc";
-    return std::nullopt;
-  }
-  return http_post_json(url, body, err);
-}
-
 std::optional<std::string> find_json_string(const std::string& json, const std::string& key) {
   std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
   std::smatch m;
   if (!std::regex_search(json, m, re)) return std::nullopt;
   return m[1].str();
+}
+
+std::optional<std::string> rpc_http_post(const std::string& url, const std::string& request, std::string* err) {
+  auto parsed = parse_http_url(url);
+  if (!parsed || parsed->path != "/rpc") {
+    if (err) *err = "url must be http://host:port/rpc";
+    return std::nullopt;
+  }
+  auto body = http_post_json(url, request, err);
+  // A JSON-RPC error object: report the server's message instead of leaving callers to misparse it.
+  if (body.has_value() && std::regex_search(*body, std::regex("\"error\"\\s*:\\s*\\{"))) {
+    if (err) *err = "rpc error: " + find_json_string(*body, "message").value_or("unknown");
+    return std::nullopt;
+  }
+  return body;
 }
 
 std::optional<std::uint64_t> find_json_u64(const std::string& json, const std::string& key) {
@@ -845,6 +852,16 @@ int run_repair_state_command(const std::string& db_path, bool force, bool dry_ru
         << "repair_state: destructive command refused without --force.\n"
         << "Use: finalis-cli repair_state --db <dir> --force\n";
     return 2;
+  }
+
+  // Deleting files under a running node corrupts its state; RocksDB's lock tells whether one holds the DB.
+  if (std::filesystem::exists(target / "LOCK", ec)) {
+    finalis::storage::DB probe;
+    std::string open_err;
+    if (!probe.open(target.string(), &open_err) && open_err.find("lock") != std::string::npos) {
+      std::cerr << "repair_state: the database is in use (stop finalis-node first): " << open_err << "\n";
+      return 1;
+    }
   }
 
   for (const auto& p : erase_entries) {
@@ -1512,14 +1529,13 @@ void print_cli_help(std::ostream& os, const std::string& mode) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run_cli(int argc, char** argv) {
   // --testnet applies to every command; drop it so no command's own parser sees it.
   std::vector<char*> args(argv, argv + argc);
-  if (const auto it = std::find_if(args.begin() + 1, args.end(),
-                                   [](const char* a) { return std::string_view(a) == "--testnet"; });
-      it != args.end()) {
+  const auto testnet_flag = [](const char* a) { return std::string_view(a) == "--testnet"; };
+  if (std::find_if(args.begin() + 1, args.end(), testnet_flag) != args.end()) {
     g_cli_network = &finalis::testnet_network();
-    args.erase(it);
+    args.erase(std::remove_if(args.begin() + 1, args.end(), testnet_flag), args.end());
   }
   argc = static_cast<int>(args.size());
   args.push_back(nullptr);
@@ -2730,6 +2746,12 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+    // Overwriting a keystore destroys the key it held (and the funds or validator seat behind it).
+    std::error_code exists_ec;
+    if (std::filesystem::exists(out_path, exists_ec)) {
+      std::cerr << "wallet_create failed: " << out_path << " already exists; refusing to overwrite a keystore\n";
+      return 1;
+    }
     finalis::keystore::ValidatorKey vk;
     std::string err;
     if (!finalis::keystore::create_validator_keystore(out_path, passphrase, network_name,
@@ -2738,6 +2760,7 @@ int main(int argc, char** argv) {
       std::cerr << "wallet_create failed: " << err << "\n";
       return 1;
     }
+    if (passphrase.empty()) std::cerr << "warning: no --pass given; the private key is stored unencrypted\n";
     std::cout << "file=" << out_path << "\n";
     std::cout << "network=" << vk.network_name << "\n";
     std::cout << "pubkey_hex=" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
@@ -3841,6 +3864,12 @@ int main(int argc, char** argv) {
       std::cerr << "--network must be mainnet or testnet\n";
       return 1;
     }
+    // Overwriting a keystore destroys the key it held (and the funds or validator seat behind it).
+    std::error_code exists_ec;
+    if (std::filesystem::exists(out_path, exists_ec)) {
+      std::cerr << "wallet_import failed: " << out_path << " already exists; refusing to overwrite a keystore\n";
+      return 1;
+    }
     finalis::keystore::ValidatorKey vk;
     std::string err;
     const std::optional<std::array<std::uint8_t, 32>> seed_override = *priv;
@@ -3850,6 +3879,7 @@ int main(int argc, char** argv) {
       std::cerr << "wallet_import failed: " << err << "\n";
       return 1;
     }
+    if (passphrase.empty()) std::cerr << "warning: no --pass given; the private key is stored unencrypted\n";
     std::cout << "file=" << out_path << "\n";
     std::cout << "network=" << vk.network_name << "\n";
     std::cout << "pubkey_hex=" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
@@ -3916,7 +3946,7 @@ int main(int argc, char** argv) {
       std::cerr << "invalid required args\n";
       return 1;
     }
-    if (prev_value < amount + fee) {
+    if (amount > prev_value || fee > prev_value - amount) {
       std::cerr << "insufficient prev output value\n";
       return 1;
     }
@@ -4014,9 +4044,13 @@ int main(int argc, char** argv) {
           finalis::OutPoint{*prev_txid, prev_indexes[i]},
           finalis::TxOut{prev_values[i], finalis::address::p2pkh_script_pubkey(from_pkh)},
       });
+      if (prev_values[i] > UINT64_MAX - total_prev_value) {
+        std::cerr << "prev output values overflow\n";
+        return 1;
+      }
       total_prev_value += prev_values[i];
     }
-    if (total_prev_value < amount + fee) {
+    if (amount > total_prev_value || fee > total_prev_value - amount) {
       std::cerr << "insufficient prev output value\n";
       return 1;
     }
@@ -4251,5 +4285,17 @@ int main(int argc, char** argv) {
   }
 
   std::cerr << "unknown command\n";
+  return 1;
+}
+
+int main(int argc, char** argv) {
+  // Option values are parsed with std::stoul/std::stoull; a malformed one is a usage error, not a crash.
+  try {
+    return run_cli(argc, argv);
+  } catch (const std::invalid_argument&) {
+    std::cerr << "error: an option that takes a number got a non-numeric value\n";
+  } catch (const std::out_of_range&) {
+    std::cerr << "error: a numeric option value is out of range\n";
+  }
   return 1;
 }
