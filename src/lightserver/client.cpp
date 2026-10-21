@@ -320,7 +320,9 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
   auto pubkey_hex = object_string(result, "validator_pubkey_hex");
   auto state_name = object_string(result, "state");
   if (!pubkey_hex || !state_name) {
-    if (err) *err = "missing onboarding fields";
+    // A server-side failure before the key is resolved carries only state and last_error_message.
+    auto server_error = object_string(result, "last_error_message");
+    if (err) *err = server_error ? *server_error : "missing onboarding fields";
     return std::nullopt;
   }
   auto pubkey = parse_hex32_field(*pubkey_hex);
