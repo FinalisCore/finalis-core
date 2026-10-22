@@ -1023,6 +1023,7 @@ TEST(test_explorer_partner_scope_mtls_and_allowlist_enforced) {
   cfg.partner_auth_required = true;
   cfg.partner_mtls_required = true;
   cfg.partner_allowed_ipv4_cidrs_raw = {"10.0.0.0/8"};
+  cfg.trusted_proxies = *finalis::net::parse_ipv4_cidr_list("127.0.0.1/32");
   const auto registry_path = unique_test_cache_path("finalis-partner-scope-registry");
   {
     std::ofstream out(registry_path);
@@ -1071,8 +1072,95 @@ TEST(test_explorer_partner_scope_mtls_and_allowlist_enforced) {
   ASSERT_EQ(ip_forbidden.status, 403);
   ASSERT_TRUE(ip_forbidden.body.find("\"auth_ip_forbidden\"") != std::string::npos);
 
+  // A client that is not the proxy cannot vouch for its own certificate.
+  const auto sig3 = hmac_sha256_hex("ssc", std::string("POST\n/api/v1/withdrawals\n") + ts + "\nscope-n3\n" + sha256_hex_text(body));
+  ASSERT_TRUE(sig3.has_value());
+  const auto forged_mtls = handle_request(
+      cfg,
+      make_http_request("POST", "/api/v1/withdrawals",
+                        {{"Idempotency-Key", "idem-scope-1"},
+                         {"X-Finalis-Api-Key", "ksc"},
+                         {"X-Finalis-Timestamp", ts},
+                         {"X-Finalis-Nonce", "scope-n3"},
+                         {"X-Finalis-Signature", *sig3},
+                         {"X-Finalis-Mtls-Verified", "true"},
+                         {"X-Real-IP", "10.1.2.3"}},
+                        body),
+      "10.9.9.9");
+  ASSERT_EQ(forged_mtls.status, 401);
+  ASSERT_TRUE(forged_mtls.body.find("\"auth_mtls_required\"") != std::string::npos);
+
+  // Through the proxy, the client it names is checked against the allowlist: 10.1.2.3 passes mTLS and
+  // the IP check and is stopped only by its scope.
+  const auto sig4 = hmac_sha256_hex("ssc", std::string("POST\n/api/v1/withdrawals\n") + ts + "\nscope-n4\n" + sha256_hex_text(body));
+  ASSERT_TRUE(sig4.has_value());
+  const auto via_proxy = handle_request(
+      cfg,
+      make_http_request("POST", "/api/v1/withdrawals",
+                        {{"Idempotency-Key", "idem-scope-1"},
+                         {"X-Finalis-Api-Key", "ksc"},
+                         {"X-Finalis-Timestamp", ts},
+                         {"X-Finalis-Nonce", "scope-n4"},
+                         {"X-Finalis-Signature", *sig4},
+                         {"X-Finalis-Mtls-Verified", "true"},
+                         {"X-Real-IP", "10.1.2.3"}},
+                        body),
+      "127.0.0.1");
+  ASSERT_EQ(via_proxy.status, 403);
+  ASSERT_TRUE(via_proxy.body.find("\"auth_scope_denied\"") != std::string::npos);
+
   std::error_code ec;
   std::filesystem::remove(registry_path, ec);
+}
+
+TEST(test_explorer_anonymous_rate_limit_keys_on_proxy_reported_client) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  Config cfg = test_config();
+  cfg.partner_rate_limit_per_minute = 2;
+  cfg.trusted_proxies = *finalis::net::parse_ipv4_cidr_list("127.0.0.1/32");
+  auto get_from = [&](const std::string& peer, const std::string& real_ip) {
+    return handle_request(cfg, make_http_request("GET", "/api/v1/committee", {{"X-Real-IP", real_ip}}, ""), peer).status;
+  };
+
+  // Every client behind the proxy shares 127.0.0.1, but each gets its own window.
+  ASSERT_TRUE(get_from("127.0.0.1", "198.51.100.21") != 429);
+  ASSERT_TRUE(get_from("127.0.0.1", "198.51.100.21") != 429);
+  ASSERT_EQ(get_from("127.0.0.1", "198.51.100.21"), 429);
+  ASSERT_TRUE(get_from("127.0.0.1", "198.51.100.22") != 429);
+
+  // Rotating addresses inside one IPv6 /64 does not buy a fresh window.
+  ASSERT_TRUE(get_from("127.0.0.1", "2001:db8:5:6::1") != 429);
+  ASSERT_TRUE(get_from("127.0.0.1", "2001:db8:5:6::2") != 429);
+  ASSERT_EQ(get_from("127.0.0.1", "2001:db8:5:6:ffff::3"), 429);
+
+  // A direct client cannot escape its window by naming someone else.
+  ASSERT_TRUE(get_from("192.0.2.31", "198.51.100.40") != 429);
+  ASSERT_TRUE(get_from("192.0.2.31", "198.51.100.41") != 429);
+  ASSERT_EQ(get_from("192.0.2.31", "198.51.100.42"), 429);
+}
+
+TEST(test_explorer_connection_cap_exempts_trusted_proxy) {
+  Config cfg = test_config();
+  cfg.trusted_proxies = *finalis::net::parse_ipv4_cidr_list("127.0.0.1/32");
+  const std::size_t before = g_active_clients.load();
+  for (std::size_t i = 0; i < kMaxConcurrentClientsPerIp; ++i) ASSERT_TRUE(try_admit_client(cfg, "198.51.100.60"));
+  ASSERT_TRUE(!try_admit_client(cfg, "198.51.100.60"));
+  // The proxy carries many clients' connections; only the global cap applies to it.
+  const std::size_t proxy_conns = kMaxConcurrentClientsPerIp * 3;
+  for (std::size_t i = 0; i < proxy_conns; ++i) ASSERT_TRUE(try_admit_client(cfg, "127.0.0.1"));
+  for (std::size_t i = 0; i < proxy_conns; ++i) release_client("127.0.0.1");
+  for (std::size_t i = 0; i < kMaxConcurrentClientsPerIp; ++i) release_client("198.51.100.60");
+  ASSERT_EQ(g_active_clients.load(), before);
+  {
+    std::lock_guard<std::mutex> lk(g_active_by_ip_mu);
+    ASSERT_TRUE(g_active_by_ip.count("127.0.0.1") == 0 && g_active_by_ip.count("198.51.100.60") == 0);
+  }
+  // Without --trusted-proxy, loopback is just another client.
+  Config plain = test_config();
+  for (std::size_t i = 0; i < kMaxConcurrentClientsPerIp; ++i) ASSERT_TRUE(try_admit_client(plain, "127.0.0.1"));
+  ASSERT_TRUE(!try_admit_client(plain, "127.0.0.1"));
+  for (std::size_t i = 0; i < kMaxConcurrentClientsPerIp; ++i) release_client("127.0.0.1");
 }
 
 TEST(test_explorer_partner_scope_matrix_enforced) {

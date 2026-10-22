@@ -1848,7 +1848,11 @@ void Server::handle_client(const Job& job) {
   const bool rpc_endpoint = req.compare(0, 10, "POST /rpc ") == 0;
   const std::string body = req.substr(hdr_end + 4);
   // Every public request is charged, including malformed ones, before any further work.
-  const bool loopback_exempt = cfg_.exempt_loopback_from_rate_limits && job.peer_ip.rfind("127.", 0) == 0;
+  const auto forwarded_ip =
+      net::forwarded_client_ip(job.peer_ip, cfg_.trusted_proxies, net::http_header_value(req, "X-Real-IP"));
+  const std::string client_ip = forwarded_ip.value_or(job.peer_ip);
+  const bool loopback_exempt =
+      !forwarded_ip.has_value() && cfg_.exempt_loopback_from_rate_limits && job.peer_ip.rfind("127.", 0) == 0;
   if (job.surface == RpcSurface::Public && !loopback_exempt) {
     std::optional<std::string> method;
     if (rpc_endpoint) {
@@ -1858,7 +1862,7 @@ void Server::handle_client(const Job& job) {
     }
     const auto cls = (method.has_value() && *method == "broadcast_tx") ? RateLimiter::Class::BroadcastTx
                                                                          : RateLimiter::Class::Read;
-    const auto decision = rate_limiter_.check(job.peer_ip, cls, steady_now_ms());
+    const auto decision = rate_limiter_.check(net::rate_limit_key(client_ip), cls, steady_now_ms());
     if (!decision.allowed) {
       send_http_error(fd, 429, -32029, "rate limited", decision.retry_after_seconds);
       return;
@@ -3662,6 +3666,12 @@ std::optional<Config> parse_args(int argc, char** argv) {
       cfg.admin_socket_path.clear();
     } else if (a == "--rate-limit-loopback") {
       cfg.exempt_loopback_from_rate_limits = false;
+    } else if (a == "--trusted-proxy") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = net::parse_ipv4_cidr_list(*v);
+      if (!parsed.has_value()) return std::nullopt;
+      cfg.trusted_proxies = std::move(*parsed);
     } else {
       return std::nullopt;
     }

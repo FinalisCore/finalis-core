@@ -35,6 +35,7 @@
 #include "common/minijson.hpp"
 #include "common/paths.hpp"
 #include "common/socket_compat.hpp"
+#include "common/trusted_proxy.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/client.hpp"
 #include "utxo/tx.hpp"
@@ -66,6 +67,9 @@ struct Config {
   std::vector<std::string> partner_allowed_ipv4_cidrs_raw;
   std::string partner_webhook_audit_log_path;
   std::string partner_auth_audit_log_path;
+  // Peers allowed to name the real client (X-Real-IP) and vouch for its certificate
+  // (X-Finalis-Mtls-Verified): the same-host reverse proxy. Empty: every peer is itself the client.
+  std::vector<finalis::net::Ipv4Cidr> trusted_proxies;
 };
 
 template <typename T>
@@ -629,6 +633,27 @@ std::unordered_map<std::string, std::size_t> g_active_by_ip;
 // bytes keep a slot forever (slowloris).
 constexpr std::uint32_t kHttpRequestReadDeadlineMs = 10'000;
 thread_local std::string g_current_request_path;
+
+// A trusted proxy is exempt from the per-IP cap: all of its clients share its address, and it
+// limits them per client itself. It still counts toward kMaxConcurrentClients.
+bool try_admit_client(const Config& cfg, const std::string& peer_ip) {
+  const bool is_proxy = finalis::net::ipv4_in_cidrs(peer_ip, cfg.trusted_proxies);
+  std::lock_guard<std::mutex> lk(g_active_by_ip_mu);
+  auto& per_ip = g_active_by_ip[peer_ip];
+  if (g_active_clients.load() < kMaxConcurrentClients && (is_proxy || per_ip < kMaxConcurrentClientsPerIp)) {
+    ++per_ip;
+    ++g_active_clients;
+    return true;
+  }
+  if (per_ip == 0) g_active_by_ip.erase(peer_ip);
+  return false;
+}
+
+void release_client(const std::string& peer_ip) {
+  --g_active_clients;
+  std::lock_guard<std::mutex> lk(g_active_by_ip_mu);
+  if (auto it = g_active_by_ip.find(peer_ip); it != g_active_by_ip.end() && --it->second == 0) g_active_by_ip.erase(it);
+}
 
 void on_signal(int) { g_stop = 1; }
 
@@ -1646,6 +1671,12 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next();
       if (!v) return std::nullopt;
       cfg.partner_auth_audit_log_path = *v;
+    } else if (a == "--trusted-proxy") {
+      auto v = next();
+      if (!v) return std::nullopt;
+      auto parsed = finalis::net::parse_ipv4_cidr_list(*v);
+      if (!parsed.has_value()) return std::nullopt;
+      cfg.trusted_proxies = std::move(*parsed);
     } else {
       return std::nullopt;
     }
@@ -5073,7 +5104,8 @@ std::optional<ApiError> enforce_partner_rate_limit(const Config& cfg, const Http
   const std::string partner_id = principal.partner_id.empty() ? "default" : principal.partner_id;
   // Anonymous callers (partner auth off) each get their own window; one shared "default" window let a
   // single client exhaust the limit for everyone.
-  const std::string bucket = (principal.authenticated ? partner_id : "ip:" + client_ip) + "|" + scope;
+  const std::string bucket =
+      (principal.authenticated ? partner_id : "ip:" + finalis::net::rate_limit_key(client_ip)) + "|" + scope;
   const std::uint64_t now_ms = now_unix_ms();
   std::uint64_t retry_after_s = 0;
   std::uint64_t limit = principal.rate_limit_per_minute == 0 ? cfg.partner_rate_limit_per_minute : principal.rate_limit_per_minute;
@@ -5513,11 +5545,7 @@ void partner_webhook_worker(const Config cfg) {
 void handle_client_session(Config cfg, finalis::net::SocketHandle fd, const std::string client_ip) {
   struct ActiveGuard {
     const std::string& ip;
-    ~ActiveGuard() {
-      --g_active_clients;
-      std::lock_guard<std::mutex> lk(g_active_by_ip_mu);
-      if (auto it = g_active_by_ip.find(ip); it != g_active_by_ip.end() && --it->second == 0) g_active_by_ip.erase(it);
-    }
+    ~ActiveGuard() { release_client(ip); }
   } guard{client_ip};
 
   const auto started = std::chrono::steady_clock::now();
@@ -5550,12 +5578,17 @@ Response handle_request(const Config& cfg, const std::string& req) {
   return handle_request(cfg, req, "127.0.0.1");
 }
 
-Response handle_request(const Config& cfg, const std::string& req, const std::string& client_ip) {
+Response handle_request(const Config& cfg, const std::string& req, const std::string& peer_ip) {
   std::string parse_err;
   auto parsed_req = parse_http_request(req, &parse_err);
   if (!parsed_req.has_value()) {
     return html_response(400, page_layout("Bad Request", "<h1>Bad Request</h1>"));
   }
+  // Only the trusted proxy may say who the client is or that it presented a valid certificate;
+  // from anyone else those headers are forgeries.
+  const std::string client_ip =
+      finalis::net::forwarded_client_ip(peer_ip, cfg.trusted_proxies, header_value(*parsed_req, "x-real-ip")).value_or(peer_ip);
+  if (!finalis::net::ipv4_in_cidrs(peer_ip, cfg.trusted_proxies)) parsed_req->headers.erase("x-finalis-mtls-verified");
   const std::string method = parsed_req->method;
   if (method != "GET" && method != "POST") {
     return html_response(405, page_layout("Method Not Allowed", "<h1>Method Not Allowed</h1>"));
@@ -6109,7 +6142,12 @@ int main(int argc, char** argv) {
                  "[--partner-events-ttl-seconds 2592000] [--partner-webhook-queue-ttl-seconds 604800] "
                  "[--partner-mtls-required 0|1] [--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32] "
                  "[--partner-webhook-audit-log-path /var/log/finalis/webhook_audit.jsonl] "
-                 "[--partner-auth-audit-log-path /var/log/finalis/auth_audit.jsonl]\n";
+                 "[--partner-auth-audit-log-path /var/log/finalis/auth_audit.jsonl] "
+                 "[--trusted-proxy 127.0.0.1/32]\n";
+    return 1;
+  }
+  if (cfg->partner_mtls_required && cfg->trusted_proxies.empty()) {
+    std::cerr << "--partner-mtls-required needs --trusted-proxy: only the TLS-terminating proxy can vouch for a client certificate\n";
     return 1;
   }
   if (cfg->cache_path.empty()) cfg->cache_path = default_explorer_cache_path(cfg->rpc_url);
@@ -6170,6 +6208,7 @@ int main(int argc, char** argv) {
             << " webhook_queue_ttl_s=" << cfg->partner_webhook_queue_ttl_seconds
             << " mtls_required=" << (cfg->partner_mtls_required ? "on" : "off")
             << " allowed_ipv4_cidrs=" << cfg->partner_allowed_ipv4_cidrs_raw.size()
+            << " trusted_proxies=" << cfg->trusted_proxies.size()
             << " webhook_audit_log=" << (cfg->partner_webhook_audit_log_path.empty() ? "(none)" : cfg->partner_webhook_audit_log_path)
             << " auth_audit_log=" << (cfg->partner_auth_audit_log_path.empty() ? "(none)" : cfg->partner_auth_audit_log_path)
             << "\n";
@@ -6185,19 +6224,7 @@ int main(int argc, char** argv) {
     char ipbuf[INET_ADDRSTRLEN] = {0};
     std::string client_ip = "0.0.0.0";
     if (::inet_ntop(AF_INET, &client.sin_addr, ipbuf, sizeof(ipbuf))) client_ip = ipbuf;
-    bool admitted = false;
-    {
-      std::lock_guard<std::mutex> lk(g_active_by_ip_mu);
-      auto& per_ip = g_active_by_ip[client_ip];
-      if (g_active_clients.load() < kMaxConcurrentClients && per_ip < kMaxConcurrentClientsPerIp) {
-        ++per_ip;
-        ++g_active_clients;
-        admitted = true;
-      } else if (per_ip == 0) {
-        g_active_by_ip.erase(client_ip);
-      }
-    }
-    if (!admitted) {
+    if (!try_admit_client(*cfg, client_ip)) {
       const std::string resp = http_response(
           html_response(503, page_layout("Busy", "<div class=\"card\"><div class=\"note\">Explorer is busy. Retry shortly.</div></div>")));
       (void)write_all(fd, resp);

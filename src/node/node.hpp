@@ -78,6 +78,8 @@ struct NodeConfig {
   std::uint16_t lightserver_port{19444};
   // Admin socket of the spawned lightserver; empty disables it. Hosts running several give each its own.
   std::string lightserver_admin_socket{default_admin_socket_path("mainnet")};
+  // Forwarded as the lightserver's --trusted-proxy (comma-separated IPv4 CIDRs); empty: none.
+  std::string lightserver_trusted_proxy;
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};

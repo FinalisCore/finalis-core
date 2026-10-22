@@ -562,6 +562,10 @@ bool Node::start_lightserver_child() {
     args.push_back("--admin-socket");
     args.push_back(cfg_.lightserver_admin_socket);
   }
+  if (!cfg_.lightserver_trusted_proxy.empty()) {
+    args.push_back("--trusted-proxy");
+    args.push_back(cfg_.lightserver_trusted_proxy);
+  }
 
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);

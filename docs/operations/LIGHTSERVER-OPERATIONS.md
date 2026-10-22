@@ -98,14 +98,20 @@ Behaviour:
 
 Clients connecting from `127.0.0.0/8` (local explorer, local wallet) are exempt by
 default. Behind a same-host reverse proxy every client appears as `127.0.0.1`, so the limits would
-never apply. In that case:
+never apply. In that case start the lightserver with `--trusted-proxy 127.0.0.1/32`
+(`finalis-node --lightserver-trusted-proxy 127.0.0.1/32` with `--with-lightserver`;
+`BEHIND_PROXY=1 scripts/start.sh` does this):
 
-- start `finalis-lightserver` with `--rate-limit-loopback`, which makes all public clients share
-  the proxy's bucket; and
-- enforce per-client limits in the proxy itself.
+- a request from a trusted peer carrying `X-Real-IP` is limited by that address and never
+  exempt, so every public client gets its own buckets;
+- a request from a trusted peer without `X-Real-IP` (the local explorer, a local wallet) is still
+  exempt;
+- `X-Real-IP` from any other peer is ignored;
+- an IPv6 client is limited as its /64.
 
-`--with-lightserver` does not forward `--rate-limit-loopback`. Run the lightserver standalone
-if you need it.
+The proxy must set `X-Real-IP` itself (overwriting the client's), as `packaging/nginx/finalis.conf.in`
+does. The older alternative, `--rate-limit-loopback`, puts every public client in one shared bucket;
+`--with-lightserver` does not forward it.
 
 ### 3.2 Capacity
 

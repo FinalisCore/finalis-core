@@ -209,7 +209,8 @@ bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeo
   return pred();
 }
 
-std::optional<std::string> http_post_rpc(const std::string& host, std::uint16_t port, const std::string& body) {
+std::optional<std::string> http_post_rpc(const std::string& host, std::uint16_t port, const std::string& body,
+                                         const std::string& extra_headers = "") {
   if (!finalis::net::ensure_sockets()) return std::nullopt;
   addrinfo hints{};
   hints.ai_family = AF_INET;
@@ -229,7 +230,7 @@ std::optional<std::string> http_post_rpc(const std::string& host, std::uint16_t 
   if (!finalis::net::valid_socket(fd)) return std::nullopt;
 
   std::string req = "POST /rpc HTTP/1.1\r\nHost: " + host + "\r\nContent-Type: application/json\r\nContent-Length: " +
-                    std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+                    std::to_string(body.size()) + "\r\nConnection: close\r\n" + extra_headers + "\r\n" + body;
   if (!p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req.data()), req.size())) {
     finalis::net::close_socket(fd);
     return std::nullopt;
@@ -2457,6 +2458,97 @@ TEST(test_lightserver_rate_limiter_per_ip_and_global_buckets) {
     }
   }
   ASSERT_EQ(allowed, lightserver::kGlobalRequestsPerMinute);
+}
+
+TEST(test_trusted_proxy_names_client_only_from_trusted_peers) {
+  const auto trusted = finalis::net::parse_ipv4_cidr_list("127.0.0.1/32, 10.8.0.0/16");
+  ASSERT_TRUE(trusted.has_value());
+  ASSERT_EQ(trusted->size(), 2u);
+  ASSERT_TRUE(!finalis::net::parse_ipv4_cidr_list("").has_value());
+  ASSERT_TRUE(!finalis::net::parse_ipv4_cidr_list("127.0.0.1/33").has_value());
+  ASSERT_TRUE(!finalis::net::parse_ipv4_cidr_list("127.0.0.1,bogus").has_value());
+  ASSERT_TRUE(!finalis::net::parse_ipv4_cidr_list("127.0.0.1/").has_value());
+
+  // Trusted peer: its X-Real-IP is the client, canonicalised; garbage names nobody.
+  ASSERT_EQ(finalis::net::forwarded_client_ip("127.0.0.1", *trusted, std::string("203.0.113.9")).value_or(""), "203.0.113.9");
+  ASSERT_EQ(finalis::net::forwarded_client_ip("10.8.3.4", *trusted, std::string("2001:DB8:0::1")).value_or(""), "2001:db8::1");
+  ASSERT_TRUE(!finalis::net::forwarded_client_ip("127.0.0.1", *trusted, std::string("203.0.113.9, 10.0.0.1")).has_value());
+  ASSERT_TRUE(!finalis::net::forwarded_client_ip("127.0.0.1", *trusted, std::nullopt).has_value());
+  // Anyone else: the header is ignored.
+  ASSERT_TRUE(!finalis::net::forwarded_client_ip("198.51.100.1", *trusted, std::string("203.0.113.9")).has_value());
+  ASSERT_TRUE(!finalis::net::forwarded_client_ip("127.0.0.1", {}, std::string("203.0.113.9")).has_value());
+
+  ASSERT_EQ(finalis::net::rate_limit_key("203.0.113.9"), "203.0.113.9");
+  ASSERT_EQ(finalis::net::rate_limit_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::/64");
+  ASSERT_EQ(finalis::net::rate_limit_key("2001:db8:1:2::9"), "2001:db8:1:2::/64");
+
+  const std::string req = "POST /rpc HTTP/1.1\r\nHost: x\r\nx-real-ip:  203.0.113.9 \r\n\r\nX-Real-IP: 1.2.3.4";
+  ASSERT_EQ(finalis::net::http_header_value(req, "X-Real-IP").value_or(""), "203.0.113.9");  // body is not a header
+  ASSERT_TRUE(!finalis::net::http_header_value("POST /rpc HTTP/1.1\r\nX-Real-IP: a\r\nX-Real-IP: b\r\n\r\n", "X-Real-IP").has_value());
+  ASSERT_TRUE(!finalis::net::http_header_value("POST /rpc HTTP/1.1\r\nHost: x\r\n\r\n", "X-Real-IP").has_value());
+}
+
+TEST(test_lightserver_parse_args_trusted_proxy) {
+  auto parse = [](std::vector<std::string> args) {
+    args.insert(args.begin(), "finalis-lightserver");
+    std::vector<char*> argv;
+    for (auto& s : args) argv.push_back(s.data());
+    return lightserver::parse_args(static_cast<int>(argv.size()), argv.data());
+  };
+  const auto ok = parse({"--trusted-proxy", "127.0.0.1/32"});
+  ASSERT_TRUE(ok.has_value());
+  ASSERT_EQ(ok->trusted_proxies.size(), 1u);
+  ASSERT_TRUE(!parse({"--trusted-proxy", "not-a-cidr"}).has_value());
+  ASSERT_TRUE(!parse({"--trusted-proxy"}).has_value());
+}
+
+// Behind a same-host proxy every connection is from 127.0.0.1. Forwarded requests must be limited per
+// real client and lose the loopback exemption; direct local callers (the explorer) keep it.
+TEST(test_lightserver_rate_limits_clients_behind_trusted_proxy) {
+  const std::string base = unique_test_base("/tmp/finalis_light_trusted_proxy");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(base));
+    Hash32 tip_hash{};
+    tip_hash[31] = 0x42;
+    ASSERT_TRUE(db.set_tip(storage::TipState{1, tip_hash}));
+    ASSERT_TRUE(db.flush());
+    db.close();
+  }
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lcfg.bind_ip = "127.0.0.1";
+  lcfg.port = 0;
+  lcfg.trusted_proxies = *finalis::net::parse_ipv4_cidr_list("127.0.0.1/32");
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  if (!ls.start()) return;  // no loopback listener in this environment
+  const std::uint16_t port = ls.bound_port();
+  const std::string body = R"({"jsonrpc":"2.0","id":1,"method":"get_tip","params":{}})";
+  auto limited = [](const std::optional<std::string>& resp) {
+    return resp.has_value() && resp->find("-32029") != std::string::npos;
+  };
+
+  const std::string client_a = "X-Real-IP: 198.51.100.7\r\n";
+  for (std::uint32_t i = 0; i < lightserver::kPublicReadRequestsPerMinutePerIp; ++i) {
+    ASSERT_TRUE(!limited(http_post_rpc("127.0.0.1", port, body, client_a)));
+  }
+  ASSERT_TRUE(limited(http_post_rpc("127.0.0.1", port, body, client_a)));
+  // Another client behind the proxy has its own bucket.
+  ASSERT_TRUE(!limited(http_post_rpc("127.0.0.1", port, body, "X-Real-IP: 198.51.100.8\r\n")));
+  // A forwarded loopback address is still a forwarded client: no exemption.
+  const std::string fake_local = "X-Real-IP: 127.0.0.9\r\n";
+  for (std::uint32_t i = 0; i < lightserver::kPublicReadRequestsPerMinutePerIp; ++i) {
+    (void)http_post_rpc("127.0.0.1", port, body, fake_local);
+  }
+  ASSERT_TRUE(limited(http_post_rpc("127.0.0.1", port, body, fake_local)));
+  // A direct local caller (no X-Real-IP) keeps the loopback exemption.
+  const auto direct = http_post_rpc("127.0.0.1", port, body);
+  ASSERT_TRUE(direct.has_value() && direct->find("\"height\"") != std::string::npos);
+  ls.stop();
 }
 
 TEST(test_lightserver_admin_methods_only_on_admin_surface) {

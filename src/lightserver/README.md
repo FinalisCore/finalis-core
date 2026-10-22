@@ -20,7 +20,9 @@
   HTTP 503 with `Retry-After`.
 - Public rate limits (token buckets): 100 req/min per IP, `broadcast_tx` 10/min per IP, 1000/min
   global; over limit returns HTTP 429 with `Retry-After`. Loopback peers are exempt unless
-  `--rate-limit-loopback` is set (required behind a same-host reverse proxy).
+  `--rate-limit-loopback` is set. Behind a same-host reverse proxy use `--trusted-proxy 127.0.0.1/32`
+  (node: `--lightserver-trusted-proxy`): requests it forwards are limited by their `X-Real-IP` and
+  never exempt.
 - Operator runbook: [docs/operations/LIGHTSERVER-OPERATIONS.md](../../docs/operations/LIGHTSERVER-OPERATIONS.md).
 
 ## Non-Goals

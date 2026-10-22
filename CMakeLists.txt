@@ -178,6 +178,7 @@ endif()
 add_library(finalis_core
   src/common/types.cpp
   src/common/network.cpp
+  src/common/trusted_proxy.cpp
   src/common/chain_id.cpp
   src/common/paths.cpp
   src/codec/bytes.cpp
