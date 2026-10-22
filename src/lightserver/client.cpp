@@ -113,6 +113,9 @@ bool write_all(net::SocketHandle fd, const std::string& data) {
   return true;
 }
 
+// Servers are untrusted (a wallet may use anyone's): a response may not grow without bound.
+constexpr std::size_t kMaxRpcResponseBytes = 16 * 1024 * 1024;
+
 std::optional<std::string> read_all(net::SocketHandle fd) {
   std::string out;
   std::array<char, 4096> buf{};
@@ -121,6 +124,7 @@ std::optional<std::string> read_all(net::SocketHandle fd) {
     if (n < 0) return std::nullopt;
     if (n == 0) break;
     out.append(buf.data(), static_cast<size_t>(n));
+    if (out.size() > kMaxRpcResponseBytes) return std::nullopt;
   }
   return out;
 }
@@ -405,6 +409,94 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
 }
 
 }  // namespace
+
+std::optional<CommitteeHandoffsView> rpc_get_committee_handoffs(const std::string& rpc_url, std::uint64_t from_epoch_start,
+                                                                std::uint64_t limit, std::string* err) {
+  std::ostringstream req;
+  req << R"({"jsonrpc":"2.0","id":1,"method":"get_committee_handoffs","params":{"from_epoch_start":)" << from_epoch_start
+      << ",\"limit\":" << limit << "}}";
+  auto body = http_post_json(rpc_url, req.str(), err);
+  if (!body) return std::nullopt;
+  auto root = minijson::parse(*body);
+  if (!root.has_value()) {
+    if (err) *err = "invalid rpc response";
+    return std::nullopt;
+  }
+  const auto* result = result_value(*root, err);
+  const auto epoch_blocks = object_u64(result, "epoch_blocks");
+  const auto* list = result ? result->get("handoffs") : nullptr;
+  if (!epoch_blocks || !list || !list->is_array()) {
+    if (err && err->empty()) *err = "invalid get_committee_handoffs response";
+    return std::nullopt;
+  }
+  CommitteeHandoffsView out;
+  out.epoch_blocks = *epoch_blocks;
+  for (const auto& item : list->array_value) {
+    const auto next = object_u64(&item, "next_epoch_start");
+    const auto bytes = hex_decode(object_string(&item, "handoff_hex").value_or(""));
+    if (!next || !bytes) {
+      if (err) *err = "invalid committee handoff";
+      return std::nullopt;
+    }
+    out.handoffs.push_back({*next, std::move(*bytes)});
+  }
+  return out;
+}
+
+std::optional<UtxoProofsView> rpc_get_utxo_proofs(const std::string& rpc_url, const std::vector<OutPoint>& outpoints,
+                                                  std::string* err) {
+  std::ostringstream req;
+  req << R"({"jsonrpc":"2.0","id":1,"method":"get_utxo_proofs","params":{"outpoints":[)";
+  for (std::size_t i = 0; i < outpoints.size(); ++i) {
+    if (i) req << ",";
+    req << "{\"txid\":\"" << hex_encode32(outpoints[i].txid) << "\",\"vout\":" << outpoints[i].index << "}";
+  }
+  req << "]}}";
+  auto body = http_post_json(rpc_url, req.str(), err);
+  if (!body) return std::nullopt;
+  auto root = minijson::parse(*body);
+  if (!root.has_value()) {
+    if (err) *err = "invalid rpc response";
+    return std::nullopt;
+  }
+  const auto* result = result_value(*root, err);
+  const auto height = object_u64(result, "height");
+  const auto transition = hex_decode(object_string(result, "transition_hex").value_or(""));
+  const auto certificate = hex_decode(object_string(result, "certificate_hex").value_or(""));
+  const auto* list = result ? result->get("proofs") : nullptr;
+  if (!height || !transition || !certificate || !list || !list->is_array()) {
+    if (err && err->empty()) *err = "invalid get_utxo_proofs response";
+    return std::nullopt;
+  }
+  UtxoProofsView out;
+  out.height = *height;
+  out.transition = std::move(*transition);
+  out.certificate = std::move(*certificate);
+  for (const auto& item : list->array_value) {
+    const auto txid = hex_decode(object_string(&item, "txid").value_or(""));
+    const auto vout = object_u64(&item, "vout");
+    const auto proof = hex_decode(object_string(&item, "proof_hex").value_or(""));
+    const auto* value = item.get("value_hex");
+    if (!txid || txid->size() != 32 || !vout || *vout > std::numeric_limits<std::uint32_t>::max() || !proof || !value) {
+      if (err) *err = "invalid utxo proof";
+      return std::nullopt;
+    }
+    UtxoProofView p;
+    std::copy(txid->begin(), txid->end(), p.outpoint.txid.begin());
+    p.outpoint.index = static_cast<std::uint32_t>(*vout);
+    p.compact_proof = std::move(*proof);
+    if (!value->is_null()) {
+      auto v = hex_decode(value->as_string().value_or(""));
+      if (!v) {
+        if (err) *err = "invalid utxo proof value";
+        return std::nullopt;
+      }
+      p.value = std::move(*v);
+    }
+    out.proofs.push_back(std::move(p));
+  }
+  return out;
+}
 
 std::optional<RpcStatusView> rpc_get_status(const std::string& rpc_url, std::string* err) {
   auto body = http_post_json(rpc_url, R"({"jsonrpc":"2.0","id":1,"method":"get_status","params":{}})", err);

@@ -6,11 +6,12 @@
 
 `finalis-core` is a finalized-state BFT blockchain in which validator lifecycle, operator-native committee formation, adaptive checkpoint derivation, and future committee eligibility are all derived deterministically from finalized history.
 
-> **Status: pre-launch.** Mainnet has not launched. There is no live chain, no
-> user funds and no legacy state to stay compatible with; confidential UTXOs are
-> enabled from genesis. Genesis is not frozen yet (see
+> **Status: pre-launch.** Mainnet has not launched: there are no user funds and
+> no legacy state to stay compatible with, and confidential UTXOs are enabled
+> from genesis. Mainnet genesis is not frozen yet (see
 > [mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md)), so the identity below can
-> still change.
+> still change. A public testnet, **testnet-1**, has been running since
+> 2026-10-19: [join it](testnet/JOIN.md).
 >
 > **Review wanted.** We are looking for independent review of the consensus
 > safety rules and the confidential transaction cryptography. Start with
@@ -24,6 +25,8 @@ Mainnet identity (pre-launch):
 - `genesis_hash`: published at launch (mainnet has not launched)
 - `magic = 0x499602D2`
 
+Testnet identity and parameters: [testnet/README.md](testnet/README.md).
+
 In the current codebase it consists of:
 
 - a UTXO ledger
@@ -31,9 +34,9 @@ In the current codebase it consists of:
   `TxV2` (confidential-capable), parsed together as `AnyTx`
 - UTXO state (`UtxoSetV2`) holding transparent and confidential outputs
 - a validator committee
-- quorum finality
+- two-phase quorum finality
 - deterministic epoch-boundary checkpoint derivation
-- finalized-state read surfaces
+- finalized-state read surfaces, with proofs that let clients verify them
 
 The live runtime processes only:
 
@@ -53,15 +56,20 @@ to mainnet; start from an empty data directory.
   - committee / finality runtime
 - `finalis-lightserver`
   - finalized-state JSON-RPC service
+  - runs standalone or as a child of the node (`--with-lightserver`)
 - `finalis-explorer`
   - HTTP UI and REST layer on top of lightserver
   - local-first cached homepage / tx / transition views with freshness and
     provenance markers
+  - versioned partner API (`/api/v1`) for exchanges and integrators
 - `finalis-wallet`
   - Qt desktop wallet
   - local-first cached runtime/view state
   - confidential account, receive-request, and imported-coin UX for the
     supported confidential subset
+  - balances verified against validator signatures (see "Read Surfaces")
+- `finalis-cli`
+  - command-line wallet, validator registration, genesis tooling and RPC queries
 
 This repository also contains:
 
@@ -69,13 +77,19 @@ This repository also contains:
 - adversarial simulation under [scripts/protocol_attack_sim.py](scripts/protocol_attack_sim.py)
 - C++ fixture export and Python conformance tests under
   [tests/fixtures/](tests/fixtures)
+- a JavaScript wallet SDK under [sdk/finalis-wallet-js/](sdk/finalis-wallet-js)
+- an Nginx reverse-proxy template for public hosts under [packaging/nginx/](packaging/nginx)
 
 ## Protocol Facts
 
-- blocks finalize with `floor(2N/3) + 1` valid signatures
-- votes and quorum certificates are bound to `(height, round, block_id)`
+- finality is two-phase (prevote, then precommit); a block finalizes with
+  `floor(2N/3) + 1` valid precommits ([TWO_PHASE_FINALITY.md](docs/spec/TWO_PHASE_FINALITY.md))
+- prevotes and precommits are bound to `(height, round, transition_id)` in
+  separate signing domains, and every signature commits to the chain
+  (network id and genesis hash)
+- target block interval: 3 minutes
 - the committee for a height comes from the finalized checkpoint for that
-  height's epoch
+  height's epoch (32 blocks)
 - validator lifecycle changes come only from finalized history
 - future checkpoint eligibility is gated by finalized projected availability
 - checkpoint target committee size, checkpoint minimum eligible threshold, and
@@ -94,6 +108,7 @@ This repository also contains:
 - `get_utxos`
 - `get_history_page`
 - `broadcast_tx`
+- `get_committee_handoffs`, `get_utxo_proofs` (light-client proofs)
 
 `finalis-explorer` exposes thin finalized-state HTTP routes such as:
 
@@ -103,8 +118,17 @@ This repository also contains:
 - `/api/transition/<height_or_hash>`
 - `/api/address/<address>`
 
+and the stable partner API under `/api/v1` ([PARTNER_API_V1.md](docs/integrations/PARTNER_API_V1.md)).
+
 `broadcast_tx` is a relay-submission surface. Finalized visibility still comes
 from finalized-state lookup.
+
+Clients need not trust a lightserver. A wallet starts from the genesis compiled
+into it, follows each epoch's committee through signed handoffs, and checks its
+coins against the validators' signatures on the finalized tip. It combines the
+coins every configured server reports, so no server can invent a coin, and one
+honest server is enough to reveal a coin another hides. See
+[LIGHT_CLIENT.md](docs/spec/LIGHT_CLIENT.md).
 
 Confidential transactions use `TxV2`. The wallet supports:
 
@@ -128,7 +152,7 @@ The current key / address model is:
 - Ed25519 32-byte public keys
 - P2PKH addresses
 - `HASH160(pubkey)` address payload
-- `sc` / `tsc` HRP-based address encoding
+- `sc` (mainnet) / `tsc` (testnet) HRP-based address encoding
 
 See [docs/ADDRESSES.md](docs/ADDRESSES.md).
 
@@ -147,38 +171,67 @@ The current code implements:
 
 ## Run A Node
 
-## Quick Start (Non-Developers)
+Mainnet has not launched. To run a node today, join the testnet:
+**[testnet/JOIN.md](testnet/JOIN.md)** (run a node, then optionally become a
+validator).
 
-### Windows
+Default ports:
 
-1. Download the latest Windows installer from the releases page.
-2. Install and launch `finalis-node` (and `finalis-lightserver` if you want wallet/explorer access).
-3. Verify identity with:
-   ```
-   curl -s http://127.0.0.1:19444/rpc -d '{"jsonrpc":"2.0","id":1,"method":"get_status","params":{}}'
-   ```
-   Confirm `network_id`, `magic`, and `genesis_hash` match the values above.
+| | mainnet | testnet |
+|---|---|---|
+| P2P | `19440` | `19540` |
+| lightserver RPC | `19444` | `19544` |
+| data directory | `~/.finalis/mainnet` | `~/.finalis/testnet` |
+
+Always verify a node's identity with `get_status` before relying on it, for example:
+
+```bash
+curl -s http://127.0.0.1:19544/rpc -d '{"jsonrpc":"2.0","id":1,"method":"get_status","params":{}}'
+```
+
+It must report the expected `network_name`, `network_id`, `genesis_hash` and
+`chain_id_ok: true`.
 
 ### Linux
 
-If a Linux binary release is available, download and run it. Otherwise use the
-build steps below (requires a C++ toolchain).
+[scripts/start.sh](scripts/start.sh) installs dependencies, builds, and installs
+systemd services for the node, lightserver and explorer:
 
-For Windows builds/releases, use:
-
-- [finalis-core releases](https://github.com/FinalisCore/finalis-core/releases)
-
-```bash
-apt install -y build-essential cmake ninja-build pkg-config git libssl-dev \
-  qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
-  libsodium-dev librocksdb-dev nlohmann-json3-dev curl jq
-```
 ```bash
 git clone https://github.com/FinalisCore/finalis-core.git
-```
-```bash
 cd finalis-core
+FINALIS_NETWORK=testnet SERVICE_NAME=finalis-testnet ./scripts/start.sh
 ```
+
+Its options (ports, binding, firewall, explorer) are listed in
+[testnet/README.md](testnet/README.md#run-a-node). To serve the explorer and RPC
+publicly over HTTPS behind Nginx, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+### Windows
+
+Installers are published on the
+[releases page](https://github.com/FinalisCore/finalis-core/releases). The
+installer's `Start-Finalis.ps1` starts mainnet; for testnet, see
+[testnet/README.md](testnet/README.md#windows).
+
+### Mainnet (at launch)
+
+Genesis validators start their nodes before `genesis_time_unix`, after checking
+that their key is in the published genesis validator set and that their
+binaries embed the canonical `genesis.bin`
+([mainnet/GENESIS_VALIDATOR_CEREMONY.md](mainnet/GENESIS_VALIDATOR_CEREMONY.md)).
+
+## Build From Source
+
+Dependencies (Debian/Ubuntu; [scripts/bootstrap_deps.sh](scripts/bootstrap_deps.sh)
+installs them on apt, dnf and pacman systems):
+
+```bash
+sudo apt install -y build-essential cmake ninja-build pkg-config git python3 libssl-dev \
+  libsodium-dev librocksdb-dev nlohmann-json3-dev \
+  qtbase5-dev qtbase5-dev-tools   # Qt only for the desktop wallet
+```
+
 Build:
 
 ```bash
@@ -186,40 +239,25 @@ cmake -S . -B build -G Ninja && cmake --build build -j
 ```
 
 Dependency notes:
-- If `third_party/secp256k1-zkp` is missing, CMake will auto-fetch it (network required).
-- To force offline builds, provide the vendored tree at the pinned commit and disable auto-fetch:
-  `git clone https://github.com/ElementsProject/secp256k1-zkp.git third_party/secp256k1-zkp`
-  `git -C third_party/secp256k1-zkp checkout 08d1cd0c9c35a5a151ba80c226d49ea949e90374`
-  `cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF -DFINALIS_BUILD_NGINX=OFF`
+
+- If `third_party/secp256k1-zkp` is missing, CMake fetches it (network required).
+- For offline builds, provide the vendored tree at the pinned commit and disable auto-fetch:
+  ```bash
+  git clone https://github.com/ElementsProject/secp256k1-zkp.git third_party/secp256k1-zkp
+  git -C third_party/secp256k1-zkp checkout 08d1cd0c9c35a5a151ba80c226d49ea949e90374
+  cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF -DFINALIS_BUILD_NGINX=OFF
+  ```
 - On Linux the default build also downloads and compiles a local Nginx (reverse proxy for public
   RPC/explorer hosts). Validators and offline builds can skip it with `-DFINALIS_BUILD_NGINX=OFF`.
-- `./scripts/bootstrap_deps.sh` installs the dependencies on apt, dnf and pacman systems.
-
-## Run
-
-Before first startup on the mainnet:
-
-- ensure your local validator key is actually present in the intended genesis
-  validator set
-- ensure your binaries embed the same canonical `genesis.bin` used for launch
-
-```
-SYNC_TURBO_MODE=extreme ./scripts/start.sh
-```
-
-Default ports from the current mainnet config:
-
-- P2P: `19440`
-- lightserver: `19444`
-
-Always verify live endpoint identity with `get_status` before relying on public
-infrastructure.
+- Without Qt5 Widgets the desktop wallet target is skipped; everything else builds.
 
 ## Testing
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
+
+Run a subset of the main suite with `FINALIS_TEST_FILTER=<substring> ./build/finalis-tests`.
 
 ## Documentation
 
@@ -231,9 +269,13 @@ ctest --test-dir build --output-on-failure
 - Physical design guidance: [docs/PHYSICAL_DESIGN_GUIDELINES.md](docs/PHYSICAL_DESIGN_GUIDELINES.md)
 - License policy: [docs/LICENSE_POLICY.md](docs/LICENSE_POLICY.md)
 - Contributing guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Testnet: [testnet/README.md](testnet/README.md), [joining guide](testnet/JOIN.md)
+- Deployment (systemd, Nginx/HTTPS): [DEPLOYMENT.md](DEPLOYMENT.md)
 - Exchange integration: [docs/integrations/EXCHANGE_INTEGRATION.md](docs/integrations/EXCHANGE_INTEGRATION.md)
 - Live protocol: [docs/LIVE_PROTOCOL.md](docs/LIVE_PROTOCOL.md)
 - Consensus overview: [docs/CONSENSUS.md](docs/CONSENSUS.md)
+- Two-phase finality: [docs/spec/TWO_PHASE_FINALITY.md](docs/spec/TWO_PHASE_FINALITY.md)
+- Light-client verification: [docs/spec/LIGHT_CLIENT.md](docs/spec/LIGHT_CLIENT.md)
 - Confidential UTXO spec: [docs/spec/CONFIDENTIAL_UTXO_SPEC.md](docs/spec/CONFIDENTIAL_UTXO_SPEC.md)
 - Checkpoint derivation spec: [docs/spec/CHECKPOINT_DERIVATION_SPEC.md](docs/spec/CHECKPOINT_DERIVATION_SPEC.md)
 - Availability completeness spec: [docs/spec/AVAILABILITY_STATE_COMPLETENESS.md](docs/spec/AVAILABILITY_STATE_COMPLETENESS.md)

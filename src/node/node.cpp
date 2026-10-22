@@ -282,6 +282,10 @@ bool Node::init() {
     return false;
   }
   {
+    std::lock_guard<std::mutex> lk(mu_);
+    backfill_committee_handoffs_locked();
+  }
+  {
     std::ostringstream oss;
     oss << "chain-id network=" << chain_id_.network_name << " proto=" << chain_id_.protocol_version
         << " network_id=" << chain_id_.network_id_hex << " magic=" << chain_id_.magic
@@ -561,6 +565,10 @@ bool Node::start_lightserver_child() {
   } else {
     args.push_back("--admin-socket");
     args.push_back(cfg_.lightserver_admin_socket);
+  }
+  if (!cfg_.lightserver_trusted_proxy.empty()) {
+    args.push_back("--trusted-proxy");
+    args.push_back(cfg_.lightserver_trusted_proxy);
   }
 
   std::vector<char*> argv;

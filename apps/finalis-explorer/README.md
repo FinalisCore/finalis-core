@@ -233,8 +233,8 @@ Partner auth (when enabled):
   - configured by `--partner-rate-limit-per-minute`
   - limit responses return `429` with `Retry-After`
 - optional mTLS verification gate for protected partner endpoints:
-  - `--partner-mtls-required 1`
-  - requires header `X-Finalis-Mtls-Verified: true`
+  - `--partner-mtls-required 1` (requires `--trusted-proxy`; startup fails without it)
+  - requires header `X-Finalis-Mtls-Verified: true`, honoured only from a trusted proxy
 - optional global source CIDR allowlist:
   - `--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32`
   - startup rejects malformed CIDRs (global or partner-level) with explicit
@@ -760,7 +760,18 @@ http://127.0.0.1:18080/
 ## Deployment notes
 
 - `finalis-explorer` is intended to sit behind a reverse proxy such as nginx or
-  caddy for public exposure
+  caddy for public exposure (template: `packaging/nginx/finalis.conf.in`;
+  `BEHIND_PROXY=1 scripts/start.sh` sets up both binaries for it)
+- behind a same-host proxy, start it with `--trusted-proxy 127.0.0.1/32` (comma-separated
+  IPv4 CIDRs). From a trusted peer:
+  - `X-Real-IP` (IPv4 or IPv6) names the client for rate limits, partner IP allowlists and
+    audit logs (an IPv6 client is rate-limited as its /64); a missing or malformed value
+    leaves the proxy's own address
+  - `X-Finalis-Mtls-Verified` is honoured; from any other peer it is dropped
+  - the 8-connections-per-IP cap does not apply (the 64-connection global cap does);
+    the proxy must limit connections per client itself
+- the proxy must overwrite `X-Real-IP` and `X-Finalis-Mtls-Verified` on every location, or
+  clients can forge them; the nginx template does
 - the explorer remains a thin finalized-state read surface and does not maintain
   its own chain/index database
 - `/healthz` is suitable for simple process-plus-upstream reachability checks

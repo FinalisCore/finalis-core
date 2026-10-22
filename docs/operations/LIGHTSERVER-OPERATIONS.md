@@ -98,14 +98,20 @@ Behaviour:
 
 Clients connecting from `127.0.0.0/8` (local explorer, local wallet) are exempt by
 default. Behind a same-host reverse proxy every client appears as `127.0.0.1`, so the limits would
-never apply. In that case:
+never apply. In that case start the lightserver with `--trusted-proxy 127.0.0.1/32`
+(`finalis-node --lightserver-trusted-proxy 127.0.0.1/32` with `--with-lightserver`;
+`BEHIND_PROXY=1 scripts/start.sh` does this):
 
-- start `finalis-lightserver` with `--rate-limit-loopback`, which makes all public clients share
-  the proxy's bucket; and
-- enforce per-client limits in the proxy itself.
+- a request from a trusted peer carrying `X-Real-IP` is limited by that address and never
+  exempt, so every public client gets its own buckets;
+- a request from a trusted peer without `X-Real-IP` (the local explorer, a local wallet) is still
+  exempt;
+- `X-Real-IP` from any other peer is ignored;
+- an IPv6 client is limited as its /64.
 
-`--with-lightserver` does not forward `--rate-limit-loopback`. Run the lightserver standalone
-if you need it.
+The proxy must set `X-Real-IP` itself (overwriting the client's), as `packaging/nginx/finalis.conf.in`
+does. The older alternative, `--rate-limit-loopback`, puts every public client in one shared bucket;
+`--with-lightserver` does not forward it.
 
 ### 3.2 Capacity
 
@@ -149,3 +155,16 @@ Do not restart the node on the same data directory. Keep a copy of it for analys
 or restore from a snapshot (`finalis-cli snapshot_import --db <new-dir> --in <snapshot.bin>`). The node aborts on corruption on
 purpose: if a corrupted record were read as missing, the node's derived state would silently
 diverge.
+
+## 5. Light-client proofs
+
+Wallets check this server's answers against validator signatures
+([LIGHT_CLIENT.md](../spec/LIGHT_CLIENT.md)). They need one committee handoff per epoch, which the
+node writes when it finalizes an epoch's last height.
+
+- A node whose database predates handoffs rebuilds the missing ones once, at startup, by replaying
+  the stored chain: `committee-handoff-backfill-start missing=<n>`, then
+  `committee-handoff-backfill-done written=<n>`. Startup takes longer while it runs.
+- A node fast-synced from a snapshot gets the handoffs with the snapshot.
+- Without handoffs or proofs (an old node), wallets show the balance as `NOT VERIFIED`. They never
+  show it as verified.

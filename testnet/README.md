@@ -1,5 +1,7 @@
 # Finalis Testnet
 
+New here? **[Join the testnet](JOIN.md)**: run a node and become a validator, step by step.
+
 A public network with mainnet's consensus and economic parameters and its own identity, so it can
 rehearse mainnet without being mistaken for it:
 

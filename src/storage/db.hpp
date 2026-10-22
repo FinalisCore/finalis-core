@@ -349,6 +349,8 @@ class DB {
   // The height index is the primary live lookup path for finalized certificates.
   bool put_finality_certificate(const FinalityCertificate& cert);
   std::optional<FinalityCertificate> get_finality_certificate_by_height(std::uint64_t height) const;
+  // Serialized consensus::CommitteeHandoff (light-client proof of that epoch's committee).
+  std::optional<Bytes> get_committee_handoff(std::uint64_t next_epoch_start) const;
 
   bool set_height_hash(std::uint64_t height, const Hash32& hash);
   std::optional<Hash32> get_height_hash(std::uint64_t height) const;
@@ -486,6 +488,9 @@ std::string key_root_index(const std::string& kind, std::uint64_t height);
 std::string key_root_index_prefix();
 std::string key_finality_certificate_height(std::uint64_t height);
 std::string key_finality_certificate_height_prefix();
+// consensus::CommitteeHandoff proving the checkpoint of the epoch starting at `next_epoch_start`.
+std::string key_committee_handoff(std::uint64_t next_epoch_start);
+std::string key_committee_handoff_prefix();
 std::string key_ingress_record_prefix();
 std::string key_finalized_ingress_tip();
 std::string key_ingress_certificate_prefix();

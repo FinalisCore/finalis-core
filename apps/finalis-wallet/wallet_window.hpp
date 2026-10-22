@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -23,6 +24,8 @@
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
 #include "utxo/tx.hpp"
+#include "wallet/light_verifier.hpp"
+#include "wallet/verified_balance.hpp"
 #include "wallet_store.hpp"
 
 class QLabel;
@@ -215,6 +218,14 @@ class WalletWindow final : public QMainWindow {
 
   enum class HistoryPersistMode : std::uint8_t { None = 0, Replace = 1, Append = 2 };
 
+  // Shared with refresh workers, which take `mu` for the whole verification.
+  struct LightVerifierSlot {
+    std::mutex mu;
+    std::optional<LightVerifier> verifier;
+    std::string unavailable;  // why there is no verifier
+    std::map<OutPoint, Bytes> confidential_leaves;  // expected UTXO leaf per confidential coin
+  };
+
   struct RefreshRequest {
     QString wallet_address;
     QString wallet_network_name;
@@ -232,6 +243,8 @@ class WalletWindow final : public QMainWindow {
     std::vector<Hash32> confidential_history_keys;
     std::string confidential_key_set_fingerprint;
     std::optional<std::uint64_t> confidential_scanned_through_height;
+    std::shared_ptr<LightVerifierSlot> light_verifier;
+    std::vector<OutPoint> confidential_unspent;
   };
 
   struct EndpointProbeResult {
@@ -273,6 +286,11 @@ class WalletWindow final : public QMainWindow {
     std::vector<std::pair<Hash32, Bytes>> confidential_scan_txs;
     std::optional<WalletStore::ConfidentialScanCursor> confidential_scan_cursor;
     std::vector<EndpointProbeResult> probe_results;
+    // Balance checked against validator signatures (wallet/verified_balance.hpp).
+    bool balance_verified{false};
+    std::uint64_t balance_verified_height{0};
+    QString balance_verification_detail;
+    Bytes light_verifier_state;
   };
 
   void build_ui();
@@ -280,6 +298,8 @@ class WalletWindow final : public QMainWindow {
   void save_settings() const;
   // Endpoints, validator paths and the explorer URL are kept per network.
   void load_network_settings();
+  // A verifier for the active network, resumed from its saved progress.
+  void reset_light_verifier();
   QString network_settings_key(const QString& key) const;
   // Moves the open wallet (same key, that network's address) and all chain views to `network`.
   void switch_network(const std::string& network);
@@ -477,6 +497,7 @@ class WalletWindow final : public QMainWindow {
   std::uint64_t tip_height_{0};
   QString confidential_receive_address_;
   std::uint64_t confidential_balance_units_{0};
+  std::uint64_t confidential_unverified_units_{0};  // in coins not yet proven unspent
   std::size_t confidential_coin_count_{0};
   bool confidential_storage_locked_{false};
   std::vector<ChainRecord> chain_records_;
@@ -507,6 +528,10 @@ class WalletWindow final : public QMainWindow {
   QString crosscheck_summary_{"Cross-check: unavailable"};
   QString crosscheck_detail_text_{"No endpoint cross-check yet."};
   std::map<QString, EndpointRuntimeState> endpoint_runtime_state_;
+  std::shared_ptr<LightVerifierSlot> light_verifier_slot_;
+  bool balance_verified_{false};
+  std::uint64_t balance_verified_height_{0};
+  QString balance_verification_detail_;
   std::map<QString, CachedPendingTxStatus> pending_tx_status_cache_;
   std::optional<WalletStore::WalletViewSnapshot> wallet_view_snapshot_;
   QString pending_tx_status_panel_txid_;

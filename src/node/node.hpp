@@ -78,6 +78,8 @@ struct NodeConfig {
   std::uint16_t lightserver_port{19444};
   // Admin socket of the spawned lightserver; empty disables it. Hosts running several give each its own.
   std::string lightserver_admin_socket{default_admin_socket_path("mainnet")};
+  // Forwarded as the lightserver's --trusted-proxy (comma-separated IPv4 CIDRs); empty: none.
+  std::string lightserver_trusted_proxy;
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};
@@ -535,6 +537,9 @@ class Node {
 
   std::optional<FrontierProposal> build_frontier_transition_locked(std::uint64_t height, std::uint32_t round);
   bool refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error = nullptr);
+  bool canonical_genesis_state_locked(consensus::CanonicalDerivedState* out, std::string* error) const;
+  // Writes the committee handoffs (light-client proofs) a database finalized without, by replaying it.
+  void backfill_committee_handoffs_locked();
   void broadcast_epoch_ticket(const consensus::EpochTicket& ticket);
   void broadcast_propose(const p2p::ProposeMsg& msg);
   void broadcast_vote(const Vote& vote);

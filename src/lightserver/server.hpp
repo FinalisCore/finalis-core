@@ -19,6 +19,7 @@
 #include "common/network.hpp"
 #include "common/paths.hpp"
 #include "common/socket_compat.hpp"
+#include "common/trusted_proxy.hpp"
 #include "crypto/smt.hpp"
 #include "storage/db.hpp"
 
@@ -91,6 +92,9 @@ struct Config {
   // Loopback peers (explorer, local wallet) skip the public rate limits. Set false
   // when a same-host reverse proxy fronts the lightserver, or every client shares 127.0.0.1.
   bool exempt_loopback_from_rate_limits{true};
+  // Peers whose X-Real-IP names the client (a same-host reverse proxy). A request forwarded this way
+  // is limited by that client's address and never gets the loopback exemption.
+  std::vector<net::Ipv4Cidr> trusted_proxies;
 };
 
 class Server {

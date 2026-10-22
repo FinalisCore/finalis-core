@@ -63,6 +63,19 @@ TEST(test_admin_socket_default_is_per_network) {
   ASSERT_EQ(ls_main_cfg->admin_socket_path, "/var/run/finalis/mainnet/admin.sock");
 }
 
+TEST(test_node_lightserver_trusted_proxy_arg) {
+  std::vector<std::string> ok_args = {"finalis-node", "--testnet", "--disable-p2p", "--lightserver-trusted-proxy", "127.0.0.1/32"};
+  auto ok_argv = make_argv(ok_args);
+  auto ok_cfg = node::parse_args(static_cast<int>(ok_argv.size()), ok_argv.data());
+  ASSERT_TRUE(ok_cfg.has_value());
+  ASSERT_EQ(ok_cfg->lightserver_trusted_proxy, "127.0.0.1/32");
+
+  // Rejected here, not later in the lightserver child where the failure is only a log line.
+  std::vector<std::string> bad_args = {"finalis-node", "--testnet", "--disable-p2p", "--lightserver-trusted-proxy", "localhost"};
+  auto bad_argv = make_argv(bad_args);
+  ASSERT_TRUE(!node::parse_args(static_cast<int>(bad_argv.size()), bad_argv.data()).has_value());
+}
+
 TEST(test_node_default_db_path_uses_home_by_network) {
   const std::string home = finalis::test::unique_test_base("/tmp/finalis_test_home_default_db");
   std::filesystem::remove_all(home);

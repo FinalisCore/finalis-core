@@ -15,12 +15,13 @@
 #include <vector>
 
 #include "consensus/ingress.hpp"
+#include "consensus/light_client.hpp"
 #include "node.hpp"
 
 namespace finalis::node::detail {
 
 // --- Constants ---
-inline constexpr std::uint32_t kFixedValidationRulesVersion = 7;
+inline constexpr std::uint32_t kFixedValidationRulesVersion = consensus::kValidationRulesVersion;
 inline constexpr std::size_t kMaxIngressRangeRequestRecords = 1024;
 inline constexpr std::size_t kMaxIngressRangeResponseRecords = 1024;
 inline constexpr std::size_t kMaxIngressRangeResponseBytes = 512 * 1024;

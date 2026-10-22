@@ -2,6 +2,16 @@
 
 limit_req_zone $binary_remote_addr zone=explorer_api:10m rate=60r/s;
 limit_req_zone $binary_remote_addr zone=lightserver_rpc:10m rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=finalis_conn_per_ip:10m;
+
+# The explorer and lightserver trust X-Real-IP and X-Finalis-Mtls-Verified only from this proxy
+# (start them with --trusted-proxy 127.0.0.1/32). Every location below must overwrite both, or a
+# client could send its own. The mTLS header is "true" only for a verified client certificate
+# (ssl_verify_client); an empty value is not forwarded at all.
+map $ssl_client_verify $finalis_mtls_verified {
+    SUCCESS "true";
+    default "";
+}
 
 upstream finalis_explorer_upstream {
     server @FINALIS_NGINX_EXPLORER_UPSTREAM@;
@@ -33,6 +43,9 @@ server {
     add_header Referrer-Policy no-referrer-when-downgrade always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
+    # The explorer serves few concurrent connections; one client must not take them all.
+    limit_conn finalis_conn_per_ip 16;
+
     set $cors_origin "";
     if ($http_origin = "@FINALIS_NGINX_CORS_ORIGIN@") {
         set $cors_origin $http_origin;
@@ -57,13 +70,17 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Finalis-Mtls-Verified $finalis_mtls_verified;
         proxy_pass http://finalis_explorer_upstream;
     }
 
     location / {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Finalis-Mtls-Verified $finalis_mtls_verified;
         proxy_pass http://finalis_explorer_upstream;
     }
 }
@@ -83,6 +100,7 @@ server {
         deny all;
 
         limit_req zone=lightserver_rpc burst=60 nodelay;
+        limit_conn finalis_conn_per_ip 8;
         client_max_body_size 2m;
 
         proxy_http_version 1.1;

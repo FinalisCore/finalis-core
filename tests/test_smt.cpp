@@ -403,3 +403,34 @@ TEST(test_persistent_smt_proofs_verify_and_delta_codec_round_trips) {
   ASSERT_TRUE(decoded.has_value() && *decoded == changes);
   ASSERT_TRUE(!crypto::decode_smt_delta(Bytes{0x05, 0x01}).has_value());
 }
+
+TEST(test_smt_prove_from_leaves_and_compact_proofs) {
+  std::vector<std::pair<Hash32, Bytes>> leaves;
+  for (std::uint8_t i = 0; i < 40; ++i) {
+    leaves.push_back({crypto::sha256(Bytes{i}), Bytes{i, static_cast<std::uint8_t>(i * 3)}});
+  }
+  const auto root = crypto::SparseMerkleTree::compute_root_from_leaves(leaves);
+  for (const auto& [key, value] : {leaves[0], leaves[17], leaves[39]}) {
+    const auto [proof_root, proof] = crypto::SparseMerkleTree::prove_from_leaves(leaves, key);
+    ASSERT_TRUE(proof_root == root);
+    ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, key, value, proof));
+    ASSERT_TRUE(!crypto::SparseMerkleTree::verify_proof(root, key, Bytes{0xee}, proof));
+    // Compact: a bitmap plus a few hashes, decoding to the same siblings.
+    const auto compact = crypto::SparseMerkleTree::encode_compact_proof(proof);
+    ASSERT_TRUE(compact.size() < 32 + 16 * 32);
+    const auto decoded = crypto::SparseMerkleTree::decode_compact_proof(compact);
+    ASSERT_TRUE(decoded.has_value() && decoded->siblings == proof.siblings);
+  }
+  // Absent key: a non-membership proof.
+  const Hash32 absent = crypto::sha256(Bytes{0xaa, 0xbb});
+  const auto [absent_root, absent_proof] = crypto::SparseMerkleTree::prove_from_leaves(leaves, absent);
+  ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(absent_root, absent, std::nullopt, absent_proof));
+  // Malformed compact encodings are rejected.
+  auto compact = crypto::SparseMerkleTree::encode_compact_proof(absent_proof);
+  ASSERT_TRUE(!crypto::SparseMerkleTree::decode_compact_proof(Bytes(31, 0)).has_value());
+  compact.push_back(0);
+  ASSERT_TRUE(!crypto::SparseMerkleTree::decode_compact_proof(compact).has_value());
+  Bytes claims_one(32, 0);
+  claims_one[0] = 1;  // promises a sibling it does not carry
+  ASSERT_TRUE(!crypto::SparseMerkleTree::decode_compact_proof(claims_one).has_value());
+}

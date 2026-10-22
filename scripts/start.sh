@@ -25,11 +25,17 @@ SEEDS_FILE="${ROOT_DIR}/${FINALIS_NETWORK}/SEEDS.json"
 DB_DIR="${DB_DIR:-$HOME/.finalis/${FINALIS_NETWORK}}"
 P2P_PORT="${P2P_PORT:-${DEFAULT_P2P_PORT}}"
 LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-${DEFAULT_LIGHTSERVER_PORT}}"
-LIGHTSERVER_BIND="${LIGHTSERVER_BIND:-0.0.0.0}"
+# BEHIND_PROXY=1: a same-host reverse proxy (packaging/nginx) is the only public entrance to the
+# lightserver and explorer. They listen on loopback and take the client address from the proxy's
+# X-Real-IP (TRUSTED_PROXY); the firewall opens 80/443 instead of the lightserver port.
+BEHIND_PROXY="${BEHIND_PROXY:-0}"
+TRUSTED_PROXY="${TRUSTED_PROXY:-127.0.0.1/32}"
+if [[ "${BEHIND_PROXY}" == "1" ]]; then DEFAULT_PUBLIC_BIND=127.0.0.1; else DEFAULT_PUBLIC_BIND=0.0.0.0; fi
+LIGHTSERVER_BIND="${LIGHTSERVER_BIND:-${DEFAULT_PUBLIC_BIND}}"
 WITH_LIGHTSERVER="${WITH_LIGHTSERVER:-1}"
 WITH_EXPLORER="${WITH_EXPLORER:-1}"
 EXPLORER_PORT="${EXPLORER_PORT:-18080}"
-EXPLORER_BIND="${EXPLORER_BIND:-0.0.0.0}"
+EXPLORER_BIND="${EXPLORER_BIND:-${DEFAULT_PUBLIC_BIND}}"
 EXPLORER_RPC_URL="${EXPLORER_RPC_URL:-http://127.0.0.1:${LIGHTSERVER_PORT}/rpc}"
 PUBLIC_NODE="${PUBLIC_NODE:-1}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-8}"
@@ -314,16 +320,21 @@ open_firewall_ports() {
   fi
 
   local s; s="$(need_sudo)"
+  local -a ports=("${P2P_PORT}")
+  if [[ "${BEHIND_PROXY}" == "1" ]]; then
+    ports+=(80 443)
+  else
+    ports+=("${LIGHTSERVER_PORT}")
+  fi
+  local port
   if have ufw; then
-    log "Opening firewall ports with ufw: ${P2P_PORT}/tcp and ${LIGHTSERVER_PORT}/tcp."
-    ${s} ufw allow "${P2P_PORT}/tcp" >/dev/null || true
-    ${s} ufw allow "${LIGHTSERVER_PORT}/tcp" >/dev/null || true
+    log "Opening firewall ports with ufw: ${ports[*]} (tcp)."
+    for port in "${ports[@]}"; do ${s} ufw allow "${port}/tcp" >/dev/null || true; done
     return 0
   fi
   if have firewall-cmd; then
-    log "Opening firewall ports with firewalld: ${P2P_PORT}/tcp and ${LIGHTSERVER_PORT}/tcp."
-    ${s} firewall-cmd --permanent --add-port="${P2P_PORT}/tcp" >/dev/null || true
-    ${s} firewall-cmd --permanent --add-port="${LIGHTSERVER_PORT}/tcp" >/dev/null || true
+    log "Opening firewall ports with firewalld: ${ports[*]} (tcp)."
+    for port in "${ports[@]}"; do ${s} firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null || true; done
     ${s} firewall-cmd --reload >/dev/null || true
     return 0
   fi
@@ -854,6 +865,9 @@ build_node_command() {
       "--lightserver-bind" "${LIGHTSERVER_BIND}"
       "--lightserver-port" "${LIGHTSERVER_PORT}"
     )
+    if [[ "${BEHIND_PROXY}" == "1" ]]; then
+      args+=("--lightserver-trusted-proxy" "${TRUSTED_PROXY}")
+    fi
   fi
 
   if [[ "${mode}" == "bootstrap" ]]; then
@@ -897,6 +911,9 @@ build_explorer_command() {
     "--port" "${EXPLORER_PORT}"
     "--rpc-url" "${EXPLORER_RPC_URL}"
   )
+  if [[ "${BEHIND_PROXY}" == "1" ]]; then
+    args+=("--trusted-proxy" "${TRUSTED_PROXY}")
+  fi
   printf '%q ' "${args[@]}"
 }
 
@@ -962,7 +979,7 @@ print_summary() {
 run_node() {
   local command_line="$1"
   if [[ "${WITH_LIGHTSERVER}" == "1" ]]; then
-    log "Starting node with public lightserver on ${LIGHTSERVER_BIND}:${LIGHTSERVER_PORT}"
+    log "Starting node with lightserver on ${LIGHTSERVER_BIND}:${LIGHTSERVER_PORT}$([[ "${BEHIND_PROXY}" == "1" ]] && echo " (behind proxy ${TRUSTED_PROXY})")"
   fi
   log "Starting finalis-node..."
   # Intentional direct exec: this script is the one command operators run.

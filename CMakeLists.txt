@@ -178,6 +178,7 @@ endif()
 add_library(finalis_core
   src/common/types.cpp
   src/common/network.cpp
+  src/common/trusted_proxy.cpp
   src/common/chain_id.cpp
   src/common/paths.cpp
   src/codec/bytes.cpp
@@ -200,6 +201,8 @@ add_library(finalis_core
   src/wallet/utxo_selection.cpp
   src/wallet/confidential_builder.cpp
   src/wallet/confidential_keys.cpp
+  src/wallet/light_verifier.cpp
+  src/wallet/verified_balance.cpp
   src/utxo/tx.cpp
   src/utxo/confidential_tx.cpp
   src/utxo/validate.cpp
@@ -209,6 +212,7 @@ add_library(finalis_core
   src/consensus/monetary.cpp
   src/consensus/committee_schedule.cpp
   src/consensus/canonical_derivation.cpp
+  src/consensus/light_client.cpp
   src/consensus/confidential_supply.cpp
   src/consensus/frontier_execution.cpp
   src/consensus/ingress.cpp

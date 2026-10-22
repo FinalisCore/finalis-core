@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include "common/paths.hpp"
+#include "common/trusted_proxy.hpp"
 #include "genesis/embedded.hpp"
 #include "node.hpp"
 #include "node_internal.hpp"
@@ -179,6 +180,10 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.lightserver_admin_socket = *v;
+    } else if (a == "--lightserver-trusted-proxy") {
+      auto v = next(a);
+      if (!v || !net::parse_ipv4_cidr_list(*v).has_value()) return std::nullopt;
+      cfg.lightserver_trusted_proxy = *v;
     } else if (a == "--bind") {
       auto v = next(a);
       if (!v) return std::nullopt;

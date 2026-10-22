@@ -28,6 +28,7 @@
 #include "codec/bytes.hpp"
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/frontier_execution.hpp"
+#include "consensus/light_client.hpp"
 #include "consensus/ingress.hpp"
 #include "consensus/validator_registry.hpp"
 #include "consensus/state_commitment.hpp"
@@ -36,6 +37,8 @@
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
 #include "wallet/confidential_builder.hpp"
+#include "wallet/light_verifier.hpp"
+#include "wallet/verified_balance.hpp"
 #include "common/keystore.hpp"
 #include "common/merkle.hpp"
 #include "node/node.hpp"
@@ -10593,6 +10596,225 @@ TEST(test_fast_start_at_last_height_of_an_epoch_keeps_next_committee) {
     n.stop();
   }
   ASSERT_TRUE(hit_boundary);
+}
+
+// A light client trusts only the genesis document: it derives the epoch-1 committee, follows each
+// epoch's committee through the stored handoffs, and accepts the tip on its committee's certificate.
+TEST(test_light_client_follows_committees_from_genesis_and_rejects_tampering) {
+  const auto base = unique_test_base("/tmp/finalis_it_light_client");
+  const auto configure = [](node::NodeConfig& c) { c.network.committee_epoch_blocks = 2; };
+  auto cluster = make_cluster(base, 4, 4, MAX_COMMITTEE, configure);
+  const node::NodeConfig cfg = cluster.configs[0];
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 9, std::chrono::seconds(60)));
+  for (auto& n : cluster.nodes) n->stop();
+  cluster.nodes.clear();
+
+  std::ifstream gin(base + "/genesis.json");
+  const std::string gjson((std::istreambuf_iterator<char>(gin)), std::istreambuf_iterator<char>());
+  const auto doc = genesis::parse_json(gjson);
+  ASSERT_TRUE(doc.has_value());
+
+  std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> node_checkpoints;
+  std::map<std::uint64_t, Bytes> handoff_bytes;
+  Hash32 genesis_hash{};
+  std::uint64_t tip = 0;
+  std::optional<FrontierTransition> tip_transition;
+  std::optional<FinalityCertificate> tip_cert;
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open_readonly(cfg.db_path));
+    const auto gh = db.get(storage::key_genesis_hash());
+    ASSERT_TRUE(gh.has_value() && gh->size() == 32);
+    std::copy(gh->begin(), gh->end(), genesis_hash.begin());
+    node_checkpoints = db.load_finalized_committee_checkpoints();
+    tip = db.get_tip()->height;
+    for (std::uint64_t next = 3; next - 1 <= tip; next += 2) {
+      auto b = db.get_committee_handoff(next);
+      ASSERT_TRUE(b.has_value());
+      handoff_bytes[next] = *b;
+    }
+    tip_transition = FrontierTransition::parse(*db.get_frontier_transition(*db.get_frontier_transition_by_height(tip)));
+    tip_cert = db.get_finality_certificate_by_height(tip);
+    ASSERT_TRUE(tip_transition.has_value() && tip_cert.has_value());
+  }
+
+  const auto genesis_checkpoint = consensus::genesis_committee_checkpoint(cfg.network, *doc, genesis_hash);
+  ASSERT_TRUE(genesis_checkpoint.has_value());
+  ASSERT_TRUE(consensus::checkpoint_commitment_value(*genesis_checkpoint) ==
+              consensus::checkpoint_commitment_value(node_checkpoints.at(1)));
+  ASSERT_EQ(genesis_checkpoint->ordered_members.size(), 4u);
+
+  const auto params = consensus::light_client_params(cfg.network, consensus::chain_id_for_genesis(cfg.network, genesis_hash));
+  storage::FinalizedCommitteeCheckpoint current = *genesis_checkpoint;
+  for (const auto& [next, bytes] : handoff_bytes) {
+    const auto handoff = consensus::CommitteeHandoff::parse(bytes);
+    ASSERT_TRUE(handoff.has_value());
+    std::string err;
+    const auto verified = consensus::verify_committee_handoff(params, current, *handoff, &err);
+    ASSERT_TRUE(verified.has_value());
+    ASSERT_TRUE(consensus::checkpoint_commitment_value(*verified) ==
+                consensus::checkpoint_commitment_value(node_checkpoints.at(next)));
+    current = *verified;
+  }
+  ASSERT_EQ(current.epoch_start_height, consensus::committee_epoch_start(tip, 2));
+  ASSERT_TRUE(consensus::verify_light_finality(params, current, *tip_transition, *tip_cert));
+
+  // Tampering with any link is caught.
+  const auto first = *consensus::CommitteeHandoff::parse(handoff_bytes.at(3));
+  ASSERT_TRUE(!consensus::verify_committee_handoff(params, node_checkpoints.at(3), first).has_value());  // wrong epoch
+  auto bad_sig = first;
+  bad_sig.certificate.signatures[0].signature[0] ^= 1;
+  ASSERT_TRUE(!consensus::verify_committee_handoff(params, *genesis_checkpoint, bad_sig).has_value());
+  auto bad_checkpoint = first;
+  bad_checkpoint.next_checkpoint[bad_checkpoint.next_checkpoint.size() - 1] ^= 1;
+  ASSERT_TRUE(!consensus::verify_committee_handoff(params, *genesis_checkpoint, bad_checkpoint).has_value());
+  auto bad_preimage = first;
+  bad_preimage.post_state_preimage[consensus::kPostStatePreimageCheckpointRootOffset] ^= 1;
+  ASSERT_TRUE(!consensus::verify_committee_handoff(params, *genesis_checkpoint, bad_preimage).has_value());
+  auto strangers = current;
+  for (auto& member : strangers.ordered_members) member[0] ^= 0xff;
+  ASSERT_TRUE(!consensus::verify_light_finality(params, strangers, *tip_transition, *tip_cert));
+
+  // A database finalized without handoffs gets them on the next start, byte for byte.
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    for (const auto& [next, bytes] : handoff_bytes) ASSERT_TRUE(db.erase(storage::key_committee_handoff(next)));
+    db.close();
+  }
+  {
+    node::Node restarted(cfg);
+    ASSERT_TRUE(restarted.init());
+    restarted.stop();
+  }
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly(cfg.db_path));
+  for (const auto& [next, bytes] : handoff_bytes) ASSERT_TRUE(db.get_committee_handoff(next) == bytes);
+}
+
+// The wallet-side verifier against a real lightserver: committees from genesis over RPC, UTXO claims
+// checked against the signed tip, and a server whose handoff was tampered with is refused.
+TEST(test_light_verifier_checks_utxos_over_rpc_and_refuses_a_lying_server) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const auto base = unique_test_base("/tmp/finalis_it_light_verifier");
+  const auto configure = [](node::NodeConfig& c) { c.network.committee_epoch_blocks = 2; };
+  auto cluster = make_cluster(base, 1, 1, MAX_COMMITTEE, configure);
+  const node::NodeConfig cfg = cluster.configs[0];
+  ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 12, std::chrono::seconds(60)));
+  cluster.nodes[0]->stop();
+  cluster.nodes.clear();
+
+  std::ifstream gin(base + "/genesis.json");
+  const auto doc = genesis::parse_json(std::string((std::istreambuf_iterator<char>(gin)), std::istreambuf_iterator<char>()));
+  ASSERT_TRUE(doc.has_value());
+  Hash32 genesis_hash{};
+  std::uint64_t tip = 0;
+  std::map<OutPoint, UtxoEntry> utxos;
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open_readonly(cfg.db_path));
+    const auto gh = db.get(storage::key_genesis_hash());
+    std::copy(gh->begin(), gh->end(), genesis_hash.begin());
+    tip = db.get_tip()->height;
+    utxos = db.load_transparent_utxos();
+  }
+  ASSERT_TRUE(!utxos.empty());
+
+  auto serve = [&]() {
+    lightserver::Config lcfg;
+    lcfg.db_path = cfg.db_path;
+    lcfg.network = cfg.network;
+    lcfg.bind_ip = "127.0.0.1";
+    lcfg.port = 0;
+    lcfg.admin_socket_path.clear();
+    return std::make_unique<lightserver::Server>(lcfg);
+  };
+  auto ls = serve();
+  ASSERT_TRUE(ls->init());
+  ASSERT_TRUE(ls->start());
+  const std::string url = "http://127.0.0.1:" + std::to_string(ls->bound_port()) + "/rpc";
+
+  auto verifier = wallet::LightVerifier::from_genesis(cfg.network, *doc, genesis_hash);
+  ASSERT_TRUE(verifier.has_value());
+  const auto& [real_op, real_entry] = *utxos.begin();
+  OutPoint unknown_op{};
+  unknown_op.txid.fill(0x5a);
+  const std::vector<std::pair<OutPoint, Bytes>> claims = {
+      {real_op, wallet::transparent_utxo_leaf(real_entry.out.value, real_entry.out.script_pubkey)},
+      {unknown_op, wallet::transparent_utxo_leaf(1'000, real_entry.out.script_pubkey)},
+      {real_op, wallet::transparent_utxo_leaf(real_entry.out.value + 1, real_entry.out.script_pubkey)},
+  };
+  std::string err;
+  const auto verified = verifier->verify_utxos(url, claims, &err);
+  if (!verified.has_value()) throw std::runtime_error("verify_utxos: " + err);
+  ASSERT_EQ(verified->height, tip);
+  ASSERT_TRUE(verified->statuses == std::vector<wallet::UtxoProofStatus>({wallet::UtxoProofStatus::Unspent,
+                                                                           wallet::UtxoProofStatus::Spent,
+                                                                           wallet::UtxoProofStatus::Different}));
+  ASSERT_EQ(verifier->trusted_epoch_start(), consensus::committee_epoch_start(tip, 2));
+
+  // Saved progress resumes on a fresh verifier; another chain's or garbage state is refused.
+  auto resumed = wallet::LightVerifier::from_genesis(cfg.network, *doc, genesis_hash);
+  ASSERT_TRUE(resumed->load(verifier->save()));
+  ASSERT_EQ(resumed->trusted_epoch_start(), verifier->trusted_epoch_start());
+  auto other_chain = genesis_hash;
+  other_chain[0] ^= 1;
+  auto stranger = wallet::LightVerifier::from_genesis(cfg.network, *doc, other_chain);
+  ASSERT_TRUE(!stranger->load(verifier->save()));
+  ASSERT_TRUE(!resumed->load(Bytes{1, 2, 3}));
+  // A verifier on another chain identity (different signing domain) rejects this chain's certificates.
+  ASSERT_TRUE(!stranger->verify_utxos(url, claims).has_value());
+
+  // Several servers' reports: coins count only when proven, and each kind of lie is attributed.
+  std::vector<wallet::ClaimedUtxo> real;
+  for (const auto& [op, entry] : utxos) {
+    real.push_back(wallet::ClaimedUtxo{op, entry.out.value, entry.out.script_pubkey, 1});
+    if (real.size() == 3) break;
+  }
+  ASSERT_TRUE(real.size() >= 2);
+  auto inventor = real;
+  inventor.push_back(wallet::ClaimedUtxo{unknown_op, 5'000'000, real[0].script_pubkey, 1});
+  auto hider = std::vector<wallet::ClaimedUtxo>(real.begin() + 1, real.end());
+  auto misdescriber = real;
+  misdescriber[0].value += 1;
+  const std::vector<wallet::EndpointClaims> reports = {
+      {"honest", tip, real}, {"inventor", tip, inventor}, {"hider", tip, hider}, {"misdescriber", tip, misdescriber},
+      {"behind", tip - 1, inventor}};
+  const auto balance = wallet::verify_claimed_balance(&*verifier, reports, {}, {"http://127.0.0.1:1/rpc", url});
+  ASSERT_TRUE(balance.verified);
+  ASSERT_EQ(balance.height, tip);
+  ASSERT_EQ(balance.proof_endpoint, url);
+  ASSERT_EQ(balance.utxos.size(), real.size());
+  std::set<std::string> caught;
+  for (const auto& [endpoint, what] : balance.misbehaving) caught.insert(endpoint);
+  ASSERT_TRUE(caught == std::set<std::string>({"inventor", "hider", "misdescriber"}));
+  // Without a genesis to start from, the first report is passed through, marked unverified.
+  const auto unverified = wallet::verify_claimed_balance(nullptr, reports, {}, {url});
+  ASSERT_TRUE(!unverified.verified && unverified.utxos.size() == real.size());
+  ls->stop();
+  ls.reset();
+
+  // A server whose stored handoff was altered: the client keeps what it proved before it and stops there.
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(cfg.db_path));
+    auto bytes = db.get_committee_handoff(7);
+    ASSERT_TRUE(bytes.has_value());
+    auto handoff = consensus::CommitteeHandoff::parse(*bytes);
+    handoff->certificate.signatures[0].signature[5] ^= 1;
+    ASSERT_TRUE(db.put(storage::key_committee_handoff(7), handoff->serialize()));
+    db.close();
+  }
+  ls = serve();
+  ASSERT_TRUE(ls->init());
+  ASSERT_TRUE(ls->start());
+  const std::string lying_url = "http://127.0.0.1:" + std::to_string(ls->bound_port()) + "/rpc";
+  auto fresh = wallet::LightVerifier::from_genesis(cfg.network, *doc, genesis_hash);
+  ASSERT_TRUE(!fresh->sync_to(lying_url, tip, &err));
+  ASSERT_TRUE(err.find("rejected") != std::string::npos);
+  ASSERT_EQ(fresh->trusted_epoch_start(), 5u);
+  ASSERT_TRUE(!fresh->verify_utxos(lying_url, claims).has_value());
+  ls->stop();
 }
 
 TEST(test_consensus_history_is_pruned_and_fast_start_rebuilds_the_retained_window) {

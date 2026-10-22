@@ -218,10 +218,14 @@ bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig&
                                                 const CanonicalDerivedState& initial_state,
                                                 const std::vector<CanonicalFrontierRecord>& chain,
                                                 CanonicalDerivedState* out, std::string* error);
+// on_applied, when set, sees each height's resulting state with its transition and certificate.
+using FrontierReplayObserver =
+    std::function<void(const CanonicalDerivedState&, const FrontierTransition&, const FinalityCertificate&)>;
 bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfig& cfg,
                                                   const CanonicalDerivedState& initial_state,
                                                   const storage::DB& db,
-                                                  CanonicalDerivedState* out, std::string* error);
+                                                  CanonicalDerivedState* out, std::string* error,
+                                                  const FrontierReplayObserver& on_applied = {});
 // History the consensus state keeps (and commits to), counted back from the epoch of the next height:
 // - committee checkpoints: the unbond delay plus 2 epochs, so equivocation evidence can be checked
 //   against its height's committee for as long as the bond can still be slashed; this also covers the
@@ -246,6 +250,20 @@ std::uint8_t ticket_difficulty_bits_for_epoch_from_state(const CanonicalDerivati
 // frontier_utxo_state_root(state.utxos).
 Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
                                        const Hash32* known_utxo_root = nullptr);
+// The bytes consensus_post_state_commitment hashes (sha256d). Fixed layout up to the checkpoint root:
+// tag(16) height(8) frontier(8) utxo_root(32) validator_root(32) randomness(32) reward_root(32)
+// reserve(8) checkpoint_root(32); see kPostStatePreimage* offsets.
+Bytes consensus_post_state_preimage(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                    const Hash32* known_utxo_root = nullptr);
+inline constexpr std::size_t kPostStatePreimageHeightOffset = 16;
+inline constexpr std::size_t kPostStatePreimageUtxoRootOffset = 32;
+inline constexpr std::size_t kPostStatePreimageCheckpointRootOffset = 168;
+// A committee checkpoint as a leaf of the post-state commitment's checkpoint tree.
+Hash32 checkpoint_commitment_key(std::uint64_t epoch_start_height);
+Bytes checkpoint_commitment_value(const storage::FinalizedCommitteeCheckpoint& checkpoint);
+std::optional<storage::FinalizedCommitteeCheckpoint> parse_checkpoint_commitment_value(const Bytes& bytes);
+std::vector<std::pair<Hash32, Bytes>> checkpoint_commitment_leaves(
+    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints);
 // sha256d("SC-CANON-STATE-V3" || finalized_identity.id || last_finality_certificate_hash || post-state commitment).
 Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state);
 Hash32 consensus_state_commitment_from_post_state(const CanonicalDerivedState& state, const Hash32& post_state_commitment);

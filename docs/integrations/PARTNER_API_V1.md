@@ -99,7 +99,8 @@ Multi-tenant behavior:
   - `events_read`
   - `webhook_manage`
 - optional deployment-wide mTLS gate via `X-Finalis-Mtls-Verified` when
-  `partner_mtls_required=true`
+  `partner_mtls_required=true`; the header counts only when set by the
+  TLS-terminating proxy named in `--trusted-proxy`
 
 ## Webhook delivery
 

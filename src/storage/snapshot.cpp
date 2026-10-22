@@ -189,6 +189,8 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   add_prefix(db, &kvs, key_frontier_height_prefix());
   add_prefix(db, &kvs, key_frontier_transition_prefix());
   add_prefix(db, &kvs, key_finality_certificate_height_prefix());
+  // Light-client proofs; self-verifying, so a snapshot cannot plant a false one.
+  add_prefix(db, &kvs, key_committee_handoff_prefix());
   add_prefix(db, &kvs, key_ingress_record_prefix());
   add_prefix(db, &kvs, key_ingress_certificate_prefix());
   add_prefix(db, &kvs, key_ingress_bytes_prefix());
