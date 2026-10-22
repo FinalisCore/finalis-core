@@ -282,6 +282,10 @@ bool Node::init() {
     return false;
   }
   {
+    std::lock_guard<std::mutex> lk(mu_);
+    backfill_committee_handoffs_locked();
+  }
+  {
     std::ostringstream oss;
     oss << "chain-id network=" << chain_id_.network_name << " proto=" << chain_id_.protocol_version
         << " network_id=" << chain_id_.network_id_hex << " magic=" << chain_id_.magic

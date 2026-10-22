@@ -115,29 +115,32 @@ An endpoint is treated as failed if the wallet cannot connect, cannot read a val
 
 This improves availability only. It does not change consensus security or replace endpoint cross-checking.
 
+## Balance verification
+
+The wallet does not take a server's word for its balance
+([docs/spec/LIGHT_CLIENT.md](../../docs/spec/LIGHT_CLIENT.md)):
+
+- It starts from the genesis compiled into the binary and learns each epoch's validator committee
+  from the previous one. No server can introduce a committee.
+- On every refresh it asks all configured lightservers for the wallet's coins and checks the union
+  against the validators' signatures on the finalized tip. Only proven coins count. A coin invented
+  by a server is dropped. A coin hidden by one server is still found if another server reports it.
+- A server that sends an invalid proof, misdescribes a coin, or (at the same height) leaves out or
+  invents one is listed under the connection status as `failed verification`.
+- The tip label shows `verified` or `NOT VERIFIED`; the tooltip gives the proven height or the
+  reason. An unverified balance is the server's report and must not be relied on for incoming
+  payments.
+- Confidential coins are proven too. One received in the latest refresh shows as "not yet
+  verified" until the next.
+- Progress is saved per network in the wallet settings, so a restart resumes instead of walking
+  from genesis.
+- Mainnet shows `NOT VERIFIED` until the embedded genesis names its validators (genesis ceremony).
+
 ## Lightserver cross-check
 
-On refresh, the wallet also samples up to three configured lightserver endpoints and compares the reported:
-
-- network name
-- finalized height
-- finalized transition hash
-
-It reports one of:
-
-- `Cross-check: consistent`
-- `Cross-check: one endpoint differs`
-- `Cross-check: endpoint disagreement`
-
-This is an informational confidence signal only. It does not verify the chain, does not block wallet operations, and endpoints can disagree temporarily.
-
-Adaptive regime diagnostics are also informational only. They are rendered from
-canonical lightserver status and do not influence wallet behavior or consensus.
-
-Network identity boundary:
-
-- if a configured endpoint reports a different `network_id` or `genesis_hash`,
-  it is not the same network
+On refresh, the wallet also samples up to three configured lightserver endpoints and compares their
+network identity, finalized height and transition hash, shown under `Advanced -> Connections`. This
+is a diagnostic; balance verification (above) is what protects the balance.
 
 ## Branding assets
 

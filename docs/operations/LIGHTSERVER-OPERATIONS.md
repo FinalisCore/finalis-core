@@ -155,3 +155,16 @@ Do not restart the node on the same data directory. Keep a copy of it for analys
 or restore from a snapshot (`finalis-cli snapshot_import --db <new-dir> --in <snapshot.bin>`). The node aborts on corruption on
 purpose: if a corrupted record were read as missing, the node's derived state would silently
 diverge.
+
+## 5. Light-client proofs
+
+Wallets check this server's answers against validator signatures
+([LIGHT_CLIENT.md](../spec/LIGHT_CLIENT.md)). They need one committee handoff per epoch, which the
+node writes when it finalizes an epoch's last height.
+
+- A node whose database predates handoffs rebuilds the missing ones once, at startup, by replaying
+  the stored chain: `committee-handoff-backfill-start missing=<n>`, then
+  `committee-handoff-backfill-done written=<n>`. Startup takes longer while it runs.
+- A node fast-synced from a snapshot gets the handoffs with the snapshot.
+- Without handoffs or proofs (an old node), wallets show the balance as `NOT VERIFIED`. They never
+  show it as verified.

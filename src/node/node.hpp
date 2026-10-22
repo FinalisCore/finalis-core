@@ -537,6 +537,9 @@ class Node {
 
   std::optional<FrontierProposal> build_frontier_transition_locked(std::uint64_t height, std::uint32_t round);
   bool refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error = nullptr);
+  bool canonical_genesis_state_locked(consensus::CanonicalDerivedState* out, std::string* error) const;
+  // Writes the committee handoffs (light-client proofs) a database finalized without, by replaying it.
+  void backfill_committee_handoffs_locked();
   void broadcast_epoch_ticket(const consensus::EpochTicket& ticket);
   void broadcast_propose(const p2p::ProposeMsg& msg);
   void broadcast_vote(const Vote& vote);

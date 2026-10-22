@@ -10,6 +10,7 @@
 #include "common/chain_id.hpp"
 #include "common/types.hpp"
 #include "onboarding/validator_onboarding.hpp"
+#include "utxo/tx.hpp"
 
 namespace finalis::lightserver {
 
@@ -139,7 +140,28 @@ struct BroadcastResult {
   std::optional<std::uint64_t> min_fee_rate_to_enter_when_full;
 };
 
+// Light-client proofs; unverified as returned (see wallet/light_verifier.hpp).
+struct CommitteeHandoffsView {
+  std::uint64_t epoch_blocks{0};
+  std::vector<std::pair<std::uint64_t, Bytes>> handoffs;  // (next_epoch_start, serialized CommitteeHandoff)
+};
+struct UtxoProofView {
+  OutPoint outpoint;
+  std::optional<Bytes> value;  // the leaf at that height; nullopt: absent (spent or never created)
+  Bytes compact_proof;
+};
+struct UtxoProofsView {
+  std::uint64_t height{0};
+  Bytes transition;
+  Bytes certificate;
+  std::vector<UtxoProofView> proofs;
+};
+
 std::optional<RpcStatusView> rpc_get_status(const std::string& rpc_url, std::string* err);
+std::optional<CommitteeHandoffsView> rpc_get_committee_handoffs(const std::string& rpc_url, std::uint64_t from_epoch_start,
+                                                                std::uint64_t limit, std::string* err);
+std::optional<UtxoProofsView> rpc_get_utxo_proofs(const std::string& rpc_url, const std::vector<OutPoint>& outpoints,
+                                                  std::string* err);
 std::optional<AddressValidationView> rpc_validate_address(const std::string& rpc_url, const std::string& address, std::string* err);
 std::optional<std::vector<UtxoView>> rpc_get_utxos(const std::string& rpc_url, const Hash32& scripthash, std::string* err);
 std::optional<std::vector<HistoryEntry>> rpc_get_history(const std::string& rpc_url, const Hash32& scripthash,

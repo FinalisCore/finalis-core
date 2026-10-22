@@ -42,6 +42,12 @@ class SparseMerkleTree {
 
   static bool verify_proof(const Hash32& root, const Hash32& key, const std::optional<Bytes>& value, const SmtProof& proof);
   static Hash32 compute_root_from_leaves(const std::vector<std::pair<Hash32, Bytes>>& leaves);
+  // compute_root_from_leaves, plus the proof for `key` (membership or non-membership) against that root.
+  static std::pair<Hash32, SmtProof> prove_from_leaves(const std::vector<std::pair<Hash32, Bytes>>& leaves,
+                                                       const Hash32& key);
+  // Most siblings are empty-subtree hashes: a 32-byte bitmap of the others, then those (leaf->root).
+  static Bytes encode_compact_proof(const SmtProof& proof);
+  static std::optional<SmtProof> decode_compact_proof(const Bytes& bytes);
   static Hash32 leaf_hash(const Hash32& key, const Bytes& value);
 
  private:

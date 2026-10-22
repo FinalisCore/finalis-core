@@ -1289,6 +1289,12 @@ std::string key_root_index(const std::string& kind, std::uint64_t height) {
 }
 std::string key_root_index_prefix() { return "ROOT:"; }
 std::string key_finality_certificate_height_prefix() { return "FC:H:"; }
+std::string key_committee_handoff(std::uint64_t next_epoch_start) {
+  codec::ByteWriter w;
+  w.u64le(next_epoch_start);
+  return key_committee_handoff_prefix() + hex_encode(w.data());
+}
+std::string key_committee_handoff_prefix() { return "LCH:"; }
 std::string key_height(std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -1912,6 +1918,10 @@ bool DB::put_finality_certificate(const FinalityCertificate& cert) {
   }
   const Bytes bytes = cert.serialize();
   return put(key_finality_certificate_height(cert.height), bytes);
+}
+
+std::optional<Bytes> DB::get_committee_handoff(std::uint64_t next_epoch_start) const {
+  return get(key_committee_handoff(next_epoch_start));
 }
 
 std::optional<FinalityCertificate> DB::get_finality_certificate_by_height(std::uint64_t height) const {

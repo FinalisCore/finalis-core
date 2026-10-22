@@ -47,6 +47,7 @@
 #include <QMenuBar>
 #include <QPushButton>
 #include <QSettings>
+#include <QByteArray>
 #include <QStatusBar>
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -1601,7 +1602,26 @@ void WalletWindow::load_network_settings() {
       load_value("validator/key_path", QDir(node_dir).filePath("keystore/validator.json")).toString());
   validator_rpc_url_edit_->setText(
       load_value("validator/rpc_url", QString::fromStdString(finalis::wallet::default_local_rpc_url(active_network_))).toString());
+  reset_light_verifier();
   apply_network_chrome();
+}
+
+void WalletWindow::reset_light_verifier() {
+  auto slot = std::make_shared<LightVerifierSlot>();
+  std::string error;
+  slot->verifier = LightVerifier::for_network(finalis::network_by_name(active_network_), &error);
+  if (!slot->verifier.has_value()) {
+    slot->unavailable = error;
+  } else {
+    // Progress this wallet proved earlier; local and trusted, so no walk from genesis on every start.
+    QSettings settings(kSettingsOrg, kSettingsApp);
+    const QByteArray saved = QByteArray::fromBase64(settings.value(network_settings_key("light_verifier_state")).toByteArray());
+    if (!saved.isEmpty()) (void)slot->verifier->load(Bytes(saved.begin(), saved.end()));
+  }
+  light_verifier_slot_ = std::move(slot);
+  balance_verified_ = false;
+  balance_verified_height_ = 0;
+  balance_verification_detail_.clear();
 }
 
 void WalletWindow::apply_network_chrome() {
@@ -2035,15 +2055,23 @@ void WalletWindow::update_wallet_views() {
     if (reserved.find(OutPoint{*txid, utxo.vout}) != reserved.end()) pending_outgoing += utxo.value;
   }
   balance_label_->setText(format_coin_amount(total));
+  balance_label_->setToolTip(
+      balance_verified_
+          ? QString("Every coin was proven against validator signatures at finalized height %1.").arg(balance_verified_height_)
+          : QString("Not verified: %1. This is what the server reports; do not rely on it for incoming payments.")
+                .arg(balance_verification_detail_.isEmpty() ? QString("not refreshed yet") : balance_verification_detail_));
   pending_balance_label_->setText(QString("Pending outgoing: %1").arg(format_coin_amount(pending_outgoing)));
   if (confidential_balance_label_) {
     if (confidential_storage_locked_) {
       confidential_balance_label_->setText("Confidential balance: locked (wallet passphrase required)");
     } else {
       confidential_balance_label_->setText(
-          QString("Confidential balance: %1 across %2 coin(s)")
+          QString("Confidential balance: %1 across %2 coin(s)%3")
               .arg(format_coin_amount(confidential_balance_units_))
-              .arg(static_cast<qulonglong>(confidential_coin_count_)));
+              .arg(static_cast<qulonglong>(confidential_coin_count_))
+              .arg(confidential_unverified_units_ == 0
+                       ? QString()
+                       : QString(" · %1 not yet verified").arg(format_coin_amount(confidential_unverified_units_))));
     }
   }
   if (receive_confidential_note_label_) {
@@ -2059,7 +2087,11 @@ void WalletWindow::update_wallet_views() {
     }
   }
   tip_status_label_->setText(tip_height_ == 0 ? (refresh_in_flight_ ? "not refreshed · refreshing..." : "not refreshed")
-                                              : QString("height %1%2").arg(tip_height_).arg(refresh_in_flight_ ? " · refreshing..." : ""));
+                                              : QString("height %1 · %2%3")
+                                                    .arg(tip_height_)
+                                                    .arg(balance_verified_ ? "verified" : "NOT VERIFIED")
+                                                    .arg(refresh_in_flight_ ? " · refreshing..." : ""));
+  tip_status_label_->setToolTip(balance_label_->toolTip());
   if (header_network_label_) {
     header_network_label_->setText(QString("Network: %1").arg(QString::fromStdString(wallet_->network_name)));
   }
@@ -3332,7 +3364,13 @@ void WalletWindow::load_wallet_local_state() {
   confidential_receive_address_ = "not configured";
   if (receive_confidential_request_label_) receive_confidential_request_label_->setText("not generated");
   confidential_balance_units_ = 0;
+  confidential_unverified_units_ = 0;
   confidential_coin_count_ = 0;
+  std::set<OutPoint> proven_confidential;
+  if (light_verifier_slot_) {
+    std::lock_guard<std::mutex> lock(light_verifier_slot_->mu);
+    for (const auto& [op, leaf] : light_verifier_slot_->confidential_leaves) proven_confidential.insert(op);
+  }
   confidential_storage_locked_ = false;
   pending_wallet_spends_.clear();
   pending_confidential_reservations_.clear();
@@ -3463,6 +3501,7 @@ void WalletWindow::load_wallet_local_state() {
       });
       if (coin.spent) continue;
       confidential_balance_units_ += coin.amount;
+      if (!proven_confidential.contains(OutPoint{*txid, coin.vout})) confidential_unverified_units_ += coin.amount;
       ++confidential_coin_count_;
     }
     const auto request_it = std::find_if(state.confidential_requests.rbegin(), state.confidential_requests.rend(),
@@ -3782,11 +3821,36 @@ bool WalletWindow::refresh_finalized_send_state(QString* err) {
   current_finalized_lag_ = status->finalized_lag ? std::optional<qulonglong>(*status->finalized_lag) : std::nullopt;
   last_refresh_text_ = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
   tip_height_ = status->tip_height;
-  utxos_.clear();
+  // The coins about to be spent are proven like the background refresh's; unproven ones are dropped.
+  EndpointClaims claims;
+  claims.endpoint = last_refresh_endpoint_.toStdString();
+  claims.tip_height = status->tip_height;
   for (const auto& utxo : *utxos) {
+    claims.utxos.push_back(ClaimedUtxo{OutPoint{utxo.txid, utxo.vout}, utxo.value, utxo.script_pubkey, utxo.height});
+  }
+  VerifiedBalance balance;
+  {
+    std::unique_lock<std::mutex> lock;
+    LightVerifier* verifier = nullptr;
+    if (light_verifier_slot_) {
+      lock = std::unique_lock<std::mutex>(light_verifier_slot_->mu);
+      if (light_verifier_slot_->verifier.has_value()) verifier = &*light_verifier_slot_->verifier;
+    }
+    balance = verify_claimed_balance(verifier, {claims}, {}, {claims.endpoint});
+    if (!verifier && light_verifier_slot_) balance.detail = light_verifier_slot_->unavailable;
+  }
+  for (const auto& [endpoint, what] : balance.misbehaving) {
+    record_lightserver_failure(QString::fromStdString(endpoint),
+                               QString("failed verification: %1").arg(QString::fromStdString(what)));
+  }
+  balance_verified_ = balance.verified;
+  balance_verified_height_ = balance.height;
+  balance_verification_detail_ = QString::fromStdString(balance.detail);
+  utxos_.clear();
+  for (const auto& utxo : balance.utxos) {
     utxos_.push_back(WalletUtxo{
-        .txid_hex = hex_encode32(utxo.txid),
-        .vout = utxo.vout,
+        .txid_hex = hex_encode32(utxo.outpoint.txid),
+        .vout = utxo.outpoint.index,
         .value = utxo.value,
         .height = utxo.height,
         .script_pubkey = utxo.script_pubkey,
@@ -3802,10 +3866,10 @@ void WalletWindow::mark_refresh_state_changed() { ++refresh_state_version_; }
 namespace {
 
 // Finalized txs in (from_height, through_height] touching any of `keys`, in (height, txid) order.
-bool scan_confidential_history(const std::string& endpoint, const std::vector<Hash32>& keys, std::uint64_t from_height,
-                               std::uint64_t through_height, std::vector<std::pair<Hash32, Bytes>>* txs, std::string* err) {
+bool find_confidential_history(const std::string& endpoint, const std::vector<Hash32>& keys, std::uint64_t from_height,
+                               std::uint64_t through_height, std::set<std::pair<std::uint64_t, Hash32>>* found,
+                               std::string* err) {
   constexpr std::size_t kKeysPerCall = 1024;  // lightserver kMaxConfidentialHistoryKeys
-  std::set<std::pair<std::uint64_t, Hash32>> found;
   for (std::size_t begin = 0; begin < keys.size(); begin += kKeysPerCall) {
     const std::vector<Hash32> chunk(keys.begin() + static_cast<std::ptrdiff_t>(begin),
                                     keys.begin() + static_cast<std::ptrdiff_t>(std::min(keys.size(), begin + kKeysPerCall)));
@@ -3820,7 +3884,7 @@ bool scan_confidential_history(const std::string& endpoint, const std::vector<Ha
           past_end = true;
           break;
         }
-        if (item.height >= from_height) found.emplace(item.height, item.txid);
+        if (item.height >= from_height) found->emplace(item.height, item.txid);
       }
       if (past_end || !page->has_more) break;
       if (!page->next_start_after.has_value()) {
@@ -3830,11 +3894,37 @@ bool scan_confidential_history(const std::string& endpoint, const std::vector<Ha
       cursor = page->next_start_after;
     }
   }
-  for (const auto& [height, txid] : found) {
-    (void)height;
-    auto view = lightserver::rpc_get_tx(endpoint, txid, err);
-    if (!view) return false;
-    txs->emplace_back(txid, std::move(view->tx_bytes));
+  return true;
+}
+
+// Transactions touching the wallet's confidential keys, as any of `endpoints` lists them: one server
+// cannot hide a payment another reports. The first endpoint must answer, and every transaction it lists
+// must load; one listed only by another server that no server can produce is skipped, so a lying server
+// cannot stall the scan. Imported outputs are proven against the finalized state on the next refresh.
+bool scan_confidential_history(const std::vector<std::string>& endpoints, const std::vector<Hash32>& keys,
+                               std::uint64_t from_height, std::uint64_t through_height,
+                               std::vector<std::pair<Hash32, Bytes>>* txs, std::string* err) {
+  if (endpoints.empty()) return false;
+  std::set<std::pair<std::uint64_t, Hash32>> primary;
+  if (!find_confidential_history(endpoints.front(), keys, from_height, through_height, &primary, err)) return false;
+  std::set<std::pair<std::uint64_t, Hash32>> found = primary;
+  for (std::size_t i = 1; i < endpoints.size(); ++i) {
+    std::string other_err;
+    (void)find_confidential_history(endpoints[i], keys, from_height, through_height, &found, &other_err);
+  }
+  for (const auto& entry : found) {
+    std::optional<lightserver::TxView> view;
+    for (const auto& endpoint : endpoints) {
+      std::string tx_err;
+      view = lightserver::rpc_get_tx(endpoint, entry.second, &tx_err);
+      if (view.has_value()) break;
+      if (err && primary.contains(entry)) *err = tx_err;
+    }
+    if (!view.has_value()) {
+      if (primary.contains(entry)) return false;
+      continue;
+    }
+    txs->emplace_back(entry.second, std::move(view->tx_bytes));
   }
   return true;
 }
@@ -3930,6 +4020,9 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   {
     std::unique_lock<std::mutex> lock(state->mu);
     state->cv.wait(lock, [&] { return state->healthy_found || state->done_count == request.endpoints.size(); });
+    // Coins are combined across servers (one honest server reveals a coin another hides), so the
+    // others get a moment once one has answered.
+    state->cv.wait_for(lock, std::chrono::seconds(3), [&] { return state->done_count == request.endpoints.size(); });
     probe_results = state->results;
   }
   if (threads.shutting_down()) {
@@ -4033,10 +4126,78 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   result.success = true;
   result.status = status;
   result.active_endpoint = active_endpoint;
-  for (const auto& utxo : *utxos) {
+
+  // Every healthy server's coins, kept only where validator signatures back them.
+  std::vector<EndpointClaims> claims;
+  std::vector<std::string> proof_endpoints{active_endpoint.toStdString()};
+  for (const auto& probe : probe_results) {
+    if (!probe.healthy || !probe.status.has_value() || !probe.utxos.has_value()) continue;
+    EndpointClaims endpoint_claims;
+    endpoint_claims.endpoint = probe.endpoint.toStdString();
+    endpoint_claims.tip_height = probe.status->tip_height;
+    for (const auto& utxo : *probe.utxos) {
+      endpoint_claims.utxos.push_back(
+          ClaimedUtxo{OutPoint{utxo.txid, utxo.vout}, utxo.value, utxo.script_pubkey, utxo.height});
+    }
+    if (probe.endpoint == active_endpoint) {
+      claims.insert(claims.begin(), std::move(endpoint_claims));
+    } else {
+      proof_endpoints.push_back(endpoint_claims.endpoint);
+      claims.push_back(std::move(endpoint_claims));
+    }
+  }
+  const auto& slot = request.light_verifier;
+  std::vector<std::pair<OutPoint, Bytes>> confidential;
+  if (slot) {
+    std::map<OutPoint, Bytes> leaves;
+    {
+      std::lock_guard<std::mutex> lock(slot->mu);
+      leaves = slot->confidential_leaves;
+    }
+    for (const auto& op : request.confidential_unspent) {
+      auto it = leaves.find(op);
+      if (it == leaves.end()) {
+        // Any server's copy will do: the proof decides whether this output is in the finalized state.
+        std::string err;
+        if (const auto view = lightserver::rpc_get_tx(active_endpoint.toStdString(), op.txid, &err)) {
+          if (auto leaf = utxo_leaf_for_output(view->tx_bytes, op.index)) it = leaves.emplace(op, std::move(*leaf)).first;
+        }
+      }
+      if (it != leaves.end()) confidential.push_back(*it);
+    }
+  }
+  VerifiedBalance balance;
+  {
+    std::unique_lock<std::mutex> lock;
+    LightVerifier* verifier = nullptr;
+    if (slot) {
+      lock = std::unique_lock<std::mutex>(slot->mu);
+      if (slot->verifier.has_value()) verifier = &*slot->verifier;
+    }
+    balance = verify_claimed_balance(verifier, claims, confidential, proof_endpoints);
+    if (verifier) {
+      result.light_verifier_state = verifier->save();
+      for (std::size_t i = 0; i < balance.confidential.size(); ++i) {
+        if (balance.confidential[i] == UtxoProofStatus::Unspent) slot->confidential_leaves[confidential[i].first] = confidential[i].second;
+      }
+    } else if (slot && !slot->unavailable.empty()) {
+      balance.detail = slot->unavailable;
+    }
+  }
+  result.balance_verified = balance.verified;
+  result.balance_verified_height = balance.height;
+  result.balance_verification_detail = QString::fromStdString(balance.detail);
+  for (const auto& [endpoint, what] : balance.misbehaving) {
+    result.endpoint_failures.push_back({QString::fromStdString(endpoint), QString("failed verification: %1").arg(QString::fromStdString(what))});
+  }
+  std::vector<OutPoint> proven_spent_confidential;
+  for (std::size_t i = 0; i < balance.confidential.size(); ++i) {
+    if (balance.confidential[i] == UtxoProofStatus::Spent) proven_spent_confidential.push_back(confidential[i].first);
+  }
+  for (const auto& utxo : balance.utxos) {
     result.utxos.push_back(WalletUtxo{
-        .txid_hex = hex_encode32(utxo.txid),
-        .vout = utxo.vout,
+        .txid_hex = hex_encode32(utxo.outpoint.txid),
+        .vout = utxo.outpoint.index,
         .value = utxo.value,
         .height = utxo.height,
         .script_pubkey = utxo.script_pubkey,
@@ -4302,8 +4463,10 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
     if (from_height > status->tip_height) {
       result.confidential_scan_cursor =
           WalletStore::ConfidentialScanCursor{request.confidential_key_set_fingerprint, status->tip_height};
-    } else if (scan_confidential_history(active_endpoint.toStdString(), request.confidential_history_keys, from_height,
-                                         status->tip_height, &scan_txs, &scan_err)) {
+    } else if (scan_confidential_history(
+                   std::vector<std::string>(proof_endpoints.begin(),
+                                            proof_endpoints.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(2, proof_endpoints.size()))),
+                   request.confidential_history_keys, from_height, status->tip_height, &scan_txs, &scan_err)) {
       result.confidential_scan_txs = std::move(scan_txs);
       result.confidential_scan_cursor =
           WalletStore::ConfidentialScanCursor{request.confidential_key_set_fingerprint, status->tip_height};
@@ -4317,6 +4480,8 @@ WalletWindow::RefreshResult WalletWindow::build_refresh_result(const RefreshRequ
   result.remove_pending_txids.assign(remove_pending.begin(), remove_pending.end());
   result.remove_sent_txids.assign(remove_sent.begin(), remove_sent.end());
   result.mark_spent_confidential_outpoints = std::move(spent_confidential_outpoints);
+  result.mark_spent_confidential_outpoints.insert(result.mark_spent_confidential_outpoints.end(),
+                                                  proven_spent_confidential.begin(), proven_spent_confidential.end());
   result.finalized_sent_txs = std::move(finalized_sent_txs);
   result.released_pending_txids = std::move(released_pending_txids);
   {
@@ -4332,6 +4497,13 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
 
   last_endpoint_probe_results_ = result.probe_results;
   last_probe_time_ = std::chrono::steady_clock::now();
+  if (!result.light_verifier_state.empty()) {
+    QSettings settings(kSettingsOrg, kSettingsApp);
+    settings.setValue(network_settings_key("light_verifier_state"),
+                      QByteArray(reinterpret_cast<const char*>(result.light_verifier_state.data()),
+                                 static_cast<int>(result.light_verifier_state.size()))
+                          .toBase64());
+  }
 
   clear_lightserver_runtime_status();
   for (const auto& [endpoint, error] : result.endpoint_failures) record_lightserver_failure(endpoint, error);
@@ -4362,6 +4534,9 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
       result.status->finalized_lag ? std::optional<qulonglong>(*result.status->finalized_lag) : std::nullopt;
   last_refresh_text_ = QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
   tip_height_ = result.status->tip_height;
+  balance_verified_ = result.balance_verified;
+  balance_verified_height_ = result.balance_verified_height;
+  balance_verification_detail_ = result.balance_verification_detail;
   utxos_ = std::move(result.utxos);
   chain_records_ = std::move(result.chain_records);
   local_sent_txids_ = std::move(result.local_sent_txids);
@@ -4517,6 +4692,10 @@ void WalletWindow::refresh_chain_state(bool interactive) {
     WalletStore::State local_state;
     if (store_.load(&local_state)) {
       request.pending_spend_records = std::move(local_state.pending_spends);
+      for (const auto& coin : local_state.confidential_coins) {
+        auto txid = decode_hex32_string(coin.txid_hex);
+        if (!coin.spent && txid) request.confidential_unspent.push_back(OutPoint{*txid, coin.vout});
+      }
       if (!confidential_storage_locked_) request.confidential_history_keys = confidential_scan_history_keys(local_state);
       request.confidential_key_set_fingerprint = confidential_scan_key_set_fingerprint(request.confidential_history_keys);
       if (local_state.confidential_scan_cursor.has_value() &&
@@ -4528,6 +4707,7 @@ void WalletWindow::refresh_chain_state(bool interactive) {
   request.finalized_history_cursor_height = finalized_history_cursor_height_;
   request.finalized_history_cursor_txid = finalized_history_cursor_txid_;
   request.finalized_tx_summary_cache = finalized_tx_summary_cache_;
+  request.light_verifier = light_verifier_slot_;
 
   QPointer<WalletWindow> self(this);
   // The registry joins this thread before it is destroyed, so the raw pointer stays valid.

@@ -393,6 +393,16 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     if (error) *error = "put-finality-certificate-failed";
     return false;
   }
+  // At an epoch's last height: the proof light clients use to learn the next epoch's committee.
+  // Only this state has what its signed post-state commitment covers; it cannot be rebuilt later.
+  if (std::string handoff_error; auto handoff = consensus::build_committee_handoff(
+                                     canonical_derivation_config_locked(), next_state, record.transition, certificate,
+                                     &handoff_error)) {
+    batch.put(storage::key_committee_handoff(record.transition.height + 1), handoff->serialize());
+  } else if (!handoff_error.empty()) {
+    log_line("committee-handoff-build-failed height=" + std::to_string(record.transition.height) +
+             " detail=" + handoff_error);
+  }
   batch.put(kConfidentialSupplyLedgerKey,
             consensus::serialize_confidential_supply_ledger(next_state.confidential_supply, record.transition.height));
   // Before hydrate replaces canonical_state_ with next_state.

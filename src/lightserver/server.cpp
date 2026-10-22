@@ -27,6 +27,7 @@
 #include "consensus/epoch_tickets.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/frontier_execution.hpp"
+#include "consensus/light_client.hpp"
 #include "consensus/randomness.hpp"
 #include "consensus/state_commitment.hpp"
 #include "consensus/validator_registry.hpp"
@@ -3461,6 +3462,78 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     for (size_t i = 0; i < proof.siblings.size(); ++i) {
       if (i) oss << ",";
       oss << "\"" << hex_encode32(proof.siblings[i]) << "\"";
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
+  }
+
+  // Light-client proofs (consensus/light_client.hpp): each handoff proves the next epoch's committee
+  // from the previous one's, starting after `from_epoch_start`, so a client walks them in order.
+  if (*method == "get_committee_handoffs") {
+    const auto from = field_u64(params, "from_epoch_start");
+    if (!from || *from == 0) return make_error(id, -32602, "missing from_epoch_start");
+    const std::uint64_t epoch_blocks = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
+    if (consensus::committee_epoch_start(*from, epoch_blocks) != *from) {
+      return make_error(id, -32602, "from_epoch_start is not an epoch start");
+    }
+    const std::uint64_t limit = std::clamp<std::uint64_t>(field_u64(params, "limit").value_or(32), 1, 64);
+    std::ostringstream oss;
+    oss << "{\"epoch_blocks\":" << epoch_blocks << ",\"handoffs\":[";
+    std::uint64_t count = 0;
+    for (std::uint64_t next = *from + epoch_blocks; count < limit; next += epoch_blocks, ++count) {
+      const auto bytes = db_.get_committee_handoff(next);
+      if (!bytes.has_value()) break;
+      if (count) oss << ",";
+      oss << "{\"next_epoch_start\":" << next << ",\"handoff_hex\":\"" << hex_encode(*bytes) << "\"}";
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
+  }
+
+  // UTXO membership proofs at one finalized height, with that height's transition and certificate,
+  // so a light client can check them against the signed next_state_root in a single round trip.
+  if (*method == "get_utxo_proofs") {
+    const auto* outpoints_value = params ? params->get("outpoints") : nullptr;
+    if (!outpoints_value || !outpoints_value->is_array()) return make_error(id, -32602, "missing outpoints");
+    if (outpoints_value->array_value.size() > 256) return make_error(id, -32602, "too many outpoints");
+    std::vector<OutPoint> outpoints;
+    for (const auto& item : outpoints_value->array_value) {
+      const auto txid = parse_hex32(field_string(&item, "txid").value_or(""));
+      const auto vout = field_u64(&item, "vout");
+      if (!txid || !vout || *vout > std::numeric_limits<std::uint32_t>::max()) {
+        return make_error(id, -32602, "bad outpoint");
+      }
+      outpoints.push_back(OutPoint{*txid, static_cast<std::uint32_t>(*vout)});
+    }
+    const auto tip = db_.get_tip();
+    if (!tip.has_value() || tip->height == 0) return make_error(id, -32000, "tip unavailable");
+    const auto transition_id = db_.get_frontier_transition_by_height(tip->height);
+    const auto transition_bytes = transition_id ? db_.get_frontier_transition(*transition_id) : std::nullopt;
+    const auto transition = transition_bytes ? FrontierTransition::parse(*transition_bytes) : std::nullopt;
+    const auto cert = db_.get_finality_certificate_by_height(tip->height);
+    if (!transition || !cert) return make_error(id, -32001, "tip proof unavailable");
+    const auto ur = db_.get(storage::key_root_index("UTXO", tip->height));
+    if (!ur.has_value() || ur->size() != 32) return make_error(id, -32001, "utxo_root unavailable");
+    Hash32 root{};
+    std::copy(ur->begin(), ur->end(), root.begin());
+    if (root != transition->next_state_root) return make_error(id, -32003, "utxo_root does not match the tip");
+    crypto::SparseMerkleTree tree(db_, "utxo");
+    std::ostringstream oss;
+    oss << "{\"height\":" << tip->height << ",\"transition_hex\":\"" << hex_encode(*transition_bytes)
+        << "\",\"certificate_hex\":\"" << hex_encode(cert->serialize()) << "\",\"proofs\":[";
+    for (std::size_t i = 0; i < outpoints.size(); ++i) {
+      const Hash32 key = consensus::utxo_commitment_key(outpoints[i]);
+      const auto proof = utxo_proof_at(tip->height, root, key);
+      if (!proof.has_value()) return make_error(id, -32001, "utxo proof unavailable");
+      const auto value = tree.get_value(key);
+      // The leaf rows can be newer than the tip read above; never hand out a proof that does not verify.
+      if (!crypto::SparseMerkleTree::verify_proof(root, key, value, *proof)) {
+        return make_error(id, -32005, "state advanced during the request; retry");
+      }
+      if (i) oss << ",";
+      oss << "{\"txid\":\"" << hex_encode32(outpoints[i].txid) << "\",\"vout\":" << outpoints[i].index
+          << ",\"value_hex\":" << (value ? "\"" + hex_encode(*value) + "\"" : std::string("null"))
+          << ",\"proof_hex\":\"" << hex_encode(crypto::SparseMerkleTree::encode_compact_proof(*proof)) << "\"}";
     }
     oss << "]}";
     return make_result(id, oss.str());

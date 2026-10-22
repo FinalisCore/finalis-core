@@ -198,6 +198,55 @@ Hash32 SparseMerkleTree::compute_root_from_leaves(const std::vector<std::pair<Ha
   return hash_sorted_leaves(leaves, nullptr, nullptr);
 }
 
+std::pair<Hash32, SmtProof> SparseMerkleTree::prove_from_leaves(const std::vector<std::pair<Hash32, Bytes>>& leaves_in,
+                                                                const Hash32& key) {
+  std::vector<std::size_t> order(leaves_in.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](std::size_t a, std::size_t b) { return leaves_in[a].first < leaves_in[b].first; });
+  std::vector<LeafRef> leaves;
+  leaves.reserve(order.size());
+  for (const auto i : order) {
+    if (!leaves.empty() && leaves.back().key == leaves_in[i].first) continue;
+    leaves.push_back(LeafRef{leaves_in[i].first, leaf_hash(leaves_in[i].first, leaves_in[i].second)});
+  }
+  SmtProof proof;
+  const Hash32 root = hash_sorted_leaves(leaves, &key, &proof);
+  return {root, std::move(proof)};
+}
+
+Bytes SparseMerkleTree::encode_compact_proof(const SmtProof& proof) {
+  static const auto empties = empty_hashes();
+  Bytes out(32, 0);
+  for (std::size_t i = 0; i < proof.siblings.size() && i < 256; ++i) {
+    // siblings[i] is the root of a subtree of height i: empty, it is empties[256 - i].
+    if (proof.siblings[i] == empties[256 - i]) continue;
+    out[i / 8] |= static_cast<std::uint8_t>(1U << (i % 8));
+    out.insert(out.end(), proof.siblings[i].begin(), proof.siblings[i].end());
+  }
+  return out;
+}
+
+std::optional<SmtProof> SparseMerkleTree::decode_compact_proof(const Bytes& bytes) {
+  static const auto empties = empty_hashes();
+  if (bytes.size() < 32) return std::nullopt;
+  SmtProof proof;
+  proof.siblings.resize(256);
+  std::size_t pos = 32;
+  for (std::size_t i = 0; i < 256; ++i) {
+    if ((bytes[i / 8] >> (i % 8)) & 1U) {
+      if (pos + 32 > bytes.size()) return std::nullopt;
+      std::copy(bytes.begin() + static_cast<std::ptrdiff_t>(pos), bytes.begin() + static_cast<std::ptrdiff_t>(pos + 32),
+                proof.siblings[i].begin());
+      pos += 32;
+    } else {
+      proof.siblings[i] = empties[256 - i];
+    }
+  }
+  if (pos != bytes.size()) return std::nullopt;
+  return proof;
+}
+
 Hash32 SparseMerkleTree::hash_sorted_leaves(const std::vector<LeafRef>& leaves, const Hash32* proof_key, SmtProof* proof) {
   static const auto empties = empty_hashes();
   if (proof) proof->siblings.assign(256, Hash32{});

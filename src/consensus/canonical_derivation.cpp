@@ -1882,7 +1882,8 @@ bool derive_canonical_state_from_frontier_chain(const CanonicalDerivationConfig&
 bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfig& cfg,
                                                   const CanonicalDerivedState& initial_state,
                                                   const storage::DB& db,
-                                                  CanonicalDerivedState* out, std::string* error) {
+                                                  CanonicalDerivedState* out, std::string* error,
+                                                  const FrontierReplayObserver& on_applied) {
   CanonicalDerivedState state = initial_state;
   const auto finalized_frontier_height = db.get_finalized_frontier_height();
   if (!finalized_frontier_height.has_value()) {
@@ -1927,6 +1928,7 @@ bool derive_canonical_state_from_frontier_storage(const CanonicalDerivationConfi
     CanonicalDerivedState next;
     if (!apply_frontier_record_impl(cfg, state, record, true, &next, error)) return false;
     state = std::move(next);
+    if (on_applied) on_applied(state, *transition, *cert);
   }
 
   state.state_commitment = consensus_state_commitment(cfg, state);
@@ -1974,8 +1976,144 @@ void prune_consensus_history(const CanonicalDerivationConfig& cfg, CanonicalDeri
                 [&](const auto& entry) { return entry.first < reward_floor && entry.second.settled; });
 }
 
-Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
-                                       const Hash32* known_utxo_root) {
+Hash32 checkpoint_commitment_key(std::uint64_t epoch_start_height) {
+  codec::ByteWriter key;
+  key.bytes(Bytes{'S', 'C', '-', 'C', 'H', 'K'});
+  key.u64le(epoch_start_height);
+  return crypto::sha256(key.data());
+}
+
+Bytes checkpoint_commitment_value(const storage::FinalizedCommitteeCheckpoint& checkpoint) {
+  codec::ByteWriter w;
+  w.u64le(checkpoint.epoch_start_height);
+  w.bytes_fixed(checkpoint.epoch_seed);
+  w.u8(checkpoint.ticket_difficulty_bits);
+  w.u8(static_cast<std::uint8_t>(checkpoint.derivation_mode));
+  w.u8(static_cast<std::uint8_t>(checkpoint.fallback_reason));
+  w.u64le(checkpoint.availability_eligible_operator_count);
+  w.u64le(checkpoint.availability_min_eligible_operators);
+  w.u64le(checkpoint.adaptive_target_committee_size);
+  w.u64le(checkpoint.adaptive_min_eligible);
+  w.u64le(checkpoint.adaptive_min_bond);
+  w.u64le(checkpoint.qualified_depth);
+  w.u32le(checkpoint.target_expand_streak);
+  w.u32le(checkpoint.target_contract_streak);
+  auto append_pubkeys = [&](const std::vector<PubKey32>& pubs) {
+    w.varint(pubs.size());
+    for (const auto& pub : pubs) w.bytes_fixed(pub);
+  };
+  auto append_u64s = [&](const std::vector<std::uint64_t>& nums) {
+    w.varint(nums.size());
+    for (const auto num : nums) w.u64le(num);
+  };
+  auto append_u32s = [&](const std::vector<std::uint32_t>& nums) {
+    w.varint(nums.size());
+    for (const auto num : nums) w.u32le(num);
+  };
+  auto append_hashes = [&](const std::vector<Hash32>& hashes) {
+    w.varint(hashes.size());
+    for (const auto& hash : hashes) w.bytes_fixed(hash);
+  };
+  append_pubkeys(checkpoint.ordered_members);
+  append_pubkeys(checkpoint.ordered_operator_ids);
+  append_u64s(checkpoint.ordered_base_weights);
+  append_u32s(checkpoint.ordered_ticket_bonus_bps);
+  append_u64s(checkpoint.ordered_final_weights);
+  append_hashes(checkpoint.ordered_ticket_hashes);
+  append_u64s(checkpoint.ordered_ticket_nonces);
+  return w.take();
+}
+
+std::optional<storage::FinalizedCommitteeCheckpoint> parse_checkpoint_commitment_value(const Bytes& bytes) {
+  storage::FinalizedCommitteeCheckpoint c;
+  const bool ok = codec::parse_exact(bytes, [&](codec::ByteReader& r) {
+    auto start = r.u64le();
+    auto seed = r.bytes_fixed<32>();
+    auto difficulty = r.u8();
+    auto mode = r.u8();
+    auto reason = r.u8();
+    auto eligible = r.u64le();
+    auto min_eligible = r.u64le();
+    auto target = r.u64le();
+    auto adaptive_min_eligible = r.u64le();
+    auto adaptive_min_bond = r.u64le();
+    auto depth = r.u64le();
+    auto expand = r.u32le();
+    auto contract = r.u32le();
+    if (!start || !seed || !difficulty || !mode || !reason || !eligible || !min_eligible || !target ||
+        !adaptive_min_eligible || !adaptive_min_bond || !depth || !expand || !contract) {
+      return false;
+    }
+    c.epoch_start_height = *start;
+    c.epoch_seed = *seed;
+    c.ticket_difficulty_bits = *difficulty;
+    c.derivation_mode = static_cast<storage::FinalizedCommitteeDerivationMode>(*mode);
+    c.fallback_reason = static_cast<storage::FinalizedCommitteeFallbackReason>(*reason);
+    c.availability_eligible_operator_count = *eligible;
+    c.availability_min_eligible_operators = *min_eligible;
+    c.adaptive_target_committee_size = *target;
+    c.adaptive_min_eligible = *adaptive_min_eligible;
+    c.adaptive_min_bond = *adaptive_min_bond;
+    c.qualified_depth = *depth;
+    c.target_expand_streak = *expand;
+    c.target_contract_streak = *contract;
+    // Each list is bounded by the bytes left, so a hostile count cannot force a large allocation.
+    auto read_count = [&](std::size_t item_size) -> std::optional<std::size_t> {
+      auto n = r.varint();
+      if (!n || *n > r.remaining() / item_size) return std::nullopt;
+      return static_cast<std::size_t>(*n);
+    };
+    auto read_hashes = [&](std::vector<Hash32>* out) {
+      auto n = read_count(32);
+      if (!n) return false;
+      for (std::size_t i = 0; i < *n; ++i) {
+        auto h = r.bytes_fixed<32>();
+        if (!h) return false;
+        out->push_back(*h);
+      }
+      return true;
+    };
+    auto read_u64s = [&](std::vector<std::uint64_t>* out) {
+      auto n = read_count(8);
+      if (!n) return false;
+      for (std::size_t i = 0; i < *n; ++i) {
+        auto v = r.u64le();
+        if (!v) return false;
+        out->push_back(*v);
+      }
+      return true;
+    };
+    auto read_u32s = [&](std::vector<std::uint32_t>* out) {
+      auto n = read_count(4);
+      if (!n) return false;
+      for (std::size_t i = 0; i < *n; ++i) {
+        auto v = r.u32le();
+        if (!v) return false;
+        out->push_back(*v);
+      }
+      return true;
+    };
+    return read_hashes(&c.ordered_members) && read_hashes(&c.ordered_operator_ids) &&
+           read_u64s(&c.ordered_base_weights) && read_u32s(&c.ordered_ticket_bonus_bps) &&
+           read_u64s(&c.ordered_final_weights) && read_hashes(&c.ordered_ticket_hashes) &&
+           read_u64s(&c.ordered_ticket_nonces);
+  });
+  if (!ok) return std::nullopt;
+  return c;
+}
+
+std::vector<std::pair<Hash32, Bytes>> checkpoint_commitment_leaves(
+    const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints) {
+  std::vector<std::pair<Hash32, Bytes>> leaves;
+  leaves.reserve(checkpoints.size());
+  for (const auto& [epoch, checkpoint] : checkpoints) {
+    leaves.push_back({checkpoint_commitment_key(epoch), checkpoint_commitment_value(checkpoint)});
+  }
+  return leaves;
+}
+
+Bytes consensus_post_state_preimage(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                    const Hash32* known_utxo_root) {
   // known_utxo_root lets a caller that already verified frontier_utxo_state_root(state.utxos) skip
   // the most expensive tree; both use the same leaves.
   Hash32 utxo_root{};
@@ -2023,52 +2161,8 @@ Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, con
   }
   const auto reward_root = crypto::SparseMerkleTree::compute_root_from_leaves(reward_leaves);
 
-  std::vector<std::pair<Hash32, Bytes>> checkpoint_leaves;
-  checkpoint_leaves.reserve(state.finalized_committee_checkpoints.size());
-  for (const auto& [epoch, checkpoint] : state.finalized_committee_checkpoints) {
-    codec::ByteWriter w;
-    w.u64le(checkpoint.epoch_start_height);
-    w.bytes_fixed(checkpoint.epoch_seed);
-    w.u8(checkpoint.ticket_difficulty_bits);
-    w.u8(static_cast<std::uint8_t>(checkpoint.derivation_mode));
-    w.u8(static_cast<std::uint8_t>(checkpoint.fallback_reason));
-    w.u64le(checkpoint.availability_eligible_operator_count);
-    w.u64le(checkpoint.availability_min_eligible_operators);
-    w.u64le(checkpoint.adaptive_target_committee_size);
-    w.u64le(checkpoint.adaptive_min_eligible);
-    w.u64le(checkpoint.adaptive_min_bond);
-    w.u64le(checkpoint.qualified_depth);
-    w.u32le(checkpoint.target_expand_streak);
-    w.u32le(checkpoint.target_contract_streak);
-    auto append_pubkeys = [&](const std::vector<PubKey32>& pubs) {
-      w.varint(pubs.size());
-      for (const auto& pub : pubs) w.bytes_fixed(pub);
-    };
-    auto append_u64s = [&](const std::vector<std::uint64_t>& nums) {
-      w.varint(nums.size());
-      for (const auto num : nums) w.u64le(num);
-    };
-    auto append_u32s = [&](const std::vector<std::uint32_t>& nums) {
-      w.varint(nums.size());
-      for (const auto num : nums) w.u32le(num);
-    };
-    auto append_hashes = [&](const std::vector<Hash32>& hashes) {
-      w.varint(hashes.size());
-      for (const auto& hash : hashes) w.bytes_fixed(hash);
-    };
-    append_pubkeys(checkpoint.ordered_members);
-    append_pubkeys(checkpoint.ordered_operator_ids);
-    append_u64s(checkpoint.ordered_base_weights);
-    append_u32s(checkpoint.ordered_ticket_bonus_bps);
-    append_u64s(checkpoint.ordered_final_weights);
-    append_hashes(checkpoint.ordered_ticket_hashes);
-    append_u64s(checkpoint.ordered_ticket_nonces);
-    codec::ByteWriter key;
-    key.bytes(Bytes{'S', 'C', '-', 'C', 'H', 'K'});
-    key.u64le(epoch);
-    checkpoint_leaves.push_back({crypto::sha256(key.data()), w.take()});
-  }
-  const auto checkpoint_root = crypto::SparseMerkleTree::compute_root_from_leaves(checkpoint_leaves);
+  const auto checkpoint_root =
+      crypto::SparseMerkleTree::compute_root_from_leaves(checkpoint_commitment_leaves(state.finalized_committee_checkpoints));
 
   std::vector<std::pair<Hash32, Bytes>> availability_operator_leaves;
   availability_operator_leaves.reserve(state.availability_state.operators.size());
@@ -2148,7 +2242,12 @@ Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, con
   w.u64le(state.validator_liveness_window_start_height);
   w.u64le(state.confidential_pool_value);
   w.bytes_fixed(metadata_root);
-  return crypto::sha256d(w.data());
+  return w.take();
+}
+
+Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                       const Hash32* known_utxo_root) {
+  return crypto::sha256d(consensus_post_state_preimage(cfg, state, known_utxo_root));
 }
 
 Hash32 consensus_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state) {

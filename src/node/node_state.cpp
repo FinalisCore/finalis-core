@@ -439,7 +439,7 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
 
 }  // namespace
 
-bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error) {
+bool Node::canonical_genesis_state_locked(consensus::CanonicalDerivedState* out, std::string* error) const {
   auto genesis_json = db_.get(storage::key_genesis_json());
   if (!genesis_json.has_value()) {
     if (error) *error = "missing-genesis-json";
@@ -464,13 +464,53 @@ bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std:
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
 
-  const auto derivation_cfg = canonical_derivation_config_locked();
-  consensus::CanonicalDerivedState canonical_genesis_state;
   std::string canonical_error;
-  if (!consensus::build_genesis_canonical_state(derivation_cfg, genesis_state, &canonical_genesis_state, &canonical_error)) {
+  if (!consensus::build_genesis_canonical_state(canonical_derivation_config_locked(), genesis_state, out, &canonical_error)) {
     if (error) *error = "canonical-genesis-failed:" + canonical_error;
     return false;
   }
+  return true;
+}
+
+void Node::backfill_committee_handoffs_locked() {
+  const std::uint64_t epoch_blocks = std::max<std::uint64_t>(1, cfg_.network.committee_epoch_blocks);
+  std::set<std::uint64_t> missing;
+  for (std::uint64_t next = 1 + epoch_blocks; next - 1 <= finalized_height_; next += epoch_blocks) {
+    if (!db_.get_committee_handoff(next).has_value()) missing.insert(next);
+  }
+  if (missing.empty()) return;
+  log_line("committee-handoff-backfill-start missing=" + std::to_string(missing.size()) +
+           " tip=" + std::to_string(finalized_height_));
+  consensus::CanonicalDerivedState genesis_state;
+  std::string error;
+  if (!canonical_genesis_state_locked(&genesis_state, &error)) {
+    log_line("committee-handoff-backfill-failed detail=" + error);
+    return;
+  }
+  const auto derivation_cfg = canonical_derivation_config_locked();
+  std::size_t written = 0;
+  const auto on_applied = [&](const consensus::CanonicalDerivedState& state, const FrontierTransition& transition,
+                              const FinalityCertificate& cert) {
+    if (!missing.contains(transition.height + 1)) return;
+    std::string handoff_error;
+    auto handoff = consensus::build_committee_handoff(derivation_cfg, state, transition, cert, &handoff_error);
+    if (!handoff.has_value()) {
+      log_line("committee-handoff-build-failed height=" + std::to_string(transition.height) + " detail=" + handoff_error);
+      return;
+    }
+    if (db_.put(storage::key_committee_handoff(transition.height + 1), handoff->serialize())) ++written;
+  };
+  if (!consensus::derive_canonical_state_from_frontier_storage(derivation_cfg, genesis_state, db_, nullptr, &error,
+                                                               on_applied)) {
+    log_line("committee-handoff-backfill-failed detail=" + error);
+  }
+  log_line("committee-handoff-backfill-done written=" + std::to_string(written));
+}
+
+bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std::string* error) {
+  const auto derivation_cfg = canonical_derivation_config_locked();
+  consensus::CanonicalDerivedState canonical_genesis_state;
+  if (!canonical_genesis_state_locked(&canonical_genesis_state, error)) return false;
 
   consensus::CanonicalDerivedState derived_state;
   std::string derivation_error;

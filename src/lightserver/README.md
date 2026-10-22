@@ -23,6 +23,11 @@
   `--rate-limit-loopback` is set. Behind a same-host reverse proxy use `--trusted-proxy 127.0.0.1/32`
   (node: `--lightserver-trusted-proxy`): requests it forwards are limited by their `X-Real-IP` and
   never exempt.
+- Light-client proofs ([docs/spec/LIGHT_CLIENT.md](../../docs/spec/LIGHT_CLIENT.md)):
+  `get_committee_handoffs` (each epoch's committee, proven from the previous one) and
+  `get_utxo_proofs` (UTXO membership proofs with the tip's transition and certificate), so clients
+  can check answers against validator signatures instead of trusting this server.
+- Responses read by the client library are capped at 16 MB (servers are untrusted).
 - Operator runbook: [docs/operations/LIGHTSERVER-OPERATIONS.md](../../docs/operations/LIGHTSERVER-OPERATIONS.md).
 
 ## Non-Goals
