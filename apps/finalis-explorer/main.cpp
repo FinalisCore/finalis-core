@@ -433,6 +433,7 @@ constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
 constexpr std::size_t kPersistedTxIndexLimit = 128;
 constexpr std::size_t kPersistedTransitionIndexLimit = 128;
+constexpr std::uint64_t kHomeLatestTransitions = 10;
 constexpr std::size_t kPersistedPartnerEventsLimit = 2048;
 constexpr std::size_t kPersistedPartnerWebhookQueueLimit = 2048;
 constexpr std::size_t kPersistedPartnerIdempotencyLimit = 200000;
@@ -584,6 +585,7 @@ std::string default_explorer_cache_path(const std::string& rpc_url) {
 }
 
 std::string format_timestamp(std::uint64_t ts);
+std::string format_age(std::uint64_t ts_unix);
 std::uint64_t now_unix_ms();
 
 struct TxSummaryBatchItem {
@@ -1489,11 +1491,14 @@ std::string page_layout(const std::string& title, const std::string& body, const
          "details.disclosure{margin-top:14px;border-top:1px solid #ebe4d4;padding-top:12px;}"
          "details.disclosure summary{cursor:pointer;font-weight:700;color:#5d522f;}"
          "details.disclosure[open] summary{margin-bottom:10px;}"
+         ".pager{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:-4px 0 4px 0;}"
+         ".pager-current{font-weight:600;color:#4a4a4a;padding:0 4px;}"
+         "table.table-compact{min-width:0;}table.table-compact th,table.table-compact td{white-space:nowrap;}"
          ".meta{margin:8px 0 0 0;color:#555;font-size:13px;line-height:1.45;}"
          "details.disclosure-plain{margin-top:0;border-top:0;padding-top:0;}"
          ".soft-empty{padding:16px 18px;border-radius:14px;background:linear-gradient(180deg,#fbfaf5 0%,#f4f1e7 100%);border:1px dashed #d6cdaa;color:#5a5342;}"
          "@media (max-width:780px){h1{font-size:26px;}.grid{grid-template-columns:1fr;}.card{padding:15px 16px;}.badge{font-size:12px;padding:5px 12px;}.mono-block{flex-direction:column;}.copy-button{align-self:flex-start;}}"
-         "@media (max-width:560px){body{padding:12px;}.hero-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;}.metric-card{padding:12px;}.metric-card .value{font-size:19px;}table{min-width:460px;font-size:13px;}th,td{padding:7px 8px;}}"
+         "@media (max-width:560px){body{padding:12px;}.hide-sm{display:none;}.hero-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;}.metric-card{padding:12px;}.metric-card .value{font-size:19px;}table{min-width:460px;font-size:13px;}th,td{padding:7px 8px;}}"
       << "</style><script>"
          "function copyText(btn){"
          "const value=btn.getAttribute('data-copy')||'';"
@@ -2884,6 +2889,27 @@ std::string render_root(const Config& cfg) {
          << "</div>";
   }
   body << "</div>";
+  if (status.value.has_value()) {
+    const auto tip = status.value->finalized_height;
+    body << "<div class=\"card\"><h2>Latest Transitions</h2><div class=\"table-wrap\"><table class=\"table-compact\"><thead><tr>"
+         << "<th>Height</th><th class=\"hide-sm\">Hash</th><th>Age</th><th class=\"num\">Txs</th></tr></thead><tbody>";
+    std::size_t rows = 0;
+    for (std::uint64_t i = 0; i < kHomeLatestTransitions && i <= tip; ++i) {
+      const auto t = fetch_transition_result(cfg, std::to_string(tip - i));
+      if (!t.value.has_value()) continue;
+      ++rows;
+      body << "<tr><td>" << link_transition_height(t.value->height) << "</td><td class=\"hide-sm\"><a href=\"/transition/" << t.value->height
+           << "\"><code>" << html_escape(short_hex(t.value->hash)) << "</code></a></td><td";
+      if (t.value->timestamp.has_value()) {
+        body << " title=\"" << html_escape(format_timestamp(*t.value->timestamp)) << "\">" << html_escape(format_age(*t.value->timestamp));
+      } else {
+        body << " class=\"muted\">n/a";
+      }
+      body << "</td><td class=\"num\">" << t.value->tx_count << "</td></tr>";
+    }
+    if (rows == 0) body << "<tr><td colspan=\"4\" class=\"muted\">Transitions unavailable.</td></tr>";
+    body << "</tbody></table></div></div>";
+  }
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
     body << "<p class=\"meta\">Flow labels are inferred from inputs and outputs, not ownership proofs. Refreshed "
@@ -3271,6 +3297,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
       result.hash = transition_hash_hex;
       result.prev_finalized_hash = finalis::hex_encode32(blk->prev_finalized_hash);
       result.round = blk->round;
+      if (blk->timestamp != 0) result.timestamp = blk->timestamp;
       result.tx_count = blk->next_frontier >= blk->prev_frontier
                             ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                             : 0;
@@ -3311,6 +3338,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
     result.hash = finalis::hex_encode32(blk->transition_id());
     result.prev_finalized_hash = finalis::hex_encode32(blk->prev_finalized_hash);
     result.round = blk->round;
+    if (blk->timestamp != 0) result.timestamp = blk->timestamp;
     result.tx_count = blk->next_frontier >= blk->prev_frontier
                           ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                           : 0;
@@ -4346,6 +4374,23 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   return page_layout("Transaction " + txid_hex, body.str(), "tx");
 }
 
+std::string format_age(std::uint64_t ts_unix) {
+  const std::uint64_t now = now_unix_ms() / 1000;
+  if (ts_unix >= now) return "just now";
+  const std::uint64_t d = now - ts_unix;
+  if (d < 60) return std::to_string(d) + "s ago";
+  if (d < 3600) return std::to_string(d / 60) + "m ago";
+  if (d < 86400) return std::to_string(d / 3600) + "h ago";
+  return std::to_string(d / 86400) + "d ago";
+}
+
+std::string linked_mono_value(const std::string& value, const std::string& href) {
+  const std::string escaped = html_escape(value);
+  return "<div class=\"mono-block\"><a href=\"" + html_escape(href) + "\"><code>" + escaped +
+         "</code></a><button class=\"copy-button\" type=\"button\" onclick=\"copyText(this)\" data-copy=\"" + escaped +
+         "\">Copy</button></div>";
+}
+
 std::string render_transition(const Config& cfg, const std::string& ident) {
   std::ostringstream body;
   body << "<h1>Transition</h1>";
@@ -4360,6 +4405,17 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   const std::string transition_api_path = "/api/transition/" + transition.hash;
   const auto summary = compute_transition_summary(cfg, transition);
   const auto flow_mix_text = summarize_flow_mix(summary.flow_mix);
+  const auto status = fetch_status_result(cfg);
+
+  body << "<div class=\"pager\">";
+  if (transition.height > 0) {
+    body << "<a class=\"top-tab\" href=\"/transition/" << (transition.height - 1) << "\">&larr; " << (transition.height - 1) << "</a>";
+  }
+  body << "<span class=\"pager-current\">Height " << transition.height << "</span>";
+  if (status.value.has_value() && transition.height < status.value->finalized_height) {
+    body << "<a class=\"top-tab\" href=\"/transition/" << (transition.height + 1) << "\">" << (transition.height + 1) << " &rarr;</a>";
+  }
+  body << "</div>";
 
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
        << render_summary_metric_card("Tx Count", std::to_string(transition.txids.size()), "finalized txids in this transition")
@@ -4374,9 +4430,14 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Height</div><div>" << transition.height << "</div>"
        << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(transition.hash) << "</div>"
-       << "<div>Prev Finalized Hash</div><div class=\"value-cell\">" << mono_value(transition.prev_finalized_hash)
+       << "<div>Prev Finalized Hash</div><div class=\"value-cell\">"
+       << (transition.height > 0 ? linked_mono_value(transition.prev_finalized_hash, "/transition/" + transition.prev_finalized_hash)
+                                 : mono_value(transition.prev_finalized_hash))
        << "</div>"
-       << (transition.timestamp.has_value() ? "<div>Timestamp</div><div>" + html_escape(format_timestamp(*transition.timestamp)) + "</div>" : std::string())
+       << (transition.timestamp.has_value()
+               ? "<div>Timestamp</div><div>" + html_escape(format_timestamp(*transition.timestamp)) + " <span class=\"muted\">" +
+                     html_escape(format_age(*transition.timestamp)) + "</span></div>"
+               : std::string())
        << "<div>Round</div><div>" << transition.round << "</div>"
        << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(transition.data_source)) << "</div>"
        << "<div>Snapshot Refreshed</div><div>"

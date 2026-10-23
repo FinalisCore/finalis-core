@@ -2190,6 +2190,38 @@ TEST(test_explorer_tx_page_and_json_surface_decoded_onboarding_registration_fiel
   ASSERT_TRUE(tx_page.find(short_hex(hex_encode(Bytes(validator.public_key.begin(), validator.public_key.end())))) != std::string::npos);
 }
 
+TEST(test_explorer_transition_navigation_and_latest_transitions) {
+  ExplorerFixture fx;
+  ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+  clear_runtime_caches();
+
+  const auto page = handle_request(cfg, make_http_get("/transition/7"));
+  ASSERT_EQ(page.status, 200);
+  ASSERT_TRUE(page.body.find("href=\"/transition/6\"") != std::string::npos);
+  ASSERT_TRUE(page.body.find("href=\"/transition/8\"") != std::string::npos);
+  ASSERT_TRUE(page.body.find("href=\"/transition/" + hex_encode32(zero_hash()) + "\"") != std::string::npos);
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Latest Transitions") != std::string::npos);
+  ASSERT_TRUE(home.body.find("href=\"/transition/7\"") != std::string::npos);
+}
+
+TEST(test_explorer_transition_next_link_hidden_at_tip) {
+  ExplorerFixture fx;
+  fx.transition = make_test_transition(10);
+  fx.transition_hash = hex_encode32(fx.transition.transition_id());
+  ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+  clear_runtime_caches();
+
+  const auto page = handle_request(cfg, make_http_get("/transition/" + fx.transition_hash));
+  ASSERT_EQ(page.status, 200);
+  ASSERT_TRUE(page.body.find("href=\"/transition/9\"") != std::string::npos);
+  ASSERT_TRUE(page.body.find("href=\"/transition/11\"") == std::string::npos);
+}
+
 TEST(test_explorer_homepage_no_stale_banner_for_never_loaded_committee) {
   ExplorerFixture fx;
   ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
