@@ -532,6 +532,11 @@ TEST(test_explorer_api_contract_headers_for_v1_and_legacy_routes) {
   ASSERT_EQ(*response_header(legacy_status, "Sunset"), "Wed, 31 Dec 2026 23:59:59 GMT");
   ASSERT_TRUE(response_header(legacy_status, "Link").has_value());
   ASSERT_EQ(*response_header(legacy_status, "Link"), "</api/v1/status>; rel=\"successor-version\"");
+
+  ASSERT_EQ(response_header(v1_status, "Access-Control-Allow-Origin").value_or(""), "*");
+  ASSERT_EQ(response_header(legacy_status, "Access-Control-Allow-Origin").value_or(""), "*");
+  const auto page = handle_request(cfg, make_http_get("/"));
+  ASSERT_TRUE(!response_header(page, "Access-Control-Allow-Origin").has_value());
 }
 
 TEST(test_explorer_api_v1_method_policy_and_error_envelope_conformance) {
