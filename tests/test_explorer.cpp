@@ -439,7 +439,8 @@ TEST(test_explorer_tx_page_makes_credit_decision_explicit) {
   ASSERT_TRUE(tx_page.body.find("Safe to credit") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("FINALIZED (CREDIT SAFE)") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("Credit Safe</div><div>YES") != std::string::npos);
-  ASSERT_TRUE(tx_page.body.find("Explorer data source: <strong>fresh finalized RPC</strong>") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("<div>Data Source</div><div>fresh finalized RPC</div>") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("Explorer data source:") == std::string::npos);
   ASSERT_TRUE(tx_page.body.find("confirm") == std::string::npos);
 }
 
@@ -1698,7 +1699,7 @@ TEST(test_explorer_root_page_recent_tx_empty_state_is_explicit) {
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
   ASSERT_TRUE(home.body.find("Finalized Transactions") != std::string::npos);
-  ASSERT_TRUE(home.body.find("No finalized transactions were found in the recent finalized-height scan window.") != std::string::npos);
+  ASSERT_TRUE(home.body.find("No transactions in the last 4096 transitions.") != std::string::npos);
 }
 
 TEST(test_explorer_root_page_committee_empty_state_is_explicit) {
@@ -1724,8 +1725,7 @@ TEST(test_explorer_root_page_availability_enforcement_empty_state_is_explicit) {
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
   ASSERT_TRUE(home.body.find("Operator View") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Committee composition, Ticket PoW, and availability mechanics live on the dedicated committee page.") !=
-              std::string::npos);
+  ASSERT_TRUE(home.body.find("Operator View: node status, committee and API") != std::string::npos);
 
   const auto committee = handle_request(cfg, make_http_get("/committee"));
   ASSERT_EQ(committee.status, 200);
@@ -2190,6 +2190,85 @@ TEST(test_explorer_tx_page_and_json_surface_decoded_onboarding_registration_fiel
   ASSERT_TRUE(tx_page.find(short_hex(hex_encode(Bytes(validator.public_key.begin(), validator.public_key.end())))) != std::string::npos);
 }
 
+TEST(test_explorer_transition_navigation_and_latest_transitions) {
+  ExplorerFixture fx;
+  ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+  clear_runtime_caches();
+
+  const auto page = handle_request(cfg, make_http_get("/transition/7"));
+  ASSERT_EQ(page.status, 200);
+  ASSERT_TRUE(page.body.find("href=\"/transition/6\"") != std::string::npos);
+  ASSERT_TRUE(page.body.find("href=\"/transition/8\"") != std::string::npos);
+  ASSERT_TRUE(page.body.find("href=\"/transition/" + hex_encode32(zero_hash()) + "\"") != std::string::npos);
+
+  const auto home = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(home.status, 200);
+  ASSERT_TRUE(home.body.find("Latest Transitions") != std::string::npos);
+  ASSERT_TRUE(home.body.find("href=\"/transition/7\"") != std::string::npos);
+}
+
+TEST(test_explorer_transition_next_link_hidden_at_tip) {
+  ExplorerFixture fx;
+  fx.transition = make_test_transition(10);
+  fx.transition_hash = hex_encode32(fx.transition.transition_id());
+  ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+  clear_runtime_caches();
+
+  const auto page = handle_request(cfg, make_http_get("/transition/" + fx.transition_hash));
+  ASSERT_EQ(page.status, 200);
+  ASSERT_TRUE(page.body.find("href=\"/transition/9\"") != std::string::npos);
+  ASSERT_TRUE(page.body.find("href=\"/transition/11\"") == std::string::npos);
+}
+
+TEST(test_explorer_payment_with_change_names_external_recipient_and_counts_as_sent) {
+  // The sender sorts first, so picking the alphabetically first output address would name the change.
+  const std::string sender = "sc1aaaa";
+  const std::string payee = "sc1zzzz";
+  std::vector<TxInputResult> inputs(1);
+  inputs[0].address = sender;
+  inputs[0].amount = 1000;
+  std::vector<TxOutputResult> outputs(2);
+  outputs[0].address = sender;
+  outputs[0].amount = 890;
+  outputs[1].address = payee;
+  outputs[1].amount = 100;
+
+  const auto flow = classify_tx_flow(inputs, outputs);
+  ASSERT_EQ(flow.kind, std::string("transfer-with-change"));
+  ASSERT_EQ(*flow.primary_sender, sender);
+  ASSERT_EQ(*flow.primary_recipient, payee);
+
+  TxResult tx;
+  tx.txid = std::string(64, 'a');
+  tx.inputs = inputs;
+  tx.outputs = outputs;
+  const auto item = classify_address_history_item(sender, tx);
+  ASSERT_EQ(item.direction, std::string("sent"));
+  ASSERT_EQ(item.net_amount, static_cast<std::int64_t>(-110));
+
+  TxResult self_tx = tx;
+  self_tx.outputs.resize(1);
+  ASSERT_EQ(classify_address_history_item(sender, self_tx).direction, std::string("self-transfer"));
+}
+
+TEST(test_explorer_homepage_no_stale_banner_for_never_loaded_committee) {
+  ExplorerFixture fx;
+  ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  Config cfg = test_config();
+  const auto temp_path = unique_test_cache_path("finalis-explorer-never-loaded-cache-test");
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+  clear_runtime_caches();
+
+  const auto home = render_root(cfg);
+  ASSERT_TRUE(persisted_committee_refreshed_unix_ms() == std::nullopt);
+  ASSERT_TRUE(home.find("Snapshot Freshness Warning") == std::string::npos);
+  std::filesystem::remove(temp_path, ec);
+}
+
 TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
   ExplorerFixture fx;
   Config cfg = test_config();
@@ -2210,10 +2289,10 @@ TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
     ScopedRpcHook rpc([&](const std::string&) { return rpc_error(-32000, "rpc should not be used"); });
     load_persisted_explorer_snapshot(cfg);
     const auto home = render_root(cfg);
-    ASSERT_TRUE(home.find("Status Snapshot Refreshed") != std::string::npos);
-    ASSERT_TRUE(home.find("Recent transactions snapshot refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(home.find("<div>Status Refreshed</div>") != std::string::npos);
+    ASSERT_TRUE(home.find("Flow labels are inferred from inputs and outputs, not ownership proofs. Refreshed ") != std::string::npos);
     const auto committee = render_committee(cfg);
-    ASSERT_TRUE(committee.find("Committee snapshot refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(committee.find("Committee snapshot refreshed ") != std::string::npos);
   }
 
   std::filesystem::remove(temp_path, ec);

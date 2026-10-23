@@ -467,6 +467,8 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
     bool fee_known = true;
     std::set<std::string> input_addresses;
     std::set<std::string> output_addresses;
+    std::vector<std::string> input_order;
+    std::vector<std::string> output_order;
 
     for (const auto& input : tx->inputs) {
       const auto prev_tx = load_tx(input.prev_txid);
@@ -477,14 +479,14 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
       const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
       total_in += prev_out.value;
       if (auto addr = p2pkh_script_to_address(prev_out.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
-        input_addresses.insert(*addr);
+        if (input_addresses.insert(*addr).second) input_order.push_back(*addr);
       }
     }
 
     for (const auto& output : tx->outputs) {
       row.total_out += output.value;
       if (auto addr = p2pkh_script_to_address(output.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
-        output_addresses.insert(*addr);
+        if (output_addresses.insert(*addr).second) output_order.push_back(*addr);
         row.recipients.push_back(*addr);
       }
     }
@@ -494,8 +496,15 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
       row.fee = total_in - row.total_out;
     }
 
-    if (!input_addresses.empty()) row.primary_sender = *input_addresses.begin();
-    if (!output_addresses.empty()) row.primary_recipient = *output_addresses.begin();
+    // Primary sender/recipient follow transaction order; the recipient skips change back to a sender.
+    if (!input_order.empty()) row.primary_sender = input_order.front();
+    for (const auto& address : output_order) {
+      if (input_addresses.count(address) == 0) {
+        row.primary_recipient = address;
+        break;
+      }
+    }
+    if (!row.primary_recipient.has_value() && !output_order.empty()) row.primary_recipient = output_order.front();
     row.recipient_count = output_addresses.size();
 
     const bool same_party = !input_addresses.empty() && !output_addresses.empty() && input_addresses == output_addresses;
@@ -638,9 +647,18 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
       row.net_amount = -static_cast<std::int64_t>(debited);
       row.detail = "Finalized spend from this address with no decoded return output";
     } else if (debited > 0 && credited > 0) {
-      row.direction = "self-transfer";
+      // Any output to another script (a confidential one included) means value left: a send with change.
+      const bool pays_elsewhere = std::any_of(tx->outputs.begin(), tx->outputs.end(), [&](const TxOut& output) {
+        return crypto::sha256(output.script_pubkey) != scripthash;
+      });
       row.net_amount = static_cast<std::int64_t>(credited) - static_cast<std::int64_t>(debited);
-      row.detail = "This address appears on both finalized inputs and outputs";
+      if (pays_elsewhere) {
+        row.direction = "sent";
+        row.detail = "Spend from this address with change returned to it";
+      } else {
+        row.direction = "self-transfer";
+        row.detail = "All outputs return to this address";
+      }
     } else {
       row.direction = "related";
       row.detail = "Address is present in finalized history but could not be classified precisely";
@@ -2905,7 +2923,8 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
 
   if (*method == "get_recent_tx_summaries") {
     const std::uint64_t limit = field_u64(params, "limit").value_or(8);
-    const std::uint64_t depth_window = field_u64(params, "depth_window").value_or(32);
+    // Clamped: on a quiet chain the scan walks the whole window.
+    const std::uint64_t depth_window = std::min<std::uint64_t>(field_u64(params, "depth_window").value_or(32), 4096);
     if (limit == 0) return make_result(id, "{\"items\":[]}");
     return make_result(id, tx_summaries_json(build_recent_tx_summary_rows(
                                *view, cfg_.network, static_cast<std::size_t>(limit), depth_window)));

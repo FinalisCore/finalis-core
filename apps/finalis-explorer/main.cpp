@@ -433,6 +433,10 @@ constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
 constexpr std::size_t kPersistedTxIndexLimit = 128;
 constexpr std::size_t kPersistedTransitionIndexLimit = 128;
+constexpr std::uint64_t kHomeLatestTransitions = 10;
+// The lightserver scans its local DB (and clamps to 4096); the per-height RPC fallback stays shallow.
+constexpr std::uint64_t kRecentTxDepthWindow = 4096;
+constexpr std::uint64_t kRecentTxFallbackDepthWindow = 32;
 constexpr std::size_t kPersistedPartnerEventsLimit = 2048;
 constexpr std::size_t kPersistedPartnerWebhookQueueLimit = 2048;
 constexpr std::size_t kPersistedPartnerIdempotencyLimit = 200000;
@@ -584,6 +588,7 @@ std::string default_explorer_cache_path(const std::string& rpc_url) {
 }
 
 std::string format_timestamp(std::uint64_t ts);
+std::string format_age(std::uint64_t ts_unix);
 std::uint64_t now_unix_ms();
 
 struct TxSummaryBatchItem {
@@ -1006,6 +1011,8 @@ std::string summarize_flow_mix(const std::map<std::string, std::size_t>& flow_mi
   return oss.str();
 }
 
+std::string format_timestamp_ms(std::uint64_t ms) { return format_timestamp(ms / 1000); }
+
 std::string explorer_data_source_label(const std::string& source) {
   if (source == "cache_finalized_snapshot") return "cached finalized snapshot";
   if (source == "rpc_live_finalized") return "fresh finalized RPC";
@@ -1015,12 +1022,19 @@ std::string explorer_data_source_label(const std::string& source) {
 std::string explorer_data_freshness_note(const std::string& source, const std::optional<std::uint64_t>& refreshed_unix_ms) {
   if (source != "cache_finalized_snapshot") return {};
   if (!refreshed_unix_ms.has_value()) return "Last refreshed from RPC: unknown";
-  return "Last refreshed from RPC: " + format_timestamp(*refreshed_unix_ms);
+  return "Last refreshed from RPC: " + format_timestamp_ms(*refreshed_unix_ms);
+}
+
+std::string explorer_cached_source_note(const std::string& source, const std::optional<std::uint64_t>& refreshed_unix_ms) {
+  const auto freshness = explorer_data_freshness_note(source, refreshed_unix_ms);
+  if (freshness.empty()) return {};
+  return "<div class=\"note\">Explorer data source: <strong>" + html_escape(explorer_data_source_label(source)) + "</strong>. " +
+         html_escape(freshness) + ".</div>";
 }
 
 std::string explorer_snapshot_freshness_text(const std::optional<std::uint64_t>& refreshed_unix_ms) {
   if (!refreshed_unix_ms.has_value()) return "unknown";
-  return format_timestamp(*refreshed_unix_ms);
+  return format_timestamp_ms(*refreshed_unix_ms);
 }
 
 std::optional<std::uint64_t> persisted_status_refreshed_unix_ms() {
@@ -1064,7 +1078,8 @@ void set_surface_state(SurfaceRuntimeState& state, std::optional<std::string> er
 }
 
 bool surface_is_stale(const std::optional<std::uint64_t>& refreshed_unix_ms) {
-  if (!refreshed_unix_ms.has_value()) return true;
+  // A surface no page has requested yet is not stale; RPC failures are reported separately.
+  if (!refreshed_unix_ms.has_value()) return false;
   const auto now_ms = now_unix_ms();
   return now_ms > *refreshed_unix_ms && (now_ms - *refreshed_unix_ms) > kExplorerSurfaceStaleThresholdMs;
 }
@@ -1311,16 +1326,29 @@ struct FlowClassification {
 FlowClassification classify_tx_flow(const std::vector<TxInputResult>& inputs, const std::vector<TxOutputResult>& outputs) {
   std::set<std::string> input_addresses;
   std::set<std::string> output_addresses;
+  std::vector<std::string> input_order;
+  std::vector<std::string> output_order;
   for (const auto& input : inputs) {
-    if (input.address.has_value() && !input.address->empty()) input_addresses.insert(*input.address);
+    if (input.address.has_value() && !input.address->empty() && input_addresses.insert(*input.address).second) {
+      input_order.push_back(*input.address);
+    }
   }
   for (const auto& output : outputs) {
-    if (output.address.has_value() && !output.address->empty()) output_addresses.insert(*output.address);
+    if (output.address.has_value() && !output.address->empty() && output_addresses.insert(*output.address).second) {
+      output_order.push_back(*output.address);
+    }
   }
 
   FlowClassification flow;
-  if (!input_addresses.empty()) flow.primary_sender = *input_addresses.begin();
-  if (!output_addresses.empty()) flow.primary_recipient = *output_addresses.begin();
+  // Primary sender/recipient follow transaction order; the recipient skips change back to a sender.
+  if (!input_order.empty()) flow.primary_sender = input_order.front();
+  for (const auto& address : output_order) {
+    if (input_addresses.count(address) == 0) {
+      flow.primary_recipient = address;
+      break;
+    }
+  }
+  if (!flow.primary_recipient.has_value() && !output_order.empty()) flow.primary_recipient = output_order.front();
   flow.participant_count = input_addresses.size() + output_addresses.size();
 
   const bool same_party = !input_addresses.empty() && !output_addresses.empty() && input_addresses == output_addresses;
@@ -1379,9 +1407,17 @@ AddressHistoryItemResult classify_address_history_item(const std::string& addres
     item.net_amount = -static_cast<std::int64_t>(debited);
     item.detail = "Finalized spend from this address with no decoded return output";
   } else if (debited > 0 && credited > 0) {
-    item.direction = "self-transfer";
+    const bool pays_elsewhere = std::any_of(tx.outputs.begin(), tx.outputs.end(), [&](const TxOutputResult& output) {
+      return !output.address.has_value() || *output.address != address;
+    });
     item.net_amount = static_cast<std::int64_t>(credited) - static_cast<std::int64_t>(debited);
-    item.detail = "This address appears on both finalized inputs and outputs";
+    if (pays_elsewhere) {
+      item.direction = "sent";
+      item.detail = "Spend from this address with change returned to it";
+    } else {
+      item.direction = "self-transfer";
+      item.detail = "All outputs return to this address";
+    }
   } else {
     item.direction = "related";
     item.net_amount = 0;
@@ -1391,7 +1427,7 @@ AddressHistoryItemResult classify_address_history_item(const std::string& addres
 }
 
 std::string global_finalized_banner() {
-  return "<div class=\"global-banner\">Explorer view is finalized-state only. Only finalized activity is shown.</div>";
+  return "<div class=\"global-banner\">Only finalized chain state is shown: no mempool or pending activity.</div>";
 }
 
 std::string top_nav(const std::string& active) {
@@ -1403,9 +1439,9 @@ std::string top_nav(const std::string& active) {
   oss << "<div class=\"top-nav\">"
       << item("Overview", "/", "overview")
       << item("Committee", "/committee", "committee")
-      << item("Tx", "/tx/", "tx")
-      << item("Transition", "/transition/", "transition")
-      << item("Address", "/address/", "address")
+      << "<form class=\"nav-search\" method=\"GET\" action=\"/search\">"
+      << "<input type=\"search\" name=\"q\" placeholder=\"txid, height, hash, or address\" aria-label=\"Search\">"
+      << "<button type=\"submit\" class=\"copy-button\">Search</button></form>"
       << "</div>";
   return oss.str();
 }
@@ -1416,23 +1452,26 @@ std::string page_layout(const std::string& title, const std::string& body, const
       << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
       << "<title>" << html_escape(title) << "</title>"
       << "<style>"
-         "body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:radial-gradient(circle at top,#f8f1dc 0%,#f5f5f2 28%,#f1f1ed 100%);color:#171717;margin:0;padding:clamp(14px,2vw,26px);}"
+         "html{min-height:100%;background:radial-gradient(circle at top,#f8f1dc 0%,#f5f5f2 28%,#f1f1ed 100%) no-repeat #f1f1ed;}"
+         "body{font-family:system-ui,-apple-system,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial,sans-serif;font-size:15px;line-height:1.5;color:#171717;margin:0;padding:clamp(14px,2vw,26px);-webkit-font-smoothing:antialiased;}"
+         "code,.mono,.mono-block{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}"
+         "input{box-sizing:border-box;max-width:100%;}"
          "main{max-width:1160px;width:min(100%,1160px);margin:0 auto;}"
          "a{color:#0f4c81;text-decoration:none;}a:hover{text-decoration:underline;}"
-         "h1,h2{margin:0 0 12px 0;}h1{font-size:34px;line-height:1.05;letter-spacing:-.02em;}h2{font-size:20px;margin-top:30px;}"
-         ".muted{color:#5b5b5b;line-height:1.45;}"
+         "h1,h2{margin:0 0 12px 0;font-weight:700;}h1{font-size:32px;line-height:1.1;letter-spacing:-.02em;}h2{font-size:19px;letter-spacing:-.01em;}"
+         ".muted{color:#555;line-height:1.45;}"
          ".card{background:rgba(255,255,255,.88);backdrop-filter:blur(6px);border:1px solid #ddd9cd;border-radius:18px;padding:18px 20px;margin:18px 0;box-shadow:0 12px 30px rgba(56,48,30,.06);}"
          ".hero-card{padding:22px 24px;background:linear-gradient(180deg,#fffdf5 0%,#fff 100%);}"
          ".grid{display:grid;grid-template-columns:minmax(180px,260px) minmax(0,1fr);gap:10px 16px;align-items:start;}"
-         ".grid>div:nth-child(odd){color:#5b5b5b;font-size:13px;text-transform:uppercase;letter-spacing:.05em;}"
+         ".grid>div:nth-child(odd){color:#4a4a4a;font-size:13px;font-weight:600;}"
          ".grid>div:nth-child(even){font-size:15px;line-height:1.45;}"
-         ".badge{display:inline-block;padding:10px 16px;border-radius:999px;font-size:16px;font-weight:800;letter-spacing:.08em;max-width:100%;white-space:normal;text-align:center;overflow-wrap:anywhere;}"
+         ".badge{display:inline-block;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:700;letter-spacing:.06em;max-width:100%;white-space:normal;text-align:center;overflow-wrap:anywhere;}"
          ".badge-finalized{background:#d9f0d8;color:#124b19;border:2px solid #5ba55e;box-shadow:0 0 0 2px rgba(91,165,94,.12) inset;}"
          ".badge-unfinalized{background:#f6e2d8;color:#8a3110;border:2px solid #c56742;box-shadow:0 0 0 2px rgba(197,103,66,.12) inset;}"
          ".table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}"
          "table{width:100%;border-collapse:collapse;font-size:14px;min-width:620px;}th,td{padding:10px 10px;border-bottom:1px solid #e7e2d8;text-align:left;vertical-align:top;overflow-wrap:anywhere;word-break:break-word;}"
-         "th{color:#4f4f4f;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.05em;}code{font-size:13px;overflow-wrap:anywhere;word-break:break-word;}"
-         ".num{text-align:right;white-space:nowrap;}"
+         "th{color:#3f3f3f;font-weight:600;font-size:13px;}code{font-size:13px;overflow-wrap:anywhere;word-break:break-word;}"
+         ".num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}"
          ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}"
          ".mono-block{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;max-width:100%;padding:10px 12px;background:#faf9f3;border:1px solid #e6e0d4;border-radius:10px;overflow-wrap:anywhere;word-break:break-word;}"
          ".mono-block code{flex:1 1 auto;min-width:0;white-space:pre-wrap;}"
@@ -1443,7 +1482,7 @@ std::string page_layout(const std::string& title, const std::string& body, const
          ".amount-out{color:#b02b2b;font-weight:700;}"
          ".value-cell{min-width:0;overflow-wrap:anywhere;word-break:break-word;}"
          "ul{padding-left:18px;} .note{padding:13px 15px;background:#f7f4eb;border-left:4px solid #8a8a80;border-radius:10px;line-height:1.45;}"
-         ".nav{margin-bottom:14px;font-size:14px;}"
+         ".nav{margin-bottom:14px;font-size:17px;font-weight:700;letter-spacing:-.01em;}.nav a{color:#171717;}"
          ".global-banner{margin:0 0 18px 0;padding:13px 15px;background:#fff3d6;border:1px solid #d8b96a;border-radius:12px;color:#5e4300;font-weight:700;box-shadow:0 6px 18px rgba(126,93,9,.06);}"
          ".status-hero{display:flex;justify-content:space-between;gap:18px;align-items:center;flex-wrap:wrap;}"
          ".status-hero>div{min-width:0;}"
@@ -1460,23 +1499,30 @@ std::string page_layout(const std::string& title, const std::string& body, const
          ".weight-flow{white-space:nowrap;}"
          ".hero-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:16px;}"
          ".metric-card{padding:14px 16px;border-radius:14px;background:linear-gradient(180deg,#fffdfa 0%,#f7f2e6 100%);border:1px solid #e7ddc6;}"
-         ".metric-card .label{display:block;color:#6e644d;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;}"
-         ".metric-card .value{display:block;font-size:22px;font-weight:800;line-height:1.1;}"
-         ".metric-card .sub{display:block;margin-top:6px;color:#5b5b5b;line-height:1.4;}"
-         ".top-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px 0;}"
-         ".top-tab{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.72);border:1px solid #e4dbc4;color:#5d522f;text-decoration:none;font-size:13px;font-weight:700;letter-spacing:.03em;}"
+         ".metric-card .label{display:block;color:#4f4635;font-size:13px;font-weight:600;margin-bottom:6px;}"
+         ".metric-card .value{display:block;font-size:24px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}"
+         ".metric-card .sub{display:block;margin-top:6px;color:#555;font-size:13px;line-height:1.4;overflow-wrap:anywhere;}"
+         ".top-nav{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px 0;}"
+         ".top-tab{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.72);border:1px solid #e4dbc4;color:#5d522f;text-decoration:none;font-size:14px;font-weight:600;}"
+         ".nav-search{display:flex;gap:8px;flex:1 1 280px;min-width:0;margin-left:auto;max-width:460px;}"
+         ".nav-search input{flex:1 1 auto;min-width:0;padding:7px 12px;font:inherit;font-size:13px;border:1px solid #e4dbc4;border-radius:999px;background:rgba(255,255,255,.85);}"
          ".top-tab:hover{background:#fff7e3;text-decoration:none;}"
          ".top-tab-active{background:#f1e3b7;border-color:#caa752;color:#3f300c;box-shadow:0 6px 18px rgba(126,93,9,.08);}"
-         ".status-chip{display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;}"
+         ".status-chip{display:inline-flex;align-items:center;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;}"
          ".status-chip-good{background:#e4f5df;color:#1c5c20;border:1px solid #89c28b;}"
          ".status-chip-warn{background:#fff1d8;color:#7b4c06;border:1px solid #dfb267;}"
          ".status-chip-muted{background:#eceae3;color:#5d5b52;border:1px solid #d7d2c7;}"
          "details.disclosure{margin-top:14px;border-top:1px solid #ebe4d4;padding-top:12px;}"
          "details.disclosure summary{cursor:pointer;font-weight:700;color:#5d522f;}"
          "details.disclosure[open] summary{margin-bottom:10px;}"
+         ".pager{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:-4px 0 4px 0;}"
+         ".pager-current{font-weight:600;color:#4a4a4a;padding:0 4px;}"
+         "table.table-compact{min-width:0;}table.table-compact th,table.table-compact td{white-space:nowrap;}"
+         ".meta{margin:8px 0 0 0;color:#555;font-size:13px;line-height:1.45;}"
+         "details.disclosure-plain{margin-top:0;border-top:0;padding-top:0;}"
          ".soft-empty{padding:16px 18px;border-radius:14px;background:linear-gradient(180deg,#fbfaf5 0%,#f4f1e7 100%);border:1px dashed #d6cdaa;color:#5a5342;}"
-         "@media (max-width:780px){h1{font-size:26px;}.grid{grid-template-columns:1fr;}.card{padding:15px 16px;}.badge{font-size:14px;padding:8px 12px;}.mono-block{flex-direction:column;}.copy-button{align-self:flex-start;}}"
-         "@media (max-width:560px){body{padding:12px;}table{min-width:460px;font-size:13px;}th,td{padding:7px 8px;}}"
+         "@media (max-width:780px){h1{font-size:26px;}.grid{grid-template-columns:1fr;}.card{padding:15px 16px;}.badge{font-size:12px;padding:5px 12px;}.mono-block{flex-direction:column;}.copy-button{align-self:flex-start;}}"
+         "@media (max-width:560px){body{padding:12px;}.hide-sm{display:none;}.hero-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;}.metric-card{padding:12px;}.metric-card .value{font-size:19px;}table{min-width:460px;font-size:13px;}th,td{padding:7px 8px;}}"
       << "</style><script>"
          "function copyText(btn){"
          "const value=btn.getAttribute('data-copy')||'';"
@@ -2851,8 +2897,7 @@ std::string render_root(const Config& cfg) {
   const auto recent = fetch_recent_tx_results(cfg, 8);
   const auto recent_refreshed_unix_ms = persisted_recent_refreshed_unix_ms();
   body << build_surface_stale_banner();
-  body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>"
-       << "<div class=\"note\">Finalized-state explorer for operators, wallets, and exchanges. It intentionally shows only finalized chain state and hides mempool ambiguity.</div>";
+  body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>";
   if (status.value.has_value()) {
     body << "<div class=\"hero-metrics\">"
          << "<div class=\"metric-card\"><span class=\"label\">Finalized Tip</span><span class=\"value\">" << status.value->finalized_height
@@ -2868,51 +2913,31 @@ std::string render_root(const Config& cfg) {
          << "</div>";
   }
   body << "</div>";
-  body << "<div class=\"card\"><h2>Search</h2><form method=\"GET\" action=\"/search\">"
-       << "<input type=\"text\" name=\"q\" placeholder=\"txid, transition height/hash, or address\" "
-       << "style=\"width:min(100%,720px);padding:10px 12px;font:inherit;border:1px solid #cfcfc6;border-radius:8px;\"> "
-       << "<button type=\"submit\" class=\"copy-button\">Search</button></form></div>";
-  body << "<div class=\"card\"><div class=\"status-hero\"><div><h2>Backend</h2></div>";
-  body << "</div><div class=\"grid\">";
-  body << "<div>Lightserver RPC</div><div class=\"value-cell\">" << mono_value(cfg.rpc_url) << "</div>";
   if (status.value.has_value()) {
-    body << "<div>Runtime Status</div><div>" << status_chip(sync_summary_text(*status.value), tone_for_sync(*status.value)) << " "
-         << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
-         << "<div>Status Snapshot Refreshed</div><div>" << html_escape(explorer_snapshot_freshness_text(status_refreshed_unix_ms)) << "</div>"
-         << "<div>Network</div><div>" << html_escape(status.value->network) << "</div>"
-         << "<div>Finalized Tip</div><div class=\"value-cell\">" << link_transition_height(status.value->finalized_height) << " <code>" << html_escape(short_hex(status.value->finalized_transition_hash))
-         << "</code> " << finalized_badge(true) << "</div>"
-         << "<div>Version</div><div>" << html_escape(status.value->backend_version) << "</div>"
-         << "<div>Peers</div><div>healthy=" << status.value->healthy_peer_count << ", established=" << status.value->established_peer_count << "</div>"
-         << "<div>Finality Committee</div><div>size=" << status.value->latest_finality_committee_size
-         << ", quorum=" << status.value->latest_finality_quorum_threshold << "</div>";
-  } else {
-    body << "<div>Status</div><div class=\"muted\">Unavailable: " << html_escape(status.error->message) << "</div>";
-  }
-  body << "</div>";
-  if (status.value.has_value()) {
-    body << "<details class=\"disclosure\"><summary>Show backend internals</summary><div class=\"grid\">"
-         << "<div>Network ID</div><div class=\"value-cell\">" << mono_value(status.value->network_id) << "</div>"
-         << "<div>Genesis Hash</div><div class=\"value-cell\">" << mono_value(status.value->genesis_hash) << "</div>"
-         << "<div>Wallet API</div><div>" << html_escape(status.value->wallet_api_version) << "</div>"
-         << "<div>Sync Detail</div><div>" << html_escape(sync_summary_text(*status.value)) << "</div>"
-         << "</div></details>";
-  }
-  body << "</div>";
-  if (status.value.has_value()) {
-    body << "<div class=\"card\"><h2>Operator View</h2>"
-         << "<div class=\"note\">The homepage stays focused on finalized chain state and recent activity. Committee composition, Ticket PoW, and availability mechanics live on the dedicated committee page.</div>"
-         << "<div class=\"summary-actions\">"
-         << "<a class=\"copy-button\" href=\"/committee\">Open Committee View</a>"
-         << "<a class=\"copy-button\" href=\"/api/committee\">Open Committee API</a>"
-         << copy_action("Copy Status API Path", "/api/status")
-         << "</div></div>";
+    const auto tip = status.value->finalized_height;
+    body << "<div class=\"card\"><h2>Latest Transitions</h2><div class=\"table-wrap\"><table class=\"table-compact\"><thead><tr>"
+         << "<th>Height</th><th class=\"hide-sm\">Hash</th><th>Age</th><th class=\"num\">Txs</th></tr></thead><tbody>";
+    std::size_t rows = 0;
+    for (std::uint64_t i = 0; i < kHomeLatestTransitions && i <= tip; ++i) {
+      const auto t = fetch_transition_result(cfg, std::to_string(tip - i));
+      if (!t.value.has_value()) continue;
+      ++rows;
+      body << "<tr><td>" << link_transition_height(t.value->height) << "</td><td class=\"hide-sm\"><a href=\"/transition/" << t.value->height
+           << "\"><code>" << html_escape(short_hex(t.value->hash)) << "</code></a></td><td";
+      if (t.value->timestamp.has_value()) {
+        body << " title=\"" << html_escape(format_timestamp(*t.value->timestamp)) << "\">" << html_escape(format_age(*t.value->timestamp));
+      } else {
+        body << " class=\"muted\">n/a";
+      }
+      body << "</td><td class=\"num\">" << t.value->tx_count << "</td></tr>";
+    }
+    if (rows == 0) body << "<tr><td colspan=\"4\" class=\"muted\">Transitions unavailable.</td></tr>";
+    body << "</tbody></table></div></div>";
   }
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
-    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>"
-         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
-         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
+    body << "<p class=\"meta\">Flow labels are inferred from inputs and outputs, not ownership proofs. Refreshed "
+         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << ".</p>";
     body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>Flow</th><th>From</th><th>To</th><th>Finalized Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
     for (const auto& item : recent) {
       body << "<tr><td>" << link_tx(item.txid) << "</td><td>"
@@ -2953,17 +2978,35 @@ std::string render_root(const Config& cfg) {
     }
     body << "</tbody></table></div>";
   } else {
-    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. This usually means the latest finalized transitions carried no user transactions, not that explorer indexing is broken.</div>"
-         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
-         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
+    body << "<div class=\"soft-empty\">No transactions in the last " << kRecentTxDepthWindow << " transitions.</div>"
+         << "<p class=\"meta\">Refreshed " << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << ".</p>";
   }
   body << "</div>";
-  body << "<div class=\"card\"><h2>Routes</h2><ul>"
-       << "<li><code>/tx/&lt;txid&gt;</code></li>"
-       << "<li><code>/transition/&lt;height&gt;</code> or <code>/transition/&lt;hash&gt;</code></li>"
-       << "<li><code>/address/&lt;address&gt;</code></li>"
-       << "<li><code>/committee</code></li>"
-       << "</ul></div>";
+  body << "<div class=\"card\"><details class=\"disclosure disclosure-plain\"><summary>Operator View: node status, committee and API</summary>";
+  body << "<div class=\"grid\">";
+  if (status.value.has_value()) {
+    body << "<div>Runtime Status</div><div>" << status_chip(sync_summary_text(*status.value), tone_for_sync(*status.value)) << " "
+         << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
+         << "<div>Status Refreshed</div><div>" << html_escape(explorer_snapshot_freshness_text(status_refreshed_unix_ms)) << "</div>"
+         << "<div>Network</div><div>" << html_escape(status.value->network) << "</div>"
+         << "<div>Version</div><div>" << html_escape(status.value->backend_version) << "</div>"
+         << "<div>Peers</div><div>" << status.value->healthy_peer_count << " healthy, " << status.value->established_peer_count << " established</div>"
+         << "<div>Finality Committee</div><div>" << status.value->latest_finality_committee_size << (status.value->latest_finality_committee_size == 1 ? " member, quorum " : " members, quorum ")
+         << status.value->latest_finality_quorum_threshold << "</div>"
+         << "<div>Network ID</div><div class=\"value-cell\">" << mono_value(status.value->network_id) << "</div>"
+         << "<div>Genesis Hash</div><div class=\"value-cell\">" << mono_value(status.value->genesis_hash) << "</div>"
+         << "<div>Wallet API</div><div>" << html_escape(status.value->wallet_api_version) << "</div>"
+         << "<div>Sync Detail</div><div>" << html_escape(sync_summary_text(*status.value)) << "</div>";
+  } else {
+    body << "<div>Status</div><div class=\"muted\">Unavailable: " << html_escape(status.error->message) << "</div>";
+  }
+  body << "</div><div class=\"summary-actions\">"
+       << "<a class=\"copy-button\" href=\"/committee\">Open Committee View</a>"
+       << "<a class=\"copy-button\" href=\"/api/committee\">Open Committee API</a>"
+       << copy_action("Copy Status API Path", "/api/status")
+       << "</div><p class=\"meta\">Routes: <code>/tx/&lt;txid&gt;</code>, <code>/transition/&lt;height|hash&gt;</code>, "
+          "<code>/address/&lt;address&gt;</code>, <code>/committee</code>, <code>/api/...</code></p>"
+       << "</details></div>";
   return page_layout("Finalis Explorer", body.str(), "overview");
 }
 
@@ -2990,9 +3033,7 @@ std::string render_committee(const Config& cfg) {
        << render_summary_metric_card("Checkpoint Mode", committee.value->checkpoint_derivation_mode.value_or("n/a"),
                                      committee.value->checkpoint_fallback_reason.value_or("no fallback"))
        << "</div></div>";
-  body << "<div class=\"card\"><div class=\"note\">Committee snapshot refreshed from RPC: "
-       << html_escape(explorer_snapshot_freshness_text(committee_refreshed_unix_ms))
-       << "</div></div>";
+  body << "<p class=\"meta\">Committee snapshot refreshed " << html_escape(explorer_snapshot_freshness_text(committee_refreshed_unix_ms)) << ".</p>";
   body << "<div class=\"card\"><h2>" << html_escape(ticket_pow_title(*status.value)) << "</h2><div class=\"grid\">"
        << "<div>Difficulty</div><div>" << status.value->ticket_pow_difficulty << " <span class=\"muted\">(range "
        << status.value->ticket_pow_difficulty_min << "&ndash;" << status.value->ticket_pow_difficulty_max << ")</span></div>"
@@ -3007,7 +3048,6 @@ std::string render_committee(const Config& cfg) {
        << "</div></div>";
   body << "<div class=\"card\"><div class=\"note\">" << html_escape(ticket_pow_note(*status.value))
        << " Finality remains BFT/quorum-based."
-       << " This page is a finalized committee snapshot, not a live mempool or proposal view."
        << "</div></div>"
        << "<div class=\"card\"><div class=\"grid\">"
        << "<div>Finalized Height</div><div>" << link_transition_height(status.value->finalized_height) << "</div>"
@@ -3281,6 +3321,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
       result.hash = transition_hash_hex;
       result.prev_finalized_hash = finalis::hex_encode32(blk->prev_finalized_hash);
       result.round = blk->round;
+      if (blk->timestamp != 0) result.timestamp = blk->timestamp;
       result.tx_count = blk->next_frontier >= blk->prev_frontier
                             ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                             : 0;
@@ -3321,6 +3362,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
     result.hash = finalis::hex_encode32(blk->transition_id());
     result.prev_finalized_hash = finalis::hex_encode32(blk->prev_finalized_hash);
     result.round = blk->round;
+    if (blk->timestamp != 0) result.timestamp = blk->timestamp;
     result.tx_count = blk->next_frontier >= blk->prev_frontier
                           ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                           : 0;
@@ -3716,7 +3758,7 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
 
   std::vector<RecentTxResult> out;
   if (max_items == 0) return out;
-  const std::uint64_t depth_window = 32;
+  const std::uint64_t depth_window = kRecentTxDepthWindow;
   bool live_recent_rpc_ok = false;
   {
     std::ostringstream params;
@@ -3762,7 +3804,7 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
       return out;
     }
     const auto tip = status.value->finalized_height;
-    const std::uint64_t start_height = tip > depth_window ? tip - depth_window : 0;
+    const std::uint64_t start_height = tip > kRecentTxFallbackDepthWindow ? tip - kRecentTxFallbackDepthWindow : 0;
     std::vector<std::pair<std::string, std::uint64_t>> tx_refs;
     for (std::uint64_t h = tip + 1; h-- > start_height && out.size() < max_items;) {
       std::string err;
@@ -4250,10 +4292,15 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   const std::string payer = tx.primary_sender.has_value() ? short_hex(*tx.primary_sender) : std::string("unknown");
   std::string payee = tx.primary_recipient.has_value() ? short_hex(*tx.primary_recipient) : std::string("unknown");
   if (!tx.outputs.empty() && tx.outputs.size() > 1) {
-    std::size_t decoded_recipient_count = 0;
-    for (const auto& out : tx.outputs) {
-      if (out.address.has_value()) ++decoded_recipient_count;
+    std::set<std::string> senders;
+    for (const auto& in : tx.inputs) {
+      if (in.address.has_value()) senders.insert(*in.address);
     }
+    std::set<std::string> recipients;
+    for (const auto& out : tx.outputs) {
+      if (out.address.has_value() && senders.count(*out.address) == 0) recipients.insert(*out.address);
+    }
+    const std::size_t decoded_recipient_count = recipients.size();
     if (decoded_recipient_count > 1) payee += " +" + std::to_string(decoded_recipient_count - 1) + " more";
   }
 
@@ -4269,12 +4316,7 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>" << mono_value(tx.txid) << "</div><div>" << finalized_badge(tx.finalized) << " "
        << credit_safe_badge(tx.credit_safe) << "</div></div>"
        << "<div class=\"decision-line\">" << html_escape(credit_decision_text(tx.finalized, tx.credit_safe)) << "</div>"
-       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(tx.data_source))
-       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
-       << (explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
-               ? std::string()
-               : "<div class=\"note\">" + html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms)) + "</div>")
-       << "<div class=\"note\">Transaction view is finalized-state only. Relay acceptance, mempool state, and pre-finality observations are intentionally not shown here.</div>"
+       << explorer_cached_source_note(tx.data_source, tx.data_refreshed_unix_ms)
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Txid</div><div class=\"value-cell\">" << mono_value(tx.txid) << "</div>"
        << "<div>Flow Classification</div><div><strong>" << html_escape(tx.flow_kind) << "</strong><div class=\"muted\">"
@@ -4286,9 +4328,8 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>Snapshot Refreshed</div><div>"
        << html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
                           ? std::string("fresh live RPC")
-                          : format_timestamp(*tx.data_refreshed_unix_ms))
-       << "</div>"
-       << "<div>Finalized Only</div><div>yes</div>";
+                          : format_timestamp_ms(*tx.data_refreshed_unix_ms))
+       << "</div>";
   if (tx.finalized_height.has_value()) body << "<div>Finalized Height</div><div>" << link_transition_height(*tx.finalized_height) << "</div>";
   if (!tx.transition_hash.empty()) body << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(tx.transition_hash) << "</div>";
   if (tx.timestamp.has_value()) body << "<div>Timestamp</div><div>" << html_escape(format_timestamp(*tx.timestamp)) << "</div>";
@@ -4362,6 +4403,23 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   return page_layout("Transaction " + txid_hex, body.str(), "tx");
 }
 
+std::string format_age(std::uint64_t ts_unix) {
+  const std::uint64_t now = now_unix_ms() / 1000;
+  if (ts_unix >= now) return "just now";
+  const std::uint64_t d = now - ts_unix;
+  if (d < 60) return std::to_string(d) + "s ago";
+  if (d < 3600) return std::to_string(d / 60) + "m ago";
+  if (d < 86400) return std::to_string(d / 3600) + "h ago";
+  return std::to_string(d / 86400) + "d ago";
+}
+
+std::string linked_mono_value(const std::string& value, const std::string& href) {
+  const std::string escaped = html_escape(value);
+  return "<div class=\"mono-block\"><a href=\"" + html_escape(href) + "\"><code>" + escaped +
+         "</code></a><button class=\"copy-button\" type=\"button\" onclick=\"copyText(this)\" data-copy=\"" + escaped +
+         "\">Copy</button></div>";
+}
+
 std::string render_transition(const Config& cfg, const std::string& ident) {
   std::ostringstream body;
   body << "<h1>Transition</h1>";
@@ -4376,6 +4434,17 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   const std::string transition_api_path = "/api/transition/" + transition.hash;
   const auto summary = compute_transition_summary(cfg, transition);
   const auto flow_mix_text = summarize_flow_mix(summary.flow_mix);
+  const auto status = fetch_status_result(cfg);
+
+  body << "<div class=\"pager\">";
+  if (transition.height > 0) {
+    body << "<a class=\"top-tab\" href=\"/transition/" << (transition.height - 1) << "\">&larr; " << (transition.height - 1) << "</a>";
+  }
+  body << "<span class=\"pager-current\">Height " << transition.height << "</span>";
+  if (status.value.has_value() && transition.height < status.value->finalized_height) {
+    body << "<a class=\"top-tab\" href=\"/transition/" << (transition.height + 1) << "\">" << (transition.height + 1) << " &rarr;</a>";
+  }
+  body << "</div>";
 
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
        << render_summary_metric_card("Tx Count", std::to_string(transition.txids.size()), "finalized txids in this transition")
@@ -4386,26 +4455,24 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
 
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(transition.hash) << "</div><div>" << finalized_badge(true) << "</div></div>"
-       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(transition.data_source))
-       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
-       << (explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms).empty()
-               ? std::string()
-               : "<div class=\"note\">" +
-                     html_escape(explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms)) + "</div>")
-       << "<div class=\"note\">Transition view is finalized-only. It shows the finalized checkpoint contents for one height, not proposal-stage or unfinalized round activity.</div>"
+       << explorer_cached_source_note(transition.data_source, transition.data_refreshed_unix_ms)
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Height</div><div>" << transition.height << "</div>"
        << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(transition.hash) << "</div>"
-       << "<div>Prev Finalized Hash</div><div class=\"value-cell\">" << mono_value(transition.prev_finalized_hash)
+       << "<div>Prev Finalized Hash</div><div class=\"value-cell\">"
+       << (transition.height > 0 ? linked_mono_value(transition.prev_finalized_hash, "/transition/" + transition.prev_finalized_hash)
+                                 : mono_value(transition.prev_finalized_hash))
        << "</div>"
-       << "<div>Timestamp</div><div>"
-       << html_escape(transition.timestamp.has_value() ? format_timestamp(*transition.timestamp) : std::string("not carried in finalized transition record")) << "</div>"
+       << (transition.timestamp.has_value()
+               ? "<div>Timestamp</div><div>" + html_escape(format_timestamp(*transition.timestamp)) + " <span class=\"muted\">" +
+                     html_escape(format_age(*transition.timestamp)) + "</span></div>"
+               : std::string())
        << "<div>Round</div><div>" << transition.round << "</div>"
        << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(transition.data_source)) << "</div>"
        << "<div>Snapshot Refreshed</div><div>"
        << html_escape(explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms).empty()
                           ? std::string("fresh live RPC")
-                          : format_timestamp(*transition.data_refreshed_unix_ms))
+                          : format_timestamp_ms(*transition.data_refreshed_unix_ms))
        << "</div>"
        << "<div>Tx Count</div><div>" << transition.tx_count << "</div></div>"
        << "<div class=\"summary-actions\">"
@@ -4414,7 +4481,7 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
        << copy_action("Copy API Path", transition_api_path)
        << "</div></div>";
 
-  body << "<div class=\"card\"><h2>Transactions</h2><div class=\"note\">This list contains finalized transaction ids only. Per-output interpretation lives on the individual transaction page.</div><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Outputs</th></tr></thead><tbody>";
+  body << "<div class=\"card\"><h2>Transactions</h2><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Outputs</th></tr></thead><tbody>";
   for (std::size_t i = 0; i < transition.txids.size(); ++i) {
     body << "<tr><td>" << i << "</td><td>" << link_tx(transition.txids[i]) << "</td><td class=\"muted\">see tx page</td></tr>";
   }
@@ -4468,7 +4535,6 @@ std::string render_address(const Config& cfg, const std::string& addr, const std
        << "</div></div>";
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(addr) << "</div><div>" << finalized_badge(true) << "</div></div>"
-       << "<div class=\"note\">Address view is finalized-state only. It shows current finalized UTXOs plus a paginated finalized-history slice, not live mempool activity.</div>"
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Address</div><div class=\"value-cell\">" << mono_value(addr) << "</div>"
        << "<div>Finalized Activity</div><div>" << (address.found ? "yes" : "no") << "</div>"
@@ -4498,7 +4564,7 @@ std::string render_address(const Config& cfg, const std::string& addr, const std
   }
   body << "</tbody></table></div></div>";
 
-  body << "<div class=\"card\"><h2>Finalized History</h2><div class=\"note\">Each row is interpreted relative to this address only, using finalized inputs and outputs.</div><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Height</th><th>Direction</th><th>Net Amount</th><th>Detail</th></tr></thead><tbody>";
+  body << "<div class=\"card\"><h2>Finalized History</h2><p class=\"meta\">Amounts are relative to this address.</p><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Height</th><th>Direction</th><th>Net Amount</th><th>Detail</th></tr></thead><tbody>";
   if (!address.history.items.empty()) {
     for (std::size_t i = 0; i < address.history.items.size(); ++i) {
       const auto& item = address.history.items[i];
@@ -6122,6 +6188,7 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
                ? json_response(200, v1 ? append_api_v1(render_address_json(*result.value)) : render_address_json(*result.value))
                : json_error_response(*result.error);
   }
+  if (path == tx_prefix || path == transition_prefix || path == address_prefix) return redirect_response("/");
   if (path.rfind(transition_prefix, 0) == 0) {
     return html_response(200, render_transition(cfg, path.substr(transition_prefix.size())));
   }
