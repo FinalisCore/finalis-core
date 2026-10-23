@@ -1006,6 +1006,8 @@ std::string summarize_flow_mix(const std::map<std::string, std::size_t>& flow_mi
   return oss.str();
 }
 
+std::string format_timestamp_ms(std::uint64_t ms) { return format_timestamp(ms / 1000); }
+
 std::string explorer_data_source_label(const std::string& source) {
   if (source == "cache_finalized_snapshot") return "cached finalized snapshot";
   if (source == "rpc_live_finalized") return "fresh finalized RPC";
@@ -1015,12 +1017,12 @@ std::string explorer_data_source_label(const std::string& source) {
 std::string explorer_data_freshness_note(const std::string& source, const std::optional<std::uint64_t>& refreshed_unix_ms) {
   if (source != "cache_finalized_snapshot") return {};
   if (!refreshed_unix_ms.has_value()) return "Last refreshed from RPC: unknown";
-  return "Last refreshed from RPC: " + format_timestamp(*refreshed_unix_ms);
+  return "Last refreshed from RPC: " + format_timestamp_ms(*refreshed_unix_ms);
 }
 
 std::string explorer_snapshot_freshness_text(const std::optional<std::uint64_t>& refreshed_unix_ms) {
   if (!refreshed_unix_ms.has_value()) return "unknown";
-  return format_timestamp(*refreshed_unix_ms);
+  return format_timestamp_ms(*refreshed_unix_ms);
 }
 
 std::optional<std::uint64_t> persisted_status_refreshed_unix_ms() {
@@ -1403,9 +1405,9 @@ std::string top_nav(const std::string& active) {
   oss << "<div class=\"top-nav\">"
       << item("Overview", "/", "overview")
       << item("Committee", "/committee", "committee")
-      << item("Tx", "/tx/", "tx")
-      << item("Transition", "/transition/", "transition")
-      << item("Address", "/address/", "address")
+      << "<form class=\"nav-search\" method=\"GET\" action=\"/search\">"
+      << "<input type=\"search\" name=\"q\" placeholder=\"txid, height, hash, or address\" aria-label=\"Search\">"
+      << "<button type=\"submit\" class=\"copy-button\">Search</button></form>"
       << "</div>";
   return oss.str();
 }
@@ -1416,7 +1418,9 @@ std::string page_layout(const std::string& title, const std::string& body, const
       << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
       << "<title>" << html_escape(title) << "</title>"
       << "<style>"
-         "body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:radial-gradient(circle at top,#f8f1dc 0%,#f5f5f2 28%,#f1f1ed 100%);color:#171717;margin:0;padding:clamp(14px,2vw,26px);}"
+         "html{min-height:100%;background:radial-gradient(circle at top,#f8f1dc 0%,#f5f5f2 28%,#f1f1ed 100%) no-repeat #f1f1ed;}"
+         "body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#171717;margin:0;padding:clamp(14px,2vw,26px);}"
+         "input{box-sizing:border-box;max-width:100%;}"
          "main{max-width:1160px;width:min(100%,1160px);margin:0 auto;}"
          "a{color:#0f4c81;text-decoration:none;}a:hover{text-decoration:underline;}"
          "h1,h2{margin:0 0 12px 0;}h1{font-size:34px;line-height:1.05;letter-spacing:-.02em;}h2{font-size:20px;margin-top:30px;}"
@@ -1463,8 +1467,10 @@ std::string page_layout(const std::string& title, const std::string& body, const
          ".metric-card .label{display:block;color:#6e644d;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;}"
          ".metric-card .value{display:block;font-size:22px;font-weight:800;line-height:1.1;}"
          ".metric-card .sub{display:block;margin-top:6px;color:#5b5b5b;line-height:1.4;}"
-         ".top-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px 0;}"
+         ".top-nav{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px 0;}"
          ".top-tab{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.72);border:1px solid #e4dbc4;color:#5d522f;text-decoration:none;font-size:13px;font-weight:700;letter-spacing:.03em;}"
+         ".nav-search{display:flex;gap:8px;flex:1 1 280px;min-width:0;margin-left:auto;max-width:460px;}"
+         ".nav-search input{flex:1 1 auto;min-width:0;padding:7px 12px;font:inherit;font-size:13px;border:1px solid #e4dbc4;border-radius:999px;background:rgba(255,255,255,.85);}"
          ".top-tab:hover{background:#fff7e3;text-decoration:none;}"
          ".top-tab-active{background:#f1e3b7;border-color:#caa752;color:#3f300c;box-shadow:0 6px 18px rgba(126,93,9,.08);}"
          ".status-chip{display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;}"
@@ -2874,7 +2880,6 @@ std::string render_root(const Config& cfg) {
        << "<button type=\"submit\" class=\"copy-button\">Search</button></form></div>";
   body << "<div class=\"card\"><div class=\"status-hero\"><div><h2>Backend</h2></div>";
   body << "</div><div class=\"grid\">";
-  body << "<div>Lightserver RPC</div><div class=\"value-cell\">" << mono_value(cfg.rpc_url) << "</div>";
   if (status.value.has_value()) {
     body << "<div>Runtime Status</div><div>" << status_chip(sync_summary_text(*status.value), tone_for_sync(*status.value)) << " "
          << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
@@ -4286,7 +4291,7 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>Snapshot Refreshed</div><div>"
        << html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
                           ? std::string("fresh live RPC")
-                          : format_timestamp(*tx.data_refreshed_unix_ms))
+                          : format_timestamp_ms(*tx.data_refreshed_unix_ms))
        << "</div>"
        << "<div>Finalized Only</div><div>yes</div>";
   if (tx.finalized_height.has_value()) body << "<div>Finalized Height</div><div>" << link_transition_height(*tx.finalized_height) << "</div>";
@@ -4405,7 +4410,7 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
        << "<div>Snapshot Refreshed</div><div>"
        << html_escape(explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms).empty()
                           ? std::string("fresh live RPC")
-                          : format_timestamp(*transition.data_refreshed_unix_ms))
+                          : format_timestamp_ms(*transition.data_refreshed_unix_ms))
        << "</div>"
        << "<div>Tx Count</div><div>" << transition.tx_count << "</div></div>"
        << "<div class=\"summary-actions\">"
@@ -6122,6 +6127,7 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
                ? json_response(200, v1 ? append_api_v1(render_address_json(*result.value)) : render_address_json(*result.value))
                : json_error_response(*result.error);
   }
+  if (path == tx_prefix || path == transition_prefix || path == address_prefix) return redirect_response("/");
   if (path.rfind(transition_prefix, 0) == 0) {
     return html_response(200, render_transition(cfg, path.substr(transition_prefix.size())));
   }
