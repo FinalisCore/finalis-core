@@ -4717,11 +4717,14 @@ void set_or_replace_header(Response* resp, std::string_view key, std::string val
 
 void apply_partner_api_governance_headers(const std::string& path, Response* resp) {
   if (!resp) return;
+  if (path.rfind("/api/", 0) != 0) return;
+  // Public read-only data, no cookies: any site may fetch it. Partner POSTs need custom headers,
+  // so the browser preflights them; OPTIONS is refused, which keeps them non-browser.
+  set_or_replace_header(resp, "Access-Control-Allow-Origin", "*");
   if (path.rfind("/api/v1/", 0) == 0) {
     set_or_replace_header(resp, "X-Finalis-Api-Version", "v1");
     return;
   }
-  if (path.rfind("/api/", 0) != 0) return;
   for (const auto& entry : kDeprecatedPartnerRoutes) {
     const bool matched = entry.exact_match ? (path == entry.legacy_prefix) : (path.rfind(entry.legacy_prefix, 0) == 0);
     if (!matched) continue;
