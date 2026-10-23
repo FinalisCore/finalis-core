@@ -24,6 +24,7 @@
 #include "common/paths.hpp"
 #include "common/socket_compat.hpp"
 #include "common/version.hpp"
+#include "consensus/canonical_derivation.hpp"
 #include "consensus/epoch_tickets.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/frontier_execution.hpp"
@@ -140,6 +141,41 @@ Tx transparent_projection(const AnyTx& any) {
   return out;
 }
 
+// A settlement (reward payout) as a Tx with no inputs: OutPoint{txid, i} pays outputs[i].
+std::optional<Tx> settlement_projection(const storage::DB& db, const Hash32& txid, std::uint64_t* height) {
+  const auto settlement_height = db.get_settlement_height(txid);
+  if (!settlement_height.has_value()) return std::nullopt;
+  const auto transition_id = db.get_frontier_transition_by_height(*settlement_height);
+  if (!transition_id.has_value()) return std::nullopt;
+  const auto transition_bytes = db.get_frontier_transition(*transition_id);
+  if (!transition_bytes.has_value()) return std::nullopt;
+  const auto transition = FrontierTransition::parse(*transition_bytes);
+  if (!transition.has_value() || consensus::frontier_settlement_txid(*transition) != txid) return std::nullopt;
+  Tx out;
+  out.version = 1;
+  for (const auto& [pub, units] : transition->settlement.outputs) {
+    const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
+    out.outputs.push_back(TxOut{units, address::p2pkh_script_pubkey(pkh)});
+  }
+  if (height) *height = *settlement_height;
+  return out;
+}
+
+// The transparent view of a finalized transaction, or of a settlement when `txid` names one.
+std::optional<Tx> load_finalized_tx(const storage::DB& db, const Hash32& txid, std::uint64_t* height = nullptr,
+                                    bool* is_settlement = nullptr) {
+  if (is_settlement) *is_settlement = false;
+  if (auto loc = db.get_tx_index(txid); loc.has_value()) {
+    auto tx = parse_any_tx(loc->tx_bytes);
+    if (!tx.has_value()) return std::nullopt;
+    if (height) *height = loc->height;
+    return transparent_projection(*tx);
+  }
+  auto settlement = settlement_projection(db, txid, height);
+  if (settlement.has_value() && is_settlement) *is_settlement = true;
+  return settlement;
+}
+
 // TxV2 carries its fee explicitly; inputs minus outputs of its projection would count hidden value.
 std::optional<std::uint64_t> explicit_txv2_fee(const Bytes& tx_bytes) {
   const auto tx = parse_any_tx(tx_bytes);
@@ -207,10 +243,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
     auto it = tx_cache.find(txid);
     if (it != tx_cache.end()) return it->second;
-    std::optional<Tx> parsed;
-    if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
-    }
+    std::optional<Tx> parsed = load_finalized_tx(db, txid);
     tx_cache.emplace(txid, parsed);
     return parsed;
   };
@@ -440,10 +473,7 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
   const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
     auto it = tx_cache.find(txid);
     if (it != tx_cache.end()) return it->second;
-    std::optional<Tx> parsed;
-    if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
-    }
+    std::optional<Tx> parsed = load_finalized_tx(db, txid);
     tx_cache.emplace(txid, parsed);
     return parsed;
   };
@@ -451,17 +481,17 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
   const auto hrp = server_hrp_for_network(network);
   const auto tip = db.get_tip();
   for (const auto& txid : txids) {
-    auto loc = db.get_tx_index(txid);
-    if (!loc.has_value()) continue;
-    auto tx = load_tx(txid);
+    std::uint64_t tx_height = 0;
+    bool is_settlement = false;
+    auto tx = load_finalized_tx(db, txid, &tx_height, &is_settlement);
     if (!tx.has_value()) continue;
 
     TxSummaryRow row;
     row.txid = hex_encode32(txid);
-    row.height = loc->height;
+    row.height = tx_height;
     row.input_count = tx->inputs.size();
     row.output_count = tx->outputs.size();
-    if (tip.has_value() && tip->height >= loc->height) row.finalized_depth = tip->height - loc->height + 1;
+    if (tip.has_value() && tip->height >= tx_height) row.finalized_depth = tip->height - tx_height + 1;
 
     std::uint64_t total_in = 0;
     bool fee_known = true;
@@ -490,7 +520,9 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
         row.recipients.push_back(*addr);
       }
     }
-    if (auto v2_fee = explicit_txv2_fee(loc->tx_bytes); v2_fee.has_value()) {
+    if (is_settlement) {
+      row.fee = 0;
+    } else if (auto v2_fee = explicit_txv2_fee(db.get_tx_index(txid)->tx_bytes); v2_fee.has_value()) {
       row.fee = *v2_fee;
     } else if (fee_known && total_in >= row.total_out) {
       row.fee = total_in - row.total_out;
@@ -515,7 +547,10 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
         std::any_of(output_addresses.begin(), output_addresses.end(),
                     [&](const std::string& address) { return input_addresses.count(address) != 0; });
 
-    if (tx->inputs.empty()) {
+    if (is_settlement) {
+      row.flow_kind = "reward";
+      row.flow_summary = "Protocol reward payout";
+    } else if (tx->inputs.empty()) {
       row.flow_kind = "issuance";
       row.flow_summary = tx->outputs.size() <= 1 ? "Protocol or settlement issuance" : "Protocol or settlement issuance fanout";
     } else if (same_party) {
@@ -603,10 +638,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
   const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
     auto it = tx_cache.find(txid);
     if (it != tx_cache.end()) return it->second;
-    std::optional<Tx> parsed;
-    if (auto loc = db.get_tx_index(txid); loc.has_value()) {
-      if (auto tx = parse_any_tx(loc->tx_bytes); tx.has_value()) parsed = transparent_projection(*tx);
-    }
+    std::optional<Tx> parsed = load_finalized_tx(db, txid);
     tx_cache.emplace(txid, parsed);
     return parsed;
   };
@@ -641,7 +673,8 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
     if (debited == 0 && credited > 0) {
       row.direction = "received";
       row.net_amount = static_cast<std::int64_t>(credited);
-      row.detail = "Finalized credit to this address";
+      row.detail = tx->inputs.empty() && db.get_settlement_height(item.txid).has_value() ? "Protocol reward"
+                                                                                        : "Finalized credit to this address";
     } else if (debited > 0 && credited == 0) {
       row.direction = "sent";
       row.net_amount = -static_cast<std::int64_t>(debited);
@@ -2857,6 +2890,28 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
 
     if (!cert.has_value()) return make_error(id, -32001, "not found");
     return make_result(id, finality_certificate_json(*cert));
+  }
+
+  // Settlement (reward payout) outputs live under a synthetic txid that get_tx does not know.
+  if (*method == "get_settlement") {
+    auto txid_hex = field_string(params, "txid");
+    if (!txid_hex) return make_error(id, -32602, "missing txid");
+    auto txid = parse_hex32(*txid_hex);
+    if (!txid) return make_error(id, -32602, "bad txid");
+    std::uint64_t height = 0;
+    const auto settlement = settlement_projection(*view, *txid, &height);
+    if (!settlement.has_value()) return make_error(id, -32001, "not found");
+    const auto transition_id = view->get_frontier_transition_by_height(height);
+    std::ostringstream oss;
+    oss << "{\"txid\":\"" << hex_encode32(*txid) << "\",\"height\":" << height << ",\"transition_hash\":";
+    if (transition_id.has_value()) oss << "\"" << hex_encode32(*transition_id) << "\""; else oss << "null";
+    oss << ",\"decoded_outputs\":[";
+    for (std::size_t i = 0; i < settlement->outputs.size(); ++i) {
+      if (i) oss << ",";
+      oss << decoded_tx_output_json(settlement->outputs[i], cfg_.network);
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
   }
 
   if (*method == "get_tx") {

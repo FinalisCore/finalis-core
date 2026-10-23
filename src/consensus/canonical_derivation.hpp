@@ -149,6 +149,9 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
 std::uint64_t genesis_validator_bond_amount();
 Hash32 canonical_finality_certificate_hash(const FinalityCertificate& cert);
 Hash32 frontier_finality_link_hash(const FrontierTransition& transition);
+// Synthetic txid of the transition's settlement (reward payout) outputs: OutPoint{txid, i} pays
+// transition.settlement.outputs[i]. No transaction with this id exists.
+Hash32 frontier_settlement_txid(const FrontierTransition& transition);
 // The finalized parent of the next frontier transition, as needed to verify and
 // account its participation record (FrontierTransition::prev_finality_signers).
 struct ParentFinalityContext {

@@ -318,3 +318,35 @@ jobs:
           name: Finalis Core ${{ github.ref_name }}
           files: dist/installer/finalis-core_installer.exe
           generate_release_notes: true
+
+  # Rolling pre-release for main: each push replaces `main-latest` with that commit's installer.
+  # Never marked latest, so tagged releases stay the default download.
+  publish-main-prerelease:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: windows-main-prerelease
+      cancel-in-progress: false
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: finalis-core-installer-${{ needs.build-installer.outputs.version }}
+          path: dist/installer
+
+      - name: Replace main-latest pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build-installer.outputs.version }}
+        run: |
+          gh release delete main-latest --cleanup-tag --yes || true
+          gh release create main-latest dist/installer/finalis-core_installer.exe \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --latest=false \
+            --title "Finalis Core main build $VERSION" \
+            --notes "Untagged build of main at ${GITHUB_SHA}. Not a versioned release; use the latest tagged release for production."

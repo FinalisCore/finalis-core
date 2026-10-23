@@ -960,6 +960,67 @@ TEST(test_lightserver_get_transition_by_height_direct) {
   ASSERT_TRUE(resp.find("\"transition_hex\":\"" + hex_encode(transition.serialize()) + "\"") != std::string::npos);
 }
 
+TEST(test_lightserver_resolves_settlement_reward_payouts) {
+  const std::string base = unique_test_base("/tmp/finalis_light_settlement");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto payee_pkh = crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end()));
+  const auto payee_spk = address::p2pkh_script_pubkey(payee_pkh);
+  const Hash32 payee_sh = crypto::sha256(payee_spk);
+
+  FrontierTransition transition;
+  transition.height = 3;
+  transition.leader_pubkey = keys[0].public_key;
+  transition.prev_finalized_hash[31] = 0x55;
+  transition.settlement.outputs.push_back({keys[0].public_key, 5000});
+  const auto transition_hash = transition.transition_id();
+  const auto settlement_txid = consensus::frontier_settlement_txid(transition);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(db.set_tip(storage::TipState{3, transition_hash}));
+  ASSERT_TRUE(db.put_frontier_transition(transition_hash, transition.serialize()));
+  ASSERT_TRUE(db.map_height_to_frontier_transition(3, transition_hash));
+  {
+    storage::DB::Batch batch(db);
+    batch.put_settlement_txid(settlement_txid, 3);
+    batch.add_script_history(payee_sh, 3, settlement_txid);
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  const auto settlement = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":1,"method":"get_settlement","params":{"txid":")") + hex_encode32(settlement_txid) + R"("}})");
+  ASSERT_TRUE(settlement.find("\"height\":3") != std::string::npos);
+  ASSERT_TRUE(settlement.find("\"transition_hash\":\"" + hex_encode32(transition_hash) + "\"") != std::string::npos);
+  ASSERT_TRUE(settlement.find("\"amount\":5000") != std::string::npos);
+  ASSERT_TRUE(settlement.find("\"script_hex\":\"" + hex_encode(payee_spk) + "\"") != std::string::npos);
+
+  const auto unknown = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":2,"method":"get_settlement","params":{"txid":")") + std::string(64, 'a') + R"("}})");
+  ASSERT_TRUE(unknown.find("\"code\":-32001") != std::string::npos);
+
+  const auto history = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":3,"method":"get_history_page_detailed","params":{"scripthash_hex":")") +
+      hex_encode32(payee_sh) + R"(","limit":10}})");
+  ASSERT_TRUE(history.find("\"direction\":\"received\"") != std::string::npos);
+  ASSERT_TRUE(history.find("\"net_amount\":5000") != std::string::npos);
+  ASSERT_TRUE(history.find("\"detail\":\"Protocol reward\"") != std::string::npos);
+
+  const auto summary = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":4,"method":"get_tx_summaries","params":{"txids":[")") + hex_encode32(settlement_txid) + R"("]}})");
+  ASSERT_TRUE(summary.find("\"flow_kind\":\"reward\"") != std::string::npos);
+  ASSERT_TRUE(summary.find("\"height\":3") != std::string::npos);
+}
+
 TEST(test_lightserver_exposes_persisted_ingress_visibility_endpoints) {
   const std::string base = unique_test_base("/tmp/finalis_light_ingress_visibility");
   std::filesystem::remove_all(base);

@@ -1839,6 +1839,36 @@ TEST(test_explorer_api_address_contract_and_empty_state) {
   ASSERT_TRUE(invalid.body.find("\"code\":\"invalid_address\"") != std::string::npos);
 }
 
+TEST(test_explorer_address_page_lists_complete_history_newest_first) {
+  ExplorerFixture fx;
+  const std::string older_txid(64, '1');
+  const std::string newer_txid(64, '2');
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_history_page_detailed\"") != std::string::npos) {
+      return rpc_result(std::string("{\"items\":[") +
+                        "{\"txid\":\"" + older_txid + "\",\"height\":5,\"direction\":\"received\",\"net_amount\":300,\"detail\":\"in\"}," +
+                        "{\"txid\":\"" + newer_txid + "\",\"height\":9,\"direction\":\"sent\",\"net_amount\":-120,\"detail\":\"out\"}" +
+                        "],\"has_more\":false,\"next_start_after\":null}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+  ScopedUtxoHook utxo_hook([&](const Hash32&, std::string*) -> std::optional<std::vector<finalis::lightserver::UtxoView>> {
+    return std::vector<finalis::lightserver::UtxoView>{};
+  });
+  const Config cfg = test_config();
+
+  const auto page = handle_request(cfg, make_http_get("/address/" + fx.known_address));
+  ASSERT_EQ(page.status, 200);
+  const auto newer_at = page.body.find("/tx/" + newer_txid);
+  const auto older_at = page.body.find("/tx/" + older_txid);
+  ASSERT_TRUE(newer_at != std::string::npos && older_at != std::string::npos);
+  ASSERT_TRUE(newer_at < older_at);
+  ASSERT_TRUE(page.body.find("Newest first.") != std::string::npos);
+  ASSERT_TRUE(page.body.find("all finalized history") != std::string::npos);
+  ASSERT_TRUE(page.body.find("History Pages Loaded") == std::string::npos);
+  ASSERT_TRUE(page.body.find("Visible Slice") == std::string::npos);
+}
+
 TEST(test_explorer_api_search_contract) {
   ExplorerFixture fx;
   ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
@@ -2107,16 +2137,12 @@ TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
     const auto tx_json = render_tx_json(*fetch_tx_result(cfg, fx.txid).value);
     ASSERT_TRUE(tx_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
     const auto tx_page = render_tx(cfg, fx.txid);
-    ASSERT_TRUE(tx_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
     ASSERT_TRUE(tx_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
-    ASSERT_TRUE(tx_page.find("Last refreshed from RPC: ") != std::string::npos);
     ASSERT_TRUE(tx_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
     const auto transition_json = render_transition_json(cfg, *fetch_transition_result(cfg, fx.transition_hash).value);
     ASSERT_TRUE(transition_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
     const auto transition_page = render_transition(cfg, fx.transition_hash);
-    ASSERT_TRUE(transition_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
     ASSERT_TRUE(transition_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
-    ASSERT_TRUE(transition_page.find("Last refreshed from RPC: ") != std::string::npos);
     ASSERT_TRUE(transition_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
   }
 
@@ -2251,6 +2277,54 @@ TEST(test_explorer_payment_with_change_names_external_recipient_and_counts_as_se
   TxResult self_tx = tx;
   self_tx.outputs.resize(1);
   ASSERT_EQ(classify_address_history_item(sender, self_tx).direction, std::string("self-transfer"));
+}
+
+TEST(test_explorer_resolves_reward_inputs_and_settlement_pages) {
+  ExplorerFixture fx;
+  // A validator (empty_address) spends its reward payout S:0 to known_address.
+  const std::string settlement_txid(64, 'b');
+  const auto validator = address::decode(fx.empty_address);
+  ASSERT_TRUE(validator.has_value());
+  const auto validator_spk = address::p2pkh_script_pubkey(validator->pubkey_hash);
+  Hash32 settlement_hash{};
+  settlement_hash.fill(0xbb);
+  Tx spend;
+  spend.version = 1;
+  spend.inputs.push_back(TxIn{settlement_hash, 0, Bytes{}, 0xFFFFFFFFu});
+  spend.outputs.push_back(TxOut{4000, address::p2pkh_script_pubkey(address::decode(fx.known_address)->pubkey_hash)});
+  const std::string spend_txid = hex_encode32(spend.txid());
+
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_settlement\"") != std::string::npos) {
+      if (body.find(settlement_txid) == std::string::npos) return rpc_error(-32001, "not found");
+      return rpc_result(std::string("{\"txid\":\"") + settlement_txid + "\",\"height\":5,\"transition_hash\":\"" +
+                        fx.transition_hash + "\",\"decoded_outputs\":[{\"amount\":5000,\"script_hex\":\"" +
+                        hex_encode(validator_spk) + "\",\"address\":\"" + fx.empty_address + "\",\"decoded_kind\":null}]}");
+    }
+    if (body.find(spend_txid) != std::string::npos) {
+      if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) {
+        return rpc_result(R"({"status":"finalized","finalized":true,"height":8,"finalized_depth":3,"credit_safe":true})");
+      }
+      if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+        return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(spend.serialize()) + "\"}");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+
+  const auto spend_tx = fetch_tx_result(cfg, spend_txid);
+  ASSERT_TRUE(spend_tx.value.has_value());
+  ASSERT_TRUE(spend_tx.value->inputs[0].reward);
+  ASSERT_EQ(*spend_tx.value->inputs[0].address, fx.empty_address);
+  ASSERT_EQ(*spend_tx.value->primary_sender, fx.empty_address);
+  ASSERT_EQ(*spend_tx.value->fee, static_cast<std::uint64_t>(1000));
+  ASSERT_EQ(spend_tx.value->flow_kind, std::string("direct-transfer"));
+
+  const auto payout = handle_request(cfg, make_http_get("/tx/" + settlement_txid));
+  ASSERT_EQ(payout.status, 200);
+  ASSERT_TRUE(payout.body.find("Protocol reward payout") != std::string::npos);
+  ASSERT_TRUE(payout.body.find("/address/" + fx.empty_address) != std::string::npos);
 }
 
 TEST(test_explorer_homepage_no_stale_banner_for_never_loaded_committee) {
