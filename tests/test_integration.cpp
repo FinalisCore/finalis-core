@@ -3770,7 +3770,10 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
 TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_registration_tx");
-  auto cluster = make_cluster(base, 1, 1, 1);
+  auto cluster = make_cluster(base, 1, 1, 1, [](node::NodeConfig& cfg) {
+    // Mainnet's 20-bit onboarding PoW mines slower than the two-epoch validity window under sanitizers.
+    cfg.network.onboarding_admission_pow_difficulty_bits = 8;
+  });
   auto& n0 = *cluster.nodes[0];
   ASSERT_TRUE(wait_for_tip(n0, 5, ci_timeout_seconds(40)));
 
@@ -3789,7 +3792,7 @@ TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) 
   ASSERT_TRUE(db0.open_readonly(base + "/node0"));
   const auto chain_id = ChainId::from_config_and_db(mainnet_network(), db0);
   ValidatorJoinAdmissionPowBuildContext pow_ctx{
-      .network = &mainnet_network(),
+      .network = &cluster.configs[0].network,
       .chain_id = &chain_id,
       .current_height = n0.status().height + 1,
       .finalized_hash_at_height = [&](std::uint64_t height) { return db0.get_height_hash(height); },
@@ -4949,8 +4952,10 @@ TEST(test_single_validator_starts_at_round_zero_when_genesis_time_arrives) {
   std::filesystem::create_directories(base);
   const auto now = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-  // The gate opens kMaxTransitionTimestampDriftS before genesis + 1.
-  const std::uint64_t genesis_time = now + consensus::kMaxTransitionTimestampDriftS + 3;
+  // The gate opens kMaxTransitionTimestampDriftS before genesis + 1. The margin outlasts keystore
+  // creation and node start under sanitizers, so the pre-gate checks below run with the gate closed.
+  const std::uint64_t gate_open_unix = now + 10;
+  const std::uint64_t genesis_time = gate_open_unix + consensus::kMaxTransitionTimestampDriftS;
   ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1, genesis_time));
 
   keystore::ValidatorKey key;
@@ -4961,9 +4966,12 @@ TEST(test_single_validator_starts_at_round_zero_when_genesis_time_arrives) {
   std::unique_ptr<node::Node> node;
   ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
   std::this_thread::sleep_for(std::chrono::seconds(1));
+  const auto checked_at = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+  ASSERT_TRUE(checked_at < gate_open_unix);
   ASSERT_EQ(node->status().height, 0u);
   ASSERT_EQ(node->status().round, 0u);
-  ASSERT_TRUE(wait_for_tip(*node, 1, std::chrono::seconds(15)));
+  ASSERT_TRUE(wait_for_tip(*node, 1, std::chrono::seconds(25)));
   node->stop();
 }
 
@@ -5863,13 +5871,16 @@ TEST(test_crash_between_persist_and_settlement_recovers_correctly) {
   {
     auto cluster = make_cluster(base, 1, 1, 1);
     ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 10; }, std::chrono::seconds(30)));
-    finalized_height = cluster.nodes[0]->status().height;
     cluster.nodes[0]->stop();
   }
 
   {
     storage::DB db;
     ASSERT_TRUE(db.open(base + "/node0"));
+    // Read the tip after shutdown: a block finalized while stopping would otherwise change the epoch total.
+    const auto tip = db.get_tip();
+    ASSERT_TRUE(tip.has_value());
+    finalized_height = tip->height;
     ASSERT_TRUE(db.erase("ER:" + epoch_db_key_suffix(1)));
     ASSERT_TRUE(db.flush());
   }
