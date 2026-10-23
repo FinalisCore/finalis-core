@@ -1699,7 +1699,7 @@ TEST(test_explorer_root_page_recent_tx_empty_state_is_explicit) {
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
   ASSERT_TRUE(home.body.find("Finalized Transactions") != std::string::npos);
-  ASSERT_TRUE(home.body.find("No finalized transactions were found in the recent finalized-height scan window.") != std::string::npos);
+  ASSERT_TRUE(home.body.find("No transactions in the last 4096 transitions.") != std::string::npos);
 }
 
 TEST(test_explorer_root_page_committee_empty_state_is_explicit) {
@@ -2220,6 +2220,37 @@ TEST(test_explorer_transition_next_link_hidden_at_tip) {
   ASSERT_EQ(page.status, 200);
   ASSERT_TRUE(page.body.find("href=\"/transition/9\"") != std::string::npos);
   ASSERT_TRUE(page.body.find("href=\"/transition/11\"") == std::string::npos);
+}
+
+TEST(test_explorer_payment_with_change_names_external_recipient_and_counts_as_sent) {
+  // The sender sorts first, so picking the alphabetically first output address would name the change.
+  const std::string sender = "sc1aaaa";
+  const std::string payee = "sc1zzzz";
+  std::vector<TxInputResult> inputs(1);
+  inputs[0].address = sender;
+  inputs[0].amount = 1000;
+  std::vector<TxOutputResult> outputs(2);
+  outputs[0].address = sender;
+  outputs[0].amount = 890;
+  outputs[1].address = payee;
+  outputs[1].amount = 100;
+
+  const auto flow = classify_tx_flow(inputs, outputs);
+  ASSERT_EQ(flow.kind, std::string("transfer-with-change"));
+  ASSERT_EQ(*flow.primary_sender, sender);
+  ASSERT_EQ(*flow.primary_recipient, payee);
+
+  TxResult tx;
+  tx.txid = std::string(64, 'a');
+  tx.inputs = inputs;
+  tx.outputs = outputs;
+  const auto item = classify_address_history_item(sender, tx);
+  ASSERT_EQ(item.direction, std::string("sent"));
+  ASSERT_EQ(item.net_amount, static_cast<std::int64_t>(-110));
+
+  TxResult self_tx = tx;
+  self_tx.outputs.resize(1);
+  ASSERT_EQ(classify_address_history_item(sender, self_tx).direction, std::string("self-transfer"));
 }
 
 TEST(test_explorer_homepage_no_stale_banner_for_never_loaded_committee) {

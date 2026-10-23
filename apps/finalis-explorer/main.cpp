@@ -434,6 +434,9 @@ constexpr std::size_t kPersistedRecentLimit = 8;
 constexpr std::size_t kPersistedTxIndexLimit = 128;
 constexpr std::size_t kPersistedTransitionIndexLimit = 128;
 constexpr std::uint64_t kHomeLatestTransitions = 10;
+// The lightserver scans its local DB (and clamps to 4096); the per-height RPC fallback stays shallow.
+constexpr std::uint64_t kRecentTxDepthWindow = 4096;
+constexpr std::uint64_t kRecentTxFallbackDepthWindow = 32;
 constexpr std::size_t kPersistedPartnerEventsLimit = 2048;
 constexpr std::size_t kPersistedPartnerWebhookQueueLimit = 2048;
 constexpr std::size_t kPersistedPartnerIdempotencyLimit = 200000;
@@ -1323,16 +1326,29 @@ struct FlowClassification {
 FlowClassification classify_tx_flow(const std::vector<TxInputResult>& inputs, const std::vector<TxOutputResult>& outputs) {
   std::set<std::string> input_addresses;
   std::set<std::string> output_addresses;
+  std::vector<std::string> input_order;
+  std::vector<std::string> output_order;
   for (const auto& input : inputs) {
-    if (input.address.has_value() && !input.address->empty()) input_addresses.insert(*input.address);
+    if (input.address.has_value() && !input.address->empty() && input_addresses.insert(*input.address).second) {
+      input_order.push_back(*input.address);
+    }
   }
   for (const auto& output : outputs) {
-    if (output.address.has_value() && !output.address->empty()) output_addresses.insert(*output.address);
+    if (output.address.has_value() && !output.address->empty() && output_addresses.insert(*output.address).second) {
+      output_order.push_back(*output.address);
+    }
   }
 
   FlowClassification flow;
-  if (!input_addresses.empty()) flow.primary_sender = *input_addresses.begin();
-  if (!output_addresses.empty()) flow.primary_recipient = *output_addresses.begin();
+  // Primary sender/recipient follow transaction order; the recipient skips change back to a sender.
+  if (!input_order.empty()) flow.primary_sender = input_order.front();
+  for (const auto& address : output_order) {
+    if (input_addresses.count(address) == 0) {
+      flow.primary_recipient = address;
+      break;
+    }
+  }
+  if (!flow.primary_recipient.has_value() && !output_order.empty()) flow.primary_recipient = output_order.front();
   flow.participant_count = input_addresses.size() + output_addresses.size();
 
   const bool same_party = !input_addresses.empty() && !output_addresses.empty() && input_addresses == output_addresses;
@@ -1391,9 +1407,17 @@ AddressHistoryItemResult classify_address_history_item(const std::string& addres
     item.net_amount = -static_cast<std::int64_t>(debited);
     item.detail = "Finalized spend from this address with no decoded return output";
   } else if (debited > 0 && credited > 0) {
-    item.direction = "self-transfer";
+    const bool pays_elsewhere = std::any_of(tx.outputs.begin(), tx.outputs.end(), [&](const TxOutputResult& output) {
+      return !output.address.has_value() || *output.address != address;
+    });
     item.net_amount = static_cast<std::int64_t>(credited) - static_cast<std::int64_t>(debited);
-    item.detail = "This address appears on both finalized inputs and outputs";
+    if (pays_elsewhere) {
+      item.direction = "sent";
+      item.detail = "Spend from this address with change returned to it";
+    } else {
+      item.direction = "self-transfer";
+      item.detail = "All outputs return to this address";
+    }
   } else {
     item.direction = "related";
     item.net_amount = 0;
@@ -2954,7 +2978,7 @@ std::string render_root(const Config& cfg) {
     }
     body << "</tbody></table></div>";
   } else {
-    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. The latest transitions carried no user transactions.</div>"
+    body << "<div class=\"soft-empty\">No transactions in the last " << kRecentTxDepthWindow << " transitions.</div>"
          << "<p class=\"meta\">Refreshed " << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << ".</p>";
   }
   body << "</div>";
@@ -3734,7 +3758,7 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
 
   std::vector<RecentTxResult> out;
   if (max_items == 0) return out;
-  const std::uint64_t depth_window = 32;
+  const std::uint64_t depth_window = kRecentTxDepthWindow;
   bool live_recent_rpc_ok = false;
   {
     std::ostringstream params;
@@ -3780,7 +3804,7 @@ std::vector<RecentTxResult> fetch_recent_tx_results(const Config& cfg, std::size
       return out;
     }
     const auto tip = status.value->finalized_height;
-    const std::uint64_t start_height = tip > depth_window ? tip - depth_window : 0;
+    const std::uint64_t start_height = tip > kRecentTxFallbackDepthWindow ? tip - kRecentTxFallbackDepthWindow : 0;
     std::vector<std::pair<std::string, std::uint64_t>> tx_refs;
     for (std::uint64_t h = tip + 1; h-- > start_height && out.size() < max_items;) {
       std::string err;
@@ -4268,10 +4292,15 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   const std::string payer = tx.primary_sender.has_value() ? short_hex(*tx.primary_sender) : std::string("unknown");
   std::string payee = tx.primary_recipient.has_value() ? short_hex(*tx.primary_recipient) : std::string("unknown");
   if (!tx.outputs.empty() && tx.outputs.size() > 1) {
-    std::size_t decoded_recipient_count = 0;
-    for (const auto& out : tx.outputs) {
-      if (out.address.has_value()) ++decoded_recipient_count;
+    std::set<std::string> senders;
+    for (const auto& in : tx.inputs) {
+      if (in.address.has_value()) senders.insert(*in.address);
     }
+    std::set<std::string> recipients;
+    for (const auto& out : tx.outputs) {
+      if (out.address.has_value() && senders.count(*out.address) == 0) recipients.insert(*out.address);
+    }
+    const std::size_t decoded_recipient_count = recipients.size();
     if (decoded_recipient_count > 1) payee += " +" + std::to_string(decoded_recipient_count - 1) + " more";
   }
 

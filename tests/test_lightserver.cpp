@@ -1980,6 +1980,7 @@ TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow
   const auto sender_spk = address::p2pkh_script_pubkey(sender_pkh);
   const auto recipient_spk = address::p2pkh_script_pubkey(recipient_pkh);
   const Hash32 recipient_sh = crypto::sha256(recipient_spk);
+  const Hash32 sender_sh = crypto::sha256(sender_spk);
 
   Tx prev;
   prev.version = 1;
@@ -1997,6 +1998,7 @@ TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow
   const auto txid = tx.txid();
   ASSERT_TRUE(db.put_tx_index(txid, 8, 0, tx_bytes));
   ASSERT_TRUE(db.add_script_history(recipient_sh, 8, txid));
+  ASSERT_TRUE(db.add_script_history(sender_sh, 8, txid));
   ASSERT_TRUE(db.flush());
   db.close();
 
@@ -2004,6 +2006,13 @@ TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow
   lcfg.db_path = base;
   lightserver::Server ls(lcfg);
   ASSERT_TRUE(ls.init());
+
+  // The sender paid 200 elsewhere and got 299 change: a send of 201 net, not a self-transfer.
+  const auto sender_resp = ls.handle_rpc_for_test(
+      std::string(R"({"jsonrpc":"2.0","id":172,"method":"get_history_page_detailed","params":{"scripthash_hex":")") +
+      hex_encode32(sender_sh) + R"(","limit":10}})");
+  ASSERT_TRUE(sender_resp.find("\"direction\":\"sent\"") != std::string::npos);
+  ASSERT_TRUE(sender_resp.find("\"net_amount\":-201") != std::string::npos);
 
   const std::string body =
       std::string(R"({"jsonrpc":"2.0","id":173,"method":"get_history_page_detailed","params":{"scripthash_hex":")") +
@@ -2080,6 +2089,11 @@ TEST(test_lightserver_get_tx_summaries_returns_batched_finalized_tx_view) {
   ASSERT_TRUE(resp.find("\"finalized_out\":499") != std::string::npos);
   ASSERT_TRUE(resp.find("\"fee\":1") != std::string::npos);
   ASSERT_TRUE(resp.find("\"flow_kind\":\"transfer-with-change\"") != std::string::npos);
+  const auto sender_addr = address::encode_p2pkh("sc", sender_pkh);
+  const auto recipient_addr = address::encode_p2pkh("sc", recipient_pkh);
+  ASSERT_TRUE(sender_addr.has_value() && recipient_addr.has_value());
+  ASSERT_TRUE(resp.find("\"primary_sender\":\"" + *sender_addr + "\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"primary_recipient\":\"" + *recipient_addr + "\"") != std::string::npos);
 }
 
 TEST(test_lightserver_get_history_supports_paged_response) {
