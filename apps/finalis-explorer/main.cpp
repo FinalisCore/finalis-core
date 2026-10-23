@@ -949,6 +949,15 @@ std::string format_signed_amount(std::int64_t value) {
   return std::string(negative ? "-" : "+") + format_amount(magnitude);
 }
 
+std::string render_summary_metric_card_html(const std::string& label, const std::string& value_html, const std::string& sub = {}) {
+  std::ostringstream oss;
+  oss << "<div class=\"metric-card\"><span class=\"label\">" << html_escape(label) << "</span><span class=\"value\">" << value_html
+      << "</span>";
+  if (!sub.empty()) oss << "<span class=\"sub\">" << html_escape(sub) << "</span>";
+  oss << "</div>";
+  return oss.str();
+}
+
 std::string render_summary_metric_card(const std::string& label, const std::string& value, const std::string& sub = {}) {
   std::ostringstream oss;
   oss << "<div class=\"metric-card\"><span class=\"label\">" << html_escape(label) << "</span><span class=\"value\">"
@@ -999,7 +1008,7 @@ TransitionSummary compute_transition_summary(const Config& cfg, const Transition
 std::string summarize_flow_mix(const std::map<std::string, std::size_t>& flow_mix) {
   std::ostringstream oss;
   if (flow_mix.empty()) {
-    oss << "no classified finalized txs";
+    oss << "none";
   } else {
     bool first = true;
     for (const auto& [kind, count] : flow_mix) {
@@ -1023,13 +1032,6 @@ std::string explorer_data_freshness_note(const std::string& source, const std::o
   if (source != "cache_finalized_snapshot") return {};
   if (!refreshed_unix_ms.has_value()) return "Last refreshed from RPC: unknown";
   return "Last refreshed from RPC: " + format_timestamp_ms(*refreshed_unix_ms);
-}
-
-std::string explorer_cached_source_note(const std::string& source, const std::optional<std::uint64_t>& refreshed_unix_ms) {
-  const auto freshness = explorer_data_freshness_note(source, refreshed_unix_ms);
-  if (freshness.empty()) return {};
-  return "<div class=\"note\">Explorer data source: <strong>" + html_escape(explorer_data_source_label(source)) + "</strong>. " +
-         html_escape(freshness) + ".</div>";
 }
 
 std::string explorer_snapshot_freshness_text(const std::optional<std::uint64_t>& refreshed_unix_ms) {
@@ -1501,6 +1503,7 @@ std::string page_layout(const std::string& title, const std::string& body, const
          ".metric-card{padding:14px 16px;border-radius:14px;background:linear-gradient(180deg,#fffdfa 0%,#f7f2e6 100%);border:1px solid #e7ddc6;}"
          ".metric-card .label{display:block;color:#4f4635;font-size:13px;font-weight:600;margin-bottom:6px;}"
          ".metric-card .value{display:block;font-size:24px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}"
+         ".metric-card .value code{font-size:16px;font-weight:600;}"
          ".metric-card .sub{display:block;margin-top:6px;color:#555;font-size:13px;line-height:1.4;overflow-wrap:anywhere;}"
          ".top-nav{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px 0;}"
          ".top-tab{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.72);border:1px solid #e4dbc4;color:#5d522f;text-decoration:none;font-size:14px;font-weight:600;}"
@@ -2938,43 +2941,23 @@ std::string render_root(const Config& cfg) {
   if (!recent.empty()) {
     body << "<p class=\"meta\">Flow labels are inferred from inputs and outputs, not ownership proofs. Refreshed "
          << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << ".</p>";
-    body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>Flow</th><th>From</th><th>To</th><th>Finalized Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
+    body << "<div class=\"table-wrap\"><table class=\"table-compact\"><thead><tr><th>Txid</th><th class=\"hide-sm\">Height</th><th class=\"hide-sm\">Flow</th>"
+         << "<th class=\"hide-sm\">From &rarr; To</th><th class=\"num\">Amount</th></tr></thead><tbody>";
     for (const auto& item : recent) {
-      body << "<tr><td>" << link_tx(item.txid) << "</td><td>"
+      body << "<tr><td>" << link_tx(item.txid) << "</td><td class=\"hide-sm\">"
            << (item.height.has_value() ? link_transition_height(*item.height) : std::string("<span class=\"muted\">n/a</span>"))
-           << "</td><td>"
-           << (item.timestamp.has_value() ? html_escape(format_timestamp(*item.timestamp)) : std::string("<span class=\"muted\">n/a</span>"))
-           << "</td><td>";
-      if (item.flow_kind.has_value()) {
-        body << "<strong>" << html_escape(*item.flow_kind) << "</strong>";
-        if (item.flow_summary.has_value()) body << "<div class=\"muted\">" << html_escape(*item.flow_summary) << "</div>";
-      } else {
-        body << "<span class=\"muted\">n/a</span>";
-      }
-      body << "</td><td>" << display_identity(item.primary_sender) << "</td><td>";
+           << "</td><td class=\"hide-sm\"";
+      if (item.flow_summary.has_value()) body << " title=\"" << html_escape(*item.flow_summary) << "\"";
+      body << ">" << (item.flow_kind.has_value() ? html_escape(*item.flow_kind) : std::string("<span class=\"muted\">n/a</span>"))
+           << "</td><td class=\"hide-sm\">" << display_identity(item.primary_sender) << " &rarr; ";
       if (item.primary_recipient.has_value()) {
         body << display_identity(item.primary_recipient);
-        if (item.recipient_count.has_value() && *item.recipient_count > 1) {
-          body << " <span class=\"muted\">+" << (*item.recipient_count - 1) << " more</span>";
-        }
       } else {
         body << "<span class=\"muted\">unknown</span>";
       }
       body << "</td><td class=\"num\">"
            << (item.total_out.has_value() ? html_escape(format_amount(*item.total_out)) : std::string("<span class=\"muted\">n/a</span>"))
-           << "</td><td class=\"num\">"
-           << (item.fee.has_value() ? html_escape(format_amount(*item.fee)) : std::string("<span class=\"muted\">n/a</span>"))
-           << "</td><td>";
-      if (item.status_label.has_value()) body << html_escape(*item.status_label);
-      else body << "<span class=\"muted\">n/a</span>";
-      if (item.credit_safe.has_value()) body << "<div class=\"muted\">credit safe: " << credit_safe_text(*item.credit_safe) << "</div>";
-      body << "</td><td>";
-      if (item.input_count.has_value() && item.output_count.has_value()) {
-        body << *item.input_count << " in / " << *item.output_count << " out";
-      } else {
-        body << "<span class=\"muted\">n/a</span>";
-      }
-      body << "</td></tr>";
+           << "</td></tr>";
     }
     body << "</tbody></table></div>";
   } else {
@@ -4289,8 +4272,12 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   const auto& tx = *lookup.value;
   const std::string tx_path = "/tx/" + tx.txid;
   const std::string tx_api_path = "/api/tx/" + tx.txid;
-  const std::string payer = tx.primary_sender.has_value() ? short_hex(*tx.primary_sender) : std::string("unknown");
-  std::string payee = tx.primary_recipient.has_value() ? short_hex(*tx.primary_recipient) : std::string("unknown");
+  const auto address_card_value = [](const std::optional<std::string>& address) -> std::string {
+    if (!address.has_value()) return "<span class=\"muted\">unknown</span>";
+    return "<a href=\"/address/" + html_escape(*address) + "\"><code>" + html_escape(short_hex(*address)) + "</code></a>";
+  };
+  const std::string payer = address_card_value(tx.primary_sender);
+  std::string payee = address_card_value(tx.primary_recipient);
   if (!tx.outputs.empty() && tx.outputs.size() > 1) {
     std::set<std::string> senders;
     for (const auto& in : tx.inputs) {
@@ -4301,14 +4288,14 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
       if (out.address.has_value() && senders.count(*out.address) == 0) recipients.insert(*out.address);
     }
     const std::size_t decoded_recipient_count = recipients.size();
-    if (decoded_recipient_count > 1) payee += " +" + std::to_string(decoded_recipient_count - 1) + " more";
+    if (decoded_recipient_count > 1) payee += " <span class=\"muted\">+" + std::to_string(decoded_recipient_count - 1) + " more</span>";
   }
 
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
        << render_summary_metric_card("Flow", tx.flow_kind, tx.flow_summary)
-       << render_summary_metric_card("Paid By", payer, "inferred from finalized inputs")
-       << render_summary_metric_card("Paid To", payee, "inferred from finalized outputs")
-       << render_summary_metric_card("Finalized Out", format_amount(tx.total_out),
+       << render_summary_metric_card_html("From", payer, "inferred from inputs")
+       << render_summary_metric_card_html("To", payee, "inferred from outputs, change excluded")
+       << render_summary_metric_card("Amount", format_amount(tx.total_out),
                                      tx.fee.has_value() ? ("fee " + format_amount(*tx.fee)) : "fee unknown")
        << "</div></div>";
 
@@ -4316,37 +4303,31 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>" << mono_value(tx.txid) << "</div><div>" << finalized_badge(tx.finalized) << " "
        << credit_safe_badge(tx.credit_safe) << "</div></div>"
        << "<div class=\"decision-line\">" << html_escape(credit_decision_text(tx.finalized, tx.credit_safe)) << "</div>"
-       << explorer_cached_source_note(tx.data_source, tx.data_refreshed_unix_ms)
-       << "<div class=\"grid\" style=\"margin-top:14px;\">"
-       << "<div>Txid</div><div class=\"value-cell\">" << mono_value(tx.txid) << "</div>"
-       << "<div>Flow Classification</div><div><strong>" << html_escape(tx.flow_kind) << "</strong><div class=\"muted\">"
-       << html_escape(tx.flow_summary) << "</div></div>"
+       << "<div class=\"grid\" style=\"margin-top:14px;\">";
+  if (tx.finalized_height.has_value()) body << "<div>Height</div><div>" << link_transition_height(*tx.finalized_height) << "</div>";
+  if (tx.timestamp.has_value()) {
+    body << "<div>Time</div><div>" << html_escape(format_timestamp(*tx.timestamp)) << " <span class=\"muted\">"
+         << html_escape(format_age(*tx.timestamp)) << "</span></div>";
+  }
+  body << "<div>Confirmations</div><div>" << tx.finalized_depth << "</div>"
+       << "<div>Shape</div><div>" << tx.inputs.size() << " in / " << tx.outputs.size() << " out</div>";
+  if (tx.fee.has_value()) body << "<div>Fee</div><div>" << html_escape(format_amount(*tx.fee)) << "</div>";
+  if (!tx.transition_hash.empty()) body << "<div>Transition</div><div class=\"value-cell\">" << mono_value(tx.transition_hash) << "</div>";
+  body << "</div>"
+       << "<details class=\"disclosure\"><summary>More details</summary><div class=\"grid\">"
        << "<div>Status</div><div>" << html_escape(tx.status_label) << "</div>"
        << "<div>Finalized</div><div>" << finalized_text(tx.finalized) << "</div>"
-       << "<div>Credit Safe</div><div>" << credit_safe_text(tx.credit_safe) << "</div>"
-       << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(tx.data_source)) << "</div>"
+       << "<div>Credit Safe</div><div>" << credit_safe_text(tx.credit_safe) << "</div>";
+  if (tx.participant_count.has_value()) body << "<div>Distinct Participants</div><div>" << *tx.participant_count << "</div>";
+  body << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(tx.data_source)) << "</div>"
        << "<div>Snapshot Refreshed</div><div>"
        << html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
                           ? std::string("fresh live RPC")
                           : format_timestamp_ms(*tx.data_refreshed_unix_ms))
-       << "</div>";
-  if (tx.finalized_height.has_value()) body << "<div>Finalized Height</div><div>" << link_transition_height(*tx.finalized_height) << "</div>";
-  if (!tx.transition_hash.empty()) body << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(tx.transition_hash) << "</div>";
-  if (tx.timestamp.has_value()) body << "<div>Timestamp</div><div>" << html_escape(format_timestamp(*tx.timestamp)) << "</div>";
-  body << "<div>Finalized Depth</div><div>" << tx.finalized_depth << "</div>";
-  if (tx.primary_sender.has_value()) body << "<div>Primary Sender</div><div>" << display_identity(tx.primary_sender) << "</div>";
-  if (tx.primary_recipient.has_value()) body << "<div>Primary Recipient</div><div>" << display_identity(tx.primary_recipient) << "</div>";
-  if (tx.participant_count.has_value()) body << "<div>Distinct Participants</div><div>" << *tx.participant_count << "</div>";
-  body << "<div>Input Count</div><div>" << tx.inputs.size() << "</div>";
-  body << "<div>Output Count</div><div>" << tx.outputs.size() << "</div>";
-  if (tx.fee.has_value()) body << "<div>Fee</div><div>" << html_escape(format_amount(*tx.fee)) << "</div>";
-  body << "<div>Finalized Out</div><div>" << html_escape(format_amount(tx.total_out)) << "</div>"
-       << "</div><div class=\"summary-actions\">"
-       << copy_action("Copy Txid", tx.txid)
+       << "</div></div><div class=\"summary-actions\">"
        << copy_action("Copy Page Path", tx_path)
-       << copy_action("Copy API Path", tx_api_path);
-  if (!tx.transition_hash.empty()) body << copy_action("Copy Transition Hash", tx.transition_hash);
-  body << "</div></div>";
+       << copy_action("Copy API Path", tx_api_path)
+       << "</div></details></div>";
 
   body << "<div class=\"card\"><h2>Inputs</h2><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Prev Tx</th><th>Vout</th><th>Decoded Source</th><th>Amount</th></tr></thead><tbody>";
   for (std::size_t i = 0; i < tx.inputs.size(); ++i) {
@@ -4447,45 +4428,40 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   body << "</div>";
 
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
-       << render_summary_metric_card("Tx Count", std::to_string(transition.txids.size()), "finalized txids in this transition")
-       << render_summary_metric_card("Total Finalized Out", format_amount(summary.finalized_out), "sum of finalized outputs in this transition")
-       << render_summary_metric_card("Distinct Recipients", std::to_string(summary.distinct_recipient_count), "decoded finalized output addresses")
-       << render_summary_metric_card("Activity Mix", flow_mix_text, "flow-type counts inferred from finalized tx structure")
+       << render_summary_metric_card("Transactions", std::to_string(transition.txids.size()))
+       << render_summary_metric_card("Amount", format_amount(summary.finalized_out), "sum of outputs")
+       << render_summary_metric_card("Recipients", std::to_string(summary.distinct_recipient_count), "distinct addresses")
+       << render_summary_metric_card("Types", flow_mix_text, "transaction flow types")
        << "</div></div>";
 
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(transition.hash) << "</div><div>" << finalized_badge(true) << "</div></div>"
-       << explorer_cached_source_note(transition.data_source, transition.data_refreshed_unix_ms)
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
-       << "<div>Height</div><div>" << transition.height << "</div>"
-       << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(transition.hash) << "</div>"
-       << "<div>Prev Finalized Hash</div><div class=\"value-cell\">"
+       << "<div>Previous</div><div class=\"value-cell\">"
        << (transition.height > 0 ? linked_mono_value(transition.prev_finalized_hash, "/transition/" + transition.prev_finalized_hash)
                                  : mono_value(transition.prev_finalized_hash))
        << "</div>"
        << (transition.timestamp.has_value()
-               ? "<div>Timestamp</div><div>" + html_escape(format_timestamp(*transition.timestamp)) + " <span class=\"muted\">" +
+               ? "<div>Time</div><div>" + html_escape(format_timestamp(*transition.timestamp)) + " <span class=\"muted\">" +
                      html_escape(format_age(*transition.timestamp)) + "</span></div>"
                : std::string())
+       << "</div><details class=\"disclosure\"><summary>More details</summary><div class=\"grid\">"
        << "<div>Round</div><div>" << transition.round << "</div>"
        << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(transition.data_source)) << "</div>"
        << "<div>Snapshot Refreshed</div><div>"
        << html_escape(explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms).empty()
                           ? std::string("fresh live RPC")
                           : format_timestamp_ms(*transition.data_refreshed_unix_ms))
-       << "</div>"
-       << "<div>Tx Count</div><div>" << transition.tx_count << "</div></div>"
-       << "<div class=\"summary-actions\">"
-       << copy_action("Copy Transition Hash", transition.hash)
+       << "</div></div><div class=\"summary-actions\">"
        << copy_action("Copy Page Path", transition_path)
        << copy_action("Copy API Path", transition_api_path)
-       << "</div></div>";
+       << "</div></details></div>";
 
-  body << "<div class=\"card\"><h2>Transactions</h2><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Outputs</th></tr></thead><tbody>";
+  body << "<div class=\"card\"><h2>Transactions</h2><div class=\"table-wrap\"><table class=\"table-compact\"><thead><tr><th>#</th><th>Txid</th></tr></thead><tbody>";
   for (std::size_t i = 0; i < transition.txids.size(); ++i) {
-    body << "<tr><td>" << i << "</td><td>" << link_tx(transition.txids[i]) << "</td><td class=\"muted\">see tx page</td></tr>";
+    body << "<tr><td>" << i << "</td><td>" << link_tx(transition.txids[i]) << "</td></tr>";
   }
-  if (transition.txids.empty()) body << "<tr><td colspan=\"3\" class=\"muted\">No transactions were finalized in this transition.</td></tr>";
+  if (transition.txids.empty()) body << "<tr><td colspan=\"2\" class=\"muted\">No transactions in this transition.</td></tr>";
   body << "</tbody></table></div></div>";
   return page_layout("Transition " + transition.hash, body.str(), "transition");
 }
@@ -4517,38 +4493,28 @@ std::string render_address(const Config& cfg, const std::string& addr, const std
   for (const auto& u : address.utxos) finalized_balance += u.amount;
   std::uint64_t received_total = 0;
   std::uint64_t sent_total = 0;
-  std::uint64_t self_transfer_total = 0;
   for (const auto& item : address.history.items) {
     if (item.net_amount > 0 && item.direction == "received") received_total += static_cast<std::uint64_t>(item.net_amount);
     else if (item.net_amount < 0 && item.direction == "sent") sent_total += static_cast<std::uint64_t>(-item.net_amount);
-    else if (item.direction == "self-transfer") {
-      self_transfer_total += static_cast<std::uint64_t>(item.net_amount >= 0 ? item.net_amount : -item.net_amount);
-    }
   }
+  // Totals cover only the loaded history; say so when more exists.
+  const bool partial_history = address.history.has_more || start_after_height.has_value();
+  const std::string totals_scope = partial_history ? "in the history shown below" : "all finalized history";
 
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
-       << render_summary_metric_card("Finalized Balance", format_amount(finalized_balance), "current spendable UTXO set")
-       << render_summary_metric_card("Received (Visible Slice)", format_amount(received_total), "credits in the current history view")
-       << render_summary_metric_card("Sent (Visible Slice)", format_amount(sent_total), "debits in the current history view")
-       << render_summary_metric_card("Self-Transfer (Visible Slice)", format_amount(self_transfer_total),
-                                     "value recycled back to the same address in this view")
+       << render_summary_metric_card("Balance", format_amount(finalized_balance),
+                                     std::to_string(address.utxos.size()) + (address.utxos.size() == 1 ? " unspent output" : " unspent outputs"))
+       << render_summary_metric_card("Received", format_amount(received_total), totals_scope)
+       << render_summary_metric_card("Sent", format_amount(sent_total), totals_scope + ", fees included")
+       << render_summary_metric_card("Transactions", std::to_string(address.history.items.size()) + (partial_history ? "+" : ""), totals_scope)
        << "</div></div>";
   body << "<div class=\"card\"><div class=\"status-hero\">"
-       << "<div>" << mono_value(addr) << "</div><div>" << finalized_badge(true) << "</div></div>"
-       << "<div class=\"grid\" style=\"margin-top:14px;\">"
-       << "<div>Address</div><div class=\"value-cell\">" << mono_value(addr) << "</div>"
-       << "<div>Finalized Activity</div><div>" << (address.found ? "yes" : "no") << "</div>"
-       << "<div>Finalized UTXOs</div><div>" << address.utxos.size() << "</div>"
-       << "<div>Finalized Balance</div><div>" << html_escape(format_amount(finalized_balance)) << "</div>"
-       << "<div>History Items (View)</div><div>" << address.history.items.size() << "</div>"
-       << "<div>History Pages Loaded</div><div>" << address.history.loaded_pages << "</div>"
-       << "<div>History Slice Complete</div><div>" << (address.history.has_more ? "no" : "yes") << "</div>";
+       << "<div>" << mono_value(addr) << "</div><div>" << finalized_badge(true) << "</div></div>";
   if (start_after_height.has_value() && start_after_txid.has_value()) {
-    body << "<div>History Position</div><div>Showing older activity after height <code>" << *start_after_height
-         << "</code> and tx <code>" << html_escape(short_hex(*start_after_txid)) << "</code></div>";
+    body << "<p class=\"meta\">Showing activity after height " << *start_after_height << ", tx <code>"
+         << html_escape(short_hex(*start_after_txid)) << "</code>. <a href=\"" << html_escape(address_path) << "\">Back to the start</a></p>";
   }
-  body << "</div><div class=\"summary-actions\">"
-       << copy_action("Copy Address", addr)
+  body << "<div class=\"summary-actions\">"
        << copy_action("Copy Page Path", address_path)
        << copy_action("Copy API Path", address_api_path)
        << "</div></div>";
@@ -4564,23 +4530,28 @@ std::string render_address(const Config& cfg, const std::string& addr, const std
   }
   body << "</tbody></table></div></div>";
 
-  body << "<div class=\"card\"><h2>Finalized History</h2><p class=\"meta\">Amounts are relative to this address.</p><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Height</th><th>Direction</th><th>Net Amount</th><th>Detail</th></tr></thead><tbody>";
+  // The lightserver pages oldest-first; a complete history is shown newest-first.
+  const bool newest_first = !partial_history;
+  body << "<div class=\"card\"><h2>History</h2><p class=\"meta\">"
+       << (newest_first ? "Newest first. " : "Oldest first; newer activity continues on the next page. ")
+       << "Amounts are relative to this address.</p><div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>Direction</th><th>Net Amount</th><th>Detail</th></tr></thead><tbody>";
   if (!address.history.items.empty()) {
-    for (std::size_t i = 0; i < address.history.items.size(); ++i) {
-      const auto& item = address.history.items[i];
+    const std::size_t n = address.history.items.size();
+    for (std::size_t k = 0; k < n; ++k) {
+      const auto& item = address.history.items[newest_first ? n - 1 - k : k];
       const char* amount_class = item.net_amount > 0 ? "amount-in" : (item.net_amount < 0 ? "amount-out" : "muted");
-      body << "<tr><td>" << i << "</td><td>" << link_tx(item.txid) << "</td><td>" << link_transition_height(item.height)
+      body << "<tr><td>" << link_tx(item.txid) << "</td><td>" << link_transition_height(item.height)
            << "</td><td><strong>" << html_escape(item.direction) << "</strong></td><td class=\"" << amount_class << "\">"
            << html_escape(format_signed_amount(item.net_amount)) << "</td><td>" << html_escape(item.detail) << "</td></tr>";
     }
   } else {
-    body << "<tr><td colspan=\"6\" class=\"muted\">No finalized history found.</td></tr>";
+    body << "<tr><td colspan=\"5\" class=\"muted\">No finalized history found.</td></tr>";
   }
   body << "</tbody></table></div></div>";
   if (address.history.has_more) {
-    body << "<div class=\"card\"><div class=\"note\">Additional finalized history exists. ";
+    body << "<div class=\"card\"><div class=\"note\">More history exists. ";
     if (address.history.next_page_path.has_value()) {
-      body << "<a href=\"" << html_escape(*address.history.next_page_path) << "\">Load older finalized activity</a>";
+      body << "<a href=\"" << html_escape(*address.history.next_page_path) << "\">Newer activity &rarr;</a>";
     } else {
       body << "Load another older page from the API.";
     }

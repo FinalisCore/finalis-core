@@ -1839,6 +1839,36 @@ TEST(test_explorer_api_address_contract_and_empty_state) {
   ASSERT_TRUE(invalid.body.find("\"code\":\"invalid_address\"") != std::string::npos);
 }
 
+TEST(test_explorer_address_page_lists_complete_history_newest_first) {
+  ExplorerFixture fx;
+  const std::string older_txid(64, '1');
+  const std::string newer_txid(64, '2');
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_history_page_detailed\"") != std::string::npos) {
+      return rpc_result(std::string("{\"items\":[") +
+                        "{\"txid\":\"" + older_txid + "\",\"height\":5,\"direction\":\"received\",\"net_amount\":300,\"detail\":\"in\"}," +
+                        "{\"txid\":\"" + newer_txid + "\",\"height\":9,\"direction\":\"sent\",\"net_amount\":-120,\"detail\":\"out\"}" +
+                        "],\"has_more\":false,\"next_start_after\":null}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+  ScopedUtxoHook utxo_hook([&](const Hash32&, std::string*) -> std::optional<std::vector<finalis::lightserver::UtxoView>> {
+    return std::vector<finalis::lightserver::UtxoView>{};
+  });
+  const Config cfg = test_config();
+
+  const auto page = handle_request(cfg, make_http_get("/address/" + fx.known_address));
+  ASSERT_EQ(page.status, 200);
+  const auto newer_at = page.body.find("/tx/" + newer_txid);
+  const auto older_at = page.body.find("/tx/" + older_txid);
+  ASSERT_TRUE(newer_at != std::string::npos && older_at != std::string::npos);
+  ASSERT_TRUE(newer_at < older_at);
+  ASSERT_TRUE(page.body.find("Newest first.") != std::string::npos);
+  ASSERT_TRUE(page.body.find("all finalized history") != std::string::npos);
+  ASSERT_TRUE(page.body.find("History Pages Loaded") == std::string::npos);
+  ASSERT_TRUE(page.body.find("Visible Slice") == std::string::npos);
+}
+
 TEST(test_explorer_api_search_contract) {
   ExplorerFixture fx;
   ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
@@ -2107,16 +2137,12 @@ TEST(test_explorer_tx_and_transition_pages_surface_cached_data_source) {
     const auto tx_json = render_tx_json(*fetch_tx_result(cfg, fx.txid).value);
     ASSERT_TRUE(tx_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
     const auto tx_page = render_tx(cfg, fx.txid);
-    ASSERT_TRUE(tx_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
     ASSERT_TRUE(tx_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
-    ASSERT_TRUE(tx_page.find("Last refreshed from RPC: ") != std::string::npos);
     ASSERT_TRUE(tx_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
     const auto transition_json = render_transition_json(cfg, *fetch_transition_result(cfg, fx.transition_hash).value);
     ASSERT_TRUE(transition_json.find("\"data_refreshed_unix_ms\":") != std::string::npos);
     const auto transition_page = render_transition(cfg, fx.transition_hash);
-    ASSERT_TRUE(transition_page.find("Explorer data source: <strong>cached finalized snapshot</strong>") != std::string::npos);
     ASSERT_TRUE(transition_page.find("<div>Data Source</div><div>cached finalized snapshot</div>") != std::string::npos);
-    ASSERT_TRUE(transition_page.find("Last refreshed from RPC: ") != std::string::npos);
     ASSERT_TRUE(transition_page.find("<div>Snapshot Refreshed</div><div>") != std::string::npos);
   }
 
