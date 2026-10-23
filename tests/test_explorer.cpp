@@ -2190,6 +2190,22 @@ TEST(test_explorer_tx_page_and_json_surface_decoded_onboarding_registration_fiel
   ASSERT_TRUE(tx_page.find(short_hex(hex_encode(Bytes(validator.public_key.begin(), validator.public_key.end())))) != std::string::npos);
 }
 
+TEST(test_explorer_homepage_no_stale_banner_for_never_loaded_committee) {
+  ExplorerFixture fx;
+  ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  Config cfg = test_config();
+  const auto temp_path = unique_test_cache_path("finalis-explorer-never-loaded-cache-test");
+  cfg.cache_path = temp_path.string();
+  std::error_code ec;
+  std::filesystem::remove(temp_path, ec);
+  clear_runtime_caches();
+
+  const auto home = render_root(cfg);
+  ASSERT_TRUE(persisted_committee_refreshed_unix_ms() == std::nullopt);
+  ASSERT_TRUE(home.find("Snapshot Freshness Warning") == std::string::npos);
+  std::filesystem::remove(temp_path, ec);
+}
+
 TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
   ExplorerFixture fx;
   Config cfg = test_config();

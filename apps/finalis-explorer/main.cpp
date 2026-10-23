@@ -1073,7 +1073,8 @@ void set_surface_state(SurfaceRuntimeState& state, std::optional<std::string> er
 }
 
 bool surface_is_stale(const std::optional<std::uint64_t>& refreshed_unix_ms) {
-  if (!refreshed_unix_ms.has_value()) return true;
+  // A surface no page has requested yet is not stale; RPC failures are reported separately.
+  if (!refreshed_unix_ms.has_value()) return false;
   const auto now_ms = now_unix_ms();
   return now_ms > *refreshed_unix_ms && (now_ms - *refreshed_unix_ms) > kExplorerSurfaceStaleThresholdMs;
 }
