@@ -355,18 +355,6 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
   return settlement;
 }
 
-Hash32 frontier_settlement_txid(const FrontierTransition& transition) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'F', 'R', 'O', 'N', 'T', 'I', 'E', 'R',
-                '_', 'S', 'E', 'T', 'T', 'L', 'E', 'M', 'E', 'N', 'T', '_', 'V', '1'});
-  w.bytes_fixed(transition.prev_finalized_hash);
-  w.u64le(transition.height);
-  w.varbytes(transition.prev_vector.serialize());
-  w.varbytes(transition.next_vector.serialize());
-  w.bytes_fixed(transition.settlement_commitment);
-  return crypto::sha256d(w.data());
-}
-
 void apply_frontier_settlement_to_utxos(const FrontierTransition& transition, UtxoSetV2* utxos) {
   if (!utxos) return;
   const auto settlement_txid = frontier_settlement_txid(transition);
@@ -836,6 +824,18 @@ void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, Canonic
 }
 
 }  // namespace
+
+Hash32 frontier_settlement_txid(const FrontierTransition& transition) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '_', 'F', 'R', 'O', 'N', 'T', 'I', 'E', 'R',
+                '_', 'S', 'E', 'T', 'T', 'L', 'E', 'M', 'E', 'N', 'T', '_', 'V', '1'});
+  w.bytes_fixed(transition.prev_finalized_hash);
+  w.u64le(transition.height);
+  w.varbytes(transition.prev_vector.serialize());
+  w.varbytes(transition.next_vector.serialize());
+  w.bytes_fixed(transition.settlement_commitment);
+  return crypto::sha256d(w.data());
+}
 
 std::uint64_t effective_validator_min_bond_for_height(const NetworkConfig& network, std::uint64_t min_bond_override,
                                                       std::uint64_t bond_min_amount, const ValidatorRegistry& validators,

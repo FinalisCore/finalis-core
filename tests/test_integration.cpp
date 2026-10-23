@@ -4578,6 +4578,20 @@ TEST(test_epoch_reward_settlement_matches_closed_epoch_rewards) {
   ASSERT_EQ(artifact->proposal.transition.settlement.settled_epoch_rewards, validator_epoch_rewards);
   ASSERT_EQ(artifact->proposal.transition.settlement.total, validator_epoch_rewards);
   ASSERT_EQ(artifact->proposal.transition.settlement.outputs[0].second, validator_epoch_rewards);
+
+  // The reward payout is indexed under its synthetic txid and credited to the recipient's history.
+  const auto settlement_txid = consensus::frontier_settlement_txid(artifact->proposal.transition);
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly(base + "/node0"));
+  ASSERT_EQ(db.get_settlement_height(settlement_txid), std::optional<std::uint64_t>(33));
+  const auto& payee = artifact->proposal.transition.settlement.outputs[0].first;
+  const auto payee_scripthash =
+      crypto::sha256(address::p2pkh_script_pubkey(crypto::h160(Bytes(payee.begin(), payee.end()))));
+  bool credited = false;
+  for (const auto& entry : db.get_script_history(payee_scripthash)) {
+    if (entry.txid == settlement_txid && entry.height == 33) credited = true;
+  }
+  ASSERT_TRUE(credited);
 }
 
 TEST(test_epoch_reward_settlement_restart_is_deterministic) {

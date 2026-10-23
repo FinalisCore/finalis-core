@@ -7,6 +7,7 @@
 #include <iostream>
 
 #include "codec/bytes.hpp"
+#include "common/address.hpp"
 #include "common/wide_arith.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/embedded.hpp"
@@ -599,6 +600,19 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
           batch.add_script_history(confidential_history_key(out.one_time_pubkey), record.transition.height, txid);
         }
       }
+    }
+  }
+  // Settlement (reward payout) outputs have no transaction: index their synthetic txid and credit
+  // each recipient's history so explorers and wallets can resolve and show them.
+  if (!record.transition.settlement.outputs.empty()) {
+    const Hash32 settlement_txid = consensus::frontier_settlement_txid(record.transition);
+    batch.put_settlement_txid(settlement_txid, record.transition.height);
+    std::set<Hash32> credited;
+    for (const auto& [pub, units] : record.transition.settlement.outputs) {
+      (void)units;
+      const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
+      const Hash32 scripthash = crypto::sha256(address::p2pkh_script_pubkey(pkh));
+      if (credited.insert(scripthash).second) batch.add_script_history(scripthash, record.transition.height, settlement_txid);
     }
   }
   // DB::set_finalized_ingress_tip's monotonicity check, replicated here: a

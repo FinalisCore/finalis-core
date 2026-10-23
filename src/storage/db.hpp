@@ -288,6 +288,8 @@ class DB {
     // A transaction carried by the finalized slice at `height` but rejected by frontier execution.
     // It has no tx index entry: it moved no funds.
     void put_rejected_tx(const Hash32& txid, std::uint64_t height);
+    // Height of the transition whose settlement (reward payout) outputs live under this synthetic txid.
+    void put_settlement_txid(const Hash32& txid, std::uint64_t height);
     void add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
     void stage_finalized_ingress_tip(std::uint64_t seq);
     void set_tip(const TipState& tip);
@@ -419,6 +421,8 @@ class DB {
   std::optional<TxLocation> get_tx_index(const Hash32& txid) const;
   // Height of the finalized slice that carried and rejected `txid`, if any.
   std::optional<std::uint64_t> get_rejected_tx_height(const Hash32& txid) const;
+  // Height of the transition that paid settlement outputs under `txid`, if any.
+  std::optional<std::uint64_t> get_settlement_height(const Hash32& txid) const;
 
   bool put_ingress_record(std::uint64_t seq, const Bytes& record_bytes);
   std::optional<Bytes> get_ingress_record(std::uint64_t seq) const;

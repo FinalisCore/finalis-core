@@ -281,6 +281,8 @@ struct TxInputResult {
   std::optional<std::uint64_t> amount;
   // Spends a confidential output: the amount is hidden, there is no address.
   bool confidential{false};
+  // Spends a settlement (protocol reward payout) output rather than a transaction output.
+  bool reward{false};
 };
 
 // A TxV2 confidential output pays a one-time key with a hidden amount; `amount` is meaningless for it.
@@ -2307,6 +2309,7 @@ finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
     json_put(item, "address", in.address);
     json_put(item, "amount", in.amount);
     json_put(item, "confidential", in.confidential);
+    json_put(item, "reward", in.reward);
     inputs.array_value.push_back(std::move(item));
   }
   auto outputs = json_array_value();
@@ -2363,6 +2366,7 @@ std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& o
           object_string(&input, "address"),
           object_u64(&input, "amount"),
           object_bool(&input, "confidential").value_or(false),
+          object_bool(&input, "reward").value_or(false),
       });
     }
   }
@@ -3365,6 +3369,48 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
   }
 }
 
+// A settlement (protocol reward payout) has no transaction; the lightserver serves its outputs by
+// their synthetic txid.
+std::optional<TxResult> fetch_settlement_tx_result(const Config& cfg, const std::string& txid_hex) {
+  auto call = rpc_call(cfg.rpc_url, "get_settlement", std::string("{\"txid\":\"") + txid_hex + "\"}");
+  if (!call.result.has_value() || !call.result->is_object()) return std::nullopt;
+  const auto& obj = *call.result;
+  TxResult result;
+  result.txid = txid_hex;
+  result.found = true;
+  result.finalized = true;
+  result.credit_safe = true;
+  result.status_label = tx_status_label(true, true);
+  result.finalized_height = object_u64(&obj, "height");
+  result.transition_hash = object_string(&obj, "transition_hash").value_or("");
+  if (auto status = fetch_status_result(cfg);
+      status.value.has_value() && result.finalized_height.has_value() && status.value->finalized_height >= *result.finalized_height) {
+    result.finalized_depth = status.value->finalized_height - *result.finalized_height + 1;
+  }
+  std::set<std::string> recipients;
+  if (const auto* outputs = obj.get("decoded_outputs"); outputs && outputs->is_array()) {
+    for (const auto& item : outputs->array_value) {
+      if (!item.is_object()) continue;
+      TxOutputResult output;
+      output.amount = object_u64(&item, "amount").value_or(0);
+      output.address = object_string(&item, "address");
+      output.script_hex = object_string(&item, "script_hex").value_or("");
+      result.total_out += output.amount;
+      if (output.address.has_value()) {
+        if (!result.primary_recipient.has_value()) result.primary_recipient = *output.address;
+        recipients.insert(*output.address);
+      }
+      result.outputs.push_back(std::move(output));
+    }
+  }
+  result.fee = 0;
+  result.flow_kind = "reward";
+  result.flow_summary = "Protocol reward payout";
+  result.participant_count = recipients.size();
+  result.data_source = "rpc_live_finalized";
+  return result;
+}
+
 LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txid_hex) {
   LookupResult<TxResult> out;
   if (!is_hex64(txid_hex)) {
@@ -3390,6 +3436,9 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
       out.error = not_final_error();
     } else if (status_text == "rejected") {
       out.error = rejected_at_finality_error(object_u64(&status, "rejected_height"));
+    } else if (auto settlement = fetch_settlement_tx_result(cfg, txid_hex); settlement.has_value()) {
+      upsert_persisted_tx_result(cfg, *settlement);
+      out.value = std::move(*settlement);
     } else {
       out.error = not_found_error(
           "not found in finalized state; a transaction submitted moments ago is not final yet");
@@ -3443,13 +3492,31 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     return view;
   };
   std::map<std::string, OutputsView> prev_tx_cache;
+  std::set<std::string> settlement_prev_txids;
   auto fetch_prev_outputs = [&](const Hash32& prev_txid) -> const OutputsView* {
     const std::string prev_txid_hex = finalis::hex_encode32(prev_txid);
     auto it = prev_tx_cache.find(prev_txid_hex);
     if (it != prev_tx_cache.end()) return &it->second;
 
     auto prev_call = rpc_call(cfg.rpc_url, "get_tx", std::string("{\"txid\":\"") + prev_txid_hex + "\"}");
-    if (!prev_call.result.has_value() || !prev_call.result->is_object()) return nullptr;
+    if (!prev_call.result.has_value() || !prev_call.result->is_object()) {
+      auto settlement = rpc_call(cfg.rpc_url, "get_settlement", std::string("{\"txid\":\"") + prev_txid_hex + "\"}");
+      if (!settlement.result.has_value() || !settlement.result->is_object()) return nullptr;
+      const auto* outputs = settlement.result->get("decoded_outputs");
+      if (!outputs || !outputs->is_array()) return nullptr;
+      OutputsView view;
+      for (const auto& item : outputs->array_value) {
+        const auto amount = object_u64(&item, "amount");
+        const auto script = finalis::hex_decode(object_string(&item, "script_hex").value_or(""));
+        if (!amount.has_value() || !script.has_value()) {
+          view.emplace_back(std::nullopt);
+          continue;
+        }
+        view.emplace_back(finalis::TxOut{*amount, *script});
+      }
+      settlement_prev_txids.insert(prev_txid_hex);
+      return &prev_tx_cache.emplace(prev_txid_hex, std::move(view)).first->second;
+    }
     auto prev_hex = object_string(&*prev_call.result, "tx_hex");
     if (!prev_hex) return nullptr;
     auto prev_bytes = finalis::hex_decode(*prev_hex);
@@ -3467,6 +3534,7 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   const auto add_transparent_input = [&](const Hash32& prev_txid, std::uint32_t prev_index) {
     TxInputResult input_view{finalis::hex_encode32(prev_txid), prev_index, std::nullopt, std::nullopt};
     const auto* prev_outputs = fetch_prev_outputs(prev_txid);
+    input_view.reward = settlement_prev_txids.count(input_view.prev_txid) != 0;
     if (!prev_outputs || prev_index >= prev_outputs->size() || !(*prev_outputs)[prev_index].has_value()) {
       result.inputs.push_back(std::move(input_view));
       fee_known = false;
@@ -4276,7 +4344,8 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
     if (!address.has_value()) return "<span class=\"muted\">unknown</span>";
     return "<a href=\"/address/" + html_escape(*address) + "\"><code>" + html_escape(short_hex(*address)) + "</code></a>";
   };
-  const std::string payer = address_card_value(tx.primary_sender);
+  const std::string payer =
+      tx.flow_kind == "reward" ? std::string("<span class=\"muted\">protocol</span>") : address_card_value(tx.primary_sender);
   std::string payee = address_card_value(tx.primary_recipient);
   if (!tx.outputs.empty() && tx.outputs.size() > 1) {
     std::set<std::string> senders;
@@ -4332,7 +4401,8 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   body << "<div class=\"card\"><h2>Inputs</h2><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Prev Tx</th><th>Vout</th><th>Decoded Source</th><th>Amount</th></tr></thead><tbody>";
   for (std::size_t i = 0; i < tx.inputs.size(); ++i) {
     const auto& in = tx.inputs[i];
-    body << "<tr><td>" << i << "</td><td>" << link_tx(in.prev_txid) << "</td><td>" << in.vout
+    body << "<tr><td>" << i << "</td><td>" << link_tx(in.prev_txid)
+         << (in.reward ? " " + status_chip("reward", "good") : std::string()) << "</td><td>" << in.vout
          << "</td><td>";
     if (in.confidential) body << "<span class=\"muted\">confidential output (no address)</span>";
     else if (in.address.has_value()) body << "<a href=\"/address/" << html_escape(*in.address) << "\"><code>" << html_escape(*in.address) << "</code></a>";

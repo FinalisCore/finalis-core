@@ -2279,6 +2279,54 @@ TEST(test_explorer_payment_with_change_names_external_recipient_and_counts_as_se
   ASSERT_EQ(classify_address_history_item(sender, self_tx).direction, std::string("self-transfer"));
 }
 
+TEST(test_explorer_resolves_reward_inputs_and_settlement_pages) {
+  ExplorerFixture fx;
+  // A validator (empty_address) spends its reward payout S:0 to known_address.
+  const std::string settlement_txid(64, 'b');
+  const auto validator = address::decode(fx.empty_address);
+  ASSERT_TRUE(validator.has_value());
+  const auto validator_spk = address::p2pkh_script_pubkey(validator->pubkey_hash);
+  Hash32 settlement_hash{};
+  settlement_hash.fill(0xbb);
+  Tx spend;
+  spend.version = 1;
+  spend.inputs.push_back(TxIn{settlement_hash, 0, Bytes{}, 0xFFFFFFFFu});
+  spend.outputs.push_back(TxOut{4000, address::p2pkh_script_pubkey(address::decode(fx.known_address)->pubkey_hash)});
+  const std::string spend_txid = hex_encode32(spend.txid());
+
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_settlement\"") != std::string::npos) {
+      if (body.find(settlement_txid) == std::string::npos) return rpc_error(-32001, "not found");
+      return rpc_result(std::string("{\"txid\":\"") + settlement_txid + "\",\"height\":5,\"transition_hash\":\"" +
+                        fx.transition_hash + "\",\"decoded_outputs\":[{\"amount\":5000,\"script_hex\":\"" +
+                        hex_encode(validator_spk) + "\",\"address\":\"" + fx.empty_address + "\",\"decoded_kind\":null}]}");
+    }
+    if (body.find(spend_txid) != std::string::npos) {
+      if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) {
+        return rpc_result(R"({"status":"finalized","finalized":true,"height":8,"finalized_depth":3,"credit_safe":true})");
+      }
+      if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+        return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(spend.serialize()) + "\"}");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+
+  const auto spend_tx = fetch_tx_result(cfg, spend_txid);
+  ASSERT_TRUE(spend_tx.value.has_value());
+  ASSERT_TRUE(spend_tx.value->inputs[0].reward);
+  ASSERT_EQ(*spend_tx.value->inputs[0].address, fx.empty_address);
+  ASSERT_EQ(*spend_tx.value->primary_sender, fx.empty_address);
+  ASSERT_EQ(*spend_tx.value->fee, static_cast<std::uint64_t>(1000));
+  ASSERT_EQ(spend_tx.value->flow_kind, std::string("direct-transfer"));
+
+  const auto payout = handle_request(cfg, make_http_get("/tx/" + settlement_txid));
+  ASSERT_EQ(payout.status, 200);
+  ASSERT_TRUE(payout.body.find("Protocol reward payout") != std::string::npos);
+  ASSERT_TRUE(payout.body.find("/address/" + fx.empty_address) != std::string::npos);
+}
+
 TEST(test_explorer_homepage_no_stale_banner_for_never_loaded_committee) {
   ExplorerFixture fx;
   ScopedRpcHook rpc([&](const std::string& body) { return default_rpc_handler(fx, body); });
