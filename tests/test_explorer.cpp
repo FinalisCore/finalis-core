@@ -439,7 +439,8 @@ TEST(test_explorer_tx_page_makes_credit_decision_explicit) {
   ASSERT_TRUE(tx_page.body.find("Safe to credit") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("FINALIZED (CREDIT SAFE)") != std::string::npos);
   ASSERT_TRUE(tx_page.body.find("Credit Safe</div><div>YES") != std::string::npos);
-  ASSERT_TRUE(tx_page.body.find("Explorer data source: <strong>fresh finalized RPC</strong>") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("<div>Data Source</div><div>fresh finalized RPC</div>") != std::string::npos);
+  ASSERT_TRUE(tx_page.body.find("Explorer data source:") == std::string::npos);
   ASSERT_TRUE(tx_page.body.find("confirm") == std::string::npos);
 }
 
@@ -1724,8 +1725,7 @@ TEST(test_explorer_root_page_availability_enforcement_empty_state_is_explicit) {
   const auto home = handle_request(cfg, make_http_get("/"));
   ASSERT_EQ(home.status, 200);
   ASSERT_TRUE(home.body.find("Operator View") != std::string::npos);
-  ASSERT_TRUE(home.body.find("Committee composition, Ticket PoW, and availability mechanics live on the dedicated committee page.") !=
-              std::string::npos);
+  ASSERT_TRUE(home.body.find("Operator View: node status, committee and API") != std::string::npos);
 
   const auto committee = handle_request(cfg, make_http_get("/committee"));
   ASSERT_EQ(committee.status, 200);
@@ -2210,10 +2210,10 @@ TEST(test_explorer_home_and_committee_surface_per_section_refresh_times) {
     ScopedRpcHook rpc([&](const std::string&) { return rpc_error(-32000, "rpc should not be used"); });
     load_persisted_explorer_snapshot(cfg);
     const auto home = render_root(cfg);
-    ASSERT_TRUE(home.find("Status Snapshot Refreshed") != std::string::npos);
-    ASSERT_TRUE(home.find("Recent transactions snapshot refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(home.find("<div>Status Refreshed</div>") != std::string::npos);
+    ASSERT_TRUE(home.find("Flow labels are inferred from inputs and outputs, not ownership proofs. Refreshed ") != std::string::npos);
     const auto committee = render_committee(cfg);
-    ASSERT_TRUE(committee.find("Committee snapshot refreshed from RPC: ") != std::string::npos);
+    ASSERT_TRUE(committee.find("Committee snapshot refreshed ") != std::string::npos);
   }
 
   std::filesystem::remove(temp_path, ec);

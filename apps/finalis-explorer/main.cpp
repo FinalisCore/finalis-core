@@ -1020,6 +1020,13 @@ std::string explorer_data_freshness_note(const std::string& source, const std::o
   return "Last refreshed from RPC: " + format_timestamp_ms(*refreshed_unix_ms);
 }
 
+std::string explorer_cached_source_note(const std::string& source, const std::optional<std::uint64_t>& refreshed_unix_ms) {
+  const auto freshness = explorer_data_freshness_note(source, refreshed_unix_ms);
+  if (freshness.empty()) return {};
+  return "<div class=\"note\">Explorer data source: <strong>" + html_escape(explorer_data_source_label(source)) + "</strong>. " +
+         html_escape(freshness) + ".</div>";
+}
+
 std::string explorer_snapshot_freshness_text(const std::optional<std::uint64_t>& refreshed_unix_ms) {
   if (!refreshed_unix_ms.has_value()) return "unknown";
   return format_timestamp_ms(*refreshed_unix_ms);
@@ -1393,7 +1400,7 @@ AddressHistoryItemResult classify_address_history_item(const std::string& addres
 }
 
 std::string global_finalized_banner() {
-  return "<div class=\"global-banner\">Explorer view is finalized-state only. Only finalized activity is shown.</div>";
+  return "<div class=\"global-banner\">Only finalized chain state is shown: no mempool or pending activity.</div>";
 }
 
 std::string top_nav(const std::string& active) {
@@ -1480,6 +1487,8 @@ std::string page_layout(const std::string& title, const std::string& body, const
          "details.disclosure{margin-top:14px;border-top:1px solid #ebe4d4;padding-top:12px;}"
          "details.disclosure summary{cursor:pointer;font-weight:700;color:#5d522f;}"
          "details.disclosure[open] summary{margin-bottom:10px;}"
+         ".meta{margin:8px 0 0 0;color:#5b5b5b;font-size:13px;line-height:1.45;}"
+         "details.disclosure-plain{margin-top:0;border-top:0;padding-top:0;}"
          ".soft-empty{padding:16px 18px;border-radius:14px;background:linear-gradient(180deg,#fbfaf5 0%,#f4f1e7 100%);border:1px dashed #d6cdaa;color:#5a5342;}"
          "@media (max-width:780px){h1{font-size:26px;}.grid{grid-template-columns:1fr;}.card{padding:15px 16px;}.badge{font-size:14px;padding:8px 12px;}.mono-block{flex-direction:column;}.copy-button{align-self:flex-start;}}"
          "@media (max-width:560px){body{padding:12px;}table{min-width:460px;font-size:13px;}th,td{padding:7px 8px;}}"
@@ -2857,8 +2866,7 @@ std::string render_root(const Config& cfg) {
   const auto recent = fetch_recent_tx_results(cfg, 8);
   const auto recent_refreshed_unix_ms = persisted_recent_refreshed_unix_ms();
   body << build_surface_stale_banner();
-  body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>"
-       << "<div class=\"note\">Finalized-state explorer for operators, wallets, and exchanges. It intentionally shows only finalized chain state and hides mempool ambiguity.</div>";
+  body << "<div class=\"card hero-card\"><h1>Finalis Explorer</h1>";
   if (status.value.has_value()) {
     body << "<div class=\"hero-metrics\">"
          << "<div class=\"metric-card\"><span class=\"label\">Finalized Tip</span><span class=\"value\">" << status.value->finalized_height
@@ -2874,50 +2882,10 @@ std::string render_root(const Config& cfg) {
          << "</div>";
   }
   body << "</div>";
-  body << "<div class=\"card\"><h2>Search</h2><form method=\"GET\" action=\"/search\">"
-       << "<input type=\"text\" name=\"q\" placeholder=\"txid, transition height/hash, or address\" "
-       << "style=\"width:min(100%,720px);padding:10px 12px;font:inherit;border:1px solid #cfcfc6;border-radius:8px;\"> "
-       << "<button type=\"submit\" class=\"copy-button\">Search</button></form></div>";
-  body << "<div class=\"card\"><div class=\"status-hero\"><div><h2>Backend</h2></div>";
-  body << "</div><div class=\"grid\">";
-  if (status.value.has_value()) {
-    body << "<div>Runtime Status</div><div>" << status_chip(sync_summary_text(*status.value), tone_for_sync(*status.value)) << " "
-         << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
-         << "<div>Status Snapshot Refreshed</div><div>" << html_escape(explorer_snapshot_freshness_text(status_refreshed_unix_ms)) << "</div>"
-         << "<div>Network</div><div>" << html_escape(status.value->network) << "</div>"
-         << "<div>Finalized Tip</div><div class=\"value-cell\">" << link_transition_height(status.value->finalized_height) << " <code>" << html_escape(short_hex(status.value->finalized_transition_hash))
-         << "</code> " << finalized_badge(true) << "</div>"
-         << "<div>Version</div><div>" << html_escape(status.value->backend_version) << "</div>"
-         << "<div>Peers</div><div>healthy=" << status.value->healthy_peer_count << ", established=" << status.value->established_peer_count << "</div>"
-         << "<div>Finality Committee</div><div>size=" << status.value->latest_finality_committee_size
-         << ", quorum=" << status.value->latest_finality_quorum_threshold << "</div>";
-  } else {
-    body << "<div>Status</div><div class=\"muted\">Unavailable: " << html_escape(status.error->message) << "</div>";
-  }
-  body << "</div>";
-  if (status.value.has_value()) {
-    body << "<details class=\"disclosure\"><summary>Show backend internals</summary><div class=\"grid\">"
-         << "<div>Network ID</div><div class=\"value-cell\">" << mono_value(status.value->network_id) << "</div>"
-         << "<div>Genesis Hash</div><div class=\"value-cell\">" << mono_value(status.value->genesis_hash) << "</div>"
-         << "<div>Wallet API</div><div>" << html_escape(status.value->wallet_api_version) << "</div>"
-         << "<div>Sync Detail</div><div>" << html_escape(sync_summary_text(*status.value)) << "</div>"
-         << "</div></details>";
-  }
-  body << "</div>";
-  if (status.value.has_value()) {
-    body << "<div class=\"card\"><h2>Operator View</h2>"
-         << "<div class=\"note\">The homepage stays focused on finalized chain state and recent activity. Committee composition, Ticket PoW, and availability mechanics live on the dedicated committee page.</div>"
-         << "<div class=\"summary-actions\">"
-         << "<a class=\"copy-button\" href=\"/committee\">Open Committee View</a>"
-         << "<a class=\"copy-button\" href=\"/api/committee\">Open Committee API</a>"
-         << copy_action("Copy Status API Path", "/api/status")
-         << "</div></div>";
-  }
   body << "<div class=\"card\"><h2>Finalized Transactions</h2>";
   if (!recent.empty()) {
-    body << "<div class=\"note\">Recent finalized on-chain activity from the latest finalized transitions. Flow labels are explorer heuristics derived from finalized inputs and outputs, not wallet ownership proofs.</div>"
-         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
-         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
+    body << "<p class=\"meta\">Flow labels are inferred from inputs and outputs, not ownership proofs. Refreshed "
+         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << ".</p>";
     body << "<div class=\"table-wrap\"><table><thead><tr><th>Txid</th><th>Height</th><th>When</th><th>Flow</th><th>From</th><th>To</th><th>Finalized Out</th><th>Fee</th><th>Status</th><th>Shape</th></tr></thead><tbody>";
     for (const auto& item : recent) {
       body << "<tr><td>" << link_tx(item.txid) << "</td><td>"
@@ -2958,17 +2926,35 @@ std::string render_root(const Config& cfg) {
     }
     body << "</tbody></table></div>";
   } else {
-    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. This usually means the latest finalized transitions carried no user transactions, not that explorer indexing is broken.</div>"
-         << "<div class=\"note\">Recent transactions snapshot refreshed from RPC: "
-         << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << "</div>";
+    body << "<div class=\"soft-empty\">No finalized transactions were found in the recent finalized-height scan window. The latest transitions carried no user transactions.</div>"
+         << "<p class=\"meta\">Refreshed " << html_escape(explorer_snapshot_freshness_text(recent_refreshed_unix_ms)) << ".</p>";
   }
   body << "</div>";
-  body << "<div class=\"card\"><h2>Routes</h2><ul>"
-       << "<li><code>/tx/&lt;txid&gt;</code></li>"
-       << "<li><code>/transition/&lt;height&gt;</code> or <code>/transition/&lt;hash&gt;</code></li>"
-       << "<li><code>/address/&lt;address&gt;</code></li>"
-       << "<li><code>/committee</code></li>"
-       << "</ul></div>";
+  body << "<div class=\"card\"><details class=\"disclosure disclosure-plain\"><summary>Operator View: node status, committee and API</summary>";
+  body << "<div class=\"grid\">";
+  if (status.value.has_value()) {
+    body << "<div>Runtime Status</div><div>" << status_chip(sync_summary_text(*status.value), tone_for_sync(*status.value)) << " "
+         << fallback_chip(*status.value) << " " << operator_chip(*status.value) << "</div>"
+         << "<div>Status Refreshed</div><div>" << html_escape(explorer_snapshot_freshness_text(status_refreshed_unix_ms)) << "</div>"
+         << "<div>Network</div><div>" << html_escape(status.value->network) << "</div>"
+         << "<div>Version</div><div>" << html_escape(status.value->backend_version) << "</div>"
+         << "<div>Peers</div><div>" << status.value->healthy_peer_count << " healthy, " << status.value->established_peer_count << " established</div>"
+         << "<div>Finality Committee</div><div>" << status.value->latest_finality_committee_size << " members, quorum "
+         << status.value->latest_finality_quorum_threshold << "</div>"
+         << "<div>Network ID</div><div class=\"value-cell\">" << mono_value(status.value->network_id) << "</div>"
+         << "<div>Genesis Hash</div><div class=\"value-cell\">" << mono_value(status.value->genesis_hash) << "</div>"
+         << "<div>Wallet API</div><div>" << html_escape(status.value->wallet_api_version) << "</div>"
+         << "<div>Sync Detail</div><div>" << html_escape(sync_summary_text(*status.value)) << "</div>";
+  } else {
+    body << "<div>Status</div><div class=\"muted\">Unavailable: " << html_escape(status.error->message) << "</div>";
+  }
+  body << "</div><div class=\"summary-actions\">"
+       << "<a class=\"copy-button\" href=\"/committee\">Open Committee View</a>"
+       << "<a class=\"copy-button\" href=\"/api/committee\">Open Committee API</a>"
+       << copy_action("Copy Status API Path", "/api/status")
+       << "</div><p class=\"meta\">Routes: <code>/tx/&lt;txid&gt;</code>, <code>/transition/&lt;height|hash&gt;</code>, "
+          "<code>/address/&lt;address&gt;</code>, <code>/committee</code>, <code>/api/...</code></p>"
+       << "</details></div>";
   return page_layout("Finalis Explorer", body.str(), "overview");
 }
 
@@ -2995,9 +2981,7 @@ std::string render_committee(const Config& cfg) {
        << render_summary_metric_card("Checkpoint Mode", committee.value->checkpoint_derivation_mode.value_or("n/a"),
                                      committee.value->checkpoint_fallback_reason.value_or("no fallback"))
        << "</div></div>";
-  body << "<div class=\"card\"><div class=\"note\">Committee snapshot refreshed from RPC: "
-       << html_escape(explorer_snapshot_freshness_text(committee_refreshed_unix_ms))
-       << "</div></div>";
+  body << "<p class=\"meta\">Committee snapshot refreshed " << html_escape(explorer_snapshot_freshness_text(committee_refreshed_unix_ms)) << ".</p>";
   body << "<div class=\"card\"><h2>" << html_escape(ticket_pow_title(*status.value)) << "</h2><div class=\"grid\">"
        << "<div>Difficulty</div><div>" << status.value->ticket_pow_difficulty << " <span class=\"muted\">(range "
        << status.value->ticket_pow_difficulty_min << "&ndash;" << status.value->ticket_pow_difficulty_max << ")</span></div>"
@@ -3012,7 +2996,6 @@ std::string render_committee(const Config& cfg) {
        << "</div></div>";
   body << "<div class=\"card\"><div class=\"note\">" << html_escape(ticket_pow_note(*status.value))
        << " Finality remains BFT/quorum-based."
-       << " This page is a finalized committee snapshot, not a live mempool or proposal view."
        << "</div></div>"
        << "<div class=\"card\"><div class=\"grid\">"
        << "<div>Finalized Height</div><div>" << link_transition_height(status.value->finalized_height) << "</div>"
@@ -4274,12 +4257,7 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << "<div>" << mono_value(tx.txid) << "</div><div>" << finalized_badge(tx.finalized) << " "
        << credit_safe_badge(tx.credit_safe) << "</div></div>"
        << "<div class=\"decision-line\">" << html_escape(credit_decision_text(tx.finalized, tx.credit_safe)) << "</div>"
-       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(tx.data_source))
-       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
-       << (explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
-               ? std::string()
-               : "<div class=\"note\">" + html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms)) + "</div>")
-       << "<div class=\"note\">Transaction view is finalized-state only. Relay acceptance, mempool state, and pre-finality observations are intentionally not shown here.</div>"
+       << explorer_cached_source_note(tx.data_source, tx.data_refreshed_unix_ms)
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Txid</div><div class=\"value-cell\">" << mono_value(tx.txid) << "</div>"
        << "<div>Flow Classification</div><div><strong>" << html_escape(tx.flow_kind) << "</strong><div class=\"muted\">"
@@ -4292,8 +4270,7 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << html_escape(explorer_data_freshness_note(tx.data_source, tx.data_refreshed_unix_ms).empty()
                           ? std::string("fresh live RPC")
                           : format_timestamp_ms(*tx.data_refreshed_unix_ms))
-       << "</div>"
-       << "<div>Finalized Only</div><div>yes</div>";
+       << "</div>";
   if (tx.finalized_height.has_value()) body << "<div>Finalized Height</div><div>" << link_transition_height(*tx.finalized_height) << "</div>";
   if (!tx.transition_hash.empty()) body << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(tx.transition_hash) << "</div>";
   if (tx.timestamp.has_value()) body << "<div>Timestamp</div><div>" << html_escape(format_timestamp(*tx.timestamp)) << "</div>";
@@ -4391,20 +4368,13 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
 
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(transition.hash) << "</div><div>" << finalized_badge(true) << "</div></div>"
-       << "<div class=\"note\">Explorer data source: <strong>" << html_escape(explorer_data_source_label(transition.data_source))
-       << "</strong>. Cached finalized snapshots remain valid, but may be older than a fresh RPC refresh.</div>"
-       << (explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms).empty()
-               ? std::string()
-               : "<div class=\"note\">" +
-                     html_escape(explorer_data_freshness_note(transition.data_source, transition.data_refreshed_unix_ms)) + "</div>")
-       << "<div class=\"note\">Transition view is finalized-only. It shows the finalized checkpoint contents for one height, not proposal-stage or unfinalized round activity.</div>"
+       << explorer_cached_source_note(transition.data_source, transition.data_refreshed_unix_ms)
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Height</div><div>" << transition.height << "</div>"
        << "<div>Transition Hash</div><div class=\"value-cell\">" << mono_value(transition.hash) << "</div>"
        << "<div>Prev Finalized Hash</div><div class=\"value-cell\">" << mono_value(transition.prev_finalized_hash)
        << "</div>"
-       << "<div>Timestamp</div><div>"
-       << html_escape(transition.timestamp.has_value() ? format_timestamp(*transition.timestamp) : std::string("not carried in finalized transition record")) << "</div>"
+       << (transition.timestamp.has_value() ? "<div>Timestamp</div><div>" + html_escape(format_timestamp(*transition.timestamp)) + "</div>" : std::string())
        << "<div>Round</div><div>" << transition.round << "</div>"
        << "<div>Data Source</div><div>" << html_escape(explorer_data_source_label(transition.data_source)) << "</div>"
        << "<div>Snapshot Refreshed</div><div>"
@@ -4419,7 +4389,7 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
        << copy_action("Copy API Path", transition_api_path)
        << "</div></div>";
 
-  body << "<div class=\"card\"><h2>Transactions</h2><div class=\"note\">This list contains finalized transaction ids only. Per-output interpretation lives on the individual transaction page.</div><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Outputs</th></tr></thead><tbody>";
+  body << "<div class=\"card\"><h2>Transactions</h2><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Outputs</th></tr></thead><tbody>";
   for (std::size_t i = 0; i < transition.txids.size(); ++i) {
     body << "<tr><td>" << i << "</td><td>" << link_tx(transition.txids[i]) << "</td><td class=\"muted\">see tx page</td></tr>";
   }
@@ -4473,7 +4443,6 @@ std::string render_address(const Config& cfg, const std::string& addr, const std
        << "</div></div>";
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(addr) << "</div><div>" << finalized_badge(true) << "</div></div>"
-       << "<div class=\"note\">Address view is finalized-state only. It shows current finalized UTXOs plus a paginated finalized-history slice, not live mempool activity.</div>"
        << "<div class=\"grid\" style=\"margin-top:14px;\">"
        << "<div>Address</div><div class=\"value-cell\">" << mono_value(addr) << "</div>"
        << "<div>Finalized Activity</div><div>" << (address.found ? "yes" : "no") << "</div>"
@@ -4503,7 +4472,7 @@ std::string render_address(const Config& cfg, const std::string& addr, const std
   }
   body << "</tbody></table></div></div>";
 
-  body << "<div class=\"card\"><h2>Finalized History</h2><div class=\"note\">Each row is interpreted relative to this address only, using finalized inputs and outputs.</div><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Height</th><th>Direction</th><th>Net Amount</th><th>Detail</th></tr></thead><tbody>";
+  body << "<div class=\"card\"><h2>Finalized History</h2><p class=\"meta\">Amounts are relative to this address.</p><div class=\"table-wrap\"><table><thead><tr><th>#</th><th>Txid</th><th>Height</th><th>Direction</th><th>Net Amount</th><th>Detail</th></tr></thead><tbody>";
   if (!address.history.items.empty()) {
     for (std::size_t i = 0; i < address.history.items.size(); ++i) {
       const auto& item = address.history.items[i];
