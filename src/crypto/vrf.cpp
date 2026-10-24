@@ -492,6 +492,25 @@ bool self_test() {
     other.push_back(0x00);
     if (verify_impl(pk, expected_pi, other).has_value()) return false;
   }
+  // The decoder is part of the consensus rule: y >= p, x = 0 with the sign bit set, a point off the
+  // curve and a small-order key must all be rejected (tests/test_vrf.cpp has the full set).
+  static constexpr const char* kRejectedKeys[] = {
+      "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0100000000000000000000000000000000000000000000000000000000000080",
+      "0200000000000000000000000000000000000000000000000000000000000000",
+      "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  };
+  const auto pi = hex_decode(kVectors[0].pi);
+  if (!pi || pi->size() != kVrfProofBytes) return false;
+  VrfProof80 proof{};
+  std::copy(pi->begin(), pi->end(), proof.begin());
+  for (const char* key : kRejectedKeys) {
+    const auto enc = hex_decode(key);
+    if (!enc || enc->size() != 32) return false;
+    PubKey32 pk{};
+    std::copy(enc->begin(), enc->end(), pk.begin());
+    if (verify_impl(pk, proof, Bytes{}).has_value()) return false;
+  }
   return true;
 }
 
