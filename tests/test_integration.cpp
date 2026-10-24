@@ -9368,9 +9368,12 @@ TEST(test_follower_sync_does_not_reject_canonical_block_due_to_local_epoch_ticke
   ASSERT_TRUE(follower.init());
   follower.start();
 
+  // Pausing stops new proposals, but one already proposed can still finalize after the snapshot
+  // above, so the follower is compared with the validators' live tip (never below the snapshot).
   ASSERT_TRUE(wait_for([&]() {
     const auto sf = follower.status();
-    return sf.height == validator_status.height && sf.transition_hash == validator_status.transition_hash;
+    const auto sv = validators[0]->status();
+    return sv.height >= validator_status.height && sf.height == sv.height && sf.transition_hash == sv.transition_hash;
   }, ci_timeout_seconds(30)));
 
   const auto local_pub = follower.local_validator_pubkey_for_test();
