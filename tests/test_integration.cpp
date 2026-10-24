@@ -3012,10 +3012,23 @@ TEST(test_restart_determinism_and_continued_finalization) {
     }
 
     ASSERT_TRUE(wait_for_same_tip(nodes, std::chrono::seconds(20)));
-    const auto s0 = nodes[0]->status();
+    // The cluster keeps finalizing, so read every node's status in one snapshot that agrees;
+    // sampling node 0 and then the others let a block land in between (seen under ASan).
+    std::vector<decltype(nodes[0]->status())> snapshot;
+    ASSERT_TRUE(wait_for(
+        [&]() {
+          snapshot.clear();
+          for (const auto& n : nodes) snapshot.push_back(n->status());
+          for (const auto& st : snapshot) {
+            if (st.height != snapshot[0].height || st.transition_hash != snapshot[0].transition_hash) return false;
+          }
+          return true;
+        },
+        std::chrono::seconds(20)));
+    const auto s0 = snapshot[0];
     const auto next_committee_before_restart = nodes[0]->committee_for_next_height_for_test();
     for (size_t i = 1; i < nodes.size(); ++i) {
-      const auto si = nodes[i]->status();
+      const auto& si = snapshot[i];
       ASSERT_EQ(si.height, s0.height);
       ASSERT_EQ(si.transition_hash, s0.transition_hash);
       ASSERT_EQ(nodes[i]->active_validators_for_next_height_for_test(),

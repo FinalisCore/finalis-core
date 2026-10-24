@@ -409,12 +409,16 @@ bool Node::init() {
     try_connect_bootstrap_peers();
   }
 
-  if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && finalized_height_ == 0 &&
-      validators_.active_sorted(1).empty()) {
-    const bool has_bootstrap_sources = !cfg_.disable_p2p && (!bootstrap_peers_.empty() || !dns_seed_peers_.empty());
-    if (!has_bootstrap_sources && bootstrap_template_bind_validator(local_key_.public_key, true)) {
-      log_line("bootstrap single-node genesis from local validator pubkey=" +
-               hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end())) + " action=init-self-bind");
+  {
+    // P2P is running: a peer's VERSION can bind a bootstrap validator (under mu_) at any moment.
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && finalized_height_ == 0 &&
+        validators_.active_sorted(1).empty()) {
+      const bool has_bootstrap_sources = !cfg_.disable_p2p && (!bootstrap_peers_.empty() || !dns_seed_peers_.empty());
+      if (!has_bootstrap_sources && bootstrap_template_bind_validator(local_key_.public_key, true)) {
+        log_line("bootstrap single-node genesis from local validator pubkey=" +
+                 hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end())) + " action=init-self-bind");
+      }
     }
   }
 
