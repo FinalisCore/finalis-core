@@ -28,13 +28,15 @@ inline bool attach_test_leader_vrf(FrontierTransition* transition, const Hash32&
 }
 
 // Sets record->transition.next_state_commitment as the proposer does, after the VRF proof (the
-// post-state depends on it). False if the record does not apply to `parent`.
+// post-state depends on it). False if the record does not apply to `parent`; the reason goes to `error`.
 inline bool attach_test_next_state_commitment(const consensus::CanonicalDerivationConfig& cfg,
                                               const consensus::CanonicalDerivedState& parent,
-                                              consensus::CanonicalFrontierRecord* record) {
-  std::string error;
+                                              consensus::CanonicalFrontierRecord* record,
+                                              std::string* error = nullptr) {
+  std::string local_error;
   return consensus::derive_frontier_next_state_commitment(cfg, parent, *record,
-                                                          &record->transition.next_state_commitment, &error);
+                                                          &record->transition.next_state_commitment,
+                                                          error ? error : &local_error);
 }
 
 }  // namespace finalis::test
