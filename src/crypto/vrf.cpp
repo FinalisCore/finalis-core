@@ -47,11 +47,15 @@ struct Sha512 {
 };
 
 // ---------------------------------------------------------------------------------------------
-// edwards25519 on public data: RFC 8032 decoding and encoding, and the complete addition law in
+// edwards25519 on public data: RFC 8032 decoding and encoding, and the twisted Edwards formulas in
 // extended coordinates, over OpenSSL big integers. Variable time, so only for public values (keys,
 // proofs, hash outputs). Every result is fixed by the curve alone. libsodium's point validation is
 // not used here: its answer for points outside the prime-order subgroup changed in a security fix,
 // and Ubuntu shipped the fix under the same 1.0.18 version, so builds disagreed on VRF proofs.
+//
+// Point coordinates are kept in Montgomery form (x*R mod p) for OpenSSL's fast modular
+// multiplication; decode() and encode() convert at the boundary. Points are updated in place with
+// per-thread scratch values, so the scalar-multiplication loops do not allocate.
 
 struct BnDeleter {
   void operator()(BIGNUM* b) const { BN_free(b); }
@@ -70,12 +74,6 @@ Bn bn_le(const std::uint8_t* p, std::size_t n) {
   return b;
 }
 
-Bn bn_dup(const BIGNUM* a) {
-  Bn b(BN_dup(a));
-  if (!b) throw std::bad_alloc();
-  return b;
-}
-
 BN_CTX* bn_ctx() {
   struct CtxDeleter {
     void operator()(BN_CTX* c) const { BN_CTX_free(c); }
@@ -85,90 +83,151 @@ BN_CTX* bn_ctx() {
   return ctx.get();
 }
 
-struct Ext {
-  Bn x, y, z, t;  // x/z, y/z, xy = t/z
-};
-
 struct Curve {
-  Bn p, d2, d, sqrt_m1, sqrt_exp, l;
-  Ext base;
+  Bn p, d, sqrt_m1, sqrt_exp, l;  // ordinary form
+  Bn d2_m, one_m;                 // Montgomery form
+  std::unique_ptr<BN_MONT_CTX, void (*)(BN_MONT_CTX*)> mont{nullptr, BN_MONT_CTX_free};
 };
 
 const Curve& curve();
 
-// r = a op b mod p
-void fmul(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_mul(r, a, b, curve().p.get(), bn_ctx()); }
-void fadd(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_add(r, a, b, curve().p.get(), bn_ctx()); }
-void fsub(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_sub(r, a, b, curve().p.get(), bn_ctx()); }
+// Montgomery-form field operations; inputs are reduced, so the quick add/sub variants apply.
+void fmul(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) {
+  BN_mod_mul_montgomery(r, a, b, curve().mont.get(), bn_ctx());
+}
+void fadd(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_add_quick(r, a, b, curve().p.get()); }
+void fsub(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_sub_quick(r, a, b, curve().p.get()); }
+// Ordinary-form multiplication, for decoding and encoding.
+void nmul(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_mul(r, a, b, curve().p.get(), bn_ctx()); }
 
-Ext identity() {
-  Ext e{bn_new(), bn_new(), bn_new(), bn_new()};
-  BN_zero(e.x.get());
-  BN_one(e.y.get());
-  BN_one(e.z.get());
-  BN_zero(e.t.get());
-  return e;
+struct Ext {
+  Bn x, y, z, t;  // x/z, y/z, xy = t/z, all in Montgomery form
+};
+
+Ext ext_new() { return Ext{bn_new(), bn_new(), bn_new(), bn_new()}; }
+
+Ext ext_copy(const Ext& p) {
+  Ext r = ext_new();
+  BN_copy(r.x.get(), p.x.get());
+  BN_copy(r.y.get(), p.y.get());
+  BN_copy(r.z.get(), p.z.get());
+  BN_copy(r.t.get(), p.t.get());
+  return r;
 }
 
-// add-2008-hwcd-3 (a = -1): complete on edwards25519, so it also doubles.
-Ext add(const Ext& p, const Ext& q) {
-  const Curve& c = curve();
-  Bn a = bn_new(), b = bn_new(), cc = bn_new(), d = bn_new(), t1 = bn_new(), t2 = bn_new();
-  fsub(t1.get(), p.y.get(), p.x.get());
-  fsub(t2.get(), q.y.get(), q.x.get());
-  fmul(a.get(), t1.get(), t2.get());
-  fadd(t1.get(), p.y.get(), p.x.get());
-  fadd(t2.get(), q.y.get(), q.x.get());
-  fmul(b.get(), t1.get(), t2.get());
-  fmul(t1.get(), p.t.get(), q.t.get());
-  fmul(cc.get(), t1.get(), c.d2.get());
-  fmul(t1.get(), p.z.get(), q.z.get());
-  fadd(d.get(), t1.get(), t1.get());
-  Bn e = bn_new(), f = bn_new(), g = bn_new(), h = bn_new();
-  fsub(e.get(), b.get(), a.get());
-  fsub(f.get(), d.get(), cc.get());
-  fadd(g.get(), d.get(), cc.get());
-  fadd(h.get(), b.get(), a.get());
-  Ext r{bn_new(), bn_new(), bn_new(), bn_new()};
-  fmul(r.x.get(), e.get(), f.get());
-  fmul(r.y.get(), g.get(), h.get());
-  fmul(r.t.get(), e.get(), h.get());
-  fmul(r.z.get(), f.get(), g.get());
-  return r;
+void set_identity(Ext& r) {
+  BN_zero(r.x.get());
+  BN_copy(r.y.get(), curve().one_m.get());
+  BN_copy(r.z.get(), curve().one_m.get());
+  BN_zero(r.t.get());
+}
+
+struct Scratch {
+  Bn a = bn_new(), b = bn_new(), c = bn_new(), d = bn_new(), e = bn_new(), f = bn_new(), g = bn_new(),
+     h = bn_new();
+};
+
+Scratch& scratch() {
+  thread_local Scratch s;
+  return s;
+}
+
+// r = p + q, add-2008-hwcd-3 (a = -1, complete on edwards25519). r may alias p or q: every input
+// is read before r is written.
+void add_to(Ext& r, const Ext& p, const Ext& q) {
+  Scratch& s = scratch();
+  fsub(s.e.get(), p.y.get(), p.x.get());
+  fsub(s.f.get(), q.y.get(), q.x.get());
+  fmul(s.a.get(), s.e.get(), s.f.get());  // A = (Y1-X1)(Y2-X2)
+  fadd(s.e.get(), p.y.get(), p.x.get());
+  fadd(s.f.get(), q.y.get(), q.x.get());
+  fmul(s.b.get(), s.e.get(), s.f.get());  // B = (Y1+X1)(Y2+X2)
+  fmul(s.e.get(), p.t.get(), q.t.get());
+  fmul(s.c.get(), s.e.get(), curve().d2_m.get());  // C = 2d T1 T2
+  fmul(s.e.get(), p.z.get(), q.z.get());
+  fadd(s.d.get(), s.e.get(), s.e.get());  // D = 2 Z1 Z2
+  fsub(s.e.get(), s.b.get(), s.a.get());  // E = B - A
+  fsub(s.f.get(), s.d.get(), s.c.get());  // F = D - C
+  fadd(s.g.get(), s.d.get(), s.c.get());  // G = D + C
+  fadd(s.h.get(), s.b.get(), s.a.get());  // H = B + A
+  fmul(r.x.get(), s.e.get(), s.f.get());
+  fmul(r.y.get(), s.g.get(), s.h.get());
+  fmul(r.t.get(), s.e.get(), s.h.get());
+  fmul(r.z.get(), s.f.get(), s.g.get());
+}
+
+// r = 2p, dbl-2008-hwcd (a = -1). r may alias p.
+void double_to(Ext& r, const Ext& p) {
+  Scratch& s = scratch();
+  fmul(s.a.get(), p.x.get(), p.x.get());  // A = X1^2
+  fmul(s.b.get(), p.y.get(), p.y.get());  // B = Y1^2
+  fmul(s.e.get(), p.z.get(), p.z.get());
+  fadd(s.c.get(), s.e.get(), s.e.get());  // C = 2 Z1^2
+  fadd(s.e.get(), p.x.get(), p.y.get());
+  fmul(s.h.get(), s.e.get(), s.e.get());
+  fsub(s.h.get(), s.h.get(), s.a.get());
+  fsub(s.e.get(), s.h.get(), s.b.get());  // E = (X1+Y1)^2 - A - B
+  fsub(s.g.get(), s.b.get(), s.a.get());  // G = D + B with D = -A
+  fsub(s.f.get(), s.g.get(), s.c.get());  // F = G - C
+  BN_zero(s.d.get());
+  fsub(s.d.get(), s.d.get(), s.a.get());
+  fsub(s.h.get(), s.d.get(), s.b.get());  // H = D - B
+  fmul(r.x.get(), s.e.get(), s.f.get());
+  fmul(r.y.get(), s.g.get(), s.h.get());
+  fmul(r.t.get(), s.e.get(), s.h.get());
+  fmul(r.z.get(), s.f.get(), s.g.get());
 }
 
 Ext negate(const Ext& p) {
-  Bn zero = bn_new();
-  BN_zero(zero.get());
-  Ext r{bn_new(), bn_dup(p.y.get()), bn_dup(p.z.get()), bn_new()};
-  fsub(r.x.get(), zero.get(), p.x.get());
-  fsub(r.t.get(), zero.get(), p.t.get());
+  Ext r = ext_copy(p);
+  BN_zero(r.x.get());
+  fsub(r.x.get(), r.x.get(), p.x.get());
+  BN_zero(r.t.get());
+  fsub(r.t.get(), r.t.get(), p.t.get());
   return r;
 }
 
-Ext mul(const Ext& p, const BIGNUM* k) {
-  Ext r = identity();
-  for (int i = BN_num_bits(k) - 1; i >= 0; --i) {
-    r = add(r, r);
-    if (BN_is_bit_set(k, i)) r = add(r, p);
+// a*P + b*Q in one double-and-add pass over the bits of both scalars (Straus/Shamir).
+Ext joint_mul(const BIGNUM* a, const Ext& p, const BIGNUM* b, const Ext& q) {
+  Ext pq = ext_new();
+  add_to(pq, p, q);
+  Ext r = ext_new();
+  set_identity(r);
+  for (int i = std::max(BN_num_bits(a), BN_num_bits(b)) - 1; i >= 0; --i) {
+    double_to(r, r);
+    const bool ba = BN_is_bit_set(a, i) != 0;
+    const bool bb = BN_is_bit_set(b, i) != 0;
+    if (ba && bb) {
+      add_to(r, r, pq);
+    } else if (ba) {
+      add_to(r, r, p);
+    } else if (bb) {
+      add_to(r, r, q);
+    }
   }
   return r;
 }
 
 Ext mul_cofactor(const Ext& p) {
-  Ext r = add(p, p);
-  r = add(r, r);
-  return add(r, r);
+  Ext r = ext_copy(p);
+  double_to(r, r);
+  double_to(r, r);
+  double_to(r, r);
+  return r;
 }
 
 bool is_identity(const Ext& p) { return BN_is_zero(p.x.get()) && BN_cmp(p.y.get(), p.z.get()) == 0; }
 
 Point encode(const Ext& p) {
-  Bn zi(BN_mod_inverse(nullptr, p.z.get(), curve().p.get(), bn_ctx()));
+  const Curve& c = curve();
+  Bn x = bn_new(), y = bn_new(), z = bn_new();
+  BN_from_montgomery(x.get(), p.x.get(), c.mont.get(), bn_ctx());
+  BN_from_montgomery(y.get(), p.y.get(), c.mont.get(), bn_ctx());
+  BN_from_montgomery(z.get(), p.z.get(), c.mont.get(), bn_ctx());
+  Bn zi(BN_mod_inverse(nullptr, z.get(), c.p.get(), bn_ctx()));
   if (!zi) throw std::bad_alloc();
-  Bn x = bn_new(), y = bn_new();
-  fmul(x.get(), p.x.get(), zi.get());
-  fmul(y.get(), p.y.get(), zi.get());
+  nmul(x.get(), x.get(), zi.get());
+  nmul(y.get(), y.get(), zi.get());
   Point out{};
   BN_bn2lebinpad(y.get(), out.data(), static_cast<int>(out.size()));
   if (BN_is_odd(x.get())) out[31] |= 0x80;
@@ -184,37 +243,39 @@ std::optional<Ext> decode(const std::uint8_t* s) {
   b[31] &= 0x7f;
   Bn y = bn_le(b.data(), b.size());
   if (BN_cmp(y.get(), c.p.get()) >= 0) return std::nullopt;
-  Bn one = bn_new(), y2 = bn_new(), u = bn_new(), v = bn_new(), t = bn_new();
+  Bn one = bn_new(), y2 = bn_new(), u = bn_new(), v = bn_new(), t = bn_new(), zero = bn_new();
   BN_one(one.get());
-  fmul(y2.get(), y.get(), y.get());
-  fsub(u.get(), y2.get(), one.get());
-  fmul(t.get(), c.d.get(), y2.get());
-  fadd(v.get(), t.get(), one.get());
+  BN_zero(zero.get());
+  nmul(y2.get(), y.get(), y.get());
+  BN_mod_sub_quick(u.get(), y2.get(), one.get(), c.p.get());
+  nmul(t.get(), c.d.get(), y2.get());
+  BN_mod_add_quick(v.get(), t.get(), one.get(), c.p.get());
   // x = u v^3 (u v^7)^((p-5)/8)
   Bn v3 = bn_new(), v7 = bn_new(), x = bn_new();
-  fmul(t.get(), v.get(), v.get());
-  fmul(v3.get(), t.get(), v.get());
-  fmul(t.get(), v3.get(), v3.get());
-  fmul(v7.get(), t.get(), v.get());
-  fmul(t.get(), u.get(), v7.get());
+  nmul(t.get(), v.get(), v.get());
+  nmul(v3.get(), t.get(), v.get());
+  nmul(t.get(), v3.get(), v3.get());
+  nmul(v7.get(), t.get(), v.get());
+  nmul(t.get(), u.get(), v7.get());
   BN_mod_exp(t.get(), t.get(), c.sqrt_exp.get(), c.p.get(), bn_ctx());
-  fmul(x.get(), u.get(), v3.get());
-  fmul(x.get(), x.get(), t.get());
-  Bn vx2 = bn_new(), neg_u = bn_new(), zero = bn_new();
-  BN_zero(zero.get());
-  fmul(t.get(), x.get(), x.get());
-  fmul(vx2.get(), v.get(), t.get());
-  fsub(neg_u.get(), zero.get(), u.get());
+  nmul(x.get(), u.get(), v3.get());
+  nmul(x.get(), x.get(), t.get());
+  Bn vx2 = bn_new(), neg_u = bn_new();
+  nmul(t.get(), x.get(), x.get());
+  nmul(vx2.get(), v.get(), t.get());
+  BN_mod_sub_quick(neg_u.get(), zero.get(), u.get(), c.p.get());
   if (BN_cmp(vx2.get(), u.get()) != 0) {
     if (BN_cmp(vx2.get(), neg_u.get()) != 0) return std::nullopt;
-    fmul(x.get(), x.get(), c.sqrt_m1.get());
+    nmul(x.get(), x.get(), c.sqrt_m1.get());
   }
   if (BN_is_zero(x.get()) && x0) return std::nullopt;
-  if ((BN_is_odd(x.get()) != 0) != x0) fsub(x.get(), zero.get(), x.get());
-  Ext p{std::move(x), std::move(y), bn_new(), bn_new()};
-  BN_one(p.z.get());
-  fmul(p.t.get(), p.x.get(), p.y.get());
-  return p;
+  if ((BN_is_odd(x.get()) != 0) != x0) BN_mod_sub_quick(x.get(), zero.get(), x.get(), c.p.get());
+  Ext pt = ext_new();
+  BN_to_montgomery(pt.x.get(), x.get(), c.mont.get(), bn_ctx());
+  BN_to_montgomery(pt.y.get(), y.get(), c.mont.get(), bn_ctx());
+  BN_copy(pt.z.get(), c.one_m.get());
+  fmul(pt.t.get(), pt.x.get(), pt.y.get());
+  return pt;
 }
 
 const Curve& curve() {
@@ -224,6 +285,8 @@ const Curve& curve() {
     k.p = bn_new();
     BN_set_bit(k.p.get(), 255);
     BN_sub_word(k.p.get(), 19);
+    k.mont.reset(BN_MONT_CTX_new());
+    if (!k.mont || BN_MONT_CTX_set(k.mont.get(), k.p.get(), ctx) != 1) throw std::bad_alloc();
     // d = -121665 / 121666
     Bn num = bn_new(), den = bn_new();
     BN_set_word(num.get(), 121665);
@@ -233,8 +296,14 @@ const Curve& curve() {
     if (!inv) throw std::bad_alloc();
     k.d = bn_new();
     BN_mod_mul(k.d.get(), num.get(), inv.get(), k.p.get(), ctx);
-    k.d2 = bn_new();
-    BN_mod_add(k.d2.get(), k.d.get(), k.d.get(), k.p.get(), ctx);
+    Bn d2 = bn_new();
+    BN_mod_add(d2.get(), k.d.get(), k.d.get(), k.p.get(), ctx);
+    k.d2_m = bn_new();
+    BN_to_montgomery(k.d2_m.get(), d2.get(), k.mont.get(), ctx);
+    Bn one = bn_new();
+    BN_one(one.get());
+    k.one_m = bn_new();
+    BN_to_montgomery(k.one_m.get(), one.get(), k.mont.get(), ctx);
     // sqrt(-1) = 2^((p-1)/4); exponent (p-5)/8 for the square root in decoding
     Bn two = bn_new(), e = bn_new();
     BN_set_word(two.get(), 2);
@@ -364,8 +433,8 @@ std::optional<VrfOutput> verify_impl(const PubKey32& pk, const VrfProof80& proof
   if (BN_cmp(s.get(), curve().l.get()) >= 0) return std::nullopt;
   const auto h = encode_to_curve(pk, alpha);
   if (!h) return std::nullopt;
-  const Ext u = add(mul(base_point(), s.get()), mul(negate(*y), c.get()));  // s*B - c*Y
-  const Ext v = add(mul(*h, s.get()), mul(negate(*gamma), c.get()));        // s*H - c*Gamma
+  const Ext u = joint_mul(s.get(), base_point(), c.get(), negate(*y));  // s*B - c*Y
+  const Ext v = joint_mul(s.get(), *h, c.get(), negate(*gamma));        // s*H - c*Gamma
   Point gamma_str{};
   std::copy_n(proof.begin(), gamma_str.size(), gamma_str.begin());
   const auto expected = challenge(pk, encode(*h), gamma_str, encode(u), encode(v));
@@ -422,6 +491,25 @@ bool self_test() {
     Bytes other = *alpha;
     other.push_back(0x00);
     if (verify_impl(pk, expected_pi, other).has_value()) return false;
+  }
+  // The decoder is part of the consensus rule: y >= p, x = 0 with the sign bit set, a point off the
+  // curve and a small-order key must all be rejected (tests/test_vrf.cpp has the full set).
+  static constexpr const char* kRejectedKeys[] = {
+      "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "0100000000000000000000000000000000000000000000000000000000000080",
+      "0200000000000000000000000000000000000000000000000000000000000000",
+      "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  };
+  const auto pi = hex_decode(kVectors[0].pi);
+  if (!pi || pi->size() != kVrfProofBytes) return false;
+  VrfProof80 proof{};
+  std::copy(pi->begin(), pi->end(), proof.begin());
+  for (const char* key : kRejectedKeys) {
+    const auto enc = hex_decode(key);
+    if (!enc || enc->size() != 32) return false;
+    PubKey32 pk{};
+    std::copy(enc->begin(), enc->end(), pk.begin());
+    if (verify_impl(pk, proof, Bytes{}).has_value()) return false;
   }
   return true;
 }

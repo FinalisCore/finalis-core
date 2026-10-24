@@ -82,6 +82,51 @@ TEST(test_vrf_outputs_differ_per_key_and_alpha) {
   ASSERT_TRUE(out_a1 != out_b1);
 }
 
+// The decoder is part of the consensus rule, and the RFC vectors only cover valid proofs. These
+// are the encodings Ed25519 implementations are known to disagree on ("Taming the many EdDSAs",
+// Chalkias et al. 2020), each classified with an independent RFC 8032 implementation: a public key
+// or Gamma with any of them must be rejected.
+TEST(test_vrf_rejects_non_canonical_off_curve_and_small_order_encodings) {
+  ASSERT_TRUE(crypto::vrf_init());
+  const auto kp = key_from_byte(0x37);
+  const auto proof = *crypto::vrf_prove(kp.private_key, text("alpha"));
+  ASSERT_TRUE(crypto::vrf_verify(kp.public_key, proof, text("alpha")).has_value());
+  struct Case {
+    const char* what;
+    const char* hex;
+    bool decodes;
+  };
+  const Case cases[] = {
+      {"y = p", "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", false},
+      {"y = p + 1 (alias of the identity)", "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", false},
+      {"y = 2^255 - 1", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", false},
+      {"identity with the sign bit set", "0100000000000000000000000000000000000000000000000000000000000080", false},
+      {"(0, -1) with the sign bit set", "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", false},
+      {"y = 2, not on the curve", "0200000000000000000000000000000000000000000000000000000000000000", false},
+      {"identity (order 1)", "0100000000000000000000000000000000000000000000000000000000000000", true},
+      {"(0, -1) (order 2)", "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", true},
+      {"y = 0 (order 4)", "0000000000000000000000000000000000000000000000000000000000000000", true},
+      {"y = 0, negative x (order 4)", "0000000000000000000000000000000000000000000000000000000000000080", true},
+      {"order 8", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a", true},
+      {"order 8", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa", true},
+      {"order 8", "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05", true},
+      {"order 8", "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85", true},
+  };
+  for (const auto& c : cases) {
+    const Bytes enc = *hex_decode(c.hex);
+    PubKey32 pk{};
+    std::copy(enc.begin(), enc.end(), pk.begin());
+    if (crypto::vrf_verify(pk, proof, text("alpha")).has_value()) throw std::runtime_error(std::string("accepted key: ") + c.what);
+    auto bad = proof;
+    std::copy(enc.begin(), enc.end(), bad.begin());
+    if (crypto::vrf_verify(kp.public_key, bad, text("alpha")).has_value())
+      throw std::runtime_error(std::string("accepted Gamma: ") + c.what);
+    // Only a Gamma that does not decode has no output (all zero); a small-order one still decodes.
+    const bool zero_output = crypto::vrf_proof_to_output(bad) == crypto::VrfOutput{};
+    if (zero_output == c.decodes) throw std::runtime_error(std::string("decode mismatch: ") + c.what);
+  }
+}
+
 // RFC 9381 appendix B.3 (ECVRF-EDWARDS25519-SHA512-TAI), examples 16-18: the published proofs and
 // outputs, so the construction is the standard one and any change to it is caught here.
 TEST(test_vrf_matches_rfc9381_edwards25519_tai_vectors) {

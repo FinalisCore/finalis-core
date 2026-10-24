@@ -1,0 +1,16 @@
+[Unit]
+Description=Finalis testnet bond faucet (Discord bot)
+After=network-online.target finalis-testnet.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+EnvironmentFile=/etc/finalis-faucet.env
+WorkingDirectory=/home/ubuntu/finalis-core/tools/discord-faucet
+ExecStart=/home/ubuntu/finalis-faucet/venv/bin/python faucet_bot.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Move the testnet validator's rewards to the faucet address
+After=finalis-testnet.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+EnvironmentFile=/etc/finalis-faucet.env
+# Exits 1 with "no spendable finalized inputs" when there is nothing to move; that is harmless.
+ExecStart=/bin/sh -c 'exec "$FAUCET_CLI" --testnet send --max --to "$FAUCET_ADDRESS" --file "$SWEEP_VALIDATOR_KEY_FILE" --rpc "$FAUCET_RPC"'
