@@ -137,8 +137,14 @@ It prints the key's `address=tsc1…` (where your bond goes) and its `balance`, 
 
 ### 4.2 Ask for testnet FLS
 
-Post your `tsc1…` address in **[Discord](https://discord.gg/8rKfKc7QR9)** and ask for validator
-funds. You need the bond plus a small fee:
+In the faucet channel on **[Discord](https://discord.gg/8rKfKc7QR9)**, type:
+
+```
+/faucet address:tsc1…
+```
+
+The faucet bot sends the bond plus 1 FLS for fees, one grant per Discord account and per address.
+The bond depends on how many validators are active:
 
 | active validators | bond |
 |---|---|
@@ -146,10 +152,12 @@ funds. You need the bond plus a small fee:
 | 4 | 2,000 FLS |
 | 16 or more | 1,000 FLS |
 
-The bond shrinks as the validator set grows, so early validators need more. We send a little extra
-for fees.
+Testnet FLS exist only as block rewards (there is no premine, also on testnet), so bonds are paid
+as the faucet earns them, in request order. The bot tells you your place in the queue and an
+estimated time, and pings you when the coins are sent and again when they are final. Meanwhile your
+node keeps running and syncing as a plain node.
 
-Once we confirm, run `getBalance` again to see the coins arrive.
+When the bot says the payment is final, run `getBalance` again to see the coins.
 
 ### 4.3 Register
 

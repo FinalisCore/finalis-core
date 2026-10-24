@@ -1,0 +1,9 @@
+[Unit]
+Description=Hourly sweep of validator rewards to the faucet
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target
