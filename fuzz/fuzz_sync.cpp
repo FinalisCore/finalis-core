@@ -204,8 +204,8 @@ Fixture build_fixture() {
     }
     Height ht;
     ht.record = consensus::CanonicalFrontierRecord{result.transition, lanes};
-    if (!test::attach_test_next_state_commitment(fx.cfg, parent, &ht.record)) {
-      throw std::runtime_error("next state commitment failed");
+    if (!test::attach_test_next_state_commitment(fx.cfg, parent, &ht.record, &err)) {
+      throw std::runtime_error("next state commitment failed: " + err);
     }
 
     const auto committee = consensus::canonical_committee_for_height_round(fx.cfg, parent, h, 0);

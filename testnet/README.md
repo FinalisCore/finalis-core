@@ -19,7 +19,7 @@ proposals and timeout votes. A transaction or vote signed for one network is the
 every other one, and the different P2P magic keeps their nodes from connecting. Still, keep testnet
 and mainnet keys separate. Testnet coins have no value.
 
-## Genesis (testnet-1)
+## Genesis (testnet-2)
 
 One bootstrap validator, run by the maintainer ([pubkeys.txt](pubkeys.txt)). Others join after
 launch (see "Join as a validator" below), funded with testnet FLS from the bootstrap validator's
@@ -55,9 +55,15 @@ scripts/genesis_to_cpp.py --network testnet --in testnet/genesis.bin --out src/g
 Commit `pubkeys.txt`, `genesis.json`, `genesis.bin` and `embedded_testnet.cpp` together, tag the
 commit, and publish the `genesis_hash`. Anyone can reproduce it from the committed files.
 
-testnet-1 is embedded (`genesis_hash` `5cabf22be344bd39a37a3a434e7a00dfa2caaba8f148de88cdcef706a103f7a0`,
+testnet-2 is embedded (`genesis_hash` `4faa7e1b8e79509c767f7f51f711eba7c75e9e9e4d9ea105fa020dd15cdd9d0c`,
 check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--genesis` flag. Its
-`genesis_time_unix` is 1792400400 (2026-10-19 09:00 UTC); the code freeze is commit 3519f84.
+`genesis_time_unix` is 1792861200 (2026-10-24 17:00 UTC); the code freeze is release v2.1.0.
+
+testnet-2 replaced testnet-1 (genesis `5cabf22b…`, 2026-10-19) when the leader VRF became RFC 9381
+ECVRF-EDWARDS25519-SHA512-TAI: testnet-1's VRF depended on the libsodium build, so nodes could
+disagree on leader proofs. A node that ran testnet-1 exits with `genesis mismatch against existing
+database`: delete its data directory (`~/.finalis/testnet`, keeping `keystore/` if you want the same
+validator key) and start it again.
 
 ### 3. Seeds
 
@@ -69,7 +75,7 @@ finalis-node --testnet --public --with-lightserver --lightserver-bind 0.0.0.0
 ```
 
 A node loads `<data dir>/keystore/validator.json` whenever that file exists, with or without
-`--validator-key-file`, so a seed must not have one. testnet-1 launched with a single host,
+`--validator-key-file`, so a seed must not have one. The testnet launched with a single host,
 130.61.126.39, which is both the seed and the bootstrap validator; a separate plain seed replaces it
 in SEEDS.json before more validators join.
 
@@ -143,7 +149,7 @@ curl -s http://127.0.0.1:19544/rpc \
 ```
 
 `get_status` must report `network_name` `testnet`, `chain_id_ok` `true` and `genesis_hash`
-`5cabf22b…f7a0`; `finalized_height` should match the explorer's.
+`4faa7e1b…9d0c`; `finalized_height` should match the explorer's.
 
 Update to a new release: `git pull`, then run the same `start.sh` command again; it rebuilds and
 restarts the services. Chain data is kept.

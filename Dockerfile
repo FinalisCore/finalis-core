@@ -100,7 +100,7 @@ WORKDIR /var/lib/finalis
 VOLUME ["/var/lib/finalis"]
 EXPOSE 19540 19544 19440 19444
 
-# Default: a public testnet-1 node with its lightserver (testnet genesis and seeds are embedded).
+# Default: a public testnet node with its lightserver (testnet genesis and seeds are embedded).
 # State and the auto-created testnet validator key live in the volume, under
 # /var/lib/finalis/.finalis/testnet. docker-compose.yml overrides this for a private devnet.
 # A mainnet validator keystore must be encrypted: pass --validator-passphrase-env and set it with
