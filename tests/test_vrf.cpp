@@ -82,27 +82,65 @@ TEST(test_vrf_outputs_differ_per_key_and_alpha) {
   ASSERT_TRUE(out_a1 != out_b1);
 }
 
-// Pins the construction: any change to the suite, hashing or encoding moves these bytes and is a
-// consensus change. The values come from an independent pure-integer edwards25519 implementation
-// of the construction in crypto/vrf.hpp (no libsodium), so they also check this one.
-TEST(test_vrf_known_answer) {
+// RFC 9381 appendix B.3 (ECVRF-EDWARDS25519-SHA512-TAI), examples 16-18: the published proofs and
+// outputs, so the construction is the standard one and any change to it is caught here.
+TEST(test_vrf_matches_rfc9381_edwards25519_tai_vectors) {
   ASSERT_TRUE(crypto::vrf_init());
-  const auto kp = key_from_byte(0x42);
-  ASSERT_EQ(hex_encode(Bytes(kp.public_key.begin(), kp.public_key.end())),
-            std::string("2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"));
-  const auto proof = *crypto::vrf_prove(kp.private_key, text("finalis-vrf-kat"));
-  ASSERT_EQ(hex_encode(Bytes(proof.begin(), proof.end())),
-            std::string("adbb2d042f536ad188a994dae02ffba740ba7f52d8f2ce1b00a25302434e2120b3ba359c03cc6fe57e3708d67a7759b7"
-                        "e445426ae80ce4d09828e9ef0bc82bd1988e24497795ea4fa75ac9e2c035160c"));
-  const auto out = crypto::vrf_proof_to_output(proof);
-  ASSERT_EQ(hex_encode(Bytes(out.begin(), out.end())),
-            std::string("2f1aee387e47aa864d2b793b56960a02fefe1114be0fe7d3eb916f35494bc7527bc919bf8e9e5cbf75de6700fc2eaa76"
-                        "879050c2fc0eb481500dbc37fa60d532"));
-  ASSERT_TRUE(crypto::vrf_verify(kp.public_key, proof, text("finalis-vrf-kat")).has_value());
+  struct Vector {
+    const char* sk;
+    const char* pk;
+    const char* alpha;
+    const char* pi;
+    const char* beta;
+  };
+  const Vector vectors[] = {
+      {"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+       "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+       "8657106690b5526245a92b003bb079ccd1a92130477671f6fc01ad16f26f723f26f8a57ccaed74ee1b190bed1f479d9727d2d0f9b0"
+       "05a6e456a35d4fb0daab1268a1b0db10836d9826a528ca76567805",
+       "90cf1df3b703cce59e2a35b925d411164068269d7b2d29f3301c03dd757876ff66b71dda49d2de59d03450451af026798e8f81cd2e33"
+       "3de5cdf4f3e140fdd8ae"},
+      {"4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+       "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+       "f3141cd382dc42909d19ec5110469e4feae18300e94f304590abdced48aed5933bf0864a62558b3ed7f2fea45c92a465301b3bbf5e"
+       "3e54ddf2d935be3b67926da3ef39226bbc355bdc9850112c8f4b02",
+       "eb4440665d3891d668e7e0fcaf587f1b4bd7fbfe99d0eb2211ccec90496310eb5e33821bc613efb94db5e5b54c70a848a0bef4553a41"
+       "befc57663b56373a5031"},
+      {"c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+       "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+       "9bc0f79119cc5604bf02d23b4caede71393cedfbb191434dd016d30177ccbf8096bb474e53895c362d8628ee9f9ea3c0e52c7a5c69"
+       "1b6c18c9979866568add7a2d41b00b05081ed0f58ee5e31b3a970e",
+       "645427e5d00c62a23fb703732fa5d892940935942101e456ecca7bb217c61c452118fec1219202a0edcf038bb6373241578be7217b"
+       "a85a2687f7a0310b2df19f"},
+  };
+  for (const auto& v : vectors) {
+    const Bytes sk = *hex_decode(v.sk);
+    const Bytes alpha = *hex_decode(v.alpha);
+    std::array<std::uint8_t, 32> seed{};
+    std::copy(sk.begin(), sk.end(), seed.begin());
+    const auto kp = *crypto::keypair_from_seed32(seed);
+    ASSERT_EQ(hex_encode(Bytes(kp.public_key.begin(), kp.public_key.end())), std::string(v.pk));
+    const auto proof = *crypto::vrf_prove(kp.private_key, alpha);
+    ASSERT_EQ(hex_encode(Bytes(proof.begin(), proof.end())), std::string(v.pi));
+    const auto out = crypto::vrf_verify(kp.public_key, proof, alpha);
+    ASSERT_TRUE(out.has_value());
+    ASSERT_EQ(hex_encode(Bytes(out->begin(), out->end())), std::string(v.beta));
+    ASSERT_TRUE(*out == crypto::vrf_proof_to_output(proof));
+  }
+}
 
-  const auto kp2 = key_from_byte(0x31);
-  const auto proof2 = *crypto::vrf_prove(kp2.private_key, text("alpha"));
-  ASSERT_EQ(hex_encode(Bytes(proof2.begin(), proof2.end())),
-            std::string("8cbd7933ba6f470fc43e6184ee6299c826dc2f00fbb57cb814cd669666fa438448c33bbba88627398932298d0239bf"
-                        "70d21d529e67f78ba9473ab399833b5813689c82cb6c82401cd509b1f2a7023b01"));
+// The input on which an Ubuntu 20.04 build (libsodium 1.0.18-1) and an Ubuntu 24.04 build
+// (1.0.18-1ubuntu0.24.04.1) produced different proofs and rejected each other's with the earlier
+// construction, which hashed to the curve through crypto_core_ed25519_is_valid_point. The proof is
+// now fixed by the curve alone; CI runs these tests on both kinds of build.
+TEST(test_vrf_proof_does_not_depend_on_libsodium_point_validation) {
+  ASSERT_TRUE(crypto::vrf_init());
+  const auto kp = key_from_byte(90);
+  const Bytes alpha = *hex_decode(
+      "53432d52414e442d5652462d56313f47e57357e6be94871d5cfdf73149b65c8fc40217390586e683872043cc3be00300000000000000");
+  const auto proof = *crypto::vrf_prove(kp.private_key, alpha);
+  ASSERT_TRUE(crypto::vrf_verify(kp.public_key, proof, alpha).has_value());
+  ASSERT_EQ(hex_encode(Bytes(proof.begin(), proof.end())),
+            std::string("9ceb68c1d38d7c1429c75b59a260612fd0a203ca04334a494d7bd56589fb88df8797dc57dbe504fc110c790db23b30f5"
+                        "72fddadf77045d7c562c8366998148525b81eb10dd9be5d7eb9b53662dc20f0a"));
 }

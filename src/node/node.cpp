@@ -49,6 +49,7 @@
 #include "crypto/hash.hpp"
 #include "crypto/secure_memory.hpp"
 #include "crypto/smt.hpp"
+#include "crypto/vrf.hpp"
 #include "genesis/genesis.hpp"
 #include "lightserver/server.hpp"
 #include "common/keystore.hpp"
@@ -147,6 +148,12 @@ bool Node::init() {
   // throttled, at-most-once-per-interval flush instead (see its definition),
   // so live-log visibility is kept without paying a syscall per log line.
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
+  // The leader VRF feeds finalized randomness: a build that does not reproduce the RFC 9381 test
+  // vectors would reject the network's proofs or produce ones the network rejects.
+  if (!crypto::vrf_init()) {
+    std::cerr << "VRF self-test failed: this build does not reproduce the RFC 9381 test vectors; refusing to start\n";
+    return false;
+  }
   genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
   cfg_.db_path = expand_user_home(cfg_.db_path);
   if (is_dangerous_db_root_path(cfg_.db_path)) {

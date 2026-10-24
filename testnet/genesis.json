@@ -4,7 +4,7 @@
   "protocol_version": 1,
   "network_id_hex": "a6ffe3b32f81d1ad7df761693dc87dd8",
   "magic": 1414742833,
-  "genesis_time_unix": 1792400400,
+  "genesis_time_unix": 1792861200,
   "initial_height": 0,
   "initial_validators": [
     "150cf9f36fe2077090b562bfd80f66c3ad13d6412695096b0058f14c21fcfc24"
@@ -18,5 +18,5 @@
   },
   "monetary_params_ref": "monetary-policy-7m-hard-cap",
   "seeds": [],
-  "note": "Finalis testnet-1: bootstrap validator 150cf9f36fe2077090b562bfd80f66c3ad13d6412695096b0058f14c21fcfc24"
+  "note": "Finalis testnet-2 (RFC 9381 VRF): bootstrap validator 150cf9f36fe2077090b562bfd80f66c3ad13d6412695096b0058f14c21fcfc24"
 }

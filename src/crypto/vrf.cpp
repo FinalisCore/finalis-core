@@ -2,34 +2,24 @@
 
 #include "crypto/vrf.hpp"
 
+#include <openssl/bn.h>
 #include <sodium.h>
 
 #include <algorithm>
-#include <cstring>
-#include <string_view>
+#include <memory>
+#include <new>
+#include <string>
 
 #include "crypto/secure_memory.hpp"
 
 namespace finalis::crypto {
 namespace {
 
-constexpr std::string_view kSuite = "FINALIS-ECVRF-EDWARDS25519-SHA512-TAI-V1";
+// RFC 9381 suite_string of ECVRF-EDWARDS25519-SHA512-TAI.
+constexpr std::uint8_t kSuite = 0x03;
 using Point = std::array<std::uint8_t, crypto_core_ed25519_BYTES>;
 using Scalar = std::array<std::uint8_t, crypto_core_ed25519_SCALARBYTES>;
 using Digest = std::array<std::uint8_t, crypto_hash_sha512_BYTES>;
-
-// L = 2^252 + 27742317777372353535851937790883648493, little endian.
-constexpr Scalar kGroupOrder = {0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7,
-                                0xa2, 0xde, 0xf9, 0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10};
-
-bool scalar_is_canonical(const Scalar& s) {
-  for (std::size_t i = s.size(); i-- > 0;) {
-    if (s[i] < kGroupOrder[i]) return true;
-    if (s[i] > kGroupOrder[i]) return false;
-  }
-  return false;  // s == L
-}
 
 Scalar reduce64(const Digest& wide) {
   Scalar out{};
@@ -56,38 +46,272 @@ struct Sha512 {
   }
 };
 
-// About 1 in 16 candidates is a canonical prime-order point; 1024 tries all fail with probability
-// (15/16)^1024 < 2^-95.
-std::optional<Point> encode_to_curve(const PubKey32& y, const Bytes& alpha) {
-  for (std::uint32_t ctr = 0; ctr < 1024; ++ctr) {
-    const std::array<std::uint8_t, 4> ctr_le{static_cast<std::uint8_t>(ctr), static_cast<std::uint8_t>(ctr >> 8),
-                                             static_cast<std::uint8_t>(ctr >> 16), static_cast<std::uint8_t>(ctr >> 24)};
-    const Digest d = Sha512().add(kSuite).add_byte(0x01).add(y).add(alpha).add(ctr_le).finish();
-    Point h{};
-    std::copy_n(d.begin(), h.size(), h.begin());
-    if (crypto_core_ed25519_is_valid_point(h.data()) == 1) return h;
+// ---------------------------------------------------------------------------------------------
+// edwards25519 on public data: RFC 8032 decoding and encoding, and the complete addition law in
+// extended coordinates, over OpenSSL big integers. Variable time, so only for public values (keys,
+// proofs, hash outputs). Every result is fixed by the curve alone. libsodium's point validation is
+// not used here: its answer for points outside the prime-order subgroup changed in a security fix,
+// and Ubuntu shipped the fix under the same 1.0.18 version, so builds disagreed on VRF proofs.
+
+struct BnDeleter {
+  void operator()(BIGNUM* b) const { BN_free(b); }
+};
+using Bn = std::unique_ptr<BIGNUM, BnDeleter>;
+
+Bn bn_new() {
+  Bn b(BN_new());
+  if (!b) throw std::bad_alloc();
+  return b;
+}
+
+Bn bn_le(const std::uint8_t* p, std::size_t n) {
+  Bn b(BN_lebin2bn(p, static_cast<int>(n), nullptr));
+  if (!b) throw std::bad_alloc();
+  return b;
+}
+
+Bn bn_dup(const BIGNUM* a) {
+  Bn b(BN_dup(a));
+  if (!b) throw std::bad_alloc();
+  return b;
+}
+
+BN_CTX* bn_ctx() {
+  struct CtxDeleter {
+    void operator()(BN_CTX* c) const { BN_CTX_free(c); }
+  };
+  thread_local std::unique_ptr<BN_CTX, CtxDeleter> ctx(BN_CTX_new());
+  if (!ctx) throw std::bad_alloc();
+  return ctx.get();
+}
+
+struct Ext {
+  Bn x, y, z, t;  // x/z, y/z, xy = t/z
+};
+
+struct Curve {
+  Bn p, d2, d, sqrt_m1, sqrt_exp, l;
+  Ext base;
+};
+
+const Curve& curve();
+
+// r = a op b mod p
+void fmul(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_mul(r, a, b, curve().p.get(), bn_ctx()); }
+void fadd(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_add(r, a, b, curve().p.get(), bn_ctx()); }
+void fsub(BIGNUM* r, const BIGNUM* a, const BIGNUM* b) { BN_mod_sub(r, a, b, curve().p.get(), bn_ctx()); }
+
+Ext identity() {
+  Ext e{bn_new(), bn_new(), bn_new(), bn_new()};
+  BN_zero(e.x.get());
+  BN_one(e.y.get());
+  BN_one(e.z.get());
+  BN_zero(e.t.get());
+  return e;
+}
+
+// add-2008-hwcd-3 (a = -1): complete on edwards25519, so it also doubles.
+Ext add(const Ext& p, const Ext& q) {
+  const Curve& c = curve();
+  Bn a = bn_new(), b = bn_new(), cc = bn_new(), d = bn_new(), t1 = bn_new(), t2 = bn_new();
+  fsub(t1.get(), p.y.get(), p.x.get());
+  fsub(t2.get(), q.y.get(), q.x.get());
+  fmul(a.get(), t1.get(), t2.get());
+  fadd(t1.get(), p.y.get(), p.x.get());
+  fadd(t2.get(), q.y.get(), q.x.get());
+  fmul(b.get(), t1.get(), t2.get());
+  fmul(t1.get(), p.t.get(), q.t.get());
+  fmul(cc.get(), t1.get(), c.d2.get());
+  fmul(t1.get(), p.z.get(), q.z.get());
+  fadd(d.get(), t1.get(), t1.get());
+  Bn e = bn_new(), f = bn_new(), g = bn_new(), h = bn_new();
+  fsub(e.get(), b.get(), a.get());
+  fsub(f.get(), d.get(), cc.get());
+  fadd(g.get(), d.get(), cc.get());
+  fadd(h.get(), b.get(), a.get());
+  Ext r{bn_new(), bn_new(), bn_new(), bn_new()};
+  fmul(r.x.get(), e.get(), f.get());
+  fmul(r.y.get(), g.get(), h.get());
+  fmul(r.t.get(), e.get(), h.get());
+  fmul(r.z.get(), f.get(), g.get());
+  return r;
+}
+
+Ext negate(const Ext& p) {
+  Bn zero = bn_new();
+  BN_zero(zero.get());
+  Ext r{bn_new(), bn_dup(p.y.get()), bn_dup(p.z.get()), bn_new()};
+  fsub(r.x.get(), zero.get(), p.x.get());
+  fsub(r.t.get(), zero.get(), p.t.get());
+  return r;
+}
+
+Ext mul(const Ext& p, const BIGNUM* k) {
+  Ext r = identity();
+  for (int i = BN_num_bits(k) - 1; i >= 0; --i) {
+    r = add(r, r);
+    if (BN_is_bit_set(k, i)) r = add(r, p);
+  }
+  return r;
+}
+
+Ext mul_cofactor(const Ext& p) {
+  Ext r = add(p, p);
+  r = add(r, r);
+  return add(r, r);
+}
+
+bool is_identity(const Ext& p) { return BN_is_zero(p.x.get()) && BN_cmp(p.y.get(), p.z.get()) == 0; }
+
+Point encode(const Ext& p) {
+  Bn zi(BN_mod_inverse(nullptr, p.z.get(), curve().p.get(), bn_ctx()));
+  if (!zi) throw std::bad_alloc();
+  Bn x = bn_new(), y = bn_new();
+  fmul(x.get(), p.x.get(), zi.get());
+  fmul(y.get(), p.y.get(), zi.get());
+  Point out{};
+  BN_bn2lebinpad(y.get(), out.data(), static_cast<int>(out.size()));
+  if (BN_is_odd(x.get())) out[31] |= 0x80;
+  return out;
+}
+
+// RFC 8032 section 5.1.3: rejects y >= p, x = 0 with the sign bit set, and points off the curve.
+std::optional<Ext> decode(const std::uint8_t* s) {
+  const Curve& c = curve();
+  Point b{};
+  std::copy_n(s, b.size(), b.begin());
+  const bool x0 = (b[31] & 0x80) != 0;
+  b[31] &= 0x7f;
+  Bn y = bn_le(b.data(), b.size());
+  if (BN_cmp(y.get(), c.p.get()) >= 0) return std::nullopt;
+  Bn one = bn_new(), y2 = bn_new(), u = bn_new(), v = bn_new(), t = bn_new();
+  BN_one(one.get());
+  fmul(y2.get(), y.get(), y.get());
+  fsub(u.get(), y2.get(), one.get());
+  fmul(t.get(), c.d.get(), y2.get());
+  fadd(v.get(), t.get(), one.get());
+  // x = u v^3 (u v^7)^((p-5)/8)
+  Bn v3 = bn_new(), v7 = bn_new(), x = bn_new();
+  fmul(t.get(), v.get(), v.get());
+  fmul(v3.get(), t.get(), v.get());
+  fmul(t.get(), v3.get(), v3.get());
+  fmul(v7.get(), t.get(), v.get());
+  fmul(t.get(), u.get(), v7.get());
+  BN_mod_exp(t.get(), t.get(), c.sqrt_exp.get(), c.p.get(), bn_ctx());
+  fmul(x.get(), u.get(), v3.get());
+  fmul(x.get(), x.get(), t.get());
+  Bn vx2 = bn_new(), neg_u = bn_new(), zero = bn_new();
+  BN_zero(zero.get());
+  fmul(t.get(), x.get(), x.get());
+  fmul(vx2.get(), v.get(), t.get());
+  fsub(neg_u.get(), zero.get(), u.get());
+  if (BN_cmp(vx2.get(), u.get()) != 0) {
+    if (BN_cmp(vx2.get(), neg_u.get()) != 0) return std::nullopt;
+    fmul(x.get(), x.get(), c.sqrt_m1.get());
+  }
+  if (BN_is_zero(x.get()) && x0) return std::nullopt;
+  if ((BN_is_odd(x.get()) != 0) != x0) fsub(x.get(), zero.get(), x.get());
+  Ext p{std::move(x), std::move(y), bn_new(), bn_new()};
+  BN_one(p.z.get());
+  fmul(p.t.get(), p.x.get(), p.y.get());
+  return p;
+}
+
+const Curve& curve() {
+  static const Curve c = [] {
+    Curve k;
+    BN_CTX* ctx = bn_ctx();
+    k.p = bn_new();
+    BN_set_bit(k.p.get(), 255);
+    BN_sub_word(k.p.get(), 19);
+    // d = -121665 / 121666
+    Bn num = bn_new(), den = bn_new();
+    BN_set_word(num.get(), 121665);
+    BN_sub(num.get(), k.p.get(), num.get());
+    BN_set_word(den.get(), 121666);
+    Bn inv(BN_mod_inverse(nullptr, den.get(), k.p.get(), ctx));
+    if (!inv) throw std::bad_alloc();
+    k.d = bn_new();
+    BN_mod_mul(k.d.get(), num.get(), inv.get(), k.p.get(), ctx);
+    k.d2 = bn_new();
+    BN_mod_add(k.d2.get(), k.d.get(), k.d.get(), k.p.get(), ctx);
+    // sqrt(-1) = 2^((p-1)/4); exponent (p-5)/8 for the square root in decoding
+    Bn two = bn_new(), e = bn_new();
+    BN_set_word(two.get(), 2);
+    BN_copy(e.get(), k.p.get());
+    BN_sub_word(e.get(), 1);
+    BN_rshift(e.get(), e.get(), 2);
+    k.sqrt_m1 = bn_new();
+    BN_mod_exp(k.sqrt_m1.get(), two.get(), e.get(), k.p.get(), ctx);
+    k.sqrt_exp = bn_new();
+    BN_copy(k.sqrt_exp.get(), k.p.get());
+    BN_sub_word(k.sqrt_exp.get(), 5);
+    BN_rshift(k.sqrt_exp.get(), k.sqrt_exp.get(), 3);
+    // L = 2^252 + 27742317777372353535851937790883648493
+    BIGNUM* l = nullptr;
+    BN_dec2bn(&l, "7237005577332262213973186563042994240857116359379907606001950938285454250989");
+    k.l = Bn(l);
+    return k;
+  }();
+  return c;
+}
+
+const Ext& base_point() {
+  static const Ext b = [] {
+    Point s{};
+    s.fill(0x66);
+    s[0] = 0x58;
+    return *decode(s.data());
+  }();
+  return b;
+}
+
+// RFC 9381 section 5.4.1.1 (try-and-increment) with the cofactor cleared: H = 8 * string_to_point(
+// SHA512(suite || 0x01 || PK || alpha || ctr || 0x00)[0..32]) for the first ctr giving a point
+// that is not the identity. About half of the candidates decode.
+std::optional<Ext> encode_to_curve(const PubKey32& pk, const Bytes& alpha) {
+  for (unsigned ctr = 0; ctr < 256; ++ctr) {
+    const Digest d = Sha512()
+                         .add_byte(kSuite)
+                         .add_byte(0x01)
+                         .add(pk)
+                         .add(alpha)
+                         .add_byte(static_cast<std::uint8_t>(ctr))
+                         .add_byte(0x00)
+                         .finish();
+    auto p = decode(d.data());
+    if (!p) continue;
+    Ext h = mul_cofactor(*p);
+    if (!is_identity(h)) return h;
   }
   return std::nullopt;
 }
 
-Scalar challenge(const PubKey32& y, const Point& h, const Point& gamma, const Point& u, const Point& v) {
-  const Digest d = Sha512().add(kSuite).add_byte(0x02).add(y).add(h).add(gamma).add(u).add(v).finish();
-  Scalar c{};
-  std::copy_n(d.begin(), 16, c.begin());
+// RFC 9381 section 5.4.3.
+std::array<std::uint8_t, 16> challenge(const PubKey32& y, const Point& h, const Point& gamma, const Point& u,
+                                       const Point& v) {
+  const Digest d =
+      Sha512().add_byte(kSuite).add_byte(0x02).add(y).add(h).add(gamma).add(u).add(v).add_byte(0x00).finish();
+  std::array<std::uint8_t, 16> c{};
+  std::copy_n(d.begin(), c.size(), c.begin());
   return c;
 }
 
-}  // namespace
-
-bool vrf_init() {
-  static const bool ok = sodium_init() >= 0;
-  return ok;
+// RFC 9381 section 5.2: SHA512(suite || 0x03 || point_to_string(8 * Gamma) || 0x00).
+VrfOutput proof_to_hash(const Ext& gamma) {
+  const Digest d = Sha512().add_byte(kSuite).add_byte(0x03).add(encode(mul_cofactor(gamma))).add_byte(0x00).finish();
+  VrfOutput out{};
+  std::copy(d.begin(), d.end(), out.begin());
+  return out;
 }
 
-std::optional<VrfProof80> vrf_prove(const Bytes& private_key_32, const Bytes& alpha) {
-  if (private_key_32.size() != 32 || !vrf_init()) return std::nullopt;
+// RFC 9381 section 5.1 with RFC 8032 key expansion and nonce generation (section 5.4.2.2). The
+// secret scalars only meet the base point and H through libsodium's constant-time code; H is
+// cofactor-cleared, so it is in the prime-order subgroup that every libsodium build accepts.
+std::optional<VrfProof80> prove_impl(const Bytes& sk, const Bytes& alpha) {
+  if (sk.size() != 32) return std::nullopt;
   Digest az{};
-  crypto_hash_sha512(az.data(), private_key_32.data(), private_key_32.size());
+  crypto_hash_sha512(az.data(), sk.data(), sk.size());
   az[0] &= 248;
   az[31] &= 127;
   az[31] |= 64;
@@ -99,21 +323,23 @@ std::optional<VrfProof80> vrf_prove(const Bytes& private_key_32, const Bytes& al
   std::optional<VrfProof80> out;
   PubKey32 y{};
   Point gamma{}, u{}, v{};
-  Scalar k{}, cx{}, s{};
+  Scalar k{}, c32{}, cx{}, s{};
   Digest k_wide{};
   if (crypto_scalarmult_ed25519_base_noclamp(y.data(), x.data()) == 0) {
     if (const auto h = encode_to_curve(y, alpha)) {
-      k_wide = Sha512().add(az.data() + 32, 32).add(*h).finish();
+      const Point h_str = encode(*h);
+      k_wide = Sha512().add(az.data() + 32, 32).add(h_str).finish();
       k = reduce64(k_wide);
-      if (crypto_scalarmult_ed25519_noclamp(gamma.data(), x.data(), h->data()) == 0 &&
+      if (crypto_scalarmult_ed25519_noclamp(gamma.data(), x.data(), h_str.data()) == 0 &&
           crypto_scalarmult_ed25519_base_noclamp(u.data(), k.data()) == 0 &&
-          crypto_scalarmult_ed25519_noclamp(v.data(), k.data(), h->data()) == 0) {
-        const Scalar c = challenge(y, *h, gamma, u, v);
-        crypto_core_ed25519_scalar_mul(cx.data(), c.data(), x.data());
+          crypto_scalarmult_ed25519_noclamp(v.data(), k.data(), h_str.data()) == 0) {
+        const auto c = challenge(y, h_str, gamma, u, v);
+        std::copy(c.begin(), c.end(), c32.begin());
+        crypto_core_ed25519_scalar_mul(cx.data(), c32.data(), x.data());
         crypto_core_ed25519_scalar_add(s.data(), k.data(), cx.data());
         VrfProof80 proof{};
         std::copy(gamma.begin(), gamma.end(), proof.begin());
-        std::copy_n(c.begin(), 16, proof.begin() + 32);
+        std::copy(c.begin(), c.end(), proof.begin() + 32);
         std::copy(s.begin(), s.end(), proof.begin() + 48);
         out = proof;
       }
@@ -127,39 +353,100 @@ std::optional<VrfProof80> vrf_prove(const Bytes& private_key_32, const Bytes& al
   return out;
 }
 
+// RFC 9381 section 5.3 with validate_key = TRUE, computed entirely in the public-data arithmetic.
+std::optional<VrfOutput> verify_impl(const PubKey32& pk, const VrfProof80& proof, const Bytes& alpha) {
+  const auto y = decode(pk.data());
+  if (!y || is_identity(mul_cofactor(*y))) return std::nullopt;  // ECVRF_validate_key
+  const auto gamma = decode(proof.data());
+  if (!gamma) return std::nullopt;
+  const Bn c = bn_le(proof.data() + 32, 16);
+  const Bn s = bn_le(proof.data() + 48, 32);
+  if (BN_cmp(s.get(), curve().l.get()) >= 0) return std::nullopt;
+  const auto h = encode_to_curve(pk, alpha);
+  if (!h) return std::nullopt;
+  const Ext u = add(mul(base_point(), s.get()), mul(negate(*y), c.get()));  // s*B - c*Y
+  const Ext v = add(mul(*h, s.get()), mul(negate(*gamma), c.get()));        // s*H - c*Gamma
+  Point gamma_str{};
+  std::copy_n(proof.begin(), gamma_str.size(), gamma_str.begin());
+  const auto expected = challenge(pk, encode(*h), gamma_str, encode(u), encode(v));
+  if (!std::equal(expected.begin(), expected.end(), proof.begin() + 32)) return std::nullopt;
+  return proof_to_hash(*gamma);
+}
+
+// RFC 9381 appendix B.3, examples 16-18. Run once before any proof is made or checked, so a build
+// whose libsodium or OpenSSL behaves differently refuses to take part in consensus.
+bool self_test() {
+  struct Vector {
+    const char* sk;
+    const char* pk;
+    const char* alpha;
+    const char* pi;
+    const char* beta;
+  };
+  static constexpr Vector kVectors[] = {
+      {"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+       "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+       "8657106690b5526245a92b003bb079ccd1a92130477671f6fc01ad16f26f723f26f8a57ccaed74ee1b190bed1f479d9727d2d0f9b0"
+       "05a6e456a35d4fb0daab1268a1b0db10836d9826a528ca76567805",
+       "90cf1df3b703cce59e2a35b925d411164068269d7b2d29f3301c03dd757876ff66b71dda49d2de59d03450451af026798e8f81cd2e33"
+       "3de5cdf4f3e140fdd8ae"},
+      {"4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+       "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+       "f3141cd382dc42909d19ec5110469e4feae18300e94f304590abdced48aed5933bf0864a62558b3ed7f2fea45c92a465301b3bbf5e"
+       "3e54ddf2d935be3b67926da3ef39226bbc355bdc9850112c8f4b02",
+       "eb4440665d3891d668e7e0fcaf587f1b4bd7fbfe99d0eb2211ccec90496310eb5e33821bc613efb94db5e5b54c70a848a0bef4553a41"
+       "befc57663b56373a5031"},
+      {"c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+       "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+       "9bc0f79119cc5604bf02d23b4caede71393cedfbb191434dd016d30177ccbf8096bb474e53895c362d8628ee9f9ea3c0e52c7a5c69"
+       "1b6c18c9979866568add7a2d41b00b05081ed0f58ee5e31b3a970e",
+       "645427e5d00c62a23fb703732fa5d892940935942101e456ecca7bb217c61c452118fec1219202a0edcf038bb6373241578be7217b"
+       "a85a2687f7a0310b2df19f"},
+  };
+  for (const auto& vec : kVectors) {
+    const auto sk = hex_decode(vec.sk);
+    const auto pk_bytes = hex_decode(vec.pk);
+    const auto alpha = hex_decode(vec.alpha);
+    const auto pi = hex_decode(vec.pi);
+    const auto beta = hex_decode(vec.beta);
+    if (!sk || !pk_bytes || !alpha || !pi || !beta || pk_bytes->size() != 32 || pi->size() != kVrfProofBytes)
+      return false;
+    PubKey32 pk{};
+    std::copy(pk_bytes->begin(), pk_bytes->end(), pk.begin());
+    VrfProof80 expected_pi{};
+    std::copy(pi->begin(), pi->end(), expected_pi.begin());
+    const auto proved = prove_impl(*sk, *alpha);
+    if (!proved || *proved != expected_pi) return false;
+    const auto out = verify_impl(pk, expected_pi, *alpha);
+    if (!out || !std::equal(out->begin(), out->end(), beta->begin(), beta->end())) return false;
+    Bytes other = *alpha;
+    other.push_back(0x00);
+    if (verify_impl(pk, expected_pi, other).has_value()) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool vrf_init() {
+  static const bool ok = sodium_init() >= 0 && self_test();
+  return ok;
+}
+
+std::optional<VrfProof80> vrf_prove(const Bytes& private_key_32, const Bytes& alpha) {
+  if (private_key_32.size() != 32 || !vrf_init()) return std::nullopt;
+  return prove_impl(private_key_32, alpha);
+}
+
 std::optional<VrfOutput> vrf_verify(const PubKey32& pubkey, const VrfProof80& proof, const Bytes& alpha) {
   if (!vrf_init()) return std::nullopt;
-  Point gamma{};
-  Scalar c{}, s{};
-  std::copy_n(proof.begin(), 32, gamma.begin());
-  std::copy_n(proof.begin() + 32, 16, c.begin());
-  std::copy_n(proof.begin() + 48, 32, s.begin());
-  if (!scalar_is_canonical(s)) return std::nullopt;
-  if (crypto_core_ed25519_is_valid_point(pubkey.data()) != 1) return std::nullopt;
-  if (crypto_core_ed25519_is_valid_point(gamma.data()) != 1) return std::nullopt;
-  const auto h = encode_to_curve(pubkey, alpha);
-  if (!h) return std::nullopt;
-
-  // U = s*B - c*Y, V = s*H - c*Gamma
-  Point sb{}, cy{}, sh{}, cg{}, u{}, v{};
-  if (crypto_scalarmult_ed25519_base_noclamp(sb.data(), s.data()) != 0 ||
-      crypto_scalarmult_ed25519_noclamp(cy.data(), c.data(), pubkey.data()) != 0 ||
-      crypto_scalarmult_ed25519_noclamp(sh.data(), s.data(), h->data()) != 0 ||
-      crypto_scalarmult_ed25519_noclamp(cg.data(), c.data(), gamma.data()) != 0 ||
-      crypto_core_ed25519_sub(u.data(), sb.data(), cy.data()) != 0 ||
-      crypto_core_ed25519_sub(v.data(), sh.data(), cg.data()) != 0) {
-    return std::nullopt;
-  }
-  const Scalar expected = challenge(pubkey, *h, gamma, u, v);
-  if (sodium_memcmp(expected.data(), c.data(), 16) != 0) return std::nullopt;
-  return vrf_proof_to_output(proof);
+  return verify_impl(pubkey, proof, alpha);
 }
 
 VrfOutput vrf_proof_to_output(const VrfProof80& proof) {
-  const Digest d = Sha512().add(kSuite).add_byte(0x03).add(proof.data(), 32).finish();
-  VrfOutput out{};
-  std::copy(d.begin(), d.end(), out.begin());
-  return out;
+  const auto gamma = decode(proof.data());
+  if (!gamma) return VrfOutput{};
+  return proof_to_hash(*gamma);
 }
 
 }  // namespace finalis::crypto
