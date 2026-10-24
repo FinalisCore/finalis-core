@@ -793,6 +793,7 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
     peer_keepalive_ms_.erase(peer_id);
     peer_last_finalized_tip_request_ms_.erase(peer_id);
     peer_last_ingress_tips_sent_ms_.erase(peer_id);
+    peer_last_ingress_tips_request_ms_.erase(peer_id);
     peer_validator_pubkeys_.erase(peer_id);
     peer_finalized_tips_.erase(peer_id);
     peer_finalized_tip_seen_ms_.erase(peer_id);
@@ -1030,7 +1031,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     // our own request rate. Scoring either banned honest nodes catching up from far behind (older
     // nodes have no outbound budget), so both are dropped unscored.
     const bool unscored = msg_type == p2p::MsgType::GET_TRANSITION_BY_HEIGHT ||
-                          msg_type == p2p::MsgType::GET_TRANSITION || msg_type == p2p::MsgType::INGRESS_TIPS ||
+                          msg_type == p2p::MsgType::GET_TRANSITION || msg_type == p2p::MsgType::GET_INGRESS_TIPS ||
+                          msg_type == p2p::MsgType::INGRESS_TIPS ||
                           msg_type == p2p::MsgType::INGRESS_RANGE || msg_type == p2p::MsgType::EPOCH_TICKETS;
     if (!unscored) score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");
     return;
@@ -1808,6 +1810,18 @@ void Node::maybe_request_getaddr(int peer_id) {
 }
 
 void Node::request_ingress_tips(int peer_id) {
+  // Called on every FINALIZED_TIP from the peer, which is once per block while it catches up. The
+  // peer answers at most every 500 ms anyway, and its GET_INGRESS_TIPS bucket is 20, 10/s.
+  constexpr std::uint64_t kIngressTipsRequestMinIntervalMs = 500;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::uint64_t tms = now_ms();
+    auto [it, inserted] = peer_last_ingress_tips_request_ms_.try_emplace(peer_id, tms);
+    if (!inserted) {
+      if (tms < it->second + kIngressTipsRequestMinIntervalMs) return;
+      it->second = tms;
+    }
+  }
   log_line("request-ingress-tips peer_id=" + std::to_string(peer_id));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_INGRESS_TIPS, p2p::ser_get_ingress_tips(p2p::GetIngressTipsMsg{}), true);
 }
@@ -2606,6 +2620,11 @@ bool Node::is_bootstrap_peer_ip(const std::string& ip) const {
     if (matches_host(peer)) return true;
   }
   for (const auto& seed : cfg_.seeds) {
+    if (matches_host(seed)) return true;
+  }
+  // Compiled-in seeds are vetted like --seeds. A literal-IP seed also "resolves" into
+  // dns_seed_peers_ below, which would otherwise strip its immunity; a hostname seed never matches.
+  for (const auto& seed : cfg_.network.default_seeds) {
     if (matches_host(seed)) return true;
   }
   for (const auto& peer : bootstrap_peers_) {

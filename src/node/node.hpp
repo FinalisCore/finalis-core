@@ -775,6 +775,7 @@ class Node {
   std::map<int, std::uint64_t> peer_keepalive_ms_;
   std::map<int, std::uint64_t> peer_last_finalized_tip_request_ms_;
   std::map<int, std::uint64_t> peer_last_ingress_tips_sent_ms_;
+  std::map<int, std::uint64_t> peer_last_ingress_tips_request_ms_;
   std::map<int, std::uint64_t> peer_tx_relay_backoff_until_ms_;
   std::map<std::uint64_t, std::size_t> sync_height_rr_cursor_;
   // Log/request throttles keyed by peer-supplied values (IPs, epochs, heights): cleared when they reach
