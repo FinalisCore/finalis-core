@@ -53,6 +53,12 @@ bool should_log_port_mapping_failure(std::uint32_t consecutive_failures) {
 }
 
 constexpr std::uint64_t kForwardSyncWindow = 64;
+// Outbound GET_TRANSITION_BY_HEIGHT budget per peer. It stays below the receiver's inbound bucket
+// for that message (120 burst, 60/s in check_rate_limit_locked): sweeps run many times a second, so
+// the per-sweep cap alone let a node far behind send hundreds of requests in one second and get
+// banned by its only sync source.
+constexpr double kSyncRequestBurst = 96.0;
+constexpr double kSyncRequestPerSec = 48.0;
 
 constexpr std::uint64_t kTxRelayPeerBackoffMs = 60'000;
 
@@ -786,12 +792,14 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
     peer_inbound_cache_.erase(peer_id);
     peer_keepalive_ms_.erase(peer_id);
     peer_last_finalized_tip_request_ms_.erase(peer_id);
+    peer_last_ingress_tips_sent_ms_.erase(peer_id);
     peer_validator_pubkeys_.erase(peer_id);
     peer_finalized_tips_.erase(peer_id);
     peer_finalized_tip_seen_ms_.erase(peer_id);
     peer_ingress_tips_.erase(peer_id);
     getaddr_requested_peers_.erase(peer_id);
     msg_rate_buckets_.erase(peer_id);
+    sync_request_out_buckets_.erase(peer_id);
     vote_verify_buckets_.erase(peer_id);
     tx_verify_buckets_.erase(peer_id);
     for (auto it = requested_ingress_ranges_.begin(); it != requested_ingress_ranges_.end();) {
@@ -1018,7 +1026,13 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   if (rate_limited) {
     log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) + " type=" + std::string(msg_type_name(msg_type)) +
              " reason=rate-limited payload_size=" + std::to_string(payload.size()));
-    score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");
+    // Excess sync requests go unanswered and the requester retries; excess replies are a symptom of
+    // our own request rate. Scoring either banned honest nodes catching up from far behind (older
+    // nodes have no outbound budget), so both are dropped unscored.
+    const bool unscored = msg_type == p2p::MsgType::GET_TRANSITION_BY_HEIGHT ||
+                          msg_type == p2p::MsgType::GET_TRANSITION || msg_type == p2p::MsgType::INGRESS_TIPS ||
+                          msg_type == p2p::MsgType::INGRESS_RANGE || msg_type == p2p::MsgType::EPOCH_TICKETS;
+    if (!unscored) score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");
     return;
   }
 
@@ -2052,6 +2066,9 @@ bool Node::maybe_request_forward_sync_block_locked(int preferred_peer_id) {
       if (sent_it != sent_per_peer.end() && sent_it->second >= max_per_peer_per_sweep) continue;
       auto req_it = requested_sync_height_peers_.find({height, peer_id});
       if (req_it != requested_sync_height_peers_.end() && tms < req_it->second + retry_ms) continue;
+      auto& out_bucket =
+          sync_request_out_buckets_.try_emplace(peer_id, kSyncRequestBurst, kSyncRequestPerSec).first->second;
+      if (!out_bucket.consume(1.0, tms)) continue;
 
       if (outstanding == requested_sync_heights_.end()) requested_sync_heights_[height] = tms;
       requested_sync_height_peers_[{height, peer_id}] = tms;

@@ -1,24 +1,94 @@
 <p align="center">
-  <img src="branding/web/logo-horizontal-dark.svg" alt="Finalis Core" width="560">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/web/logo-horizontal-dark.svg">
+    <img src="branding/web/logo-horizontal-light.svg" alt="Finalis Core" width="480">
+  </picture>
 </p>
 
-# Finalis Core
+<p align="center">
+  <b>A blockchain where a block is final the moment validators sign it,<br>
+  with confidential transactions from genesis and a wallet that trusts no server.</b>
+</p>
 
-`finalis-core` is a finalized-state BFT blockchain in which validator lifecycle, operator-native committee formation, adaptive checkpoint derivation, and future committee eligibility are all derived deterministically from finalized history.
+<p align="center">
+  <a href="https://github.com/FinalisCore/finalis-core/actions/workflows/linux-ci.yml"><img src="https://github.com/FinalisCore/finalis-core/actions/workflows/linux-ci.yml/badge.svg" alt="Linux CI"></a>
+  <a href="https://github.com/FinalisCore/finalis-core/actions/workflows/formal-verification.yml"><img src="https://github.com/FinalisCore/finalis-core/actions/workflows/formal-verification.yml/badge.svg" alt="TLA+ model checking"></a>
+  <a href="https://github.com/FinalisCore/finalis-core/actions/workflows/cflite-batch.yml"><img src="https://github.com/FinalisCore/finalis-core/actions/workflows/cflite-batch.yml/badge.svg" alt="Fuzzing"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <a href="testnet/JOIN.md"><img src="https://img.shields.io/badge/testnet--1-live-brightgreen.svg" alt="testnet-1 live"></a>
+  <a href="https://discord.gg/8rKfKc7QR9"><img src="https://img.shields.io/badge/chat-Discord-5865F2.svg" alt="Discord"></a>
+</p>
 
-> **Status: pre-launch.** Mainnet has not launched: there are no user funds and
-> no legacy state to stay compatible with, and confidential UTXOs are enabled
-> from genesis. Mainnet genesis is not frozen yet (see
-> [mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md)), so the identity below can
-> still change. A public testnet, **testnet-1**, has been running since
-> 2026-10-19: [join it](testnet/JOIN.md).
->
-> **Review wanted.** We are looking for independent review of the consensus
-> safety rules and the confidential transaction cryptography. Start with
-> [docs/REVIEWING.md](docs/REVIEWING.md). Report vulnerabilities privately as
-> described in [SECURITY.md](SECURITY.md).
+<p align="center">
+  <a href="testnet/JOIN.md"><b>Run a node</b></a> ·
+  <a href="https://finalis.self-link.com"><b>Live explorer</b></a> ·
+  <a href="docs/REVIEWING.md"><b>Break our claims</b></a> ·
+  <a href="docs/whitepaper/WHITEPAPER.md"><b>Whitepaper</b></a> ·
+  <a href="https://discord.gg/8rKfKc7QR9"><b>Discord</b></a>
+</p>
 
-Mainnet identity (pre-launch):
+---
+
+## Why Finalis
+
+- **Final means final.** A block is final once more than two-thirds of the
+  validator committee precommits to it. There is no fork choice, no reorgs and
+  no "wait for 6 confirmations": the node only ever builds on
+  `finalized_height + 1`.
+- **Confidential from genesis.** Amounts in confidential transfers are hidden
+  with Pedersen commitments and Bulletproof range proofs (secp256k1-zkp), and
+  outputs go to unlinkable one-time keys. Privacy is part of the base layer,
+  not an add-on. What stays public is stated in
+  [the spec](docs/spec/CONFIDENTIAL_UTXO_SPEC.md) (§3.3).
+- **Your wallet checks, not trusts.** The wallet starts from the genesis
+  compiled into it, follows each committee handoff, and checks its balance
+  against validator signatures. A server cannot invent coins, and one honest
+  server is enough to expose a hidden one ([LIGHT_CLIENT.md](docs/spec/LIGHT_CLIENT.md)).
+- **Deterministic from finalized history.** Committees, validator lifecycle,
+  checkpoints and rewards are all derived from finalized state, so every honest
+  node computes the same result with no off-chain coordination.
+- **Fixed supply.** 7,000,000 FLS hard cap, emitted over 12 years with 20%
+  annual decay, then fees only ([ECONOMICS.md](docs/ECONOMICS.md)).
+
+## Built To Be Checked
+
+- **TLA+ models** of two-phase finality and checkpoint availability, including
+  mutation configs that must fail ([formal/](formal/)), model-checked in CI.
+- **Continuous fuzzing** of consensus messages, P2P framing, sync, the sparse
+  Merkle tree and confidential transactions ([fuzz/](fuzz/)).
+- **Nightly chaos runs** with crashing and Byzantine validators, plus an
+  [adversarial protocol simulator](docs/PROTOCOL_ATTACK_SIMULATOR.md).
+- **Explicit claims.** [docs/REVIEWING.md](docs/REVIEWING.md) lists the safety,
+  liveness and privacy claims we want broken, with the spec section and code
+  for each.
+
+## Get Involved
+
+**Run a node or become a validator.** testnet-1 has been live since
+2026-10-19 and runs mainnet's rules. Its coins have no value, and validator
+bonds are free from the team. Four independent validators is the first size
+that survives one going down, and ten is the next goal.
+→ **[testnet/JOIN.md](testnet/JOIN.md)**: one command with the prebuilt Linux
+package or Docker (x86_64 and ARM64), or Windows installers from the
+[releases page](https://github.com/FinalisCore/finalis-core/releases).
+
+**Review the protocol or the cryptography.** Finalis is pre-launch, so a
+finding can still change the protocol itself. Start with
+[docs/REVIEWING.md](docs/REVIEWING.md) and report vulnerabilities privately per
+[SECURITY.md](SECURITY.md).
+
+**Contribute code.** C++20 node, Qt wallet, explorer and a JavaScript SDK.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[codebase map](docs/CODEBASE_MAP.md).
+
+> **Status: pre-launch.** Mainnet has not launched, so there are no user funds
+> and no legacy state. Mainnet genesis is not frozen yet
+> ([mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md)), so the identity below
+> can still change.
+
+## Network Identity
+
+Mainnet (pre-launch):
 
 - `network_name = mainnet`
 - `network_id = fe561911730912cced1e83bc273fab13`
@@ -27,7 +97,7 @@ Mainnet identity (pre-launch):
 
 Testnet identity and parameters: [testnet/README.md](testnet/README.md).
 
-In the current codebase it consists of:
+The codebase consists of:
 
 - a UTXO ledger
 - two transaction formats, both valid from genesis: `Tx` (transparent) and
@@ -37,12 +107,6 @@ In the current codebase it consists of:
 - two-phase quorum finality
 - deterministic epoch-boundary checkpoint derivation
 - finalized-state read surfaces, with proofs that let clients verify them
-
-The live runtime processes only:
-
-`height = finalized_height + 1`
-
-There is no live longest-chain fork-choice path in the node runtime.
 
 Databases and artifacts from earlier development networks are not valid inputs
 to mainnet; start from an empty data directory.
@@ -194,8 +258,22 @@ It must report the expected `network_name`, `network_id`, `genesis_hash` and
 
 ### Linux
 
-[scripts/start.sh](scripts/start.sh) installs dependencies, builds, and installs
-systemd services for the node, lightserver and explorer:
+Prebuilt package (x86_64 or ARM64; Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FinalisCore/finalis-core/main/scripts/install.sh | bash
+```
+
+Docker (any distro):
+
+```bash
+docker run -d --name finalis --restart on-failure:5 \
+  -p 19540:19540 -p 127.0.0.1:19544:19544 -v finalis-data:/var/lib/finalis \
+  ghcr.io/finaliscore/finalis-core:main
+```
+
+From source, [scripts/start.sh](scripts/start.sh) installs dependencies, builds,
+and installs systemd services for the node, lightserver and explorer:
 
 ```bash
 git clone https://github.com/FinalisCore/finalis-core.git

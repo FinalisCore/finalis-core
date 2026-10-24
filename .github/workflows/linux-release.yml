@@ -1,0 +1,208 @@
+name: linux-release
+
+# Linux node packages, built natively for amd64 and arm64 from the Dockerfile:
+#   - ghcr.io/finaliscore/finalis-core image (:main on main, :<version> and :latest on v* tags)
+#   - finalis-core-linux-<arch>.tar.gz (portable: bundles every shared library except glibc),
+#     attached to the tag's release, or to the rolling `main-latest-linux` pre-release on main.
+# scripts/install.sh downloads these tarballs.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/finaliscore/finalis-core
+  PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build tarball payload
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: dist
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=out/finalis-core
+          cache-from: type=gha,scope=linux-${{ matrix.arch }}
+          cache-to: type=gha,scope=linux-${{ matrix.arch }},mode=max
+
+      # Run the bundled binaries on distros that have none of their libraries installed.
+      - name: Smoke-test tarball on clean distros
+        run: |
+          echo "${GITHUB_REF_NAME} ${GITHUB_SHA}" > out/finalis-core/VERSION
+          for img in debian:trixie-slim fedora:41 ubuntu:24.04; do
+            echo "== $img"
+            docker run --rm -v "$PWD/out/finalis-core:/opt/finalis-core:ro" "$img" \
+              /opt/finalis-core/bin/finalis-cli --testnet genesis_print_embedded
+          done
+
+      - name: Pack tarball
+        run: tar -C out -czf finalis-core-linux-${{ matrix.arch }}.tar.gz finalis-core
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: finalis-core-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: Build and push image by digest
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ env.PUBLISH }}
+          cache-from: type=gha,scope=linux-${{ matrix.arch }}
+
+      - name: Export digest
+        if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+
+      - name: Upload digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  publish-image:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha
+
+      - name: Create multi-arch manifest
+        working-directory: digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"
+
+  publish-tarballs:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: linux-release-tarballs
+      cancel-in-progress: false
+    steps:
+      - name: Download tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: tarball-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum finalis-core-linux-*.tar.gz | tee SHA256SUMS-linux.txt
+
+      - name: Attach to tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Finalis Core ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/finalis-core-linux-*.tar.gz
+            dist/SHA256SUMS-linux.txt
+
+      # Separate from windows-release's `main-latest`, which that workflow deletes and recreates on
+      # every push to main.
+      - name: Replace main-latest-linux pre-release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete main-latest-linux --cleanup-tag --yes || true
+          gh release create main-latest-linux dist/finalis-core-linux-*.tar.gz dist/SHA256SUMS-linux.txt \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --latest=false \
+            --title "Finalis Core main build (Linux)" \
+            --notes "Untagged build of main at ${GITHUB_SHA}. Not a versioned release. Install with scripts/install.sh, or use ghcr.io/finaliscore/finalis-core:main."
