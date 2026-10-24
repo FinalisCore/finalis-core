@@ -1,2 +1,4 @@
 # Checkpoint fixtures are compared byte for byte across platforms (windows-release.yml).
 tests/fixtures/** text eol=lf
+# Shared SDK test vectors are compared byte for byte by test_finality_shared_vectors_match_ts.
+sdk/finalis-wallet-js/test-vectors/** text eol=lf
