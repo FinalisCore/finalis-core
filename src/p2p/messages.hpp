@@ -56,7 +56,7 @@ struct VersionMsg {
   std::uint64_t services{0};
   std::uint64_t timestamp{0};
   std::uint32_t nonce{0};
-  std::string node_software_version{"finalis-core/0.7"};
+  std::string node_software_version;
   std::uint64_t start_height{0};
   Hash32 start_hash{};
 };

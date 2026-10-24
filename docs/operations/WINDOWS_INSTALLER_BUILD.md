@@ -104,7 +104,7 @@ $iscc = "C:\Program Files (x86)\Inno Setup 6\iscc.exe"
 cd C:\path\to\finalis-core\packaging\windows
 
 & $iscc finalis-core.iss `
-  /DMyAppVersion="1.0.2" `
+  /DMyAppVersion="2.0.0" `
   /DSourceDir="C:\path\to\dist\windows\payload" `
   /DOutputDir="C:\path\to\dist\installer"
 ```
@@ -185,7 +185,7 @@ cmake --build build\windows-release -j $env:NUMBER_OF_PROCESSORS
 
 $iscc = "C:\Program Files (x86)\Inno Setup 6\iscc.exe"
 cd .\packaging\windows
-& $iscc finalis-core.iss /DMyAppVersion="1.0.2" /DSourceDir="C:\dist\windows\payload" /DOutputDir="C:\dist\installer"
+& $iscc finalis-core.iss /DMyAppVersion="2.0.0" /DSourceDir="C:\dist\windows\payload" /DOutputDir="C:\dist\installer"
 
 # Test
 C:\dist\installer\finalis-core_installer.exe

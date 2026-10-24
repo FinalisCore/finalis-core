@@ -52,7 +52,7 @@ It checks the download's checksum, installs to `/opt/finalis-core`, and runs the
 docker run -d --name finalis --restart on-failure:5 \
   -p 19540:19540 -p 127.0.0.1:19544:19544 \
   -v finalis-data:/var/lib/finalis \
-  ghcr.io/finaliscore/finalis-core:main
+  ghcr.io/finaliscore/finalis-core:latest
 ```
 
 Data and keys live in the `finalis-data` volume. Watch it with `docker logs -f finalis`.
@@ -189,7 +189,7 @@ sudo systemctl restart finalis-testnet
 **Updating:** when we announce a new release on Discord:
 
 - **A. prebuilt:** run the `curl … install.sh | bash` line again.
-- **B. Docker:** `docker pull ghcr.io/finaliscore/finalis-core:main`, then `docker rm -f finalis` and
+- **B. Docker:** `docker pull ghcr.io/finaliscore/finalis-core:latest`, then `docker rm -f finalis` and
   the `docker run` line again (the volume keeps your data).
 - **C. source:** `cd finalis-core && git pull && FINALIS_NETWORK=testnet SERVICE_NAME=finalis-testnet ./scripts/start.sh`
 

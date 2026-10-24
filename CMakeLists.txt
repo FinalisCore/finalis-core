@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.22)
-project(finalis_core LANGUAGES CXX)
+# The release version. Tags must match it (vX.Y.Z); the release workflows check this.
+project(finalis_core VERSION 2.0.0 LANGUAGES CXX)
+add_compile_definitions(FINALIS_RELEASE_VERSION="${PROJECT_VERSION}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)

@@ -81,10 +81,13 @@ jobs:
         id: meta
         shell: pwsh
         run: |
+          $base = (Select-String -Path CMakeLists.txt -Pattern 'project\(finalis_core VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          if (-not $base) { throw "project(finalis_core VERSION ...) not found in CMakeLists.txt" }
           if ("${{ github.ref_type }}" -eq "tag") {
             $version = "${{ github.ref_name }}".TrimStart("v")
+            if ($version -ne $base) { throw "tag v$version does not match CMakeLists.txt version $base" }
           } else {
-            $version = "0.7.0-${{ github.run_number }}"
+            $version = "$base-dev.${{ github.run_number }}"
           }
           $qtDeploy = Get-ChildItem -Path "${{ github.workspace }}\.qt" -Filter windeployqt.exe -Recurse | Select-Object -First 1
           if (-not $qtDeploy) {
