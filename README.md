@@ -269,7 +269,7 @@ Docker (any distro):
 ```bash
 docker run -d --name finalis --restart on-failure:5 \
   -p 19540:19540 -p 127.0.0.1:19544:19544 -v finalis-data:/var/lib/finalis \
-  ghcr.io/finaliscore/finalis-core:main
+  ghcr.io/finaliscore/finalis-core:latest
 ```
 
 From source, [scripts/start.sh](scripts/start.sh) installs dependencies, builds,

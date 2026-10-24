@@ -21,6 +21,7 @@
 #include <thread>
 
 #include "common/address.hpp"
+#include "common/version.hpp"
 #include "consensus/availability_retention.hpp"
 #include "consensus/ingress.hpp"
 #include "consensus/validator_registry.hpp"
@@ -1290,8 +1291,9 @@ TEST(test_lightserver_get_status_exposes_runtime_sync_summary) {
   ASSERT_TRUE(resp.find("\"healthy_peer_count\":2") != std::string::npos);
   ASSERT_TRUE(resp.find("\"established_peer_count\":3") != std::string::npos);
   ASSERT_TRUE(resp.find("\"binary\":\"finalis-lightserver\"") != std::string::npos);
-  ASSERT_TRUE(resp.find("\"binary_version\":\"finalis-lightserver/0.7\"") != std::string::npos);
-  ASSERT_TRUE(resp.find("\"release\":\"0.7\"") != std::string::npos);
+  ASSERT_TRUE(resp.find(std::string("\"binary_version\":\"") + finalis::lightserver_software_version() + "\"") !=
+              std::string::npos);
+  ASSERT_TRUE(resp.find(std::string("\"release\":\"") + finalis::kReleaseVersion + "\"") != std::string::npos);
   ASSERT_TRUE(resp.find("\"wallet_api_version\":\"FINALIS_WALLET_API_V1\"") != std::string::npos);
   ASSERT_TRUE(resp.find("\"snapshot_present\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"observed_network_finalized_height\":15") != std::string::npos);

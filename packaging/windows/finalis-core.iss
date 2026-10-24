@@ -1,6 +1,6 @@
 #define MyAppName "Finalis Core"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.2"
+  #define MyAppVersion "2.0.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\dist\windows\payload"
