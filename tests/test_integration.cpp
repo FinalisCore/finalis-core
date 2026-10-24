@@ -10522,9 +10522,11 @@ TEST(test_restart_replay_is_independent_of_validator_reward_and_checkpoint_cache
   auto cluster = make_cluster(base, 1, 1, 1);
   const node::NodeConfig cfg = single_node_cfg(base, 1);
   ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 4, std::chrono::seconds(20)));
+  // Read the tip after shutdown: a block finalized between reading it and stopping would otherwise
+  // make the restarted node correctly report one block more.
+  cluster.nodes[0]->stop();
   const auto before = cluster.nodes[0]->status();
   const auto before_commitment = cluster.nodes[0]->canonical_state_commitment_for_test();
-  cluster.nodes[0]->stop();
   cluster.nodes.clear();
 
   storage::DB db;
@@ -10550,9 +10552,11 @@ TEST(test_fast_start_restores_state_verified_against_signed_tip) {
   const node::NodeConfig cfg = single_node_cfg(base, 1);
   ASSERT_TRUE(cfg.fast_start);
   ASSERT_TRUE(wait_for_tip(*cluster.nodes[0], 4, std::chrono::seconds(20)));
+  // Read the tip after shutdown: a block finalized between reading it and stopping would otherwise
+  // make the restarted node correctly report one block more.
+  cluster.nodes[0]->stop();
   const auto before = cluster.nodes[0]->status();
   const auto before_commitment = cluster.nodes[0]->canonical_state_commitment_for_test();
-  cluster.nodes[0]->stop();
   cluster.nodes.clear();
 
   {
