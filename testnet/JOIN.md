@@ -9,7 +9,7 @@ We are looking for people to run nodes and, if they want, to become validators. 
 has **one** validator, so every block depends on a single machine. Four independent validators is
 the first size that survives one going down. You can help get there.
 
-This guide takes about 30 minutes, most of it waiting for the build.
+Running a node takes about 5 minutes with the prebuilt package or Docker.
 
 - **Run a node** (steps 1–3): syncs and relays the chain. No coins or keys needed.
 - **Become a validator** (step 4): your node signs blocks. You need a bond in testnet FLS, which we
@@ -21,8 +21,9 @@ Questions at any point: **[Discord](https://discord.gg/8rKfKc7QR9)**.
 
 ## What you need
 
-- Linux: Ubuntu, Debian, Fedora or Arch. A small VPS is fine; so is a home machine.
-- 2 CPU cores and 2 GB RAM recommended (compiling uses the most memory; on 1 GB add swap first).
+- Linux on x86_64 or ARM64 (Oracle Ampere, Raspberry Pi 4/5, Graviton). A small VPS is fine; so is
+  a home machine.
+- 1 CPU core and 1 GB RAM for a node. Building from source wants 2 GB (or swap).
 - About 10 GB free disk. The chain itself is small for now.
 - A normal user account with `sudo`.
 - For a validator: a machine that stays on. Validators that miss too many blocks are suspended.
@@ -33,23 +34,54 @@ Windows can run a plain node; see [README.md](README.md#windows). This guide cov
 
 ## 1. Install and start the node
 
+Pick one. All three start a node that syncs testnet-1 and starts again after a reboot.
+
+**A. Prebuilt package** (Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FinalisCore/finalis-core/main/scripts/install.sh | bash
+```
+
+It checks the download's checksum, installs to `/opt/finalis-core`, and runs the node as the
+`finalis-testnet` service under its own `finalis` user, with data in `/var/lib/finalis`. Read the
+[script](../scripts/install.sh) first if you like; re-running it upgrades the node.
+
+**B. Docker** (any Linux with Docker, including older distros):
+
+```bash
+docker run -d --name finalis --restart on-failure:5 \
+  -p 19540:19540 -p 127.0.0.1:19544:19544 \
+  -v finalis-data:/var/lib/finalis \
+  ghcr.io/finaliscore/finalis-core:main
+```
+
+Data and keys live in the `finalis-data` volume. Watch it with `docker logs -f finalis`.
+
+**C. Build from source** (also installs a local block explorer):
+
 ```bash
 git clone https://github.com/FinalisCore/finalis-core.git
 cd finalis-core
 FINALIS_NETWORK=testnet SERVICE_NAME=finalis-testnet ./scripts/start.sh
 ```
 
-Run it as your normal user; it asks for `sudo` where it needs it. The script:
+Run it as your normal user; it asks for `sudo` where it needs it. It installs the build tools,
+compiles everything into `build/` (about 30 minutes), and starts two services, `finalis-testnet`
+(the node) and `finalis-testnet-explorer` (an explorer at `http://127.0.0.1:18080`).
 
-- installs the build tools and compiles everything into `build/` (this is the slow part);
-- starts two background services, `finalis-testnet` (the node) and `finalis-testnet-explorer` (a
-  block explorer for your own use), which also start again after a reboot;
-- connects to the testnet and begins syncing.
+The later steps run `finalis-cli`. Type it the way that matches your install:
+
+| install | `finalis-cli` means |
+|---|---|
+| A. prebuilt | `sudo -u finalis -H finalis-cli` |
+| B. Docker | `docker exec finalis finalis-cli` |
+| C. source | `./build/finalis-cli` (from the `finalis-core` folder) |
 
 ## 2. Check that it is syncing
 
 ```bash
-sudo journalctl -u finalis-testnet -f
+sudo journalctl -u finalis-testnet -f     # A and C
+docker logs -f finalis                    # B
 ```
 
 Lines like `testnet h=1650 ... peers=1` mean it is working; `h` is the block height it has reached.
@@ -62,7 +94,7 @@ curl -s http://127.0.0.1:19544/rpc -d '{"jsonrpc":"2.0","id":1,"method":"get_sta
 ```
 
 Look for `"network_name":"testnet"`, `"chain_id_ok":true` and a `genesis_hash` starting with
-`5cabf22b`. You can also open your own explorer at `http://127.0.0.1:18080` on that machine.
+`5cabf22b`.
 
 ## 3. Let other nodes connect to you (recommended)
 
@@ -70,6 +102,7 @@ Your node works without this: it connects out and syncs. Opening **TCP port 1954
 connect in, which makes the network sturdier.
 
 - **Firewall on the machine:** `start.sh` opens it with `ufw` or `firewalld` when one is installed.
+  With the prebuilt package or Docker, open it yourself, for example `sudo ufw allow 19540/tcp`.
 - **Cloud VPS:** also add an inbound rule for TCP 19540 in the provider's console (security group /
   firewall).
 - **Home connection:** the node asks your router to forward the port by itself. If the log shows
@@ -87,10 +120,11 @@ port: [README.md → Open ports](README.md#open-ports).
 ### 4.1 Find your validator address
 
 On first start the node created a validator key for this machine at
-`~/.finalis/testnet/keystore/validator.json`. From the `finalis-core` folder:
+`~/.finalis/testnet/keystore/validator.json` in the node's home folder (`/var/lib/finalis` for the
+prebuilt package and Docker). With `finalis-cli` as in step 1:
 
 ```bash
-./build/finalis-cli --testnet getBalance
+finalis-cli --testnet getBalance
 ```
 
 It prints the key's `address=tsc1…` (where your bond goes) and its `balance`, in units:
@@ -119,7 +153,7 @@ Once we confirm, run `getBalance` again to see the coins arrive.
 ### 4.3 Register
 
 ```bash
-./build/finalis-cli --testnet validator-register
+finalis-cli --testnet validator-register
 ```
 
 This builds your bond and registration transactions from the key's own coins, sends them, and
@@ -127,7 +161,7 @@ follows them until they are final. It includes a short proof-of-work, so it can 
 If you close the terminal, check on it later with:
 
 ```bash
-./build/finalis-cli --testnet validator-register-status
+finalis-cli --testnet validator-register-status
 ```
 
 ### 4.4 Wait for your first block
@@ -150,18 +184,20 @@ sudo journalctl -u finalis-testnet -f      # live log
 sudo systemctl restart finalis-testnet
 ```
 
+(Docker: `docker ps`, `docker logs -f finalis`, `docker restart finalis`.)
+
 **Updating:** when we announce a new release on Discord:
 
-```bash
-cd finalis-core
-git pull
-FINALIS_NETWORK=testnet SERVICE_NAME=finalis-testnet ./scripts/start.sh
-```
+- **A. prebuilt:** run the `curl … install.sh | bash` line again.
+- **B. Docker:** `docker pull ghcr.io/finaliscore/finalis-core:main`, then `docker rm -f finalis` and
+  the `docker run` line again (the volume keeps your data).
+- **C. source:** `cd finalis-core && git pull && FINALIS_NETWORK=testnet SERVICE_NAME=finalis-testnet ./scripts/start.sh`
 
-It rebuilds and restarts; your chain data and key are kept. After an update that adds features, the
+Your chain data and key are kept. After an update that adds features, the
 first start can take a little longer while the node prepares data for them.
 
-**Stopping for good:** `sudo systemctl disable --now finalis-testnet finalis-testnet-explorer`. If you
+**Stopping for good:** `sudo systemctl disable --now finalis-testnet` (C: also
+`finalis-testnet-explorer`; Docker: `docker rm -f finalis`). If you
 were a validator, tell us on Discord so we know to expect it.
 
 ## Something not working?
@@ -171,7 +207,8 @@ were a validator, tell us on Discord so we know to expect it.
 | `peer-connect-failed ... reason=tcp-connect-failed` | the node cannot reach a seed; check outbound firewall rules |
 | `upnp-igd-refresh status=failed` | harmless on a VPS; at home, forward port 19540 by hand |
 | `genesis-fingerprint-mismatch` | the data folder belongs to another chain; see [README.md → Troubleshooting](README.md#troubleshooting) |
-| the build stops with a memory error | add 2 GB of swap and run `start.sh` again |
+| the build stops with a memory error | add 2 GB of swap and run `start.sh` again, or use the prebuilt package |
+| `install.sh`: glibc is older than 2.39 | your distro is too old for the package; use Docker |
 
 Still stuck? Ask in **[Discord](https://discord.gg/8rKfKc7QR9)** with the last 50 log lines
 (`sudo journalctl -u finalis-testnet -n 50`). Bugs are welcome as GitHub issues; security problems go

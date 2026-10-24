@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     librocksdb-dev \
     nlohmann-json3-dev \
     ca-certificates \
+    patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -31,9 +32,30 @@ RUN cmake -S . -B build -G Ninja \
       -DFINALIS_BUILD_FUZZ=OFF \
       -DFINALIS_BUILD_NGINX=OFF \
       -DFINALIS_GENERATE_NGINX_CONFIG=OFF \
-    && cmake --build build --target finalis-node finalis-lightserver finalis-cli -j"$(nproc)"
+    && cmake --build build --target finalis-node finalis-lightserver finalis-cli finalis-explorer -j"$(nproc)"
 
-# ---- Stage 2: runtime --------------------------------------------------------
+# ---- Stage 2: portable Linux tarball payload ----------------------------------
+# Binaries plus every shared library they load except glibc, found through an
+# $ORIGIN-relative RPATH, so the tarball runs on any distro with glibc >= the
+# builder's (2.39: Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch). Exported with
+# `docker buildx build --target dist --output type=local,dest=...`.
+FROM builder AS dist-stage
+RUN set -eu; d=/dist; mkdir -p "$d/bin" "$d/lib" "$d/testnet" "$d/packaging"; \
+    for b in finalis-node finalis-lightserver finalis-cli finalis-explorer; do \
+      cp "build/$b" "$d/bin/"; strip "$d/bin/$b"; \
+      ldd "build/$b" | awk '/=> \//{print $3}'; \
+    done | sort -u | grep -vE '/(libc|libm|libdl|libpthread|librt|libresolv|ld-linux[^/]*)\.so' \
+      | xargs -r -I{} cp -L {} "$d/lib/"; \
+    for b in "$d"/bin/*; do patchelf --force-rpath --set-rpath '$ORIGIN/../lib' "$b"; done; \
+    for l in "$d"/lib/*; do patchelf --force-rpath --set-rpath '$ORIGIN' "$l"; done; \
+    cp testnet/SEEDS.json testnet/genesis.json "$d/testnet/"; \
+    cp packaging/linux/finalis-node.service "$d/packaging/"; \
+    cp LICENSE README.md "$d/"
+
+FROM scratch AS dist
+COPY --from=dist-stage /dist /
+
+# ---- Stage 3: runtime --------------------------------------------------------
 FROM ubuntu:24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -52,10 +74,11 @@ COPY --from=builder /src/build/finalis-node /opt/finalis-core/bin/finalis-node
 COPY --from=builder /src/build/finalis-cli  /opt/finalis-core/bin/finalis-cli
 # --with-lightserver execs this as a sibling of finalis-node.
 COPY --from=builder /src/build/finalis-lightserver /opt/finalis-core/bin/finalis-lightserver
-COPY --from=builder /src/mainnet/genesis.bin /opt/finalis-core/mainnet/genesis.bin
+COPY --from=builder /src/build/finalis-explorer /opt/finalis-core/bin/finalis-explorer
 COPY --from=builder /src/mainnet/SEEDS.json  /opt/finalis-core/mainnet/SEEDS.json
 
-ENV PATH="/opt/finalis-core/bin:${PATH}"
+ENV PATH="/opt/finalis-core/bin:${PATH}" \
+    HOME=/var/lib/finalis
 # Steps 1-3 RocksDB tuning env vars are read directly from the process
 # environment by src/storage/db.cpp's env_u64_or_default() calls -- nothing
 # Dockerfile-side needed beyond letting docker-compose's `environment:` block
@@ -75,15 +98,12 @@ RUN mkdir -p /var/lib/finalis/keystore /var/lib/finalis/logs /run/finalis \
 USER finalis
 WORKDIR /var/lib/finalis
 VOLUME ["/var/lib/finalis"]
-EXPOSE 19440 19444
+EXPOSE 19540 19544 19440 19444
 
-# The validator keystore is created/unlocked with the passphrase in FINALIS_VALIDATOR_PASSPHRASE
-# (docker run -e FINALIS_VALIDATOR_PASSPHRASE=...); the node refuses to create an unencrypted one.
+# Default: a public testnet-1 node with its lightserver (testnet genesis and seeds are embedded).
+# State and the auto-created testnet validator key live in the volume, under
+# /var/lib/finalis/.finalis/testnet. docker-compose.yml overrides this for a private devnet.
+# A mainnet validator keystore must be encrypted: pass --validator-passphrase-env and set it with
+# docker run -e.
 ENTRYPOINT ["finalis-node"]
-CMD ["--db", "/var/lib/finalis/db", "--genesis", "/opt/finalis-core/mainnet/genesis.bin", \
-     "--allow-unsafe-genesis-override", \
-     "--validator-key-file", "/var/lib/finalis/keystore/validator.json", \
-     "--validator-passphrase-env", "FINALIS_VALIDATOR_PASSPHRASE", \
-     "--listen", "--bind", "0.0.0.0", "--port", "19440", \
-     "--with-lightserver", "--lightserver-bind", "0.0.0.0", "--lightserver-port", "19444", \
-     "--no-dns-seeds"]
+CMD ["--testnet", "--public", "--with-lightserver", "--lightserver-bind", "0.0.0.0"]

@@ -68,8 +68,9 @@
 2026-10-19 and runs mainnet's rules. Its coins have no value, and validator
 bonds are free from the team. Four independent validators is the first size
 that survives one going down, and ten is the next goal.
-→ **[testnet/JOIN.md](testnet/JOIN.md)** (Linux, about 30 minutes; Windows
-installers on the [releases page](https://github.com/FinalisCore/finalis-core/releases)).
+→ **[testnet/JOIN.md](testnet/JOIN.md)**: one command with the prebuilt Linux
+package or Docker (x86_64 and ARM64), or Windows installers from the
+[releases page](https://github.com/FinalisCore/finalis-core/releases).
 
 **Review the protocol or the cryptography.** Finalis is pre-launch, so a
 finding can still change the protocol itself. Start with
@@ -257,8 +258,22 @@ It must report the expected `network_name`, `network_id`, `genesis_hash` and
 
 ### Linux
 
-[scripts/start.sh](scripts/start.sh) installs dependencies, builds, and installs
-systemd services for the node, lightserver and explorer:
+Prebuilt package (x86_64 or ARM64; Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FinalisCore/finalis-core/main/scripts/install.sh | bash
+```
+
+Docker (any distro):
+
+```bash
+docker run -d --name finalis --restart on-failure:5 \
+  -p 19540:19540 -p 127.0.0.1:19544:19544 -v finalis-data:/var/lib/finalis \
+  ghcr.io/finaliscore/finalis-core:main
+```
+
+From source, [scripts/start.sh](scripts/start.sh) installs dependencies, builds,
+and installs systemd services for the node, lightserver and explorer:
 
 ```bash
 git clone https://github.com/FinalisCore/finalis-core.git
