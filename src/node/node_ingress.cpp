@@ -54,6 +54,18 @@ void Node::on_get_ingress_tips(int peer_id, const Bytes& payload) {
     return;
   }
   log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
+  // A peer asks on every FINALIZED_TIP we announce, which is once per block while we catch up.
+  // Answer at most twice a second so our replies stay inside its INGRESS_TIPS bucket (20, 10/s).
+  constexpr std::uint64_t kIngressTipsReplyMinIntervalMs = 500;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::uint64_t tms = now_ms();
+    auto [it, inserted] = peer_last_ingress_tips_sent_ms_.try_emplace(peer_id, tms);
+    if (!inserted) {
+      if (tms < it->second + kIngressTipsReplyMinIntervalMs) return;
+      it->second = tms;
+    }
+  }
   send_ingress_tips(peer_id);
   return;
 }

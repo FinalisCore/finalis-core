@@ -763,6 +763,8 @@ class Node {
   std::map<int, std::map<std::uint16_t, p2p::TokenBucket>> msg_rate_buckets_;
   std::map<int, p2p::TokenBucket> vote_verify_buckets_;
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;
+  // Outbound GET_TRANSITION_BY_HEIGHT budget per sync peer (see kSyncRequestBurst).
+  std::map<int, p2p::TokenBucket> sync_request_out_buckets_;
   std::map<Hash32, std::size_t> candidate_block_sizes_;
   std::map<Hash32, ValidatorJoinRequest> validator_join_requests_;
   std::map<Hash32, std::uint64_t> requested_sync_artifacts_;
@@ -772,6 +774,7 @@ class Node {
   std::map<int, bool> peer_inbound_cache_;
   std::map<int, std::uint64_t> peer_keepalive_ms_;
   std::map<int, std::uint64_t> peer_last_finalized_tip_request_ms_;
+  std::map<int, std::uint64_t> peer_last_ingress_tips_sent_ms_;
   std::map<int, std::uint64_t> peer_tx_relay_backoff_until_ms_;
   std::map<std::uint64_t, std::size_t> sync_height_rr_cursor_;
   // Log/request throttles keyed by peer-supplied values (IPs, epochs, heights): cleared when they reach
