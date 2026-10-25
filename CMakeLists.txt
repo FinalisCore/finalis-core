@@ -484,6 +484,8 @@ add_executable(finalis-tests
   tests/test_wallet_confidential_receive.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp
+  tests/test_storage_faults.cpp
+  tests/support/storage_fault_injection.cpp
   tests/test_lightserver.cpp
   tests/test_explorer.cpp
 )
@@ -517,6 +519,17 @@ endif()
 enable_testing()
 add_test(NAME finalis-tests COMMAND finalis-tests)
 set_tests_properties(finalis-tests PROPERTIES RESOURCE_LOCK ports)
+# Regression tests for open production defects (tests/KNOWN_DEFECTS.md). They fail until fixed, so
+# they run as their own ctest entry: `ctest -LE known-defect` is the gate, `ctest -L known-defect`
+# (or the run-known-defect-tests target) reports them.
+add_test(NAME finalis-known-defects COMMAND finalis-tests)
+set_tests_properties(finalis-known-defects PROPERTIES RESOURCE_LOCK ports LABELS known-defect
+                     ENVIRONMENT FINALIS_TEST_KNOWN_DEFECTS=only WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_custom_target(run-known-defect-tests
+  COMMAND ${CMAKE_COMMAND} -E env FINALIS_TEST_KNOWN_DEFECTS=only $<TARGET_FILE:finalis-tests>
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  DEPENDS finalis-tests
+  USES_TERMINAL)
 if(TARGET finalis-wallet-widget-tests)
   add_test(NAME finalis-wallet-widget-tests COMMAND finalis-wallet-widget-tests)
   set_tests_properties(finalis-wallet-widget-tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

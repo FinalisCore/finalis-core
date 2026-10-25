@@ -131,6 +131,22 @@ int main(int argc, char** argv) {
   const std::size_t shard_count = shard_count_env ? static_cast<std::size_t>(std::atoi(shard_count_env)) : 1;
   const std::size_t shard_index = shard_index_env ? static_cast<std::size_t>(std::atoi(shard_index_env)) : 0;
 
+  // Tests tagged "known-defect" reproduce open production defects and fail until they are fixed
+  // (tests/KNOWN_DEFECTS.md). Default: excluded, and counted in the header so they stay visible.
+  // FINALIS_TEST_KNOWN_DEFECTS=only runs just them; =include runs everything. --run ignores this.
+  const char* known_defects_env = std::getenv("FINALIS_TEST_KNOWN_DEFECTS");
+  const std::string known_defects = known_defects_env ? known_defects_env : "exclude";
+  if (known_defects != "exclude" && known_defects != "only" && known_defects != "include") {
+    return usage_error("FINALIS_TEST_KNOWN_DEFECTS must be exclude, only or include");
+  }
+  const auto is_known_defect = [](const std::string& name) {
+    auto it = test_tags().find(name);
+    if (it == test_tags().end()) return false;
+    const std::string tags = "," + it->second + ",";
+    return tags.find(",known-defect,") != std::string::npos;
+  };
+  std::size_t known_defects_skipped = 0;
+
   std::vector<std::pair<std::string, TestFn>> selected;
   selected.reserve(tests().size());
   if (run_exact.has_value()) {
@@ -145,6 +161,11 @@ int main(int argc, char** argv) {
     std::size_t shard_counter = 0;
     for (const auto& [name, fn] : tests()) {
       if (filter && std::string(name).find(filter) == std::string::npos) continue;
+      const bool known = is_known_defect(name);
+      if ((known && known_defects == "exclude") || (!known && known_defects == "only")) {
+        if (known) ++known_defects_skipped;
+        continue;
+      }
       if (shard_count > 1 && (shard_counter++ % shard_count) != shard_index) continue;
       selected.push_back({name, fn});
     }
@@ -154,7 +175,12 @@ int main(int argc, char** argv) {
   std::cout << "[tests] total=" << total;
   if (filter) std::cout << " filter=\"" << filter << "\"";
   if (shard_count > 1 && !run_exact.has_value()) std::cout << " shard=" << shard_index << "/" << shard_count;
+  if (known_defects != "exclude") std::cout << " known-defects=" << known_defects;
   std::cout << std::endl;
+  if (known_defects_skipped > 0) {
+    std::cout << "[tests] skipped " << known_defects_skipped
+              << " known-defect test(s); run them with FINALIS_TEST_KNOWN_DEFECTS=only (tests/KNOWN_DEFECTS.md)" << std::endl;
+  }
 
   TtyProgress tty_progress;
   std::size_t index = 0;

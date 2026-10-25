@@ -165,3 +165,28 @@ in-memory timed-out rounds; lock, valid value and own prevotes are durable).
 It abstracts away (each abstraction only adds behaviours): transition ids as abstract values that a
 fresh proposal may reuse, body availability, TC formation, the per-round reservations that a reset
 clears, and the once-per-round limit on honest proposals. Liveness is not checked.
+
+## Two-Phase Finality Persistence Model
+
+[two_phase_finality_persistence.tla](two_phase_finality_persistence.tla) adds the persistence layer to
+the abstract model: per-node in-memory and durable copies of the lock and prevote record, ambiguous
+write failures (the batch may or may not survive a restart), optional sticky failure (RocksDB's
+background error: every later write fails until restart), restarts that reload memory from disk, and
+the code paths that send votes from memory without a write (`lock_on_polka_locked`'s early return,
+the stall rebroadcast, the reconnect reseed). Only sent votes count toward polkas and commits.
+`Fix = FALSE` is the code at 9467c05; `Fix = TRUE` changes memory only after a successful write.
+3 honest + 1 Byzantine, two values, symmetry over values and honest nodes.
+
+| Config | Expected | Result (2026-10-25) |
+|---|---|---|
+| `_current_durable.cfg` (rounds 0..2) | `SentPrecommitDurable` violated | violated, depth 5 |
+| `_current_prevote.cfg` (rounds 0..2) | `NoHonestDoublePrevote` violated | violated, depth 5 |
+| `_current_r1.cfg` (rounds 0..1) | `Agreement` violated | violated, depth 12, 2.1M states, 29 s |
+| `_current.cfg` (rounds 0..2) | `Agreement` violated | **incomplete** (stopped at 20 min, ~7.7M states, no counterexample yet) |
+| `_fix_r1.cfg`, `_fix_nonsticky_r1.cfg` (rounds 0..1) | all invariants hold | hold, complete (128,082 / 63,411 states) |
+| `_fix.cfg`, `_fix_nonsticky.cfg` (rounds 0..2) | all invariants hold | hold, complete (26,435,096 / 12,744,290 states, depth 25) |
+| `_fix_reach.cfg` | `NothingFinalizes` violated | violated (finality reachable) |
+
+Run: `./scripts/run_tlc.sh --spec formal/two_phase_finality_persistence.tla --config <cfg>` (add
+`--expect-violation <invariant>` for the `_current*` and `_reach` configs). The tests that reproduce
+the same defects in the node are listed in [tests/KNOWN_DEFECTS.md](../tests/KNOWN_DEFECTS.md).

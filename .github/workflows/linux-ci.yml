@@ -41,7 +41,11 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 5400
+        run: ctest --test-dir build --output-on-failure --timeout 5400 -LE known-defect
+      # Open production defects (tests/KNOWN_DEFECTS.md): reported on every run, not a gate until fixed.
+      - name: Known-defect regression tests (expected to fail)
+        continue-on-error: true
+        run: ctest --test-dir build --output-on-failure --timeout 5400 -L known-defect
       - name: Fuzz smoke
         run: |
           ./build/fuzz_p2p_frame
