@@ -511,19 +511,29 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
                                       prev_lane_roots, ctx, out, error);
 }
 
-std::optional<TimedEscrow> open_timed_escrow(const OutPoint& fee_outpoint, std::uint64_t fee_input_value,
-                                             std::uint64_t prepaid_fee, const std::optional<TxOut>& fee_change) {
+std::optional<TimedInclusion> open_timed_escrow(const OutPoint& fee_outpoint, std::uint64_t fee_input_value,
+                                                std::uint64_t prepaid_fee, std::uint64_t forfeit_bond,
+                                                const Bytes& bond_refund_script,
+                                                const std::optional<TxOut>& fee_change, std::uint64_t min_bond) {
+  if (forfeit_bond < min_bond) return std::nullopt;
   const std::uint64_t change = fee_change ? fee_change->value : 0;
-  if (prepaid_fee > fee_input_value || fee_input_value - prepaid_fee != change) return std::nullopt;
-  return TimedEscrow{fee_outpoint, fee_input_value, prepaid_fee, fee_change};
+  // value == prepaid + bond + change, each subtraction checked so nothing wraps.
+  if (prepaid_fee > fee_input_value) return std::nullopt;
+  const std::uint64_t after_fee = fee_input_value - prepaid_fee;
+  if (forfeit_bond > after_fee || after_fee - forfeit_bond != change) return std::nullopt;
+  TimedInclusion out;
+  out.fee = prepaid_fee;
+  if (fee_change && fee_change->value > 0) out.change = fee_change;
+  out.escrow = TimedEscrow{fee_outpoint, forfeit_bond, bond_refund_script};
+  return out;
 }
 
 TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied) {
   TimedSettlement out;
   if (body_applied) {
-    if (escrow.fee_change && escrow.fee_change->value > 0) out.released_change = escrow.fee_change;
+    if (escrow.forfeit_bond > 0) out.refund = TxOut{escrow.forfeit_bond, escrow.bond_refund_script};
   } else {
-    out.forfeited_to_validators = escrow.escrowed();
+    out.forfeited_fee = escrow.forfeit_bond;
   }
   return out;
 }

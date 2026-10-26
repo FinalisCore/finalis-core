@@ -115,15 +115,23 @@ struct TxV2 {
 //   committee_root is that committee's key root (a ciphertext to any other key set never opens);
 //   swe_ciphertext parses for that committee and swe_proof (crypto/swe_proofs.hpp) verifies;
 //   the fee input is a standard transparent P2PKH UTXO whose script_sig signs the envelope
-//   (signing_message_for_timed_fee_input), and its value is exactly prepaid_fee + fee_change.value.
+//   (signing_message_for_timed_fee_input), and its value is exactly
+//   prepaid_fee + forfeit_bond + fee_change.value; bond_refund_script is a standard P2PKH script.
 // A TxTimed included after unlock_height is invalid: its key is already public.
 // Delay ("time-locked outputs") is unlock_height > h: the body's outputs appear at unlock_height + 1.
 //
-// Value (consensus::settle_timed_escrow): the fee input is spent at h; prepaid_fee goes to the
-// validators of h, the rest is held in escrow. At unlock_height + 1 a body that decrypts, parses and
-// applies releases fee_change to its owner; any other body (undecryptable, unparsable, invalid, a
-// double spend) applies nothing and the escrow goes to the validators of that block. Either way the
-// whole fee-input value is accounted for; nothing is burned or created.
+// Value (consensus::open_timed_escrow / settle_timed_escrow): the fee input is spent at h. prepaid_fee
+// is a fee of block h (normal fee distribution), fee_change is created at h, and only forfeit_bond is
+// held in escrow. In block unlock_height + 1 a body that decrypts, parses and applies returns the bond
+// as a new output paying bond_refund_script; any other body (undecryptable, unparsable, invalid, a
+// double spend) applies nothing and the bond becomes a fee of that block, distributed like every fee
+// (not to the proposer alone). The penalty is the declared bond, never more; the fee input's value is
+// accounted for in every case, nothing is burned or created.
+//
+// Settlement order (enforced where execution settles): every escrow due at a block settles first, in
+// inclusion order, before any other transaction of that block; a block that omits or reorders a due
+// settlement is invalid. Otherwise the proposer could include a revealed body as an ordinary
+// transaction first, make the timed body a double spend of itself, and collect the bond.
 inline constexpr std::uint32_t kTxTimedMaxScriptBytes = 1024;
 // Exact SWE footprint at MAX_COMMITTEE keys and a 256-bit key (crypto::SweCiphertext::serialize).
 inline constexpr std::uint32_t kTxTimedMaxSweCiphertextBytes =
@@ -141,8 +149,10 @@ struct TxTimed {
   std::uint32_t version{static_cast<std::uint32_t>(TxTimedVersionKind::TIMED_V3)};
   // Cleartext fee part: spent at inclusion (see "Value" above).
   TxIn fee_input;                     // transparent, P2PKH; script_sig signs the envelope
-  std::uint64_t prepaid_fee{0};
-  std::optional<TxOut> fee_change;    // transparent P2PKH, released only if the body applies
+  std::uint64_t prepaid_fee{0};       // fee of the inclusion block
+  std::uint64_t forfeit_bond{0};      // escrowed: refunded if the body applies, else a fee
+  Bytes bond_refund_script;           // P2PKH script of the refund output
+  std::optional<TxOut> fee_change;    // transparent P2PKH, created at inclusion
   // Time lock.
   std::uint64_t unlock_height{0};     // decrypted with the time signature of this height
   std::uint64_t committee_epoch{0};   // epoch_of(unlock_height); checked, not trusted
@@ -153,7 +163,7 @@ struct TxTimed {
   Bytes body_ciphertext;              // ciphertext || 16-byte tag
 
   // u32 version | fee_input (prev_txid, prev_index, varbytes script_sig, sequence) | u64 prepaid_fee
-  // | u8 has_change [u64 value, varbytes script_pubkey] | u64 unlock_height | u64 committee_epoch
+  // | u64 forfeit_bond | varbytes bond_refund_script | u8 has_change [u64 value, varbytes script_pubkey] | u64 unlock_height | u64 committee_epoch
   // | committee_root | varbytes swe_ciphertext | varbytes swe_proof | body_nonce
   // | varbytes body_ciphertext   (little-endian integers, as Tx / TxV2)
   Bytes serialize() const;

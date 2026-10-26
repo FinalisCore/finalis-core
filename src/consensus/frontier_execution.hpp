@@ -109,33 +109,38 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
 
 // --- TxTimed value accounting (utxo/confidential_tx.hpp, "Value") ---
 //
-// The fee input is spent when the TxTimed is included: prepaid_fee is that block's validator fee and
-// the rest (exactly fee_change.value) is escrowed. In the execution of unlock_height + 1 the escrow
-// settles: released to fee_change if the body applied, otherwise forfeited to that block's
-// validator reward. Invariant, checked by the tests: prepaid_fee + released + forfeited equals the
-// fee input's value, and released and forfeited are never both non-zero.
+// At inclusion the fee input is spent into: prepaid_fee (a fee of the inclusion block), fee_change
+// (an output created there) and forfeit_bond (escrowed). At unlock_height + 1 the bond settles:
+// refunded to bond_refund_script if the body applied, otherwise a fee of the settling block.
+// Invariant, checked by the tests: prepaid_fee + change + refund + forfeit == fee input value, and
+// refund and forfeit are never both non-zero.
 struct TimedEscrow {
   OutPoint fee_outpoint{};
-  std::uint64_t fee_input_value{0};
-  std::uint64_t prepaid_fee{0};      // paid to the validators of the inclusion block
-  std::optional<TxOut> fee_change;   // its value is the escrowed amount
-
-  std::uint64_t escrowed() const { return fee_change ? fee_change->value : 0; }
+  std::uint64_t forfeit_bond{0};
+  Bytes bond_refund_script;
 };
 
-// The escrow for an included TxTimed, or nullopt unless fee_input_value == prepaid_fee +
-// fee_change.value exactly (no overflow): no implicit fee, nothing unaccounted for.
-std::optional<TimedEscrow> open_timed_escrow(const OutPoint& fee_outpoint, std::uint64_t fee_input_value,
-                                             std::uint64_t prepaid_fee, const std::optional<TxOut>& fee_change);
+struct TimedInclusion {
+  std::uint64_t fee{0};               // prepaid_fee: a fee of the inclusion block
+  std::optional<TxOut> change;        // created at inclusion
+  TimedEscrow escrow;
+};
+
+// Nullopt unless fee_input_value == prepaid_fee + forfeit_bond + change exactly (no overflow) and the
+// bond is at least min_bond: no implicit fee, nothing unaccounted for, a protocol-minimum penalty.
+std::optional<TimedInclusion> open_timed_escrow(const OutPoint& fee_outpoint, std::uint64_t fee_input_value,
+                                                std::uint64_t prepaid_fee, std::uint64_t forfeit_bond,
+                                                const Bytes& bond_refund_script,
+                                                const std::optional<TxOut>& fee_change, std::uint64_t min_bond);
 
 struct TimedSettlement {
-  std::optional<TxOut> released_change;      // a new output owned by the sender, if the body applied
-  std::uint64_t forfeited_to_validators{0};  // added to the settling block's validator reward
+  std::optional<TxOut> refund;         // the bond back to the sender, if the body applied
+  std::uint64_t forfeited_fee{0};      // otherwise: the bond, as a fee of the settling block
 };
 
 // body_applied: the body decrypted, opened (open_timed_body), parsed and applied as a whole in the
-// settling block. Anything else (no key, a wrong tag, garbage, an invalid or double-spending body)
-// forfeits the escrow; the body itself then changes nothing.
+// settling block, before any non-settlement transaction of it. Anything else (no key, a wrong tag,
+// garbage, an invalid or double-spending body) forfeits the bond; the body itself changes nothing.
 TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied);
 
 }  // namespace finalis::consensus

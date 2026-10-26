@@ -61,6 +61,8 @@ TxTimed sample_envelope(bool with_change) {
   tx.fee_input.prev_index = 3;
   tx.fee_input.script_sig = Bytes(96, 0x22);
   tx.prepaid_fee = 1000;
+  tx.forfeit_bond = 5000;
+  tx.bond_refund_script = Bytes{0x76, 0xa9, 0x14, 0x02};
   if (with_change) tx.fee_change = TxOut{9000, Bytes{0x76, 0xa9, 0x14, 0x01}};
   tx.unlock_height = 1200;
   tx.committee_epoch = 1184;
@@ -127,6 +129,12 @@ TEST(test_timed_tx_signing_and_time_messages) {
   auto other_unlock = tx;
   other_unlock.unlock_height += 1;
   ASSERT_TRUE(signing_message_for_timed_fee_input(domain, other_unlock) != m);
+  auto other_bond = tx;
+  other_bond.forfeit_bond += 1;
+  ASSERT_TRUE(signing_message_for_timed_fee_input(domain, other_bond) != m);
+  auto other_refund = tx;
+  other_refund.bond_refund_script.back() ^= 1;
+  ASSERT_TRUE(signing_message_for_timed_fee_input(domain, other_refund) != m);
   ASSERT_TRUE(signing_message_for_timed_fee_input(filled(0xd1), tx) != m);
 
   ASSERT_EQ(time_signature_message(domain, 7).size(), 32u);
@@ -191,6 +199,9 @@ TEST(test_timed_tx_end_to_end_with_committee_time_signature) {
   auto other_fee = *got;
   other_fee.prepaid_fee += 1;
   ASSERT_TRUE(!open_timed_body(other_fee, key).has_value());
+  auto other_refund = *got;
+  other_refund.bond_refund_script.push_back(0);  // the refund destination is bound to the body
+  ASSERT_TRUE(!open_timed_body(other_refund, key).has_value());
   auto flipped = *got;
   flipped.body_ciphertext[3] ^= 1;
   ASSERT_TRUE(!open_timed_body(flipped, key).has_value());
@@ -225,35 +236,38 @@ TEST(test_timed_tx_garbage_body_does_not_open) {
   ASSERT_TRUE(open_timed_body(ok, key).has_value());
 }
 
-// Value conservation of the fee-forfeiture rule.
+// Value conservation of the bond rule: the penalty is the declared bond, never more.
 TEST(test_timed_escrow_conserves_value) {
   const OutPoint op{filled(0x01), 0};
-  // Exactly prepaid + change, nothing else.
-  ASSERT_TRUE(consensus::open_timed_escrow(op, 1000, 1000, std::nullopt).has_value());
-  ASSERT_TRUE(!consensus::open_timed_escrow(op, 1000, 999, std::nullopt).has_value());
-  ASSERT_TRUE(!consensus::open_timed_escrow(op, 1000, 400, TxOut{500, {}}).has_value());
-  ASSERT_TRUE(!consensus::open_timed_escrow(op, 1000, 1001, std::nullopt).has_value());
-  ASSERT_TRUE(!consensus::open_timed_escrow(op, 100, ~std::uint64_t{0}, TxOut{101, {}}).has_value());
+  const Bytes refund{0x76, 0xa9};
+  // Exactly prepaid + bond + change, and the bond meets the minimum.
+  ASSERT_TRUE(consensus::open_timed_escrow(op, 1000, 400, 600, refund, std::nullopt, 600).has_value());
+  ASSERT_TRUE(!consensus::open_timed_escrow(op, 1000, 400, 600, refund, std::nullopt, 601).has_value());
+  ASSERT_TRUE(!consensus::open_timed_escrow(op, 1000, 400, 500, refund, std::nullopt, 0).has_value());
+  ASSERT_TRUE(!consensus::open_timed_escrow(op, 1000, 400, 500, refund, TxOut{99, {}}, 0).has_value());
+  ASSERT_TRUE(consensus::open_timed_escrow(op, 1000, 400, 500, refund, TxOut{100, {}}, 0).has_value());
+  ASSERT_TRUE(!consensus::open_timed_escrow(op, 1000, 1001, 0, refund, std::nullopt, 0).has_value());
+  ASSERT_TRUE(!consensus::open_timed_escrow(op, 100, 50, ~std::uint64_t{0}, refund, TxOut{51, {}}, 0).has_value());
 
   std::mt19937_64 rng(42);
   for (int i = 0; i < 10000; ++i) {
     const std::uint64_t value = rng() >> (rng() % 63);
-    const std::uint64_t prepaid = value == 0 ? 0 : rng() % (value + 1);
+    const std::uint64_t prepaid = rng() % (value + 1);
+    const std::uint64_t bond = rng() % (value - prepaid + 1);
+    const std::uint64_t change_value = value - prepaid - bond;
     std::optional<TxOut> change;
-    if (value > prepaid) change = TxOut{value - prepaid, Bytes{1}};
-    const auto escrow = consensus::open_timed_escrow(op, value, prepaid, change);
-    ASSERT_TRUE(escrow.has_value());
+    if (change_value > 0) change = TxOut{change_value, Bytes{1}};
+    const auto inc = consensus::open_timed_escrow(op, value, prepaid, bond, refund, change, 0);
+    ASSERT_TRUE(inc.has_value());
+    const std::uint64_t at_inclusion = inc->fee + (inc->change ? inc->change->value : 0);
+    ASSERT_EQ(at_inclusion + inc->escrow.forfeit_bond, value);
     for (const bool applied : {true, false}) {
-      const auto s = consensus::settle_timed_escrow(*escrow, applied);
-      const std::uint64_t released = s.released_change ? s.released_change->value : 0;
-      ASSERT_EQ(prepaid + released + s.forfeited_to_validators, value);
-      ASSERT_TRUE(released == 0 || s.forfeited_to_validators == 0);
-      if (applied) {
-        ASSERT_EQ(s.forfeited_to_validators, 0u);
-      } else {
-        ASSERT_TRUE(!s.released_change.has_value());
-        ASSERT_EQ(prepaid + s.forfeited_to_validators, value);  // the whole input goes to validators
-      }
+      const auto s = consensus::settle_timed_escrow(inc->escrow, applied);
+      const std::uint64_t refunded = s.refund ? s.refund->value : 0;
+      ASSERT_EQ(at_inclusion + refunded + s.forfeited_fee, value);
+      ASSERT_TRUE(refunded == 0 || s.forfeited_fee == 0);
+      ASSERT_EQ(applied ? refunded : s.forfeited_fee, bond);  // the penalty is the bond, never more
+      if (s.refund) ASSERT_TRUE(s.refund->script_pubkey == refund);
     }
   }
 }

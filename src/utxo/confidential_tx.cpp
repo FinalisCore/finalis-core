@@ -210,6 +210,8 @@ void write_timed(codec::ByteWriter& w, const TxTimed& tx, bool with_script_sig, 
   w.varbytes(with_script_sig ? tx.fee_input.script_sig : Bytes{});
   w.u32le(tx.fee_input.sequence);
   w.u64le(tx.prepaid_fee);
+  w.u64le(tx.forfeit_bond);
+  w.varbytes(tx.bond_refund_script);
   w.u8(tx.fee_change.has_value() ? 1 : 0);
   if (tx.fee_change) {
     w.u64le(tx.fee_change->value);
@@ -250,10 +252,16 @@ std::optional<TxTimed> TxTimed::parse(const Bytes& b) {
           const auto script = read_capped(r, kTxTimedMaxScriptBytes);
           const auto seq = r.u32le();
           const auto fee = r.u64le();
+          const auto bond = r.u64le();
+          const auto refund = read_capped(r, kTxTimedMaxScriptBytes);
           const auto has_change = r.u8();
-          if (!prev || !idx || !script || !seq || !fee || !has_change || *has_change > 1) return false;
+          if (!prev || !idx || !script || !seq || !fee || !bond || !refund || !has_change || *has_change > 1) {
+            return false;
+          }
           tx.fee_input = TxIn{*prev, *idx, *script, *seq};
           tx.prepaid_fee = *fee;
+          tx.forfeit_bond = *bond;
+          tx.bond_refund_script = *refund;
           if (*has_change == 1) {
             const auto value = r.u64le();
             const auto spk = read_capped(r, kTxTimedMaxScriptBytes);
