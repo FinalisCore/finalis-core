@@ -6,6 +6,8 @@
 #include <variant>
 
 #include "crypto/confidential.hpp"
+#include "crypto/swe.hpp"
+#include "crypto/swe_proofs.hpp"
 #include "utxo/tx.hpp"
 
 namespace finalis {
@@ -99,26 +101,36 @@ struct TxV2 {
   bool operator==(const TxV2&) const = default;
 };
 
-// --- Timed transactions (McFly time layer; design sketch, not yet part of AnyTx) ---
+// --- Timed transactions (McFly time layer; not yet part of AnyTx) ---
 //
 // A TxTimed is included at height h and ordered blindly; its body is decrypted and applied in the
 // execution of block unlock_height + 1, once the aggregate time signature for unlock_height exists
 // (every block carries the one for its parent). Hybrid encryption: a 256-bit AEAD key is encrypted
-// with McFly SWE to the committee of epoch_of(unlock_height) and the time-signature message for
-// unlock_height; the body (a serialized Tx or TxV2) is AEAD-encrypted under that key.
+// with McFly SWE (crypto/swe.hpp) to the committee of epoch_of(unlock_height) and the time-signature
+// message of unlock_height (time_signature_message); the body, a serialized Tx or TxV2, is
+// ChaCha20-Poly1305-encrypted under that key.
 //
 // Validity at inclusion (block h), all public:
 //   h <= unlock_height <= the last height whose committee is already finalized (the horizon), and
 //   committee_root is that committee's key root (a ciphertext to any other key set never opens);
-//   the SWE proof verifies (decrypts to the same key for every signer subset, every chunk in range);
-//   the fee input is a standard transparent UTXO, its script_sig signs the whole envelope, and it
-//   covers prepaid_fee (+ the change output). The fee is charged at h whatever the body turns out to
-//   be: an undecryptable-looking but proven ciphertext, garbage, or a double spend at execution.
-// A TxTimed included after unlock_height is invalid: its key is already public, so it would be
-// ordered with its contents known. Delay ("time-locked outputs") is unlock_height > h: the body's
-// outputs appear only at unlock_height + 1.
-inline constexpr std::uint32_t kTxTimedMaxSweCiphertextBytes = 32 * 1024;  // n <= MAX_COMMITTEE key-group elements + 11 chunks
-inline constexpr std::uint32_t kTxTimedMaxSweProofBytes = 16 * 1024;
+//   swe_ciphertext parses for that committee and swe_proof (crypto/swe_proofs.hpp) verifies;
+//   the fee input is a standard transparent P2PKH UTXO whose script_sig signs the envelope
+//   (signing_message_for_timed_fee_input), and its value is exactly prepaid_fee + fee_change.value.
+// A TxTimed included after unlock_height is invalid: its key is already public.
+// Delay ("time-locked outputs") is unlock_height > h: the body's outputs appear at unlock_height + 1.
+//
+// Value (consensus::settle_timed_escrow): the fee input is spent at h; prepaid_fee goes to the
+// validators of h, the rest is held in escrow. At unlock_height + 1 a body that decrypts, parses and
+// applies releases fee_change to its owner; any other body (undecryptable, unparsable, invalid, a
+// double spend) applies nothing and the escrow goes to the validators of that block. Either way the
+// whole fee-input value is accounted for; nothing is burned or created.
+inline constexpr std::uint32_t kTxTimedMaxScriptBytes = 1024;
+// Exact SWE footprint at MAX_COMMITTEE keys and a 256-bit key (crypto::SweCiphertext::serialize).
+inline constexpr std::uint32_t kTxTimedMaxSweCiphertextBytes =
+    7 + (2 + MAX_COMMITTEE) * crypto::kBlsPublicKeyBytes +
+    crypto::kSweKeyChunks * (crypto::kBlsPublicKeyBytes + crypto::kBlsSignatureBytes + crypto::kGtBytes);
+inline constexpr std::uint32_t kTxTimedSweProofBytes = crypto::kSweWellFormednessProofBytes;
+inline constexpr std::uint32_t kTxTimedBodyTagBytes = 16;  // Poly1305
 inline constexpr std::uint32_t kTxTimedMaxBodyCiphertextBytes = 64 * 1024;
 
 enum class TxTimedVersionKind : std::uint32_t {
@@ -127,32 +139,44 @@ enum class TxTimedVersionKind : std::uint32_t {
 
 struct TxTimed {
   std::uint32_t version{static_cast<std::uint32_t>(TxTimedVersionKind::TIMED_V3)};
-  // Cleartext fee part, applied at inclusion.
+  // Cleartext fee part: spent at inclusion (see "Value" above).
   TxIn fee_input;                     // transparent, P2PKH; script_sig signs the envelope
   std::uint64_t prepaid_fee{0};
-  std::optional<TxOut> fee_change;    // transparent P2PKH change from fee_input
+  std::optional<TxOut> fee_change;    // transparent P2PKH, released only if the body applies
   // Time lock.
   std::uint64_t unlock_height{0};     // decrypted with the time signature of this height
   std::uint64_t committee_epoch{0};   // epoch_of(unlock_height); checked, not trusted
   Hash32 committee_root{};            // root of that epoch's ordered BLS keys (the SWE key set V)
-  // McFly SWE' (paper section 6.1, enhanced) of the 256-bit AEAD key, and its verifiability proof
-  // (well-formedness + plaintext equality + range, section 7). Opaque here; crypto/swe.* owns the
-  // encodings and their size checks.
-  Bytes swe_ciphertext;
-  Bytes swe_proof;
-  // AEAD (ChaCha20-Poly1305, 12-byte nonce) of serialize_any_tx(body); the associated data commits
-  // to every field above, so no part of the envelope can be swapped under a valid body.
+  Bytes swe_ciphertext;               // crypto::SweCiphertext of the 256-bit body key
+  Bytes swe_proof;                    // crypto::SweWellFormednessProof
   std::array<std::uint8_t, 12> body_nonce{};
-  Bytes body_ciphertext;
+  Bytes body_ciphertext;              // ciphertext || 16-byte tag
 
-  bool operator==(const TxTimed&) const = default;
+  // u32 version | fee_input (prev_txid, prev_index, varbytes script_sig, sequence) | u64 prepaid_fee
+  // | u8 has_change [u64 value, varbytes script_pubkey] | u64 unlock_height | u64 committee_epoch
+  // | committee_root | varbytes swe_ciphertext | varbytes swe_proof | body_nonce
+  // | varbytes body_ciphertext   (little-endian integers, as Tx / TxV2)
+  Bytes serialize() const;
+  // Enforces the size limits above; does not parse the SWE ciphertext or proof (that needs the
+  // committee).
+  static std::optional<TxTimed> parse(const Bytes& b);
+  Hash32 txid() const;
+  // Associated data of the body AEAD: SHA256d("SC-TIMED-AAD-V1" || serialize() without the fee
+  // script_sig and the body ciphertext), so the body key opens the body only inside this envelope.
+  Hash32 body_aad() const;
 };
-
 using AnyTx = std::variant<Tx, TxV2>;
 
 std::optional<AnyTx> parse_any_tx(const Bytes& b);
 Bytes serialize_any_tx(const AnyTx& tx);
 Hash32 txid_any(const AnyTx& tx);
+
+// Encrypts serialize_any_tx(body) into tx.body_ciphertext under `key`, with tx.body_nonce and
+// tx.body_aad(); every other field must already be final. False if the body is too large.
+bool seal_timed_body(TxTimed& tx, const Hash32& key, const AnyTx& body);
+// The body, or nullopt if the tag does not verify under `key` and tx.body_aad() or the plaintext is
+// not exactly one Tx / TxV2 encoding. Either way the chain treats nullopt as an invalid body.
+std::optional<AnyTx> open_timed_body(const TxTimed& tx, const Hash32& key);
 
 // Address-history key of a confidential one-time key: SHA256("FINALIS/conf-history/v1" || one_time_pubkey).
 // Finalized outputs paying the key and confidential inputs spending it are indexed under it, so a

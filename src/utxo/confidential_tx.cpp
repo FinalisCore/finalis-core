@@ -2,6 +2,8 @@
 
 #include "utxo/confidential_tx.hpp"
 
+#include <sodium.h>
+
 #include <string_view>
 
 #include "codec/bytes.hpp"
@@ -197,6 +199,131 @@ Bytes serialize_any_tx(const AnyTx& tx) {
 
 Hash32 txid_any(const AnyTx& tx) {
   return std::visit([](const auto& value) { return value.txid(); }, tx);
+}
+
+namespace {
+
+void write_timed(codec::ByteWriter& w, const TxTimed& tx, bool with_script_sig, bool with_body) {
+  w.u32le(tx.version);
+  w.bytes_fixed(tx.fee_input.prev_txid);
+  w.u32le(tx.fee_input.prev_index);
+  w.varbytes(with_script_sig ? tx.fee_input.script_sig : Bytes{});
+  w.u32le(tx.fee_input.sequence);
+  w.u64le(tx.prepaid_fee);
+  w.u8(tx.fee_change.has_value() ? 1 : 0);
+  if (tx.fee_change) {
+    w.u64le(tx.fee_change->value);
+    w.varbytes(tx.fee_change->script_pubkey);
+  }
+  w.u64le(tx.unlock_height);
+  w.u64le(tx.committee_epoch);
+  w.bytes_fixed(tx.committee_root);
+  w.varbytes(tx.swe_ciphertext);
+  w.varbytes(tx.swe_proof);
+  w.bytes_fixed(tx.body_nonce);
+  w.varbytes(with_body ? tx.body_ciphertext : Bytes{});
+}
+
+std::optional<Bytes> read_capped(codec::ByteReader& r, std::size_t cap) {
+  auto len = r.varint();
+  if (!len || *len > cap || *len > r.remaining()) return std::nullopt;
+  return r.bytes(static_cast<std::size_t>(*len));
+}
+
+}  // namespace
+
+Bytes TxTimed::serialize() const {
+  codec::ByteWriter w;
+  write_timed(w, *this, true, true);
+  return w.take();
+}
+
+std::optional<TxTimed> TxTimed::parse(const Bytes& b) {
+  TxTimed tx;
+  try {
+    if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+          const auto version = r.u32le();
+          if (!version || *version != static_cast<std::uint32_t>(TxTimedVersionKind::TIMED_V3)) return false;
+          tx.version = *version;
+          const auto prev = r.bytes_fixed<32>();
+          const auto idx = r.u32le();
+          const auto script = read_capped(r, kTxTimedMaxScriptBytes);
+          const auto seq = r.u32le();
+          const auto fee = r.u64le();
+          const auto has_change = r.u8();
+          if (!prev || !idx || !script || !seq || !fee || !has_change || *has_change > 1) return false;
+          tx.fee_input = TxIn{*prev, *idx, *script, *seq};
+          tx.prepaid_fee = *fee;
+          if (*has_change == 1) {
+            const auto value = r.u64le();
+            const auto spk = read_capped(r, kTxTimedMaxScriptBytes);
+            if (!value || !spk) return false;
+            tx.fee_change = TxOut{*value, *spk};
+          }
+          const auto unlock = r.u64le();
+          const auto epoch = r.u64le();
+          const auto root = r.bytes_fixed<32>();
+          const auto ct = read_capped(r, kTxTimedMaxSweCiphertextBytes);
+          const auto proof = read_capped(r, kTxTimedSweProofBytes);
+          const auto nonce = r.bytes_fixed<12>();
+          const auto body = read_capped(r, kTxTimedMaxBodyCiphertextBytes);
+          if (!unlock || !epoch || !root || !ct || !proof || !nonce || !body) return false;
+          if (proof->size() != kTxTimedSweProofBytes || body->size() < kTxTimedBodyTagBytes) return false;
+          tx.unlock_height = *unlock;
+          tx.committee_epoch = *epoch;
+          tx.committee_root = *root;
+          tx.swe_ciphertext = std::move(*ct);
+          tx.swe_proof = std::move(*proof);
+          tx.body_nonce = *nonce;
+          tx.body_ciphertext = std::move(*body);
+          return true;
+        })) {
+      return std::nullopt;
+    }
+  } catch (...) {
+    return std::nullopt;
+  }
+  return tx;
+}
+
+Hash32 TxTimed::txid() const { return crypto::sha256d(serialize()); }
+
+Hash32 TxTimed::body_aad() const {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'D', '-', 'A', 'A', 'D', '-', 'V', '1'});
+  write_timed(w, *this, false, false);
+  return crypto::sha256d(w.data());
+}
+
+bool seal_timed_body(TxTimed& tx, const Hash32& key, const AnyTx& body) {
+  if (sodium_init() < 0) return false;
+  const Bytes plain = serialize_any_tx(body);
+  if (plain.size() + kTxTimedBodyTagBytes > kTxTimedMaxBodyCiphertextBytes) return false;
+  const Hash32 aad = tx.body_aad();
+  Bytes out(plain.size() + crypto_aead_chacha20poly1305_ietf_ABYTES);
+  unsigned long long out_len = 0;
+  if (crypto_aead_chacha20poly1305_ietf_encrypt(out.data(), &out_len, plain.data(), plain.size(), aad.data(), aad.size(),
+                                                nullptr, tx.body_nonce.data(), key.data()) != 0) {
+    return false;
+  }
+  out.resize(static_cast<std::size_t>(out_len));
+  tx.body_ciphertext = std::move(out);
+  return true;
+}
+
+std::optional<AnyTx> open_timed_body(const TxTimed& tx, const Hash32& key) {
+  if (sodium_init() < 0) return std::nullopt;
+  if (tx.body_ciphertext.size() < crypto_aead_chacha20poly1305_ietf_ABYTES) return std::nullopt;
+  const Hash32 aad = tx.body_aad();
+  Bytes plain(tx.body_ciphertext.size() - crypto_aead_chacha20poly1305_ietf_ABYTES);
+  unsigned long long plain_len = 0;
+  if (crypto_aead_chacha20poly1305_ietf_decrypt(plain.data(), &plain_len, nullptr, tx.body_ciphertext.data(),
+                                                tx.body_ciphertext.size(), aad.data(), aad.size(), tx.body_nonce.data(),
+                                                key.data()) != 0) {
+    return std::nullopt;
+  }
+  plain.resize(static_cast<std::size_t>(plain_len));
+  return parse_any_tx(plain);  // exact Tx / TxV2 encoding only (parse_exact)
 }
 
 Hash32 confidential_history_key(const PubKey33& one_time_pubkey) {

@@ -11,9 +11,10 @@
 #include <blst.h>
 
 #include "crypto/hash.hpp"
+#include "crypto/swe_internal.hpp"
 
 namespace finalis::crypto {
-namespace {
+namespace swe_internal {
 
 constexpr std::uint8_t kSweVersion = 1;
 constexpr std::uint32_t kBabySteps = 1u << (kSweChunkBits / 2);  // 4096
@@ -230,12 +231,19 @@ std::optional<std::vector<blst_fr>> evaluation_points(const std::vector<BlsPubli
   return out;
 }
 
+}  // namespace swe_internal
+
+namespace {
+using namespace swe_internal;
+
 void put_u16(Bytes& out, std::size_t v) {
   out.push_back(static_cast<std::uint8_t>(v >> 8));
   out.push_back(static_cast<std::uint8_t>(v));
 }
 
 }  // namespace
+
+using namespace swe_internal;
 
 // --- ciphertext encoding ---
 

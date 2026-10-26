@@ -511,4 +511,21 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
                                       prev_lane_roots, ctx, out, error);
 }
 
+std::optional<TimedEscrow> open_timed_escrow(const OutPoint& fee_outpoint, std::uint64_t fee_input_value,
+                                             std::uint64_t prepaid_fee, const std::optional<TxOut>& fee_change) {
+  const std::uint64_t change = fee_change ? fee_change->value : 0;
+  if (prepaid_fee > fee_input_value || fee_input_value - prepaid_fee != change) return std::nullopt;
+  return TimedEscrow{fee_outpoint, fee_input_value, prepaid_fee, fee_change};
+}
+
+TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied) {
+  TimedSettlement out;
+  if (body_applied) {
+    if (escrow.fee_change && escrow.fee_change->value > 0) out.released_change = escrow.fee_change;
+  } else {
+    out.forfeited_to_validators = escrow.escrowed();
+  }
+  return out;
+}
+
 }  // namespace finalis::consensus

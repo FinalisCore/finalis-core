@@ -611,6 +611,27 @@ Bytes propose_signing_message(const Hash32& chain_domain, std::uint64_t height, 
   return Bytes(msg.begin(), msg.end());
 }
 
+Bytes time_signature_message(const Hash32& chain_domain, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
+  w.u64le(height);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes signing_message_for_timed_fee_input(const Hash32& chain_domain, const TxTimed& tx) {
+  TxTimed signing = tx;
+  signing.fee_input.script_sig.clear();
+  const Hash32 txh = crypto::sha256d(signing.serialize());
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'D', '-', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
+  w.bytes_fixed(txh);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
 Bytes timeout_vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'O', 'U', 'T', '-', 'V', '1'});

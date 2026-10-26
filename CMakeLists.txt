@@ -258,6 +258,7 @@ add_library(finalis_core
   src/crypto/vrf.cpp
   src/crypto/bls12_381.cpp
   src/crypto/swe.cpp
+  src/crypto/swe_proofs.cpp
   src/crypto/secure_memory.cpp
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
@@ -534,6 +535,8 @@ add_executable(finalis-tests
   tests/test_vrf.cpp
   tests/test_bls12_381.cpp
   tests/test_swe.cpp
+  tests/test_swe_proofs.cpp
+  tests/test_timed_tx.cpp
   tests/test_availability.cpp
   tests/test_snapshot.cpp
   tests/test_validator_lifecycle.cpp

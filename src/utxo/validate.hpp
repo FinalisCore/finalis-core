@@ -59,6 +59,9 @@ std::optional<Bytes> signing_message_for_input_v2(const Hash32& chain_domain, co
                                                   std::uint32_t input_index);
 std::optional<Hash32> balance_proof_message_v2(const Hash32& chain_domain, const TxV2& tx);
 std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index);
+// The fee input's signature of a TxTimed: covers every field (the SWE ciphertext, proof and the
+// sealed body included) except the script_sig itself.
+Bytes signing_message_for_timed_fee_input(const Hash32& chain_domain, const TxTimed& tx);
 // The chain domain transaction signatures are checked under; empty when ctx lacks chain identity.
 std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx);
 Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
@@ -99,6 +102,11 @@ Bytes prevote_signing_message(const Hash32& chain_domain, std::uint64_t height, 
 Bytes propose_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
                               const Hash32& transition_id, std::optional<std::uint32_t> pol_round);
 Bytes timeout_vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round);
+// The McFly time-signature message T of a height: what every committee member signs with its BLS key
+// (crypto::kBlsTimeSignatureDst) once it holds that height's finality certificate, and what a
+// TxTimed with that unlock_height is SWE-encrypted to. No round or transition: it must be known in
+// advance.
+Bytes time_signature_message(const Hash32& chain_domain, std::uint64_t height);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);
 bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubKey32* out_pub = nullptr);
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey);
