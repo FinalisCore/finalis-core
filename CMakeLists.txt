@@ -170,6 +170,50 @@ if(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND AND NOT FINALIS_USE_SECP256K1_ZKP_BACKEN
     "Ensure third_party/secp256k1-zkp is present or provide a compatible system secp256k1-zkp installation.")
 endif()
 
+# blst (BLS12-381, Apache-2.0): validator time signatures and McFly signature-based witness
+# encryption (src/crypto/bls12_381.*). Required: consensus verifies time signatures with it.
+# third_party/blst if present, else fetched at a pinned commit (tag v0.3.17). blst has no CMake
+# build; its two amalgamation units are compiled directly, as its build.sh does.
+set(FINALIS_BLST_SOURCE "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/blst/bindings/blst.h")
+  set(FINALIS_BLST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/blst")
+  message(STATUS "Using vendored blst")
+elseif(FINALIS_AUTO_FETCH_DEPS)
+  include(FetchContent)
+  message(STATUS "Vendored blst not found; fetching from upstream")
+  FetchContent_Declare(
+    blst
+    GIT_REPOSITORY https://github.com/supranational/blst.git
+    GIT_TAG 54e6e55674722fc2797ebb4bbb71b26d881eb4b8  # v0.3.17
+  )
+  FetchContent_Populate(blst)
+  set(FINALIS_BLST_SOURCE "${blst_SOURCE_DIR}")
+else()
+  message(FATAL_ERROR "blst not found: place it in third_party/blst or enable FINALIS_AUTO_FETCH_DEPS.")
+endif()
+# Portable (runtime CPU dispatch) by default: release binaries run on hosts other than the build host.
+option(FINALIS_BLST_PORTABLE "Build blst with -D__BLST_PORTABLE__" ON)
+enable_language(C)
+set(FINALIS_BLST_SOURCES "${FINALIS_BLST_SOURCE}/src/server.c")
+set(FINALIS_BLST_DEFINES "")
+# No assembly under MSVC (its .asm needs MASM wiring, not done yet) or in fuzz/sanitizer builds
+# (MSan does not see writes made by assembly): portable C, slower.
+if(MSVC OR FINALIS_LIB_FUZZING_ENGINE OR FINALIS_SANITIZE)
+  list(APPEND FINALIS_BLST_DEFINES __BLST_NO_ASM__)
+else()
+  enable_language(ASM)
+  list(APPEND FINALIS_BLST_SOURCES "${FINALIS_BLST_SOURCE}/build/assembly.S")
+  if(FINALIS_BLST_PORTABLE)
+    list(APPEND FINALIS_BLST_DEFINES __BLST_PORTABLE__)
+  endif()
+endif()
+add_library(finalis_blst STATIC ${FINALIS_BLST_SOURCES})
+target_include_directories(finalis_blst PUBLIC "${FINALIS_BLST_SOURCE}/bindings")
+target_compile_definitions(finalis_blst PRIVATE ${FINALIS_BLST_DEFINES})
+if(NOT MSVC)
+  target_compile_options(finalis_blst PRIVATE -O2 -fno-builtin -fPIC)
+endif()
+
 # Storage. RocksDB is required: without it storage::DB uses a file backend that rewrites kv.bin in
 # place (no fsync, no atomic rename), so a "durable" write is not durable and a crash mid-write can
 # lose all state. That backend is for fuzzing and tests only (ClusterFuzzLite has no RocksDB), and
@@ -212,6 +256,8 @@ add_library(finalis_core
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
   src/crypto/vrf.cpp
+  src/crypto/bls12_381.cpp
+  src/crypto/swe.cpp
   src/crypto/secure_memory.cpp
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
@@ -276,6 +322,7 @@ target_link_libraries(finalis_core PUBLIC ${SODIUM_LIB})
 if(FINALIS_SECP256K1_INCLUDE_DIR)
   target_include_directories(finalis_core PUBLIC ${FINALIS_SECP256K1_INCLUDE_DIR})
 endif()
+target_link_libraries(finalis_core PUBLIC finalis_blst)
 if(FINALIS_SECP256K1_TARGET)
   target_link_libraries(finalis_core PUBLIC ${FINALIS_SECP256K1_TARGET})
 elseif(SECP256K1_LIB AND SECP256K1_INCLUDE_DIR)
@@ -485,6 +532,8 @@ add_executable(finalis-tests
   tests/test_bonding.cpp
   tests/test_finality_certificate.cpp
   tests/test_vrf.cpp
+  tests/test_bls12_381.cpp
+  tests/test_swe.cpp
   tests/test_availability.cpp
   tests/test_snapshot.cpp
   tests/test_validator_lifecycle.cpp
