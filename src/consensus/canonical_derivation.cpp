@@ -754,21 +754,18 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
     }
 
     for (const auto& out : outputs) {
-      PubKey32 onboarding_validator_pub{};
-      PubKey32 onboarding_payout_pub{};
-      Sig64 onboarding_pop{};
-      if (is_onboarding_registration_script(out.script_pubkey, &onboarding_validator_pub, &onboarding_payout_pub,
-                                            &onboarding_pop)) {
+      OnboardingRegistrationScriptData onboarding{};
+      if (parse_onboarding_registration_script(out.script_pubkey, &onboarding)) {
         std::string err;
-        (void)state->validators.register_onboarding(
-            onboarding_validator_pub, height, &err,
-            canonical_operator_id_from_join_request(onboarding_payout_pub));
+        (void)state->validators.register_onboarding(onboarding.validator_pubkey, height, &err,
+                                                    canonical_operator_id_from_join_request(onboarding.payout_pubkey),
+                                                    onboarding.bls_pubkey);
         continue;
       }
-      PubKey32 validator_pub{};
-      PubKey32 payout_pub{};
-      Sig64 pop{};
-      if (!is_validator_join_request_script(out.script_pubkey, &validator_pub, &payout_pub, &pop)) continue;
+      ValidatorJoinRequestScriptData join{};
+      if (!parse_validator_join_request_script(out.script_pubkey, &join)) continue;
+      const PubKey32& validator_pub = join.validator_pubkey;
+      const PubKey32& payout_pub = join.payout_pubkey;
 
       for (const auto& bond_out : outputs) {
         PubKey32 bond_pub{};
@@ -786,7 +783,8 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
         }
         std::string err;
         if (state->validators.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err,
-                                            canonical_operator_id_from_join_request(req.payout_pubkey))) {
+                                            canonical_operator_id_from_join_request(req.payout_pubkey),
+                                            join.bls_pubkey)) {
           req.status = ValidatorJoinRequestStatus::APPROVED;
           req.approved_height = height;
           state->validator_join_requests[txid] = req;

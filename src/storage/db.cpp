@@ -281,6 +281,7 @@ Bytes serialize_validator(const consensus::ValidatorInfo& info) {
   w.u64le(info.last_exit_height);
   w.u32le(info.penalty_strikes);
   w.u64le(info.bonded_amount);
+  w.bytes_fixed(info.bls_pubkey);
   return w.take();
 }
 
@@ -299,7 +300,8 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
           info.unbond_height = 0;
           return true;
         }
-        if (r.remaining() == 137) {
+        // 137 / 185: the current layouts with operator_id, without / with the BLS key.
+        if (r.remaining() == 137 || r.remaining() == 137 + crypto::kBlsPublicKeyBytes) {
           auto operator_id = r.bytes_fixed<32>();
           if (!operator_id) return false;
           info.operator_id = *operator_id;
@@ -330,8 +332,13 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         info.penalty_strikes = *strikes;
         if (!r.eof()) {
           auto bonded = r.u64le();
-          if (!bonded || !r.eof()) return false;
+          if (!bonded) return false;
           info.bonded_amount = *bonded;
+          if (!r.eof()) {
+            auto bls = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+            if (!bls || !r.eof()) return false;
+            info.bls_pubkey = *bls;
+          }
         } else {
           info.bonded_amount = BOND_AMOUNT;
         }

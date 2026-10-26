@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/types.hpp"
+#include "crypto/bls12_381.hpp"
 #include "crypto/confidential.hpp"
 
 namespace finalis {
@@ -351,10 +352,21 @@ Bytes serialize_utxo_entry_v2(const UtxoEntryV2& entry);
 std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b);
 std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry);
 
+// SCVALJRQ / SCONBREG scripts: prefix(8) | validator_pubkey(32) | payout_pubkey(32) | pop(64) |
+// bls_pubkey(48) | bls_pop(96) [| admission_pow_epoch(u64le) | admission_pow_nonce(u64le)]:
+// 280 bytes, or 296 with admission PoW. pop is the Ed25519 signature of the registration message,
+// which covers bls_pubkey (the validator vouches for its BLS key); bls_pop is the BLS proof of
+// possession of bls_pubkey (crypto::bls_pop_prove; rules out rogue-key aggregation).
+inline constexpr std::size_t kValidatorRegistrationScriptBytes = 8 + 32 + 32 + 64 + crypto::kBlsPublicKeyBytes +
+                                                                 crypto::kBlsSignatureBytes;
+inline constexpr std::size_t kValidatorRegistrationScriptPowBytes = kValidatorRegistrationScriptBytes + 16;
+
 struct ValidatorJoinRequestScriptData {
   PubKey32 validator_pubkey{};
   PubKey32 payout_pubkey{};
   Sig64 pop{};
+  crypto::BlsPublicKey bls_pubkey{};
+  crypto::BlsSignature bls_pop{};
   bool has_admission_pow{false};
   std::uint64_t admission_pow_epoch{0};
   std::uint64_t admission_pow_nonce{0};
@@ -364,10 +376,15 @@ struct OnboardingRegistrationScriptData {
   PubKey32 validator_pubkey{};
   PubKey32 payout_pubkey{};
   Sig64 pop{};
+  crypto::BlsPublicKey bls_pubkey{};
+  crypto::BlsSignature bls_pop{};
   bool has_admission_pow{false};
   std::uint64_t admission_pow_epoch{0};
   std::uint64_t admission_pow_nonce{0};
 };
+
+Bytes encode_validator_join_request_script(const ValidatorJoinRequestScriptData& data);
+Bytes encode_onboarding_registration_script(const OnboardingRegistrationScriptData& data);
 
 bool is_validator_register_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
 bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey = nullptr);

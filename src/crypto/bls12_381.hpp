@@ -48,6 +48,11 @@ struct BlsSecretKey {
 
 // IETF BLS KeyGen (HKDF-SHA256) from at least 32 bytes of key material.
 std::optional<BlsSecretKey> bls_keygen(const Bytes& ikm);
+// A validator's BLS key, derived from its Ed25519 seed (the 32-byte private key of crypto::KeyPair):
+// KeyGen(SHA256(tag || 0 || seed) || SHA256(tag || 1 || seed)) with tag
+// "FINALIS-VALIDATOR-BLS-V1". One seed, one validator identity: no separate BLS key file, and the
+// Ed25519 key never doubles as BLS key material directly (domain-separated derivation).
+std::optional<BlsSecretKey> bls_key_from_validator_seed(const Bytes& ed25519_seed_32);
 std::optional<BlsPublicKey> bls_public_key(const BlsSecretKey& sk);
 std::optional<BlsSignature> bls_sign(const BlsSecretKey& sk, const Bytes& msg, std::string_view dst);
 bool bls_verify(const BlsPublicKey& pk, const Bytes& msg, std::string_view dst, const BlsSignature& sig);

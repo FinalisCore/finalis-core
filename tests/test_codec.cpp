@@ -444,12 +444,15 @@ TEST(test_validator_db_roundtrip_preserves_operator_id) {
   Hash32 bond_txid{};
   bond_txid.fill(0x01);
   info.bond_outpoint = OutPoint{bond_txid, 2};
+  info.bls_pubkey.fill(0xab);  // the time-signature key rides at the end of the record
   ASSERT_TRUE(db.put_validator(pub, info));
 
   const auto validators = db.load_validators();
   auto it = validators.find(pub);
   ASSERT_TRUE(it != validators.end());
   ASSERT_EQ(it->second.operator_id, operator_id);
+  ASSERT_TRUE(it->second.bls_pubkey == info.bls_pubkey);
+  ASSERT_EQ(it->second.bonded_amount, info.bonded_amount);
   ASSERT_EQ(it->second.bonded_amount, info.bonded_amount);
 }
 

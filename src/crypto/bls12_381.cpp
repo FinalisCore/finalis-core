@@ -89,6 +89,23 @@ std::optional<BlsSecretKey> bls_keygen(const Bytes& ikm) {
   return sk;
 }
 
+std::optional<BlsSecretKey> bls_key_from_validator_seed(const Bytes& ed25519_seed_32) {
+  if (ed25519_seed_32.size() != 32) return std::nullopt;
+  static constexpr std::string_view kTag = "FINALIS-VALIDATOR-BLS-V1";
+  Bytes ikm;
+  ScopedWipe wipe(ikm);
+  for (std::uint8_t ctr = 0; ctr < 2; ++ctr) {
+    Bytes in(kTag.begin(), kTag.end());
+    in.push_back(ctr);
+    in.insert(in.end(), ed25519_seed_32.begin(), ed25519_seed_32.end());
+    auto h = sha256(in);
+    secure_wipe(in);
+    ikm.insert(ikm.end(), h.begin(), h.end());
+    secure_wipe(h);
+  }
+  return bls_keygen(ikm);
+}
+
 std::optional<BlsPublicKey> bls_public_key(const BlsSecretKey& sk) {
   auto s = secret_scalar(sk);
   if (!s) return std::nullopt;

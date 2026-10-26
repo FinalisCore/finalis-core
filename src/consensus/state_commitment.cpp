@@ -95,6 +95,7 @@ Bytes validator_commitment_value_v6(const ValidatorInfo& info) {
   w.u64le(info.last_join_height);
   w.u64le(info.last_exit_height);
   w.u32le(info.penalty_strikes);
+  w.bytes_fixed(info.bls_pubkey);  // the time-signature key is consensus state
   return w.take();
 }
 

@@ -764,28 +764,73 @@ bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey) {
   return true;
 }
 
-bool parse_onboarding_registration_script(const Bytes& script, OnboardingRegistrationScriptData* out) {
-  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
-  if (script.size() != 136 && script.size() != 152) return false;
-  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
-  if (out) {
-    std::copy(script.begin() + 8, script.begin() + 40, out->validator_pubkey.begin());
-    std::copy(script.begin() + 40, script.begin() + 72, out->payout_pubkey.begin());
-    std::copy(script.begin() + 72, script.begin() + 136, out->pop.begin());
-    out->has_admission_pow = (script.size() == 152);
-    out->admission_pow_epoch = 0;
-    out->admission_pow_nonce = 0;
-    if (out->has_admission_pow) {
-      Bytes suffix(script.begin() + 136, script.end());
-      codec::ByteReader r(suffix);
-      auto epoch = r.u64le();
-      auto nonce = r.u64le();
-      if (!epoch || !nonce || !r.eof()) return false;
-      out->admission_pow_epoch = *epoch;
-      out->admission_pow_nonce = *nonce;
-    }
+namespace {
+
+constexpr std::array<std::uint8_t, 8> kJoinRequestPrefix = {'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
+constexpr std::array<std::uint8_t, 8> kOnboardingPrefix = {'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
+
+// Both registration scripts share one layout (tx.hpp); only the prefix differs.
+template <typename Data>
+bool parse_registration_script(const Bytes& script, const std::array<std::uint8_t, 8>& prefix, Data* out) {
+  if (script.size() != kValidatorRegistrationScriptBytes && script.size() != kValidatorRegistrationScriptPowBytes) {
+    return false;
   }
+  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
+  Data d;
+  auto it = script.begin() + 8;
+  auto take = [&](auto& dst) {
+    std::copy(it, it + static_cast<std::ptrdiff_t>(dst.size()), dst.begin());
+    it += static_cast<std::ptrdiff_t>(dst.size());
+  };
+  take(d.validator_pubkey);
+  take(d.payout_pubkey);
+  take(d.pop);
+  take(d.bls_pubkey);
+  take(d.bls_pop);
+  d.has_admission_pow = script.size() == kValidatorRegistrationScriptPowBytes;
+  if (d.has_admission_pow) {
+    Bytes suffix(it, script.end());
+    codec::ByteReader r(suffix);
+    auto epoch = r.u64le();
+    auto nonce = r.u64le();
+    if (!epoch || !nonce || !r.eof()) return false;
+    d.admission_pow_epoch = *epoch;
+    d.admission_pow_nonce = *nonce;
+  }
+  if (out) *out = d;
   return true;
+}
+
+template <typename Data>
+Bytes encode_registration_script(const std::array<std::uint8_t, 8>& prefix, const Data& d) {
+  Bytes s(prefix.begin(), prefix.end());
+  s.insert(s.end(), d.validator_pubkey.begin(), d.validator_pubkey.end());
+  s.insert(s.end(), d.payout_pubkey.begin(), d.payout_pubkey.end());
+  s.insert(s.end(), d.pop.begin(), d.pop.end());
+  s.insert(s.end(), d.bls_pubkey.begin(), d.bls_pubkey.end());
+  s.insert(s.end(), d.bls_pop.begin(), d.bls_pop.end());
+  if (d.has_admission_pow) {
+    codec::ByteWriter w;
+    w.u64le(d.admission_pow_epoch);
+    w.u64le(d.admission_pow_nonce);
+    const auto suffix = w.take();
+    s.insert(s.end(), suffix.begin(), suffix.end());
+  }
+  return s;
+}
+
+}  // namespace
+
+Bytes encode_validator_join_request_script(const ValidatorJoinRequestScriptData& data) {
+  return encode_registration_script(kJoinRequestPrefix, data);
+}
+
+Bytes encode_onboarding_registration_script(const OnboardingRegistrationScriptData& data) {
+  return encode_registration_script(kOnboardingPrefix, data);
+}
+
+bool parse_onboarding_registration_script(const Bytes& script, OnboardingRegistrationScriptData* out) {
+  return parse_registration_script(script, kOnboardingPrefix, out);
 }
 
 bool is_onboarding_registration_script(const Bytes& script, PubKey32* out_validator_pubkey,
@@ -803,27 +848,7 @@ bool is_onboarding_registration_script(const Bytes& script, PubKey32* out_valida
 }
 
 bool parse_validator_join_request_script(const Bytes& script, ValidatorJoinRequestScriptData* out) {
-  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  if (script.size() != 136 && script.size() != 152) return false;
-  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
-  if (out) {
-    std::copy(script.begin() + 8, script.begin() + 40, out->validator_pubkey.begin());
-    std::copy(script.begin() + 40, script.begin() + 72, out->payout_pubkey.begin());
-    std::copy(script.begin() + 72, script.begin() + 136, out->pop.begin());
-    out->has_admission_pow = (script.size() == 152);
-    out->admission_pow_epoch = 0;
-    out->admission_pow_nonce = 0;
-    if (out->has_admission_pow) {
-      Bytes suffix(script.begin() + 136, script.end());
-      codec::ByteReader r(suffix);
-      auto epoch = r.u64le();
-      auto nonce = r.u64le();
-      if (!epoch || !nonce || !r.eof()) return false;
-      out->admission_pow_epoch = *epoch;
-      out->admission_pow_nonce = *nonce;
-    }
-  }
-  return true;
+  return parse_registration_script(script, kJoinRequestPrefix, out);
 }
 
 bool is_validator_join_request_script(const Bytes& script, PubKey32* out_validator_pubkey,

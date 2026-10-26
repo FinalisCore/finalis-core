@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_validator_bls.hpp"
 
 #include <limits>
 
@@ -251,12 +252,15 @@ Bytes burn_script(const Hash32& h) {
   return s;
 }
 
-Bytes join_request_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
-  Bytes s{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
-  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
-  s.insert(s.end(), pop.begin(), pop.end());
-  return s;
+Bytes join_request_script(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop) {
+  const auto bls = test::test_bls_registration(validator);
+  ValidatorJoinRequestScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  return encode_validator_join_request_script(d);
 }
 
 Tx make_spend_tx(const OutPoint& op, const TxOut& prev_out, const crypto::KeyPair& kp, const std::vector<TxOut>& outputs) {
@@ -392,10 +396,10 @@ TEST(test_protocol_scope_rejects_tx_when_verify_budget_exceeded_by_join_request_
   tx.outputs.push_back(TxOut{4'000'000, address::p2pkh_script_pubkey(sponsor_pkh)});
 
   const auto pop =
-      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key), validator.private_key);
+      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)), validator.private_key);
   for (std::size_t i = 0; i < kMaxTxEd25519Verifies; ++i) {
     tx.outputs.push_back(TxOut{BOND_AMOUNT, reg_script(validator.public_key)});
-    tx.outputs.push_back(TxOut{0, join_request_script(validator.public_key, payout.public_key, pop)});
+    tx.outputs.push_back(TxOut{0, join_request_script(validator, payout.public_key, pop)});
   }
 
   auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);

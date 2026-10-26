@@ -82,12 +82,16 @@ Its finalized effect is:
 - set `operator_id` from `payout_pubkey`
 - set `bonded_amount = 0`
 - set `has_bond = false`
+- set `bls_pubkey` (the validator's time-signature key)
 
-Minimal payload carried by the script:
+Payload carried by the script (`SCONBREG` and `SCVALJRQ` share the layout, `src/utxo/tx.hpp`):
 
 - `validator_pubkey`
 - `payout_pubkey`
-- proof of possession over the validator key
+- Ed25519 proof of possession over the validator key; its message covers the BLS key
+- `bls_pubkey` (BLS12-381, G1) and its BLS proof of possession; the key is derived from the
+  validator's Ed25519 seed (`crypto::bls_key_from_validator_seed`) and must not belong to another
+  validator
 - optional admission PoW fields when admission PoW is enabled:
   - `pow_epoch`
   - `pow_nonce`

@@ -48,6 +48,8 @@ struct SlashEvidence {
 
 inline constexpr std::size_t kMaxTxInputs = 512;
 inline constexpr std::size_t kMaxTxEd25519Verifies = 1024;
+// A BLS proof-of-possession check (two pairings) in units of the Ed25519 verify budget.
+inline constexpr std::size_t kBlsPopVerifyCost = 32;
 
 TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
                                const SpecialValidationContext* ctx = nullptr);
@@ -64,8 +66,12 @@ std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const 
 Bytes signing_message_for_timed_fee_input(const Hash32& chain_domain, const TxTimed& tx);
 // The chain domain transaction signatures are checked under; empty when ctx lacks chain identity.
 std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx);
-Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
-Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
+// The Ed25519 proof of a registration covers the validator's BLS key: a script that pairs a
+// validator with someone else's BLS key does not verify.
+Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                          const crypto::BlsPublicKey& bls_pubkey);
+Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                         const crypto::BlsPublicKey& bls_pubkey);
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id);
 Hash32 onboarding_registration_commitment(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs);

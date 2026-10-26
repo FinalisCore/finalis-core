@@ -254,6 +254,15 @@ std::optional<Tx> build_unbond_tx(const Hash32& chain_domain, const OutPoint& bo
   return tx;
 }
 
+std::optional<ValidatorBlsRegistration> validator_bls_registration(const Bytes& validator_privkey_32) {
+  const auto sk = crypto::bls_key_from_validator_seed(validator_privkey_32);
+  if (!sk) return std::nullopt;
+  const auto pk = crypto::bls_public_key(*sk);
+  const auto pop = crypto::bls_pop_prove(*sk);
+  if (!pk || !pop) return std::nullopt;
+  return ValidatorBlsRegistration{*pk, *pop};
+}
+
 std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,
                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
@@ -287,7 +296,13 @@ std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, co
     if (err) *err = "insufficient prev value for bond + fee";
     return std::nullopt;
   }
-  auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator_pubkey, payout_pubkey), validator_privkey_32);
+  const auto bls = validator_bls_registration(validator_privkey_32);
+  if (!bls) {
+    if (err) *err = "failed to derive validator bls key";
+    return std::nullopt;
+  }
+  auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator_pubkey, payout_pubkey, bls->pubkey),
+                                  validator_privkey_32);
   if (!pop.has_value()) {
     if (err) *err = "failed to sign join request proof";
     return std::nullopt;
@@ -295,10 +310,12 @@ std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, co
 
   Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
   reg_spk.insert(reg_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
-  Bytes req_spk{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  req_spk.insert(req_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
-  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  ValidatorJoinRequestScriptData req{};
+  req.validator_pubkey = validator_pubkey;
+  req.payout_pubkey = payout_pubkey;
+  req.pop = *pop;
+  req.bls_pubkey = bls->pubkey;
+  req.bls_pop = bls->pop;
   if (pow_ctx && pow_ctx->network && validator_join_admission_pow_enabled(*pow_ctx->network)) {
     // The admission PoW is epoch-scoped, expires quickly, and is only used to
     // make fresh operator admission attempts more expensive to mint.
@@ -329,14 +346,12 @@ std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, co
       }
       ++nonce;
     }
-    codec::ByteWriter w;
-    w.u64le(pow_epoch);
-    w.u64le(nonce);
-    const auto suffix = w.take();
-    req_spk.insert(req_spk.end(), suffix.begin(), suffix.end());
+    req.has_admission_pow = true;
+    req.admission_pow_epoch = pow_epoch;
+    req.admission_pow_nonce = nonce;
   }
 
-  std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
+  std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, encode_validator_join_request_script(req)}};
   const std::uint64_t change = total_prev - required;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
   return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);
@@ -370,17 +385,24 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
     if (err) *err = "insufficient prev value for fee";
     return std::nullopt;
   }
-  auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator_pubkey, payout_pubkey),
+  const auto bls = validator_bls_registration(validator_privkey_32);
+  if (!bls) {
+    if (err) *err = "failed to derive validator bls key";
+    return std::nullopt;
+  }
+  auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator_pubkey, payout_pubkey, bls->pubkey),
                                   validator_privkey_32);
   if (!pop.has_value()) {
     if (err) *err = "failed to sign onboarding registration proof";
     return std::nullopt;
   }
 
-  Bytes req_spk{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
-  req_spk.insert(req_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
-  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  OnboardingRegistrationScriptData req{};
+  req.validator_pubkey = validator_pubkey;
+  req.payout_pubkey = payout_pubkey;
+  req.pop = *pop;
+  req.bls_pubkey = bls->pubkey;
+  req.bls_pop = bls->pop;
   if (pow_ctx && pow_ctx->network && onboarding_admission_pow_enabled(*pow_ctx->network)) {
     if (!pow_ctx->chain_id) {
       if (err) *err = "missing chain id for onboarding admission pow";
@@ -407,14 +429,12 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
       }
       ++nonce;
     }
-    codec::ByteWriter w;
-    w.u64le(pow_epoch);
-    w.u64le(nonce);
-    const auto suffix = w.take();
-    req_spk.insert(req_spk.end(), suffix.begin(), suffix.end());
+    req.has_admission_pow = true;
+    req.admission_pow_epoch = pow_epoch;
+    req.admission_pow_nonce = nonce;
   }
 
-  std::vector<TxOut> outputs{TxOut{0, req_spk}};
+  std::vector<TxOut> outputs{TxOut{0, encode_onboarding_registration_script(req)}};
   const std::uint64_t change = total_prev - fee;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
   return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);

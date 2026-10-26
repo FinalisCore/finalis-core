@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_validator_bls.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
 #include "support/storage_fault_injection.hpp"
@@ -790,16 +791,20 @@ std::optional<Tx> create_join_request_tx_from_validator0(node::Node& node0, cons
   if (in_sum < bond_amount + fee) return std::nullopt;
 
   auto pop = crypto::ed25519_sign(
-      validator_join_request_pop_message(new_validator.public_key, new_validator.public_key),
+      validator_join_request_pop_message(new_validator.public_key, new_validator.public_key, test::test_bls_pubkey(new_validator)),
       Bytes(new_validator.private_key.begin(), new_validator.private_key.end()));
   if (!pop.has_value()) return std::nullopt;
 
   Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
   reg_spk.insert(reg_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  Bytes req_spk{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  req_spk.insert(req_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  req_spk.insert(req_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  ValidatorJoinRequestScriptData req{};
+  req.validator_pubkey = new_validator.public_key;
+  req.payout_pubkey = new_validator.public_key;
+  req.pop = *pop;
+  const auto bls = test::test_bls_registration(new_validator);
+  req.bls_pubkey = bls.pubkey;
+  req.bls_pop = bls.pop;
+  const Bytes req_spk = encode_validator_join_request_script(req);
 
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
   const std::uint64_t change = in_sum - bond_amount - fee;
@@ -858,16 +863,20 @@ std::optional<Tx> create_join_request_tx_from_validator0_with_payout(node::Node&
   if (in_sum < bond_amount + fee) return std::nullopt;
 
   auto pop = crypto::ed25519_sign(
-      validator_join_request_pop_message(new_validator.public_key, payout_pubkey),
+      validator_join_request_pop_message(new_validator.public_key, payout_pubkey, test::test_bls_pubkey(new_validator)),
       Bytes(new_validator.private_key.begin(), new_validator.private_key.end()));
   if (!pop.has_value()) return std::nullopt;
 
   Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
   reg_spk.insert(reg_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  Bytes req_spk{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  req_spk.insert(req_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  ValidatorJoinRequestScriptData req{};
+  req.validator_pubkey = new_validator.public_key;
+  req.payout_pubkey = payout_pubkey;
+  req.pop = *pop;
+  const auto bls = test::test_bls_registration(new_validator);
+  req.bls_pubkey = bls.pubkey;
+  req.bls_pop = bls.pop;
+  const Bytes req_spk = encode_validator_join_request_script(req);
 
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
   const std::uint64_t change = in_sum - bond_amount - fee;

@@ -52,6 +52,13 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const Hash32& chain_domain, 
 std::optional<Tx> build_unbond_tx(const Hash32& chain_domain, const OutPoint& bond_outpoint, const PubKey32& validator_pubkey,
                                   std::uint64_t bond_value, std::uint64_t fee,
                                   const Bytes& validator_privkey_32, std::string* err = nullptr);
+// A validator's BLS key (derived from its Ed25519 seed, crypto::bls_key_from_validator_seed) and its
+// proof of possession, as registration scripts and genesis entries carry them.
+struct ValidatorBlsRegistration {
+  crypto::BlsPublicKey pubkey{};
+  crypto::BlsSignature pop{};
+};
+std::optional<ValidatorBlsRegistration> validator_bls_registration(const Bytes& validator_privkey_32);
 std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,
                                                   const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
                                                   const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,

@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_validator_bls.hpp"
 
 #include <stdexcept>
 #include <variant>
@@ -65,12 +66,15 @@ Bytes validator_register_script(const PubKey32& validator_pub) {
   return s;
 }
 
-Bytes validator_join_request_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
-  Bytes s{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
-  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
-  s.insert(s.end(), pop.begin(), pop.end());
-  return s;
+Bytes validator_join_request_script(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop) {
+  const auto bls = test::test_bls_registration(validator);
+  ValidatorJoinRequestScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  return encode_validator_join_request_script(d);
 }
 
 void resign_input0(TxV2& tx, const crypto::KeyPair& from) {
@@ -786,11 +790,11 @@ TEST(test_validate_tx_v2_rejects_validator_join_request_without_matching_registe
       .kind = TxInputKind::Transparent,
       .witness = TransparentInputWitnessV2{},
   });
-  const auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key),
+  const auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                                         validator.private_key);
   ASSERT_TRUE(pop.has_value());
   tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
-                               .body = TransparentTxOutV2{0, validator_join_request_script(validator.public_key,
+                               .body = TransparentTxOutV2{0, validator_join_request_script(validator,
                                                                                            payout.public_key, *pop)}});
   tx.outputs.push_back(TxOutV2{
       .kind = TxOutputKind::Transparent,
@@ -834,13 +838,13 @@ TEST(test_validate_tx_v2_accepts_matching_validator_register_and_join_request_ou
       .kind = TxInputKind::Transparent,
       .witness = TransparentInputWitnessV2{},
   });
-  const auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key),
+  const auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                                         validator.private_key);
   ASSERT_TRUE(pop.has_value());
   tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
                                .body = TransparentTxOutV2{BOND_AMOUNT, validator_register_script(validator.public_key)}});
   tx.outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
-                               .body = TransparentTxOutV2{0, validator_join_request_script(validator.public_key,
+                               .body = TransparentTxOutV2{0, validator_join_request_script(validator,
                                                                                            payout.public_key, *pop)}});
   tx.outputs.push_back(TxOutV2{
       .kind = TxOutputKind::Transparent,

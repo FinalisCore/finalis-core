@@ -202,6 +202,8 @@ Validator-control script semantics are unified across `Tx` and `TxV2`:
 
 - `SCONBREG` must be zero-value, PoP-valid, and cannot appear with
   `SCVALREG`/`SCVALJRQ` in the same transaction
+- `SCONBREG` and `SCVALJRQ` carry the validator's BLS time-signature key with a BLS proof of
+  possession; the Ed25519 proof covers that key, and a BLS key belongs to one validator only
 - `SCVALJRQ` and `SCVALREG` must appear as a matched pair for the same
   validator pubkey
 - admission PoW checks for onboarding/join requests are enforced from the same

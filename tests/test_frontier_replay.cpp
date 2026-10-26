@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_validator_bls.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
 
@@ -64,12 +65,15 @@ Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
   return ss;
 }
 
-Bytes onboarding_registration_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
-  Bytes s{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
-  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
-  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
-  s.insert(s.end(), pop.begin(), pop.end());
-  return s;
+Bytes onboarding_registration_script(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop) {
+  const auto bls = test::test_bls_registration(validator);
+  OnboardingRegistrationScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  return encode_onboarding_registration_script(d);
 }
 
 Bytes raw_signed_spend_v2_with_outputs(const OutPoint& op, const crypto::KeyPair& from,
@@ -1980,14 +1984,14 @@ TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
   op.index = 0;
   auto parent_state = build_parent_state_with_utxo(cfg, 0, op, p2pkh_out_for_pub(from.public_key, 10'000));
 
-  const auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+  const auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                                         validator.private_key);
   ASSERT_TRUE(pop.has_value());
 
   std::vector<TxOutV2> outputs;
   outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
                             .body = TransparentTxOutV2{0,
-                                                       onboarding_registration_script(validator.public_key,
+                                                       onboarding_registration_script(validator,
                                                                                       payout.public_key, *pop)}});
   outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
                             .body = TransparentTxOutV2{9'500, p2pkh_script_for_pub(payout.public_key)}});

@@ -19,8 +19,39 @@ PubKey32 canonical_operator_id_from_join_request(const PubKey32& payout_pubkey) 
 
 void ValidatorRegistry::upsert(PubKey32 pub, ValidatorInfo info) { validators_[pub] = info; }
 
+namespace {
+
+// A registration may name a BLS key only if no other validator holds it and the validator does not
+// already hold a different one (a key is bound to its validator for good).
+bool bls_key_assignable(const ValidatorRegistry& reg, const PubKey32& pub,
+                        const std::optional<crypto::BlsPublicKey>& bls_pubkey, std::string* err) {
+  if (!bls_pubkey) return true;
+  if (const auto owner = reg.bls_key_owner(*bls_pubkey); owner.has_value() && *owner != pub) {
+    if (err) *err = "bls key already registered";
+    return false;
+  }
+  if (const auto current = reg.get(pub);
+      current.has_value() && current->bls_pubkey != crypto::BlsPublicKey{} && current->bls_pubkey != *bls_pubkey) {
+    if (err) *err = "bls key mismatch";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+std::optional<PubKey32> ValidatorRegistry::bls_key_owner(const crypto::BlsPublicKey& bls_pubkey) const {
+  if (bls_pubkey == crypto::BlsPublicKey{}) return std::nullopt;
+  for (const auto& [pub, info] : validators_) {
+    if (info.bls_pubkey == bls_pubkey) return pub;
+  }
+  return std::nullopt;
+}
+
 bool ValidatorRegistry::register_onboarding(const PubKey32& pub, std::uint64_t joined_height, std::string* err,
-                                            const std::optional<PubKey32>& operator_id) {
+                                            const std::optional<PubKey32>& operator_id,
+                                            const std::optional<crypto::BlsPublicKey>& bls_pubkey) {
+  if (!bls_key_assignable(*this, pub, bls_pubkey, err)) return false;
   const auto it = validators_.find(pub);
   if (it != validators_.end()) {
     const auto& v = it->second;
@@ -42,6 +73,7 @@ bool ValidatorRegistry::register_onboarding(const PubKey32& pub, std::uint64_t j
   v.unbond_height = 0;
   v.suspended_until_height = 0;
   v.last_join_height = joined_height;
+  if (bls_pubkey) v.bls_pubkey = *bls_pubkey;
   return true;
 }
 
@@ -90,12 +122,14 @@ bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t hei
 bool ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height) {
   // FIX: Keep the legacy convenience overload subject to the same validation
   // and initialization path as every other bond registration.
-  return register_bond(pub, bond_outpoint, joined_height, BOND_AMOUNT, nullptr, std::nullopt);
+  return register_bond(pub, bond_outpoint, joined_height, BOND_AMOUNT, nullptr, std::nullopt, std::nullopt);
 }
 
 bool ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height,
-                                      std::uint64_t bond_amount, std::string* err, const std::optional<PubKey32>& operator_id) {
+                                      std::uint64_t bond_amount, std::string* err, const std::optional<PubKey32>& operator_id,
+                                      const std::optional<crypto::BlsPublicKey>& bls_pubkey) {
   if (!can_register_bond(pub, joined_height, bond_amount, err)) return false;
+  if (!bls_key_assignable(*this, pub, bls_pubkey, err)) return false;
   auto& v = validators_[pub];
   v.status = ValidatorStatus::PENDING;
   v.joined_height = joined_height;
@@ -106,6 +140,7 @@ bool ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_
   v.unbond_height = 0;
   v.last_join_height = joined_height;
   if (v.liveness_window_start == 0) v.liveness_window_start = joined_height;
+  if (bls_pubkey) v.bls_pubkey = *bls_pubkey;
   return true;
 }
 

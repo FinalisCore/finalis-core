@@ -106,14 +106,23 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
         return false;
       }
       std::string budget_error;
-      if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
+      if (!consume_verify_budget(verify_budget_remaining, 1 + kBlsPopVerifyCost, &budget_error)) {
         if (error) *error = budget_error;
         return false;
       }
-      if (!crypto::ed25519_verify(
-              onboarding_registration_pop_message(onboarding_req.validator_pubkey, onboarding_req.payout_pubkey),
-              onboarding_req.pop, onboarding_req.validator_pubkey)) {
+      if (!crypto::ed25519_verify(onboarding_registration_pop_message(onboarding_req.validator_pubkey,
+                                                                      onboarding_req.payout_pubkey,
+                                                                      onboarding_req.bls_pubkey),
+                                  onboarding_req.pop, onboarding_req.validator_pubkey)) {
         if (error) *error = "onboarding registration proof invalid";
+        return false;
+      }
+      if (!crypto::bls_pop_verify(onboarding_req.bls_pubkey, onboarding_req.bls_pop)) {
+        if (error) *error = "onboarding registration bls proof invalid";
+        return false;
+      }
+      if (ctx && ctx->validators && ctx->validators->bls_key_owner(onboarding_req.bls_pubkey).has_value()) {
+        if (error) *error = "bls key already registered";
         return false;
       }
       if (ctx && ctx->validators) {
@@ -155,15 +164,26 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
         return false;
       }
       std::string budget_error;
-      if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
+      if (!consume_verify_budget(verify_budget_remaining, 1 + kBlsPopVerifyCost, &budget_error)) {
         if (error) *error = budget_error;
         return false;
       }
       if (!crypto::ed25519_verify(
-              validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey), join_req.pop,
-              join_req.validator_pubkey)) {
+              validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey, join_req.bls_pubkey),
+              join_req.pop, join_req.validator_pubkey)) {
         if (error) *error = "validator join request proof invalid";
         return false;
+      }
+      if (!crypto::bls_pop_verify(join_req.bls_pubkey, join_req.bls_pop)) {
+        if (error) *error = "validator join request bls proof invalid";
+        return false;
+      }
+      if (ctx && ctx->validators) {
+        const auto owner = ctx->validators->bls_key_owner(join_req.bls_pubkey);
+        if (owner.has_value() && *owner != join_req.validator_pubkey) {
+          if (error) *error = "bls key already registered";
+          return false;
+        }
       }
       if (ctx && ctx->network && validator_join_admission_pow_enabled(*ctx->network) && !join_req.has_admission_pow) {
         if (error) *error = "missing admission pow";
@@ -358,20 +378,24 @@ std::optional<Hash32> balance_proof_message_v2(const Hash32& chain_domain, const
   return crypto::sha256d(w.data());
 }
 
-Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                          const crypto::BlsPublicKey& bls_pubkey) {
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '-', 'V', '2'});
   w.bytes_fixed(validator_pubkey);
   w.bytes_fixed(payout_pubkey);
+  w.bytes_fixed(bls_pubkey);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
 
-Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                         const crypto::BlsPublicKey& bls_pubkey) {
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '2'});
   w.bytes_fixed(validator_pubkey);
   w.bytes_fixed(payout_pubkey);
+  w.bytes_fixed(bls_pubkey);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
