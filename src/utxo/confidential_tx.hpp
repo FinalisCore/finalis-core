@@ -99,6 +99,55 @@ struct TxV2 {
   bool operator==(const TxV2&) const = default;
 };
 
+// --- Timed transactions (McFly time layer; design sketch, not yet part of AnyTx) ---
+//
+// A TxTimed is included at height h and ordered blindly; its body is decrypted and applied in the
+// execution of block unlock_height + 1, once the aggregate time signature for unlock_height exists
+// (every block carries the one for its parent). Hybrid encryption: a 256-bit AEAD key is encrypted
+// with McFly SWE to the committee of epoch_of(unlock_height) and the time-signature message for
+// unlock_height; the body (a serialized Tx or TxV2) is AEAD-encrypted under that key.
+//
+// Validity at inclusion (block h), all public:
+//   h <= unlock_height <= the last height whose committee is already finalized (the horizon), and
+//   committee_root is that committee's key root (a ciphertext to any other key set never opens);
+//   the SWE proof verifies (decrypts to the same key for every signer subset, every chunk in range);
+//   the fee input is a standard transparent UTXO, its script_sig signs the whole envelope, and it
+//   covers prepaid_fee (+ the change output). The fee is charged at h whatever the body turns out to
+//   be: an undecryptable-looking but proven ciphertext, garbage, or a double spend at execution.
+// A TxTimed included after unlock_height is invalid: its key is already public, so it would be
+// ordered with its contents known. Delay ("time-locked outputs") is unlock_height > h: the body's
+// outputs appear only at unlock_height + 1.
+inline constexpr std::uint32_t kTxTimedMaxSweCiphertextBytes = 32 * 1024;  // n <= MAX_COMMITTEE key-group elements + 11 chunks
+inline constexpr std::uint32_t kTxTimedMaxSweProofBytes = 16 * 1024;
+inline constexpr std::uint32_t kTxTimedMaxBodyCiphertextBytes = 64 * 1024;
+
+enum class TxTimedVersionKind : std::uint32_t {
+  TIMED_V3 = 3,
+};
+
+struct TxTimed {
+  std::uint32_t version{static_cast<std::uint32_t>(TxTimedVersionKind::TIMED_V3)};
+  // Cleartext fee part, applied at inclusion.
+  TxIn fee_input;                     // transparent, P2PKH; script_sig signs the envelope
+  std::uint64_t prepaid_fee{0};
+  std::optional<TxOut> fee_change;    // transparent P2PKH change from fee_input
+  // Time lock.
+  std::uint64_t unlock_height{0};     // decrypted with the time signature of this height
+  std::uint64_t committee_epoch{0};   // epoch_of(unlock_height); checked, not trusted
+  Hash32 committee_root{};            // root of that epoch's ordered BLS keys (the SWE key set V)
+  // McFly SWE' (paper section 6.1, enhanced) of the 256-bit AEAD key, and its verifiability proof
+  // (well-formedness + plaintext equality + range, section 7). Opaque here; crypto/swe.* owns the
+  // encodings and their size checks.
+  Bytes swe_ciphertext;
+  Bytes swe_proof;
+  // AEAD (ChaCha20-Poly1305, 12-byte nonce) of serialize_any_tx(body); the associated data commits
+  // to every field above, so no part of the envelope can be swapped under a valid body.
+  std::array<std::uint8_t, 12> body_nonce{};
+  Bytes body_ciphertext;
+
+  bool operator==(const TxTimed&) const = default;
+};
+
 using AnyTx = std::variant<Tx, TxV2>;
 
 std::optional<AnyTx> parse_any_tx(const Bytes& b);
