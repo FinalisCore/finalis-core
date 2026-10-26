@@ -404,7 +404,7 @@ install_deps() {
         install_pacman
       else
         log "Unsupported Linux package manager. Install manually:"
-        log "  C++20 compiler, cmake>=3.22, git, pkg-config, OpenSSL dev, nlohmann-json, libsodium dev, RocksDB dev (optional)"
+        log "  C++20 compiler, cmake>=3.22, git, pkg-config, OpenSSL dev, nlohmann-json, libsodium dev, RocksDB dev (required)"
         exit 1
       fi
       ;;

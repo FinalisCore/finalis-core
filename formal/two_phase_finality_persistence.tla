@@ -16,20 +16,20 @@
 (* - StickyFailure: after a failure every write fails until restart       *)
 (*   (RocksDB background error). FALSE allows later writes to succeed.    *)
 (*                                                                         *)
-(* Code paths (Fix = FALSE, the code at 9467c05):                          *)
+(* Code paths (FixLock = FixPrevote = FALSE, the code at 9467c05):        *)
 (* - prevote / lock: memory is updated, then written; on failure memory   *)
 (*   keeps the new value and nothing is sent;                              *)
 (* - PrecommitFromMemoryLock: lock_on_polka_locked's early return on a    *)
 (*   re-delivered polka, local_votes_for_rebroadcast_locked and            *)
 (*   reseed_local_votes_locked all send a precommit for the memory lock;   *)
 (* - PrevoteFromMemory: the stall rebroadcast sends memory prevotes.       *)
-(* Fix = TRUE models the candidate fix: memory changes only after the     *)
-(* write succeeds (restore on failure), so memory never runs ahead of     *)
-(* what a successful write made durable.                                   *)
+(* FixLock / FixPrevote = TRUE model the candidate fix for the lock and   *)
+(* the prevote record separately: memory changes only after the write     *)
+(* succeeds (restore on failure). A hypothetical design, not the code.    *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
-CONSTANTS Honest, Byz, Values, MaxRound, Nil, Fix, StickyFailure
+CONSTANTS Honest, Byz, Values, MaxRound, Nil, FixLock, FixPrevote, StickyFailure
 
 N      == Cardinality(Honest \cup Byz)
 Q      == (2 * N) \div 3 + 1
@@ -92,7 +92,7 @@ Prevote(n, r, v, vr) ==
      \E ok \in BOOLEAN :
        /\ ok => CanSucceed(n)
        /\ WriteOutcome(n, mLockV[n], mLockR[n], pv, ok)
-       /\ mPv' = IF ok \/ ~Fix THEN [mPv EXCEPT ![n] = pv] ELSE mPv
+       /\ mPv' = IF ok \/ ~FixPrevote THEN [mPv EXCEPT ![n] = pv] ELSE mPv
        /\ sentPv' = IF ok THEN sentPv \cup {<<n, r, v>>} ELSE sentPv
   /\ UNCHANGED <<mLockV, mLockR, sentPc>>
 
@@ -104,7 +104,7 @@ Precommit(n, r, v) ==
   /\ \E ok \in BOOLEAN :
        /\ ok => CanSucceed(n)
        /\ WriteOutcome(n, v, r, mPv[n], ok)
-       /\ IF ok \/ ~Fix
+       /\ IF ok \/ ~FixLock
             THEN mLockV' = [mLockV EXCEPT ![n] = v] /\ mLockR' = [mLockR EXCEPT ![n] = r]
             ELSE UNCHANGED <<mLockV, mLockR>>
        /\ sentPc' = IF ok THEN sentPc \cup {<<n, r, v>>} ELSE sentPc
@@ -158,6 +158,13 @@ SentPrevoteDurable ==
 
 \* Reachability (expected to be violated): something finalizes, so the safety checks are not vacuous.
 NothingFinalizes == \A v \in Values, r \in Rounds : ~Committed(v, r)
+
+\* Memory never runs ahead of disk: every in-memory lock and prevote record is durable. Holds for
+\* the fix (disk may be ahead after an ambiguous commit), not for the current code.
+MemoryBackedByDisk ==
+  \A n \in Honest :
+    /\ mLockR[n] <= dLockR[n]
+    /\ \A r \in Rounds : mPv[n][r] # Nil => dPv[n][r] = mPv[n][r]
 
 ValuesSymmetry == Permutations(Values)
 HonestSymmetry == Permutations(Honest)

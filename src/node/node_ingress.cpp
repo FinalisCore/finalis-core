@@ -416,7 +416,7 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
 
   const auto signing_hash = cert.signing_hash();
   const Bytes msg(signing_hash.begin(), signing_hash.end());
-  auto sig = crypto::ed25519_sign(msg, local_key_.private_key);
+  auto sig = sign_consensus_locked(msg);
   if (!sig.has_value()) {
     if (error) *error = "ingress-sign-failed";
     return false;

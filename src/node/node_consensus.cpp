@@ -414,6 +414,40 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
       next_state.confidential_supply.txv2_count != canonical_state_->confidential_supply.txv2_count ||
       next_state.confidential_supply.known != canonical_state_->confidential_supply.known;
 
+  // SAFETY (D7): nothing below is visible before the batch is durable. The new state is hydrated
+  // only to stage the rows derived from it (state commitment, validator roots, availability, status
+  // snapshot); the previous runtime fields are held aside and put back exactly if the write fails.
+  // Every other effect (mempool, round and vote state, safety-row memory, epoch closeout) runs only
+  // after the write succeeded. All of it under mu_, so no reader sees the staged state.
+  auto previous_runtime = take_canonical_runtime_locked();
+  hydrate_runtime_from_canonical_state_locked(std::move(next_state));
+  const auto restore_previous = [&] {
+    restore_canonical_runtime_locked(std::move(previous_runtime));
+  };
+
+  // apply_frontier_record computed next_state.state_commitment; recomputing it here would hash the whole
+  // UTXO set again.
+  if (!verify_and_persist_consensus_state_commitment_locked(*canonical_state_, batch, /*recompute=*/false)) {
+    restore_previous();
+    if (error) *error = "persist-consensus-state-commitment-failed";
+    return false;
+  }
+  persist_validator_roots(db_, batch, finalized_height_, validators_, kFixedValidationRulesVersion);
+  if (finalized_height_ > 0) stage_consensus_safety_clear(finalized_height_, batch);
+  persist_availability_state_locked(batch);
+  batch.put_node_runtime_status_snapshot(build_runtime_status_snapshot_locked(now_unix() * 1000));
+
+  // Durable: the finalized tip is reported to peers and to status() once this returns, and a restart
+  // must find it (the vote at the next height assumed this height final).
+  std::string write_error;
+  if (!db_.write_batch_durable(batch, &write_error)) {
+    restore_previous();
+    enter_safety_fail_stop_locked("finalization height=" + std::to_string(record.transition.height), write_error);
+    if (error) *error = "write-batch-commit-failed";
+    return false;
+  }
+
+  // Published: the batch is durable.
   std::vector<Hash32> confirmed_txids;
   for (const auto& raw : record.ordered_records) {
     auto tx = parse_any_tx(raw);
@@ -423,7 +457,6 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     mempool_.on_finalized_block_timestamp(record.transition.timestamp);
   }
   mempool_.remove_confirmed(confirmed_txids);
-  hydrate_runtime_from_canonical_state_locked(std::move(next_state));
   if (block_had_txv2) run_confidential_supply_audit_locked("finalized-block");
   mempool_.prune_against_utxo(utxos_);
   (void)mempool_.set_confidential_pool_value(canonical_state_->confidential_pool_value);
@@ -465,14 +498,6 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     last_finalized_progress_ms_ = now;
   }
 
-  // apply_frontier_record computed next_state.state_commitment; recomputing it here would hash the whole
-  // UTXO set again.
-  if (!verify_and_persist_consensus_state_commitment_locked(*canonical_state_, batch, /*recompute=*/false)) {
-    if (error) *error = "persist-consensus-state-commitment-failed";
-    return false;
-  }
-  persist_validator_roots(db_, batch, finalized_height_, validators_, kFixedValidationRulesVersion);
-
   if (clear_requested_sync) {
     requested_sync_artifacts_.erase(transition_id);
     requested_sync_heights_.erase(record.transition.height);
@@ -503,18 +528,11 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   votes_.clear_height(record.transition.height);
   prevotes_.clear_height(record.transition.height);
   timeout_votes_.clear_height(record.transition.height);
-  if (finalized_height_ > 0) clear_consensus_safety_state_locked(finalized_height_, batch);
-  // Epoch-committee closeout only fires at epoch boundaries (not every
-  // block) and owns its own checkpoint/telemetry persistence; left on its
-  // existing immediate-write path rather than folded into this batch.
+  if (finalized_height_ > 0) forget_consensus_safety_state_locked(finalized_height_);
+  // Epoch-committee closeout only fires at epoch boundaries (not every block) and owns its own
+  // checkpoint/telemetry persistence on its immediate-write path; it runs once the height it closes
+  // on is durable.
   maybe_finalize_epoch_committees_locked();
-  persist_availability_state_locked(batch);
-  batch.put_node_runtime_status_snapshot(build_runtime_status_snapshot_locked(now_unix() * 1000));
-
-  if (!db_.write_batch(batch)) {
-    if (error) *error = "write-batch-commit-failed";
-    return false;
-  }
   drop_stale_unfinalized_ingress_locked();
   // Stable, parseable record of every finalization (scripts/chaos_devnet.py compares these across
   // nodes to detect forks and measure rounds per height).
@@ -682,13 +700,22 @@ std::optional<Vote> Node::on_prevotes_changed_locked(const Hash32& transition_id
   // Valid value: the highest-round polka (Tendermint validValue / validRound).
   auto valid_it = valid_polka_by_height_.find(height);
   if (valid_it == valid_polka_by_height_.end() || round > valid_it->second.round) {
-    valid_polka_by_height_[height] = polka;
+    // Published only once durable, like the lock and the prevotes it shares a row with.
+    auto candidate = consensus_safety_state_locked(height);
+    candidate.valid_polka = polka;
     storage::DB::Batch batch(db_);
-    persist_consensus_safety_state_locked(height, batch);
+    stage_consensus_safety_state(height, candidate, batch);
     batch.put(key_consensus_locked_proposal(height), proposal.serialize());
-    (void)db_.write_batch_durable(batch);
-    log_line("polka-valid-value height=" + std::to_string(height) + " round=" + std::to_string(round) +
-             " transition=" + short_hash_hex(transition_id));
+    std::string error;
+    if (db_.write_batch_durable(batch, &error)) {
+      valid_polka_by_height_[height] = polka;
+      log_line("polka-valid-value height=" + std::to_string(height) + " round=" + std::to_string(round) +
+               " transition=" + short_hash_hex(transition_id));
+    } else {
+      log_line("polka-valid-value-persist-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
+               " transition=" + short_hash_hex(transition_id));
+      enter_safety_fail_stop_locked("valid-polka height=" + std::to_string(height), error);
+    }
   }
 
   // Lock and precommit: only in the current round, once per round.
@@ -710,7 +737,7 @@ std::optional<Vote> Node::on_prevotes_changed_locked(const Hash32& transition_id
              " transition=" + short_hash_hex(transition_id) + " reason=certified-ingress detail=" + ingress_detail);
     return std::nullopt;
   }
-  auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key);
+  auto sig = sign_consensus_locked(vote_signing_message(consensus_domain_, height, round, transition_id));
   if (!sig.has_value()) return std::nullopt;
   // SAFETY: the lock is durable before the precommit leaves this process.
   if (!lock_on_polka_locked(height, round, proposal)) {
@@ -826,16 +853,21 @@ bool Node::can_prevote_locked(std::uint64_t height, const Hash32& transition_id,
 // and only after this lock (T, r) is durable. The lock moves only to a newer polka (r' > r) and is
 // released when h finalizes. The proposal is persisted alongside so the node can still re-propose
 // its valid value after a restart.
+// The lock is published to local_vote_locks_ only after its write succeeded, so the early return
+// below (and the rebroadcast / reseed paths, which sign from the map) only ever see a durable lock.
+// On a failed write the previous lock, if any, stays exactly as it was: it may back a precommit
+// already sent.
 bool Node::lock_on_polka_locked(std::uint64_t height, std::uint32_t round, const FrontierProposal& proposal) {
   const auto transition_id = proposal.transition.transition_id();
   auto it = local_vote_locks_.find(height);
   if (it != local_vote_locks_.end() && it->second.first == transition_id && it->second.second == round) return true;
   // One polka per round: a second lock at the same round would mean two precommits in it.
   if (it != local_vote_locks_.end() && round <= it->second.second) return false;
+  auto candidate = consensus_safety_state_locked(height);
+  candidate.lock = std::make_pair(transition_id, round);
+  if (!persist_consensus_safety_state_locked(height, candidate, "vote-lock")) return false;
   local_vote_locks_[height] = {transition_id, round};
-  storage::DB::Batch batch(db_);
-  persist_consensus_safety_state_locked(height, batch);
-  return db_.write_batch_durable(batch);
+  return true;
 }
 
 std::uint32_t Node::local_vote_round_floor_locked(std::uint64_t height) const {
@@ -851,13 +883,15 @@ std::uint32_t Node::local_vote_round_floor_locked(std::uint64_t height) const {
 Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_t height) const {
   constexpr std::size_t kRounds = 3;  // latest rounds only: older ones cannot complete a useful TC or polka
   LocalVoteRebroadcast out;
+  // Fail-stop: nothing, not even votes already signed or relayed signatures of others.
+  if (safety_storage_failed()) return out;
   std::vector<std::uint32_t> timed_out;
   for (auto it = local_timed_out_rounds_.lower_bound({height, 0});
        it != local_timed_out_rounds_.end() && it->first == height; ++it) {
     timed_out.push_back(it->second);
   }
   for (std::size_t k = timed_out.size() > kRounds ? timed_out.size() - kRounds : 0; k < timed_out.size(); ++k) {
-    if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(consensus_domain_, height, timed_out[k]), local_key_.private_key)) {
+    if (auto sig = sign_consensus_locked(timeout_vote_signing_message(consensus_domain_, height, timed_out[k]))) {
       out.timeouts.push_back(TimeoutVote{height, timed_out[k], local_key_.public_key, *sig});
     }
   }
@@ -867,7 +901,7 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
   }
   for (std::size_t k = prevotes.size() > kRounds ? prevotes.size() - kRounds : 0; k < prevotes.size(); ++k) {
     const auto& [round, transition_id] = prevotes[k];
-    if (auto sig = crypto::ed25519_sign(prevote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key)) {
+    if (auto sig = sign_consensus_locked(prevote_signing_message(consensus_domain_, height, round, transition_id))) {
       out.prevotes.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
     }
   }
@@ -899,7 +933,7 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
   if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end() && !own_rounds.count(lock->second.second)) {
     // The lock's precommit is normally in votes_ already; a reconnect reset may have cleared them.
     const auto& [transition_id, round] = lock->second;
-    if (auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key)) {
+    if (auto sig = sign_consensus_locked(vote_signing_message(consensus_domain_, height, round, transition_id))) {
       out.precommits.push_back(Vote{height, round, transition_id, local_key_.public_key, *sig});
     }
   }
@@ -923,26 +957,32 @@ Node::LocalVoteRebroadcast Node::local_votes_for_rebroadcast_locked(std::uint64_
 }
 
 void Node::reseed_local_votes_locked(std::uint64_t height) {
+  if (safety_storage_failed()) return;
   for (auto it = local_prevotes_.lower_bound({height, 0}); it != local_prevotes_.end() && it->first.first == height; ++it) {
     const auto round = it->first.second;
-    if (auto sig = crypto::ed25519_sign(prevote_signing_message(consensus_domain_, height, round, it->second), local_key_.private_key)) {
+    if (auto sig = sign_consensus_locked(prevote_signing_message(consensus_domain_, height, round, it->second))) {
       (void)prevotes_.add_vote(Vote{height, round, it->second, local_key_.public_key, *sig});
     }
   }
   if (auto lock = local_vote_locks_.find(height); lock != local_vote_locks_.end()) {
     const auto& [transition_id, round] = lock->second;
-    if (auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, transition_id), local_key_.private_key)) {
+    if (auto sig = sign_consensus_locked(vote_signing_message(consensus_domain_, height, round, transition_id))) {
       (void)votes_.add_vote(Vote{height, round, transition_id, local_key_.public_key, *sig});
       local_vote_reservations_.insert({height, round});
     }
   }
 }
 
+// SAFETY: the prevote record is published only once durable. On a failed write nothing changes in
+// memory: the stall rebroadcast and the reconnect reseed, which re-send local_prevotes_, never send a
+// prevote a restart could forget. The write may still have reached disk (a failed WAL sync is
+// replayed on reopen); that record was never sent, so a restart that loads it is only stricter.
 bool Node::record_local_prevote_locked(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) {
+  auto candidate = consensus_safety_state_locked(height);
+  candidate.prevotes[round] = transition_id;
+  if (!persist_consensus_safety_state_locked(height, candidate, "prevote-record")) return false;
   local_prevotes_[{height, round}] = transition_id;
-  storage::DB::Batch batch(db_);
-  persist_consensus_safety_state_locked(height, batch);
-  return db_.write_batch_durable(batch);
+  return true;
 }
 
 Node::PrevFinalityRecord Node::prev_finality_record_for_next_height_locked() const {
@@ -1001,38 +1041,88 @@ bool Node::record_late_finalized_vote_locked(const Vote& vote) {
   return true;
 }
 
-void Node::persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch) {
-  std::optional<std::pair<Hash32, std::uint32_t>> lock_state;
-  if (auto it = local_vote_locks_.find(height); it != local_vote_locks_.end()) lock_state = it->second;
-  std::optional<QuorumCertificate> valid_polka;
-  if (auto it = valid_polka_by_height_.find(height); it != valid_polka_by_height_.end()) valid_polka = it->second;
-  std::map<std::uint32_t, Hash32> prevotes;
+Node::ConsensusSafetyState Node::consensus_safety_state_locked(std::uint64_t height) const {
+  ConsensusSafetyState state;
+  if (auto it = local_vote_locks_.find(height); it != local_vote_locks_.end()) state.lock = it->second;
+  if (auto it = valid_polka_by_height_.find(height); it != valid_polka_by_height_.end()) state.valid_polka = it->second;
   for (auto it = local_prevotes_.lower_bound({height, 0}); it != local_prevotes_.end() && it->first.first == height; ++it) {
-    prevotes.emplace(it->first.second, it->second);
+    state.prevotes.emplace(it->first.second, it->second);
   }
-  if (!lock_state.has_value() && !valid_polka.has_value() && prevotes.empty()) {
+  return state;
+}
+
+void Node::stage_consensus_safety_state(std::uint64_t height, const ConsensusSafetyState& state,
+                                        storage::DB::Batch& batch) const {
+  if (!state.lock.has_value() && !state.valid_polka.has_value() && state.prevotes.empty()) {
     batch.erase(key_consensus_safety_state(height));
     batch.erase(key_consensus_safety_mirror(height));
     return;
   }
   // Primary and mirror go in the same atomic batch; load_state falls back to the mirror when the
   // primary is unreadable and abstains only if both are.
-  const Bytes inner = serialize_consensus_safety_state(lock_state, valid_polka, prevotes);
+  const Bytes inner = serialize_consensus_safety_state(state.lock, state.valid_polka, state.prevotes);
   batch.put(key_consensus_safety_state(height), seal_consensus_safety_row(inner, false));
   batch.put(key_consensus_safety_mirror(height), seal_consensus_safety_row(inner, true));
 }
 
-// Convenience wrapper for callers outside the batched finalization path
-// (round-state cleanup on its own, not alongside a broader commit).
-bool Node::persist_consensus_safety_state_locked(std::uint64_t height) {
+bool Node::persist_consensus_safety_state_locked(std::uint64_t height, const ConsensusSafetyState& state,
+                                                 const char* operation) {
   storage::DB::Batch batch(db_);
-  persist_consensus_safety_state_locked(height, batch);
-  return db_.write_batch_durable(batch);
+  stage_consensus_safety_state(height, state, batch);
+  std::string error;
+  if (db_.write_batch_durable(batch, &error)) return true;
+  enter_safety_fail_stop_locked(std::string(operation) + " height=" + std::to_string(height), error);
+  return false;
+}
+
+std::optional<Sig64> Node::sign_consensus_locked(const Bytes& msg) const {
+  if (safety_storage_failed()) return std::nullopt;  // includes a DB that fenced itself
+  auto sig = crypto::ed25519_sign(msg, local_key_.private_key);
+  if (sig.has_value()) ++consensus_signatures_;
+  return sig;
+}
+
+std::optional<VrfProof80> Node::vrf_prove_consensus_locked(const Bytes& alpha) const {
+  if (safety_storage_failed()) return std::nullopt;  // includes a DB that fenced itself
+  auto proof = crypto::vrf_prove(local_key_.private_key, alpha);
+  if (proof.has_value()) ++consensus_signatures_;
+  return proof;
+}
+
+// SAFETY (fail-stop): after a failed safety-critical write the in-memory state is still backed by
+// disk (P1), but the storage engine refuses further writes until reopened (RocksDB background
+// error), an ambiguous write is resolved only by a reload, and a second write after an ENOSPC
+// failure can abort the process (E1). So the node stops signing at every height, the DB stops
+// accepting writes, and the event loop exits; the operator's supervisor restarts the process,
+// which reloads the safety state from disk. The failed write is still reported as a failure to
+// its caller, which does not emit the vote that needed it.
+void Node::enter_safety_fail_stop_locked(const std::string& operation, const std::string& reason) {
+  if (safety_storage_failed_.load(std::memory_order_relaxed)) return;  // only the first failure is logged
+  // Fence before publishing the flag: a thread that sees the flag also finds the DB fenced. (A failed
+  // write has fenced it already; the first reason is kept.)
+  db_.fence_writes(operation + ": " + reason);
+  safety_storage_failed_.store(true, std::memory_order_release);
+  consensus_signatures_at_fail_stop_ = consensus_signatures_;
+  safety_storage_failure_ = operation + ": " + reason;
+  log_line("CRITICAL safety-storage-failure operation=" + operation + " reason=\"" + reason +
+           "\" action=fail-stop (no further consensus signatures or votes; stopping for a restart from disk)");
 }
 
 // SAFETY: releases the local vote lock at `height`. Only call this for a height that has
 // finalized; calling it for an open height lets this node sign a conflicting payload there.
 void Node::clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch) {
+  stage_consensus_safety_clear(height, batch);
+  forget_consensus_safety_state_locked(height);
+}
+
+void Node::stage_consensus_safety_clear(std::uint64_t height, storage::DB::Batch& batch) const {
+  batch.erase(key_consensus_safety_state(height));
+  batch.erase(key_consensus_safety_mirror(height));
+  batch.erase(key_consensus_locked_proposal(height));
+  batch.erase(key_consensus_safety_quarantine(height));
+}
+
+void Node::forget_consensus_safety_state_locked(std::uint64_t height) {
   local_vote_locks_.erase(height);
   valid_polka_by_height_.erase(height);
   local_prevotes_.erase(local_prevotes_.lower_bound({height, 0}), local_prevotes_.lower_bound({height + 1, 0}));
@@ -1044,14 +1134,10 @@ void Node::clear_consensus_safety_state_locked(std::uint64_t height, storage::DB
       ++it;
     }
   }
-  batch.erase(key_consensus_safety_state(height));
-  batch.erase(key_consensus_safety_mirror(height));
-  batch.erase(key_consensus_locked_proposal(height));
   // The height is final, so an abstention there has done its job.
   if (abstain_heights_.erase(height) != 0) {
     log_line("consensus-abstain-end height=" + std::to_string(height) + " reason=height-finalized");
   }
-  batch.erase(key_consensus_safety_quarantine(height));
 }
 
 void Node::clear_consensus_safety_state_locked(std::uint64_t height) {
@@ -1709,8 +1795,8 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     if (chaos_byzantine_ && is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
       // Vote for everything at both phases: no lock, floor, once-per-round or polka checks, nothing
       // persisted. Honest validators must stay safe against up to f of these.
-      auto pv = crypto::ed25519_sign(prevote_signing_message(consensus_domain_, msg.height, msg.round, transition_id), local_key_.private_key);
-      auto pc = crypto::ed25519_sign(vote_signing_message(consensus_domain_, msg.height, msg.round, transition_id), local_key_.private_key);
+      auto pv = sign_consensus_locked(prevote_signing_message(consensus_domain_, msg.height, msg.round, transition_id));
+      auto pc = sign_consensus_locked(vote_signing_message(consensus_domain_, msg.height, msg.round, transition_id));
       if (pv.has_value()) maybe_vote = Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pv};
       if (pc.has_value()) {
         pending_local_precommits_.push_back(Vote{msg.height, msg.round, transition_id, local_key_.public_key, *pc});
@@ -1758,7 +1844,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
     }
     if (local_can_vote) {
       auto sig =
-          crypto::ed25519_sign(prevote_signing_message(consensus_domain_, msg.height, msg.round, transition_id), local_key_.private_key);
+          sign_consensus_locked(prevote_signing_message(consensus_domain_, msg.height, msg.round, transition_id));
       if (!sig.has_value()) {
         log_propose_soft_reject("local-prevote-sign-failed");  // local condition, see candidate-cache-full
         return ProposeHandlingResult::SoftReject;
@@ -2674,7 +2760,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   // abstention must be enforced here as well.
   if (sigs.empty() && expected_quorum == 1 && expected_committee.size() == 1 &&
       expected_committee.front() == local_key_.public_key && !abstaining_at_height_locked(height)) {
-    if (auto sig = crypto::ed25519_sign(vote_signing_message(consensus_domain_, height, round, block_id), local_key_.private_key);
+    if (auto sig = sign_consensus_locked(vote_signing_message(consensus_domain_, height, round, block_id));
         sig.has_value()) {
       const Vote local_vote{height, round, block_id, local_key_.public_key, *sig};
       // INVARIANT: this is the other insertion path into votes_ (see the matching comment
@@ -2890,7 +2976,7 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       return std::nullopt;
     }
     const auto vrf_proof =
-        crypto::vrf_prove(local_key_.private_key, consensus::leader_vrf_alpha(canonical_state_->finalized_randomness, height));
+        vrf_prove_consensus_locked(consensus::leader_vrf_alpha(canonical_state_->finalized_randomness, height));
     if (!vrf_proof) {
       last_test_hook_error_ = "frontier-build-vrf-failed";
       return std::nullopt;

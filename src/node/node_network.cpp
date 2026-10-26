@@ -1463,6 +1463,7 @@ void Node::on_pong(int peer_id, const Bytes& payload) {
 }
 
 void Node::broadcast_propose(const p2p::ProposeMsg& p) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) { spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); }); });
   } else {
@@ -1481,6 +1482,7 @@ void Node::broadcast_epoch_ticket(const consensus::EpochTicket& ticket) {
 }
 
 void Node::broadcast_vote(const Vote& vote) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   p2p::VoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
@@ -1493,6 +1495,7 @@ void Node::broadcast_vote(const Vote& vote) {
 }
 
 void Node::broadcast_prevote(const Vote& vote) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   p2p::PrevoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
@@ -1505,6 +1508,7 @@ void Node::broadcast_prevote(const Vote& vote) {
 }
 
 void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   p2p::TimeoutVoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
@@ -1527,6 +1531,9 @@ void Node::flush_pending_finalized_broadcasts() {
     if (pending_finalized_tip_broadcast_) tip = p2p::FinalizedTipMsg{finalized_height_, finalized_identity_.id};
     pending_finalized_tip_broadcast_ = false;
   }
+  // Fail-stop: precommits queued before the failure were backed by a durable lock, but none is
+  // sent once the node has halted.
+  if (safety_storage_failed()) precommits.clear();
   for (const auto& vote : precommits) {
     broadcast_vote(vote);
     (void)handle_vote(vote, false, 0);

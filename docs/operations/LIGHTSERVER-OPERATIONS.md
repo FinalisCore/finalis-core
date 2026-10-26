@@ -126,12 +126,14 @@ does. The older alternative, `--rate-limit-loopback`, puts every public client i
 ## 4. Node fail-stop states
 
 Some states need an operator decision. Restarting unchanged cannot fix them, so the shipped
-service definitions do not restart on them.
+service definitions do not restart on them. A failed safety-state write also stops the node, but a
+restart is the recovery, so that exit code is restarted.
 
 | State | Signal | Exit | Restart policy |
 |---|---|---|---|
 | Next committee derived by the emergency prior-committee rule ([CHECKPOINT_DERIVATION_SPEC §11.1](../spec/CHECKPOINT_DERIVATION_SPEC.md)) and the node was not started with `--acknowledge-emergency-fallback` | `CRITICAL emergency-fallback-committee-active` in the log, stderr explains | `78` | systemd `RestartPreventExitStatus=78` |
 | RocksDB reports corruption on a read or prefix scan | `finalized-state-invariant-violation source=db-read-corruption` (or `db-scan-corruption`) | `SIGABRT` | systemd `RestartPreventExitStatus=SIGABRT` |
+| A durable write of consensus safety state (vote lock, prevote record, valid polka) failed (disk full, I/O error) | `CRITICAL safety-storage-failure operation=... reason=...`; the node signs nothing further and stops | `75` | restarts (reloads the safety state from disk); with the disk still failing it fails again and systemd stops after `StartLimitBurst` |
 
 Other failures restart after 5 s. systemd stops trying after 5 failed starts in 300 s
 (`StartLimitBurst=5`, `StartLimitIntervalSec=300`); clear it with `systemctl reset-failed finalis-node`.

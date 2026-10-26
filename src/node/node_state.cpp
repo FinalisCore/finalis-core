@@ -648,6 +648,7 @@ void Node::hydrate_runtime_from_canonical_state_locked(const consensus::Canonica
   hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState(state));
 }
 
+// Keep in sync with CanonicalRuntimeFields (take_ / restore_canonical_runtime_locked).
 void Node::hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& owned) {
   canonical_state_ = std::move(owned);
   const auto& state = *canonical_state_;
@@ -666,6 +667,47 @@ void Node::hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDeriv
   validator_liveness_window_start_height_ = state.validator_liveness_window_start_height;
   last_participation_eligible_signers_ = state.last_participation_eligible_signers;
   availability_state_ = state.availability_state;
+}
+
+Node::CanonicalRuntimeFields Node::take_canonical_runtime_locked() {
+  CanonicalRuntimeFields f;
+  f.canonical_state = std::move(canonical_state_);
+  canonical_state_.reset();
+  f.finalized_height = finalized_height_;
+  f.finalized_identity = finalized_identity_;
+  f.utxos = std::move(utxos_);
+  f.validators = std::move(validators_);
+  f.validator_join_requests = std::move(validator_join_requests_);
+  f.finalized_randomness = finalized_randomness_;
+  f.committee_epoch_randomness_cache = std::move(committee_epoch_randomness_cache_);
+  f.protocol_reserve_balance_units = protocol_reserve_balance_units_;
+  f.epoch_reward_states = std::move(epoch_reward_states_);
+  f.finalized_committee_checkpoints = std::move(finalized_committee_checkpoints_);
+  f.validator_join_window_start_height = validator_join_window_start_height_;
+  f.validator_join_count_in_window = validator_join_count_in_window_;
+  f.validator_liveness_window_start_height = validator_liveness_window_start_height_;
+  f.last_participation_eligible_signers = last_participation_eligible_signers_;
+  f.availability_state = std::move(availability_state_);
+  return f;
+}
+
+void Node::restore_canonical_runtime_locked(CanonicalRuntimeFields&& f) {
+  canonical_state_ = std::move(f.canonical_state);
+  finalized_height_ = f.finalized_height;
+  finalized_identity_ = f.finalized_identity;
+  utxos_ = std::move(f.utxos);
+  validators_ = std::move(f.validators);
+  validator_join_requests_ = std::move(f.validator_join_requests);
+  finalized_randomness_ = f.finalized_randomness;
+  committee_epoch_randomness_cache_ = std::move(f.committee_epoch_randomness_cache);
+  protocol_reserve_balance_units_ = f.protocol_reserve_balance_units;
+  epoch_reward_states_ = std::move(f.epoch_reward_states);
+  finalized_committee_checkpoints_ = std::move(f.finalized_committee_checkpoints);
+  validator_join_window_start_height_ = f.validator_join_window_start_height;
+  validator_join_count_in_window_ = f.validator_join_count_in_window;
+  validator_liveness_window_start_height_ = f.validator_liveness_window_start_height;
+  last_participation_eligible_signers_ = f.last_participation_eligible_signers;
+  availability_state_ = std::move(f.availability_state);
 }
 
 bool Node::init_mainnet_genesis() {
@@ -1291,7 +1333,11 @@ bool Node::load_state() {
     // Rewrite both sealed copies when the primary was bad or the mirror is missing.
     const bool needs_rewrite = !polka_valid || mirror_ok || !mirror_row.has_value() ||
                                !unseal_consensus_safety_row(*mirror_row, true).has_value();
-    if (needs_rewrite && !persist_consensus_safety_state_locked(height)) return false;
+    // Memory holds what was just read from disk (less an unverifiable polka), so it is not ahead of disk.
+    if (needs_rewrite && !persist_consensus_safety_state_locked(height, consensus_safety_state_locked(height),
+                                                                "startup-rewrite")) {
+      return false;
+    }
   }
   for (const auto& [key, value] : db_.scan_prefix(kConsensusSafetyQuarantinePrefix)) {
     const auto height = parse_height_key(key, kConsensusSafetyQuarantinePrefix);

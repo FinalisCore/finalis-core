@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -242,6 +243,13 @@ class Node {
   bool init_requires_operator_action() const { return init_requires_operator_action_; }
   void start();
   void stop();
+  // Fail-stop after a failed safety-critical write (see safety_storage_failed_): the node signs and
+  // sends no consensus message any more, and the process should stop and restart from disk.
+  // Also true as soon as any DB write failed (the DB fences itself, P5), before the event loop has
+  // formally entered fail-stop for it.
+  bool safety_storage_failed() const {
+    return safety_storage_failed_.load(std::memory_order_acquire) || db_.writes_fenced();
+  }
 
   NodeStatus status() const;
 
@@ -289,7 +297,22 @@ class Node {
   std::optional<std::pair<Hash32, std::uint32_t>> local_vote_lock_for_test(std::uint64_t height) const;
   // Precommit signed by this node.
   bool local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
+  // Precommit by `signer` for (height, round, transition) held in the vote tracker.
+  bool vote_recorded_by_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
+                                 const PubKey32& signer) const;
   std::vector<Vote> precommits_for_rebroadcast_for_test(std::uint64_t height) const;
+  // {timeouts, prevotes, precommits} the stall rebroadcast would send at `height` now.
+  std::array<std::size_t, 3> rebroadcast_sizes_for_test(std::uint64_t height) const;
+  void reseed_local_votes_for_test(std::uint64_t height);
+  // Validator-key signatures made so far, and how many of them were made after fail-stop began
+  // (must stay 0).
+  std::uint64_t consensus_signature_count_for_test() const;
+  std::uint64_t signatures_after_fail_stop_for_test() const;
+  // Drives the quorum-1 self-vote path of finalize_if_quorum.
+  bool finalize_if_quorum_for_test(const Hash32& block_id, std::uint64_t height, std::uint32_t round);
+  std::string safety_storage_failure_for_test() const;
+  // Enters fail-stop as a failed safety write would (for paths no write precedes, e.g. quorum-1).
+  void enter_safety_fail_stop_for_test(const std::string& reason);
   bool local_prevote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
   std::string inject_network_prevote_result_for_test(const Vote& vote);
   bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
@@ -506,6 +529,15 @@ class Node {
   // (restart, reconnect reset): its recorded prevotes, and the precommit its lock implies.
   // Ed25519 is deterministic, so the re-signed votes are the ones already sent.
   void reseed_local_votes_locked(std::uint64_t height);
+  // SAFETY (fail-stop): the only way consensus code signs with the validator key. Returns nullopt
+  // once safety_storage_failed_ is set. Callers hold mu_, which orders every signature against
+  // enter_safety_fail_stop_locked: a signature is either made before the failure (from state P1
+  // keeps durable) or refused.
+  std::optional<Sig64> sign_consensus_locked(const Bytes& msg) const;
+  std::optional<VrfProof80> vrf_prove_consensus_locked(const Bytes& alpha) const;
+  // Enters fail-stop after a failed safety-critical write: sets safety_storage_failed_ and fences
+  // the DB before mu_ is released, logs CRITICAL once, and asks the event loop to stop. Idempotent.
+  void enter_safety_fail_stop_locked(const std::string& operation, const std::string& reason);
   // Records a prevote this node signed; durable before the prevote is sent.
   bool record_local_prevote_locked(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
   // Participation record for the finalized tip, for the next transition's
@@ -520,9 +552,24 @@ class Node {
   };
   PrevFinalityRecord prev_finality_record_for_next_height_locked() const;
   bool record_late_finalized_vote_locked(const Vote& vote);
-  void persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
-  bool persist_consensus_safety_state_locked(std::uint64_t height);
+  // One height's row of consensus safety state: the vote lock, the valid polka and the own prevotes.
+  struct ConsensusSafetyState {
+    std::optional<std::pair<Hash32, std::uint32_t>> lock;
+    std::optional<QuorumCertificate> valid_polka;
+    std::map<std::uint32_t, Hash32> prevotes;
+  };
+  // SAFETY: the in-memory maps hold only state a durable write has stored. A change is made on a copy
+  // (consensus_safety_state_locked), written with persist_consensus_safety_state_locked and published
+  // to the maps only if that write succeeded; the maps are never ahead of disk.
+  ConsensusSafetyState consensus_safety_state_locked(std::uint64_t height) const;
+  void stage_consensus_safety_state(std::uint64_t height, const ConsensusSafetyState& state, storage::DB::Batch& batch) const;
+  // Durable write of one height's row; a failure enters fail-stop (`operation` names the caller).
+  bool persist_consensus_safety_state_locked(std::uint64_t height, const ConsensusSafetyState& state,
+                                             const char* operation);
   void clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
+  // The two halves of the above: the row erases, and the in-memory release (after the batch is durable).
+  void stage_consensus_safety_clear(std::uint64_t height, storage::DB::Batch& batch) const;
+  void forget_consensus_safety_state_locked(std::uint64_t height);
   void clear_consensus_safety_state_locked(std::uint64_t height);
   std::vector<FinalitySig> canonicalize_finality_signatures_locked(const std::vector<FinalitySig>& signatures,
                                                                    std::size_t quorum) const;
@@ -566,6 +613,29 @@ class Node {
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
   // Same, taking ownership: saves copying the state (its UTXO set) once per finalized block.
   void hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& state);
+  // Every runtime field hydrate_runtime_from_canonical_state_locked sets (keep the two in sync).
+  // Finalization moves them aside while it stages the new state, and moves them back if the durable
+  // write fails, so the live finalized state is exactly the previous one (KNOWN_DEFECTS.md D7).
+  struct CanonicalRuntimeFields {
+    std::optional<consensus::CanonicalDerivedState> canonical_state;
+    std::uint64_t finalized_height{0};
+    consensus::FinalizedIdentity finalized_identity{};
+    UtxoSetV2 utxos;
+    consensus::ValidatorRegistry validators;
+    std::map<Hash32, ValidatorJoinRequest> validator_join_requests;
+    Hash32 finalized_randomness{};
+    std::map<std::uint64_t, Hash32> committee_epoch_randomness_cache;
+    std::uint64_t protocol_reserve_balance_units{0};
+    std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
+    std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints;
+    std::uint64_t validator_join_window_start_height{0};
+    std::uint32_t validator_join_count_in_window{0};
+    std::uint64_t validator_liveness_window_start_height{0};
+    std::size_t last_participation_eligible_signers{0};
+    availability::AvailabilityPersistentState availability_state;
+  };
+  CanonicalRuntimeFields take_canonical_runtime_locked();
+  void restore_canonical_runtime_locked(CanonicalRuntimeFields&& fields);
   // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
   std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {
     if (!canonical_state_) return std::nullopt;
@@ -900,6 +970,19 @@ class Node {
   bool is_validator_{false};
 
   std::atomic<bool> running_{false};
+  // SAFETY (fail-stop): set when a write of consensus safety state (vote lock, prevote record,
+  // valid polka) or of a finalization failed, directly by that path; and by the event loop for any
+  // other failed DB write (the DB fences itself, so safety_storage_failed() is already true). Never
+  // cleared in this process. Written only under mu_, before mu_ is released. Read under mu_ by every
+  // signing site (sign_consensus_locked) and without mu_ by the send helpers (broadcast_*), the
+  // event loop and stop(). A message that passes the send check was signed before the flag was set
+  // (or the DB fenced), i.e. from durable state.
+  std::atomic<bool> safety_storage_failed_{false};
+  std::string safety_storage_failure_;  // "operation: reason" of the first failure; under mu_
+  // Validator-key signatures made by sign_consensus_locked / vrf_prove_consensus_locked, and the count
+  // when fail-stop began; tests check that the two stay equal. Both under mu_.
+  mutable std::uint64_t consensus_signatures_{0};
+  std::uint64_t consensus_signatures_at_fail_stop_{0};
   std::thread loop_thread_;
   mutable std::mutex local_bus_tasks_mu_;
   std::vector<std::thread> local_bus_tasks_;

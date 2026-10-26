@@ -170,11 +170,35 @@ if(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND AND NOT FINALIS_USE_SECP256K1_ZKP_BACKEN
     "Ensure third_party/secp256k1-zkp is present or provide a compatible system secp256k1-zkp installation.")
 endif()
 
+# Storage. RocksDB is required: without it storage::DB uses a file backend that rewrites kv.bin in
+# place (no fsync, no atomic rename), so a "durable" write is not durable and a crash mid-write can
+# lose all state. That backend is for fuzzing and tests only (ClusterFuzzLite has no RocksDB), and
+# finalis-node built on it refuses to start.
+option(FINALIS_ALLOW_FILE_BACKEND "Allow building without RocksDB on the non-durable file backend (fuzz/test only)" OFF)
 find_library(ROCKSDB_LIB rocksdb)
 find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h)
 if(ROCKSDB_LIB AND ROCKSDB_INCLUDE_DIR)
-  message(STATUS "Using RocksDB")
+  message(STATUS "Using RocksDB: ${ROCKSDB_LIB}")
   add_compile_definitions(SC_HAS_ROCKSDB=1)
+  # Distro packages (Ubuntu/Debian librocksdb8.9) are built without NDEBUG: RocksDB's internal
+  # asserts are live and abort the process where a release build returns an error. storage::DB
+  # never writes again after a failed write (its write fence), which closes the observed abort
+  # (KNOWN_DEFECTS.md E1), but other asserts stay reachable in principle. Reported, not fatal.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    execute_process(COMMAND nm -D "${ROCKSDB_LIB}" OUTPUT_VARIABLE _rocksdb_syms ERROR_QUIET RESULT_VARIABLE _rocksdb_nm_rc)
+    if(_rocksdb_nm_rc EQUAL 0 AND _rocksdb_syms MATCHES "U __assert_fail")
+      message(WARNING "${ROCKSDB_LIB} is built with assertions enabled (no NDEBUG): an internal RocksDB "
+                      "assertion aborts the node instead of returning an error. Prefer a release (NDEBUG) "
+                      "RocksDB build for validators; see tests/KNOWN_DEFECTS.md E1.")
+    endif()
+  endif()
+elseif(FINALIS_ALLOW_FILE_BACKEND)
+  message(WARNING "RocksDB not found: building on the NON-DURABLE file backend (FINALIS_ALLOW_FILE_BACKEND=ON). "
+                  "For fuzzing and tests only; finalis-node built this way refuses to start.")
+else()
+  message(FATAL_ERROR "RocksDB not found (librocksdb-dev / rocksdb-devel / vcpkg rocksdb). Node storage needs it: "
+                      "the fallback file backend is not crash-durable. For fuzz or test builds only, configure with "
+                      "-DFINALIS_ALLOW_FILE_BACKEND=ON.")
 endif()
 
 add_library(finalis_core
@@ -498,7 +522,7 @@ endif()
 
 if(FINALIS_BUILD_FUZZ)
   foreach(fuzz_target fuzz_p2p_frame fuzz_consensus_msgs fuzz_consensus_node fuzz_tx_parse fuzz_smt
-                      fuzz_confidential fuzz_wire_codecs fuzz_sync)
+                      fuzz_confidential fuzz_wire_codecs fuzz_sync fuzz_consensus_persistence)
     add_executable(${fuzz_target} fuzz/${fuzz_target}.cpp)
     target_link_libraries(${fuzz_target} PRIVATE finalis_core)
     if(FINALIS_SANITIZE)
@@ -514,9 +538,16 @@ if(FINALIS_BUILD_FUZZ)
   endforeach()
   # fuzz_sync builds its reference chain with the header-only test helpers.
   target_include_directories(fuzz_sync PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  # fuzz_consensus_persistence injects storage faults with the test-only WAL interposer (a no-op
+  # without RocksDB, e.g. in the ClusterFuzzLite build).
+  target_sources(fuzz_consensus_persistence PRIVATE tests/support/storage_fault_injection.cpp)
+  target_include_directories(fuzz_consensus_persistence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 endif()
 
 enable_testing()
+add_test(NAME configure-rejects-file-backend
+         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DBIN=${CMAKE_CURRENT_BINARY_DIR}/configure-probe-file-backend
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_file_backend_rejected.cmake)
 add_test(NAME finalis-tests COMMAND finalis-tests)
 set_tests_properties(finalis-tests PROPERTIES RESOURCE_LOCK ports)
 # Regression tests for open production defects (tests/KNOWN_DEFECTS.md). They fail until fixed, so

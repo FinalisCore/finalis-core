@@ -11,7 +11,10 @@
 #include <filesystem>
 #include <mutex>
 
+#include <csignal>
+
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <unistd.h>
 
 namespace finalis::test::storage_faults {
@@ -70,9 +73,26 @@ int sync_with(int fd, const char* name) {
   }
 }
 
+// Ubuntu's librocksdb is built with assertions; some WAL-error interleavings abort inside it. Print
+// the aborting thread's stack (test diagnostics only), then let the default action run.
+void on_abort(int sig) {
+  void* frames[64];
+  const int n = ::backtrace(frames, 64);
+  static const char kHeader[] = "\n[storage-faults] SIGABRT while faults were armed; backtrace:\n";
+  (void)!::write(2, kHeader, sizeof(kHeader) - 1);
+  ::backtrace_symbols_fd(frames, n, 2);
+  std::signal(sig, SIG_DFL);
+  std::raise(sig);
+}
+
 }  // namespace
 
 void arm(const std::string& db_dir, Mode mode, int count) {
+  static const bool handler_installed = [] {
+    std::signal(SIGABRT, on_abort);
+    return true;
+  }();
+  (void)handler_installed;
   std::lock_guard<std::mutex> lk(g_mu);
   std::error_code ec;
   const auto canonical = std::filesystem::weakly_canonical(db_dir, ec);

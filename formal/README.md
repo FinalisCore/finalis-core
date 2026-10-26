@@ -174,19 +174,35 @@ write failures (the batch may or may not survive a restart), optional sticky fai
 background error: every later write fails until restart), restarts that reload memory from disk, and
 the code paths that send votes from memory without a write (`lock_on_polka_locked`'s early return,
 the stall rebroadcast, the reconnect reseed). Only sent votes count toward polkas and commits.
-`Fix = FALSE` is the code at 9467c05; `Fix = TRUE` changes memory only after a successful write.
-3 honest + 1 Byzantine, two values, symmetry over values and honest nodes.
 
-| Config | Expected | Result (2026-10-25) |
+- Current code: `FixLock = FixPrevote = FALSE` (the code at 9467c05 / 23fed2b).
+- Candidate fix (hypothetical, not implemented): `FixLock` / `FixPrevote` = TRUE change memory only after
+  a successful write, for the lock and the prevote record separately.
+- Assumptions: 3 honest + 1 Byzantine validator (the Byzantine one counts toward every polka and commit),
+  quorum `2N/3 + 1` = 3, two values, one height; asynchronous delivery (a quorum is acted on whenever it
+  exists); a write serializes the node's whole safety state for the height; symmetry over values and
+  honest nodes. Not modelled: valid-value re-proposal, timed-out rounds, finalization writes (D7), the
+  RocksDB abort / hang behaviours (E1, E2).
+- Invariants: `Agreement`, `NoHonestDoublePrevote`, `NoHonestDoublePrecommit`, `SentPrecommitDurable`,
+  `SentPrevoteDurable`, `MemoryBackedByDisk`; reachability `NothingFinalizes` (must be violated).
+
+| Config | Expected | Result (2026-10-26, TLC 4 workers) |
 |---|---|---|
 | `_current_durable.cfg` (rounds 0..2) | `SentPrecommitDurable` violated | violated, depth 5 |
 | `_current_prevote.cfg` (rounds 0..2) | `NoHonestDoublePrevote` violated | violated, depth 5 |
-| `_current_r1.cfg` (rounds 0..1) | `Agreement` violated | violated, depth 12, 2.1M states, 29 s |
-| `_current.cfg` (rounds 0..2) | `Agreement` violated | **incomplete** (stopped at 20 min, ~7.7M states, no counterexample yet) |
-| `_fix_r1.cfg`, `_fix_nonsticky_r1.cfg` (rounds 0..1) | all invariants hold | hold, complete (128,082 / 63,411 states) |
-| `_fix.cfg`, `_fix_nonsticky.cfg` (rounds 0..2) | all invariants hold | hold, complete (26,435,096 / 12,744,290 states, depth 25) |
-| `_fix_reach.cfg` | `NothingFinalizes` violated | violated (finality reachable) |
+| `_current_memory_r1.cfg` | `MemoryBackedByDisk` violated | violated, depth 2 |
+| `_current_r1.cfg` (rounds 0..1) | `Agreement` violated | violated, depth 12 (2,007,734 states, 30 s) |
+| `_current.cfg` (rounds 0..2), exhaustive | `Agreement` violated | **incomplete** (stopped at 20 min, ~7.7M states) |
+| `_current.cfg` with `-simulate num=2000000 -depth 40 -seed 20261025` | `Agreement` violated | violated (simulation, not exhaustive) |
+| `_lockfix_only_r1.cfg` | `Agreement` violated | violated, depth 12, via a prevote sent from memory + restart |
+| `_prevotefix_only_r1.cfg` | `Agreement` violated | violated, depth 11, via a precommit from the memory lock + restart |
+| `_fix_r1.cfg`, `_fix_nonsticky_r1.cfg` | all invariants hold | hold, complete (128,082 / 63,411 states, depth 18) |
+| `_fix.cfg`, `_fix_nonsticky.cfg` (rounds 0..2) | all invariants hold | hold, complete (26,435,096 / 12,744,290 states, depth 25; 22 / 12 min) |
+| `_fix_reach.cfg` | `NothingFinalizes` violated | violated (finality reachable: the fix results are not vacuous) |
+
+A passing fix model shows the design rule is sufficient within these bounds; it is not evidence that a
+C++ implementation of it is correct. Both halves are needed (the partial-fix rows).
 
 Run: `./scripts/run_tlc.sh --spec formal/two_phase_finality_persistence.tla --config <cfg>` (add
-`--expect-violation <invariant>` for the `_current*` and `_reach` configs). The tests that reproduce
-the same defects in the node are listed in [tests/KNOWN_DEFECTS.md](../tests/KNOWN_DEFECTS.md).
+`--expect-violation <invariant>` for the `_current*`, `_*fix_only*` and `_reach` configs). The tests that
+reproduce the same defects in the node are listed in [tests/KNOWN_DEFECTS.md](../tests/KNOWN_DEFECTS.md).

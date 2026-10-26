@@ -467,11 +467,18 @@ void Node::stop() {
   }
   const bool was_running = running_.exchange(false);
   stop_lightserver_child();
+  // Fail-stop: skip every optional write (peer lists, address book, memtable flush); the DB is
+  // fenced, so only close() touches storage. Not bounded here: close() can block after an ENOSPC
+  // WAL failure (KNOWN_DEFECTS.md E2); apps/finalis-node bounds the process with a watchdog.
+  const bool halted = safety_storage_failed();
+  if (halted && was_running) log_line("shutdown-begin reason=safety-storage-failure skip=peers,addrman,flush");
   if (!was_running) {
     join_local_bus_tasks();
-    persist_peers();
-    persist_addrman();
-    persist_validators_addrman({});
+    if (!halted) {
+      persist_peers();
+      persist_addrman();
+      persist_validators_addrman({});
+    }
     p2p_.stop();
     db_.close();
     return;
@@ -496,13 +503,15 @@ void Node::stop() {
   for (int id : p2p_.peer_ids()) persisted_peers.push_back(p2p_.get_peer_info(id));
   p2p_.stop();
   if (restart_debug_) log_line("restart-debug p2p-stopped");
-  persist_peers(persisted_peers);
-  persist_addrman();
-  persist_validators_addrman(persisted_peers);
-  if (restart_debug_) log_line("restart-debug peers-persisted");
+  if (!halted) {
+    persist_peers(persisted_peers);
+    persist_addrman();
+    persist_validators_addrman(persisted_peers);
+    if (restart_debug_) log_line("restart-debug peers-persisted");
+  }
   {
     std::lock_guard<std::mutex> lk(mu_);
-    (void)db_.flush();
+    if (!halted) (void)db_.flush();
     if (restart_debug_) log_line("restart-debug db-flushed");
     db_.close();
     if (restart_debug_) log_line("restart-debug db-closed");
@@ -1122,6 +1131,18 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
 
 void Node::event_loop() {
   while (running_) {
+    // Fail-stop: no proposals, timeout votes, rebroadcasts or background writes; stop() and the
+    // process supervisor take it from here.
+    if (safety_storage_failed()) {
+      {
+        // Any failed DB write fences the DB (storage::DB::fence_writes); fail-stop on it as on a
+        // failed safety write. No-op if a safety write already entered fail-stop.
+        std::lock_guard<std::mutex> lk(mu_);
+        enter_safety_fail_stop_locked("storage-write", db_.write_fence_reason());
+      }
+      log_line("event-loop-exit reason=safety-storage-failure");
+      break;
+    }
     (void)reap_lightserver_child(true);
     std::optional<p2p::ProposeMsg> propose_to_send;
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
@@ -1542,7 +1563,7 @@ void Node::event_loop() {
         // Timeout votes are blocked too while abstaining (conservative: no signatures at all at h).
         const bool abstaining = abstaining_at_height_locked(h);
         if (local_timeout_member && !local_timeout_reserved && !abstaining) {
-          if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(consensus_domain_, h, timeout_round), local_key_.private_key);
+          if (auto sig = sign_consensus_locked(timeout_vote_signing_message(consensus_domain_, h, timeout_round));
               sig.has_value()) {
             local_timeout_vote_reservations_.insert(timeout_vote_key);
             local_timed_out_rounds_.insert(timeout_vote_key);
@@ -1618,8 +1639,8 @@ void Node::event_loop() {
         const auto transition_id = selected->transition.transition_id();
         const std::optional<std::uint32_t> pol_round =
             reproposal_pol.has_value() ? std::optional<std::uint32_t>(reproposal_pol->round) : std::nullopt;
-        auto sig = crypto::ed25519_sign(propose_signing_message(consensus_domain_, build_height, build_round, transition_id, pol_round),
-                                        local_key_.private_key);
+        auto sig =
+            sign_consensus_locked(propose_signing_message(consensus_domain_, build_height, build_round, transition_id, pol_round));
         if (finalized_height_ + 1 == build_height && current_round_ == build_round && sig.has_value() &&
             proposed_in_round_.find(key) == proposed_in_round_.end()) {
           proposed_in_round_[key] = true;
@@ -1654,9 +1675,13 @@ void Node::event_loop() {
           alt.frontier_proposal_bytes = proposal->serialize();
           const std::optional<std::uint32_t> pol_round =
               alt.pol.has_value() ? std::optional<std::uint32_t>(alt.pol->round) : std::nullopt;
-          if (auto sig = crypto::ed25519_sign(
-                  propose_signing_message(consensus_domain_, alt.height, alt.round, proposal->transition.transition_id(), pol_round),
-                  local_key_.private_key)) {
+          std::optional<Sig64> sig;
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            sig = sign_consensus_locked(
+                propose_signing_message(consensus_domain_, alt.height, alt.round, proposal->transition.transition_id(), pol_round));
+          }
+          if (sig) {
             alt.proposer_signature = *sig;
             bool flip = false;
             for (int peer_id : p2p_.peer_ids()) {

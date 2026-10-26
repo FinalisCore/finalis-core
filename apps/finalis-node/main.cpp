@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+#include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <thread>
 
@@ -11,6 +13,11 @@ using finalis::node::Node;
 
 namespace {
 constexpr int kExitOperatorActionRequired = 78;  // EX_CONFIG
+// A safety-critical write failed and the node fail-stopped. Restartable: the restart reloads the
+// consensus safety state from disk.
+constexpr int kExitSafetyStorageFailed = 75;  // EX_TEMPFAIL
+// Bound on shutdown after fail-stop; DB close can block after an ENOSPC WAL failure.
+constexpr auto kFailStopShutdownBound = std::chrono::seconds(30);
 volatile std::sig_atomic_t g_stop = 0;
 void on_sigint(int) { g_stop = 1; }
 }  // namespace
@@ -24,6 +31,12 @@ int main(int argc, char** argv) {
     }
   }
 
+#ifndef SC_HAS_ROCKSDB
+  // Built with FINALIS_ALLOW_FILE_BACKEND (see CMakeLists.txt): that storage is not crash-durable,
+  // so a validator's vote locks and finalized state could be lost or torn.
+  std::cerr << "finalis-node was built without RocksDB (non-durable file backend, fuzz/test only); refusing to start\n";
+  return kExitOperatorActionRequired;
+#endif
   auto cfg = finalis::node::parse_args(argc, argv);
   if (!cfg.has_value()) {
     std::cerr << "usage: finalis-node [--testnet] [--node-id <id>] [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--unsafe-discard-vote-lock-at-height <h>] [--port <p>] "
@@ -58,10 +71,23 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_sigint);
   std::signal(SIGTERM, on_sigint);
 
-  while (!g_stop) {
+  while (!g_stop && !node.safety_storage_failed()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
 
+  if (node.safety_storage_failed()) {
+    std::cerr << "CRITICAL safety-critical storage write failed; node stopped signing and is shutting down "
+                 "(exit "
+              << kExitSafetyStorageFailed << "); see the log for the failed operation\n";
+    // Ends the process if stop() blocks; nothing after the failure needs to reach disk.
+    std::thread([] {
+      std::this_thread::sleep_for(kFailStopShutdownBound);
+      std::cerr << "CRITICAL fail-stop shutdown exceeded " << kFailStopShutdownBound.count() << "s; exiting\n";
+      std::_Exit(kExitSafetyStorageFailed);
+    }).detach();
+    node.stop();
+    return kExitSafetyStorageFailed;
+  }
   node.stop();
   return 0;
 }

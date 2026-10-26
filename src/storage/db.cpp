@@ -1420,6 +1420,34 @@ class DB::RocksImpl {
 DB::DB() = default;
 DB::~DB() = default;
 
+void DB::fence_writes(const std::string& reason) {
+  std::lock_guard<std::mutex> lk(write_fence_->mu);
+  if (!write_fence_->fenced.load(std::memory_order_relaxed)) write_fence_->reason = reason;
+  write_fence_->fenced.store(true, std::memory_order_release);
+}
+
+std::string DB::write_fence_reason() const {
+  std::lock_guard<std::mutex> lk(write_fence_->mu);
+  return write_fence_->reason;
+}
+
+namespace {
+// The key's leading printable characters (its kind prefix), for a fence reason.
+std::string key_tag(const std::string& key) {
+  std::string out;
+  for (char ch : key) {
+    if (out.size() == 12 || ch < 0x21 || ch > 0x7e) break;
+    out += ch;
+  }
+  return "[" + out + "]";
+}
+}  // namespace
+
+bool DB::fail_write(const std::string& reason) {
+  fence_writes(reason);
+  return false;
+}
+
 // --- DB::Batch -------------------------------------------------------------
 //
 // Accumulates Put/Delete ops for one atomic DB::write_batch() commit. Every
@@ -1612,34 +1640,45 @@ void DB::Batch::put_consensus_state_commitment_cache(const ConsensusStateCommitm
 }
 
 bool DB::write_batch(Batch& batch, bool disable_wal) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
   if (batch.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   rocksdb::WriteOptions opts;
   opts.disableWAL = disable_wal;
-  return rocks_->db->Write(opts, &batch.impl_->wb).ok();
+  const auto s = rocks_->db->Write(opts, &batch.impl_->wb);
+  return s.ok() || fail_write("write_batch: " + s.ToString());
 #else
   for (auto& [k, v] : batch.impl_->ops) {
     if (v.has_value()) mem_[k] = *v; else mem_.erase(k);
   }
-  return flush_file();
+  return flush_file() || fail_write("write_batch: file-flush-failed");
 #endif
 }
 
-bool DB::write_batch_durable(Batch& batch) {
-  if (readonly_) return false;
+bool DB::write_batch_durable(Batch& batch, std::string* error) {
+  auto fail = [error](const std::string& why) {
+    if (error) *error = why;
+    return false;
+  };
+  if (readonly_) return fail("read-only");
+  if (writes_fenced()) return fail("writes-fenced");
   if (batch.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
-  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
+  if (!rocks_ || !rocks_->db) return fail("db-closed");  // closed or never opened
   rocksdb::WriteOptions opts;
   opts.sync = true;
-  return rocks_->db->Write(opts, &batch.impl_->wb).ok();
+  const auto s = rocks_->db->Write(opts, &batch.impl_->wb);
+  if (s.ok()) return true;
+  fence_writes("write_batch_durable: " + s.ToString());
+  return fail(s.ToString());
 #else
   for (auto& [k, v] : batch.impl_->ops) {
     if (v.has_value()) mem_[k] = *v; else mem_.erase(k);
   }
-  return flush_file();
+  if (flush_file()) return true;
+  fence_writes("write_batch_durable: file-flush-failed");
+  return fail("file-flush-failed");
 #endif
 }
 // --- end DB::Batch ----------------------------------------------------------
@@ -1741,19 +1780,19 @@ bool DB::catch_up_with_primary() {
 }
 
 bool DB::put(const std::string& key, const Bytes& value) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Put(rocksdb::WriteOptions(), key, rocksdb::Slice(reinterpret_cast<const char*>(value.data()), value.size()));
-  return s.ok();
+  return s.ok() || fail_write("put" + key_tag(key) + ": " + s.ToString());
 #else
   mem_[key] = value;
-  return flush_file();
+  return flush_file() || fail_write("put" + key_tag(key) + ": file-flush-failed");
 #endif
 }
 
 bool DB::put_many(const std::vector<std::pair<std::string, Bytes>>& entries, bool disable_wal) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
   if (entries.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
@@ -1766,10 +1805,10 @@ bool DB::put_many(const std::vector<std::pair<std::string, Bytes>>& entries, boo
   rocksdb::WriteOptions opts;
   opts.disableWAL = disable_wal;
   auto status = rocks_->db->Write(opts, &batch);
-  return status.ok();
+  return status.ok() || fail_write("put_many: " + status.ToString());
 #else
   for (const auto& [key, value] : entries) mem_[key] = value;
-  return flush_file();
+  return flush_file() || fail_write("put_many: file-flush-failed");
 #endif
 }
 
@@ -1872,14 +1911,14 @@ std::optional<Bytes> DB::get(const std::string& key) const {
 }
 
 bool DB::erase(const std::string& key) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key);
-  return s.ok();
+  return s.ok() || fail_write("erase: " + s.ToString());
 #else
   mem_.erase(key);
-  return flush_file();
+  return flush_file() || fail_write("erase: file-flush-failed");
 #endif
 }
 
@@ -1958,14 +1997,14 @@ std::optional<Hash32> DB::get_height_hash(std::uint64_t height) const {
 bool DB::put_utxo(const OutPoint& op, const TxOut& out) { return put(key_utxo(op), serialize_txout(out)); }
 bool DB::put_utxo_v2(const OutPoint& op, const UtxoEntryV2& entry) { return put(key_utxo(op), serialize_utxo_entry_v2(entry)); }
 bool DB::erase_utxo(const OutPoint& op) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_utxo(op));
-  return s.ok();
+  return s.ok() || fail_write("erase_utxo: " + s.ToString());
 #else
   mem_.erase(key_utxo(op));
-  return flush_file();
+  return flush_file() || fail_write("erase_utxo: file-flush-failed");
 #endif
 }
 
@@ -2235,7 +2274,7 @@ std::map<PubKey32, consensus::EpochBestTicket> DB::load_best_epoch_tickets(std::
 }
 
 bool DB::clear_best_epoch_tickets(std::uint64_t epoch) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
   const std::string prefix = "EB:" + key_epoch_prefix(epoch) + ":";
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
@@ -2243,12 +2282,12 @@ bool DB::clear_best_epoch_tickets(std::uint64_t epoch) {
   for (const auto& [k, _] : scan_prefix(prefix)) keys.push_back(k);
   for (const auto& k : keys) {
     auto s = rocks_->db->Delete(rocksdb::WriteOptions(), k);
-    if (!s.ok()) return false;
+    if (!s.ok()) return fail_write("clear_best_epoch_tickets: " + s.ToString());
   }
   return true;
 #else
   for (const auto& [k, _] : scan_prefix(prefix)) mem_.erase(k);
-  return flush_file();
+  return flush_file() || fail_write("clear_best_epoch_tickets: file-flush-failed");
 #endif
 }
 
@@ -2676,14 +2715,14 @@ bool DB::put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxO
 }
 
 bool DB::erase_script_utxo(const Hash32& scripthash, const OutPoint& op) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_script_utxo(scripthash, op));
-  return s.ok();
+  return s.ok() || fail_write("erase_script_utxo: " + s.ToString());
 #else
   mem_.erase(key_script_utxo(scripthash, op));
-  return flush_file();
+  return flush_file() || fail_write("erase_script_utxo: file-flush-failed");
 #endif
 }
 
@@ -2725,14 +2764,15 @@ bool DB::add_script_history(const Hash32& scripthash, std::uint64_t height, cons
 }
 
 bool DB::flush() {
+  if (writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;
   rocksdb::FlushOptions opts;
   opts.wait = true;
   auto s = rocks_->db->Flush(opts);
-  return s.ok();
+  return s.ok() || fail_write("flush: " + s.ToString());
 #else
-  return flush_file();
+  return flush_file() || fail_write("flush: file-flush-failed");
 #endif
 }
 

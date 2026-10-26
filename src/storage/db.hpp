@@ -2,8 +2,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -321,7 +323,20 @@ class DB {
   // Same as write_batch(), but fsyncs the WAL before returning. Use for state
   // that must survive power loss before a dependent message leaves the process
   // (e.g. a validator's vote lock, which must be durable before the vote is sent).
-  bool write_batch_durable(Batch& batch);
+  // On failure, `error` (if non-null) gets the rocksdb::Status message.
+  bool write_batch_durable(Batch& batch, std::string* error = nullptr);
+
+  // Write fence: every later write and flush returns false without reaching the storage engine.
+  // Set by fence_writes (node fail-stop) and by the DB itself on the first failed write or flush of
+  // any kind: RocksDB 8.9 does not stop writes after an ENOSPC WAL failure (it auto-recovers), and
+  // a later write can reach the failed WAL writer, which aborts an assertion-enabled build
+  // (KNOWN_DEFECTS.md E1) and returns an error otherwise. So after one failure nothing more is
+  // written in this process, whatever the error and whatever the caller. Never lifted; reopening is
+  // a restart. Safe from any thread.
+  void fence_writes(const std::string& reason = "fenced-by-caller");
+  bool writes_fenced() const { return write_fence_->fenced.load(std::memory_order_acquire); }
+  // The first failure (or fence_writes reason), "" while not fenced.
+  std::string write_fence_reason() const;
 
   // On failure, if `error` is non-null it's populated with the underlying
   // rocksdb::Status's message (lock held by another process, IO error, disk
@@ -471,6 +486,15 @@ class DB {
   std::string path_;
   bool readonly_{false};
   bool secondary_{false};
+  // Heap-held so DB stays movable.
+  struct WriteFence {
+    std::atomic<bool> fenced{false};
+    mutable std::mutex mu;
+    std::string reason;  // under mu
+  };
+  std::unique_ptr<WriteFence> write_fence_ = std::make_unique<WriteFence>();
+  // Fences writes with `reason` (if not fenced yet) and returns false, for `return fail_write(...)`.
+  bool fail_write(const std::string& reason);
 
 #ifdef SC_HAS_ROCKSDB
   class RocksImpl;
