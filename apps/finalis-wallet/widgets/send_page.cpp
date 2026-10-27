@@ -11,6 +11,7 @@
 #include <QPushButton>
 #include <QComboBox>
 #include <QScrollArea>
+#include <QSpinBox>
 #include <QVariant>
 #include <QVBoxLayout>
 
@@ -85,11 +86,23 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   mode_combo_->addItem("Transparent -> Confidential");
   mode_combo_->addItem("Confidential -> Transparent");
   mode_combo_->addItem("Confidential -> Confidential");
+  mode_combo_->addItem("Transparent -> Transparent (time-locked)");
   amount_edit_->setPlaceholderText("0.00");
+  unlock_delay_spin_ = new QSpinBox(form_box);
+  unlock_delay_spin_->setRange(0, 1000);
+  unlock_delay_spin_->setValue(2);
+  unlock_delay_spin_->setSuffix(" blocks");
+  unlock_delay_spin_->setToolTip(
+      "The transfer is sealed until this many blocks after the next one is final, then opens and applies. "
+      "Limited to the current committee epoch.");
+  unlock_delay_label_ = new QLabel("Opens after", form_box);
   form->addRow("Recipient address", address_edit_);
   form->addRow("Send mode", mode_combo_);
   form->addRow("Amount (FLS)", amount_edit_);
   form->addRow("Fixed fee (FLS)", fee_edit_);
+  form->addRow(unlock_delay_label_, unlock_delay_spin_);
+  unlock_delay_label_->hide();
+  unlock_delay_spin_->hide();
 
   auto* actions = new QHBoxLayout();
   actions->setSpacing(8);
@@ -97,6 +110,8 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   import_confidential_request_button_ = new QPushButton("Import Request", form_box);
   review_button_ = new QPushButton("Review Send", form_box);
   send_button_ = new QPushButton("Send", form_box);
+  cancel_timed_button_ = new QPushButton("Cancel Time-Locked...", form_box);
+  cancel_timed_button_->setToolTip("Spend the coins of a pending time-locked transfer back to this wallet before it opens.");
   max_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   import_confidential_request_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   review_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
@@ -105,6 +120,7 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   actions->addWidget(import_confidential_request_button_);
   actions->addWidget(review_button_);
   actions->addWidget(send_button_);
+  actions->addWidget(cancel_timed_button_);
   actions->addStretch(1);
   form->addRow("", actions);
   content->addWidget(form_box);

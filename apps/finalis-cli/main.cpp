@@ -3837,22 +3837,14 @@ int run_cli(int argc, char** argv) {
     for (const auto& u : *rpc_utxos) {
       if (u.value > 0) coins.push_back({finalis::OutPoint{u.txid, u.vout}, finalis::TxOut{u.value, u.script_pubkey}});
     }
-    // Fee coin: the smallest coin covering prepaid fee + bond; the body spends the others.
-    std::sort(coins.begin(), coins.end(), [](const auto& a, const auto& b) { return a.second.value < b.second.value; });
-    const auto fee_it = std::find_if(coins.begin(), coins.end(),
-                                     [&](const auto& c) { return c.second.value >= prepaid_fee + bond; });
-    if (fee_it == coins.end()) {
-      std::cerr << "timed_send failed: no coin covers prepaid fee + bond (" << prepaid_fee + bond << ")\n";
+    const auto timed_plan = finalis::plan_timed_p2pkh_send(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash),
+                                                           own_script, amount_units, fee, prepaid_fee, bond, &err);
+    if (!timed_plan.has_value()) {
+      std::cerr << "timed_send planning failed: " << err << "\n";
       return 1;
     }
-    const auto fee_coin = *fee_it;
-    coins.erase(fee_it);
-    auto plan = finalis::plan_wallet_p2pkh_send(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash), own_script,
-                                                amount_units, fee, finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
-    if (!plan.has_value()) {
-      std::cerr << "timed_send planning failed (the transfer cannot use the fee coin): " << err << "\n";
-      return 1;
-    }
+    const auto& fee_coin = timed_plan->fee_coin;
+    const auto* plan = &timed_plan->body;
     const auto chain_domain = rpc_chain_domain(rpc_url, &err);
     if (!chain_domain.has_value()) {
       std::cerr << "timed_send failed to load chain identity: " << err << "\n";
@@ -3870,8 +3862,7 @@ int run_cli(int argc, char** argv) {
     params.prepaid_fee = prepaid_fee;
     params.forfeit_bond = bond;
     params.bond_refund_script = own_script;
-    const std::uint64_t change = fee_coin.second.value - prepaid_fee - bond;
-    if (change > 0) params.fee_change = finalis::TxOut{change, own_script};
+    if (timed_plan->fee_change_units > 0) params.fee_change = finalis::TxOut{timed_plan->fee_change_units, own_script};
     params.unlock_height = unlock;
     params.committee_epoch = finalis::consensus::committee_epoch_start(unlock, epoch_blocks);
     params.committee_root = committee->root;
@@ -3899,6 +3890,11 @@ int run_cli(int argc, char** argv) {
     std::cout << "body_fee=" << plan->applied_fee_units << "\n";
     std::cout << "timed_txid=" << finalis::hex_encode32(timed->txid()) << "\n";
     std::cout << "body_txid=" << finalis::hex_encode32(body->txid()) << "\n";
+    // To cancel before it opens, spend these back to yourself (build_p2pkh_multi_tx + broadcast_tx); once
+    // the envelope is in a block that forfeits the bond.
+    for (const auto& [op, _] : plan->selected_prevs) {
+      std::cout << "body_input=" << finalis::hex_encode32(op.txid) << ":" << op.index << "\n";
+    }
     std::cout << "envelope_bytes=" << timed->serialize().size() << "\n";
     if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
       std::cout << "accepted=no\n";

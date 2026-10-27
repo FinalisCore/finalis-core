@@ -8,6 +8,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QSettings>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -22,6 +23,7 @@
 #include "apps/finalis-wallet/widgets/activity_page.hpp"
 #include "apps/finalis-wallet/wallet_network.hpp"
 #include "apps/finalis-wallet/widgets/advanced_page.hpp"
+#include "apps/finalis-wallet/widgets/send_page.hpp"
 
 #define private public
 #include "apps/finalis-wallet/wallet_window.hpp"
@@ -297,6 +299,25 @@ void test_wallet_window_onboarding_badge_states() {
   require(window.validator_state_label_->text().contains("DETACHED"), "wallet onboarding state missing detached badge");
 }
 
+// The time-locked mode: its own entry, and the "Opens after" field only while it is selected.
+void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
+  QSettings settings(kSettingsOrg, kSettingsApp);
+  settings.clear();
+  settings.sync();
+  finalis::wallet::WalletWindow window;
+  auto* combo = window.send_mode_combo_;
+  require(combo != nullptr && combo->count() == 5, "send mode count mismatch");
+  require(combo->itemText(4).toStdString() == "Transparent -> Transparent (time-locked)", "time-locked mode missing");
+  require(window.send_unlock_delay_spin_ != nullptr && window.send_cancel_timed_button_ != nullptr,
+          "time-locked controls missing");
+  require(window.send_unlock_delay_spin_->isHidden(), "unlock delay visible outside time-locked mode");
+  combo->setCurrentIndex(4);
+  require(!window.send_unlock_delay_spin_->isHidden(), "unlock delay hidden in time-locked mode");
+  require(window.send_unlock_delay_spin_->value() == 2, "unlock delay default mismatch");
+  combo->setCurrentIndex(0);
+  require(window.send_unlock_delay_spin_->isHidden(), "unlock delay still visible after leaving time-locked mode");
+}
+
 void test_wallet_window_defaults_to_lightserver_rpc_port() {
   QSettings settings(kSettingsOrg, kSettingsApp);
   settings.clear();
@@ -427,6 +448,9 @@ int main(int argc, char** argv) {
     std::cout << "Starting test 7: test_wallet_window_onboarding_badge_states" << std::endl;
     test_wallet_window_onboarding_badge_states();
     std::cout << "Completed test 7" << std::endl;
+    std::cout << "Starting test 7b: test_wallet_window_time_locked_send_mode_shows_unlock_delay" << std::endl;
+    test_wallet_window_time_locked_send_mode_shows_unlock_delay();
+    std::cout << "Completed test 7b" << std::endl;
     std::cout << "Starting test 8: test_wallet_window_defaults_to_lightserver_rpc_port" << std::endl;
     test_wallet_window_defaults_to_lightserver_rpc_port();
     std::cout << "Completed test 8" << std::endl;

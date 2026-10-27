@@ -47,6 +47,7 @@
 #include <QMenuBar>
 #include <QPushButton>
 #include <QSettings>
+#include <QSpinBox>
 #include <QByteArray>
 #include <QStatusBar>
 #include <QTableWidget>
@@ -84,6 +85,8 @@
 #include "wallet/confidential_builder.hpp"
 #include "wallet/confidential_keys.hpp"
 #include "utxo/confidential_tx.hpp"
+#include "consensus/frontier_execution.hpp"
+#include "consensus/randomness.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 
@@ -313,6 +316,7 @@ enum class WalletSendMode : std::uint8_t {
   TransparentToConfidential = 1,
   ConfidentialToTransparent = 2,
   ConfidentialToConfidential = 3,
+  TimeLocked = 4,  // transparent -> transparent, sealed until an unlock height (TxTimed)
 };
 
 WalletSendMode wallet_send_mode_from_combo(const QComboBox* combo) {
@@ -324,6 +328,8 @@ WalletSendMode wallet_send_mode_from_combo(const QComboBox* combo) {
       return WalletSendMode::ConfidentialToTransparent;
     case 3:
       return WalletSendMode::ConfidentialToConfidential;
+    case 4:
+      return WalletSendMode::TimeLocked;
     default:
       return WalletSendMode::TransparentToTransparent;
   }
@@ -339,6 +345,8 @@ QString wallet_send_mode_default_placeholder(WalletSendMode mode) {
       return "sc...";
     case WalletSendMode::ConfidentialToConfidential:
       return "scconfreq1:...";
+    case WalletSendMode::TimeLocked:
+      return "sc...";
   }
   return "sc...";
 }
@@ -353,6 +361,8 @@ QString wallet_send_mode_recipient_label(WalletSendMode mode) {
       return "Recipient address";
     case WalletSendMode::ConfidentialToConfidential:
       return "Recipient request";
+    case WalletSendMode::TimeLocked:
+      return "Recipient address";
   }
   return "Recipient";
 }
@@ -1251,6 +1261,9 @@ void WalletWindow::build_ui() {
   send_amount_edit_ = send_page_->amount_edit();
   send_fee_edit_ = send_page_->fee_edit();
   send_max_button_ = send_page_->max_button();
+  send_unlock_delay_spin_ = send_page_->unlock_delay_spin();
+  send_unlock_delay_label_ = send_page_->unlock_delay_label();
+  send_cancel_timed_button_ = send_page_->cancel_timed_button();
   send_import_confidential_request_button_ = send_page_->import_confidential_request_button();
   send_review_button_ = send_page_->review_button();
   send_button_ = send_page_->send_button();
@@ -1459,6 +1472,7 @@ void WalletWindow::build_ui() {
           [this]() { import_confidential_request(); });
   connect(send_review_button_, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button_, &QPushButton::clicked, this, [this]() { submit_send(); });
+  connect(send_cancel_timed_button_, &QPushButton::clicked, this, [this]() { cancel_timed_send(); });
   connect(validator_action_button_, &QPushButton::clicked, this, [this]() { start_validator_onboarding_clicked(); });
   connect(validator_refresh_button_, &QPushButton::clicked, this, [this]() { refresh_validator_readiness_panel(true); });
   connect(validator_cancel_button_, &QPushButton::clicked, this, [this]() { cancel_validator_onboarding_clicked(); });
@@ -1515,6 +1529,9 @@ void WalletWindow::build_ui() {
   const auto update_send_mode_ui = [this]() {
     const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
     if (send_address_edit_) send_address_edit_->setPlaceholderText(wallet_send_mode_default_placeholder(mode));
+    const bool timed = mode == WalletSendMode::TimeLocked;
+    if (send_unlock_delay_spin_) send_unlock_delay_spin_->setVisible(timed);
+    if (send_unlock_delay_label_) send_unlock_delay_label_->setVisible(timed);
   };
   const auto update_send_state = [this]() {
     const bool wallet_ready = wallet_.has_value();
@@ -3570,6 +3587,172 @@ void WalletWindow::show_send_inline_status(const QString& text) {
   send_review_status_label_->setText(text);
 }
 
+std::optional<WalletWindow::PreparedTimedSend> WalletWindow::prepare_timed_send(const QString& destination,
+                                                                               std::uint64_t amount_units,
+                                                                               bool fetch_committee, QString* err) {
+  const auto fail = [&](const QString& why) -> std::optional<PreparedTimedSend> {
+    if (err) *err = why;
+    return std::nullopt;
+  };
+  if (!wallet_) return fail("No wallet loaded.");
+  const auto decoded_to = finalis::address::decode(destination.toStdString());
+  const auto own_decoded = finalis::address::decode(wallet_->address);
+  if (!decoded_to || !own_decoded) return fail("Address data is invalid.");
+  // Lockable heights: from the next block to the end of its committee epoch.
+  const auto& network = network_by_name(wallet_->network_name);
+  const std::uint64_t epoch_blocks = std::max<std::uint64_t>(1, network.committee_epoch_blocks);
+  const std::uint64_t next_height = tip_height_ + 1;
+  const std::uint64_t horizon = finalis::consensus::committee_epoch_start(next_height, epoch_blocks) + epoch_blocks - 1;
+  const std::uint64_t delay = send_unlock_delay_spin_ ? static_cast<std::uint64_t>(send_unlock_delay_spin_->value()) : 2;
+  PreparedTimedSend out;
+  out.unlock_height = next_height + delay;
+  if (out.unlock_height > horizon) {
+    return fail(QString("Opens after at most %1 blocks right now (the current committee epoch ends at block %2).")
+                    .arg(horizon - next_height)
+                    .arg(horizon));
+  }
+  out.committee_epoch = finalis::consensus::committee_epoch_start(out.unlock_height, epoch_blocks);
+
+  std::size_t reserved_excluded = 0;
+  std::size_t pending_reserved_excluded = 0;
+  std::size_t onboarding_reserved_excluded = 0;
+  QString prev_err;
+  auto available_prevs =
+      send_available_prevs(&reserved_excluded, &pending_reserved_excluded, &onboarding_reserved_excluded, &prev_err);
+  if (!available_prevs) return fail(prev_err.isEmpty() ? "No spendable finalized inputs are currently available." : prev_err);
+  std::string plan_err;
+  auto plan = finalis::plan_timed_p2pkh_send(
+      *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
+      finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), amount_units, finalis::DEFAULT_WALLET_SEND_FEE_UNITS,
+      finalis::DEFAULT_WALLET_SEND_FEE_UNITS, finalis::consensus::kTxTimedMinForfeitBond, &plan_err);
+  if (!plan) return fail(QString::fromStdString(plan_err));
+  out.plan = std::move(*plan);
+  if (!fetch_committee) return out;
+
+  // The unlock epoch's keys, from the first endpoint that has them; the key root is checked locally.
+  QString last_err = "No lightserver endpoint is configured.";
+  for (const auto& endpoint : configured_lightserver_endpoints()) {
+    std::string rpc_err;
+    const auto committee = lightserver::rpc_get_committee_bls_keys(endpoint.toStdString(), out.unlock_height, &rpc_err);
+    if (!committee) {
+      last_err = QString::fromStdString(rpc_err);
+      continue;
+    }
+    if (finalis::consensus::committee_bls_key_root(committee->keys) != committee->root || committee->keys.empty()) {
+      last_err = "Endpoint returned an inconsistent committee key set.";
+      continue;
+    }
+    out.committee_keys = committee->keys;
+    out.committee_root = committee->root;
+    return out;
+  }
+  return fail("Could not load the committee keys for block " + QString::number(out.unlock_height) + ": " + last_err);
+}
+
+void WalletWindow::cancel_timed_send() {
+  if (!ensure_wallet_loaded("Cancel Time-Locked Send")) return;
+  WalletStore::State state;
+  if (!store_.load(&state)) {
+    QMessageBox::warning(this, "Cancel Time-Locked Send", "Unable to load local wallet state.");
+    return;
+  }
+  // Only transfers that have not opened yet (they open in block unlock + 1).
+  std::vector<WalletStore::TimedSendRecord> open;
+  QStringList labels;
+  for (const auto& record : state.timed_sends) {
+    if (!record.cancel_txid_hex.empty() || record.unlock_height + 1 <= tip_height_) continue;
+    labels << QString("%1 to %2, opens in block %3")
+                  .arg(format_coin_amount(record.amount))
+                  .arg(elide_middle(QString::fromStdString(record.recipient)))
+                  .arg(record.unlock_height + 1);
+    open.push_back(record);
+  }
+  if (open.empty()) {
+    QMessageBox::information(this, "Cancel Time-Locked Send", "No pending time-locked send to cancel.");
+    return;
+  }
+  bool ok = false;
+  const QString chosen = QInputDialog::getItem(this, "Cancel Time-Locked Send", "Pending time-locked send:", labels, 0, false, &ok);
+  if (!ok) return;
+  const auto record = open[static_cast<std::size_t>(labels.indexOf(chosen))];
+  const bool envelope_pending = std::find(local_sent_txids_.begin(), local_sent_txids_.end(), record.timed_txid_hex) !=
+                                local_sent_txids_.end();
+  QString confirm = QString("Spend the coins of this transfer back to your wallet before block %1?\n\n"
+                            "Once it is in a block, cancelling forfeits its bond (%2).")
+                        .arg(record.unlock_height + 1)
+                        .arg(format_coin_amount(record.forfeit_bond));
+  if (envelope_pending) {
+    confirm += "\n\nIts envelope is not in a block yet: the wallet also spends its fee coin, which keeps the bond if "
+               "that spend is finalized first.";
+  }
+  if (QMessageBox::question(this, "Cancel Time-Locked Send", confirm, QMessageBox::Yes | QMessageBox::No,
+                            QMessageBox::No) != QMessageBox::Yes) {
+    return;
+  }
+  std::string err;
+  auto key = load_wallet_key(&err);
+  auto own_decoded = finalis::address::decode(wallet_->address);
+  const auto chain_domain = signing_chain_domain();
+  if (!key || !own_decoded || !chain_domain) {
+    QMessageBox::warning(this, "Cancel Time-Locked Send",
+                         key ? QString("Not connected to a verified endpoint.") : QString::fromStdString(err));
+    return;
+  }
+  const auto own_script = finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash);
+  const auto privkey_holder = key_bytes(key->privkey);  // wiped on scope exit
+    const auto& privkey = privkey_holder.bytes;
+  const auto self_spend = [&](const std::vector<std::pair<OutPoint, TxOut>>& coins) -> std::optional<Tx> {
+    std::uint64_t total = 0;
+    for (const auto& [_, out] : coins) total += out.value;
+    if (total <= finalis::DEFAULT_WALLET_SEND_FEE_UNITS) return std::nullopt;
+    return finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, coins, privkey,
+                                                      {TxOut{total - finalis::DEFAULT_WALLET_SEND_FEE_UNITS, own_script}}, &err);
+  };
+  const auto cancel = self_spend(record.body_inputs);
+  if (!cancel) {
+    QMessageBox::warning(this, "Cancel Time-Locked Send", "Could not build the cancelling spend: " + QString::fromStdString(err));
+    return;
+  }
+  QString used_endpoint;
+  const auto result = broadcast_tx_with_failover(cancel->serialize(), &err, &used_endpoint);
+  if (!result || result->outcome != lightserver::BroadcastOutcome::Sent) {
+    const std::string reason = result ? (!result->error_message.empty() ? result->error_message : result->error) : err;
+    QMessageBox::warning(this, "Cancel Time-Locked Send", "Broadcast rejected: " + QString::fromStdString(reason));
+    return;
+  }
+  // The cancelling spend now holds the transfer's coins.
+  std::vector<OutPoint> body_inputs;
+  for (const auto& [op, _] : record.body_inputs) body_inputs.push_back(op);
+  pending_wallet_spends_.erase(record.body_txid_hex);
+  (void)store_.remove_pending_spend(record.body_txid_hex);
+  local_sent_txids_.push_back(result->txid_hex);
+  pending_wallet_spends_[result->txid_hex] = body_inputs;
+  (void)store_.add_sent_txid(result->txid_hex);
+  (void)store_.upsert_pending_spend(result->txid_hex, body_inputs, tip_height_,
+                                    static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch()));
+  QString fee_note;
+  if (envelope_pending) {
+    if (const auto fee_spend = self_spend({record.fee_coin}); fee_spend.has_value()) {
+      std::string fee_err;
+      QString fee_endpoint;
+      const auto fee_result = broadcast_tx_with_failover(fee_spend->serialize(), &fee_err, &fee_endpoint);
+      fee_note = fee_result && fee_result->outcome == lightserver::BroadcastOutcome::Sent
+                     ? QString(" The fee coin spend was submitted too.")
+                     : QString(" The fee coin could not be spent (the envelope may already be in a block).");
+    }
+  }
+  auto updated = record;
+  updated.cancel_txid_hex = result->txid_hex;
+  (void)store_.upsert_timed_send(updated);
+  mark_refresh_state_changed();
+  save_wallet_local_state();
+  append_local_event(QString("[pending] cancelled time-locked send %1 (%2)")
+                         .arg(elide_middle(QString::fromStdString(record.timed_txid_hex), 12))
+                         .arg(elide_middle(QString::fromStdString(result->txid_hex), 12)));
+  refresh_chain_state(false);
+  show_send_inline_status("Cancelling spend submitted, not final." + fee_note);
+}
+
 std::optional<std::vector<std::pair<OutPoint, TxOut>>> WalletWindow::send_available_prevs(std::size_t* reserved_excluded,
                                                                                            std::size_t* pending_reserved_excluded,
                                                                                            std::size_t* onboarding_reserved_excluded,
@@ -5285,6 +5468,41 @@ void WalletWindow::validate_send_form() {
     show_send_inline_status("Review unavailable");
     return;
   }
+  if (mode == WalletSendMode::TimeLocked) {
+    if (const auto recipient_err = recipient_address_error(recipient_text)) {
+      show_send_inline_warning(*recipient_err);
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    QString prep_err;
+    const auto prepared = prepare_timed_send(recipient_text, *amount_units, false, &prep_err);
+    if (!prepared) {
+      show_send_inline_warning(prep_err);
+      show_send_inline_status("Review unavailable");
+      return;
+    }
+    const auto& plan = prepared->plan;
+    const std::uint64_t fees = plan.body.applied_fee_units + finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    send_review_recipient_label_->setText(recipient_text);
+    send_review_amount_label_->setText(format_coin_amount(*amount_units));
+    send_review_fee_label_->setText(QString("%1 (transfer %2 + envelope %3)")
+                                        .arg(format_coin_amount(fees))
+                                        .arg(format_coin_amount(plan.body.applied_fee_units))
+                                        .arg(format_coin_amount(finalis::DEFAULT_WALLET_SEND_FEE_UNITS)));
+    send_review_total_label_->setText(format_coin_amount(*amount_units + fees));
+    send_review_change_label_->setText(QString("%1 transfer change; bond %2 returned when it opens")
+                                           .arg(format_coin_amount(plan.body.change_units))
+                                           .arg(format_coin_amount(finalis::consensus::kTxTimedMinForfeitBond)));
+    send_review_inputs_label_->setText(QString::number(plan.body.selected_prevs.size() + 1));
+    send_review_note_label_->setText(
+        QString("Sealed until block %1 is final; it opens and applies in block %2. Its coins stay reserved until then. "
+                "If it cannot apply when it opens (for example its coins were spent first), the bond is forfeited.")
+            .arg(prepared->unlock_height)
+            .arg(prepared->unlock_height + 1));
+    show_send_inline_status("Review ready");
+    if (send_review_warning_label_) send_review_warning_label_->hide();
+    return;
+  }
   if (mode == WalletSendMode::TransparentToTransparent) {
     if (const auto recipient_err = recipient_address_error(recipient_text)) {
       show_send_inline_warning(*recipient_err);
@@ -5497,6 +5715,11 @@ void WalletWindow::populate_send_max_amount() {
   if (!ensure_wallet_loaded("Send Max")) return;
   reset_send_review_panel();
   const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
+  if (mode == WalletSendMode::TimeLocked) {
+    show_send_inline_warning("Send Max is not available for time-locked sends: one coin pays the envelope.");
+    show_send_inline_status("Send max unavailable");
+    return;
+  }
   if (mode == WalletSendMode::ConfidentialToConfidential) {
     if (confidential_storage_locked_) {
       show_send_inline_warning("Unlock confidential state first.");
@@ -5653,8 +5876,89 @@ void WalletWindow::submit_send() {
   bool auto_retry_used = false;
   std::optional<finalis::keystore::ValidatorKey> cached_key;
   std::optional<finalis::address::DecodedAddress> cached_sender_address;
+  // Time-locked: the sealed transfer and the record kept for showing and cancelling it.
+  std::optional<WalletStore::TimedSendRecord> timed_record;
 
-  if (mode == WalletSendMode::TransparentToTransparent) {
+  if (mode == WalletSendMode::TimeLocked) {
+    if (const auto recipient_err = recipient_address_error(destination)) {
+      QMessageBox::warning(this, "Send", *recipient_err);
+      return;
+    }
+    QString prep_err;
+    const auto prepared = prepare_timed_send(destination, *amount_units, true, &prep_err);
+    if (!prepared) {
+      show_send_inline_warning(prep_err);
+      show_send_inline_status("Send blocked");
+      return;
+    }
+    auto key = load_wallet_key(&err);
+    auto own_decoded = finalis::address::decode(wallet_->address);
+    if (!key || !own_decoded) {
+      QMessageBox::warning(this, "Send", key ? QString("Wallet address is invalid.") : QString::fromStdString(err));
+      return;
+    }
+    const auto& plan = prepared->plan;
+    const std::uint64_t bond = finalis::consensus::kTxTimedMinForfeitBond;
+    confirm = QString("Time-locked send to %1\n\nAmount: %2\nOpens in block: %3 (sealed until block %4 is final)\n"
+                      "Fees: %5\nBond (returned when it opens): %6\n\n"
+                      "Nobody, including the validators, can read the transfer before then. If it cannot apply when it "
+                      "opens, for example because its coins were spent first, the bond is forfeited.")
+                  .arg(elide_middle(destination))
+                  .arg(format_coin_amount(*amount_units))
+                  .arg(prepared->unlock_height + 1)
+                  .arg(prepared->unlock_height)
+                  .arg(format_coin_amount(plan.body.applied_fee_units + finalis::DEFAULT_WALLET_SEND_FEE_UNITS))
+                  .arg(format_coin_amount(bond));
+    if (QMessageBox::question(this, "Confirm Time-Locked Send", confirm, QMessageBox::Yes | QMessageBox::No,
+                              QMessageBox::No) != QMessageBox::Yes) {
+      show_send_inline_status("Send cancelled");
+      return;
+    }
+    const auto chain_domain = signing_chain_domain();
+    if (!chain_domain) {
+      QMessageBox::warning(this, "Send", "Not connected to a verified endpoint: transactions are signed for its chain. Wait for the connection, then retry.");
+      return;
+    }
+    const auto privkey_holder = key_bytes(key->privkey);  // wiped on scope exit
+    const auto& privkey = privkey_holder.bytes;
+    auto body = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, plan.body.selected_prevs, privkey,
+                                                           plan.body.outputs, &err);
+    if (!body) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    const auto own_script = finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash);
+    TimedTxParams params;
+    params.fee_outpoint = plan.fee_coin.first;
+    params.fee_prev_out = plan.fee_coin.second;
+    params.prepaid_fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    params.forfeit_bond = bond;
+    params.bond_refund_script = own_script;
+    if (plan.fee_change_units > 0) params.fee_change = TxOut{plan.fee_change_units, own_script};
+    params.unlock_height = prepared->unlock_height;
+    params.committee_epoch = prepared->committee_epoch;
+    params.committee_root = prepared->committee_root;
+    params.committee_keys = prepared->committee_keys;
+    params.threshold = static_cast<std::uint32_t>(finalis::consensus::quorum_threshold(prepared->committee_keys.size()));
+    Hash32 seed = random_hash32();
+    crypto::ScopedWipe<Hash32> wipe_seed(seed);
+    auto timed = finalis::build_signed_timed_tx(*chain_domain, params, AnyTx{*body}, privkey, seed, &err);
+    if (!timed) {
+      QMessageBox::warning(this, "Send", QString::fromStdString(err));
+      return;
+    }
+    tx_bytes = timed->serialize();
+    reserved_inputs.push_back(plan.fee_coin.first);
+    timed_record = WalletStore::TimedSendRecord{};
+    timed_record->timed_txid_hex = hex_encode32(timed->txid());
+    timed_record->body_txid_hex = hex_encode32(body->txid());
+    timed_record->unlock_height = prepared->unlock_height;
+    timed_record->forfeit_bond = bond;
+    timed_record->amount = *amount_units;
+    timed_record->recipient = destination.toStdString();
+    timed_record->fee_coin = plan.fee_coin;
+    timed_record->body_inputs = plan.body.selected_prevs;
+  } else if (mode == WalletSendMode::TransparentToTransparent) {
     if (const auto recipient_err = recipient_address_error(destination)) {
       QMessageBox::warning(this, "Send", *recipient_err);
       return;
@@ -6071,6 +6375,19 @@ void WalletWindow::submit_send() {
 
   local_sent_txids_.push_back(result->txid_hex);
   pending_wallet_spends_[result->txid_hex] = reserved_inputs;
+  if (timed_record.has_value()) {
+    // The sealed transfer's coins stay unspent until block unlock + 1. Reserve them under its own txid,
+    // dated at the unlock height: a pending spend that is not found is released only two blocks after
+    // its creation height, so they stay reserved until the transfer has opened (or failed to).
+    std::vector<OutPoint> body_inputs;
+    for (const auto& [op, _] : timed_record->body_inputs) body_inputs.push_back(op);
+    local_sent_txids_.push_back(timed_record->body_txid_hex);
+    pending_wallet_spends_[timed_record->body_txid_hex] = body_inputs;
+    (void)store_.add_sent_txid(timed_record->body_txid_hex);
+    (void)store_.upsert_pending_spend(timed_record->body_txid_hex, body_inputs, timed_record->unlock_height,
+                                      static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch()));
+    (void)store_.upsert_timed_send(*timed_record);
+  }
   if (change_request_used.has_value()) {
     // Never hand this request index out again; the change is imported when the tx finalizes.
     WalletStore::State state;

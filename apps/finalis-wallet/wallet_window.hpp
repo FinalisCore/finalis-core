@@ -23,6 +23,7 @@
 #include "common/types.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
+#include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 #include "wallet/light_verifier.hpp"
 #include "wallet/verified_balance.hpp"
@@ -31,6 +32,7 @@
 class QLabel;
 class QLineEdit;
 class QComboBox;
+class QSpinBox;
 class QCheckBox;
 class QPushButton;
 class QScrollArea;
@@ -366,6 +368,19 @@ class WalletWindow final : public QMainWindow {
   void validate_send_form();
   void populate_send_max_amount();
   void submit_send();
+  // Time-locked sends (TxTimed): the plan, unlock height and committee keys for the current form.
+  struct PreparedTimedSend {
+    TimedSendPlan plan;
+    std::uint64_t unlock_height{0};
+    std::uint64_t committee_epoch{0};
+    std::vector<crypto::BlsPublicKey> committee_keys;
+    Hash32 committee_root{};
+  };
+  std::optional<PreparedTimedSend> prepare_timed_send(const QString& destination, std::uint64_t amount_units,
+                                                      bool fetch_committee, QString* err);
+  // Spends a pending time-locked transfer's coins back to this wallet before it opens (forfeiting
+  // the bond); also spends the fee coin if the envelope is not in a block yet.
+  void cancel_timed_send();
   void show_selected_history_detail();
   void refresh_history_table();
   QUrl explorer_home_url() const;
@@ -460,6 +475,9 @@ class WalletWindow final : public QMainWindow {
   QLineEdit* send_amount_edit_{nullptr};
   QLineEdit* send_fee_edit_{nullptr};
   QPushButton* send_max_button_{nullptr};
+  QSpinBox* send_unlock_delay_spin_{nullptr};
+  QLabel* send_unlock_delay_label_{nullptr};
+  QPushButton* send_cancel_timed_button_{nullptr};
   QPushButton* send_import_confidential_request_button_{nullptr};
   QPushButton* send_review_button_{nullptr};
   QPushButton* send_button_{nullptr};

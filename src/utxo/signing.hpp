@@ -71,6 +71,19 @@ struct TimedTxParams {
   std::vector<crypto::BlsPublicKey> committee_keys;
   std::uint32_t threshold{0};
 };
+// Coin selection for a time-locked transparent transfer: the envelope's fee coin is the smallest coin
+// covering prepaid_fee + forfeit_bond (the rest returns as change), and the sealed transfer is planned
+// from the other coins. The two never share a coin, so the transfer cannot spend the fee input.
+struct TimedSendPlan {
+  std::pair<OutPoint, TxOut> fee_coin;
+  WalletSendPlan body;
+  std::uint64_t fee_change_units{0};
+};
+std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
+                                                   const Bytes& recipient_script_pubkey, const Bytes& change_script_pubkey,
+                                                   std::uint64_t amount_units, std::uint64_t body_fee_units,
+                                                   std::uint64_t prepaid_fee_units, std::uint64_t forfeit_bond_units,
+                                                   std::string* err = nullptr);
 std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const AnyTx& body,
                                              const Bytes& fee_private_key_32, const Hash32& seed_32,
                                              std::string* err = nullptr);

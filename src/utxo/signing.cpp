@@ -103,6 +103,45 @@ std::optional<WalletSendPlan> plan_wallet_p2pkh_send(const std::vector<std::pair
   return plan;
 }
 
+std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
+                                                   const Bytes& recipient_script_pubkey, const Bytes& change_script_pubkey,
+                                                   std::uint64_t amount_units, std::uint64_t body_fee_units,
+                                                   std::uint64_t prepaid_fee_units, std::uint64_t forfeit_bond_units,
+                                                   std::string* err) {
+  if (prepaid_fee_units > std::numeric_limits<std::uint64_t>::max() - forfeit_bond_units) {
+    if (err) *err = "prepaid fee + bond overflows";
+    return std::nullopt;
+  }
+  const std::uint64_t envelope_units = prepaid_fee_units + forfeit_bond_units;
+  std::optional<std::size_t> fee_index;
+  for (std::size_t i = 0; i < available_prevs.size(); ++i) {
+    const auto& out = available_prevs[i].second;
+    if (out.value < envelope_units) continue;
+    if (!fee_index || out.value < available_prevs[*fee_index].second.value) fee_index = i;
+  }
+  if (!fee_index) {
+    if (err) *err = "no coin covers the prepaid fee + bond";
+    return std::nullopt;
+  }
+  std::vector<std::pair<OutPoint, TxOut>> rest;
+  rest.reserve(available_prevs.size() - 1);
+  for (std::size_t i = 0; i < available_prevs.size(); ++i) {
+    if (i != *fee_index) rest.push_back(available_prevs[i]);
+  }
+  std::string plan_err;
+  auto body = plan_wallet_p2pkh_send(rest, recipient_script_pubkey, change_script_pubkey, amount_units, body_fee_units,
+                                     DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &plan_err);
+  if (!body) {
+    if (err) *err = "the transfer needs coins other than the envelope's fee coin: " + plan_err;
+    return std::nullopt;
+  }
+  TimedSendPlan out;
+  out.fee_coin = available_prevs[*fee_index];
+  out.body = std::move(*body);
+  out.fee_change_units = out.fee_coin.second.value - envelope_units;
+  return out;
+}
+
 std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const AnyTx& body,
                                              const Bytes& fee_private_key_32, const Hash32& seed_32, std::string* err) {
   auto kp = keypair_from_private_key(fee_private_key_32, err);

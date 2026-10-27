@@ -8,6 +8,7 @@ class QLineEdit;
 class QPushButton;
 class QLabel;
 class QComboBox;
+class QSpinBox;
 
 namespace finalis::wallet {
 
@@ -20,6 +21,10 @@ class SendPage final : public QWidget {
   QLineEdit* amount_edit() const { return amount_edit_; }
   QLineEdit* fee_edit() const { return fee_edit_; }
   QPushButton* max_button() const { return max_button_; }
+  // Time-locked mode: the transfer opens this many blocks after the next one (within the epoch).
+  QSpinBox* unlock_delay_spin() const { return unlock_delay_spin_; }
+  QLabel* unlock_delay_label() const { return unlock_delay_label_; }
+  QPushButton* cancel_timed_button() const { return cancel_timed_button_; }
   QPushButton* import_confidential_request_button() const { return import_confidential_request_button_; }
   QPushButton* review_button() const { return review_button_; }
   QPushButton* send_button() const { return send_button_; }
@@ -39,6 +44,9 @@ class SendPage final : public QWidget {
   QLineEdit* amount_edit_{nullptr};
   QLineEdit* fee_edit_{nullptr};
   QPushButton* max_button_{nullptr};
+  QSpinBox* unlock_delay_spin_{nullptr};
+  QLabel* unlock_delay_label_{nullptr};
+  QPushButton* cancel_timed_button_{nullptr};
   QPushButton* import_confidential_request_button_{nullptr};
   QPushButton* review_button_{nullptr};
   QPushButton* send_button_{nullptr};

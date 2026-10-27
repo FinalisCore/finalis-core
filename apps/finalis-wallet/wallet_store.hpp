@@ -29,6 +29,20 @@ class WalletStore {
     std::uint64_t created_unix_ms{0};
   };
 
+  // A time-locked send this wallet made (TxTimed): enough to show it and to cancel it, since the
+  // sealed transfer cannot be read back from the chain before it opens.
+  struct TimedSendRecord {
+    std::string timed_txid_hex;
+    std::string body_txid_hex;
+    std::uint64_t unlock_height{0};
+    std::uint64_t forfeit_bond{0};
+    std::uint64_t amount{0};
+    std::string recipient;
+    std::pair<OutPoint, TxOut> fee_coin;
+    std::vector<std::pair<OutPoint, TxOut>> body_inputs;
+    std::string cancel_txid_hex;  // set once cancelled
+  };
+
   struct FinalizedHistoryRecord {
     std::string txid_hex;
     std::uint64_t height{0};
@@ -149,6 +163,7 @@ class WalletStore {
     std::vector<std::string> sent_txids;
     std::vector<std::string> local_events;
     std::vector<PendingSpend> pending_spends;
+    std::vector<TimedSendRecord> timed_sends;
     std::vector<FinalizedHistoryRecord> finalized_history;
     std::optional<std::uint64_t> history_cursor_height;
     std::optional<std::string> history_cursor_txid;
@@ -171,6 +186,7 @@ class WalletStore {
   bool upsert_pending_spend(const std::string& txid, const std::vector<OutPoint>& inputs,
                             std::uint64_t created_tip_height = 0, std::uint64_t created_unix_ms = 0);
   bool remove_pending_spend(const std::string& txid);
+  bool upsert_timed_send(const TimedSendRecord& record);
   bool replace_finalized_history(const std::vector<FinalizedHistoryRecord>& records);
   bool append_finalized_history(const std::vector<FinalizedHistoryRecord>& records);
   bool set_history_cursor(const std::optional<std::uint64_t>& height, const std::optional<std::string>& txid);

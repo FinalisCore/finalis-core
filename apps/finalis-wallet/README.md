@@ -95,6 +95,22 @@ supported subset:
   creating accounts again restores 1, 2, ... in order. Accounts imported from a raw view + spend
   secret need that pair backed up separately.
 
+## Time-locked sends
+
+`Send -> Transparent -> Transparent (time-locked)` seals a transfer until a height is final
+(`TxTimed`, see docs/CONSENSUS.md "Timed Transactions"): "Opens after" N blocks puts the unlock
+height at next block + N, at most the end of the current committee epoch. One coin pays the envelope
+(prepaid fee + a bond, the rest returns as change); the transfer is planned from the other coins
+(`plan_timed_p2pkh_send`). Its coins stay reserved until it opens: the wallet records the sealed
+transfer as a pending spend dated at the unlock height, so the usual not-found release cannot free
+them early. The bond comes back when the transfer applies in block unlock + 1.
+
+`Cancel Time-Locked...` lists sends that have not opened yet and spends the transfer's coins back to
+the wallet, which makes the transfer fail when it opens (the bond is forfeited, by design: a free
+cancel would make every envelope a free option). If the envelope is not in a block yet, it also spends
+the fee coin, which keeps the bond if that spend finalizes first. Records are kept in the wallet store
+(`TIMED:`), because the chain holds the transfer encrypted until it opens.
+
 ## Lightserver failover
 
 The wallet accepts an ordered list of lightserver RPC endpoints in `Advanced -> Connections`.
