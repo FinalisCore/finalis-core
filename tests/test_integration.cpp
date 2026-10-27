@@ -10713,6 +10713,17 @@ TEST(test_light_client_follows_committees_from_genesis_and_rejects_tampering) {
   ASSERT_TRUE(consensus::checkpoint_commitment_value(*genesis_checkpoint) ==
               consensus::checkpoint_commitment_value(node_checkpoints.at(1)));
   ASSERT_EQ(genesis_checkpoint->ordered_members.size(), 4u);
+  // Every committee carries each member's genesis BLS key, in member order.
+  std::map<PubKey32, crypto::BlsPublicKey> genesis_bls;
+  for (std::size_t i = 0; i < doc->initial_validators.size(); ++i) {
+    genesis_bls[doc->initial_validators[i]] = doc->initial_validator_bls[i].pubkey;
+  }
+  for (const auto& [epoch, checkpoint] : node_checkpoints) {
+    ASSERT_EQ(checkpoint.ordered_bls_keys.size(), checkpoint.ordered_members.size());
+    for (std::size_t i = 0; i < checkpoint.ordered_members.size(); ++i) {
+      ASSERT_TRUE(checkpoint.ordered_bls_keys[i] == genesis_bls.at(checkpoint.ordered_members[i]));
+    }
+  }
 
   const auto params = consensus::light_client_params(cfg.network, consensus::chain_id_for_genesis(cfg.network, genesis_hash));
   storage::FinalizedCommitteeCheckpoint current = *genesis_checkpoint;

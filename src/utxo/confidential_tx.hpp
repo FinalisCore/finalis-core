@@ -156,7 +156,7 @@ struct TxTimed {
   // Time lock.
   std::uint64_t unlock_height{0};     // decrypted with the time signature of this height
   std::uint64_t committee_epoch{0};   // epoch_of(unlock_height); checked, not trusted
-  Hash32 committee_root{};            // root of that epoch's ordered BLS keys (the SWE key set V)
+  Hash32 committee_root{};            // consensus::committee_bls_key_root of that epoch's checkpoint keys (the SWE key set V)
   Bytes swe_ciphertext;               // crypto::SweCiphertext of the 256-bit body key
   Bytes swe_proof;                    // crypto::SweWellFormednessProof
   std::array<std::uint8_t, 12> body_nonce{};

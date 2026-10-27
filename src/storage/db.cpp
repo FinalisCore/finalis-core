@@ -515,6 +515,8 @@ Bytes serialize_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoin
   w.u64le(checkpoint.qualified_depth);
   w.u32le(checkpoint.target_expand_streak);
   w.u32le(checkpoint.target_contract_streak);
+  w.varint(checkpoint.ordered_bls_keys.size());
+  for (const auto& key : checkpoint.ordered_bls_keys) w.bytes_fixed(key);
   return w.take();
 }
 
@@ -631,10 +633,19 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         auto qualified_depth = r.u64le();
         auto expand_streak = r.u32le();
         auto contract_streak = r.u32le();
+        auto bls_count = r.varint();
         if (!adaptive_target || !adaptive_min_eligible || !adaptive_min_bond || !qualified_depth || !expand_streak ||
-            !contract_streak || !r.eof()) {
+            !contract_streak || !bls_count || *bls_count > r.remaining() / crypto::kBlsPublicKeyBytes) {
           return false;
         }
+        checkpoint.ordered_bls_keys.clear();
+        checkpoint.ordered_bls_keys.reserve(*bls_count);
+        for (std::uint64_t i = 0; i < *bls_count; ++i) {
+          auto key = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+          if (!key) return false;
+          checkpoint.ordered_bls_keys.push_back(*key);
+        }
+        if (!r.eof()) return false;
         checkpoint.adaptive_target_committee_size = *adaptive_target;
         checkpoint.adaptive_min_eligible = *adaptive_min_eligible;
         checkpoint.adaptive_min_bond = *adaptive_min_bond;

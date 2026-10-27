@@ -1199,6 +1199,7 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
     checkpoint.ordered_ticket_hashes.push_back(it->ticket_work_hash);
     checkpoint.ordered_ticket_nonces.push_back(it->ticket_nonce);
   }
+  assign_checkpoint_bls_keys(state.validators, &checkpoint);
   state.finalized_committee_checkpoints[1] = checkpoint;
   state.state_commitment = consensus_state_commitment(cfg, state);
   *out = std::move(state);
@@ -2035,6 +2036,8 @@ Bytes checkpoint_commitment_value(const storage::FinalizedCommitteeCheckpoint& c
   append_u64s(checkpoint.ordered_final_weights);
   append_hashes(checkpoint.ordered_ticket_hashes);
   append_u64s(checkpoint.ordered_ticket_nonces);
+  w.varint(checkpoint.ordered_bls_keys.size());
+  for (const auto& key : checkpoint.ordered_bls_keys) w.bytes_fixed(key);
   return w.take();
 }
 
@@ -2107,10 +2110,20 @@ std::optional<storage::FinalizedCommitteeCheckpoint> parse_checkpoint_commitment
       }
       return true;
     };
+    auto read_bls_keys = [&](std::vector<crypto::BlsPublicKey>* out) {
+      auto n = read_count(crypto::kBlsPublicKeyBytes);
+      if (!n) return false;
+      for (std::size_t i = 0; i < *n; ++i) {
+        auto k = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+        if (!k) return false;
+        out->push_back(*k);
+      }
+      return true;
+    };
     return read_hashes(&c.ordered_members) && read_hashes(&c.ordered_operator_ids) &&
            read_u64s(&c.ordered_base_weights) && read_u32s(&c.ordered_ticket_bonus_bps) &&
            read_u64s(&c.ordered_final_weights) && read_hashes(&c.ordered_ticket_hashes) &&
-           read_u64s(&c.ordered_ticket_nonces);
+           read_u64s(&c.ordered_ticket_nonces) && read_bls_keys(&c.ordered_bls_keys);
   });
   if (!ok) return std::nullopt;
   return c;
@@ -2425,6 +2438,24 @@ std::vector<PubKey32> emergency_fallback_committee_members(
   return out;
 }
 
+void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::FinalizedCommitteeCheckpoint* checkpoint) {
+  checkpoint->ordered_bls_keys.clear();
+  checkpoint->ordered_bls_keys.reserve(checkpoint->ordered_members.size());
+  for (const auto& pub : checkpoint->ordered_members) {
+    const auto info = validators.get(pub);
+    checkpoint->ordered_bls_keys.push_back(info.has_value() ? info->bls_pubkey : crypto::BlsPublicKey{});
+  }
+}
+
+Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '-', 'C', 'O', 'M', 'M', 'I', 'T', 'T', 'E', 'E', '-', 'B', 'L', 'S',
+                '-', 'V', '1'});
+  w.varint(ordered_bls_keys.size());
+  for (const auto& key : ordered_bls_keys) w.bytes_fixed(key);
+  return crypto::sha256d(w.data());
+}
+
 bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,
                                         const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
                                         std::uint64_t committee_epoch_blocks,
@@ -2514,7 +2545,8 @@ bool canonical_checkpoints_equal(const storage::FinalizedCommitteeCheckpoint& a,
          a.ordered_members == b.ordered_members &&
          a.ordered_operator_ids == b.ordered_operator_ids && a.ordered_base_weights == b.ordered_base_weights &&
          a.ordered_ticket_bonus_bps == b.ordered_ticket_bonus_bps && a.ordered_final_weights == b.ordered_final_weights &&
-         a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces;
+         a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces &&
+         a.ordered_bls_keys == b.ordered_bls_keys;
 }
 
 std::optional<PubKey32> empty_active_set_escape_member(const ValidatorRegistry& validators) {
@@ -2612,6 +2644,7 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
     if (error) *error = "empty-committee-no-emergency-fallback";
     return false;
   }
+  assign_checkpoint_bls_keys(state.validators, &checkpoint);
   *out = std::move(checkpoint);
   return true;
 }

@@ -554,7 +554,8 @@ bool same_finalized_checkpoint(const storage::FinalizedCommitteeCheckpoint& a,
          a.ordered_members == b.ordered_members &&
          a.ordered_operator_ids == b.ordered_operator_ids && a.ordered_base_weights == b.ordered_base_weights &&
          a.ordered_ticket_bonus_bps == b.ordered_ticket_bonus_bps && a.ordered_final_weights == b.ordered_final_weights &&
-         a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces;
+         a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces &&
+         a.ordered_bls_keys == b.ordered_bls_keys;
 }
 
 bool same_finalized_checkpoint_maps(const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& a,

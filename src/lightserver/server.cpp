@@ -3421,6 +3421,13 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     } else {
       oss << "null";
     }
+    oss << ",\"committee_bls_key_root\":";
+    if (checkpoint.has_value() && checkpoint->ordered_bls_keys.size() == checkpoint->ordered_members.size()) {
+      const auto root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
+      oss << "\"" << hex_encode(Bytes(root.begin(), root.end())) << "\"";
+    } else {
+      oss << "null";
+    }
     oss
         << ",\"ticket_pow\":" << ticket_pow_status_json(ticket_pow)
         << ",\"members\":[";
@@ -3433,6 +3440,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       std::optional<std::uint64_t> final_weight;
       std::optional<Hash32> ticket_hash;
       std::optional<std::uint64_t> ticket_nonce;
+      std::optional<crypto::BlsPublicKey> bls_pubkey;
       if (checkpoint.has_value()) {
         if (i < checkpoint->ordered_operator_ids.size()) operator_id = checkpoint->ordered_operator_ids[i];
         if (i < checkpoint->ordered_base_weights.size()) base_weight = checkpoint->ordered_base_weights[i];
@@ -3440,6 +3448,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         if (i < checkpoint->ordered_final_weights.size()) final_weight = checkpoint->ordered_final_weights[i];
         if (i < checkpoint->ordered_ticket_hashes.size()) ticket_hash = checkpoint->ordered_ticket_hashes[i];
         if (i < checkpoint->ordered_ticket_nonces.size()) ticket_nonce = checkpoint->ordered_ticket_nonces[i];
+        if (i < checkpoint->ordered_bls_keys.size()) bls_pubkey = checkpoint->ordered_bls_keys[i];
       }
       if (!operator_id.has_value()) {
         auto it = validators.find(representative_pubkey);
@@ -3471,6 +3480,9 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       else oss << "null";
       oss << ",\"ticket_nonce\":";
       if (ticket_nonce.has_value()) oss << *ticket_nonce;
+      else oss << "null";
+      oss << ",\"bls_pubkey\":";
+      if (bls_pubkey.has_value()) oss << "\"" << hex_encode(Bytes(bls_pubkey->begin(), bls_pubkey->end())) << "\"";
       else oss << "null";
       oss << "}";
     }

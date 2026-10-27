@@ -1226,6 +1226,7 @@ bool Node::load_state() {
         checkpoint.ordered_ticket_hashes.push_back(winner.work_hash);
         checkpoint.ordered_ticket_nonces.push_back(winner.nonce);
       }
+      consensus::assign_checkpoint_bls_keys(validators_, &checkpoint);
       if (!db_.put_finalized_committee_checkpoint(checkpoint)) {
         log_line("finalized-state-invariant-violation source=load-state-checkpoint-repair-failed epoch=" +
                  std::to_string(epoch_start));

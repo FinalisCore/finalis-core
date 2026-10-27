@@ -91,6 +91,9 @@ struct FinalizedCommitteeCheckpoint {
   std::vector<std::uint64_t> ordered_final_weights;
   std::vector<Hash32> ordered_ticket_hashes;
   std::vector<std::uint64_t> ordered_ticket_nonces;
+  // Each member's BLS time-signature key (ValidatorInfo::bls_pubkey), parallel to ordered_members:
+  // the key set V that time signatures of this epoch aggregate over and TxTimed encrypts to.
+  std::vector<crypto::BlsPublicKey> ordered_bls_keys;
 };
 
 struct EpochRewardSettlementState {

@@ -2290,6 +2290,55 @@ TEST(test_adaptive_checkpoint_metadata_is_replay_equivalent) {
   ASSERT_EQ(checkpoint_a.target_contract_streak, checkpoint_b.target_contract_streak);
 }
 
+// Each checkpoint carries its members' BLS time-signature keys in member order: the genesis
+// checkpoint from the genesis entries, later ones from the registrations, whatever the selection.
+TEST(test_committee_checkpoints_carry_member_bls_keys_in_member_order) {
+  const auto cfg = live_activation_cfg();
+  const auto bootstrap = key_from_byte(91);
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
+
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  const auto& genesis_checkpoint = state.finalized_committee_checkpoints.at(1);
+  ASSERT_TRUE(genesis_checkpoint.ordered_members == std::vector<PubKey32>{bootstrap.public_key});
+  ASSERT_TRUE(genesis_checkpoint.ordered_bls_keys == std::vector<crypto::BlsPublicKey>{test::test_bls_pubkey(bootstrap)});
+
+  std::map<PubKey32, crypto::BlsPublicKey> keys{{bootstrap.public_key, test::test_bls_pubkey(bootstrap)}};
+  for (std::size_t i = 0; i < live_normal_min_eligible() + 2; ++i) {
+    const auto seed = static_cast<std::uint8_t>(0xC0 + i);
+    const auto kp = key_from_byte(seed);
+    OutPoint bond{};
+    bond.txid.fill(seed);
+    bond.txid[0] = 0xEE;
+    const auto bls = test::test_bls_pubkey(kp);
+    ASSERT_TRUE(state.validators.register_bond(kp.public_key, bond, 0, live_adaptive_test_bond(), &err, kp.public_key, bls));
+    state.availability_state.operators.push_back(active_availability_operator(kp.public_key));
+    keys[kp.public_key] = bls;
+  }
+  state.validators.advance_height(1);
+
+  storage::FinalizedCommitteeCheckpoint checkpoint;
+  ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
+  ASSERT_TRUE(checkpoint.ordered_members.size() > 1);
+  ASSERT_EQ(checkpoint.ordered_bls_keys.size(), checkpoint.ordered_members.size());
+  std::vector<crypto::BlsPublicKey> expected;
+  for (const auto& member : checkpoint.ordered_members) expected.push_back(keys.at(member));
+  ASSERT_TRUE(checkpoint.ordered_bls_keys == expected);
+  ASSERT_TRUE(consensus::validate_next_epoch_checkpoint_from_state(cfg, state, 5, checkpoint, &err));
+
+  // A checkpoint whose keys disagree with the registry is not the canonical one.
+  auto swapped = checkpoint;
+  std::swap(swapped.ordered_bls_keys[0], swapped.ordered_bls_keys[1]);
+  ASSERT_TRUE(!consensus::validate_next_epoch_checkpoint_from_state(cfg, state, 5, swapped, &err));
+  ASSERT_TRUE(consensus::committee_bls_key_root(swapped.ordered_bls_keys) !=
+              consensus::committee_bls_key_root(checkpoint.ordered_bls_keys));
+}
+
 TEST(test_live_bporeligibility_filters_future_committee_checkpoint_membership) {
   const auto cfg = live_activation_cfg();
   const auto bootstrap = key_from_byte(96);

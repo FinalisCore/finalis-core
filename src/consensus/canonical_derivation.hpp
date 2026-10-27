@@ -312,6 +312,12 @@ std::vector<PubKey32> emergency_fallback_committee_members(
     const ValidatorRegistry& validators,
     const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
     std::uint64_t committee_epoch_blocks);
+// Sets checkpoint->ordered_bls_keys to each member's registered BLS key, in member order (a zero
+// key for a member without one; every registration and genesis entry carries one).
+void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::FinalizedCommitteeCheckpoint* checkpoint);
+// The committee key root a TxTimed names (TxTimed::committee_root):
+// sha256d("FINALIS-COMMITTEE-BLS-V1" || varint n || key_1 .. key_n), keys in checkpoint order.
+Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys);
 // Fills `checkpoint` (whose ordered_members is empty) with the emergency committee. Returns false
 // when there is no prior committee member to recover from.
 bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,

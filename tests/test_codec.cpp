@@ -15,6 +15,7 @@
 #include <filesystem>
 
 #include "codec/bytes.hpp"
+#include "consensus/canonical_derivation.hpp"
 #include "consensus/monetary.hpp"
 #include "codec/varint.hpp"
 #include "storage/db.hpp"
@@ -177,6 +178,11 @@ TEST(test_finalized_committee_checkpoint_db_roundtrip) {
   hb.fill(0x44);
   snapshot.ordered_ticket_hashes = {ha, hb};
   snapshot.ordered_ticket_nonces = {7, 9};
+  crypto::BlsPublicKey ka{};
+  crypto::BlsPublicKey kb{};
+  ka.fill(0x77);
+  kb.fill(0x88);
+  snapshot.ordered_bls_keys = {ka, kb};
 
   ASSERT_TRUE(db.put_finalized_committee_checkpoint(snapshot));
   const auto loaded = db.get_finalized_committee_checkpoint(snapshot.epoch_start_height);
@@ -201,6 +207,19 @@ TEST(test_finalized_committee_checkpoint_db_roundtrip) {
   ASSERT_EQ(loaded->ordered_final_weights, snapshot.ordered_final_weights);
   ASSERT_EQ(loaded->ordered_ticket_hashes, snapshot.ordered_ticket_hashes);
   ASSERT_EQ(loaded->ordered_ticket_nonces, snapshot.ordered_ticket_nonces);
+  ASSERT_TRUE(loaded->ordered_bls_keys == snapshot.ordered_bls_keys);
+
+  // The state-commitment encoding carries the keys too (the light client reads checkpoints from it),
+  // and a truncated key is refused.
+  const auto value = consensus::checkpoint_commitment_value(snapshot);
+  const auto parsed = consensus::parse_checkpoint_commitment_value(value);
+  ASSERT_TRUE(parsed.has_value());
+  ASSERT_TRUE(parsed->ordered_bls_keys == snapshot.ordered_bls_keys);
+  ASSERT_TRUE(consensus::canonical_checkpoints_equal(*parsed, snapshot));
+  ASSERT_TRUE(!consensus::parse_checkpoint_commitment_value(Bytes(value.begin(), value.end() - 1)).has_value());
+  auto other_keys = snapshot;
+  other_keys.ordered_bls_keys[1][0] ^= 1;
+  ASSERT_TRUE(!consensus::canonical_checkpoints_equal(other_keys, snapshot));
 
   const auto all = db.load_finalized_committee_checkpoints();
   auto it = all.find(snapshot.epoch_start_height);
@@ -212,6 +231,21 @@ TEST(test_finalized_committee_checkpoint_db_roundtrip) {
   ASSERT_EQ(it->second.ordered_final_weights, snapshot.ordered_final_weights);
   ASSERT_EQ(it->second.ordered_ticket_hashes, snapshot.ordered_ticket_hashes);
   ASSERT_EQ(it->second.ordered_ticket_nonces, snapshot.ordered_ticket_nonces);
+  ASSERT_TRUE(it->second.ordered_bls_keys == snapshot.ordered_bls_keys);
+}
+
+// TxTimed::committee_root: binds the exact key set and its order.
+TEST(test_committee_bls_key_root_binds_keys_and_order) {
+  crypto::BlsPublicKey ka{};
+  crypto::BlsPublicKey kb{};
+  ka.fill(0x77);
+  kb.fill(0x88);
+  const auto root = consensus::committee_bls_key_root({ka, kb});
+  ASSERT_EQ(root, consensus::committee_bls_key_root({ka, kb}));
+  ASSERT_TRUE(root != consensus::committee_bls_key_root({kb, ka}));
+  ASSERT_TRUE(root != consensus::committee_bls_key_root({ka}));
+  ASSERT_TRUE(root != consensus::committee_bls_key_root({ka, kb, kb}));
+  ASSERT_TRUE(consensus::committee_bls_key_root({}) != consensus::committee_bls_key_root({ka}));
 }
 
 TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback_observability) {
@@ -371,10 +405,11 @@ TEST(test_finalized_committee_checkpoint_rejects_unknown_enum_values) {
   auto rows = db.scan_prefix("CE:");
   ASSERT_EQ(rows.size(), 1u);
   auto raw = rows.begin()->second;
+  // Trailer: mode, fallback_reason, 6 x u64, 2 x u32, then the BLS key list (varint 0: empty).
   constexpr std::size_t kCheckpointTrailerBytes =
-      1 + 1 + (6 * sizeof(std::uint64_t)) + (2 * sizeof(std::uint32_t));
+      1 + 1 + (6 * sizeof(std::uint64_t)) + (2 * sizeof(std::uint32_t)) + 1;
   constexpr std::size_t kFallbackReasonOffsetFromEnd =
-      (6 * sizeof(std::uint64_t)) + (2 * sizeof(std::uint32_t)) + 1;
+      (6 * sizeof(std::uint64_t)) + (2 * sizeof(std::uint32_t)) + 1 + 1;
   ASSERT_TRUE(raw.size() >= kCheckpointTrailerBytes);
   raw[raw.size() - kFallbackReasonOffsetFromEnd] = 0xFF;
   ASSERT_TRUE(db.put(rows.begin()->first, raw));
