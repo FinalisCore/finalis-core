@@ -398,6 +398,9 @@ endif()
 # Confidential verify-weight calibration (not a test; run manually from a Release build).
 add_executable(finalis-bench-confidential tools/bench_confidential_verify.cpp)
 target_link_libraries(finalis-bench-confidential PRIVATE finalis_core)
+# Time-lock (McFly SWE) cost per committee size and per worst-case block (not a test; Release build).
+add_executable(finalis-bench-swe tools/bench_swe.cpp)
+target_link_libraries(finalis-bench-swe PRIVATE finalis_core)
 
 add_executable(finalis-explorer apps/finalis-explorer/main.cpp)
 target_link_libraries(finalis-explorer PRIVATE finalis_core)
