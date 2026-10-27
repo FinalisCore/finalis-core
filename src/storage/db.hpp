@@ -295,6 +295,8 @@ class DB {
     void put_rejected_tx(const Hash32& txid, std::uint64_t height);
     // Height of the transition whose settlement (reward payout) outputs live under this synthetic txid.
     void put_settlement_txid(const Hash32& txid, std::uint64_t height);
+    // A reveal body's data, published when the TxTimed `timed_txid` settled at `height`.
+    void put_timed_reveal(const Hash32& timed_txid, std::uint64_t height, const Bytes& data);
     void add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
     void stage_finalized_ingress_tip(std::uint64_t seq);
     void set_tip(const TipState& tip);
@@ -441,6 +443,12 @@ class DB {
   std::optional<std::uint64_t> get_rejected_tx_height(const Hash32& txid) const;
   // Height of the transition that paid settlement outputs under `txid`, if any.
   std::optional<std::uint64_t> get_settlement_height(const Hash32& txid) const;
+  struct TimedRevealLocation {
+    std::uint64_t height{0};
+    Bytes data;
+  };
+  // The data a TxTimed's reveal body published, and the height it settled at, if any.
+  std::optional<TimedRevealLocation> get_timed_reveal(const Hash32& timed_txid) const;
 
   bool put_ingress_record(std::uint64_t seq, const Bytes& record_bytes);
   std::optional<Bytes> get_ingress_record(std::uint64_t seq) const;
@@ -547,6 +555,7 @@ std::string key_utxo(const OutPoint& op);
 std::string key_validator_prefix();
 std::string key_validator(const PubKey32& pub);
 std::string key_txidx_prefix();
+std::string key_timed_reveal_prefix();
 std::string key_lane_state_prefix();
 std::string key_ingress_equivocation_prefix();
 std::string key_node_runtime_status_snapshot();

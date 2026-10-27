@@ -3273,7 +3273,7 @@ consensus::TimedEscrowState no_escrows;
 
 // Encrypted to the committee of the inclusion epoch (that of state's next height), as consensus requires.
 std::optional<TxTimed> build_timed(const TimedFixture& fx, const consensus::CanonicalDerivedState& state,
-                                   std::uint64_t unlock, const AnyTx& body, std::uint64_t bond = 2'000'000,
+                                   std::uint64_t unlock, const TimedBody& body, std::uint64_t bond = 2'000'000,
                                    std::uint8_t seed = 1, std::uint64_t prepaid_fee = 1'000) {
   const auto epoch = consensus::committee_epoch_start(state.finalized_height + 1, fx.cfg.network.committee_epoch_blocks);
   auto keys = consensus::time_signature_committee_keys(fx.cfg, state, epoch);
@@ -3333,6 +3333,57 @@ TEST(test_timed_tx_is_escrowed_then_settled_with_the_parent_time_signature) {
   ASSERT_TRUE(refund != s2.utxos.end());
   ASSERT_EQ(transparent_txout_from_utxo_entry(refund->second)->value, 2'000'000u);
   ASSERT_EQ(record2.transition.settlement.current_fees, 500u);  // the body's own fee
+}
+
+// A reveal body publishes its data in the settlement and refunds the bond; it moves nothing else.
+TEST(test_timed_reveal_body_publishes_its_data_and_refunds_the_bond) {
+  auto fx = make_timed_fixture();
+  const Bytes data{'a', 'u', 'c', 't', 'i', 'o', 'n', ' ', '7', ':', ' ', '5', '0', '0'};
+  const auto timed = build_timed(fx, fx.parent, 1, TimedReveal{data});
+  ASSERT_TRUE(timed.has_value());
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()});
+  ASSERT_EQ(s1.timed_escrows.size(), 1u);
+  const auto record2 = make_frontier_record(s1, {}, fx.cfg);
+  consensus::CanonicalDerivedState s2;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &s2, &err));
+  ASSERT_TRUE(s2.timed_escrows.empty());
+  ASSERT_EQ(s2.last_timed_settlements.size(), 1u);
+  const auto& settled = s2.last_timed_settlements[0];
+  ASSERT_TRUE(settled.body_applied && settled.revealed_data == data);
+  ASSERT_TRUE(!settled.body_txid.has_value() && !settled.applied_body.has_value());
+  ASSERT_TRUE(has_utxo(s2, consensus::timed_refund_outpoint(timed->txid())));
+  ASSERT_TRUE(has_utxo(s2, fx.body_op));
+  ASSERT_EQ(record2.transition.settlement.current_fees, 0u);
+  ASSERT_EQ(s2.utxos.size(), s1.utxos.size() + 1);  // the refund only
+}
+
+// A data output has zero value and never enters the UTXO set; a sealed transfer may carry one (a
+// bid paid with the money itself, tagged with its auction).
+TEST(test_data_outputs_carry_no_value_and_are_never_spendable) {
+  auto fx = make_timed_fixture();
+  const auto tag = *data_output_script_pubkey(Bytes{'a', 'u', 'c', 't', 'i', 'o', 'n', ' ', '7'});
+  const auto pay_with_data = [&](std::uint64_t data_value) {
+    auto tx = build_signed_p2pkh_tx_single_input(
+        replay_chain_domain(), fx.body_op, fx.body_out, fx.user.private_key,
+        {p2pkh_out_for_pub(fx.recipient.public_key, fx.body_out.value - 500 - data_value), TxOut{data_value, tag}});
+    if (!tx.has_value()) throw std::runtime_error("data tx build failed");
+    return *tx;
+  };
+  const auto tx = pay_with_data(0);
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {tx.serialize()});
+  ASSERT_TRUE(!has_utxo(s1, fx.body_op));
+  ASSERT_TRUE(has_utxo(s1, OutPoint{tx.txid(), 0}));
+  ASSERT_TRUE(!has_utxo(s1, OutPoint{tx.txid(), 1}));
+  const auto valued = apply_frontier_or_throw(fx.cfg, fx.parent, {pay_with_data(1).serialize()});
+  ASSERT_TRUE(has_utxo(valued, fx.body_op));  // rejected
+
+  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{tx});
+  ASSERT_TRUE(timed.has_value());
+  const auto s2 = apply_frontier_or_throw(fx.cfg, apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()}), {});
+  ASSERT_EQ(s2.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(s2.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(has_utxo(s2, OutPoint{tx.txid(), 0}) && !has_utxo(s2, OutPoint{tx.txid(), 1}));
 }
 
 // A body that opens but cannot apply forfeits the bond as a fee of the settling block; nothing else moves.
@@ -3625,6 +3676,47 @@ TEST(test_long_timed_lock_inclusion_rules) {
   ASSERT_TRUE(large.has_value() && large->serialize().size() > 1024);
   ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{*large}, 2'000'000, 1, fee)));
   ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, epoch_blocks, AnyTx{*large})));
+}
+
+// Long-term archiving: a reveal at the full long-lock body size is admitted, and its named committee's
+// opening publishes the data.
+TEST(test_long_timed_lock_reveals_data) {
+  auto fx = make_timed_fixture();
+  const auto epoch_blocks = fx.cfg.network.committee_epoch_blocks;
+  const auto unlock = epoch_blocks + kLongUnlockPastEpoch;
+  const Bytes data(kTimedRevealMaxDataBytes, 0x6b);
+  const auto fee = *consensus::timed_long_lock_min_fee(1, unlock, epoch_blocks);
+  const auto timed = build_timed(fx, fx.parent, unlock, TimedReveal{data}, 2'000'000, 1, fee);
+  ASSERT_TRUE(timed.has_value() && timed->body_ciphertext.size() == consensus::kTxTimedMaxLongBodyCiphertextBytes);
+  auto state = advance_to(fx.cfg, apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()}), unlock + 1);
+  ASSERT_EQ(state.timed_escrows.size(), 1u);
+  const auto sig = test::test_time_signature_by(fx.cfg, state.timed_key_sets.at(timed->committee_root), unlock,
+                                                {key_from_byte(90)});
+  ASSERT_TRUE(sig.has_value());
+  const std::vector<LongTimeSignature> entries{LongTimeSignature{unlock, timed->committee_root, *sig}};
+  const auto record = make_frontier_record(state, {}, fx.cfg, 0, {}, nullptr, &entries);
+  consensus::CanonicalDerivedState settled;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, state, record, &settled, &err));
+  ASSERT_EQ(settled.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(settled.last_timed_settlements[0].revealed_data == data);
+  ASSERT_TRUE(has_utxo(settled, consensus::timed_refund_outpoint(timed->txid())));
+}
+
+// A reveal is stored as one "TR:" row: settling height and data.
+TEST(test_timed_reveal_rows_round_trip) {
+  const std::string path = unique_test_base("/tmp/finalis_test_timed_reveal_rows");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+  Hash32 txid{};
+  txid.fill(0x3e);
+  ASSERT_TRUE(!db.get_timed_reveal(txid).has_value());
+  storage::DB::Batch batch(db);
+  batch.put_timed_reveal(txid, 42, Bytes{1, 2, 3});
+  ASSERT_TRUE(db.write_batch(batch));
+  const auto got = db.get_timed_reveal(txid);
+  ASSERT_TRUE(got.has_value() && got->height == 42 && got->data == (Bytes{1, 2, 3}));
 }
 
 // Key sets persist as one "TK:" row each and load back only if the keys hash to the row's root.

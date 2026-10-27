@@ -254,7 +254,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     if (!tx.has_value()) continue;
     for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
       const auto& out = tx->outputs[i];
-      if (!script_indexed_under(out.script_pubkey, scripthash)) continue;
+      if (!script_indexed_under(out.script_pubkey, scripthash) || is_data_output_script(out.script_pubkey)) continue;
       const OutPoint op{item.txid, static_cast<std::uint32_t>(i)};
       canonical_matches[op] = storage::DB::ScriptUtxoEntry{op, out.value, out.script_pubkey, item.height};
     }

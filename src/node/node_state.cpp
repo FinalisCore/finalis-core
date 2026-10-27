@@ -606,6 +606,9 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       batch.put_tx_index(body_txid, height, tx_index++, serialize_any_tx(*settlement.applied_body));
       add_history(body_txid, *settlement.applied_body);
     }
+    if (settlement.revealed_data.has_value()) {
+      batch.put_timed_reveal(settlement.timed_txid, height, *settlement.revealed_data);
+    }
     batch.add_script_history(crypto::sha256(settlement.bond_refund_script), height, settlement.timed_txid);
   }
 

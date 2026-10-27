@@ -84,7 +84,7 @@ std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<O
                                                    std::uint64_t amount_units, std::uint64_t body_fee_units,
                                                    std::uint64_t prepaid_fee_units, std::uint64_t forfeit_bond_units,
                                                    std::string* err = nullptr);
-std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const AnyTx& body,
+std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const TimedBody& body,
                                              const Bytes& fee_private_key_32, const Hash32& seed_32,
                                              std::string* err = nullptr);
 // A validator's BLS key (derived from its Ed25519 seed, crypto::bls_key_from_validator_seed) and its

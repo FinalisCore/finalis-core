@@ -266,6 +266,14 @@ spend them (`script_index_hashes`), so the beneficiary's wallet finds them by it
 `finalis-cli lock_send` and the wallet's height-locked send mode create them; ordinary sends spend
 them once spendable. Hidden transfers and secrets use `TxTimed` below (long locks for far heights).
 
+## Data Outputs
+
+`SCDATA01`: `"SCDATA01" | data` with 1..80 bytes of data, in a Tx v1 output or a TxV2 transparent
+output. Its value must be 0 and it is never spendable: it is not added to the UTXO set, only to
+address history, under its script and, when the data is longer than 32 bytes, under the data script
+of its first 32 bytes (a topic, such as an auction id, that lists every output starting with it).
+A sealed transfer body may carry one (a bid paid with the money itself, tagged with its auction).
+
 ## Timed Transactions
 
 A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (version 3; never an
@@ -274,9 +282,11 @@ A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (ve
 
 1. **Settlement first.** Every escrow locked to `h - 1`, in inclusion order: SWE-decrypt the body key
    with the block's `prev_time_signature` (the aggregate for `h - 1`), open the body, and apply it
-   like a record if it is a plain transfer (P2PKH / confidential inputs and outputs only). Applied:
-   the bond is refunded at `(timed txid, 1)`. Otherwise the bond is a fee of block `h`. No record of
-   `h` runs before, so none can front-run a revealed body.
+   like a record if it is a plain transfer (P2PKH / confidential inputs and outputs, and data
+   outputs). A reveal body (`"SCREVEAL" | data`, 1..1016 bytes, `TimedReveal`) moves nothing: its
+   data is published in the settlement record (`revealed_data`, node rows `TR:` by timed txid with
+   the settling height). Applied or revealed: the bond is refunded at `(timed txid, 1)`. Otherwise
+   the bond is a fee of block `h`. No record of `h` runs before, so none can front-run a revealed body.
 2. **Records.** A `TxTimed` is accepted (escrowed) when `h <= unlock_height`,
    `committee_epoch` and `committee_root` name `h`'s epoch checkpoint keys, the ciphertext has
    threshold `quorum(n)` and its well-formedness proof verifies, the fee input is an unspent P2PKH
@@ -289,7 +299,8 @@ committee named at inclusion signs `time_signature_message(D, unlock_height)` on
 final, wherever its members are then (their BLS keys are seed-derived and permanent). Rules:
 
 - inclusion: a prepaid fee of at least `kTxTimedLongFeePerEpoch` (0.001 FLS) per epoch, started or
-  whole, past the inclusion epoch, and a body ciphertext of at most 1 KiB + tag
+  whole, past the inclusion epoch, and a body ciphertext of at most 1 KiB + tag (a reveal of up to
+  1016 bytes fits exactly: archiving a key or a sealed bid that needs no input held for years)
 - the named key set is kept in `CanonicalDerivedState::timed_key_sets` (rows `TK:`, by
   `committee_root`, dropped once no escrow names it), since checkpoints are pruned
 - a block may carry `long_time_signatures`: `(unlock_height, committee_root, signer indices,

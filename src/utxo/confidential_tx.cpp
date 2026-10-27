@@ -303,9 +303,36 @@ Hash32 TxTimed::body_aad() const {
   return crypto::sha256d(w.data());
 }
 
-bool seal_timed_body(TxTimed& tx, const Hash32& key, const AnyTx& body) {
+namespace {
+constexpr std::array<std::uint8_t, kTimedRevealTagBytes> kTimedRevealTag = {'S', 'C', 'R', 'E', 'V', 'E', 'A', 'L'};
+}  // namespace
+
+Bytes serialize_timed_body(const TimedBody& body) {
+  if (const auto* tx = std::get_if<AnyTx>(&body)) return serialize_any_tx(*tx);
+  const auto& data = std::get<TimedReveal>(body).data;
+  Bytes out(kTimedRevealTag.begin(), kTimedRevealTag.end());
+  out.insert(out.end(), data.begin(), data.end());
+  return out;
+}
+
+std::optional<TimedBody> parse_timed_body(const Bytes& plain) {
+  if (plain.size() >= kTimedRevealTagBytes && std::equal(kTimedRevealTag.begin(), kTimedRevealTag.end(), plain.begin())) {
+    const std::size_t len = plain.size() - kTimedRevealTagBytes;
+    if (len == 0 || len > kTimedRevealMaxDataBytes) return std::nullopt;
+    return TimedBody{TimedReveal{Bytes(plain.begin() + kTimedRevealTagBytes, plain.end())}};
+  }
+  auto tx = parse_any_tx(plain);  // exact Tx / TxV2 encoding only (parse_exact)
+  if (!tx.has_value()) return std::nullopt;
+  return TimedBody{std::move(*tx)};
+}
+
+bool seal_timed_body(TxTimed& tx, const Hash32& key, const TimedBody& body) {
   if (sodium_init() < 0) return false;
-  const Bytes plain = serialize_any_tx(body);
+  if (const auto* reveal = std::get_if<TimedReveal>(&body);
+      reveal != nullptr && (reveal->data.empty() || reveal->data.size() > kTimedRevealMaxDataBytes)) {
+    return false;
+  }
+  const Bytes plain = serialize_timed_body(body);
   if (plain.size() + kTxTimedBodyTagBytes > kTxTimedMaxBodyCiphertextBytes) return false;
   const Hash32 aad = tx.body_aad();
   Bytes out(plain.size() + crypto_aead_chacha20poly1305_ietf_ABYTES);
@@ -319,7 +346,7 @@ bool seal_timed_body(TxTimed& tx, const Hash32& key, const AnyTx& body) {
   return true;
 }
 
-std::optional<AnyTx> open_timed_body(const TxTimed& tx, const Hash32& key) {
+std::optional<TimedBody> open_timed_body(const TxTimed& tx, const Hash32& key) {
   if (sodium_init() < 0) return std::nullopt;
   if (tx.body_ciphertext.size() < crypto_aead_chacha20poly1305_ietf_ABYTES) return std::nullopt;
   const Hash32 aad = tx.body_aad();
@@ -331,7 +358,7 @@ std::optional<AnyTx> open_timed_body(const TxTimed& tx, const Hash32& key) {
     return std::nullopt;
   }
   plain.resize(static_cast<std::size_t>(plain_len));
-  return parse_any_tx(plain);  // exact Tx / TxV2 encoding only (parse_exact)
+  return parse_timed_body(plain);
 }
 
 Hash32 confidential_history_key(const PubKey33& one_time_pubkey) {

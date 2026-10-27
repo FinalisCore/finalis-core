@@ -116,11 +116,13 @@ struct TimedSettlementRecord {
   TimedEscrowKey key;
   Hash32 timed_txid{};
   bool body_applied{false};
-  std::optional<Hash32> body_txid;  // set when the body opened and parsed
+  std::optional<Hash32> body_txid;  // set when a transfer body opened and parsed
   std::optional<AnyTx> applied_body;
   Bytes bond_refund_script;
   // A long lock nobody opened within the grace period: the bond was refunded, the body never ran.
   bool expired{false};
+  // A reveal body's data (body_applied is then true and the bond refunded).
+  std::optional<Bytes> revealed_data;
 };
 
 
@@ -250,6 +252,7 @@ struct TimedSettlement {
 // body_applied: the body decrypted, opened (open_timed_body), parsed and applied as a whole in the
 // settling block, before any non-settlement transaction of it. Anything else (no key, a wrong tag,
 // garbage, an invalid or double-spending body) forfeits the bond; the body itself changes nothing.
+// A reveal body (TimedReveal) settles as body_applied: its data is published, nothing else changes.
 // An expired long lock settles as body_applied (refund) with no body.
 TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied);
 

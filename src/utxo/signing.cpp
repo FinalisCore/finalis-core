@@ -142,7 +142,7 @@ std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<O
   return out;
 }
 
-std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const AnyTx& body,
+std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const TimedBody& body,
                                              const Bytes& fee_private_key_32, const Hash32& seed_32, std::string* err) {
   auto kp = keypair_from_private_key(fee_private_key_32, err);
   if (!kp.has_value()) return std::nullopt;

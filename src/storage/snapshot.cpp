@@ -200,6 +200,7 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   add_prefix(db, &kvs, key_utxo_prefix());
   add_prefix(db, &kvs, key_validator_prefix());
   add_prefix(db, &kvs, key_txidx_prefix());
+  add_prefix(db, &kvs, key_timed_reveal_prefix());
   add_prefix(db, &kvs, key_script_utxo_prefix(Hash32{}).substr(0, 3));
   add_prefix(db, &kvs, key_script_history_prefix(Hash32{}).substr(0, 3));
   add_prefix(db, &kvs, key_root_index_prefix());

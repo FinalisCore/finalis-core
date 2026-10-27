@@ -185,12 +185,28 @@ std::optional<AnyTx> parse_any_tx(const Bytes& b);
 Bytes serialize_any_tx(const AnyTx& tx);
 Hash32 txid_any(const AnyTx& tx);
 
-// Encrypts serialize_any_tx(body) into tx.body_ciphertext under `key`, with tx.body_nonce and
+// A reveal body: data only, no inputs or outputs. Settling it publishes the data (stored with the
+// settlement) and refunds the bond. Plaintext "SCREVEAL" | data, 1..kTimedRevealMaxDataBytes bytes, so
+// it fits a long lock's body; no Tx / TxV2 encoding starts with the tag (their u32 version is 1 or 2).
+inline constexpr std::size_t kTimedRevealTagBytes = 8;
+inline constexpr std::size_t kTimedRevealMaxDataBytes = 1024 - kTimedRevealTagBytes;
+struct TimedReveal {
+  Bytes data;
+
+  bool operator==(const TimedReveal&) const = default;
+};
+// A sealed body: a transfer (Tx / TxV2) or a reveal.
+using TimedBody = std::variant<AnyTx, TimedReveal>;
+Bytes serialize_timed_body(const TimedBody& body);
+// Exact encodings only; nullopt for an empty or oversized reveal.
+std::optional<TimedBody> parse_timed_body(const Bytes& plain);
+
+// Encrypts serialize_timed_body(body) into tx.body_ciphertext under `key`, with tx.body_nonce and
 // tx.body_aad(); every other field must already be final. False if the body is too large.
-bool seal_timed_body(TxTimed& tx, const Hash32& key, const AnyTx& body);
+bool seal_timed_body(TxTimed& tx, const Hash32& key, const TimedBody& body);
 // The body, or nullopt if the tag does not verify under `key` and tx.body_aad() or the plaintext is
-// not exactly one Tx / TxV2 encoding. Either way the chain treats nullopt as an invalid body.
-std::optional<AnyTx> open_timed_body(const TxTimed& tx, const Hash32& key);
+// not exactly one body encoding. Either way the chain treats nullopt as an invalid body.
+std::optional<TimedBody> open_timed_body(const TxTimed& tx, const Hash32& key);
 
 // Address-history key of a confidential one-time key: SHA256("FINALIS/conf-history/v1" || one_time_pubkey).
 // Finalized outputs paying the key and confidential inputs spending it are indexed under it, so a

@@ -98,7 +98,7 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
     if (!tx.has_value()) continue;
     for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
       const auto& txout = tx->outputs[i];
-      if (!script_indexed_under(txout.script_pubkey, scripthash)) continue;
+      if (!script_indexed_under(txout.script_pubkey, scripthash) || is_data_output_script(txout.script_pubkey)) continue;
       canonical_matches.emplace(OutPoint{item.txid, static_cast<std::uint32_t>(i)}, txout);
     }
     for (const auto& input : tx->inputs) {

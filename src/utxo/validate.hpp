@@ -139,11 +139,23 @@ std::optional<HeightLockScript> parse_height_lock_script(const Bytes& script_pub
 Bytes height_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& pkh);
 Bytes inheritance_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& owner_pkh,
                                      const std::array<std::uint8_t, 20>& heir_pkh);
+// --- Data outputs ---
+//
+// SCDATA01: "SCDATA01" | data (1..kDataOutputMaxBytes bytes). Value 0, never spendable: it is not
+// added to the UTXO set, only to address history. Indexed under sha256(script_pubkey) and, when the
+// data is longer than kDataOutputTopicBytes, under the data output script of its first
+// kDataOutputTopicBytes bytes (a topic, such as an auction id, shared by all outputs that start with it).
+inline constexpr std::size_t kDataOutputMaxBytes = 80;
+inline constexpr std::size_t kDataOutputTopicBytes = 32;
+bool is_data_output_script(const Bytes& script_pubkey, Bytes* out_data = nullptr);
+std::optional<Bytes> data_output_script_pubkey(const Bytes& data);
+
 // Whether the key with hash `pkh` may spend an output with `script_pubkey` in a block at `height`:
 // P2PKH to pkh, or a height lock's permitted branch. Wallets use it to pick spendable coins.
 bool script_spendable_by(const Bytes& script_pubkey, const std::array<std::uint8_t, 20>& pkh, std::uint64_t height);
 // Address-index keys of a transparent output: sha256(script_pubkey), plus for a height lock the P2PKH
-// scripthash of each key that may spend it, so the beneficiary's (and owner's) wallet finds it.
+// scripthash of each key that may spend it, so the beneficiary's (and owner's) wallet finds it, and
+// for a data output its topic's scripthash.
 std::vector<Hash32> script_index_hashes(const Bytes& script_pubkey);
 bool script_indexed_under(const Bytes& script_pubkey, const Hash32& scripthash);
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out);

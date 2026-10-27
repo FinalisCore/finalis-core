@@ -99,6 +99,11 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
       return false;
     }
 
+    if (is_data_output_script(out.script_pubkey) && out.value != 0) {
+      if (error) *error = "SCDATA01 output must have zero value";
+      return false;
+    }
+
     OnboardingRegistrationScriptData onboarding_req{};
     if (parse_onboarding_registration_script(out.script_pubkey, &onboarding_req)) {
       if (out.value != 0) {
@@ -301,6 +306,7 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_
 namespace {
 constexpr char kHeightLockPrefix[] = "SCHLOCK1";
 constexpr char kInheritanceLockPrefix[] = "SCHLOCK2";
+constexpr char kDataOutputPrefix[] = "SCDATA01";
 
 bool has_prefix(const Bytes& script, const char* prefix) {
   return script.size() >= 8 && std::equal(prefix, prefix + 8, script.begin());
@@ -351,6 +357,20 @@ Bytes inheritance_lock_script_pubkey(std::uint64_t unlock_height, const std::arr
   return out;
 }
 
+bool is_data_output_script(const Bytes& script_pubkey, Bytes* out_data) {
+  if (script_pubkey.size() <= 8 || script_pubkey.size() > 8 + kDataOutputMaxBytes) return false;
+  if (!has_prefix(script_pubkey, kDataOutputPrefix)) return false;
+  if (out_data) out_data->assign(script_pubkey.begin() + 8, script_pubkey.end());
+  return true;
+}
+
+std::optional<Bytes> data_output_script_pubkey(const Bytes& data) {
+  if (data.empty() || data.size() > kDataOutputMaxBytes) return std::nullopt;
+  Bytes out(kDataOutputPrefix, kDataOutputPrefix + 8);
+  out.insert(out.end(), data.begin(), data.end());
+  return out;
+}
+
 bool script_spendable_by(const Bytes& script_pubkey, const std::array<std::uint8_t, 20>& pkh, std::uint64_t height) {
   std::array<std::uint8_t, 20> p2pkh{};
   if (is_p2pkh_script_pubkey(script_pubkey, &p2pkh)) return p2pkh == pkh;
@@ -365,6 +385,10 @@ std::vector<Hash32> script_index_hashes(const Bytes& script_pubkey) {
   if (const auto lock = parse_height_lock_script(script_pubkey); lock.has_value()) {
     out.push_back(crypto::sha256(address::p2pkh_script_pubkey(lock->beneficiary_pkh)));
     if (lock->owner_pkh.has_value()) out.push_back(crypto::sha256(address::p2pkh_script_pubkey(*lock->owner_pkh)));
+  }
+  if (Bytes data; is_data_output_script(script_pubkey, &data) && data.size() > kDataOutputTopicBytes) {
+    data.resize(kDataOutputTopicBytes);
+    out.push_back(crypto::sha256(*data_output_script_pubkey(data)));
   }
   return out;
 }
@@ -381,7 +405,7 @@ bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
          is_validator_unbond_script(script_pubkey, nullptr) ||
          is_onboarding_registration_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
-         is_burn_script(script_pubkey, nullptr);
+         is_burn_script(script_pubkey, nullptr) || is_data_output_script(script_pubkey);
 }
 
 std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index) {
@@ -1423,6 +1447,7 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
           }
           const Hash32 txid = value.txid();
           for (std::uint32_t out_i = 0; out_i < value.outputs.size(); ++out_i) {
+            if (is_data_output_script(value.outputs[out_i].script_pubkey)) continue;  // never spendable
             utxos[OutPoint{txid, out_i}] = UtxoEntryV2{value.outputs[out_i]};
           }
         } else {
@@ -1434,6 +1459,7 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
             const auto& out = value.outputs[out_i];
             if (out.kind == TxOutputKind::Transparent) {
               const auto& transparent = std::get<TransparentTxOutV2>(out.body);
+              if (is_data_output_script(transparent.script_pubkey)) continue;  // never spendable
               utxos[OutPoint{txid, out_i}] = UtxoEntryV2{TxOut{transparent.value, transparent.script_pubkey}};
             } else {
               const auto& confidential = std::get<ConfidentialTxOutV2>(out.body);

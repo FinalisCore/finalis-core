@@ -38,8 +38,8 @@ bool is_p2pkh_entry(const UtxoEntryV2& entry) {
   return out.has_value() && is_p2pkh_script_pubkey(out->script_pubkey, nullptr);
 }
 
-// A time-locked body moves value only: P2PKH or confidential inputs and outputs, no validator or
-// burn scripts (validator lifecycle changes are never deferred into a sealed envelope).
+// A time-locked body moves value only: P2PKH or confidential inputs and outputs (and data outputs),
+// no validator or burn scripts (validator lifecycle changes are never deferred into a sealed envelope).
 bool timed_body_is_plain(const AnyTx& body, const UtxoSetV2& utxos) {
   return std::visit(
       [&](const auto& tx) {
@@ -50,10 +50,13 @@ bool timed_body_is_plain(const AnyTx& body, const UtxoSetV2& utxos) {
         }
         for (const auto& out : tx.outputs) {
           if constexpr (std::is_same_v<std::decay_t<decltype(tx)>, Tx>) {
-            if (!is_p2pkh_script_pubkey(out.script_pubkey, nullptr)) return false;
+            if (!is_p2pkh_script_pubkey(out.script_pubkey, nullptr) && !is_data_output_script(out.script_pubkey)) {
+              return false;
+            }
           } else {
             if (out.kind != TxOutputKind::Transparent) continue;
-            if (!is_p2pkh_script_pubkey(std::get<TransparentTxOutV2>(out.body).script_pubkey, nullptr)) return false;
+            const auto& script = std::get<TransparentTxOutV2>(out.body).script_pubkey;
+            if (!is_p2pkh_script_pubkey(script, nullptr) && !is_data_output_script(script)) return false;
           }
         }
         return true;
@@ -64,7 +67,7 @@ bool timed_body_is_plain(const AnyTx& body, const UtxoSetV2& utxos) {
 // The body of a due escrow, opened with an aggregate on its unlock height by `keys` (the key set it
 // was encrypted to): SWE-decrypt the body key with the signers the aggregate names, then open the
 // AEAD. Nullopt on any failure (the bond is forfeited).
-std::optional<AnyTx> open_due_timed_body(const TxTimed& tx, const TimedExecutionContext& timed,
+std::optional<TimedBody> open_due_timed_body(const TxTimed& tx, const TimedExecutionContext& timed,
                                          const std::vector<crypto::BlsPublicKey>& keys,
                                          const TimeSignatureAggregate& time_signature) {
   if (keys.empty()) return std::nullopt;
@@ -519,6 +522,22 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     return true;
   };
 
+  // An opened body: a transfer applies as a whole if it is plain, a reveal publishes its data; either
+  // way the bond is refunded. Nothing opened (nullopt) leaves the record unapplied.
+  const auto run_body = [&](TimedSettlementRecord* record, const std::optional<TimedBody>& body) {
+    if (!body.has_value()) return;
+    if (const auto* reveal = std::get_if<TimedReveal>(&*body)) {
+      record->body_applied = true;
+      record->revealed_data = reveal->data;
+      return;
+    }
+    const auto& tx = std::get<AnyTx>(*body);
+    record->body_txid = txid_any(tx);
+    FrontierRejectReason reason = FrontierRejectReason::NONE;
+    record->body_applied = timed_body_is_plain(tx, work) && try_apply(tx, &reason);
+    if (record->body_applied) record->applied_body = tx;
+  };
+
   // Settlement first: every short-lock escrow locked to the parent height, in inclusion order, then
   // the long locks this block opens or expires, before any record of this block (so no record can
   // front-run a revealed body to make it a double spend).
@@ -530,15 +549,9 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
       if (timed_is_long_lock(envelope, timed->committee_epoch_blocks)) continue;  // settled below
       TimedSettlementRecord record{it->first, envelope.txid(), false, std::nullopt, std::nullopt,
                                    envelope.bond_refund_script};
-      if (const auto body = timed->parent_time_signature == nullptr
-                                ? std::nullopt
-                                : open_due_timed_body(envelope, *timed, timed->parent_committee_keys,
-                                                      *timed->parent_time_signature);
-          body.has_value()) {
-        record.body_txid = txid_any(*body);
-        FrontierRejectReason reason = FrontierRejectReason::NONE;
-        record.body_applied = timed_body_is_plain(*body, work) && try_apply(*body, &reason);
-        if (record.body_applied) record.applied_body = *body;
+      if (timed->parent_time_signature != nullptr) {
+        run_body(&record, open_due_timed_body(envelope, *timed, timed->parent_committee_keys,
+                                              *timed->parent_time_signature));
       }
       const auto settled = settle_timed_escrow(
           TimedEscrow{OutPoint{envelope.fee_input.prev_txid, envelope.fee_input.prev_index}, envelope.forfeit_bond,
@@ -559,11 +572,8 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
       TimedSettlementRecord record{key, envelope.txid(), false, std::nullopt, std::nullopt, envelope.bond_refund_script};
       if (keys == nullptr) {
         record.expired = true;
-      } else if (const auto body = open_due_timed_body(envelope, *timed, *keys, *time_signature); body.has_value()) {
-        record.body_txid = txid_any(*body);
-        FrontierRejectReason reason = FrontierRejectReason::NONE;
-        record.body_applied = timed_body_is_plain(*body, work) && try_apply(*body, &reason);
-        if (record.body_applied) record.applied_body = *body;
+      } else {
+        run_body(&record, open_due_timed_body(envelope, *timed, *keys, *time_signature));
       }
       const auto settled = settle_timed_escrow(
           TimedEscrow{OutPoint{envelope.fee_input.prev_txid, envelope.fee_input.prev_index}, envelope.forfeit_bond,

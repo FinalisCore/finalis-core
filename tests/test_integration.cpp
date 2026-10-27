@@ -3804,8 +3804,9 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
 
 // A time-locked transfer end to end on a live node: the envelope enters through the node's intake,
 // a block escrows it, the committee time-signs the unlock height, and block unlock + 1 opens and
-// applies the transfer first and refunds the bond.
-void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base) {
+// applies the transfer first and refunds the bond. With `reveal`, the body is data only: block
+// unlock + 1 publishes it ("TR:" row) and refunds the bond.
+void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base, bool reveal = false) {
   const auto keys = node::Node::deterministic_test_keypairs();
   auto cluster = make_cluster(base, static_cast<int>(n_nodes), static_cast<int>(n_nodes), MAX_COMMITTEE);
   auto& n0 = *cluster.nodes[0];
@@ -3860,10 +3861,33 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base)
   params.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(checkpoint->ordered_bls_keys.size()));
   Hash32 seed{};
   seed.fill(0x3c);
-  const auto timed = build_signed_timed_tx(domain, params, AnyTx{*body}, sender_priv, seed);
+  const Bytes revealed{'s', 'e', 'a', 'l', 'e', 'd', ' ', 'b', 'i', 'd'};
+  const auto timed = reveal ? build_signed_timed_tx(domain, params, TimedReveal{revealed}, sender_priv, seed)
+                            : build_signed_timed_tx(domain, params, AnyTx{*body}, sender_priv, seed);
   ASSERT_TRUE(timed.has_value());
   std::string reason;
   ASSERT_TRUE(n0.inject_record_for_test(timed->serialize(), &reason));
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  const auto refunded = [&]() {
+    for (const auto& [op, out] : n0.find_utxos_by_pubkey_hash_for_test(sender_pkh)) {
+      const auto refund_op = consensus::timed_refund_outpoint(timed->txid());
+      if (op.txid == refund_op.txid && op.index == refund_op.index && out.value == bond) return true;
+    }
+    return false;
+  };
+  if (reveal) {
+    std::optional<storage::DB::TimedRevealLocation> published;
+    ASSERT_TRUE(wait_for([&]() {
+      storage::DB db;
+      if (!db.open_readonly(base + "/node0")) return false;
+      published = db.get_timed_reveal(timed->txid());
+      return published.has_value();
+    }, ci_timeout_seconds(120)));
+    ASSERT_EQ(published->height, unlock + 1);
+    ASSERT_TRUE(published->data == revealed);
+    ASSERT_TRUE(refunded());
+    return;
+  }
 
   std::optional<storage::DB::TxLocation> included;
   std::optional<storage::DB::TxLocation> opened;
@@ -3879,13 +3903,7 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base)
   const auto recipient_utxos = n0.find_utxos_by_pubkey_hash_for_test(recipient_pkh);
   ASSERT_EQ(recipient_utxos.size(), 1u);
   ASSERT_EQ(recipient_utxos[0].second.value, coins[1].second.value - 500);
-  bool refunded = false;
-  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
-  for (const auto& [op, out] : n0.find_utxos_by_pubkey_hash_for_test(sender_pkh)) {
-    const auto refund_op = consensus::timed_refund_outpoint(timed->txid());
-    if (op.txid == refund_op.txid && op.index == refund_op.index && out.value == bond) refunded = true;
-  }
-  ASSERT_TRUE(refunded);
+  ASSERT_TRUE(refunded());
   // Every node settled it the same way.
   for (std::size_t i = 1; i < n_nodes; ++i) {
     ASSERT_TRUE(wait_for([&]() { return cluster.nodes[i]->find_utxos_by_pubkey_hash_for_test(recipient_pkh).size() == 1; },
@@ -3895,6 +3913,10 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base)
 
 TEST(test_timed_transfer_opens_after_its_unlock_height_on_a_live_node) {
   run_timed_transfer_on_cluster(1, unique_test_base("/tmp/finalis_it_timed_transfer"));
+}
+
+TEST(test_timed_reveal_is_published_after_its_unlock_height_on_a_live_node) {
+  run_timed_transfer_on_cluster(1, unique_test_base("/tmp/finalis_it_timed_reveal"), true);
 }
 
 // Four validators: the envelope reaches its lane's certifier from another node, and the unlock

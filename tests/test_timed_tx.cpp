@@ -190,7 +190,7 @@ TEST(test_timed_tx_end_to_end_with_committee_time_signature) {
   ASSERT_TRUE(recovered.has_value() && *recovered == key);
   const auto body = open_timed_body(*got, *recovered);
   ASSERT_TRUE(body.has_value());
-  ASSERT_TRUE(serialize_any_tx(*body) == sample_body().serialize());
+  ASSERT_TRUE(serialize_any_tx(std::get<AnyTx>(*body)) == sample_body().serialize());
 
   // The body opens only in its own envelope and under its own key.
   auto moved = *got;
@@ -234,6 +234,51 @@ TEST(test_timed_tx_garbage_body_does_not_open) {
   TxTimed ok = sample_envelope(false);
   seal_raw(ok, sample_body().serialize());
   ASSERT_TRUE(open_timed_body(ok, key).has_value());
+}
+
+// A reveal body round-trips through the envelope; it carries 1..kTimedRevealMaxDataBytes bytes and
+// its tag never parses as a transfer.
+TEST(test_timed_reveal_body_seals_and_opens) {
+  ASSERT_TRUE(sodium_init() >= 0);
+  const Hash32 key = filled(0x0c);
+  const TimedReveal reveal{Bytes{'b', 'i', 'd', ':', '5', '0', '0'}};
+  TxTimed tx = sample_envelope(false);
+  ASSERT_TRUE(seal_timed_body(tx, key, reveal));
+  const auto opened = open_timed_body(tx, key);
+  ASSERT_TRUE(opened.has_value() && std::get<TimedReveal>(*opened) == reveal);
+  ASSERT_TRUE(!parse_any_tx(serialize_timed_body(reveal)).has_value());
+
+  TxTimed full = sample_envelope(false);
+  ASSERT_TRUE(seal_timed_body(full, key, TimedReveal{Bytes(kTimedRevealMaxDataBytes, 0x41)}));
+  ASSERT_EQ(full.body_ciphertext.size(), 1024u + kTxTimedBodyTagBytes);
+  TxTimed rejected = sample_envelope(false);
+  ASSERT_TRUE(!seal_timed_body(rejected, key, TimedReveal{Bytes{}}));
+  ASSERT_TRUE(!seal_timed_body(rejected, key, TimedReveal{Bytes(kTimedRevealMaxDataBytes + 1, 0x41)}));
+  ASSERT_TRUE(parse_timed_body(serialize_timed_body(TimedReveal{Bytes(kTimedRevealMaxDataBytes, 1)})).has_value());
+  ASSERT_TRUE(!parse_timed_body(serialize_timed_body(TimedReveal{Bytes(kTimedRevealMaxDataBytes + 1, 1)})).has_value());
+  ASSERT_TRUE(!parse_timed_body(serialize_timed_body(TimedReveal{Bytes{}})).has_value());
+  const auto transfer = parse_timed_body(sample_body().serialize());
+  ASSERT_TRUE(transfer.has_value() && std::holds_alternative<AnyTx>(*transfer));
+}
+
+// SCDATA01: 1..80 bytes of data, indexed under its script and, past 32 bytes, its topic.
+TEST(test_data_output_script) {
+  const Bytes data(40, 0x77);
+  const auto script = data_output_script_pubkey(data);
+  ASSERT_TRUE(script.has_value() && script->size() == 8 + data.size());
+  Bytes got;
+  ASSERT_TRUE(is_data_output_script(*script, &got) && got == data);
+  ASSERT_TRUE(is_supported_base_layer_output_script(*script));
+  ASSERT_TRUE(!data_output_script_pubkey(Bytes{}).has_value());
+  ASSERT_TRUE(!data_output_script_pubkey(Bytes(kDataOutputMaxBytes + 1, 1)).has_value());
+  auto too_long = *data_output_script_pubkey(Bytes(kDataOutputMaxBytes, 1));
+  too_long.push_back(1);
+  ASSERT_TRUE(!is_data_output_script(too_long) && !is_supported_base_layer_output_script(too_long));
+  ASSERT_TRUE(!is_data_output_script(Bytes{'S', 'C', 'D', 'A', 'T', 'A', '0', '1'}));
+  const auto topic = *data_output_script_pubkey(Bytes(kDataOutputTopicBytes, 0x77));
+  ASSERT_TRUE(script_indexed_under(*script, crypto::sha256(*script)));
+  ASSERT_TRUE(script_indexed_under(*script, crypto::sha256(topic)));
+  ASSERT_EQ(script_index_hashes(topic).size(), 1u);  // a topic-length datum is its own topic
 }
 
 // Value conservation of the bond rule: the penalty is the declared bond, never more.

@@ -1368,6 +1368,8 @@ std::string key_validator_onboarding(const PubKey32& pub) { return "VO:" + hex_e
 std::string key_txidx_prefix() { return "X:"; }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_rejected_tx(const Hash32& txid) { return "XR:" + hex_encode(Bytes(txid.begin(), txid.end())); }
+std::string key_timed_reveal_prefix() { return "TR:"; }
+std::string key_timed_reveal(const Hash32& txid) { return "TR:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_settlement_txid(const Hash32& txid) { return "XS:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_ingress_record_prefix() { return "IR:"; }
 std::string key_ingress_record(std::uint64_t seq) { return "IR:" + hex_encode(u64be_bytes(seq)); }
@@ -1589,6 +1591,13 @@ void DB::Batch::put_rejected_tx(const Hash32& txid, std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
   put(key_rejected_tx(txid), w.take());
+}
+
+void DB::Batch::put_timed_reveal(const Hash32& timed_txid, std::uint64_t height, const Bytes& data) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  w.varbytes(data);
+  put(key_timed_reveal(timed_txid), w.take());
 }
 
 void DB::Batch::put_settlement_txid(const Hash32& txid, std::uint64_t height) {
@@ -2445,6 +2454,23 @@ std::optional<std::uint64_t> DB::get_rejected_tx_height(const Hash32& txid) cons
     return std::nullopt;
   }
   return height;
+}
+
+std::optional<DB::TimedRevealLocation> DB::get_timed_reveal(const Hash32& timed_txid) const {
+  auto b = get(key_timed_reveal(timed_txid));
+  if (!b.has_value()) return std::nullopt;
+  TimedRevealLocation out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto data = r.varbytes();
+        if (!h || !data) return false;
+        out.height = *h;
+        out.data = std::move(*data);
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
 }
 
 std::optional<std::uint64_t> DB::get_settlement_height(const Hash32& txid) const {
