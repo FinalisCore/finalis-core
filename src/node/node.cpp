@@ -1874,7 +1874,11 @@ SpecialValidationContext Node::special_validation_context_locked(std::uint64_t h
         if (anchor_height == 0) return zero_hash();
         return db_.get_height_hash(anchor_height);
       },
-      .confidential_policy = &confidential_policy_};
+      .confidential_policy = &confidential_policy_,
+      .timed_bond_lien = [this](const PubKey32& pub, std::uint64_t h) {
+        return canonical_state_.has_value() &&
+               consensus::timed_bond_lien(*canonical_state_, pub, h, cfg_.network.committee_epoch_blocks);
+      }};
 }
 
 std::uint64_t Node::now_unix() const {

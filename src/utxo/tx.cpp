@@ -542,6 +542,14 @@ Bytes FrontierTransition::serialize() const {
   w.varint(prev_time_signature.signer_indices.size());
   for (const auto index : prev_time_signature.signer_indices) w.varint(index);
   w.bytes_fixed(prev_time_signature.aggregate);
+  w.varint(long_time_signatures.size());
+  for (const auto& entry : long_time_signatures) {
+    w.u64le(entry.unlock_height);
+    w.bytes_fixed(entry.committee_root);
+    w.varint(entry.signature.signer_indices.size());
+    for (const auto index : entry.signature.signer_indices) w.varint(index);
+    w.bytes_fixed(entry.signature.aggregate);
+  }
   w.varbytes(settlement.serialize());
   w.bytes_fixed(settlement_commitment);
   return w.take();
@@ -618,6 +626,27 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
         auto time_aggregate = r.bytes_fixed<crypto::kBlsSignatureBytes>();
         if (!time_aggregate) return false;
         out.prev_time_signature.aggregate = *time_aggregate;
+        auto long_count = r.varint();
+        if (!long_count || *long_count > kMaxLongTimeSignaturesPerBlock) return false;
+        out.long_time_signatures.clear();
+        for (std::uint64_t i = 0; i < *long_count; ++i) {
+          LongTimeSignature entry;
+          auto unlock = r.u64le();
+          auto root = r.bytes_fixed<32>();
+          auto count = r.varint();
+          if (!unlock || !root || !count || *count > MAX_COMMITTEE) return false;
+          entry.unlock_height = *unlock;
+          entry.committee_root = *root;
+          for (std::uint64_t j = 0; j < *count; ++j) {
+            auto index = r.varint();
+            if (!index || *index >= MAX_COMMITTEE) return false;
+            entry.signature.signer_indices.push_back(static_cast<std::uint32_t>(*index));
+          }
+          auto aggregate = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+          if (!aggregate) return false;
+          entry.signature.aggregate = *aggregate;
+          out.long_time_signatures.push_back(std::move(entry));
+        }
         auto settlement_bytes = r.varbytes();
         auto settlement_commitment = r.bytes_fixed<32>();
         if (!settlement_bytes || !settlement_commitment) return false;

@@ -37,6 +37,9 @@ struct SpecialValidationContext {
   // anchor may come from legacy block history or frontier transition history.
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
   const struct ConfidentialPolicy* confidential_policy{nullptr};
+  // True while (validator pubkey, height) holds a bond a pending long time lock names
+  // (consensus::timed_bond_lien): the bond cannot be withdrawn yet. Unset: no lien.
+  std::function<bool(const PubKey32&, std::uint64_t)> timed_bond_lien;
 };
 
 struct SlashEvidence {

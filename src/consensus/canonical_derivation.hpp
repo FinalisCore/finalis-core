@@ -127,6 +127,9 @@ struct CanonicalDerivedState {
   std::uint64_t confidential_pool_value{0};
   // TxTimed escrows waiting for their unlock height (consensus/frontier_execution.hpp). Committed.
   TimedEscrowState timed_escrows;
+  // Key sets the waiting escrows name (long locks), by committee_root. Not committed separately: each
+  // is fixed by its root, which the committed escrows carry. Kept because checkpoints are pruned.
+  TimedKeySets timed_key_sets;
   // Settlements of the last applied transition (derived, not committed): what the node indexes.
   std::vector<TimedSettlementRecord> last_timed_settlements;
   std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
@@ -198,11 +201,18 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
 // node's frozen-epoch rebuild so the two cannot drift.
 // The timed context for executing block `height` on `prev`, settling with `parent_time_signature`
 // (the block's own prev_time_signature). Holds pointers into `prev` and `parent_time_signature`.
+// `long_time_signatures`: the block's openings of long locks (also held by pointer).
 TimedExecutionContext timed_execution_context_for(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                                   std::uint64_t height,
-                                                  const TimeSignatureAggregate& parent_time_signature);
-// Escrows after block `height`: those due at it (unlock height - 1) settled, the opened ones added.
-void apply_timed_escrows(std::uint64_t height, const FrontierExecutionResult& result, TimedEscrowState* escrows);
+                                                  const TimeSignatureAggregate& parent_time_signature,
+                                                  const std::vector<LongTimeSignature>* long_time_signatures = nullptr);
+// Escrows after a block: those it settled removed, the opened ones added; key sets added for the
+// opened long escrows and dropped once no escrow names them.
+void apply_timed_escrows(const FrontierExecutionResult& result, TimedEscrowState* escrows, TimedKeySets* key_sets);
+// True if `validator`'s BLS key is named by a long escrow of `state` included less than
+// kTimedLongLienBlocks before `height`: its bond cannot be withdrawn yet.
+bool timed_bond_lien(const CanonicalDerivedState& state, const PubKey32& validator, std::uint64_t height,
+                     std::uint64_t committee_epoch_blocks);
 // Root of the escrow set as committed in the post-state (one leaf per escrow: key -> envelope txid).
 Hash32 timed_escrow_commitment_root(const TimedEscrowState& escrows);
 // Time signatures (TimeSignatureAggregate). The key set of a height is its epoch checkpoint's

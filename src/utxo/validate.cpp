@@ -1014,6 +1014,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       if (!ctx->validators->can_withdraw_bond(unbond_pub, ctx->current_height, ctx->unbond_delay_blocks)) {
         return {false, "unbond delay not reached", 0};
       }
+      if (ctx->timed_bond_lien && ctx->timed_bond_lien(unbond_pub, ctx->current_height)) {
+        return {false, "bond held by a pending long time lock", 0};
+      }
 
       Sig64 sig{};
       PubKey32 pub{};

@@ -704,6 +704,13 @@ TEST(test_unbond_delay_enforced) {
   SpecialValidationContext late = finalis::test::with_test_chain_identity(SpecialValidationContext{.validators = &vr, .current_height = 50 + UNBOND_DELAY_BLOCKS});
   auto r2 = validate_tx(tx, 1, view, &late);
   ASSERT_TRUE(r2.ok);
+
+  // A pending long time lock that names the validator's key holds the bond past the delay.
+  SpecialValidationContext held = late;
+  held.timed_bond_lien = [&](const PubKey32& pub, std::uint64_t) { return pub == kp.public_key; };
+  auto r3 = validate_tx(tx, 1, view, &held);
+  ASSERT_TRUE(!r3.ok);
+  ASSERT_EQ(r3.error, std::string("bond held by a pending long time lock"));
 }
 
 TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {

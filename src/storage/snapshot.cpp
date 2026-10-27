@@ -187,6 +187,7 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   add_prefix(db, &kvs, "H:");
   add_prefix(db, &kvs, "ER:");
   add_prefix(db, &kvs, "TE:");
+  add_prefix(db, &kvs, "TK:");
   add_prefix(db, &kvs, key_frontier_height_prefix());
   add_prefix(db, &kvs, key_frontier_transition_prefix());
   add_prefix(db, &kvs, key_finality_certificate_height_prefix());

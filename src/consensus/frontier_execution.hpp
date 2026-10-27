@@ -35,8 +35,8 @@ using FrontierLaneRoots = std::array<Hash32, finalis::INGRESS_LANE_COUNT>;
 
 // --- TxTimed escrows (utxo/confidential_tx.hpp) ---
 //
-// An included TxTimed waits in the committed escrow state until block unlock_height + 1, which
-// settles it before any of its own records. Keyed so that map order is settlement order: unlock
+// An included TxTimed waits in the committed escrow state until the block that settles it before
+// any of its own records: unlock_height + 1 for a short lock, see "Long locks" for a long one. Keyed so that map order is settlement order: unlock
 // height, then inclusion height and position (index among the block's accepted timed records).
 struct TimedEscrowKey {
   std::uint64_t unlock_height{0};
@@ -59,6 +59,37 @@ inline constexpr std::size_t kMaxTimedEscrowsPerUnlockHeight = 16;
 // Provisional: the minimum forfeit_bond (0.01 FLS), a floor on the cost of an envelope that never opens.
 inline constexpr std::uint64_t kTxTimedMinForfeitBond = 1'000'000;
 
+// --- Long locks ---
+//
+// A TxTimed always names the committee of its inclusion epoch (committee_epoch, committee_root). If
+// its unlock height lies in that epoch it is a short lock, settled by the next block's
+// prev_time_signature. Otherwise it is a long lock: the same validators sign the unlock height once
+// it is final, wherever they are then, and a block carries their aggregate as a LongTimeSignature
+// (utxo/tx.hpp). The escrow settles in the first block from unlock + 1 to unlock + kTimedLongGraceBlocks
+// that carries it; if none does, the bond is refunded at unlock + kTimedLongGraceBlocks + 1 (not the
+// sender's failure). The named key set is kept in TimedKeySets while an escrow needs it (checkpoints
+// are pruned). A validator whose BLS key a long escrow names cannot withdraw its bond until that
+// escrow settles or kTimedLongLienBlocks after its inclusion, whichever is first.
+inline constexpr std::uint64_t kTimedLongGraceBlocks = 480;     // one day at 180 s blocks
+inline constexpr std::uint64_t kTimedLongLienBlocks = 175'200;  // one year at 180 s blocks
+// Provisional: the minimum prepaid fee per epoch a long lock reaches beyond its inclusion epoch.
+inline constexpr std::uint64_t kTxTimedLongFeePerEpoch = 100'000;  // 0.001 FLS
+// A long lock's body ciphertext (plaintext + Poly1305 tag) is at most this.
+inline constexpr std::size_t kTxTimedMaxLongBodyCiphertextBytes = 1024 + 16;
+// Escrows a block may settle through its long_time_signatures (each is one SWE decryption).
+inline constexpr std::size_t kMaxLongSettlementsPerBlock = 16;
+
+// Key sets of long escrows, by committee_bls_key_root.
+using TimedKeySets = std::map<Hash32, std::vector<crypto::BlsPublicKey>>;
+
+// True if `tx` unlocks beyond the epoch it names (a long lock).
+bool timed_is_long_lock(const TxTimed& tx, std::uint64_t committee_epoch_blocks);
+// The minimum prepaid fee of a long lock included at `height`: kTxTimedLongFeePerEpoch for every
+// epoch, started or whole, from the end of `height`'s epoch to unlock_height. 0 for a short lock;
+// nullopt on overflow.
+std::optional<std::uint64_t> timed_long_lock_min_fee(std::uint64_t height, std::uint64_t unlock_height,
+                                                     std::uint64_t committee_epoch_blocks);
+
 // What execution of block `height` needs for timed records. Consensus callers always pass it; without
 // it a TxTimed record is rejected and nothing settles.
 struct TimedExecutionContext {
@@ -75,6 +106,9 @@ struct TimedExecutionContext {
   // to any height from `height` to the end of `height`'s epoch (the horizon of known committees).
   std::function<std::optional<std::vector<crypto::BlsPublicKey>>(std::uint64_t epoch_start)> committee_keys;
   std::uint64_t min_bond{kTxTimedMinForfeitBond};
+  // Long locks: the block's long_time_signatures and the parent's key sets.
+  const std::vector<LongTimeSignature>* long_time_signatures{nullptr};
+  const TimedKeySets* key_sets{nullptr};
 };
 
 // Outcome of one settled escrow, in settlement order.
@@ -85,6 +119,8 @@ struct TimedSettlementRecord {
   std::optional<Hash32> body_txid;  // set when the body opened and parsed
   std::optional<AnyTx> applied_body;
   Bytes bond_refund_script;
+  // A long lock nobody opened within the grace period: the bond was refunded, the body never ran.
+  bool expired{false};
 };
 
 
@@ -111,6 +147,8 @@ struct FrontierExecutionResult {
   // Timed records: escrows opened by this block (keyed for settlement) and the escrows it settled.
   TimedEscrowState opened_escrows;
   std::vector<TimedSettlementRecord> settlements;
+  // Key sets the opened long escrows name.
+  TimedKeySets opened_key_sets;
 
   Hash32 result_id() const;
 };
@@ -212,12 +250,14 @@ struct TimedSettlement {
 // body_applied: the body decrypted, opened (open_timed_body), parsed and applied as a whole in the
 // settling block, before any non-settlement transaction of it. Anything else (no key, a wrong tag,
 // garbage, an invalid or double-spending body) forfeits the bond; the body itself changes nothing.
+// An expired long lock settles as body_applied (refund) with no body.
 TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied);
 
 // The per-envelope inclusion rules of a TxTimed at block timed.height against `utxos` (everything but
-// the per-block caps and conflicts with other records of the block): unlock height within the horizon,
-// the committee epoch and root, threshold, well-formedness proof, a P2PKH fee input in `utxos` signed
-// over the envelope, exact value accounting and the minimum bond. Mempool admission uses it as is.
+// the per-block caps and conflicts with other records of the block): unlock height not passed, the
+// inclusion epoch's committee and root, threshold, well-formedness proof, a long lock's fee and body
+// size, a P2PKH fee input in `utxos` signed over the envelope, exact value accounting and the
+// minimum bond. Mempool admission uses it as is.
 // On success `inclusion` (if given) holds the fee, change and escrow; `reason` says why not otherwise.
 bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed, const UtxoSetV2& utxos,
                            TimedInclusion* inclusion = nullptr, std::string* reason = nullptr);

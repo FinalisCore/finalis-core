@@ -190,6 +190,18 @@ struct TimeSignatureAggregate {
   bool operator==(const TimeSignatureAggregate&) const = default;
 };
 
+// A long time lock's opening (consensus/frontier_execution.hpp, "long locks"): the aggregate, by the
+// key set `committee_root` names (the committee of the lock's inclusion epoch), on
+// time_signature_message(chain domain, unlock_height), signer indices into that key set.
+struct LongTimeSignature {
+  std::uint64_t unlock_height{0};
+  Hash32 committee_root{};
+  TimeSignatureAggregate signature;
+
+  bool operator==(const LongTimeSignature&) const = default;
+};
+inline constexpr std::size_t kMaxLongTimeSignaturesPerBlock = 16;
+
 struct FrontierTransition {
   Hash32 prev_finalized_hash{};
   Hash32 prev_finality_link_hash{};
@@ -235,6 +247,9 @@ struct FrontierTransition {
   // Time signature of the parent height, at least the parent committee's quorum of signers. Empty
   // (no signers, zero aggregate) only when the parent is genesis.
   TimeSignatureAggregate prev_time_signature;
+  // Openings of long time locks this block settles, strictly ascending by (unlock_height,
+  // committee_root); at most kMaxLongTimeSignaturesPerBlock. Optional: a block never waits for them.
+  std::vector<LongTimeSignature> long_time_signatures;
   FrontierSettlement settlement;
   Hash32 settlement_commitment{};
 

@@ -622,6 +622,37 @@ std::string timed_escrow_db_key(const consensus::TimedEscrowKey& key) {
   return "TE:" + hex_encode(w.data());
 }
 
+std::string timed_key_set_db_key(const Hash32& root) { return "TK:" + hex_encode(Bytes(root.begin(), root.end())); }
+
+Bytes encode_timed_key_set(const std::vector<crypto::BlsPublicKey>& keys) {
+  codec::ByteWriter w;
+  w.varint(keys.size());
+  for (const auto& key : keys) w.bytes_fixed(key);
+  return w.take();
+}
+
+consensus::TimedKeySets load_timed_key_sets(const storage::DB& db) {
+  consensus::TimedKeySets out;
+  for (const auto& [key, value] : db.scan_prefix("TK:")) {
+    std::vector<crypto::BlsPublicKey> keys;
+    const bool ok = codec::parse_exact(value, [&](codec::ByteReader& r) {
+      auto n = r.varint();
+      if (!n || *n == 0 || *n > MAX_COMMITTEE) return false;
+      for (std::uint64_t i = 0; i < *n; ++i) {
+        auto k = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+        if (!k) return false;
+        keys.push_back(*k);
+      }
+      return true;
+    });
+    if (!ok) continue;
+    const auto root = consensus::committee_bls_key_root(keys);
+    if (timed_key_set_db_key(root) != key) continue;
+    out[root] = std::move(keys);
+  }
+  return out;
+}
+
 consensus::TimedEscrowState load_timed_escrows(const storage::DB& db) {
   consensus::TimedEscrowState out;
   for (const auto& [key, value] : db.scan_prefix("TE:")) {
@@ -721,6 +752,8 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   }
   for (const auto& [key, _] : db.scan_prefix("TE:")) batch.erase(key);
   for (const auto& [key, tx] : state.timed_escrows) batch.put(timed_escrow_db_key(key), tx.serialize());
+  for (const auto& [key, _] : db.scan_prefix("TK:")) batch.erase(key);
+  for (const auto& [root, keys] : state.timed_key_sets) batch.put(timed_key_set_db_key(root), encode_timed_key_set(keys));
   stage_canonical_scalars(batch, state);
   return true;
 }
@@ -792,6 +825,12 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
   }
   for (const auto& [key, tx] : next.timed_escrows) {
     if (!prev.timed_escrows.contains(key)) batch.put(timed_escrow_db_key(key), tx.serialize());
+  }
+  for (const auto& [root, _] : prev.timed_key_sets) {
+    if (!next.timed_key_sets.contains(root)) batch.erase(timed_key_set_db_key(root));
+  }
+  for (const auto& [root, keys] : next.timed_key_sets) {
+    if (!prev.timed_key_sets.contains(root)) batch.put(timed_key_set_db_key(root), encode_timed_key_set(keys));
   }
   stage_canonical_scalars(batch, next);
   batch.put(storage::key_smt_delta(kSmtTreeUtxo, next.finalized_height), crypto::encode_smt_delta(tree_changes));

@@ -337,6 +337,14 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   }
   if (auto pool = db.get_confidential_pool_value(); pool.has_value()) state.confidential_pool_value = *pool;
   state.timed_escrows = load_timed_escrows(db);
+  state.timed_key_sets = load_timed_key_sets(db);
+  for (const auto& [key, tx] : state.timed_escrows) {
+    if (consensus::timed_is_long_lock(tx, cfg.network.committee_epoch_blocks) &&
+        !state.timed_key_sets.contains(tx.committee_root)) {
+      if (error) *error = "checkpoint-timed-key-set-missing unlock=" + std::to_string(key.unlock_height);
+      return false;
+    }
+  }
   if (auto persisted_randomness = db.get(kFinalizedRandomnessKey);
       persisted_randomness.has_value() && persisted_randomness->size() == 32) {
     std::copy(persisted_randomness->begin(), persisted_randomness->end(), state.finalized_randomness.begin());

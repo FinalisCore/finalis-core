@@ -944,13 +944,16 @@ std::size_t time_signature_threshold(std::size_t committee_size) { return quorum
 
 TimedExecutionContext timed_execution_context_for(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                                                   std::uint64_t height,
-                                                  const TimeSignatureAggregate& parent_time_signature) {
+                                                  const TimeSignatureAggregate& parent_time_signature,
+                                                  const std::vector<LongTimeSignature>* long_time_signatures) {
   TimedExecutionContext timed;
   timed.height = height;
   timed.chain_domain = consensus_chain_domain(cfg.network, cfg.chain_id);
   timed.committee_epoch_blocks = cfg.network.committee_epoch_blocks;
   timed.escrows = &prev.timed_escrows;
   timed.parent_time_signature = &parent_time_signature;
+  timed.long_time_signatures = long_time_signatures;
+  timed.key_sets = &prev.timed_key_sets;
   if (height >= 2) {
     if (auto keys = time_signature_committee_keys(cfg, prev, height - 1)) timed.parent_committee_keys = std::move(*keys);
   }
@@ -970,12 +973,27 @@ TimedExecutionContext timed_execution_context_for(const CanonicalDerivationConfi
   return timed;
 }
 
-void apply_timed_escrows(std::uint64_t height, const FrontierExecutionResult& result, TimedEscrowState* escrows) {
-  if (height >= 2) {
-    escrows->erase(escrows->lower_bound(TimedEscrowKey{height - 1, 0, 0}),
-                   escrows->lower_bound(TimedEscrowKey{height, 0, 0}));
-  }
+void apply_timed_escrows(const FrontierExecutionResult& result, TimedEscrowState* escrows, TimedKeySets* key_sets) {
+  for (const auto& settlement : result.settlements) escrows->erase(settlement.key);
   for (const auto& [key, tx] : result.opened_escrows) (*escrows)[key] = tx;
+  for (const auto& [root, keys] : result.opened_key_sets) key_sets->emplace(root, keys);
+  std::set<Hash32> named;
+  for (const auto& [_, tx] : *escrows) named.insert(tx.committee_root);
+  std::erase_if(*key_sets, [&](const auto& entry) { return !named.contains(entry.first); });
+}
+
+bool timed_bond_lien(const CanonicalDerivedState& state, const PubKey32& validator, std::uint64_t height,
+                     std::uint64_t committee_epoch_blocks) {
+  const auto info = state.validators.get(validator);
+  if (!info.has_value() || info->bls_pubkey == crypto::BlsPublicKey{}) return false;
+  for (const auto& [key, tx] : state.timed_escrows) {
+    if (height - std::min(height, key.inclusion_height) >= kTimedLongLienBlocks) continue;
+    if (!timed_is_long_lock(tx, committee_epoch_blocks)) continue;
+    const auto keys = state.timed_key_sets.find(tx.committee_root);
+    if (keys == state.timed_key_sets.end()) continue;
+    if (std::find(keys->second.begin(), keys->second.end(), info->bls_pubkey) != keys->second.end()) return true;
+  }
+  return false;
 }
 
 std::optional<std::vector<crypto::BlsPublicKey>> time_signature_committee_keys(const CanonicalDerivationConfig& cfg,
@@ -1487,6 +1505,10 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
               return std::nullopt;
             },
         .confidential_policy = &cfg.confidential_policy,
+        .timed_bond_lien =
+            [&](const PubKey32& pub, std::uint64_t h) {
+              return timed_bond_lien(prev, pub, h, cfg.network.committee_epoch_blocks);
+            },
     };
   };
 
@@ -1554,7 +1576,8 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     }
     auto vctx = build_validation_context(record.transition.height);
     const auto timed = timed_execution_context_for(cfg, prev, record.transition.height,
-                                                   record.transition.prev_time_signature);
+                                                   record.transition.prev_time_signature,
+                                                   &record.transition.long_time_signatures);
     FrontierExecutionResult result;
     if (!execute_frontier_slice(prev.utxos, prev.confidential_pool_value, prev.finalized_frontier, record.ordered_records,
                                 &vctx, &result, error, true, nullptr, &timed)) {
@@ -1720,7 +1743,8 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   // prev_state_root is checked against execution's recomputation below.
   auto vctx = build_validation_context(record.transition.height);
   const auto timed = timed_execution_context_for(cfg, prev, record.transition.height,
-                                                 record.transition.prev_time_signature);
+                                                 record.transition.prev_time_signature,
+                                                 &record.transition.long_time_signatures);
   FrontierExecutionResult result;
   const auto parent_tree = utxo_tree_for(prev);
   if (!execute_frontier_lane_prefix(prev.utxos, prev.confidential_pool_value, prev.finalized_frontier_vector,
@@ -1925,7 +1949,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   next.utxos = std::move(recomputed.next_utxos);
   next.utxo_tree = recomputed.has_next_utxo_tree ? std::move(recomputed.next_utxo_tree) : crypto::PersistentSmt{};
   next.confidential_pool_value = recomputed.next_confidential_pool_value;
-  apply_timed_escrows(record.transition.height, recomputed, &next.timed_escrows);
+  apply_timed_escrows(recomputed, &next.timed_escrows, &next.timed_key_sets);
   next.last_timed_settlements = recomputed.settlements;
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
   next.finalized_timestamp = record.transition.timestamp;

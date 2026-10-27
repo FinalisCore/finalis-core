@@ -244,8 +244,9 @@ A leader proposes only once it holds the threshold for the parent (`proposal-bui
 reason=time-signatures` otherwise). Safety: the at most `f < quorum` faulty members cannot produce
 the aggregate for a height that is not final, because the honest members sign only after finality.
 Liveness: the `n - f >= quorum` honest members all sign once they learn of finality. The aggregate
-of `H` is the witness that opens a `TxTimed` locked to `H` (encrypted with the same threshold to the
-same keys, `consensus::committee_bls_key_root`).
+of `H` is the witness that opens a short `TxTimed` locked to `H` (encrypted with the same threshold to
+the same keys, `consensus::committee_bls_key_root`); long locks are opened by the committee they name
+(see Timed Transactions).
 
 ## Height-Locked Outputs
 
@@ -263,8 +264,7 @@ is not a lock (invalid script). Without a block height (no validation context) s
 invalid. The outputs are indexed under the script and under the P2PKH address of each key that may
 spend them (`script_index_hashes`), so the beneficiary's wallet finds them by its own address.
 `finalis-cli lock_send` and the wallet's height-locked send mode create them; ordinary sends spend
-them once spendable. Secrets that must stay hidden for long periods are a separate, open design
-(committee keys cannot be chosen years ahead); hidden transfers use `TxTimed` below.
+them once spendable. Hidden transfers and secrets use `TxTimed` below (long locks for far heights).
 
 ## Timed Transactions
 
@@ -277,12 +277,34 @@ A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (ve
    like a record if it is a plain transfer (P2PKH / confidential inputs and outputs only). Applied:
    the bond is refunded at `(timed txid, 1)`. Otherwise the bond is a fee of block `h`. No record of
    `h` runs before, so none can front-run a revealed body.
-2. **Records.** A `TxTimed` is accepted (escrowed) when `h <= unlock_height <= end of h's epoch`,
-   `committee_epoch` and `committee_root` name that epoch's checkpoint keys, the ciphertext has
+2. **Records.** A `TxTimed` is accepted (escrowed) when `h <= unlock_height`,
+   `committee_epoch` and `committee_root` name `h`'s epoch checkpoint keys, the ciphertext has
    threshold `quorum(n)` and its well-formedness proof verifies, the fee input is an unspent P2PKH
    output signed over the envelope, and its value is exactly `prepaid_fee + forfeit_bond + change`
    with `forfeit_bond >= kTxTimedMinForfeitBond`. The prepaid fee is a fee of `h`; change appears at
    `(timed txid, 0)`.
+
+**Long locks.** A `TxTimed` whose unlock height lies beyond its inclusion epoch is a long lock: the
+committee named at inclusion signs `time_signature_message(D, unlock_height)` once that height is
+final, wherever its members are then (their BLS keys are seed-derived and permanent). Rules:
+
+- inclusion: a prepaid fee of at least `kTxTimedLongFeePerEpoch` (0.001 FLS) per epoch, started or
+  whole, past the inclusion epoch, and a body ciphertext of at most 1 KiB + tag
+- the named key set is kept in `CanonicalDerivedState::timed_key_sets` (rows `TK:`, by
+  `committee_root`, dropped once no escrow names it), since checkpoints are pruned
+- a block may carry `long_time_signatures`: `(unlock_height, committee_root, signer indices,
+  aggregate)`, strictly ascending by `(unlock_height, committee_root)`, at most 16, each for an unlock
+  height `u` with `u < h <= u + kTimedLongGraceBlocks` (480), a stored key set with at least one
+  waiting long escrow, at least `quorum(n)` signers of that set and a verifying aggregate, and at
+  most 16 escrows settled through them in all; otherwise the block is invalid. They are optional: a
+  block never waits for them
+- settlement, after the short locks and before any record: every long escrow an entry names, in
+  inclusion order, opened with the entry's aggregate and the stored keys, exactly like a short lock
+- expiry: a long escrow still waiting at `u + kTimedLongGraceBlocks + 1` is refunded (bond to the
+  refund script, `expired` in the settlement record, the body never runs)
+- bond lien: a validator whose BLS key a waiting long escrow names cannot withdraw its bond
+  (`consensus::timed_bond_lien`, "bond held by a pending long time lock") until that escrow settles
+  or `kTimedLongLienBlocks` (one year) after its inclusion
 
 Intake: a `TxTimed` travels in `TX` / `SUBMIT_TX` like any record. The node admits it with the
 same `consensus::check_timed_inclusion` the block applies (against the next height), a prepaid fee at
