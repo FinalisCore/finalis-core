@@ -95,7 +95,7 @@ curl -s http://127.0.0.1:19544/rpc -d '{"jsonrpc":"2.0","id":1,"method":"get_sta
 ```
 
 Look for `"network_name":"testnet"`, `"chain_id_ok":true` and a `genesis_hash` starting with
-`887c5294`.
+`32d49e35`.
 
 ## 3. Let other nodes connect to you (recommended)
 
