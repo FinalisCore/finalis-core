@@ -662,8 +662,9 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   for (const auto& [op, entry] : state.utxos) {
     const auto transparent = transparent_txout_from_utxo_entry(entry);
     if (!transparent.has_value()) continue;
-    const auto scripthash = crypto::sha256(transparent->script_pubkey);
-    desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
+    for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+      desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
+    }
   }
   std::vector<std::string> script_utxos_to_erase;
   std::set<std::string> existing_script_utxos;
@@ -679,9 +680,10 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   for (const auto& [op, entry] : state.utxos) {
     const auto transparent = transparent_txout_from_utxo_entry(entry);
     if (!transparent.has_value()) continue;
-    const auto scripthash = crypto::sha256(transparent->script_pubkey);
-    if (existing_script_utxos.contains(storage::key_script_utxo(scripthash, op))) continue;
-    batch.put_script_utxo(scripthash, op, *transparent, state.finalized_height);
+    for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+      if (existing_script_utxos.contains(storage::key_script_utxo(scripthash, op))) continue;
+      batch.put_script_utxo(scripthash, op, *transparent, state.finalized_height);
+    }
   }
 
   for (const auto& [pub, info] : state.validators.all()) batch.put_validator(pub, info);
@@ -733,7 +735,9 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
     batch.put(storage::key_smt_leaf(kSmtTreeUtxo, key), value);
     tree_changes.push_back({key, crypto::SparseMerkleTree::leaf_hash(key, value)});
     if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
-      batch.put_script_utxo(crypto::sha256(transparent->script_pubkey), op, *transparent, next.finalized_height);
+      for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+        batch.put_script_utxo(scripthash, op, *transparent, next.finalized_height);
+      }
     }
   };
   const auto stage_erase = [&](const OutPoint& op, const UtxoEntryV2& entry) {
@@ -741,7 +745,9 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
     batch.erase(storage::key_smt_leaf(kSmtTreeUtxo, consensus::utxo_commitment_key(op)));
     tree_changes.push_back({consensus::utxo_commitment_key(op), std::nullopt});
     if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
-      batch.erase(storage::key_script_utxo(crypto::sha256(transparent->script_pubkey), op));
+      for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+        batch.erase(storage::key_script_utxo(scripthash, op));
+      }
     }
   };
   // Ordered merge of the two UTXO sets: only spent, created or changed outputs touch storage.

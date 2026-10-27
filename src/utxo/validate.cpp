@@ -298,8 +298,86 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_
   return true;
 }
 
+namespace {
+constexpr char kHeightLockPrefix[] = "SCHLOCK1";
+constexpr char kInheritanceLockPrefix[] = "SCHLOCK2";
+
+bool has_prefix(const Bytes& script, const char* prefix) {
+  return script.size() >= 8 && std::equal(prefix, prefix + 8, script.begin());
+}
+
+std::uint64_t read_u64le(const Bytes& b, std::size_t off) {
+  std::uint64_t v = 0;
+  for (std::size_t i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(b[off + i]) << (8 * i);
+  return v;
+}
+
+void append_u64le(Bytes* b, std::uint64_t v) {
+  for (std::size_t i = 0; i < 8; ++i) b->push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+}
+}  // namespace
+
+std::optional<HeightLockScript> parse_height_lock_script(const Bytes& script_pubkey) {
+  HeightLockScript out;
+  if (script_pubkey.size() == kHeightLockScriptBytes && has_prefix(script_pubkey, kHeightLockPrefix)) {
+    out.unlock_height = read_u64le(script_pubkey, 8);
+    std::copy(script_pubkey.begin() + 16, script_pubkey.begin() + 36, out.beneficiary_pkh.begin());
+  } else if (script_pubkey.size() == kInheritanceLockScriptBytes && has_prefix(script_pubkey, kInheritanceLockPrefix)) {
+    out.unlock_height = read_u64le(script_pubkey, 8);
+    std::array<std::uint8_t, 20> owner{};
+    std::copy(script_pubkey.begin() + 16, script_pubkey.begin() + 36, owner.begin());
+    std::copy(script_pubkey.begin() + 36, script_pubkey.begin() + 56, out.beneficiary_pkh.begin());
+    out.owner_pkh = owner;
+  } else {
+    return std::nullopt;
+  }
+  if (out.unlock_height == 0) return std::nullopt;  // a lock to height 0 is just P2PKH
+  return out;
+}
+
+Bytes height_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& pkh) {
+  Bytes out(kHeightLockPrefix, kHeightLockPrefix + 8);
+  append_u64le(&out, unlock_height);
+  out.insert(out.end(), pkh.begin(), pkh.end());
+  return out;
+}
+
+Bytes inheritance_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& owner_pkh,
+                                     const std::array<std::uint8_t, 20>& heir_pkh) {
+  Bytes out(kInheritanceLockPrefix, kInheritanceLockPrefix + 8);
+  append_u64le(&out, unlock_height);
+  out.insert(out.end(), owner_pkh.begin(), owner_pkh.end());
+  out.insert(out.end(), heir_pkh.begin(), heir_pkh.end());
+  return out;
+}
+
+bool script_spendable_by(const Bytes& script_pubkey, const std::array<std::uint8_t, 20>& pkh, std::uint64_t height) {
+  std::array<std::uint8_t, 20> p2pkh{};
+  if (is_p2pkh_script_pubkey(script_pubkey, &p2pkh)) return p2pkh == pkh;
+  const auto lock = parse_height_lock_script(script_pubkey);
+  if (!lock.has_value()) return false;
+  if (lock->owner_pkh.has_value() && *lock->owner_pkh == pkh) return true;
+  return lock->beneficiary_pkh == pkh && height >= lock->unlock_height;
+}
+
+std::vector<Hash32> script_index_hashes(const Bytes& script_pubkey) {
+  std::vector<Hash32> out{crypto::sha256(script_pubkey)};
+  if (const auto lock = parse_height_lock_script(script_pubkey); lock.has_value()) {
+    out.push_back(crypto::sha256(address::p2pkh_script_pubkey(lock->beneficiary_pkh)));
+    if (lock->owner_pkh.has_value()) out.push_back(crypto::sha256(address::p2pkh_script_pubkey(*lock->owner_pkh)));
+  }
+  return out;
+}
+
+bool script_indexed_under(const Bytes& script_pubkey, const Hash32& scripthash) {
+  for (const auto& h : script_index_hashes(script_pubkey)) {
+    if (h == scripthash) return true;
+  }
+  return false;
+}
+
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
-  return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
+  return is_p2pkh_script_pubkey(script_pubkey, nullptr) || parse_height_lock_script(script_pubkey).has_value() || is_validator_register_script(script_pubkey, nullptr) ||
          is_validator_unbond_script(script_pubkey, nullptr) ||
          is_onboarding_registration_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
@@ -786,6 +864,31 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         return {false, "pubkey hash mismatch", 0};
       }
 
+      const auto msg = signing_message_for_input(*chain_domain, tx, i);
+      if (!msg.has_value()) return {false, "sighash failed", 0};
+      std::string budget_error;
+      if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
+      if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
+      in_sum += prev_out.value;
+      continue;
+    }
+
+    if (const auto lock = parse_height_lock_script(prev_out.script_pubkey); lock.has_value()) {
+      // The spending block's height decides; without it (no context) the input cannot be judged.
+      if (!ctx) return {false, "height-locked input needs a block height", 0};
+      Sig64 sig{};
+      PubKey32 pub{};
+      if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad script_sig", 0};
+      const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
+      std::array<std::uint8_t, 20> spender{};
+      std::copy(derived.begin(), derived.end(), spender.begin());
+      if (!script_spendable_by(prev_out.script_pubkey, spender, ctx->current_height)) {
+        const bool is_beneficiary = spender == lock->beneficiary_pkh;
+        return {false, is_beneficiary ? "height lock not reached" : "pubkey hash mismatch", 0};
+      }
       const auto msg = signing_message_for_input(*chain_domain, tx, i);
       if (!msg.has_value()) return {false, "sighash failed", 0};
       std::string budget_error;

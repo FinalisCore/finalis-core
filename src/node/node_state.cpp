@@ -560,12 +560,14 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
     if (prev_it == prev_utxos.end()) return;
     const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
     if (!spent_out.has_value()) return;
-    batch.add_script_history(crypto::sha256(spent_out->script_pubkey), height, txid);
+    for (const auto& h : script_index_hashes(spent_out->script_pubkey)) batch.add_script_history(h, height, txid);
   };
   const auto add_history = [&](const Hash32& txid, const AnyTx& tx) {
     if (const auto* legacy = std::get_if<Tx>(&tx)) {
       for (const auto& input : legacy->inputs) add_spent(txid, input.prev_txid, input.prev_index);
-      for (const auto& output : legacy->outputs) batch.add_script_history(crypto::sha256(output.script_pubkey), height, txid);
+      for (const auto& output : legacy->outputs) {
+        for (const auto& h : script_index_hashes(output.script_pubkey)) batch.add_script_history(h, height, txid);
+      }
     } else if (const auto* v2 = std::get_if<TxV2>(&tx)) {
       for (const auto& input : v2->inputs) {
         if (input.kind == TxInputKind::Transparent) {
@@ -578,7 +580,7 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       for (const auto& output : v2->outputs) {
         if (output.kind == TxOutputKind::Transparent) {
           const auto& out = std::get<TransparentTxOutV2>(output.body);
-          batch.add_script_history(crypto::sha256(out.script_pubkey), height, txid);
+          for (const auto& h : script_index_hashes(out.script_pubkey)) batch.add_script_history(h, height, txid);
         } else {
           const auto& out = std::get<ConfidentialTxOutV2>(output.body);
           batch.add_script_history(confidential_history_key(out.one_time_pubkey), height, txid);

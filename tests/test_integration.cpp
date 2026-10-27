@@ -3903,6 +3903,65 @@ TEST(test_timed_transfer_on_a_four_validator_cluster) {
   run_timed_transfer_on_cluster(4, unique_test_base("/tmp/finalis_it_timed_transfer4"));
 }
 
+// A height-locked payment on a live node: admitted and finalized, found under the recipient's own
+// address, refused before its height (mempool and block), and spent from it.
+TEST(test_height_locked_payment_on_a_live_node) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto base = unique_test_base("/tmp/finalis_it_height_lock");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 3, ci_timeout_seconds(40)));
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, 2'000'000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+  const auto& sender = keys[funded->key_index];
+  const auto recipient = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x6e});
+  const auto recipient_h = crypto::h160(Bytes(recipient->public_key.begin(), recipient->public_key.end()));
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  std::copy(recipient_h.begin(), recipient_h.end(), recipient_pkh.begin());
+  const auto domain = node_chain_domain(n0);
+
+  const auto unlock = n0.status().height + 6;
+  auto coin = funded->utxos.front();
+  for (const auto& c : funded->utxos) if (c.second.value > coin.second.value) coin = c;
+  const auto lock_tx = build_signed_p2pkh_tx_single_input(
+      domain, coin.first, coin.second, Bytes(sender.private_key.begin(), sender.private_key.end()),
+      {TxOut{1'000'000, height_lock_script_pubkey(unlock, recipient_pkh)},
+       TxOut{coin.second.value - 1'000'000 - 1'000, coin.second.script_pubkey}});
+  ASSERT_TRUE(lock_tx.has_value());
+  ASSERT_TRUE(n0.inject_tx_for_test(AnyTx{*lock_tx}, true));
+
+  // Indexed under the recipient's plain address (what its wallet queries).
+  const auto recipient_scripthash = crypto::sha256(address::p2pkh_script_pubkey(recipient_h));
+  std::vector<std::pair<OutPoint, TxOut>> found;
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    found.clear();
+    for (const auto& e : db.get_script_utxos(recipient_scripthash)) found.push_back({e.outpoint, TxOut{e.value, e.script_pubkey}});
+    return found.size() == 1;
+  }, ci_timeout_seconds(60)));
+  ASSERT_TRUE(found[0].first.txid == lock_tx->txid());
+  ASSERT_TRUE(n0.status().height + 1 < unlock);
+
+  const auto spend = build_signed_p2pkh_tx_single_input(
+      domain, found[0].first, found[0].second, Bytes(recipient->private_key.begin(), recipient->private_key.end()),
+      {TxOut{1'000'000 - 1'000, address::p2pkh_script_pubkey(recipient_h)}});
+  ASSERT_TRUE(spend.has_value());
+  ASSERT_TRUE(!n0.inject_tx_for_test(AnyTx{*spend}, true));  // too early: refused
+
+  ASSERT_TRUE(wait_for_tip(n0, unlock - 1, ci_timeout_seconds(90)));  // the next block is at the unlock height
+  ASSERT_TRUE(n0.inject_tx_for_test(AnyTx{*spend}, true));
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    const auto loc = db.get_tx_index(spend->txid());
+    return loc.has_value() && loc->height >= unlock;
+  }, ci_timeout_seconds(60)));
+}
+
 TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_registration_tx");

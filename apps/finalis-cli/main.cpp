@@ -1450,6 +1450,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli getWallet [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli lock_send --to <addr> (--amount <coins> | --amount-units <u64>) (--unlock-height <h> | --lock-blocks <n>) [--inheritance] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # spendable by <addr> only from <h>; --inheritance: you keep spending it, <addr> is the heir from <h>\n"
      << "  finalis-cli timed_send --to <addr> (--amount <coins> | --amount-units <u64>) [--unlock-height <h> | --delay <blocks>] [--bond <u64>] [--prepaid-fee <u64>] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # sealed until <h> is final\n"
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
@@ -3649,10 +3650,18 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
 
+    // Height-locked coins count only once the next block may spend them.
+    std::uint64_t spend_height = 0;
+    if (const auto tip_status = finalis::lightserver::rpc_get_status(rpc_url, &err); tip_status.has_value()) {
+      spend_height = tip_status->tip_height + 1;
+    }
+    std::array<std::uint8_t, 20> own_pkh{};
+    std::copy(own_decoded->pubkey_hash.begin(), own_decoded->pubkey_hash.end(), own_pkh.begin());
     std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> available_prevs;
     available_prevs.reserve(rpc_utxos->size());
     for (const auto& utxo : *rpc_utxos) {
       if (utxo.value == 0) continue;
+      if (!finalis::script_spendable_by(utxo.script_pubkey, own_pkh, spend_height)) continue;
       available_prevs.push_back({finalis::OutPoint{utxo.txid, utxo.vout}, finalis::TxOut{utxo.value, utxo.script_pubkey}});
     }
     std::sort(available_prevs.begin(), available_prevs.end(), [](const auto& a, const auto& b) {
@@ -3736,6 +3745,135 @@ int run_cli(int argc, char** argv) {
     std::cout << "accepted=yes\n";
     std::cout << "status=accepted_for_relay\n";
     print_submitted_not_final(tx->txid());
+    return 0;
+  }
+
+  if (cmd == "lock_send") {
+    // A height-locked payment: an output the recipient can spend only from --unlock-height (or after
+    // --lock-blocks more blocks). With --inheritance the sender keeps spending it at any time and the
+    // recipient (the heir) may spend it from that height on.
+    std::string file_path = default_validator_key_path();
+    std::string passphrase;
+    std::string rpc_url = default_rpc_url();
+    std::string to_addr;
+    std::string amount_text;
+    std::uint64_t amount_units = 0;
+    std::uint64_t fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    std::optional<std::uint64_t> unlock_height;
+    std::optional<std::uint64_t> lock_blocks;
+    bool inheritance = false;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--to" && i + 1 < argc) to_addr = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount_text = argv[++i];
+      else if (a == "--amount-units" && i + 1 < argc) amount_units = std::stoull(argv[++i]);
+      else if (a == "--fee" && i + 1 < argc) fee = std::stoull(argv[++i]);
+      else if (a == "--unlock-height" && i + 1 < argc) unlock_height = std::stoull(argv[++i]);
+      else if (a == "--lock-blocks" && i + 1 < argc) lock_blocks = std::stoull(argv[++i]);
+      else if (a == "--inheritance") inheritance = true;
+    }
+    if (to_addr.empty() || !decode_network_address(to_addr, "--to").has_value()) {
+      std::cerr << "--to <address> is required (the recipient, or the heir with --inheritance)\n";
+      return 1;
+    }
+    if (unlock_height.has_value() == lock_blocks.has_value()) {
+      std::cerr << "choose exactly one of --unlock-height or --lock-blocks\n";
+      return 1;
+    }
+    if (!amount_text.empty()) {
+      auto parsed = parse_coin_amount_text(amount_text);
+      if (!parsed.has_value()) {
+        std::cerr << "invalid --amount\n";
+        return 1;
+      }
+      amount_units = *parsed;
+    }
+    if (amount_units == 0) {
+      std::cerr << "--amount or --amount-units is required\n";
+      return 1;
+    }
+    file_path = expand_user(file_path);
+    finalis::keystore::ValidatorKey vk;
+    std::string err;
+    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
+      std::cerr << "lock_send failed to load key: " << err << "\n";
+      return 1;
+    }
+    const auto own = finalis::address::decode(vk.address);
+    const auto to = finalis::address::decode(to_addr);
+    if (!own.has_value() || !to.has_value()) {
+      std::cerr << "lock_send failed: invalid address\n";
+      return 1;
+    }
+    const auto status = finalis::lightserver::rpc_get_status(rpc_url, &err);
+    if (!status.has_value()) {
+      std::cerr << "lock_send failed to load rpc status: " << err << "\n";
+      return 1;
+    }
+    const std::uint64_t next_height = status->tip_height + 1;
+    const std::uint64_t unlock = unlock_height.value_or(next_height + lock_blocks.value_or(0));
+    if (unlock <= next_height) {
+      std::cerr << "lock_send failed: the unlock height must be after the next block (" << next_height << ")\n";
+      return 1;
+    }
+    std::array<std::uint8_t, 20> own_pkh{};
+    std::array<std::uint8_t, 20> to_pkh{};
+    std::copy(own->pubkey_hash.begin(), own->pubkey_hash.end(), own_pkh.begin());
+    std::copy(to->pubkey_hash.begin(), to->pubkey_hash.end(), to_pkh.begin());
+    const auto lock_script = inheritance ? finalis::inheritance_lock_script_pubkey(unlock, own_pkh, to_pkh)
+                                         : finalis::height_lock_script_pubkey(unlock, to_pkh);
+    auto validated = finalis::lightserver::rpc_validate_address(rpc_url, vk.address, &err);
+    if (!validated.has_value() || !validated->valid || !validated->has_scripthash) {
+      std::cerr << "lock_send failed to validate wallet address: " << err << "\n";
+      return 1;
+    }
+    auto rpc_utxos = finalis::lightserver::rpc_get_utxos(rpc_url, validated->scripthash, &err);
+    if (!rpc_utxos.has_value()) {
+      std::cerr << "lock_send failed to load utxos: " << err << "\n";
+      return 1;
+    }
+    std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> coins;
+    for (const auto& u : *rpc_utxos) {
+      if (u.value > 0 && finalis::script_spendable_by(u.script_pubkey, own_pkh, next_height)) {
+        coins.push_back({finalis::OutPoint{u.txid, u.vout}, finalis::TxOut{u.value, u.script_pubkey}});
+      }
+    }
+    auto plan = finalis::plan_wallet_p2pkh_send(coins, lock_script, finalis::address::p2pkh_script_pubkey(own->pubkey_hash),
+                                                amount_units, fee, finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
+    if (!plan.has_value()) {
+      std::cerr << "lock_send planning failed: " << err << "\n";
+      return 1;
+    }
+    const auto chain_domain = rpc_chain_domain(rpc_url, &err);
+    if (!chain_domain.has_value()) {
+      std::cerr << "lock_send failed to load chain identity: " << err << "\n";
+      return 1;
+    }
+    auto tx = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, plan->selected_prevs,
+                                                         finalis::Bytes(vk.privkey.begin(), vk.privkey.end()),
+                                                         plan->outputs, &err);
+    if (!tx.has_value()) {
+      std::cerr << "lock_send build failed: " << err << "\n";
+      return 1;
+    }
+    auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, tx->serialize(), &err);
+    std::cout << "address=" << vk.address << "\n";
+    std::cout << (inheritance ? "heir=" : "recipient=") << to_addr << "\n";
+    std::cout << "form=" << (inheritance ? "inheritance" : "locked") << "\n";
+    std::cout << "amount=" << amount_units << "\n";
+    std::cout << "unlock_height=" << unlock << "\n";
+    std::cout << "fee=" << plan->applied_fee_units << "\n";
+    std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
+    std::cout << "locked_output=" << finalis::hex_encode32(tx->txid()) << ":0\n";
+    if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
+      std::cout << "accepted=no\n";
+      std::cout << "error_message=" << (!result.error_message.empty() ? result.error_message : result.error) << "\n";
+      return 1;
+    }
+    std::cout << "accepted=yes\n";
     return 0;
   }
 
@@ -3835,7 +3973,13 @@ int run_cli(int argc, char** argv) {
     }
     std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> coins;
     for (const auto& u : *rpc_utxos) {
-      if (u.value > 0) coins.push_back({finalis::OutPoint{u.txid, u.vout}, finalis::TxOut{u.value, u.script_pubkey}});
+      std::array<std::uint8_t, 20> own_pkh{};
+      std::copy(own->pubkey_hash.begin(), own->pubkey_hash.end(), own_pkh.begin());
+      // Plain coins only: a height-locked coin is not P2PKH, which a TxTimed fee input must be.
+      if (u.value > 0 && finalis::is_p2pkh_script_pubkey(u.script_pubkey) &&
+          finalis::script_spendable_by(u.script_pubkey, own_pkh, next_height)) {
+        coins.push_back({finalis::OutPoint{u.txid, u.vout}, finalis::TxOut{u.value, u.script_pubkey}});
+      }
     }
     const auto timed_plan = finalis::plan_timed_p2pkh_send(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash),
                                                            own_script, amount_units, fee, prepaid_fee, bond, &err);

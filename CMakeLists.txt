@@ -537,6 +537,7 @@ add_executable(finalis-tests
   tests/test_swe.cpp
   tests/test_swe_proofs.cpp
   tests/test_timed_tx.cpp
+  tests/test_height_lock.cpp
   tests/test_availability.cpp
   tests/test_snapshot.cpp
   tests/test_validator_lifecycle.cpp

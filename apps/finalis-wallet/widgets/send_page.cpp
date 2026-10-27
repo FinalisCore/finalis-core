@@ -9,6 +9,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QScrollArea>
 #include <QSpinBox>
@@ -87,6 +88,7 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   mode_combo_->addItem("Confidential -> Transparent");
   mode_combo_->addItem("Confidential -> Confidential");
   mode_combo_->addItem("Transparent -> Transparent (time-locked)");
+  mode_combo_->addItem("Transparent -> Height-locked (vesting / inheritance)");
   amount_edit_->setPlaceholderText("0.00");
   unlock_delay_spin_ = new QSpinBox(form_box);
   unlock_delay_spin_->setRange(0, 1000);
@@ -103,6 +105,18 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   form->addRow(unlock_delay_label_, unlock_delay_spin_);
   unlock_delay_label_->hide();
   unlock_delay_spin_->hide();
+  lock_height_label_ = new QLabel("Spendable from block", form_box);
+  lock_height_edit_ = new QLineEdit(form_box);
+  lock_height_edit_->setPlaceholderText("block height, e.g. 250000");
+  lock_height_edit_->setToolTip("The recipient can spend the payment only in this block or later. Any distance works.");
+  inheritance_check_ = new QCheckBox("I keep spending it until then (the recipient is my heir)", form_box);
+  inheritance_check_->setToolTip(
+      "Inheritance: you can still spend these coins at any time; the recipient can claim them from the block above.");
+  form->addRow(lock_height_label_, lock_height_edit_);
+  form->addRow("", inheritance_check_);
+  lock_height_label_->hide();
+  lock_height_edit_->hide();
+  inheritance_check_->hide();
 
   auto* actions = new QHBoxLayout();
   actions->setSpacing(8);

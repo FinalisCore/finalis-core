@@ -381,6 +381,9 @@ class WalletWindow final : public QMainWindow {
   // Spends a pending time-locked transfer's coins back to this wallet before it opens (forfeiting
   // the bond); also spends the fee coin if the envelope is not in a block yet.
   void cancel_timed_send();
+  // Height-locked mode: the output script for the form (locked to the recipient, or inheritance with
+  // this wallet as owner and the recipient as heir) and its unlock height.
+  std::optional<Bytes> height_lock_output_script(const QString& destination, std::uint64_t* unlock_height, QString* err) const;
   void show_selected_history_detail();
   void refresh_history_table();
   QUrl explorer_home_url() const;
@@ -478,6 +481,9 @@ class WalletWindow final : public QMainWindow {
   QSpinBox* send_unlock_delay_spin_{nullptr};
   QLabel* send_unlock_delay_label_{nullptr};
   QPushButton* send_cancel_timed_button_{nullptr};
+  QLineEdit* send_lock_height_edit_{nullptr};
+  QLabel* send_lock_height_label_{nullptr};
+  QCheckBox* send_inheritance_check_{nullptr};
   QPushButton* send_import_confidential_request_button_{nullptr};
   QPushButton* send_review_button_{nullptr};
   QPushButton* send_button_{nullptr};

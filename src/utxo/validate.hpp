@@ -116,6 +116,33 @@ Bytes time_signature_message(const Hash32& chain_domain, std::uint64_t height);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);
 bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubKey32* out_pub = nullptr);
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey);
+
+// --- Height-locked outputs (transparent, Tx v1) ---
+//
+// SCHLOCK1 "locked":      "SCHLOCK1" | u64le unlock_height | pkh(20)
+//   spendable by pkh in a block at height >= unlock_height.
+// SCHLOCK2 "inheritance": "SCHLOCK2" | u64le unlock_height | owner_pkh(20) | heir_pkh(20)
+//   spendable by the owner at any height, and by the heir at height >= unlock_height.
+// The script_sig is the P2PKH one (sig, pubkey) and signs signing_message_for_input. The rule needs
+// nothing but the block height, so a lock holds for any horizon whoever validates then.
+inline constexpr std::size_t kHeightLockScriptBytes = 8 + 8 + 20;
+inline constexpr std::size_t kInheritanceLockScriptBytes = 8 + 8 + 20 + 20;
+struct HeightLockScript {
+  std::uint64_t unlock_height{0};
+  std::array<std::uint8_t, 20> beneficiary_pkh{};        // spends from unlock_height
+  std::optional<std::array<std::uint8_t, 20>> owner_pkh;  // inheritance form: spends at any height
+};
+std::optional<HeightLockScript> parse_height_lock_script(const Bytes& script_pubkey);
+Bytes height_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& pkh);
+Bytes inheritance_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& owner_pkh,
+                                     const std::array<std::uint8_t, 20>& heir_pkh);
+// Whether the key with hash `pkh` may spend an output with `script_pubkey` in a block at `height`:
+// P2PKH to pkh, or a height lock's permitted branch. Wallets use it to pick spendable coins.
+bool script_spendable_by(const Bytes& script_pubkey, const std::array<std::uint8_t, 20>& pkh, std::uint64_t height);
+// Address-index keys of a transparent output: sha256(script_pubkey), plus for a height lock the P2PKH
+// scripthash of each key that may spend it, so the beneficiary's (and owner's) wallet finds it.
+std::vector<Hash32> script_index_hashes(const Bytes& script_pubkey);
+bool script_indexed_under(const Bytes& script_pubkey, const Hash32& scripthash);
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out);
 
 struct ConfidentialPolicy {

@@ -226,13 +226,15 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const Hash32& chain_domain,
     return std::nullopt;
   }
 
-  std::array<std::uint8_t, 20> expected_pkh{};
-  if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, &expected_pkh)) {
-    if (err) *err = "prev output is not P2PKH";
+  // P2PKH, or a height lock this key may spend (whether its height is reached is the chain's call).
+  const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
+  std::array<std::uint8_t, 20> signer{};
+  std::copy(got_pkh.begin(), got_pkh.end(), signer.begin());
+  if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, nullptr) && !parse_height_lock_script(prev_out.script_pubkey)) {
+    if (err) *err = "prev output is not P2PKH or height-locked";
     return std::nullopt;
   }
-  const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
-  if (!std::equal(got_pkh.begin(), got_pkh.end(), expected_pkh.begin())) {
+  if (!script_spendable_by(prev_out.script_pubkey, signer, std::numeric_limits<std::uint64_t>::max())) {
     if (err) *err = "private key does not match prev output pubkey hash";
     return std::nullopt;
   }
@@ -281,12 +283,14 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const Hash32& chain_domain, 
   const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
   for (const auto& [prev_outpoint, prev_out] : prevs) {
     (void)prev_outpoint;
-    std::array<std::uint8_t, 20> expected_pkh{};
-    if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, &expected_pkh)) {
-      if (err) *err = "prev output is not P2PKH";
+    // P2PKH, or a height lock this key may spend (whether its height is reached is the chain's call).
+    std::array<std::uint8_t, 20> signer{};
+    std::copy(got_pkh.begin(), got_pkh.end(), signer.begin());
+    if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, nullptr) && !parse_height_lock_script(prev_out.script_pubkey)) {
+      if (err) *err = "prev output is not P2PKH or height-locked";
       return std::nullopt;
     }
-    if (!std::equal(got_pkh.begin(), got_pkh.end(), expected_pkh.begin())) {
+    if (!script_spendable_by(prev_out.script_pubkey, signer, std::numeric_limits<std::uint64_t>::max())) {
       if (err) *err = "private key does not match prev output pubkey hash";
       return std::nullopt;
     }

@@ -247,6 +247,25 @@ Liveness: the `n - f >= quorum` honest members all sign once they learn of final
 of `H` is the witness that opens a `TxTimed` locked to `H` (encrypted with the same threshold to the
 same keys, `consensus::committee_bls_key_root`).
 
+## Height-Locked Outputs
+
+Locking value needs no secret and no committee: a transparent output (Tx v1) whose script names a
+height. Every node checks it against the height of the block that spends it, so a lock holds for any
+horizon, whoever validates then, and nothing that leaks or colludes can open it early.
+
+- `SCHLOCK1` (locked): `"SCHLOCK1" | u64le unlock_height | pkh(20)`: spendable by `pkh` in a block at
+  height `>= unlock_height`.
+- `SCHLOCK2` (inheritance): `"SCHLOCK2" | u64le unlock_height | owner_pkh(20) | heir_pkh(20)`: the owner
+  spends at any height, the heir from `unlock_height`.
+
+The input carries the usual P2PKH `script_sig` over `signing_message_for_input`. An unlock height of 0
+is not a lock (invalid script). Without a block height (no validation context) such an input is
+invalid. The outputs are indexed under the script and under the P2PKH address of each key that may
+spend them (`script_index_hashes`), so the beneficiary's wallet finds them by its own address.
+`finalis-cli lock_send` and the wallet's height-locked send mode create them; ordinary sends spend
+them once spendable. Secrets that must stay hidden for long periods are a separate, open design
+(committee keys cannot be chosen years ahead); hidden transfers use `TxTimed` below.
+
 ## Timed Transactions
 
 A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (version 3; never an

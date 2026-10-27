@@ -111,6 +111,14 @@ cancel would make every envelope a free option). If the envelope is not in a blo
 the fee coin, which keeps the bond if that spend finalizes first. Records are kept in the wallet store
 (`TIMED:`), because the chain holds the transfer encrypted until it opens.
 
+## Height-locked sends
+
+`Send -> Transparent -> Height-locked (vesting / inheritance)` pays an output the recipient can spend
+only from a chosen block (`SCHLOCK1`), for any distance. With "I keep spending it until then" it is an
+inheritance output (`SCHLOCK2`): this wallet can still spend it at any time, the recipient (heir) from
+that block. Locked coins are found by the recipient's normal address; the balance shows them as
+"Height-locked" until spendable, and ordinary sends use them from then on (no separate claim step).
+
 ## Lightserver failover
 
 The wallet accepts an ordered list of lightserver RPC endpoints in `Advanced -> Connections`.

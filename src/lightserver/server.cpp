@@ -209,7 +209,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     const auto canonical_utxos = db.load_transparent_utxos();
     std::map<OutPoint, TxOut> canonical_matches;
     for (const auto& [op, entry] : canonical_utxos) {
-      if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
       canonical_matches.emplace(op, entry.out);
     }
     std::vector<storage::DB::ScriptUtxoEntry> out;
@@ -254,7 +254,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     if (!tx.has_value()) continue;
     for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
       const auto& out = tx->outputs[i];
-      if (crypto::sha256(out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(out.script_pubkey, scripthash)) continue;
       const OutPoint op{item.txid, static_cast<std::uint32_t>(i)};
       canonical_matches[op] = storage::DB::ScriptUtxoEntry{op, out.value, out.script_pubkey, item.height};
     }
@@ -263,7 +263,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
       if (!prev_tx.has_value()) continue;
       if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
       const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
-      if (crypto::sha256(prev_out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(prev_out.script_pubkey, scripthash)) continue;
       canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
     }
   }
@@ -271,7 +271,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   // so settlement outputs remain visible even when history is non-empty.
   const auto canonical_utxos = db.load_transparent_utxos();
   for (const auto& [op, entry] : canonical_utxos) {
-    if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+    if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
     if (canonical_matches.find(op) != canonical_matches.end()) continue;
     storage::DB::ScriptUtxoEntry merged;
     merged.outpoint = op;
@@ -658,7 +658,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
 
     std::uint64_t credited = 0;
     for (const auto& output : tx->outputs) {
-      if (crypto::sha256(output.script_pubkey) == scripthash) credited += output.value;
+      if (script_indexed_under(output.script_pubkey, scripthash)) credited += output.value;
     }
 
     std::uint64_t debited = 0;
@@ -667,7 +667,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
       if (!prev_tx.has_value()) continue;
       if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
       const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
-      if (crypto::sha256(prev_out.script_pubkey) == scripthash) debited += prev_out.value;
+      if (script_indexed_under(prev_out.script_pubkey, scripthash)) debited += prev_out.value;
     }
 
     if (debited == 0 && credited > 0) {
@@ -682,7 +682,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
     } else if (debited > 0 && credited > 0) {
       // Any output to another script (a confidential one included) means value left: a send with change.
       const bool pays_elsewhere = std::any_of(tx->outputs.begin(), tx->outputs.end(), [&](const TxOut& output) {
-        return crypto::sha256(output.script_pubkey) != scripthash;
+        return !script_indexed_under(output.script_pubkey, scripthash);
       });
       row.net_amount = static_cast<std::int64_t>(credited) - static_cast<std::int64_t>(debited);
       if (pays_elsewhere) {

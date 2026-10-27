@@ -8,6 +8,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QCheckBox>
 #include <QSpinBox>
 #include <QSettings>
 #include <QTabWidget>
@@ -306,7 +307,7 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   settings.sync();
   finalis::wallet::WalletWindow window;
   auto* combo = window.send_mode_combo_;
-  require(combo != nullptr && combo->count() == 5, "send mode count mismatch");
+  require(combo != nullptr && combo->count() == 6, "send mode count mismatch");
   require(combo->itemText(4).toStdString() == "Transparent -> Transparent (time-locked)", "time-locked mode missing");
   require(window.send_unlock_delay_spin_ != nullptr && window.send_cancel_timed_button_ != nullptr,
           "time-locked controls missing");
@@ -316,6 +317,14 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   require(window.send_unlock_delay_spin_->value() == 2, "unlock delay default mismatch");
   combo->setCurrentIndex(0);
   require(window.send_unlock_delay_spin_->isHidden(), "unlock delay still visible after leaving time-locked mode");
+  // Height-locked mode: its block field and the inheritance option, only in that mode.
+  require(combo->itemText(5).toStdString() == "Transparent -> Height-locked (vesting / inheritance)", "height-locked mode missing");
+  require(window.send_lock_height_edit_->isHidden() && window.send_inheritance_check_->isHidden(),
+          "height-lock fields visible outside their mode");
+  combo->setCurrentIndex(5);
+  require(!window.send_lock_height_edit_->isHidden() && !window.send_inheritance_check_->isHidden(),
+          "height-lock fields hidden in height-locked mode");
+  require(window.send_unlock_delay_spin_->isHidden(), "time-lock field visible in height-locked mode");
 }
 
 void test_wallet_window_defaults_to_lightserver_rpc_port() {
