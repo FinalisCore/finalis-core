@@ -79,6 +79,10 @@ struct TimedSendPlan {
   WalletSendPlan body;
   std::uint64_t fee_change_units{0};
 };
+// The envelope's fee coin: the smallest of `available_prevs` covering prepaid fee + bond.
+std::optional<std::pair<OutPoint, TxOut>> select_timed_fee_coin(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
+                                                                std::uint64_t prepaid_fee_units,
+                                                                std::uint64_t forfeit_bond_units, std::string* err = nullptr);
 std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
                                                    const Bytes& recipient_script_pubkey, const Bytes& change_script_pubkey,
                                                    std::uint64_t amount_units, std::uint64_t body_fee_units,

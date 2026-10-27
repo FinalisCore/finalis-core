@@ -103,11 +103,9 @@ std::optional<WalletSendPlan> plan_wallet_p2pkh_send(const std::vector<std::pair
   return plan;
 }
 
-std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
-                                                   const Bytes& recipient_script_pubkey, const Bytes& change_script_pubkey,
-                                                   std::uint64_t amount_units, std::uint64_t body_fee_units,
-                                                   std::uint64_t prepaid_fee_units, std::uint64_t forfeit_bond_units,
-                                                   std::string* err) {
+std::optional<std::pair<OutPoint, TxOut>> select_timed_fee_coin(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
+                                                                std::uint64_t prepaid_fee_units,
+                                                                std::uint64_t forfeit_bond_units, std::string* err) {
   if (prepaid_fee_units > std::numeric_limits<std::uint64_t>::max() - forfeit_bond_units) {
     if (err) *err = "prepaid fee + bond overflows";
     return std::nullopt;
@@ -123,10 +121,21 @@ std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<O
     if (err) *err = "no coin covers the prepaid fee + bond";
     return std::nullopt;
   }
+  return available_prevs[*fee_index];
+}
+
+std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
+                                                   const Bytes& recipient_script_pubkey, const Bytes& change_script_pubkey,
+                                                   std::uint64_t amount_units, std::uint64_t body_fee_units,
+                                                   std::uint64_t prepaid_fee_units, std::uint64_t forfeit_bond_units,
+                                                   std::string* err) {
+  const auto fee_coin = select_timed_fee_coin(available_prevs, prepaid_fee_units, forfeit_bond_units, err);
+  if (!fee_coin) return std::nullopt;
+  const std::uint64_t envelope_units = prepaid_fee_units + forfeit_bond_units;
   std::vector<std::pair<OutPoint, TxOut>> rest;
   rest.reserve(available_prevs.size() - 1);
-  for (std::size_t i = 0; i < available_prevs.size(); ++i) {
-    if (i != *fee_index) rest.push_back(available_prevs[i]);
+  for (const auto& coin : available_prevs) {
+    if (coin.first.txid != fee_coin->first.txid || coin.first.index != fee_coin->first.index) rest.push_back(coin);
   }
   std::string plan_err;
   auto body = plan_wallet_p2pkh_send(rest, recipient_script_pubkey, change_script_pubkey, amount_units, body_fee_units,
@@ -136,7 +145,7 @@ std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<O
     return std::nullopt;
   }
   TimedSendPlan out;
-  out.fee_coin = available_prevs[*fee_index];
+  out.fee_coin = *fee_coin;
   out.body = std::move(*body);
   out.fee_change_units = out.fee_coin.second.value - envelope_units;
   return out;

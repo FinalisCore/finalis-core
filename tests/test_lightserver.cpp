@@ -554,6 +554,43 @@ TEST(test_lightserver_get_tx_status_direct) {
   ASSERT_TRUE(missing_resp.find("\"credit_safe\":false") != std::string::npos);
 }
 
+// get_timed_reveal: the data of a settled reveal body (a "TR:" row) by timed txid; revealed=false otherwise.
+TEST(test_lightserver_get_timed_reveal_direct) {
+  const std::string base = unique_test_base("/tmp/finalis_light_timed_reveal");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x98;
+  ASSERT_TRUE(db.set_tip(storage::TipState{9, tip_hash}));
+  Hash32 txid{};
+  txid[31] = 0x24;
+  {
+    storage::DB::Batch batch(db);
+    batch.put_timed_reveal(txid, 7, Bytes{'b', 'i', 'd'});
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto query = [&](const Hash32& id) {
+    return ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":103,"method":"get_timed_reveal","params":{"txid":")") +
+                                  hex_encode32(id) + R"("}})");
+  };
+  const auto resp = query(txid);
+  ASSERT_TRUE(resp.find("\"revealed\":true") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"height\":7") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"data_hex\":\"626964\"") != std::string::npos);
+  Hash32 sealed{};
+  sealed[31] = 0x25;
+  ASSERT_TRUE(query(sealed).find("\"revealed\":false") != std::string::npos);
+}
+
 // The node keeps writing while the lightserver runs: every RPC must read the node's latest finalized
 // state, not what was on disk when the lightserver started.
 TEST(test_lightserver_reads_state_written_after_init) {

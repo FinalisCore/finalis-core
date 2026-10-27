@@ -950,6 +950,38 @@ std::optional<TxStatusView> rpc_get_tx_status(const std::string& rpc_url, const 
   return out;
 }
 
+std::optional<TimedRevealView> rpc_get_timed_reveal(const std::string& rpc_url, const Hash32& timed_txid, std::string* err) {
+  const std::string body_json = std::string(R"({"jsonrpc":"2.0","id":35,"method":"get_timed_reveal","params":{"txid":")") +
+                                hex_encode32(timed_txid) + R"("}})";
+  auto body = http_post_json(rpc_url, body_json, err);
+  if (!body) return std::nullopt;
+  auto root = minijson::parse(*body);
+  if (!root.has_value()) {
+    if (err) *err = "invalid rpc response";
+    return std::nullopt;
+  }
+  const auto* result = result_value(*root, err);
+  if (!result || !result->is_object()) return std::nullopt;
+  const auto revealed = object_bool(result, "revealed");
+  if (!revealed) {
+    if (err) *err = "missing timed reveal fields";
+    return std::nullopt;
+  }
+  TimedRevealView out;
+  out.revealed = *revealed;
+  if (!out.revealed) return out;
+  const auto height = object_u64(result, "height");
+  const auto data_hex = object_string(result, "data_hex");
+  auto data = data_hex ? hex_decode(*data_hex) : std::nullopt;
+  if (!height || !data) {
+    if (err) *err = "missing timed reveal fields";
+    return std::nullopt;
+  }
+  out.height = *height;
+  out.data = std::move(*data);
+  return out;
+}
+
 BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_bytes, std::string* err) {
   const std::string body_json = std::string(R"({"jsonrpc":"2.0","id":5,"method":"broadcast_tx","params":{"tx_hex":")") +
                                 hex_encode(tx_bytes) + R"("}})";

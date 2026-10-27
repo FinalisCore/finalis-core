@@ -1451,7 +1451,8 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli lock_send --to <addr> (--amount <coins> | --amount-units <u64>) (--unlock-height <h> | --lock-blocks <n>) [--inheritance] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # spendable by <addr> only from <h>; --inheritance: you keep spending it, <addr> is the heir from <h>\n"
-     << "  finalis-cli timed_send --to <addr> (--amount <coins> | --amount-units <u64>) [--unlock-height <h> | --delay <blocks>] [--bond <u64>] [--prepaid-fee <u64>] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # sealed until <h> is final\n"
+     << "  finalis-cli timed_send (--to <addr> (--amount <coins> | --amount-units <u64>) | --data-text <text> | --data-hex <hex>) [--unlock-height <h> | --delay <blocks>] [--bond <u64>] [--prepaid-fee <u64>] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # sealed until <h> is final; past the current epoch: a long lock\n"
+     << "  finalis-cli get_timed_reveal --txid <timed txid> [--rpc <url>]  # the data a reveal published\n"
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
@@ -3882,6 +3883,9 @@ int run_cli(int argc, char** argv) {
     // A time-locked transfer (TxTimed): the transfer is sealed now and opens, and applies, in block
     // unlock_height + 1, once the committee has time-signed unlock_height. Two coins: one pays the
     // envelope (prepaid fee + forfeit bond, the rest back as change), the others fund the sealed transfer.
+    // With --data-text / --data-hex the body is a reveal instead: up to 1016 bytes published at unlock
+    // (get_timed_reveal), one coin only. An unlock past the current epoch is a long lock: the current
+    // committee is named and opens it, for a per-epoch fee.
     std::string file_path = default_validator_key_path();
     std::string passphrase;
     std::string rpc_url = default_rpc_url();
@@ -3893,6 +3897,8 @@ int run_cli(int argc, char** argv) {
     std::uint64_t bond = finalis::consensus::kTxTimedMinForfeitBond;
     std::optional<std::uint64_t> unlock_height;
     std::uint64_t delay = 2;
+    bool delay_given = false;
+    std::optional<finalis::Bytes> reveal_data;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--file" && i + 1 < argc) file_path = argv[++i];
@@ -3905,10 +3911,27 @@ int run_cli(int argc, char** argv) {
       else if (a == "--prepaid-fee" && i + 1 < argc) prepaid_fee = std::stoull(argv[++i]);
       else if (a == "--bond" && i + 1 < argc) bond = std::stoull(argv[++i]);
       else if (a == "--unlock-height" && i + 1 < argc) unlock_height = std::stoull(argv[++i]);
-      else if (a == "--delay" && i + 1 < argc) delay = std::stoull(argv[++i]);
+      else if (a == "--delay" && i + 1 < argc) {
+        delay = std::stoull(argv[++i]);
+        delay_given = true;
+      } else if (a == "--data-text" && i + 1 < argc) {
+        const std::string text = argv[++i];
+        reveal_data = finalis::Bytes(text.begin(), text.end());
+      } else if (a == "--data-hex" && i + 1 < argc) {
+        reveal_data = finalis::hex_decode(argv[++i]);
+        if (!reveal_data.has_value()) {
+          std::cerr << "invalid --data-hex\n";
+          return 1;
+        }
+      }
     }
-    if (to_addr.empty() || !decode_network_address(to_addr, "--to").has_value()) {
-      std::cerr << "--to <address> is required\n";
+    const bool reveal = reveal_data.has_value();
+    if (reveal && (reveal_data->empty() || reveal_data->size() > finalis::kTimedRevealMaxDataBytes)) {
+      std::cerr << "--data must be 1.." << finalis::kTimedRevealMaxDataBytes << " bytes\n";
+      return 1;
+    }
+    if (!reveal && (to_addr.empty() || !decode_network_address(to_addr, "--to").has_value())) {
+      std::cerr << "--to <address> is required (or --data-text / --data-hex)\n";
       return 1;
     }
     if (!amount_text.empty()) {
@@ -3919,7 +3942,7 @@ int run_cli(int argc, char** argv) {
       }
       amount_units = *parsed;
     }
-    if (amount_units == 0) {
+    if (!reveal && amount_units == 0) {
       std::cerr << "--amount or --amount-units is required\n";
       return 1;
     }
@@ -3931,7 +3954,7 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
     const auto own = finalis::address::decode(vk.address);
-    const auto to = finalis::address::decode(to_addr);
+    const auto to = reveal ? own : finalis::address::decode(to_addr);
     if (!own.has_value() || !to.has_value()) {
       std::cerr << "timed_send failed: invalid address\n";
       return 1;
@@ -3942,17 +3965,24 @@ int run_cli(int argc, char** argv) {
       std::cerr << "timed_send failed to load rpc status: " << err << "\n";
       return 1;
     }
-    // Lockable heights: from the next block to the end of its epoch (later committees are not known yet).
+    // The envelope names the next block's epoch committee; an unlock past that epoch is a long lock.
     const std::uint64_t next_height = status->tip_height + 1;
     const std::uint64_t epoch_blocks = std::max<std::uint64_t>(1, cli_network().committee_epoch_blocks);
     const std::uint64_t horizon = finalis::consensus::committee_epoch_start(next_height, epoch_blocks) + epoch_blocks - 1;
-    const std::uint64_t unlock = unlock_height.value_or(std::min(horizon, next_height + delay));
-    if (unlock < next_height || unlock > horizon) {
-      std::cerr << "timed_send failed: --unlock-height must be in [" << next_height << ", " << horizon
-                << "] (the current epoch's committee)\n";
+    const std::uint64_t unlock =
+        unlock_height.value_or(delay_given ? next_height + delay : std::min(horizon, next_height + delay));
+    const auto terms = finalis::consensus::timed_lock_terms(next_height, unlock, epoch_blocks, prepaid_fee, &err);
+    if (!terms.has_value()) {
+      std::cerr << "timed_send failed: " << err << "\n";
       return 1;
     }
-    const auto committee = finalis::lightserver::rpc_get_committee_bls_keys(rpc_url, unlock, &err);
+    prepaid_fee = terms->prepaid_fee;
+    if (terms->beyond_lien) {
+      std::cerr << "warning: unlock is more than " << finalis::consensus::kTimedLongLienBlocks
+                << " blocks away; the named validators' bonds are held only that long, after which opening "
+                   "relies on them signing voluntarily (else the bond is refunded and the body stays sealed)\n";
+    }
+    const auto committee = finalis::lightserver::rpc_get_committee_bls_keys(rpc_url, next_height, &err);
     if (!committee.has_value()) {
       std::cerr << "timed_send failed to load committee keys: " << err << "\n";
       return 1;
@@ -3982,8 +4012,14 @@ int run_cli(int argc, char** argv) {
         coins.push_back({finalis::OutPoint{u.txid, u.vout}, finalis::TxOut{u.value, u.script_pubkey}});
       }
     }
-    const auto timed_plan = finalis::plan_timed_p2pkh_send(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash),
-                                                           own_script, amount_units, fee, prepaid_fee, bond, &err);
+    std::optional<finalis::TimedSendPlan> timed_plan;
+    if (reveal) {
+      const auto coin = finalis::select_timed_fee_coin(coins, prepaid_fee, bond, &err);
+      if (coin.has_value()) timed_plan = finalis::TimedSendPlan{*coin, {}, coin->second.value - prepaid_fee - bond};
+    } else {
+      timed_plan = finalis::plan_timed_p2pkh_send(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash),
+                                                  own_script, amount_units, fee, prepaid_fee, bond, &err);
+    }
     if (!timed_plan.has_value()) {
       std::cerr << "timed_send planning failed: " << err << "\n";
       return 1;
@@ -3996,10 +4032,13 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
     const finalis::Bytes privkey(vk.privkey.begin(), vk.privkey.end());
-    auto body = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, plan->selected_prevs, privkey, plan->outputs, &err);
-    if (!body.has_value()) {
-      std::cerr << "timed_send body build failed: " << err << "\n";
-      return 1;
+    std::optional<finalis::Tx> body;
+    if (!reveal) {
+      body = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, plan->selected_prevs, privkey, plan->outputs, &err);
+      if (!body.has_value()) {
+        std::cerr << "timed_send body build failed: " << err << "\n";
+        return 1;
+      }
     }
     finalis::TimedTxParams params;
     params.fee_outpoint = fee_coin.first;
@@ -4009,7 +4048,7 @@ int run_cli(int argc, char** argv) {
     params.bond_refund_script = own_script;
     if (timed_plan->fee_change_units > 0) params.fee_change = finalis::TxOut{timed_plan->fee_change_units, own_script};
     params.unlock_height = unlock;
-    params.committee_epoch = finalis::consensus::committee_epoch_start(unlock, epoch_blocks);
+    params.committee_epoch = terms->committee_epoch;
     params.committee_root = committee->root;
     params.committee_keys = committee->keys;
     params.threshold = static_cast<std::uint32_t>(finalis::consensus::quorum_threshold(committee->keys.size()));
@@ -4018,23 +4057,38 @@ int run_cli(int argc, char** argv) {
       std::cerr << "timed_send failed: no randomness\n";
       return 1;
     }
-    auto timed = finalis::build_signed_timed_tx(*chain_domain, params, finalis::AnyTx{*body}, privkey, seed, &err);
+    const finalis::TimedBody sealed = reveal ? finalis::TimedBody{finalis::TimedReveal{*reveal_data}}
+                                             : finalis::TimedBody{finalis::AnyTx{*body}};
+    auto timed = finalis::build_signed_timed_tx(*chain_domain, params, sealed, privkey, seed, &err);
     finalis::crypto::secure_wipe(seed);
     if (!timed.has_value()) {
       std::cerr << "timed_send build failed: " << err << "\n";
       return 1;
     }
+    if (terms->long_lock && timed->body_ciphertext.size() > finalis::consensus::kTxTimedMaxLongBodyCiphertextBytes) {
+      std::cerr << "timed_send failed: a long lock's sealed body is at most 1 KiB (this one is "
+                << timed->body_ciphertext.size() - finalis::kTxTimedBodyTagBytes << " bytes); use fewer inputs\n";
+      return 1;
+    }
     auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, timed->serialize(), &err);
     std::cout << "address=" << vk.address << "\n";
-    std::cout << "recipient=" << to_addr << "\n";
-    std::cout << "amount=" << amount_units << "\n";
+    if (reveal) {
+      std::cout << "reveal_bytes=" << reveal_data->size() << "\n";
+    } else {
+      std::cout << "recipient=" << to_addr << "\n";
+      std::cout << "amount=" << amount_units << "\n";
+    }
     std::cout << "unlock_height=" << unlock << "\n";
+    std::cout << "lock=" << (terms->long_lock ? "long" : "short") << "\n";
+    std::cout << "include_by_height=" << terms->last_inclusion_height << "\n";
     std::cout << "opens_in_block=" << unlock + 1 << "\n";
     std::cout << "prepaid_fee=" << prepaid_fee << "\n";
     std::cout << "forfeit_bond=" << bond << "\n";
-    std::cout << "body_fee=" << plan->applied_fee_units << "\n";
     std::cout << "timed_txid=" << finalis::hex_encode32(timed->txid()) << "\n";
-    std::cout << "body_txid=" << finalis::hex_encode32(body->txid()) << "\n";
+    if (!reveal) {
+      std::cout << "body_fee=" << plan->applied_fee_units << "\n";
+      std::cout << "body_txid=" << finalis::hex_encode32(body->txid()) << "\n";
+    }
     // To cancel before it opens, spend these back to yourself (build_p2pkh_multi_tx + broadcast_tx); once
     // the envelope is in a block that forfeits the bond.
     for (const auto& [op, _] : plan->selected_prevs) {
@@ -4047,6 +4101,34 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
     std::cout << "accepted=yes\n";
+    return 0;
+  }
+
+  // The data a timed send's reveal body published (timed_send --data-*), once it has opened.
+  if (cmd == "get_timed_reveal") {
+    std::string rpc_url = default_rpc_url();
+    std::string txid_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--txid" && i + 1 < argc) txid_hex = argv[++i];
+    }
+    const auto txid = decode_hex32(txid_hex);
+    if (!txid) {
+      std::cerr << "--txid <timed txid hex32> is required\n";
+      return 1;
+    }
+    std::string err;
+    const auto reveal = finalis::lightserver::rpc_get_timed_reveal(rpc_url, *txid, &err);
+    if (!reveal) {
+      std::cerr << "get_timed_reveal failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "revealed=" << (reveal->revealed ? "yes" : "no") << "\n";
+    if (reveal->revealed) {
+      std::cout << "height=" << reveal->height << "\n";
+      std::cout << "data_hex=" << finalis::hex_encode(reveal->data) << "\n";
+    }
     return 0;
   }
 

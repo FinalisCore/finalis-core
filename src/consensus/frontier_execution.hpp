@@ -90,6 +90,23 @@ bool timed_is_long_lock(const TxTimed& tx, std::uint64_t committee_epoch_blocks)
 std::optional<std::uint64_t> timed_long_lock_min_fee(std::uint64_t height, std::uint64_t unlock_height,
                                                      std::uint64_t committee_epoch_blocks);
 
+// Client side: the terms of a TxTimed unlocking at `unlock` sent when the next block is `next_height`.
+// It names next_height's epoch (encrypt to that epoch's committee keys, fetched at next_height) and
+// must be included in it; a long lock adds timed_long_lock_min_fee to `base_prepaid_fee`. Nullopt (with
+// `err`) if unlock < next_height, the fee overflows, or a long lock has fewer than
+// kTimedLongInclusionMarginBlocks blocks of the epoch left to be included in.
+inline constexpr std::uint64_t kTimedLongInclusionMarginBlocks = 3;
+struct TimedLockTerms {
+  std::uint64_t committee_epoch{0};
+  bool long_lock{false};
+  std::uint64_t prepaid_fee{0};
+  std::uint64_t last_inclusion_height{0};  // the end of the named epoch (and at most unlock)
+  bool beyond_lien{false};                 // unlock more than kTimedLongLienBlocks away: bonds no longer held
+};
+std::optional<TimedLockTerms> timed_lock_terms(std::uint64_t next_height, std::uint64_t unlock,
+                                               std::uint64_t committee_epoch_blocks, std::uint64_t base_prepaid_fee,
+                                               std::string* err = nullptr);
+
 // What execution of block `height` needs for timed records. Consensus callers always pass it; without
 // it a TxTimed record is rejected and nothing settles.
 struct TimedExecutionContext {

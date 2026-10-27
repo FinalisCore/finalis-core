@@ -2962,6 +2962,21 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     return make_result(id, tx_status_json(*txid, loc, tip, *view));
   }
 
+  // The data a TxTimed's reveal body published when it settled (DB "TR:" rows); revealed=false while
+  // it is sealed, unknown, or not a reveal.
+  if (*method == "get_timed_reveal") {
+    auto txid_hex = field_string(params, "txid");
+    if (!txid_hex) return make_error(id, -32602, "missing txid");
+    auto txid = parse_hex32(*txid_hex);
+    if (!txid) return make_error(id, -32602, "bad txid");
+    const auto reveal = view->get_timed_reveal(*txid);
+    std::ostringstream oss;
+    oss << "{\"txid\":\"" << hex_encode32(*txid) << "\",\"revealed\":" << (reveal ? "true" : "false");
+    if (reveal) oss << ",\"height\":" << reveal->height << ",\"data_hex\":\"" << hex_encode(reveal->data) << "\"";
+    oss << "}";
+    return make_result(id, oss.str());
+  }
+
   if (*method == "get_tx_summaries") {
     const auto* txids_value = params ? params->get("txids") : nullptr;
     if (!txids_value || !txids_value->is_array()) return make_error(id, -32602, "missing txids");

@@ -187,6 +187,12 @@ std::optional<DetailedHistoryPageView> rpc_get_history_page_detailed(const std::
                                                                      std::string* err);
 std::optional<TxView> rpc_get_tx(const std::string& rpc_url, const Hash32& txid, std::string* err);
 std::optional<TxStatusView> rpc_get_tx_status(const std::string& rpc_url, const Hash32& txid, std::string* err);
+struct TimedRevealView {
+  bool revealed{false};
+  std::uint64_t height{0};  // settling height, when revealed
+  Bytes data;
+};
+std::optional<TimedRevealView> rpc_get_timed_reveal(const std::string& rpc_url, const Hash32& timed_txid, std::string* err);
 BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_bytes, std::string* err);
 // Admin RPCs: only served on the lightserver admin Unix socket (see default_admin_rpc_url); a TCP
 // endpoint answers them with "method not found".

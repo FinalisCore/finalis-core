@@ -336,7 +336,10 @@ least the relay floor, and an unused fee input, into a timed pool next to the me
 certified in its lane and relayed like other records, and dropped once its fee input is spent or its
 unlock height has passed. A proposer stops a lane before the per-block cap rather than let a record
 be rejected. `finalis-cli timed_send` builds one (`build_signed_timed_tx`) from the committee keys of
-`get_committee` (verbose).
+`get_committee` (verbose) at the next height, with `consensus::timed_lock_terms`: an unlock past the
+current epoch is a long lock (fee per epoch added, included by the epoch's end, a warning past the
+lien); `--data-text` / `--data-hex` seal a reveal instead of a transfer. RPC `get_timed_reveal`
+(`finalis-cli get_timed_reveal --txid`) returns a settled reveal's data and height.
 
 Bounds: at most `kMaxTimedTxPerBlock` (8) accepted per block, at most
 `kMaxTimedEscrowsPerUnlockHeight` (16) waiting per unlock height. Escrows are consensus state:

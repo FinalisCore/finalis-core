@@ -3703,6 +3703,37 @@ TEST(test_long_timed_lock_reveals_data) {
   ASSERT_TRUE(has_utxo(settled, consensus::timed_refund_outpoint(timed->txid())));
 }
 
+// Client terms: a lock within the next block's epoch is short at the base fee; past it, long, with the
+// per-epoch fee, an inclusion deadline at the epoch's end, a margin before it, and the lien warning.
+TEST(test_timed_lock_terms) {
+  constexpr std::uint64_t epoch = 32;
+  const auto short_lock = consensus::timed_lock_terms(33, 40, epoch, 1'000);
+  ASSERT_TRUE(short_lock.has_value() && !short_lock->long_lock && short_lock->prepaid_fee == 1'000);
+  ASSERT_EQ(short_lock->committee_epoch, 33u);
+  ASSERT_EQ(short_lock->last_inclusion_height, 40u);
+  const auto long_lock = consensus::timed_lock_terms(33, 64 + 33, epoch, 1'000);
+  ASSERT_TRUE(long_lock.has_value() && long_lock->long_lock && !long_lock->beyond_lien);
+  ASSERT_EQ(long_lock->prepaid_fee, 1'000 + 2 * consensus::kTxTimedLongFeePerEpoch);
+  ASSERT_EQ(long_lock->committee_epoch, 33u);
+  ASSERT_EQ(long_lock->last_inclusion_height, 64u);
+  ASSERT_TRUE(consensus::timed_lock_terms(62, 200, epoch, 1'000).has_value());
+  std::string err;
+  ASSERT_TRUE(!consensus::timed_lock_terms(63, 200, epoch, 1'000, &err).has_value() && !err.empty());
+  ASSERT_TRUE(consensus::timed_lock_terms(63, 64, epoch, 1'000).has_value());  // short: no margin needed
+  ASSERT_TRUE(!consensus::timed_lock_terms(33, 32, epoch, 1'000).has_value());
+  ASSERT_TRUE(consensus::timed_lock_terms(33, 33 + consensus::kTimedLongLienBlocks + 1, epoch, 1'000)->beyond_lien);
+
+  std::vector<std::pair<OutPoint, TxOut>> coins;
+  for (std::uint8_t i = 1; i <= 3; ++i) {
+    OutPoint op{};
+    op.txid.fill(i);
+    coins.push_back({op, p2pkh_out_for_pub(key_from_byte(171).public_key, 1'000'000ull * i)});
+  }
+  const auto coin = select_timed_fee_coin(coins, 500'000, 1'000'000);
+  ASSERT_TRUE(coin.has_value() && coin->second.value == 2'000'000);
+  ASSERT_TRUE(!select_timed_fee_coin(coins, 3'000'000, 1).has_value());
+}
+
 // A reveal is stored as one "TR:" row: settling height and data.
 TEST(test_timed_reveal_rows_round_trip) {
   const std::string path = unique_test_base("/tmp/finalis_test_timed_reveal_rows");

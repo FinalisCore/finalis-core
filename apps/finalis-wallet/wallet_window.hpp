@@ -370,14 +370,18 @@ class WalletWindow final : public QMainWindow {
   void submit_send();
   // Time-locked sends (TxTimed): the plan, unlock height and committee keys for the current form.
   struct PreparedTimedSend {
-    TimedSendPlan plan;
+    TimedSendPlan plan;  // a reveal: the fee coin only
     std::uint64_t unlock_height{0};
     std::uint64_t committee_epoch{0};
+    consensus::TimedLockTerms terms;
     std::vector<crypto::BlsPublicKey> committee_keys;
     Hash32 committee_root{};
   };
+  // A time-locked transfer to `destination`, or with `reveal_data` a sealed data reveal (destination
+  // and amount unused).
   std::optional<PreparedTimedSend> prepare_timed_send(const QString& destination, std::uint64_t amount_units,
-                                                      bool fetch_committee, QString* err);
+                                                      bool fetch_committee, QString* err,
+                                                      const Bytes* reveal_data = nullptr);
   // Spends a pending time-locked transfer's coins back to this wallet before it opens (forfeiting
   // the bond); also spends the fee coin if the envelope is not in a block yet.
   void cancel_timed_send();

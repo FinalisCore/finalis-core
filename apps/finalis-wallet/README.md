@@ -99,7 +99,9 @@ supported subset:
 
 `Send -> Transparent -> Transparent (time-locked)` seals a transfer until a height is final
 (`TxTimed`, see docs/CONSENSUS.md "Timed Transactions"): "Opens after" N blocks puts the unlock
-height at next block + N, at most the end of the current committee epoch. One coin pays the envelope
+height at next block + N. Past the end of the current committee epoch it is a long lock: the current
+committee opens it, the envelope pays 0.001 FLS per epoch of lock, its sealed transfer is at most 1 KiB,
+and the review warns when the lock runs past the validators' one-year bond hold. One coin pays the envelope
 (prepaid fee + a bond, the rest returns as change); the transfer is planned from the other coins
 (`plan_timed_p2pkh_send`). Its coins stay reserved until it opens: the wallet records the sealed
 transfer as a pending spend dated at the unlock height, so the usual not-found release cannot free
@@ -110,6 +112,11 @@ the wallet, which makes the transfer fail when it opens (the bond is forfeited, 
 cancel would make every envelope a free option). If the envelope is not in a block yet, it also spends
 the fee coin, which keeps the bond if that spend finalizes first. Records are kept in the wallet store
 (`TIMED:`), because the chain holds the transfer encrypted until it opens.
+
+`Send -> Sealed data (published at a block)` seals the text in the data field (up to 1016 bytes)
+instead of a transfer: nobody can read it until the unlock height is final, then it is published for
+anyone (`get_timed_reveal`) and the bond comes back. It needs only the envelope's coin and cannot be
+cancelled once in a block.
 
 ## Height-locked sends
 

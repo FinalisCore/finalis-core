@@ -307,7 +307,7 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   settings.sync();
   finalis::wallet::WalletWindow window;
   auto* combo = window.send_mode_combo_;
-  require(combo != nullptr && combo->count() == 6, "send mode count mismatch");
+  require(combo != nullptr && combo->count() == 7, "send mode count mismatch");
   require(combo->itemText(4).toStdString() == "Transparent -> Transparent (time-locked)", "time-locked mode missing");
   require(window.send_unlock_delay_spin_ != nullptr && window.send_cancel_timed_button_ != nullptr,
           "time-locked controls missing");
@@ -325,6 +325,14 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   require(!window.send_lock_height_edit_->isHidden() && !window.send_inheritance_check_->isHidden(),
           "height-lock fields hidden in height-locked mode");
   require(window.send_unlock_delay_spin_->isHidden(), "time-lock field visible in height-locked mode");
+  // Sealed data: the unlock field, no amount; long delays are allowed (long locks).
+  require(combo->itemText(6).toStdString() == "Sealed data (published at a block)", "sealed data mode missing");
+  combo->setCurrentIndex(6);
+  require(!window.send_unlock_delay_spin_->isHidden(), "unlock delay hidden in sealed data mode");
+  require(!window.send_amount_edit_->isEnabled(), "amount enabled in sealed data mode");
+  require(window.send_unlock_delay_spin_->maximum() >= 1'000'000, "long lock delays not selectable");
+  combo->setCurrentIndex(4);
+  require(window.send_amount_edit_->isEnabled(), "amount disabled in time-locked mode");
 }
 
 void test_wallet_window_defaults_to_lightserver_rpc_port() {

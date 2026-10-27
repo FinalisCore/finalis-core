@@ -827,6 +827,33 @@ std::optional<std::uint64_t> timed_long_lock_min_fee(std::uint64_t height, std::
   return epochs * kTxTimedLongFeePerEpoch;
 }
 
+std::optional<TimedLockTerms> timed_lock_terms(std::uint64_t next_height, std::uint64_t unlock,
+                                               std::uint64_t committee_epoch_blocks, std::uint64_t base_prepaid_fee,
+                                               std::string* err) {
+  const auto fail = [&](std::string why) -> std::optional<TimedLockTerms> {
+    if (err) *err = std::move(why);
+    return std::nullopt;
+  };
+  const auto epoch_blocks = std::max<std::uint64_t>(1, committee_epoch_blocks);
+  if (unlock < next_height) return fail("unlock height " + std::to_string(unlock) + " is before the next block");
+  TimedLockTerms out;
+  out.committee_epoch = committee_epoch_start(next_height, epoch_blocks);
+  const auto epoch_end = out.committee_epoch + epoch_blocks - 1;
+  out.long_lock = unlock > epoch_end;
+  out.last_inclusion_height = std::min(epoch_end, unlock);
+  const auto long_fee = timed_long_lock_min_fee(next_height, unlock, epoch_blocks);
+  if (!long_fee.has_value() || *long_fee > std::numeric_limits<std::uint64_t>::max() - base_prepaid_fee) {
+    return fail("long lock fee overflows");
+  }
+  out.prepaid_fee = base_prepaid_fee + *long_fee;
+  if (out.long_lock && epoch_end + 1 - next_height < kTimedLongInclusionMarginBlocks) {
+    return fail("the current committee epoch ends at block " + std::to_string(epoch_end) +
+                "; send a long lock from block " + std::to_string(epoch_end + 1) + " on");
+  }
+  out.beyond_lien = unlock - next_height > kTimedLongLienBlocks;
+  return out;
+}
+
 Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys) {
   codec::ByteWriter w;
   w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '-', 'C', 'O', 'M', 'M', 'I', 'T', 'T', 'E', 'E', '-', 'B', 'L', 'S',

@@ -89,14 +89,16 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   mode_combo_->addItem("Confidential -> Confidential");
   mode_combo_->addItem("Transparent -> Transparent (time-locked)");
   mode_combo_->addItem("Transparent -> Height-locked (vesting / inheritance)");
+  mode_combo_->addItem("Sealed data (published at a block)");
   amount_edit_->setPlaceholderText("0.00");
   unlock_delay_spin_ = new QSpinBox(form_box);
-  unlock_delay_spin_->setRange(0, 1000);
+  unlock_delay_spin_->setRange(0, 10'000'000);
   unlock_delay_spin_->setValue(2);
   unlock_delay_spin_->setSuffix(" blocks");
   unlock_delay_spin_->setToolTip(
-      "The transfer is sealed until this many blocks after the next one is final, then opens and applies. "
-      "Limited to the current committee epoch.");
+      "Sealed until this many blocks after the next one is final, then it opens. Past the current committee "
+      "epoch it is a long lock: the current committee opens it, for a fee per epoch of lock (about 0.001 FLS "
+      "per 96 minutes).");
   unlock_delay_label_ = new QLabel("Opens after", form_box);
   form->addRow("Recipient address", address_edit_);
   form->addRow("Send mode", mode_combo_);
