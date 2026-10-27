@@ -560,6 +560,26 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
   return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);
 }
 
+Tx build_early_time_signature_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, std::uint64_t height,
+                                       const crypto::BlsSignature& signature) {
+  codec::ByteWriter ev;
+  ev.u64le(height);
+  ev.bytes_fixed(signature);
+  const Bytes evidence_blob = ev.take();
+  codec::ByteWriter ss;
+  ss.bytes(Bytes{'S', 'C', 'T', 'S', 'L', 'A', 'S', 'H'});
+  ss.varbytes(evidence_blob);
+  const Hash32 evh = crypto::sha256d(evidence_blob);
+  Bytes burn{'S', 'C', 'B', 'U', 'R', 'N'};
+  burn.insert(burn.end(), evh.begin(), evh.end());
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{bond_outpoint.txid, bond_outpoint.index, ss.take(), 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{bond_value, burn});
+  return tx;
+}
+
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
                                  const Vote& vote_b, std::uint64_t fee, std::string* err, SlashVoteKind kind) {
   if (bond_value < fee) {

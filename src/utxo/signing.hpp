@@ -121,5 +121,10 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
                                  const Vote& vote_b, std::uint64_t fee = 0, std::string* err = nullptr,
                                  SlashVoteKind kind = SlashVoteKind::Precommit);
+// Burns the whole bond (or unbond output) of the validator whose registered BLS key made `signature`
+// on time_signature_message(D, height); valid only in a block at a height <= `height`
+// (EarlyTimeSignatureEvidence).
+Tx build_early_time_signature_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, std::uint64_t height,
+                                       const crypto::BlsSignature& signature);
 
 }  // namespace finalis

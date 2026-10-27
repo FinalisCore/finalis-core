@@ -49,6 +49,17 @@ struct SlashEvidence {
   Bytes raw_blob;
 };
 
+// Early time signature: a validator's BLS signature on time_signature_message(D, height) included in a
+// block at a height <= `height`, before that height is final. Honest validators sign a height only
+// once they hold its finality certificate (and named committees of long locks only after that), so it
+// proves the key's owner leaked a share of a time lock's key early. Script_sig
+// "SCTSLASH" | varbytes(u64le height | signature(96)); the SCBURN output commits to sha256d of the blob.
+struct EarlyTimeSignatureEvidence {
+  std::uint64_t height{0};
+  crypto::BlsSignature signature{};
+  Bytes raw_blob;
+};
+
 inline constexpr std::size_t kMaxTxInputs = 512;
 inline constexpr std::size_t kMaxTxEd25519Verifies = 1024;
 // A BLS proof-of-possession check (two pairings) in units of the Ed25519 verify budget.
@@ -159,6 +170,9 @@ bool script_spendable_by(const Bytes& script_pubkey, const std::array<std::uint8
 std::vector<Hash32> script_index_hashes(const Bytes& script_pubkey);
 bool script_indexed_under(const Bytes& script_pubkey, const Hash32& scripthash);
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out);
+bool parse_early_time_signature_script_sig(const Bytes& script_sig, EarlyTimeSignatureEvidence* out = nullptr);
+// Either kind of slashing evidence (equivocation or early time signature): the spend bans the validator.
+bool is_slash_script_sig(const Bytes& script_sig);
 
 struct ConfidentialPolicy {
   std::uint32_t max_inputs_per_tx{kTxV2MaxInputs};

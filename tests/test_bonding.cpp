@@ -1020,6 +1020,78 @@ TEST(test_scvalunb_slash_evidence_validation) {
   ASSERT_TRUE(r.ok);
 }
 
+// A time signature on a height not yet final when the evidence is included (height >= the block's)
+// burns the signer's whole bond or unbond output, even while a long lock holds the bond; a final
+// height, another key, another chain or a tampered burn is not evidence.
+TEST(test_early_time_signature_slash_evidence) {
+  const auto kp = key_from_byte(18);
+  const auto other = key_from_byte(19);
+  OutPoint bond_op{};
+  bond_op.txid.fill(0xC5);
+  UtxoSet view;
+  view[bond_op] = UtxoEntry{TxOut{BOND_AMOUNT, reg_script(kp.public_key)}};
+  consensus::ValidatorRegistry vr;
+  ASSERT_TRUE(vr.register_bond(kp.public_key, bond_op, 10, BOND_AMOUNT, nullptr, std::nullopt,
+                               finalis::test::test_bls_pubkey(kp)));
+  vr.advance_height(200);
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
+      .network = &mainnet_network(),
+      .chain_id = &slash_test_chain_id(),
+      .validators = &vr,
+      .current_height = 200,
+      .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
+  });
+  const auto time_sig = [&](const crypto::KeyPair& signer, const Hash32& domain, std::uint64_t height) {
+    const auto sk = crypto::bls_key_from_validator_seed(Bytes(signer.private_key.begin(), signer.private_key.end()));
+    return *crypto::bls_sign(*sk, time_signature_message(domain, height), crypto::kBlsTimeSignatureDst);
+  };
+  const auto slash = [&](const OutPoint& op, std::uint64_t value, const crypto::KeyPair& signer, const Hash32& domain,
+                         std::uint64_t height) {
+    return build_early_time_signature_slash_tx(op, value, height, time_sig(signer, domain, height));
+  };
+  const auto validate = [&](const Tx& tx) { return validate_tx(tx, 1, view, &ctx); };
+
+  const auto now = slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 200);
+  EarlyTimeSignatureEvidence evidence;
+  ASSERT_TRUE(parse_early_time_signature_script_sig(now.inputs[0].script_sig, &evidence));
+  ASSERT_EQ(evidence.height, 200u);
+  ASSERT_TRUE(is_slash_script_sig(now.inputs[0].script_sig));
+  ASSERT_TRUE(!parse_slash_script_sig(now.inputs[0].script_sig, nullptr));
+  ASSERT_TRUE(validate(now).ok);
+  ASSERT_TRUE(validate(slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 1'000'000)).ok);
+
+  const auto final_height = validate(slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 199));
+  ASSERT_TRUE(!final_height.ok && final_height.error == "time signature evidence height already final");
+  ASSERT_TRUE(!validate(slash(bond_op, BOND_AMOUNT, other, slash_test_domain(), 250)).ok);
+  ChainId other_chain = slash_test_chain_id();
+  other_chain.genesis_hash_hex = "3333333333333333333333333333333333333333333333333333333333333333";
+  ASSERT_TRUE(!validate(slash(bond_op, BOND_AMOUNT, kp, consensus_chain_domain(mainnet_network(), other_chain), 250)).ok);
+  auto short_burn = now;
+  short_burn.outputs[0].value -= 1;
+  ASSERT_TRUE(!validate(short_burn).ok);
+  auto other_height = now;
+  other_height.inputs[0].script_sig = slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 201).inputs[0].script_sig;
+  ASSERT_TRUE(validate(other_height).error == "slash evidence hash mismatch");
+
+  // An exiting validator's unbond output, held by a long lock's lien, is still slashable.
+  OutPoint unb_op{};
+  unb_op.txid.fill(0xC6);
+  view[unb_op] = UtxoEntry{TxOut{BOND_AMOUNT - 1000, unb_script(kp.public_key)}};
+  ASSERT_TRUE(vr.request_unbond(kp.public_key, 150));
+  ctx.timed_bond_lien = [](const PubKey32&, std::uint64_t) { return true; };
+  ASSERT_TRUE(validate(slash(unb_op, BOND_AMOUNT - 1000, kp, slash_test_domain(), 300)).ok);
+  ASSERT_TRUE(!validate(slash(unb_op, BOND_AMOUNT - 1000, kp, slash_test_domain(), 100)).ok);
+
+  // A validator without a registered BLS key has nothing to verify against.
+  const auto keyless = key_from_byte(20);
+  OutPoint keyless_op{};
+  keyless_op.txid.fill(0xC7);
+  view[keyless_op] = UtxoEntry{TxOut{BOND_AMOUNT, reg_script(keyless.public_key)}};
+  vr.register_bond(keyless.public_key, keyless_op, 10);
+  ASSERT_TRUE(validate(slash(keyless_op, BOND_AMOUNT, keyless, slash_test_domain(), 300)).error ==
+              "time signature evidence key not registered");
+}
+
 TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
   const auto kp = key_from_byte(13);
   OutPoint bond_op{};

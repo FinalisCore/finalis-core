@@ -822,6 +822,66 @@ bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
   return true;
 }
 
+bool parse_early_time_signature_script_sig(const Bytes& script_sig, EarlyTimeSignatureEvidence* out) {
+  static const Bytes marker{'S', 'C', 'T', 'S', 'L', 'A', 'S', 'H'};
+  if (script_sig.size() < marker.size()) return false;
+  if (!std::equal(marker.begin(), marker.end(), script_sig.begin())) return false;
+  Bytes tail(script_sig.begin() + static_cast<long>(marker.size()), script_sig.end());
+  Bytes blob;
+  if (!codec::parse_exact(tail, [&](codec::ByteReader& r) {
+        auto b = r.varbytes();
+        if (!b) return false;
+        blob = *b;
+        return true;
+      })) {
+    return false;
+  }
+  EarlyTimeSignatureEvidence ev;
+  if (!codec::parse_exact(blob, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto sig = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+        if (!h || !sig) return false;
+        ev.height = *h;
+        ev.signature = *sig;
+        return true;
+      })) {
+    return false;
+  }
+  ev.raw_blob = std::move(blob);
+  if (out) *out = std::move(ev);
+  return true;
+}
+
+bool is_slash_script_sig(const Bytes& script_sig) {
+  return parse_slash_script_sig(script_sig, nullptr) || parse_early_time_signature_script_sig(script_sig, nullptr);
+}
+
+namespace {
+
+// The checks of an early-time-signature slash of the bond (or unbond output) of `owner`: a single
+// SCBURN output committing to the evidence, a height not yet final at ctx->current_height, and a
+// signature that verifies under the owner's registered BLS key. Empty on success, else the error.
+std::string check_early_time_signature_slash(const Tx& tx, const EarlyTimeSignatureEvidence& evidence,
+                                             const PubKey32& owner, const SpecialValidationContext& ctx,
+                                             const Hash32& chain_domain, std::size_t* verify_budget_remaining) {
+  if (tx.outputs.size() != 1) return "slash tx must have exactly one output";
+  Hash32 burn_hash{};
+  if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return "slash output must be SCBURN";
+  if (burn_hash != crypto::sha256d(evidence.raw_blob)) return "slash evidence hash mismatch";
+  if (evidence.height < ctx.current_height) return "time signature evidence height already final";
+  const auto info = ctx.validators->get(owner);
+  if (!info.has_value() || info->bls_pubkey == crypto::BlsPublicKey{}) return "time signature evidence key not registered";
+  std::string budget_error;
+  if (!consume_verify_budget(verify_budget_remaining, kBlsPopVerifyCost, &budget_error)) return budget_error;
+  if (!crypto::bls_verify(info->bls_pubkey, time_signature_message(chain_domain, evidence.height),
+                          crypto::kBlsTimeSignatureDst, evidence.signature)) {
+    return "invalid time signature evidence";
+  }
+  return "";
+}
+
+}  // namespace
+
 TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
                                const SpecialValidationContext* ctx) {
   const auto chain_domain = tx_chain_domain(ctx);
@@ -930,7 +990,14 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       if (!ctx || !ctx->validators) return {false, "bond spend requires validator context", 0};
 
       SlashEvidence evidence;
-      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+      EarlyTimeSignatureEvidence early;
+      if (parse_early_time_signature_script_sig(in.script_sig, &early)) {
+        const auto slash_error =
+            check_early_time_signature_slash(tx, early, bond_pub, *ctx, *chain_domain, &verify_budget_remaining);
+        if (!slash_error.empty()) return {false, slash_error, 0};
+        has_slash_input = true;
+        slashed_sum += prev_out.value;  // bounded by the guarded in_sum below
+      } else if (parse_slash_script_sig(in.script_sig, &evidence)) {
         if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
         Hash32 burn_hash{};
         if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return {false, "slash output must be SCBURN", 0};
@@ -999,6 +1066,19 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       auto info = ctx->validators->get(unbond_pub);
       if (!info.has_value()) return {false, "unknown validator for unbond output", 0};
       SlashEvidence evidence;
+      EarlyTimeSignatureEvidence early;
+      if (parse_early_time_signature_script_sig(in.script_sig, &early)) {
+        const auto slash_error =
+            check_early_time_signature_slash(tx, early, unbond_pub, *ctx, *chain_domain, &verify_budget_remaining);
+        if (!slash_error.empty()) return {false, slash_error, 0};
+        has_slash_input = true;
+        slashed_sum += prev_out.value;  // bounded by the guarded in_sum below
+        if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+          return {false, "input sum overflow", 0};
+        }
+        in_sum += prev_out.value;
+        continue;
+      }
       if (parse_slash_script_sig(in.script_sig, &evidence)) {
         if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
         Hash32 burn_hash{};

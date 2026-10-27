@@ -693,9 +693,8 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
       const auto prev_out = transparent_txout_from_utxo_entry(it->second);
       if (!prev_out.has_value()) continue;
       PubKey32 pub{};
-      SlashEvidence evidence;
       if (is_validator_register_script(prev_out->script_pubkey, &pub)) {
-        if (parse_slash_script_sig(in.script_sig, &evidence)) {
+        if (is_slash_script_sig(in.script_sig)) {
           state->validators.ban(pub, height);
           (void)state->validators.finalize_withdrawal(pub);
         } else {
@@ -722,7 +721,7 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
         continue;
       }
       if (is_validator_unbond_script(prev_out->script_pubkey, &pub)) {
-        if (parse_slash_script_sig(in.script_sig, &evidence)) state->validators.ban(pub, height);
+        if (is_slash_script_sig(in.script_sig)) state->validators.ban(pub, height);
         (void)state->validators.finalize_withdrawal(pub);
       }
     }

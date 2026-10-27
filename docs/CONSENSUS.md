@@ -316,6 +316,13 @@ final, wherever its members are then (their BLS keys are seed-derived and perman
 - bond lien: a validator whose BLS key a waiting long escrow names cannot withdraw its bond
   (`consensus::timed_bond_lien`, "bond held by a pending long time lock") until that escrow settles
   or `kTimedLongLienBlocks` (one year) after its inclusion
+- early signing is slashable: a validator's BLS signature on `time_signature_message(D, H)` carried
+  in a block at a height `<= H` (before `H` is final) is evidence. The slash tx spends its bond or
+  unbond output (also while the lien holds it) with script_sig `"SCTSLASH" | varbytes(u64le H |
+  signature(96))` into one `SCBURN` output of the whole value committing to `sha256d` of the blob; the
+  signature verifies under the owner's registered BLS key; the validator is banned. Honest
+  validators sign `H` only once they hold its finality certificate, so honest signatures are never
+  evidence. `finalis-cli create_time_slash_tx` builds it
 
 Intake: a `TxTimed` travels in `TX` / `SUBMIT_TX` like any record. The node admits it with the
 same `consensus::check_timed_inclusion` the block applies (against the next height), a prepaid fee at

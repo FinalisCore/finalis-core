@@ -4349,6 +4349,45 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   }
 }
 
+// A validator's time signature on a height not yet final, carried as evidence, burns its bond and
+// bans it on a live node.
+TEST(test_early_time_signature_slash_bans_validator) {
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_time_slash"), 1, 1, 1);
+  auto& nodes = cluster.nodes;
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 6; }, ci_timeout_seconds(60)));
+
+  const auto slash_pub = keys[0].public_key;
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(*nodes[0], cluster.configs[0]);
+  Hash32 bond_txid{};
+  bond_txid.fill(0xA6);
+  const OutPoint bond_op{bond_txid, 0};
+  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(60)));
+  const auto info0 = nodes[0]->validator_info_for_test(slash_pub);
+  ASSERT_TRUE(info0.has_value() && info0->has_bond);
+
+  // Far enough ahead that the evidence is included before that height is final.
+  const auto early = nodes[0]->status().height + 1'000;
+  const auto sk = crypto::bls_key_from_validator_seed(Bytes(keys[0].private_key.begin(), keys[0].private_key.end()));
+  ASSERT_TRUE(sk.has_value());
+  const auto sig = crypto::bls_sign(*sk, time_signature_message(nodes[0]->consensus_domain_for_test(), early),
+                                    crypto::kBlsTimeSignatureDst);
+  ASSERT_TRUE(sig.has_value());
+  const auto slash_tx = build_early_time_signature_slash_tx(bond_op, info0->bonded_amount, early, *sig);
+  append_live_certified_tx_or_throw(cluster, slash_tx, "append time slash tx failed");
+  for (auto& n : nodes) n->pause_proposals_for_test(false);
+
+  if (!wait_for([&]() {
+        const auto info = nodes[0]->validator_info_for_test(slash_pub);
+        return info.has_value() && info->status == consensus::ValidatorStatus::BANNED && !info->has_bond;
+      }, ci_timeout_seconds(300))) {
+    throw std::runtime_error("time slash did not ban:" +
+                             summarize_validator_fixture_nodes(nodes, slash_pub, slash_tx.txid(), &cluster.configs));
+  }
+}
+
 TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_banned_onboarding_reentry"), 1, 1, 1, [](node::NodeConfig& cfg) {
     // Mainnet's 20-bit onboarding PoW mines slower than the two-epoch validity window under sanitizers.

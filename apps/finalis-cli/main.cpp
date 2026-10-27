@@ -1492,6 +1492,7 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network " << net << "] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
      << "  finalis-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>] [--genesis-hash <hex32>]\n"
      << "  finalis-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-transition <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-transition <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>] [--kind precommit|prevote]\n"
+     << "  finalis-cli create_time_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --height <u64> --sig <hex96>\n"
      << "  finalis-cli slash_records [--db <dir>] [--tail <n>]\n"
      << "  finalis-cli epoch_tickets [--db <dir>] --epoch <n>\n"
      << "  finalis-cli epoch_best [--db <dir>] --epoch <n>\n"
@@ -4516,6 +4517,36 @@ int run_cli(int argc, char** argv) {
     }
     std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
     std::cout << "tx_hex=" << finalis::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  // A validator's time signature on a height that was not final yet: burns its bond (or unbond output).
+  if (cmd == "create_time_slash_tx") {
+    std::string bond_txid_hex;
+    std::string sig_hex;
+    std::uint32_t bond_index = 0;
+    std::uint64_t bond_value = 0;
+    std::uint64_t height = 0;
+    for (int i = 2; i < argc; ++i) {
+      std::string k = argv[i];
+      if (k == "--bond-txid" && i + 1 < argc) bond_txid_hex = argv[++i];
+      else if (k == "--bond-index" && i + 1 < argc) bond_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (k == "--bond-value" && i + 1 < argc) bond_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (k == "--height" && i + 1 < argc) height = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (k == "--sig" && i + 1 < argc) sig_hex = argv[++i];
+    }
+    const auto bond_txid = decode_hex32(bond_txid_hex);
+    const auto sig_bytes = finalis::hex_decode(sig_hex);
+    if (!bond_txid || !sig_bytes || sig_bytes->size() != finalis::crypto::kBlsSignatureBytes || bond_value == 0) {
+      std::cerr << "invalid time slash args\n";
+      return 1;
+    }
+    finalis::crypto::BlsSignature sig{};
+    std::copy(sig_bytes->begin(), sig_bytes->end(), sig.begin());
+    const auto tx = finalis::build_early_time_signature_slash_tx(finalis::OutPoint{*bond_txid, bond_index}, bond_value,
+                                                                 height, sig);
+    std::cout << "txid=" << finalis::hex_encode32(tx.txid()) << "\n";
+    std::cout << "tx_hex=" << finalis::hex_encode(tx.serialize()) << "\n";
     return 0;
   }
 
