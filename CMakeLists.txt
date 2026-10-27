@@ -196,9 +196,10 @@ option(FINALIS_BLST_PORTABLE "Build blst with -D__BLST_PORTABLE__" ON)
 enable_language(C)
 set(FINALIS_BLST_SOURCES "${FINALIS_BLST_SOURCE}/src/server.c")
 set(FINALIS_BLST_DEFINES "")
-# No assembly under MSVC (its .asm needs MASM wiring, not done yet) or in fuzz/sanitizer builds
-# (MSan does not see writes made by assembly): portable C, slower.
-if(MSVC OR FINALIS_LIB_FUZZING_ENGINE OR FINALIS_SANITIZE)
+# No assembly under MSVC (its .asm needs MASM wiring, not done yet): portable C, slower. Fuzz and
+# ASan/UBSan builds keep the assembly: blst v0.3.17's no-asm path does not build with 64-bit limbs
+# (no llimb_t on x86_64/aarch64), and only MSan, not run here, needs it.
+if(MSVC)
   list(APPEND FINALIS_BLST_DEFINES __BLST_NO_ASM__)
 else()
   enable_language(ASM)
