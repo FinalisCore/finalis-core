@@ -3812,7 +3812,8 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base,
   auto& n0 = *cluster.nodes[0];
   ASSERT_TRUE(wait_for_tip(n0, 3, ci_timeout_seconds(40)));
   const std::uint64_t bond = consensus::kTxTimedMinForfeitBond;
-  const std::uint64_t prepaid = 1'000;
+  // Covers any envelope here: the largest committee and a body of up to 1 KiB.
+  const std::uint64_t prepaid = consensus::timed_min_prepaid_fee(timed_envelope_bytes_bound(MAX_COMMITTEE, 1024));
 
   std::optional<FundedTestWallet> funded;
   ASSERT_TRUE(wait_for([&]() {
@@ -3940,7 +3941,7 @@ TEST(test_long_time_lock_opens_on_a_four_validator_cluster) {
 
   std::optional<FundedTestWallet> funded;
   ASSERT_TRUE(wait_for([&]() {
-    funded = find_funded_test_wallet(n0, keys, 2 * (bond + 10 * consensus::kTxTimedLongFeePerEpoch), 2);
+    funded = find_funded_test_wallet(n0, keys, 2 * (bond + 1'000'000 + 10 * consensus::kTxTimedLongFeePerEpoch), 2);
     return funded.has_value();
   }, ci_timeout_seconds(120)));
   // Early in an epoch, so the envelope is included in the epoch it names.
@@ -3951,7 +3952,8 @@ TEST(test_long_time_lock_opens_on_a_four_validator_cluster) {
   const auto next = n0.status().height + 1;
   const auto epoch = consensus::committee_epoch_start(next, epoch_blocks);
   const auto unlock = epoch + epoch_blocks + 2;
-  const auto prepaid = std::max<std::uint64_t>(1'000, *consensus::timed_long_lock_min_fee(next, unlock, epoch_blocks));
+  const auto prepaid = consensus::timed_min_prepaid_fee(timed_envelope_bytes_bound(MAX_COMMITTEE, 1024)) +
+                       *consensus::timed_long_lock_min_fee(next, unlock, epoch_blocks);
 
   auto coins = funded->utxos;
   std::sort(coins.begin(), coins.end(), [](const auto& a, const auto& b) { return a.second.value > b.second.value; });

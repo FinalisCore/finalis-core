@@ -3253,7 +3253,7 @@ struct TimedFixture {
 TimedFixture make_timed_fixture() {
   TimedFixture fx;
   fx.fee_op.txid.fill(0xA1);
-  fx.fee_out = p2pkh_out_for_pub(fx.user.public_key, 10'000'000);
+  fx.fee_out = p2pkh_out_for_pub(fx.user.public_key, 50'000'000);
   fx.body_op.txid.fill(0xA2);
   fx.body_out = p2pkh_out_for_pub(fx.user.public_key, 3'000'000);
   fx.parent = build_parent_state_with_utxo(fx.cfg, 0, fx.fee_op, fx.fee_out);
@@ -3272,12 +3272,23 @@ Tx timed_body_spend(const TimedFixture& fx, const OutPoint& op, const TxOut& pre
 consensus::TimedEscrowState no_escrows;
 
 // Encrypted to the committee of the inclusion epoch (that of state's next height), as consensus requires.
+constexpr std::uint64_t kBond = consensus::kTxTimedMinForfeitBond;
+
+// The prepaid fee defaults to what a client pays (consensus::timed_lock_terms over the envelope bound).
 std::optional<TxTimed> build_timed(const TimedFixture& fx, const consensus::CanonicalDerivedState& state,
-                                   std::uint64_t unlock, const TimedBody& body, std::uint64_t bond = 2'000'000,
-                                   std::uint8_t seed = 1, std::uint64_t prepaid_fee = 1'000) {
+                                   std::uint64_t unlock, const TimedBody& body, std::uint64_t bond = kBond,
+                                   std::uint8_t seed = 1, std::optional<std::uint64_t> prepaid = std::nullopt) {
   const auto epoch = consensus::committee_epoch_start(state.finalized_height + 1, fx.cfg.network.committee_epoch_blocks);
   auto keys = consensus::time_signature_committee_keys(fx.cfg, state, epoch);
   if (!keys.has_value()) return std::nullopt;
+  if (!prepaid.has_value()) {
+    const auto bound = timed_envelope_bytes_bound(keys->size(), serialize_timed_body(body).size());
+    const auto terms =
+        consensus::timed_lock_terms(state.finalized_height + 1, unlock, fx.cfg.network.committee_epoch_blocks, bound);
+    // A client refuses a passed unlock height; the size fee still lets tests build one.
+    prepaid = terms.has_value() ? terms->prepaid_fee : consensus::timed_min_prepaid_fee(bound);
+  }
+  const std::uint64_t prepaid_fee = *prepaid;
   TimedTxParams p;
   p.fee_outpoint = fx.fee_op;
   p.fee_prev_out = fx.fee_out;
@@ -3310,7 +3321,7 @@ TEST(test_timed_tx_is_escrowed_then_settled_with_the_parent_time_signature) {
   const auto timed_txid = timed->txid();
 
   const auto record1 = make_frontier_record(fx.parent, {timed->serialize()}, fx.cfg);
-  ASSERT_EQ(record1.transition.settlement.current_fees, 1'000u);  // the prepaid fee only
+  ASSERT_EQ(record1.transition.settlement.current_fees, timed->prepaid_fee);  // the prepaid fee only
   consensus::CanonicalDerivedState s1;
   std::string err;
   ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, fx.parent, record1, &s1, &err));
@@ -3331,7 +3342,7 @@ TEST(test_timed_tx_is_escrowed_then_settled_with_the_parent_time_signature) {
   ASSERT_TRUE(has_utxo(s2, OutPoint{body.txid(), 0}));
   const auto refund = s2.utxos.find(consensus::timed_refund_outpoint(timed_txid));
   ASSERT_TRUE(refund != s2.utxos.end());
-  ASSERT_EQ(transparent_txout_from_utxo_entry(refund->second)->value, 2'000'000u);
+  ASSERT_EQ(transparent_txout_from_utxo_entry(refund->second)->value, kBond);
   ASSERT_EQ(record2.transition.settlement.current_fees, 500u);  // the body's own fee
 }
 
@@ -3402,7 +3413,7 @@ TEST(test_timed_tx_invalid_body_forfeits_the_bond) {
   ASSERT_TRUE(s2.timed_escrows.empty());
   ASSERT_TRUE(!has_utxo(s2, consensus::timed_refund_outpoint(timed->txid())));
   ASSERT_TRUE(has_utxo(s2, fx.body_op));
-  ASSERT_EQ(record2.transition.settlement.current_fees, 2'000'000u);
+  ASSERT_EQ(record2.transition.settlement.current_fees, kBond);
 }
 
 // Settlement runs before the settling block's records: a record spending the body's input (here a
@@ -3472,7 +3483,7 @@ TEST(test_timed_tx_caps) {
   for (const auto& [op, out] : coins) {
     auto f = fx;
     f.fee_op = op;
-    records.push_back(build_timed(f, fx.parent, 3, AnyTx{body}, 2'000'000, op.txid[0])->serialize());
+    records.push_back(build_timed(f, fx.parent, 3, AnyTx{body}, kBond, op.txid[0])->serialize());
   }
   const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, records);
   ASSERT_EQ(s1.timed_escrows.size(), consensus::kMaxTimedTxPerBlock);
@@ -3517,9 +3528,7 @@ LongLockFixture make_long_lock_fixture() {
   LongLockFixture f;
   f.body = timed_body_spend(f.fx, f.fx.body_op, f.fx.body_out);
   f.unlock = f.fx.cfg.network.committee_epoch_blocks + kLongUnlockPastEpoch;
-  const auto fee = consensus::timed_long_lock_min_fee(1, f.unlock, f.fx.cfg.network.committee_epoch_blocks);
-  if (!fee.has_value()) throw std::runtime_error("long lock fee");
-  const auto timed = build_timed(f.fx, f.fx.parent, f.unlock, AnyTx{f.body}, 2'000'000, 1, *fee);
+  const auto timed = build_timed(f.fx, f.fx.parent, f.unlock, AnyTx{f.body});
   if (!timed.has_value()) throw std::runtime_error("long lock build failed");
   f.timed = *timed;
   f.included = apply_frontier_or_throw(f.fx.cfg, f.fx.parent, {f.timed.serialize()});
@@ -3644,7 +3653,7 @@ TEST(test_long_timed_lock_expires_with_a_refund) {
   ASSERT_TRUE(!expired.last_timed_settlements[0].body_applied);
   const auto refund = expired.utxos.find(consensus::timed_refund_outpoint(f.timed.txid()));
   ASSERT_TRUE(refund != expired.utxos.end());
-  ASSERT_EQ(transparent_txout_from_utxo_entry(refund->second)->value, 2'000'000u);
+  ASSERT_EQ(transparent_txout_from_utxo_entry(refund->second)->value, kBond);
   ASSERT_TRUE(has_utxo(expired, f.fx.body_op));
 }
 
@@ -3665,16 +3674,25 @@ TEST(test_long_timed_lock_inclusion_rules) {
     return !apply_frontier_or_throw(fx.cfg, fx.parent, {tx.serialize()}).timed_escrows.empty();
   };
   const auto unlock = 3 * epoch_blocks;
-  const auto fee = *consensus::timed_long_lock_min_fee(1, unlock, epoch_blocks);
-  ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{body}, 2'000'000, 1, fee)));
-  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{body}, 2'000'000, 1, fee - 1)));
+  // The exact floor: the envelope's size fee plus the per-epoch fee (the size does not depend on the fee).
+  const auto sized = *build_timed(fx, fx.parent, unlock, AnyTx{body});
+  const auto fee = consensus::timed_min_prepaid_fee(sized.serialize().size()) +
+                   *consensus::timed_long_lock_min_fee(1, unlock, epoch_blocks);
+  ASSERT_TRUE(sized.prepaid_fee >= fee);
+  ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{body}, kBond, 1, fee)));
+  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{body}, kBond, 1, fee - 1)));
+  // A short lock pays the size fee alone.
+  const auto short_sized = *build_timed(fx, fx.parent, epoch_blocks, AnyTx{body});
+  const auto short_fee = consensus::timed_min_prepaid_fee(short_sized.serialize().size());
+  ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, epoch_blocks, AnyTx{body}, kBond, 1, short_fee)));
+  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, epoch_blocks, AnyTx{body}, kBond, 1, short_fee - 1)));
 
   std::vector<TxOut> outs;
   for (int i = 0; i < 40; ++i) outs.push_back(p2pkh_out_for_pub(fx.recipient.public_key, 1'000));
   const auto large = build_signed_p2pkh_tx_single_input(replay_chain_domain(), fx.body_op, fx.body_out,
                                                         fx.user.private_key, outs);
   ASSERT_TRUE(large.has_value() && large->serialize().size() > 1024);
-  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{*large}, 2'000'000, 1, fee)));
+  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{*large})));
   ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, epoch_blocks, AnyTx{*large})));
 }
 
@@ -3685,8 +3703,7 @@ TEST(test_long_timed_lock_reveals_data) {
   const auto epoch_blocks = fx.cfg.network.committee_epoch_blocks;
   const auto unlock = epoch_blocks + kLongUnlockPastEpoch;
   const Bytes data(kTimedRevealMaxDataBytes, 0x6b);
-  const auto fee = *consensus::timed_long_lock_min_fee(1, unlock, epoch_blocks);
-  const auto timed = build_timed(fx, fx.parent, unlock, TimedReveal{data}, 2'000'000, 1, fee);
+  const auto timed = build_timed(fx, fx.parent, unlock, TimedReveal{data});
   ASSERT_TRUE(timed.has_value() && timed->body_ciphertext.size() == consensus::kTxTimedMaxLongBodyCiphertextBytes);
   auto state = advance_to(fx.cfg, apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()}), unlock + 1);
   ASSERT_EQ(state.timed_escrows.size(), 1u);
@@ -3707,21 +3724,37 @@ TEST(test_long_timed_lock_reveals_data) {
 // per-epoch fee, an inclusion deadline at the epoch's end, a margin before it, and the lien warning.
 TEST(test_timed_lock_terms) {
   constexpr std::uint64_t epoch = 32;
-  const auto short_lock = consensus::timed_lock_terms(33, 40, epoch, 1'000);
-  ASSERT_TRUE(short_lock.has_value() && !short_lock->long_lock && short_lock->prepaid_fee == 1'000);
+  ASSERT_EQ(consensus::timed_min_prepaid_fee(1), consensus::kTxTimedMinPrepaidFee + consensus::kTxTimedPrepaidFeePerKiB);
+  ASSERT_EQ(consensus::timed_min_prepaid_fee(2048), consensus::kTxTimedMinPrepaidFee + 2 * consensus::kTxTimedPrepaidFeePerKiB);
+  ASSERT_EQ(consensus::timed_min_prepaid_fee(2049), consensus::kTxTimedMinPrepaidFee + 3 * consensus::kTxTimedPrepaidFeePerKiB);
+  constexpr std::size_t bytes = 9'000;  // 9 KiB started
+  const auto size_fee = consensus::timed_min_prepaid_fee(bytes);
+  const auto short_lock = consensus::timed_lock_terms(33, 40, epoch, bytes);
+  ASSERT_TRUE(short_lock.has_value() && !short_lock->long_lock && short_lock->prepaid_fee == size_fee);
   ASSERT_EQ(short_lock->committee_epoch, 33u);
   ASSERT_EQ(short_lock->last_inclusion_height, 40u);
-  const auto long_lock = consensus::timed_lock_terms(33, 64 + 33, epoch, 1'000);
+  const auto long_lock = consensus::timed_lock_terms(33, 64 + 33, epoch, bytes);
   ASSERT_TRUE(long_lock.has_value() && long_lock->long_lock && !long_lock->beyond_lien);
-  ASSERT_EQ(long_lock->prepaid_fee, 1'000 + 2 * consensus::kTxTimedLongFeePerEpoch);
+  ASSERT_EQ(long_lock->prepaid_fee, size_fee + 2 * consensus::kTxTimedLongFeePerEpoch);
   ASSERT_EQ(long_lock->committee_epoch, 33u);
   ASSERT_EQ(long_lock->last_inclusion_height, 64u);
-  ASSERT_TRUE(consensus::timed_lock_terms(62, 200, epoch, 1'000).has_value());
+  ASSERT_TRUE(consensus::timed_lock_terms(62, 200, epoch, bytes).has_value());
   std::string err;
-  ASSERT_TRUE(!consensus::timed_lock_terms(63, 200, epoch, 1'000, &err).has_value() && !err.empty());
-  ASSERT_TRUE(consensus::timed_lock_terms(63, 64, epoch, 1'000).has_value());  // short: no margin needed
-  ASSERT_TRUE(!consensus::timed_lock_terms(33, 32, epoch, 1'000).has_value());
-  ASSERT_TRUE(consensus::timed_lock_terms(33, 33 + consensus::kTimedLongLienBlocks + 1, epoch, 1'000)->beyond_lien);
+  ASSERT_TRUE(!consensus::timed_lock_terms(63, 200, epoch, bytes, &err).has_value() && !err.empty());
+  ASSERT_TRUE(consensus::timed_lock_terms(63, 64, epoch, bytes).has_value());  // short: no margin needed
+  ASSERT_TRUE(!consensus::timed_lock_terms(33, 32, epoch, bytes).has_value());
+  ASSERT_TRUE(consensus::timed_lock_terms(33, 33 + consensus::kTimedLongLienBlocks + 1, epoch, bytes)->beyond_lien);
+
+  // The client bound covers a real envelope (four keys, a one-input transfer and a full reveal).
+  auto fx = make_timed_fixture();
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto keys = consensus::time_signature_committee_keys(fx.cfg, fx.parent, 1);
+  for (const TimedBody& sealed : {TimedBody{AnyTx{body}}, TimedBody{TimedReveal{Bytes(kTimedRevealMaxDataBytes, 1)}}}) {
+    const auto timed = build_timed(fx, fx.parent, 1, sealed);
+    ASSERT_TRUE(timed.has_value());
+    const auto bound = timed_envelope_bytes_bound(keys->size(), serialize_timed_body(sealed).size());
+    ASSERT_TRUE(timed->serialize().size() <= bound && bound - timed->serialize().size() < 256);
+  }
 
   std::vector<std::pair<OutPoint, TxOut>> coins;
   for (std::uint8_t i = 1; i <= 3; ++i) {

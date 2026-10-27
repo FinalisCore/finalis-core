@@ -151,6 +151,37 @@ std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<O
   return out;
 }
 
+std::size_t timed_p2pkh_body_bytes(const WalletSendPlan& plan) {
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  for (const auto& [op, _] : plan.selected_prevs) tx.inputs.push_back(TxIn{op.txid, op.index, Bytes(98, 0), 0xFFFFFFFF});
+  tx.outputs = plan.outputs;
+  return tx.serialize().size();
+}
+
+std::optional<TimedSendPlan> plan_timed_p2pkh_send_priced(
+    const std::vector<std::pair<OutPoint, TxOut>>& available_prevs, const Bytes& recipient_script_pubkey,
+    const Bytes& change_script_pubkey, std::uint64_t amount_units, std::uint64_t body_fee_units,
+    std::uint64_t forfeit_bond_units, const std::function<std::optional<std::uint64_t>(std::size_t)>& prepaid_for_body_bytes,
+    std::uint64_t* prepaid_fee_out, std::string* err) {
+  auto prepaid = prepaid_for_body_bytes(0);
+  for (int attempt = 0; attempt < 4 && prepaid.has_value(); ++attempt) {
+    auto plan = plan_timed_p2pkh_send(available_prevs, recipient_script_pubkey, change_script_pubkey, amount_units,
+                                      body_fee_units, *prepaid, forfeit_bond_units, err);
+    if (!plan) return std::nullopt;
+    const auto needed = prepaid_for_body_bytes(timed_p2pkh_body_bytes(plan->body));
+    if (!needed.has_value()) break;
+    if (*needed <= *prepaid) {
+      if (prepaid_fee_out) *prepaid_fee_out = *prepaid;
+      return plan;
+    }
+    prepaid = needed;
+  }
+  if (err) *err = "could not price the envelope's prepaid fee";
+  return std::nullopt;
+}
+
 std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const TimedBody& body,
                                              const Bytes& fee_private_key_32, const Hash32& seed_32, std::string* err) {
   auto kp = keypair_from_private_key(fee_private_key_32, err);

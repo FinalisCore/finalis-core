@@ -378,9 +378,8 @@ class WalletWindow final : public QMainWindow {
     Hash32 committee_root{};
   };
   // A time-locked transfer to `destination`, or with `reveal_data` a sealed data reveal (destination
-  // and amount unused).
-  std::optional<PreparedTimedSend> prepare_timed_send(const QString& destination, std::uint64_t amount_units,
-                                                      bool fetch_committee, QString* err,
+  // and amount unused). Loads the next block's committee keys (they price the envelope).
+  std::optional<PreparedTimedSend> prepare_timed_send(const QString& destination, std::uint64_t amount_units, QString* err,
                                                       const Bytes* reveal_data = nullptr);
   // Spends a pending time-locked transfer's coins back to this wallet before it opens (forfeiting
   // the bond); also spends the fee coin if the envelope is not in a block yet.

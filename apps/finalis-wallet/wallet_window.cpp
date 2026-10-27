@@ -3672,8 +3672,7 @@ std::optional<Bytes> WalletWindow::height_lock_output_script(const QString& dest
 }
 
 std::optional<WalletWindow::PreparedTimedSend> WalletWindow::prepare_timed_send(const QString& destination,
-                                                                               std::uint64_t amount_units,
-                                                                               bool fetch_committee, QString* err,
+                                                                               std::uint64_t amount_units, QString* err,
                                                                                const Bytes* reveal_data) {
   const auto fail = [&](const QString& why) -> std::optional<PreparedTimedSend> {
     if (err) *err = why;
@@ -3693,9 +3692,36 @@ std::optional<WalletWindow::PreparedTimedSend> WalletWindow::prepare_timed_send(
   const std::uint64_t delay = send_unlock_delay_spin_ ? static_cast<std::uint64_t>(send_unlock_delay_spin_->value()) : 2;
   PreparedTimedSend out;
   out.unlock_height = next_height + delay;
+
+  // The named epoch's keys, from the first endpoint that has them; the key root is checked locally.
+  // Their count prices the envelope.
+  QString last_err = "No lightserver endpoint is configured.";
+  for (const auto& endpoint : configured_lightserver_endpoints()) {
+    std::string rpc_err;
+    const auto committee = lightserver::rpc_get_committee_bls_keys(endpoint.toStdString(), next_height, &rpc_err);
+    if (!committee) {
+      last_err = QString::fromStdString(rpc_err);
+      continue;
+    }
+    if (finalis::consensus::committee_bls_key_root(committee->keys) != committee->root || committee->keys.empty()) {
+      last_err = "Endpoint returned an inconsistent committee key set.";
+      continue;
+    }
+    out.committee_keys = committee->keys;
+    out.committee_root = committee->root;
+    break;
+  }
+  if (out.committee_keys.empty()) {
+    return fail("Could not load the committee keys for block " + QString::number(next_height) + ": " + last_err);
+  }
+  const auto terms_for = [&](std::size_t body_bytes, std::string* terms_err) {
+    return finalis::consensus::timed_lock_terms(
+        next_height, out.unlock_height, epoch_blocks,
+        finalis::timed_envelope_bytes_bound(out.committee_keys.size(), body_bytes), terms_err);
+  };
   std::string terms_err;
-  const auto terms = finalis::consensus::timed_lock_terms(next_height, out.unlock_height, epoch_blocks,
-                                                          finalis::DEFAULT_WALLET_SEND_FEE_UNITS, &terms_err);
+  const std::size_t reveal_bytes = reveal_data ? finalis::kTimedRevealTagBytes + reveal_data->size() : 0;
+  const auto terms = terms_for(reveal_bytes, &terms_err);
   if (!terms) return fail(QString::fromStdString(terms_err));
   out.terms = *terms;
   out.committee_epoch = terms->committee_epoch;
@@ -3711,38 +3737,26 @@ std::optional<WalletWindow::PreparedTimedSend> WalletWindow::prepare_timed_send(
   std::erase_if(*available_prevs, [](const auto& c) { return !finalis::is_p2pkh_script_pubkey(c.second.script_pubkey); });
   std::string plan_err;
   std::optional<TimedSendPlan> plan;
+  const std::uint64_t bond = finalis::consensus::kTxTimedMinForfeitBond;
   if (reveal_data) {
-    const auto coin = finalis::select_timed_fee_coin(*available_prevs, terms->prepaid_fee,
-                                                     finalis::consensus::kTxTimedMinForfeitBond, &plan_err);
-    if (coin) plan = TimedSendPlan{*coin, {}, coin->second.value - terms->prepaid_fee - finalis::consensus::kTxTimedMinForfeitBond};
+    const auto coin = finalis::select_timed_fee_coin(*available_prevs, terms->prepaid_fee, bond, &plan_err);
+    if (coin) plan = TimedSendPlan{*coin, {}, coin->second.value - terms->prepaid_fee - bond};
   } else {
-    plan = finalis::plan_timed_p2pkh_send(
+    std::uint64_t prepaid = 0;
+    plan = finalis::plan_timed_p2pkh_send_priced(
         *available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
         finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), amount_units, finalis::DEFAULT_WALLET_SEND_FEE_UNITS,
-        terms->prepaid_fee, finalis::consensus::kTxTimedMinForfeitBond, &plan_err);
+        bond,
+        [&](std::size_t body_bytes) -> std::optional<std::uint64_t> {
+          const auto t = terms_for(body_bytes, nullptr);
+          return t ? std::optional<std::uint64_t>(t->prepaid_fee) : std::nullopt;
+        },
+        &prepaid, &plan_err);
+    out.terms.prepaid_fee = prepaid;
   }
   if (!plan) return fail(QString::fromStdString(plan_err));
   out.plan = std::move(*plan);
-  if (!fetch_committee) return out;
-
-  // The named epoch's keys, from the first endpoint that has them; the key root is checked locally.
-  QString last_err = "No lightserver endpoint is configured.";
-  for (const auto& endpoint : configured_lightserver_endpoints()) {
-    std::string rpc_err;
-    const auto committee = lightserver::rpc_get_committee_bls_keys(endpoint.toStdString(), next_height, &rpc_err);
-    if (!committee) {
-      last_err = QString::fromStdString(rpc_err);
-      continue;
-    }
-    if (finalis::consensus::committee_bls_key_root(committee->keys) != committee->root || committee->keys.empty()) {
-      last_err = "Endpoint returned an inconsistent committee key set.";
-      continue;
-    }
-    out.committee_keys = committee->keys;
-    out.committee_root = committee->root;
-    return out;
-  }
-  return fail("Could not load the committee keys for block " + QString::number(next_height) + ": " + last_err);
+  return out;
 }
 
 void WalletWindow::cancel_timed_send() {
@@ -5556,7 +5570,7 @@ void WalletWindow::validate_send_form() {
     const QByteArray utf8 = recipient_text.toUtf8();
     const Bytes data(utf8.begin(), utf8.end());
     QString prep_err;
-    const auto prepared = prepare_timed_send(QString(), 0, false, &prep_err, &data);
+    const auto prepared = prepare_timed_send(QString(), 0, &prep_err, &data);
     if (!prepared) {
       show_send_inline_warning(prep_err);
       show_send_inline_status("Review unavailable");
@@ -5647,7 +5661,7 @@ void WalletWindow::validate_send_form() {
       return;
     }
     QString prep_err;
-    const auto prepared = prepare_timed_send(recipient_text, *amount_units, false, &prep_err);
+    const auto prepared = prepare_timed_send(recipient_text, *amount_units, &prep_err);
     if (!prepared) {
       show_send_inline_warning(prep_err);
       show_send_inline_status("Review unavailable");
@@ -6129,7 +6143,7 @@ void WalletWindow::submit_send() {
       return;
     }
     QString prep_err;
-    const auto prepared = prepare_timed_send(destination, *amount_units, true, &prep_err);
+    const auto prepared = prepare_timed_send(destination, *amount_units, &prep_err);
     if (!prepared) {
       show_send_inline_warning(prep_err);
       show_send_inline_status("Send blocked");
@@ -6213,7 +6227,7 @@ void WalletWindow::submit_send() {
     const QByteArray utf8 = destination.toUtf8();
     const Bytes data(utf8.begin(), utf8.end());
     QString prep_err;
-    const auto prepared = prepare_timed_send(QString(), 0, true, &prep_err, &data);
+    const auto prepared = prepare_timed_send(QString(), 0, &prep_err, &data);
     if (!prepared) {
       show_send_inline_warning(prep_err);
       show_send_inline_status("Send blocked");

@@ -56,8 +56,15 @@ Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_b
 // may wait for one unlock height (each costs a decryption, ~94 ms, in the settling block).
 inline constexpr std::size_t kMaxTimedTxPerBlock = 8;
 inline constexpr std::size_t kMaxTimedEscrowsPerUnlockHeight = 16;
-// Provisional: the minimum forfeit_bond (0.01 FLS), a floor on the cost of an envelope that never opens.
-inline constexpr std::uint64_t kTxTimedMinForfeitBond = 1'000'000;
+// The minimum forfeit_bond (0.1 FLS): what an envelope whose body never applies costs at least (an
+// honest sender gets it back).
+inline constexpr std::uint64_t kTxTimedMinForfeitBond = 10'000'000;
+// The minimum prepaid fee: kTxTimedMinPrepaidFee plus kTxTimedPrepaidFeePerKiB per KiB, started or
+// whole, of the serialized envelope (an envelope is 8-14 KiB of SWE ciphertext, checked at inclusion
+// and decrypted at settlement). A long lock adds timed_long_lock_min_fee.
+inline constexpr std::uint64_t kTxTimedMinPrepaidFee = 10'000;     // 0.0001 FLS
+inline constexpr std::uint64_t kTxTimedPrepaidFeePerKiB = 10'000;  // 0.0001 FLS
+std::uint64_t timed_min_prepaid_fee(std::size_t envelope_bytes);
 
 // --- Long locks ---
 //
@@ -72,7 +79,7 @@ inline constexpr std::uint64_t kTxTimedMinForfeitBond = 1'000'000;
 // escrow settles or kTimedLongLienBlocks after its inclusion, whichever is first.
 inline constexpr std::uint64_t kTimedLongGraceBlocks = 480;     // one day at 180 s blocks
 inline constexpr std::uint64_t kTimedLongLienBlocks = 175'200;  // one year at 180 s blocks
-// Provisional: the minimum prepaid fee per epoch a long lock reaches beyond its inclusion epoch.
+// The prepaid fee a long lock adds per epoch it reaches beyond its inclusion epoch.
 inline constexpr std::uint64_t kTxTimedLongFeePerEpoch = 100'000;  // 0.001 FLS
 // A long lock's body ciphertext (plaintext + Poly1305 tag) is at most this.
 inline constexpr std::size_t kTxTimedMaxLongBodyCiphertextBytes = 1024 + 16;
@@ -92,7 +99,8 @@ std::optional<std::uint64_t> timed_long_lock_min_fee(std::uint64_t height, std::
 
 // Client side: the terms of a TxTimed unlocking at `unlock` sent when the next block is `next_height`.
 // It names next_height's epoch (encrypt to that epoch's committee keys, fetched at next_height) and
-// must be included in it; a long lock adds timed_long_lock_min_fee to `base_prepaid_fee`. Nullopt (with
+// must be included in it; its prepaid fee is timed_min_prepaid_fee(envelope_bytes) (a bound such as
+// timed_envelope_bytes_bound) plus, for a long lock, timed_long_lock_min_fee. Nullopt (with
 // `err`) if unlock < next_height, the fee overflows, or a long lock has fewer than
 // kTimedLongInclusionMarginBlocks blocks of the epoch left to be included in.
 inline constexpr std::uint64_t kTimedLongInclusionMarginBlocks = 3;
@@ -104,7 +112,7 @@ struct TimedLockTerms {
   bool beyond_lien{false};                 // unlock more than kTimedLongLienBlocks away: bonds no longer held
 };
 std::optional<TimedLockTerms> timed_lock_terms(std::uint64_t next_height, std::uint64_t unlock,
-                                               std::uint64_t committee_epoch_blocks, std::uint64_t base_prepaid_fee,
+                                               std::uint64_t committee_epoch_blocks, std::size_t envelope_bytes,
                                                std::string* err = nullptr);
 
 // What execution of block `height` needs for timed records. Consensus callers always pass it; without

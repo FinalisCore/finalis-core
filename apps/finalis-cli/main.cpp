@@ -3971,17 +3971,6 @@ int run_cli(int argc, char** argv) {
     const std::uint64_t horizon = finalis::consensus::committee_epoch_start(next_height, epoch_blocks) + epoch_blocks - 1;
     const std::uint64_t unlock =
         unlock_height.value_or(delay_given ? next_height + delay : std::min(horizon, next_height + delay));
-    const auto terms = finalis::consensus::timed_lock_terms(next_height, unlock, epoch_blocks, prepaid_fee, &err);
-    if (!terms.has_value()) {
-      std::cerr << "timed_send failed: " << err << "\n";
-      return 1;
-    }
-    prepaid_fee = terms->prepaid_fee;
-    if (terms->beyond_lien) {
-      std::cerr << "warning: unlock is more than " << finalis::consensus::kTimedLongLienBlocks
-                << " blocks away; the named validators' bonds are held only that long, after which opening "
-                   "relies on them signing voluntarily (else the bond is refunded and the body stays sealed)\n";
-    }
     const auto committee = finalis::lightserver::rpc_get_committee_bls_keys(rpc_url, next_height, &err);
     if (!committee.has_value()) {
       std::cerr << "timed_send failed to load committee keys: " << err << "\n";
@@ -3990,6 +3979,27 @@ int run_cli(int argc, char** argv) {
     if (finalis::consensus::committee_bls_key_root(committee->keys) != committee->root) {
       std::cerr << "timed_send failed: committee key root mismatch\n";
       return 1;
+    }
+    // The prepaid fee is priced on an envelope bound for a body of `body_bytes` (at least --prepaid-fee).
+    const std::uint64_t min_prepaid_fee = prepaid_fee;
+    const auto prepaid_for = [&](std::size_t body_bytes) -> std::optional<std::uint64_t> {
+      const auto t = finalis::consensus::timed_lock_terms(
+          next_height, unlock, epoch_blocks, finalis::timed_envelope_bytes_bound(committee->keys.size(), body_bytes));
+      if (!t.has_value()) return std::nullopt;
+      return std::max(min_prepaid_fee, t->prepaid_fee);
+    };
+    const std::size_t reveal_bytes = reveal ? finalis::kTimedRevealTagBytes + reveal_data->size() : 0;
+    const auto terms = finalis::consensus::timed_lock_terms(
+        next_height, unlock, epoch_blocks, finalis::timed_envelope_bytes_bound(committee->keys.size(), reveal_bytes), &err);
+    if (!terms.has_value()) {
+      std::cerr << "timed_send failed: " << err << "\n";
+      return 1;
+    }
+    prepaid_fee = std::max(min_prepaid_fee, terms->prepaid_fee);
+    if (terms->beyond_lien) {
+      std::cerr << "warning: unlock is more than " << finalis::consensus::kTimedLongLienBlocks
+                << " blocks away; the named validators' bonds are held only that long, after which opening "
+                   "relies on them signing voluntarily (else the bond is refunded and the body stays sealed)\n";
     }
 
     auto validated = finalis::lightserver::rpc_validate_address(rpc_url, vk.address, &err);
@@ -4017,8 +4027,9 @@ int run_cli(int argc, char** argv) {
       const auto coin = finalis::select_timed_fee_coin(coins, prepaid_fee, bond, &err);
       if (coin.has_value()) timed_plan = finalis::TimedSendPlan{*coin, {}, coin->second.value - prepaid_fee - bond};
     } else {
-      timed_plan = finalis::plan_timed_p2pkh_send(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash),
-                                                  own_script, amount_units, fee, prepaid_fee, bond, &err);
+      timed_plan = finalis::plan_timed_p2pkh_send_priced(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash),
+                                                         own_script, amount_units, fee, bond, prepaid_for, &prepaid_fee,
+                                                         &err);
     }
     if (!timed_plan.has_value()) {
       std::cerr << "timed_send planning failed: " << err << "\n";

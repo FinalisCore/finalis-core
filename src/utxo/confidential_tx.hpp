@@ -144,6 +144,18 @@ inline constexpr std::uint32_t kTxTimedMaxSweCiphertextBytes =
 inline constexpr std::uint32_t kTxTimedSweProofBytes = crypto::kSweWellFormednessProofBytes;
 inline constexpr std::uint32_t kTxTimedBodyTagBytes = 16;  // Poly1305
 inline constexpr std::uint32_t kTxTimedMaxBodyCiphertextBytes = 64 * 1024;
+// Serialized size of the SWE ciphertext for `committee_size` keys, and an upper bound on a whole
+// envelope's (all other fields are at most kTxTimedEnvelopeFixedBytesBound with P2PKH scripts) for a
+// body of `body_plain_bytes` (serialize_timed_body): clients price the prepaid fee from it.
+inline constexpr std::size_t kTxTimedEnvelopeFixedBytesBound = 512;
+constexpr std::size_t timed_swe_ciphertext_bytes(std::size_t committee_size) {
+  return 7 + (2 + committee_size) * crypto::kBlsPublicKeyBytes +
+         crypto::kSweKeyChunks * (crypto::kBlsPublicKeyBytes + crypto::kBlsSignatureBytes + crypto::kGtBytes);
+}
+constexpr std::size_t timed_envelope_bytes_bound(std::size_t committee_size, std::size_t body_plain_bytes) {
+  return kTxTimedEnvelopeFixedBytesBound + timed_swe_ciphertext_bytes(committee_size) + kTxTimedSweProofBytes +
+         body_plain_bytes + kTxTimedBodyTagBytes;
+}
 
 enum class TxTimedVersionKind : std::uint32_t {
   TIMED_V3 = 3,

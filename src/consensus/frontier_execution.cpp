@@ -768,10 +768,15 @@ bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed
   // height lies in this epoch, a long lock's beyond it).
   const auto epoch = committee_epoch_start(height, epoch_blocks);
   if (tx.committee_epoch != epoch) return fail("committee-epoch-mismatch");
-  if (timed_is_long_lock(tx, epoch_blocks)) {
-    if (tx.body_ciphertext.size() > kTxTimedMaxLongBodyCiphertextBytes) return fail("long-lock-body-too-large");
-    const auto min_fee = timed_long_lock_min_fee(height, tx.unlock_height, epoch_blocks);
-    if (!min_fee.has_value() || tx.prepaid_fee < *min_fee) return fail("long-lock-fee-below-minimum");
+  const bool long_lock = timed_is_long_lock(tx, epoch_blocks);
+  if (long_lock && tx.body_ciphertext.size() > kTxTimedMaxLongBodyCiphertextBytes) return fail("long-lock-body-too-large");
+  {
+    const auto size_fee = timed_min_prepaid_fee(tx.serialize().size());
+    const auto long_fee = timed_long_lock_min_fee(height, tx.unlock_height, epoch_blocks);
+    if (!long_fee.has_value() || *long_fee > std::numeric_limits<std::uint64_t>::max() - size_fee ||
+        tx.prepaid_fee < size_fee + *long_fee) {
+      return fail(long_lock ? "long-lock-fee-below-minimum" : "prepaid-fee-below-minimum");
+    }
   }
 
   const OutPoint fee_outpoint{tx.fee_input.prev_txid, tx.fee_input.prev_index};
@@ -827,8 +832,13 @@ std::optional<std::uint64_t> timed_long_lock_min_fee(std::uint64_t height, std::
   return epochs * kTxTimedLongFeePerEpoch;
 }
 
+std::uint64_t timed_min_prepaid_fee(std::size_t envelope_bytes) {
+  const std::uint64_t kib = (static_cast<std::uint64_t>(envelope_bytes) + 1023) / 1024;  // envelopes are < 128 KiB
+  return kTxTimedMinPrepaidFee + kib * kTxTimedPrepaidFeePerKiB;
+}
+
 std::optional<TimedLockTerms> timed_lock_terms(std::uint64_t next_height, std::uint64_t unlock,
-                                               std::uint64_t committee_epoch_blocks, std::uint64_t base_prepaid_fee,
+                                               std::uint64_t committee_epoch_blocks, std::size_t envelope_bytes,
                                                std::string* err) {
   const auto fail = [&](std::string why) -> std::optional<TimedLockTerms> {
     if (err) *err = std::move(why);
@@ -841,11 +851,12 @@ std::optional<TimedLockTerms> timed_lock_terms(std::uint64_t next_height, std::u
   const auto epoch_end = out.committee_epoch + epoch_blocks - 1;
   out.long_lock = unlock > epoch_end;
   out.last_inclusion_height = std::min(epoch_end, unlock);
+  const auto base_fee = timed_min_prepaid_fee(envelope_bytes);
   const auto long_fee = timed_long_lock_min_fee(next_height, unlock, epoch_blocks);
-  if (!long_fee.has_value() || *long_fee > std::numeric_limits<std::uint64_t>::max() - base_prepaid_fee) {
+  if (!long_fee.has_value() || *long_fee > std::numeric_limits<std::uint64_t>::max() - base_fee) {
     return fail("long lock fee overflows");
   }
-  out.prepaid_fee = base_prepaid_fee + *long_fee;
+  out.prepaid_fee = base_fee + *long_fee;
   if (out.long_lock && epoch_end + 1 - next_height < kTimedLongInclusionMarginBlocks) {
     return fail("the current committee epoch ends at block " + std::to_string(epoch_end) +
                 "; send a long lock from block " + std::to_string(epoch_end + 1) + " on");

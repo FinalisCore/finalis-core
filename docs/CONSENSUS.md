@@ -291,15 +291,17 @@ A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (ve
    `committee_epoch` and `committee_root` name `h`'s epoch checkpoint keys, the ciphertext has
    threshold `quorum(n)` and its well-formedness proof verifies, the fee input is an unspent P2PKH
    output signed over the envelope, and its value is exactly `prepaid_fee + forfeit_bond + change`
-   with `forfeit_bond >= kTxTimedMinForfeitBond`. The prepaid fee is a fee of `h`; change appears at
+   with `forfeit_bond >= kTxTimedMinForfeitBond` (0.1 FLS) and `prepaid_fee >=
+   timed_min_prepaid_fee(serialized size)`: 0.0001 FLS plus 0.0001 FLS per KiB, started or whole
+   (plus the long-lock fee below). The prepaid fee is a fee of `h`; change appears at
    `(timed txid, 0)`.
 
 **Long locks.** A `TxTimed` whose unlock height lies beyond its inclusion epoch is a long lock: the
 committee named at inclusion signs `time_signature_message(D, unlock_height)` once that height is
 final, wherever its members are then (their BLS keys are seed-derived and permanent). Rules:
 
-- inclusion: a prepaid fee of at least `kTxTimedLongFeePerEpoch` (0.001 FLS) per epoch, started or
-  whole, past the inclusion epoch, and a body ciphertext of at most 1 KiB + tag (a reveal of up to
+- inclusion: a prepaid fee of the size fee plus `kTxTimedLongFeePerEpoch` (0.001 FLS) per epoch,
+  started or whole, past the inclusion epoch, and a body ciphertext of at most 1 KiB + tag (a reveal of up to
   1016 bytes fits exactly: archiving a key or a sealed bid that needs no input held for years)
 - the named key set is kept in `CanonicalDerivedState::timed_key_sets` (rows `TK:`, by
   `committee_root`, dropped once no escrow names it), since checkpoints are pruned

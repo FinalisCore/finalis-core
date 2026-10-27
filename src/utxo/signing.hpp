@@ -88,6 +88,16 @@ std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<O
                                                    std::uint64_t amount_units, std::uint64_t body_fee_units,
                                                    std::uint64_t prepaid_fee_units, std::uint64_t forfeit_bond_units,
                                                    std::string* err = nullptr);
+// serialize_timed_body size of the signed P2PKH transfer `plan` describes (script_sigs are fixed-size).
+std::size_t timed_p2pkh_body_bytes(const WalletSendPlan& plan);
+// plan_timed_p2pkh_send with the prepaid fee the envelope needs: `prepaid_for_body_bytes` prices a
+// body of that many bytes (e.g. timed_lock_terms over timed_envelope_bytes_bound); re-plans until the
+// fee covers the planned transfer. The fee is returned in *prepaid_fee_out.
+std::optional<TimedSendPlan> plan_timed_p2pkh_send_priced(
+    const std::vector<std::pair<OutPoint, TxOut>>& available_prevs, const Bytes& recipient_script_pubkey,
+    const Bytes& change_script_pubkey, std::uint64_t amount_units, std::uint64_t body_fee_units,
+    std::uint64_t forfeit_bond_units, const std::function<std::optional<std::uint64_t>(std::size_t)>& prepaid_for_body_bytes,
+    std::uint64_t* prepaid_fee_out, std::string* err = nullptr);
 std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const TimedBody& body,
                                              const Bytes& fee_private_key_32, const Hash32& seed_32,
                                              std::string* err = nullptr);
