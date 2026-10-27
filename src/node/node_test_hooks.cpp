@@ -189,6 +189,10 @@ bool Node::inject_frontier_block_for_test(const FrontierProposal& proposal, cons
   return false;
 }
 
+bool Node::inject_record_for_test(const Bytes& raw, std::string* reason) {
+  return handle_record_bytes(raw, false, 0, reason);
+}
+
 bool Node::inject_tx_for_test(const AnyTx& tx, bool relay) {
   if (relay) return handle_tx(tx, false);
   std::lock_guard<std::mutex> lk(mu_);

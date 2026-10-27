@@ -3676,6 +3676,26 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     auto tx = parse_any_tx(*tx_bytes);
     if (!tx.has_value()) {
+      // A TxTimed: its admission needs the committee keys and the SWE proof check, which the node's
+      // timed intake (consensus::check_timed_inclusion) does; relay it and report the node's verdict.
+      if (const auto timed = TxTimed::parse(*tx_bytes); timed.has_value()) {
+        const std::string timed_txid_hex = hex_encode32(timed->txid());
+        if (view->get_tx_index(timed->txid()).has_value()) {
+          return make_result(id, broadcast_result_json(false, timed_txid_hex, "rejected", "", std::string("tx_duplicate"),
+                                                       std::string("This transaction is already finalized."), false,
+                                                       "none", false, std::nullopt));
+        }
+        const auto relay = relay_tx_to_peer(*tx_bytes);
+        if (relay.outcome != TxRelayResult::Outcome::Accepted) {
+          const std::string code = relay.outcome == TxRelayResult::Outcome::Unavailable ? std::string("relay_unavailable")
+                                                                                        : std::string("tx_invalid");
+          return make_result(id, broadcast_result_json(false, timed_txid_hex, "rejected", "", code, relay.detail,
+                                                       code == "relay_unavailable", retry_class_for_error_code(code),
+                                                       false, std::nullopt));
+        }
+        return make_result(id, broadcast_result_json(true, timed_txid_hex, "accepted_for_relay", "accepted_for_relay",
+                                                     std::nullopt, std::nullopt, false, "none", false, std::nullopt));
+      }
       return make_result(id, broadcast_result_json(false, "", "rejected", "", std::string("tx_invalid"),
                                                    std::string("tx parse failed"), false, "none", false, std::nullopt));
     }

@@ -83,7 +83,11 @@ struct TimedSettlementRecord {
   Hash32 timed_txid{};
   bool body_applied{false};
   std::optional<Hash32> body_txid;  // set when the body opened and parsed
+  std::optional<AnyTx> applied_body;
+  Bytes bond_refund_script;
 };
+
+
 
 // A TxTimed's outputs: the fee change (if any) at index 0 at inclusion, the bond refund at index 1 at
 // settlement.
@@ -209,5 +213,13 @@ struct TimedSettlement {
 // settling block, before any non-settlement transaction of it. Anything else (no key, a wrong tag,
 // garbage, an invalid or double-spending body) forfeits the bond; the body itself changes nothing.
 TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied);
+
+// The per-envelope inclusion rules of a TxTimed at block timed.height against `utxos` (everything but
+// the per-block caps and conflicts with other records of the block): unlock height within the horizon,
+// the committee epoch and root, threshold, well-formedness proof, a P2PKH fee input in `utxos` signed
+// over the envelope, exact value accounting and the minimum bond. Mempool admission uses it as is.
+// On success `inclusion` (if given) holds the fee, change and escrow; `reason` says why not otherwise.
+bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed, const UtxoSetV2& utxos,
+                           TimedInclusion* inclusion = nullptr, std::string* reason = nullptr);
 
 }  // namespace finalis::consensus

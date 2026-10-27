@@ -410,6 +410,39 @@ std::optional<onboarding::ValidatorOnboardingRecord> parse_onboarding_record_res
 
 }  // namespace
 
+std::optional<CommitteeBlsKeysView> rpc_get_committee_bls_keys(const std::string& rpc_url, std::uint64_t height,
+                                                               std::string* err) {
+  std::ostringstream req;
+  req << R"({"jsonrpc":"2.0","id":1,"method":"get_committee","params":{"height":)" << height << R"(,"verbose":true}})";
+  auto body = http_post_json(rpc_url, req.str(), err);
+  if (!body) return std::nullopt;
+  auto root = minijson::parse(*body);
+  if (!root.has_value()) {
+    if (err) *err = "invalid rpc response";
+    return std::nullopt;
+  }
+  const auto* result = result_value(*root, err);
+  const auto root_bytes = hex_decode(object_string(result, "committee_bls_key_root").value_or(""));
+  const auto* members = result ? result->get("members") : nullptr;
+  if (!root_bytes || root_bytes->size() != 32 || !members || !members->is_array()) {
+    if (err && err->empty()) *err = "committee keys unavailable for height " + std::to_string(height);
+    return std::nullopt;
+  }
+  CommitteeBlsKeysView out;
+  std::copy(root_bytes->begin(), root_bytes->end(), out.root.begin());
+  for (const auto& member : members->array_value) {
+    const auto key = hex_decode(object_string(&member, "bls_pubkey").value_or(""));
+    if (!key || key->size() != crypto::kBlsPublicKeyBytes) {
+      if (err) *err = "invalid committee member bls key";
+      return std::nullopt;
+    }
+    crypto::BlsPublicKey k{};
+    std::copy(key->begin(), key->end(), k.begin());
+    out.keys.push_back(k);
+  }
+  return out;
+}
+
 std::optional<CommitteeHandoffsView> rpc_get_committee_handoffs(const std::string& rpc_url, std::uint64_t from_epoch_start,
                                                                 std::uint64_t limit, std::string* err) {
   std::ostringstream req;

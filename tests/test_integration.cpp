@@ -3802,6 +3802,107 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
   }, std::chrono::seconds(120)));
 }
 
+// A time-locked transfer end to end on a live node: the envelope enters through the node's intake,
+// a block escrows it, the committee time-signs the unlock height, and block unlock + 1 opens and
+// applies the transfer first and refunds the bond.
+void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(base, static_cast<int>(n_nodes), static_cast<int>(n_nodes), MAX_COMMITTEE);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 3, ci_timeout_seconds(40)));
+  const std::uint64_t bond = consensus::kTxTimedMinForfeitBond;
+  const std::uint64_t prepaid = 1'000;
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, 2 * (bond + prepaid), 2);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+  auto coins = funded->utxos;
+  std::sort(coins.begin(), coins.end(), [](const auto& a, const auto& b) { return a.second.value > b.second.value; });
+  ASSERT_TRUE(coins[0].second.value >= bond + prepaid);
+  const auto& sender = keys[funded->key_index];
+  const Bytes sender_priv(sender.private_key.begin(), sender.private_key.end());
+  const auto sender_script = coins[0].second.script_pubkey;
+  const auto recipient = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x5d});
+  const auto recipient_pkh = crypto::h160(Bytes(recipient->public_key.begin(), recipient->public_key.end()));
+  const auto domain = node_chain_domain(n0);
+
+  const auto& epoch_blocks = cluster.configs[0].network.committee_epoch_blocks;
+  const auto tip = n0.status().height;
+  const auto unlock = std::min(tip + 4, consensus::committee_epoch_start(tip + 1, epoch_blocks) + epoch_blocks - 1);
+  ASSERT_TRUE(unlock >= tip + 2);  // room for the envelope to be included first
+  std::optional<storage::FinalizedCommitteeCheckpoint> checkpoint;
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open_readonly(base + "/node0"));
+    checkpoint = db.get_finalized_committee_checkpoint(consensus::committee_epoch_start(unlock, epoch_blocks));
+  }
+  ASSERT_TRUE(checkpoint.has_value() && !checkpoint->ordered_bls_keys.empty());
+
+  const auto body = build_signed_p2pkh_tx_single_input(
+      domain, coins[1].first, coins[1].second, sender_priv,
+      {TxOut{coins[1].second.value - 500, address::p2pkh_script_pubkey(recipient_pkh)}});
+  ASSERT_TRUE(body.has_value());
+  TimedTxParams params;
+  params.fee_outpoint = coins[0].first;
+  params.fee_prev_out = coins[0].second;
+  params.prepaid_fee = prepaid;
+  params.forfeit_bond = bond;
+  params.bond_refund_script = sender_script;
+  if (coins[0].second.value > bond + prepaid) {
+    params.fee_change = TxOut{coins[0].second.value - bond - prepaid, sender_script};
+  }
+  params.unlock_height = unlock;
+  params.committee_epoch = consensus::committee_epoch_start(unlock, epoch_blocks);
+  params.committee_root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
+  params.committee_keys = checkpoint->ordered_bls_keys;
+  params.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(checkpoint->ordered_bls_keys.size()));
+  Hash32 seed{};
+  seed.fill(0x3c);
+  const auto timed = build_signed_timed_tx(domain, params, AnyTx{*body}, sender_priv, seed);
+  ASSERT_TRUE(timed.has_value());
+  std::string reason;
+  ASSERT_TRUE(n0.inject_record_for_test(timed->serialize(), &reason));
+
+  std::optional<storage::DB::TxLocation> included;
+  std::optional<storage::DB::TxLocation> opened;
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    included = db.get_tx_index(timed->txid());
+    opened = db.get_tx_index(body->txid());
+    return included.has_value() && opened.has_value();
+  }, ci_timeout_seconds(120)));
+  ASSERT_TRUE(included->height <= unlock);
+  ASSERT_EQ(opened->height, unlock + 1);
+  const auto recipient_utxos = n0.find_utxos_by_pubkey_hash_for_test(recipient_pkh);
+  ASSERT_EQ(recipient_utxos.size(), 1u);
+  ASSERT_EQ(recipient_utxos[0].second.value, coins[1].second.value - 500);
+  bool refunded = false;
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  for (const auto& [op, out] : n0.find_utxos_by_pubkey_hash_for_test(sender_pkh)) {
+    const auto refund_op = consensus::timed_refund_outpoint(timed->txid());
+    if (op.txid == refund_op.txid && op.index == refund_op.index && out.value == bond) refunded = true;
+  }
+  ASSERT_TRUE(refunded);
+  // Every node settled it the same way.
+  for (std::size_t i = 1; i < n_nodes; ++i) {
+    ASSERT_TRUE(wait_for([&]() { return cluster.nodes[i]->find_utxos_by_pubkey_hash_for_test(recipient_pkh).size() == 1; },
+                         ci_timeout_seconds(60)));
+  }
+}
+
+TEST(test_timed_transfer_opens_after_its_unlock_height_on_a_live_node) {
+  run_timed_transfer_on_cluster(1, unique_test_base("/tmp/finalis_it_timed_transfer"));
+}
+
+// Four validators: the envelope reaches its lane's certifier from another node, and the unlock
+// height's time signature is aggregated from several validators' signatures.
+TEST(test_timed_transfer_on_a_four_validator_cluster) {
+  run_timed_transfer_on_cluster(4, unique_test_base("/tmp/finalis_it_timed_transfer4"));
+}
+
 TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_registration_tx");

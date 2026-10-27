@@ -461,11 +461,13 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     for (auto it = timed->escrows->lower_bound(TimedEscrowKey{unlock, 0, 0});
          it != timed->escrows->end() && it->first.unlock_height == unlock; ++it) {
       const auto& envelope = it->second;
-      TimedSettlementRecord record{it->first, envelope.txid(), false, std::nullopt};
+      TimedSettlementRecord record{it->first, envelope.txid(), false, std::nullopt, std::nullopt,
+                                   envelope.bond_refund_script};
       if (const auto body = open_due_timed_body(envelope, *timed); body.has_value()) {
         record.body_txid = txid_any(*body);
         FrontierRejectReason reason = FrontierRejectReason::NONE;
         record.body_applied = timed_body_is_plain(*body, work) && try_apply(*body, &reason);
+        if (record.body_applied) record.applied_body = *body;
       }
       const auto settled = settle_timed_escrow(
           TimedEscrow{OutPoint{envelope.fee_input.prev_txid, envelope.fee_input.prev_index}, envelope.forfeit_bond,
@@ -480,17 +482,10 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     }
   }
 
-  // Inclusion of one TxTimed (utxo/confidential_tx.hpp, "Validity at inclusion"): cheap checks first,
-  // the SWE well-formedness proof last.
+  // Inclusion of one TxTimed: the envelope rules (check_timed_inclusion), then the block's caps and conflicts.
   const auto try_include_timed = [&](const TxTimed& tx) -> bool {
     if (timed == nullptr || timed->escrows == nullptr || !timed->committee_keys) return false;
     if (opened_escrows.size() >= kMaxTimedTxPerBlock) return false;
-    const auto height = timed->height;
-    const auto epoch_blocks = std::max<std::uint64_t>(1, timed->committee_epoch_blocks);
-    const auto horizon = committee_epoch_start(height, epoch_blocks) + epoch_blocks - 1;
-    if (tx.unlock_height < height || tx.unlock_height > horizon) return false;
-    const auto epoch = committee_epoch_start(tx.unlock_height, epoch_blocks);
-    if (tx.committee_epoch != epoch) return false;
     std::size_t waiting = 0;
     for (auto it = timed->escrows->lower_bound(TimedEscrowKey{tx.unlock_height, 0, 0});
          it != timed->escrows->end() && it->first.unlock_height == tx.unlock_height; ++it) {
@@ -498,38 +493,12 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     }
     for (const auto& [key, _] : opened_escrows) waiting += key.unlock_height == tx.unlock_height ? 1 : 0;
     if (waiting >= kMaxTimedEscrowsPerUnlockHeight) return false;
-
     const OutPoint fee_outpoint{tx.fee_input.prev_txid, tx.fee_input.prev_index};
     if (consumed_domains.count(fee_outpoint) != 0) return false;
-    const auto fee_it = work.find(fee_outpoint);
-    if (fee_it == work.end()) return false;
-    const auto fee_out = transparent_txout_from_utxo_entry(fee_it->second);
-    std::array<std::uint8_t, 20> pkh{};
-    if (!fee_out.has_value() || !is_p2pkh_script_pubkey(fee_out->script_pubkey, &pkh)) return false;
-    Sig64 sig{};
-    PubKey32 pub{};
-    if (!is_p2pkh_script_sig(tx.fee_input.script_sig, &sig, &pub)) return false;
-    const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
-    if (!std::equal(derived.begin(), derived.end(), pkh.begin())) return false;
-    if (!crypto::ed25519_verify(signing_message_for_timed_fee_input(timed->chain_domain, tx), sig, pub)) return false;
-    if (!is_p2pkh_script_pubkey(tx.bond_refund_script, nullptr)) return false;
-    if (tx.fee_change.has_value() && !is_p2pkh_script_pubkey(tx.fee_change->script_pubkey, nullptr)) return false;
-    const auto inclusion = open_timed_escrow(fee_outpoint, fee_out->value, tx.prepaid_fee, tx.forfeit_bond,
-                                             tx.bond_refund_script, tx.fee_change, timed->min_bond);
-    if (!inclusion.has_value()) return false;
-
-    const auto keys = timed->committee_keys(epoch);
-    if (!keys.has_value() || tx.committee_root != committee_bls_key_root(*keys)) return false;
-    const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys->size(), crypto::kSweKeyChunks);
-    if (!ct.has_value() || ct->key_shares.size() != keys->size() || ct->threshold != quorum_threshold(keys->size())) {
-      return false;
-    }
-    const auto proof = crypto::SweWellFormednessProof::parse(tx.swe_proof);
-    if (!proof.has_value() ||
-        !crypto::swe_verify_well_formed(*ct, *keys, time_signature_message(timed->chain_domain, tx.unlock_height),
-                                        crypto::kBlsTimeSignatureDst, *proof)) {
-      return false;
-    }
+    TimedInclusion inclusion_value;
+    if (!check_timed_inclusion(tx, *timed, work, &inclusion_value)) return false;
+    const auto inclusion = std::optional<TimedInclusion>(inclusion_value);
+    const auto height = timed->height;
 
     const auto txid = tx.txid();
     consumed_domains.insert(fee_outpoint);
@@ -655,6 +624,59 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
                                   FrontierExecutionResult* out, std::string* error) {
   return execute_frontier_lane_prefix(upgrade_utxo_set_v2(parent_utxos), 0, prev_vector, next_vector, lane_records,
                                       prev_lane_roots, ctx, out, error);
+}
+
+bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed, const UtxoSetV2& utxos,
+                           TimedInclusion* inclusion_out, std::string* reason) {
+  const auto fail = [&](const char* why) {
+    if (reason) *reason = why;
+    return false;
+  };
+  if (!timed.committee_keys) return fail("no-committee-context");
+  const auto height = timed.height;
+  const auto epoch_blocks = std::max<std::uint64_t>(1, timed.committee_epoch_blocks);
+  const auto horizon = committee_epoch_start(height, epoch_blocks) + epoch_blocks - 1;
+  if (tx.unlock_height < height) return fail("unlock-height-passed");
+  if (tx.unlock_height > horizon) return fail("unlock-height-beyond-known-committee");
+  const auto epoch = committee_epoch_start(tx.unlock_height, epoch_blocks);
+  if (tx.committee_epoch != epoch) return fail("committee-epoch-mismatch");
+
+  const OutPoint fee_outpoint{tx.fee_input.prev_txid, tx.fee_input.prev_index};
+  const auto fee_it = utxos.find(fee_outpoint);
+  if (fee_it == utxos.end()) return fail("fee-input-missing");
+  const auto fee_out = transparent_txout_from_utxo_entry(fee_it->second);
+  std::array<std::uint8_t, 20> pkh{};
+  if (!fee_out.has_value() || !is_p2pkh_script_pubkey(fee_out->script_pubkey, &pkh)) return fail("fee-input-not-p2pkh");
+  Sig64 sig{};
+  PubKey32 pub{};
+  if (!is_p2pkh_script_sig(tx.fee_input.script_sig, &sig, &pub)) return fail("fee-script-sig-malformed");
+  const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
+  if (!std::equal(derived.begin(), derived.end(), pkh.begin())) return fail("fee-pubkey-hash-mismatch");
+  if (!crypto::ed25519_verify(signing_message_for_timed_fee_input(timed.chain_domain, tx), sig, pub)) {
+    return fail("fee-signature-invalid");
+  }
+  if (!is_p2pkh_script_pubkey(tx.bond_refund_script, nullptr)) return fail("refund-script-not-p2pkh");
+  if (tx.fee_change.has_value() && !is_p2pkh_script_pubkey(tx.fee_change->script_pubkey, nullptr)) {
+    return fail("change-script-not-p2pkh");
+  }
+  const auto inclusion = open_timed_escrow(fee_outpoint, fee_out->value, tx.prepaid_fee, tx.forfeit_bond,
+                                           tx.bond_refund_script, tx.fee_change, timed.min_bond);
+  if (!inclusion.has_value()) return fail("value-accounting-or-bond-below-minimum");
+
+  const auto keys = timed.committee_keys(epoch);
+  if (!keys.has_value()) return fail("committee-keys-unknown");
+  if (tx.committee_root != committee_bls_key_root(*keys)) return fail("committee-root-mismatch");
+  const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys->size(), crypto::kSweKeyChunks);
+  if (!ct.has_value() || ct->key_shares.size() != keys->size()) return fail("swe-ciphertext-invalid");
+  if (ct->threshold != quorum_threshold(keys->size())) return fail("swe-threshold-mismatch");
+  const auto proof = crypto::SweWellFormednessProof::parse(tx.swe_proof);
+  if (!proof.has_value() ||
+      !crypto::swe_verify_well_formed(*ct, *keys, time_signature_message(timed.chain_domain, tx.unlock_height),
+                                      crypto::kBlsTimeSignatureDst, *proof)) {
+    return fail("swe-proof-invalid");
+  }
+  if (inclusion_out) *inclusion_out = *inclusion;
+  return true;
 }
 
 Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys) {

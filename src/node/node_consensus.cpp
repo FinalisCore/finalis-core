@@ -42,12 +42,12 @@ struct FrontierBuildSelection {
 
 bool inspect_frontier_ordered_record_supported(const Bytes& raw_record, std::size_t index, Hash32* txid_out,
                                                std::string* error) {
-  const auto tx = parse_any_tx(raw_record);
-  if (!tx.has_value()) {
+  const auto identity = consensus::ingress_record_identity(raw_record);
+  if (!identity.has_value()) {
     if (error) *error = "frontier-ordered-record-parse-failed index=" + std::to_string(index);
     return false;
   }
-  if (txid_out) *txid_out = txid_any(*tx);
+  if (txid_out) *txid_out = identity->txid;
   return true;
 }
 
@@ -384,7 +384,8 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   storage::DB::Batch batch(db_);
 
   std::string persist_error;
-  if (!persist_finalized_frontier_record(record, utxos_, accepted_txids, batch, &persist_error)) {
+  if (!persist_finalized_frontier_record(record, utxos_, accepted_txids, next_state.last_timed_settlements, batch,
+                                         &persist_error)) {
     if (error) *error = "persist-frontier-record-failed" +
                         (persist_error.empty() ? std::string() : ":" + persist_error);
     return false;
@@ -450,9 +451,11 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   // Published: the batch is durable.
   std::vector<Hash32> confirmed_txids;
   for (const auto& raw : record.ordered_records) {
-    auto tx = parse_any_tx(raw);
-    if (tx.has_value()) confirmed_txids.push_back(txid_any(*tx));
+    if (const auto identity = consensus::ingress_record_identity(raw); identity.has_value()) {
+      confirmed_txids.push_back(identity->txid);
+    }
   }
+  prune_timed_pool_locked();
   if (record.transition.timestamp != 0) {
     mempool_.on_finalized_block_timestamp(record.transition.timestamp);
   }
@@ -2992,6 +2995,7 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
     std::array<bool, finalis::INGRESS_LANE_COUNT> lane_blocked{};
     std::size_t total_bytes = 0;
     std::uint64_t total_verify_weight = 0;
+    std::size_t timed_records = 0;  // executor cap: a timed record past it would be rejected (and lost)
     bool capped = false;
     for (std::uint64_t r = 1; r <= max_delta && !capped; ++r) {
       for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
@@ -3036,6 +3040,13 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                    " lane=" + std::to_string(lane) + " seq=" + std::to_string(seq) +
                    " reason=" + ordered_record_error);
           return std::nullopt;
+        }
+        if (const auto identity = consensus::ingress_record_identity(ingress.tx_bytes); identity && identity->timed) {
+          if (timed_records >= consensus::kMaxTimedTxPerBlock) {
+            lane_blocked[lane] = true;  // the lane resumes here in the next block
+            continue;
+          }
+          ++timed_records;
         }
         const auto record_verify_weight = consensus::ordered_record_confidential_verify_weight(ingress.tx_bytes);
         if (selection.ordered_records.size() >= consensus::kMaxFrontierSliceRecords ||

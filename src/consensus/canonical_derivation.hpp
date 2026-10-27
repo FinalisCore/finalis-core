@@ -127,6 +127,8 @@ struct CanonicalDerivedState {
   std::uint64_t confidential_pool_value{0};
   // TxTimed escrows waiting for their unlock height (consensus/frontier_execution.hpp). Committed.
   TimedEscrowState timed_escrows;
+  // Settlements of the last applied transition (derived, not committed): what the node indexes.
+  std::vector<TimedSettlementRecord> last_timed_settlements;
   std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
   std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints;
   std::map<std::uint64_t, CanonicalFinalizedMetadata> finalized_block_metadata;

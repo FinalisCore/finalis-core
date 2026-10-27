@@ -538,8 +538,9 @@ bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std:
 }
 
 bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                             const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
-                                             std::string* error) {
+                                             const std::set<Hash32>& accepted_txids,
+                                             const std::vector<consensus::TimedSettlementRecord>& timed_settlements,
+                                             storage::DB::Batch& batch, std::string* error) {
   auto fail = [&](const std::string& reason) {
     if (error) *error = reason;
     return false;
@@ -551,58 +552,81 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
     return fail("frontier-continuity-mismatch");
   }
 
-  std::uint64_t seq = record.transition.prev_frontier;
-  std::uint32_t tx_index = 0;
-  for (const auto& ordered_record : record.ordered_records) {
-    ++seq;
-    if (!batch.put_ingress_record(seq, ordered_record)) return fail("put-ingress-record-failed seq=" + std::to_string(seq));
-    auto tx = parse_any_tx(ordered_record);
-    if (!tx.has_value()) {
-      log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
-               std::to_string(record.transition.height));
-      return fail("ordered-record-tx-parse-failed seq=" + std::to_string(seq));
-    }
-    const Hash32 txid = txid_any(*tx);
-    // Only executed transactions are finalized transfers. A rejected one moved no funds: no tx index
-    // and no address history, or get_tx_status would report it finalized and credit-safe.
-    if (!accepted_txids.contains(txid)) {
-      batch.put_rejected_tx(txid, record.transition.height);
-      continue;
-    }
-    batch.put_tx_index(txid, record.transition.height, tx_index++, ordered_record);
-    // Address history covers the transparent side of both formats; confidential outputs and the
-    // inputs spending them are indexed under confidential_history_key(one_time_pubkey).
-    const auto add_spent = [&](const Hash32& prev_txid, std::uint32_t prev_index) {
-      const auto prev_it = prev_utxos.find(OutPoint{prev_txid, prev_index});
-      if (prev_it == prev_utxos.end()) return;
-      const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
-      if (!spent_out.has_value()) return;
-      batch.add_script_history(crypto::sha256(spent_out->script_pubkey), record.transition.height, txid);
-    };
-    if (const auto* legacy = std::get_if<Tx>(&*tx)) {
-      for (const auto& input : legacy->inputs) add_spent(input.prev_txid, input.prev_index);
-      for (const auto& output : legacy->outputs) {
-        batch.add_script_history(crypto::sha256(output.script_pubkey), record.transition.height, txid);
-      }
-    } else if (const auto* v2 = std::get_if<TxV2>(&*tx)) {
+  const auto height = record.transition.height;
+  // Address history covers the transparent side of both formats; confidential outputs and the
+  // inputs spending them are indexed under confidential_history_key(one_time_pubkey).
+  const auto add_spent = [&](const Hash32& txid, const Hash32& prev_txid, std::uint32_t prev_index) {
+    const auto prev_it = prev_utxos.find(OutPoint{prev_txid, prev_index});
+    if (prev_it == prev_utxos.end()) return;
+    const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
+    if (!spent_out.has_value()) return;
+    batch.add_script_history(crypto::sha256(spent_out->script_pubkey), height, txid);
+  };
+  const auto add_history = [&](const Hash32& txid, const AnyTx& tx) {
+    if (const auto* legacy = std::get_if<Tx>(&tx)) {
+      for (const auto& input : legacy->inputs) add_spent(txid, input.prev_txid, input.prev_index);
+      for (const auto& output : legacy->outputs) batch.add_script_history(crypto::sha256(output.script_pubkey), height, txid);
+    } else if (const auto* v2 = std::get_if<TxV2>(&tx)) {
       for (const auto& input : v2->inputs) {
         if (input.kind == TxInputKind::Transparent) {
-          add_spent(input.prev_txid, input.prev_index);
+          add_spent(txid, input.prev_txid, input.prev_index);
         } else {
           const auto& witness = std::get<ConfidentialInputWitnessV2>(input.witness);
-          batch.add_script_history(confidential_history_key(witness.one_time_pubkey), record.transition.height, txid);
+          batch.add_script_history(confidential_history_key(witness.one_time_pubkey), height, txid);
         }
       }
       for (const auto& output : v2->outputs) {
         if (output.kind == TxOutputKind::Transparent) {
           const auto& out = std::get<TransparentTxOutV2>(output.body);
-          batch.add_script_history(crypto::sha256(out.script_pubkey), record.transition.height, txid);
+          batch.add_script_history(crypto::sha256(out.script_pubkey), height, txid);
         } else {
           const auto& out = std::get<ConfidentialTxOutV2>(output.body);
-          batch.add_script_history(confidential_history_key(out.one_time_pubkey), record.transition.height, txid);
+          batch.add_script_history(confidential_history_key(out.one_time_pubkey), height, txid);
         }
       }
     }
+  };
+
+  std::uint32_t tx_index = 0;
+  // Timed settlements ran before this block's records: the bodies they applied are transfers of this
+  // block (indexed first, in settlement order), and the sender's refund script sees the outcome.
+  for (const auto& settlement : timed_settlements) {
+    if (settlement.applied_body.has_value()) {
+      const auto body_txid = txid_any(*settlement.applied_body);
+      batch.put_tx_index(body_txid, height, tx_index++, serialize_any_tx(*settlement.applied_body));
+      add_history(body_txid, *settlement.applied_body);
+    }
+    batch.add_script_history(crypto::sha256(settlement.bond_refund_script), height, settlement.timed_txid);
+  }
+
+  std::uint64_t seq = record.transition.prev_frontier;
+  for (const auto& ordered_record : record.ordered_records) {
+    ++seq;
+    if (!batch.put_ingress_record(seq, ordered_record)) return fail("put-ingress-record-failed seq=" + std::to_string(seq));
+    const auto identity = consensus::ingress_record_identity(ordered_record);
+    if (!identity.has_value()) {
+      log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
+               std::to_string(height));
+      return fail("ordered-record-tx-parse-failed seq=" + std::to_string(seq));
+    }
+    const Hash32 txid = identity->txid;
+    // Only executed transactions are finalized transfers. A rejected one moved no funds: no tx index
+    // and no address history, or get_tx_status would report it finalized and credit-safe.
+    if (!accepted_txids.contains(txid)) {
+      batch.put_rejected_tx(txid, height);
+      continue;
+    }
+    batch.put_tx_index(txid, height, tx_index++, ordered_record);
+    if (identity->timed) {
+      // An escrowed envelope: its fee input is spent here and its change created here.
+      const auto timed = TxTimed::parse(ordered_record);
+      add_spent(txid, timed->fee_input.prev_txid, timed->fee_input.prev_index);
+      if (timed->fee_change.has_value()) {
+        batch.add_script_history(crypto::sha256(timed->fee_change->script_pubkey), height, txid);
+      }
+      continue;
+    }
+    add_history(txid, *parse_any_tx(ordered_record));
   }
   // Settlement (reward payout) outputs have no transaction: index their synthetic txid and credit
   // each recipient's history so explorers and wallets can resolve and show them.

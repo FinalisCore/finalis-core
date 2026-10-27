@@ -158,6 +158,14 @@ struct UtxoProofsView {
 };
 
 std::optional<RpcStatusView> rpc_get_status(const std::string& rpc_url, std::string* err);
+// The committee BLS keys of `height`'s epoch, in checkpoint order, and their key root (get_committee
+// verbose). A TxTimed locked to `height` encrypts to exactly these keys.
+struct CommitteeBlsKeysView {
+  std::vector<crypto::BlsPublicKey> keys;
+  Hash32 root{};
+};
+std::optional<CommitteeBlsKeysView> rpc_get_committee_bls_keys(const std::string& rpc_url, std::uint64_t height,
+                                                               std::string* err);
 std::optional<CommitteeHandoffsView> rpc_get_committee_handoffs(const std::string& rpc_url, std::uint64_t from_epoch_start,
                                                                 std::uint64_t limit, std::string* err);
 std::optional<UtxoProofsView> rpc_get_utxo_proofs(const std::string& rpc_url, const std::vector<OutPoint>& outpoints,

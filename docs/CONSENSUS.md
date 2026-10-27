@@ -265,6 +265,14 @@ A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (ve
    with `forfeit_bond >= kTxTimedMinForfeitBond`. The prepaid fee is a fee of `h`; change appears at
    `(timed txid, 0)`.
 
+Intake: a `TxTimed` travels in `TX` / `SUBMIT_TX` like any record. The node admits it with the
+same `consensus::check_timed_inclusion` the block applies (against the next height), a prepaid fee at
+least the relay floor, and an unused fee input, into a timed pool next to the mempool; it is
+certified in its lane and relayed like other records, and dropped once its fee input is spent or its
+unlock height has passed. A proposer stops a lane before the per-block cap rather than let a record
+be rejected. `finalis-cli timed_send` builds one (`build_signed_timed_tx`) from the committee keys of
+`get_committee` (verbose).
+
 Bounds: at most `kMaxTimedTxPerBlock` (8) accepted per block, at most
 `kMaxTimedEscrowsPerUnlockHeight` (16) waiting per unlock height. Escrows are consensus state:
 `CanonicalDerivedState::timed_escrows`, committed as `timed_escrow_commitment_root` at the end of the

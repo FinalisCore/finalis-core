@@ -1450,6 +1450,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli getWallet [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli timed_send --to <addr> (--amount <coins> | --amount-units <u64>) [--unlock-height <h> | --delay <blocks>] [--bond <u64>] [--prepaid-fee <u64>] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # sealed until <h> is final\n"
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
@@ -3735,6 +3736,176 @@ int run_cli(int argc, char** argv) {
     std::cout << "accepted=yes\n";
     std::cout << "status=accepted_for_relay\n";
     print_submitted_not_final(tx->txid());
+    return 0;
+  }
+
+  if (cmd == "timed_send") {
+    // A time-locked transfer (TxTimed): the transfer is sealed now and opens, and applies, in block
+    // unlock_height + 1, once the committee has time-signed unlock_height. Two coins: one pays the
+    // envelope (prepaid fee + forfeit bond, the rest back as change), the others fund the sealed transfer.
+    std::string file_path = default_validator_key_path();
+    std::string passphrase;
+    std::string rpc_url = default_rpc_url();
+    std::string to_addr;
+    std::string amount_text;
+    std::uint64_t amount_units = 0;
+    std::uint64_t fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    std::uint64_t prepaid_fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
+    std::uint64_t bond = finalis::consensus::kTxTimedMinForfeitBond;
+    std::optional<std::uint64_t> unlock_height;
+    std::uint64_t delay = 2;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--to" && i + 1 < argc) to_addr = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount_text = argv[++i];
+      else if (a == "--amount-units" && i + 1 < argc) amount_units = std::stoull(argv[++i]);
+      else if (a == "--fee" && i + 1 < argc) fee = std::stoull(argv[++i]);
+      else if (a == "--prepaid-fee" && i + 1 < argc) prepaid_fee = std::stoull(argv[++i]);
+      else if (a == "--bond" && i + 1 < argc) bond = std::stoull(argv[++i]);
+      else if (a == "--unlock-height" && i + 1 < argc) unlock_height = std::stoull(argv[++i]);
+      else if (a == "--delay" && i + 1 < argc) delay = std::stoull(argv[++i]);
+    }
+    if (to_addr.empty() || !decode_network_address(to_addr, "--to").has_value()) {
+      std::cerr << "--to <address> is required\n";
+      return 1;
+    }
+    if (!amount_text.empty()) {
+      auto parsed = parse_coin_amount_text(amount_text);
+      if (!parsed.has_value()) {
+        std::cerr << "invalid --amount\n";
+        return 1;
+      }
+      amount_units = *parsed;
+    }
+    if (amount_units == 0) {
+      std::cerr << "--amount or --amount-units is required\n";
+      return 1;
+    }
+    file_path = expand_user(file_path);
+    finalis::keystore::ValidatorKey vk;
+    std::string err;
+    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
+      std::cerr << "timed_send failed to load key: " << err << "\n";
+      return 1;
+    }
+    const auto own = finalis::address::decode(vk.address);
+    const auto to = finalis::address::decode(to_addr);
+    if (!own.has_value() || !to.has_value()) {
+      std::cerr << "timed_send failed: invalid address\n";
+      return 1;
+    }
+    const auto own_script = finalis::address::p2pkh_script_pubkey(own->pubkey_hash);
+    const auto status = finalis::lightserver::rpc_get_status(rpc_url, &err);
+    if (!status.has_value()) {
+      std::cerr << "timed_send failed to load rpc status: " << err << "\n";
+      return 1;
+    }
+    // Lockable heights: from the next block to the end of its epoch (later committees are not known yet).
+    const std::uint64_t next_height = status->tip_height + 1;
+    const std::uint64_t epoch_blocks = std::max<std::uint64_t>(1, cli_network().committee_epoch_blocks);
+    const std::uint64_t horizon = finalis::consensus::committee_epoch_start(next_height, epoch_blocks) + epoch_blocks - 1;
+    const std::uint64_t unlock = unlock_height.value_or(std::min(horizon, next_height + delay));
+    if (unlock < next_height || unlock > horizon) {
+      std::cerr << "timed_send failed: --unlock-height must be in [" << next_height << ", " << horizon
+                << "] (the current epoch's committee)\n";
+      return 1;
+    }
+    const auto committee = finalis::lightserver::rpc_get_committee_bls_keys(rpc_url, unlock, &err);
+    if (!committee.has_value()) {
+      std::cerr << "timed_send failed to load committee keys: " << err << "\n";
+      return 1;
+    }
+    if (finalis::consensus::committee_bls_key_root(committee->keys) != committee->root) {
+      std::cerr << "timed_send failed: committee key root mismatch\n";
+      return 1;
+    }
+
+    auto validated = finalis::lightserver::rpc_validate_address(rpc_url, vk.address, &err);
+    if (!validated.has_value() || !validated->valid || !validated->has_scripthash) {
+      std::cerr << "timed_send failed to validate wallet address: " << err << "\n";
+      return 1;
+    }
+    auto rpc_utxos = finalis::lightserver::rpc_get_utxos(rpc_url, validated->scripthash, &err);
+    if (!rpc_utxos.has_value()) {
+      std::cerr << "timed_send failed to load utxos: " << err << "\n";
+      return 1;
+    }
+    std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> coins;
+    for (const auto& u : *rpc_utxos) {
+      if (u.value > 0) coins.push_back({finalis::OutPoint{u.txid, u.vout}, finalis::TxOut{u.value, u.script_pubkey}});
+    }
+    // Fee coin: the smallest coin covering prepaid fee + bond; the body spends the others.
+    std::sort(coins.begin(), coins.end(), [](const auto& a, const auto& b) { return a.second.value < b.second.value; });
+    const auto fee_it = std::find_if(coins.begin(), coins.end(),
+                                     [&](const auto& c) { return c.second.value >= prepaid_fee + bond; });
+    if (fee_it == coins.end()) {
+      std::cerr << "timed_send failed: no coin covers prepaid fee + bond (" << prepaid_fee + bond << ")\n";
+      return 1;
+    }
+    const auto fee_coin = *fee_it;
+    coins.erase(fee_it);
+    auto plan = finalis::plan_wallet_p2pkh_send(coins, finalis::address::p2pkh_script_pubkey(to->pubkey_hash), own_script,
+                                                amount_units, fee, finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
+    if (!plan.has_value()) {
+      std::cerr << "timed_send planning failed (the transfer cannot use the fee coin): " << err << "\n";
+      return 1;
+    }
+    const auto chain_domain = rpc_chain_domain(rpc_url, &err);
+    if (!chain_domain.has_value()) {
+      std::cerr << "timed_send failed to load chain identity: " << err << "\n";
+      return 1;
+    }
+    const finalis::Bytes privkey(vk.privkey.begin(), vk.privkey.end());
+    auto body = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, plan->selected_prevs, privkey, plan->outputs, &err);
+    if (!body.has_value()) {
+      std::cerr << "timed_send body build failed: " << err << "\n";
+      return 1;
+    }
+    finalis::TimedTxParams params;
+    params.fee_outpoint = fee_coin.first;
+    params.fee_prev_out = fee_coin.second;
+    params.prepaid_fee = prepaid_fee;
+    params.forfeit_bond = bond;
+    params.bond_refund_script = own_script;
+    const std::uint64_t change = fee_coin.second.value - prepaid_fee - bond;
+    if (change > 0) params.fee_change = finalis::TxOut{change, own_script};
+    params.unlock_height = unlock;
+    params.committee_epoch = finalis::consensus::committee_epoch_start(unlock, epoch_blocks);
+    params.committee_root = committee->root;
+    params.committee_keys = committee->keys;
+    params.threshold = static_cast<std::uint32_t>(finalis::consensus::quorum_threshold(committee->keys.size()));
+    finalis::Hash32 seed{};
+    if (!finalis::crypto::secure_random_bytes(seed.data(), seed.size())) {
+      std::cerr << "timed_send failed: no randomness\n";
+      return 1;
+    }
+    auto timed = finalis::build_signed_timed_tx(*chain_domain, params, finalis::AnyTx{*body}, privkey, seed, &err);
+    finalis::crypto::secure_wipe(seed);
+    if (!timed.has_value()) {
+      std::cerr << "timed_send build failed: " << err << "\n";
+      return 1;
+    }
+    auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, timed->serialize(), &err);
+    std::cout << "address=" << vk.address << "\n";
+    std::cout << "recipient=" << to_addr << "\n";
+    std::cout << "amount=" << amount_units << "\n";
+    std::cout << "unlock_height=" << unlock << "\n";
+    std::cout << "opens_in_block=" << unlock + 1 << "\n";
+    std::cout << "prepaid_fee=" << prepaid_fee << "\n";
+    std::cout << "forfeit_bond=" << bond << "\n";
+    std::cout << "body_fee=" << plan->applied_fee_units << "\n";
+    std::cout << "timed_txid=" << finalis::hex_encode32(timed->txid()) << "\n";
+    std::cout << "body_txid=" << finalis::hex_encode32(body->txid()) << "\n";
+    std::cout << "envelope_bytes=" << timed->serialize().size() << "\n";
+    if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
+      std::cout << "accepted=no\n";
+      std::cout << "error_message=" << (!result.error_message.empty() ? result.error_message : result.error) << "\n";
+      return 1;
+    }
+    std::cout << "accepted=yes\n";
     return 0;
   }
 

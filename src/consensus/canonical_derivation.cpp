@@ -1912,6 +1912,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   if (accepted_txids) {
     accepted_txids->clear();
     for (const auto& tx : recomputed.accepted_txs) accepted_txids->insert(txid_any(tx));
+    for (const auto& [key, tx] : recomputed.opened_escrows) accepted_txids->insert(tx.txid());
   }
   apply_validator_state_changes_from_txs(cfg, &next, recomputed.accepted_txs, 0, pre_utxos,
                                          record.transition.height);
@@ -1925,6 +1926,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   next.utxo_tree = recomputed.has_next_utxo_tree ? std::move(recomputed.next_utxo_tree) : crypto::PersistentSmt{};
   next.confidential_pool_value = recomputed.next_confidential_pool_value;
   apply_timed_escrows(record.transition.height, recomputed, &next.timed_escrows);
+  next.last_timed_settlements = recomputed.settlements;
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
   next.finalized_timestamp = record.transition.timestamp;
   next.last_finality_certificate_hash = frontier_finality_link_hash(record.transition);

@@ -1623,6 +1623,26 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
   }
 }
 
+void Node::broadcast_record_bytes(const Bytes& tx_bytes, int skip_peer_id) {
+  if (cfg_.disable_p2p) {
+    for_each_local_bus_peer(
+        [&](Node* peer) { spawn_local_bus_task([peer, tx_bytes]() { (void)peer->handle_record_bytes(tx_bytes, true); }); });
+    return;
+  }
+  const auto payload = p2p::ser_tx(p2p::TxMsg{tx_bytes});
+  const std::uint64_t now = now_ms();
+  for (int id : p2p_.peer_ids()) {
+    if (id == skip_peer_id) continue;
+    if (should_mute_peer(id)) continue;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = peer_tx_relay_backoff_until_ms_.find(id);
+      if (it != peer_tx_relay_backoff_until_ms_.end() && now < it->second) continue;
+    }
+    (void)p2p_.send_to(id, p2p::MsgType::TX, payload, true);
+  }
+}
+
 void Node::broadcast_tx(const AnyTx& tx, int skip_peer_id) {
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) { spawn_local_bus_task([peer, tx]() { peer->handle_tx(tx, true); }); });

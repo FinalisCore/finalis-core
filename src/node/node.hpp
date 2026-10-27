@@ -15,6 +15,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "consensus/ingress.hpp"
 #include "consensus/availability_retention.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/canonical_derivation.hpp"
@@ -275,6 +276,8 @@ class Node {
   bool observe_frontier_proposal_for_test(const FrontierProposal& proposal);
   bool inject_frontier_block_for_test(const FrontierProposal& proposal, const std::vector<FinalitySig>& finality_signatures);
   bool inject_tx_for_test(const AnyTx& tx, bool relay);
+  // Any ordered record (Tx, TxV2, TxTimed) through the node's intake, as a local submission.
+  bool inject_record_for_test(const Bytes& raw, std::string* reason = nullptr);
   bool pause_proposals_for_test(bool pause);
   bool advance_round_for_test(std::uint64_t expected_height, std::uint32_t target_round);
   bool mempool_contains_for_test(const Hash32& txid) const;
@@ -473,6 +476,15 @@ class Node {
   bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
   bool handle_tx(const AnyTx& tx, bool from_network, int from_peer_id = 0, std::string* reject_reason = nullptr);
   bool maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error = nullptr);
+  // An ordered record (Tx, TxV2 or TxTimed) as raw bytes: the transport-independent intake.
+  bool handle_record_bytes(const Bytes& raw, bool from_network, int from_peer_id = 0, std::string* reject_reason = nullptr);
+  // TxTimed intake: consensus::check_timed_inclusion against the next height (the same rules the block
+  // applies), a prepaid fee at least the relay floor, then the timed pool, certification and relay.
+  bool handle_timed_tx(const TxTimed& tx, bool from_network, int from_peer_id = 0, std::string* reject_reason = nullptr);
+  bool maybe_certify_record_locked(const Bytes& tx_bytes, const consensus::IngressRecordIdentity& identity,
+                                   std::string* error = nullptr);
+  // Drops envelopes whose fee input is gone (included or conflicted) or whose unlock height passed.
+  void prune_timed_pool_locked();
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
                                     std::string* error = nullptr);
   bool finalize_if_quorum(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
@@ -613,6 +625,7 @@ class Node {
   void broadcast_time_signature(const p2p::TimeSignatureMsg& msg);
   void broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate);
   void broadcast_tx(const AnyTx& tx, int skip_peer_id = 0);
+  void broadcast_record_bytes(const Bytes& tx_bytes, int skip_peer_id = 0);
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
   // LIVENESS: a transaction is forwarded to its lane's designated certifier once, on admission, and
   // silently not at all if that peer is unreachable then. Re-forwards (or certifies, when this node
@@ -625,10 +638,12 @@ class Node {
   // epoch by reforward_uncertified_mempool_txs_locked.
   void drop_stale_unfinalized_ingress_locked();
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
+  void maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_bytes, std::uint32_t lane, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                         const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
-                                         std::string* error = nullptr);
+                                         const std::set<Hash32>& accepted_txids,
+                                         const std::vector<consensus::TimedSettlementRecord>& timed_settlements,
+                                         storage::DB::Batch& batch, std::string* error = nullptr);
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
   // Same, taking ownership: saves copying the state (its UTXO set) once per finalized block.
   void hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& state);
@@ -996,6 +1011,9 @@ class Node {
   // Verified time signatures by height and committee index (finalized tip and one height either side).
   std::map<std::uint64_t, std::map<std::uint32_t, crypto::BlsSignature>> time_signatures_;
   std::uint64_t local_time_signature_height_{0};  // highest height this node has signed
+  // Admitted TxTimed envelopes awaiting a block (the mempool holds AnyTx only).
+  std::map<Hash32, TxTimed> timed_pool_;
+  static constexpr std::size_t kMaxTimedPoolEntries = 256;
   // This node's signature on the tip, re-sent every round timeout until the next height finalizes
   // (a lost message must not leave the next proposer short of the threshold).
   std::optional<p2p::TimeSignatureMsg> local_time_signature_;

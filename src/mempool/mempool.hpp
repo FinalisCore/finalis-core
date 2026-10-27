@@ -60,6 +60,8 @@ class Mempool {
   std::size_t size() const;
   std::size_t total_bytes() const;
   bool contains(const Hash32& txid) const;
+  // True if a pooled transaction spends `op`.
+  bool spends(const OutPoint& op) const;
   // Up to `max` entries, in txid order.
   std::vector<MempoolEntry> entries(std::size_t max) const;
   MempoolPolicyStats policy_stats() const;
