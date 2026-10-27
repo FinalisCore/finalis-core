@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_genesis.hpp"
 #include "support/test_paths.hpp"
 
 #include <filesystem>
@@ -42,7 +43,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   if (keys.size() < n_validators) return false;
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -62,6 +63,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   std::filesystem::create_directories(std::filesystem::path(path).parent_path());
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
+  finalis::test::fill_test_genesis_bls(d);
   out << genesis::to_json(d);
   return out.good();
 }

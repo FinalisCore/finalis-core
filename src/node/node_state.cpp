@@ -464,6 +464,7 @@ bool Node::canonical_genesis_state_locked(consensus::CanonicalDerivedState* out,
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
+  genesis_state.initial_validator_bls_keys = genesis::bls_keys_for(*genesis_doc, genesis_state.initial_validators);
 
   std::string canonical_error;
   if (!consensus::build_genesis_canonical_state(canonical_derivation_config_locked(), genesis_state, out, &canonical_error)) {
@@ -799,29 +800,26 @@ bool Node::init_mainnet_genesis() {
     return false;
   }
 
-  for (const auto& pub : doc->initial_validators) {
+  const auto genesis_bls = genesis::bls_keys_for(*doc, doc->initial_validators);
+  auto genesis_validator_info = [&](std::size_t i) {
     consensus::ValidatorInfo vi;
     vi.status = consensus::ValidatorStatus::ACTIVE;
     vi.joined_height = 0;
     vi.bonded_amount = consensus::genesis_validator_bond_amount();
-    vi.operator_id = pub;
+    vi.operator_id = doc->initial_validators[i];
     vi.has_bond = true;
     vi.bond_outpoint = OutPoint{zero_hash(), 0};
     vi.unbond_height = 0;
-    if (!db_.put_validator(pub, vi)) return false;
+    if (!genesis_bls.empty()) vi.bls_pubkey = genesis_bls[i];
+    return vi;
+  };
+  for (std::size_t i = 0; i < doc->initial_validators.size(); ++i) {
+    if (!db_.put_validator(doc->initial_validators[i], genesis_validator_info(i))) return false;
   }
   {
     consensus::ValidatorRegistry vr;
-    for (const auto& pub : doc->initial_validators) {
-      consensus::ValidatorInfo vi;
-      vi.status = consensus::ValidatorStatus::ACTIVE;
-      vi.joined_height = 0;
-      vi.bonded_amount = consensus::genesis_validator_bond_amount();
-      vi.operator_id = pub;
-      vi.has_bond = true;
-      vi.bond_outpoint = OutPoint{zero_hash(), 0};
-      vi.unbond_height = 0;
-      vr.upsert(pub, vi);
+    for (std::size_t i = 0; i < doc->initial_validators.size(); ++i) {
+      vr.upsert(doc->initial_validators[i], genesis_validator_info(i));
     }
     const UtxoSetV2 empty_utxos;
     (void)persist_state_roots(db_, 0, empty_utxos, vr, kFixedValidationRulesVersion);
@@ -842,6 +840,7 @@ bool Node::init_mainnet_genesis() {
   consensus::CanonicalGenesisState genesis_state;
   genesis_state.genesis_artifact_id = gblock;
   genesis_state.initial_validators = doc->initial_validators;
+  genesis_state.initial_validator_bls_keys = genesis::bls_keys_for(*doc, doc->initial_validators);
   genesis_state.genesis_time_unix = doc->genesis_time_unix;
   consensus::CanonicalDerivedState canonical_genesis_state;
   std::string canonical_error;
@@ -907,6 +906,7 @@ bool Node::load_state() {
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
+  genesis_state.initial_validator_bls_keys = genesis::bls_keys_for(*genesis_doc, genesis_state.initial_validators);
 
   const auto stored_replay_mode_bytes = db_.get(kStartupReplayModeKey);
   if (stored_replay_mode_bytes.has_value() && !replay_mode_is_frontier(*stored_replay_mode_bytes)) {

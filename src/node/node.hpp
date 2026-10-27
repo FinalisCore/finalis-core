@@ -25,6 +25,7 @@
 #include "consensus/validator_registry.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
+#include "genesis/genesis.hpp"
 #include "mempool/mempool.hpp"
 #include "p2p/messages.hpp"
 #include "p2p/addrman.hpp"
@@ -646,9 +647,15 @@ class Node {
                                                        storage::DB::Batch& batch, bool recompute = true);
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state);
   bool init_local_validator_key();
-  bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator);
+  // bls: the validator's time-signature key and proof; for the local validator derived from its
+  // seed when absent. A remote validator without a verifying one is not bound.
+  bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator,
+                                         const std::optional<genesis::ValidatorBls>& bls = std::nullopt);
   bool maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32& pub, std::uint64_t peer_height,
-                                                 const char* source);
+                                                 const char* source,
+                                                 const std::optional<genesis::ValidatorBls>& bls = std::nullopt);
+  // The bound bootstrap validator's BLS key and proof, from the stored (effective) genesis.
+  std::optional<genesis::ValidatorBls> bootstrap_validator_bls_locked() const;
   void maybe_self_bootstrap_template(std::uint64_t now_ms);
   bool bootstrap_sync_incomplete_locked(int peer_id) const;
   bool check_and_record_proposer_equivocation_locked(const FrontierTransition& transition);

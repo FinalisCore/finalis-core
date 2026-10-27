@@ -9,7 +9,7 @@ namespace {
 
 // The VERSION fingerprint currently carries chain-id plus bootstrap/runtime
 // metadata, so the cap must comfortably exceed the minimal local fingerprint.
-constexpr std::size_t kMaxSoftwareVersionBytes = 512;
+constexpr std::size_t kMaxSoftwareVersionBytes = 1024;  // room for the bootstrap validator BLS key + proof
 constexpr std::size_t kMaxProposalBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxBlockMessageBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxTxMessageBytes = 256 * 1024;

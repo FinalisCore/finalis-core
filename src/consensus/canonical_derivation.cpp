@@ -1107,6 +1107,15 @@ std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivat
   return schedule[static_cast<std::size_t>(round) % schedule.size()];
 }
 
+CanonicalGenesisState canonical_genesis_state_from_document(const genesis::Document& doc) {
+  CanonicalGenesisState g;
+  g.genesis_artifact_id = genesis::block_id(doc);
+  g.initial_validators = doc.initial_validators;
+  g.initial_validator_bls_keys = genesis::bls_keys_for(doc, doc.initial_validators);
+  g.genesis_time_unix = doc.genesis_time_unix;
+  return g;
+}
+
 bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const CanonicalGenesisState& genesis,
                                    CanonicalDerivedState* out, std::string* error) {
   if (!out) {
@@ -1128,7 +1137,13 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
       .warmup_blocks = cfg.validator_warmup_blocks,
       .cooldown_blocks = cfg.validator_cooldown_blocks,
   });
-  for (const auto& pub : genesis.initial_validators) {
+  if (!genesis.initial_validator_bls_keys.empty() &&
+      genesis.initial_validator_bls_keys.size() != genesis.initial_validators.size()) {
+    if (error) *error = "genesis-bls-keys-mismatch";
+    return false;
+  }
+  for (std::size_t i = 0; i < genesis.initial_validators.size(); ++i) {
+    const auto& pub = genesis.initial_validators[i];
     ValidatorInfo vi;
     vi.status = ValidatorStatus::ACTIVE;
     vi.joined_height = 0;
@@ -1136,6 +1151,7 @@ bool build_genesis_canonical_state(const CanonicalDerivationConfig& cfg, const C
     vi.operator_id = pub;
     vi.has_bond = true;
     vi.bond_outpoint = OutPoint{zero_hash(), 0};
+    if (!genesis.initial_validator_bls_keys.empty()) vi.bls_pubkey = genesis.initial_validator_bls_keys[i];
     state.validators.upsert(pub, vi);
   }
   state.availability_state.current_epoch = committee_epoch_start(1, cfg.network.committee_epoch_blocks);

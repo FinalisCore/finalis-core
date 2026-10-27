@@ -2,7 +2,7 @@
 
 ## Genesis JSON schema (`mainnet/genesis.json`)
 Fields:
-- `version` (u32)
+- `version` (u32, must be `2`)
 - `network_name` (`"mainnet"`)
 - `protocol_version` (u32)
 - `network_id_hex` (16-byte hex)
@@ -10,6 +10,11 @@ Fields:
 - `genesis_time_unix` (u64)
 - `initial_height` (u64, must be `0`)
 - `initial_validators` (array of 32-byte Ed25519 pubkey hex)
+- `initial_validator_bls_pubkeys` (array of 48-byte BLS12-381 G1 pubkey hex, one per validator,
+  same order): the validator's time-signature key, derived from its Ed25519 seed
+  (`finalis-cli validator_bls`)
+- `initial_validator_bls_pops` (array of 96-byte BLS proof-of-possession hex, same order); every
+  proof must verify and the BLS keys must be distinct
 - `initial_active_set_size` (u32, must equal validator count)
 - `initial_committee_params`: `{min_committee,max_committee,sizing_rule,C}`
 - `monetary_params_ref` (string)
@@ -37,6 +42,8 @@ Deterministic field order, LE integers, ULEB128 lengths:
 8. `initial_height` u64le
 9. validator count varint
 10. validators fixed 32 bytes each
+10a. BLS entry count varint (equals the validator count)
+10b. per validator: BLS pubkey fixed 48 bytes, then BLS proof of possession fixed 96 bytes
 11. `initial_active_set_size` u32le
 12. `min_committee` u32le
 13. `max_committee` u32le

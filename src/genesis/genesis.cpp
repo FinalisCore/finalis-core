@@ -139,6 +139,26 @@ std::optional<Document> parse_json(const std::string& json_text, std::string* er
     }
     d.initial_validators.push_back(pk);
   }
+  // Parallel arrays; absent means none (validate_document requires one per validator).
+  const auto bls_keys = find_string_array(json_text, "initial_validator_bls_pubkeys");
+  const auto bls_pops = find_string_array(json_text, "initial_validator_bls_pops");
+  d.initial_validator_bls.clear();
+  if (bls_keys.has_value() != bls_pops.has_value() || (bls_keys && bls_keys->size() != bls_pops->size())) {
+    if (err) *err = "initial_validator_bls_pubkeys / _pops mismatch";
+    return std::nullopt;
+  }
+  for (std::size_t i = 0; bls_keys && i < bls_keys->size(); ++i) {
+    const auto k = hex_decode((*bls_keys)[i]);
+    const auto p = hex_decode((*bls_pops)[i]);
+    if (!k || k->size() != crypto::kBlsPublicKeyBytes || !p || p->size() != crypto::kBlsSignatureBytes) {
+      if (err) *err = "invalid validator bls hex";
+      return std::nullopt;
+    }
+    ValidatorBls v;
+    std::copy(k->begin(), k->end(), v.pubkey.begin());
+    std::copy(p->begin(), p->end(), v.pop.begin());
+    d.initial_validator_bls.push_back(v);
+  }
 
   auto seeds = find_string_array(json_text, "seeds");
   if (seeds.has_value()) d.seeds = *seeds;
@@ -146,6 +166,17 @@ std::optional<Document> parse_json(const std::string& json_text, std::string* er
   if (note.has_value()) d.note = *note;
 
   return d;
+}
+
+std::vector<crypto::BlsPublicKey> bls_keys_for(const Document& doc, const std::vector<PubKey32>& validators) {
+  std::vector<crypto::BlsPublicKey> out;
+  if (doc.initial_validator_bls.size() != doc.initial_validators.size()) return out;
+  for (const auto& pub : validators) {
+    const auto it = std::find(doc.initial_validators.begin(), doc.initial_validators.end(), pub);
+    if (it == doc.initial_validators.end()) return {};
+    out.push_back(doc.initial_validator_bls[static_cast<std::size_t>(it - doc.initial_validators.begin())].pubkey);
+  }
+  return out;
 }
 
 std::string to_json(const Document& d) {
@@ -165,6 +196,17 @@ std::string to_json(const Document& d) {
     oss << "\n";
   }
   oss << "  ],\n";
+  for (const bool pops : {false, true}) {
+    oss << (pops ? "  \"initial_validator_bls_pops\": [\n" : "  \"initial_validator_bls_pubkeys\": [\n");
+    for (std::size_t i = 0; i < d.initial_validator_bls.size(); ++i) {
+      const auto& v = d.initial_validator_bls[i];
+      oss << "    \"" << (pops ? hex_encode(Bytes(v.pop.begin(), v.pop.end())) : hex_encode(Bytes(v.pubkey.begin(), v.pubkey.end())))
+          << "\"";
+      if (i + 1 != d.initial_validator_bls.size()) oss << ",";
+      oss << "\n";
+    }
+    oss << "  ],\n";
+  }
   oss << "  \"initial_active_set_size\": " << d.initial_active_set_size << ",\n";
   oss << "  \"initial_committee_params\": {\n";
   oss << "    \"min_committee\": " << d.initial_committee_params.min_committee << ",\n";
@@ -196,6 +238,11 @@ Bytes encode_bin(const Document& d) {
   w.u64le(d.initial_height);
   w.varint(d.initial_validators.size());
   for (const auto& pk : d.initial_validators) w.bytes_fixed(pk);
+  w.varint(d.initial_validator_bls.size());
+  for (const auto& v : d.initial_validator_bls) {
+    w.bytes_fixed(v.pubkey);
+    w.bytes_fixed(v.pop);
+  }
   w.u32le(d.initial_active_set_size);
   w.u32le(d.initial_committee_params.min_committee);
   w.u32le(d.initial_committee_params.max_committee);
@@ -242,6 +289,16 @@ std::optional<Document> decode_bin(const Bytes& bin, std::string* err) {
           auto pk = r.bytes_fixed<32>();
           if (!pk) return false;
           d.initial_validators.push_back(*pk);
+        }
+        auto nbls = r.varint();
+        if (!nbls) return false;
+        d.initial_validator_bls.clear();
+        d.initial_validator_bls.reserve(std::min<std::uint64_t>(*nbls, r.remaining()));
+        for (std::uint64_t i = 0; i < *nbls; ++i) {
+          auto k = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+          auto p = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+          if (!k || !p) return false;
+          d.initial_validator_bls.push_back(ValidatorBls{*k, *p});
         }
 
         auto active = r.u32le();
@@ -299,7 +356,7 @@ Hash32 block_id(const Document& doc) {
 }
 
 bool validate_document(const Document& doc, const NetworkConfig& cfg, std::string* err, std::size_t min_validators) {
-  if (doc.version != 1) {
+  if (doc.version != kGenesisVersion) {
     if (err) *err = "unsupported genesis version";
     return false;
   }
@@ -335,6 +392,22 @@ bool validate_document(const Document& doc, const NetworkConfig& cfg, std::strin
   if (uniq.size() != doc.initial_validators.size()) {
     if (err) *err = "duplicate initial validators";
     return false;
+  }
+  // Every initial validator has a time-signature key with a proof of possession, keys unique.
+  if (doc.initial_validator_bls.size() != doc.initial_validators.size()) {
+    if (err) *err = "initial_validator_bls must have one entry per validator";
+    return false;
+  }
+  std::set<crypto::BlsPublicKey> bls_uniq;
+  for (const auto& v : doc.initial_validator_bls) {
+    if (!crypto::bls_pop_verify(v.pubkey, v.pop)) {
+      if (err) *err = "invalid initial validator bls proof";
+      return false;
+    }
+    if (!bls_uniq.insert(v.pubkey).second) {
+      if (err) *err = "duplicate initial validator bls key";
+      return false;
+    }
   }
   if (doc.initial_committee_params.max_committee == 0 ||
       doc.initial_committee_params.max_committee > cfg.max_committee) {

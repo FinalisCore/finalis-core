@@ -1495,6 +1495,7 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli epoch_best [--db <dir>] --epoch <n>\n"
      << "  finalis-cli epoch_committee [--db <dir>] --epoch <n>\n"
      << "  finalis-cli epoch_state [--db <dir>] --epoch <n>\n"
+     << "  finalis-cli validator_bls --file <path> [--pass <pass>]   (genesis BLS key + proof)\n"
      << "  finalis-cli genesis_build --in <genesis.json> --out <genesis.bin>\n"
      << "  finalis-cli genesis_hash --in <genesis.bin>\n"
      << "  finalis-cli genesis_verify --json <genesis.json> --bin <genesis.bin>\n"
@@ -2787,6 +2788,39 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
     std::cout << vk.address << "\n";
+    return 0;
+  }
+
+  if (cmd == "validator_bls") {
+    // A genesis validator's BLS time-signature key and proof of possession (derived from the
+    // keystore's Ed25519 seed). Public output only: paste it into the genesis inputs.
+    std::string file_path;
+    std::string passphrase;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+    }
+    if (file_path.empty()) {
+      std::cerr << "--file is required\n";
+      return 1;
+    }
+    finalis::keystore::ValidatorKey vk;
+    std::string err;
+    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
+      std::cerr << "validator_bls failed: " << err << "\n";
+      return 1;
+    }
+    finalis::Bytes seed(vk.privkey.begin(), vk.privkey.end());
+    const auto reg = finalis::validator_bls_registration(seed);
+    finalis::crypto::secure_wipe(seed);
+    if (!reg) {
+      std::cerr << "validator_bls failed: key derivation\n";
+      return 1;
+    }
+    std::cout << "validator_pubkey=" << finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
+    std::cout << "bls_pubkey=" << finalis::hex_encode(finalis::Bytes(reg->pubkey.begin(), reg->pubkey.end())) << "\n";
+    std::cout << "bls_pop=" << finalis::hex_encode(finalis::Bytes(reg->pop.begin(), reg->pop.end())) << "\n";
     return 0;
   }
 

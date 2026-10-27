@@ -132,7 +132,7 @@ run_cli() {
 kv() { sed -n "s/^$1=//p" <<<"$2" | head -n1; }
 
 # --- validator keys -----------------------------------------------------------
-declare -a PUBKEYS ADDRESSES
+declare -a PUBKEYS ADDRESSES BLS_KEYS BLS_POPS
 for ((i = 1; i <= VALIDATORS; i++)); do
   if [[ "$PROFILE" == "production" ]]; then
     pass="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -147,6 +147,13 @@ for ((i = 1; i <= VALIDATORS; i++)); do
   PUBKEYS[i]="$(kv pubkey_hex "$out")"
   ADDRESSES[i]="$(kv address "$out")"
   [[ "${PUBKEYS[i]}" =~ ^[0-9a-f]{64}$ ]] || die "unexpected wallet_create output for validator $i:"$'\n'"$out"
+  # BLS time-signature key + proof of possession (genesis version 2), derived from the same key.
+  bls_out="$(run_cli validator_bls --file "/work/keys/validator-$i.json" --pass "$pass")" \
+    || die "validator_bls failed for validator $i"
+  BLS_KEYS[i]="$(kv bls_pubkey "$bls_out")"
+  BLS_POPS[i]="$(kv bls_pop "$bls_out")"
+  [[ "${BLS_KEYS[i]}" =~ ^[0-9a-f]{96}$ && "${BLS_POPS[i]}" =~ ^[0-9a-f]{192}$ ]] \
+    || die "unexpected validator_bls output for validator $i:"$'\n'"$bls_out"
 
   # Keystores are passphrase-encrypted; 0644 lets the container's non-root
   # user read the bind mount, while the 0700 parent keeps other host users out.
@@ -157,16 +164,22 @@ chmod 700 "$OUT_DIR" "$OUT_DIR/keys"
 
 # --- genesis.json -------------------------------------------------------------
 GENESIS_TIME="$(date -u +%s)"
-python3 - "$MAINNET_JSON" "$OUT_DIR/genesis.json" "$GENESIS_TIME" "$PROFILE" "$STAMP" "${PUBKEYS[@]}" <<'PY'
+TRIPLES=()
+for ((i = 1; i <= VALIDATORS; i++)); do TRIPLES+=("${PUBKEYS[i]}" "${BLS_KEYS[i]}" "${BLS_POPS[i]}"); done
+python3 - "$MAINNET_JSON" "$OUT_DIR/genesis.json" "$GENESIS_TIME" "$PROFILE" "$STAMP" "${TRIPLES[@]}" <<'PY'
 import json, sys
 
-src, dst, gtime, profile, stamp, *validators = sys.argv[1:]
+src, dst, gtime, profile, stamp, *flat = sys.argv[1:]
+validators, bls_keys, bls_pops = flat[0::3], flat[1::3], flat[2::3]
 with open(src) as f:
     doc = json.load(f)
 
+doc["version"] = 2
 doc["genesis_time_unix"] = int(gtime)
 doc["initial_height"] = 0
 doc["initial_validators"] = validators
+doc["initial_validator_bls_pubkeys"] = bls_keys
+doc["initial_validator_bls_pops"] = bls_pops
 doc["initial_active_set_size"] = len(validators)
 doc["seeds"] = []
 doc["note"] = f"Fresh {profile} genesis {stamp} with {len(validators)} generated validators"

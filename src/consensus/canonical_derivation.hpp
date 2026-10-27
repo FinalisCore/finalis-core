@@ -16,6 +16,7 @@
 #include "consensus/confidential_supply.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/validator_registry.hpp"
+#include "genesis/genesis.hpp"
 #include "storage/db.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
@@ -52,9 +53,16 @@ struct CanonicalDerivationConfig {
 struct CanonicalGenesisState {
   Hash32 genesis_artifact_id{};
   std::vector<PubKey32> initial_validators;
+  // Time-signature keys, parallel to initial_validators (genesis::Document::initial_validator_bls,
+  // proofs checked by genesis::validate_document); empty leaves the validators without one.
+  std::vector<crypto::BlsPublicKey> initial_validator_bls_keys;
   // Parent timestamp of height 1 (unix seconds).
   std::uint64_t genesis_time_unix{0};
 };
+
+// The canonical genesis state of a genesis document: artifact id, validators with their BLS keys,
+// genesis time. Every builder (node, light client, tools, tests) uses this one.
+CanonicalGenesisState canonical_genesis_state_from_document(const genesis::Document& doc);
 
 struct CanonicalFrontierRecord {
   FrontierTransition transition;

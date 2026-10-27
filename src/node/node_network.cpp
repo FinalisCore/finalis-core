@@ -947,6 +947,12 @@ void Node::send_version(int peer_id) {
   if (bootstrap_validator_pubkey_.has_value()) {
     v.node_software_version +=
         ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
+    // Its time-signature key and proof: followers that adopt it need the same genesis state.
+    if (const auto bls = bootstrap_validator_bls_locked()) {
+      Bytes kp(bls->pubkey.begin(), bls->pubkey.end());
+      kp.insert(kp.end(), bls->pop.begin(), bls->pop.end());
+      v.node_software_version += ";bootstrap_validator_bls=" + hex_encode(kp);
+    }
   }
   if (auto advertised = current_advertised_endpoint(); advertised.has_value()) {
     v.node_software_version += ";external_endpoint=" + advertised->key();
@@ -1217,8 +1223,18 @@ void Node::on_version(int peer_id, const Bytes& payload) {
     if (b && b->size() == 32) {
       PubKey32 pub{};
       std::copy(b->begin(), b->end(), pub.begin());
+      std::optional<genesis::ValidatorBls> bls;
+      if (const auto tag = software_fingerprint_value(v->node_software_version, "bootstrap_validator_bls")) {
+        const auto kb = hex_decode(*tag);
+        if (kb && kb->size() == crypto::kBlsPublicKeyBytes + crypto::kBlsSignatureBytes) {
+          genesis::ValidatorBls parsed;
+          std::copy(kb->begin(), kb->begin() + crypto::kBlsPublicKeyBytes, parsed.pubkey.begin());
+          std::copy(kb->begin() + crypto::kBlsPublicKeyBytes, kb->end(), parsed.pop.begin());
+          bls = parsed;  // checked when binding
+        }
+      }
       std::lock_guard<std::mutex> lk(mu_);
-      (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap");
+      (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap", bls);
     }
   }
   if (peer_validator.has_value()) {

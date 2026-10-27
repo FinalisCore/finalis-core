@@ -22,6 +22,9 @@ Publish, and do not change afterwards:
   and timestamped.
 - Each submission is signed by the submitted key over the announcement text, which proves control
   of the key.
+- Each submission also carries the operator's BLS time-signature key and its proof of possession,
+  printed by `finalis-cli validator_bls --file validator.json` (derived from the same keystore;
+  public output only). Genesis rejects a validator without a valid, distinct BLS key.
 
 ## Deterministic selection
 

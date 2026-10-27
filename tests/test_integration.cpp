@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_genesis.hpp"
 #include "support/test_validator_bls.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
@@ -343,10 +344,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
   if (!doc.has_value()) return false;
 
-  consensus::CanonicalGenesisState genesis_state;
-  genesis_state.genesis_artifact_id = genesis::block_id(*doc);
-  genesis_state.initial_validators = doc->initial_validators;
-  genesis_state.genesis_time_unix = doc->genesis_time_unix;
+  consensus::CanonicalGenesisState genesis_state = consensus::canonical_genesis_state_from_document(*doc);
 
   consensus::CanonicalDerivedState genesis_derived;
   std::string error;
@@ -504,10 +502,7 @@ bool persist_certified_ingress_fixture(const node::NodeConfig& cfg, storage::DB&
   auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
   if (!doc.has_value()) return false;
 
-  consensus::CanonicalGenesisState genesis_state;
-  genesis_state.genesis_artifact_id = genesis::block_id(*doc);
-  genesis_state.initial_validators = doc->initial_validators;
-  genesis_state.genesis_time_unix = doc->genesis_time_unix;
+  consensus::CanonicalGenesisState genesis_state = consensus::canonical_genesis_state_from_document(*doc);
 
   consensus::CanonicalDerivedState genesis_derived;
   std::string error;
@@ -590,10 +585,7 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
   if (!doc.has_value()) return false;
 
-  consensus::CanonicalGenesisState genesis_state;
-  genesis_state.genesis_artifact_id = genesis::block_id(*doc);
-  genesis_state.initial_validators = doc->initial_validators;
-  genesis_state.genesis_time_unix = doc->genesis_time_unix;
+  consensus::CanonicalGenesisState genesis_state = consensus::canonical_genesis_state_from_document(*doc);
 
   CertifiedIngressFixture fixture;
   std::string error;
@@ -1927,6 +1919,20 @@ struct StoredFrontierArtifact {
   FinalityCertificate certificate;
 };
 
+// The bound bootstrap validator's BLS key || proof (hex) from a node's stored effective genesis, as
+// that node advertises it in VERSION.
+std::string bootstrap_validator_bls_hex_from_db(const std::string& db_path) {
+  storage::DB db;
+  if (!db.open_readonly(db_path) && !db.open(db_path)) return {};
+  const auto gj = db.get(storage::key_genesis_json());
+  if (!gj) return {};
+  const auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
+  if (!doc || doc->initial_validator_bls.size() != 1) return {};
+  Bytes kp(doc->initial_validator_bls[0].pubkey.begin(), doc->initial_validator_bls[0].pubkey.end());
+  kp.insert(kp.end(), doc->initial_validator_bls[0].pop.begin(), doc->initial_validator_bls[0].pop.end());
+  return hex_encode(kp);
+}
+
 std::optional<StoredFrontierArtifact> load_frontier_artifact_at_height(const std::string& db_path, std::uint64_t height) {
   storage::DB db;
   if (!db.open_readonly(db_path) && !db.open(db_path)) return std::nullopt;
@@ -1977,6 +1983,7 @@ struct OutOfOrderBlockSyncServer {
   std::uint64_t tip_height{0};
   PubKey32 bootstrap_pub{};
   std::string consensus_rules_fingerprint;  // advertised as crh=; peers reject VERSION without it
+  std::string bootstrap_validator_bls_hex;  // advertised as bootstrap_validator_bls=; adoption needs it
   std::map<Hash32, p2p::TransitionMsg> transitions;
   mutable std::mutex mu;
   mutable std::mutex client_mu;
@@ -2094,6 +2101,9 @@ struct OutOfOrderBlockSyncServer {
                   hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end())) + ";validator_pubkey=" +
                   hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end()));
               if (!consensus_rules_fingerprint.empty()) reply.node_software_version += ";crh=" + consensus_rules_fingerprint;
+              if (!bootstrap_validator_bls_hex.empty()) {
+                reply.node_software_version += ";bootstrap_validator_bls=" + bootstrap_validator_bls_hex;
+              }
               (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(reply)}, net.magic,
                                         net.protocol_version);
               sent_version = true;
@@ -2181,7 +2191,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   if (keys.size() < n_validators) return false;
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -2202,13 +2212,14 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   std::filesystem::create_directories(std::filesystem::path(path).parent_path());
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
+  finalis::test::fill_test_genesis_bls(d);
   out << genesis::to_json(d);
   return out.good();
 }
 
 bool write_empty_mainnet_bootstrap_genesis_file(const std::string& path) {
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -2227,6 +2238,7 @@ bool write_empty_mainnet_bootstrap_genesis_file(const std::string& path) {
   std::filesystem::create_directories(std::filesystem::path(path).parent_path());
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
+  finalis::test::fill_test_genesis_bls(d);
   out << genesis::to_json(d);
   return out.good();
 }
@@ -9112,6 +9124,7 @@ TEST(test_sync_peer_rejects_tampered_finalized_block_body) {
                       p2p::TransitionMsg{a2->proposal.serialize(), a2->certificate});
   transitions.emplace(frontier_proposal_id(a3->proposal),
                       p2p::TransitionMsg{tampered_proposal.serialize(), a3->certificate});
+  server.bootstrap_validator_bls_hex = bootstrap_validator_bls_hex_from_db(bootstrap_cfg.db_path);
   ASSERT_TRUE(server.start_transitions(bootstrap_cfg.network, bootstrap_status.genesis_hash, *bootstrap_pub, tampered_height,
                                        frontier_proposal_id(a3->proposal), std::move(transitions)));
 
@@ -9827,6 +9840,7 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
                       p2p::TransitionMsg{a2->proposal.serialize(), a2->certificate});
   transitions.emplace(frontier_proposal_id(a3->proposal),
                       p2p::TransitionMsg{a3->proposal.serialize(), a3->certificate});
+  server.bootstrap_validator_bls_hex = bootstrap_validator_bls_hex_from_db(bootstrap_cfg.db_path);
   ASSERT_TRUE(server.start_transitions(bootstrap_cfg.network, bootstrap_status.genesis_hash, *bootstrap_pub, 3,
                                        frontier_proposal_id(a3->proposal), std::move(transitions)));
 
@@ -9915,6 +9929,7 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
                       p2p::TransitionMsg{a2->proposal.serialize(), a2->certificate});
   transitions.emplace(frontier_proposal_id(a3->proposal),
                       p2p::TransitionMsg{a3->proposal.serialize(), a3->certificate});
+  server.bootstrap_validator_bls_hex = bootstrap_validator_bls_hex_from_db(bootstrap_cfg.db_path);
   ASSERT_TRUE(server.start_transitions(bootstrap_cfg.network, bootstrap_status.genesis_hash, *bootstrap_pub, 3,
                                        frontier_proposal_id(a3->proposal), std::move(transitions), 2));
 
