@@ -178,6 +178,18 @@ struct FrontierVector {
   std::uint64_t total_count() const;
 };
 
+// The parent height's time signature: the Lagrange-weighted aggregate (crypto::mcfly_aggregate) of
+// the BLS signatures of `signer_indices` (into the parent epoch checkpoint's ordered_bls_keys,
+// strictly ascending) on time_signature_message(chain domain, parent height). Validators sign only
+// heights they hold a finality certificate for, so the aggregate exists only once the parent is
+// final; it is the witness that opens a TxTimed locked to the parent height.
+struct TimeSignatureAggregate {
+  std::vector<std::uint32_t> signer_indices;
+  crypto::BlsSignature aggregate{};
+
+  bool operator==(const TimeSignatureAggregate&) const = default;
+};
+
 struct FrontierTransition {
   Hash32 prev_finalized_hash{};
   Hash32 prev_finality_link_hash{};
@@ -220,6 +232,9 @@ struct FrontierTransition {
   // height are evaluated from this set, not from the quorum-truncated
   // finality certificate.
   std::vector<FinalitySig> prev_finality_signers;
+  // Time signature of the parent height, at least the parent committee's quorum of signers. Empty
+  // (no signers, zero aggregate) only when the parent is genesis.
+  TimeSignatureAggregate prev_time_signature;
   FrontierSettlement settlement;
   Hash32 settlement_commitment{};
 

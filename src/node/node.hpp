@@ -394,6 +394,7 @@ class Node {
   void on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_prevote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_time_signature(int peer_id, const Bytes& payload, const Hash32& payload_id);
   // reply: a SUBMIT_TX; answer the sender with TX_RESULT.
   void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bool reply = false);
   void on_getaddr(int peer_id, const Bytes& payload);
@@ -442,6 +443,10 @@ class Node {
                                            std::string* reject_reason = nullptr);
   bool handle_prevote(const Vote& vote, bool from_network, int from_peer_id = 0);
   bool handle_timeout_vote(const TimeoutVote& vote, bool from_network, int from_peer_id = 0);
+  enum class TimeSignatureHandlingResult { Accepted, Duplicate, SoftReject, HardReject };
+  TimeSignatureHandlingResult handle_time_signature_result(const p2p::TimeSignatureMsg& msg, bool from_network,
+                                                           int from_peer_id = 0);
+  bool handle_time_signature(const p2p::TimeSignatureMsg& msg, bool from_network, int from_peer_id = 0);
   // cert_check must be the result of precheck_finality_certificate(*certificate, proposal.transition),
   // computed by the caller BEFORE mu_ was locked (this function always runs with mu_ held). Passing
   // std::nullopt here when `certificate` has a value is a caller bug, not a valid "skip" state --
@@ -536,6 +541,9 @@ class Node {
   // keeps durable) or refused.
   std::optional<Sig64> sign_consensus_locked(const Bytes& msg) const;
   std::optional<VrfProof80> vrf_prove_consensus_locked(const Bytes& alpha) const;
+  // BLS time signature with the seed-derived key; nullopt in fail-stop or if that key is not `registered`.
+  std::optional<crypto::BlsSignature> bls_time_sign_consensus_locked(const Bytes& msg,
+                                                                     const crypto::BlsPublicKey& registered) const;
   // Enters fail-stop after a failed safety-critical write: sets safety_storage_failed_ and fences
   // the DB before mu_ is released, logs CRITICAL once, and asks the event loop to stop. Idempotent.
   void enter_safety_fail_stop_locked(const std::string& operation, const std::string& reason);
@@ -552,6 +560,15 @@ class Node {
     std::vector<FinalitySig> signers;
   };
   PrevFinalityRecord prev_finality_record_for_next_height_locked() const;
+  // Time signatures (consensus::verify_prev_time_signature). This node signs the finalized tip once
+  // it is a member of the tip's committee; the returned message is broadcast outside mu_. Never
+  // signs a height that is not finalized here, and nothing once in fail-stop.
+  std::optional<p2p::TimeSignatureMsg> maybe_sign_time_signature_locked();
+  // The tip's aggregate for the next proposal, nullopt while fewer than the threshold are known.
+  // The genesis parent needs none (an empty aggregate).
+  std::optional<TimeSignatureAggregate> prev_time_signature_for_next_height_locked() const;
+  // Count-only form of the above for the event loop (no aggregation): {known, threshold}.
+  std::pair<std::size_t, std::size_t> time_signature_progress_for_next_height_locked() const;
   bool record_late_finalized_vote_locked(const Vote& vote);
   // One height's row of consensus safety state: the vote lock, the valid polka and the own prevotes.
   struct ConsensusSafetyState {
@@ -593,6 +610,7 @@ class Node {
   void broadcast_vote(const Vote& vote);
   void broadcast_prevote(const Vote& vote);
   void broadcast_timeout_vote(const TimeoutVote& vote);
+  void broadcast_time_signature(const p2p::TimeSignatureMsg& msg);
   void broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate);
   void broadcast_tx(const AnyTx& tx, int skip_peer_id = 0);
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
@@ -975,6 +993,14 @@ class Node {
 
   crypto::KeyPair local_key_;
   bool is_validator_{false};
+  // Verified time signatures by height and committee index (finalized tip and one height either side).
+  std::map<std::uint64_t, std::map<std::uint32_t, crypto::BlsSignature>> time_signatures_;
+  std::uint64_t local_time_signature_height_{0};  // highest height this node has signed
+  // This node's signature on the tip, re-sent every round timeout until the next height finalizes
+  // (a lost message must not leave the next proposer short of the threshold).
+  std::optional<p2p::TimeSignatureMsg> local_time_signature_;
+  std::uint64_t last_time_signature_broadcast_ms_{0};
+  std::uint64_t last_time_signature_wait_log_ms_{0};
 
   std::atomic<bool> running_{false};
   // SAFETY (fail-stop): set when a write of consensus safety state (vote lock, prevote record,

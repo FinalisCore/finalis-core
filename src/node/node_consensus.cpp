@@ -1030,6 +1030,110 @@ Node::PrevFinalityRecord Node::prev_finality_record_for_next_height_locked() con
   return out;
 }
 
+std::optional<p2p::TimeSignatureMsg> Node::maybe_sign_time_signature_locked() {
+  if (safety_storage_failed() || !canonical_state_.has_value()) return std::nullopt;
+  const auto height = canonical_state_->finalized_height;
+  if (height >= 2) time_signatures_.erase(time_signatures_.begin(), time_signatures_.lower_bound(height - 1));
+  if (height == 0 || height <= local_time_signature_height_) return std::nullopt;
+  local_time_signature_height_ = height;  // one attempt per height: membership and keys are fixed
+  const auto cp = canonical_state_->finalized_committee_checkpoints.find(
+      consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks));
+  if (cp == canonical_state_->finalized_committee_checkpoints.end()) return std::nullopt;
+  const auto& members = cp->second.ordered_members;
+  const auto member = std::find(members.begin(), members.end(), local_key_.public_key);
+  if (member == members.end()) return std::nullopt;
+  const auto index = static_cast<std::uint32_t>(member - members.begin());
+  if (index >= cp->second.ordered_bls_keys.size()) return std::nullopt;
+  const auto sig = bls_time_sign_consensus_locked(time_signature_message(consensus_domain_, height),
+                                                  cp->second.ordered_bls_keys[index]);
+  if (!sig.has_value()) {
+    log_line("time-signature-skip height=" + std::to_string(height) + " reason=sign-failed-or-key-not-registered");
+    return std::nullopt;
+  }
+  time_signatures_[height][index] = *sig;
+  local_time_signature_ = p2p::TimeSignatureMsg{height, local_key_.public_key, *sig};
+  return local_time_signature_;
+}
+
+std::pair<std::size_t, std::size_t> Node::time_signature_progress_for_next_height_locked() const {
+  if (!canonical_state_.has_value()) return {0, 1};
+  const auto parent = canonical_state_->finalized_height;
+  if (parent == 0) return {0, 0};
+  const auto keys = consensus::time_signature_committee_keys(canonical_derivation_config_locked(), *canonical_state_, parent);
+  if (!keys.has_value()) return {0, 1};
+  const auto it = time_signatures_.find(parent);
+  return {it == time_signatures_.end() ? 0 : it->second.size(), consensus::time_signature_threshold(keys->size())};
+}
+
+std::optional<TimeSignatureAggregate> Node::prev_time_signature_for_next_height_locked() const {
+  if (!canonical_state_.has_value()) return std::nullopt;
+  const auto parent = canonical_state_->finalized_height;
+  if (parent == 0) return TimeSignatureAggregate{};
+  const auto keys = consensus::time_signature_committee_keys(canonical_derivation_config_locked(), *canonical_state_, parent);
+  const auto it = time_signatures_.find(parent);
+  if (!keys.has_value() || it == time_signatures_.end()) return std::nullopt;
+  const auto threshold = consensus::time_signature_threshold(keys->size());
+  if (it->second.size() < threshold) return std::nullopt;
+  return consensus::aggregate_time_signatures(*keys, it->second, threshold);
+}
+
+Node::TimeSignatureHandlingResult Node::handle_time_signature_result(const p2p::TimeSignatureMsg& msg, bool from_network,
+                                                                     int from_peer_id) {
+  bool relay = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if ((from_network && !running_) || !canonical_state_.has_value()) return TimeSignatureHandlingResult::SoftReject;
+    const auto tip = canonical_state_->finalized_height;
+    // The tip and one height either side: a peer a block ahead signs its tip before we finalize it.
+    if (msg.height == 0 || msg.height + 1 < tip || msg.height > tip + 1) return TimeSignatureHandlingResult::SoftReject;
+    const auto cp = canonical_state_->finalized_committee_checkpoints.find(
+        consensus::committee_epoch_start(msg.height, cfg_.network.committee_epoch_blocks));
+    if (cp == canonical_state_->finalized_committee_checkpoints.end()) return TimeSignatureHandlingResult::SoftReject;
+    const auto& members = cp->second.ordered_members;
+    const auto member = std::find(members.begin(), members.end(), msg.validator_pubkey);
+    if (member == members.end()) return TimeSignatureHandlingResult::HardReject;
+    const auto index = static_cast<std::uint32_t>(member - members.begin());
+    if (index >= cp->second.ordered_bls_keys.size()) return TimeSignatureHandlingResult::SoftReject;
+    auto& known = time_signatures_[msg.height];
+    if (known.count(index) != 0) return TimeSignatureHandlingResult::Duplicate;
+    if (!crypto::bls_verify(cp->second.ordered_bls_keys[index], time_signature_message(consensus_domain_, msg.height),
+                            crypto::kBlsTimeSignatureDst, msg.signature)) {
+      if (known.empty()) time_signatures_.erase(msg.height);
+      log_line("time-signature-reject height=" + std::to_string(msg.height) +
+               " signer=" + short_pub_hex(msg.validator_pubkey) + " reason=invalid-signature");
+      return TimeSignatureHandlingResult::HardReject;
+    }
+    known.emplace(index, msg.signature);
+    relay = from_network && !should_mute_peer_locked(from_peer_id);
+  }
+  if (relay) broadcast_time_signature(msg);
+  return TimeSignatureHandlingResult::Accepted;
+}
+
+bool Node::handle_time_signature(const p2p::TimeSignatureMsg& msg, bool from_network, int from_peer_id) {
+  const auto result = handle_time_signature_result(msg, from_network, from_peer_id);
+  return result == TimeSignatureHandlingResult::Accepted || result == TimeSignatureHandlingResult::Duplicate;
+}
+
+void Node::on_time_signature(int peer_id, const Bytes& payload, const Hash32& payload_id) {
+  const auto msg = p2p::de_time_signature(payload);
+  if (!msg.has_value()) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-time-signature-msg");
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (bootstrap_sync_incomplete_locked(peer_id)) return;
+  }
+  if (handle_time_signature_result(*msg, true, peer_id) == TimeSignatureHandlingResult::HardReject) {
+    std::lock_guard<std::mutex> lk(mu_);
+    invalid_message_payloads_.insert(payload_id);
+    score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-time-signature");
+  }
+}
+
 bool Node::record_late_finalized_vote_locked(const Vote& vote) {
   if (finalized_tip_votes_.height == 0 || vote.height != finalized_tip_votes_.height) return false;
   if (vote.round != finalized_tip_votes_.round || vote.frontier_transition_id != finalized_tip_votes_.transition_id) return false;
@@ -1078,6 +1182,16 @@ bool Node::persist_consensus_safety_state_locked(std::uint64_t height, const Con
 std::optional<Sig64> Node::sign_consensus_locked(const Bytes& msg) const {
   if (safety_storage_failed()) return std::nullopt;  // includes a DB that fenced itself
   auto sig = crypto::ed25519_sign(msg, local_key_.private_key);
+  if (sig.has_value()) ++consensus_signatures_;
+  return sig;
+}
+
+std::optional<crypto::BlsSignature> Node::bls_time_sign_consensus_locked(const Bytes& msg,
+                                                                        const crypto::BlsPublicKey& registered) const {
+  if (safety_storage_failed()) return std::nullopt;  // includes a DB that fenced itself
+  const auto sk = crypto::bls_key_from_validator_seed(local_key_.private_key);
+  if (!sk.has_value() || crypto::bls_public_key(*sk) != registered) return std::nullopt;
+  auto sig = crypto::bls_sign(*sk, msg, crypto::kBlsTimeSignatureDst);
   if (sig.has_value()) ++consensus_signatures_;
   return sig;
 }
@@ -2964,11 +3078,16 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       return std::nullopt;
     }
     const auto prev_finality = prev_finality_record_for_next_height_locked();
+    const auto prev_time_signature = prev_time_signature_for_next_height_locked();
+    if (!prev_time_signature.has_value()) {
+      last_test_hook_error_ = "frontier-build-time-signature-unavailable";
+      return std::nullopt;
+    }
     // Wall clock; populate raises it to parent + 1 when the clock is behind the chain.
     result.transition.timestamp = now_unix();
     if (!consensus::populate_frontier_transition_metadata(canonical_derivation_config_locked(), *canonical_state_, height, round,
                                                           local_key_.public_key, prev_finality.round,
-                                                          prev_finality.signers,
+                                                          prev_finality.signers, *prev_time_signature,
                                                           result.accepted_fee_units,
                                                           result.next_utxos, &result.transition, &validation_error,
                                                           result.has_next_utxo_tree ? &result.next_utxo_tree : nullptr)) {

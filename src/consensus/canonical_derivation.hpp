@@ -192,6 +192,25 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
 // participation for the parent height (parent_committee vs the signer pubkeys
 // in transition.prev_finality_signers). Shared by canonical derivation and the
 // node's frozen-epoch rebuild so the two cannot drift.
+// Time signatures (TimeSignatureAggregate). The key set of a height is its epoch checkpoint's
+// ordered_bls_keys; a valid aggregate needs time_signature_threshold(n) of them, the same quorum
+// that finalizes the height, so the f validators an adversary may hold can never produce one (and
+// never open a TxTimed early), while the honest quorum always can once the height is final.
+std::size_t time_signature_threshold(std::size_t committee_size);
+// The epoch checkpoint keys for `height`, nullopt if the checkpoint is missing or a key is unset.
+std::optional<std::vector<crypto::BlsPublicKey>> time_signature_committee_keys(const CanonicalDerivationConfig& cfg,
+                                                                               const CanonicalDerivedState& state,
+                                                                               std::uint64_t height);
+// Requires: no signers and a zero aggregate iff the parent (prev.finalized_height) is genesis;
+// otherwise strictly ascending indices into the parent's committee keys, at least the threshold,
+// and an aggregate that verifies for them on time_signature_message(chain domain, parent height).
+bool verify_prev_time_signature(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                const TimeSignatureAggregate& time_signature, std::string* error);
+// Aggregates the lowest-index `threshold` signatures of `sigs` (index -> signature, each already
+// verified); nullopt if there are fewer.
+std::optional<TimeSignatureAggregate> aggregate_time_signatures(const std::vector<crypto::BlsPublicKey>& committee_keys,
+                                                                const std::map<std::uint32_t, crypto::BlsSignature>& sigs,
+                                                                std::size_t threshold);
 void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators,
                                   std::map<std::uint64_t, storage::EpochRewardSettlementState>* reward_states,
                                   const FrontierTransition& transition,
@@ -200,6 +219,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
                                            std::uint32_t prev_finality_round,
                                            const std::vector<FinalitySig>& prev_finality_signers,
+                                           const TimeSignatureAggregate& prev_time_signature,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
                                            std::string* error,

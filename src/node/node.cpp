@@ -1146,6 +1146,7 @@ void Node::event_loop() {
     (void)reap_lightserver_child(true);
     std::optional<p2p::ProposeMsg> propose_to_send;
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
+    std::optional<p2p::TimeSignatureMsg> time_signature_to_broadcast;
     LocalVoteRebroadcast votes_to_rebroadcast;
     std::vector<int> keepalive_peers;
     std::vector<int> finalized_tip_poll_peers;
@@ -1359,6 +1360,16 @@ void Node::event_loop() {
       }
       }
 
+      if (!repair_mode_) {
+        time_signature_to_broadcast = maybe_sign_time_signature_locked();
+        if (!time_signature_to_broadcast.has_value() && local_time_signature_.has_value() &&
+            local_time_signature_->height == finalized_height_ &&
+            now_ms >= last_time_signature_broadcast_ms_ + cfg_.network.round_timeout_ms) {
+          time_signature_to_broadcast = local_time_signature_;
+        }
+        if (time_signature_to_broadcast.has_value()) last_time_signature_broadcast_ms_ = now_ms;
+      }
+
       const auto committee = committee_for_height_round(h, current_round_);
       const bool committee_ready = !committee.empty();
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
@@ -1510,11 +1521,21 @@ void Node::event_loop() {
         force_validator_redial = true;
       }
       const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
+      // A proposal carries the parent's time signature (consensus::verify_prev_time_signature).
+      const auto [time_signatures_known, time_signature_threshold] = time_signature_progress_for_next_height_locked();
+      const bool time_signature_ready = time_signatures_known >= time_signature_threshold;
+      if (!time_signature_ready && can_propose && proposal_block_interval_ready && proposal_clock_ready &&
+          now_ms >= last_time_signature_wait_log_ms_ + 5000) {
+        log_line("proposal-build-wait height=" + std::to_string(h) + " round=" + std::to_string(current_round_) +
+                 " reason=time-signatures known=" + std::to_string(time_signatures_known) +
+                 " threshold=" + std::to_string(time_signature_threshold));
+        last_time_signature_wait_log_ms_ = now_ms;
+      }
       // SAFETY: an abstaining node may already have proposed at this height before losing its
       // safety state; proposing again could be a different payload (proposer equivocation).
       if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready && proposal_clock_ready &&
           ticket_window_elapsed && !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready &&
-          !abstaining_at_height_locked(h)) {
+          time_signature_ready && !abstaining_at_height_locked(h)) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           should_build_proposal = true;
@@ -1706,6 +1727,8 @@ void Node::event_loop() {
 
     // Backstop for finalizations reached from event-loop paths (sync, repair).
     flush_pending_finalized_broadcasts();
+
+    if (time_signature_to_broadcast.has_value()) broadcast_time_signature(*time_signature_to_broadcast);
 
     for (const auto& v : votes_to_rebroadcast.timeouts) broadcast_timeout_vote(v);
     for (const auto& v : votes_to_rebroadcast.prevotes) broadcast_prevote(v);

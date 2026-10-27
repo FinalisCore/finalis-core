@@ -222,6 +222,31 @@ Finalized execution remains validator-signature-driven even when confidential
 transactions are present; `TxV2` does not change the validator-key consensus
 model.
 
+## Time Signatures
+
+Once a node holds the finality certificate for `H`, if it is a member of `H`'s epoch committee it
+signs `time_signature_message(D, H)` with its BLS key (derived from its validator seed, registered in
+genesis or in its registration, copied into the checkpoint's `ordered_bls_keys`) and sends
+`TIME_SIGNATURE {H, validator, signature}`. Receivers verify the signature against the checkpoint key
+and relay it once; they keep the tip and one height either side. A node never signs a height it has
+not finalized, and signs nothing in fail-stop. BLS signatures are deterministic, so signing again
+cannot equivocate; the own signature is re-sent every round timeout until `H + 1` finalizes.
+
+`H + 1` carries `prev_time_signature`: strictly ascending indices into `H`'s checkpoint keys and
+their Lagrange-weighted aggregate (`crypto::mcfly_aggregate`). Before applying `H + 1`, nodes require
+(`consensus::verify_prev_time_signature`):
+
+- no signers and a zero aggregate if and only if the parent is genesis
+- at least `time_signature_threshold(n) = quorum(n)` signers, each index `< n`
+- the aggregate verifies for those keys on `time_signature_message(D, H)`
+
+A leader proposes only once it holds the threshold for the parent (`proposal-build-wait
+reason=time-signatures` otherwise). Safety: the at most `f < quorum` faulty members cannot produce
+the aggregate for a height that is not final, because the honest members sign only after finality.
+Liveness: the `n - f >= quorum` honest members all sign once they learn of finality. The aggregate
+of `H` is the witness that opens a `TxTimed` locked to `H` (encrypted with the same threshold to the
+same keys, `consensus::committee_bls_key_root`).
+
 ## Transition Timestamp
 
 `FrontierTransition.timestamp` is unix seconds and part of the transition id.

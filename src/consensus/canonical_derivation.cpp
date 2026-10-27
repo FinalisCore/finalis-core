@@ -940,6 +940,82 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
   return true;
 }
 
+std::size_t time_signature_threshold(std::size_t committee_size) { return quorum_threshold(committee_size); }
+
+std::optional<std::vector<crypto::BlsPublicKey>> time_signature_committee_keys(const CanonicalDerivationConfig& cfg,
+                                                                               const CanonicalDerivedState& state,
+                                                                               std::uint64_t height) {
+  if (height == 0) return std::nullopt;
+  const auto it = state.finalized_committee_checkpoints.find(committee_epoch_start(height, cfg.network.committee_epoch_blocks));
+  if (it == state.finalized_committee_checkpoints.end()) return std::nullopt;
+  const auto& checkpoint = it->second;
+  if (checkpoint.ordered_members.empty() || checkpoint.ordered_bls_keys.size() != checkpoint.ordered_members.size()) {
+    return std::nullopt;
+  }
+  for (const auto& key : checkpoint.ordered_bls_keys) {
+    if (key == crypto::BlsPublicKey{}) return std::nullopt;
+  }
+  return checkpoint.ordered_bls_keys;
+}
+
+bool verify_prev_time_signature(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                const TimeSignatureAggregate& time_signature, std::string* error) {
+  const auto parent_height = prev.finalized_height;
+  if (parent_height == 0) {
+    if (!time_signature.signer_indices.empty() || time_signature.aggregate != crypto::BlsSignature{}) {
+      if (error) *error = "frontier-time-signature-unexpected-for-genesis-parent";
+      return false;
+    }
+    return true;
+  }
+  const auto keys = time_signature_committee_keys(cfg, prev, parent_height);
+  if (!keys.has_value()) {
+    if (error) *error = "frontier-time-signature-missing-committee-keys";
+    return false;
+  }
+  std::vector<crypto::BlsPublicKey> signers;
+  signers.reserve(time_signature.signer_indices.size());
+  for (std::size_t i = 0; i < time_signature.signer_indices.size(); ++i) {
+    const auto index = time_signature.signer_indices[i];
+    if (index >= keys->size() || (i > 0 && index <= time_signature.signer_indices[i - 1])) {
+      if (error) *error = "frontier-time-signature-signers-not-canonical";
+      return false;
+    }
+    signers.push_back((*keys)[index]);
+  }
+  if (signers.size() < time_signature_threshold(keys->size())) {
+    if (error) *error = "frontier-time-signature-below-threshold";
+    return false;
+  }
+  const auto msg = time_signature_message(consensus_chain_domain(cfg.network, cfg.chain_id), parent_height);
+  if (!crypto::mcfly_aggregate_verify(signers, msg, crypto::kBlsTimeSignatureDst, time_signature.aggregate)) {
+    if (error) *error = "frontier-time-signature-invalid";
+    return false;
+  }
+  return true;
+}
+
+std::optional<TimeSignatureAggregate> aggregate_time_signatures(const std::vector<crypto::BlsPublicKey>& committee_keys,
+                                                                const std::map<std::uint32_t, crypto::BlsSignature>& sigs,
+                                                                std::size_t threshold) {
+  if (threshold == 0) return std::nullopt;
+  TimeSignatureAggregate out;
+  std::vector<crypto::BlsPublicKey> signers;
+  std::vector<crypto::BlsSignature> parts;
+  for (const auto& [index, sig] : sigs) {  // ascending index
+    if (out.signer_indices.size() == threshold) break;
+    if (index >= committee_keys.size()) continue;
+    out.signer_indices.push_back(index);
+    signers.push_back(committee_keys[index]);
+    parts.push_back(sig);
+  }
+  if (out.signer_indices.size() < threshold) return std::nullopt;
+  const auto aggregate = crypto::mcfly_aggregate(signers, parts);
+  if (!aggregate.has_value()) return std::nullopt;
+  out.aggregate = *aggregate;
+  return out;
+}
+
 void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators,
                                   std::map<std::uint64_t, storage::EpochRewardSettlementState>* reward_states,
                                   const FrontierTransition& transition,
@@ -967,6 +1043,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
                                            std::uint32_t prev_finality_round,
                                            const std::vector<FinalitySig>& prev_finality_signers,
+                                           const TimeSignatureAggregate& prev_time_signature,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
                                            std::string* error,
@@ -1000,6 +1077,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
                                                      &canonical_signers, error)) {
     return false;
   }
+  if (!verify_prev_time_signature(cfg, prev, prev_time_signature, error)) return false;
 
   // Frontier transitions normally chain to a finalized transition identity, but
   // the genesis handoff intentionally uses the raw finalized identity value so
@@ -1014,6 +1092,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
   transition->quorum_threshold = quorum;
   transition->prev_finality_round = prev_finality_round;
   transition->prev_finality_signers = std::move(canonical_signers);
+  transition->prev_time_signature = prev_time_signature;
   transition->settlement = derive_frontier_settlement_from_state(cfg, prev, height, leader_pubkey, accepted_fee_units);
   transition->settlement_commitment = transition->settlement.commitment();
   if (post_execution_tree != nullptr) {
@@ -1490,7 +1569,8 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     FrontierTransition expected_transition = result.transition;
     const bool have_current_expected = populate_frontier_transition_metadata(
         cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-        record.transition.prev_finality_round, record.transition.prev_finality_signers, result.accepted_fee_units,
+        record.transition.prev_finality_round, record.transition.prev_finality_signers,
+        record.transition.prev_time_signature, result.accepted_fee_units,
         result.next_utxos, &expected_transition, error);
     if (!have_current_expected) return false;
     const auto transition_metadata_matches = [&](const FrontierTransition& expected) {
@@ -1638,7 +1718,8 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   crypto::PersistentSmt settled_tree;
   const bool have_current_expected = populate_frontier_transition_metadata(
       cfg, prev, record.transition.height, record.transition.round, record.transition.leader_pubkey,
-      record.transition.prev_finality_round, record.transition.prev_finality_signers, result.accepted_fee_units,
+      record.transition.prev_finality_round, record.transition.prev_finality_signers,
+        record.transition.prev_time_signature, result.accepted_fee_units,
       result.next_utxos, &expected_transition, error, result.has_next_utxo_tree ? &result.next_utxo_tree : nullptr,
       &settled_tree);
   if (!have_current_expected) return false;

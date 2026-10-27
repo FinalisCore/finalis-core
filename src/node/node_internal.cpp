@@ -48,6 +48,8 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "PREVOTE";
     case p2p::MsgType::TIMEOUT_VOTE:
       return "TIMEOUT_VOTE";
+    case p2p::MsgType::TIME_SIGNATURE:
+      return "TIME_SIGNATURE";
     case p2p::MsgType::GET_TRANSITION:
       return "GET_TRANSITION";
     case p2p::MsgType::TRANSITION:

@@ -382,7 +382,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   const auto leader = consensus::canonical_leader_for_height_round(derivation_cfg, genesis_derived, 1, 0);
   if (!leader.has_value()) return false;
   if (!consensus::populate_frontier_transition_metadata(derivation_cfg, genesis_derived, 1, 0, *leader, 0, {},
-                                                        exec_result.accepted_fee_units, exec_result.next_utxos,
+                                                        TimeSignatureAggregate{}, exec_result.accepted_fee_units, exec_result.next_utxos,
                                                         &exec_result.transition, &error)) {
     return false;
   }
@@ -603,7 +603,7 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   // fixture.parent is the genesis-derived state, so there is no parent
   // participation to record.
   if (!consensus::populate_frontier_transition_metadata(derivation_cfg, fixture.parent, height, round, *leader, 0, {},
-                                                        exec_result.accepted_fee_units, exec_result.next_utxos,
+                                                        TimeSignatureAggregate{}, exec_result.accepted_fee_units, exec_result.next_utxos,
                                                         &exec_result.transition, &error)) {
     return false;
   }
@@ -10738,6 +10738,24 @@ TEST(test_light_client_follows_committees_from_genesis_and_rejects_tampering) {
     current = *verified;
   }
   ASSERT_EQ(current.epoch_start_height, consensus::committee_epoch_start(tip, 2));
+  // Every block after the first carries its parent's time signature: a threshold of the parent
+  // committee's BLS keys, verifying on time_signature_message(parent height).
+  {
+    storage::DB tdb;
+    ASSERT_TRUE(tdb.open_readonly(cfg.db_path));
+    const auto domain = consensus_chain_domain(cfg.network, consensus::chain_id_for_genesis(cfg.network, genesis_hash));
+    for (std::uint64_t h = 2; h <= tip; ++h) {
+      const auto t = FrontierTransition::parse(*tdb.get_frontier_transition(*tdb.get_frontier_transition_by_height(h)));
+      ASSERT_TRUE(t.has_value());
+      const auto& checkpoint = node_checkpoints.at(consensus::committee_epoch_start(h - 1, 2));
+      ASSERT_TRUE(t->prev_time_signature.signer_indices.size() >=
+                  consensus::time_signature_threshold(checkpoint.ordered_bls_keys.size()));
+      std::vector<crypto::BlsPublicKey> signers;
+      for (const auto i : t->prev_time_signature.signer_indices) signers.push_back(checkpoint.ordered_bls_keys.at(i));
+      ASSERT_TRUE(crypto::mcfly_aggregate_verify(signers, time_signature_message(domain, h - 1),
+                                                 crypto::kBlsTimeSignatureDst, t->prev_time_signature.aggregate));
+    }
+  }
   ASSERT_TRUE(consensus::verify_light_finality(params, current, *tip_transition, *tip_cert));
 
   // Tampering with any link is caught.

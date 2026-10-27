@@ -4,6 +4,7 @@
 #include "test_framework.hpp"
 #include "support/test_validator_bls.hpp"
 #include "support/test_leader_vrf.hpp"
+#include "support/test_time_signature.hpp"
 #include "support/test_paths.hpp"
 
 #include <algorithm>
@@ -238,6 +239,7 @@ consensus::CanonicalDerivedState build_parent_state_with_utxo(const consensus::C
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -338,9 +340,11 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   const auto leader = consensus::canonical_leader_for_height_round(cfg, parent_state, height, round);
   if (!leader.has_value()) throw std::runtime_error("missing canonical leader");
   const auto signers = prev_signers.empty() ? default_prev_finality_signers(cfg, parent_state) : prev_signers;
+  const auto time_signature = test::test_prev_time_signature(cfg, parent_state, {key_from_byte(90)});
+  if (!time_signature.has_value()) throw std::runtime_error("parent time signature below threshold");
   if (!consensus::populate_frontier_transition_metadata(cfg, parent_state, height, round, *leader,
                                                         fixture_parent_commit_round(parent_state), signers,
-                                                        result.accepted_fee_units, result.next_utxos, &result.transition,
+                                                        *time_signature, result.accepted_fee_units, result.next_utxos, &result.transition,
                                                         &err)) {
     throw std::runtime_error("frontier metadata population failed: " + err);
   }
@@ -498,6 +502,7 @@ TEST(test_availability_long_horizon_replay_equivalence_across_continuous_epoch_a
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -573,6 +578,7 @@ TEST(test_availability_evidence_isolation_preserves_checkpoint_output) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState base;
   std::string err;
@@ -634,6 +640,7 @@ TEST(test_availability_evidence_isolation_preserves_restart_boundary_checkpoint_
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -715,6 +722,7 @@ TEST(test_availability_evidence_isolation_holds_across_long_horizon_restart_sche
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -801,6 +809,7 @@ TEST(test_availability_state_epoch_boundary_replay_matches_persisted_restore_bef
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -873,6 +882,7 @@ TEST(test_state_commitment_identical_after_restart_at_each_epoch_boundary) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -1590,6 +1600,7 @@ TEST(test_finality_rejects_quorum_below_threshold_exact_boundary) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators = {v0.public_key, v1.public_key, v2.public_key};
+  genesis.initial_validator_bls_keys = {test::test_bls_pubkey(v0), test::test_bls_pubkey(v1), test::test_bls_pubkey(v2)};
 
   consensus::CanonicalDerivedState parent;
   std::string err;
@@ -1796,6 +1807,7 @@ TEST(test_frontier_storage_replay_rejects_tampered_quorum_threshold_metadata) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators = {signer.public_key};
+  genesis.initial_validator_bls_keys = {test::test_bls_pubkey(signer)};
 
   consensus::CanonicalDerivedState parent;
   std::string err;
@@ -1842,6 +1854,7 @@ TEST(test_live_validator_membership_state_mid_epoch_is_only_committee_eligible_a
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -1882,6 +1895,7 @@ TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_act
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2073,6 +2087,7 @@ TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
   const auto v3 = key_from_byte(104);
   const auto v4 = key_from_byte(105);
   genesis.initial_validators = {v0.public_key, v1.public_key, v2.public_key, v3.public_key, v4.public_key};
+  genesis.initial_validator_bls_keys = {test::test_bls_pubkey(v0), test::test_bls_pubkey(v1), test::test_bls_pubkey(v2), test::test_bls_pubkey(v3), test::test_bls_pubkey(v4)};
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2248,6 +2263,7 @@ TEST(test_adaptive_checkpoint_metadata_is_replay_equivalent) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2288,6 +2304,70 @@ TEST(test_adaptive_checkpoint_metadata_is_replay_equivalent) {
   ASSERT_EQ(checkpoint_a.qualified_depth, checkpoint_b.qualified_depth);
   ASSERT_EQ(checkpoint_a.target_expand_streak, checkpoint_b.target_expand_streak);
   ASSERT_EQ(checkpoint_a.target_contract_streak, checkpoint_b.target_contract_streak);
+}
+
+// The parent's time signature (consensus::verify_prev_time_signature): exactly the threshold of the
+// parent committee's keys on time_signature_message(parent height), canonical indices, and nothing
+// for the genesis parent.
+TEST(test_prev_time_signature_rule) {
+  const auto cfg = test_cfg();
+  std::vector<crypto::KeyPair> keys;
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  for (std::uint8_t i = 0; i < 4; ++i) {
+    keys.push_back(key_from_byte(static_cast<std::uint8_t>(110 + i)));
+    genesis.initial_validators.push_back(keys.back().public_key);
+    genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(keys.back()));
+  }
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+
+  // Genesis parent: no signers, zero aggregate.
+  ASSERT_TRUE(consensus::verify_prev_time_signature(cfg, state, TimeSignatureAggregate{}, &err));
+  TimeSignatureAggregate stray;
+  stray.signer_indices = {0};
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, stray, &err));
+
+  // Parent height 1, committee of 4 from the epoch-1 checkpoint: threshold 3.
+  state.finalized_height = 1;
+  const auto committee_keys = consensus::time_signature_committee_keys(cfg, state, 1);
+  ASSERT_TRUE(committee_keys.has_value());
+  ASSERT_EQ(consensus::time_signature_threshold(committee_keys->size()), 3u);
+  ASSERT_TRUE(!test::test_prev_time_signature(cfg, state, {keys[0], keys[1]}).has_value());  // 2 < 3
+  const auto good = test::test_prev_time_signature(cfg, state, keys);
+  ASSERT_TRUE(good.has_value());
+  ASSERT_EQ(good->signer_indices.size(), 3u);
+  ASSERT_TRUE(consensus::verify_prev_time_signature(cfg, state, *good, &err));
+
+  auto tampered = *good;
+  tampered.aggregate[10] ^= 1;
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, tampered, &err));
+  auto too_few = *good;
+  too_few.signer_indices.pop_back();
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, too_few, &err));
+  ASSERT_EQ(err, std::string("frontier-time-signature-below-threshold"));
+  auto unsorted = *good;
+  std::swap(unsorted.signer_indices[0], unsorted.signer_indices[1]);
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, unsorted, &err));
+  ASSERT_EQ(err, std::string("frontier-time-signature-signers-not-canonical"));
+  auto out_of_range = *good;
+  out_of_range.signer_indices.back() = 4;
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, out_of_range, &err));
+  auto wrong_signers = *good;  // the same aggregate claimed for a different signer set
+  wrong_signers.signer_indices = {0, 1, 3};
+  if (wrong_signers.signer_indices != good->signer_indices) {
+    ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, wrong_signers, &err));
+  }
+  // A signature on another height does not count for this one.
+  state.finalized_height = 2;
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, *good, &err));
+  ASSERT_TRUE(consensus::verify_prev_time_signature(cfg, state, *test::test_prev_time_signature(cfg, state, keys), &err));
+  // The aggregate is exactly the SWE witness a TxTimed locked to that height needs.
+  const auto msg = time_signature_message(consensus_chain_domain(cfg.network, cfg.chain_id), 1);
+  std::vector<crypto::BlsPublicKey> signers;
+  for (const auto i : good->signer_indices) signers.push_back((*committee_keys)[i]);
+  ASSERT_TRUE(crypto::mcfly_aggregate_verify(signers, msg, crypto::kBlsTimeSignatureDst, good->aggregate));
 }
 
 // Each checkpoint carries its members' BLS time-signature keys in member order: the genesis
@@ -2349,6 +2429,7 @@ TEST(test_live_bporeligibility_filters_future_committee_checkpoint_membership) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2416,6 +2497,7 @@ TEST(test_live_bpoar_checkpoint_fallback_mode_is_deterministic_and_explicit) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2479,6 +2561,7 @@ TEST(test_live_bpoar_checkpoint_fallback_hysteresis_is_sticky_until_recovery_thr
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2540,6 +2623,7 @@ TEST(test_live_bpoar_checkpoint_cross_node_determinism_uses_canonical_operator_o
     consensus::CanonicalGenesisState genesis;
     genesis.genesis_artifact_id = zero_hash();
     genesis.initial_validators.push_back(bootstrap.public_key);
+    genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
     consensus::CanonicalDerivedState state;
     std::string local_err;
@@ -2642,6 +2726,7 @@ TEST(test_genesis_checkpoint_metadata_matches_later_checkpoint_semantics) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2665,6 +2750,7 @@ TEST(test_bootstrap_availability_grace_does_not_relax_post_genesis_joiner_requir
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2696,6 +2782,7 @@ TEST(test_bootstrap_handoff_complete_is_purely_derived_from_finalized_state) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2799,6 +2886,7 @@ TEST(test_live_validator_exit_mid_epoch_is_removed_only_at_next_epoch_checkpoint
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;

@@ -493,8 +493,9 @@ TEST(test_storage_write_fence_blocks_every_write) {
 }
 
 // Fail-stop audit, static half: in src/node every use of the validator private key for signing goes
-// through Node::sign_consensus_locked / vrf_prove_consensus_locked, which refuse after fail-stop.
-// Allowed elsewhere: loading and wiping the key (node_validator_ops.cpp) and the two guarded helpers.
+// through Node::sign_consensus_locked / vrf_prove_consensus_locked / bls_time_sign_consensus_locked,
+// which refuse after fail-stop. Allowed elsewhere: loading and wiping the key (node_validator_ops.cpp)
+// and the three guarded helpers.
 TEST(test_failstop_validator_key_signing_has_one_guarded_entry) {
   const auto src = std::filesystem::path(__FILE__).parent_path().parent_path() / "src" / "node";
   ASSERT_TRUE(std::filesystem::is_directory(src));
@@ -508,7 +509,8 @@ TEST(test_failstop_validator_key_signing_has_one_guarded_entry) {
       if (file == "node_validator_ops.cpp") continue;  // key load / wipe / mlock
       const bool helper = file == "node_consensus.cpp" &&
                           (line.find("crypto::ed25519_sign(msg, local_key_.private_key)") != std::string::npos ||
-                           line.find("crypto::vrf_prove(local_key_.private_key, alpha)") != std::string::npos);
+                           line.find("crypto::vrf_prove(local_key_.private_key, alpha)") != std::string::npos ||
+                           line.find("crypto::bls_key_from_validator_seed(local_key_.private_key)") != std::string::npos);
       if (helper) {
         ++helper_uses;
         continue;
@@ -517,5 +519,5 @@ TEST(test_failstop_validator_key_signing_has_one_guarded_entry) {
       ASSERT_TRUE(false);
     }
   }
-  ASSERT_EQ(helper_uses, static_cast<std::size_t>(2));
+  ASSERT_EQ(helper_uses, static_cast<std::size_t>(3));
 }

@@ -1106,6 +1106,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       return on_prevote(peer_id, payload, payload_id);
     case p2p::MsgType::TIMEOUT_VOTE:
       return on_timeout_vote(peer_id, payload, payload_id);
+    case p2p::MsgType::TIME_SIGNATURE:
+      return on_time_signature(peer_id, payload, payload_id);
     case p2p::MsgType::TX:
       return on_tx(peer_id, payload, payload_id);
     case p2p::MsgType::SUBMIT_TX:
@@ -1533,6 +1535,17 @@ void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
     });
   } else {
     p2p_.broadcast(p2p::MsgType::TIMEOUT_VOTE, p2p::ser_timeout_vote(vm));
+  }
+}
+
+void Node::broadcast_time_signature(const p2p::TimeSignatureMsg& msg) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
+  if (cfg_.disable_p2p) {
+    for_each_local_bus_peer([&](Node* peer) {
+      spawn_local_bus_task([peer, msg]() { (void)peer->handle_time_signature(msg, true, 0); });
+    });
+  } else {
+    p2p_.broadcast(p2p::MsgType::TIME_SIGNATURE, p2p::ser_time_signature(msg));
   }
 }
 
@@ -2730,6 +2743,8 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
     case p2p::MsgType::PREVOTE:
       return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
     case p2p::MsgType::TIMEOUT_VOTE:
+      return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::TIME_SIGNATURE:
       return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
     case p2p::MsgType::TRANSITION:
       return get(msg_type, cfg_.block_rate_capacity, cfg_.block_rate_refill).consume(1.0, nms);

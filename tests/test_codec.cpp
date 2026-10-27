@@ -521,6 +521,8 @@ TEST(test_frontier_transition_and_ingress_db_roundtrip) {
   Sig64 prev_sig{};
   prev_sig.fill(0x66);
   transition.prev_finality_signers.push_back(FinalitySig{transition.leader_pubkey, prev_sig});
+  transition.prev_time_signature.signer_indices = {0, 3, 127};
+  transition.prev_time_signature.aggregate.fill(0x77);
   transition.settlement.settlement_epoch_start = 1;
   transition.settlement.outputs.push_back({transition.leader_pubkey, 123});
   transition.settlement.total = 123;
@@ -534,11 +536,19 @@ TEST(test_frontier_transition_and_ingress_db_roundtrip) {
   ASSERT_TRUE(transition_parsed.has_value());
   ASSERT_EQ(transition_parsed->serialize(), transition_ser);
   ASSERT_EQ(transition_parsed->timestamp, transition.timestamp);
+  ASSERT_TRUE(transition_parsed->prev_time_signature == transition.prev_time_signature);
   const auto transition_id = transition.transition_id();
 
   auto other = transition;
   other.timestamp += 1;
   ASSERT_NE(other.transition_id(), transition_id);
+  // The time signature is part of the signed transition.
+  auto other_time = transition;
+  other_time.prev_time_signature.aggregate[5] ^= 1;
+  ASSERT_NE(other_time.transition_id(), transition_id);
+  auto bad_index = transition;
+  bad_index.prev_time_signature.signer_indices = {MAX_COMMITTEE};
+  ASSERT_TRUE(!FrontierTransition::parse(bad_index.serialize()).has_value());
 
   ASSERT_EQ(mainnet_network().magic, MAGIC);
 

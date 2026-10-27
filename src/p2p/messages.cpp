@@ -31,6 +31,7 @@ bool is_known_message_type(std::uint16_t msg_type) {
     case MsgType::VOTE:
     case MsgType::PREVOTE:
     case MsgType::TIMEOUT_VOTE:
+    case MsgType::TIME_SIGNATURE:
     case MsgType::GET_TRANSITION:
     case MsgType::TRANSITION:
     case MsgType::TX:
@@ -280,6 +281,29 @@ std::optional<TimeoutVoteMsg> de_timeout_vote(const Bytes& b) {
         m.vote.round = *round;
         m.vote.validator_pubkey = *pub;
         m.vote.signature = *sig;
+        return true;
+      })) return std::nullopt;
+  return m;
+}
+
+Bytes ser_time_signature(const TimeSignatureMsg& m) {
+  codec::ByteWriter w;
+  w.u64le(m.height);
+  w.bytes_fixed(m.validator_pubkey);
+  w.bytes_fixed(m.signature);
+  return w.take();
+}
+
+std::optional<TimeSignatureMsg> de_time_signature(const Bytes& b) {
+  TimeSignatureMsg m;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto pub = r.bytes_fixed<32>();
+        auto sig = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+        if (!h || !pub || !sig) return false;
+        m.height = *h;
+        m.validator_pubkey = *pub;
+        m.signature = *sig;
         return true;
       })) return std::nullopt;
   return m;

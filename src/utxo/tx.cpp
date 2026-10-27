@@ -539,6 +539,9 @@ Bytes FrontierTransition::serialize() const {
     w.bytes_fixed(sig.validator_pubkey);
     w.bytes_fixed(sig.signature);
   }
+  w.varint(prev_time_signature.signer_indices.size());
+  for (const auto index : prev_time_signature.signer_indices) w.varint(index);
+  w.bytes_fixed(prev_time_signature.aggregate);
   w.varbytes(settlement.serialize());
   w.bytes_fixed(settlement_commitment);
   return w.take();
@@ -603,6 +606,18 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
           if (!pub || !sig) return false;
           out.prev_finality_signers.push_back(FinalitySig{*pub, *sig});
         }
+        auto time_signer_count = r.varint();
+        if (!time_signer_count || *time_signer_count > MAX_COMMITTEE) return false;
+        out.prev_time_signature.signer_indices.clear();
+        out.prev_time_signature.signer_indices.reserve(static_cast<std::size_t>(*time_signer_count));
+        for (std::uint64_t i = 0; i < *time_signer_count; ++i) {
+          auto index = r.varint();
+          if (!index || *index >= MAX_COMMITTEE) return false;
+          out.prev_time_signature.signer_indices.push_back(static_cast<std::uint32_t>(*index));
+        }
+        auto time_aggregate = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+        if (!time_aggregate) return false;
+        out.prev_time_signature.aggregate = *time_aggregate;
         auto settlement_bytes = r.varbytes();
         auto settlement_commitment = r.bytes_fixed<32>();
         if (!settlement_bytes || !settlement_commitment) return false;
