@@ -1080,33 +1080,150 @@ std::optional<TimeSignatureAggregate> Node::prev_time_signature_for_next_height_
   return consensus::aggregate_time_signatures(*keys, it->second, threshold);
 }
 
+std::map<std::pair<std::uint64_t, Hash32>, std::size_t> Node::pending_long_openings_locked() const {
+  std::map<std::pair<std::uint64_t, Hash32>, std::size_t> out;
+  if (!canonical_state_.has_value()) return out;
+  const auto next = canonical_state_->finalized_height + 1;
+  const auto first = next > consensus::kTimedLongGraceBlocks ? next - consensus::kTimedLongGraceBlocks : 0;
+  const auto& escrows = canonical_state_->timed_escrows;
+  for (auto it = escrows.lower_bound(consensus::TimedEscrowKey{first, 0, 0});
+       it != escrows.end() && it->first.unlock_height < next; ++it) {
+    if (!consensus::timed_is_long_lock(it->second, cfg_.network.committee_epoch_blocks)) continue;
+    ++out[{it->first.unlock_height, it->second.committee_root}];
+  }
+  return out;
+}
+
+std::vector<p2p::TimeSignatureMsg> Node::maybe_sign_long_time_signatures_locked() {
+  std::vector<p2p::TimeSignatureMsg> out;
+  const auto pending = pending_long_openings_locked();
+  std::erase_if(long_time_signatures_, [&](const auto& entry) { return !pending.contains(entry.first); });
+  std::erase_if(local_long_time_signatures_, [&](const auto& entry) {
+    const auto it = pending.lower_bound({entry.first, Hash32{}});
+    return it == pending.end() || it->first.first != entry.first;
+  });
+  if (pending.empty() || safety_storage_failed()) return out;
+  // The registered key (still in the registry after exit); the guarded signer checks it is ours.
+  const auto info = canonical_state_->validators.get(local_key_.public_key);
+  if (!info.has_value() || info->bls_pubkey == crypto::BlsPublicKey{}) return out;
+  const auto own = std::optional<crypto::BlsPublicKey>(info->bls_pubkey);
+  for (const auto& [pair, _] : pending) {
+    const auto& [unlock, root] = pair;
+    const auto keys = canonical_state_->timed_key_sets.find(root);
+    if (keys == canonical_state_->timed_key_sets.end()) continue;
+    const auto member = std::find(keys->second.begin(), keys->second.end(), *own);
+    if (member == keys->second.end()) continue;
+    const auto index = static_cast<std::uint32_t>(member - keys->second.begin());
+    if (long_time_signatures_[pair].contains(index)) continue;
+    auto local = local_long_time_signatures_.find(unlock);
+    if (local == local_long_time_signatures_.end()) {
+      const auto sig = bls_time_sign_consensus_locked(time_signature_message(consensus_domain_, unlock), *own);
+      if (!sig.has_value()) continue;
+      local = local_long_time_signatures_.emplace(unlock, p2p::TimeSignatureMsg{unlock, local_key_.public_key, *sig}).first;
+      out.push_back(local->second);
+      log_line("long-time-signature-signed height=" + std::to_string(unlock) + " root=" + short_hash_hex(root));
+    }
+    long_time_signatures_[pair][index] = local->second.signature;
+  }
+  return out;
+}
+
+std::vector<LongTimeSignature> Node::long_time_signatures_for_next_height_locked() const {
+  std::vector<LongTimeSignature> out;
+  std::size_t settled = 0;
+  for (const auto& [pair, escrow_count] : pending_long_openings_locked()) {  // map order == canonical order
+    if (out.size() >= kMaxLongTimeSignaturesPerBlock) break;
+    if (settled + escrow_count > consensus::kMaxLongSettlementsPerBlock) continue;
+    const auto sigs = long_time_signatures_.find(pair);
+    const auto keys = canonical_state_->timed_key_sets.find(pair.second);
+    if (sigs == long_time_signatures_.end() || keys == canonical_state_->timed_key_sets.end()) continue;
+    const auto threshold = consensus::time_signature_threshold(keys->second.size());
+    if (sigs->second.size() < threshold) continue;
+    const auto aggregate = consensus::aggregate_time_signatures(keys->second, sigs->second, threshold);
+    if (!aggregate.has_value()) continue;
+    out.push_back(LongTimeSignature{pair.first, pair.second, *aggregate});
+    settled += escrow_count;
+  }
+  return out;
+}
+
 Node::TimeSignatureHandlingResult Node::handle_time_signature_result(const p2p::TimeSignatureMsg& msg, bool from_network,
                                                                      int from_peer_id) {
   bool relay = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if ((from_network && !running_) || !canonical_state_.has_value()) return TimeSignatureHandlingResult::SoftReject;
+    if (msg.height == 0) return TimeSignatureHandlingResult::SoftReject;
+    const auto message = time_signature_message(consensus_domain_, msg.height);
+    // Pending long-lock openings at this height whose key set names the signer's registered BLS key
+    // (committee member or not) and that lack its signature.
+    std::vector<std::pair<std::pair<std::uint64_t, Hash32>, std::uint32_t>> long_targets;
+    std::optional<crypto::BlsPublicKey> long_key;
+    const auto pending = pending_long_openings_locked();
+    for (auto it = pending.lower_bound({msg.height, Hash32{}}); it != pending.end() && it->first.first == msg.height; ++it) {
+      if (!long_key.has_value()) {
+        const auto info = canonical_state_->validators.get(msg.validator_pubkey);
+        if (!info.has_value() || info->bls_pubkey == crypto::BlsPublicKey{}) break;
+        long_key = info->bls_pubkey;
+      }
+      const auto keys = canonical_state_->timed_key_sets.find(it->first.second);
+      if (keys == canonical_state_->timed_key_sets.end()) continue;
+      const auto member = std::find(keys->second.begin(), keys->second.end(), *long_key);
+      if (member == keys->second.end()) continue;
+      const auto index = static_cast<std::uint32_t>(member - keys->second.begin());
+      const auto known = long_time_signatures_.find(it->first);
+      if (known != long_time_signatures_.end() && known->second.contains(index)) continue;
+      long_targets.emplace_back(it->first, index);
+    }
+
+    // The committee path: the tip and one height either side (a peer a block ahead signs its tip
+    // before we finalize it).
     const auto tip = canonical_state_->finalized_height;
-    // The tip and one height either side: a peer a block ahead signs its tip before we finalize it.
-    if (msg.height == 0 || msg.height + 1 < tip || msg.height > tip + 1) return TimeSignatureHandlingResult::SoftReject;
-    const auto cp = canonical_state_->finalized_committee_checkpoints.find(
-        consensus::committee_epoch_start(msg.height, cfg_.network.committee_epoch_blocks));
-    if (cp == canonical_state_->finalized_committee_checkpoints.end()) return TimeSignatureHandlingResult::SoftReject;
-    const auto& members = cp->second.ordered_members;
-    const auto member = std::find(members.begin(), members.end(), msg.validator_pubkey);
-    if (member == members.end()) return TimeSignatureHandlingResult::HardReject;
-    const auto index = static_cast<std::uint32_t>(member - members.begin());
-    if (index >= cp->second.ordered_bls_keys.size()) return TimeSignatureHandlingResult::SoftReject;
-    auto& known = time_signatures_[msg.height];
-    if (known.count(index) != 0) return TimeSignatureHandlingResult::Duplicate;
-    if (!crypto::bls_verify(cp->second.ordered_bls_keys[index], time_signature_message(consensus_domain_, msg.height),
-                            crypto::kBlsTimeSignatureDst, msg.signature)) {
-      if (known.empty()) time_signatures_.erase(msg.height);
+    std::optional<std::uint32_t> committee_index;
+    std::optional<crypto::BlsPublicKey> committee_key;
+    bool committee_duplicate = false;
+    const auto reject_unless_long = [&](TimeSignatureHandlingResult result) {
+      return long_targets.empty() ? std::optional<TimeSignatureHandlingResult>(result) : std::nullopt;
+    };
+    std::optional<TimeSignatureHandlingResult> committee_reject;
+    if (msg.height + 1 < tip || msg.height > tip + 1) {
+      committee_reject = reject_unless_long(TimeSignatureHandlingResult::SoftReject);
+    } else if (const auto cp = canonical_state_->finalized_committee_checkpoints.find(
+                   consensus::committee_epoch_start(msg.height, cfg_.network.committee_epoch_blocks));
+               cp == canonical_state_->finalized_committee_checkpoints.end()) {
+      committee_reject = reject_unless_long(TimeSignatureHandlingResult::SoftReject);
+    } else {
+      const auto& members = cp->second.ordered_members;
+      const auto member = std::find(members.begin(), members.end(), msg.validator_pubkey);
+      const auto index = static_cast<std::uint32_t>(member - members.begin());
+      if (member == members.end()) {
+        committee_reject = reject_unless_long(TimeSignatureHandlingResult::HardReject);
+      } else if (index >= cp->second.ordered_bls_keys.size()) {
+        committee_reject = reject_unless_long(TimeSignatureHandlingResult::SoftReject);
+      } else {
+        const auto known = time_signatures_.find(msg.height);
+        committee_duplicate = known != time_signatures_.end() && known->second.contains(index);
+        if (!committee_duplicate) {
+          committee_index = index;
+          committee_key = cp->second.ordered_bls_keys[index];
+        }
+      }
+    }
+    if (committee_reject.has_value()) return *committee_reject;
+    if (!committee_index.has_value() && long_targets.empty()) return TimeSignatureHandlingResult::Duplicate;
+
+    const auto verified = [&](const crypto::BlsPublicKey& key) {
+      return crypto::bls_verify(key, message, crypto::kBlsTimeSignatureDst, msg.signature);
+    };
+    const bool committee_ok = !committee_key.has_value() || verified(*committee_key);
+    const bool long_ok = long_targets.empty() || (committee_key == long_key ? committee_ok : verified(*long_key));
+    if (!committee_ok || !long_ok) {
       log_line("time-signature-reject height=" + std::to_string(msg.height) +
                " signer=" + short_pub_hex(msg.validator_pubkey) + " reason=invalid-signature");
       return TimeSignatureHandlingResult::HardReject;
     }
-    known.emplace(index, msg.signature);
+    if (committee_index.has_value()) time_signatures_[msg.height].emplace(*committee_index, msg.signature);
+    for (const auto& [pair, index] : long_targets) long_time_signatures_[pair].emplace(index, msg.signature);
     relay = from_network && !should_mute_peer_locked(from_peer_id);
   }
   if (relay) broadcast_time_signature(msg);
@@ -3071,8 +3188,10 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       last_test_hook_error_ = "frontier-build-time-signature-unavailable";
       return std::nullopt;
     }
+    // Long-lock openings this block carries (optional: never waited for).
+    const auto long_time_signatures = long_time_signatures_for_next_height_locked();
     const auto timed = consensus::timed_execution_context_for(canonical_derivation_config_locked(), *canonical_state_,
-                                                              height, *prev_time_signature);
+                                                              height, *prev_time_signature, &long_time_signatures);
 
     consensus::FrontierExecutionResult result;
     std::string validation_error;

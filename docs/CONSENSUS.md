@@ -323,6 +323,12 @@ final, wherever its members are then (their BLS keys are seed-derived and perman
   signature verifies under the owner's registered BLS key; the validator is banned. Honest
   validators sign `H` only once they hold its finality certificate, so honest signatures are never
   evidence. `finalis-cli create_time_slash_tx` builds it
+- node: once `u` is final, every node whose BLS key a waiting long escrow's key set holds (committee
+  member or retired) signs `time_signature_message(D, u)` and broadcasts it as `TIME_SIGNATURE`,
+  re-sent every round timeout while the opening is pending. Receivers accept a signature for a
+  pending `(u, root)` from the signer's registered BLS key if the set holds it, outside the committee
+  window too, and relay it. The leader puts every pending pair with a quorum of its set into
+  `long_time_signatures` (canonical order, within the caps); it never waits for one
 
 Intake: a `TxTimed` travels in `TX` / `SUBMIT_TX` like any record. The node admits it with the
 same `consensus::check_timed_inclusion` the block applies (against the next height), a prepaid fee at

@@ -581,6 +581,15 @@ class Node {
   std::optional<TimeSignatureAggregate> prev_time_signature_for_next_height_locked() const;
   // Count-only form of the above for the event loop (no aggregation): {known, threshold}.
   std::pair<std::size_t, std::size_t> time_signature_progress_for_next_height_locked() const;
+  // Long locks (LongTimeSignature): the (unlock height, key set root) pairs a block at the next height
+  // may open, each with the number of long escrows it settles.
+  std::map<std::pair<std::uint64_t, Hash32>, std::size_t> pending_long_openings_locked() const;
+  // Signs every pending opening whose key set holds this node's BLS key, committee member or not (a
+  // final height only, so never slashable as early); returns the new messages to broadcast.
+  std::vector<p2p::TimeSignatureMsg> maybe_sign_long_time_signatures_locked();
+  // The openings the next proposal carries: each pending pair with a quorum of its key set, in
+  // canonical order, within the per-block caps.
+  std::vector<LongTimeSignature> long_time_signatures_for_next_height_locked() const;
   bool record_late_finalized_vote_locked(const Vote& vote);
   // One height's row of consensus safety state: the vote lock, the valid polka and the own prevotes.
   struct ConsensusSafetyState {
@@ -1011,6 +1020,11 @@ class Node {
   // Verified time signatures by height and committee index (finalized tip and one height either side).
   std::map<std::uint64_t, std::map<std::uint32_t, crypto::BlsSignature>> time_signatures_;
   std::uint64_t local_time_signature_height_{0};  // highest height this node has signed
+  // Verified signatures for pending long-lock openings, by (unlock height, key set root) and key index.
+  std::map<std::pair<std::uint64_t, Hash32>, std::map<std::uint32_t, crypto::BlsSignature>> long_time_signatures_;
+  // This node's signatures for pending openings, by height, re-sent every round timeout.
+  std::map<std::uint64_t, p2p::TimeSignatureMsg> local_long_time_signatures_;
+  std::uint64_t last_long_time_signature_broadcast_ms_{0};
   // Admitted TxTimed envelopes awaiting a block (the mempool holds AnyTx only).
   std::map<Hash32, TxTimed> timed_pool_;
   static constexpr std::size_t kMaxTimedPoolEntries = 256;

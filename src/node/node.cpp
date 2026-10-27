@@ -1147,6 +1147,7 @@ void Node::event_loop() {
     std::optional<p2p::ProposeMsg> propose_to_send;
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
     std::optional<p2p::TimeSignatureMsg> time_signature_to_broadcast;
+    std::vector<p2p::TimeSignatureMsg> long_time_signatures_to_broadcast;
     LocalVoteRebroadcast votes_to_rebroadcast;
     std::vector<int> keepalive_peers;
     std::vector<int> finalized_tip_poll_peers;
@@ -1368,6 +1369,12 @@ void Node::event_loop() {
           time_signature_to_broadcast = local_time_signature_;
         }
         if (time_signature_to_broadcast.has_value()) last_time_signature_broadcast_ms_ = now_ms;
+        long_time_signatures_to_broadcast = maybe_sign_long_time_signatures_locked();
+        if (long_time_signatures_to_broadcast.empty() && !local_long_time_signatures_.empty() &&
+            now_ms >= last_long_time_signature_broadcast_ms_ + cfg_.network.round_timeout_ms) {
+          for (const auto& [_, msg] : local_long_time_signatures_) long_time_signatures_to_broadcast.push_back(msg);
+        }
+        if (!long_time_signatures_to_broadcast.empty()) last_long_time_signature_broadcast_ms_ = now_ms;
       }
 
       const auto committee = committee_for_height_round(h, current_round_);
@@ -1729,6 +1736,7 @@ void Node::event_loop() {
     flush_pending_finalized_broadcasts();
 
     if (time_signature_to_broadcast.has_value()) broadcast_time_signature(*time_signature_to_broadcast);
+    for (const auto& msg : long_time_signatures_to_broadcast) broadcast_time_signature(msg);
 
     for (const auto& v : votes_to_rebroadcast.timeouts) broadcast_timeout_vote(v);
     for (const auto& v : votes_to_rebroadcast.prevotes) broadcast_prevote(v);
