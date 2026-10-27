@@ -125,6 +125,8 @@ struct CanonicalDerivedState {
   // Confidential turnstile P: value held in confidential (TxV2) outputs, accounted from public boundary
   // flows only. Committed; a TxV2 that would make it negative is invalid (confidential-turnstile-negative).
   std::uint64_t confidential_pool_value{0};
+  // TxTimed escrows waiting for their unlock height (consensus/frontier_execution.hpp). Committed.
+  TimedEscrowState timed_escrows;
   std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
   std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints;
   std::map<std::uint64_t, CanonicalFinalizedMetadata> finalized_block_metadata;
@@ -192,6 +194,15 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
 // participation for the parent height (parent_committee vs the signer pubkeys
 // in transition.prev_finality_signers). Shared by canonical derivation and the
 // node's frozen-epoch rebuild so the two cannot drift.
+// The timed context for executing block `height` on `prev`, settling with `parent_time_signature`
+// (the block's own prev_time_signature). Holds pointers into `prev` and `parent_time_signature`.
+TimedExecutionContext timed_execution_context_for(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                                  std::uint64_t height,
+                                                  const TimeSignatureAggregate& parent_time_signature);
+// Escrows after block `height`: those due at it (unlock height - 1) settled, the opened ones added.
+void apply_timed_escrows(std::uint64_t height, const FrontierExecutionResult& result, TimedEscrowState* escrows);
+// Root of the escrow set as committed in the post-state (one leaf per escrow: key -> envelope txid).
+Hash32 timed_escrow_commitment_root(const TimedEscrowState& escrows);
 // Time signatures (TimeSignatureAggregate). The key set of a height is its epoch checkpoint's
 // ordered_bls_keys; a valid aggregate needs time_signature_threshold(n) of them, the same quorum
 // that finalizes the height, so the f validators an adversary may hold can never produce one (and
@@ -335,9 +346,6 @@ std::vector<PubKey32> emergency_fallback_committee_members(
 // Sets checkpoint->ordered_bls_keys to each member's registered BLS key, in member order (a zero
 // key for a member without one; every registration and genesis entry carries one).
 void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::FinalizedCommitteeCheckpoint* checkpoint);
-// The committee key root a TxTimed names (TxTimed::committee_root):
-// sha256d("FINALIS-COMMITTEE-BLS-V1" || varint n || key_1 .. key_n), keys in checkpoint order.
-Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys);
 // Fills `checkpoint` (whose ordered_members is empty) with the emergency committee. Returns false
 // when there is no prior committee member to recover from.
 bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,

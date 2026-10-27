@@ -101,7 +101,11 @@ struct TxV2 {
   bool operator==(const TxV2&) const = default;
 };
 
-// --- Timed transactions (McFly time layer; not yet part of AnyTx) ---
+// --- Timed transactions (McFly time layer): an ordered record of its own, not an AnyTx ---
+//
+// Executed by consensus::execute_frontier_slice (TimedExecutionContext): escrowed at inclusion,
+// settled first in block unlock_height + 1. Bounds and the provisional minimum bond are in
+// consensus/frontier_execution.hpp.
 //
 // A TxTimed is included at height h and ordered blindly; its body is decrypted and applied in the
 // execution of block unlock_height + 1, once the aggregate time signature for unlock_height exists

@@ -8,6 +8,8 @@
 #include "codec/bytes.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/swe.hpp"
+#include "crypto/swe_proofs.hpp"
 #include "utxo/validate.hpp"
 
 namespace finalis {
@@ -99,6 +101,81 @@ std::optional<WalletSendPlan> plan_wallet_p2pkh_send(const std::vector<std::pair
   }
   plan.applied_fee_units = requested_fee_units + (raw_change - plan.change_units);
   return plan;
+}
+
+std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const AnyTx& body,
+                                             const Bytes& fee_private_key_32, const Hash32& seed_32, std::string* err) {
+  auto kp = keypair_from_private_key(fee_private_key_32, err);
+  if (!kp.has_value()) return std::nullopt;
+  std::array<std::uint8_t, 20> expected_pkh{};
+  if (!is_p2pkh_script_pubkey(params.fee_prev_out.script_pubkey, &expected_pkh)) {
+    if (err) *err = "fee input is not P2PKH";
+    return std::nullopt;
+  }
+  const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
+  if (!std::equal(got_pkh.begin(), got_pkh.end(), expected_pkh.begin())) {
+    if (err) *err = "private key does not match the fee input";
+    return std::nullopt;
+  }
+  const std::uint64_t change = params.fee_change ? params.fee_change->value : 0;
+  if (params.prepaid_fee > params.fee_prev_out.value ||
+      params.fee_prev_out.value - params.prepaid_fee < params.forfeit_bond ||
+      params.fee_prev_out.value - params.prepaid_fee - params.forfeit_bond != change) {
+    if (err) *err = "fee input value != prepaid_fee + forfeit_bond + change";
+    return std::nullopt;
+  }
+
+  TxTimed tx;
+  tx.fee_input = TxIn{params.fee_outpoint.txid, params.fee_outpoint.index, Bytes{}, 0xFFFFFFFF};
+  tx.prepaid_fee = params.prepaid_fee;
+  tx.forfeit_bond = params.forfeit_bond;
+  tx.bond_refund_script = params.bond_refund_script;
+  tx.fee_change = params.fee_change;
+  tx.unlock_height = params.unlock_height;
+  tx.committee_epoch = params.committee_epoch;
+  tx.committee_root = params.committee_root;
+
+  // Body key and SWE randomness, both from the secret seed (domain-separated).
+  const auto derive = [&](char tag) {
+    Bytes in{'S', 'C', '-', 'T', 'I', 'M', 'E', 'D', '-', 'S', 'E', 'E', 'D', '-', 'V', '1', static_cast<std::uint8_t>(tag)};
+    in.insert(in.end(), seed_32.begin(), seed_32.end());
+    return crypto::sha256(in);
+  };
+  const Hash32 body_key = derive('k');
+  const Hash32 swe_seed = derive('s');
+  const Hash32 nonce_seed = derive('n');
+  std::copy(nonce_seed.begin(), nonce_seed.begin() + tx.body_nonce.size(), tx.body_nonce.begin());
+  const auto msg = time_signature_message(chain_domain, params.unlock_height);
+  const auto ct = crypto::swe_encrypt(params.committee_keys, params.threshold, msg, crypto::kBlsTimeSignatureDst,
+                                      crypto::swe_key_to_chunks(body_key), swe_seed);
+  if (!ct.has_value()) {
+    if (err) *err = "swe encryption failed";
+    return std::nullopt;
+  }
+  const auto proof = crypto::swe_prove_well_formed(*ct, params.committee_keys, msg, crypto::kBlsTimeSignatureDst, swe_seed);
+  if (!proof.has_value()) {
+    if (err) *err = "swe proof failed";
+    return std::nullopt;
+  }
+  tx.swe_ciphertext = ct->serialize();
+  tx.swe_proof = proof->serialize();
+  if (!seal_timed_body(tx, body_key, body)) {
+    if (err) *err = "body too large";
+    return std::nullopt;
+  }
+  const auto sig = crypto::ed25519_sign(signing_message_for_timed_fee_input(chain_domain, tx), fee_private_key_32);
+  if (!sig.has_value()) {
+    if (err) *err = "failed to sign";
+    return std::nullopt;
+  }
+  Bytes script_sig;
+  script_sig.reserve(98);
+  script_sig.push_back(0x40);
+  script_sig.insert(script_sig.end(), sig->begin(), sig->end());
+  script_sig.push_back(0x20);
+  script_sig.insert(script_sig.end(), kp->public_key.begin(), kp->public_key.end());
+  tx.fee_input.script_sig = std::move(script_sig);
+  return tx;
 }
 
 std::optional<Tx> build_signed_p2pkh_tx_single_input(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,

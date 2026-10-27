@@ -336,6 +336,7 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
     state.protocol_reserve_balance_units = *reserve;
   }
   if (auto pool = db.get_confidential_pool_value(); pool.has_value()) state.confidential_pool_value = *pool;
+  state.timed_escrows = load_timed_escrows(db);
   if (auto persisted_randomness = db.get(kFinalizedRandomnessKey);
       persisted_randomness.has_value() && persisted_randomness->size() == 32) {
     std::copy(persisted_randomness->begin(), persisted_randomness->end(), state.finalized_randomness.begin());

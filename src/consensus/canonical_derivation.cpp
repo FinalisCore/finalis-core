@@ -942,6 +942,42 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
 
 std::size_t time_signature_threshold(std::size_t committee_size) { return quorum_threshold(committee_size); }
 
+TimedExecutionContext timed_execution_context_for(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                                  std::uint64_t height,
+                                                  const TimeSignatureAggregate& parent_time_signature) {
+  TimedExecutionContext timed;
+  timed.height = height;
+  timed.chain_domain = consensus_chain_domain(cfg.network, cfg.chain_id);
+  timed.committee_epoch_blocks = cfg.network.committee_epoch_blocks;
+  timed.escrows = &prev.timed_escrows;
+  timed.parent_time_signature = &parent_time_signature;
+  if (height >= 2) {
+    if (auto keys = time_signature_committee_keys(cfg, prev, height - 1)) timed.parent_committee_keys = std::move(*keys);
+  }
+  const auto* state = &prev;
+  timed.committee_keys = [state](std::uint64_t epoch_start) -> std::optional<std::vector<crypto::BlsPublicKey>> {
+    const auto it = state->finalized_committee_checkpoints.find(epoch_start);
+    if (it == state->finalized_committee_checkpoints.end()) return std::nullopt;
+    const auto& checkpoint = it->second;
+    if (checkpoint.ordered_members.empty() || checkpoint.ordered_bls_keys.size() != checkpoint.ordered_members.size()) {
+      return std::nullopt;
+    }
+    for (const auto& key : checkpoint.ordered_bls_keys) {
+      if (key == crypto::BlsPublicKey{}) return std::nullopt;
+    }
+    return checkpoint.ordered_bls_keys;
+  };
+  return timed;
+}
+
+void apply_timed_escrows(std::uint64_t height, const FrontierExecutionResult& result, TimedEscrowState* escrows) {
+  if (height >= 2) {
+    escrows->erase(escrows->lower_bound(TimedEscrowKey{height - 1, 0, 0}),
+                   escrows->lower_bound(TimedEscrowKey{height, 0, 0}));
+  }
+  for (const auto& [key, tx] : result.opened_escrows) (*escrows)[key] = tx;
+}
+
 std::optional<std::vector<crypto::BlsPublicKey>> time_signature_committee_keys(const CanonicalDerivationConfig& cfg,
                                                                                const CanonicalDerivedState& state,
                                                                                std::uint64_t height) {
@@ -1411,12 +1447,12 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
     *next_vector = prev.finalized_frontier_vector;
     *next_lane_roots = prev.finalized_lane_roots;
     for (const auto& raw : ordered_records) {
-      const auto tx = parse_any_tx(raw);
-      if (!tx.has_value()) {
+      const auto identity = ingress_record_identity(raw);
+      if (!identity.has_value()) {
         if (cursor_error) *cursor_error = "frontier-certified-ingress-parse-failed";
         return false;
       }
-      const auto lane = assign_ingress_lane(*tx);
+      const auto lane = identity->lane;
       if (lane >= finalis::INGRESS_LANE_COUNT) {
         if (cursor_error) *cursor_error = "frontier-certified-ingress-lane-out-of-range";
         return false;
@@ -1517,9 +1553,11 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
       return false;
     }
     auto vctx = build_validation_context(record.transition.height);
+    const auto timed = timed_execution_context_for(cfg, prev, record.transition.height,
+                                                   record.transition.prev_time_signature);
     FrontierExecutionResult result;
     if (!execute_frontier_slice(prev.utxos, prev.confidential_pool_value, prev.finalized_frontier, record.ordered_records,
-                                &vctx, &result, error)) {
+                                &vctx, &result, error, true, nullptr, &timed)) {
       if (error && error->empty()) *error = "frontier-execution-failed";
       return false;
     }
@@ -1681,12 +1719,14 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
   }
   // prev_state_root is checked against execution's recomputation below.
   auto vctx = build_validation_context(record.transition.height);
+  const auto timed = timed_execution_context_for(cfg, prev, record.transition.height,
+                                                 record.transition.prev_time_signature);
   FrontierExecutionResult result;
   const auto parent_tree = utxo_tree_for(prev);
   if (!execute_frontier_lane_prefix(prev.utxos, prev.confidential_pool_value, prev.finalized_frontier_vector,
                                     record.transition.next_vector,
                                     record.lane_records, prev.finalized_lane_roots, &vctx, &result, error,
-                                    /*compute_next_state_root=*/false, &parent_tree)) {
+                                    /*compute_next_state_root=*/false, &parent_tree, &timed)) {
     if (error && error->empty()) *error = "frontier-execution-failed";
     return false;
   }
@@ -1884,6 +1924,7 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   next.utxos = std::move(recomputed.next_utxos);
   next.utxo_tree = recomputed.has_next_utxo_tree ? std::move(recomputed.next_utxo_tree) : crypto::PersistentSmt{};
   next.confidential_pool_value = recomputed.next_confidential_pool_value;
+  apply_timed_escrows(record.transition.height, recomputed, &next.timed_escrows);
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
   next.finalized_timestamp = record.transition.timestamp;
   next.last_finality_certificate_hash = frontier_finality_link_hash(record.transition);
@@ -2350,7 +2391,23 @@ Bytes consensus_post_state_preimage(const CanonicalDerivationConfig& cfg, const 
   w.u64le(state.validator_liveness_window_start_height);
   w.u64le(state.confidential_pool_value);
   w.bytes_fixed(metadata_root);
+  w.bytes_fixed(timed_escrow_commitment_root(state.timed_escrows));
   return w.take();
+}
+
+Hash32 timed_escrow_commitment_root(const TimedEscrowState& escrows) {
+  std::vector<std::pair<Hash32, Bytes>> leaves;
+  leaves.reserve(escrows.size());
+  for (const auto& [key, tx] : escrows) {
+    codec::ByteWriter k;
+    k.bytes(Bytes{'S', 'C', '-', 'T', 'E', 'S'});
+    k.u64le(key.unlock_height);
+    k.u64le(key.inclusion_height);
+    k.u32le(key.inclusion_index);
+    const auto txid = tx.txid();  // covers every field of the envelope
+    leaves.push_back({crypto::sha256(k.data()), Bytes(txid.begin(), txid.end())});
+  }
+  return crypto::SparseMerkleTree::compute_root_from_leaves(leaves);
 }
 
 Hash32 consensus_post_state_commitment(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
@@ -2526,15 +2583,6 @@ void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::Fi
     const auto info = validators.get(pub);
     checkpoint->ordered_bls_keys.push_back(info.has_value() ? info->bls_pubkey : crypto::BlsPublicKey{});
   }
-}
-
-Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '-', 'C', 'O', 'M', 'M', 'I', 'T', 'T', 'E', 'E', '-', 'B', 'L', 'S',
-                '-', 'V', '1'});
-  w.varint(ordered_bls_keys.size());
-  for (const auto& key : ordered_bls_keys) w.bytes_fixed(key);
-  return crypto::sha256d(w.data());
 }
 
 bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,

@@ -2,12 +2,17 @@
 
 #pragma once
 
+#include <compare>
 #include <cstddef>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "crypto/bls12_381.hpp"
 #include "crypto/smt.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/tx.hpp"
 #include "utxo/validate.hpp"
 
@@ -28,6 +33,63 @@ struct CertifiedIngressRecord {
 using CertifiedIngressLaneRecords = std::array<std::vector<CertifiedIngressRecord>, finalis::INGRESS_LANE_COUNT>;
 using FrontierLaneRoots = std::array<Hash32, finalis::INGRESS_LANE_COUNT>;
 
+// --- TxTimed escrows (utxo/confidential_tx.hpp) ---
+//
+// An included TxTimed waits in the committed escrow state until block unlock_height + 1, which
+// settles it before any of its own records. Keyed so that map order is settlement order: unlock
+// height, then inclusion height and position (index among the block's accepted timed records).
+struct TimedEscrowKey {
+  std::uint64_t unlock_height{0};
+  std::uint64_t inclusion_height{0};
+  std::uint32_t inclusion_index{0};
+
+  auto operator<=>(const TimedEscrowKey&) const = default;
+};
+using TimedEscrowState = std::map<TimedEscrowKey, TxTimed>;
+
+// The committee key root a TxTimed names (TxTimed::committee_root):
+// sha256d("FINALIS-COMMITTEE-BLS-V1" || varint n || key_1 .. key_n), keys in checkpoint order.
+Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys);
+
+// Consensus bounds. A block accepts at most kMaxTimedTxPerBlock TxTimed records (each costs an SWE
+// well-formedness check, ~45 ms at 128 keys), and at most kMaxTimedEscrowsPerUnlockHeight escrows
+// may wait for one unlock height (each costs a decryption, ~94 ms, in the settling block).
+inline constexpr std::size_t kMaxTimedTxPerBlock = 8;
+inline constexpr std::size_t kMaxTimedEscrowsPerUnlockHeight = 16;
+// Provisional: the minimum forfeit_bond (0.01 FLS), a floor on the cost of an envelope that never opens.
+inline constexpr std::uint64_t kTxTimedMinForfeitBond = 1'000'000;
+
+// What execution of block `height` needs for timed records. Consensus callers always pass it; without
+// it a TxTimed record is rejected and nothing settles.
+struct TimedExecutionContext {
+  std::uint64_t height{0};
+  Hash32 chain_domain{};
+  std::uint64_t committee_epoch_blocks{1};
+  // Escrows of the parent state (all of them: settlement takes those due, inclusion counts per height).
+  const TimedEscrowState* escrows{nullptr};
+  // Settlement of unlock height `height - 1`: the parent's time signature (as the block carries it)
+  // and the key set of epoch_of(height - 1).
+  const TimeSignatureAggregate* parent_time_signature{nullptr};
+  std::vector<crypto::BlsPublicKey> parent_committee_keys;
+  // Inclusion: the ordered checkpoint keys of an epoch, nullopt if not yet known. A TxTimed may lock
+  // to any height from `height` to the end of `height`'s epoch (the horizon of known committees).
+  std::function<std::optional<std::vector<crypto::BlsPublicKey>>(std::uint64_t epoch_start)> committee_keys;
+  std::uint64_t min_bond{kTxTimedMinForfeitBond};
+};
+
+// Outcome of one settled escrow, in settlement order.
+struct TimedSettlementRecord {
+  TimedEscrowKey key;
+  Hash32 timed_txid{};
+  bool body_applied{false};
+  std::optional<Hash32> body_txid;  // set when the body opened and parsed
+};
+
+// A TxTimed's outputs: the fee change (if any) at index 0 at inclusion, the bond refund at index 1 at
+// settlement.
+inline OutPoint timed_change_outpoint(const Hash32& timed_txid) { return OutPoint{timed_txid, 0}; }
+inline OutPoint timed_refund_outpoint(const Hash32& timed_txid) { return OutPoint{timed_txid, 1}; }
+
 struct FrontierExecutionResult {
   FrontierTransition transition;
   std::vector<FrontierDecision> decisions;
@@ -42,6 +104,9 @@ struct FrontierExecutionResult {
   // parent's tree (after populate_frontier_transition_metadata: including settlement outputs).
   crypto::PersistentSmt next_utxo_tree;
   bool has_next_utxo_tree{false};
+  // Timed records: escrows opened by this block (keyed for settlement) and the escrows it settled.
+  TimedEscrowState opened_escrows;
+  std::vector<TimedSettlementRecord> settlements;
 
   Hash32 result_id() const;
 };
@@ -90,7 +155,8 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
                             std::uint64_t prev_frontier, const std::vector<Bytes>& ordered_records,
                             const SpecialValidationContext* ctx, FrontierExecutionResult* out,
                             std::string* error = nullptr, bool compute_next_state_root = true,
-                            const crypto::PersistentSmt* parent_utxo_tree = nullptr);
+                            const crypto::PersistentSmt* parent_utxo_tree = nullptr,
+                            const TimedExecutionContext* timed = nullptr);
 bool execute_frontier_slice(const UtxoSet& parent_utxos, std::uint64_t prev_frontier,
                             const std::vector<Bytes>& ordered_records, const SpecialValidationContext* ctx,
                             FrontierExecutionResult* out, std::string* error = nullptr);
@@ -100,7 +166,8 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
                                   FrontierExecutionResult* out, std::string* error = nullptr,
                                   bool compute_next_state_root = true,
-                                  const crypto::PersistentSmt* parent_utxo_tree = nullptr);
+                                  const crypto::PersistentSmt* parent_utxo_tree = nullptr,
+                                  const TimedExecutionContext* timed = nullptr);
 bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVector& prev_vector,
                                   const FrontierVector& next_vector, const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,

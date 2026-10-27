@@ -247,6 +247,29 @@ Liveness: the `n - f >= quorum` honest members all sign once they learn of final
 of `H` is the witness that opens a `TxTimed` locked to `H` (encrypted with the same threshold to the
 same keys, `consensus::committee_bls_key_root`).
 
+## Timed Transactions
+
+A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (version 3; never an
+`AnyTx`), in the lane of its fee input's outpoint. Execution of block `h`
+(`consensus::execute_frontier_slice` with a `TimedExecutionContext`):
+
+1. **Settlement first.** Every escrow locked to `h - 1`, in inclusion order: SWE-decrypt the body key
+   with the block's `prev_time_signature` (the aggregate for `h - 1`), open the body, and apply it
+   like a record if it is a plain transfer (P2PKH / confidential inputs and outputs only). Applied:
+   the bond is refunded at `(timed txid, 1)`. Otherwise the bond is a fee of block `h`. No record of
+   `h` runs before, so none can front-run a revealed body.
+2. **Records.** A `TxTimed` is accepted (escrowed) when `h <= unlock_height <= end of h's epoch`,
+   `committee_epoch` and `committee_root` name that epoch's checkpoint keys, the ciphertext has
+   threshold `quorum(n)` and its well-formedness proof verifies, the fee input is an unspent P2PKH
+   output signed over the envelope, and its value is exactly `prepaid_fee + forfeit_bond + change`
+   with `forfeit_bond >= kTxTimedMinForfeitBond`. The prepaid fee is a fee of `h`; change appears at
+   `(timed txid, 0)`.
+
+Bounds: at most `kMaxTimedTxPerBlock` (8) accepted per block, at most
+`kMaxTimedEscrowsPerUnlockHeight` (16) waiting per unlock height. Escrows are consensus state:
+`CanonicalDerivedState::timed_escrows`, committed as `timed_escrow_commitment_root` at the end of the
+post-state preimage and stored as one `TE:` row each.
+
 ## Transition Timestamp
 
 `FrontierTransition.timestamp` is unix seconds and part of the transition id.

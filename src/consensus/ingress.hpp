@@ -27,6 +27,15 @@ std::uint32_t assign_ingress_lane(const TxV2& tx);
 std::uint32_t assign_ingress_lane(const AnyTx& tx);
 Hash32 compute_lane_root_append(const Hash32& prev_root, const Hash32& tx_hash);
 
+// An ordered (ingress) record is a Tx, a TxV2 or a TxTimed. A TxTimed is anchored on its fee input,
+// like a Tx spending the same outpoint, so the two land in one lane and conflict there.
+struct IngressRecordIdentity {
+  Hash32 txid{};
+  std::uint32_t lane{0};
+  bool timed{false};
+};
+std::optional<IngressRecordIdentity> ingress_record_identity(const Bytes& tx_bytes);
+
 // tx_bytes parse, and their txid, hash and lane match the certificate.
 bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_bytes, std::string* error = nullptr);
 

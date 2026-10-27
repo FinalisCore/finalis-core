@@ -3054,6 +3054,14 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
     }
 
   SpecialValidationContext vctx = special_validation_context_locked(height);
+    // The parent's time signature, before execution: settling the escrows due now opens them with it.
+    const auto prev_time_signature = prev_time_signature_for_next_height_locked();
+    if (!prev_time_signature.has_value()) {
+      last_test_hook_error_ = "frontier-build-time-signature-unavailable";
+      return std::nullopt;
+    }
+    const auto timed = consensus::timed_execution_context_for(canonical_derivation_config_locked(), *canonical_state_,
+                                                              height, *prev_time_signature);
 
     consensus::FrontierExecutionResult result;
     std::string validation_error;
@@ -3062,7 +3070,7 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                                                  canonical_state_->finalized_frontier_vector,
                                                  selection.next_vector, selection.lane_records,
                                                  canonical_state_->finalized_lane_roots, &vctx, &result, &validation_error,
-                                                 /*compute_next_state_root=*/false, &parent_tree)) {
+                                                 /*compute_next_state_root=*/false, &parent_tree, &timed)) {
       if (attempt == 0 &&
           (validation_error.find("frontier-certified-ingress-prev-root-mismatch") != std::string::npos ||
            validation_error.find("frontier-certified-ingress-prev-root-state-mismatch") != std::string::npos)) {
@@ -3078,11 +3086,6 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       return std::nullopt;
     }
     const auto prev_finality = prev_finality_record_for_next_height_locked();
-    const auto prev_time_signature = prev_time_signature_for_next_height_locked();
-    if (!prev_time_signature.has_value()) {
-      last_test_hook_error_ = "frontier-build-time-signature-unavailable";
-      return std::nullopt;
-    }
     // Wall clock; populate raises it to parent + 1 when the clock is behind the chain.
     result.transition.timestamp = now_unix();
     if (!consensus::populate_frontier_transition_metadata(canonical_derivation_config_locked(), *canonical_state_, height, round,

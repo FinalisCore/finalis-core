@@ -7,6 +7,7 @@
 
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/tx.hpp"
 
 namespace finalis {
@@ -52,6 +53,27 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const Hash32& chain_domain, 
 std::optional<Tx> build_unbond_tx(const Hash32& chain_domain, const OutPoint& bond_outpoint, const PubKey32& validator_pubkey,
                                   std::uint64_t bond_value, std::uint64_t fee,
                                   const Bytes& validator_privkey_32, std::string* err = nullptr);
+// A time-locked transaction (utxo/confidential_tx.hpp, TxTimed): `body` sealed under a fresh key
+// that is SWE-encrypted, with its well-formedness proof, to `committee_keys` (the checkpoint keys of
+// epoch_of(unlock_height), in order, with root committee_root) at `threshold`; the fee input is a
+// P2PKH output of `fee_private_key_32` and must hold exactly prepaid_fee + forfeit_bond + change.
+// `seed_32` must be fresh and secret: whoever learns it can open the body before unlock_height.
+struct TimedTxParams {
+  OutPoint fee_outpoint{};
+  TxOut fee_prev_out;
+  std::uint64_t prepaid_fee{0};
+  std::uint64_t forfeit_bond{0};
+  Bytes bond_refund_script;
+  std::optional<TxOut> fee_change;
+  std::uint64_t unlock_height{0};
+  std::uint64_t committee_epoch{0};
+  Hash32 committee_root{};
+  std::vector<crypto::BlsPublicKey> committee_keys;
+  std::uint32_t threshold{0};
+};
+std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const AnyTx& body,
+                                             const Bytes& fee_private_key_32, const Hash32& seed_32,
+                                             std::string* err = nullptr);
 // A validator's BLS key (derived from its Ed25519 seed, crypto::bls_key_from_validator_seed) and its
 // proof of possession, as registration scripts and genesis entries carry them.
 struct ValidatorBlsRegistration {

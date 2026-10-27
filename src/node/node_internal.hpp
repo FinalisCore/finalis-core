@@ -129,6 +129,9 @@ FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_
 bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state);
 bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDerivedState& state);
 void stage_canonical_scalars(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state);
+// TxTimed escrow rows: "TE:" + hex(u64le unlock | u64le inclusion height | u32le index) -> envelope.
+std::string timed_escrow_db_key(const consensus::TimedEscrowKey& key);
+consensus::TimedEscrowState load_timed_escrows(const storage::DB& db);
 // Per-finalized-block persistence: stages only the rows that differ between consecutive states (the
 // full rewrite above is for startup and repair).
 // Per-height UTXO tree change rows kept for readers (lightserver) catching up their in-memory tree.
