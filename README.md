@@ -15,7 +15,7 @@
   <a href="https://github.com/FinalisCore/finalis-core/actions/workflows/formal-verification.yml"><img src="https://github.com/FinalisCore/finalis-core/actions/workflows/formal-verification.yml/badge.svg" alt="TLA+ model checking"></a>
   <a href="https://github.com/FinalisCore/finalis-core/actions/workflows/cflite-batch.yml"><img src="https://github.com/FinalisCore/finalis-core/actions/workflows/cflite-batch.yml/badge.svg" alt="Fuzzing"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <a href="testnet/JOIN.md"><img src="https://img.shields.io/badge/testnet--2-live-brightgreen.svg" alt="testnet-2 live"></a>
+  <a href="testnet/JOIN.md"><img src="https://img.shields.io/badge/testnet--3-live-brightgreen.svg" alt="testnet-3 live"></a>
   <a href="https://discord.gg/8rKfKc7QR9"><img src="https://img.shields.io/badge/chat-Discord-5865F2.svg" alt="Discord"></a>
 </p>
 
@@ -64,7 +64,7 @@
 
 ## Get Involved
 
-**Run a node or become a validator.** testnet-2 starts on 2026-10-24 at
+**Run a node or become a validator.** testnet-3 starts on 2026-10-28 at
 17:00 UTC and runs mainnet's rules. Its coins have no value, and validator
 bonds are free from the team. Four independent validators is the first size
 that survives one going down, and ten is the next goal.

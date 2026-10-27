@@ -2,9 +2,9 @@
 
 Finalis is a blockchain where every block is final the moment validators sign it: no waiting for
 confirmations and no reorgs, with confidential (amount-hiding) transactions built in from genesis.
-**testnet-2** starts on 24 October 2026 at 17:00 UTC. It uses mainnet's rules with its own identity,
-and its coins (FLS) **have no value**. (It replaces testnet-1; if you ran a testnet-1 node, see
-[README.md](README.md#genesis-testnet-2).)
+**testnet-3** starts on 28 October 2026 at 17:00 UTC. It uses mainnet's rules with its own identity,
+and its coins (FLS) **have no value**. (It replaces testnet-2; if you ran a testnet-2 node, see
+[README.md](README.md#genesis-testnet-3).)
 
 We are looking for people to run nodes and, if they want, to become validators. Today the testnet
 has **one** validator, so every block depends on a single machine. Four independent validators is
@@ -95,7 +95,7 @@ curl -s http://127.0.0.1:19544/rpc -d '{"jsonrpc":"2.0","id":1,"method":"get_sta
 ```
 
 Look for `"network_name":"testnet"`, `"chain_id_ok":true` and a `genesis_hash` starting with
-`4faa7e1b`.
+`887c5294`.
 
 ## 3. Let other nodes connect to you (recommended)
 
