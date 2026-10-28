@@ -89,6 +89,15 @@ std::optional<std::string> http_header_value(std::string_view request, std::stri
   return found;
 }
 
+bool is_http_header_name(std::string_view name) {
+  if (name.empty() || name.size() > 64) return false;
+  for (const char c : name) {
+    const auto u = static_cast<unsigned char>(c);
+    if (std::isalnum(u) == 0 && std::strchr("!#$%&'*+-.^_`|~", c) == nullptr) return false;
+  }
+  return true;
+}
+
 std::optional<std::string> parse_client_ip_literal(const std::string& raw) {
   in_addr v4{};
   if (::inet_pton(AF_INET, raw.c_str(), &v4) == 1) {

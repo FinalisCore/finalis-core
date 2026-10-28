@@ -772,6 +772,12 @@ http://127.0.0.1:18080/
     the proxy must limit connections per client itself
 - the proxy must overwrite `X-Real-IP` and `X-Finalis-Mtls-Verified` on every location, or
   clients can forge them; the nginx template does
+- behind a Cloudflare tunnel (cloudflared to `http://localhost:<port>`), add
+  `--client-ip-header CF-Connecting-IP` (`CLIENT_IP_HEADER=CF-Connecting-IP` with
+  `BEHIND_PROXY=1 scripts/start.sh`). cloudflared passes client headers through unchanged, so
+  `X-Real-IP` would be whatever the client sent; the Cloudflare edge overwrites
+  `CF-Connecting-IP`. For the same reason `X-Finalis-Mtls-Verified` is forgeable through a
+  tunnel: do not use `--partner-mtls-required` behind one
 - the explorer remains a thin finalized-state read surface and does not maintain
   its own chain/index database
 - `/healthz` is suitable for simple process-plus-upstream reachability checks

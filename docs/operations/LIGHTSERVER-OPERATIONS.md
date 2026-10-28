@@ -110,7 +110,9 @@ never apply. In that case start the lightserver with `--trusted-proxy 127.0.0.1/
 - an IPv6 client is limited as its /64.
 
 The proxy must set `X-Real-IP` itself (overwriting the client's), as `packaging/nginx/finalis.conf.in`
-does. The older alternative, `--rate-limit-loopback`, puts every public client in one shared bucket;
+does. Behind a Cloudflare tunnel, which passes client headers through, use
+`--client-ip-header CF-Connecting-IP` (node: `--lightserver-client-ip-header`; start.sh:
+`CLIENT_IP_HEADER`): the edge overwrites that header. The older alternative, `--rate-limit-loopback`, puts every public client in one shared bucket;
 `--with-lightserver` does not forward it.
 
 ### 3.2 Capacity

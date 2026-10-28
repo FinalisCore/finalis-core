@@ -69,6 +69,15 @@ TEST(test_node_lightserver_trusted_proxy_arg) {
   auto ok_cfg = node::parse_args(static_cast<int>(ok_argv.size()), ok_argv.data());
   ASSERT_TRUE(ok_cfg.has_value());
   ASSERT_EQ(ok_cfg->lightserver_trusted_proxy, "127.0.0.1/32");
+  ASSERT_TRUE(ok_cfg->lightserver_client_ip_header.empty());
+  std::vector<std::string> cf_args = {"finalis-node", "--testnet", "--disable-p2p", "--lightserver-client-ip-header", "CF-Connecting-IP"};
+  auto cf_argv = make_argv(cf_args);
+  auto cf_cfg = node::parse_args(static_cast<int>(cf_argv.size()), cf_argv.data());
+  ASSERT_TRUE(cf_cfg.has_value());
+  ASSERT_EQ(cf_cfg->lightserver_client_ip_header, "CF-Connecting-IP");
+  std::vector<std::string> bad_hdr = {"finalis-node", "--testnet", "--disable-p2p", "--lightserver-client-ip-header", "a b"};
+  auto bad_hdr_argv = make_argv(bad_hdr);
+  ASSERT_TRUE(!node::parse_args(static_cast<int>(bad_hdr_argv.size()), bad_hdr_argv.data()).has_value());
 
   // Rejected here, not later in the lightserver child where the failure is only a log line.
   std::vector<std::string> bad_args = {"finalis-node", "--testnet", "--disable-p2p", "--lightserver-trusted-proxy", "localhost"};

@@ -590,6 +590,10 @@ bool Node::start_lightserver_child() {
     args.push_back("--trusted-proxy");
     args.push_back(cfg_.lightserver_trusted_proxy);
   }
+  if (!cfg_.lightserver_client_ip_header.empty()) {
+    args.push_back("--client-ip-header");
+    args.push_back(cfg_.lightserver_client_ip_header);
+  }
 
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);

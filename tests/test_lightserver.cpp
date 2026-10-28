@@ -2628,6 +2628,19 @@ TEST(test_lightserver_parse_args_trusted_proxy) {
   ASSERT_EQ(ok->trusted_proxies.size(), 1u);
   ASSERT_TRUE(!parse({"--trusted-proxy", "not-a-cidr"}).has_value());
   ASSERT_TRUE(!parse({"--trusted-proxy"}).has_value());
+  ASSERT_EQ(ok->client_ip_header, "X-Real-IP");
+  const auto cf = parse({"--trusted-proxy", "127.0.0.1/32", "--client-ip-header", "CF-Connecting-IP"});
+  ASSERT_TRUE(cf.has_value());
+  ASSERT_EQ(cf->client_ip_header, "CF-Connecting-IP");
+  ASSERT_TRUE(!parse({"--client-ip-header", "X Real IP"}).has_value());
+  ASSERT_TRUE(!parse({"--client-ip-header", ""}).has_value());
+  ASSERT_TRUE(!parse({"--client-ip-header", "X-Real-IP:"}).has_value());
+  // Behind a Cloudflare tunnel the client's own X-Real-IP is passed through; only CF-Connecting-IP counts.
+  const std::string req = "POST /rpc HTTP/1.1\r\nX-Real-IP: 1.2.3.4\r\ncf-connecting-ip: 203.0.113.7\r\n\r\n";
+  ASSERT_EQ(finalis::net::forwarded_client_ip("127.0.0.1", cf->trusted_proxies,
+                                              finalis::net::http_header_value(req, cf->client_ip_header))
+                .value_or(""),
+            "203.0.113.7");
 }
 
 // Behind a same-host proxy every connection is from 127.0.0.1. Forwarded requests must be limited per

@@ -26,6 +26,12 @@ bool ipv4_in_cidrs(const std::string& ip, const std::vector<Ipv4Cidr>& cidrs);
 // Value of header `name` (case-insensitive) in a raw HTTP request head. nullopt if absent or repeated.
 std::optional<std::string> http_header_value(std::string_view request, std::string_view name);
 
+// Header in which the trusted proxy names the client. nginx sets X-Real-IP; a Cloudflare tunnel passes
+// client headers through unchanged and names the client in CF-Connecting-IP, which the edge overwrites.
+inline constexpr const char* kDefaultClientIpHeader = "X-Real-IP";
+// An RFC 9110 field-name token (the value of --client-ip-header).
+bool is_http_header_name(std::string_view name);
+
 // X-Real-IP as an IPv4 or IPv6 literal in canonical form; nullopt for anything else.
 std::optional<std::string> parse_client_ip_literal(const std::string& raw);
 

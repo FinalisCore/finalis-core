@@ -30,6 +30,9 @@ LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-${DEFAULT_LIGHTSERVER_PORT}}"
 # X-Real-IP (TRUSTED_PROXY); the firewall opens 80/443 instead of the lightserver port.
 BEHIND_PROXY="${BEHIND_PROXY:-0}"
 TRUSTED_PROXY="${TRUSTED_PROXY:-127.0.0.1/32}"
+# CLIENT_IP_HEADER=CF-Connecting-IP behind a Cloudflare tunnel: cloudflared passes client headers through,
+# so a client-sent X-Real-IP would be trusted; the edge overwrites CF-Connecting-IP.
+CLIENT_IP_HEADER="${CLIENT_IP_HEADER:-X-Real-IP}"
 if [[ "${BEHIND_PROXY}" == "1" ]]; then DEFAULT_PUBLIC_BIND=127.0.0.1; else DEFAULT_PUBLIC_BIND=0.0.0.0; fi
 LIGHTSERVER_BIND="${LIGHTSERVER_BIND:-${DEFAULT_PUBLIC_BIND}}"
 WITH_LIGHTSERVER="${WITH_LIGHTSERVER:-1}"
@@ -866,7 +869,7 @@ build_node_command() {
       "--lightserver-port" "${LIGHTSERVER_PORT}"
     )
     if [[ "${BEHIND_PROXY}" == "1" ]]; then
-      args+=("--lightserver-trusted-proxy" "${TRUSTED_PROXY}")
+      args+=("--lightserver-trusted-proxy" "${TRUSTED_PROXY}" "--lightserver-client-ip-header" "${CLIENT_IP_HEADER}")
     fi
   fi
 
@@ -912,7 +915,7 @@ build_explorer_command() {
     "--rpc-url" "${EXPLORER_RPC_URL}"
   )
   if [[ "${BEHIND_PROXY}" == "1" ]]; then
-    args+=("--trusted-proxy" "${TRUSTED_PROXY}")
+    args+=("--trusted-proxy" "${TRUSTED_PROXY}" "--client-ip-header" "${CLIENT_IP_HEADER}")
   fi
   printf '%q ' "${args[@]}"
 }

@@ -83,6 +83,8 @@ struct NodeConfig {
   std::string lightserver_admin_socket{default_admin_socket_path("mainnet")};
   // Forwarded as the lightserver's --trusted-proxy (comma-separated IPv4 CIDRs); empty: none.
   std::string lightserver_trusted_proxy;
+  // Forwarded as the lightserver's --client-ip-header; empty: its default (X-Real-IP).
+  std::string lightserver_client_ip_header;
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};

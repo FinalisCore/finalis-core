@@ -1146,6 +1146,35 @@ TEST(test_explorer_anonymous_rate_limit_keys_on_proxy_reported_client) {
   ASSERT_EQ(get_from("192.0.2.31", "198.51.100.42"), 429);
 }
 
+TEST(test_explorer_client_ip_header_selects_the_proxy_header) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  Config cfg = test_config();
+  cfg.partner_rate_limit_per_minute = 1;
+  cfg.trusted_proxies = *finalis::net::parse_ipv4_cidr_list("127.0.0.1/32");
+  std::vector<char*> argv;
+  std::vector<std::string> args = {"finalis-explorer", "--trusted-proxy", "127.0.0.1/32", "--client-ip-header", "CF-Connecting-IP"};
+  for (auto& s : args) argv.push_back(s.data());
+  const auto parsed = parse_args(static_cast<int>(argv.size()), argv.data());
+  ASSERT_TRUE(parsed.has_value());
+  ASSERT_EQ(parsed->client_ip_header, "cf-connecting-ip");
+  cfg.client_ip_header = parsed->client_ip_header;
+  args[4] = "bad header";
+  argv.clear();
+  for (auto& s : args) argv.push_back(s.data());
+  ASSERT_TRUE(!parse_args(static_cast<int>(argv.size()), argv.data()).has_value());
+
+  auto get = [&](const std::string& cf_ip, const std::string& real_ip) {
+    return handle_request(cfg, make_http_request("GET", "/api/v1/committee", {{"CF-Connecting-IP", cf_ip}, {"X-Real-IP", real_ip}}, ""),
+                          "127.0.0.1")
+        .status;
+  };
+  // The window follows CF-Connecting-IP; a client rotating its own X-Real-IP gains nothing.
+  ASSERT_TRUE(get("198.51.100.71", "10.0.0.1") != 429);
+  ASSERT_EQ(get("198.51.100.71", "10.0.0.2"), 429);
+  ASSERT_TRUE(get("198.51.100.72", "10.0.0.2") != 429);
+}
+
 TEST(test_explorer_connection_cap_exempts_trusted_proxy) {
   Config cfg = test_config();
   cfg.trusted_proxies = *finalis::net::parse_ipv4_cidr_list("127.0.0.1/32");

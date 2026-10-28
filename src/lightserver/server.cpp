@@ -1901,7 +1901,7 @@ void Server::handle_client(const Job& job) {
   const std::string body = req.substr(hdr_end + 4);
   // Every public request is charged, including malformed ones, before any further work.
   const auto forwarded_ip =
-      net::forwarded_client_ip(job.peer_ip, cfg_.trusted_proxies, net::http_header_value(req, "X-Real-IP"));
+      net::forwarded_client_ip(job.peer_ip, cfg_.trusted_proxies, net::http_header_value(req, cfg_.client_ip_header));
   const std::string client_ip = forwarded_ip.value_or(job.peer_ip);
   const bool loopback_exempt =
       !forwarded_ip.has_value() && cfg_.exempt_loopback_from_rate_limits && job.peer_ip.rfind("127.", 0) == 0;
@@ -3872,6 +3872,10 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto parsed = net::parse_ipv4_cidr_list(*v);
       if (!parsed.has_value()) return std::nullopt;
       cfg.trusted_proxies = std::move(*parsed);
+    } else if (a == "--client-ip-header") {
+      auto v = next();
+      if (!v || !net::is_http_header_name(*v)) return std::nullopt;
+      cfg.client_ip_header = *v;
     } else {
       return std::nullopt;
     }
