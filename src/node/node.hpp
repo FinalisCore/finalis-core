@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
@@ -30,6 +31,7 @@
 #include "mempool/mempool.hpp"
 #include "p2p/messages.hpp"
 #include "p2p/addrman.hpp"
+#include "p2p/endpoints.hpp"
 #include "p2p/peer_manager.hpp"
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
@@ -85,6 +87,10 @@ struct NodeConfig {
   std::string lightserver_trusted_proxy;
   // Forwarded as the lightserver's --client-ip-header; empty: its default (X-Real-IP).
   std::string lightserver_client_ip_header;
+  // Announced to the network as this node's public lightserver (p2p/endpoints.hpp); empty: none.
+  std::string public_lightserver_url;
+  // Announce it even while this node is a registered validator (off by default; see node_endpoints.cpp).
+  bool announce_endpoint_as_validator{false};
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};
@@ -410,6 +416,14 @@ class Node {
   void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bool reply = false);
   void on_getaddr(int peer_id, const Bytes& payload);
   void on_addr(int peer_id, const Bytes& payload);
+  // Public lightserver discovery (node_endpoints.cpp).
+  void on_get_endpoints(int peer_id, const Bytes& payload);
+  void on_endpoints(int peer_id, const Bytes& payload);
+  void maybe_request_endpoints(int peer_id);
+  // Event loop: expire, re-announce this node's endpoint, pull from a random peer, persist.
+  void maintain_endpoints();
+  void persist_endpoints_locked();
+  bool endpoints_allow_private() const { return cfg_.network.name != "mainnet"; }
   void on_ping(int peer_id, const Bytes& payload);
   void on_pong(int peer_id, const Bytes& payload);
 
@@ -1147,6 +1161,19 @@ class Node {
   std::optional<Hash32> expected_genesis_hash_;
   std::string genesis_source_hint_{"embedded"};
   std::set<int> getaddr_requested_peers_;
+  p2p::EndpointTable endpoints_;
+  std::optional<crypto::KeyPair> endpoint_key_;
+  std::optional<p2p::EndpointAnnouncement> own_endpoint_;
+  bool own_endpoint_verified_{false};  // its URL was seen to reach this node's lightserver
+  std::atomic<int> endpoint_self_check_{0};
+  std::string endpoint_self_check_detail_;
+  std::thread endpoint_self_check_thread_;
+  std::uint64_t next_endpoint_self_check_ms_{0};
+  std::set<int> endpoints_requested_peers_;
+  std::mt19937_64 endpoint_rng_{std::random_device{}()};
+  std::uint64_t last_endpoint_pull_ms_{0};
+  std::uint64_t last_endpoint_persist_ms_{0};
+  bool endpoints_dirty_{false};
   std::string last_bootstrap_source_{"none"};
   std::string mining_log_path_;
   bool bootstrap_template_mode_{false};

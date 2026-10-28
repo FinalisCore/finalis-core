@@ -2,15 +2,24 @@
 
 #include "lightserver/client.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <limits>
 #include <sstream>
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
+#include <cstdlib>
+#include <memory>
+
 #include "codec/bytes.hpp"
 #include "common/minijson.hpp"
 #include "common/paths.hpp"
 #include "common/socket_compat.hpp"
+#include "utxo/validate.hpp"
 
 #ifndef _WIN32
 #include <sys/un.h>
@@ -20,9 +29,10 @@ namespace finalis::lightserver {
 namespace {
 
 struct ParsedHttpUrl {
-  std::string host;
+  std::string host;  // without IPv6 brackets
   std::uint16_t port{0};
   std::string path;
+  bool tls{false};
 };
 
 struct UtxoCursor {
@@ -40,7 +50,7 @@ struct UtxoPageView {
 std::optional<net::SocketHandle> connect_tcp(const std::string& host, std::uint16_t port) {
   if (!net::ensure_sockets()) return std::nullopt;
   addrinfo hints{};
-  hints.ai_family = AF_INET;
+  hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
   if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return std::nullopt;
@@ -87,21 +97,138 @@ std::optional<net::SocketHandle> connect_unix(const std::string& path) {
 #endif
 }
 
+// http://host[:port][/path] or https://...; host may be a bracketed IPv6 literal. Default ports 80/443.
 std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
-  const std::string prefix = "http://";
-  if (url.rfind(prefix, 0) != 0) return std::nullopt;
-  const std::string rest = url.substr(prefix.size());
+  ParsedHttpUrl parsed;
+  std::string rest;
+  if (url.rfind("http://", 0) == 0) {
+    rest = url.substr(7);
+  } else if (url.rfind("https://", 0) == 0) {
+    rest = url.substr(8);
+    parsed.tls = true;
+  } else {
+    return std::nullopt;
+  }
   const auto slash = rest.find('/');
   const std::string hostport = (slash == std::string::npos) ? rest : rest.substr(0, slash);
-  const std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-  const auto colon = hostport.rfind(':');
-  if (colon == std::string::npos) return std::nullopt;
-  ParsedHttpUrl parsed;
-  parsed.host = hostport.substr(0, colon);
-  parsed.port = static_cast<std::uint16_t>(std::stoi(hostport.substr(colon + 1)));
-  parsed.path = path;
+  parsed.path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+  std::string port;
+  if (!hostport.empty() && hostport.front() == '[') {
+    const auto close = hostport.find(']');
+    if (close == std::string::npos) return std::nullopt;
+    parsed.host = hostport.substr(1, close - 1);
+    const std::string after = hostport.substr(close + 1);
+    if (!after.empty()) {
+      if (after.front() != ':') return std::nullopt;
+      port = after.substr(1);
+    }
+  } else {
+    const auto colon = hostport.rfind(':');
+    parsed.host = hostport.substr(0, colon);
+    if (colon != std::string::npos) {
+      port = hostport.substr(colon + 1);
+      if (port.empty()) return std::nullopt;
+    }
+  }
+  if (parsed.host.empty()) return std::nullopt;
+  if (port.empty()) {
+    parsed.port = parsed.tls ? 443 : 80;
+  } else {
+    if (port.size() > 5 || !std::all_of(port.begin(), port.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+      return std::nullopt;
+    }
+    const auto p = std::stoul(port);
+    if (p == 0 || p > 65535) return std::nullopt;
+    parsed.port = static_cast<std::uint16_t>(p);
+  }
   return parsed;
 }
+
+// One TLS client session over a connected socket: certificate chain checked against the system trust
+// store (or FINALIS_CA_FILE), and the certificate must name the host (DNS name or IP address).
+class TlsSession {
+ public:
+  static std::unique_ptr<TlsSession> open(net::SocketHandle fd, const std::string& host, std::string* err) {
+    auto out = std::unique_ptr<TlsSession>(new TlsSession());
+    out->ctx_ = SSL_CTX_new(TLS_client_method());
+    if (!out->ctx_) return fail(err, "tls init failed");
+    (void)SSL_CTX_set_min_proto_version(out->ctx_, TLS1_2_VERSION);
+    SSL_CTX_set_verify(out->ctx_, SSL_VERIFY_PEER, nullptr);
+#ifdef SSL_OP_IGNORE_UNEXPECTED_EOF
+    SSL_CTX_set_options(out->ctx_, SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
+    const char* ca_file = std::getenv("FINALIS_CA_FILE");
+    if (ca_file && *ca_file) {
+      if (SSL_CTX_load_verify_locations(out->ctx_, ca_file, nullptr) != 1) return fail(err, "cannot load FINALIS_CA_FILE");
+    } else if (SSL_CTX_set_default_verify_paths(out->ctx_) != 1) {
+      return fail(err, "no system trust store");
+    }
+    out->ssl_ = SSL_new(out->ctx_);
+    if (!out->ssl_) return fail(err, "tls init failed");
+    in6_addr a6{};
+    in_addr a4{};
+    const bool is_ip = ::inet_pton(AF_INET, host.c_str(), &a4) == 1 || ::inet_pton(AF_INET6, host.c_str(), &a6) == 1;
+    if (is_ip) {
+      if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(out->ssl_), host.c_str()) != 1) return fail(err, "tls ip check setup failed");
+    } else {
+      if (SSL_set_tlsext_host_name(out->ssl_, host.c_str()) != 1 || SSL_set1_host(out->ssl_, host.c_str()) != 1) {
+        return fail(err, "tls host check setup failed");
+      }
+    }
+    if (SSL_set_fd(out->ssl_, static_cast<int>(fd)) != 1) return fail(err, "tls init failed");
+    if (SSL_connect(out->ssl_) != 1) {
+      const long verify = SSL_get_verify_result(out->ssl_);
+      return fail(err, verify != X509_V_OK ? std::string("tls certificate rejected: ") + X509_verify_cert_error_string(verify)
+                                           : std::string("tls handshake failed"));
+    }
+    return out;
+  }
+  ~TlsSession() {
+    if (ssl_) {
+      (void)SSL_shutdown(ssl_);
+      SSL_free(ssl_);
+    }
+    if (ctx_) SSL_CTX_free(ctx_);
+  }
+  bool write_all(const std::string& data) {
+    std::size_t off = 0;
+    while (off < data.size()) {
+      const int n = SSL_write(ssl_, data.data() + off, static_cast<int>(std::min<std::size_t>(data.size() - off, 1 << 20)));
+      if (n <= 0) return false;
+      off += static_cast<std::size_t>(n);
+    }
+    return true;
+  }
+  std::optional<std::string> read_all(std::size_t max_bytes) {
+    std::string out;
+    std::array<char, 4096> buf{};
+    while (true) {
+      const int n = SSL_read(ssl_, buf.data(), static_cast<int>(buf.size()));
+      if (n > 0) {
+        out.append(buf.data(), static_cast<std::size_t>(n));
+        if (out.size() > max_bytes) return std::nullopt;
+        continue;
+      }
+      const int e = SSL_get_error(ssl_, n);
+      if (e == SSL_ERROR_ZERO_RETURN) break;
+      // A server closing without close_notify after a full response (Connection: close).
+      if (e == SSL_ERROR_SYSCALL && !out.empty()) break;
+      if (e == SSL_ERROR_SSL && !out.empty() && ERR_GET_REASON(ERR_peek_last_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) break;
+      return std::nullopt;
+    }
+    return out;
+  }
+
+ private:
+  TlsSession() = default;
+  static std::unique_ptr<TlsSession> fail(std::string* err, const std::string& what) {
+    if (err) *err = what;
+    ERR_clear_error();
+    return nullptr;
+  }
+  SSL_CTX* ctx_{nullptr};
+  SSL* ssl_{nullptr};
+};
 
 bool write_all(net::SocketHandle fd, const std::string& data) {
   size_t off = 0;
@@ -129,10 +256,19 @@ std::optional<std::string> read_all(net::SocketHandle fd) {
   return out;
 }
 
-std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body,
+                                          const std::vector<std::pair<std::string, std::string>>& headers,
+                                          std::string* err) {
+  for (const auto& [k, v] : headers) {
+    if (k.find_first_of("\r\n:") != std::string::npos || v.find_first_of("\r\n") != std::string::npos) {
+      if (err) *err = "invalid header";
+      return std::nullopt;
+    }
+  }
   std::optional<net::SocketHandle> fd_opt;
   std::string path = "/rpc";
   std::string host_header = "localhost";
+  std::optional<std::string> tls_host;
   if (const auto socket_path = parse_unix_socket_url(url); socket_path.has_value()) {
     fd_opt = connect_unix(*socket_path);
   } else {
@@ -143,7 +279,9 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
     }
     fd_opt = connect_tcp(parsed->host, parsed->port);
     path = parsed->path;
-    host_header = parsed->host + ":" + std::to_string(parsed->port);
+    const bool v6 = parsed->host.find(':') != std::string::npos;
+    host_header = (v6 ? "[" + parsed->host + "]" : parsed->host) + ":" + std::to_string(parsed->port);
+    tls_host = parsed->tls ? std::optional<std::string>(parsed->host) : std::nullopt;
   }
   if (!fd_opt) {
     if (err) *err = "connect failed";
@@ -153,16 +291,36 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
   std::ostringstream req;
   req << "POST " << path << " HTTP/1.1\r\n"
       << "Host: " << host_header << "\r\n"
-      << "Content-Type: application/json\r\n"
-      << "Content-Length: " << body.size() << "\r\n"
+      << "Content-Type: application/json\r\n";
+  for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
+  req << "Content-Length: " << body.size() << "\r\n"
       << "Connection: close\r\n\r\n"
       << body;
-  if (!write_all(fd, req.str())) {
-    net::close_socket(fd);
-    if (err) *err = "send failed";
-    return std::nullopt;
+  std::optional<std::string> resp;
+  if (tls_host.has_value()) {
+    std::string tls_err;
+    auto tls = TlsSession::open(fd, *tls_host, &tls_err);
+    if (!tls) {
+      net::close_socket(fd);
+      if (err) *err = tls_err;
+      return std::nullopt;
+    }
+    if (!tls->write_all(req.str())) {
+      tls.reset();
+      net::close_socket(fd);
+      if (err) *err = "send failed";
+      return std::nullopt;
+    }
+    resp = tls->read_all(kMaxRpcResponseBytes);
+    tls.reset();
+  } else {
+    if (!write_all(fd, req.str())) {
+      net::close_socket(fd);
+      if (err) *err = "send failed";
+      return std::nullopt;
+    }
+    resp = read_all(fd);
   }
-  auto resp = read_all(fd);
   net::close_socket(fd);
   if (!resp) {
     if (err) *err = "read failed";
@@ -174,6 +332,10 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
     return std::nullopt;
   }
   return resp->substr(body_pos + 4);
+}
+
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
+  return http_post_json(url, body, {}, err);
 }
 
 const minijson::Value* result_value(const minijson::Value& root, std::string* err) {
@@ -578,6 +740,8 @@ std::optional<RpcStatusView> rpc_get_status(const std::string& rpc_url, std::str
   out.healthy_peer_count = healthy_peer_count;
   out.established_peer_count = established_peer_count;
   out.chain_id_ok = chain_id_ok.value_or(true);
+  out.endpoint_pubkey_hex = object_string(result, "endpoint_pubkey").value_or("");
+  out.base_fee_per_kib = object_u64(result, "base_fee_per_kib").value_or(1);
   if (sync && sync->is_object()) {
     out.observed_network_height_known = object_bool(sync, "observed_network_height_known").value_or(false);
     out.peer_height_disagreement = object_bool(sync, "peer_height_disagreement").value_or(false);
@@ -950,6 +1114,60 @@ std::optional<TxStatusView> rpc_get_tx_status(const std::string& rpc_url, const 
   return out;
 }
 
+std::optional<std::vector<p2p::EndpointAnnouncement>> rpc_get_lightserver_endpoints(const std::string& rpc_url,
+                                                                                     std::string* err) {
+  auto body = http_post_json(rpc_url, R"({"jsonrpc":"2.0","id":36,"method":"get_lightserver_endpoints","params":{}})", err);
+  if (!body) return std::nullopt;
+  auto root = minijson::parse(*body);
+  if (!root.has_value()) {
+    if (err) *err = "invalid rpc response";
+    return std::nullopt;
+  }
+  const auto* result = result_value(*root, err);
+  const auto* list = result && result->is_object() ? result->get("endpoints") : nullptr;
+  if (!list || !list->is_array()) {
+    if (err && err->empty()) *err = "missing endpoints";
+    return std::nullopt;
+  }
+  std::vector<p2p::EndpointAnnouncement> out;
+  for (const auto& item : list->array_value) {
+    if (out.size() >= p2p::kEndpointTableCapacity) break;
+    const auto pub = hex_decode(object_string(&item, "pubkey").value_or(""));
+    const auto sig = hex_decode(object_string(&item, "signature").value_or(""));
+    const auto url = object_string(&item, "url");
+    const auto issued = object_u64(&item, "issued_unix");
+    if (!pub || pub->size() != 32 || !sig || sig->size() != 64 || !url || url->size() > p2p::kMaxEndpointUrlBytes ||
+        !issued) {
+      continue;
+    }
+    p2p::EndpointAnnouncement a;
+    std::copy(pub->begin(), pub->end(), a.pubkey.begin());
+    std::copy(sig->begin(), sig->end(), a.signature.begin());
+    a.url = *url;
+    a.issued_unix = *issued;
+    out.push_back(std::move(a));
+  }
+  return out;
+}
+
+bool probe_announced_endpoint(const p2p::EndpointAnnouncement& a, const Hash32& chain_domain, bool allow_private,
+                              std::uint64_t now_unix, std::string* why) {
+  const auto fail = [&](const std::string& reason) {
+    if (why) *why = reason;
+    return false;
+  };
+  if (!p2p::verify_endpoint_announcement(chain_domain, a, now_unix, allow_private)) return fail("bad announcement");
+  std::string err;
+  const auto status = rpc_get_status(a.url, &err);
+  if (!status) return fail("unreachable: " + err);
+  const auto domain = chain_domain_from_hex(status->chain.network_id_hex, status->chain.genesis_hash_hex);
+  if (!domain || *domain != chain_domain) return fail("serves another chain");
+  if (status->endpoint_pubkey_hex != hex_encode(Bytes(a.pubkey.begin(), a.pubkey.end()))) {
+    return fail("server does not report the announced key");
+  }
+  return true;
+}
+
 std::optional<TimedRevealView> rpc_get_timed_reveal(const std::string& rpc_url, const Hash32& timed_txid, std::string* err) {
   const std::string body_json = std::string(R"({"jsonrpc":"2.0","id":35,"method":"get_timed_reveal","params":{"txid":")") +
                                 hex_encode32(timed_txid) + R"("}})";
@@ -1070,6 +1288,12 @@ std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_st
 
 std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body, std::string* err) {
   return http_post_json(url, body, err);
+}
+
+std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body,
+                                              const std::vector<std::pair<std::string, std::string>>& headers,
+                                              std::string* err) {
+  return http_post_json(url, body, headers, err);
 }
 
 }  // namespace finalis::lightserver

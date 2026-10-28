@@ -269,7 +269,9 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
       }
       return false;
     }
-    if (*existing_cert == cert) return true;
+    // Already appended only if the lane tip covers it. A stored certificate above the tip is an
+    // orphan of an interrupted append: applying it again is the repair, or the lane stays wedged.
+    if (*existing_cert == cert && lane_state.has_value() && lane_state->max_seq >= cert.seq) return true;
   }
 
   if (lane_state.has_value()) {
@@ -295,22 +297,13 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
     return false;
   }
 
-  if (!db.put_ingress_bytes(cert.txid, tx_bytes)) {
-    if (error) *error = "ingress-bytes-store-failed";
-    return false;
-  }
-  if (!db.put_ingress_certificate(cert.lane, cert.seq, cert.serialize())) {
-    if (error && error->empty()) *error = "ingress-certificate-store-failed";
-    return false;
-  }
-
   LaneState next_state;
   next_state.epoch = cert.epoch;
   next_state.lane = cert.lane;
   next_state.max_seq = cert.seq;
   next_state.lane_root = compute_lane_root_append(lane_state.has_value() ? lane_state->lane_root : zero_hash(), cert.tx_hash);
-  if (!db.put_lane_state(cert.lane, next_state)) {
-    if (error) *error = "lane-state-store-failed";
+  if (!db.append_ingress_record_atomic(cert.serialize(), tx_bytes, next_state)) {
+    if (error) *error = "ingress-append-store-failed";
     return false;
   }
   return true;

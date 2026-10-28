@@ -360,6 +360,7 @@ Bytes serialize_validator_join_request(const ValidatorJoinRequest& req) {
   w.u64le(req.requested_height);
   w.u64le(req.approved_height);
   w.u8(static_cast<std::uint8_t>(req.status));
+  w.bytes_fixed(req.bls_pubkey);
   return w.take();
 }
 
@@ -387,6 +388,11 @@ std::optional<ValidatorJoinRequest> parse_validator_join_request(const Bytes& b)
         req.requested_height = *requested_height;
         req.approved_height = *approved_height;
         req.status = static_cast<ValidatorJoinRequestStatus>(*status);
+        if (!r.eof()) {
+          auto bls = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+          if (!bls || !r.eof()) return false;
+          req.bls_pubkey = *bls;
+        }
         return true;
       })) {
     return std::nullopt;
@@ -687,6 +693,7 @@ Bytes serialize_epoch_reward_settlement(const EpochRewardSettlementState& state)
     w.bytes_fixed(pub);
     w.u64le(score);
   }
+  w.u64le(state.recycled_units);
   return w.take();
 }
 
@@ -753,7 +760,10 @@ std::optional<EpochRewardSettlementState> parse_epoch_reward_settlement(const By
           if (!pub || !score) return false;
           state.onboarding_score_units[*pub] = *score;
         }
-        if (!r.eof()) return false;
+        if (!r.remaining()) return true;
+        auto recycled = r.u64le();
+        if (!recycled || !r.eof()) return false;
+        state.recycled_units = *recycled;
         return true;
       })) {
     return std::nullopt;
@@ -1313,6 +1323,11 @@ std::string key_committee_handoff(std::uint64_t next_epoch_start) {
   return key_committee_handoff_prefix() + hex_encode(w.data());
 }
 std::string key_committee_handoff_prefix() { return "LCH:"; }
+std::string key_lightserver_endpoint(const PubKey32& pubkey) {
+  return key_lightserver_endpoint_prefix() + hex_encode(Bytes(pubkey.begin(), pubkey.end()));
+}
+std::string key_lightserver_endpoint_prefix() { return "LSEP:"; }
+std::string key_own_lightserver_endpoint() { return "LSEPSELF"; }
 std::string key_height(std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -1364,6 +1379,7 @@ std::string key_availability_persistent_state() { return "APS"; }
 std::string key_consensus_state_commitment_cache() { return "CSC:TIP"; }
 std::string key_protocol_reserve_balance() { return "PRB"; }
 std::string key_confidential_pool_value() { return "CPOOL"; }
+std::string key_base_fee_per_kib() { return "BASEFEE"; }
 std::string key_validator_onboarding(const PubKey32& pub) { return "VO:" + hex_encode(Bytes(pub.begin(), pub.end())); }
 std::string key_txidx_prefix() { return "X:"; }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
@@ -1652,6 +1668,12 @@ void DB::Batch::put_confidential_pool_value(std::uint64_t value_units) {
   codec::ByteWriter w;
   w.u64le(value_units);
   put(key_confidential_pool_value(), w.take());
+}
+
+void DB::Batch::put_base_fee_per_kib(std::uint64_t units) {
+  codec::ByteWriter w;
+  w.u64le(units);
+  put(key_base_fee_per_kib(), w.take());
 }
 
 void DB::Batch::put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint) {
@@ -2235,6 +2257,21 @@ std::optional<std::uint64_t> DB::get_protocol_reserve_balance() const {
   return out;
 }
 
+std::optional<std::uint64_t> DB::get_base_fee_per_kib() const {
+  auto b = get(key_base_fee_per_kib());
+  if (!b.has_value()) return std::nullopt;
+  std::optional<std::uint64_t> out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto value = r.u64le();
+        if (!value || !r.eof()) return false;
+        out = *value;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
 std::optional<std::uint64_t> DB::get_confidential_pool_value() const {
   auto b = get(key_confidential_pool_value());
   if (!b.has_value()) return std::nullopt;
@@ -2654,6 +2691,35 @@ bool DB::put_ingress_bytes(const Hash32& txid, const Bytes& tx_bytes) {
 }
 
 std::optional<Bytes> DB::get_ingress_bytes(const Hash32& txid) const { return get(key_ingress_bytes(txid)); }
+
+bool DB::append_ingress_record_atomic(const Bytes& cert_bytes, const Bytes& tx_bytes, const LaneState& next_state) {
+  const auto cert = IngressCertificate::parse(cert_bytes);
+  const auto fail = [&](const char* detail) {
+    std::cerr << "finalized-state-invariant-violation source=db-append-ingress-record lane=" << next_state.lane
+              << " seq=" << next_state.max_seq << " detail=" << detail << "\n";
+    return false;
+  };
+  if (!cert.has_value()) return fail("invalid-certificate");
+  if (next_state.lane != cert->lane || next_state.max_seq != cert->seq) return fail("state-mismatch");
+  if (auto existing = get_ingress_bytes(cert->txid); existing.has_value() && *existing != tx_bytes) {
+    return fail("conflicting-ingress-bytes");
+  }
+  if (auto existing = get(key_ingress_certificate(cert->lane, cert->seq)); existing.has_value() && *existing != cert_bytes) {
+    return fail("conflicting-rewrite");
+  }
+  const auto state = get_lane_state(cert->lane);
+  if (state.has_value()) {
+    if (cert->seq != state->max_seq + 1) return fail("gap");
+    if (cert->prev_lane_root != state->lane_root) return fail("prev-lane-root-mismatch");
+  } else if (cert->seq != 1) {
+    return fail("missing-lane-state");
+  }
+  Batch batch(*this);
+  batch.put(key_ingress_bytes(cert->txid), tx_bytes);
+  batch.put(key_ingress_certificate(cert->lane, cert->seq), cert_bytes);
+  batch.put(key_lane_state(cert->lane), next_state.serialize());
+  return write_batch(batch);
+}
 
 bool DB::put_lane_state(std::uint32_t lane, const LaneState& state) {
   if (state.lane != lane) {

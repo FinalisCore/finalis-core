@@ -102,6 +102,7 @@ struct EpochRewardSettlementState {
   std::uint64_t fee_pool_units{0};
   std::uint64_t reserve_accrual_units{0};
   std::uint64_t reserve_subsidy_units{0};
+  std::uint64_t recycled_units{0};  // burned in this epoch's blocks; returns to the reserve at settlement
   bool settled{false};
   std::map<PubKey32, std::uint64_t> reward_score_units;
   std::map<PubKey32, std::uint64_t> expected_participation_units;
@@ -307,6 +308,7 @@ class DB {
     void put_epoch_reward_settlement(const EpochRewardSettlementState& state);
     void put_protocol_reserve_balance(std::uint64_t balance_units);
     void put_confidential_pool_value(std::uint64_t value_units);
+    void put_base_fee_per_kib(std::uint64_t units);
     void put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint);
     void put_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& snapshot);
     void put_consensus_state_commitment_cache(const ConsensusStateCommitmentCache& cache);
@@ -406,6 +408,7 @@ class DB {
   bool put_protocol_reserve_balance(std::uint64_t balance_units);
   std::optional<std::uint64_t> get_protocol_reserve_balance() const;
   std::optional<std::uint64_t> get_confidential_pool_value() const;
+  std::optional<std::uint64_t> get_base_fee_per_kib() const;
   bool put_epoch_ticket(const consensus::EpochTicket& ticket);
   std::vector<consensus::EpochTicket> load_epoch_tickets(std::uint64_t epoch) const;
   std::vector<std::uint64_t> load_epoch_ticket_epochs() const;
@@ -458,6 +461,10 @@ class DB {
   bool force_set_finalized_ingress_tip(std::uint64_t seq);
   std::optional<std::uint64_t> get_finalized_ingress_tip() const;
   bool put_ingress_certificate(std::uint32_t lane, std::uint64_t seq, const Bytes& cert_bytes);
+  // One appended ingress record: its payload, certificate and the lane's new tip in a single atomic
+  // write. Written separately, a crash between them leaves a certificate above the lane tip. The
+  // certificate may already be stored (such an orphan, being repaired); it must then be identical.
+  bool append_ingress_record_atomic(const Bytes& cert_bytes, const Bytes& tx_bytes, const LaneState& next_state);
   std::optional<Bytes> get_ingress_certificate(std::uint32_t lane, std::uint64_t seq) const;
   bool put_ingress_bytes(const Hash32& txid, const Bytes& tx_bytes);
   std::optional<Bytes> get_ingress_bytes(const Hash32& txid) const;
@@ -530,6 +537,11 @@ std::string key_finality_certificate_height_prefix();
 // consensus::CommitteeHandoff proving the checkpoint of the epoch starting at `next_epoch_start`.
 std::string key_committee_handoff(std::uint64_t next_epoch_start);
 std::string key_committee_handoff_prefix();
+// Public lightserver endpoints the node learned (p2p/endpoints.hpp), and its own announcement; written
+// by the node for its lightserver to serve. Not consensus state.
+std::string key_lightserver_endpoint(const PubKey32& pubkey);
+std::string key_lightserver_endpoint_prefix();
+std::string key_own_lightserver_endpoint();
 std::string key_ingress_record_prefix();
 std::string key_finalized_ingress_tip();
 std::string key_ingress_certificate_prefix();
@@ -563,6 +575,7 @@ std::string key_availability_persistent_state();
 std::string key_consensus_state_commitment_cache();
 std::string key_protocol_reserve_balance();
 std::string key_confidential_pool_value();
+std::string key_base_fee_per_kib();
 std::string key_adaptive_epoch_telemetry_prefix();
 std::string key_validator_onboarding(const PubKey32& pub);
 AdaptiveTelemetrySummary summarize_adaptive_epoch_telemetry(

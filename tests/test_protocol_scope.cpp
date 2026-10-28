@@ -131,6 +131,38 @@ TEST(test_protocol_scope_signature_covers_spent_values_and_scripts) {
   ASSERT_TRUE(!signing_message_for_input(test::test_chain_domain(), *good, 0, {real0}).has_value());
 }
 
+// A transaction pays at least the chain's base fee per started KiB; a timed body (prepaid) is exempt.
+TEST(test_protocol_scope_rejects_fee_below_base_fee) {
+  const auto kp = key_from_byte(37);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const auto script = address::p2pkh_script_pubkey(pkh);
+  OutPoint op{};
+  op.txid.fill(0xC7);
+  UtxoSetV2 view;
+  view[op] = UtxoEntryV2(TxOut{100'000, script});
+  const Bytes priv(kp.private_key.begin(), kp.private_key.end());
+  const auto tx = build_signed_p2pkh_tx_single_input(test::test_chain_domain(), op, TxOut{100'000, script}, priv,
+                                                     {TxOut{99'000, script}});  // fee 1,000, under 1 KiB
+  ASSERT_TRUE(tx.has_value());
+  auto ctx = *finalis::test::test_validation_ctx();
+  ctx.base_fee_per_kib = 1'000;
+  const auto at = validate_any_tx(AnyTx{*tx}, 1, view, &ctx);
+  if (!at.ok) throw std::runtime_error("unexpected rejection: " + at.error);
+  ctx.base_fee_per_kib = 1'001;
+  const auto low = validate_any_tx(AnyTx{*tx}, 1, view, &ctx);
+  ASSERT_TRUE(!low.ok && low.error.find("fee below base fee") == 0);
+  // A timed body (signed under its own domain) pays nothing here: its fee was prepaid.
+  const auto body = build_signed_p2pkh_tx_single_input(timed_body_chain_domain(test::test_chain_domain()), op,
+                                                       TxOut{100'000, script}, priv, {TxOut{100'000, script}});
+  ASSERT_TRUE(body.has_value());
+  ctx.timed_body = true;
+  const auto body_result = validate_any_tx(AnyTx{*body}, 1, view, &ctx);
+  if (!body_result.ok) throw std::runtime_error("timed body rejected: " + body_result.error);
+  ctx.timed_body = false;
+  ctx.base_fee_per_kib = 0;  // unset: not checked
+  ASSERT_TRUE(validate_any_tx(AnyTx{*tx}, 1, view, &ctx).ok);
+}
+
 TEST(test_protocol_scope_rejects_fee_overflow_u64_boundary) {
   const auto kp = key_from_byte(35);
   const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));

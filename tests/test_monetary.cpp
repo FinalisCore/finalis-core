@@ -2,6 +2,7 @@
 
 #include "test_framework.hpp"
 
+#include "common/network.hpp"
 #include "consensus/monetary.hpp"
 #include "consensus/randomness.hpp"
 
@@ -188,21 +189,82 @@ TEST(test_epoch_settlement_keeps_onboarding_slice_in_validator_pool_when_no_onbo
   ASSERT_EQ(validator_units, payout.total);
 }
 
-TEST(test_post_cap_reserve_subsidy_respects_gap_floor_and_runway_caps) {
+// Fixed supply, paid forever: the reserve pays a fixed fraction of itself per epoch once emission
+// ends (never a fixed amount, so it never runs dry), and half of every fee returns to it.
+TEST(test_reserve_pays_a_fraction_of_itself_after_emission_and_keeps_half_the_fees) {
   using namespace finalis::consensus;
-  const std::uint64_t large_reserve_balance =
-      POST_CAP_RESERVE_FLOOR_UNITS + (POST_CAP_MIN_RESERVE_RUNWAY_EPOCHS * 9ULL);
-  const std::uint64_t low_runway_reserve_balance = POST_CAP_RESERVE_FLOOR_UNITS + 100ULL;
-  const std::uint64_t low_runway_cap = low_runway_reserve_balance / POST_CAP_MIN_RESERVE_RUNWAY_EPOCHS;
-  const std::uint64_t spendable_large_reserve = large_reserve_balance - POST_CAP_RESERVE_FLOOR_UNITS;
-  ASSERT_EQ(post_cap_support_target_units(3), 15'000'000ULL);
-  ASSERT_EQ(post_cap_reserve_subsidy_units(0, 0, large_reserve_balance), 0ULL);
-  ASSERT_EQ(post_cap_reserve_subsidy_units(3, 15'000'000ULL, large_reserve_balance), 0ULL);
-  ASSERT_EQ(post_cap_reserve_subsidy_units(3, 0, POST_CAP_RESERVE_FLOOR_UNITS), 0ULL);
-  ASSERT_EQ(post_cap_reserve_subsidy_units(3, 0, large_reserve_balance), spendable_large_reserve);
-  ASSERT_EQ(post_cap_reserve_subsidy_units(3, 14'999'995ULL, large_reserve_balance), 5ULL);
-  ASSERT_EQ(post_cap_reserve_subsidy_units(3, 0, low_runway_reserve_balance), 100ULL);
-  ASSERT_TRUE(low_runway_cap > 100ULL);
+  const std::uint64_t reserve = 2'100'000ULL * BASE_UNITS_PER_COIN;
+  ASSERT_EQ(reserve_payout_units(EMISSION_BLOCKS - 1, reserve), 0ULL);  // nothing while emission runs
+  const auto per_epoch = reserve_payout_units(EMISSION_BLOCKS, reserve);
+  ASSERT_EQ(per_epoch, reserve * RESERVE_PAYOUT_BPS_PER_YEAR / (10'000ULL * EPOCHS_PER_YEAR_365));
+  // A year of epochs takes about 5 %; the balance never reaches zero however long it pays.
+  std::uint64_t r = reserve;
+  for (std::uint64_t e = 0; e < EPOCHS_PER_YEAR_365; ++e) r -= reserve_payout_units(EMISSION_BLOCKS, r);
+  ASSERT_TRUE(r > reserve / 100 * 95 - BASE_UNITS_PER_COIN && r < reserve / 100 * 96);
+  for (std::uint64_t e = 0; e < 200 * EPOCHS_PER_YEAR_365; ++e) r -= reserve_payout_units(EMISSION_BLOCKS, r);
+  ASSERT_TRUE(r > 0);
+  ASSERT_EQ(fee_reserve_share_units(1'000), 500ULL);
+  ASSERT_EQ(fee_reserve_share_units(1), 0ULL);  // the odd unit is paid to validators
+}
+
+TEST(test_emitted_supply_matches_the_reward_schedule) {
+  using namespace finalis::consensus;
+  ASSERT_EQ(emitted_supply_units(0), 0ULL);
+  std::uint64_t sum = 0;
+  for (std::uint64_t h = 1; h <= 3 * BLOCKS_PER_YEAR_365 + 17; ++h) {
+    sum += reward_units(h);
+    if (h == 1 || h == 1000 || h == BLOCKS_PER_YEAR_365 - 1 || h == BLOCKS_PER_YEAR_365 || h == 2 * BLOCKS_PER_YEAR_365 + 5) {
+      ASSERT_EQ(emitted_supply_units(h), sum);
+    }
+  }
+  ASSERT_EQ(emitted_supply_units(3 * BLOCKS_PER_YEAR_365 + 17), sum);
+  // All of it, less genesis height 0, by the end; never more afterwards.
+  ASSERT_EQ(emitted_supply_units(EMISSION_BLOCKS + 1'000'000), TOTAL_SUPPLY_UNITS - reward_units(0));
+}
+
+TEST(test_base_fee_follows_block_fullness_and_never_leaves_its_bounds) {
+  using namespace finalis::consensus;
+  // Half-full blocks keep it; full blocks raise it by 1/8, empty ones lower it by 1/8.
+  ASSERT_EQ(next_base_fee_per_kib(8'000, BASE_FEE_TARGET_FULLNESS_PPM), 8'000ULL);
+  ASSERT_EQ(next_base_fee_per_kib(8'000, 1'000'000), 9'000ULL);
+  ASSERT_EQ(next_base_fee_per_kib(8'000, 0), 7'000ULL);
+  // At the minimum a full block still raises it, an empty one cannot push it lower.
+  ASSERT_EQ(next_base_fee_per_kib(BASE_FEE_MIN_PER_KIB, 1'000'000), BASE_FEE_MIN_PER_KIB + 1);
+  ASSERT_EQ(next_base_fee_per_kib(BASE_FEE_MIN_PER_KIB, 0), BASE_FEE_MIN_PER_KIB);
+  ASSERT_EQ(next_base_fee_per_kib(BASE_FEE_MAX_PER_KIB, 1'000'000), BASE_FEE_MAX_PER_KIB);
+  // Sustained congestion: from the minimum to 1,000 units/KiB within a few hours of full blocks.
+  std::uint64_t f = BASE_FEE_MIN_PER_KIB;
+  std::size_t blocks = 0;
+  while (f < 1'000 && blocks < 1'000) f = next_base_fee_per_kib(f, 1'000'000), ++blocks;
+  ASSERT_TRUE(blocks > 20 && blocks < 120);
+  // ... and back down once demand goes.
+  for (std::size_t i = 0; i < 2'000; ++i) f = next_base_fee_per_kib(f, 0);
+  ASSERT_EQ(f, BASE_FEE_MIN_PER_KIB);
+  // Per started KiB.
+  ASSERT_EQ(required_base_fee_units(10, 1), 10ULL);
+  ASSERT_EQ(required_base_fee_units(10, 1024), 10ULL);
+  ASSERT_EQ(required_base_fee_units(10, 1025), 20ULL);
+}
+
+TEST(test_validator_min_bond_follows_validators_and_supply) {
+  using namespace finalis::consensus;
+  const auto& net = finalis::mainnet_network();
+  const auto coins = [](std::uint64_t units) { return units / BASE_UNITS_PER_COIN; };
+  // Launch: the 150 FLS floor, whatever the validator count.
+  ASSERT_EQ(coins(validator_min_bond_units(net, 1, 1)), 150ULL);
+  ASSERT_EQ(coins(validator_min_bond_units(net, 1, 128)), 150ULL);
+  // (150 * sqrt(N / 16) + 2 * supply / 12,800) / 3.
+  const std::uint64_t h = 2 * BLOCKS_PER_YEAR_365;
+  const auto supply = emitted_supply_units(h);
+  const auto expect = [&](std::uint64_t n_root_x100) {  // 150 * sqrt(N/16), from sqrt(N/16) * 100
+    return (150ULL * BASE_UNITS_PER_COIN * n_root_x100 / 100 + 2 * (supply / MIN_BOND_SUPPLY_DIVISOR)) / 3;
+  };
+  ASSERT_EQ(validator_min_bond_units(net, h, 64), expect(200));    // sqrt(4) = 2
+  ASSERT_EQ(validator_min_bond_units(net, h, 256), expect(400));   // sqrt(16) = 4
+  // Counted up to 512 validators: faking more does not raise the bond.
+  ASSERT_EQ(validator_min_bond_units(net, h, 512), validator_min_bond_units(net, h, 100'000));
+  // It rises with the supply.
+  ASSERT_TRUE(validator_min_bond_units(net, 6 * BLOCKS_PER_YEAR_365, 64) > validator_min_bond_units(net, h, 64));
 }
 
 TEST(test_payout_after_emission_before_fork_is_fees_only) {

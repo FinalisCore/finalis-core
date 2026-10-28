@@ -34,8 +34,29 @@ bool bootstrap_validator_record(const ValidatorInfo& info) {
 }
 
 constexpr std::uint64_t kAdaptiveMinBondFloor = 150ULL * BASE_UNITS_PER_COIN;
-constexpr std::uint64_t kAdaptiveMinBondCeiling = 500ULL * BASE_UNITS_PER_COIN;
+// Committee eligibility never asks more than the lowest bond any registration ever required (the
+// registration minimum's 150 FLS floor), so no validator that joined legally is ever shut out later.
+constexpr std::uint64_t kAdaptiveMinBondCeiling = kAdaptiveMinBondFloor;
 constexpr std::uint64_t kAdaptiveMinBondBase = 150ULL * BASE_UNITS_PER_COIN;
+
+// Value of the burn (SCBURN) outputs of accepted transactions.
+std::uint64_t burned_output_units(const std::vector<AnyTx>& txs) {
+  std::uint64_t total = 0;
+  for (const auto& tx : txs) {
+    if (const auto* v1 = std::get_if<Tx>(&tx)) {
+      for (const auto& out : v1->outputs) {
+        if (is_burn_script(out.script_pubkey, nullptr)) total += out.value;
+      }
+    } else {
+      for (const auto& out : std::get<TxV2>(tx).outputs) {
+        if (out.kind != TxOutputKind::Transparent) continue;
+        const auto& t = std::get<TransparentTxOutV2>(out.body);
+        if (is_burn_script(t.script_pubkey, nullptr)) total += t.value;
+      }
+    }
+  }
+  return total;
+}
 
 inline bool deferred_exit_fork_active(const NetworkConfig& network, std::uint64_t height) {
   return height >= network.deferred_exit_activation_height;
@@ -273,23 +294,8 @@ std::map<PubKey32, std::uint64_t> checkpoint_onboarding_scores(
 std::uint64_t epoch_reserve_subsidy_units(const CanonicalDerivationConfig& cfg, std::uint64_t height,
                                           const storage::EpochRewardSettlementState& reward_state,
                                           std::uint64_t reserve_balance_before_accrual) {
-  if (height < EMISSION_BLOCKS) return 0;
-  const auto threshold_bps = active_economics_policy(cfg.network, height).participation_threshold_bps;
-  std::size_t eligible_validator_count = 0;
-  for (const auto& [pub, raw_score] : reward_state.reward_score_units) {
-    const auto expected_it = reward_state.expected_participation_units.find(pub);
-    const auto observed_it = reward_state.observed_participation_units.find(pub);
-    const std::uint64_t expected =
-        expected_it == reward_state.expected_participation_units.end() ? 0 : expected_it->second;
-    const std::uint64_t observed =
-        observed_it == reward_state.observed_participation_units.end() ? 0 : observed_it->second;
-    const std::uint32_t participation_bps =
-        expected == 0 ? 10'000U
-                      : static_cast<std::uint32_t>(wide::mul_div_u64(std::min(observed, expected), 10'000ULL, expected));
-    if (apply_participation_penalty_bps(raw_score, participation_bps, threshold_bps) > 0) ++eligible_validator_count;
-  }
-  return post_cap_reserve_subsidy_units(eligible_validator_count, reward_state.fee_pool_units,
-                                        reserve_balance_before_accrual + reward_state.reserve_accrual_units);
+  (void)cfg;
+  return reserve_payout_units(height, reserve_balance_before_accrual + reward_state.reserve_accrual_units);
 }
 
 FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivationConfig& cfg,
@@ -309,7 +315,8 @@ FrontierSettlement derive_frontier_settlement_from_state(const CanonicalDerivati
     auto it = prev.epoch_reward_states.find(*settlement_epoch);
     if (it != prev.epoch_reward_states.end() && !it->second.settled) {
       settlement_rewards = it->second.total_reward_units;
-      settled_epoch_fees = height >= EMISSION_BLOCKS ? it->second.fee_pool_units : 0;
+      // Validators' half of the epoch's fees; the other half goes to the reserve at settlement.
+      settled_epoch_fees = it->second.fee_pool_units - fee_reserve_share_units(it->second.fee_pool_units);
       // Computed here from the pre-block state, not read back: the stored field
       // is only filled when this same settlement is applied.
       reserve_subsidy = epoch_reserve_subsidy_units(cfg, height, it->second, prev.protocol_reserve_balance_units);
@@ -592,7 +599,9 @@ void mark_epoch_reward_settled_for_height(const CanonicalDerivationConfig& cfg, 
   reward_state.reserve_subsidy_units =
       epoch_reserve_subsidy_units(cfg, height, reward_state, state->protocol_reserve_balance_units);
   reward_state.settled = true;
-  state->protocol_reserve_balance_units += reward_state.reserve_accrual_units;
+  state->protocol_reserve_balance_units += reward_state.reserve_accrual_units +
+                                          fee_reserve_share_units(reward_state.fee_pool_units) +
+                                          reward_state.recycled_units;
   if (state->protocol_reserve_balance_units >= reward_state.reserve_subsidy_units) {
     state->protocol_reserve_balance_units -= reward_state.reserve_subsidy_units;
   } else {
@@ -669,6 +678,8 @@ void update_validator_liveness_from_observed_participants(const CanonicalDerivat
                                            cfg.validator_liveness_window_blocks);
 }
 
+}  // namespace
+
 void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
                                             const std::vector<AnyTx>& txs, std::size_t input_start_index,
                                             const UtxoSetV2& pre_utxos, std::uint64_t height) {
@@ -680,6 +691,34 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
   if (cfg.validator_join_limit_window_blocks > 0) {
     advance_validator_join_window(height, cfg.validator_join_limit_window_blocks, &state->validator_join_window_start_height,
                                   &state->validator_join_count_in_window);
+  }
+  const auto window_full = [&]() {
+    return cfg.validator_join_limit_window_blocks > 0 && cfg.validator_join_limit_max_new > 0 &&
+           state->validator_join_count_in_window >= cfg.validator_join_limit_max_new;
+  };
+  // Joins finalized while the window was full wait their turn (oldest first), ahead of this block's.
+  // A request that cannot register yet (bond below the current minimum, key already registered)
+  // stays queued and does not hold up the ones behind it.
+  {
+    std::vector<ValidatorJoinRequest*> queued;
+    for (auto& [_, req] : state->validator_join_requests) {
+      if (req.status == ValidatorJoinRequestStatus::REQUESTED) queued.push_back(&req);
+    }
+    std::sort(queued.begin(), queued.end(), [](const ValidatorJoinRequest* a, const ValidatorJoinRequest* b) {
+      if (a->requested_height != b->requested_height) return a->requested_height < b->requested_height;
+      return a->request_txid < b->request_txid;
+    });
+    for (auto* req : queued) {
+      if (window_full()) break;
+      std::string err;
+      if (!state->validators.register_bond(req->validator_pubkey, req->bond_outpoint, height, req->bond_amount, &err,
+                                           canonical_operator_id_from_join_request(req->payout_pubkey), req->bls_pubkey)) {
+        continue;
+      }
+      req->status = ValidatorJoinRequestStatus::APPROVED;
+      req->approved_height = height;
+      if (cfg.validator_join_limit_window_blocks > 0) ++state->validator_join_count_in_window;
+    }
   }
 
   for (size_t txi = input_start_index; txi < txs.size(); ++txi) {
@@ -776,8 +815,11 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
         req.bond_outpoint = OutPoint{txid, bond_out.index};
         req.bond_amount = bond_out.value;
         req.requested_height = height;
-        if (cfg.validator_join_limit_window_blocks > 0 && cfg.validator_join_limit_max_new > 0 &&
-            state->validator_join_count_in_window >= cfg.validator_join_limit_max_new) {
+        req.bls_pubkey = join.bls_pubkey;
+        if (window_full()) {
+          // The bond is locked on chain either way: queue the join instead of dropping it, which
+          // stranded the bond (unbonding needs a registered validator).
+          state->validator_join_requests[txid] = req;
           break;
         }
         std::string err;
@@ -811,6 +853,8 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
   }
   state->validators.advance_height(height + 1);
 }
+
+namespace {
 
 void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state, const Block& block,
                                    const UtxoSetV2& pre_utxos, std::uint64_t height) {
@@ -1084,7 +1128,7 @@ void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const Va
   const auto reserve_delta = next_reserve - reward_state.reserve_accrual_units;
   reward_state.reserve_accrual_units = next_reserve;
   reward_state.total_reward_units += gross_reward - reserve_delta;
-  if (transition.height >= EMISSION_BLOCKS) reward_state.fee_pool_units += transition.settlement.current_fees;
+  reward_state.fee_pool_units += transition.settlement.current_fees;
   const auto inputs = compute_deterministic_epoch_reward_inputs(cfg, validators, transition.height, transition.leader_pubkey,
                                                                 parent_committee, transition.prev_finality_signers);
   for (const auto& [pub, units] : inputs.expected_participation_units) reward_state.expected_participation_units[pub] += units;
@@ -1504,6 +1548,7 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
               return std::nullopt;
             },
         .confidential_policy = &cfg.confidential_policy,
+        .base_fee_per_kib = prev.base_fee_per_kib,
         .timed_bond_lien =
             [&](const PubKey32& pub, std::uint64_t h) {
               return timed_bond_lien(prev, pub, h, cfg.network.committee_epoch_blocks);
@@ -1931,6 +1976,11 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   accrue_frontier_epoch_reward(cfg, next.validators, &next.epoch_reward_states, record.transition, parent.committee);
   update_validator_liveness_from_observed_participants(cfg, &next, record.transition.height, parent.committee,
                                                        parent_participants);
+  // Burned coins (slashed bonds) are not lost to the fixed supply: they return to the reserve.
+  if (const auto burned = burned_output_units(recomputed.accepted_txs); burned > 0) {
+    next.epoch_reward_states[committee_epoch_start(record.transition.height, cfg.network.committee_epoch_blocks)]
+        .recycled_units += burned;
+  }
   const UtxoSetV2 pre_utxos = next.utxos;
   if (accepted_txids) {
     accepted_txids->clear();
@@ -1948,6 +1998,15 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   next.utxos = std::move(recomputed.next_utxos);
   next.utxo_tree = recomputed.has_next_utxo_tree ? std::move(recomputed.next_utxo_tree) : crypto::PersistentSmt{};
   next.confidential_pool_value = recomputed.next_confidential_pool_value;
+  {
+    // How full this block was, by bytes or by records, steers the next block's base fee.
+    std::uint64_t bytes = 0;
+    for (const auto& tx : recomputed.accepted_txs) bytes += serialize_any_tx(tx).size();
+    const std::uint64_t by_bytes = wide::mul_div_u64(bytes, 1'000'000ULL, kMaxFrontierSliceBytes);
+    const std::uint64_t by_records =
+        wide::mul_div_u64(recomputed.accepted_txs.size(), 1'000'000ULL, kMaxFrontierSliceRecords);
+    next.base_fee_per_kib = next_base_fee_per_kib(prev.base_fee_per_kib, std::max(by_bytes, by_records));
+  }
   apply_timed_escrows(recomputed, &next.timed_escrows, &next.timed_key_sets);
   next.last_timed_settlements = recomputed.settlements;
   next.finalized_identity = FinalizedIdentity::transition(record.transition.transition_id());
@@ -2317,6 +2376,7 @@ Bytes consensus_post_state_preimage(const CanonicalDerivationConfig& cfg, const 
     w.u64le(reward_state.fee_pool_units);
     w.u64le(reward_state.reserve_accrual_units);
     w.u64le(reward_state.reserve_subsidy_units);
+    w.u64le(reward_state.recycled_units);
     w.u8(reward_state.settled ? 1 : 0);
     auto append_map = [&](const std::map<PubKey32, std::uint64_t>& m) {
       w.varint(m.size());
@@ -2417,7 +2477,29 @@ Bytes consensus_post_state_preimage(const CanonicalDerivationConfig& cfg, const 
   w.u64le(state.confidential_pool_value);
   w.bytes_fixed(metadata_root);
   w.bytes_fixed(timed_escrow_commitment_root(state.timed_escrows));
+  w.bytes_fixed(queued_join_commitment_root(state.validator_join_requests));
+  w.u64le(state.base_fee_per_kib);
   return w.take();
+}
+
+Hash32 queued_join_commitment_root(const std::map<Hash32, ValidatorJoinRequest>& requests) {
+  std::vector<std::pair<Hash32, Bytes>> leaves;
+  for (const auto& [txid, req] : requests) {
+    if (req.status != ValidatorJoinRequestStatus::REQUESTED) continue;
+    codec::ByteWriter k;
+    k.bytes(Bytes{'S', 'C', '-', 'P', 'J', 'R'});
+    k.u64le(req.requested_height);
+    k.bytes_fixed(txid);
+    codec::ByteWriter v;
+    v.bytes_fixed(req.validator_pubkey);
+    v.bytes_fixed(req.payout_pubkey);
+    v.bytes_fixed(req.bond_outpoint.txid);
+    v.u32le(req.bond_outpoint.index);
+    v.u64le(req.bond_amount);
+    v.bytes_fixed(req.bls_pubkey);
+    leaves.push_back({crypto::sha256(k.data()), v.take()});
+  }
+  return crypto::SparseMerkleTree::compute_root_from_leaves(leaves);
 }
 
 Hash32 timed_escrow_commitment_root(const TimedEscrowState& escrows) {

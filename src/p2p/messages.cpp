@@ -39,6 +39,8 @@ bool is_known_message_type(std::uint16_t msg_type) {
     case MsgType::TX_RESULT:
     case MsgType::GETADDR:
     case MsgType::ADDR:
+    case MsgType::GET_ENDPOINTS:
+    case MsgType::ENDPOINTS:
     case MsgType::PING:
     case MsgType::PONG:
     case MsgType::GET_TRANSITION_BY_HEIGHT:

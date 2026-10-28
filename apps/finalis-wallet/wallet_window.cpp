@@ -1648,6 +1648,8 @@ void WalletWindow::load_network_settings() {
     }
   }
   set_lightserver_endpoints(endpoints);
+  discovered_lightserver_endpoints_ = settings.value(network_settings_key("discovered_lightservers")).toStringList();
+  last_lightserver_discovery_secs_ = 0;
   pin_lightserver_endpoint_checkbox_->setChecked(load_value("lightserver_pin_first", false).toBool());
   last_successful_lightserver_endpoint_ =
       normalize_lightserver_endpoint(load_value("lightserver_last_good", QString{}).toString());
@@ -1911,6 +1913,9 @@ QStringList WalletWindow::configured_lightserver_endpoints() const {
 QStringList WalletWindow::ordered_lightserver_endpoints() const {
   QStringList endpoints = configured_lightserver_endpoints();
   if (endpoints.isEmpty()) return endpoints;
+  for (const auto& discovered : discovered_lightserver_endpoints_) {
+    if (!endpoints.contains(discovered)) endpoints.push_back(discovered);
+  }
   const bool pin_first = pin_lightserver_endpoint_checkbox_ && pin_lightserver_endpoint_checkbox_->isChecked();
   if (pin_first || last_successful_lightserver_endpoint_.isEmpty()) return endpoints;
   const int idx = endpoints.indexOf(last_successful_lightserver_endpoint_);
@@ -5005,12 +5010,74 @@ void WalletWindow::apply_refresh_result(std::uint64_t generation, std::uint64_t 
                   .arg(display_lightserver_endpoint(last_successful_lightserver_endpoint_));
     statusBar()->showMessage(message, 3000);
   }
+  maybe_discover_lightservers();
   if (rescan_needed) {
     QPointer<WalletWindow> self(this);
     QTimer::singleShot(0, this, [self]() {
       if (self) self->refresh_chain_state(false);
     });
   }
+}
+
+void WalletWindow::maybe_discover_lightservers() {
+  constexpr int kMaxDiscovered = 16;
+  constexpr std::size_t kMaxProbesPerRound = 8;
+  if (lightserver_discovery_in_flight_ || last_successful_lightserver_endpoint_.isEmpty()) return;
+  const qint64 now_secs = QDateTime::currentSecsSinceEpoch();
+  if (last_lightserver_discovery_secs_ != 0 && now_secs - last_lightserver_discovery_secs_ < 30 * 60) return;
+  // The chain is the one this binary embeds, not whatever the servers say.
+  const auto& network = finalis::network_by_name(active_network_);
+  const auto embedded = finalis::genesis::embedded_genesis_for(network.name);
+  if (!embedded) return;
+  const Hash32 chain_domain = chain_domain_from_ids(network.network_id, embedded->hash);
+  const bool allow_private = finalis::wallet::wallet_network_is_testnet(active_network_);
+  last_lightserver_discovery_secs_ = now_secs;
+  lightserver_discovery_in_flight_ = true;
+  const std::string source = last_successful_lightserver_endpoint_.toStdString();
+  QStringList known = configured_lightserver_endpoints();
+  known.append(discovered_lightserver_endpoints_);
+  const QString network_key = network_settings_key("discovered_lightservers");
+  QPointer<WalletWindow> self(this);
+  const bool spawned = background_threads_.spawn([self, source, known, chain_domain, allow_private, network_key]() {
+    std::string err;
+    QStringList verified;
+    if (auto listed = lightserver::rpc_get_lightserver_endpoints(source, &err)) {
+      std::shuffle(listed->begin(), listed->end(), std::mt19937_64(std::random_device{}()));
+      std::size_t probes = 0;
+      const auto now = static_cast<std::uint64_t>(QDateTime::currentSecsSinceEpoch());
+      for (const auto& a : *listed) {
+        const QString url = normalize_lightserver_endpoint(QString::fromStdString(a.url));
+        if (url.isEmpty() || known.contains(url) || verified.contains(url)) continue;
+        if (probes++ >= kMaxProbesPerRound) break;
+        std::string why;
+        if (lightserver::probe_announced_endpoint(a, chain_domain, allow_private, now, &why)) {
+          verified.push_back(url);
+        }
+      }
+    }
+    QMetaObject::invokeMethod(
+        self,
+        [self, verified, network_key]() {
+          if (!self) return;
+          self->lightserver_discovery_in_flight_ = false;
+          if (network_key != self->network_settings_key("discovered_lightservers")) return;  // network switched
+          bool changed = false;
+          for (const auto& url : verified) {
+            if (self->discovered_lightserver_endpoints_.size() >= kMaxDiscovered) break;
+            if (!self->discovered_lightserver_endpoints_.contains(url)) {
+              self->discovered_lightserver_endpoints_.push_back(url);
+              changed = true;
+            }
+          }
+          if (!changed) return;
+          QSettings settings(kSettingsOrg, kSettingsApp);
+          settings.setValue(network_key, self->discovered_lightserver_endpoints_);
+          self->update_connection_views();
+          self->statusBar()->showMessage(QString("Found %1 new public lightserver(s) on the network.").arg(verified.size()), 4000);
+        },
+        Qt::QueuedConnection);
+  });
+  if (!spawned) lightserver_discovery_in_flight_ = false;
 }
 
 void WalletWindow::refresh_chain_state(bool interactive) {

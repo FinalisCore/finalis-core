@@ -41,6 +41,9 @@ enum MsgType : std::uint16_t {
   TX_RESULT = 26,
   // A committee member's BLS time signature on a height it holds a finality certificate for.
   TIME_SIGNATURE = 27,
+  // Public lightserver discovery (p2p/endpoints.hpp): a request, and signed endpoint announcements.
+  GET_ENDPOINTS = 28,
+  ENDPOINTS = 29,
 };
 
 // Sync requests and replies a peer accepts once both VERSIONs and the sender's VERACK are

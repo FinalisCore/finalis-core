@@ -62,6 +62,10 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "TX_RESULT";
     case p2p::MsgType::GETADDR:
       return "GETADDR";
+    case p2p::MsgType::GET_ENDPOINTS:
+      return "GET_ENDPOINTS";
+    case p2p::MsgType::ENDPOINTS:
+      return "ENDPOINTS";
     case p2p::MsgType::ADDR:
       return "ADDR";
     case p2p::MsgType::PING:
@@ -505,7 +509,8 @@ bool same_join_request(const ValidatorJoinRequest& a, const ValidatorJoinRequest
   return a.request_txid == b.request_txid && a.validator_pubkey == b.validator_pubkey &&
          a.payout_pubkey == b.payout_pubkey && a.bond_outpoint.txid == b.bond_outpoint.txid &&
          a.bond_outpoint.index == b.bond_outpoint.index && a.bond_amount == b.bond_amount &&
-         a.requested_height == b.requested_height && a.approved_height == b.approved_height && a.status == b.status;
+         a.requested_height == b.requested_height && a.approved_height == b.approved_height && a.status == b.status &&
+         a.bls_pubkey == b.bls_pubkey;
 }
 
 bool same_join_request_maps(const std::map<Hash32, ValidatorJoinRequest>& a,
@@ -523,7 +528,7 @@ bool same_join_request_maps(const std::map<Hash32, ValidatorJoinRequest>& a,
 bool same_epoch_reward_state(const storage::EpochRewardSettlementState& a, const storage::EpochRewardSettlementState& b) {
   return a.epoch_start_height == b.epoch_start_height && a.total_reward_units == b.total_reward_units &&
          a.fee_pool_units == b.fee_pool_units && a.reserve_accrual_units == b.reserve_accrual_units &&
-         a.reserve_subsidy_units == b.reserve_subsidy_units &&
+         a.reserve_subsidy_units == b.reserve_subsidy_units && a.recycled_units == b.recycled_units &&
          a.settled == b.settled && a.reward_score_units == b.reward_score_units &&
          a.onboarding_score_units == b.onboarding_score_units &&
          a.expected_participation_units == b.expected_participation_units &&
@@ -725,6 +730,7 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   }
   batch.put_protocol_reserve_balance(state.protocol_reserve_balance_units);
   batch.put_confidential_pool_value(state.confidential_pool_value);
+  batch.put_base_fee_per_kib(state.base_fee_per_kib);
   std::set<std::uint64_t> desired_checkpoint_epochs;
   for (const auto& [epoch, _] : state.finalized_committee_checkpoints) {
     desired_checkpoint_epochs.insert(epoch);
@@ -805,7 +811,9 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
 
   for (const auto& [pub, info] : next.validators.all()) batch.put_validator(pub, info);
   for (const auto& [txid, req] : next.validator_join_requests) {
-    if (!prev.validator_join_requests.contains(txid)) batch.put_validator_join_request(txid, req);
+    // New, or admitted from the queue (REQUESTED -> APPROVED).
+    const auto it = prev.validator_join_requests.find(txid);
+    if (it == prev.validator_join_requests.end() || !same_join_request(it->second, req)) batch.put_validator_join_request(txid, req);
   }
   // Both maps are bounded by prune_consensus_history; pruned entries keep their history rows.
   for (const auto& [epoch, reward_state] : next.epoch_reward_states) {
@@ -820,6 +828,7 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
   }
   batch.put_protocol_reserve_balance(next.protocol_reserve_balance_units);
   batch.put_confidential_pool_value(next.confidential_pool_value);
+  batch.put_base_fee_per_kib(next.base_fee_per_kib);
   for (const auto& [key, _] : prev.timed_escrows) {
     if (!next.timed_escrows.contains(key)) batch.erase(timed_escrow_db_key(key));
   }

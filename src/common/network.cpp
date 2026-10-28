@@ -15,8 +15,8 @@ constexpr std::uint32_t kTestnetMagic = 0x54534331;  // "TSC1"
 constexpr std::uint64_t kCoin = 100'000'000ULL;
 
 constexpr std::uint64_t kTargetValidators = 16;
-constexpr std::uint64_t kBaseMinBond = 1'000ULL * kCoin;
-constexpr std::uint64_t kMinBondFloor = 1'000ULL * kCoin;
+constexpr std::uint64_t kBaseMinBond = 150ULL * kCoin;
+constexpr std::uint64_t kMinBondFloor = 150ULL * kCoin;
 constexpr std::uint64_t kValidatorBondMaxAmount = BOND_AMOUNT * 100;
 // The adaptive minimum bond must never exceed the structural bond cap.
 constexpr std::uint64_t kMinBondCeiling = kValidatorBondMaxAmount;
@@ -109,7 +109,7 @@ NetworkConfig make_testnet() {
   net.magic = kTestnetMagic;
   net.p2p_default_port = 19540;
   net.lightserver_default_port = 19544;
-  net.default_seeds = {"130.61.126.39:19540"};
+  net.default_seeds = {"130.61.126.39:19540", "159.200.236.114:19540"};
   return net;
 }
 

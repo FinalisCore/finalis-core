@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     std::cerr << "usage: finalis-node [--testnet] [--node-id <id>] [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--unsafe-discard-vote-lock-at-height <h>] [--port <p>] "
                  "[--validator-key-file <path>] [--validator-passphrase <pass>] [--validator-passphrase-env <ENV>] [--allow-unencrypted-keystore] "
                  "[--public] [--listen] [--bind <ip>] [--with-lightserver] [--lightserver-bind <ip>] "
-                 "[--lightserver-port <p>] [--lightserver-admin-socket <path>] [--lightserver-trusted-proxy <cidrs>] [--lightserver-client-ip-header <name>] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
+                 "[--lightserver-port <p>] [--lightserver-admin-socket <path>] [--lightserver-trusted-proxy <cidrs>] [--lightserver-client-ip-header <name>] [--public-lightserver-url https://host/rpc] [--announce-endpoint-as-validator] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
                  "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--acknowledge-emergency-fallback] [--no-reindex] [--no-fast-start] [--log-json] "
                  "[--handshake-timeout-ms <ms>] [--frame-timeout-ms <ms>] [--idle-timeout-ms <ms>] "
                  "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--max-inbound <n>] [--ban-seconds <s>] "

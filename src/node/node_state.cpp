@@ -336,6 +336,7 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
     state.protocol_reserve_balance_units = *reserve;
   }
   if (auto pool = db.get_confidential_pool_value(); pool.has_value()) state.confidential_pool_value = *pool;
+  if (auto base_fee = db.get_base_fee_per_kib(); base_fee.has_value()) state.base_fee_per_kib = *base_fee;
   state.timed_escrows = load_timed_escrows(db);
   state.timed_key_sets = load_timed_key_sets(db);
   for (const auto& [key, tx] : state.timed_escrows) {

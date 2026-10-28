@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Generate a fresh validator set and genesis for a devnet or launch ceremony.
+# Generate a fresh validator set and genesis for a devnet or a test network.
 #
 # Output: devnet/<UTC timestamp>/ (git-ignored)
 #   keys/validator-<i>.json      encrypted validator keystores (wallet_create)

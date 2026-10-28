@@ -144,28 +144,6 @@ const char* epoch_ticket_origin_name(finalis::consensus::EpochTicketOrigin origi
   }
 }
 
-std::optional<finalis::net::SocketHandle> connect_tcp(const std::string& host, std::uint16_t port) {
-  if (!finalis::net::ensure_sockets()) return std::nullopt;
-  addrinfo hints{};
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-  addrinfo* res = nullptr;
-  if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return std::nullopt;
-
-  auto fd = finalis::net::kInvalidSocket;
-  for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
-    fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-    if (!finalis::net::valid_socket(fd)) continue;
-    (void)finalis::net::set_socket_timeouts(fd, 15'000);
-    if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
-    finalis::net::close_socket(fd);
-    fd = finalis::net::kInvalidSocket;
-  }
-  ::freeaddrinfo(res);
-  if (!finalis::net::valid_socket(fd)) return std::nullopt;
-  return fd;
-}
-
 bool do_handshake_v0(finalis::net::SocketHandle fd) {
   finalis::p2p::VersionMsg v;
   v.timestamp = static_cast<std::uint64_t>(std::time(nullptr));
@@ -216,23 +194,6 @@ std::optional<std::array<std::uint8_t, 64>> decode_hex64(const std::string& hex)
   if (!b.has_value() || b->size() != 64) return std::nullopt;
   std::array<std::uint8_t, 64> out{};
   std::copy(b->begin(), b->end(), out.begin());
-  return out;
-}
-
-struct ParsedHttpUrl {
-  std::string host;
-  std::uint16_t port{0};
-  std::string path;
-};
-
-std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
-  std::regex re(R"(^http://([^/:]+):([0-9]+)(/[^ ]*)$)");
-  std::smatch m;
-  if (!std::regex_match(url, m, re)) return std::nullopt;
-  ParsedHttpUrl out;
-  out.host = m[1].str();
-  out.port = static_cast<std::uint16_t>(std::stoul(m[2].str()));
-  out.path = m[3].str();
   return out;
 }
 
@@ -288,47 +249,11 @@ std::optional<std::uint64_t> parse_coin_amount_text(const std::string& text) {
   return units;
 }
 
+// The shared lightserver client: http:// and https:// (system trust store, or FINALIS_CA_FILE), a
+// bounded response.
 std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
                                                        const HttpHeaders& headers, std::string* err) {
-  auto parsed = parse_http_url(url);
-  if (!parsed) {
-    if (err) *err = "url must be http://host:port/path";
-    return std::nullopt;
-  }
-  auto fd_opt = connect_tcp(parsed->host, parsed->port);
-  if (!fd_opt.has_value()) {
-    if (err) *err = "connect failed";
-    return std::nullopt;
-  }
-  const auto fd = *fd_opt;
-  std::ostringstream req;
-  req << "POST " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port
-      << "\r\nContent-Type: application/json\r\n";
-  for (const auto& [k, v] : headers) {
-    req << k << ": " << v << "\r\n";
-  }
-  req << "Content-Length: " << body.size()
-      << "\r\nConnection: close\r\n\r\n" << body;
-  const auto req_s = req.str();
-  if (!finalis::p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req_s.data()), req_s.size())) {
-    finalis::net::close_socket(fd);
-    if (err) *err = "send failed";
-    return std::nullopt;
-  }
-  std::string resp;
-  std::array<char, 4096> buf{};
-  while (true) {
-    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
-    if (n <= 0) break;
-    resp.append(buf.data(), static_cast<std::size_t>(n));
-  }
-  finalis::net::close_socket(fd);
-  const auto pos = resp.find("\r\n\r\n");
-  if (pos == std::string::npos) {
-    if (err) *err = "bad http response";
-    return std::nullopt;
-  }
-  return resp.substr(pos + 4);
+  return finalis::lightserver::http_post_json_raw(url, body, headers, err);
 }
 
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body,
@@ -350,9 +275,9 @@ std::optional<std::string> find_json_string(const std::string& json, const std::
 }
 
 std::optional<std::string> rpc_http_post(const std::string& url, const std::string& request, std::string* err) {
-  auto parsed = parse_http_url(url);
-  if (!parsed || parsed->path != "/rpc") {
-    if (err) *err = "url must be http://host:port/rpc";
+  const bool scheme_ok = url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0;
+  if (!scheme_ok || url.size() < 4 || url.compare(url.size() - 4, 4, "/rpc") != 0) {
+    if (err) *err = "url must be http(s)://host[:port]/rpc";
     return std::nullopt;
   }
   auto body = http_post_json(url, request, err);
@@ -1528,6 +1453,7 @@ void print_user_cli_help(std::ostream& os) {
      << "    --allow-unverified trusts the lightserver when no proof can be had\n"
      << "  finalis-cli --version\n"
      << "  finalis-cli getWallet [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli discover_endpoints [--rpc <url>] [--no-probe]  # public lightservers announced on the network; verified = signed and the server reports the announced key\n"
      << "  finalis-cli balance [--rpc <url>] [--address <addr> | --file <keystore> [--pass <pass>]] [--allow-unverified]  # proven against validator signatures\n"
      << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
@@ -3170,6 +3096,42 @@ int run_cli(int argc, char** argv) {
     return 0;
   }
 
+  if (cmd == "discover_endpoints") {
+    std::string rpc_url = default_rpc_url();
+    std::string genesis_hash_hex;
+    bool probe = true;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--genesis-hash" && i + 1 < argc) genesis_hash_hex = argv[++i];
+      else if (a == "--no-probe") probe = false;
+    }
+    // The chain is ours (embedded genesis), not the queried server's word for it.
+    const auto chain_domain = offline_chain_domain(genesis_hash_hex);
+    if (!chain_domain) return 1;
+    std::string err;
+    const auto listed = finalis::lightserver::rpc_get_lightserver_endpoints(rpc_url, &err);
+    if (!listed) {
+      std::cerr << "discover_endpoints failed: " << err << "\n";
+      return 1;
+    }
+    const bool allow_private = cli_network().name != "mainnet";
+    const auto now = static_cast<std::uint64_t>(std::time(nullptr));
+    std::size_t usable = 0;
+    for (const auto& a : *listed) {
+      std::string why;
+      const bool ok = probe ? finalis::lightserver::probe_announced_endpoint(a, *chain_domain, allow_private, now, &why)
+                            : finalis::p2p::verify_endpoint_announcement(*chain_domain, a, now, allow_private);
+      if (!ok && why.empty()) why = "bad announcement";
+      if (ok) ++usable;
+      std::cout << "endpoint=" << a.url << " pubkey=" << finalis::hex_encode(finalis::Bytes(a.pubkey.begin(), a.pubkey.end()))
+                << " issued_unix=" << a.issued_unix << " status=" << (ok ? (probe ? "verified" : "signed") : why) << "\n";
+    }
+    std::cout << "endpoints=" << listed->size() << "\n";
+    std::cout << "usable=" << usable << "\n";
+    return 0;
+  }
+
   if (cmd == "balance") {
     std::string rpc_url = default_rpc_url();
     std::string address;
@@ -3887,8 +3849,10 @@ int run_cli(int argc, char** argv) {
 
     // Height-locked coins count only once the next block may spend them.
     std::uint64_t spend_height = 0;
+    std::uint64_t base_fee_per_kib = 1;
     if (const auto tip_status = finalis::lightserver::rpc_get_status(rpc_url, &err); tip_status.has_value()) {
       spend_height = tip_status->tip_height + 1;
+      base_fee_per_kib = tip_status->base_fee_per_kib;
     }
     std::array<std::uint8_t, 20> own_pkh{};
     std::copy(own_decoded->pubkey_hash.begin(), own_decoded->pubkey_hash.end(), own_pkh.begin());
@@ -3926,25 +3890,40 @@ int run_cli(int argc, char** argv) {
       amount_units = total_available - fee;
     }
 
-    auto plan = finalis::plan_wallet_p2pkh_send(
-        available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
-        finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), amount_units, fee,
-        finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
-    if (!plan.has_value()) {
-      std::cerr << "send planning failed: " << err << "\n";
-      return 1;
-    }
-
     const auto chain_domain = rpc_chain_domain(rpc_url, &err);
     if (!chain_domain.has_value()) {
       std::cerr << "send failed to load chain identity: " << err << "\n";
       return 1;
     }
-    auto tx = finalis::build_signed_p2pkh_tx_multi_input(
-        *chain_domain, plan->selected_prevs, finalis::Bytes(vk.privkey.begin(), vk.privkey.end()), plan->outputs, &err);
-    if (!tx.has_value()) {
-      std::cerr << "send build failed: " << err << "\n";
-      return 1;
+    // The fee is at least the chain's base fee for the transaction's size: plan, build, and if the
+    // signed transaction needs more, plan again with that fee (its size barely changes).
+    std::optional<finalis::WalletSendPlan> plan;
+    std::optional<finalis::Tx> tx;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      if (send_max) {
+        if (total_available <= fee) {
+          std::cerr << "send failed: available finalized balance is too small to cover fee\n";
+          return 1;
+        }
+        amount_units = total_available - fee;
+      }
+      plan = finalis::plan_wallet_p2pkh_send(
+          available_prevs, finalis::address::p2pkh_script_pubkey(decoded_to->pubkey_hash),
+          finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), amount_units, fee,
+          finalis::DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &err);
+      if (!plan.has_value()) {
+        std::cerr << "send planning failed: " << err << "\n";
+        return 1;
+      }
+      tx = finalis::build_signed_p2pkh_tx_multi_input(
+          *chain_domain, plan->selected_prevs, finalis::Bytes(vk.privkey.begin(), vk.privkey.end()), plan->outputs, &err);
+      if (!tx.has_value()) {
+        std::cerr << "send build failed: " << err << "\n";
+        return 1;
+      }
+      const auto required = finalis::consensus::required_base_fee_units(base_fee_per_kib, tx->serialize().size());
+      if (plan->applied_fee_units >= required) break;
+      fee = required;
     }
 
     auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, tx->serialize(), &err);

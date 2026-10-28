@@ -125,6 +125,8 @@ struct CanonicalDerivedState {
   // Confidential turnstile P: value held in confidential (TxV2) outputs, accounted from public boundary
   // flows only. Committed; a TxV2 that would make it negative is invalid (confidential-turnstile-negative).
   std::uint64_t confidential_pool_value{0};
+  // Base fee for the next block (consensus::next_base_fee_per_kib), units per started KiB.
+  std::uint64_t base_fee_per_kib{BASE_FEE_MIN_PER_KIB};
   // TxTimed escrows waiting for their unlock height (consensus/frontier_execution.hpp). Committed.
   TimedEscrowState timed_escrows;
   // Key sets the waiting escrows name (long locks), by committee_root. Not committed separately: each
@@ -299,6 +301,12 @@ inline constexpr std::uint64_t kRetainedMetadataEpochs = 8;
 std::uint64_t retained_checkpoint_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
 std::uint64_t retained_metadata_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
 void prune_consensus_history(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state);
+// The validator registry effects of a finalized block's transactions from `input_start_index` on:
+// joins (queued while the join window is full, then admitted oldest first), unbonds, slashes and
+// liveness exits.
+void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
+                                            const std::vector<AnyTx>& txs, std::size_t input_start_index,
+                                            const UtxoSetV2& pre_utxos, std::uint64_t height);
 // The ticket difficulty checkpoint derivation uses for `epoch_start_height`, from finalized state (the
 // same rule and inputs the next checkpoint will be derived with).
 std::uint8_t ticket_difficulty_bits_for_epoch_from_state(const CanonicalDerivationConfig& cfg,
@@ -320,6 +328,9 @@ inline constexpr std::size_t kPostStatePreimageHeightOffset = 16;
 inline constexpr std::size_t kPostStatePreimageUtxoRootOffset = 32;
 inline constexpr std::size_t kPostStatePreimageCheckpointRootOffset = 168;
 // A committee checkpoint as a leaf of the post-state commitment's checkpoint tree.
+// Joins waiting for room in the join window (REQUESTED), keyed by finalization order; part of the
+// post-state commitment, since they decide who registers next.
+Hash32 queued_join_commitment_root(const std::map<Hash32, ValidatorJoinRequest>& requests);
 Hash32 checkpoint_commitment_key(std::uint64_t epoch_start_height);
 Bytes checkpoint_commitment_value(const storage::FinalizedCommitteeCheckpoint& checkpoint);
 std::optional<storage::FinalizedCommitteeCheckpoint> parse_checkpoint_commitment_value(const Bytes& bytes);

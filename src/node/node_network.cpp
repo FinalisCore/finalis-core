@@ -799,6 +799,7 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
     peer_finalized_tip_seen_ms_.erase(peer_id);
     peer_ingress_tips_.erase(peer_id);
     getaddr_requested_peers_.erase(peer_id);
+    endpoints_requested_peers_.erase(peer_id);
     msg_rate_buckets_.erase(peer_id);
     sync_request_out_buckets_.erase(peer_id);
     vote_verify_buckets_.erase(peer_id);
@@ -1118,6 +1119,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       return on_getaddr(peer_id, payload);
     case p2p::MsgType::ADDR:
       return on_addr(peer_id, payload);
+    case p2p::MsgType::GET_ENDPOINTS:
+      return on_get_endpoints(peer_id, payload);
+    case p2p::MsgType::ENDPOINTS:
+      return on_endpoints(peer_id, payload);
     case p2p::MsgType::PING:
       return on_ping(peer_id, payload);
     case p2p::MsgType::PONG:
@@ -1307,6 +1312,7 @@ void Node::on_verack(int peer_id, const Bytes& /*payload*/) {
   log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
   p2p_.mark_handshake_rx(peer_id, false, true);
   maybe_request_getaddr(peer_id);
+  maybe_request_endpoints(peer_id);
   send_finalized_tip(peer_id);
   request_finalized_tip(peer_id);
   send_ingress_tips(peer_id);
@@ -2783,6 +2789,10 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
     case p2p::MsgType::GETADDR:
       return get(msg_type, 4.0, 1.0).consume(1.0, nms);
     case p2p::MsgType::ADDR:
+      return get(msg_type, 8.0, 2.0).consume(1.0, nms);
+    case p2p::MsgType::GET_ENDPOINTS:
+      return get(msg_type, 4.0, 1.0).consume(1.0, nms);
+    case p2p::MsgType::ENDPOINTS:
       return get(msg_type, 8.0, 2.0).consume(1.0, nms);
     case p2p::MsgType::PING:
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);

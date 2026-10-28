@@ -495,6 +495,7 @@ void Node::stop() {
     }
   }
   if (restart_debug_) log_line("restart-debug event-loop-joined");
+  if (endpoint_self_check_thread_.joinable()) endpoint_self_check_thread_.join();
   if (restart_debug_) log_line("restart-debug round-timer-cancelled");
   join_local_bus_tasks();
   if (restart_debug_) log_line("restart-debug local-bus-tasks-joined");
@@ -1747,6 +1748,7 @@ void Node::event_loop() {
 
     // Backstop for finalizations reached from event-loop paths (sync, repair).
     flush_pending_finalized_broadcasts();
+    maintain_endpoints();
 
     if (time_signature_to_broadcast.has_value()) broadcast_time_signature(*time_signature_to_broadcast);
     for (const auto& msg : long_time_signatures_to_broadcast) broadcast_time_signature(msg);
@@ -1896,6 +1898,7 @@ SpecialValidationContext Node::special_validation_context_locked(std::uint64_t h
         return db_.get_height_hash(anchor_height);
       },
       .confidential_policy = &confidential_policy_,
+      .base_fee_per_kib = canonical_state_.has_value() ? canonical_state_->base_fee_per_kib : 0,
       .timed_bond_lien = [this](const PubKey32& pub, std::uint64_t h) {
         return canonical_state_.has_value() &&
                consensus::timed_bond_lien(*canonical_state_, pub, h, cfg_.network.committee_epoch_blocks);

@@ -84,6 +84,9 @@ bool Node::init_local_validator_key() {
   local_key_.private_key.reserve(32);
   local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
   local_key_.public_key = vk.pubkey;
+  // The public-lightserver announcement key (node_endpoints.cpp): derived one way, so it does not
+  // reveal this key, and derived here so the validator key is read in one place.
+  endpoint_key_ = p2p::derive_endpoint_keypair(local_key_.private_key);
   if (!crypto::lock_memory(local_key_.private_key.data(), local_key_.private_key.size())) {
     log_line("warning: mlock of validator key failed; key pages may be swapped to disk");
   }

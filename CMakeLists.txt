@@ -301,6 +301,7 @@ add_library(finalis_core
   src/storage/snapshot.cpp
   src/p2p/framing.cpp
   src/p2p/addrman.cpp
+  src/p2p/endpoints.cpp
   src/p2p/hardening.cpp
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
@@ -312,6 +313,7 @@ add_library(finalis_core
   src/node/node_consensus.cpp
   src/node/node_ingress.cpp
   src/node/node_network.cpp
+  src/node/node_endpoints.cpp
   src/node/node_validator_ops.cpp
   src/lightserver/client.cpp
   src/lightserver/server.cpp
@@ -529,6 +531,8 @@ add_executable(finalis-tests
   tests/test_address.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp
+  tests/test_endpoints.cpp
+  tests/test_join_queue.cpp
   tests/test_monetary.cpp
   tests/test_wide_arith.cpp
   tests/test_committee_schedule.cpp

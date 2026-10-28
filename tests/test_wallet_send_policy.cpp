@@ -293,7 +293,8 @@ TEST(test_wallet_network_helpers_separate_mainnet_and_testnet) {
   ASSERT_EQ(wallet::wallet_settings_key("testnet", "lightserver_endpoints"), std::string("testnet/lightserver_endpoints"));
   ASSERT_EQ(wallet::default_local_rpc_url("mainnet"), std::string("http://127.0.0.1:19444/rpc"));
   ASSERT_EQ(wallet::default_local_rpc_url("testnet"), std::string("http://127.0.0.1:19544/rpc"));
-  ASSERT_EQ(wallet::default_lightserver_endpoints("testnet").front(), std::string("http://130.61.126.39:19544/rpc"));
+  ASSERT_EQ(wallet::default_lightserver_endpoints("testnet").front(), std::string("https://159.200.236.114/rpc"));
+  ASSERT_EQ(wallet::default_lightserver_endpoints("testnet").back(), std::string("http://130.61.126.39:19544/rpc"));
   ASSERT_EQ(wallet::wallet_store_path("/w/a.json", "mainnet"), std::string("/w/a.json.walletdb"));
   ASSERT_EQ(wallet::wallet_store_path("/w/a.json", "testnet"), std::string("/w/a.json.testnet.walletdb"));
 

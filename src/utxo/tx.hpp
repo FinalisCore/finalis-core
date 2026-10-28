@@ -443,7 +443,9 @@ struct ValidatorJoinRequest {
   std::uint64_t bond_amount{0};
   std::uint64_t requested_height{0};
   std::uint64_t approved_height{0};
+  // REQUESTED: finalized while the join window was full; admitted in order once it has room.
   ValidatorJoinRequestStatus status{ValidatorJoinRequestStatus::REQUESTED};
+  crypto::BlsPublicKey bls_pubkey{};  // from the join request script, registered on admission
 };
 
 }  // namespace finalis

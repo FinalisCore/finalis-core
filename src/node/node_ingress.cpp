@@ -925,7 +925,10 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
                  " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
         return false;
       }
-      already_held = *existing == record.certificate;
+      // Held only if the lane tip covers it: a stored certificate above the tip is an orphan of an
+      // interrupted append and is applied again (append_validated_ingress_record repairs it).
+      already_held = *existing == record.certificate &&
+                     (simulated_state.has_value() ? simulated_state->max_seq : 0) >= expected_seq;
     }
     if (already_held) {
       // Already appended, typically via gossip racing this range response: a no-op, as in

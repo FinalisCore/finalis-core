@@ -2,6 +2,8 @@
 
 #include "lightserver/server.hpp"
 
+#include "p2p/endpoints.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -2225,7 +2227,16 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       local_registry_pubkey = runtime->availability_local_operator_pubkey;
     }
     std::ostringstream oss;
-    oss << "{\"network_name\":\"" << cfg_.network.name << "\",\"protocol_version\":"
+    // The key this server's node announces it under (p2p/endpoints.hpp): a client keeps a discovered
+    // endpoint only when the server behind its URL reports the announced key here.
+    std::string endpoint_pubkey;
+    if (const auto own = view->get(storage::key_own_lightserver_endpoint())) {
+      if (const auto a = p2p::de_endpoint_announcement(*own)) endpoint_pubkey = hex_encode(Bytes(a->pubkey.begin(), a->pubkey.end()));
+    }
+    // The base fee the next block requires (units per started KiB of a transaction).
+    const auto base_fee = view->get_base_fee_per_kib().value_or(consensus::BASE_FEE_MIN_PER_KIB);
+    oss << "{\"network_name\":\"" << cfg_.network.name << "\",\"endpoint_pubkey\":\"" << endpoint_pubkey
+        << "\",\"base_fee_per_kib\":" << base_fee << ",\"protocol_version\":"
         << cfg_.network.protocol_version << ",\"feature_flags\":" << cfg_.network.feature_flags
         << ",\"network_id\":\"" << chain_id_.network_id_hex << "\",\"magic\":" << chain_id_.magic
         << ",\"genesis_hash\":\"" << chain_id_.genesis_hash_hex << "\",\"genesis_source\":\""
@@ -3576,6 +3587,25 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
 
   // Light-client proofs (consensus/light_client.hpp): each handoff proves the next epoch's committee
   // from the previous one's, starting after `from_epoch_start`, so a client walks them in order.
+  // Public lightservers this node learned from the network, as signed announcements: clients verify
+  // each signature and that the server at the URL reports the announced endpoint_pubkey.
+  if (*method == "get_lightserver_endpoints") {
+    std::ostringstream oss;
+    oss << "{\"endpoints\":[";
+    std::size_t count = 0;
+    for (const auto& [_, bytes] : db_.scan_prefix(storage::key_lightserver_endpoint_prefix())) {
+      const auto a = p2p::de_endpoint_announcement(bytes);
+      if (!a || !p2p::valid_endpoint_url(a->url, true)) continue;
+      if (count++) oss << ",";
+      oss << "{\"pubkey\":\"" << hex_encode(Bytes(a->pubkey.begin(), a->pubkey.end())) << "\",\"url\":\"" << a->url
+          << "\",\"issued_unix\":" << a->issued_unix << ",\"signature\":\""
+          << hex_encode(Bytes(a->signature.begin(), a->signature.end())) << "\"}";
+      if (count >= p2p::kEndpointTableCapacity) break;
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
+  }
+
   if (*method == "get_committee_handoffs") {
     const auto from = field_u64(params, "from_epoch_start");
     if (!from || *from == 0) return make_error(id, -32602, "missing from_epoch_start");

@@ -37,6 +37,9 @@ struct SpecialValidationContext {
   // anchor may come from legacy block history or frontier transition history.
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
   const struct ConfidentialPolicy* confidential_policy{nullptr};
+  // The chain's base fee for this height (consensus::next_base_fee_per_kib): every transaction pays at
+  // least this per started KiB. 0: not checked. A timed body is exempt (its fee was prepaid).
+  std::uint64_t base_fee_per_kib{0};
   // True while (validator pubkey, height) holds a bond a pending long time lock names
   // (consensus::timed_bond_lien): the bond cannot be withdrawn yet. Unset: no lien.
   std::function<bool(const PubKey32&, std::uint64_t)> timed_bond_lien;
@@ -217,6 +220,9 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
                                      const SpecialValidationContext* ctx = nullptr);
 AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                       const SpecialValidationContext* ctx = nullptr);
+// The same without the base-fee check (callers that apply their own fee rules).
+AnyTxValidationResult validate_any_tx_without_base_fee(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
+                                                       const SpecialValidationContext* ctx = nullptr);
 
 // Confidential verification weight (consensus). Unit: one range-proof byte (~0.72 us of verify).
 // Computed from structure alone so a block's total can be bounded before any cryptographic

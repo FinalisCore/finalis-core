@@ -21,15 +21,30 @@ constexpr std::uint64_t EMISSION_YEARS = 12ULL;
 constexpr std::uint64_t EMISSION_BLOCKS = EMISSION_YEARS * BLOCKS_PER_YEAR_365;
 constexpr std::uint64_t EMISSION_DECAY_NUM = 4ULL;
 constexpr std::uint64_t EMISSION_DECAY_DEN = 5ULL;
-constexpr std::uint32_t RESERVE_ACCRUAL_BPS = 1'000U;
+// The supply is fixed at TOTAL_SUPPLY_UNITS, emitted over EMISSION_YEARS. Validators are paid for
+// ever without new coins from a protocol reserve that is never emptied:
+// - RESERVE_ACCRUAL_BPS of every block's emission is saved into it;
+// - FEE_RESERVE_BPS of the fees, every slashed bond and every burn go back into it (fees, bonds and
+//   burns move coins, they never create them);
+// - after emission ends it pays out RESERVE_PAYOUT_BPS_PER_YEAR of its balance per year, a fixed
+//   fraction per epoch, so it can never run dry.
+constexpr std::uint32_t RESERVE_ACCRUAL_BPS = 3'000U;
+constexpr std::uint32_t FEE_RESERVE_BPS = 5'000U;
+constexpr std::uint32_t RESERVE_PAYOUT_BPS_PER_YEAR = 500U;
 constexpr std::uint64_t EPOCHS_PER_YEAR_365 = BLOCKS_PER_YEAR_365 / 32ULL;
-constexpr std::uint64_t POST_CAP_SUPPORT_UNITS_PER_ELIGIBLE_VALIDATOR_PER_EPOCH = 5'000'000ULL;
-constexpr std::uint64_t POST_CAP_MIN_RESERVE_RUNWAY_EPOCHS = 10ULL * EPOCHS_PER_YEAR_365;
-constexpr std::uint64_t POST_CAP_RESERVE_FLOOR_UNITS =
-    ((TOTAL_SUPPLY_UNITS * RESERVE_ACCRUAL_BPS) / 10'000ULL) / 5ULL;
 constexpr std::uint64_t ONBOARDING_REWARD_BPS = 300ULL;
-// CLEANSLATE: The restart applies the 1,000 FLS minimum-bond policy from genesis.
-constexpr std::uint64_t POST_FORK_VALIDATOR_MIN_BOND_UNITS = 1'000ULL * BASE_UNITS_PER_COIN;
+// Minimum validator bond (validator_min_bond_units): max(floor, (B_N + 2 * B_S) / 3) with
+// B_N = base * sqrt(min(N, cap) / target) and B_S = emitted supply / MIN_BOND_SUPPLY_DIVISOR, so that
+// 128 minimum bonds lock 1 % of the supply; computed from finalized state only.
+constexpr std::uint64_t MIN_BOND_SUPPLY_DIVISOR = 12'800ULL;
+constexpr std::uint64_t MIN_BOND_VALIDATOR_COUNT_CAP = 512ULL;
+// Automatic base fee: every transaction pays at least base_fee_per_kib per started KiB of its size.
+// After each block it moves towards keeping blocks half full (fullness = the larger of the byte and
+// record shares of the block limits), by at most 1/8 per block, and never below the minimum. It
+// follows demand alone: no price, no setting.
+constexpr std::uint64_t BASE_FEE_MIN_PER_KIB = 1ULL;
+constexpr std::uint64_t BASE_FEE_MAX_PER_KIB = 1'000'000'000'000ULL;
+constexpr std::uint64_t BASE_FEE_TARGET_FULLNESS_PPM = 500'000ULL;
 
 struct Payout {
   std::uint64_t leader{0};
@@ -56,27 +71,37 @@ std::uint64_t reward_units(std::uint64_t height);
 std::uint64_t validator_reward_units(std::uint64_t height);
 std::uint64_t reserve_reward_units(std::uint64_t height);
 std::uint64_t emission_year_budget_units(std::uint64_t year_index);
-std::uint64_t post_cap_support_target_units(std::size_t eligible_validator_count);
-std::uint64_t post_cap_reserve_subsidy_units(std::size_t eligible_validator_count, std::uint64_t settled_epoch_fee_units,
-                                             std::uint64_t reserve_balance_units);
+// Coins emitted by heights 1..height (the circulating supply plus the reserve).
+std::uint64_t emitted_supply_units(std::uint64_t height);
+// The reserve's payout for one epoch settled at `height`: zero while emission runs, then
+// RESERVE_PAYOUT_BPS_PER_YEAR / EPOCHS_PER_YEAR_365 of the balance.
+std::uint64_t reserve_payout_units(std::uint64_t height, std::uint64_t reserve_balance_units);
+// The base fee after a block that was `fullness_ppm` full (0..1,000,000).
+std::uint64_t next_base_fee_per_kib(std::uint64_t base_fee_per_kib, std::uint64_t fullness_ppm);
+// The least fee a transaction of `serialized_size` bytes pays under `base_fee_per_kib`.
+std::uint64_t required_base_fee_units(std::uint64_t base_fee_per_kib, std::uint64_t serialized_size);
+// The reserve's share of an epoch's fees; validators are paid the rest.
+std::uint64_t fee_reserve_share_units(std::uint64_t fee_pool_units);
 std::uint64_t onboarding_reward_units(std::uint64_t settlement_reward_units);
 std::uint64_t validator_min_bond_units(std::uint64_t height);
 std::uint64_t integer_sqrt(std::uint64_t value);
 std::uint64_t effective_weight(std::uint64_t bonded_amount);
 std::uint64_t validator_min_bond_units(const NetworkConfig& network, std::uint64_t height,
                                        std::size_t finalized_active_validators);
-std::uint64_t validator_min_bond_units(const EconomicsConfig& economics, std::size_t finalized_active_validators);
+std::uint64_t validator_min_bond_units(const EconomicsConfig& economics, std::uint64_t height,
+                                       std::size_t finalized_active_validators);
 std::uint64_t validator_max_effective_bond_units(const NetworkConfig& network, std::uint64_t height,
                                                  std::size_t finalized_active_validators);
-std::uint64_t validator_max_effective_bond_units(const EconomicsConfig& economics, std::size_t finalized_active_validators);
+std::uint64_t validator_max_effective_bond_units(const EconomicsConfig& economics, std::uint64_t height,
+                                                 std::size_t finalized_active_validators);
 std::uint64_t capped_effective_bond_units(const NetworkConfig& network, std::uint64_t height,
                                           std::size_t finalized_active_validators, std::uint64_t actual_bond);
-std::uint64_t capped_effective_bond_units(const EconomicsConfig& economics, std::size_t finalized_active_validators,
-                                          std::uint64_t actual_bond);
+std::uint64_t capped_effective_bond_units(const EconomicsConfig& economics, std::uint64_t height,
+                                          std::size_t finalized_active_validators, std::uint64_t actual_bond);
 std::uint64_t effective_weight(const NetworkConfig& network, std::uint64_t height,
                                std::size_t finalized_active_validators, std::uint64_t actual_bond);
-std::uint64_t effective_weight(const EconomicsConfig& economics, std::size_t finalized_active_validators,
-                               std::uint64_t actual_bond);
+std::uint64_t effective_weight(const EconomicsConfig& economics, std::uint64_t height,
+                               std::size_t finalized_active_validators, std::uint64_t actual_bond);
 std::uint64_t reward_weight(const NetworkConfig& network, std::uint64_t height,
                             std::size_t finalized_active_validators, std::uint64_t actual_bond);
 std::uint64_t apply_participation_penalty_bps(std::uint64_t reward_weight_units, std::uint32_t participation_bps,

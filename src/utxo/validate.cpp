@@ -1546,6 +1546,19 @@ std::uint64_t any_tx_confidential_verify_weight(const AnyTx& tx) {
 
 AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                       const SpecialValidationContext* ctx) {
+  auto result = validate_any_tx_without_base_fee(tx, tx_index_in_block, utxos, ctx);
+  if (result.ok && ctx && ctx->base_fee_per_kib > 0 && !ctx->timed_body) {
+    const auto required = consensus::required_base_fee_units(ctx->base_fee_per_kib, result.cost.serialized_size);
+    if (result.cost.fee < required) {
+      result.ok = false;
+      result.error = "fee below base fee (needs " + std::to_string(required) + ")";
+    }
+  }
+  return result;
+}
+
+AnyTxValidationResult validate_any_tx_without_base_fee(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
+                                                       const SpecialValidationContext* ctx) {
   return std::visit(
       [&](const auto& value) -> AnyTxValidationResult {
         using T = std::decay_t<decltype(value)>;
@@ -1573,7 +1586,11 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
           }
           const Hash32 txid = value.txid();
           for (std::uint32_t out_i = 0; out_i < value.outputs.size(); ++out_i) {
-            if (is_data_output_script(value.outputs[out_i].script_pubkey)) continue;  // never spendable
+            // Data and burn outputs are never spendable; burned value goes to the reserve instead.
+            if (is_data_output_script(value.outputs[out_i].script_pubkey) ||
+                is_burn_script(value.outputs[out_i].script_pubkey, nullptr)) {
+              continue;
+            }
             utxos[OutPoint{txid, out_i}] = UtxoEntryV2{value.outputs[out_i]};
           }
         } else {
@@ -1585,7 +1602,9 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
             const auto& out = value.outputs[out_i];
             if (out.kind == TxOutputKind::Transparent) {
               const auto& transparent = std::get<TransparentTxOutV2>(out.body);
-              if (is_data_output_script(transparent.script_pubkey)) continue;  // never spendable
+              if (is_data_output_script(transparent.script_pubkey) || is_burn_script(transparent.script_pubkey, nullptr)) {
+                continue;  // never spendable
+              }
               utxos[OutPoint{txid, out_i}] = UtxoEntryV2{TxOut{transparent.value, transparent.script_pubkey}};
             } else {
               const auto& confidential = std::get<ConfidentialTxOutV2>(out.body);

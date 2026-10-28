@@ -326,6 +326,10 @@ class WalletWindow final : public QMainWindow {
                                              const QString& last_error = {}) const;
   QStringList configured_lightserver_endpoints() const;
   QStringList ordered_lightserver_endpoints() const;
+  // Public lightservers announced on the network (p2p/endpoints.hpp), learned from a working server
+  // at most every 30 min and kept only once each one is seen to serve this chain under the announced
+  // key; tried after the configured ones. Stored per network.
+  void maybe_discover_lightservers();
   void set_lightserver_endpoints(const QStringList& endpoints);
   void record_lightserver_success(const QString& endpoint, bool fallback_used);
   void record_lightserver_failure(const QString& endpoint, const QString& error);
@@ -560,6 +564,9 @@ class WalletWindow final : public QMainWindow {
   QString crosscheck_detail_text_{"No endpoint cross-check yet."};
   std::map<QString, EndpointRuntimeState> endpoint_runtime_state_;
   std::shared_ptr<LightVerifierSlot> light_verifier_slot_;
+  QStringList discovered_lightserver_endpoints_;
+  qint64 last_lightserver_discovery_secs_{0};
+  bool lightserver_discovery_in_flight_{false};
   bool balance_verified_{false};
   std::uint64_t balance_verified_height_{0};
   QString balance_verification_detail_;
