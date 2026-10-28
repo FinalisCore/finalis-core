@@ -854,6 +854,14 @@ TEST(test_slash_evidence_parsing_and_validation) {
 
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
+
+  // A slash pays no fee (its burn output carries the whole bond) and is valid however congested the
+  // chain is: the base fee does not apply to it.
+  UtxoSetV2 view_v2;
+  view_v2[bond_op] = UtxoEntryV2(TxOut{BOND_AMOUNT, reg_script(kp.public_key)});
+  ctx.base_fee_per_kib = 1'000'000;
+  const auto congested = validate_any_tx(AnyTx{*tx}, 1, view_v2, &ctx);
+  if (!congested.ok) throw std::runtime_error("slash rejected under a base fee: " + congested.error);
 }
 
 // A key reused on another network signs there under that network's chain domain. Two such votes are
