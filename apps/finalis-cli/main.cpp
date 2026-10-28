@@ -21,6 +21,12 @@
 #include <vector>
 #include <filesystem>
 #include <cstdio>
+#ifdef _WIN32
+#include <conio.h>
+#else
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 #include "common/address.hpp"
 #include "common/chain_id.hpp"
@@ -49,7 +55,9 @@
 #include "storage/db.hpp"
 #include "storage/snapshot.hpp"
 #include "utxo/signing.hpp"
+#include "wallet/light_verifier.hpp"
 #include "wallet/utxo_selection.hpp"
+#include "wallet/verified_balance.hpp"
 
 namespace {
 
@@ -778,6 +786,74 @@ std::string default_validator_key_path() {
   return (std::filesystem::path(default_db_path()) / "keystore" / "validator.json").string();
 }
 
+// --allow-unverified: spend or report coins a lightserver lists even when validator signatures could
+// not prove them (stripped in run_cli like --testnet).
+bool g_allow_unverified = false;
+
+std::string light_verifier_state_path() {
+  return (std::filesystem::path(default_db_path()) / "cli-light-verifier.bin").string();
+}
+
+// The coins a lightserver lists for `scripthash`, kept only when validator signatures prove each one
+// unspent exactly as listed. Transparent signatures do not commit to input values, so a coin listed
+// with too small a value would otherwise silently become fee. Trust starts at the embedded genesis;
+// proven checkpoints are cached next to the node data so later calls do not walk from genesis.
+// Prints coins_verified=yes|no. nullopt: no list, or a proof failed and --allow-unverified is not set.
+std::optional<std::vector<finalis::lightserver::UtxoView>> proven_rpc_utxos(const std::string& rpc_url,
+                                                                             const finalis::Hash32& scripthash,
+                                                                             std::string* err) {
+  auto listed = finalis::lightserver::rpc_get_utxos(rpc_url, scripthash, err);
+  if (!listed.has_value()) return std::nullopt;
+  std::string verr;
+  auto verifier = finalis::wallet::LightVerifier::for_network(cli_network(), &verr);
+  if (!verifier.has_value()) {
+    // No genesis to start from (a network that has not launched): nothing can be proven.
+    std::cout << "coins_verified=no\n";
+    std::cerr << "warning: coins not verified: " << verr << "\n";
+    return listed;
+  }
+  const auto state_path = light_verifier_state_path();
+  if (std::ifstream in(state_path, std::ios::binary); in) {
+    const finalis::Bytes saved((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    (void)verifier->load(saved);
+  }
+  finalis::wallet::EndpointClaims claims;
+  claims.endpoint = rpc_url;
+  if (const auto status = finalis::lightserver::rpc_get_status(rpc_url, &verr)) claims.tip_height = status->tip_height;
+  for (const auto& u : *listed) {
+    claims.utxos.push_back(finalis::wallet::ClaimedUtxo{finalis::OutPoint{u.txid, u.vout}, u.value, u.script_pubkey, u.height});
+  }
+  const auto balance = finalis::wallet::verify_claimed_balance(&*verifier, {claims}, {}, {rpc_url});
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(state_path).parent_path(), ec);
+    const auto saved = verifier->save();
+    std::ofstream out(state_path, std::ios::binary | std::ios::trunc);
+    if (out) out.write(reinterpret_cast<const char*>(saved.data()), static_cast<std::streamsize>(saved.size()));
+  }
+  for (const auto& [endpoint, what] : balance.misbehaving) {
+    std::cerr << "warning: " << endpoint << " failed verification: " << what << "\n";
+  }
+  if (!balance.verified) {
+    std::cout << "coins_verified=no\n";
+    if (!g_allow_unverified) {
+      if (err) *err = "coins could not be proven against validator signatures (" + balance.detail +
+                      "); pass --allow-unverified to trust the server";
+      return std::nullopt;
+    }
+    std::cerr << "warning: coins not verified (" << balance.detail << "); trusting the server (--allow-unverified)\n";
+    return listed;
+  }
+  std::cout << "coins_verified=yes\n";
+  std::cout << "coins_verified_height=" << balance.height << "\n";
+  std::vector<finalis::lightserver::UtxoView> proven;
+  proven.reserve(balance.utxos.size());
+  for (const auto& c : balance.utxos) {
+    proven.push_back(finalis::lightserver::UtxoView{c.outpoint.txid, c.outpoint.index, c.value, c.height, c.script_pubkey});
+  }
+  return proven;
+}
+
 std::string platform_default_db_path_note() {
 #ifdef _WIN32
   return "Windows default --db: %APPDATA%\\.finalis\\" + cli_network().name;
@@ -1446,8 +1522,13 @@ void print_user_cli_help(std::ostream& os) {
      << "  " << platform_default_db_path_note() << "\n"
      << "  Cross-platform defaults: Linux ~/.finalis/" << net << " | Windows %APPDATA%\\.finalis\\" << net << "\n"
      << "  finalis-cli help [user|dev|all]\n"
+     << "  Anywhere --pass <pass> is accepted: --pass-env <VAR> | --pass-file <path> | --pass-prompt\n"
+     << "    (--pass shows in ps and shell history; these do not)\n"
+     << "  send, lock_send, timed_send and balance spend/count only coins proven against validator signatures;\n"
+     << "    --allow-unverified trusts the lightserver when no proof can be had\n"
      << "  finalis-cli --version\n"
      << "  finalis-cli getWallet [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli balance [--rpc <url>] [--address <addr> | --file <keystore> [--pass <pass>]] [--allow-unverified]  # proven against validator signatures\n"
      << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli lock_send --to <addr> (--amount <coins> | --amount-units <u64>) (--unlock-height <h> | --lock-blocks <n>) [--inheritance] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # spendable by <addr> only from <h>; --inheritance: you keep spending it, <addr> is the heir from <h>\n"
@@ -1518,6 +1599,105 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli broadcast_tx [--url http://host:port/rpc | --host <ip> --port <p>] --tx-hex <hex>\n";
 }
 
+// One line from the terminal with echo off; nullopt at EOF. Read from stdin when it is not a terminal.
+std::optional<std::string> read_hidden_line(const std::string& prompt) {
+  std::cerr << prompt << std::flush;
+  std::string line;
+#ifdef _WIN32
+  for (int c = _getch(); c != '\r' && c != '\n'; c = _getch()) {
+    if (c == 3 || c == EOF) return std::nullopt;
+    if (c == '\b') {
+      if (!line.empty()) line.pop_back();
+    } else {
+      line.push_back(static_cast<char>(c));
+    }
+  }
+#else
+  termios old{};
+  const bool tty = ::isatty(STDIN_FILENO) == 1 && ::tcgetattr(STDIN_FILENO, &old) == 0;
+  if (tty) {
+    termios quiet = old;
+    quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    (void)::tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet);
+  }
+  const bool got = static_cast<bool>(std::getline(std::cin, line));
+  if (tty) (void)::tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
+  if (!got) {
+    std::cerr << "\n";
+    return std::nullopt;
+  }
+#endif
+  std::cerr << "\n";
+  if (!line.empty() && line.back() == '\r') line.pop_back();
+  return line;
+}
+
+// --pass puts the passphrase in `ps` and shell history. --pass-env <VAR>, --pass-file <path> (first
+// line) and --pass-prompt (asked with echo off; twice for wallet_create/wallet_import) are rewritten
+// into --pass <value> here, so every command's own parser keeps handling --pass alone.
+bool resolve_passphrase_args(std::vector<std::string>& args) {
+  const bool creates = args.size() >= 2 && (args[1] == "wallet_create" || args[1] == "wallet_import");
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    const std::string a = args[i];
+    if (a == "--pass") {
+      ++i;  // a literal passphrase, even one spelled like an option
+      continue;
+    }
+    if (a != "--pass-env" && a != "--pass-file" && a != "--pass-prompt") continue;
+    std::string value;
+    std::size_t consumed = 1;
+    if (a == "--pass-prompt") {
+      const auto first = read_hidden_line("passphrase: ");
+      if (!first) {
+        std::cerr << "error: --pass-prompt: no passphrase entered\n";
+        return false;
+      }
+      if (creates) {
+        const auto again = read_hidden_line("repeat passphrase: ");
+        if (!again || *again != *first) {
+          std::cerr << "error: --pass-prompt: the passphrases do not match\n";
+          return false;
+        }
+      }
+      value = *first;
+    } else {
+      if (i + 1 >= args.size()) {
+        std::cerr << "error: " << a << " needs a value\n";
+        return false;
+      }
+      consumed = 2;
+      if (a == "--pass-env") {
+        const char* v = std::getenv(args[i + 1].c_str());
+        if (v == nullptr) {
+          std::cerr << "error: --pass-env: environment variable " << args[i + 1] << " is not set\n";
+          return false;
+        }
+        value = v;
+      } else {
+        std::ifstream in(expand_user(args[i + 1]), std::ios::binary);
+        if (!in) {
+          std::cerr << "error: --pass-file: cannot read " << args[i + 1] << "\n";
+          return false;
+        }
+        std::getline(in, value);
+        if (!value.empty() && value.back() == '\r') value.pop_back();
+      }
+    }
+    if (value.empty()) {
+      std::cerr << "error: " << a << ": the passphrase is empty\n";
+      return false;
+    }
+    args[i] = "--pass";
+    if (consumed == 2) {
+      args[i + 1] = value;
+    } else {
+      args.insert(args.begin() + static_cast<std::ptrdiff_t>(i) + 1, value);
+    }
+    ++i;
+  }
+  return true;
+}
+
 void print_cli_help(std::ostream& os, const std::string& mode) {
   if (mode == "dev") {
     print_dev_cli_help(os);
@@ -1542,6 +1722,16 @@ int run_cli(int argc, char** argv) {
     g_cli_network = &finalis::testnet_network();
     args.erase(std::remove_if(args.begin() + 1, args.end(), testnet_flag), args.end());
   }
+  const auto unverified_flag = [](const char* a) { return std::string_view(a) == "--allow-unverified"; };
+  if (std::find_if(args.begin() + 1, args.end(), unverified_flag) != args.end()) {
+    g_allow_unverified = true;
+    args.erase(std::remove_if(args.begin() + 1, args.end(), unverified_flag), args.end());
+  }
+  static std::vector<std::string> owned;
+  owned.assign(args.begin(), args.end());
+  if (!resolve_passphrase_args(owned)) return 1;
+  args.clear();
+  for (auto& a : owned) args.push_back(a.data());
   argc = static_cast<int>(args.size());
   args.push_back(nullptr);
   argv = args.data();
@@ -2980,6 +3170,49 @@ int run_cli(int argc, char** argv) {
     return 0;
   }
 
+  if (cmd == "balance") {
+    std::string rpc_url = default_rpc_url();
+    std::string address;
+    std::string file_path;
+    std::string passphrase;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--address" && i + 1 < argc) address = argv[++i];
+      else if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+    }
+    std::string err;
+    if (address.empty()) {
+      finalis::keystore::ValidatorKey vk;
+      const std::string path = expand_user(file_path.empty() ? default_validator_key_path() : file_path);
+      if (!finalis::keystore::load_validator_keystore(path, passphrase, &vk, &err)) {
+        std::cerr << "balance failed to load key: " << err << "\n";
+        return 1;
+      }
+      address = vk.address;
+    }
+    const auto decoded = decode_network_address(address, "--address");
+    if (!decoded.has_value()) return 1;
+    if (!rpc_chain_domain(rpc_url, &err).has_value()) {
+      std::cerr << "balance failed: " << err << "\n";
+      return 1;
+    }
+    const auto scripthash =
+        finalis::crypto::sha256(finalis::address::p2pkh_script_pubkey(decoded->pubkey_hash));
+    std::cout << "address=" << address << "\n";
+    auto utxos = proven_rpc_utxos(rpc_url, scripthash, &err);
+    if (!utxos.has_value()) {
+      std::cerr << "balance failed: " << err << "\n";
+      return 1;
+    }
+    std::uint64_t total = 0;
+    for (const auto& u : *utxos) total += u.value;
+    std::cout << "balance=" << total << "\n";
+    std::cout << "utxos=" << utxos->size() << "\n";
+    return 0;
+  }
+
   if (cmd == "getBalance") {
     std::string db_path = default_db_path();
     std::string file_path = default_validator_key_path();
@@ -3646,7 +3879,7 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
 
-    auto rpc_utxos = finalis::lightserver::rpc_get_utxos(rpc_url, validated->scripthash, &err);
+    auto rpc_utxos = proven_rpc_utxos(rpc_url, validated->scripthash, &err);
     if (!rpc_utxos.has_value()) {
       std::cerr << "send failed to load finalized rpc utxos: " << err << "\n";
       return 1;
@@ -3832,7 +4065,7 @@ int run_cli(int argc, char** argv) {
       std::cerr << "lock_send failed to validate wallet address: " << err << "\n";
       return 1;
     }
-    auto rpc_utxos = finalis::lightserver::rpc_get_utxos(rpc_url, validated->scripthash, &err);
+    auto rpc_utxos = proven_rpc_utxos(rpc_url, validated->scripthash, &err);
     if (!rpc_utxos.has_value()) {
       std::cerr << "lock_send failed to load utxos: " << err << "\n";
       return 1;
@@ -4007,7 +4240,7 @@ int run_cli(int argc, char** argv) {
       std::cerr << "timed_send failed to validate wallet address: " << err << "\n";
       return 1;
     }
-    auto rpc_utxos = finalis::lightserver::rpc_get_utxos(rpc_url, validated->scripthash, &err);
+    auto rpc_utxos = proven_rpc_utxos(rpc_url, validated->scripthash, &err);
     if (!rpc_utxos.has_value()) {
       std::cerr << "timed_send failed to load utxos: " << err << "\n";
       return 1;

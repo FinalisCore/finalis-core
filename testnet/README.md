@@ -34,7 +34,7 @@ each on its own machine.
 ### 1. Keys: on each validator machine, never copied elsewhere
 
 ```bash
-finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass "<passphrase>"
+finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass-prompt
 ```
 
 Keep the passphrase off the machine's shell history (for example, read it from a file with
@@ -42,7 +42,7 @@ Keep the passphrase off the machine's shell history (for example, read it from a
 proof of possession (public output; derived from the same key):
 
 ```bash
-finalis-cli validator_bls --file ~/.finalis/testnet/keystore/validator.json --pass "<passphrase>"
+finalis-cli validator_bls --file ~/.finalis/testnet/keystore/validator.json --pass-prompt
 ```
 
 ### 2. genesis.json and genesis.bin: on the release commit
@@ -276,7 +276,7 @@ On Windows: `Test-NetConnection <your public IP> -Port 19540`. Or use an online 
 2. Create a validator key on that machine and note its `address` (`tsc1…`):
 
    ```bash
-   finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass "<passphrase>"
+   finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass-prompt
    ```
 
 3. Get testnet FLS to that address: the bond (1,000 to 4,000 FLS, depending on the number of
@@ -284,7 +284,7 @@ On Windows: `Test-NetConnection <your public IP> -Port 19540`. Or use an online 
 
    ```bash
    finalis-cli --testnet send --to <tsc1 address> --amount-units <units> \
-       --file <bootstrap validator.json> --pass "<passphrase>" --db <wallet dir>
+       --file <bootstrap validator.json> --pass-prompt --db <wallet dir>
    ```
 
    (1 FLS = 100,000,000 units.)
@@ -293,7 +293,7 @@ On Windows: `Test-NetConnection <your public IP> -Port 19540`. Or use an online 
    to finality:
 
    ```bash
-   finalis-cli --testnet validator-register --file ~/.finalis/testnet/keystore/validator.json --pass "<passphrase>"
+   finalis-cli --testnet validator-register --file ~/.finalis/testnet/keystore/validator.json --pass-prompt
    ```
 
 5. Restart the node with the key so it validates:
