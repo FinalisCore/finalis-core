@@ -26,6 +26,7 @@ class SendPage final : public QWidget {
   QSpinBox* unlock_delay_spin() const { return unlock_delay_spin_; }
   QLabel* unlock_delay_label() const { return unlock_delay_label_; }
   QPushButton* cancel_timed_button() const { return cancel_timed_button_; }
+  QPushButton* read_sealed_button() const { return read_sealed_button_; }
   // Height-locked mode: the block from which the recipient may spend, and whether the sender keeps
   // spending it until then (inheritance).
   QLineEdit* lock_height_edit() const { return lock_height_edit_; }
@@ -53,6 +54,7 @@ class SendPage final : public QWidget {
   QSpinBox* unlock_delay_spin_{nullptr};
   QLabel* unlock_delay_label_{nullptr};
   QPushButton* cancel_timed_button_{nullptr};
+  QPushButton* read_sealed_button_{nullptr};
   QLineEdit* lock_height_edit_{nullptr};
   QLabel* lock_height_label_{nullptr};
   QCheckBox* inheritance_check_{nullptr};

@@ -128,6 +128,8 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   send_button_ = new QPushButton("Send", form_box);
   cancel_timed_button_ = new QPushButton("Cancel Time-Locked...", form_box);
   cancel_timed_button_->setToolTip("Spend the coins of a pending time-locked transfer back to this wallet before it opens.");
+  read_sealed_button_ = new QPushButton("Read Sealed Data...", form_box);
+  read_sealed_button_->setToolTip("Show the data a sealed-data transaction published when it opened.");
   max_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   import_confidential_request_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   review_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
@@ -137,6 +139,7 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   actions->addWidget(review_button_);
   actions->addWidget(send_button_);
   actions->addWidget(cancel_timed_button_);
+  actions->addWidget(read_sealed_button_);
   actions->addStretch(1);
   form->addRow("", actions);
   content->addWidget(form_box);

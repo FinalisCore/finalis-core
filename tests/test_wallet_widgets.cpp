@@ -309,6 +309,8 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   auto* combo = window.send_mode_combo_;
   require(combo != nullptr && combo->count() == 7, "send mode count mismatch");
   require(combo->itemText(4).toStdString() == "Transparent -> Transparent (time-locked)", "time-locked mode missing");
+  require(window.send_read_sealed_button_ != nullptr && window.send_read_sealed_button_->isEnabled(),
+          "read sealed data button missing");
   require(window.send_unlock_delay_spin_ != nullptr && window.send_cancel_timed_button_ != nullptr,
           "time-locked controls missing");
   require(window.send_unlock_delay_spin_->isHidden(), "unlock delay visible outside time-locked mode");

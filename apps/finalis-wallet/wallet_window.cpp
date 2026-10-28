@@ -1292,6 +1292,7 @@ void WalletWindow::build_ui() {
   send_unlock_delay_spin_ = send_page_->unlock_delay_spin();
   send_unlock_delay_label_ = send_page_->unlock_delay_label();
   send_cancel_timed_button_ = send_page_->cancel_timed_button();
+  send_read_sealed_button_ = send_page_->read_sealed_button();
   send_lock_height_edit_ = send_page_->lock_height_edit();
   send_lock_height_label_ = send_page_->lock_height_label();
   send_inheritance_check_ = send_page_->inheritance_check();
@@ -1504,6 +1505,7 @@ void WalletWindow::build_ui() {
   connect(send_review_button_, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button_, &QPushButton::clicked, this, [this]() { submit_send(); });
   connect(send_cancel_timed_button_, &QPushButton::clicked, this, [this]() { cancel_timed_send(); });
+  connect(send_read_sealed_button_, &QPushButton::clicked, this, [this]() { read_sealed_data(); });
   connect(validator_action_button_, &QPushButton::clicked, this, [this]() { start_validator_onboarding_clicked(); });
   connect(validator_refresh_button_, &QPushButton::clicked, this, [this]() { refresh_validator_readiness_panel(true); });
   connect(validator_cancel_button_, &QPushButton::clicked, this, [this]() { cancel_validator_onboarding_clicked(); });
@@ -3757,6 +3759,55 @@ std::optional<WalletWindow::PreparedTimedSend> WalletWindow::prepare_timed_send(
   if (!plan) return fail(QString::fromStdString(plan_err));
   out.plan = std::move(*plan);
   return out;
+}
+
+void WalletWindow::read_sealed_data() {
+  const QString title = "Read Sealed Data";
+  // The txid most likely wanted is the one just copied (e.g. from the send confirmation).
+  QString suggested = QApplication::clipboard()->text().trimmed();
+  if (!decode_hex32_string(suggested.toStdString())) suggested.clear();
+  bool ok = false;
+  const QString txid = QInputDialog::getText(this, title, "Sealed-data transaction id:", QLineEdit::Normal, suggested, &ok).trimmed();
+  if (!ok || txid.isEmpty()) return;
+  const auto parsed = decode_hex32_string(txid.toStdString());
+  if (!parsed) {
+    QMessageBox::warning(this, title, "Not a transaction id (64 hex characters).");
+    return;
+  }
+  std::string rpc_err;
+  QString used_endpoint;
+  std::optional<lightserver::TimedRevealView> reveal;
+  for (const QString& endpoint : ordered_lightserver_endpoints()) {
+    reveal = lightserver::rpc_get_timed_reveal(endpoint.toStdString(), *parsed, &rpc_err);
+    if (reveal) {
+      used_endpoint = endpoint;
+      break;
+    }
+  }
+  if (!reveal) {
+    QMessageBox::warning(this, title,
+                         rpc_err.empty() ? QString("No configured lightserver answered.") : QString::fromStdString(rpc_err));
+    return;
+  }
+  if (!reveal->revealed) {
+    QMessageBox::information(this, title,
+                             "Not published yet: the data is sealed until the block after its unlock height is final, "
+                             "or this is not a sealed-data transaction.");
+    return;
+  }
+  const QByteArray raw(reinterpret_cast<const char*>(reveal->data.data()), static_cast<qsizetype>(reveal->data.size()));
+  const QString text = QString::fromUtf8(raw);
+  const bool printable_utf8 = text.toUtf8() == raw && std::none_of(text.begin(), text.end(), [](QChar c) {
+                                return c.category() == QChar::Other_Control && c != '\n' && c != '\t';
+                              });
+  QString body = QString("Published in block %1 (reported by %2), %3 bytes.\n\n")
+                     .arg(reveal->height)
+                     .arg(display_lightserver_endpoint(used_endpoint))
+                     .arg(reveal->data.size());
+  body += printable_utf8 ? text : QString("Hex:\n") + QString::fromStdString(hex_encode(reveal->data));
+  QMessageBox box(QMessageBox::Information, title, body, QMessageBox::Ok, this);
+  box.setTextInteractionFlags(Qt::TextSelectableByMouse);
+  box.exec();
 }
 
 void WalletWindow::cancel_timed_send() {
