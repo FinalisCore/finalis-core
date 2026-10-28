@@ -40,9 +40,10 @@ constexpr std::uint64_t MIN_BOND_SUPPLY_DIVISOR = 12'800ULL;
 constexpr std::uint64_t MIN_BOND_VALIDATOR_COUNT_CAP = 512ULL;
 // Automatic base fee: every transaction pays at least base_fee_per_kib per started KiB of its size.
 // After each block it moves towards keeping blocks half full (fullness = the larger of the byte and
-// record shares of the block limits), by at most 1/8 per block, and never below the minimum. It
-// follows demand alone: no price, no setting.
-constexpr std::uint64_t BASE_FEE_MIN_PER_KIB = 1ULL;
+// record shares of the block limits), by at most 1/8 per block (at least 1 unit when above target),
+// and never below the minimum. It follows demand alone: no price, no setting.
+// Zero at rest: while blocks are less than half full no fee is required (as before the base fee).
+constexpr std::uint64_t BASE_FEE_MIN_PER_KIB = 0ULL;
 constexpr std::uint64_t BASE_FEE_MAX_PER_KIB = 1'000'000'000'000ULL;
 constexpr std::uint64_t BASE_FEE_TARGET_FULLNESS_PPM = 500'000ULL;
 

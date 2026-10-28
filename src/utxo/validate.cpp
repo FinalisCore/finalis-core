@@ -1544,10 +1544,30 @@ std::uint64_t any_tx_confidential_verify_weight(const AnyTx& tx) {
   return 0;
 }
 
+namespace {
+bool tx_has_burn_output(const AnyTx& tx) {
+  if (const auto* v1 = std::get_if<Tx>(&tx)) {
+    for (const auto& out : v1->outputs) {
+      if (is_burn_script(out.script_pubkey, nullptr)) return true;
+    }
+    return false;
+  }
+  for (const auto& out : std::get<TxV2>(tx).outputs) {
+    if (out.kind == TxOutputKind::Transparent &&
+        is_burn_script(std::get<TransparentTxOutV2>(out.body).script_pubkey, nullptr)) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
 AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                       const SpecialValidationContext* ctx) {
   auto result = validate_any_tx_without_base_fee(tx, tx_index_in_block, utxos, ctx);
-  if (result.ok && ctx && ctx->base_fee_per_kib > 0 && !ctx->timed_body) {
+  // Exempt: a timed body (its fee was prepaid) and a slash (its burn output must carry the whole
+  // slashed bond, so it cannot pay a fee, and congestion must not stop punishment).
+  if (result.ok && ctx && ctx->base_fee_per_kib > 0 && !ctx->timed_body && !tx_has_burn_output(tx)) {
     const auto required = consensus::required_base_fee_units(ctx->base_fee_per_kib, result.cost.serialized_size);
     if (result.cost.fee < required) {
       result.ok = false;

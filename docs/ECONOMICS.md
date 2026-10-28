@@ -160,8 +160,10 @@ new coins, from a protocol reserve that cannot run dry:
   reserve smooths that over decades.
 - **Base fee:** every transaction pays at least `base_fee_per_kib` per started KiB of its size. After
   each block it moves by at most 1/8 towards keeping blocks half full (fullness is the larger of the
-  byte and record shares), with a floor of 1 unit. It follows demand only, so it works at any FLS
-  price without anyone setting it. Timed transactions' bodies are exempt (their fee is prepaid).
+  byte and record shares). It is zero at rest (no fee required while blocks are less than half full)
+  and rises by at least 1 unit a block under congestion. It follows demand only, so it works at any FLS
+  price without anyone setting it. Exempt: timed transactions' bodies (their fee is prepaid) and
+  slashes (their burn output carries the whole bond, and congestion must not stop punishment).
   `get_status` reports it; `finalis-cli send` pays it automatically.
 
 Primary emission constants:

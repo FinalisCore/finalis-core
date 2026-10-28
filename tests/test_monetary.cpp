@@ -228,7 +228,9 @@ TEST(test_base_fee_follows_block_fullness_and_never_leaves_its_bounds) {
   ASSERT_EQ(next_base_fee_per_kib(8'000, BASE_FEE_TARGET_FULLNESS_PPM), 8'000ULL);
   ASSERT_EQ(next_base_fee_per_kib(8'000, 1'000'000), 9'000ULL);
   ASSERT_EQ(next_base_fee_per_kib(8'000, 0), 7'000ULL);
-  // At the minimum a full block still raises it, an empty one cannot push it lower.
+  // At the minimum (zero: no fee required at rest) a full block still raises it, an empty one cannot
+  // push it lower.
+  ASSERT_EQ(BASE_FEE_MIN_PER_KIB, 0ULL);
   ASSERT_EQ(next_base_fee_per_kib(BASE_FEE_MIN_PER_KIB, 1'000'000), BASE_FEE_MIN_PER_KIB + 1);
   ASSERT_EQ(next_base_fee_per_kib(BASE_FEE_MIN_PER_KIB, 0), BASE_FEE_MIN_PER_KIB);
   ASSERT_EQ(next_base_fee_per_kib(BASE_FEE_MAX_PER_KIB, 1'000'000), BASE_FEE_MAX_PER_KIB);
