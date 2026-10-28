@@ -543,6 +543,15 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
            hex_encode32(transition_id) + " round=" + std::to_string(record.transition.round) +
            " commit_round=" + std::to_string(commit_round) + " source=" +
            (clear_requested_sync ? "delivered" : "quorum"));
+  if (canonical_state_.has_value()) {
+    for (const auto& settled : canonical_state_->last_timed_settlements) {
+      log_line("timed-settled height=" + std::to_string(record.transition.height) + " txid=" +
+               hex_encode32(settled.timed_txid) + " unlock_height=" + std::to_string(settled.key.unlock_height) +
+               " outcome=" + (settled.expired ? "expired" : settled.body_applied ? "applied" : "forfeited") +
+               (settled.body_txid ? " body_txid=" + hex_encode32(*settled.body_txid) : std::string()) +
+               (settled.body_reject_reason.empty() ? std::string() : " reason=\"" + settled.body_reject_reason + "\""));
+    }
+  }
   if (error) error->clear();
   return true;
 }
@@ -613,7 +622,7 @@ bool Node::verify_finality_certificate_for_frontier_locked(const FinalityCertifi
     return false;
   }
   // A transition re-proposed as the valid value can be precommitted in a later round.
-  if (cert.round < transition.round) {
+  if (!consensus::vote_round_covers_transition(cert.round, transition.round)) {
     if (error) *error = "certificate-round-mismatch";
     return false;
   }
@@ -699,6 +708,8 @@ std::optional<Vote> Node::on_prevotes_changed_locked(const Hash32& transition_id
   auto proposal_it = candidate_frontier_proposals_.find(transition_id);
   if (proposal_it == candidate_frontier_proposals_.end()) return std::nullopt;  // retried when the body arrives
   const FrontierProposal proposal = proposal_it->second;
+  // SAFETY (R1): no valid value, lock or precommit from a polka below the transition's own round.
+  if (!consensus::vote_round_covers_transition(round, proposal.transition.round)) return std::nullopt;
 
   // Valid value: the highest-round polka (Tendermint validValue / validRound).
   auto valid_it = valid_polka_by_height_.find(height);
@@ -1287,6 +1298,11 @@ void Node::stage_consensus_safety_state(std::uint64_t height, const ConsensusSaf
   const Bytes inner = serialize_consensus_safety_state(state.lock, state.valid_polka, state.prevotes);
   batch.put(key_consensus_safety_state(height), seal_consensus_safety_row(inner, false));
   batch.put(key_consensus_safety_mirror(height), seal_consensus_safety_row(inner, true));
+  if (height > load_consensus_safety_highwater(db_)) {
+    codec::ByteWriter w;
+    w.u64le(height);
+    batch.put(kConsensusSafetyHighwaterKey, w.data());
+  }
 }
 
 bool Node::persist_consensus_safety_state_locked(std::uint64_t height, const ConsensusSafetyState& state,
@@ -2924,6 +2940,14 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
     log_line(std::string(in_flight ? "finalize-wait" : "finalize-skip") + " height=" + std::to_string(height) +
              " round=" + std::to_string(round) + " transition=" + short_hash_hex(block_id) + " reason=" +
              (in_flight ? "candidate-pending" : "missing-candidate"));
+    return false;
+  }
+  // SAFETY (R1): a precommit quorum below the transition's own round finalizes nothing, as in the
+  // derivation (verify_frontier_finality_certificate), which a restart replays.
+  if (!consensus::vote_round_covers_transition(round, proposal_it->second.transition.round)) {
+    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " transition=" + short_hash_hex(block_id) + " reason=round-below-transition-round transition_round=" +
+             std::to_string(proposal_it->second.transition.round));
     return false;
   }
   // LIVENESS: count votes before re-executing the transition below. That re-execution costs

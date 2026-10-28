@@ -2061,9 +2061,15 @@ TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   auto unavailable = [](std::string detail) {
     return TxRelayResult{TxRelayResult::Outcome::Unavailable, std::move(detail)};
   };
-  const auto parsed = parse_any_tx(tx_bytes);
-  if (!parsed.has_value()) return TxRelayResult{TxRelayResult::Outcome::Rejected, "tx parse failed"};
-  const Hash32 txid = txid_any(*parsed);
+  // A Tx / TxV2, or a TxTimed (its own record kind: broadcast_tx relays it unchecked to the node).
+  Hash32 txid{};
+  if (const auto parsed = parse_any_tx(tx_bytes); parsed.has_value()) {
+    txid = txid_any(*parsed);
+  } else if (const auto timed = TxTimed::parse(tx_bytes); timed.has_value()) {
+    txid = timed->txid();
+  } else {
+    return TxRelayResult{TxRelayResult::Outcome::Rejected, "tx parse failed"};
+  }
   constexpr std::uint32_t kRelayHandshakeTimeoutMs = 2000;
   constexpr std::uint32_t kRelayVerdictTimeoutMs = 5000;
   constexpr std::uint32_t kRelayDrainTimeoutMs = 1000;

@@ -259,6 +259,13 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                            const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error,
                            std::set<Hash32>* accepted_txids = nullptr);
+// Votes of round `vote_round` can certify a transition of round `transition_round` only from its own
+// round on (a re-proposed valid value is precommitted in later rounds, never earlier). The derivation
+// rejects a certificate below it, so the live path must ignore polkas, locks and precommit quorums
+// below it too: a node that finalized from one could not restart from its own database.
+inline bool vote_round_covers_transition(std::uint32_t vote_round, std::uint32_t transition_round) {
+  return vote_round >= transition_round;
+}
 // Checks `cert` finalizes `transition` with a quorum of valid precommits from the committee that
 // `state`'s checkpoints give for (transition.height, cert.round).
 bool verify_frontier_finality_certificate(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,

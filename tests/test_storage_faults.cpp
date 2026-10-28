@@ -267,12 +267,18 @@ std::string run_storage_child(const std::function<int()>& body) {
   std::cerr.flush();
   const pid_t pid = ::fork();
   if (pid == 0) {
+#if !defined(__SANITIZE_THREAD__)
+    // The first backtrace() loads libgcc (malloc): do it before the handler can run. Left out under
+    // TSan, which reports any signal-unsafe call in a handler (diagnostics only).
+    void* warm[1];
+    (void)::backtrace(warm, 1);
     std::signal(SIGABRT, [](int) {
       void* frames[64];
       ::backtrace_symbols_fd(frames, ::backtrace(frames, 64), 2);
       std::signal(SIGABRT, SIG_DFL);
       std::abort();
     });
+#endif
     std::thread([] {
       std::this_thread::sleep_for(std::chrono::seconds(60));
       _exit(99);

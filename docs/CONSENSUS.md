@@ -287,6 +287,10 @@ A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (ve
    data is published in the settlement record (`revealed_data`, node rows `TR:` by timed txid with
    the settling height). Applied or revealed: the bond is refunded at `(timed txid, 1)`. Otherwise
    the bond is a fee of block `h`. No record of `h` runs before, so none can front-run a revealed body.
+   A transfer body is signed under `timed_body_chain_domain(D)` = `sha256d("FINALIS-TIMED-BODY-V1" | D)`
+   in place of the chain domain `D` (`SpecialValidationContext::timed_body`): revealed, it is no valid
+   record on its own, so nobody who decrypted it (a long lock's aggregate can circulate before a block
+   carries it) can spend its inputs first and make the settlement forfeit the bond.
 2. **Records.** A `TxTimed` is accepted (escrowed) when `h <= unlock_height`,
    `committee_epoch` and `committee_root` name `h`'s epoch checkpoint keys, the ciphertext has
    threshold `quorum(n)` and its well-formedness proof verifies, the fee input is an unspent P2PKH

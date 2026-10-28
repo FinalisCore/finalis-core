@@ -148,6 +148,8 @@ struct TimedSettlementRecord {
   bool expired{false};
   // A reveal body's data (body_applied is then true and the bond refunded).
   std::optional<Bytes> revealed_data;
+  // Diagnostics only (not committed): why an opened transfer body did not apply.
+  std::string body_reject_reason;
 };
 
 
@@ -285,9 +287,15 @@ TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied
 // the per-block caps and conflicts with other records of the block): unlock height not passed, the
 // inclusion epoch's committee and root, threshold, well-formedness proof, a long lock's fee and body
 // size, a P2PKH fee input in `utxos` signed over the envelope, exact value accounting and the
-// minimum bond. Mempool admission uses it as is.
+// minimum bond. Mempool admission runs it in two parts: everything but the proof (SkipSweProof)
+// under the node lock, then verify_timed_swe_proof outside it.
 // On success `inclusion` (if given) holds the fee, change and escrow; `reason` says why not otherwise.
+enum class TimedInclusionCheck { Full, SkipSweProof };
 bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed, const UtxoSetV2& utxos,
-                           TimedInclusion* inclusion = nullptr, std::string* reason = nullptr);
+                           TimedInclusion* inclusion = nullptr, std::string* reason = nullptr,
+                           TimedInclusionCheck check = TimedInclusionCheck::Full);
+// The well-formedness proof check of check_timed_inclusion (its costly part: ~45 ms at 128 keys) for
+// the ordered keys of the envelope's committee (`keys`, whose root check_timed_inclusion checked).
+bool verify_timed_swe_proof(const TxTimed& tx, const std::vector<crypto::BlsPublicKey>& keys, const Hash32& chain_domain);
 
 }  // namespace finalis::consensus

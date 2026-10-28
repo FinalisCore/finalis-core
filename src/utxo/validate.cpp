@@ -696,7 +696,14 @@ std::optional<Hash32> chain_domain_from_hex(const std::string& network_id_hex, c
 
 std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx) {
   if (!ctx || !ctx->network || !ctx->chain_id) return std::nullopt;
-  return consensus_chain_domain(*ctx->network, *ctx->chain_id);
+  const auto domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
+  return ctx->timed_body ? timed_body_chain_domain(domain) : domain;
+}
+
+Hash32 timed_body_chain_domain(const Hash32& chain_domain) {
+  Bytes in{'F', 'I', 'N', 'A', 'L', 'I', 'S', '-', 'T', 'I', 'M', 'E', 'D', '-', 'B', 'O', 'D', 'Y', '-', 'V', '1'};
+  in.insert(in.end(), chain_domain.begin(), chain_domain.end());
+  return crypto::sha256d(in);
 }
 
 Bytes vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,

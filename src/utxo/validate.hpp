@@ -40,6 +40,8 @@ struct SpecialValidationContext {
   // True while (validator pubkey, height) holds a bond a pending long time lock names
   // (consensus::timed_bond_lien): the bond cannot be withdrawn yet. Unset: no lien.
   std::function<bool(const PubKey32&, std::uint64_t)> timed_bond_lien;
+  // Validating the sealed body of a settling TxTimed: its signatures cover timed_body_chain_domain.
+  bool timed_body{false};
 };
 
 struct SlashEvidence {
@@ -80,6 +82,10 @@ std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const 
 Bytes signing_message_for_timed_fee_input(const Hash32& chain_domain, const TxTimed& tx);
 // The chain domain transaction signatures are checked under; empty when ctx lacks chain identity.
 std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx);
+// The domain a TxTimed's sealed transfer is signed under (in place of the chain domain). A revealed
+// body is then no valid transaction on its own: it runs only through its settlement, so nobody who
+// decrypted it can spend its inputs first and make the settlement forfeit the bond.
+Hash32 timed_body_chain_domain(const Hash32& chain_domain);
 // The Ed25519 proof of a registration covers the validator's BLS key: a script that pairs a
 // validator with someone else's BLS key does not verify.
 Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,

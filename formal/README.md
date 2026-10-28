@@ -166,6 +166,30 @@ It abstracts away (each abstraction only adds behaviours): transition ids as abs
 fresh proposal may reuse, body availability, TC formation, the per-round reservations that a reset
 clears, and the once-per-round limit on honest proposals. Liveness is not checked.
 
+## Timed Release Model
+
+- Spec: [timed_release.tla](timed_release.tla) (docs/CONSENSUS.md, "Timed Transactions")
+- Configs: [timed_release.cfg](timed_release.cfg) (invariants hold, exhaustive: 3 honest + 1 Byzantine,
+  2 transactions, 5 heights, grace 2; 53,781 distinct states, seconds); reachability
+  `timed_release_reach_{applied,long_opened,long_expired}.cfg`; mutations
+  `timed_release_{sign_early,late_inclusion,standalone_body,settle_last}_mutation.cfg`
+
+Abstracts finality (one height at a time) and cryptography (a body key for unlock height `u` is known
+once a threshold signed `time_signature_message(u)`; Byzantine validators have signed everything).
+Models: honest signing only of final heights, the proposal gate on the parent's aggregate, inclusion at
+or before the unlock height, settlement before records (short locks at `u + 1`, optional long openings
+within the grace period, expiry at `u + Grace + 1`), relays of decrypted bodies, early-signature evidence.
+
+| Invariant | Meaning | Mutation that breaks it |
+|---|---|---|
+| `NoEarlyKey` | no body key for a height that is not final | `sign_early` |
+| `SettleOnTime` | short locks settle at `u + 1`, long ones open in the window or expire on time | `late_inclusion` |
+| `NoBondLoss` | nobody can spend a sealed body's inputs first and forfeit the sender's bond | `standalone_body` (long locks), `settle_last` (short too) |
+| `HonestNotSlashed` | early-signature evidence never hits an honest validator | `sign_early` |
+
+`standalone_body` is the T1 defect (tests/KNOWN_DEFECTS.md): bodies signed under the plain chain domain
+can be relayed on their own once a long lock's key is known; `timed_body_chain_domain` removes that action.
+
 ## Two-Phase Finality Persistence Model
 
 [two_phase_finality_persistence.tla](two_phase_finality_persistence.tla) adds the persistence layer to

@@ -258,6 +258,8 @@ class Node {
   // Test hooks.
   bool inject_vote_for_test(const Vote& vote);
   bool inject_timeout_vote_for_test(const TimeoutVote& vote);
+  // A peer's time signature (TIME_SIGNATURE) as if received from the network.
+  bool inject_time_signature_for_test(const p2p::TimeSignatureMsg& msg);
   std::string inject_network_vote_result_for_test(const Vote& vote);
   std::string inject_network_vote_diagnostic_for_test(const Vote& vote);
   std::string inject_network_propose_result_for_test(const p2p::ProposeMsg& msg);
@@ -278,6 +280,8 @@ class Node {
   bool inject_tx_for_test(const AnyTx& tx, bool relay);
   // Any ordered record (Tx, TxV2, TxTimed) through the node's intake, as a local submission.
   bool inject_record_for_test(const Bytes& raw, std::string* reason = nullptr);
+  // As received from peer `peer_id` (network rate limits apply).
+  bool inject_network_record_for_test(const Bytes& raw, int peer_id, std::string* reason = nullptr);
   bool pause_proposals_for_test(bool pause);
   bool advance_round_for_test(std::uint64_t expected_height, std::uint32_t target_round);
   bool mempool_contains_for_test(const Hash32& txid) const;
@@ -314,6 +318,8 @@ class Node {
   std::uint64_t signatures_after_fail_stop_for_test() const;
   // Drives the quorum-1 self-vote path of finalize_if_quorum.
   bool finalize_if_quorum_for_test(const Hash32& block_id, std::uint64_t height, std::uint32_t round);
+  // True once a finalized frontier and its certificate were queued for broadcast (since start).
+  bool finalized_broadcast_queued_for_test() const;
   std::string safety_storage_failure_for_test() const;
   // Enters fail-stop as a failed safety write would (for paths no write precedes, e.g. quorum-1).
   void enter_safety_fail_stop_for_test(const std::string& reason);
@@ -882,6 +888,9 @@ class Node {
   std::map<int, std::map<std::uint16_t, p2p::TokenBucket>> msg_rate_buckets_;
   std::map<int, p2p::TokenBucket> vote_verify_buckets_;
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;
+  // Node-wide budget of TxTimed SWE proof checks from the network (per second; a block holds at most
+  // kMaxTimedTxPerBlock of them).
+  p2p::TokenBucket timed_verify_bucket_{16.0, 4.0};
   // Outbound GET_TRANSITION_BY_HEIGHT budget per sync peer (see kSyncRequestBurst).
   std::map<int, p2p::TokenBucket> sync_request_out_buckets_;
   std::map<Hash32, std::size_t> candidate_block_sizes_;

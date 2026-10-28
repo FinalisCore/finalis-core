@@ -474,8 +474,10 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
   std::vector<TimedSettlementRecord> settlements;
   TimedKeySets opened_key_sets;
 
-  // Applies one Tx / TxV2 as an accepted record; on rejection nothing changes and `reason` says why.
-  const auto try_apply = [&](const AnyTx& tx, FrontierRejectReason* reason) -> bool {
+  // Applies one Tx / TxV2 as an accepted record (validated under `vctx`); on rejection nothing
+  // changes and `reason` says why.
+  const auto try_apply = [&](const AnyTx& tx, const SpecialValidationContext* vctx, FrontierRejectReason* reason,
+                             std::string* detail = nullptr) -> bool {
     const auto domains = frontier_conflict_domains_for_tx(tx);
     for (const auto& domain : domains) {
       if (consumed_domains.find(domain) != consumed_domains.end()) {
@@ -483,13 +485,14 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
         return false;
       }
     }
-    if (!ctx && tx_uses_special_scripts(tx)) {
+    if (!vctx && tx_uses_special_scripts(tx)) {
       *reason = FrontierRejectReason::TX_INVALID;
       return false;
     }
-    const auto validation = validate_any_tx(tx, 1, work, ctx);
+    const auto validation = validate_any_tx(tx, 1, work, vctx);
     if (!validation.ok) {
       *reason = FrontierRejectReason::TX_INVALID;
+      if (detail) *detail = validation.error;
       return false;
     }
     // Consensus turnstile: value can only leave the confidential pool if it entered it. Rejecting the
@@ -522,8 +525,14 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     return true;
   };
 
-  // An opened body: a transfer applies as a whole if it is plain, a reveal publishes its data; either
-  // way the bond is refunded. Nothing opened (nullopt) leaves the record unapplied.
+  // An opened body: a transfer applies as a whole if it is plain (signed under timed_body_chain_domain),
+  // a reveal publishes its data; either way the bond is refunded. Nothing opened (nullopt) leaves the
+  // record unapplied.
+  std::optional<SpecialValidationContext> body_ctx;
+  if (ctx) {
+    body_ctx = *ctx;
+    body_ctx->timed_body = true;
+  }
   const auto run_body = [&](TimedSettlementRecord* record, const std::optional<TimedBody>& body) {
     if (!body.has_value()) return;
     if (const auto* reveal = std::get_if<TimedReveal>(&*body)) {
@@ -534,8 +543,17 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     const auto& tx = std::get<AnyTx>(*body);
     record->body_txid = txid_any(tx);
     FrontierRejectReason reason = FrontierRejectReason::NONE;
-    record->body_applied = timed_body_is_plain(tx, work) && try_apply(tx, &reason);
-    if (record->body_applied) record->applied_body = tx;
+    if (!timed_body_is_plain(tx, work)) {
+      record->body_reject_reason = "not-plain";
+      return;
+    }
+    std::string detail;
+    record->body_applied = try_apply(tx, body_ctx ? &*body_ctx : nullptr, &reason, &detail);
+    if (record->body_applied) {
+      record->applied_body = tx;
+    } else {
+      record->body_reject_reason = detail.empty() ? "reject-reason-" + std::to_string(static_cast<int>(reason)) : detail;
+    }
   };
 
   // Settlement first: every short-lock escrow locked to the parent height, in inclusion order, then
@@ -657,7 +675,7 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
     }
     decision.record_id = txid_any(*tx);
     FrontierRejectReason reason = FrontierRejectReason::NONE;
-    decision.accepted = try_apply(*tx, &reason);
+    decision.accepted = try_apply(*tx, ctx, &reason);
     decision.reject_reason = decision.accepted ? FrontierRejectReason::NONE : reason;
     decisions.push_back(decision);
   }
@@ -754,8 +772,16 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
                                       prev_lane_roots, ctx, out, error);
 }
 
+bool verify_timed_swe_proof(const TxTimed& tx, const std::vector<crypto::BlsPublicKey>& keys, const Hash32& chain_domain) {
+  const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys.size(), crypto::kSweKeyChunks);
+  const auto proof = crypto::SweWellFormednessProof::parse(tx.swe_proof);
+  return ct.has_value() && proof.has_value() &&
+         crypto::swe_verify_well_formed(*ct, keys, time_signature_message(chain_domain, tx.unlock_height),
+                                        crypto::kBlsTimeSignatureDst, *proof);
+}
+
 bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed, const UtxoSetV2& utxos,
-                           TimedInclusion* inclusion_out, std::string* reason) {
+                           TimedInclusion* inclusion_out, std::string* reason, TimedInclusionCheck check) {
   const auto fail = [&](const char* why) {
     if (reason) *reason = why;
     return false;
@@ -807,10 +833,8 @@ bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed
   const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys->size(), crypto::kSweKeyChunks);
   if (!ct.has_value() || ct->key_shares.size() != keys->size()) return fail("swe-ciphertext-invalid");
   if (ct->threshold != quorum_threshold(keys->size())) return fail("swe-threshold-mismatch");
-  const auto proof = crypto::SweWellFormednessProof::parse(tx.swe_proof);
-  if (!proof.has_value() ||
-      !crypto::swe_verify_well_formed(*ct, *keys, time_signature_message(timed.chain_domain, tx.unlock_height),
-                                      crypto::kBlsTimeSignatureDst, *proof)) {
+  if (!crypto::SweWellFormednessProof::parse(tx.swe_proof).has_value()) return fail("swe-proof-invalid");
+  if (check == TimedInclusionCheck::Full && !verify_timed_swe_proof(tx, *keys, timed.chain_domain)) {
     return fail("swe-proof-invalid");
   }
   if (inclusion_out) *inclusion_out = *inclusion;

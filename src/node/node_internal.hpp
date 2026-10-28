@@ -44,6 +44,12 @@ inline constexpr const char* kConsensusSafetyMirrorPrefix = "CSAFE_MIRROR:";
 // Raw bytes of a safety-state row that could not be read at startup. While present above the
 // finalized height, the node abstains from signing anything at that height.
 inline constexpr const char* kConsensusSafetyQuarantinePrefix = "CSAFE_QUARANTINE:";
+// Highest height that ever had a safety-state row (u64le), raised in the batch of every row write. A
+// height in (finalized, highwater] with no row at startup lost its vote history (both rows gone): the
+// node abstains there instead of voting freely (G1).
+inline constexpr const char* kConsensusSafetyHighwaterKey = "CSAFE_HIGHWATER";
+// Marker stored as the quarantined bytes of a height whose rows were missing below the highwater.
+inline constexpr const char* kConsensusSafetyMissingMarker = "CSAFE-MISSING";
 
 // --- In-process local bus (disable_p2p mode); defined in node_internal.cpp ---
 extern std::mutex g_local_bus_mu;
@@ -158,6 +164,7 @@ std::string key_consensus_locked_proposal(std::uint64_t height);
 std::string key_consensus_safety_state(std::uint64_t height);
 std::string key_consensus_safety_mirror(std::uint64_t height);
 std::string key_consensus_safety_quarantine(std::uint64_t height);
+std::uint64_t load_consensus_safety_highwater(const storage::DB& db);
 // Wraps a serialized safety state as magic | version | inner | checksum. The checksum domain
 // differs between primary and mirror so a copy stored under the wrong key fails verification.
 Bytes seal_consensus_safety_row(const Bytes& inner, bool mirror);

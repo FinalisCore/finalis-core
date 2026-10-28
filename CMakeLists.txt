@@ -579,7 +579,8 @@ endif()
 
 if(FINALIS_BUILD_FUZZ)
   foreach(fuzz_target fuzz_p2p_frame fuzz_consensus_msgs fuzz_consensus_node fuzz_tx_parse fuzz_smt
-                      fuzz_confidential fuzz_wire_codecs fuzz_sync fuzz_consensus_persistence)
+                      fuzz_confidential fuzz_wire_codecs fuzz_sync fuzz_consensus_persistence
+                      fuzz_timed_execution)
     add_executable(${fuzz_target} fuzz/${fuzz_target}.cpp)
     target_link_libraries(${fuzz_target} PRIVATE finalis_core)
     if(FINALIS_SANITIZE)

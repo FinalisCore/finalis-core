@@ -23,6 +23,8 @@ bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, fal
 
 bool Node::inject_timeout_vote_for_test(const TimeoutVote& vote) { return handle_timeout_vote(vote, false, 0); }
 
+bool Node::inject_time_signature_for_test(const p2p::TimeSignatureMsg& msg) { return handle_time_signature(msg, true, 1); }
+
 std::string Node::inject_network_vote_result_for_test(const Vote& vote) {
   switch (handle_vote_result(vote, true, 1)) {
     case VoteHandlingResult::Accepted:
@@ -191,6 +193,10 @@ bool Node::inject_frontier_block_for_test(const FrontierProposal& proposal, cons
 
 bool Node::inject_record_for_test(const Bytes& raw, std::string* reason) {
   return handle_record_bytes(raw, false, 0, reason);
+}
+
+bool Node::inject_network_record_for_test(const Bytes& raw, int peer_id, std::string* reason) {
+  return handle_record_bytes(raw, true, peer_id, reason);
 }
 
 bool Node::inject_tx_for_test(const AnyTx& tx, bool relay) {
@@ -366,6 +372,11 @@ std::uint64_t Node::signatures_after_fail_stop_for_test() const {
 bool Node::finalize_if_quorum_for_test(const Hash32& block_id, std::uint64_t height, std::uint32_t round) {
   std::lock_guard<std::mutex> lk(mu_);
   return finalize_if_quorum(block_id, height, round);
+}
+
+bool Node::finalized_broadcast_queued_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return last_broadcast_finality_certificate_.has_value();
 }
 
 void Node::enter_safety_fail_stop_for_test(const std::string& reason) {

@@ -3263,7 +3263,7 @@ TimedFixture make_timed_fixture() {
 }
 
 Tx timed_body_spend(const TimedFixture& fx, const OutPoint& op, const TxOut& prev) {
-  auto tx = build_signed_p2pkh_tx_single_input(replay_chain_domain(), op, prev, fx.user.private_key,
+  auto tx = build_signed_p2pkh_tx_single_input(timed_body_chain_domain(replay_chain_domain()), op, prev, fx.user.private_key,
                                                {p2pkh_out_for_pub(fx.recipient.public_key, prev.value - 500)});
   if (!tx.has_value()) throw std::runtime_error("body build failed");
   return *tx;
@@ -3374,9 +3374,11 @@ TEST(test_timed_reveal_body_publishes_its_data_and_refunds_the_bond) {
 TEST(test_data_outputs_carry_no_value_and_are_never_spendable) {
   auto fx = make_timed_fixture();
   const auto tag = *data_output_script_pubkey(Bytes{'a', 'u', 'c', 't', 'i', 'o', 'n', ' ', '7'});
-  const auto pay_with_data = [&](std::uint64_t data_value) {
+  // Signed under the chain domain as a plain record, under timed_body_chain_domain as a sealed body.
+  const auto pay_with_data = [&](std::uint64_t data_value, bool sealed = false) {
     auto tx = build_signed_p2pkh_tx_single_input(
-        replay_chain_domain(), fx.body_op, fx.body_out, fx.user.private_key,
+        sealed ? timed_body_chain_domain(replay_chain_domain()) : replay_chain_domain(), fx.body_op, fx.body_out,
+        fx.user.private_key,
         {p2pkh_out_for_pub(fx.recipient.public_key, fx.body_out.value - 500 - data_value), TxOut{data_value, tag}});
     if (!tx.has_value()) throw std::runtime_error("data tx build failed");
     return *tx;
@@ -3389,12 +3391,13 @@ TEST(test_data_outputs_carry_no_value_and_are_never_spendable) {
   const auto valued = apply_frontier_or_throw(fx.cfg, fx.parent, {pay_with_data(1).serialize()});
   ASSERT_TRUE(has_utxo(valued, fx.body_op));  // rejected
 
-  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{tx});
+  const auto sealed = pay_with_data(0, true);
+  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{sealed});
   ASSERT_TRUE(timed.has_value());
   const auto s2 = apply_frontier_or_throw(fx.cfg, apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()}), {});
   ASSERT_EQ(s2.last_timed_settlements.size(), 1u);
   ASSERT_TRUE(s2.last_timed_settlements[0].body_applied);
-  ASSERT_TRUE(has_utxo(s2, OutPoint{tx.txid(), 0}) && !has_utxo(s2, OutPoint{tx.txid(), 1}));
+  ASSERT_TRUE(has_utxo(s2, OutPoint{sealed.txid(), 0}) && !has_utxo(s2, OutPoint{sealed.txid(), 1}));
 }
 
 // A body that opens but cannot apply forfeits the bond as a fee of the settling block; nothing else moves.
@@ -3657,6 +3660,47 @@ TEST(test_long_timed_lock_expires_with_a_refund) {
   ASSERT_TRUE(has_utxo(expired, f.fx.body_op));
 }
 
+// Once the unlock height is final its time signature can open the body before any block carries the
+// opening. The sealed transfer is signed under timed_body_chain_domain, so replayed as a plain record
+// it is rejected: its coin stays for the settlement, which applies it and refunds the bond. A body
+// signed under the chain domain never applies at settlement (the bond is forfeited).
+TEST(test_revealed_long_lock_body_is_no_standalone_transaction) {
+  auto f = make_long_lock_fixture();
+  const auto& cfg = f.fx.cfg;
+  const auto due = advance_to(cfg, f.included, f.unlock + 1);
+  const auto replayed = apply_frontier_or_throw(cfg, due, {f.body.serialize()});
+  ASSERT_TRUE(has_utxo(replayed, f.fx.body_op));
+  ASSERT_TRUE(!has_utxo(replayed, OutPoint{f.body.txid(), 0}));
+
+  const std::vector<LongTimeSignature> entries{long_opening(f, replayed)};
+  const auto record = make_frontier_record(replayed, {}, cfg, 0, {}, nullptr, &entries);
+  consensus::CanonicalDerivedState settled;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(cfg, replayed, record, &settled, &err));
+  ASSERT_EQ(settled.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(settled.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(has_utxo(settled, OutPoint{f.body.txid(), 0}));
+  ASSERT_TRUE(has_utxo(settled, consensus::timed_refund_outpoint(f.timed.txid())));
+
+  auto g = make_long_lock_fixture();
+  const auto chain_signed = build_signed_p2pkh_tx_single_input(
+      replay_chain_domain(), g.fx.body_op, g.fx.body_out, g.fx.user.private_key,
+      {p2pkh_out_for_pub(g.fx.recipient.public_key, g.fx.body_out.value - 500)});
+  ASSERT_TRUE(chain_signed.has_value());
+  const auto timed = build_timed(g.fx, g.fx.parent, g.unlock, AnyTx{*chain_signed});
+  ASSERT_TRUE(timed.has_value());
+  g.timed = *timed;
+  const auto included = apply_frontier_or_throw(cfg, g.fx.parent, {g.timed.serialize()});
+  const auto g_due = advance_to(cfg, included, g.unlock + 1);
+  const std::vector<LongTimeSignature> g_entries{long_opening(g, g_due)};
+  const auto g_record = make_frontier_record(g_due, {}, cfg, 0, {}, nullptr, &g_entries);
+  ASSERT_TRUE(consensus::apply_frontier_record(cfg, g_due, g_record, &settled, &err));
+  ASSERT_EQ(settled.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(!settled.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(has_utxo(settled, g.fx.body_op));
+  ASSERT_TRUE(!has_utxo(settled, consensus::timed_refund_outpoint(g.timed.txid())));
+}
+
 // A long lock pays kTxTimedLongFeePerEpoch per epoch past its inclusion epoch and seals at most
 // kTxTimedMaxLongBodyCiphertextBytes; short locks keep the plain rules.
 TEST(test_long_timed_lock_inclusion_rules) {
@@ -3689,7 +3733,7 @@ TEST(test_long_timed_lock_inclusion_rules) {
 
   std::vector<TxOut> outs;
   for (int i = 0; i < 40; ++i) outs.push_back(p2pkh_out_for_pub(fx.recipient.public_key, 1'000));
-  const auto large = build_signed_p2pkh_tx_single_input(replay_chain_domain(), fx.body_op, fx.body_out,
+  const auto large = build_signed_p2pkh_tx_single_input(timed_body_chain_domain(replay_chain_domain()), fx.body_op, fx.body_out,
                                                         fx.user.private_key, outs);
   ASSERT_TRUE(large.has_value() && large->serialize().size() > 1024);
   ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{*large})));

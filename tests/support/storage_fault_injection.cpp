@@ -87,8 +87,26 @@ void on_abort(int sig) {
 
 }  // namespace
 
+// TSan reports any non-async-signal-safe call in a handler and exits with its own code, which would
+// hide the abort the storage tests assert; the handler is diagnostics only, so it is left out there.
+#if defined(__SANITIZE_THREAD__)
+constexpr bool kInstallAbortHandler = false;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+constexpr bool kInstallAbortHandler = false;
+#else
+constexpr bool kInstallAbortHandler = true;
+#endif
+#else
+constexpr bool kInstallAbortHandler = true;
+#endif
+
 void arm(const std::string& db_dir, Mode mode, int count) {
   static const bool handler_installed = [] {
+    if (!kInstallAbortHandler) return false;
+    // The first backtrace() loads libgcc (malloc, dlopen): do it here, not inside the handler.
+    void* warm[1];
+    (void)::backtrace(warm, 1);
     std::signal(SIGABRT, on_abort);
     return true;
   }();

@@ -357,8 +357,10 @@ bool Node::handle_timed_tx(const TxTimed& tx, bool from_network, int from_peer_i
   if (from_network && !running_) return reject("node not running");
   const Hash32 txid = tx.txid();
   const Bytes raw = tx.serialize();
-  {
-    std::lock_guard<std::mutex> lk(mu_);
+  // Everything but the SWE proof, under mu_; nullopt once the envelope may be pooled, else the result.
+  std::vector<crypto::BlsPublicKey> keys;
+  Hash32 chain_domain{};
+  const auto cheap_checks_locked = [&](bool charge) -> std::optional<bool> {
     if (from_network && !running_) return reject("node not running");
     if (!canonical_state_.has_value()) return reject("no canonical state");
     const auto identity = consensus::ingress_record_identity(raw);
@@ -368,10 +370,14 @@ bool Node::handle_timed_tx(const TxTimed& tx, bool from_network, int from_peer_i
       (void)maybe_certify_record_locked(raw, *identity, &ingress_error);
       return true;
     }
-    // The SWE proof check costs about as much as a thousand signature checks.
-    auto& verify_bucket = tx_verify_buckets_[from_peer_id];
-    verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
-    if (from_network && !verify_bucket.consume(64.0, now_ms())) return reject("verify rate limited");
+    if (charge && from_network) {
+      // The SWE proof check costs about as much as a thousand signature checks: per peer, and in all
+      // (many peers must not add up to more proof checks than the node can afford).
+      auto& verify_bucket = tx_verify_buckets_[from_peer_id];
+      verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
+      if (!verify_bucket.consume(64.0, now_ms())) return reject("verify rate limited");
+      if (!timed_verify_bucket_.consume(1.0, now_ms())) return reject("timed verify rate limited");
+    }
     if (timed_pool_.size() >= kMaxTimedPoolEntries) return reject("timed pool full");
     const OutPoint fee_outpoint{tx.fee_input.prev_txid, tx.fee_input.prev_index};
     for (const auto& [_, pooled] : timed_pool_) {
@@ -386,10 +392,30 @@ bool Node::handle_timed_tx(const TxTimed& tx, bool from_network, int from_peer_i
     const auto timed = consensus::timed_execution_context_for(canonical_derivation_config_locked(), *canonical_state_,
                                                               next_height, no_settlement);
     std::string reason;
-    if (!consensus::check_timed_inclusion(tx, timed, canonical_state_->utxos, nullptr, &reason)) {
+    if (!consensus::check_timed_inclusion(tx, timed, canonical_state_->utxos, nullptr, &reason,
+                                          consensus::TimedInclusionCheck::SkipSweProof)) {
       log_line("tx-reject txid=" + hex_encode32(txid) + " kind=timed reason=" + reason);
       return reject(reason);
     }
+    keys = timed.committee_keys(tx.committee_epoch).value_or(std::vector<crypto::BlsPublicKey>{});
+    chain_domain = timed.chain_domain;
+    return std::nullopt;
+  };
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (const auto done = cheap_checks_locked(true); done.has_value()) return *done;
+  }
+  // LIVENESS: the proof check runs without mu_, so a flood of costly envelopes cannot stall consensus.
+  if (!consensus::verify_timed_swe_proof(tx, keys, chain_domain)) {
+    std::lock_guard<std::mutex> lk(mu_);
+    log_line("tx-reject txid=" + hex_encode32(txid) + " kind=timed reason=swe-proof-invalid");
+    return reject("swe-proof-invalid");
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // The state may have moved while unlocked: check again (the proof is bound to the envelope).
+    if (const auto done = cheap_checks_locked(false); done.has_value()) return *done;
+    const auto identity = consensus::ingress_record_identity(raw);
     timed_pool_.emplace(txid, tx);
     std::string ingress_error;
     if (!maybe_certify_record_locked(raw, *identity, &ingress_error) && !ingress_error.empty()) {

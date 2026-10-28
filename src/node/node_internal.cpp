@@ -880,6 +880,14 @@ std::string key_consensus_safety_quarantine(std::uint64_t height) {
   return std::string(kConsensusSafetyQuarantinePrefix) + hex_encode(w.data());
 }
 
+std::uint64_t load_consensus_safety_highwater(const storage::DB& db) {
+  const auto row = db.get(kConsensusSafetyHighwaterKey);
+  if (!row.has_value() || row->size() != 8) return 0;
+  std::uint64_t height = 0;
+  for (std::size_t i = 0; i < 8; ++i) height |= static_cast<std::uint64_t>((*row)[i]) << (8 * i);
+  return height;
+}
+
 namespace {
 
 // Legacy rows start with a 0/1 has-lock flag, so this magic cannot collide with them.

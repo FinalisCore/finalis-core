@@ -9,6 +9,24 @@ Each `fuzz/<target>.cpp` builds two ways (`FINALIS_BUILD_FUZZ=ON`, the default):
   ClusterFuzzLite on pull requests (`cflite-pr.yml`, 10 min) and nightly (`cflite-batch.yml`, 1 h), starting
   from `seed_corpus/<target>.zip`. That build has no RocksDB (storage uses its file backend).
 
+## fuzz_timed_execution
+
+Stateful time-lock (TxTimed) execution fuzzer: a chain of blocks through `execute_frontier_slice` with a
+`TimedExecutionContext`, carrying UTXOs, escrows and long-lock key sets as the derivation does
+(`apply_timed_escrows`); committees alternate per 8-block epoch. Scripts mix new envelopes (short/long
+locks; transfer, reveal, non-plain, undecryptable and fee-coin-spending bodies; low fee or bond),
+plain transfers racing a body's inputs, replays (of envelopes, and of sealed bodies as plain records),
+garbage, missing or wrong-height parent time signatures, withheld or forged long openings, and jumps past
+the long-lock grace period. Oracles (top of the source): value conservation, every escrow settles once
+at its height or expires on time, refund iff applied/expired, no body applies without a valid time
+signature, valid unspent transfer bodies apply, a sealed transfer is never a standalone record, forged
+openings invalidate the block, deterministic re-execution.
+
+```sh
+./build/fuzz_timed_execution                                  # smoke (40 scripts, ~2 s)
+FINALIS_FUZZ_SEED=7 FINALIS_FUZZ_ITERS=400 ./build/fuzz_timed_execution
+```
+
 ## fuzz_consensus_persistence
 
 Stateful consensus + storage-fault fuzzer for the vote-persistence paths (tests/KNOWN_DEFECTS.md). One

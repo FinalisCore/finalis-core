@@ -6180,7 +6180,7 @@ void WalletWindow::submit_send() {
     }
     const auto privkey_holder = key_bytes(key->privkey);  // wiped on scope exit
     const auto& privkey = privkey_holder.bytes;
-    auto body = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, plan.body.selected_prevs, privkey,
+    auto body = finalis::build_signed_p2pkh_tx_multi_input(finalis::timed_body_chain_domain(*chain_domain), plan.body.selected_prevs, privkey,
                                                            plan.body.outputs, &err);
     if (!body) {
       QMessageBox::warning(this, "Send", QString::fromStdString(err));

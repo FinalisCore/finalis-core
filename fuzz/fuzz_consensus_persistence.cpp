@@ -61,7 +61,9 @@
 #include "common/keystore.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/genesis.hpp"
+#include "support/test_genesis.hpp"
 #include "node/node.hpp"
+#include "crypto/bls12_381.hpp"
 #include "p2p/messages.hpp"
 #include "support/storage_fault_injection.hpp"
 #include "utxo/validate.hpp"
@@ -91,7 +93,7 @@ struct Cursor {
 
 bool write_genesis(const std::string& path, const std::vector<crypto::KeyPair>& keys) {
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -106,6 +108,7 @@ bool write_genesis(const std::string& path, const std::vector<crypto::KeyPair>& 
   d.monetary_params_ref = "README.md#monetary-policy-7m-hard-cap";
   d.note = "fuzz-consensus-persistence";
   for (std::size_t i = 0; i < kValidators; ++i) d.initial_validators.push_back(keys[i].public_key);
+  test::fill_test_genesis_bls(d, keys);
   std::ofstream out(path, std::ios::trunc);
   out << genesis::to_json(d);
   return out.good();
@@ -212,6 +215,7 @@ class Runner {
   std::optional<Violation> run(const Bytes& in) {
     Cursor c{in, &history_};
     while (!c.done()) {
+      deliver_time_signatures();
       const std::uint8_t op = c.u8() % 12;
       ++stats.ops;
       switch (op) {
@@ -243,6 +247,8 @@ class Runner {
     Bytes bytes;
     PubKey32 leader;
   };
+
+  std::uint64_t time_signatures_delivered_{0};  // tip whose peer time signatures the node holds
 
   std::uint64_t next_height() const { return fx_.node->status().height + 1; }
   std::uint32_t current_round() const { return fx_.node->status().round; }
@@ -503,6 +509,21 @@ class Runner {
 
   void settle() { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
 
+  // The other members' time signatures on the finalized tip, as honest peers send them once it is
+  // final: the node's own proposal for the next height waits for a threshold of them. Consumes no
+  // script bytes.
+  void deliver_time_signatures() {
+    const auto tip = fx_.node->status().height;
+    if (tip == 0 || tip == time_signatures_delivered_) return;
+    const auto msg = time_signature_message(fx_.domain, tip);
+    for (const auto* kp : others(0, kValidators - 1)) {
+      const auto sk = crypto::bls_key_from_validator_seed(kp->private_key);
+      const auto sig = sk ? crypto::bls_sign(*sk, msg, crypto::kBlsTimeSignatureDst) : std::nullopt;
+      if (sig) (void)fx_.node->inject_time_signature_for_test(p2p::TimeSignatureMsg{tip, kp->public_key, *sig});
+    }
+    time_signatures_delivered_ = tip;
+  }
+
   void restart() {
     note("restart");
     settle();
@@ -517,6 +538,7 @@ class Runner {
     }
     ++stats.restarts;
     after_restart_ = true;
+    time_signatures_delivered_ = 0;
   }
 
   void rebroadcast_probe() {

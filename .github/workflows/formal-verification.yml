@@ -10,6 +10,7 @@ on:
       - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
       - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
       - "docs/spec/TWO_PHASE_FINALITY.md"
+      - "docs/CONSENSUS.md"
       - "docs/LIVE_PROTOCOL.md"
       - "README.md"
       - ".github/workflows/formal-verification.yml"
@@ -22,6 +23,7 @@ on:
       - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
       - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
       - "docs/spec/TWO_PHASE_FINALITY.md"
+      - "docs/CONSENSUS.md"
       - "docs/LIVE_PROTOCOL.md"
       - "README.md"
       - ".github/workflows/formal-verification.yml"
@@ -70,6 +72,23 @@ jobs:
             --expect-violation Agreement
           ./scripts/run_tlc.sh --spec "$spec" --config formal/two_phase_finality_abstract_floor_mutation.cfg \
             --expect-violation Agreement
+
+      # Time-locked transactions (formal/README.md, "Timed Release Model"): the safety invariants must
+      # hold exhaustively; the reachability configs and the four rule mutations must be violated.
+      - name: Run TLC timed release suite
+        run: |
+          spec=formal/timed_release.tla
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release.cfg
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_reach_applied.cfg --expect-violation NothingApplied
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_reach_long_opened.cfg --expect-violation NoLongOpened
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_reach_long_expired.cfg --expect-violation NoLongExpired
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_sign_early_mutation.cfg --expect-violation NoEarlyKey
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_late_inclusion_mutation.cfg \
+            --expect-violation SettleOnTime
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_standalone_body_mutation.cfg \
+            --expect-violation NoBondLoss
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_settle_last_mutation.cfg \
+            --expect-violation NoBondLoss
 
       - name: Upload TLC artifacts
         if: always()

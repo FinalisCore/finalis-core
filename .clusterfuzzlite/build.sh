@@ -16,7 +16,7 @@ cmake -S . -B build-fuzz -G Ninja \
 # fuzz_consensus_persistence runs here without RocksDB: its storage-fault ops are no-ops, restarts
 # and recovery over the file backend are still fuzzed against its oracles.
 targets="fuzz_p2p_frame fuzz_tx_parse fuzz_consensus_msgs fuzz_consensus_node fuzz_smt fuzz_confidential
-  fuzz_wire_codecs fuzz_sync fuzz_consensus_persistence"
+  fuzz_wire_codecs fuzz_sync fuzz_consensus_persistence fuzz_timed_execution"
 cmake --build build-fuzz -j"$(nproc)" --target $targets
 for target in $targets; do
   cp "build-fuzz/$target" "$OUT/"

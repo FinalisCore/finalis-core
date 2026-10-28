@@ -1319,10 +1319,18 @@ bool Node::load_state() {
       if (!inner.has_value()) return false;
       return parse_consensus_safety_state(*inner, &lock_state, &valid_polka, &prevotes);
     };
-    const bool primary_ok = decode(primary_row, false);
-    const bool mirror_ok = !primary_ok && decode(mirror_row, true);
+    // G2: both copies are written in one atomic batch, so two readable copies that differ can only
+    // come from outside damage (e.g. an older row restored over one of them): neither is trusted.
+    const auto primary_inner = primary_row ? unseal_consensus_safety_row(*primary_row, false) : std::nullopt;
+    const auto mirror_inner = mirror_row ? unseal_consensus_safety_row(*mirror_row, true) : std::nullopt;
+    const bool copies_disagree = primary_inner.has_value() && mirror_inner.has_value() && *primary_inner != *mirror_inner;
+    if (copies_disagree) {
+      log_line("consensus-safety-copies-disagree height=" + std::to_string(height) + " treating both as unreadable");
+    }
+    const bool primary_ok = !copies_disagree && decode(primary_row, false);
+    const bool mirror_ok = !copies_disagree && !primary_ok && decode(mirror_row, true);
     if (!primary_ok && !mirror_ok) {
-      // Both copies unreadable: the lock and prevote record (if any) are lost.
+      // Both copies unreadable (or disagreeing): the lock and prevote record (if any) are lost.
       // A node outside a multi-member committee for this height cannot have voted here, so the
       // row could only have held an observed polka and is safe to drop. Committees of size < 2 use
       // per-round fallback members, so membership is not knowable for every round: quarantine.
@@ -1378,6 +1386,30 @@ bool Node::load_state() {
       return false;
     }
   }
+  // G1: a height below the highwater with no row at all lost both copies (a missing row reads as
+  // "never voted"): quarantine it like an unreadable one. Bounded: rows only exist just above the
+  // finalized height, so a larger span means a damaged key and quarantines the first heights only.
+  {
+    constexpr std::uint64_t kMaxMissingSafetySpan = 64;
+    const auto highwater = load_consensus_safety_highwater(db_);
+    for (std::uint64_t height = finalized_height_ + 1;
+         height <= highwater && height <= finalized_height_ + kMaxMissingSafetySpan; ++height) {
+      if (safety_heights.contains(height) || db_.get(key_consensus_safety_quarantine(height)).has_value()) continue;
+      if (height == finalized_height_ + 1) {
+        const auto committee = committee_for_height_round(height, 0);
+        if (committee.size() >= 2 &&
+            std::find(committee.begin(), committee.end(), local_key_.public_key) == committee.end()) {
+          continue;  // could not have voted here (see the unreadable-row case above)
+        }
+      }
+      log_line("Consensus safety state for height " + std::to_string(height) + " missing below highwater " +
+               std::to_string(highwater) + ", quarantining and abstaining from voting");
+      const std::string marker = kConsensusSafetyMissingMarker;
+      storage::DB::Batch quarantine(db_);
+      quarantine.put(key_consensus_safety_quarantine(height), Bytes(marker.begin(), marker.end()));
+      if (!db_.write_batch_durable(quarantine)) return false;
+    }
+  }
   for (const auto& [key, value] : db_.scan_prefix(kConsensusSafetyQuarantinePrefix)) {
     const auto height = parse_height_key(key, kConsensusSafetyQuarantinePrefix);
     if (!height.has_value()) continue;
@@ -1395,6 +1427,11 @@ bool Node::load_state() {
       storage::DB::Batch discard(db_);
       discard.erase(key_consensus_safety_quarantine(h));
       discard.erase(key_consensus_locked_proposal(h));
+      if (load_consensus_safety_highwater(db_) == h) {  // else the next start quarantines h again (G1)
+        codec::ByteWriter w;
+        w.u64le(h - 1);
+        discard.put(kConsensusSafetyHighwaterKey, w.data());
+      }
       if (!db_.write_batch_durable(discard)) return false;
       abstain_heights_.erase(h);
     } else {

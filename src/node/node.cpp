@@ -616,6 +616,15 @@ bool Node::start_lightserver_child() {
   ::usleep(200 * 1000);
   int status = 0;
   const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+  bool reaped_elsewhere = false;  // the exit monitor may have collected it first ("lightserver exited")
+  if (waited < 0 && errno == ECHILD) {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    reaped_elsewhere = lightserver_pid_ != static_cast<int>(pid);
+  }
+  if (reaped_elsewhere) {
+    log_line("lightserver startup failed mode=" + mode + " pid=" + std::to_string(pid) + " reason=exited-early");
+    return false;
+  }
   if (waited == pid) {
     std::lock_guard<std::mutex> lk(lightserver_mu_);
     lightserver_pid_ = -1;

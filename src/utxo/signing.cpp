@@ -118,7 +118,12 @@ std::optional<std::pair<OutPoint, TxOut>> select_timed_fee_coin(const std::vecto
     if (!fee_index || out.value < available_prevs[*fee_index].second.value) fee_index = i;
   }
   if (!fee_index) {
-    if (err) *err = "no coin covers the prepaid fee + bond";
+    if (err) {
+      std::uint64_t largest = 0;
+      for (const auto& [_, out] : available_prevs) largest = std::max(largest, out.value);
+      *err = "no coin covers the prepaid fee + bond (" + std::to_string(envelope_units) + " units; " +
+             std::to_string(available_prevs.size()) + " coin(s), largest " + std::to_string(largest) + ")";
+    }
     return std::nullopt;
   }
   return available_prevs[*fee_index];

@@ -71,6 +71,7 @@ jobs:
           ./build/fuzz_confidential
           ./build/fuzz_wire_codecs
           ./build/fuzz_sync
+          ./build/fuzz_timed_execution
           scripts/fuzz_replay_corpus.sh build
 
   sanitize:
@@ -99,7 +100,7 @@ jobs:
         run: cmake -S . -B build $CMAKE_COMMON_FLAGS -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFINALIS_SANITIZE=ON
       - name: Build
         run: cmake --build build --target finalis-tests fuzz_p2p_frame fuzz_tx_parse fuzz_consensus_msgs fuzz_consensus_node
-          fuzz_smt fuzz_confidential fuzz_wire_codecs fuzz_sync -j"$(nproc)"
+          fuzz_smt fuzz_confidential fuzz_wire_codecs fuzz_sync fuzz_timed_execution -j"$(nproc)"
       - name: Test
         run: ./build/finalis-tests
       - name: Fuzz smoke
@@ -113,6 +114,7 @@ jobs:
           ./build/fuzz_confidential
           ./build/fuzz_wire_codecs
           ./build/fuzz_sync
+          ./build/fuzz_timed_execution
           scripts/fuzz_replay_corpus.sh build
 
   tsan:

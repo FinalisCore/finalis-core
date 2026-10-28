@@ -4045,7 +4045,7 @@ int run_cli(int argc, char** argv) {
     const finalis::Bytes privkey(vk.privkey.begin(), vk.privkey.end());
     std::optional<finalis::Tx> body;
     if (!reveal) {
-      body = finalis::build_signed_p2pkh_tx_multi_input(*chain_domain, plan->selected_prevs, privkey, plan->outputs, &err);
+      body = finalis::build_signed_p2pkh_tx_multi_input(finalis::timed_body_chain_domain(*chain_domain), plan->selected_prevs, privkey, plan->outputs, &err);
       if (!body.has_value()) {
         std::cerr << "timed_send body build failed: " << err << "\n";
         return 1;
@@ -4096,6 +4096,7 @@ int run_cli(int argc, char** argv) {
     std::cout << "prepaid_fee=" << prepaid_fee << "\n";
     std::cout << "forfeit_bond=" << bond << "\n";
     std::cout << "timed_txid=" << finalis::hex_encode32(timed->txid()) << "\n";
+    std::cout << "fee_input=" << finalis::hex_encode32(fee_coin.first.txid) << ":" << fee_coin.first.index << "\n";
     if (!reveal) {
       std::cout << "body_fee=" << plan->applied_fee_units << "\n";
       std::cout << "body_txid=" << finalis::hex_encode32(body->txid()) << "\n";

@@ -182,7 +182,7 @@ bool verify_frontier_finality_certificate_against_state(const CanonicalDerivatio
     return false;
   }
   // A transition re-proposed as the valid value can be precommitted in a later round.
-  if (cert.round < transition.round) {
+  if (!vote_round_covers_transition(cert.round, transition.round)) {
     if (error) *error = "certificate-round-mismatch";
     return false;
   }
