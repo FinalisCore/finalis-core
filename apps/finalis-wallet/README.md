@@ -165,7 +165,7 @@ The wallet does not take a server's word for its balance
   verified" until the next.
 - Progress is saved per network in the wallet settings, so a restart resumes instead of walking
   from genesis.
-- Mainnet shows `NOT VERIFIED` until the embedded genesis names its validators (genesis ceremony).
+- Mainnet shows `NOT VERIFIED` until the embedded genesis names its bootstrap validator (at launch).
 
 ## Lightserver cross-check
 

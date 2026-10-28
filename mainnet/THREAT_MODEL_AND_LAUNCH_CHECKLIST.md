@@ -17,7 +17,6 @@ healthy:
 Use this together with:
 
 - [GENESIS_SPEC.md](GENESIS_SPEC.md)
-- [GENESIS_VALIDATOR_CEREMONY.md](GENESIS_VALIDATOR_CEREMONY.md)
 - [MAINNET_PLAN.md](MAINNET_PLAN.md)
 - [../docs/MAINNET.md](../docs/MAINNET.md)
 - [../docs/integrations/EXCHANGE_INTEGRATION.md](../docs/integrations/EXCHANGE_INTEGRATION.md)
@@ -45,15 +44,16 @@ Pass conditions:
   ASan/UBSan on the release commit, both as smoke binaries (linux-ci) and as libFuzzer targets in
   ClusterFuzzLite (`.clusterfuzzlite/`, workflows `cflite-pr` and `cflite-batch`), with no open
   ClusterFuzzLite crash.
-- Independent genesis validators: the genesis set is selected per
-  [GENESIS_VALIDATOR_CEREMONY.md](GENESIS_VALIDATOR_CEREMONY.md), with operators other than the
-  maintainer able to form a quorum without the maintainer's keys.
+- Bootstrap launch model ([MAINNET_PLAN.md](MAINNET_PLAN.md#launch-model)): genesis names exactly one
+  validator, the maintainer's published bootstrap key; the faucet rules for joiners' bonds are
+  published; the explorer shows, from block 0, how many validators are active and how many of them
+  the maintainer runs (one).
 
 Launch blocker:
 
 - any fork or non-converging chaos seed on the release binaries
 - an unresolved consensus finding from the external review
-- a genesis set in which one operator controls more than `f` validators
+- a genesis that names any validator besides the published bootstrap key
 
 ## 1. Threat Model
 
@@ -323,7 +323,7 @@ Mark every item before calling bootstrap launch healthy:
 
 - [ ] consensus readiness gate (section 0) passes: external review published with findings
       resolved, chaos campaign clean on the release binaries, fuzz targets clean
-- [ ] genesis validators selected by the ceremony; no operator controls more than `f` of them
+- [ ] genesis names only the published bootstrap validator key; faucet rules published
 - [ ] `mainnet/genesis.json` and `mainnet/genesis.bin` reproduce cleanly
 - [ ] embedded genesis was regenerated from the canonical binary before the
       release build

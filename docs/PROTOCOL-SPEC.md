@@ -302,7 +302,8 @@ Fees and issuance are separated.
 - before the cap:
   - current-block fees are immediate on the frontier transition path
   - issuance accrues from finalized participation
-  - `10%` of gross issuance accrues into protocol reserve
+  - `30%` of gross issuance accrues into protocol reserve (see `docs/ECONOMICS.md` §4: half of
+    every fee and every slashed bond also return to it; after year 12 it pays 5 % of itself a year)
   - `90%` of gross issuance accrues into validator settlement rewards
 - after the cap:
   - new issuance is zero
@@ -341,7 +342,7 @@ Let:
 
 The live economics helpers use the canonical reward/admission policy:
 
-`min_bond(height) = clamp(min_bond_floor, min_bond_ceiling, base_min_bond * sqrt(target_validators / max(1, active_operators)))`
+`min_bond(height) = clamp(min_bond_floor, min_bond_ceiling, (base_min_bond * sqrt(min(active_operators, 512) / target_validators) + 2 * emitted_supply(height) / 12,800) / 3)`
 
 `max_effective_bond(height) = max_effective_bond_multiple * min_bond(height)`
 

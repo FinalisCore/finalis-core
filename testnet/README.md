@@ -23,8 +23,8 @@ and mainnet keys separate. Testnet coins have no value.
 
 One bootstrap validator, run by the maintainer ([pubkeys.txt](pubkeys.txt)). Others join after
 launch (see "Join as a validator" below), funded with testnet FLS from the bootstrap validator's
-block rewards. The mainnet ceremony
-([../mainnet/GENESIS_VALIDATOR_CEREMONY.md](../mainnet/GENESIS_VALIDATOR_CEREMONY.md)) is not used.
+block rewards. Mainnet launches the same way
+([../mainnet/MAINNET_PLAN.md](../mainnet/MAINNET_PLAN.md#launch-model)).
 
 Until more validators are active the chain has no fault tolerance: the bootstrap validator alone
 finalizes every block, and the chain stops while it is down. Quorum with 2 validators is 2 (either
@@ -83,8 +83,8 @@ finalis-node --testnet --public --with-lightserver --lightserver-bind 0.0.0.0
 
 A node loads `<data dir>/keystore/validator.json` whenever that file exists, with or without
 `--validator-key-file`, so a seed must not have one. The testnet launched with a single host,
-130.61.126.39, which is both the seed and the bootstrap validator; a separate plain seed replaces it
-in SEEDS.json before more validators join.
+130.61.126.39, which is both a seed and the bootstrap validator; 159.200.236.114 is a plain seed and
+public lightserver (HTTPS) next to it, so the validator is not the only public entrance.
 
 ### 4. Launch
 

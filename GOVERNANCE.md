@@ -11,14 +11,21 @@ process. There is no company, foundation, token sale or premine, and nobody is p
 One maintainer is a single point of failure, and it means "community-owned" is a goal, not yet a
 fact. The rest of this file is how we get from one to many.
 
+The same holds for the chain at launch: until other validators join, the maintainer's bootstrap
+validator alone finalizes blocks and earns the emission. That ends as validators join (quorum is
+`floor(2n/3) + 1`): with 2 the maintainer can no longer finalize alone, and from 4 independent
+validators the chain keeps going without the bootstrap node.
+
 ## What the maintainer does not control
 
 These hold now and are not up to the maintainer:
 
 - The rules are the code and the specs in `docs/spec/`. Anyone can fork under the MIT license.
-- Genesis validators are chosen by the public, verifiable ceremony in
-  [mainnet/GENESIS_VALIDATOR_CEREMONY.md](mainnet/GENESIS_VALIDATOR_CEREMONY.md). The maintainer
-  holds at most `f` of the genesis keys, so the other validators can finalize without them.
+- Nobody gets a validator slot by being chosen. Mainnet starts with one bootstrap validator, run by
+  the maintainer, and every other validator joins by bonding FLS on chain, the same way for
+  everyone ([mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md#launch-model)). The maintainer runs
+  one validator, never more; once enough others are active the chain finalizes without it, and the
+  maintainer can switch it off for good.
 - After launch, consensus rules change only when validators run a release that changes them. No
   key, flag or server lets the maintainer change a live network.
 - Launch waits for the published checklist

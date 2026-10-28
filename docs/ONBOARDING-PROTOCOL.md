@@ -209,7 +209,7 @@ Current rule:
 
 - `3%` of settlement rewards are carved from the validator settlement reward
   slice
-- reserve accrual remains `10%` of gross issuance
+- reserve accrual remains `30%` of gross issuance
 - fees and reserve subsidy are not shared with onboarding rewards
 
 The onboarding reward bucket is paid only to participants with at least one valid finalized epoch ticket.

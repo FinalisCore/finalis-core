@@ -68,6 +68,9 @@
 17:00 UTC and runs mainnet's rules. Its coins have no value, and validator
 bonds are free from the team. Four independent validators is the first size
 that survives one going down, and ten is the next goal.
+Mainnet will start the same way: one bootstrap validator, and everyone else
+joins by bonding coins from the faucet, with no reserved slots
+([mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md#launch-model)).
 → **[testnet/JOIN.md](testnet/JOIN.md)**: one command with the prebuilt Linux
 package or Docker (x86_64 and ARM64), or Windows installers from the
 [releases page](https://github.com/FinalisCore/finalis-core/releases).
@@ -229,9 +232,10 @@ The current code implements:
 - adaptive checkpoint target / minimum eligible / minimum bond derivation
 - exact hard cap of `7,000,000 FLS`
 - deterministic `12`-year emission schedule with annual `20%` decay
-- `10%` reserve accrual during the emission era
+- `30%` reserve accrual during the emission era; half of every fee and every slashed bond return to
+  the reserve, which pays 5 % of itself a year after emission ends (fixed 7M supply, paid for ever)
 - zero new issuance after the cap
-- post-cap epoch fee pooling with deterministic reserve subsidy support
+- an automatic base fee that follows block fullness (no price, no setting)
 
 ## Run A Node
 
@@ -294,10 +298,11 @@ installer's `Start-Finalis.ps1` starts mainnet; for testnet, see
 
 ### Mainnet (at launch)
 
-Genesis validators start their nodes before `genesis_time_unix`, after checking
-that their key is in the published genesis validator set and that their
-binaries embed the canonical `genesis.bin`
-([mainnet/GENESIS_VALIDATOR_CEREMONY.md](mainnet/GENESIS_VALIDATOR_CEREMONY.md)).
+The bootstrap validator starts before `genesis_time_unix`; everyone else runs a
+node and joins as a validator by bonding, exactly as on the testnet
+([testnet/JOIN.md](testnet/JOIN.md),
+[mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md#launch-model)). Check that
+your binaries embed the canonical `genesis.bin` (`finalis-cli genesis_print_embedded`).
 
 ## Build From Source
 

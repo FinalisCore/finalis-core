@@ -125,6 +125,43 @@ does. Behind a Cloudflare tunnel, which passes client headers through, use
 - The 1000/min global bucket is shared by all clients, so a set of IPs at their per-IP limit can
   use it up. Public operators should put a proxy or CDN with its own per-client limits in front.
 
+## 3.3 Public lightserver discovery
+
+A node can announce its lightserver to the network so wallets, the CLI and apps find it without
+editing `SEEDS.json` (`src/p2p/endpoints.hpp`; not consensus):
+
+- `finalis-node --public-lightserver-url <http(s)://host[:port]/...rpc>`. `scripts/start.sh` sets it
+  by default from the host's public IPv4 (`PUBLIC_LIGHTSERVER=auto`; it asks api.ipify.org,
+  ifconfig.me or icanhazip.com), or from `PUBLIC_LIGHTSERVER_URL`; `PUBLIC_LIGHTSERVER=0` announces
+  nothing. A joiner that announces also gets its lightserver port opened in the firewall.
+- The announcement is signed with a key derived one way from the node key, so it does not reveal a
+  validator identity, and it is bound to the chain. Its lightserver's `get_status` reports the key
+  as `endpoint_pubkey`.
+- Before gossiping, the node fetches `get_status` from the URL itself and needs its own key back. A
+  machine behind NAT without port forwarding, or a URL that reaches another server, is not
+  announced (`endpoint-self-check-failed` in the log; retried every 10 min).
+- A registered validator does not announce (`endpoint-withdrawn reason=local-validator`): a
+  published validator address invites attacks that can halt the chain. Run a separate public node
+  next to it, or pass `--announce-endpoint-as-validator` (`ANNOUNCE_AS_VALIDATOR=1`).
+- Nodes exchange announcements with `GET_ENDPOINTS`/`ENDPOINTS`, keep at most 4 per network group
+  (/16, /32 IPv6 or registrable domain) and 1024 in all, drop them after 48 h, and re-announce every
+  6 h. `get_lightserver_endpoints` lists what the node knows.
+- Clients keep an endpoint only if its signature holds and the server at the URL serves this chain
+  under the announced key (`finalis-cli discover_endpoints`; the desktop wallet does this every 30 min
+  and tries such servers after its configured ones).
+- HTTPS: clients check the certificate against the system trust store (`FINALIS_CA_FILE` overrides
+  it) and require it to name the host or IP. Let's Encrypt issues IP-address certificates (160 h,
+  HTTP-01 or TLS-ALPN-01 validation), so a host without a domain can still serve HTTPS.
+- `PUBLIC_HTTPS=1 scripts/start.sh` sets this up (`scripts/setup_https.sh`): nginx on 80/443 in front
+  of the loopback lightserver (`/rpc`) and explorer (`/`, unless `HTTPS_EXPLORER=0`), a certificate
+  from lego (pinned v5.5.2, checksum-verified) over HTTP-01, and `finalis-acme-renew.timer` running
+  twice a day (lego renews at half the lifetime, about every 3 days for an IP certificate, then the
+  hook reloads nginx). `HTTPS_HOST` defaults to the public IPv4; a DNS name pointing at the host also
+  works. The node then announces `https://<host>/rpc`. Needs port 80 reachable from the internet;
+  `ACME_STAGING=1` rehearses against the staging CA, `ACME_EMAIL` sets a contact address. nginx sets
+  both `X-Real-IP` and `CF-Connecting-IP`, so the explorer's `--client-ip-header` may be either (a
+  host that also reaches the explorer through a Cloudflare tunnel uses `CF-Connecting-IP`).
+
 ## 4. Node fail-stop states
 
 Some states need an operator decision. Restarting unchanged cannot fix them, so the shipped

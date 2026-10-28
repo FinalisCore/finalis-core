@@ -2,7 +2,7 @@
 
 Finalis is a blockchain where every block is final the moment validators sign it: no waiting for
 confirmations and no reorgs, with confidential (amount-hiding) transactions built in from genesis.
-**testnet-3** starts on 28 October 2026 at 17:00 UTC. It uses mainnet's rules with its own identity,
+**testnet-3** starts on 30 October 2026 at 17:00 UTC. It uses mainnet's rules with its own identity,
 and its coins (FLS) **have no value**. (It replaces testnet-2; if you ran a testnet-2 node, see
 [README.md](README.md#genesis-testnet-3).)
 
@@ -15,6 +15,7 @@ Running a node takes about 5 minutes with the prebuilt package or Docker.
 - **Run a node** (steps 1–3): syncs and relays the chain. No coins or keys needed.
 - **Become a validator** (step 4): your node signs blocks. You need a bond in testnet FLS, which we
   send you for free.
+
 
 Questions at any point: **[Discord](https://discord.gg/8rKfKc7QR9)**.
 
@@ -144,13 +145,9 @@ In the faucet channel on **[Discord](https://discord.gg/8rKfKc7QR9)**, type:
 ```
 
 The faucet bot sends the bond plus 1 FLS for fees, one grant per Discord account and per address.
-The bond depends on how many validators are active:
-
-| active validators | bond |
-|---|---|
-| 1 (now) | 4,000 FLS |
-| 4 | 2,000 FLS |
-| 16 or more | 1,000 FLS |
+The bond is **150 FLS** at launch. It rises slowly and automatically as the supply and the number of
+validators grow (about 280 FLS after two years on a growing network); the amount you bond when you
+join is all you ever need, it is never raised for you later.
 
 Testnet FLS exist only as block rewards (there is no premine, also on testnet), so bonds are paid
 as the faucet earns them, in request order. The bot tells you your place in the queue and an

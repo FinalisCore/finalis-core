@@ -20,7 +20,7 @@ The client trusts only the genesis document compiled into its binary
 (`genesis::embedded_genesis_for`). From it, it derives the epoch-1 committee checkpoint exactly as
 every node does (`build_genesis_canonical_state` with `network_canonical_derivation_config`, the
 network's parameters without test overrides). Mainnet's embedded genesis names no validators until
-the genesis ceremony; until then mainnet clients report "not verified".
+launch (it then names the bootstrap validator); until then mainnet clients report "not verified".
 
 ## 3. What is signed
 

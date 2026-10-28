@@ -44,9 +44,9 @@ genesis:
 
 - `activation_height = 0`
 - `target_validators = 16`
-- `base_min_bond = 100 FLS`
-- `min_bond_floor = 50 FLS`
-- `min_bond_ceiling = 500 FLS`
+- `base_min_bond = 150 FLS`
+- `min_bond_floor = 150 FLS`
+- `min_bond_ceiling = 5,000 FLS`
 - `max_effective_bond_multiple = 10`
 - `participation_threshold_bps = 8000`
 - `ticket_bonus_cap_bps = 1000`
@@ -109,7 +109,21 @@ Let:
 
 The canonical reward/admission helpers derive:
 
-`min_bond(height) = clamp(min_bond_floor, min_bond_ceiling, base_min_bond * sqrt(target_validators / max(1, active_operators)))`
+The minimum bond a validator posts **when it joins** follows the network, from finalized state only
+(no price, no setting, nobody adjusts it):
+
+`B_N = base_min_bond * sqrt(min(active_operators, 512) / target_validators)` (validators competing
+for the 128 committee seats; counted up to 512, so faked operators cannot price newcomers out)
+
+`B_S = emitted_supply(height) / 12,800` (128 minimum bonds lock 1 % of the supply)
+
+`min_bond(height) = clamp(min_bond_floor, min_bond_ceiling, (B_N + 2 * B_S) / 3)`
+
+It starts at the 150 FLS floor and rises with the supply and the validator count (about 280 FLS
+after 2 years and 470 after 6 on a network growing to 128-200 validators). A bond already posted is
+never asked to grow: committee eligibility requires 150 FLS, the lowest any registration ever
+required, so no validator that joined legally is shut out later. Joins beyond 64 per 1,000 blocks
+wait in a committed queue and are admitted oldest first.
 
 `max_effective_bond(height) = max_effective_bond_multiple * min_bond(height)`
 
@@ -126,38 +140,29 @@ Important boundary:
 
 - checkpoint minimum bond for future committee derivation is adaptive
 
-## 4. Fees and issuance
+## 4. Fees, issuance and the reserve
 
-Fees, issuance, and reserve support are epoch-settled.
+The supply is fixed at 7,000,000 FLS and is never exceeded. Validators are paid for ever without
+new coins, from a protocol reserve that cannot run dry:
 
-For each finalized transition:
-
-- before the emission cap:
-  - gross issuance accrues deterministically by height
-  - `10%` of gross issuance is accrued into protocol reserve
-  - the remaining `90%` enters epoch settlement rewards
-  - within epoch settlement rewards, `3%` is carved into the onboarding bucket
-    when eligible onboarding recipients exist
-- after the emission cap:
-  - new issuance is zero
-  - finalized transaction fees are pooled into the closed epoch instead of being
-    paid immediately
-- settlement at the next epoch boundary applies finalized participation
-  adjustment using the live policy and distributes the closed epoch pool
-
-So the live mainnet settlement split is:
-
-- `10%` reserve accrual from gross issuance
-- `87.3%` validator settlement rewards from gross issuance when onboarding is
-  populated
-- `2.7%` onboarding rewards from gross issuance when onboarding is populated
-
-Important boundary:
-
-- the `3%` onboarding carve-out is taken from settlement rewards, not from
-  reserve accrual
-- if the onboarding score set is empty, that `3%` remains in the validator
-  settlement pool
+- **Emission (years 1-12):** gross issuance accrues by height on a schedule declining 20 % a year;
+  `30 %` of it is saved into the protocol reserve (`RESERVE_ACCRUAL_BPS = 3,000`), the remaining
+  `70 %` enters epoch settlement rewards, of which `3 %` goes to onboarding rewards when eligible
+  onboarding recipients exist.
+- **Fees, from block 1:** every finalized fee is pooled into its epoch. At settlement half is paid
+  to the epoch's validators with the rewards and half returns to the reserve
+  (`FEE_RESERVE_BPS = 5,000`).
+- **Burns:** slashed bonds (SCBURN outputs) are not destroyed: their value returns to the reserve
+  at settlement; burn outputs do not stay in the coin set.
+- **Reserve payout (after year 12):** each epoch pays out `RESERVE_PAYOUT_BPS_PER_YEAR = 500` (5 %
+  a year) of the reserve's balance, a fixed fraction, never a fixed amount, so it never empties; fees
+  and burns keep refilling it. In the long run validators earn what users pay in fees, and the
+  reserve smooths that over decades.
+- **Base fee:** every transaction pays at least `base_fee_per_kib` per started KiB of its size. After
+  each block it moves by at most 1/8 towards keeping blocks half full (fullness is the larger of the
+  byte and record shares), with a floor of 1 unit. It follows demand only, so it works at any FLS
+  price without anyone setting it. Timed transactions' bodies are exempt (their fee is prepaid).
+  `get_status` reports it; `finalis-cli send` pays it automatically.
 
 Primary emission constants:
 
@@ -165,31 +170,13 @@ Primary emission constants:
 - `EMISSION_YEARS = 12`
 - `BLOCKS_PER_YEAR_365 = 175,200`
 - `EMISSION_BLOCKS = 2,102,400`
-- `EMISSION_DECAY_NUM = 4`
-- `EMISSION_DECAY_DEN = 5`
-- `RESERVE_ACCRUAL_BPS = 1,000`
+- `EMISSION_DECAY_NUM = 4`, `EMISSION_DECAY_DEN = 5`
+- `RESERVE_ACCRUAL_BPS = 3,000`, `FEE_RESERVE_BPS = 5,000`, `RESERVE_PAYOUT_BPS_PER_YEAR = 500`
 - `BLOCK_TIME_TARGET_SECONDS = 180`
 
-So the current code has:
-
-- exact primary emission total: `7,000,000 FLS`
-- annual issuance declines by `20%` year-over-year
-- yearly budgets are precomputed deterministically and sum exactly to the cap
-- reserve accrual during emission totals `10%` of gross issuance
-- zero new issuance after that
-
-It is therefore a strict hard-cap system in the current implementation.
-
-Post-cap continuity support is deterministic, not discretionary:
-
-- epoch fees remain pooled and distributed at settlement
-- reserve subsidy is only available after the cap
-- reserve subsidy is computed from:
-  - eligible validator count after participation penalty
-  - the closed epoch fee pool
-  - a hard reserve floor
-  - a minimum reserve runway cap
-- reserve is protocol state, not a validator-controlled treasury wallet
+Per validator (no fees assumed): about 64,000 FLS in year 1 with 16 validators (8,000 with 128),
+6,600 in year 13, 2,700 in year 30 and 1,000 in year 50 with 16 validators. The reserve is protocol
+state, not a wallet: nobody can spend it.
 
 ## 5. Participation and rewards
 
