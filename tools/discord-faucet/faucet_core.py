@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 """Testnet validator-bond faucet: queue, limits, funding and sending, with no Discord code.
 
-Each Discord account and each address gets one grant. A grant is the current minimum validator bond
-(from `finalis-cli economics_status`) plus a small fee buffer. Grants are paid in request order, one
-at a time: the next payment waits until the previous one is finalized, because the faucet's change
-output is only spendable once final. While the faucet holds too little, requests wait in the queue.
+Each Discord account and each address gets one grant, and there are only MAX_GRANTS grants ever (a
+failed payment does not use one up); after that validators buy or receive their coins. A grant is
+the current minimum validator bond (from `finalis-cli economics_status`) plus a small fee buffer.
+Grants are paid in request order, one at a time: the next payment waits until the previous one is
+finalized, because the faucet's change output is only spendable once final. While the faucet holds
+too little, requests wait in the queue.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Callable, Optional
 
 UNITS_PER_FLS = 100_000_000
 BLOCK_SECONDS = 180
+MAX_GRANTS = 128  # the launch model's faucet rule (mainnet/MAINNET_PLAN.md)
 
 
 def fls(units: int) -> str:
@@ -138,6 +141,10 @@ class Store:
         self.db.commit()
         return self.by_user(user_id)
 
+    def granted(self) -> int:
+        """Grants that count against the limit: queued, sent or paid (not failed)."""
+        return self.db.execute("SELECT COUNT(*) FROM grants WHERE state != 'failed'").fetchone()[0]
+
     def first(self, state: str) -> Optional[Grant]:
         return self._grant(self.db.execute(f"SELECT {self._COLS} FROM grants WHERE state = ? ORDER BY id LIMIT 1",
                                            (state,)).fetchone())
@@ -154,8 +161,9 @@ class Store:
 
 class Faucet:
     def __init__(self, store: Store, rpc: Rpc, cli: Cli, faucet_address: str, fee_buffer_units: int,
-                 income_units_per_block: int, clock: Callable[[], float] = time.time):
+                 income_units_per_block: int, clock: Callable[[], float] = time.time, max_grants: int = MAX_GRANTS):
         self.store, self.rpc, self.cli = store, rpc, cli
+        self.max_grants = max_grants
         self.faucet_address = faucet_address
         self.fee_buffer_units = fee_buffer_units
         self.income_units_per_block = income_units_per_block
@@ -172,6 +180,10 @@ class Faucet:
             return "You already have a grant. " + self.describe(existing)
         if self.store.by_address(address):
             return "That address already has a grant. Each address can be funded once."
+        if self.store.granted() >= self.max_grants:
+            return (f"All {self.max_grants} faucet grants are taken: the faucet funds only the first "
+                    f"{self.max_grants} validators. To join now, buy FLS or receive them from someone, then "
+                    "run `finalis-cli validator-register`.")
         try:
             check = self.rpc.validate_address(address)
         except Exception as exc:  # RPC down or malformed reply
@@ -181,7 +193,8 @@ class Faucet:
         if check.get("server_network_match") is not True:
             return "That address is not a testnet address. Testnet addresses start with `tsc1`."
         grant = self.store.add(user_id, check.get("normalized_address") or address)
-        return "You're in the queue. " + self.describe(grant)
+        return (f"You're in the queue (grant {self.store.granted()} of {self.max_grants}). "
+                + self.describe(grant))
 
     def describe(self, grant: Grant) -> str:
         if grant.state == "done":

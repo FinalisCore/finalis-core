@@ -1,14 +1,15 @@
 # Testnet bond faucet (Discord bot)
 
 `/faucet address:tsc1…` in the faucet channel queues one free validator bond per Discord account and
-per address. The bot pays the current minimum bond (`finalis-cli economics_status`) plus 1 FLS for
-fees, one payment at a time and in request order, and pings the user when the payment is sent and
-again when it is final.
+per address, for the **first 128 grants only** (`MAX_GRANTS`; a failed payment frees its slot). After
+that the bot answers that validators buy or receive their coins. It pays the current minimum bond
+(`finalis-cli economics_status`, 150 FLS at launch) plus 1 FLS for fees, one payment at a time and in
+request order, and pings the user when the payment is sent and again when it is final. These are the
+launch model's faucet rules (`mainnet/MAINNET_PLAN.md`).
 
-Testnet coins only exist as block rewards (there is no premine, also on testnet), so the faucet can
-only pay out what the validator has earned: about 5.75 FLS per block, while a bond is 4,000 FLS with
-one validator. Requests wait in the queue until the faucet holds enough; the bot tells each user their
-place and an estimated time.
+Coins only exist as block rewards (there is no premine), so the faucet can only pay out what the
+validator has earned. Requests wait in the queue until the faucet holds enough; the bot tells each
+user their place and an estimated time.
 
 - `faucet_core.py`: queue, limits and payments (no Discord code). `python3 -m unittest test_faucet_core`
   runs its offline tests.

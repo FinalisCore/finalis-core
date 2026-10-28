@@ -149,8 +149,8 @@ editing `SEEDS.json` (`src/p2p/endpoints.hpp`; not consensus):
 - Clients keep an endpoint only if its signature holds and the server at the URL serves this chain
   under the announced key (`finalis-cli discover_endpoints`; the desktop wallet does this every 30 min
   and tries such servers after its configured ones).
-- HTTPS: clients check the certificate against the system trust store (`FINALIS_CA_FILE` overrides
-  it) and require it to name the host or IP. Let's Encrypt issues IP-address certificates (160 h,
+- HTTPS: clients check the certificate against the system trust store (on Windows the system
+  "ROOT" certificate store; `FINALIS_CA_FILE` overrides it) and require it to name the host or IP. Let's Encrypt issues IP-address certificates (160 h,
   HTTP-01 or TLS-ALPN-01 validation), so a host without a domain can still serve HTTPS.
 - `PUBLIC_HTTPS=1 scripts/start.sh` sets this up (`scripts/setup_https.sh`): nginx on 80/443 in front
   of the loopback lightserver (`/rpc`) and explorer (`/`, unless `HTTPS_EXPLORER=0`), a certificate

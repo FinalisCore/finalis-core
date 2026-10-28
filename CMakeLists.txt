@@ -340,7 +340,7 @@ if(ZLIB_FOUND)
   target_link_libraries(finalis_core PUBLIC ZLIB::ZLIB)
 endif()
 if(WIN32)
-  target_link_libraries(finalis_core PUBLIC ws2_32 rpcrt4 shlwapi)
+  target_link_libraries(finalis_core PUBLIC ws2_32 rpcrt4 shlwapi crypt32)
 endif()
 
 if(FINALIS_STRICT_WARNINGS)

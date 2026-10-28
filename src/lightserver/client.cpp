@@ -19,6 +19,9 @@
 #include "common/minijson.hpp"
 #include "common/paths.hpp"
 #include "common/socket_compat.hpp"
+#ifdef _WIN32
+#include <wincrypt.h>
+#endif
 #include "utxo/validate.hpp"
 
 #ifndef _WIN32
@@ -144,6 +147,28 @@ std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
   return parsed;
 }
 
+#ifdef _WIN32
+// OpenSSL's default verify paths are usually empty on Windows: trust what Windows trusts, the
+// certificates of the system "ROOT" store. False if none could be loaded.
+bool load_windows_root_store(SSL_CTX* ctx) {
+  HCERTSTORE store = CertOpenSystemStoreW(0, L"ROOT");
+  if (!store) return false;
+  X509_STORE* x509_store = SSL_CTX_get_cert_store(ctx);
+  int added = 0;
+  PCCERT_CONTEXT cert = nullptr;
+  while ((cert = CertEnumCertificatesInStore(store, cert)) != nullptr) {
+    const unsigned char* der = cert->pbCertEncoded;
+    X509* x509 = d2i_X509(nullptr, &der, static_cast<long>(cert->cbCertEncoded));
+    if (!x509) continue;
+    if (X509_STORE_add_cert(x509_store, x509) == 1) ++added;
+    X509_free(x509);
+  }
+  CertCloseStore(store, 0);
+  ERR_clear_error();  // duplicates in the store are reported as errors; they are harmless
+  return added > 0;
+}
+#endif
+
 // One TLS client session over a connected socket: certificate chain checked against the system trust
 // store (or FINALIS_CA_FILE), and the certificate must name the host (DNS name or IP address).
 class TlsSession {
@@ -160,8 +185,12 @@ class TlsSession {
     const char* ca_file = std::getenv("FINALIS_CA_FILE");
     if (ca_file && *ca_file) {
       if (SSL_CTX_load_verify_locations(out->ctx_, ca_file, nullptr) != 1) return fail(err, "cannot load FINALIS_CA_FILE");
-    } else if (SSL_CTX_set_default_verify_paths(out->ctx_) != 1) {
-      return fail(err, "no system trust store");
+    } else {
+#ifdef _WIN32
+      if (!load_windows_root_store(out->ctx_)) return fail(err, "no system trust store (Windows ROOT store empty)");
+#else
+      if (SSL_CTX_set_default_verify_paths(out->ctx_) != 1) return fail(err, "no system trust store");
+#endif
     }
     out->ssl_ = SSL_new(out->ctx_);
     if (!out->ssl_) return fail(err, "tls init failed");

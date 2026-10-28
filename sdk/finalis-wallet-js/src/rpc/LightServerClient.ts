@@ -86,6 +86,7 @@ export class LightServerClient {
     mempool_size: number | null;
     uptime_s: number;
     version: string;
+    base_fee_per_kib?: number;
   }): Status {
     return {
       network_name: raw.network_name,
@@ -96,6 +97,7 @@ export class LightServerClient {
       mempool_size: raw.mempool_size,
       uptime_s: BigInt(raw.uptime_s),
       version: raw.version,
+      base_fee_per_kib: BigInt(raw.base_fee_per_kib ?? 1),
     };
   }
 

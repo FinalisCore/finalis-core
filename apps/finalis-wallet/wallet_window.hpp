@@ -530,6 +530,8 @@ class WalletWindow final : public QMainWindow {
   std::optional<std::uint64_t> finalized_history_cursor_height_;
   std::optional<std::string> finalized_history_cursor_txid_;
   std::uint64_t tip_height_{0};
+  // The chain's base fee from the last status (consensus::next_base_fee_per_kib), units per KiB.
+  std::uint64_t base_fee_per_kib_{1};
   QString confidential_receive_address_;
   std::uint64_t confidential_balance_units_{0};
   std::uint64_t confidential_unverified_units_{0};  // in coins not yet proven unspent
@@ -546,6 +548,10 @@ class WalletWindow final : public QMainWindow {
   // Chain domain of the connected endpoint's chain (network id + genesis hash); transactions are signed
   // under it. Empty until an endpoint's identity is known.
   std::optional<Hash32> signing_chain_domain() const;
+  // The fee a send pays: the default, or more when the chain's base fee asks more for a transaction
+  // of about `estimated_bytes` (twice the current base fee, which can rise by 1/8 a block until the
+  // transaction is in one).
+  std::uint64_t send_fee_units(std::size_t estimated_bytes) const;
   QString current_binary_version_;
   QString current_wallet_api_version_;
   std::optional<lightserver::RpcStatusView> current_lightserver_status_;

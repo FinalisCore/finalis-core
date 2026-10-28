@@ -46,6 +46,14 @@ export function serializeTx(tx: Tx): Uint8Array {
   return w.finish();
 }
 
+export const DEFAULT_FEE_UNITS = 1_000n;
+
+// The least fee a transaction of `sizeBytes` pays under the chain's base fee: per started KiB.
+// Must match consensus::required_base_fee_units in src/consensus/monetary.cpp.
+export function requiredBaseFeeUnits(baseFeePerKib: bigint, sizeBytes: number): bigint {
+  return baseFeePerKib * BigInt(Math.ceil(sizeBytes / 1024));
+}
+
 export function txidHex(tx: Tx): string {
   return bytesToHex(sha256dBytes(serializeTx(tx)));
 }

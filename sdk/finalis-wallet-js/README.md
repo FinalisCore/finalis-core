@@ -79,7 +79,8 @@ const { txid } = await wallet.sendTransaction({
   fromPrivkeyHex: keypair.privkeyHex,
   toAddress: 'tsc1...',
   amountUnits: 1000n,
-  feeUnits: 1000n,
+  // feeUnits omitted: the SDK pays the default fee, or what the chain's base fee asks if more
+  // (getStatus().base_fee_per_kib, units per started KiB). An explicit feeUnits below it is refused.
   hrp: 'tsc',
   chainDomainHex,
 });

@@ -6,7 +6,7 @@ import unittest
 
 from faucet_core import UNITS_PER_FLS, Faucet, Store
 
-BOND = 4000 * UNITS_PER_FLS
+BOND = 150 * UNITS_PER_FLS
 BUFFER = 1 * UNITS_PER_FLS
 FAUCET = "tsc1faucet"
 
@@ -69,6 +69,17 @@ class FaucetTest(unittest.TestCase):
         self.assertIn("queue", self.faucet.request("u1", "tsc1a"))
         self.assertIn("already have a grant", self.faucet.request("u1", "tsc1b"))
         self.assertIn("already has a grant", self.faucet.request("u2", "tsc1a"))
+
+    def test_only_the_first_max_grants_are_given(self):
+        faucet = Faucet(self.faucet.store, self.rpc, self.cli, FAUCET, BUFFER, 575_000_000, max_grants=2)
+        self.assertIn("grant 1 of 2", faucet.request("u1", "tsc1a"))
+        self.assertIn("grant 2 of 2", faucet.request("u2", "tsc1b"))
+        reply = faucet.request("u3", "tsc1c")
+        self.assertIn("All 2 faucet grants are taken", reply)
+        self.assertIsNone(faucet.store.by_user("u3"))
+        # A failed payment frees its slot.
+        faucet.store.update(faucet.store.by_user("u1").id, state="failed", error="x")
+        self.assertIn("grant 2 of 2", faucet.request("u3", "tsc1c"))
 
     def test_waits_for_funds_then_pays_bond_plus_buffer_in_order(self):
         self.faucet.request("u1", "tsc1a")

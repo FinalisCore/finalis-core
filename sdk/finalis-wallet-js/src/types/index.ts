@@ -19,6 +19,8 @@ export interface Status {
   mempool_size: number | null;
   uptime_s: bigint;
   version: string;
+  // Base fee the next block requires: units per started KiB of a transaction (1 when not reported).
+  base_fee_per_kib: bigint;
 }
 
 export interface RootPair {
@@ -104,7 +106,9 @@ export interface BuildTxParams {
   fromPrivkeyHex: Hex;
   toAddress: string;
   amountUnits: bigint;
-  feeUnits: bigint;
+  // Omitted: the default fee, raised to what the chain's base fee asks for the signed transaction.
+  // Given: used as is, but refused if below the base fee (the network would reject it).
+  feeUnits?: bigint;
   changeAddress?: string;
   hrp?: 'sc' | 'tsc';
   dustThresholdUnits?: bigint;
