@@ -46,6 +46,7 @@ describe('tx signing interop', () => {
     const tx = createSignedP2PKHTransaction({
       prevTxidHex: vectors.tx_signing.prev_txid_hex,
       prevIndex: vectors.tx_signing.prev_index,
+      prevOutput: { valueUnits: BigInt(vectors.tx_signing.prev_value_units), scriptPubKeyHex: vectors.script.script_pubkey_hex },
       privkeyHex: vectors.tx_signing.from_privkey_hex,
       pubkeyHex: vectors.tx_signing.from_pubkey_hex,
       outputs: [
@@ -67,6 +68,7 @@ describe('tx signing interop', () => {
     const tx = createSignedP2PKHTransaction({
       prevTxidHex: vectors.tx_signing.prev_txid_hex,
       prevIndex: vectors.tx_signing.prev_index,
+      prevOutput: { valueUnits: BigInt(vectors.tx_signing.prev_value_units), scriptPubKeyHex: vectors.script.script_pubkey_hex },
       privkeyHex: vectors.tx_signing.from_privkey_hex,
       pubkeyHex: vectors.tx_signing.from_pubkey_hex,
       outputs: [{ valueUnits: 1000n, scriptPubKeyHex: bytesToHex(p2pkhScriptPubKey(to.pubkeyHash)) }],
@@ -75,6 +77,7 @@ describe('tx signing interop', () => {
     const same = createSignedP2PKHTransaction({
       prevTxidHex: vectors.tx_signing.prev_txid_hex,
       prevIndex: vectors.tx_signing.prev_index,
+      prevOutput: { valueUnits: BigInt(vectors.tx_signing.prev_value_units), scriptPubKeyHex: vectors.script.script_pubkey_hex },
       privkeyHex: vectors.tx_signing.from_privkey_hex,
       pubkeyHex: vectors.tx_signing.from_pubkey_hex,
       outputs: [{ valueUnits: 1000n, scriptPubKeyHex: bytesToHex(p2pkhScriptPubKey(to.pubkeyHash)) }],
@@ -83,5 +86,20 @@ describe('tx signing interop', () => {
     // Only the input signature differs (the txid covers it too).
     expect(tx.txHex).not.toBe(same.txHex);
     expect(tx.txHex.length).toBe(same.txHex.length);
+  });
+
+  it('signs over the spent output, so a misreported coin value yields an invalid signature', () => {
+    const to = decodeAddress(vectors.tx_signing.to_address);
+    const sign = (valueUnits: bigint) =>
+      createSignedP2PKHTransaction({
+        prevTxidHex: vectors.tx_signing.prev_txid_hex,
+        prevIndex: vectors.tx_signing.prev_index,
+        prevOutput: { valueUnits, scriptPubKeyHex: vectors.script.script_pubkey_hex },
+        privkeyHex: vectors.tx_signing.from_privkey_hex,
+        pubkeyHex: vectors.tx_signing.from_pubkey_hex,
+        outputs: [{ valueUnits: 1000n, scriptPubKeyHex: bytesToHex(p2pkhScriptPubKey(to.pubkeyHash)) }],
+        chainDomainHex: vectors.tx_signing.chain_domain_hex,
+      });
+    expect(sign(BigInt(vectors.tx_signing.prev_value_units)).txHex).not.toBe(sign(2000n).txHex);
   });
 });

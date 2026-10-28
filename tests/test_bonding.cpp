@@ -643,7 +643,7 @@ TEST(test_scvalreg_requires_matching_join_request) {
   tx.inputs.push_back(TxIn{spend_op.txid, spend_op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{BOND_AMOUNT, reg_script(kp.public_key)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[spend_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, sponsor.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -686,7 +686,7 @@ TEST(test_unbond_delay_enforced) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 2000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[unb_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -736,7 +736,7 @@ TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 2000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[unb_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -1108,7 +1108,7 @@ TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 1000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[bond_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());

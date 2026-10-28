@@ -408,8 +408,20 @@ bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
          is_burn_script(script_pubkey, nullptr) || is_data_output_script(script_pubkey);
 }
 
-std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index) {
-  if (input_index >= tx.inputs.size()) return std::nullopt;
+Hash32 spent_outputs_hash(const std::vector<TxOut>& spent) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'P', 'E', 'N', 'T', '-', 'V', '1'});
+  w.varint(spent.size());
+  for (const auto& out : spent) {
+    w.u64le(out.value);
+    w.varbytes(out.script_pubkey);
+  }
+  return crypto::sha256d(w.data());
+}
+
+std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                               const std::vector<TxOut>& spent) {
+  if (input_index >= tx.inputs.size() || spent.size() != tx.inputs.size()) return std::nullopt;
   Tx signing = tx;
   for (auto& in : signing.inputs) {
     in.script_sig.clear();
@@ -417,16 +429,18 @@ std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const
   const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '4'});
   w.bytes_fixed(chain_domain);
   w.u32le(input_index);
   w.bytes_fixed(txh);
+  w.bytes_fixed(spent_outputs_hash(spent));
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
 
-std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index) {
-  if (input_index >= tx.inputs.size()) return std::nullopt;
+std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                              const std::vector<TxOut>& spent) {
+  if (input_index >= tx.inputs.size() || spent.size() != tx.inputs.size()) return std::nullopt;
   Tx signing = tx;
   for (auto& in : signing.inputs) {
     in.script_sig.clear();
@@ -434,10 +448,11 @@ std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const 
   const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '2'});
   w.bytes_fixed(chain_domain);
   w.bytes_fixed(txh);
   w.u32le(input_index);
+  w.bytes_fixed(spent_outputs_hash(spent));
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
@@ -935,6 +950,22 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     out_sum += out.value;
   }
 
+  // Every signature covers all spent outputs; resolved once, at the first signature checked.
+  std::optional<std::vector<TxOut>> spent;
+  const auto spent_outputs = [&]() -> const std::vector<TxOut>* {
+    if (!spent.has_value()) {
+      std::vector<TxOut> all;
+      all.reserve(tx.inputs.size());
+      for (const auto& input : tx.inputs) {
+        const auto found = utxos.find(OutPoint{input.prev_txid, input.prev_index});
+        if (found == utxos.end()) return nullptr;
+        all.push_back(found->second.out);
+      }
+      spent = std::move(all);
+    }
+    return &*spent;
+  };
+
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
     const auto& in = tx.inputs[i];
     if (in.sequence != 0xFFFFFFFF) return {false, "sequence must be FFFFFFFF", 0};
@@ -955,7 +986,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         return {false, "pubkey hash mismatch", 0};
       }
 
-      const auto msg = signing_message_for_input(*chain_domain, tx, i);
+      const auto* all_spent = spent_outputs();
+      if (all_spent == nullptr) return {false, "missing utxo", 0};
+      const auto msg = signing_message_for_input(*chain_domain, tx, i, *all_spent);
       if (!msg.has_value()) return {false, "sighash failed", 0};
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -980,7 +1013,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         const bool is_beneficiary = spender == lock->beneficiary_pkh;
         return {false, is_beneficiary ? "height lock not reached" : "pubkey hash mismatch", 0};
       }
-      const auto msg = signing_message_for_input(*chain_domain, tx, i);
+      const auto* all_spent = spent_outputs();
+      if (all_spent == nullptr) return {false, "missing utxo", 0};
+      const auto msg = signing_message_for_input(*chain_domain, tx, i, *all_spent);
       if (!msg.has_value()) return {false, "sighash failed", 0};
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -1054,7 +1089,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         PubKey32 pub{};
         if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond auth script_sig", 0};
         if (pub != bond_pub) return {false, "unbond auth pubkey mismatch", 0};
-        const auto msg = unbond_message_for_input(*chain_domain, tx, i);
+        const auto* all_spent = spent_outputs();
+        if (all_spent == nullptr) return {false, "missing utxo", 0};
+        const auto msg = unbond_message_for_input(*chain_domain, tx, i, *all_spent);
         if (!msg.has_value()) return {false, "unbond sighash failed", 0};
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -1133,7 +1170,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       PubKey32 pub{};
       if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond-spend script_sig", 0};
       if (pub != unbond_pub) return {false, "unbond-spend pubkey mismatch", 0};
-      const auto msg = signing_message_for_input(*chain_domain, tx, i);
+      const auto* all_spent = spent_outputs();
+      if (all_spent == nullptr) return {false, "missing utxo", 0};
+      const auto msg = signing_message_for_input(*chain_domain, tx, i, *all_spent);
       if (!msg.has_value()) return {false, "unbond-spend sighash failed", 0};
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};

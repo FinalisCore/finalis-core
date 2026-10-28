@@ -158,8 +158,14 @@ Signatures bind the chain. Every transaction signature covers the chain domain
 `D = sha256d("SC-CHAIN-DOMAIN-V1" || network_id || genesis_hash)`, the same value consensus
 signatures cover:
 
-- `Tx` input: `sha256d("SC-SIG-V1" || D || u32le(input_index) || sha256d(tx without script_sigs))`
-- `Tx` unbond: the same with tag `SC-UNBOND-V1`
+- `Tx` input: `sha256d("SC-SIG-V4" || D || u32le(input_index) || sha256d(tx without script_sigs) || S)`
+- `Tx` unbond: `sha256d("SC-UNBOND-V2" || D || sha256d(tx without script_sigs) || u32le(input_index) || S)`
+- `S = sha256d("SC-SPENT-V1" || varint(n) || n x (u64le(value) || varbytes(script_pubkey)))` over the
+  outputs the `n` inputs spend, in input order. A `Tx` names its inputs only by outpoint, so without
+  `S` a signer told a smaller value for a coin than the chain holds would sign away the difference
+  as fee; with it, any wrong value or script makes every signature of the transaction invalid.
+  (`TxV2` and the `TxTimed` fee input need no `S`: the balance proof and the exact fee-input sum
+  fail on a wrong value.)
 - `TxV2` input (transparent or confidential): tag `SC-SIG-V3`
 - `TxV2` balance proof: `sha256d("SC-BAL-V3" || D || tx without signatures)`
 

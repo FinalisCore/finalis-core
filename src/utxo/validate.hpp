@@ -72,11 +72,19 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
 // Transaction signatures cover the chain domain (consensus_chain_domain: network id and genesis
 // hash), like consensus signatures, so a transaction signed for one network is invalid on every other
 // one even when it spends an outpoint that exists on both (genesis bonds).
-std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index);
+//
+// They also cover every output the transaction spends (value and script, in input order; `spent` has
+// one entry per input): a signer told a wrong value or script for any input signs a transaction that
+// is invalid, instead of one whose real fee is larger than it was shown. nullopt if `spent` does not
+// match the inputs.
+std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                               const std::vector<TxOut>& spent);
+Hash32 spent_outputs_hash(const std::vector<TxOut>& spent);
 std::optional<Bytes> signing_message_for_input_v2(const Hash32& chain_domain, const TxV2& tx,
                                                   std::uint32_t input_index);
 std::optional<Hash32> balance_proof_message_v2(const Hash32& chain_domain, const TxV2& tx);
-std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index);
+std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                              const std::vector<TxOut>& spent);
 // The fee input's signature of a TxTimed: covers every field (the SWE ciphertext, proof and the
 // sealed body included) except the script_sig itself.
 Bytes signing_message_for_timed_fee_input(const Hash32& chain_domain, const TxTimed& tx);

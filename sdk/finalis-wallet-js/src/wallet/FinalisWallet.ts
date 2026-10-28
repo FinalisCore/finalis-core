@@ -109,8 +109,9 @@ export class FinalisWallet {
       tx.outputs.push({ valueUnits: change, scriptPubKeyHex: p2pkhScriptPubKeyHexFromAddress(chAddr) });
     }
 
+    const spent = selected.map((u) => ({ valueUnits: u.valueUnits, scriptPubKeyHex: u.scriptPubKeyHex }));
     for (let i = 0; i < tx.inputs.length; i++) {
-      signInputP2PKH(tx, i, kp.privkeyHex, kp.pubkeyHex, params.chainDomainHex);
+      signInputP2PKH(tx, i, kp.privkeyHex, kp.pubkeyHex, params.chainDomainHex, spent);
     }
 
     const txHex = bytesToHex(serializeTx(tx));

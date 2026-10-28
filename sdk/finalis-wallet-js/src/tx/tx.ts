@@ -50,11 +50,22 @@ export function txidHex(tx: Tx): string {
   return bytesToHex(sha256dBytes(serializeTx(tx)));
 }
 
-// sha256d("SC-SIG-V1" || chain_domain || u32le(input_index) || sha256d(tx without script_sigs)). The
-// chain domain (consensusChainDomain(network_id, genesis_hash)) makes a transaction signed for one
-// network invalid on every other one. Must match signing_message_for_input in src/utxo/validate.cpp.
-export function signingMessageForInput(tx: Tx, inputIndex: number, chainDomainHex: string): Uint8Array {
+// sha256d("SC-SPENT-V1" || varint(n) || per spent output: u64le(value) || varbytes(script_pubkey)).
+export function spentOutputsHash(spent: TxOutput[]): Uint8Array {
+  const w = new Writer().bytes(utf8Bytes('SC-SPENT-V1')).varint(BigInt(spent.length));
+  for (const out of spent) w.u64le(out.valueUnits).varbytes(hexToBytes(out.scriptPubKeyHex));
+  return sha256dBytes(w.finish());
+}
+
+// sha256d("SC-SIG-V4" || chain_domain || u32le(input_index) || sha256d(tx without script_sigs) ||
+// spentOutputsHash(spent)). The chain domain (consensusChainDomain(network_id, genesis_hash)) makes a
+// transaction signed for one network invalid on every other one. `spent` is the output each input
+// spends, in input order: a signer told a wrong value or script for any of them signs an invalid
+// transaction instead of overpaying the fee unknowingly. Must match signing_message_for_input in
+// src/utxo/validate.cpp.
+export function signingMessageForInput(tx: Tx, inputIndex: number, chainDomainHex: string, spent: TxOutput[]): Uint8Array {
   if (inputIndex < 0 || inputIndex >= tx.inputs.length) throw new Error('input index out of range');
+  if (spent.length !== tx.inputs.length) throw new Error('spent outputs must match the inputs');
   const chainDomain = hexToBytes(chainDomainHex);
   if (chainDomain.length !== 32) throw new Error('chain domain must be 32 bytes hex');
   const txCopy: Tx = {
@@ -64,12 +75,12 @@ export function signingMessageForInput(tx: Tx, inputIndex: number, chainDomainHe
     inputs: tx.inputs.map((i) => ({ ...i, scriptSigHex: '' })),
   };
   const txHash = sha256dBytes(serializeTx(txCopy));
-  const msgPreimage = concatBytes(utf8Bytes('SC-SIG-V1'), chainDomain, new Uint8Array([
+  const msgPreimage = concatBytes(utf8Bytes('SC-SIG-V4'), chainDomain, new Uint8Array([
     inputIndex & 0xff,
     (inputIndex >>> 8) & 0xff,
     (inputIndex >>> 16) & 0xff,
     (inputIndex >>> 24) & 0xff,
-  ]), txHash);
+  ]), txHash, spentOutputsHash(spent));
   return sha256dBytes(msgPreimage);
 }
 
@@ -79,8 +90,9 @@ export function signInputP2PKH(
   privkeyHex: string,
   pubkeyHex: string,
   chainDomainHex: string,
+  spent: TxOutput[],
 ): void {
-  const sig = signEd25519(signingMessageForInput(tx, inputIndex, chainDomainHex), privkeyHex);
+  const sig = signEd25519(signingMessageForInput(tx, inputIndex, chainDomainHex, spent), privkeyHex);
   const pub = hexToBytes(pubkeyHex);
   if (pub.length !== 32) throw new Error('pubkey must be 32 bytes hex');
   const scriptSig = new Writer().u8(0x40).bytes(sig).u8(0x20).bytes(pub).finish();
@@ -90,6 +102,8 @@ export function signInputP2PKH(
 export function createSignedP2PKHTransaction(args: {
   prevTxidHex: string;
   prevIndex: number;
+  // The output being spent, as the chain holds it (value and script); the signature covers it.
+  prevOutput: TxOutput;
   privkeyHex: string;
   pubkeyHex: string;
   outputs: TxOutput[];
@@ -109,7 +123,7 @@ export function createSignedP2PKHTransaction(args: {
     outputs: args.outputs,
   };
 
-  signInputP2PKH(tx, 0, args.privkeyHex, args.pubkeyHex, args.chainDomainHex);
+  signInputP2PKH(tx, 0, args.privkeyHex, args.pubkeyHex, args.chainDomainHex, [args.prevOutput]);
   const bytes = serializeTx(tx);
   return { tx, txHex: bytesToHex(bytes), txid: bytesToHex(sha256dBytes(bytes)) };
 }

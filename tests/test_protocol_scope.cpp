@@ -9,6 +9,7 @@
 #include "common/address.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "utxo/signing.hpp"
 #include "utxo/validate.hpp"
 
 using namespace finalis;
@@ -36,7 +37,7 @@ TEST(test_protocol_scope_rejects_duplicate_inputs) {
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {prev_out, prev_out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -65,7 +66,7 @@ TEST(test_protocol_scope_rejects_input_output_sum_mismatch) {
   // Output sum greater than input sum
   tx.outputs.push_back(TxOut{11'000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {prev_out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -74,6 +75,60 @@ TEST(test_protocol_scope_rejects_input_output_sum_mismatch) {
   auto r = validate_tx(tx, 1, view, finalis::test::test_validation_ctx());
   ASSERT_TRUE(!r.ok);
   ASSERT_TRUE(r.error.find("negative fee") != std::string::npos);
+}
+
+// A signer told a smaller value (or another script) for a coin than the chain holds would otherwise
+// pay the difference as fee without seeing it. Signatures cover every spent output, so such a
+// transaction is invalid; one wrong input among several invalidates every signature.
+TEST(test_protocol_scope_signature_covers_spent_values_and_scripts) {
+  const auto kp = key_from_byte(36);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const auto script = address::p2pkh_script_pubkey(pkh);
+  const Bytes priv(kp.private_key.begin(), kp.private_key.end());
+  OutPoint op0{};
+  op0.txid.fill(0xC5);
+  OutPoint op1{};
+  op1.txid.fill(0xC6);
+  const TxOut real0{100'000, script};
+  const TxOut real1{50'000, script};
+  UtxoSet view;
+  view[op0] = UtxoEntry{real0};
+  view[op1] = UtxoEntry{real1};
+  const std::vector<TxOut> pay{TxOut{60'000, script}};
+
+  const auto honest = build_signed_p2pkh_tx_single_input(test::test_chain_domain(), op0, real0, priv, {TxOut{99'000, script}});
+  ASSERT_TRUE(honest.has_value());
+  ASSERT_TRUE(validate_tx(*honest, 1, view, test::test_validation_ctx()).ok);
+
+  // Told 10'000 instead of 100'000: the signer thinks it pays a 1'000 fee, the chain would take 91'000.
+  const auto understated =
+      build_signed_p2pkh_tx_single_input(test::test_chain_domain(), op0, TxOut{10'000, script}, priv, {TxOut{9'000, script}});
+  ASSERT_TRUE(understated.has_value());
+  auto r = validate_tx(*understated, 1, view, test::test_validation_ctx());
+  ASSERT_TRUE(!r.ok && r.error == "signature invalid");
+
+  // Told a different script for the same coin.
+  auto other_script = script;
+  other_script.back() ^= 1;
+  const auto wrong_script =
+      build_signed_p2pkh_tx_multi_input(test::test_chain_domain(), {{op0, TxOut{100'000, other_script}}}, priv, {TxOut{99'000, script}});
+  ASSERT_TRUE(!wrong_script.has_value() ||
+              !validate_tx(*wrong_script, 1, view, test::test_validation_ctx()).ok);
+
+  // Two inputs, the second misreported: the first input's signature fails too.
+  const auto both = build_signed_p2pkh_tx_multi_input(test::test_chain_domain(), {{op0, real0}, {op1, TxOut{5'000, script}}}, priv, pay);
+  ASSERT_TRUE(both.has_value());
+  r = validate_tx(*both, 1, view, test::test_validation_ctx());
+  ASSERT_TRUE(!r.ok && r.error == "signature invalid");
+  const auto good = build_signed_p2pkh_tx_multi_input(test::test_chain_domain(), {{op0, real0}, {op1, real1}}, priv, pay);
+  ASSERT_TRUE(good.has_value());
+  ASSERT_TRUE(validate_tx(*good, 1, view, test::test_validation_ctx()).ok);
+
+  // The message is bound to the spent list: same tx, different spent outputs, different message.
+  const auto m_real = signing_message_for_input(test::test_chain_domain(), *good, 0, {real0, real1});
+  const auto m_lied = signing_message_for_input(test::test_chain_domain(), *good, 0, {real0, TxOut{5'000, script}});
+  ASSERT_TRUE(m_real.has_value() && m_lied.has_value() && *m_real != *m_lied);
+  ASSERT_TRUE(!signing_message_for_input(test::test_chain_domain(), *good, 0, {real0}).has_value());
 }
 
 TEST(test_protocol_scope_rejects_fee_overflow_u64_boundary) {
@@ -100,8 +155,8 @@ TEST(test_protocol_scope_rejects_fee_overflow_u64_boundary) {
   tx.inputs.push_back(TxIn{op1.txid, op1.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg0 = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
-  auto msg1 = signing_message_for_input(finalis::test::test_chain_domain(), tx, 1);
+  auto msg0 = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {prev0, prev1});
+  auto msg1 = signing_message_for_input(finalis::test::test_chain_domain(), tx, 1, {prev0, prev1});
   ASSERT_TRUE(msg0.has_value() && msg1.has_value());
   auto sig0 = crypto::ed25519_sign(*msg0, kp.private_key);
   auto sig1 = crypto::ed25519_sign(*msg1, kp.private_key);
@@ -131,7 +186,7 @@ TEST(test_protocol_scope_rejects_value_overflow_total_output_sum) {
   tx.outputs.push_back(TxOut{std::numeric_limits<std::uint64_t>::max(), address::p2pkh_script_pubkey(pkh)});
   tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {prev_out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -156,7 +211,7 @@ TEST(test_protocol_scope_rejects_missing_utxo) {
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{1, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {TxOut{1, address::p2pkh_script_pubkey(pkh)}});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -269,7 +324,7 @@ Tx make_spend_tx(const OutPoint& op, const TxOut& prev_out, const crypto::KeyPai
   tx.lock_time = 0;
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs = outputs;
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {prev_out});
   if (!msg.has_value()) throw std::runtime_error("sighash failed");
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   if (!sig.has_value()) throw std::runtime_error("sign failed");
@@ -402,7 +457,7 @@ TEST(test_protocol_scope_rejects_tx_when_verify_budget_exceeded_by_join_request_
     tx.outputs.push_back(TxOut{0, join_request_script(validator, payout.public_key, pop)});
   }
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {prev_out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, sponsor.private_key);
   ASSERT_TRUE(sig.has_value());

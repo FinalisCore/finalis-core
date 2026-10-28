@@ -750,8 +750,10 @@ std::optional<Tx> create_bond_tx_from_validator0(node::Node& node0, const crypto
   }
   tx.outputs = outs;
 
+  std::vector<TxOut> spent;
+  for (const auto& [_, out] : selected) spent.push_back(out);
   for (std::size_t i = 0; i < selected.size(); ++i) {
-    auto msg = signing_message_for_input(node_chain_domain(node0), tx, static_cast<std::uint32_t>(i));
+    auto msg = signing_message_for_input(node_chain_domain(node0), tx, static_cast<std::uint32_t>(i), spent);
     if (!msg.has_value()) return std::nullopt;
     auto sig = crypto::ed25519_sign(*msg, validator0.private_key);
     if (!sig.has_value()) return std::nullopt;

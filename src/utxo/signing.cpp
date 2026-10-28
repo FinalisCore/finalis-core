@@ -290,7 +290,7 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const Hash32& chain_domain,
   tx.inputs.push_back(TxIn{prev_outpoint.txid, prev_outpoint.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs = outputs;
 
-  auto msg = signing_message_for_input(chain_domain, tx, 0);
+  auto msg = signing_message_for_input(chain_domain, tx, 0, {prev_out});
   if (!msg.has_value()) {
     if (err) *err = "failed to build sighash";
     return std::nullopt;
@@ -350,8 +350,11 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const Hash32& chain_domain, 
     tx.inputs.push_back(TxIn{prev_outpoint.txid, prev_outpoint.index, Bytes{}, 0xFFFFFFFF});
   }
 
+  std::vector<TxOut> spent;
+  spent.reserve(prevs.size());
+  for (const auto& [_, prev_out] : prevs) spent.push_back(prev_out);
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
-    auto msg = signing_message_for_input(chain_domain, tx, i);
+    auto msg = signing_message_for_input(chain_domain, tx, i, spent);
     if (!msg.has_value()) {
       if (err) *err = "failed to build sighash";
       return std::nullopt;
@@ -398,7 +401,9 @@ std::optional<Tx> build_unbond_tx(const Hash32& chain_domain, const OutPoint& bo
   spk.insert(spk.end(), validator_pubkey.begin(), validator_pubkey.end());
   tx.outputs.push_back(TxOut{bond_value - fee, spk});
 
-  auto msg = unbond_message_for_input(chain_domain, tx, 0);
+  Bytes bond_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+  bond_spk.insert(bond_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
+  auto msg = unbond_message_for_input(chain_domain, tx, 0, {TxOut{bond_value, bond_spk}});
   if (!msg.has_value()) {
     if (err) *err = "unbond sighash failed";
     return std::nullopt;

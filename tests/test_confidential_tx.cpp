@@ -359,7 +359,7 @@ TEST(test_validate_any_tx_dispatches_v1_against_utxoset_v2) {
   tx.version = 1;
   tx.inputs.push_back(TxIn{op.txid, op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(to.public_key.begin(), to.public_key.end())))});
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {prev});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, from.private_key);
   ASSERT_TRUE(sig.has_value());
