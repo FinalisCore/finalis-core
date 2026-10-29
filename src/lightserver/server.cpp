@@ -1318,11 +1318,15 @@ std::string onboarding_record_json_for_rpc(const NetworkConfig& network, const s
 
 // SECURITY: keystore unlock is reachable only on the admin Unix socket (owner-only, peer uid
 // checked), never on TCP. It still must not act as a confused deputy: key files are confined to
-// <db_path>/keystore and must be passphrase-encrypted (knowing the passphrase is the authorization).
+// <db_path>/keystore and, on mainnet, must be passphrase-encrypted (knowing the passphrase is the
+// authorization). Other networks accept the unencrypted key the node creates for itself
+// (node_validator_ops.cpp): there the owner-only socket is the authorization, as it already is for
+// every process that can read that key file.
 // The former process-global 1s failure throttle is gone: any client could use it to lock the
 // operator out; public-surface abuse is handled by per-IP token buckets instead.
-std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const std::string& db_path, const std::string& key_file,
-                                                                 const std::string& passphrase, std::string* err) {
+std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const NetworkConfig& network, const std::string& db_path,
+                                                                 const std::string& key_file, const std::string& passphrase,
+                                                                 std::string* err) {
   auto fail = [&](const std::string& msg) -> std::optional<keystore::ValidatorKey> {
     if (err) *err = msg;
     return std::nullopt;
@@ -1338,7 +1342,7 @@ std::optional<keystore::ValidatorKey> load_validator_key_for_rpc(const std::stri
   const auto rel = resolved.lexically_relative(allowed_dir);
   if (rel.empty() || rel.is_absolute() || *rel.begin() == "..") return fail("key_file must be inside the node keystore directory");
   if (!std::filesystem::is_regular_file(resolved, ec)) return fail("invalid key_file");
-  if (passphrase.empty() || !keystore::keystore_is_encrypted(resolved.string())) {
+  if (network.name == "mainnet" && (passphrase.empty() || !keystore::keystore_is_encrypted(resolved.string()))) {
     return fail("rpc requires a passphrase-encrypted keystore");
   }
 
@@ -3025,7 +3029,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const bool wait_for_sync = field_bool(params, "wait_for_sync").value_or(true);
     const std::string tracked_txid_hex = field_string(params, "txid_hex").value_or("");
     std::string err;
-    auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
+    auto key = load_validator_key_for_rpc(cfg_.network, cfg_.db_path, *key_file, passphrase, &err);
     if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
     storage::DB& live_db = db_;
     auto record =
@@ -3041,7 +3045,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     const std::uint64_t fee = field_u64(params, "fee").value_or(10'000);
     const bool wait_for_sync = field_bool(params, "wait_for_sync").value_or(true);
     std::string err;
-    auto key = load_validator_key_for_rpc(cfg_.db_path, *key_file, passphrase, &err);
+    auto key = load_validator_key_for_rpc(cfg_.network, cfg_.db_path, *key_file, passphrase, &err);
     if (!key.has_value()) return make_result(id, std::string("{\"state\":\"failed\",\"last_error_message\":\"") + minijson::escape(err) + "\"}");
     storage::DB& live_db = db_;
     auto record = onboarding_status_from_readonly_db(cfg_.network, live_db, *key, fee, wait_for_sync, "", &err);
