@@ -196,11 +196,20 @@ option(FINALIS_BLST_PORTABLE "Build blst with -D__BLST_PORTABLE__" ON)
 enable_language(C)
 set(FINALIS_BLST_SOURCES "${FINALIS_BLST_SOURCE}/src/server.c")
 set(FINALIS_BLST_DEFINES "")
-# No assembly under MSVC (its .asm needs MASM wiring, not done yet): portable C, slower. Fuzz and
-# ASan/UBSan builds keep the assembly: blst v0.3.17's no-asm path does not build with 64-bit limbs
-# (no llimb_t on x86_64/aarch64), and only MSan, not run here, needs it.
+# Assembly everywhere: blst v0.3.17's no-asm C path does not build with 64-bit limbs (no llimb_t on
+# x86_64/aarch64) and needs C99 VLAs, which MSVC lacks. Under MSVC it is the MASM files blst's own
+# build.bat assembles (build/win64/*-x86_64.asm, ml64). Fuzz and ASan/UBSan builds keep it too;
+# only MSan, not run here, needs the no-asm path.
 if(MSVC)
-  list(APPEND FINALIS_BLST_DEFINES __BLST_NO_ASM__)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64|x64)$")
+    message(FATAL_ERROR "blst under MSVC is wired for x86_64 only (got ${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+  enable_language(ASM_MASM)
+  file(GLOB FINALIS_BLST_MASM_SOURCES "${FINALIS_BLST_SOURCE}/build/win64/*-x86_64.asm")
+  if(NOT FINALIS_BLST_MASM_SOURCES)
+    message(FATAL_ERROR "blst win64 assembly not found under ${FINALIS_BLST_SOURCE}/build/win64")
+  endif()
+  list(APPEND FINALIS_BLST_SOURCES ${FINALIS_BLST_MASM_SOURCES})
 else()
   enable_language(ASM)
   list(APPEND FINALIS_BLST_SOURCES "${FINALIS_BLST_SOURCE}/build/assembly.S")
@@ -211,7 +220,10 @@ endif()
 add_library(finalis_blst STATIC ${FINALIS_BLST_SOURCES})
 target_include_directories(finalis_blst PUBLIC "${FINALIS_BLST_SOURCE}/bindings")
 target_compile_definitions(finalis_blst PRIVATE ${FINALIS_BLST_DEFINES})
-if(NOT MSVC)
+if(MSVC)
+  # As build.bat: keep symbol case, so the C side's lower-case names resolve.
+  target_compile_options(finalis_blst PRIVATE "$<$<COMPILE_LANGUAGE:ASM_MASM>:/Cp;/Cx>")
+else()
   target_compile_options(finalis_blst PRIVATE -O2 -fno-builtin -fPIC)
 endif()
 
