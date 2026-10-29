@@ -1297,7 +1297,7 @@ std::string onboarding_record_json(const onboarding::ValidatorOnboardingRecord& 
       << "\",\"activation_height\":" << record.activation_height
       << ",\"rejoin_eligible_height\":" << record.rejoin_eligible_height
       << ",\"rejoin_blocked_reason\":\"" << minijson::escape(record.rejoin_blocked_reason)
-      << ",\"last_error_code\":\"" << minijson::escape(record.last_error_code)
+      << "\",\"last_error_code\":\"" << minijson::escape(record.last_error_code)
       << "\",\"last_error_message\":\"" << minijson::escape(record.last_error_message)
       << "\",\"readiness\":" << readiness_json(record.readiness) << "}";
   return oss.str();
