@@ -3833,41 +3833,46 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base,
   const auto domain = node_chain_domain(n0);
 
   const auto& epoch_blocks = cluster.configs[0].network.committee_epoch_blocks;
-  const auto tip = n0.status().height;
-  const auto unlock = std::min(tip + 4, consensus::committee_epoch_start(tip + 1, epoch_blocks) + epoch_blocks - 1);
-  ASSERT_TRUE(unlock >= tip + 2);  // room for the envelope to be included first
-  std::optional<storage::FinalizedCommitteeCheckpoint> checkpoint;
-  {
-    storage::DB db;
-    ASSERT_TRUE(db.open_readonly(base + "/node0"));
-    checkpoint = db.get_finalized_committee_checkpoint(consensus::committee_epoch_start(unlock, epoch_blocks));
-  }
-  ASSERT_TRUE(checkpoint.has_value() && !checkpoint->ordered_bls_keys.empty());
-
   const auto body = build_signed_p2pkh_tx_single_input(
       timed_body_chain_domain(domain), coins[1].first, coins[1].second, sender_priv,
       {TxOut{coins[1].second.value - 500, address::p2pkh_script_pubkey(recipient_pkh)}});
   ASSERT_TRUE(body.has_value());
-  TimedTxParams params;
-  params.fee_outpoint = coins[0].first;
-  params.fee_prev_out = coins[0].second;
-  params.prepaid_fee = prepaid;
-  params.forfeit_bond = bond;
-  params.bond_refund_script = sender_script;
-  if (coins[0].second.value > bond + prepaid) {
-    params.fee_change = TxOut{coins[0].second.value - bond - prepaid, sender_script};
-  }
-  params.unlock_height = unlock;
-  params.committee_epoch = consensus::committee_epoch_start(unlock, epoch_blocks);
-  params.committee_root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
-  params.committee_keys = checkpoint->ordered_bls_keys;
-  params.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(checkpoint->ordered_bls_keys.size()));
-  Hash32 seed{};
-  seed.fill(0x3c);
   const Bytes revealed{'s', 'e', 'a', 'l', 'e', 'd', ' ', 'b', 'i', 'd'};
-  const auto timed = reveal ? build_signed_timed_tx(domain, params, TimedReveal{revealed}, sender_priv, seed)
-                            : build_signed_timed_tx(domain, params, AnyTx{*body}, sender_priv, seed);
-  ASSERT_TRUE(timed.has_value());
+  // Picks an unlock height a few blocks past the current tip and builds the envelope for it. The
+  // envelope must be included at or below its unlock height, so it is rebuilt after slow steps.
+  std::uint64_t unlock = 0;
+  const auto build_envelope = [&]() -> std::optional<TxTimed> {
+    const auto tip = n0.status().height;
+    unlock = std::min(tip + 4, consensus::committee_epoch_start(tip + 1, epoch_blocks) + epoch_blocks - 1);
+    if (unlock < tip + 2) return std::nullopt;  // room for the envelope to be included first
+    std::optional<storage::FinalizedCommitteeCheckpoint> checkpoint;
+    {
+      storage::DB db;
+      if (!db.open_readonly(base + "/node0")) return std::nullopt;
+      checkpoint = db.get_finalized_committee_checkpoint(consensus::committee_epoch_start(unlock, epoch_blocks));
+    }
+    if (!checkpoint.has_value() || checkpoint->ordered_bls_keys.empty()) return std::nullopt;
+    TimedTxParams params;
+    params.fee_outpoint = coins[0].first;
+    params.fee_prev_out = coins[0].second;
+    params.prepaid_fee = prepaid;
+    params.forfeit_bond = bond;
+    params.bond_refund_script = sender_script;
+    if (coins[0].second.value > bond + prepaid) {
+      params.fee_change = TxOut{coins[0].second.value - bond - prepaid, sender_script};
+    }
+    params.unlock_height = unlock;
+    params.committee_epoch = consensus::committee_epoch_start(unlock, epoch_blocks);
+    params.committee_root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
+    params.committee_keys = checkpoint->ordered_bls_keys;
+    params.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(checkpoint->ordered_bls_keys.size()));
+    Hash32 seed{};
+    seed.fill(0x3c);
+    return reveal ? build_signed_timed_tx(domain, params, TimedReveal{revealed}, sender_priv, seed)
+                  : build_signed_timed_tx(domain, params, AnyTx{*body}, sender_priv, seed);
+  };
+  std::optional<TxTimed> timed;
+  ASSERT_TRUE(wait_for([&]() { return (timed = build_envelope()).has_value(); }, ci_timeout_seconds(60)));
   std::string reason;
   if (n_nodes == 1 && !reveal) {
     // A well-signed envelope with a broken proof: rejected after the (unlocked) proof check, and from
@@ -3902,9 +3907,12 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base,
     lcfg.admin_socket_path.clear();
     lightserver::Server ls(lcfg);
     ASSERT_TRUE(ls.init());
-    // The burst above drained the node-wide budget: retry until it refills (4 per second).
+    // The burst above drained the node-wide budget: retry until it refills (4 per second). The burst
+    // and the lightserver start are slow under sanitizers, so a retry rebuilds the envelope once the
+    // tip nears its unlock height.
     std::string relayed;
     ASSERT_TRUE(wait_for([&]() {
+      if (n0.status().height + 2 > unlock && !(timed = build_envelope())) return false;
       relayed = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":1,"method":"broadcast_tx","params":{"tx_hex":")") +
                                        hex_encode(timed->serialize()) + R"("}})");
       return relayed.find("\"accepted\":true") != std::string::npos;

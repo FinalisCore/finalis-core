@@ -242,7 +242,9 @@ class TlsSession {
       if (e == SSL_ERROR_ZERO_RETURN) break;
       // A server closing without close_notify after a full response (Connection: close).
       if (e == SSL_ERROR_SYSCALL && !out.empty()) break;
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING  // OpenSSL 3; 1.1 reports it as SSL_ERROR_SYSCALL above
       if (e == SSL_ERROR_SSL && !out.empty() && ERR_GET_REASON(ERR_peek_last_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) break;
+#endif
       return std::nullopt;
     }
     return out;

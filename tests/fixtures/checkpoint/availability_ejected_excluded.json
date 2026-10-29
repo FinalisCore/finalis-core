@@ -5,7 +5,7 @@
     "epoch_start_height": 33,
     "committee_size": 3,
     "min_eligible": 2,
-    "effective_min_bond": 200000000000,
+    "effective_min_bond": 15000000000,
     "ticket_difficulty_bits": 8,
     "ticket_bonus_cap_bps": 1000,
     "max_effective_bond_multiple": 10,
