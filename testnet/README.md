@@ -61,9 +61,9 @@ scripts/genesis_to_cpp.py --network testnet --in testnet/genesis.bin --out src/g
 Commit `pubkeys.txt`, `genesis.json`, `genesis.bin` and `embedded_testnet.cpp` together, tag the
 commit, and publish the `genesis_hash`. Anyone can reproduce it from the committed files.
 
-testnet-3 is embedded (`genesis_hash` `32d49e35be5bd5db785e2c5db3fae68e9ff080c27e105337090721883f5f58ce`,
+testnet-3 is embedded (`genesis_hash` `f68c3097f1b5fce94ef79840418617719c75b57ee66b7bd51b6735a8a34193b6`,
 check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--genesis` flag. Its
-`genesis_time_unix` is 1793379600 (2026-10-30 17:00 UTC).
+`genesis_time_unix` is 1793253600 (2026-10-29 06:00 UTC).
 
 testnet-3 replaced testnet-2 (genesis `4faa7e1b…`, 2026-10-24) when genesis validators gained BLS
 time-signature keys (genesis version 2). testnet-2 had replaced testnet-1 (genesis `5cabf22b…`,
@@ -156,7 +156,7 @@ curl -s http://127.0.0.1:19544/rpc \
 ```
 
 `get_status` must report `network_name` `testnet`, `chain_id_ok` `true` and `genesis_hash`
-`32d49e35…58ce`; `finalized_height` should match the explorer's.
+`f68c3097…93b6`; `finalized_height` should match the explorer's.
 
 Update to a new release: `git pull`, then run the same `start.sh` command again; it rebuilds and
 restarts the services. Chain data is kept.

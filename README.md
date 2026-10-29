@@ -64,8 +64,8 @@
 
 ## Get Involved
 
-**Run a node or become a validator.** testnet-3 starts on 2026-10-30 at
-17:00 UTC and runs mainnet's rules. Its coins have no value, and validator
+**Run a node or become a validator.** testnet-3 starts on 2026-10-29 at
+06:00 UTC (10:00 UTC+4) and runs mainnet's rules. Its coins have no value, and validator
 bonds are free from the team. Four independent validators is the first size
 that survives one going down, and ten is the next goal.
 Mainnet will start the same way: one bootstrap validator, and everyone else
