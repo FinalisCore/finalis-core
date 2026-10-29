@@ -30,6 +30,7 @@
 #include "crypto/hash.hpp"
 #include "genesis/genesis.hpp"
 #include "common/keystore.hpp"
+#include "common/minijson.hpp"
 #include "lightserver/server.hpp"
 #include "mempool/mempool.hpp"
 #include "node/node.hpp"
@@ -2481,6 +2482,8 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   const auto public_start_resp = ls.handle_rpc_for_test(start_body);
   ASSERT_TRUE(public_start_resp.find("\"code\":-32601") != std::string::npos);
   const auto start_resp = ls.handle_admin_rpc_for_test(start_body);
+  // finalis-cli parses this; it must be valid JSON, not just contain the expected fields.
+  ASSERT_TRUE(minijson::parse(start_resp).has_value());
   ASSERT_TRUE(start_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
   ASSERT_TRUE(start_resp.find("\"onboarding_id\":\"rpc\"") != std::string::npos);
   ASSERT_TRUE(start_resp.find("\"wait_for_sync\":true") != std::string::npos);
@@ -2496,6 +2499,7 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
       R"("}})";
   ASSERT_TRUE(ls.handle_rpc_for_test(status_body).find("\"code\":-32601") != std::string::npos);
   const auto status_resp = ls.handle_admin_rpc_for_test(status_body);
+  ASSERT_TRUE(minijson::parse(status_resp).has_value());
   ASSERT_TRUE(status_resp.find("\"state\":\"waiting_for_finalization\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find(std::string("\"txid_hex\":\"") + *tracked_txid + "\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find("\"broadcast_outcome\":\"sent\"") != std::string::npos);
@@ -2551,6 +2555,7 @@ TEST(test_lightserver_onboarding_rpc_accepts_unencrypted_keystore_only_off_mainn
     const auto plain = ls.handle_admin_rpc_for_test(status_body(plain_key, ""));
     ASSERT_TRUE(plain.find(refused) == std::string::npos);
     ASSERT_TRUE(plain.find("\"state\"") != std::string::npos);
+    ASSERT_TRUE(minijson::parse(plain).has_value());
     // An encrypted key still needs its passphrase.
     ASSERT_TRUE(ls.handle_admin_rpc_for_test(status_body(sealed_key, "")).find("\"state\":\"failed\"") != std::string::npos);
     ASSERT_TRUE(ls.handle_admin_rpc_for_test(status_body(sealed_key, "pw")).find(refused) == std::string::npos);
