@@ -2,7 +2,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 # The release version. Tags must match it (vX.Y.Z); the release workflows check this.
-project(finalis_core VERSION 2.1.0 LANGUAGES CXX)
+project(finalis_core VERSION 2.2.0 LANGUAGES CXX)
 add_compile_definitions(FINALIS_RELEASE_VERSION="${PROJECT_VERSION}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
