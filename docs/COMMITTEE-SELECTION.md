@@ -21,8 +21,17 @@ Checkpoint fields:
 - `ordered_members`
 - `ordered_ticket_hashes`
 - `ordered_ticket_nonces`
+- `ordered_bls_keys`
 
 `ordered_members` is the live committee member list for that epoch.
+
+`ordered_bls_keys` holds each member's BLS time-signature key (`ValidatorInfo::bls_pubkey`, from its
+genesis entry or registration), parallel to `ordered_members`. It is copied from the registry when
+the checkpoint is derived, is part of the state commitment and the light-client handoff, and is the
+key set that the epoch's time signatures aggregate over. `consensus::committee_bls_key_root` hashes it
+(`sha256d("FINALIS-COMMITTEE-BLS-V1" || varint n || keys)`, in member order) into the
+`committee_root` that a `TxTimed` names. The lightserver's `get_committee` returns each member's
+`bls_pubkey` and the `committee_bls_key_root`.
 
 ## Candidate Construction
 

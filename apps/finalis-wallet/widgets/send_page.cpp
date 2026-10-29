@@ -9,8 +9,10 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QScrollArea>
+#include <QSpinBox>
 #include <QVariant>
 #include <QVBoxLayout>
 
@@ -85,11 +87,38 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   mode_combo_->addItem("Transparent -> Confidential");
   mode_combo_->addItem("Confidential -> Transparent");
   mode_combo_->addItem("Confidential -> Confidential");
+  mode_combo_->addItem("Transparent -> Transparent (time-locked)");
+  mode_combo_->addItem("Transparent -> Height-locked (vesting / inheritance)");
+  mode_combo_->addItem("Sealed data (published at a block)");
   amount_edit_->setPlaceholderText("0.00");
+  unlock_delay_spin_ = new QSpinBox(form_box);
+  unlock_delay_spin_->setRange(0, 10'000'000);
+  unlock_delay_spin_->setValue(2);
+  unlock_delay_spin_->setSuffix(" blocks");
+  unlock_delay_spin_->setToolTip(
+      "Sealed until this many blocks after the next one is final, then it opens. Past the current committee "
+      "epoch it is a long lock: the current committee opens it, for a fee per epoch of lock (about 0.001 FLS "
+      "per 96 minutes).");
+  unlock_delay_label_ = new QLabel("Opens after", form_box);
   form->addRow("Recipient address", address_edit_);
   form->addRow("Send mode", mode_combo_);
   form->addRow("Amount (FLS)", amount_edit_);
   form->addRow("Fixed fee (FLS)", fee_edit_);
+  form->addRow(unlock_delay_label_, unlock_delay_spin_);
+  unlock_delay_label_->hide();
+  unlock_delay_spin_->hide();
+  lock_height_label_ = new QLabel("Spendable from block", form_box);
+  lock_height_edit_ = new QLineEdit(form_box);
+  lock_height_edit_->setPlaceholderText("block height, e.g. 250000");
+  lock_height_edit_->setToolTip("The recipient can spend the payment only in this block or later. Any distance works.");
+  inheritance_check_ = new QCheckBox("I keep spending it until then (the recipient is my heir)", form_box);
+  inheritance_check_->setToolTip(
+      "Inheritance: you can still spend these coins at any time; the recipient can claim them from the block above.");
+  form->addRow(lock_height_label_, lock_height_edit_);
+  form->addRow("", inheritance_check_);
+  lock_height_label_->hide();
+  lock_height_edit_->hide();
+  inheritance_check_->hide();
 
   auto* actions = new QHBoxLayout();
   actions->setSpacing(8);
@@ -97,6 +126,10 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   import_confidential_request_button_ = new QPushButton("Import Request", form_box);
   review_button_ = new QPushButton("Review Send", form_box);
   send_button_ = new QPushButton("Send", form_box);
+  cancel_timed_button_ = new QPushButton("Cancel Time-Locked...", form_box);
+  cancel_timed_button_->setToolTip("Spend the coins of a pending time-locked transfer back to this wallet before it opens.");
+  read_sealed_button_ = new QPushButton("Read Sealed Data...", form_box);
+  read_sealed_button_->setToolTip("Show the data a sealed-data transaction published when it opened.");
   max_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   import_confidential_request_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
   review_button_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
@@ -105,6 +138,8 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   actions->addWidget(import_confidential_request_button_);
   actions->addWidget(review_button_);
   actions->addWidget(send_button_);
+  actions->addWidget(cancel_timed_button_);
+  actions->addWidget(read_sealed_button_);
   actions->addStretch(1);
   form->addRow("", actions);
   content->addWidget(form_box);

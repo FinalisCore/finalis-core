@@ -2,18 +2,21 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
 
+#include "consensus/ingress.hpp"
 #include "consensus/availability_retention.hpp"
 #include "consensus/finalized_committee.hpp"
 #include "consensus/canonical_derivation.hpp"
@@ -24,9 +27,11 @@
 #include "consensus/validator_registry.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
+#include "genesis/genesis.hpp"
 #include "mempool/mempool.hpp"
 #include "p2p/messages.hpp"
 #include "p2p/addrman.hpp"
+#include "p2p/endpoints.hpp"
 #include "p2p/peer_manager.hpp"
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
@@ -80,6 +85,12 @@ struct NodeConfig {
   std::string lightserver_admin_socket{default_admin_socket_path("mainnet")};
   // Forwarded as the lightserver's --trusted-proxy (comma-separated IPv4 CIDRs); empty: none.
   std::string lightserver_trusted_proxy;
+  // Forwarded as the lightserver's --client-ip-header; empty: its default (X-Real-IP).
+  std::string lightserver_client_ip_header;
+  // Announced to the network as this node's public lightserver (p2p/endpoints.hpp); empty: none.
+  std::string public_lightserver_url;
+  // Announce it even while this node is a registered validator (off by default; see node_endpoints.cpp).
+  bool announce_endpoint_as_validator{false};
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"~/.finalis/mainnet"};
@@ -242,12 +253,21 @@ class Node {
   bool init_requires_operator_action() const { return init_requires_operator_action_; }
   void start();
   void stop();
+  // Fail-stop after a failed safety-critical write (see safety_storage_failed_): the node signs and
+  // sends no consensus message any more, and the process should stop and restart from disk.
+  // Also true as soon as any DB write failed (the DB fences itself, P5), before the event loop has
+  // formally entered fail-stop for it.
+  bool safety_storage_failed() const {
+    return safety_storage_failed_.load(std::memory_order_acquire) || db_.writes_fenced();
+  }
 
   NodeStatus status() const;
 
   // Test hooks.
   bool inject_vote_for_test(const Vote& vote);
   bool inject_timeout_vote_for_test(const TimeoutVote& vote);
+  // A peer's time signature (TIME_SIGNATURE) as if received from the network.
+  bool inject_time_signature_for_test(const p2p::TimeSignatureMsg& msg);
   std::string inject_network_vote_result_for_test(const Vote& vote);
   std::string inject_network_vote_diagnostic_for_test(const Vote& vote);
   std::string inject_network_propose_result_for_test(const p2p::ProposeMsg& msg);
@@ -266,6 +286,10 @@ class Node {
   bool observe_frontier_proposal_for_test(const FrontierProposal& proposal);
   bool inject_frontier_block_for_test(const FrontierProposal& proposal, const std::vector<FinalitySig>& finality_signatures);
   bool inject_tx_for_test(const AnyTx& tx, bool relay);
+  // Any ordered record (Tx, TxV2, TxTimed) through the node's intake, as a local submission.
+  bool inject_record_for_test(const Bytes& raw, std::string* reason = nullptr);
+  // As received from peer `peer_id` (network rate limits apply).
+  bool inject_network_record_for_test(const Bytes& raw, int peer_id, std::string* reason = nullptr);
   bool pause_proposals_for_test(bool pause);
   bool advance_round_for_test(std::uint64_t expected_height, std::uint32_t target_round);
   bool mempool_contains_for_test(const Hash32& txid) const;
@@ -289,7 +313,24 @@ class Node {
   std::optional<std::pair<Hash32, std::uint32_t>> local_vote_lock_for_test(std::uint64_t height) const;
   // Precommit signed by this node.
   bool local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
+  // Precommit by `signer` for (height, round, transition) held in the vote tracker.
+  bool vote_recorded_by_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
+                                 const PubKey32& signer) const;
   std::vector<Vote> precommits_for_rebroadcast_for_test(std::uint64_t height) const;
+  // {timeouts, prevotes, precommits} the stall rebroadcast would send at `height` now.
+  std::array<std::size_t, 3> rebroadcast_sizes_for_test(std::uint64_t height) const;
+  void reseed_local_votes_for_test(std::uint64_t height);
+  // Validator-key signatures made so far, and how many of them were made after fail-stop began
+  // (must stay 0).
+  std::uint64_t consensus_signature_count_for_test() const;
+  std::uint64_t signatures_after_fail_stop_for_test() const;
+  // Drives the quorum-1 self-vote path of finalize_if_quorum.
+  bool finalize_if_quorum_for_test(const Hash32& block_id, std::uint64_t height, std::uint32_t round);
+  // True once a finalized frontier and its certificate were queued for broadcast (since start).
+  bool finalized_broadcast_queued_for_test() const;
+  std::string safety_storage_failure_for_test() const;
+  // Enters fail-stop as a failed safety write would (for paths no write precedes, e.g. quorum-1).
+  void enter_safety_fail_stop_for_test(const std::string& reason);
   bool local_prevote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
   std::string inject_network_prevote_result_for_test(const Vote& vote);
   bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
@@ -370,10 +411,19 @@ class Node {
   void on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_prevote(int peer_id, const Bytes& payload, const Hash32& payload_id);
   void on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payload_id);
+  void on_time_signature(int peer_id, const Bytes& payload, const Hash32& payload_id);
   // reply: a SUBMIT_TX; answer the sender with TX_RESULT.
   void on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bool reply = false);
   void on_getaddr(int peer_id, const Bytes& payload);
   void on_addr(int peer_id, const Bytes& payload);
+  // Public lightserver discovery (node_endpoints.cpp).
+  void on_get_endpoints(int peer_id, const Bytes& payload);
+  void on_endpoints(int peer_id, const Bytes& payload);
+  void maybe_request_endpoints(int peer_id);
+  // Event loop: expire, re-announce this node's endpoint, pull from a random peer, persist.
+  void maintain_endpoints();
+  void persist_endpoints_locked();
+  bool endpoints_allow_private() const { return cfg_.network.name != "mainnet"; }
   void on_ping(int peer_id, const Bytes& payload);
   void on_pong(int peer_id, const Bytes& payload);
 
@@ -418,6 +468,10 @@ class Node {
                                            std::string* reject_reason = nullptr);
   bool handle_prevote(const Vote& vote, bool from_network, int from_peer_id = 0);
   bool handle_timeout_vote(const TimeoutVote& vote, bool from_network, int from_peer_id = 0);
+  enum class TimeSignatureHandlingResult { Accepted, Duplicate, SoftReject, HardReject };
+  TimeSignatureHandlingResult handle_time_signature_result(const p2p::TimeSignatureMsg& msg, bool from_network,
+                                                           int from_peer_id = 0);
+  bool handle_time_signature(const p2p::TimeSignatureMsg& msg, bool from_network, int from_peer_id = 0);
   // cert_check must be the result of precheck_finality_certificate(*certificate, proposal.transition),
   // computed by the caller BEFORE mu_ was locked (this function always runs with mu_ held). Passing
   // std::nullopt here when `certificate` has a value is a caller bug, not a valid "skip" state --
@@ -444,6 +498,15 @@ class Node {
   bool maybe_apply_buffered_sync_frontiers_locked(int preferred_peer_id);
   bool handle_tx(const AnyTx& tx, bool from_network, int from_peer_id = 0, std::string* reject_reason = nullptr);
   bool maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error = nullptr);
+  // An ordered record (Tx, TxV2 or TxTimed) as raw bytes: the transport-independent intake.
+  bool handle_record_bytes(const Bytes& raw, bool from_network, int from_peer_id = 0, std::string* reject_reason = nullptr);
+  // TxTimed intake: consensus::check_timed_inclusion against the next height (the same rules the block
+  // applies), a prepaid fee at least the relay floor, then the timed pool, certification and relay.
+  bool handle_timed_tx(const TxTimed& tx, bool from_network, int from_peer_id = 0, std::string* reject_reason = nullptr);
+  bool maybe_certify_record_locked(const Bytes& tx_bytes, const consensus::IngressRecordIdentity& identity,
+                                   std::string* error = nullptr);
+  // Drops envelopes whose fee input is gone (included or conflicted) or whose unlock height passed.
+  void prune_timed_pool_locked();
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
                                     std::string* error = nullptr);
   bool finalize_if_quorum(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);
@@ -506,6 +569,18 @@ class Node {
   // (restart, reconnect reset): its recorded prevotes, and the precommit its lock implies.
   // Ed25519 is deterministic, so the re-signed votes are the ones already sent.
   void reseed_local_votes_locked(std::uint64_t height);
+  // SAFETY (fail-stop): the only way consensus code signs with the validator key. Returns nullopt
+  // once safety_storage_failed_ is set. Callers hold mu_, which orders every signature against
+  // enter_safety_fail_stop_locked: a signature is either made before the failure (from state P1
+  // keeps durable) or refused.
+  std::optional<Sig64> sign_consensus_locked(const Bytes& msg) const;
+  std::optional<VrfProof80> vrf_prove_consensus_locked(const Bytes& alpha) const;
+  // BLS time signature with the seed-derived key; nullopt in fail-stop or if that key is not `registered`.
+  std::optional<crypto::BlsSignature> bls_time_sign_consensus_locked(const Bytes& msg,
+                                                                     const crypto::BlsPublicKey& registered) const;
+  // Enters fail-stop after a failed safety-critical write: sets safety_storage_failed_ and fences
+  // the DB before mu_ is released, logs CRITICAL once, and asks the event loop to stop. Idempotent.
+  void enter_safety_fail_stop_locked(const std::string& operation, const std::string& reason);
   // Records a prevote this node signed; durable before the prevote is sent.
   bool record_local_prevote_locked(std::uint64_t height, std::uint32_t round, const Hash32& transition_id);
   // Participation record for the finalized tip, for the next transition's
@@ -519,10 +594,43 @@ class Node {
     std::vector<FinalitySig> signers;
   };
   PrevFinalityRecord prev_finality_record_for_next_height_locked() const;
+  // Time signatures (consensus::verify_prev_time_signature). This node signs the finalized tip once
+  // it is a member of the tip's committee; the returned message is broadcast outside mu_. Never
+  // signs a height that is not finalized here, and nothing once in fail-stop.
+  std::optional<p2p::TimeSignatureMsg> maybe_sign_time_signature_locked();
+  // The tip's aggregate for the next proposal, nullopt while fewer than the threshold are known.
+  // The genesis parent needs none (an empty aggregate).
+  std::optional<TimeSignatureAggregate> prev_time_signature_for_next_height_locked() const;
+  // Count-only form of the above for the event loop (no aggregation): {known, threshold}.
+  std::pair<std::size_t, std::size_t> time_signature_progress_for_next_height_locked() const;
+  // Long locks (LongTimeSignature): the (unlock height, key set root) pairs a block at the next height
+  // may open, each with the number of long escrows it settles.
+  std::map<std::pair<std::uint64_t, Hash32>, std::size_t> pending_long_openings_locked() const;
+  // Signs every pending opening whose key set holds this node's BLS key, committee member or not (a
+  // final height only, so never slashable as early); returns the new messages to broadcast.
+  std::vector<p2p::TimeSignatureMsg> maybe_sign_long_time_signatures_locked();
+  // The openings the next proposal carries: each pending pair with a quorum of its key set, in
+  // canonical order, within the per-block caps.
+  std::vector<LongTimeSignature> long_time_signatures_for_next_height_locked() const;
   bool record_late_finalized_vote_locked(const Vote& vote);
-  void persist_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
-  bool persist_consensus_safety_state_locked(std::uint64_t height);
+  // One height's row of consensus safety state: the vote lock, the valid polka and the own prevotes.
+  struct ConsensusSafetyState {
+    std::optional<std::pair<Hash32, std::uint32_t>> lock;
+    std::optional<QuorumCertificate> valid_polka;
+    std::map<std::uint32_t, Hash32> prevotes;
+  };
+  // SAFETY: the in-memory maps hold only state a durable write has stored. A change is made on a copy
+  // (consensus_safety_state_locked), written with persist_consensus_safety_state_locked and published
+  // to the maps only if that write succeeded; the maps are never ahead of disk.
+  ConsensusSafetyState consensus_safety_state_locked(std::uint64_t height) const;
+  void stage_consensus_safety_state(std::uint64_t height, const ConsensusSafetyState& state, storage::DB::Batch& batch) const;
+  // Durable write of one height's row; a failure enters fail-stop (`operation` names the caller).
+  bool persist_consensus_safety_state_locked(std::uint64_t height, const ConsensusSafetyState& state,
+                                             const char* operation);
   void clear_consensus_safety_state_locked(std::uint64_t height, storage::DB::Batch& batch);
+  // The two halves of the above: the row erases, and the in-memory release (after the batch is durable).
+  void stage_consensus_safety_clear(std::uint64_t height, storage::DB::Batch& batch) const;
+  void forget_consensus_safety_state_locked(std::uint64_t height);
   void clear_consensus_safety_state_locked(std::uint64_t height);
   std::vector<FinalitySig> canonicalize_finality_signatures_locked(const std::vector<FinalitySig>& signatures,
                                                                    std::size_t quorum) const;
@@ -545,8 +653,10 @@ class Node {
   void broadcast_vote(const Vote& vote);
   void broadcast_prevote(const Vote& vote);
   void broadcast_timeout_vote(const TimeoutVote& vote);
+  void broadcast_time_signature(const p2p::TimeSignatureMsg& msg);
   void broadcast_finalized_frontier(const FrontierProposal& proposal, const FinalityCertificate& certificate);
   void broadcast_tx(const AnyTx& tx, int skip_peer_id = 0);
+  void broadcast_record_bytes(const Bytes& tx_bytes, int skip_peer_id = 0);
   void broadcast_ingress_record(const IngressCertificate& cert, const Bytes& tx_bytes, int skip_peer_id = 0);
   // LIVENESS: a transaction is forwarded to its lane's designated certifier once, on admission, and
   // silently not at all if that peer is unreachable then. Re-forwards (or certifies, when this node
@@ -559,13 +669,38 @@ class Node {
   // epoch by reforward_uncertified_mempool_txs_locked.
   void drop_stale_unfinalized_ingress_locked();
   void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
+  void maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_bytes, std::uint32_t lane, int skip_peer_id = 0);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                         const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
-                                         std::string* error = nullptr);
+                                         const std::set<Hash32>& accepted_txids,
+                                         const std::vector<consensus::TimedSettlementRecord>& timed_settlements,
+                                         storage::DB::Batch& batch, std::string* error = nullptr);
   void hydrate_runtime_from_canonical_state_locked(const consensus::CanonicalDerivedState& state);
   // Same, taking ownership: saves copying the state (its UTXO set) once per finalized block.
   void hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& state);
+  // Every runtime field hydrate_runtime_from_canonical_state_locked sets (keep the two in sync).
+  // Finalization moves them aside while it stages the new state, and moves them back if the durable
+  // write fails, so the live finalized state is exactly the previous one (KNOWN_DEFECTS.md D7).
+  struct CanonicalRuntimeFields {
+    std::optional<consensus::CanonicalDerivedState> canonical_state;
+    std::uint64_t finalized_height{0};
+    consensus::FinalizedIdentity finalized_identity{};
+    UtxoSetV2 utxos;
+    consensus::ValidatorRegistry validators;
+    std::map<Hash32, ValidatorJoinRequest> validator_join_requests;
+    Hash32 finalized_randomness{};
+    std::map<std::uint64_t, Hash32> committee_epoch_randomness_cache;
+    std::uint64_t protocol_reserve_balance_units{0};
+    std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
+    std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints;
+    std::uint64_t validator_join_window_start_height{0};
+    std::uint32_t validator_join_count_in_window{0};
+    std::uint64_t validator_liveness_window_start_height{0};
+    std::size_t last_participation_eligible_signers{0};
+    availability::AvailabilityPersistentState availability_state;
+  };
+  CanonicalRuntimeFields take_canonical_runtime_locked();
+  void restore_canonical_runtime_locked(CanonicalRuntimeFields&& fields);
   // Committed turnstile P the mempool pre-checks TxV2 admission against (nullopt: no canonical state yet).
   std::optional<std::uint64_t> mempool_confidential_pool_value_locked() const {
     if (!canonical_state_) return std::nullopt;
@@ -576,9 +711,15 @@ class Node {
                                                        storage::DB::Batch& batch, bool recompute = true);
   bool verify_and_persist_consensus_state_commitment_locked(const consensus::CanonicalDerivedState& state);
   bool init_local_validator_key();
-  bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator);
+  // bls: the validator's time-signature key and proof; for the local validator derived from its
+  // seed when absent. A remote validator without a verifying one is not bound.
+  bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator,
+                                         const std::optional<genesis::ValidatorBls>& bls = std::nullopt);
   bool maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32& pub, std::uint64_t peer_height,
-                                                 const char* source);
+                                                 const char* source,
+                                                 const std::optional<genesis::ValidatorBls>& bls = std::nullopt);
+  // The bound bootstrap validator's BLS key and proof, from the stored (effective) genesis.
+  std::optional<genesis::ValidatorBls> bootstrap_validator_bls_locked() const;
   void maybe_self_bootstrap_template(std::uint64_t now_ms);
   bool bootstrap_sync_incomplete_locked(int peer_id) const;
   bool check_and_record_proposer_equivocation_locked(const FrontierTransition& transition);
@@ -763,6 +904,9 @@ class Node {
   std::map<int, std::map<std::uint16_t, p2p::TokenBucket>> msg_rate_buckets_;
   std::map<int, p2p::TokenBucket> vote_verify_buckets_;
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;
+  // Node-wide budget of TxTimed SWE proof checks from the network (per second; a block holds at most
+  // kMaxTimedTxPerBlock of them).
+  p2p::TokenBucket timed_verify_bucket_{16.0, 4.0};
   // Outbound GET_TRANSITION_BY_HEIGHT budget per sync peer (see kSyncRequestBurst).
   std::map<int, p2p::TokenBucket> sync_request_out_buckets_;
   std::map<Hash32, std::size_t> candidate_block_sizes_;
@@ -898,8 +1042,37 @@ class Node {
 
   crypto::KeyPair local_key_;
   bool is_validator_{false};
+  // Verified time signatures by height and committee index (finalized tip and one height either side).
+  std::map<std::uint64_t, std::map<std::uint32_t, crypto::BlsSignature>> time_signatures_;
+  std::uint64_t local_time_signature_height_{0};  // highest height this node has signed
+  // Verified signatures for pending long-lock openings, by (unlock height, key set root) and key index.
+  std::map<std::pair<std::uint64_t, Hash32>, std::map<std::uint32_t, crypto::BlsSignature>> long_time_signatures_;
+  // This node's signatures for pending openings, by height, re-sent every round timeout.
+  std::map<std::uint64_t, p2p::TimeSignatureMsg> local_long_time_signatures_;
+  std::uint64_t last_long_time_signature_broadcast_ms_{0};
+  // Admitted TxTimed envelopes awaiting a block (the mempool holds AnyTx only).
+  std::map<Hash32, TxTimed> timed_pool_;
+  static constexpr std::size_t kMaxTimedPoolEntries = 256;
+  // This node's signature on the tip, re-sent every round timeout until the next height finalizes
+  // (a lost message must not leave the next proposer short of the threshold).
+  std::optional<p2p::TimeSignatureMsg> local_time_signature_;
+  std::uint64_t last_time_signature_broadcast_ms_{0};
+  std::uint64_t last_time_signature_wait_log_ms_{0};
 
   std::atomic<bool> running_{false};
+  // SAFETY (fail-stop): set when a write of consensus safety state (vote lock, prevote record,
+  // valid polka) or of a finalization failed, directly by that path; and by the event loop for any
+  // other failed DB write (the DB fences itself, so safety_storage_failed() is already true). Never
+  // cleared in this process. Written only under mu_, before mu_ is released. Read under mu_ by every
+  // signing site (sign_consensus_locked) and without mu_ by the send helpers (broadcast_*), the
+  // event loop and stop(). A message that passes the send check was signed before the flag was set
+  // (or the DB fenced), i.e. from durable state.
+  std::atomic<bool> safety_storage_failed_{false};
+  std::string safety_storage_failure_;  // "operation: reason" of the first failure; under mu_
+  // Validator-key signatures made by sign_consensus_locked / vrf_prove_consensus_locked, and the count
+  // when fail-stop began; tests check that the two stay equal. Both under mu_.
+  mutable std::uint64_t consensus_signatures_{0};
+  std::uint64_t consensus_signatures_at_fail_stop_{0};
   std::thread loop_thread_;
   mutable std::mutex local_bus_tasks_mu_;
   std::vector<std::thread> local_bus_tasks_;
@@ -988,6 +1161,19 @@ class Node {
   std::optional<Hash32> expected_genesis_hash_;
   std::string genesis_source_hint_{"embedded"};
   std::set<int> getaddr_requested_peers_;
+  p2p::EndpointTable endpoints_;
+  std::optional<crypto::KeyPair> endpoint_key_;
+  std::optional<p2p::EndpointAnnouncement> own_endpoint_;
+  bool own_endpoint_verified_{false};  // its URL was seen to reach this node's lightserver
+  std::atomic<int> endpoint_self_check_{0};
+  std::string endpoint_self_check_detail_;
+  std::thread endpoint_self_check_thread_;
+  std::uint64_t next_endpoint_self_check_ms_{0};
+  std::set<int> endpoints_requested_peers_;
+  std::mt19937_64 endpoint_rng_{std::random_device{}()};
+  std::uint64_t last_endpoint_pull_ms_{0};
+  std::uint64_t last_endpoint_persist_ms_{0};
+  bool endpoints_dirty_{false};
   std::string last_bootstrap_source_{"none"};
   std::string mining_log_path_;
   bool bootstrap_template_mode_{false};

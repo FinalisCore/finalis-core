@@ -54,7 +54,7 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
     std::set<OutPoint> seen;
     std::map<OutPoint, TxOut> canonical_matches;
     for (const auto& [op, entry] : canonical_utxos) {
-      if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
       canonical_matches.emplace(op, entry.out);
     }
     for (const auto& entry : entries) {
@@ -98,7 +98,7 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
     if (!tx.has_value()) continue;
     for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
       const auto& txout = tx->outputs[i];
-      if (crypto::sha256(txout.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(txout.script_pubkey, scripthash) || is_data_output_script(txout.script_pubkey)) continue;
       canonical_matches.emplace(OutPoint{item.txid, static_cast<std::uint32_t>(i)}, txout);
     }
     for (const auto& input : tx->inputs) {
@@ -106,7 +106,7 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
       if (!prev_tx.has_value()) continue;
       if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
       const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
-      if (crypto::sha256(prev_out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(prev_out.script_pubkey, scripthash)) continue;
       canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
     }
   }
@@ -115,7 +115,7 @@ std::vector<SpendableUtxo> spendable_p2pkh_utxos_for_pubkey_hash(
   const auto canonical_utxos = db.load_transparent_utxos();
   std::map<OutPoint, TxOut> canonical_current;
   for (const auto& [op, entry] : canonical_utxos) {
-    if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+    if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
     canonical_current.emplace(op, entry.out);
     if (canonical_matches.find(op) != canonical_matches.end()) continue;
     canonical_matches.emplace(op, entry.out);

@@ -10,6 +10,7 @@
 #include "common/chain_id.hpp"
 #include "common/types.hpp"
 #include "onboarding/validator_onboarding.hpp"
+#include "p2p/endpoints.hpp"
 #include "utxo/tx.hpp"
 
 namespace finalis::lightserver {
@@ -27,6 +28,10 @@ struct RpcStatusView {
   std::optional<std::uint64_t> finalized_lag;
   bool chain_id_ok{true};
   bool observed_network_height_known{false};
+  // Key the server's node announces it under (p2p/endpoints.hpp); empty when it announces none.
+  std::string endpoint_pubkey_hex;
+  // Base fee the next block requires, units per started KiB of a transaction (consensus/monetary.hpp).
+  std::uint64_t base_fee_per_kib{1};
   bool peer_height_disagreement{false};
   bool bootstrap_sync_incomplete{false};
   std::optional<std::string> checkpoint_derivation_mode;
@@ -158,6 +163,14 @@ struct UtxoProofsView {
 };
 
 std::optional<RpcStatusView> rpc_get_status(const std::string& rpc_url, std::string* err);
+// The committee BLS keys of `height`'s epoch, in checkpoint order, and their key root (get_committee
+// verbose). A TxTimed locked to `height` encrypts to exactly these keys.
+struct CommitteeBlsKeysView {
+  std::vector<crypto::BlsPublicKey> keys;
+  Hash32 root{};
+};
+std::optional<CommitteeBlsKeysView> rpc_get_committee_bls_keys(const std::string& rpc_url, std::uint64_t height,
+                                                               std::string* err);
 std::optional<CommitteeHandoffsView> rpc_get_committee_handoffs(const std::string& rpc_url, std::uint64_t from_epoch_start,
                                                                 std::uint64_t limit, std::string* err);
 std::optional<UtxoProofsView> rpc_get_utxo_proofs(const std::string& rpc_url, const std::vector<OutPoint>& outpoints,
@@ -179,6 +192,20 @@ std::optional<DetailedHistoryPageView> rpc_get_history_page_detailed(const std::
                                                                      std::string* err);
 std::optional<TxView> rpc_get_tx(const std::string& rpc_url, const Hash32& txid, std::string* err);
 std::optional<TxStatusView> rpc_get_tx_status(const std::string& rpc_url, const Hash32& txid, std::string* err);
+struct TimedRevealView {
+  bool revealed{false};
+  std::uint64_t height{0};  // settling height, when revealed
+  Bytes data;
+};
+// Public lightservers the server's node learned from the network: signed claims, not yet checked.
+std::optional<std::vector<p2p::EndpointAnnouncement>> rpc_get_lightserver_endpoints(const std::string& rpc_url,
+                                                                                     std::string* err);
+// An announced endpoint is usable when its signature holds for `chain_domain` and the server at its
+// URL serves that chain and reports the announced key as its endpoint_pubkey (so nobody can announce a
+// server they do not run). Contacts the URL. `why` says what failed.
+bool probe_announced_endpoint(const p2p::EndpointAnnouncement& a, const Hash32& chain_domain, bool allow_private,
+                              std::uint64_t now_unix, std::string* why);
+std::optional<TimedRevealView> rpc_get_timed_reveal(const std::string& rpc_url, const Hash32& timed_txid, std::string* err);
 BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_bytes, std::string* err);
 // Admin RPCs: only served on the lightserver admin Unix socket (see default_admin_rpc_url); a TCP
 // endpoint answers them with "method not found".
@@ -189,5 +216,9 @@ std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_st
 std::optional<onboarding::ValidatorOnboardingRecord> rpc_validator_onboarding_start(
     const std::string& rpc_url, const onboarding::ValidatorOnboardingOptions& options, std::string* err);
 std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body, std::string* err);
+// The same with extra request headers (name, value); http://, https:// or unix:// URLs.
+std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body,
+                                              const std::vector<std::pair<std::string, std::string>>& headers,
+                                              std::string* err);
 
 }  // namespace finalis::lightserver

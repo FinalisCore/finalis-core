@@ -23,6 +23,11 @@ max(1, f - K) honest nodes.
 --tx-interval S sends a payment every S seconds (after the first reward settlement funds the
 validators) through a random running node's lightserver and tracks it to finality.
 
+--timed-interval S sends a time-locked transfer (finalis-cli timed_send, --timed-delay blocks ahead)
+every S seconds and tracks it until its sealed body opens. An envelope that finalized but whose body
+never opened (its bond was forfeited) is a failure (exit 5): the time signature gate and the
+settle-first rule must open every honest lock whatever the faults.
+
 Liveness: stalls (exit 2), recovery times, rounds per height, catch-up lag at the end.
 
 Usage:
@@ -395,6 +400,25 @@ class Traffic:
         self.inputs: dict[str, list[tuple[str, int]]] = {}  # txid -> spent outpoints
         self.lost_class: dict[str, str] = {}   # lost/pending txid -> finalized_late | conflicting_spend | dropped
         self.busy: set[int] = set()
+        # Time-locked transfers: body txid -> (submit time, sender, timed txid, opens_in_block).
+        self.rejection_shapes: set[str] = set()
+        self.timed_sent = 0
+        self.timed_rejected = 0
+        self.timed_pending: dict[str, tuple[float, int, str, int]] = {}
+        self.timed_opened: dict[str, float] = {}  # body txid -> seconds from submit to opening
+        self.timed_lost: list[str] = []
+        self.timed_not_opened: list[str] = []     # envelope finalized, body never applied
+        self.timed_inputs: dict[str, list[tuple[str, int]]] = {}  # body txid -> its inputs
+        self.timed_fee_inputs: dict[str, list[tuple[str, int]]] = {}  # body txid -> its envelope's fee input
+        self.timed_not_opened_class: dict[str, str] = {}  # body txid -> input_spent_by_payment | unexplained
+
+    def _log_rejection(self, kind: str, sender: int, text: str) -> None:
+        """Logs each distinct rejection reason once (numbers masked)."""
+        tail = ' | '.join(text.strip().splitlines()[-3:])
+        shape = re.sub(r"[0-9a-f]{16,}|\d+", "N", tail)
+        if shape not in self.rejection_shapes:
+            self.rejection_shapes.add(shape)
+            log(f"{kind} rejected (sender {sender}): {tail}")
 
     async def _rpc(self, url: str, method: str, params: dict) -> dict | None:
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
@@ -436,22 +460,98 @@ class Traffic:
                 self.pending_sender[m[1]] = sender
                 return
             self.rejected += 1
+            self._log_rejection("payment", sender, text)
+        except BaseException:
+            self.busy.discard(sender)
+            raise
+        self.busy.discard(sender)
+
+    async def _send_timed(self, sender: int) -> None:
+        self.busy.add(sender)
+        try:
+            running = self.nodes.running()
+            if not running:
+                self.busy.discard(sender)
+                return
+            via = self.rng.choice(running)
+            to = self.rng.choice([i for i in range(self.args.nodes) if i != sender])
+            proc = await asyncio.create_subprocess_exec(
+                str(self.args.build_dir / "finalis-cli"), "timed_send", "--to", self.addresses[to],
+                "--amount-units", str(self.rng.randint(1000, 50000)), "--delay", str(self.args.timed_delay),
+                "--rpc", self.nodes.rpc_url(via),
+                "--file", str(self.genesis_dir / "keys" / f"validator-{sender + 1}.json"), "--pass", PASSPHRASE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await proc.communicate()
+            text = out.decode(errors="replace")
+            body = re.search(r"^body_txid=([0-9a-f]{64})$", text, re.M)
+            timed = re.search(r"^timed_txid=([0-9a-f]{64})$", text, re.M)
+            opens = re.search(r"^opens_in_block=(\d+)$", text, re.M)
+            if proc.returncode == 0 and body and timed and opens and "accepted=yes" in text:
+                self.timed_sent += 1
+                # The sender stays busy until the body opens: its coins are sealed in it.
+                self.timed_pending[body[1]] = (time.monotonic(), sender, timed[1], int(opens[1]))
+                self.timed_inputs[body[1]] = [(t, int(v)) for t, v in re.findall(r"^body_input=([0-9a-f]{64}):(\d+)$", text, re.M)]
+                self.timed_fee_inputs[body[1]] = [(t, int(v)) for t, v in re.findall(r"^fee_input=([0-9a-f]{64}):(\d+)$", text, re.M)]
+                return
+            self.timed_rejected += 1
+            self._log_rejection("timed send", sender, text)
         except BaseException:
             self.busy.discard(sender)
             raise
         self.busy.discard(sender)
 
     async def run(self, stop: asyncio.Event) -> None:
+        if self.args.tx_interval <= 0:
+            return
         while not stop.is_set():
             await asyncio.sleep(self.args.tx_interval)
             idle = [i for i in range(self.args.nodes) if i not in self.busy]
             if idle:
                 asyncio.create_task(self._send(self.rng.choice(idle)))
 
+    async def run_timed(self, stop: asyncio.Event) -> None:
+        if self.args.timed_interval <= 0:
+            return
+        while not stop.is_set():
+            await asyncio.sleep(self.args.timed_interval)
+            idle = [i for i in range(self.args.nodes) if i not in self.busy]
+            if idle:
+                asyncio.create_task(self._send_timed(self.rng.choice(idle)))
+
+    async def check_timed(self) -> None:
+        running = self.nodes.running()
+        if not running:
+            return
+        now = time.monotonic()
+        for body, (t0, sender, timed, _) in list(self.timed_pending.items()):
+            res = await self._rpc(self.nodes.rpc_url(self.rng.choice(running)), "get_tx_status", {"txid": body})
+            if res and res.get("finalized"):
+                self.timed_pending.pop(body, None)
+                self.timed_opened[body] = now - t0
+                self.busy.discard(sender)
+            elif now - t0 > self.args.tx_lost_s:
+                self.timed_pending.pop(body, None)
+                self.busy.discard(sender)
+                env = await self._rpc(self.nodes.rpc_url(self.rng.choice(running)), "get_tx_status", {"txid": timed})
+                if env and env.get("finalized"):
+                    self.timed_not_opened.append(body)
+                    # The wallet built the body from a lagging node's UTXO view and one of our own
+                    # payments spent an input first: a client race (the bond is forfeited as designed).
+                    mine = set(self.timed_inputs.get(body, []))
+                    others = [set(ins) for ins in self.inputs.values()]
+                    others += [set(ins) for b, ins in self.timed_inputs.items() if b != body]
+                    others += [set(ins) for ins in self.timed_fee_inputs.values()]
+                    raced = any(mine & o for o in others)
+                    self.timed_not_opened_class[body] = "input_spent_by_own_tx" if raced else "unexplained"
+                    log(f"timed body {body[:16]} not opened (envelope {timed[:16]}): {self.timed_not_opened_class[body]}")
+                else:
+                    self.timed_lost.append(body)
+
     async def track(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             await asyncio.sleep(2)
             await self.check_pending()
+            await self.check_timed()
 
     async def check_pending(self) -> None:
         running = self.nodes.running()
@@ -512,7 +612,14 @@ class Traffic:
                 "pending_by_class": {c: sum(1 for t in self.pending if self.lost_class.get(t) == c)
                                      for c in ("finalized_late", "conflicting_spend", "dropped")},
                 "finality_latency_s": {"p50": percentile(lat, 0.5), "p95": percentile(lat, 0.95),
-                                       "max": max(lat, default=None)}}
+                                       "max": max(lat, default=None)},
+                "timed": {"accepted": self.timed_sent, "rejected_or_failed": self.timed_rejected,
+                          "opened": len(self.timed_opened), "pending": len(self.timed_pending),
+                          "envelope_lost": len(self.timed_lost), "not_opened": self.timed_not_opened[:10],
+                          "not_opened_by_class": {c: sum(1 for b in self.timed_not_opened if self.timed_not_opened_class.get(b) == c)
+                                                  for c in ("input_spent_by_own_tx", "unexplained")},
+                          "open_latency_s": {"p50": percentile(list(self.timed_opened.values()), 0.5),
+                                             "max": max(self.timed_opened.values(), default=None)}}}
 
 
 # --- main ----------------------------------------------------------------------------------------
@@ -598,11 +705,12 @@ async def amain(args) -> int:
     for i in range(args.nodes):
         nodes.start(i)
     final: dict = {}
-    traffic = Traffic(args, genesis_dir, nodes, workdir, rng) if args.tx_interval > 0 else None
+    traffic = Traffic(args, genesis_dir, nodes, workdir, rng) if args.tx_interval > 0 or args.timed_interval > 0 else None
     stop_traffic = asyncio.Event()
     traffic_tasks = []
     if traffic:
-        traffic_tasks = [asyncio.create_task(traffic.run(stop_traffic)), asyncio.create_task(traffic.track(stop_traffic))]
+        traffic_tasks = [asyncio.create_task(traffic.run(stop_traffic)), asyncio.create_task(traffic.run_timed(stop_traffic)),
+                         asyncio.create_task(traffic.track(stop_traffic))]
     try:
         warm_deadline = time.monotonic() + args.recovery_deadline * 2
         while mon.max_height() < args.warmup_heights and time.monotonic() < warm_deadline:
@@ -631,8 +739,9 @@ async def amain(args) -> int:
             stop_traffic.set()
             # Give in-flight payments time to finalize on the healed network.
             end = time.monotonic() + args.recovery_deadline
-            while traffic.pending and time.monotonic() < end:
+            while (traffic.pending or traffic.timed_pending) and time.monotonic() < end:
                 await traffic.check_pending()
+                await traffic.check_timed()
                 await asyncio.sleep(2)
             await traffic.classify_lost(mon)
     finally:
@@ -649,6 +758,8 @@ async def amain(args) -> int:
             f"recovery_p95={report['recovery_s']['p95']}s final={final} tx={report['transactions']}")
     if mon.forks:
         return 3
+    if traffic and any(c == "unexplained" for c in traffic.timed_not_opened_class.values()):
+        return 5
     if chaos.stalls or not final.get("converged", False):
         return 2
     return 0
@@ -672,6 +783,9 @@ def main() -> int:
     ap.add_argument("--stop-on-stall", action="store_true")
     ap.add_argument("--byzantine", type=int, default=0, help="first K validators are Byzantine (chaos build)")
     ap.add_argument("--tx-interval", type=float, default=0, help="seconds between payments (0: no traffic)")
+    ap.add_argument("--timed-interval", type=float, default=0,
+                    help="seconds between time-locked transfers (0: none)")
+    ap.add_argument("--timed-delay", type=int, default=4, help="blocks from the next height to a timed transfer's unlock")
     ap.add_argument("--fault-mix", choices=["default", "crash"], default="default",
                     help="fault weights; crash: mostly hard crash/restart")
     ap.add_argument("--tx-lost-s", type=float, default=120, help="an accepted payment not finalized by then is lost")

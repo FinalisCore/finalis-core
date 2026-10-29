@@ -17,6 +17,7 @@
 #include "common/paths.hpp"
 #include "crypto/secure_memory.hpp"
 #include "genesis/genesis.hpp"
+#include "utxo/signing.hpp"
 #include "common/keystore.hpp"
 
 namespace finalis::node {
@@ -83,6 +84,9 @@ bool Node::init_local_validator_key() {
   local_key_.private_key.reserve(32);
   local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
   local_key_.public_key = vk.pubkey;
+  // The public-lightserver announcement key (node_endpoints.cpp): derived one way, so it does not
+  // reveal this key, and derived here so the validator key is read in one place.
+  endpoint_key_ = p2p::derive_endpoint_keypair(local_key_.private_key);
   if (!crypto::lock_memory(local_key_.private_key.data(), local_key_.private_key.size())) {
     log_line("warning: mlock of validator key failed; key pages may be swapped to disk");
   }
@@ -90,13 +94,23 @@ bool Node::init_local_validator_key() {
   return true;
 }
 
-bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator) {
+bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator,
+                                             const std::optional<genesis::ValidatorBls>& bls_in) {
   if (bootstrap_handoff_complete_locked()) {
     log_line("bootstrap-bind-skip reason=handoff-complete height=" + std::to_string(finalized_height_));
     return false;
   }
+  // The bound validator's time-signature key is genesis state like the validator itself.
+  std::optional<genesis::ValidatorBls> bls = bls_in;
+  if (!bls && local_validator && pub == local_key_.public_key) {
+    if (const auto reg = validator_bls_registration(local_key_.private_key)) bls = genesis::ValidatorBls{reg->pubkey, reg->pop};
+  }
+  if (!bls || !crypto::bls_pop_verify(bls->pubkey, bls->pop)) {
+    log_line("bootstrap-bind-skip reason=missing-or-invalid-bls-key");
+    return false;
+  }
   genesis::Document effective;
-  effective.version = 1;
+  effective.version = genesis::kGenesisVersion;
   effective.network_name = cfg_.network.name;
   effective.protocol_version = cfg_.network.protocol_version;
   effective.network_id = cfg_.network.network_id;
@@ -104,6 +118,7 @@ bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_val
   effective.genesis_time_unix = 1735689600ULL;
   effective.initial_height = 0;
   effective.initial_validators = {pub};
+  effective.initial_validator_bls = {*bls};
   effective.initial_active_set_size = 1;
   effective.initial_committee_params.min_committee = 1;
   effective.initial_committee_params.max_committee = static_cast<std::uint32_t>(cfg_.network.max_committee);
@@ -122,6 +137,7 @@ bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_val
     std::copy(stored_genesis_artifact->begin(), stored_genesis_artifact->end(), rebound_genesis.genesis_artifact_id.begin());
   }
   rebound_genesis.initial_validators = {pub};
+  rebound_genesis.initial_validator_bls_keys = {bls->pubkey};
 
   consensus::CanonicalDerivedState rebound_state;
   std::string rebound_error;
@@ -151,8 +167,21 @@ bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_val
   return true;
 }
 
+std::optional<genesis::ValidatorBls> Node::bootstrap_validator_bls_locked() const {
+  if (!bootstrap_validator_pubkey_) return std::nullopt;
+  const auto gj = db_.get(storage::key_genesis_json());
+  if (!gj) return std::nullopt;
+  const auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
+  if (!doc || doc->initial_validators.size() != 1 || doc->initial_validators[0] != *bootstrap_validator_pubkey_ ||
+      doc->initial_validator_bls.size() != 1) {
+    return std::nullopt;
+  }
+  return doc->initial_validator_bls[0];
+}
+
 bool Node::maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32& pub, std::uint64_t peer_height,
-                                                     const char* source) {
+                                                     const char* source,
+                                                     const std::optional<genesis::ValidatorBls>& bls) {
   const auto info = p2p_.get_peer_info(peer_id);
   const std::string ip = info.ip.empty() ? endpoint_to_ip(info.endpoint) : info.ip;
   // Trust boundary: height-0 bootstrap adoption is only allowed from an explicitly
@@ -188,7 +217,7 @@ bool Node::maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32
              " reason=peer-height-zero");
     return false;
   }
-  if (!bootstrap_template_bind_validator(pub, pub == local_key_.public_key)) {
+  if (!bootstrap_template_bind_validator(pub, pub == local_key_.public_key, bls)) {
     log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=bind-failed");
     return false;

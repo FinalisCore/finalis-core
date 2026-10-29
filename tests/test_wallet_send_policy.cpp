@@ -293,7 +293,8 @@ TEST(test_wallet_network_helpers_separate_mainnet_and_testnet) {
   ASSERT_EQ(wallet::wallet_settings_key("testnet", "lightserver_endpoints"), std::string("testnet/lightserver_endpoints"));
   ASSERT_EQ(wallet::default_local_rpc_url("mainnet"), std::string("http://127.0.0.1:19444/rpc"));
   ASSERT_EQ(wallet::default_local_rpc_url("testnet"), std::string("http://127.0.0.1:19544/rpc"));
-  ASSERT_EQ(wallet::default_lightserver_endpoints("testnet").front(), std::string("http://130.61.126.39:19544/rpc"));
+  ASSERT_EQ(wallet::default_lightserver_endpoints("testnet").front(), std::string("https://159.200.236.114/rpc"));
+  ASSERT_EQ(wallet::default_lightserver_endpoints("testnet").back(), std::string("http://130.61.126.39:19544/rpc"));
   ASSERT_EQ(wallet::wallet_store_path("/w/a.json", "mainnet"), std::string("/w/a.json.walletdb"));
   ASSERT_EQ(wallet::wallet_store_path("/w/a.json", "testnet"), std::string("/w/a.json.testnet.walletdb"));
 
@@ -311,4 +312,36 @@ TEST(test_wallet_network_helpers_separate_mainnet_and_testnet) {
   ASSERT_TRUE(!wallet::address_matches_network(*main_addr, "testnet"));
   ASSERT_TRUE(wallet::address_matches_network(*test_addr, "testnet"));
   ASSERT_TRUE(!wallet::address_for_network("zz", "testnet").has_value());
+}
+
+// A time-locked send: the envelope's fee coin is the smallest coin covering prepaid fee + bond, and the
+// sealed transfer never uses it (so it cannot be spent twice by the same send).
+TEST(test_wallet_timed_send_plan_keeps_the_fee_coin_out_of_the_transfer) {
+  const auto sender = key_from_byte(0x13);
+  const auto recipient = key_from_byte(0x23);
+  const auto spk = [](const crypto::KeyPair& k) {
+    return address::p2pkh_script_pubkey(crypto::h160(Bytes(k.public_key.begin(), k.public_key.end())));
+  };
+  std::vector<std::pair<OutPoint, TxOut>> available{
+      make_prev(0x0B, 0, 5'000'000, sender.public_key),
+      make_prev(0x0C, 0, 1'500'000, sender.public_key),  // smallest coin covering 1'001'000
+      make_prev(0x0D, 0, 900'000, sender.public_key),
+  };
+  std::string err;
+  auto plan = plan_timed_p2pkh_send(available, spk(recipient), spk(sender), 4'000'000, DEFAULT_WALLET_SEND_FEE_UNITS,
+                                    1'000, 1'000'000, &err);
+  ASSERT_TRUE(plan.has_value());
+  ASSERT_EQ(plan->fee_coin.second.value, 1'500'000u);
+  ASSERT_EQ(plan->fee_change_units, 499'000u);
+  for (const auto& [op, _] : plan->body.selected_prevs) ASSERT_TRUE(!(op.txid == plan->fee_coin.first.txid));
+
+  // The transfer cannot borrow the fee coin.
+  // 5.9M + fee needs more than the 5.9M outside the fee coin, though all coins hold 7.4M.
+  ASSERT_TRUE(!plan_timed_p2pkh_send(available, spk(recipient), spk(sender), 5'900'000, DEFAULT_WALLET_SEND_FEE_UNITS,
+                                     1'000, 1'000'000, &err)
+                   .has_value());
+  // No coin covers prepaid fee + bond.
+  ASSERT_TRUE(!plan_timed_p2pkh_send({make_prev(0x0E, 0, 999'999, sender.public_key)}, spk(recipient), spk(sender), 1,
+                                     DEFAULT_WALLET_SEND_FEE_UNITS, 1'000, 1'000'000, &err)
+                   .has_value());
 }

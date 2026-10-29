@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "network_name": "mainnet",
   "protocol_version": 1,
   "network_id_hex": "fe561911730912cced1e83bc273fab13",
@@ -7,6 +7,8 @@
   "genesis_time_unix": 0,
   "initial_height": 0,
   "initial_validators": [],
+  "initial_validator_bls_pubkeys": [],
+  "initial_validator_bls_pops": [],
   "initial_active_set_size": 0,
   "initial_committee_params": {
     "min_committee": 1,

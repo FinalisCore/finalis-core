@@ -305,7 +305,7 @@ std::vector<PubKey32> proposer_schedule_for_checkpoint(const consensus::Canonica
 // checkpoint_fixture_json() rejects a case where they stop straddling it, so a bond-schedule
 // change cannot silently turn "meets the minimum" fixtures into "below the minimum" ones.
 constexpr std::uint64_t kFixtureMinBond = 3000ULL * consensus::BASE_UNITS_PER_COIN;
-constexpr std::uint64_t kFixtureLowBond = 1500ULL * consensus::BASE_UNITS_PER_COIN;
+constexpr std::uint64_t kFixtureLowBond = 100ULL * consensus::BASE_UNITS_PER_COIN;
 
 std::string checkpoint_fixture_json(const CheckpointFixtureCase& fixture) {
   const std::uint64_t epoch_start_height = 33;

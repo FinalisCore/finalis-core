@@ -23,6 +23,7 @@
 #include "common/types.hpp"
 #include "lightserver/client.hpp"
 #include "onboarding/validator_onboarding.hpp"
+#include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 #include "wallet/light_verifier.hpp"
 #include "wallet/verified_balance.hpp"
@@ -31,6 +32,7 @@
 class QLabel;
 class QLineEdit;
 class QComboBox;
+class QSpinBox;
 class QCheckBox;
 class QPushButton;
 class QScrollArea;
@@ -324,6 +326,10 @@ class WalletWindow final : public QMainWindow {
                                              const QString& last_error = {}) const;
   QStringList configured_lightserver_endpoints() const;
   QStringList ordered_lightserver_endpoints() const;
+  // Public lightservers announced on the network (p2p/endpoints.hpp), learned from a working server
+  // at most every 30 min and kept only once each one is seen to serve this chain under the announced
+  // key; tried after the configured ones. Stored per network.
+  void maybe_discover_lightservers();
   void set_lightserver_endpoints(const QStringList& endpoints);
   void record_lightserver_success(const QString& endpoint, bool fallback_used);
   void record_lightserver_failure(const QString& endpoint, const QString& error);
@@ -366,6 +372,28 @@ class WalletWindow final : public QMainWindow {
   void validate_send_form();
   void populate_send_max_amount();
   void submit_send();
+  // Time-locked sends (TxTimed): the plan, unlock height and committee keys for the current form.
+  struct PreparedTimedSend {
+    TimedSendPlan plan;  // a reveal: the fee coin only
+    std::uint64_t unlock_height{0};
+    std::uint64_t committee_epoch{0};
+    consensus::TimedLockTerms terms;
+    std::vector<crypto::BlsPublicKey> committee_keys;
+    Hash32 committee_root{};
+  };
+  // A time-locked transfer to `destination`, or with `reveal_data` a sealed data reveal (destination
+  // and amount unused). Loads the next block's committee keys (they price the envelope).
+  std::optional<PreparedTimedSend> prepare_timed_send(const QString& destination, std::uint64_t amount_units, QString* err,
+                                                      const Bytes* reveal_data = nullptr);
+  // Spends a pending time-locked transfer's coins back to this wallet before it opens (forfeiting
+  // the bond); also spends the fee coin if the envelope is not in a block yet.
+  void cancel_timed_send();
+  // Asks for a sealed-data transaction id and shows its data once the block after its unlock height
+  // has published it (get_timed_reveal, first endpoint that answers).
+  void read_sealed_data();
+  // Height-locked mode: the output script for the form (locked to the recipient, or inheritance with
+  // this wallet as owner and the recipient as heir) and its unlock height.
+  std::optional<Bytes> height_lock_output_script(const QString& destination, std::uint64_t* unlock_height, QString* err) const;
   void show_selected_history_detail();
   void refresh_history_table();
   QUrl explorer_home_url() const;
@@ -460,6 +488,13 @@ class WalletWindow final : public QMainWindow {
   QLineEdit* send_amount_edit_{nullptr};
   QLineEdit* send_fee_edit_{nullptr};
   QPushButton* send_max_button_{nullptr};
+  QSpinBox* send_unlock_delay_spin_{nullptr};
+  QLabel* send_unlock_delay_label_{nullptr};
+  QPushButton* send_cancel_timed_button_{nullptr};
+  QPushButton* send_read_sealed_button_{nullptr};
+  QLineEdit* send_lock_height_edit_{nullptr};
+  QLabel* send_lock_height_label_{nullptr};
+  QCheckBox* send_inheritance_check_{nullptr};
   QPushButton* send_import_confidential_request_button_{nullptr};
   QPushButton* send_review_button_{nullptr};
   QPushButton* send_button_{nullptr};
@@ -495,6 +530,8 @@ class WalletWindow final : public QMainWindow {
   std::optional<std::uint64_t> finalized_history_cursor_height_;
   std::optional<std::string> finalized_history_cursor_txid_;
   std::uint64_t tip_height_{0};
+  // The chain's base fee from the last status (consensus::next_base_fee_per_kib), units per KiB.
+  std::uint64_t base_fee_per_kib_{1};
   QString confidential_receive_address_;
   std::uint64_t confidential_balance_units_{0};
   std::uint64_t confidential_unverified_units_{0};  // in coins not yet proven unspent
@@ -511,6 +548,10 @@ class WalletWindow final : public QMainWindow {
   // Chain domain of the connected endpoint's chain (network id + genesis hash); transactions are signed
   // under it. Empty until an endpoint's identity is known.
   std::optional<Hash32> signing_chain_domain() const;
+  // The fee a send pays: the default, or more when the chain's base fee asks more for a transaction
+  // of about `estimated_bytes` (twice the current base fee, which can rise by 1/8 a block until the
+  // transaction is in one).
+  std::uint64_t send_fee_units(std::size_t estimated_bytes) const;
   QString current_binary_version_;
   QString current_wallet_api_version_;
   std::optional<lightserver::RpcStatusView> current_lightserver_status_;
@@ -529,6 +570,9 @@ class WalletWindow final : public QMainWindow {
   QString crosscheck_detail_text_{"No endpoint cross-check yet."};
   std::map<QString, EndpointRuntimeState> endpoint_runtime_state_;
   std::shared_ptr<LightVerifierSlot> light_verifier_slot_;
+  QStringList discovered_lightserver_endpoints_;
+  qint64 last_lightserver_discovery_secs_{0};
+  bool lightserver_discovery_in_flight_{false};
   bool balance_verified_{false};
   std::uint64_t balance_verified_height_{0};
   QString balance_verification_detail_;

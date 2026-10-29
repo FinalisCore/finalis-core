@@ -44,6 +44,12 @@ inline constexpr const char* kConsensusSafetyMirrorPrefix = "CSAFE_MIRROR:";
 // Raw bytes of a safety-state row that could not be read at startup. While present above the
 // finalized height, the node abstains from signing anything at that height.
 inline constexpr const char* kConsensusSafetyQuarantinePrefix = "CSAFE_QUARANTINE:";
+// Highest height that ever had a safety-state row (u64le), raised in the batch of every row write. A
+// height in (finalized, highwater] with no row at startup lost its vote history (both rows gone): the
+// node abstains there instead of voting freely (G1).
+inline constexpr const char* kConsensusSafetyHighwaterKey = "CSAFE_HIGHWATER";
+// Marker stored as the quarantined bytes of a height whose rows were missing below the highwater.
+inline constexpr const char* kConsensusSafetyMissingMarker = "CSAFE-MISSING";
 
 // --- In-process local bus (disable_p2p mode); defined in node_internal.cpp ---
 extern std::mutex g_local_bus_mu;
@@ -129,6 +135,14 @@ FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_
 bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state);
 bool persist_canonical_cache_rows(storage::DB& db, const consensus::CanonicalDerivedState& state);
 void stage_canonical_scalars(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state);
+// TxTimed escrow rows: "TE:" + hex(u64le unlock | u64le inclusion height | u32le index) -> envelope.
+std::string timed_escrow_db_key(const consensus::TimedEscrowKey& key);
+consensus::TimedEscrowState load_timed_escrows(const storage::DB& db);
+// Long-lock key set rows: "TK:" + hex(committee_root) -> varint n | n x 48-byte BLS key. A row whose
+// keys do not hash to its root is skipped on load.
+std::string timed_key_set_db_key(const Hash32& root);
+Bytes encode_timed_key_set(const std::vector<crypto::BlsPublicKey>& keys);
+consensus::TimedKeySets load_timed_key_sets(const storage::DB& db);
 // Per-finalized-block persistence: stages only the rows that differ between consecutive states (the
 // full rewrite above is for startup and repair).
 // Per-height UTXO tree change rows kept for readers (lightserver) catching up their in-memory tree.
@@ -150,6 +164,7 @@ std::string key_consensus_locked_proposal(std::uint64_t height);
 std::string key_consensus_safety_state(std::uint64_t height);
 std::string key_consensus_safety_mirror(std::uint64_t height);
 std::string key_consensus_safety_quarantine(std::uint64_t height);
+std::uint64_t load_consensus_safety_highwater(const storage::DB& db);
 // Wraps a serialized safety state as magic | version | inner | checksum. The checksum domain
 // differs between primary and mirror so a copy stored under the wrong key fails verification.
 Bytes seal_consensus_safety_row(const Bytes& inner, bool mirror);

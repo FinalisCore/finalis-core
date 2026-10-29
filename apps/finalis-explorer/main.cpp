@@ -70,6 +70,8 @@ struct Config {
   // Peers allowed to name the real client (X-Real-IP) and vouch for its certificate
   // (X-Finalis-Mtls-Verified): the same-host reverse proxy. Empty: every peer is itself the client.
   std::vector<finalis::net::Ipv4Cidr> trusted_proxies;
+  // Header in which the trusted proxy names the client (lowercase, as parsed requests store it).
+  std::string client_ip_header{"x-real-ip"};
 };
 
 template <typename T>
@@ -1728,6 +1730,10 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto parsed = finalis::net::parse_ipv4_cidr_list(*v);
       if (!parsed.has_value()) return std::nullopt;
       cfg.trusted_proxies = std::move(*parsed);
+    } else if (a == "--client-ip-header") {
+      auto v = next();
+      if (!v || !finalis::net::is_http_header_name(*v)) return std::nullopt;
+      cfg.client_ip_header = lowercase_ascii(*v);
     } else {
       return std::nullopt;
     }
@@ -5697,7 +5703,7 @@ Response handle_request(const Config& cfg, const std::string& req, const std::st
   // Only the trusted proxy may say who the client is or that it presented a valid certificate;
   // from anyone else those headers are forgeries.
   const std::string client_ip =
-      finalis::net::forwarded_client_ip(peer_ip, cfg.trusted_proxies, header_value(*parsed_req, "x-real-ip")).value_or(peer_ip);
+      finalis::net::forwarded_client_ip(peer_ip, cfg.trusted_proxies, header_value(*parsed_req, cfg.client_ip_header)).value_or(peer_ip);
   if (!finalis::net::ipv4_in_cidrs(peer_ip, cfg.trusted_proxies)) parsed_req->headers.erase("x-finalis-mtls-verified");
   const std::string method = parsed_req->method;
   if (method != "GET" && method != "POST") {
@@ -6254,7 +6260,7 @@ int main(int argc, char** argv) {
                  "[--partner-mtls-required 0|1] [--partner-allowed-ipv4-cidrs 10.0.0.0/8,127.0.0.1/32] "
                  "[--partner-webhook-audit-log-path /var/log/finalis/webhook_audit.jsonl] "
                  "[--partner-auth-audit-log-path /var/log/finalis/auth_audit.jsonl] "
-                 "[--trusted-proxy 127.0.0.1/32]\n";
+                 "[--trusted-proxy 127.0.0.1/32] [--client-ip-header X-Real-IP|CF-Connecting-IP]\n";
     return 1;
   }
   if (cfg->partner_mtls_required && cfg->trusted_proxies.empty()) {

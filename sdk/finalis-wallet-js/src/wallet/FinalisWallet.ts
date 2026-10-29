@@ -3,7 +3,7 @@ import { keypairFromPrivkeyHex, keypairFromSeed32 } from '../crypto/ed25519.js';
 import { bytesToHex, hexToBytes } from '../crypto/hash.js';
 import { LightServerClient } from '../rpc/LightServerClient.js';
 import { p2pkhScriptPubKeyHexFromAddress, scriptHashHex, scriptHashHexFromAddress } from '../script/index.js';
-import { signInputP2PKH, type Tx, txidHex, serializeTx } from '../tx/tx.js';
+import { DEFAULT_FEE_UNITS, requiredBaseFeeUnits, signInputP2PKH, type Tx, txidHex, serializeTx } from '../tx/tx.js';
 import type {
   BuildTxParams,
   BuildTxResult,
@@ -72,16 +72,37 @@ export class FinalisWallet {
 
   async buildTransaction(params: BuildTxParams): Promise<BuildTxResult> {
     if (params.amountUnits <= 0n) throw new Error('amountUnits must be positive');
-    if (params.feeUnits < 0n) throw new Error('feeUnits must be >= 0');
+    if (params.feeUnits !== undefined && params.feeUnits < 0n) throw new Error('feeUnits must be >= 0');
 
     const kp = keypairFromPrivkeyHex(params.fromPrivkeyHex);
     const to = decodeAddress(params.toAddress);
     const hrp = (params.hrp ?? to.hrp) as 'sc' | 'tsc';
-
     const fromAddress = deriveAddressFromPubkey(kp.pubkeyHex, hrp);
-    const target = params.amountUnits + params.feeUnits;
-
     const all = await this.listUtxos(fromAddress);
+    // Twice the current base fee: it can rise by 1/8 a block until the transaction is in one.
+    const baseFeePerKib = 2n * (await this.client.getStatus()).base_fee_per_kib;
+
+    let fee = params.feeUnits ?? DEFAULT_FEE_UNITS;
+    for (let attempt = 0; ; attempt++) {
+      const built = this.buildWithFee(params, kp, fromAddress, all, fee);
+      const required = requiredBaseFeeUnits(baseFeePerKib / 2n, hexToBytes(built.txHex).length);
+      if (built.feeUnits >= required) return built.result;
+      if (params.feeUnits !== undefined) {
+        throw new Error(`feeUnits ${params.feeUnits} is below the chain's base fee (needs ${required})`);
+      }
+      if (attempt >= 2) throw new Error('could not meet the base fee');
+      fee = requiredBaseFeeUnits(baseFeePerKib, hexToBytes(built.txHex).length);
+    }
+  }
+
+  private buildWithFee(
+    params: BuildTxParams,
+    kp: { privkeyHex: string; pubkeyHex: string },
+    fromAddress: string,
+    all: WalletUtxo[],
+    feeUnits: bigint,
+  ): { result: BuildTxResult; txHex: string; feeUnits: bigint } {
+    const target = params.amountUnits + feeUnits;
     const selected = selectCoins(all, target);
     const inSum = selected.reduce((sum, u) => sum + u.valueUnits, 0n);
     const change = inSum - target;
@@ -109,17 +130,18 @@ export class FinalisWallet {
       tx.outputs.push({ valueUnits: change, scriptPubKeyHex: p2pkhScriptPubKeyHexFromAddress(chAddr) });
     }
 
+    const spent = selected.map((u) => ({ valueUnits: u.valueUnits, scriptPubKeyHex: u.scriptPubKeyHex }));
     for (let i = 0; i < tx.inputs.length; i++) {
-      signInputP2PKH(tx, i, kp.privkeyHex, kp.pubkeyHex, params.chainDomainHex);
+      signInputP2PKH(tx, i, kp.privkeyHex, kp.pubkeyHex, params.chainDomainHex, spent);
     }
 
     const txHex = bytesToHex(serializeTx(tx));
+    // Change below the dust threshold is left to the fee.
+    const paid = change > dust ? feeUnits : feeUnits + change;
     return {
+      result: { txHex, txid: txidHex(tx), inputs: selected, outputs: tx.outputs, changeUnits: change > dust ? change : 0n },
       txHex,
-      txid: txidHex(tx),
-      inputs: selected,
-      outputs: tx.outputs,
-      changeUnits: change > dust ? change : 0n,
+      feeUnits: paid,
     };
   }
 

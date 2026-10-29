@@ -29,6 +29,7 @@ std::string from_bytes(const Bytes& value) { return std::string(value.begin(), v
 
 std::string key_sent(const std::string& txid) { return "SENT:" + txid; }
 std::string key_pending(const std::string& txid) { return "PEND:" + txid; }
+std::string key_timed_send(const std::string& txid) { return "TIMED:" + txid; }
 std::string key_event_seq() { return "EVT:SEQ"; }
 std::string key_history_seq() { return "HIST:SEQ"; }
 std::string key_event(std::uint64_t seq) {
@@ -187,6 +188,65 @@ std::optional<WalletStore::PendingSpend> parse_pending_spend(const std::string& 
     return std::nullopt;
   }
   return out;
+}
+
+Bytes serialize_timed_send(const WalletStore::TimedSendRecord& r) {
+  codec::ByteWriter w;
+  w.varbytes(to_bytes(r.body_txid_hex));
+  w.u64le(r.unlock_height);
+  w.u64le(r.forfeit_bond);
+  w.u64le(r.amount);
+  w.varbytes(to_bytes(r.recipient));
+  const auto put_coin = [&](const std::pair<OutPoint, TxOut>& coin) {
+    w.bytes_fixed(coin.first.txid);
+    w.u32le(coin.first.index);
+    w.u64le(coin.second.value);
+    w.varbytes(coin.second.script_pubkey);
+  };
+  put_coin(r.fee_coin);
+  w.varint(r.body_inputs.size());
+  for (const auto& coin : r.body_inputs) put_coin(coin);
+  w.varbytes(to_bytes(r.cancel_txid_hex));
+  return w.take();
+}
+
+std::optional<WalletStore::TimedSendRecord> parse_timed_send(const std::string& txid_hex, const Bytes& value) {
+  WalletStore::TimedSendRecord r;
+  r.timed_txid_hex = txid_hex;
+  const bool ok = codec::parse_exact(value, [&](codec::ByteReader& rd) {
+    const auto get_coin = [&](std::pair<OutPoint, TxOut>* coin) {
+      auto txid = rd.bytes_fixed<32>();
+      auto index = rd.u32le();
+      auto amount = rd.u64le();
+      auto script = rd.varbytes();
+      if (!txid || !index || !amount || !script) return false;
+      *coin = {OutPoint{*txid, *index}, TxOut{*amount, *script}};
+      return true;
+    };
+    auto body = rd.varbytes();
+    auto unlock = rd.u64le();
+    auto bond = rd.u64le();
+    auto amount = rd.u64le();
+    auto recipient = rd.varbytes();
+    if (!body || !unlock || !bond || !amount || !recipient || !get_coin(&r.fee_coin)) return false;
+    auto count = rd.varint();
+    if (!count || *count > rd.remaining()) return false;
+    r.body_inputs.resize(static_cast<std::size_t>(*count));
+    for (auto& coin : r.body_inputs) {
+      if (!get_coin(&coin)) return false;
+    }
+    auto cancel = rd.varbytes();
+    if (!cancel) return false;
+    r.body_txid_hex = from_bytes(*body);
+    r.unlock_height = *unlock;
+    r.forfeit_bond = *bond;
+    r.amount = *amount;
+    r.recipient = from_bytes(*recipient);
+    r.cancel_txid_hex = from_bytes(*cancel);
+    return true;
+  });
+  if (!ok) return std::nullopt;
+  return r;
 }
 
 Bytes serialize_finalized_history_record(const WalletStore::FinalizedHistoryRecord& record) {
@@ -640,6 +700,7 @@ bool WalletStore::load(State* out) const {
   out->sent_txids.clear();
   out->local_events.clear();
   out->pending_spends.clear();
+  out->timed_sends.clear();
   out->finalized_history.clear();
   out->history_cursor_height.reset();
   out->history_cursor_txid.reset();
@@ -662,6 +723,12 @@ bool WalletStore::load(State* out) const {
   }
   std::sort(out->pending_spends.begin(), out->pending_spends.end(),
             [](const auto& a, const auto& b) { return a.txid_hex < b.txid_hex; });
+
+  for (const auto& [key, value] : db_.scan_prefix("TIMED:")) {
+    if (auto parsed = parse_timed_send(key.substr(6), value)) out->timed_sends.push_back(std::move(*parsed));
+  }
+  std::sort(out->timed_sends.begin(), out->timed_sends.end(),
+            [](const auto& a, const auto& b) { return a.unlock_height < b.unlock_height; });
 
   for (const auto& [key, value] : db_.scan_prefix("HIST:")) {
     if (key == key_history_seq()) continue;
@@ -750,6 +817,10 @@ bool WalletStore::upsert_pending_spend(const std::string& txid, const std::vecto
 }
 
 bool WalletStore::remove_pending_spend(const std::string& txid) { return db_.erase(key_pending(txid)); }
+
+bool WalletStore::upsert_timed_send(const TimedSendRecord& record) {
+  return db_.put(key_timed_send(record.timed_txid_hex), serialize_timed_send(record));
+}
 
 bool WalletStore::replace_finalized_history(const std::vector<FinalizedHistoryRecord>& records) {
   for (const auto& [key, _] : db_.scan_prefix("HIST:")) {

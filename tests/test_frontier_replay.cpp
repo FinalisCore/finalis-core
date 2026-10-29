@@ -2,7 +2,10 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_validator_bls.hpp"
 #include "support/test_leader_vrf.hpp"
+#include "support/test_time_signature.hpp"
+#include "node/node_internal.hpp"
 #include "support/test_paths.hpp"
 
 #include <algorithm>
@@ -64,12 +67,15 @@ Bytes make_p2pkh_script_sig(const Sig64& sig, const PubKey32& pub) {
   return ss;
 }
 
-Bytes onboarding_registration_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
-  Bytes s{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
-  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
-  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
-  s.insert(s.end(), pop.begin(), pop.end());
-  return s;
+Bytes onboarding_registration_script(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop) {
+  const auto bls = test::test_bls_registration(validator);
+  OnboardingRegistrationScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  return encode_onboarding_registration_script(d);
 }
 
 Bytes raw_signed_spend_v2_with_outputs(const OutPoint& op, const crypto::KeyPair& from,
@@ -234,6 +240,7 @@ consensus::CanonicalDerivedState build_parent_state_with_utxo(const consensus::C
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -260,14 +267,14 @@ consensus::CertifiedIngressLaneRecords make_lane_records(const consensus::Canoni
       ? consensus::committee_epoch_start(next_height, epoch_blocks)
       : 1;
   for (const auto& raw : ordered_records) {
-    auto tx = parse_any_tx(raw);
-    if (!tx.has_value()) throw std::runtime_error("failed to parse ordered test tx");
-    const auto lane = consensus::assign_ingress_lane(*tx);
+    const auto identity = consensus::ingress_record_identity(raw);
+    if (!identity.has_value()) throw std::runtime_error("failed to parse ordered test tx");
+    const auto lane = identity->lane;
     IngressCertificate cert;
     cert.epoch = cert_epoch;
     cert.lane = lane;
     cert.seq = ++next_vector.lane_max_seq[lane];
-    cert.txid = txid_any(*tx);
+    cert.txid = identity->txid;
     cert.tx_hash = crypto::sha256d(raw);
     cert.prev_lane_root = lane_roots[lane];
     const auto signing_hash = cert.signing_hash();
@@ -316,7 +323,8 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
                                                         const consensus::CanonicalDerivationConfig& cfg = test_cfg(),
                                                         std::uint32_t round = 0,
                                                         const std::vector<FinalitySig>& prev_signers = {},
-                                                        const SpecialValidationContext* vctx = nullptr) {
+                                                        const SpecialValidationContext* vctx = nullptr,
+                                                        const std::vector<LongTimeSignature>* long_time_signatures = nullptr) {
   FrontierVector next_vector;
   auto lane_records = make_lane_records(parent_state, ordered_records, &next_vector, cfg.network.committee_epoch_blocks);
   // Without an explicit context, validate under the fixture chain identity, as replay does.
@@ -324,19 +332,24 @@ consensus::CanonicalFrontierRecord make_frontier_record(const consensus::Canonic
   identity_ctx.network = &cfg.network;
   identity_ctx.chain_id = &cfg.chain_id;
   if (!vctx) vctx = &identity_ctx;
+  const auto height = parent_state.finalized_height + 1;
+  const auto time_signature = test::test_prev_time_signature(cfg, parent_state, {key_from_byte(90)});
+  if (!time_signature.has_value()) throw std::runtime_error("parent time signature below threshold");
+  const auto timed =
+      consensus::timed_execution_context_for(cfg, parent_state, height, *time_signature, long_time_signatures);
   consensus::FrontierExecutionResult result;
   std::string err;
   if (!consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.confidential_pool_value, parent_state.finalized_frontier_vector, next_vector,
-                                               lane_records, parent_state.finalized_lane_roots, vctx, &result, &err)) {
+                                               lane_records, parent_state.finalized_lane_roots, vctx, &result, &err,
+                                               true, nullptr, &timed)) {
     throw std::runtime_error("frontier execution failed: " + err);
   }
-  const auto height = parent_state.finalized_height + 1;
   const auto leader = consensus::canonical_leader_for_height_round(cfg, parent_state, height, round);
   if (!leader.has_value()) throw std::runtime_error("missing canonical leader");
   const auto signers = prev_signers.empty() ? default_prev_finality_signers(cfg, parent_state) : prev_signers;
   if (!consensus::populate_frontier_transition_metadata(cfg, parent_state, height, round, *leader,
                                                         fixture_parent_commit_round(parent_state), signers,
-                                                        result.accepted_fee_units, result.next_utxos, &result.transition,
+                                                        *time_signature, result.accepted_fee_units, result.next_utxos, &result.transition,
                                                         &err)) {
     throw std::runtime_error("frontier metadata population failed: " + err);
   }
@@ -494,6 +507,7 @@ TEST(test_availability_long_horizon_replay_equivalence_across_continuous_epoch_a
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -569,6 +583,7 @@ TEST(test_availability_evidence_isolation_preserves_checkpoint_output) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState base;
   std::string err;
@@ -630,6 +645,7 @@ TEST(test_availability_evidence_isolation_preserves_restart_boundary_checkpoint_
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -711,6 +727,7 @@ TEST(test_availability_evidence_isolation_holds_across_long_horizon_restart_sche
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -797,6 +814,7 @@ TEST(test_availability_state_epoch_boundary_replay_matches_persisted_restore_bef
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -869,6 +887,7 @@ TEST(test_state_commitment_identical_after_restart_at_each_epoch_boundary) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(key_from_byte(90).public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(key_from_byte(90)));
 
   consensus::CanonicalDerivedState genesis_state;
   std::string err;
@@ -1586,6 +1605,7 @@ TEST(test_finality_rejects_quorum_below_threshold_exact_boundary) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators = {v0.public_key, v1.public_key, v2.public_key};
+  genesis.initial_validator_bls_keys = {test::test_bls_pubkey(v0), test::test_bls_pubkey(v1), test::test_bls_pubkey(v2)};
 
   consensus::CanonicalDerivedState parent;
   std::string err;
@@ -1792,6 +1812,7 @@ TEST(test_frontier_storage_replay_rejects_tampered_quorum_threshold_metadata) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators = {signer.public_key};
+  genesis.initial_validator_bls_keys = {test::test_bls_pubkey(signer)};
 
   consensus::CanonicalDerivedState parent;
   std::string err;
@@ -1838,6 +1859,7 @@ TEST(test_live_validator_membership_state_mid_epoch_is_only_committee_eligible_a
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -1878,6 +1900,7 @@ TEST(test_live_validator_membership_state_on_epoch_edge_has_single_canonical_act
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -1980,14 +2003,14 @@ TEST(test_frontier_apply_updates_validator_state_for_txv2_onboarding_output) {
   op.index = 0;
   auto parent_state = build_parent_state_with_utxo(cfg, 0, op, p2pkh_out_for_pub(from.public_key, 10'000));
 
-  const auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+  const auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                                         validator.private_key);
   ASSERT_TRUE(pop.has_value());
 
   std::vector<TxOutV2> outputs;
   outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
                             .body = TransparentTxOutV2{0,
-                                                       onboarding_registration_script(validator.public_key,
+                                                       onboarding_registration_script(validator,
                                                                                       payout.public_key, *pop)}});
   outputs.push_back(TxOutV2{.kind = TxOutputKind::Transparent,
                             .body = TransparentTxOutV2{9'500, p2pkh_script_for_pub(payout.public_key)}});
@@ -2069,6 +2092,7 @@ TEST(test_checkpoint_derivation_ignores_below_difficulty_ticket_hashes) {
   const auto v3 = key_from_byte(104);
   const auto v4 = key_from_byte(105);
   genesis.initial_validators = {v0.public_key, v1.public_key, v2.public_key, v3.public_key, v4.public_key};
+  genesis.initial_validator_bls_keys = {test::test_bls_pubkey(v0), test::test_bls_pubkey(v1), test::test_bls_pubkey(v2), test::test_bls_pubkey(v3), test::test_bls_pubkey(v4)};
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2244,6 +2268,7 @@ TEST(test_adaptive_checkpoint_metadata_is_replay_equivalent) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2286,6 +2311,119 @@ TEST(test_adaptive_checkpoint_metadata_is_replay_equivalent) {
   ASSERT_EQ(checkpoint_a.target_contract_streak, checkpoint_b.target_contract_streak);
 }
 
+// The parent's time signature (consensus::verify_prev_time_signature): exactly the threshold of the
+// parent committee's keys on time_signature_message(parent height), canonical indices, and nothing
+// for the genesis parent.
+TEST(test_prev_time_signature_rule) {
+  const auto cfg = test_cfg();
+  std::vector<crypto::KeyPair> keys;
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  for (std::uint8_t i = 0; i < 4; ++i) {
+    keys.push_back(key_from_byte(static_cast<std::uint8_t>(110 + i)));
+    genesis.initial_validators.push_back(keys.back().public_key);
+    genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(keys.back()));
+  }
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+
+  // Genesis parent: no signers, zero aggregate.
+  ASSERT_TRUE(consensus::verify_prev_time_signature(cfg, state, TimeSignatureAggregate{}, &err));
+  TimeSignatureAggregate stray;
+  stray.signer_indices = {0};
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, stray, &err));
+
+  // Parent height 1, committee of 4 from the epoch-1 checkpoint: threshold 3.
+  state.finalized_height = 1;
+  const auto committee_keys = consensus::time_signature_committee_keys(cfg, state, 1);
+  ASSERT_TRUE(committee_keys.has_value());
+  ASSERT_EQ(consensus::time_signature_threshold(committee_keys->size()), 3u);
+  ASSERT_TRUE(!test::test_prev_time_signature(cfg, state, {keys[0], keys[1]}).has_value());  // 2 < 3
+  const auto good = test::test_prev_time_signature(cfg, state, keys);
+  ASSERT_TRUE(good.has_value());
+  ASSERT_EQ(good->signer_indices.size(), 3u);
+  ASSERT_TRUE(consensus::verify_prev_time_signature(cfg, state, *good, &err));
+
+  auto tampered = *good;
+  tampered.aggregate[10] ^= 1;
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, tampered, &err));
+  auto too_few = *good;
+  too_few.signer_indices.pop_back();
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, too_few, &err));
+  ASSERT_EQ(err, std::string("frontier-time-signature-below-threshold"));
+  auto unsorted = *good;
+  std::swap(unsorted.signer_indices[0], unsorted.signer_indices[1]);
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, unsorted, &err));
+  ASSERT_EQ(err, std::string("frontier-time-signature-signers-not-canonical"));
+  auto out_of_range = *good;
+  out_of_range.signer_indices.back() = 4;
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, out_of_range, &err));
+  auto wrong_signers = *good;  // the same aggregate claimed for a different signer set
+  wrong_signers.signer_indices = {0, 1, 3};
+  if (wrong_signers.signer_indices != good->signer_indices) {
+    ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, wrong_signers, &err));
+  }
+  // A signature on another height does not count for this one.
+  state.finalized_height = 2;
+  ASSERT_TRUE(!consensus::verify_prev_time_signature(cfg, state, *good, &err));
+  ASSERT_TRUE(consensus::verify_prev_time_signature(cfg, state, *test::test_prev_time_signature(cfg, state, keys), &err));
+  // The aggregate is exactly the SWE witness a TxTimed locked to that height needs.
+  const auto msg = time_signature_message(consensus_chain_domain(cfg.network, cfg.chain_id), 1);
+  std::vector<crypto::BlsPublicKey> signers;
+  for (const auto i : good->signer_indices) signers.push_back((*committee_keys)[i]);
+  ASSERT_TRUE(crypto::mcfly_aggregate_verify(signers, msg, crypto::kBlsTimeSignatureDst, good->aggregate));
+}
+
+// Each checkpoint carries its members' BLS time-signature keys in member order: the genesis
+// checkpoint from the genesis entries, later ones from the registrations, whatever the selection.
+TEST(test_committee_checkpoints_carry_member_bls_keys_in_member_order) {
+  const auto cfg = live_activation_cfg();
+  const auto bootstrap = key_from_byte(91);
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
+
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  const auto& genesis_checkpoint = state.finalized_committee_checkpoints.at(1);
+  ASSERT_TRUE(genesis_checkpoint.ordered_members == std::vector<PubKey32>{bootstrap.public_key});
+  ASSERT_TRUE(genesis_checkpoint.ordered_bls_keys == std::vector<crypto::BlsPublicKey>{test::test_bls_pubkey(bootstrap)});
+
+  std::map<PubKey32, crypto::BlsPublicKey> keys{{bootstrap.public_key, test::test_bls_pubkey(bootstrap)}};
+  for (std::size_t i = 0; i < live_normal_min_eligible() + 2; ++i) {
+    const auto seed = static_cast<std::uint8_t>(0xC0 + i);
+    const auto kp = key_from_byte(seed);
+    OutPoint bond{};
+    bond.txid.fill(seed);
+    bond.txid[0] = 0xEE;
+    const auto bls = test::test_bls_pubkey(kp);
+    ASSERT_TRUE(state.validators.register_bond(kp.public_key, bond, 0, live_adaptive_test_bond(), &err, kp.public_key, bls));
+    state.availability_state.operators.push_back(active_availability_operator(kp.public_key));
+    keys[kp.public_key] = bls;
+  }
+  state.validators.advance_height(1);
+
+  storage::FinalizedCommitteeCheckpoint checkpoint;
+  ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 5, &checkpoint, &err));
+  ASSERT_TRUE(checkpoint.ordered_members.size() > 1);
+  ASSERT_EQ(checkpoint.ordered_bls_keys.size(), checkpoint.ordered_members.size());
+  std::vector<crypto::BlsPublicKey> expected;
+  for (const auto& member : checkpoint.ordered_members) expected.push_back(keys.at(member));
+  ASSERT_TRUE(checkpoint.ordered_bls_keys == expected);
+  ASSERT_TRUE(consensus::validate_next_epoch_checkpoint_from_state(cfg, state, 5, checkpoint, &err));
+
+  // A checkpoint whose keys disagree with the registry is not the canonical one.
+  auto swapped = checkpoint;
+  std::swap(swapped.ordered_bls_keys[0], swapped.ordered_bls_keys[1]);
+  ASSERT_TRUE(!consensus::validate_next_epoch_checkpoint_from_state(cfg, state, 5, swapped, &err));
+  ASSERT_TRUE(consensus::committee_bls_key_root(swapped.ordered_bls_keys) !=
+              consensus::committee_bls_key_root(checkpoint.ordered_bls_keys));
+}
+
 TEST(test_live_bporeligibility_filters_future_committee_checkpoint_membership) {
   const auto cfg = live_activation_cfg();
   const auto bootstrap = key_from_byte(96);
@@ -2296,6 +2434,7 @@ TEST(test_live_bporeligibility_filters_future_committee_checkpoint_membership) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2363,6 +2502,7 @@ TEST(test_live_bpoar_checkpoint_fallback_mode_is_deterministic_and_explicit) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2426,6 +2566,7 @@ TEST(test_live_bpoar_checkpoint_fallback_hysteresis_is_sticky_until_recovery_thr
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2487,6 +2628,7 @@ TEST(test_live_bpoar_checkpoint_cross_node_determinism_uses_canonical_operator_o
     consensus::CanonicalGenesisState genesis;
     genesis.genesis_artifact_id = zero_hash();
     genesis.initial_validators.push_back(bootstrap.public_key);
+    genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
     consensus::CanonicalDerivedState state;
     std::string local_err;
@@ -2589,6 +2731,7 @@ TEST(test_genesis_checkpoint_metadata_matches_later_checkpoint_semantics) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2612,6 +2755,7 @@ TEST(test_bootstrap_availability_grace_does_not_relax_post_genesis_joiner_requir
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2643,6 +2787,7 @@ TEST(test_bootstrap_handoff_complete_is_purely_derived_from_finalized_state) {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -2746,6 +2891,7 @@ TEST(test_live_validator_exit_mid_epoch_is_removed_only_at_next_epoch_checkpoint
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
 
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -3085,4 +3231,616 @@ TEST(test_turnstile_restart_preserves_p) {
   ASSERT_TRUE(db.open(dir));
   ASSERT_TRUE(db.get_confidential_pool_value().has_value());
   ASSERT_EQ(*db.get_confidential_pool_value(), 7'000u);
+}
+
+// --- TxTimed: inclusion, escrow, settlement (consensus/frontier_execution.hpp) ---
+
+namespace {
+
+struct TimedFixture {
+  consensus::CanonicalDerivationConfig cfg = test_cfg();
+  crypto::KeyPair user = key_from_byte(171);
+  crypto::KeyPair recipient = key_from_byte(172);
+  OutPoint fee_op{};
+  TxOut fee_out;
+  OutPoint body_op{};
+  TxOut body_out;
+  consensus::CanonicalDerivedState parent;
+};
+
+// Genesis with the fixture validator (key 90) and two coins of `user`: one pays the envelope's fee
+// input, the other is what the sealed body spends.
+TimedFixture make_timed_fixture() {
+  TimedFixture fx;
+  fx.fee_op.txid.fill(0xA1);
+  fx.fee_out = p2pkh_out_for_pub(fx.user.public_key, 50'000'000);
+  fx.body_op.txid.fill(0xA2);
+  fx.body_out = p2pkh_out_for_pub(fx.user.public_key, 3'000'000);
+  fx.parent = build_parent_state_with_utxo(fx.cfg, 0, fx.fee_op, fx.fee_out);
+  fx.parent.utxos[fx.body_op] = UtxoEntryV2{fx.body_out};
+  fx.parent.state_commitment = consensus::consensus_state_commitment(fx.cfg, fx.parent);
+  return fx;
+}
+
+Tx timed_body_spend(const TimedFixture& fx, const OutPoint& op, const TxOut& prev) {
+  auto tx = build_signed_p2pkh_tx_single_input(timed_body_chain_domain(replay_chain_domain()), op, prev, fx.user.private_key,
+                                               {p2pkh_out_for_pub(fx.recipient.public_key, prev.value - 500)});
+  if (!tx.has_value()) throw std::runtime_error("body build failed");
+  return *tx;
+}
+
+consensus::TimedEscrowState no_escrows;
+
+// Encrypted to the committee of the inclusion epoch (that of state's next height), as consensus requires.
+constexpr std::uint64_t kBond = consensus::kTxTimedMinForfeitBond;
+
+// The prepaid fee defaults to what a client pays (consensus::timed_lock_terms over the envelope bound).
+std::optional<TxTimed> build_timed(const TimedFixture& fx, const consensus::CanonicalDerivedState& state,
+                                   std::uint64_t unlock, const TimedBody& body, std::uint64_t bond = kBond,
+                                   std::uint8_t seed = 1, std::optional<std::uint64_t> prepaid = std::nullopt) {
+  const auto epoch = consensus::committee_epoch_start(state.finalized_height + 1, fx.cfg.network.committee_epoch_blocks);
+  auto keys = consensus::time_signature_committee_keys(fx.cfg, state, epoch);
+  if (!keys.has_value()) return std::nullopt;
+  if (!prepaid.has_value()) {
+    const auto bound = timed_envelope_bytes_bound(keys->size(), serialize_timed_body(body).size());
+    const auto terms =
+        consensus::timed_lock_terms(state.finalized_height + 1, unlock, fx.cfg.network.committee_epoch_blocks, bound);
+    // A client refuses a passed unlock height; the size fee still lets tests build one.
+    prepaid = terms.has_value() ? terms->prepaid_fee : consensus::timed_min_prepaid_fee(bound);
+  }
+  const std::uint64_t prepaid_fee = *prepaid;
+  TimedTxParams p;
+  p.fee_outpoint = fx.fee_op;
+  p.fee_prev_out = fx.fee_out;
+  p.prepaid_fee = prepaid_fee;
+  p.forfeit_bond = bond;
+  p.bond_refund_script = p2pkh_out_for_pub(fx.user.public_key, 0).script_pubkey;
+  p.fee_change = p2pkh_out_for_pub(fx.user.public_key, fx.fee_out.value - prepaid_fee - bond);
+  p.unlock_height = unlock;
+  p.committee_epoch = epoch;
+  p.committee_root = consensus::committee_bls_key_root(*keys);
+  p.committee_keys = *keys;
+  p.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(keys->size()));
+  Hash32 s{};
+  s.fill(seed);
+  std::string err;
+  return build_signed_timed_tx(replay_chain_domain(), p, body, fx.user.private_key, s, &err);
+}
+
+bool has_utxo(const consensus::CanonicalDerivedState& s, const OutPoint& op) { return s.utxos.contains(op); }
+
+}  // namespace
+
+// Included at h with unlock height h: the fee input is spent into prepaid fee, change and an escrowed
+// bond; block h + 1 opens the body with h's time signature first, applies it and refunds the bond.
+TEST(test_timed_tx_is_escrowed_then_settled_with_the_parent_time_signature) {
+  auto fx = make_timed_fixture();
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{body});
+  ASSERT_TRUE(timed.has_value());
+  const auto timed_txid = timed->txid();
+
+  const auto record1 = make_frontier_record(fx.parent, {timed->serialize()}, fx.cfg);
+  ASSERT_EQ(record1.transition.settlement.current_fees, timed->prepaid_fee);  // the prepaid fee only
+  consensus::CanonicalDerivedState s1;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, fx.parent, record1, &s1, &err));
+  ASSERT_EQ(s1.timed_escrows.size(), 1u);
+  ASSERT_TRUE(s1.timed_escrows.begin()->second.txid() == timed_txid);
+  ASSERT_TRUE(!has_utxo(s1, fx.fee_op));
+  ASSERT_TRUE(has_utxo(s1, consensus::timed_change_outpoint(timed_txid)));
+  ASSERT_TRUE(has_utxo(s1, fx.body_op));  // the body is still sealed
+  ASSERT_TRUE(s1.state_commitment != fx.parent.state_commitment);
+  ASSERT_TRUE(consensus::timed_escrow_commitment_root(s1.timed_escrows) !=
+              consensus::timed_escrow_commitment_root(no_escrows));
+
+  const auto record2 = make_frontier_record(s1, {}, fx.cfg);
+  consensus::CanonicalDerivedState s2;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &s2, &err));
+  ASSERT_TRUE(s2.timed_escrows.empty());
+  ASSERT_TRUE(!has_utxo(s2, fx.body_op));
+  ASSERT_TRUE(has_utxo(s2, OutPoint{body.txid(), 0}));
+  const auto refund = s2.utxos.find(consensus::timed_refund_outpoint(timed_txid));
+  ASSERT_TRUE(refund != s2.utxos.end());
+  ASSERT_EQ(transparent_txout_from_utxo_entry(refund->second)->value, kBond);
+  ASSERT_EQ(record2.transition.settlement.current_fees, 500u);  // the body's own fee
+}
+
+// A reveal body publishes its data in the settlement and refunds the bond; it moves nothing else.
+TEST(test_timed_reveal_body_publishes_its_data_and_refunds_the_bond) {
+  auto fx = make_timed_fixture();
+  const Bytes data{'a', 'u', 'c', 't', 'i', 'o', 'n', ' ', '7', ':', ' ', '5', '0', '0'};
+  const auto timed = build_timed(fx, fx.parent, 1, TimedReveal{data});
+  ASSERT_TRUE(timed.has_value());
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()});
+  ASSERT_EQ(s1.timed_escrows.size(), 1u);
+  const auto record2 = make_frontier_record(s1, {}, fx.cfg);
+  consensus::CanonicalDerivedState s2;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &s2, &err));
+  ASSERT_TRUE(s2.timed_escrows.empty());
+  ASSERT_EQ(s2.last_timed_settlements.size(), 1u);
+  const auto& settled = s2.last_timed_settlements[0];
+  ASSERT_TRUE(settled.body_applied && settled.revealed_data == data);
+  ASSERT_TRUE(!settled.body_txid.has_value() && !settled.applied_body.has_value());
+  ASSERT_TRUE(has_utxo(s2, consensus::timed_refund_outpoint(timed->txid())));
+  ASSERT_TRUE(has_utxo(s2, fx.body_op));
+  ASSERT_EQ(record2.transition.settlement.current_fees, 0u);
+  ASSERT_EQ(s2.utxos.size(), s1.utxos.size() + 1);  // the refund only
+}
+
+// A data output has zero value and never enters the UTXO set; a sealed transfer may carry one (a
+// bid paid with the money itself, tagged with its auction).
+TEST(test_data_outputs_carry_no_value_and_are_never_spendable) {
+  auto fx = make_timed_fixture();
+  const auto tag = *data_output_script_pubkey(Bytes{'a', 'u', 'c', 't', 'i', 'o', 'n', ' ', '7'});
+  // Signed under the chain domain as a plain record, under timed_body_chain_domain as a sealed body.
+  const auto pay_with_data = [&](std::uint64_t data_value, bool sealed = false) {
+    auto tx = build_signed_p2pkh_tx_single_input(
+        sealed ? timed_body_chain_domain(replay_chain_domain()) : replay_chain_domain(), fx.body_op, fx.body_out,
+        fx.user.private_key,
+        {p2pkh_out_for_pub(fx.recipient.public_key, fx.body_out.value - 500 - data_value), TxOut{data_value, tag}});
+    if (!tx.has_value()) throw std::runtime_error("data tx build failed");
+    return *tx;
+  };
+  const auto tx = pay_with_data(0);
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {tx.serialize()});
+  ASSERT_TRUE(!has_utxo(s1, fx.body_op));
+  ASSERT_TRUE(has_utxo(s1, OutPoint{tx.txid(), 0}));
+  ASSERT_TRUE(!has_utxo(s1, OutPoint{tx.txid(), 1}));
+  const auto valued = apply_frontier_or_throw(fx.cfg, fx.parent, {pay_with_data(1).serialize()});
+  ASSERT_TRUE(has_utxo(valued, fx.body_op));  // rejected
+
+  const auto sealed = pay_with_data(0, true);
+  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{sealed});
+  ASSERT_TRUE(timed.has_value());
+  const auto s2 = apply_frontier_or_throw(fx.cfg, apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()}), {});
+  ASSERT_EQ(s2.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(s2.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(has_utxo(s2, OutPoint{sealed.txid(), 0}) && !has_utxo(s2, OutPoint{sealed.txid(), 1}));
+}
+
+// A body that opens but cannot apply forfeits the bond as a fee of the settling block; nothing else moves.
+TEST(test_timed_tx_invalid_body_forfeits_the_bond) {
+  auto fx = make_timed_fixture();
+  OutPoint missing{};
+  missing.txid.fill(0xEE);
+  const auto body = timed_body_spend(fx, missing, fx.body_out);
+  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{body});
+  ASSERT_TRUE(timed.has_value());
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()});
+  const auto record2 = make_frontier_record(s1, {}, fx.cfg);
+  consensus::CanonicalDerivedState s2;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &s2, &err));
+  ASSERT_TRUE(s2.timed_escrows.empty());
+  ASSERT_TRUE(!has_utxo(s2, consensus::timed_refund_outpoint(timed->txid())));
+  ASSERT_TRUE(has_utxo(s2, fx.body_op));
+  ASSERT_EQ(record2.transition.settlement.current_fees, kBond);
+}
+
+// Settlement runs before the settling block's records: a record spending the body's input (here a
+// competing spend by the same owner) conflicts with the already-applied body and is rejected.
+TEST(test_timed_settlement_precedes_records_of_the_settling_block) {
+  auto fx = make_timed_fixture();
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{body});
+  ASSERT_TRUE(timed.has_value());
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()});
+  const auto front_run = raw_signed_spend(fx.body_op, fx.body_out, fx.user, fx.user.public_key, fx.body_out.value - 100);
+  const auto record2 = make_frontier_record(s1, {front_run}, fx.cfg);
+  consensus::CanonicalDerivedState s2;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &s2, &err));
+  ASSERT_TRUE(has_utxo(s2, OutPoint{body.txid(), 0}));
+  ASSERT_TRUE(has_utxo(s2, consensus::timed_refund_outpoint(timed->txid())));
+  ASSERT_TRUE(!has_utxo(s2, OutPoint{Tx::parse(front_run)->txid(), 0}));
+}
+
+// Inclusion rules: the inclusion epoch's committee and root, the minimum bond, a valid fee signature,
+// and never after the unlock height (its key may already be public).
+TEST(test_timed_tx_inclusion_rules) {
+  auto fx = make_timed_fixture();
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto rejected_at = [&](const consensus::CanonicalDerivedState& state, const TxTimed& tx) {
+    const auto next = apply_frontier_or_throw(fx.cfg, state, {tx.serialize()});
+    return next.timed_escrows.empty() && has_utxo(next, fx.fee_op);
+  };
+  const auto epoch_end = fx.cfg.network.committee_epoch_blocks;  // epoch 1 is [1, epoch_blocks]
+  ASSERT_TRUE(!rejected_at(fx.parent, *build_timed(fx, fx.parent, epoch_end, AnyTx{body})));
+
+  auto next_epoch = *build_timed(fx, fx.parent, 1, AnyTx{body});
+  next_epoch.committee_epoch = epoch_end + 1;  // names a committee other than the inclusion epoch's
+  ASSERT_TRUE(rejected_at(fx.parent, next_epoch));
+  auto wrong_root = *build_timed(fx, fx.parent, 1, AnyTx{body});
+  wrong_root.committee_root[0] ^= 1;
+  ASSERT_TRUE(rejected_at(fx.parent, wrong_root));
+  ASSERT_TRUE(rejected_at(fx.parent, *build_timed(fx, fx.parent, 1, AnyTx{body}, consensus::kTxTimedMinForfeitBond - 1)));
+  auto bad_sig = *build_timed(fx, fx.parent, 1, AnyTx{body});
+  bad_sig.fee_input.script_sig[5] ^= 1;
+  ASSERT_TRUE(rejected_at(fx.parent, bad_sig));
+  auto bad_proof = *build_timed(fx, fx.parent, 1, AnyTx{body});
+  bad_proof.swe_proof[40] ^= 1;
+  ASSERT_TRUE(rejected_at(fx.parent, bad_proof));
+
+  // At height 2 an envelope locked to height 1 is late.
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {});
+  ASSERT_TRUE(rejected_at(s1, *build_timed(fx, s1, 1, AnyTx{body})));
+  ASSERT_TRUE(!rejected_at(s1, *build_timed(fx, s1, 2, AnyTx{body})));
+}
+
+// Per-block and per-unlock-height caps bound the SWE work of one block.
+TEST(test_timed_tx_caps) {
+  ASSERT_TRUE(consensus::kMaxTimedTxPerBlock <= consensus::kMaxTimedEscrowsPerUnlockHeight);
+  auto fx = make_timed_fixture();
+  std::vector<Bytes> records;
+  std::vector<std::pair<OutPoint, TxOut>> coins;
+  for (std::uint8_t i = 0; i < consensus::kMaxTimedTxPerBlock + 1; ++i) {
+    OutPoint op{};
+    op.txid.fill(static_cast<std::uint8_t>(0xB0 + i));
+    fx.parent.utxos[op] = UtxoEntryV2{fx.fee_out};
+    coins.push_back({op, fx.fee_out});
+  }
+  fx.parent.state_commitment = consensus::consensus_state_commitment(fx.cfg, fx.parent);
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  for (const auto& [op, out] : coins) {
+    auto f = fx;
+    f.fee_op = op;
+    records.push_back(build_timed(f, fx.parent, 3, AnyTx{body}, kBond, op.txid[0])->serialize());
+  }
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, records);
+  ASSERT_EQ(s1.timed_escrows.size(), consensus::kMaxTimedTxPerBlock);
+}
+
+// Escrows persist as one "TE:" row each (node_internal), read back into the same keyed state; a full
+// rewrite of a state without escrows removes the rows.
+TEST(test_timed_escrows_persist_and_reload) {
+  auto fx = make_timed_fixture();
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {build_timed(fx, fx.parent, 2, AnyTx{body})->serialize()});
+  ASSERT_EQ(s1.timed_escrows.size(), 1u);
+  const std::string path = unique_test_base("/tmp/finalis_test_timed_escrow_rows");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+  ASSERT_TRUE(node::detail::persist_canonical_cache_rows(db, s1));
+  const auto loaded = node::detail::load_timed_escrows(db);
+  ASSERT_EQ(loaded.size(), 1u);
+  ASSERT_TRUE(loaded.begin()->first == s1.timed_escrows.begin()->first);
+  ASSERT_TRUE(loaded.begin()->second.serialize() == s1.timed_escrows.begin()->second.serialize());
+  ASSERT_TRUE(consensus::timed_escrow_commitment_root(loaded) == consensus::timed_escrow_commitment_root(s1.timed_escrows));
+  ASSERT_TRUE(node::detail::persist_canonical_cache_rows(db, fx.parent));
+  ASSERT_TRUE(node::detail::load_timed_escrows(db).empty());
+}
+
+// --- Long time locks: unlock beyond the inclusion epoch, opened by the named committee ---
+
+namespace {
+
+constexpr std::uint64_t kLongUnlockPastEpoch = 3;
+
+struct LongLockFixture {
+  TimedFixture fx = make_timed_fixture();
+  Tx body;
+  TxTimed timed;
+  std::uint64_t unlock{0};
+  consensus::CanonicalDerivedState included;  // after the inclusion block (height 1)
+};
+
+LongLockFixture make_long_lock_fixture() {
+  LongLockFixture f;
+  f.body = timed_body_spend(f.fx, f.fx.body_op, f.fx.body_out);
+  f.unlock = f.fx.cfg.network.committee_epoch_blocks + kLongUnlockPastEpoch;
+  const auto timed = build_timed(f.fx, f.fx.parent, f.unlock, AnyTx{f.body});
+  if (!timed.has_value()) throw std::runtime_error("long lock build failed");
+  f.timed = *timed;
+  f.included = apply_frontier_or_throw(f.fx.cfg, f.fx.parent, {f.timed.serialize()});
+  return f;
+}
+
+consensus::CanonicalDerivedState advance_to(const consensus::CanonicalDerivationConfig& cfg,
+                                            consensus::CanonicalDerivedState state, std::uint64_t height) {
+  while (state.finalized_height < height) state = apply_frontier_or_throw(cfg, state, {});
+  return state;
+}
+
+LongTimeSignature long_opening(const LongLockFixture& f, const consensus::CanonicalDerivedState& state) {
+  const auto sig = test::test_time_signature_by(f.fx.cfg, state.timed_key_sets.at(f.timed.committee_root), f.unlock,
+                                                {key_from_byte(90)});
+  if (!sig.has_value()) throw std::runtime_error("long opening below threshold");
+  return LongTimeSignature{f.unlock, f.timed.committee_root, *sig};
+}
+
+// Executes the next (empty) block on `parent` with `entries`; the error, empty if it executed.
+std::string execute_with_openings(const consensus::CanonicalDerivationConfig& cfg,
+                                  const consensus::CanonicalDerivedState& parent,
+                                  const std::vector<LongTimeSignature>& entries) {
+  const auto height = parent.finalized_height + 1;
+  const auto time_signature = test::test_prev_time_signature(cfg, parent, {key_from_byte(90)});
+  const auto timed = consensus::timed_execution_context_for(cfg, parent, height, *time_signature, &entries);
+  SpecialValidationContext ctx;
+  ctx.network = &cfg.network;
+  ctx.chain_id = &cfg.chain_id;
+  consensus::FrontierExecutionResult result;
+  std::string err;
+  if (!consensus::execute_frontier_slice(parent.utxos, parent.confidential_pool_value, parent.finalized_frontier, {},
+                                         &ctx, &result, &err, true, nullptr, &timed)) {
+    return err.empty() ? "failed" : err;
+  }
+  return "";
+}
+
+}  // namespace
+
+// Included at height 1 to unlock past its epoch: it names the inclusion epoch's committee, whose keys
+// are kept with the escrow; unlock + 1 passes without an opening (no short-lock settlement); the
+// block carrying the committee's aggregate on the unlock height settles it first, applies the body
+// and refunds the bond, and the key set and the bond lien go with it.
+TEST(test_long_timed_lock_settles_with_its_named_committee) {
+  auto f = make_long_lock_fixture();
+  const auto epoch_blocks = f.fx.cfg.network.committee_epoch_blocks;
+  ASSERT_TRUE(consensus::timed_is_long_lock(f.timed, epoch_blocks));
+  ASSERT_EQ(f.timed.committee_epoch, 1u);
+  ASSERT_EQ(f.included.timed_escrows.size(), 1u);
+  ASSERT_EQ(f.included.timed_key_sets.size(), 1u);
+  ASSERT_TRUE(consensus::committee_bls_key_root(f.included.timed_key_sets.at(f.timed.committee_root)) ==
+              f.timed.committee_root);
+  const auto validator = key_from_byte(90).public_key;
+  ASSERT_TRUE(consensus::timed_bond_lien(f.included, validator, 2, epoch_blocks));
+  ASSERT_TRUE(!consensus::timed_bond_lien(f.included, validator, 1 + consensus::kTimedLongLienBlocks, epoch_blocks));
+  ASSERT_TRUE(!consensus::timed_bond_lien(f.included, key_from_byte(91).public_key, 2, epoch_blocks));
+
+  auto state = advance_to(f.fx.cfg, f.included, f.unlock + 1);
+  ASSERT_EQ(state.timed_escrows.size(), 1u);
+  ASSERT_TRUE(has_utxo(state, f.fx.body_op));
+
+  const std::vector<LongTimeSignature> entries{long_opening(f, state)};
+  const auto record = make_frontier_record(state, {}, f.fx.cfg, 0, {}, nullptr, &entries);
+  ASSERT_TRUE(record.transition.long_time_signatures == entries);
+  const auto parsed = FrontierTransition::parse(record.transition.serialize());
+  ASSERT_TRUE(parsed.has_value() && parsed->long_time_signatures == entries);
+  ASSERT_TRUE(parsed->transition_id() == record.transition.transition_id());
+  consensus::CanonicalDerivedState settled;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(f.fx.cfg, state, record, &settled, &err));
+  ASSERT_TRUE(settled.timed_escrows.empty());
+  ASSERT_TRUE(settled.timed_key_sets.empty());
+  ASSERT_EQ(settled.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(settled.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(!settled.last_timed_settlements[0].expired);
+  ASSERT_TRUE(has_utxo(settled, OutPoint{f.body.txid(), 0}));
+  ASSERT_TRUE(has_utxo(settled, consensus::timed_refund_outpoint(f.timed.txid())));
+  ASSERT_TRUE(!consensus::timed_bond_lien(settled, validator, settled.finalized_height + 1, epoch_blocks));
+}
+
+// An opening must be canonical, for a final unlock height, name a stored key set with a waiting
+// escrow, and carry a threshold aggregate that verifies; anything else makes the block invalid.
+TEST(test_long_time_signature_rules) {
+  auto f = make_long_lock_fixture();
+  const auto& cfg = f.fx.cfg;
+  const auto before = advance_to(cfg, f.included, f.unlock - 1);  // next block is the unlock height
+  const auto due = advance_to(cfg, before, f.unlock);
+  const auto valid = long_opening(f, due);
+  ASSERT_EQ(execute_with_openings(cfg, due, {valid}), "");
+  ASSERT_EQ(execute_with_openings(cfg, before, {valid}), "frontier-long-time-signature-height-out-of-window");
+  ASSERT_EQ(execute_with_openings(cfg, due, {valid, valid}), "frontier-long-time-signatures-not-canonical");
+  auto unknown = valid;
+  unknown.committee_root[0] ^= 1;
+  ASSERT_EQ(execute_with_openings(cfg, due, {unknown}), "frontier-long-time-signature-unknown-key-set");
+  auto other_height = valid;
+  other_height.unlock_height -= 1;
+  ASSERT_EQ(execute_with_openings(cfg, due, {other_height}), "frontier-long-time-signature-nothing-to-settle");
+  auto no_signers = valid;
+  no_signers.signature.signer_indices.clear();
+  ASSERT_EQ(execute_with_openings(cfg, due, {no_signers}), "frontier-long-time-signature-below-threshold");
+  auto bad_index = valid;
+  bad_index.signature.signer_indices = {7};
+  ASSERT_EQ(execute_with_openings(cfg, due, {bad_index}), "frontier-long-time-signature-signers-not-canonical");
+  auto wrong_message = valid;
+  wrong_message.signature = *test::test_time_signature_by(cfg, due.timed_key_sets.at(f.timed.committee_root),
+                                                          f.unlock + 1, {key_from_byte(90)});
+  ASSERT_EQ(execute_with_openings(cfg, due, {wrong_message}), "frontier-long-time-signature-invalid");
+}
+
+// Nobody opens it: the escrow waits through the grace period, then the block after refunds the bond
+// without running the body (the sealed body's coin stays unspent).
+TEST(test_long_timed_lock_expires_with_a_refund) {
+  auto f = make_long_lock_fixture();
+  const auto last_chance = advance_to(f.fx.cfg, f.included, f.unlock + consensus::kTimedLongGraceBlocks);
+  ASSERT_EQ(last_chance.timed_escrows.size(), 1u);
+  const auto expired = advance_to(f.fx.cfg, last_chance, f.unlock + consensus::kTimedLongGraceBlocks + 1);
+  ASSERT_TRUE(expired.timed_escrows.empty());
+  ASSERT_TRUE(expired.timed_key_sets.empty());
+  ASSERT_EQ(expired.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(expired.last_timed_settlements[0].expired);
+  ASSERT_TRUE(!expired.last_timed_settlements[0].body_applied);
+  const auto refund = expired.utxos.find(consensus::timed_refund_outpoint(f.timed.txid()));
+  ASSERT_TRUE(refund != expired.utxos.end());
+  ASSERT_EQ(transparent_txout_from_utxo_entry(refund->second)->value, kBond);
+  ASSERT_TRUE(has_utxo(expired, f.fx.body_op));
+}
+
+// Once the unlock height is final its time signature can open the body before any block carries the
+// opening. The sealed transfer is signed under timed_body_chain_domain, so replayed as a plain record
+// it is rejected: its coin stays for the settlement, which applies it and refunds the bond. A body
+// signed under the chain domain never applies at settlement (the bond is forfeited).
+TEST(test_revealed_long_lock_body_is_no_standalone_transaction) {
+  auto f = make_long_lock_fixture();
+  const auto& cfg = f.fx.cfg;
+  const auto due = advance_to(cfg, f.included, f.unlock + 1);
+  const auto replayed = apply_frontier_or_throw(cfg, due, {f.body.serialize()});
+  ASSERT_TRUE(has_utxo(replayed, f.fx.body_op));
+  ASSERT_TRUE(!has_utxo(replayed, OutPoint{f.body.txid(), 0}));
+
+  const std::vector<LongTimeSignature> entries{long_opening(f, replayed)};
+  const auto record = make_frontier_record(replayed, {}, cfg, 0, {}, nullptr, &entries);
+  consensus::CanonicalDerivedState settled;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(cfg, replayed, record, &settled, &err));
+  ASSERT_EQ(settled.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(settled.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(has_utxo(settled, OutPoint{f.body.txid(), 0}));
+  ASSERT_TRUE(has_utxo(settled, consensus::timed_refund_outpoint(f.timed.txid())));
+
+  auto g = make_long_lock_fixture();
+  const auto chain_signed = build_signed_p2pkh_tx_single_input(
+      replay_chain_domain(), g.fx.body_op, g.fx.body_out, g.fx.user.private_key,
+      {p2pkh_out_for_pub(g.fx.recipient.public_key, g.fx.body_out.value - 500)});
+  ASSERT_TRUE(chain_signed.has_value());
+  const auto timed = build_timed(g.fx, g.fx.parent, g.unlock, AnyTx{*chain_signed});
+  ASSERT_TRUE(timed.has_value());
+  g.timed = *timed;
+  const auto included = apply_frontier_or_throw(cfg, g.fx.parent, {g.timed.serialize()});
+  const auto g_due = advance_to(cfg, included, g.unlock + 1);
+  const std::vector<LongTimeSignature> g_entries{long_opening(g, g_due)};
+  const auto g_record = make_frontier_record(g_due, {}, cfg, 0, {}, nullptr, &g_entries);
+  ASSERT_TRUE(consensus::apply_frontier_record(cfg, g_due, g_record, &settled, &err));
+  ASSERT_EQ(settled.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(!settled.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(has_utxo(settled, g.fx.body_op));
+  ASSERT_TRUE(!has_utxo(settled, consensus::timed_refund_outpoint(g.timed.txid())));
+}
+
+// A long lock pays kTxTimedLongFeePerEpoch per epoch past its inclusion epoch and seals at most
+// kTxTimedMaxLongBodyCiphertextBytes; short locks keep the plain rules.
+TEST(test_long_timed_lock_inclusion_rules) {
+  auto fx = make_timed_fixture();
+  const auto epoch_blocks = fx.cfg.network.committee_epoch_blocks;
+  ASSERT_EQ(*consensus::timed_long_lock_min_fee(1, epoch_blocks, epoch_blocks), 0u);
+  ASSERT_EQ(*consensus::timed_long_lock_min_fee(1, epoch_blocks + 1, epoch_blocks), consensus::kTxTimedLongFeePerEpoch);
+  ASSERT_EQ(*consensus::timed_long_lock_min_fee(1, 2 * epoch_blocks, epoch_blocks), consensus::kTxTimedLongFeePerEpoch);
+  ASSERT_EQ(*consensus::timed_long_lock_min_fee(1, 2 * epoch_blocks + 1, epoch_blocks),
+            2 * consensus::kTxTimedLongFeePerEpoch);
+  ASSERT_TRUE(!consensus::timed_long_lock_min_fee(1, std::numeric_limits<std::uint64_t>::max(), 1).has_value());
+
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto accepted_at = [&](const TxTimed& tx) {
+    return !apply_frontier_or_throw(fx.cfg, fx.parent, {tx.serialize()}).timed_escrows.empty();
+  };
+  const auto unlock = 3 * epoch_blocks;
+  // The exact floor: the envelope's size fee plus the per-epoch fee (the size does not depend on the fee).
+  const auto sized = *build_timed(fx, fx.parent, unlock, AnyTx{body});
+  const auto fee = consensus::timed_min_prepaid_fee(sized.serialize().size()) +
+                   *consensus::timed_long_lock_min_fee(1, unlock, epoch_blocks);
+  ASSERT_TRUE(sized.prepaid_fee >= fee);
+  ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{body}, kBond, 1, fee)));
+  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{body}, kBond, 1, fee - 1)));
+  // A short lock pays the size fee alone.
+  const auto short_sized = *build_timed(fx, fx.parent, epoch_blocks, AnyTx{body});
+  const auto short_fee = consensus::timed_min_prepaid_fee(short_sized.serialize().size());
+  ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, epoch_blocks, AnyTx{body}, kBond, 1, short_fee)));
+  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, epoch_blocks, AnyTx{body}, kBond, 1, short_fee - 1)));
+
+  std::vector<TxOut> outs;
+  for (int i = 0; i < 40; ++i) outs.push_back(p2pkh_out_for_pub(fx.recipient.public_key, 1'000));
+  const auto large = build_signed_p2pkh_tx_single_input(timed_body_chain_domain(replay_chain_domain()), fx.body_op, fx.body_out,
+                                                        fx.user.private_key, outs);
+  ASSERT_TRUE(large.has_value() && large->serialize().size() > 1024);
+  ASSERT_TRUE(!accepted_at(*build_timed(fx, fx.parent, unlock, AnyTx{*large})));
+  ASSERT_TRUE(accepted_at(*build_timed(fx, fx.parent, epoch_blocks, AnyTx{*large})));
+}
+
+// Long-term archiving: a reveal at the full long-lock body size is admitted, and its named committee's
+// opening publishes the data.
+TEST(test_long_timed_lock_reveals_data) {
+  auto fx = make_timed_fixture();
+  const auto epoch_blocks = fx.cfg.network.committee_epoch_blocks;
+  const auto unlock = epoch_blocks + kLongUnlockPastEpoch;
+  const Bytes data(kTimedRevealMaxDataBytes, 0x6b);
+  const auto timed = build_timed(fx, fx.parent, unlock, TimedReveal{data});
+  ASSERT_TRUE(timed.has_value() && timed->body_ciphertext.size() == consensus::kTxTimedMaxLongBodyCiphertextBytes);
+  auto state = advance_to(fx.cfg, apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()}), unlock + 1);
+  ASSERT_EQ(state.timed_escrows.size(), 1u);
+  const auto sig = test::test_time_signature_by(fx.cfg, state.timed_key_sets.at(timed->committee_root), unlock,
+                                                {key_from_byte(90)});
+  ASSERT_TRUE(sig.has_value());
+  const std::vector<LongTimeSignature> entries{LongTimeSignature{unlock, timed->committee_root, *sig}};
+  const auto record = make_frontier_record(state, {}, fx.cfg, 0, {}, nullptr, &entries);
+  consensus::CanonicalDerivedState settled;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, state, record, &settled, &err));
+  ASSERT_EQ(settled.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(settled.last_timed_settlements[0].revealed_data == data);
+  ASSERT_TRUE(has_utxo(settled, consensus::timed_refund_outpoint(timed->txid())));
+}
+
+// Client terms: a lock within the next block's epoch is short at the base fee; past it, long, with the
+// per-epoch fee, an inclusion deadline at the epoch's end, a margin before it, and the lien warning.
+TEST(test_timed_lock_terms) {
+  constexpr std::uint64_t epoch = 32;
+  ASSERT_EQ(consensus::timed_min_prepaid_fee(1), consensus::kTxTimedMinPrepaidFee + consensus::kTxTimedPrepaidFeePerKiB);
+  ASSERT_EQ(consensus::timed_min_prepaid_fee(2048), consensus::kTxTimedMinPrepaidFee + 2 * consensus::kTxTimedPrepaidFeePerKiB);
+  ASSERT_EQ(consensus::timed_min_prepaid_fee(2049), consensus::kTxTimedMinPrepaidFee + 3 * consensus::kTxTimedPrepaidFeePerKiB);
+  constexpr std::size_t bytes = 9'000;  // 9 KiB started
+  const auto size_fee = consensus::timed_min_prepaid_fee(bytes);
+  const auto short_lock = consensus::timed_lock_terms(33, 40, epoch, bytes);
+  ASSERT_TRUE(short_lock.has_value() && !short_lock->long_lock && short_lock->prepaid_fee == size_fee);
+  ASSERT_EQ(short_lock->committee_epoch, 33u);
+  ASSERT_EQ(short_lock->last_inclusion_height, 40u);
+  const auto long_lock = consensus::timed_lock_terms(33, 64 + 33, epoch, bytes);
+  ASSERT_TRUE(long_lock.has_value() && long_lock->long_lock && !long_lock->beyond_lien);
+  ASSERT_EQ(long_lock->prepaid_fee, size_fee + 2 * consensus::kTxTimedLongFeePerEpoch);
+  ASSERT_EQ(long_lock->committee_epoch, 33u);
+  ASSERT_EQ(long_lock->last_inclusion_height, 64u);
+  ASSERT_TRUE(consensus::timed_lock_terms(62, 200, epoch, bytes).has_value());
+  std::string err;
+  ASSERT_TRUE(!consensus::timed_lock_terms(63, 200, epoch, bytes, &err).has_value() && !err.empty());
+  ASSERT_TRUE(consensus::timed_lock_terms(63, 64, epoch, bytes).has_value());  // short: no margin needed
+  ASSERT_TRUE(!consensus::timed_lock_terms(33, 32, epoch, bytes).has_value());
+  ASSERT_TRUE(consensus::timed_lock_terms(33, 33 + consensus::kTimedLongLienBlocks + 1, epoch, bytes)->beyond_lien);
+
+  // The client bound covers a real envelope (four keys, a one-input transfer and a full reveal).
+  auto fx = make_timed_fixture();
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto keys = consensus::time_signature_committee_keys(fx.cfg, fx.parent, 1);
+  for (const TimedBody& sealed : {TimedBody{AnyTx{body}}, TimedBody{TimedReveal{Bytes(kTimedRevealMaxDataBytes, 1)}}}) {
+    const auto timed = build_timed(fx, fx.parent, 1, sealed);
+    ASSERT_TRUE(timed.has_value());
+    const auto bound = timed_envelope_bytes_bound(keys->size(), serialize_timed_body(sealed).size());
+    ASSERT_TRUE(timed->serialize().size() <= bound && bound - timed->serialize().size() < 256);
+  }
+
+  std::vector<std::pair<OutPoint, TxOut>> coins;
+  for (std::uint8_t i = 1; i <= 3; ++i) {
+    OutPoint op{};
+    op.txid.fill(i);
+    coins.push_back({op, p2pkh_out_for_pub(key_from_byte(171).public_key, 1'000'000ull * i)});
+  }
+  const auto coin = select_timed_fee_coin(coins, 500'000, 1'000'000);
+  ASSERT_TRUE(coin.has_value() && coin->second.value == 2'000'000);
+  ASSERT_TRUE(!select_timed_fee_coin(coins, 3'000'000, 1).has_value());
+}
+
+// A reveal is stored as one "TR:" row: settling height and data.
+TEST(test_timed_reveal_rows_round_trip) {
+  const std::string path = unique_test_base("/tmp/finalis_test_timed_reveal_rows");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+  Hash32 txid{};
+  txid.fill(0x3e);
+  ASSERT_TRUE(!db.get_timed_reveal(txid).has_value());
+  storage::DB::Batch batch(db);
+  batch.put_timed_reveal(txid, 42, Bytes{1, 2, 3});
+  ASSERT_TRUE(db.write_batch(batch));
+  const auto got = db.get_timed_reveal(txid);
+  ASSERT_TRUE(got.has_value() && got->height == 42 && got->data == (Bytes{1, 2, 3}));
+}
+
+// Key sets persist as one "TK:" row each and load back only if the keys hash to the row's root.
+TEST(test_long_lock_key_sets_persist_and_reload) {
+  auto f = make_long_lock_fixture();
+  const std::string path = unique_test_base("/tmp/finalis_test_timed_key_set_rows");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+  ASSERT_TRUE(node::detail::persist_canonical_cache_rows(db, f.included));
+  ASSERT_TRUE(node::detail::load_timed_key_sets(db) == f.included.timed_key_sets);
+  Hash32 other{};
+  other.fill(0x5A);
+  ASSERT_TRUE(db.put(node::detail::timed_key_set_db_key(other),
+                     node::detail::encode_timed_key_set(f.included.timed_key_sets.begin()->second)));
+  ASSERT_TRUE(node::detail::load_timed_key_sets(db) == f.included.timed_key_sets);
+  ASSERT_TRUE(node::detail::persist_canonical_cache_rows(db, f.fx.parent));
+  ASSERT_TRUE(node::detail::load_timed_key_sets(db).empty());
 }

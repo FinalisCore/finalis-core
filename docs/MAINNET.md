@@ -18,6 +18,8 @@ It should be used together with:
 - magic: `0x499602D2` (`1234567890`)
 - default p2p port: `19440`
 - default lightserver RPC port: `19444`
+- validators: genesis names one bootstrap validator (the maintainer's published key); every other
+  validator joins by bonding on chain (`mainnet/MAINNET_PLAN.md`, "Launch model")
 
 ## 2. Public lightserver RPC endpoints
 

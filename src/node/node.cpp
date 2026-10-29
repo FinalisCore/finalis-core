@@ -467,11 +467,18 @@ void Node::stop() {
   }
   const bool was_running = running_.exchange(false);
   stop_lightserver_child();
+  // Fail-stop: skip every optional write (peer lists, address book, memtable flush); the DB is
+  // fenced, so only close() touches storage. Not bounded here: close() can block after an ENOSPC
+  // WAL failure (KNOWN_DEFECTS.md E2); apps/finalis-node bounds the process with a watchdog.
+  const bool halted = safety_storage_failed();
+  if (halted && was_running) log_line("shutdown-begin reason=safety-storage-failure skip=peers,addrman,flush");
   if (!was_running) {
     join_local_bus_tasks();
-    persist_peers();
-    persist_addrman();
-    persist_validators_addrman({});
+    if (!halted) {
+      persist_peers();
+      persist_addrman();
+      persist_validators_addrman({});
+    }
     p2p_.stop();
     db_.close();
     return;
@@ -488,6 +495,7 @@ void Node::stop() {
     }
   }
   if (restart_debug_) log_line("restart-debug event-loop-joined");
+  if (endpoint_self_check_thread_.joinable()) endpoint_self_check_thread_.join();
   if (restart_debug_) log_line("restart-debug round-timer-cancelled");
   join_local_bus_tasks();
   if (restart_debug_) log_line("restart-debug local-bus-tasks-joined");
@@ -496,13 +504,15 @@ void Node::stop() {
   for (int id : p2p_.peer_ids()) persisted_peers.push_back(p2p_.get_peer_info(id));
   p2p_.stop();
   if (restart_debug_) log_line("restart-debug p2p-stopped");
-  persist_peers(persisted_peers);
-  persist_addrman();
-  persist_validators_addrman(persisted_peers);
-  if (restart_debug_) log_line("restart-debug peers-persisted");
+  if (!halted) {
+    persist_peers(persisted_peers);
+    persist_addrman();
+    persist_validators_addrman(persisted_peers);
+    if (restart_debug_) log_line("restart-debug peers-persisted");
+  }
   {
     std::lock_guard<std::mutex> lk(mu_);
-    (void)db_.flush();
+    if (!halted) (void)db_.flush();
     if (restart_debug_) log_line("restart-debug db-flushed");
     db_.close();
     if (restart_debug_) log_line("restart-debug db-closed");
@@ -581,6 +591,10 @@ bool Node::start_lightserver_child() {
     args.push_back("--trusted-proxy");
     args.push_back(cfg_.lightserver_trusted_proxy);
   }
+  if (!cfg_.lightserver_client_ip_header.empty()) {
+    args.push_back("--client-ip-header");
+    args.push_back(cfg_.lightserver_client_ip_header);
+  }
 
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);
@@ -607,6 +621,15 @@ bool Node::start_lightserver_child() {
   ::usleep(200 * 1000);
   int status = 0;
   const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+  bool reaped_elsewhere = false;  // the exit monitor may have collected it first ("lightserver exited")
+  if (waited < 0 && errno == ECHILD) {
+    std::lock_guard<std::mutex> lk(lightserver_mu_);
+    reaped_elsewhere = lightserver_pid_ != static_cast<int>(pid);
+  }
+  if (reaped_elsewhere) {
+    log_line("lightserver startup failed mode=" + mode + " pid=" + std::to_string(pid) + " reason=exited-early");
+    return false;
+  }
   if (waited == pid) {
     std::lock_guard<std::mutex> lk(lightserver_mu_);
     lightserver_pid_ = -1;
@@ -1122,9 +1145,23 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
 
 void Node::event_loop() {
   while (running_) {
+    // Fail-stop: no proposals, timeout votes, rebroadcasts or background writes; stop() and the
+    // process supervisor take it from here.
+    if (safety_storage_failed()) {
+      {
+        // Any failed DB write fences the DB (storage::DB::fence_writes); fail-stop on it as on a
+        // failed safety write. No-op if a safety write already entered fail-stop.
+        std::lock_guard<std::mutex> lk(mu_);
+        enter_safety_fail_stop_locked("storage-write", db_.write_fence_reason());
+      }
+      log_line("event-loop-exit reason=safety-storage-failure");
+      break;
+    }
     (void)reap_lightserver_child(true);
     std::optional<p2p::ProposeMsg> propose_to_send;
     std::optional<TimeoutVote> timeout_vote_to_broadcast;
+    std::optional<p2p::TimeSignatureMsg> time_signature_to_broadcast;
+    std::vector<p2p::TimeSignatureMsg> long_time_signatures_to_broadcast;
     LocalVoteRebroadcast votes_to_rebroadcast;
     std::vector<int> keepalive_peers;
     std::vector<int> finalized_tip_poll_peers;
@@ -1338,6 +1375,22 @@ void Node::event_loop() {
       }
       }
 
+      if (!repair_mode_) {
+        time_signature_to_broadcast = maybe_sign_time_signature_locked();
+        if (!time_signature_to_broadcast.has_value() && local_time_signature_.has_value() &&
+            local_time_signature_->height == finalized_height_ &&
+            now_ms >= last_time_signature_broadcast_ms_ + cfg_.network.round_timeout_ms) {
+          time_signature_to_broadcast = local_time_signature_;
+        }
+        if (time_signature_to_broadcast.has_value()) last_time_signature_broadcast_ms_ = now_ms;
+        long_time_signatures_to_broadcast = maybe_sign_long_time_signatures_locked();
+        if (long_time_signatures_to_broadcast.empty() && !local_long_time_signatures_.empty() &&
+            now_ms >= last_long_time_signature_broadcast_ms_ + cfg_.network.round_timeout_ms) {
+          for (const auto& [_, msg] : local_long_time_signatures_) long_time_signatures_to_broadcast.push_back(msg);
+        }
+        if (!long_time_signatures_to_broadcast.empty()) last_long_time_signature_broadcast_ms_ = now_ms;
+      }
+
       const auto committee = committee_for_height_round(h, current_round_);
       const bool committee_ready = !committee.empty();
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
@@ -1489,11 +1542,21 @@ void Node::event_loop() {
         force_validator_redial = true;
       }
       const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
+      // A proposal carries the parent's time signature (consensus::verify_prev_time_signature).
+      const auto [time_signatures_known, time_signature_threshold] = time_signature_progress_for_next_height_locked();
+      const bool time_signature_ready = time_signatures_known >= time_signature_threshold;
+      if (!time_signature_ready && can_propose && proposal_block_interval_ready && proposal_clock_ready &&
+          now_ms >= last_time_signature_wait_log_ms_ + 5000) {
+        log_line("proposal-build-wait height=" + std::to_string(h) + " round=" + std::to_string(current_round_) +
+                 " reason=time-signatures known=" + std::to_string(time_signatures_known) +
+                 " threshold=" + std::to_string(time_signature_threshold));
+        last_time_signature_wait_log_ms_ = now_ms;
+      }
       // SAFETY: an abstaining node may already have proposed at this height before losing its
       // safety state; proposing again could be a different payload (proposer equivocation).
       if (!repair_mode_ && !pause_proposals_.load() && can_propose && committee_ready && proposal_block_interval_ready && proposal_clock_ready &&
           ticket_window_elapsed && !committee.empty() && round_justification_ready && quorum_validator_connectivity_ready &&
-          !abstaining_at_height_locked(h)) {
+          time_signature_ready && !abstaining_at_height_locked(h)) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           should_build_proposal = true;
@@ -1542,7 +1605,7 @@ void Node::event_loop() {
         // Timeout votes are blocked too while abstaining (conservative: no signatures at all at h).
         const bool abstaining = abstaining_at_height_locked(h);
         if (local_timeout_member && !local_timeout_reserved && !abstaining) {
-          if (auto sig = crypto::ed25519_sign(timeout_vote_signing_message(consensus_domain_, h, timeout_round), local_key_.private_key);
+          if (auto sig = sign_consensus_locked(timeout_vote_signing_message(consensus_domain_, h, timeout_round));
               sig.has_value()) {
             local_timeout_vote_reservations_.insert(timeout_vote_key);
             local_timed_out_rounds_.insert(timeout_vote_key);
@@ -1618,8 +1681,8 @@ void Node::event_loop() {
         const auto transition_id = selected->transition.transition_id();
         const std::optional<std::uint32_t> pol_round =
             reproposal_pol.has_value() ? std::optional<std::uint32_t>(reproposal_pol->round) : std::nullopt;
-        auto sig = crypto::ed25519_sign(propose_signing_message(consensus_domain_, build_height, build_round, transition_id, pol_round),
-                                        local_key_.private_key);
+        auto sig =
+            sign_consensus_locked(propose_signing_message(consensus_domain_, build_height, build_round, transition_id, pol_round));
         if (finalized_height_ + 1 == build_height && current_round_ == build_round && sig.has_value() &&
             proposed_in_round_.find(key) == proposed_in_round_.end()) {
           proposed_in_round_[key] = true;
@@ -1654,9 +1717,13 @@ void Node::event_loop() {
           alt.frontier_proposal_bytes = proposal->serialize();
           const std::optional<std::uint32_t> pol_round =
               alt.pol.has_value() ? std::optional<std::uint32_t>(alt.pol->round) : std::nullopt;
-          if (auto sig = crypto::ed25519_sign(
-                  propose_signing_message(consensus_domain_, alt.height, alt.round, proposal->transition.transition_id(), pol_round),
-                  local_key_.private_key)) {
+          std::optional<Sig64> sig;
+          {
+            std::lock_guard<std::mutex> lk(mu_);
+            sig = sign_consensus_locked(
+                propose_signing_message(consensus_domain_, alt.height, alt.round, proposal->transition.transition_id(), pol_round));
+          }
+          if (sig) {
             alt.proposer_signature = *sig;
             bool flip = false;
             for (int peer_id : p2p_.peer_ids()) {
@@ -1681,6 +1748,10 @@ void Node::event_loop() {
 
     // Backstop for finalizations reached from event-loop paths (sync, repair).
     flush_pending_finalized_broadcasts();
+    maintain_endpoints();
+
+    if (time_signature_to_broadcast.has_value()) broadcast_time_signature(*time_signature_to_broadcast);
+    for (const auto& msg : long_time_signatures_to_broadcast) broadcast_time_signature(msg);
 
     for (const auto& v : votes_to_rebroadcast.timeouts) broadcast_timeout_vote(v);
     for (const auto& v : votes_to_rebroadcast.prevotes) broadcast_prevote(v);
@@ -1826,7 +1897,12 @@ SpecialValidationContext Node::special_validation_context_locked(std::uint64_t h
         if (anchor_height == 0) return zero_hash();
         return db_.get_height_hash(anchor_height);
       },
-      .confidential_policy = &confidential_policy_};
+      .confidential_policy = &confidential_policy_,
+      .base_fee_per_kib = canonical_state_.has_value() ? canonical_state_->base_fee_per_kib : 0,
+      .timed_bond_lien = [this](const PubKey32& pub, std::uint64_t h) {
+        return canonical_state_.has_value() &&
+               consensus::timed_bond_lien(*canonical_state_, pub, h, cfg_.network.committee_epoch_blocks);
+      }};
 }
 
 std::uint64_t Node::now_unix() const {

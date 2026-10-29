@@ -37,6 +37,14 @@ struct SpecialValidationContext {
   // anchor may come from legacy block history or frontier transition history.
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
   const struct ConfidentialPolicy* confidential_policy{nullptr};
+  // The chain's base fee for this height (consensus::next_base_fee_per_kib): every transaction pays at
+  // least this per started KiB. 0: not checked. A timed body is exempt (its fee was prepaid).
+  std::uint64_t base_fee_per_kib{0};
+  // True while (validator pubkey, height) holds a bond a pending long time lock names
+  // (consensus::timed_bond_lien): the bond cannot be withdrawn yet. Unset: no lien.
+  std::function<bool(const PubKey32&, std::uint64_t)> timed_bond_lien;
+  // Validating the sealed body of a settling TxTimed: its signatures cover timed_body_chain_domain.
+  bool timed_body{false};
 };
 
 struct SlashEvidence {
@@ -46,23 +54,55 @@ struct SlashEvidence {
   Bytes raw_blob;
 };
 
+// Early time signature: a validator's BLS signature on time_signature_message(D, height) included in a
+// block at a height <= `height`, before that height is final. Honest validators sign a height only
+// once they hold its finality certificate (and named committees of long locks only after that), so it
+// proves the key's owner leaked a share of a time lock's key early. Script_sig
+// "SCTSLASH" | varbytes(u64le height | signature(96)); the SCBURN output commits to sha256d of the blob.
+struct EarlyTimeSignatureEvidence {
+  std::uint64_t height{0};
+  crypto::BlsSignature signature{};
+  Bytes raw_blob;
+};
+
 inline constexpr std::size_t kMaxTxInputs = 512;
 inline constexpr std::size_t kMaxTxEd25519Verifies = 1024;
+// A BLS proof-of-possession check (two pairings) in units of the Ed25519 verify budget.
+inline constexpr std::size_t kBlsPopVerifyCost = 32;
 
 TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
                                const SpecialValidationContext* ctx = nullptr);
 // Transaction signatures cover the chain domain (consensus_chain_domain: network id and genesis
 // hash), like consensus signatures, so a transaction signed for one network is invalid on every other
 // one even when it spends an outpoint that exists on both (genesis bonds).
-std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index);
+//
+// They also cover every output the transaction spends (value and script, in input order; `spent` has
+// one entry per input): a signer told a wrong value or script for any input signs a transaction that
+// is invalid, instead of one whose real fee is larger than it was shown. nullopt if `spent` does not
+// match the inputs.
+std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                               const std::vector<TxOut>& spent);
+Hash32 spent_outputs_hash(const std::vector<TxOut>& spent);
 std::optional<Bytes> signing_message_for_input_v2(const Hash32& chain_domain, const TxV2& tx,
                                                   std::uint32_t input_index);
 std::optional<Hash32> balance_proof_message_v2(const Hash32& chain_domain, const TxV2& tx);
-std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index);
+std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                              const std::vector<TxOut>& spent);
+// The fee input's signature of a TxTimed: covers every field (the SWE ciphertext, proof and the
+// sealed body included) except the script_sig itself.
+Bytes signing_message_for_timed_fee_input(const Hash32& chain_domain, const TxTimed& tx);
 // The chain domain transaction signatures are checked under; empty when ctx lacks chain identity.
 std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx);
-Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
-Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
+// The domain a TxTimed's sealed transfer is signed under (in place of the chain domain). A revealed
+// body is then no valid transaction on its own: it runs only through its settlement, so nobody who
+// decrypted it can spend its inputs first and make the settlement forfeit the bond.
+Hash32 timed_body_chain_domain(const Hash32& chain_domain);
+// The Ed25519 proof of a registration covers the validator's BLS key: a script that pairs a
+// validator with someone else's BLS key does not verify.
+Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                          const crypto::BlsPublicKey& bls_pubkey);
+Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                         const crypto::BlsPublicKey& bls_pubkey);
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id);
 Hash32 onboarding_registration_commitment(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs);
@@ -99,10 +139,57 @@ Bytes prevote_signing_message(const Hash32& chain_domain, std::uint64_t height, 
 Bytes propose_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
                               const Hash32& transition_id, std::optional<std::uint32_t> pol_round);
 Bytes timeout_vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round);
+// The McFly time-signature message T of a height: what every committee member signs with its BLS key
+// (crypto::kBlsTimeSignatureDst) once it holds that height's finality certificate, and what a
+// TxTimed with that unlock_height is SWE-encrypted to. No round or transition: it must be known in
+// advance.
+Bytes time_signature_message(const Hash32& chain_domain, std::uint64_t height);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);
 bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubKey32* out_pub = nullptr);
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey);
+
+// --- Height-locked outputs (transparent, Tx v1) ---
+//
+// SCHLOCK1 "locked":      "SCHLOCK1" | u64le unlock_height | pkh(20)
+//   spendable by pkh in a block at height >= unlock_height.
+// SCHLOCK2 "inheritance": "SCHLOCK2" | u64le unlock_height | owner_pkh(20) | heir_pkh(20)
+//   spendable by the owner at any height, and by the heir at height >= unlock_height.
+// The script_sig is the P2PKH one (sig, pubkey) and signs signing_message_for_input. The rule needs
+// nothing but the block height, so a lock holds for any horizon whoever validates then.
+inline constexpr std::size_t kHeightLockScriptBytes = 8 + 8 + 20;
+inline constexpr std::size_t kInheritanceLockScriptBytes = 8 + 8 + 20 + 20;
+struct HeightLockScript {
+  std::uint64_t unlock_height{0};
+  std::array<std::uint8_t, 20> beneficiary_pkh{};        // spends from unlock_height
+  std::optional<std::array<std::uint8_t, 20>> owner_pkh;  // inheritance form: spends at any height
+};
+std::optional<HeightLockScript> parse_height_lock_script(const Bytes& script_pubkey);
+Bytes height_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& pkh);
+Bytes inheritance_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& owner_pkh,
+                                     const std::array<std::uint8_t, 20>& heir_pkh);
+// --- Data outputs ---
+//
+// SCDATA01: "SCDATA01" | data (1..kDataOutputMaxBytes bytes). Value 0, never spendable: it is not
+// added to the UTXO set, only to address history. Indexed under sha256(script_pubkey) and, when the
+// data is longer than kDataOutputTopicBytes, under the data output script of its first
+// kDataOutputTopicBytes bytes (a topic, such as an auction id, shared by all outputs that start with it).
+inline constexpr std::size_t kDataOutputMaxBytes = 80;
+inline constexpr std::size_t kDataOutputTopicBytes = 32;
+bool is_data_output_script(const Bytes& script_pubkey, Bytes* out_data = nullptr);
+std::optional<Bytes> data_output_script_pubkey(const Bytes& data);
+
+// Whether the key with hash `pkh` may spend an output with `script_pubkey` in a block at `height`:
+// P2PKH to pkh, or a height lock's permitted branch. Wallets use it to pick spendable coins.
+bool script_spendable_by(const Bytes& script_pubkey, const std::array<std::uint8_t, 20>& pkh, std::uint64_t height);
+// Address-index keys of a transparent output: sha256(script_pubkey), plus for a height lock the P2PKH
+// scripthash of each key that may spend it, so the beneficiary's (and owner's) wallet finds it, and
+// for a data output its topic's scripthash.
+std::vector<Hash32> script_index_hashes(const Bytes& script_pubkey);
+bool script_indexed_under(const Bytes& script_pubkey, const Hash32& scripthash);
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out);
+bool parse_early_time_signature_script_sig(const Bytes& script_sig, EarlyTimeSignatureEvidence* out = nullptr);
+// Either kind of slashing evidence (equivocation or early time signature): the spend bans the validator.
+bool is_slash_script_sig(const Bytes& script_sig);
 
 struct ConfidentialPolicy {
   std::uint32_t max_inputs_per_tx{kTxV2MaxInputs};
@@ -133,6 +220,9 @@ AnyTxValidationResult validate_tx_v2(const TxV2& tx, size_t tx_index_in_block, c
                                      const SpecialValidationContext* ctx = nullptr);
 AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                       const SpecialValidationContext* ctx = nullptr);
+// The same without the base-fee check (callers that apply their own fee rules).
+AnyTxValidationResult validate_any_tx_without_base_fee(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
+                                                       const SpecialValidationContext* ctx = nullptr);
 
 // Confidential verification weight (consensus). Unit: one range-proof byte (~0.72 us of verify).
 // Computed from structure alone so a block's total can be bounded before any cryptographic

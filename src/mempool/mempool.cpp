@@ -405,6 +405,8 @@ std::size_t Mempool::size() const { return by_txid_.size(); }
 
 std::size_t Mempool::total_bytes() const { return total_bytes_; }
 
+bool Mempool::spends(const OutPoint& op) const { return spent_outpoints_.contains(op); }
+
 bool Mempool::contains(const Hash32& txid) const { return by_txid_.find(txid) != by_txid_.end(); }
 
 std::vector<MempoolEntry> Mempool::entries(std::size_t max) const {

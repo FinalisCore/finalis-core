@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_validator_bls.hpp"
 
 #include "common/address.hpp"
 #include "common/chain_id.hpp"
@@ -38,42 +39,56 @@ Bytes unb_script(const PubKey32& pub) {
   return s;
 }
 
-Bytes join_request_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
-  Bytes s{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
-  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
-  s.insert(s.end(), pop.begin(), pop.end());
-  return s;
+Bytes join_request_script(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop) {
+  const auto bls = test::test_bls_registration(validator);
+  ValidatorJoinRequestScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  return encode_validator_join_request_script(d);
 }
 
-Bytes onboarding_registration_script(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop) {
-  Bytes s{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
-  s.insert(s.end(), validator_pub.begin(), validator_pub.end());
-  s.insert(s.end(), payout_pub.begin(), payout_pub.end());
-  s.insert(s.end(), pop.begin(), pop.end());
-  return s;
+Bytes onboarding_registration_script(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop) {
+  const auto bls = test::test_bls_registration(validator);
+  OnboardingRegistrationScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  return encode_onboarding_registration_script(d);
 }
 
-Bytes onboarding_registration_script_with_pow(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop,
+Bytes onboarding_registration_script_with_pow(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop,
                                               std::uint64_t epoch, std::uint64_t nonce) {
-  Bytes s = onboarding_registration_script(validator_pub, payout_pub, pop);
-  codec::ByteWriter w;
-  w.u64le(epoch);
-  w.u64le(nonce);
-  const auto suffix = w.take();
-  s.insert(s.end(), suffix.begin(), suffix.end());
-  return s;
+  const auto bls = test::test_bls_registration(validator);
+  OnboardingRegistrationScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  d.has_admission_pow = true;
+  d.admission_pow_epoch = epoch;
+  d.admission_pow_nonce = nonce;
+  return encode_onboarding_registration_script(d);
 }
 
-Bytes join_request_script_with_pow(const PubKey32& validator_pub, const PubKey32& payout_pub, const Sig64& pop,
+Bytes join_request_script_with_pow(const crypto::KeyPair& validator, const PubKey32& payout_pub, const Sig64& pop,
                                    std::uint64_t epoch, std::uint64_t nonce) {
-  Bytes s = join_request_script(validator_pub, payout_pub, pop);
-  codec::ByteWriter w;
-  w.u64le(epoch);
-  w.u64le(nonce);
-  const auto suffix = w.take();
-  s.insert(s.end(), suffix.begin(), suffix.end());
-  return s;
+  const auto bls = test::test_bls_registration(validator);
+  ValidatorJoinRequestScriptData d{};
+  d.validator_pubkey = validator.public_key;
+  d.payout_pubkey = payout_pub;
+  d.pop = pop;
+  d.bls_pubkey = bls.pubkey;
+  d.bls_pop = bls.pop;
+  d.has_admission_pow = true;
+  d.admission_pow_epoch = epoch;
+  d.admission_pow_nonce = nonce;
+  return encode_validator_join_request_script(d);
 }
 
 ChainId sample_chain_id(const NetworkConfig& net) {
@@ -147,9 +162,9 @@ TEST(test_onboarding_registration_script_detection) {
   const auto validator = key_from_byte(0x31);
   const auto payout = key_from_byte(0x32);
   const auto pop =
-      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                             validator.private_key);
-  Bytes req = onboarding_registration_script(validator.public_key, payout.public_key, pop);
+  Bytes req = onboarding_registration_script(validator, payout.public_key, pop);
   PubKey32 out_validator{};
   PubKey32 out_payout{};
   Sig64 out_pop{};
@@ -167,9 +182,9 @@ TEST(test_onboarding_registration_script_roundtrip_with_admission_pow_fields) {
   const auto validator = key_from_byte(0x33);
   const auto payout = key_from_byte(0x34);
   const auto pop =
-      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                             validator.private_key);
-  const auto script = onboarding_registration_script_with_pow(validator.public_key, payout.public_key, pop, 33, 9);
+  const auto script = onboarding_registration_script_with_pow(validator, payout.public_key, pop, 33, 9);
   OnboardingRegistrationScriptData parsed{};
   ASSERT_TRUE(parse_onboarding_registration_script(script, &parsed));
   ASSERT_TRUE(parsed.has_admission_pow);
@@ -205,15 +220,15 @@ TEST(test_sconbreg_tx_rejects_join_request_mixing) {
       BOND_AMOUNT + 1000,
       address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
   auto join_pop =
-      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key),
+      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                             validator.private_key);
   auto onboarding_pop =
-      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key),
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)),
                             validator.private_key);
   std::vector<TxOut> outputs{
       TxOut{BOND_AMOUNT, reg_script(validator.public_key)},
-      TxOut{0, join_request_script(validator.public_key, payout.public_key, join_pop)},
-      TxOut{0, onboarding_registration_script(validator.public_key, payout.public_key, onboarding_pop)},
+      TxOut{0, join_request_script(validator, payout.public_key, join_pop)},
+      TxOut{0, onboarding_registration_script(validator, payout.public_key, onboarding_pop)},
   };
   const auto change = prev_out.value - BOND_AMOUNT - 1000;
   if (change > 0) outputs.push_back(TxOut{change, prev_out.script_pubkey});
@@ -351,7 +366,7 @@ TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_ancho
     ++bad_nonce;
   }
   auto bad_nonce_script = onboarding_registration_script_with_pow(
-      validator.public_key, payout.public_key, parsed.pop, parsed.admission_pow_epoch, bad_nonce);
+      validator, payout.public_key, parsed.pop, parsed.admission_pow_epoch, bad_nonce);
   auto bad_nonce_tx = build_signed_p2pkh_tx_single_input(consensus_chain_domain(net, chain_id), 
       spend_op, prev_out, sponsor.private_key,
       std::vector<TxOut>{TxOut{0, bad_nonce_script}, TxOut{prev_out.value - 1000, prev_out.script_pubkey}});
@@ -375,10 +390,10 @@ TEST(test_sconbreg_admission_pow_rejects_invalid_nonce_expired_epoch_wrong_ancho
   ASSERT_TRUE(!validate_tx(*valid_tx, 1, view, &expired_ctx).ok);
 
   auto wrong_payout_pop =
-      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, other_payout.public_key),
+      *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, other_payout.public_key, test::test_bls_pubkey(validator)),
                             validator.private_key);
   auto wrong_payout_script = onboarding_registration_script_with_pow(
-      validator.public_key, other_payout.public_key, wrong_payout_pop, parsed.admission_pow_epoch,
+      validator, other_payout.public_key, wrong_payout_pop, parsed.admission_pow_epoch,
       parsed.admission_pow_nonce);
   auto wrong_payout_tx = build_signed_p2pkh_tx_single_input(consensus_chain_domain(net, chain_id), 
       spend_op, prev_out, sponsor.private_key,
@@ -414,8 +429,8 @@ TEST(test_join_request_script_roundtrip_with_admission_pow_fields) {
   const auto validator = key_from_byte(0x51);
   const auto payout = key_from_byte(0x52);
   const auto pop =
-      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key), validator.private_key);
-  const auto script = join_request_script_with_pow(validator.public_key, payout.public_key, pop, 33, 7);
+      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)), validator.private_key);
+  const auto script = join_request_script_with_pow(validator, payout.public_key, pop, 33, 7);
   ValidatorJoinRequestScriptData parsed;
   ASSERT_TRUE(parse_validator_join_request_script(script, &parsed));
   ASSERT_EQ(parsed.validator_pubkey, validator.public_key);
@@ -510,9 +525,9 @@ TEST(test_validator_join_admission_pow_rejects_invalid_nonce_expired_epoch_wrong
   ASSERT_TRUE(parse_validator_join_request_script(valid_tx->outputs[1].script_pubkey, &parsed));
 
   const auto pop_same =
-      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key), validator.private_key);
+      *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key, test::test_bls_pubkey(validator)), validator.private_key);
   auto bad_nonce_script =
-      join_request_script_with_pow(validator.public_key, payout.public_key, pop_same, parsed.admission_pow_epoch,
+      join_request_script_with_pow(validator, payout.public_key, pop_same, parsed.admission_pow_epoch,
                                    parsed.admission_pow_nonce + 1);
   auto bad_nonce_tx =
       build_manual_join_tx(spend_op, prev_out, sponsor.private_key, validator.public_key, BOND_AMOUNT, 1'000, change_spk,
@@ -530,9 +545,9 @@ TEST(test_validator_join_admission_pow_rejects_invalid_nonce_expired_epoch_wrong
   ASSERT_TRUE(!validate_tx(*valid_tx, 1, view, &expired_ctx).ok);
 
   const auto mutated_pop = *crypto::ed25519_sign(
-      validator_join_request_pop_message(validator.public_key, other_payout.public_key), validator.private_key);
+      validator_join_request_pop_message(validator.public_key, other_payout.public_key, test::test_bls_pubkey(validator)), validator.private_key);
   auto wrong_payout_script =
-      join_request_script_with_pow(validator.public_key, other_payout.public_key, mutated_pop, parsed.admission_pow_epoch,
+      join_request_script_with_pow(validator, other_payout.public_key, mutated_pop, parsed.admission_pow_epoch,
                                    parsed.admission_pow_nonce);
   auto wrong_payout_tx =
       build_manual_join_tx(spend_op, prev_out, sponsor.private_key, validator.public_key, BOND_AMOUNT, 1'000, change_spk,
@@ -628,7 +643,7 @@ TEST(test_scvalreg_requires_matching_join_request) {
   tx.inputs.push_back(TxIn{spend_op.txid, spend_op.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs.push_back(TxOut{BOND_AMOUNT, reg_script(kp.public_key)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[spend_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, sponsor.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -671,7 +686,7 @@ TEST(test_unbond_delay_enforced) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 2000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[unb_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -689,6 +704,13 @@ TEST(test_unbond_delay_enforced) {
   SpecialValidationContext late = finalis::test::with_test_chain_identity(SpecialValidationContext{.validators = &vr, .current_height = 50 + UNBOND_DELAY_BLOCKS});
   auto r2 = validate_tx(tx, 1, view, &late);
   ASSERT_TRUE(r2.ok);
+
+  // A pending long time lock that names the validator's key holds the bond past the delay.
+  SpecialValidationContext held = late;
+  held.timed_bond_lien = [&](const PubKey32& pub, std::uint64_t) { return pub == kp.public_key; };
+  auto r3 = validate_tx(tx, 1, view, &held);
+  ASSERT_TRUE(!r3.ok);
+  ASSERT_EQ(r3.error, std::string("bond held by a pending long time lock"));
 }
 
 TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {
@@ -714,7 +736,7 @@ TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 2000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[unb_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -832,6 +854,14 @@ TEST(test_slash_evidence_parsing_and_validation) {
 
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
+
+  // A slash pays no fee (its burn output carries the whole bond) and is valid however congested the
+  // chain is: the base fee does not apply to it.
+  UtxoSetV2 view_v2;
+  view_v2[bond_op] = UtxoEntryV2(TxOut{BOND_AMOUNT, reg_script(kp.public_key)});
+  ctx.base_fee_per_kib = 1'000'000;
+  const auto congested = validate_any_tx(AnyTx{*tx}, 1, view_v2, &ctx);
+  if (!congested.ok) throw std::runtime_error("slash rejected under a base fee: " + congested.error);
 }
 
 // A key reused on another network signs there under that network's chain domain. Two such votes are
@@ -998,6 +1028,78 @@ TEST(test_scvalunb_slash_evidence_validation) {
   ASSERT_TRUE(r.ok);
 }
 
+// A time signature on a height not yet final when the evidence is included (height >= the block's)
+// burns the signer's whole bond or unbond output, even while a long lock holds the bond; a final
+// height, another key, another chain or a tampered burn is not evidence.
+TEST(test_early_time_signature_slash_evidence) {
+  const auto kp = key_from_byte(18);
+  const auto other = key_from_byte(19);
+  OutPoint bond_op{};
+  bond_op.txid.fill(0xC5);
+  UtxoSet view;
+  view[bond_op] = UtxoEntry{TxOut{BOND_AMOUNT, reg_script(kp.public_key)}};
+  consensus::ValidatorRegistry vr;
+  ASSERT_TRUE(vr.register_bond(kp.public_key, bond_op, 10, BOND_AMOUNT, nullptr, std::nullopt,
+                               finalis::test::test_bls_pubkey(kp)));
+  vr.advance_height(200);
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
+      .network = &mainnet_network(),
+      .chain_id = &slash_test_chain_id(),
+      .validators = &vr,
+      .current_height = 200,
+      .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
+  });
+  const auto time_sig = [&](const crypto::KeyPair& signer, const Hash32& domain, std::uint64_t height) {
+    const auto sk = crypto::bls_key_from_validator_seed(Bytes(signer.private_key.begin(), signer.private_key.end()));
+    return *crypto::bls_sign(*sk, time_signature_message(domain, height), crypto::kBlsTimeSignatureDst);
+  };
+  const auto slash = [&](const OutPoint& op, std::uint64_t value, const crypto::KeyPair& signer, const Hash32& domain,
+                         std::uint64_t height) {
+    return build_early_time_signature_slash_tx(op, value, height, time_sig(signer, domain, height));
+  };
+  const auto validate = [&](const Tx& tx) { return validate_tx(tx, 1, view, &ctx); };
+
+  const auto now = slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 200);
+  EarlyTimeSignatureEvidence evidence;
+  ASSERT_TRUE(parse_early_time_signature_script_sig(now.inputs[0].script_sig, &evidence));
+  ASSERT_EQ(evidence.height, 200u);
+  ASSERT_TRUE(is_slash_script_sig(now.inputs[0].script_sig));
+  ASSERT_TRUE(!parse_slash_script_sig(now.inputs[0].script_sig, nullptr));
+  ASSERT_TRUE(validate(now).ok);
+  ASSERT_TRUE(validate(slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 1'000'000)).ok);
+
+  const auto final_height = validate(slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 199));
+  ASSERT_TRUE(!final_height.ok && final_height.error == "time signature evidence height already final");
+  ASSERT_TRUE(!validate(slash(bond_op, BOND_AMOUNT, other, slash_test_domain(), 250)).ok);
+  ChainId other_chain = slash_test_chain_id();
+  other_chain.genesis_hash_hex = "3333333333333333333333333333333333333333333333333333333333333333";
+  ASSERT_TRUE(!validate(slash(bond_op, BOND_AMOUNT, kp, consensus_chain_domain(mainnet_network(), other_chain), 250)).ok);
+  auto short_burn = now;
+  short_burn.outputs[0].value -= 1;
+  ASSERT_TRUE(!validate(short_burn).ok);
+  auto other_height = now;
+  other_height.inputs[0].script_sig = slash(bond_op, BOND_AMOUNT, kp, slash_test_domain(), 201).inputs[0].script_sig;
+  ASSERT_TRUE(validate(other_height).error == "slash evidence hash mismatch");
+
+  // An exiting validator's unbond output, held by a long lock's lien, is still slashable.
+  OutPoint unb_op{};
+  unb_op.txid.fill(0xC6);
+  view[unb_op] = UtxoEntry{TxOut{BOND_AMOUNT - 1000, unb_script(kp.public_key)}};
+  ASSERT_TRUE(vr.request_unbond(kp.public_key, 150));
+  ctx.timed_bond_lien = [](const PubKey32&, std::uint64_t) { return true; };
+  ASSERT_TRUE(validate(slash(unb_op, BOND_AMOUNT - 1000, kp, slash_test_domain(), 300)).ok);
+  ASSERT_TRUE(!validate(slash(unb_op, BOND_AMOUNT - 1000, kp, slash_test_domain(), 100)).ok);
+
+  // A validator without a registered BLS key has nothing to verify against.
+  const auto keyless = key_from_byte(20);
+  OutPoint keyless_op{};
+  keyless_op.txid.fill(0xC7);
+  view[keyless_op] = UtxoEntry{TxOut{BOND_AMOUNT, reg_script(keyless.public_key)}};
+  vr.register_bond(keyless.public_key, keyless_op, 10);
+  ASSERT_TRUE(validate(slash(keyless_op, BOND_AMOUNT, keyless, slash_test_domain(), 300)).error ==
+              "time signature evidence key not registered");
+}
+
 TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
   const auto kp = key_from_byte(13);
   OutPoint bond_op{};
@@ -1014,7 +1116,7 @@ TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
   auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
   tx.outputs.push_back(TxOut{BOND_AMOUNT - 1000, address::p2pkh_script_pubkey(pkh)});
 
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0);
+  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[bond_op].out});
   ASSERT_TRUE(msg.has_value());
   auto sig = crypto::ed25519_sign(*msg, kp.private_key);
   ASSERT_TRUE(sig.has_value());
@@ -1035,4 +1137,120 @@ TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
 
   auto r = validate_tx(tx, 1, view, &ctx);
   ASSERT_TRUE(!r.ok);
+}
+
+// --- Validator BLS keys (time signatures) ---
+
+TEST(test_validator_bls_key_is_derived_from_the_ed25519_seed_and_proven) {
+  const auto a = key_from_byte(0x71);
+  const auto b = key_from_byte(0x72);
+  const auto ra = test::test_bls_registration(a);
+  ASSERT_TRUE(test::test_bls_registration(a).pubkey == ra.pubkey);  // deterministic
+  ASSERT_TRUE(test::test_bls_registration(b).pubkey != ra.pubkey);
+  ASSERT_TRUE(crypto::bls_pop_verify(ra.pubkey, ra.pop));
+  ASSERT_TRUE(!crypto::bls_pop_verify(test::test_bls_registration(b).pubkey, ra.pop));
+  ASSERT_TRUE(!validator_bls_registration(Bytes(31, 1)).has_value());
+  // The BLS key is not the Ed25519 key reused: its secret differs from the seed.
+  const auto sk = crypto::bls_key_from_validator_seed(a.private_key);
+  ASSERT_TRUE(sk.has_value());
+  ASSERT_TRUE(!std::equal(sk->bytes.begin(), sk->bytes.end(), a.private_key.begin()));
+}
+
+TEST(test_registration_scripts_carry_the_bls_key_and_reject_the_old_layout) {
+  const auto v = key_from_byte(0x73);
+  const auto payout = key_from_byte(0x74);
+  const auto pop = *crypto::ed25519_sign(
+      validator_join_request_pop_message(v.public_key, payout.public_key, test::test_bls_pubkey(v)), v.private_key);
+  for (const bool pow : {false, true}) {
+    const Bytes s = pow ? join_request_script_with_pow(v, payout.public_key, pop, 5, 6) : join_request_script(v, payout.public_key, pop);
+    ASSERT_EQ(s.size(), pow ? kValidatorRegistrationScriptPowBytes : kValidatorRegistrationScriptBytes);
+    ValidatorJoinRequestScriptData d{};
+    ASSERT_TRUE(parse_validator_join_request_script(s, &d));
+    ASSERT_TRUE(d.bls_pubkey == test::test_bls_pubkey(v));
+    ASSERT_TRUE(d.bls_pop == test::test_bls_registration(v).pop);
+    ASSERT_EQ(d.has_admission_pow, pow);
+    ASSERT_TRUE(encode_validator_join_request_script(d) == s);
+    OnboardingRegistrationScriptData o{};
+    ASSERT_TRUE(!parse_onboarding_registration_script(s, &o));  // prefixes are not interchangeable
+  }
+  // The pre-BLS layout (136 / 152 bytes) no longer parses.
+  Bytes old{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
+  old.resize(136, 0);
+  ASSERT_TRUE(!parse_validator_join_request_script(old));
+  old.resize(152, 0);
+  ASSERT_TRUE(!parse_validator_join_request_script(old));
+  ASSERT_TRUE(!is_supported_base_layer_output_script(old));
+}
+
+// The Ed25519 proof binds the BLS key, the BLS proof shows possession, and a key belongs to one
+// validator only.
+TEST(test_sconbreg_rejects_foreign_unproven_or_taken_bls_key) {
+  const auto sponsor = key_from_byte(0x75);
+  const auto validator = key_from_byte(0x76);
+  const auto other = key_from_byte(0x77);
+  const auto payout = key_from_byte(0x78);
+  const OutPoint spend_op{Hash32{0x75}, 0};
+  const TxOut prev_out{
+      1'000'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  UtxoSet utxos;
+  utxos.emplace(spend_op, UtxoEntry{prev_out});
+  const auto mine = test::test_bls_registration(validator);
+  const auto theirs = test::test_bls_registration(other);
+  auto validate_with = [&](const crypto::BlsPublicKey& bls_pk, const crypto::BlsSignature& bls_pop, const crypto::BlsPublicKey& signed_pk,
+                           const SpecialValidationContext* ctx) {
+    OnboardingRegistrationScriptData d{};
+    d.validator_pubkey = validator.public_key;
+    d.payout_pubkey = payout.public_key;
+    d.pop = *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key, signed_pk),
+                                  validator.private_key);
+    d.bls_pubkey = bls_pk;
+    d.bls_pop = bls_pop;
+    std::vector<TxOut> outputs{TxOut{0, encode_onboarding_registration_script(d)},
+                               TxOut{prev_out.value - 1000, prev_out.script_pubkey}};
+    auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), spend_op, prev_out, sponsor.private_key, outputs);
+    ASSERT_TRUE(tx.has_value());
+    return validate_tx(*tx, 1, utxos, ctx ? ctx : finalis::test::test_validation_ctx());
+  };
+  ASSERT_TRUE(validate_with(mine.pubkey, mine.pop, mine.pubkey, nullptr).ok);
+  // Someone else's key under this validator's Ed25519 proof of the original key.
+  auto r = validate_with(theirs.pubkey, theirs.pop, mine.pubkey, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("onboarding registration proof invalid"));
+  // The validator vouches for a key it cannot prove possession of.
+  r = validate_with(theirs.pubkey, mine.pop, theirs.pubkey, nullptr);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("onboarding registration bls proof invalid"));
+  // A key already registered to another validator.
+  consensus::ValidatorRegistry vr;
+  std::string err;
+  ASSERT_TRUE(vr.register_onboarding(other.public_key, 3, &err, std::nullopt, mine.pubkey));
+  SpecialValidationContext ctx = finalis::test::with_test_chain_identity(SpecialValidationContext{
+      .validators = &vr,
+      .current_height = 4,
+  });
+  r = validate_with(mine.pubkey, mine.pop, mine.pubkey, &ctx);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("bls key already registered"));
+}
+
+TEST(test_registry_binds_a_bls_key_to_one_validator) {
+  const auto a = key_from_byte(0x79);
+  const auto b = key_from_byte(0x7a);
+  const auto ka = test::test_bls_pubkey(a);
+  const auto kb = test::test_bls_pubkey(b);
+  consensus::ValidatorRegistry vr;
+  std::string err;
+  ASSERT_TRUE(vr.register_onboarding(a.public_key, 1, &err, std::nullopt, ka));
+  ASSERT_TRUE(vr.bls_key_owner(ka) == a.public_key);
+  ASSERT_TRUE(!vr.bls_key_owner(kb).has_value());
+  // Bonding after onboarding must name the same key; with it, the key is kept.
+  err.clear();
+  ASSERT_TRUE(!vr.register_bond(a.public_key, OutPoint{Hash32{0x79}, 0}, 2, BOND_AMOUNT, &err, std::nullopt, kb));
+  ASSERT_EQ(err, std::string("bls key mismatch"));
+  ASSERT_TRUE(vr.register_bond(a.public_key, OutPoint{Hash32{0x79}, 0}, 2, BOND_AMOUNT, &err, std::nullopt, ka));
+  ASSERT_TRUE(vr.get(a.public_key)->bls_pubkey == ka);
+  // Another validator cannot take it.
+  ASSERT_TRUE(!vr.register_bond(b.public_key, OutPoint{Hash32{0x7a}, 0}, 2, BOND_AMOUNT, &err, std::nullopt, ka));
+  ASSERT_EQ(err, std::string("bls key already registered"));
+  ASSERT_TRUE(vr.register_bond(b.public_key, OutPoint{Hash32{0x7a}, 0}, 2, BOND_AMOUNT, &err, std::nullopt, kb));
 }

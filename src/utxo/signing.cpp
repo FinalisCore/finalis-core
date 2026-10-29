@@ -8,6 +8,8 @@
 #include "codec/bytes.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/swe.hpp"
+#include "crypto/swe_proofs.hpp"
 #include "utxo/validate.hpp"
 
 namespace finalis {
@@ -101,6 +103,165 @@ std::optional<WalletSendPlan> plan_wallet_p2pkh_send(const std::vector<std::pair
   return plan;
 }
 
+std::optional<std::pair<OutPoint, TxOut>> select_timed_fee_coin(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
+                                                                std::uint64_t prepaid_fee_units,
+                                                                std::uint64_t forfeit_bond_units, std::string* err) {
+  if (prepaid_fee_units > std::numeric_limits<std::uint64_t>::max() - forfeit_bond_units) {
+    if (err) *err = "prepaid fee + bond overflows";
+    return std::nullopt;
+  }
+  const std::uint64_t envelope_units = prepaid_fee_units + forfeit_bond_units;
+  std::optional<std::size_t> fee_index;
+  for (std::size_t i = 0; i < available_prevs.size(); ++i) {
+    const auto& out = available_prevs[i].second;
+    if (out.value < envelope_units) continue;
+    if (!fee_index || out.value < available_prevs[*fee_index].second.value) fee_index = i;
+  }
+  if (!fee_index) {
+    if (err) {
+      std::uint64_t largest = 0;
+      for (const auto& [_, out] : available_prevs) largest = std::max(largest, out.value);
+      *err = "no coin covers the prepaid fee + bond (" + std::to_string(envelope_units) + " units; " +
+             std::to_string(available_prevs.size()) + " coin(s), largest " + std::to_string(largest) + ")";
+    }
+    return std::nullopt;
+  }
+  return available_prevs[*fee_index];
+}
+
+std::optional<TimedSendPlan> plan_timed_p2pkh_send(const std::vector<std::pair<OutPoint, TxOut>>& available_prevs,
+                                                   const Bytes& recipient_script_pubkey, const Bytes& change_script_pubkey,
+                                                   std::uint64_t amount_units, std::uint64_t body_fee_units,
+                                                   std::uint64_t prepaid_fee_units, std::uint64_t forfeit_bond_units,
+                                                   std::string* err) {
+  const auto fee_coin = select_timed_fee_coin(available_prevs, prepaid_fee_units, forfeit_bond_units, err);
+  if (!fee_coin) return std::nullopt;
+  const std::uint64_t envelope_units = prepaid_fee_units + forfeit_bond_units;
+  std::vector<std::pair<OutPoint, TxOut>> rest;
+  rest.reserve(available_prevs.size() - 1);
+  for (const auto& coin : available_prevs) {
+    if (coin.first.txid != fee_coin->first.txid || coin.first.index != fee_coin->first.index) rest.push_back(coin);
+  }
+  std::string plan_err;
+  auto body = plan_wallet_p2pkh_send(rest, recipient_script_pubkey, change_script_pubkey, amount_units, body_fee_units,
+                                     DEFAULT_WALLET_DUST_THRESHOLD_UNITS, &plan_err);
+  if (!body) {
+    if (err) *err = "the transfer needs coins other than the envelope's fee coin: " + plan_err;
+    return std::nullopt;
+  }
+  TimedSendPlan out;
+  out.fee_coin = *fee_coin;
+  out.body = std::move(*body);
+  out.fee_change_units = out.fee_coin.second.value - envelope_units;
+  return out;
+}
+
+std::size_t timed_p2pkh_body_bytes(const WalletSendPlan& plan) {
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  for (const auto& [op, _] : plan.selected_prevs) tx.inputs.push_back(TxIn{op.txid, op.index, Bytes(98, 0), 0xFFFFFFFF});
+  tx.outputs = plan.outputs;
+  return tx.serialize().size();
+}
+
+std::optional<TimedSendPlan> plan_timed_p2pkh_send_priced(
+    const std::vector<std::pair<OutPoint, TxOut>>& available_prevs, const Bytes& recipient_script_pubkey,
+    const Bytes& change_script_pubkey, std::uint64_t amount_units, std::uint64_t body_fee_units,
+    std::uint64_t forfeit_bond_units, const std::function<std::optional<std::uint64_t>(std::size_t)>& prepaid_for_body_bytes,
+    std::uint64_t* prepaid_fee_out, std::string* err) {
+  auto prepaid = prepaid_for_body_bytes(0);
+  for (int attempt = 0; attempt < 4 && prepaid.has_value(); ++attempt) {
+    auto plan = plan_timed_p2pkh_send(available_prevs, recipient_script_pubkey, change_script_pubkey, amount_units,
+                                      body_fee_units, *prepaid, forfeit_bond_units, err);
+    if (!plan) return std::nullopt;
+    const auto needed = prepaid_for_body_bytes(timed_p2pkh_body_bytes(plan->body));
+    if (!needed.has_value()) break;
+    if (*needed <= *prepaid) {
+      if (prepaid_fee_out) *prepaid_fee_out = *prepaid;
+      return plan;
+    }
+    prepaid = needed;
+  }
+  if (err) *err = "could not price the envelope's prepaid fee";
+  return std::nullopt;
+}
+
+std::optional<TxTimed> build_signed_timed_tx(const Hash32& chain_domain, const TimedTxParams& params, const TimedBody& body,
+                                             const Bytes& fee_private_key_32, const Hash32& seed_32, std::string* err) {
+  auto kp = keypair_from_private_key(fee_private_key_32, err);
+  if (!kp.has_value()) return std::nullopt;
+  std::array<std::uint8_t, 20> expected_pkh{};
+  if (!is_p2pkh_script_pubkey(params.fee_prev_out.script_pubkey, &expected_pkh)) {
+    if (err) *err = "fee input is not P2PKH";
+    return std::nullopt;
+  }
+  const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
+  if (!std::equal(got_pkh.begin(), got_pkh.end(), expected_pkh.begin())) {
+    if (err) *err = "private key does not match the fee input";
+    return std::nullopt;
+  }
+  const std::uint64_t change = params.fee_change ? params.fee_change->value : 0;
+  if (params.prepaid_fee > params.fee_prev_out.value ||
+      params.fee_prev_out.value - params.prepaid_fee < params.forfeit_bond ||
+      params.fee_prev_out.value - params.prepaid_fee - params.forfeit_bond != change) {
+    if (err) *err = "fee input value != prepaid_fee + forfeit_bond + change";
+    return std::nullopt;
+  }
+
+  TxTimed tx;
+  tx.fee_input = TxIn{params.fee_outpoint.txid, params.fee_outpoint.index, Bytes{}, 0xFFFFFFFF};
+  tx.prepaid_fee = params.prepaid_fee;
+  tx.forfeit_bond = params.forfeit_bond;
+  tx.bond_refund_script = params.bond_refund_script;
+  tx.fee_change = params.fee_change;
+  tx.unlock_height = params.unlock_height;
+  tx.committee_epoch = params.committee_epoch;
+  tx.committee_root = params.committee_root;
+
+  // Body key and SWE randomness, both from the secret seed (domain-separated).
+  const auto derive = [&](char tag) {
+    Bytes in{'S', 'C', '-', 'T', 'I', 'M', 'E', 'D', '-', 'S', 'E', 'E', 'D', '-', 'V', '1', static_cast<std::uint8_t>(tag)};
+    in.insert(in.end(), seed_32.begin(), seed_32.end());
+    return crypto::sha256(in);
+  };
+  const Hash32 body_key = derive('k');
+  const Hash32 swe_seed = derive('s');
+  const Hash32 nonce_seed = derive('n');
+  std::copy(nonce_seed.begin(), nonce_seed.begin() + tx.body_nonce.size(), tx.body_nonce.begin());
+  const auto msg = time_signature_message(chain_domain, params.unlock_height);
+  const auto ct = crypto::swe_encrypt(params.committee_keys, params.threshold, msg, crypto::kBlsTimeSignatureDst,
+                                      crypto::swe_key_to_chunks(body_key), swe_seed);
+  if (!ct.has_value()) {
+    if (err) *err = "swe encryption failed";
+    return std::nullopt;
+  }
+  const auto proof = crypto::swe_prove_well_formed(*ct, params.committee_keys, msg, crypto::kBlsTimeSignatureDst, swe_seed);
+  if (!proof.has_value()) {
+    if (err) *err = "swe proof failed";
+    return std::nullopt;
+  }
+  tx.swe_ciphertext = ct->serialize();
+  tx.swe_proof = proof->serialize();
+  if (!seal_timed_body(tx, body_key, body)) {
+    if (err) *err = "body too large";
+    return std::nullopt;
+  }
+  const auto sig = crypto::ed25519_sign(signing_message_for_timed_fee_input(chain_domain, tx), fee_private_key_32);
+  if (!sig.has_value()) {
+    if (err) *err = "failed to sign";
+    return std::nullopt;
+  }
+  Bytes script_sig;
+  script_sig.reserve(98);
+  script_sig.push_back(0x40);
+  script_sig.insert(script_sig.end(), sig->begin(), sig->end());
+  script_sig.push_back(0x20);
+  script_sig.insert(script_sig.end(), kp->public_key.begin(), kp->public_key.end());
+  tx.fee_input.script_sig = std::move(script_sig);
+  return tx;
+}
+
 std::optional<Tx> build_signed_p2pkh_tx_single_input(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,
                                                       const Bytes& private_key_32,
                                                       const std::vector<TxOut>& outputs,
@@ -110,13 +271,15 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const Hash32& chain_domain,
     return std::nullopt;
   }
 
-  std::array<std::uint8_t, 20> expected_pkh{};
-  if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, &expected_pkh)) {
-    if (err) *err = "prev output is not P2PKH";
+  // P2PKH, or a height lock this key may spend (whether its height is reached is the chain's call).
+  const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
+  std::array<std::uint8_t, 20> signer{};
+  std::copy(got_pkh.begin(), got_pkh.end(), signer.begin());
+  if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, nullptr) && !parse_height_lock_script(prev_out.script_pubkey)) {
+    if (err) *err = "prev output is not P2PKH or height-locked";
     return std::nullopt;
   }
-  const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
-  if (!std::equal(got_pkh.begin(), got_pkh.end(), expected_pkh.begin())) {
+  if (!script_spendable_by(prev_out.script_pubkey, signer, std::numeric_limits<std::uint64_t>::max())) {
     if (err) *err = "private key does not match prev output pubkey hash";
     return std::nullopt;
   }
@@ -127,7 +290,7 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const Hash32& chain_domain,
   tx.inputs.push_back(TxIn{prev_outpoint.txid, prev_outpoint.index, Bytes{}, 0xFFFFFFFF});
   tx.outputs = outputs;
 
-  auto msg = signing_message_for_input(chain_domain, tx, 0);
+  auto msg = signing_message_for_input(chain_domain, tx, 0, {prev_out});
   if (!msg.has_value()) {
     if (err) *err = "failed to build sighash";
     return std::nullopt;
@@ -165,12 +328,14 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const Hash32& chain_domain, 
   const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
   for (const auto& [prev_outpoint, prev_out] : prevs) {
     (void)prev_outpoint;
-    std::array<std::uint8_t, 20> expected_pkh{};
-    if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, &expected_pkh)) {
-      if (err) *err = "prev output is not P2PKH";
+    // P2PKH, or a height lock this key may spend (whether its height is reached is the chain's call).
+    std::array<std::uint8_t, 20> signer{};
+    std::copy(got_pkh.begin(), got_pkh.end(), signer.begin());
+    if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, nullptr) && !parse_height_lock_script(prev_out.script_pubkey)) {
+      if (err) *err = "prev output is not P2PKH or height-locked";
       return std::nullopt;
     }
-    if (!std::equal(got_pkh.begin(), got_pkh.end(), expected_pkh.begin())) {
+    if (!script_spendable_by(prev_out.script_pubkey, signer, std::numeric_limits<std::uint64_t>::max())) {
       if (err) *err = "private key does not match prev output pubkey hash";
       return std::nullopt;
     }
@@ -185,8 +350,11 @@ std::optional<Tx> build_signed_p2pkh_tx_multi_input(const Hash32& chain_domain, 
     tx.inputs.push_back(TxIn{prev_outpoint.txid, prev_outpoint.index, Bytes{}, 0xFFFFFFFF});
   }
 
+  std::vector<TxOut> spent;
+  spent.reserve(prevs.size());
+  for (const auto& [_, prev_out] : prevs) spent.push_back(prev_out);
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
-    auto msg = signing_message_for_input(chain_domain, tx, i);
+    auto msg = signing_message_for_input(chain_domain, tx, i, spent);
     if (!msg.has_value()) {
       if (err) *err = "failed to build sighash";
       return std::nullopt;
@@ -233,7 +401,9 @@ std::optional<Tx> build_unbond_tx(const Hash32& chain_domain, const OutPoint& bo
   spk.insert(spk.end(), validator_pubkey.begin(), validator_pubkey.end());
   tx.outputs.push_back(TxOut{bond_value - fee, spk});
 
-  auto msg = unbond_message_for_input(chain_domain, tx, 0);
+  Bytes bond_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+  bond_spk.insert(bond_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
+  auto msg = unbond_message_for_input(chain_domain, tx, 0, {TxOut{bond_value, bond_spk}});
   if (!msg.has_value()) {
     if (err) *err = "unbond sighash failed";
     return std::nullopt;
@@ -252,6 +422,15 @@ std::optional<Tx> build_unbond_tx(const Hash32& chain_domain, const OutPoint& bo
   tx.inputs[0].script_sig = script_sig;
 
   return tx;
+}
+
+std::optional<ValidatorBlsRegistration> validator_bls_registration(const Bytes& validator_privkey_32) {
+  const auto sk = crypto::bls_key_from_validator_seed(validator_privkey_32);
+  if (!sk) return std::nullopt;
+  const auto pk = crypto::bls_public_key(*sk);
+  const auto pop = crypto::bls_pop_prove(*sk);
+  if (!pk || !pop) return std::nullopt;
+  return ValidatorBlsRegistration{*pk, *pop};
 }
 
 std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, const OutPoint& prev_outpoint, const TxOut& prev_out,
@@ -287,7 +466,13 @@ std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, co
     if (err) *err = "insufficient prev value for bond + fee";
     return std::nullopt;
   }
-  auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator_pubkey, payout_pubkey), validator_privkey_32);
+  const auto bls = validator_bls_registration(validator_privkey_32);
+  if (!bls) {
+    if (err) *err = "failed to derive validator bls key";
+    return std::nullopt;
+  }
+  auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator_pubkey, payout_pubkey, bls->pubkey),
+                                  validator_privkey_32);
   if (!pop.has_value()) {
     if (err) *err = "failed to sign join request proof";
     return std::nullopt;
@@ -295,10 +480,12 @@ std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, co
 
   Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
   reg_spk.insert(reg_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
-  Bytes req_spk{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  req_spk.insert(req_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
-  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  ValidatorJoinRequestScriptData req{};
+  req.validator_pubkey = validator_pubkey;
+  req.payout_pubkey = payout_pubkey;
+  req.pop = *pop;
+  req.bls_pubkey = bls->pubkey;
+  req.bls_pop = bls->pop;
   if (pow_ctx && pow_ctx->network && validator_join_admission_pow_enabled(*pow_ctx->network)) {
     // The admission PoW is epoch-scoped, expires quickly, and is only used to
     // make fresh operator admission attempts more expensive to mint.
@@ -329,14 +516,12 @@ std::optional<Tx> build_validator_join_request_tx(const Hash32& chain_domain, co
       }
       ++nonce;
     }
-    codec::ByteWriter w;
-    w.u64le(pow_epoch);
-    w.u64le(nonce);
-    const auto suffix = w.take();
-    req_spk.insert(req_spk.end(), suffix.begin(), suffix.end());
+    req.has_admission_pow = true;
+    req.admission_pow_epoch = pow_epoch;
+    req.admission_pow_nonce = nonce;
   }
 
-  std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
+  std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, encode_validator_join_request_script(req)}};
   const std::uint64_t change = total_prev - required;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
   return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);
@@ -370,17 +555,24 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
     if (err) *err = "insufficient prev value for fee";
     return std::nullopt;
   }
-  auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator_pubkey, payout_pubkey),
+  const auto bls = validator_bls_registration(validator_privkey_32);
+  if (!bls) {
+    if (err) *err = "failed to derive validator bls key";
+    return std::nullopt;
+  }
+  auto pop = crypto::ed25519_sign(onboarding_registration_pop_message(validator_pubkey, payout_pubkey, bls->pubkey),
                                   validator_privkey_32);
   if (!pop.has_value()) {
     if (err) *err = "failed to sign onboarding registration proof";
     return std::nullopt;
   }
 
-  Bytes req_spk{'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
-  req_spk.insert(req_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
-  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  OnboardingRegistrationScriptData req{};
+  req.validator_pubkey = validator_pubkey;
+  req.payout_pubkey = payout_pubkey;
+  req.pop = *pop;
+  req.bls_pubkey = bls->pubkey;
+  req.bls_pop = bls->pop;
   if (pow_ctx && pow_ctx->network && onboarding_admission_pow_enabled(*pow_ctx->network)) {
     if (!pow_ctx->chain_id) {
       if (err) *err = "missing chain id for onboarding admission pow";
@@ -407,17 +599,35 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
       }
       ++nonce;
     }
-    codec::ByteWriter w;
-    w.u64le(pow_epoch);
-    w.u64le(nonce);
-    const auto suffix = w.take();
-    req_spk.insert(req_spk.end(), suffix.begin(), suffix.end());
+    req.has_admission_pow = true;
+    req.admission_pow_epoch = pow_epoch;
+    req.admission_pow_nonce = nonce;
   }
 
-  std::vector<TxOut> outputs{TxOut{0, req_spk}};
+  std::vector<TxOut> outputs{TxOut{0, encode_onboarding_registration_script(req)}};
   const std::uint64_t change = total_prev - fee;
   if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
   return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);
+}
+
+Tx build_early_time_signature_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, std::uint64_t height,
+                                       const crypto::BlsSignature& signature) {
+  codec::ByteWriter ev;
+  ev.u64le(height);
+  ev.bytes_fixed(signature);
+  const Bytes evidence_blob = ev.take();
+  codec::ByteWriter ss;
+  ss.bytes(Bytes{'S', 'C', 'T', 'S', 'L', 'A', 'S', 'H'});
+  ss.varbytes(evidence_blob);
+  const Hash32 evh = crypto::sha256d(evidence_blob);
+  Bytes burn{'S', 'C', 'B', 'U', 'R', 'N'};
+  burn.insert(burn.end(), evh.begin(), evh.end());
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.inputs.push_back(TxIn{bond_outpoint.txid, bond_outpoint.index, ss.take(), 0xFFFFFFFF});
+  tx.outputs.push_back(TxOut{bond_value, burn});
+  return tx;
 }
 
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,

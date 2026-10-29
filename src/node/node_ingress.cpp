@@ -221,6 +221,22 @@ void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bo
   }
   auto tx = parse_any_tx(m->tx_bytes);
   if (!tx.has_value()) {
+    if (const auto timed = TxTimed::parse(m->tx_bytes); timed.has_value()) {
+      const Hash32 timed_txid = timed->txid();
+      log_line("recv " + std::string(reply ? "SUBMIT_TX" : "TX") + " peer_id=" + std::to_string(peer_id) +
+               " txid=" + hex_encode32(timed_txid) + " kind=timed");
+      std::string reason;
+      if (handle_timed_tx(*timed, true, peer_id, &reason)) {
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          accepted_tx_payloads_.insert(payload_id);
+        }
+        send_result(timed_txid, true, "");
+      } else {
+        send_result(timed_txid, false, reason);
+      }
+      return;
+    }
     {
       std::lock_guard<std::mutex> lk(mu_);
       invalid_message_payloads_.insert(payload_id);
@@ -324,6 +340,107 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id, std::
   return true;
 }
 
+bool Node::handle_record_bytes(const Bytes& raw, bool from_network, int from_peer_id, std::string* reject_reason) {
+  if (const auto tx = parse_any_tx(raw); tx.has_value()) return handle_tx(*tx, from_network, from_peer_id, reject_reason);
+  if (const auto timed = TxTimed::parse(raw); timed.has_value()) {
+    return handle_timed_tx(*timed, from_network, from_peer_id, reject_reason);
+  }
+  if (reject_reason) *reject_reason = "tx parse failed";
+  return false;
+}
+
+bool Node::handle_timed_tx(const TxTimed& tx, bool from_network, int from_peer_id, std::string* reject_reason) {
+  auto reject = [&](const std::string& reason) {
+    if (reject_reason) *reject_reason = reason;
+    return false;
+  };
+  if (from_network && !running_) return reject("node not running");
+  const Hash32 txid = tx.txid();
+  const Bytes raw = tx.serialize();
+  // Everything but the SWE proof, under mu_; nullopt once the envelope may be pooled, else the result.
+  std::vector<crypto::BlsPublicKey> keys;
+  Hash32 chain_domain{};
+  const auto cheap_checks_locked = [&](bool charge) -> std::optional<bool> {
+    if (from_network && !running_) return reject("node not running");
+    if (!canonical_state_.has_value()) return reject("no canonical state");
+    const auto identity = consensus::ingress_record_identity(raw);
+    if (!identity.has_value()) return reject("tx parse failed");
+    if (timed_pool_.contains(txid)) {
+      std::string ingress_error;
+      (void)maybe_certify_record_locked(raw, *identity, &ingress_error);
+      return true;
+    }
+    if (charge && from_network) {
+      // The SWE proof check costs about as much as a thousand signature checks: per peer, and in all
+      // (many peers must not add up to more proof checks than the node can afford).
+      auto& verify_bucket = tx_verify_buckets_[from_peer_id];
+      verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
+      if (!verify_bucket.consume(64.0, now_ms())) return reject("verify rate limited");
+      if (!timed_verify_bucket_.consume(1.0, now_ms())) return reject("timed verify rate limited");
+    }
+    if (timed_pool_.size() >= kMaxTimedPoolEntries) return reject("timed pool full");
+    const OutPoint fee_outpoint{tx.fee_input.prev_txid, tx.fee_input.prev_index};
+    for (const auto& [_, pooled] : timed_pool_) {
+      if (pooled.fee_input.prev_txid == fee_outpoint.txid && pooled.fee_input.prev_index == fee_outpoint.index) {
+        return reject("fee input already used by a pending timed tx");
+      }
+    }
+    if (mempool_.spends(fee_outpoint)) return reject("fee input already spent in mempool");
+    const auto next_height = finalized_height_ + 1;
+    if (tx.prepaid_fee < effective_min_relay_fee_for_height(next_height)) return reject("prepaid fee below min relay fee");
+    const TimeSignatureAggregate no_settlement;
+    const auto timed = consensus::timed_execution_context_for(canonical_derivation_config_locked(), *canonical_state_,
+                                                              next_height, no_settlement);
+    std::string reason;
+    if (!consensus::check_timed_inclusion(tx, timed, canonical_state_->utxos, nullptr, &reason,
+                                          consensus::TimedInclusionCheck::SkipSweProof)) {
+      log_line("tx-reject txid=" + hex_encode32(txid) + " kind=timed reason=" + reason);
+      return reject(reason);
+    }
+    keys = timed.committee_keys(tx.committee_epoch).value_or(std::vector<crypto::BlsPublicKey>{});
+    chain_domain = timed.chain_domain;
+    return std::nullopt;
+  };
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (const auto done = cheap_checks_locked(true); done.has_value()) return *done;
+  }
+  // LIVENESS: the proof check runs without mu_, so a flood of costly envelopes cannot stall consensus.
+  if (!consensus::verify_timed_swe_proof(tx, keys, chain_domain)) {
+    std::lock_guard<std::mutex> lk(mu_);
+    log_line("tx-reject txid=" + hex_encode32(txid) + " kind=timed reason=swe-proof-invalid");
+    return reject("swe-proof-invalid");
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // The state may have moved while unlocked: check again (the proof is bound to the envelope).
+    if (const auto done = cheap_checks_locked(false); done.has_value()) return *done;
+    const auto identity = consensus::ingress_record_identity(raw);
+    timed_pool_.emplace(txid, tx);
+    std::string ingress_error;
+    if (!maybe_certify_record_locked(raw, *identity, &ingress_error) && !ingress_error.empty()) {
+      log_line("ingress-local-certify-skip txid=" + hex_encode32(txid) + " reason=" + ingress_error);
+    }
+    maybe_forward_record_to_designated_certifier_locked(raw, identity->lane, from_network ? from_peer_id : 0);
+    log_line("timed-pool-accept txid=" + hex_encode32(txid) + " unlock_height=" + std::to_string(tx.unlock_height) +
+             " pool_size=" + std::to_string(timed_pool_.size()));
+  }
+  if (from_network && !should_mute_peer(from_peer_id)) broadcast_record_bytes(raw, from_peer_id);
+  return true;
+}
+
+void Node::prune_timed_pool_locked() {
+  const auto next_height = finalized_height_ + 1;
+  for (auto it = timed_pool_.begin(); it != timed_pool_.end();) {
+    const OutPoint fee_outpoint{it->second.fee_input.prev_txid, it->second.fee_input.prev_index};
+    if (!utxos_.contains(fee_outpoint) || it->second.unlock_height < next_height) {
+      it = timed_pool_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended, std::string* error) {
   if (appended) *appended = false;
   if (msg.certificate.lane >= INGRESS_LANE_COUNT || msg.certificate.seq == 0) {
@@ -377,6 +494,13 @@ bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg
 }
 
 bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string* error) {
+  return maybe_certify_record_locked(serialize_any_tx(tx),
+                                     consensus::IngressRecordIdentity{txid_any(tx), consensus::assign_ingress_lane(tx), false},
+                                     error);
+}
+
+bool Node::maybe_certify_record_locked(const Bytes& tx_bytes, const consensus::IngressRecordIdentity& identity,
+                                       std::string* error) {
   if (!is_validator_) {
     if (error) *error = "local-not-validator";
     return false;
@@ -389,7 +513,7 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
     return false;
   }
 
-  const std::uint32_t lane = consensus::assign_ingress_lane(tx);
+  const std::uint32_t lane = identity.lane;
   const PubKey32 designated_certifier = consensus::designated_ingress_certifier(
       committee, lane, consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks));
   if (designated_certifier != local_key_.public_key) {
@@ -397,14 +521,13 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
     return false;
   }
 
-  const auto txid = txid_any(tx);
+  const auto txid = identity.txid;
   if (db_.get_ingress_bytes(txid).has_value()) {
     if (error) error->clear();
     return true;
   }
 
   const auto lane_state = db_.get_lane_state(lane);
-  const Bytes tx_bytes = serialize_any_tx(tx);
 
   IngressCertificate cert;
   cert.epoch = consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks);
@@ -416,7 +539,7 @@ bool Node::maybe_certify_locally_accepted_tx_locked(const AnyTx& tx, std::string
 
   const auto signing_hash = cert.signing_hash();
   const Bytes msg(signing_hash.begin(), signing_hash.end());
-  auto sig = crypto::ed25519_sign(msg, local_key_.private_key);
+  auto sig = sign_consensus_locked(msg);
   if (!sig.has_value()) {
     if (error) *error = "ingress-sign-failed";
     return false;
@@ -500,7 +623,9 @@ bool Node::store_finalized_lane_certificates_locked(const FrontierProposal& prop
   for (const auto& cert : lane_certificates) offered.emplace(std::make_pair(cert.lane, cert.seq), &cert);
   std::map<Hash32, const Bytes*> tx_bytes_by_id;
   for (const auto& raw : proposal.ordered_records) {
-    if (auto tx = parse_any_tx(raw); tx.has_value()) tx_bytes_by_id.emplace(txid_any(*tx), &raw);
+    if (auto identity = consensus::ingress_record_identity(raw); identity.has_value()) {
+      tx_bytes_by_id.emplace(identity->txid, &raw);
+    }
   }
   const std::uint64_t epoch = consensus::committee_epoch_start(transition.height, cfg_.network.committee_epoch_blocks);
   const auto committee = ingress_committee_locked(epoch);
@@ -556,15 +681,29 @@ void Node::reforward_uncertified_mempool_txs_locked() {
     maybe_forward_tx_to_designated_certifier_locked(entry.tx, 0);
     ++count;
   }
+  for (const auto& [txid, timed] : timed_pool_) {
+    if (db_.get_ingress_bytes(txid).has_value()) continue;
+    const auto raw = timed.serialize();
+    const auto identity = consensus::ingress_record_identity(raw);
+    if (!identity.has_value()) continue;
+    std::string error;
+    if (!maybe_certify_record_locked(raw, *identity, &error)) {
+      maybe_forward_record_to_designated_certifier_locked(raw, identity->lane, 0);
+    }
+    ++count;
+  }
   if (count > 0) log_line("tx-reforward-uncertified count=" + std::to_string(count));
 }
 
 void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id) {
+  maybe_forward_record_to_designated_certifier_locked(serialize_any_tx(tx), consensus::assign_ingress_lane(tx), skip_peer_id);
+}
+
+void Node::maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_bytes, std::uint32_t lane, int skip_peer_id) {
   const std::uint64_t next_height = finalized_height_ + 1;
   auto committee = ingress_committee_locked(next_height);
   if (committee.empty()) return;
 
-  const std::uint32_t lane = consensus::assign_ingress_lane(tx);
   const PubKey32 designated_certifier = consensus::designated_ingress_certifier(
       committee, lane, consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks));
   if (designated_certifier == local_key_.public_key) return;
@@ -573,7 +712,7 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int 
     for_each_local_bus_peer([&](Node* peer) {
       // local_key_ is fixed after init(); taking the peer's mu_ here (while holding ours) inverts lock order.
       if (peer->local_key_.public_key != designated_certifier) return false;
-      spawn_local_bus_task([peer, tx]() { (void)peer->handle_tx(tx, true); });
+      spawn_local_bus_task([peer, tx_bytes]() { (void)peer->handle_record_bytes(tx_bytes, true); });
       log_line("tx-forward-designated lane=" + std::to_string(lane) +
                " designated=" + short_pub_hex(designated_certifier) + " transport=local-bus");
       return true;
@@ -586,7 +725,7 @@ void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int 
     if (it != peer_validator_pubkeys_.end() && it->second == designated_certifier) return;
   }
 
-  const auto payload = p2p::ser_tx(p2p::TxMsg{serialize_any_tx(tx)});
+  const auto payload = p2p::ser_tx(p2p::TxMsg{tx_bytes});
   for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
     if (peer_id == skip_peer_id) continue;
     if (peer_pub != designated_certifier) continue;
@@ -786,7 +925,10 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
                  " seq=" + std::to_string(expected_seq) + " reason=" + validation_error);
         return false;
       }
-      already_held = *existing == record.certificate;
+      // Held only if the lane tip covers it: a stored certificate above the tip is an orphan of an
+      // interrupted append and is applied again (append_validated_ingress_record repairs it).
+      already_held = *existing == record.certificate &&
+                     (simulated_state.has_value() ? simulated_state->max_seq : 0) >= expected_seq;
     }
     if (already_held) {
       // Already appended, typically via gossip racing this range response: a no-op, as in

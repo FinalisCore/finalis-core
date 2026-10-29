@@ -37,6 +37,9 @@ struct ValidatorInfo {
   std::uint64_t last_join_height{0};
   std::uint64_t last_exit_height{0};
   std::uint32_t penalty_strikes{0};
+  // Time-signature key (crypto/bls12_381.hpp), registered with its proof of possession in the
+  // validator's join request, onboarding registration or genesis entry. All zero: none registered.
+  crypto::BlsPublicKey bls_pubkey{};
 };
 
 struct ValidatorRules {
@@ -50,12 +53,16 @@ class ValidatorRegistry {
   void set_rules(ValidatorRules rules) { rules_ = rules; }
   const ValidatorRules& rules() const { return rules_; }
   void upsert(PubKey32 pub, ValidatorInfo info);
+  // bls_pubkey: the key from the registration (its proofs already checked). Refused if another
+  // validator holds it, or if this validator already holds a different one.
   bool register_onboarding(const PubKey32& pub, std::uint64_t joined_height, std::string* err = nullptr,
-                           const std::optional<PubKey32>& operator_id = std::nullopt);
+                           const std::optional<PubKey32>& operator_id = std::nullopt,
+                           const std::optional<crypto::BlsPublicKey>& bls_pubkey = std::nullopt);
   bool can_register_bond(const PubKey32& pub, std::uint64_t height, std::uint64_t bond_amount, std::string* err = nullptr) const;
   bool register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height);
   bool register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height, std::uint64_t bond_amount,
-                     std::string* err = nullptr, const std::optional<PubKey32>& operator_id = std::nullopt);
+                     std::string* err = nullptr, const std::optional<PubKey32>& operator_id = std::nullopt,
+                     const std::optional<crypto::BlsPublicKey>& bls_pubkey = std::nullopt);
   bool request_unbond(const PubKey32& pub, std::uint64_t height);
   void ban(const PubKey32& pub, std::uint64_t height = 0);
   bool finalize_withdrawal(const PubKey32& pub);
@@ -66,6 +73,8 @@ class ValidatorRegistry {
   bool is_active_for_height(const PubKey32& pub, std::uint64_t height) const;
   std::optional<ValidatorInfo> get(const PubKey32& pub) const;
   std::optional<PubKey32> pubkey_by_bond_outpoint(const OutPoint& op) const;
+  // The validator registered with this BLS key, if any (keys are unique across the registry).
+  std::optional<PubKey32> bls_key_owner(const crypto::BlsPublicKey& bls_pubkey) const;
   std::map<PubKey32, ValidatorInfo>& mutable_all() { return validators_; }
   const std::map<PubKey32, ValidatorInfo>& all() const { return validators_; }
 

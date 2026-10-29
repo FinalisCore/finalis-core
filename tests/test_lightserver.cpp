@@ -2,6 +2,7 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_genesis.hpp"
 #include "support/test_paths.hpp"
 
 #ifndef _WIN32
@@ -68,7 +69,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   if (keys.size() < n_validators) return false;
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -89,6 +90,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   std::filesystem::create_directories(std::filesystem::path(path).parent_path());
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
+  finalis::test::fill_test_genesis_bls(d);
   out << genesis::to_json(d);
   return out.good();
 }
@@ -268,7 +270,7 @@ TEST(test_lightserver_indexing_after_finalization) {
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -284,6 +286,7 @@ TEST(test_lightserver_indexing_after_finalization) {
   d.seeds = {};
   d.note = "lightserver-indexing-direct";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -465,7 +468,7 @@ TEST(test_lightserver_exposes_script_history_endpoint_direct) {
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -481,6 +484,7 @@ TEST(test_lightserver_exposes_script_history_endpoint_direct) {
   d.seeds = {};
   d.note = "lightserver-history-direct";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -548,6 +552,43 @@ TEST(test_lightserver_get_tx_status_direct) {
   ASSERT_TRUE(missing_resp.find("\"status\":\"not_found\"") != std::string::npos);
   ASSERT_TRUE(missing_resp.find("\"finalized\":false") != std::string::npos);
   ASSERT_TRUE(missing_resp.find("\"credit_safe\":false") != std::string::npos);
+}
+
+// get_timed_reveal: the data of a settled reveal body (a "TR:" row) by timed txid; revealed=false otherwise.
+TEST(test_lightserver_get_timed_reveal_direct) {
+  const std::string base = unique_test_base("/tmp/finalis_light_timed_reveal");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x98;
+  ASSERT_TRUE(db.set_tip(storage::TipState{9, tip_hash}));
+  Hash32 txid{};
+  txid[31] = 0x24;
+  {
+    storage::DB::Batch batch(db);
+    batch.put_timed_reveal(txid, 7, Bytes{'b', 'i', 'd'});
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto query = [&](const Hash32& id) {
+    return ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":103,"method":"get_timed_reveal","params":{"txid":")") +
+                                  hex_encode32(id) + R"("}})");
+  };
+  const auto resp = query(txid);
+  ASSERT_TRUE(resp.find("\"revealed\":true") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"height\":7") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"data_hex\":\"626964\"") != std::string::npos);
+  Hash32 sealed{};
+  sealed[31] = 0x25;
+  ASSERT_TRUE(query(sealed).find("\"revealed\":false") != std::string::npos);
 }
 
 // The node keeps writing while the lightserver runs: every RPC must read the node's latest finalized
@@ -657,7 +698,7 @@ TEST(test_lightserver_get_utxos_uses_canonical_utxo_set_even_with_incomplete_scr
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -673,6 +714,7 @@ TEST(test_lightserver_get_utxos_uses_canonical_utxo_set_even_with_incomplete_scr
   d.seeds = {};
   d.note = "lightserver-canonical-utxos";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -721,7 +763,7 @@ TEST(test_lightserver_get_utxos_ignores_stale_or_missing_script_index_entries) {
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -737,6 +779,7 @@ TEST(test_lightserver_get_utxos_ignores_stale_or_missing_script_index_entries) {
   d.seeds = {};
   d.note = "lightserver-stale-or-missing-su";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -783,7 +826,7 @@ TEST(test_lightserver_get_utxos_keeps_settlement_credit_height_when_history_exis
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -799,6 +842,7 @@ TEST(test_lightserver_get_utxos_keeps_settlement_credit_height_when_history_exis
   d.seeds = {};
   d.note = "lightserver-settlement-height";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -1703,7 +1747,7 @@ TEST(test_lightserver_validate_address_reports_network_and_error_reason) {
   storage::DB db;
   ASSERT_TRUE(db.open(base));
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -1719,6 +1763,7 @@ TEST(test_lightserver_validate_address_reports_network_and_error_reason) {
   d.seeds = {};
   d.note = "lightserver-validate-address";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
   ASSERT_TRUE(db.flush());
@@ -1775,7 +1820,7 @@ TEST(test_lightserver_history_page_is_deterministic) {
   storage::DB db;
   ASSERT_TRUE(db.open(base));
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -1791,6 +1836,7 @@ TEST(test_lightserver_history_page_is_deterministic) {
   d.seeds = {};
   d.note = "lightserver-history-page";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -1847,7 +1893,7 @@ TEST(test_lightserver_confidential_history_page_merges_keys) {
   storage::DB db;
   ASSERT_TRUE(db.open(base));
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -1863,6 +1909,7 @@ TEST(test_lightserver_confidential_history_page_merges_keys) {
   d.seeds = {};
   d.note = "lightserver-conf-history-page";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -1936,7 +1983,7 @@ TEST(test_lightserver_get_utxos_supports_paged_response) {
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -1952,6 +1999,7 @@ TEST(test_lightserver_get_utxos_supports_paged_response) {
   d.seeds = {};
   d.note = "lightserver-utxos-page";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -2017,7 +2065,7 @@ TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -2033,6 +2081,7 @@ TEST(test_lightserver_get_history_page_detailed_classifies_address_relative_flow
   d.seeds = {};
   d.note = "lightserver-history-detailed";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -2095,7 +2144,7 @@ TEST(test_lightserver_get_tx_summaries_returns_batched_finalized_tx_view) {
   ASSERT_TRUE(db.open(base));
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -2111,6 +2160,7 @@ TEST(test_lightserver_get_tx_summaries_returns_batched_finalized_tx_view) {
   d.seeds = {};
   d.note = "lightserver-tx-summaries";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -2167,7 +2217,7 @@ TEST(test_lightserver_get_history_supports_paged_response) {
   storage::DB db;
   ASSERT_TRUE(db.open(base));
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -2183,6 +2233,7 @@ TEST(test_lightserver_get_history_supports_paged_response) {
   d.seeds = {};
   d.note = "lightserver-history-page-support";
   d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
   const auto genesis_json = genesis::to_json(d);
   ASSERT_TRUE(db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end())));
 
@@ -2577,6 +2628,19 @@ TEST(test_lightserver_parse_args_trusted_proxy) {
   ASSERT_EQ(ok->trusted_proxies.size(), 1u);
   ASSERT_TRUE(!parse({"--trusted-proxy", "not-a-cidr"}).has_value());
   ASSERT_TRUE(!parse({"--trusted-proxy"}).has_value());
+  ASSERT_EQ(ok->client_ip_header, "X-Real-IP");
+  const auto cf = parse({"--trusted-proxy", "127.0.0.1/32", "--client-ip-header", "CF-Connecting-IP"});
+  ASSERT_TRUE(cf.has_value());
+  ASSERT_EQ(cf->client_ip_header, "CF-Connecting-IP");
+  ASSERT_TRUE(!parse({"--client-ip-header", "X Real IP"}).has_value());
+  ASSERT_TRUE(!parse({"--client-ip-header", ""}).has_value());
+  ASSERT_TRUE(!parse({"--client-ip-header", "X-Real-IP:"}).has_value());
+  // Behind a Cloudflare tunnel the client's own X-Real-IP is passed through; only CF-Connecting-IP counts.
+  const std::string req = "POST /rpc HTTP/1.1\r\nX-Real-IP: 1.2.3.4\r\ncf-connecting-ip: 203.0.113.7\r\n\r\n";
+  ASSERT_EQ(finalis::net::forwarded_client_ip("127.0.0.1", cf->trusted_proxies,
+                                              finalis::net::http_header_value(req, cf->client_ip_header))
+                .value_or(""),
+            "203.0.113.7");
 }
 
 // Behind a same-host proxy every connection is from 127.0.0.1. Forwarded requests must be limited per

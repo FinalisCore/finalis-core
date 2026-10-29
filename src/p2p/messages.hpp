@@ -39,6 +39,11 @@ enum MsgType : std::uint16_t {
   // Client submission (lightserver relay): the node processes it like TX and answers TX_RESULT.
   SUBMIT_TX = 25,
   TX_RESULT = 26,
+  // A committee member's BLS time signature on a height it holds a finality certificate for.
+  TIME_SIGNATURE = 27,
+  // Public lightserver discovery (p2p/endpoints.hpp): a request, and signed endpoint announcements.
+  GET_ENDPOINTS = 28,
+  ENDPOINTS = 29,
 };
 
 // Sync requests and replies a peer accepts once both VERSIONs and the sender's VERACK are
@@ -92,6 +97,13 @@ struct PrevoteMsg {
 
 struct TimeoutVoteMsg {
   TimeoutVote vote;
+};
+
+// bls_sign(validator's BLS key, time_signature_message(chain domain, height), kBlsTimeSignatureDst).
+struct TimeSignatureMsg {
+  std::uint64_t height{0};
+  PubKey32 validator_pubkey{};
+  crypto::BlsSignature signature{};
 };
 
 struct GetTransitionMsg {
@@ -191,6 +203,8 @@ Bytes ser_prevote(const PrevoteMsg& m);
 std::optional<PrevoteMsg> de_prevote(const Bytes& b);
 Bytes ser_timeout_vote(const TimeoutVoteMsg& m);
 std::optional<TimeoutVoteMsg> de_timeout_vote(const Bytes& b);
+Bytes ser_time_signature(const TimeSignatureMsg& m);
+std::optional<TimeSignatureMsg> de_time_signature(const Bytes& b);
 Bytes ser_get_transition(const GetTransitionMsg& m);
 std::optional<GetTransitionMsg> de_get_transition(const Bytes& b);
 Bytes ser_get_transition_by_height(const GetTransitionByHeightMsg& m);

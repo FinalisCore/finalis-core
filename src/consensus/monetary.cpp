@@ -94,20 +94,54 @@ std::uint64_t emission_year_budget_units(std::uint64_t year_index) {
   return emission_year_budgets()[static_cast<std::size_t>(year_index)];
 }
 
-std::uint64_t post_cap_support_target_units(std::size_t eligible_validator_count) {
-  return static_cast<std::uint64_t>(eligible_validator_count) * POST_CAP_SUPPORT_UNITS_PER_ELIGIBLE_VALIDATOR_PER_EPOCH;
+std::uint64_t emitted_supply_units(std::uint64_t height) {
+  // Heights 1..height; year y covers heights [y * BPY, (y + 1) * BPY) and pays base, plus one unit at
+  // offsets below its remainder (gross_reward_units_for_height).
+  const std::uint64_t last = std::min<std::uint64_t>(height, EMISSION_BLOCKS - 1);
+  if (height == 0) return 0;
+  std::uint64_t total = 0;
+  for (std::uint64_t year = 0; year < EMISSION_YEARS; ++year) {
+    const std::uint64_t lo = std::max<std::uint64_t>(1, year * BLOCKS_PER_YEAR_365);
+    const std::uint64_t hi = std::min<std::uint64_t>(last, (year + 1) * BLOCKS_PER_YEAR_365 - 1);
+    if (lo > hi) continue;
+    const auto budget = emission_year_budgets()[static_cast<std::size_t>(year)];
+    const auto base = budget / BLOCKS_PER_YEAR_365;
+    const auto rem = budget % BLOCKS_PER_YEAR_365;
+    const std::uint64_t off_lo = lo - year * BLOCKS_PER_YEAR_365;
+    const std::uint64_t off_hi = hi - year * BLOCKS_PER_YEAR_365;
+    const std::uint64_t extra = off_lo < rem ? std::min(off_hi, rem - 1) - off_lo + 1 : 0;
+    total += base * (off_hi - off_lo + 1) + extra;
+  }
+  return total;
 }
 
-std::uint64_t post_cap_reserve_subsidy_units(std::size_t eligible_validator_count, std::uint64_t settled_epoch_fee_units,
-                                             std::uint64_t reserve_balance_units) {
-  if (eligible_validator_count == 0) return 0;
-  const auto target_support = post_cap_support_target_units(eligible_validator_count);
-  if (settled_epoch_fee_units >= target_support) return 0;
-  if (reserve_balance_units <= POST_CAP_RESERVE_FLOOR_UNITS) return 0;
-  const auto support_gap = target_support - settled_epoch_fee_units;
-  const auto spendable_reserve = reserve_balance_units - POST_CAP_RESERVE_FLOOR_UNITS;
-  const auto runway_cap = reserve_balance_units / std::max<std::uint64_t>(1, POST_CAP_MIN_RESERVE_RUNWAY_EPOCHS);
-  return std::min({support_gap, spendable_reserve, runway_cap});
+std::uint64_t reserve_payout_units(std::uint64_t height, std::uint64_t reserve_balance_units) {
+  if (height < EMISSION_BLOCKS) return 0;
+  return wide::mul_div_u64(reserve_balance_units, RESERVE_PAYOUT_BPS_PER_YEAR, 10'000ULL * EPOCHS_PER_YEAR_365);
+}
+
+std::uint64_t next_base_fee_per_kib(std::uint64_t base_fee_per_kib, std::uint64_t fullness_ppm) {
+  const std::uint64_t base = std::clamp(base_fee_per_kib, BASE_FEE_MIN_PER_KIB, BASE_FEE_MAX_PER_KIB);
+  const std::uint64_t fullness = std::min<std::uint64_t>(fullness_ppm, 1'000'000ULL);
+  constexpr std::uint64_t target = BASE_FEE_TARGET_FULLNESS_PPM;
+  std::uint64_t next = base;
+  if (fullness > target) {
+    next = base + std::max<std::uint64_t>(1, wide::mul_div_u64(base, fullness - target, target * 8));
+  } else if (fullness < target) {
+    const std::uint64_t step = std::max<std::uint64_t>(1, wide::mul_div_u64(base, target - fullness, target * 8));
+    next = base > step ? base - step : BASE_FEE_MIN_PER_KIB;
+  }
+  return std::clamp(next, BASE_FEE_MIN_PER_KIB, BASE_FEE_MAX_PER_KIB);
+}
+
+std::uint64_t required_base_fee_units(std::uint64_t base_fee_per_kib, std::uint64_t serialized_size) {
+  const std::uint64_t kib = (serialized_size + 1023) / 1024;
+  return wide::mul_u64_exceeds_u64(base_fee_per_kib, kib) ? std::numeric_limits<std::uint64_t>::max()
+                                                          : base_fee_per_kib * kib;
+}
+
+std::uint64_t fee_reserve_share_units(std::uint64_t fee_pool_units) {
+  return wide::mul_div_u64(fee_pool_units, FEE_RESERVE_BPS, 10'000ULL);
 }
 
 std::uint64_t onboarding_reward_units(std::uint64_t settlement_reward_units) {
@@ -115,9 +149,8 @@ std::uint64_t onboarding_reward_units(std::uint64_t settlement_reward_units) {
 }
 
 std::uint64_t validator_min_bond_units(std::uint64_t height) {
-  (void)height;
-  // CLEANSLATE: The post-fork minimum applies without a historical branch.
-  return POST_FORK_VALIDATOR_MIN_BOND_UNITS;
+  // Without a validator count (wallet previews): one active validator.
+  return validator_min_bond_units(mainnet_network(), height, 1);
 }
 
 std::uint64_t integer_sqrt(std::uint64_t value) {
@@ -139,27 +172,32 @@ std::uint64_t effective_weight(std::uint64_t bonded_amount) { return std::max<st
 std::uint64_t validator_min_bond_units(const NetworkConfig& network, std::uint64_t height,
                                        std::size_t finalized_active_validators) {
   const auto& cfg = active_economics_policy(network, height);
-  return validator_min_bond_units(cfg, finalized_active_validators);
+  return validator_min_bond_units(cfg, height, finalized_active_validators);
 }
 
-std::uint64_t validator_min_bond_units(const EconomicsConfig& cfg, std::size_t finalized_active_validators) {
-  const std::uint64_t active = std::max<std::uint64_t>(1, static_cast<std::uint64_t>(finalized_active_validators));
+std::uint64_t validator_min_bond_units(const EconomicsConfig& cfg, std::uint64_t height,
+                                       std::size_t finalized_active_validators) {
+  const std::uint64_t active = std::clamp<std::uint64_t>(static_cast<std::uint64_t>(finalized_active_validators), 1,
+                                                         MIN_BOND_VALIDATOR_COUNT_CAP);
   constexpr std::uint64_t kScale = 100'000'000ULL;
   constexpr std::uint64_t kScaleSqrt = 10'000ULL;
-  const std::uint64_t scaled_ratio = wide::mul_div_u64(cfg.target_validators, kScale, active);
-  const std::uint64_t multiplier = integer_sqrt(scaled_ratio);
-  const std::uint64_t scaled = wide::mul_div_u64(cfg.base_min_bond, multiplier, kScaleSqrt);
-  return clamp_u64(scaled, cfg.min_bond_floor, cfg.min_bond_ceiling);
+  // B_N grows with the number of validators competing for the committee, B_S with the supply.
+  const std::uint64_t ratio = wide::mul_div_u64(active, kScale, std::max<std::uint64_t>(1, cfg.target_validators));
+  const std::uint64_t b_n = wide::mul_div_u64(cfg.base_min_bond, integer_sqrt(ratio), kScaleSqrt);
+  const std::uint64_t b_s = emitted_supply_units(height) / MIN_BOND_SUPPLY_DIVISOR;
+  const std::uint64_t mean = (b_n + 2 * b_s) / 3;
+  return clamp_u64(mean, cfg.min_bond_floor, cfg.min_bond_ceiling);
 }
 
 std::uint64_t validator_max_effective_bond_units(const NetworkConfig& network, std::uint64_t height,
                                                  std::size_t finalized_active_validators) {
   const auto& cfg = active_economics_policy(network, height);
-  return validator_max_effective_bond_units(cfg, finalized_active_validators);
+  return validator_max_effective_bond_units(cfg, height, finalized_active_validators);
 }
 
-std::uint64_t validator_max_effective_bond_units(const EconomicsConfig& cfg, std::size_t finalized_active_validators) {
-  const auto min_bond = validator_min_bond_units(cfg, finalized_active_validators);
+std::uint64_t validator_max_effective_bond_units(const EconomicsConfig& cfg, std::uint64_t height,
+                                                 std::size_t finalized_active_validators) {
+  const auto min_bond = validator_min_bond_units(cfg, height, finalized_active_validators);
   const auto multiple = cfg.max_effective_bond_multiple;
   return wide::mul_u64_exceeds_u64(min_bond, multiple) ? std::numeric_limits<std::uint64_t>::max()
                                                        : (min_bond * multiple);
@@ -170,9 +208,9 @@ std::uint64_t capped_effective_bond_units(const NetworkConfig& network, std::uin
   return std::min(actual_bond, validator_max_effective_bond_units(network, height, finalized_active_validators));
 }
 
-std::uint64_t capped_effective_bond_units(const EconomicsConfig& economics, std::size_t finalized_active_validators,
-                                          std::uint64_t actual_bond) {
-  return std::min(actual_bond, validator_max_effective_bond_units(economics, finalized_active_validators));
+std::uint64_t capped_effective_bond_units(const EconomicsConfig& economics, std::uint64_t height,
+                                          std::size_t finalized_active_validators, std::uint64_t actual_bond) {
+  return std::min(actual_bond, validator_max_effective_bond_units(economics, height, finalized_active_validators));
 }
 
 std::uint64_t effective_weight(const NetworkConfig& network, std::uint64_t height,
@@ -180,9 +218,9 @@ std::uint64_t effective_weight(const NetworkConfig& network, std::uint64_t heigh
   return effective_weight(capped_effective_bond_units(network, height, finalized_active_validators, actual_bond));
 }
 
-std::uint64_t effective_weight(const EconomicsConfig& economics, std::size_t finalized_active_validators,
-                               std::uint64_t actual_bond) {
-  return effective_weight(capped_effective_bond_units(economics, finalized_active_validators, actual_bond));
+std::uint64_t effective_weight(const EconomicsConfig& economics, std::uint64_t height,
+                               std::size_t finalized_active_validators, std::uint64_t actual_bond) {
+  return effective_weight(capped_effective_bond_units(economics, height, finalized_active_validators, actual_bond));
 }
 
 std::uint64_t reward_weight(const NetworkConfig& network, std::uint64_t height,

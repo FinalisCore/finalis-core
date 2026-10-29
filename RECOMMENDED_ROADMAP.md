@@ -248,7 +248,7 @@ Resolved and built clean: **D5** (item 8), **D1** (item 9), **D3** (item 10). No
     - D4: a peer-loss reset or restart drops to round 0 and restarts the backoff from base.
 
 - [ ] **11. Remaining audit items** — D2 (stall-time inactivity escape), D4 (round persistence and
-  TC-based round jumps), D6 (≥4 genesis validators), D7 (post-cap security budget), state growth
+  TC-based round jumps), D6 (≥4 genesis validators; superseded 2026-10-28: mainnet launches with one bootstrap validator and others join by bonding, see `mainnet/MAINNET_PLAN.md` "Launch model"), D7 (post-cap security budget), state growth
   (`CanonicalDerivedState` pruning and per-block copy).
 
 ## G. Phase 4: Strict Monetary & Economic Safety (from the 2026-10-04 monetary audit)

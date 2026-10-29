@@ -158,8 +158,14 @@ Signatures bind the chain. Every transaction signature covers the chain domain
 `D = sha256d("SC-CHAIN-DOMAIN-V1" || network_id || genesis_hash)`, the same value consensus
 signatures cover:
 
-- `Tx` input: `sha256d("SC-SIG-V1" || D || u32le(input_index) || sha256d(tx without script_sigs))`
-- `Tx` unbond: the same with tag `SC-UNBOND-V1`
+- `Tx` input: `sha256d("SC-SIG-V4" || D || u32le(input_index) || sha256d(tx without script_sigs) || S)`
+- `Tx` unbond: `sha256d("SC-UNBOND-V2" || D || sha256d(tx without script_sigs) || u32le(input_index) || S)`
+- `S = sha256d("SC-SPENT-V1" || varint(n) || n x (u64le(value) || varbytes(script_pubkey)))` over the
+  outputs the `n` inputs spend, in input order. A `Tx` names its inputs only by outpoint, so without
+  `S` a signer told a smaller value for a coin than the chain holds would sign away the difference
+  as fee; with it, any wrong value or script makes every signature of the transaction invalid.
+  (`TxV2` and the `TxTimed` fee input need no `S`: the balance proof and the exact fee-input sum
+  fail on a wrong value.)
 - `TxV2` input (transparent or confidential): tag `SC-SIG-V3`
 - `TxV2` balance proof: `sha256d("SC-BAL-V3" || D || tx without signatures)`
 
@@ -202,6 +208,8 @@ Validator-control script semantics are unified across `Tx` and `TxV2`:
 
 - `SCONBREG` must be zero-value, PoP-valid, and cannot appear with
   `SCVALREG`/`SCVALJRQ` in the same transaction
+- `SCONBREG` and `SCVALJRQ` carry the validator's BLS time-signature key with a BLS proof of
+  possession; the Ed25519 proof covers that key, and a BLS key belongs to one validator only
 - `SCVALJRQ` and `SCVALREG` must appear as a matched pair for the same
   validator pubkey
 - admission PoW checks for onboarding/join requests are enforced from the same
@@ -294,7 +302,8 @@ Fees and issuance are separated.
 - before the cap:
   - current-block fees are immediate on the frontier transition path
   - issuance accrues from finalized participation
-  - `10%` of gross issuance accrues into protocol reserve
+  - `30%` of gross issuance accrues into protocol reserve (see `docs/ECONOMICS.md` §4: half of
+    every fee and every slashed bond also return to it; after year 12 it pays 5 % of itself a year)
   - `90%` of gross issuance accrues into validator settlement rewards
 - after the cap:
   - new issuance is zero
@@ -333,7 +342,7 @@ Let:
 
 The live economics helpers use the canonical reward/admission policy:
 
-`min_bond(height) = clamp(min_bond_floor, min_bond_ceiling, base_min_bond * sqrt(target_validators / max(1, active_operators)))`
+`min_bond(height) = clamp(min_bond_floor, min_bond_ceiling, (base_min_bond * sqrt(min(active_operators, 512) / target_validators) + 2 * emitted_supply(height) / 12,800) / 3)`
 
 `max_effective_bond(height) = max_effective_bond_multiple * min_bond(height)`
 

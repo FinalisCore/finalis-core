@@ -170,11 +170,80 @@ if(FINALIS_REQUIRE_CONFIDENTIAL_BACKEND AND NOT FINALIS_USE_SECP256K1_ZKP_BACKEN
     "Ensure third_party/secp256k1-zkp is present or provide a compatible system secp256k1-zkp installation.")
 endif()
 
+# blst (BLS12-381, Apache-2.0): validator time signatures and McFly signature-based witness
+# encryption (src/crypto/bls12_381.*). Required: consensus verifies time signatures with it.
+# third_party/blst if present, else fetched at a pinned commit (tag v0.3.17). blst has no CMake
+# build; its two amalgamation units are compiled directly, as its build.sh does.
+set(FINALIS_BLST_SOURCE "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/blst/bindings/blst.h")
+  set(FINALIS_BLST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/blst")
+  message(STATUS "Using vendored blst")
+elseif(FINALIS_AUTO_FETCH_DEPS)
+  include(FetchContent)
+  message(STATUS "Vendored blst not found; fetching from upstream")
+  FetchContent_Declare(
+    blst
+    GIT_REPOSITORY https://github.com/supranational/blst.git
+    GIT_TAG 54e6e55674722fc2797ebb4bbb71b26d881eb4b8  # v0.3.17
+  )
+  FetchContent_Populate(blst)
+  set(FINALIS_BLST_SOURCE "${blst_SOURCE_DIR}")
+else()
+  message(FATAL_ERROR "blst not found: place it in third_party/blst or enable FINALIS_AUTO_FETCH_DEPS.")
+endif()
+# Portable (runtime CPU dispatch) by default: release binaries run on hosts other than the build host.
+option(FINALIS_BLST_PORTABLE "Build blst with -D__BLST_PORTABLE__" ON)
+enable_language(C)
+set(FINALIS_BLST_SOURCES "${FINALIS_BLST_SOURCE}/src/server.c")
+set(FINALIS_BLST_DEFINES "")
+# No assembly under MSVC (its .asm needs MASM wiring, not done yet): portable C, slower. Fuzz and
+# ASan/UBSan builds keep the assembly: blst v0.3.17's no-asm path does not build with 64-bit limbs
+# (no llimb_t on x86_64/aarch64), and only MSan, not run here, needs it.
+if(MSVC)
+  list(APPEND FINALIS_BLST_DEFINES __BLST_NO_ASM__)
+else()
+  enable_language(ASM)
+  list(APPEND FINALIS_BLST_SOURCES "${FINALIS_BLST_SOURCE}/build/assembly.S")
+  if(FINALIS_BLST_PORTABLE)
+    list(APPEND FINALIS_BLST_DEFINES __BLST_PORTABLE__)
+  endif()
+endif()
+add_library(finalis_blst STATIC ${FINALIS_BLST_SOURCES})
+target_include_directories(finalis_blst PUBLIC "${FINALIS_BLST_SOURCE}/bindings")
+target_compile_definitions(finalis_blst PRIVATE ${FINALIS_BLST_DEFINES})
+if(NOT MSVC)
+  target_compile_options(finalis_blst PRIVATE -O2 -fno-builtin -fPIC)
+endif()
+
+# Storage. RocksDB is required: without it storage::DB uses a file backend that rewrites kv.bin in
+# place (no fsync, no atomic rename), so a "durable" write is not durable and a crash mid-write can
+# lose all state. That backend is for fuzzing and tests only (ClusterFuzzLite has no RocksDB), and
+# finalis-node built on it refuses to start.
+option(FINALIS_ALLOW_FILE_BACKEND "Allow building without RocksDB on the non-durable file backend (fuzz/test only)" OFF)
 find_library(ROCKSDB_LIB rocksdb)
 find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h)
 if(ROCKSDB_LIB AND ROCKSDB_INCLUDE_DIR)
-  message(STATUS "Using RocksDB")
+  message(STATUS "Using RocksDB: ${ROCKSDB_LIB}")
   add_compile_definitions(SC_HAS_ROCKSDB=1)
+  # Distro packages (Ubuntu/Debian librocksdb8.9) are built without NDEBUG: RocksDB's internal
+  # asserts are live and abort the process where a release build returns an error. storage::DB
+  # never writes again after a failed write (its write fence), which closes the observed abort
+  # (KNOWN_DEFECTS.md E1), but other asserts stay reachable in principle. Reported, not fatal.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    execute_process(COMMAND nm -D "${ROCKSDB_LIB}" OUTPUT_VARIABLE _rocksdb_syms ERROR_QUIET RESULT_VARIABLE _rocksdb_nm_rc)
+    if(_rocksdb_nm_rc EQUAL 0 AND _rocksdb_syms MATCHES "U __assert_fail")
+      message(WARNING "${ROCKSDB_LIB} is built with assertions enabled (no NDEBUG): an internal RocksDB "
+                      "assertion aborts the node instead of returning an error. Prefer a release (NDEBUG) "
+                      "RocksDB build for validators; see tests/KNOWN_DEFECTS.md E1.")
+    endif()
+  endif()
+elseif(FINALIS_ALLOW_FILE_BACKEND)
+  message(WARNING "RocksDB not found: building on the NON-DURABLE file backend (FINALIS_ALLOW_FILE_BACKEND=ON). "
+                  "For fuzzing and tests only; finalis-node built this way refuses to start.")
+else()
+  message(FATAL_ERROR "RocksDB not found (librocksdb-dev / rocksdb-devel / vcpkg rocksdb). Node storage needs it: "
+                      "the fallback file backend is not crash-durable. For fuzz or test builds only, configure with "
+                      "-DFINALIS_ALLOW_FILE_BACKEND=ON.")
 endif()
 
 add_library(finalis_core
@@ -188,6 +257,9 @@ add_library(finalis_core
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
   src/crypto/vrf.cpp
+  src/crypto/bls12_381.cpp
+  src/crypto/swe.cpp
+  src/crypto/swe_proofs.cpp
   src/crypto/secure_memory.cpp
   src/crypto/smt.cpp
   src/crypto/confidential.cpp
@@ -229,6 +301,7 @@ add_library(finalis_core
   src/storage/snapshot.cpp
   src/p2p/framing.cpp
   src/p2p/addrman.cpp
+  src/p2p/endpoints.cpp
   src/p2p/hardening.cpp
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
@@ -240,6 +313,7 @@ add_library(finalis_core
   src/node/node_consensus.cpp
   src/node/node_ingress.cpp
   src/node/node_network.cpp
+  src/node/node_endpoints.cpp
   src/node/node_validator_ops.cpp
   src/lightserver/client.cpp
   src/lightserver/server.cpp
@@ -252,6 +326,7 @@ target_link_libraries(finalis_core PUBLIC ${SODIUM_LIB})
 if(FINALIS_SECP256K1_INCLUDE_DIR)
   target_include_directories(finalis_core PUBLIC ${FINALIS_SECP256K1_INCLUDE_DIR})
 endif()
+target_link_libraries(finalis_core PUBLIC finalis_blst)
 if(FINALIS_SECP256K1_TARGET)
   target_link_libraries(finalis_core PUBLIC ${FINALIS_SECP256K1_TARGET})
 elseif(SECP256K1_LIB AND SECP256K1_INCLUDE_DIR)
@@ -265,7 +340,7 @@ if(ZLIB_FOUND)
   target_link_libraries(finalis_core PUBLIC ZLIB::ZLIB)
 endif()
 if(WIN32)
-  target_link_libraries(finalis_core PUBLIC ws2_32 rpcrt4 shlwapi)
+  target_link_libraries(finalis_core PUBLIC ws2_32 rpcrt4 shlwapi crypt32)
 endif()
 
 if(FINALIS_STRICT_WARNINGS)
@@ -326,6 +401,9 @@ endif()
 # Confidential verify-weight calibration (not a test; run manually from a Release build).
 add_executable(finalis-bench-confidential tools/bench_confidential_verify.cpp)
 target_link_libraries(finalis-bench-confidential PRIVATE finalis_core)
+# Time-lock (McFly SWE) cost per committee size and per worst-case block (not a test; Release build).
+add_executable(finalis-bench-swe tools/bench_swe.cpp)
+target_link_libraries(finalis-bench-swe PRIVATE finalis_core)
 
 add_executable(finalis-explorer apps/finalis-explorer/main.cpp)
 target_link_libraries(finalis-explorer PRIVATE finalis_core)
@@ -453,6 +531,8 @@ add_executable(finalis-tests
   tests/test_address.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp
+  tests/test_endpoints.cpp
+  tests/test_join_queue.cpp
   tests/test_monetary.cpp
   tests/test_wide_arith.cpp
   tests/test_committee_schedule.cpp
@@ -461,6 +541,11 @@ add_executable(finalis-tests
   tests/test_bonding.cpp
   tests/test_finality_certificate.cpp
   tests/test_vrf.cpp
+  tests/test_bls12_381.cpp
+  tests/test_swe.cpp
+  tests/test_swe_proofs.cpp
+  tests/test_timed_tx.cpp
+  tests/test_height_lock.cpp
   tests/test_availability.cpp
   tests/test_snapshot.cpp
   tests/test_validator_lifecycle.cpp
@@ -484,6 +569,8 @@ add_executable(finalis-tests
   tests/test_wallet_confidential_receive.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp
+  tests/test_storage_faults.cpp
+  tests/support/storage_fault_injection.cpp
   tests/test_lightserver.cpp
   tests/test_explorer.cpp
 )
@@ -496,7 +583,8 @@ endif()
 
 if(FINALIS_BUILD_FUZZ)
   foreach(fuzz_target fuzz_p2p_frame fuzz_consensus_msgs fuzz_consensus_node fuzz_tx_parse fuzz_smt
-                      fuzz_confidential fuzz_wire_codecs fuzz_sync)
+                      fuzz_confidential fuzz_wire_codecs fuzz_sync fuzz_consensus_persistence
+                      fuzz_timed_execution)
     add_executable(${fuzz_target} fuzz/${fuzz_target}.cpp)
     target_link_libraries(${fuzz_target} PRIVATE finalis_core)
     if(FINALIS_SANITIZE)
@@ -512,11 +600,29 @@ if(FINALIS_BUILD_FUZZ)
   endforeach()
   # fuzz_sync builds its reference chain with the header-only test helpers.
   target_include_directories(fuzz_sync PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  # fuzz_consensus_persistence injects storage faults with the test-only WAL interposer (a no-op
+  # without RocksDB, e.g. in the ClusterFuzzLite build).
+  target_sources(fuzz_consensus_persistence PRIVATE tests/support/storage_fault_injection.cpp)
+  target_include_directories(fuzz_consensus_persistence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 endif()
 
 enable_testing()
+add_test(NAME configure-rejects-file-backend
+         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DBIN=${CMAKE_CURRENT_BINARY_DIR}/configure-probe-file-backend
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_file_backend_rejected.cmake)
 add_test(NAME finalis-tests COMMAND finalis-tests)
 set_tests_properties(finalis-tests PROPERTIES RESOURCE_LOCK ports)
+# Regression tests for open production defects (tests/KNOWN_DEFECTS.md). They fail until fixed, so
+# they run as their own ctest entry: `ctest -LE known-defect` is the gate, `ctest -L known-defect`
+# (or the run-known-defect-tests target) reports them.
+add_test(NAME finalis-known-defects COMMAND finalis-tests)
+set_tests_properties(finalis-known-defects PROPERTIES RESOURCE_LOCK ports LABELS known-defect
+                     ENVIRONMENT FINALIS_TEST_KNOWN_DEFECTS=only WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_custom_target(run-known-defect-tests
+  COMMAND ${CMAKE_COMMAND} -E env FINALIS_TEST_KNOWN_DEFECTS=only $<TARGET_FILE:finalis-tests>
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  DEPENDS finalis-tests
+  USES_TERMINAL)
 if(TARGET finalis-wallet-widget-tests)
   add_test(NAME finalis-wallet-widget-tests COMMAND finalis-wallet-widget-tests)
   set_tests_properties(finalis-wallet-widget-tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

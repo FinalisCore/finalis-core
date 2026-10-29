@@ -19,12 +19,12 @@ proposals and timeout votes. A transaction or vote signed for one network is the
 every other one, and the different P2P magic keeps their nodes from connecting. Still, keep testnet
 and mainnet keys separate. Testnet coins have no value.
 
-## Genesis (testnet-2)
+## Genesis (testnet-3)
 
 One bootstrap validator, run by the maintainer ([pubkeys.txt](pubkeys.txt)). Others join after
 launch (see "Join as a validator" below), funded with testnet FLS from the bootstrap validator's
-block rewards. The mainnet ceremony
-([../mainnet/GENESIS_VALIDATOR_CEREMONY.md](../mainnet/GENESIS_VALIDATOR_CEREMONY.md)) is not used.
+block rewards. Mainnet launches the same way
+([../mainnet/MAINNET_PLAN.md](../mainnet/MAINNET_PLAN.md#launch-model)).
 
 Until more validators are active the chain has no fault tolerance: the bootstrap validator alone
 finalizes every block, and the chain stops while it is down. Quorum with 2 validators is 2 (either
@@ -34,15 +34,21 @@ each on its own machine.
 ### 1. Keys: on each validator machine, never copied elsewhere
 
 ```bash
-finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass "<passphrase>"
+finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass-prompt
 ```
 
 Keep the passphrase off the machine's shell history (for example, read it from a file with
-`--validator-passphrase-env` later). Record only the printed `pubkey_hex`.
+`--validator-passphrase-env` later). Record only the printed `pubkey_hex`, then print the validator's BLS time-signature key and its
+proof of possession (public output; derived from the same key):
+
+```bash
+finalis-cli validator_bls --file ~/.finalis/testnet/keystore/validator.json --pass-prompt
+```
 
 ### 2. genesis.json and genesis.bin: on the release commit
 
-Put the genesis `pubkey_hex` values in `testnet/pubkeys.txt`, one per line, then:
+Put one line per genesis validator in `testnet/pubkeys.txt`, `<pubkey_hex> <bls_pubkey> <bls_pop>`,
+then:
 
 ```bash
 scripts/make_genesis_json.py --network testnet --pubkeys testnet/pubkeys.txt \
@@ -55,13 +61,14 @@ scripts/genesis_to_cpp.py --network testnet --in testnet/genesis.bin --out src/g
 Commit `pubkeys.txt`, `genesis.json`, `genesis.bin` and `embedded_testnet.cpp` together, tag the
 commit, and publish the `genesis_hash`. Anyone can reproduce it from the committed files.
 
-testnet-2 is embedded (`genesis_hash` `4faa7e1b8e79509c767f7f51f711eba7c75e9e9e4d9ea105fa020dd15cdd9d0c`,
+testnet-3 is embedded (`genesis_hash` `f68c3097f1b5fce94ef79840418617719c75b57ee66b7bd51b6735a8a34193b6`,
 check with `finalis-cli --testnet genesis_print_embedded`), so nodes need no `--genesis` flag. Its
-`genesis_time_unix` is 1792861200 (2026-10-24 17:00 UTC); the code freeze is release v2.1.0.
+`genesis_time_unix` is 1793253600 (2026-10-29 06:00 UTC).
 
-testnet-2 replaced testnet-1 (genesis `5cabf22b…`, 2026-10-19) when the leader VRF became RFC 9381
-ECVRF-EDWARDS25519-SHA512-TAI: testnet-1's VRF depended on the libsodium build, so nodes could
-disagree on leader proofs. A node that ran testnet-1 exits with `genesis mismatch against existing
+testnet-3 replaced testnet-2 (genesis `4faa7e1b…`, 2026-10-24) when genesis validators gained BLS
+time-signature keys (genesis version 2). testnet-2 had replaced testnet-1 (genesis `5cabf22b…`,
+2026-10-19) when the leader VRF became RFC 9381 ECVRF-EDWARDS25519-SHA512-TAI. A node that ran an
+earlier testnet exits with `genesis mismatch against existing
 database`: delete its data directory (`~/.finalis/testnet`, keeping `keystore/` if you want the same
 validator key) and start it again.
 
@@ -76,8 +83,8 @@ finalis-node --testnet --public --with-lightserver --lightserver-bind 0.0.0.0
 
 A node loads `<data dir>/keystore/validator.json` whenever that file exists, with or without
 `--validator-key-file`, so a seed must not have one. The testnet launched with a single host,
-130.61.126.39, which is both the seed and the bootstrap validator; a separate plain seed replaces it
-in SEEDS.json before more validators join.
+130.61.126.39, which is both a seed and the bootstrap validator; 159.200.236.114 is a plain seed and
+public lightserver (HTTPS) next to it, so the validator is not the only public entrance.
 
 ### 4. Launch
 
@@ -149,7 +156,7 @@ curl -s http://127.0.0.1:19544/rpc \
 ```
 
 `get_status` must report `network_name` `testnet`, `chain_id_ok` `true` and `genesis_hash`
-`4faa7e1b…9d0c`; `finalized_height` should match the explorer's.
+`f68c3097…93b6`; `finalized_height` should match the explorer's.
 
 Update to a new release: `git pull`, then run the same `start.sh` command again; it rebuilds and
 restarts the services. Chain data is kept.
@@ -269,7 +276,7 @@ On Windows: `Test-NetConnection <your public IP> -Port 19540`. Or use an online 
 2. Create a validator key on that machine and note its `address` (`tsc1…`):
 
    ```bash
-   finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass "<passphrase>"
+   finalis-cli --testnet wallet_create --out ~/.finalis/testnet/keystore/validator.json --pass-prompt
    ```
 
 3. Get testnet FLS to that address: the bond (1,000 to 4,000 FLS, depending on the number of
@@ -277,7 +284,7 @@ On Windows: `Test-NetConnection <your public IP> -Port 19540`. Or use an online 
 
    ```bash
    finalis-cli --testnet send --to <tsc1 address> --amount-units <units> \
-       --file <bootstrap validator.json> --pass "<passphrase>" --db <wallet dir>
+       --file <bootstrap validator.json> --pass-prompt --db <wallet dir>
    ```
 
    (1 FLS = 100,000,000 units.)
@@ -286,7 +293,7 @@ On Windows: `Test-NetConnection <your public IP> -Port 19540`. Or use an online 
    to finality:
 
    ```bash
-   finalis-cli --testnet validator-register --file ~/.finalis/testnet/keystore/validator.json --pass "<passphrase>"
+   finalis-cli --testnet validator-register --file ~/.finalis/testnet/keystore/validator.json --pass-prompt
    ```
 
 5. Restart the node with the key so it validates:

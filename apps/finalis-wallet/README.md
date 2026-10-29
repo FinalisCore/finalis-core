@@ -95,6 +95,37 @@ supported subset:
   creating accounts again restores 1, 2, ... in order. Accounts imported from a raw view + spend
   secret need that pair backed up separately.
 
+## Time-locked sends
+
+`Send -> Transparent -> Transparent (time-locked)` seals a transfer until a height is final
+(`TxTimed`, see docs/CONSENSUS.md "Timed Transactions"): "Opens after" N blocks puts the unlock
+height at next block + N. Past the end of the current committee epoch it is a long lock: the current
+committee opens it, the envelope pays 0.001 FLS per epoch of lock, its sealed transfer is at most 1 KiB,
+and the review warns when the lock runs past the validators' one-year bond hold. One coin pays the envelope
+(prepaid fee + a bond, the rest returns as change); the transfer is planned from the other coins
+(`plan_timed_p2pkh_send`). Its coins stay reserved until it opens: the wallet records the sealed
+transfer as a pending spend dated at the unlock height, so the usual not-found release cannot free
+them early. The bond comes back when the transfer applies in block unlock + 1.
+
+`Cancel Time-Locked...` lists sends that have not opened yet and spends the transfer's coins back to
+the wallet, which makes the transfer fail when it opens (the bond is forfeited, by design: a free
+cancel would make every envelope a free option). If the envelope is not in a block yet, it also spends
+the fee coin, which keeps the bond if that spend finalizes first. Records are kept in the wallet store
+(`TIMED:`), because the chain holds the transfer encrypted until it opens.
+
+`Send -> Sealed data (published at a block)` seals the text in the data field (up to 1016 bytes)
+instead of a transfer: nobody can read it until the unlock height is final, then it is published for
+anyone (`get_timed_reveal`) and the bond comes back. It needs only the envelope's coin and cannot be
+cancelled once in a block.
+
+## Height-locked sends
+
+`Send -> Transparent -> Height-locked (vesting / inheritance)` pays an output the recipient can spend
+only from a chosen block (`SCHLOCK1`), for any distance. With "I keep spending it until then" it is an
+inheritance output (`SCHLOCK2`): this wallet can still spend it at any time, the recipient (heir) from
+that block. Locked coins are found by the recipient's normal address; the balance shows them as
+"Height-locked" until spendable, and ordinary sends use them from then on (no separate claim step).
+
 ## Lightserver failover
 
 The wallet accepts an ordered list of lightserver RPC endpoints in `Advanced -> Connections`.
@@ -134,7 +165,7 @@ The wallet does not take a server's word for its balance
   verified" until the next.
 - Progress is saved per network in the wallet settings, so a restart resumes instead of walking
   from genesis.
-- Mainnet shows `NOT VERIFIED` until the embedded genesis names its validators (genesis ceremony).
+- Mainnet shows `NOT VERIFIED` until the embedded genesis names its bootstrap validator (at launch).
 
 ## Lightserver cross-check
 

@@ -2,6 +2,8 @@
 
 #include "lightserver/server.hpp"
 
+#include "p2p/endpoints.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -209,7 +211,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     const auto canonical_utxos = db.load_transparent_utxos();
     std::map<OutPoint, TxOut> canonical_matches;
     for (const auto& [op, entry] : canonical_utxos) {
-      if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
       canonical_matches.emplace(op, entry.out);
     }
     std::vector<storage::DB::ScriptUtxoEntry> out;
@@ -254,7 +256,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
     if (!tx.has_value()) continue;
     for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
       const auto& out = tx->outputs[i];
-      if (crypto::sha256(out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(out.script_pubkey, scripthash) || is_data_output_script(out.script_pubkey)) continue;
       const OutPoint op{item.txid, static_cast<std::uint32_t>(i)};
       canonical_matches[op] = storage::DB::ScriptUtxoEntry{op, out.value, out.script_pubkey, item.height};
     }
@@ -263,7 +265,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
       if (!prev_tx.has_value()) continue;
       if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
       const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
-      if (crypto::sha256(prev_out.script_pubkey) != scripthash) continue;
+      if (!script_indexed_under(prev_out.script_pubkey, scripthash)) continue;
       canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
     }
   }
@@ -271,7 +273,7 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   // so settlement outputs remain visible even when history is non-empty.
   const auto canonical_utxos = db.load_transparent_utxos();
   for (const auto& [op, entry] : canonical_utxos) {
-    if (crypto::sha256(entry.out.script_pubkey) != scripthash) continue;
+    if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
     if (canonical_matches.find(op) != canonical_matches.end()) continue;
     storage::DB::ScriptUtxoEntry merged;
     merged.outpoint = op;
@@ -658,7 +660,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
 
     std::uint64_t credited = 0;
     for (const auto& output : tx->outputs) {
-      if (crypto::sha256(output.script_pubkey) == scripthash) credited += output.value;
+      if (script_indexed_under(output.script_pubkey, scripthash)) credited += output.value;
     }
 
     std::uint64_t debited = 0;
@@ -667,7 +669,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
       if (!prev_tx.has_value()) continue;
       if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
       const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
-      if (crypto::sha256(prev_out.script_pubkey) == scripthash) debited += prev_out.value;
+      if (script_indexed_under(prev_out.script_pubkey, scripthash)) debited += prev_out.value;
     }
 
     if (debited == 0 && credited > 0) {
@@ -682,7 +684,7 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
     } else if (debited > 0 && credited > 0) {
       // Any output to another script (a confidential one included) means value left: a send with change.
       const bool pays_elsewhere = std::any_of(tx->outputs.begin(), tx->outputs.end(), [&](const TxOut& output) {
-        return crypto::sha256(output.script_pubkey) != scripthash;
+        return !script_indexed_under(output.script_pubkey, scripthash);
       });
       row.net_amount = static_cast<std::int64_t>(credited) - static_cast<std::int64_t>(debited);
       if (pays_elsewhere) {
@@ -1901,7 +1903,7 @@ void Server::handle_client(const Job& job) {
   const std::string body = req.substr(hdr_end + 4);
   // Every public request is charged, including malformed ones, before any further work.
   const auto forwarded_ip =
-      net::forwarded_client_ip(job.peer_ip, cfg_.trusted_proxies, net::http_header_value(req, "X-Real-IP"));
+      net::forwarded_client_ip(job.peer_ip, cfg_.trusted_proxies, net::http_header_value(req, cfg_.client_ip_header));
   const std::string client_ip = forwarded_ip.value_or(job.peer_ip);
   const bool loopback_exempt =
       !forwarded_ip.has_value() && cfg_.exempt_loopback_from_rate_limits && job.peer_ip.rfind("127.", 0) == 0;
@@ -2061,9 +2063,15 @@ TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   auto unavailable = [](std::string detail) {
     return TxRelayResult{TxRelayResult::Outcome::Unavailable, std::move(detail)};
   };
-  const auto parsed = parse_any_tx(tx_bytes);
-  if (!parsed.has_value()) return TxRelayResult{TxRelayResult::Outcome::Rejected, "tx parse failed"};
-  const Hash32 txid = txid_any(*parsed);
+  // A Tx / TxV2, or a TxTimed (its own record kind: broadcast_tx relays it unchecked to the node).
+  Hash32 txid{};
+  if (const auto parsed = parse_any_tx(tx_bytes); parsed.has_value()) {
+    txid = txid_any(*parsed);
+  } else if (const auto timed = TxTimed::parse(tx_bytes); timed.has_value()) {
+    txid = timed->txid();
+  } else {
+    return TxRelayResult{TxRelayResult::Outcome::Rejected, "tx parse failed"};
+  }
   constexpr std::uint32_t kRelayHandshakeTimeoutMs = 2000;
   constexpr std::uint32_t kRelayVerdictTimeoutMs = 5000;
   constexpr std::uint32_t kRelayDrainTimeoutMs = 1000;
@@ -2219,7 +2227,16 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       local_registry_pubkey = runtime->availability_local_operator_pubkey;
     }
     std::ostringstream oss;
-    oss << "{\"network_name\":\"" << cfg_.network.name << "\",\"protocol_version\":"
+    // The key this server's node announces it under (p2p/endpoints.hpp): a client keeps a discovered
+    // endpoint only when the server behind its URL reports the announced key here.
+    std::string endpoint_pubkey;
+    if (const auto own = view->get(storage::key_own_lightserver_endpoint())) {
+      if (const auto a = p2p::de_endpoint_announcement(*own)) endpoint_pubkey = hex_encode(Bytes(a->pubkey.begin(), a->pubkey.end()));
+    }
+    // The base fee the next block requires (units per started KiB of a transaction).
+    const auto base_fee = view->get_base_fee_per_kib().value_or(consensus::BASE_FEE_MIN_PER_KIB);
+    oss << "{\"network_name\":\"" << cfg_.network.name << "\",\"endpoint_pubkey\":\"" << endpoint_pubkey
+        << "\",\"base_fee_per_kib\":" << base_fee << ",\"protocol_version\":"
         << cfg_.network.protocol_version << ",\"feature_flags\":" << cfg_.network.feature_flags
         << ",\"network_id\":\"" << chain_id_.network_id_hex << "\",\"magic\":" << chain_id_.magic
         << ",\"genesis_hash\":\"" << chain_id_.genesis_hash_hex << "\",\"genesis_source\":\""
@@ -2962,6 +2979,21 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     return make_result(id, tx_status_json(*txid, loc, tip, *view));
   }
 
+  // The data a TxTimed's reveal body published when it settled (DB "TR:" rows); revealed=false while
+  // it is sealed, unknown, or not a reveal.
+  if (*method == "get_timed_reveal") {
+    auto txid_hex = field_string(params, "txid");
+    if (!txid_hex) return make_error(id, -32602, "missing txid");
+    auto txid = parse_hex32(*txid_hex);
+    if (!txid) return make_error(id, -32602, "bad txid");
+    const auto reveal = view->get_timed_reveal(*txid);
+    std::ostringstream oss;
+    oss << "{\"txid\":\"" << hex_encode32(*txid) << "\",\"revealed\":" << (reveal ? "true" : "false");
+    if (reveal) oss << ",\"height\":" << reveal->height << ",\"data_hex\":\"" << hex_encode(reveal->data) << "\"";
+    oss << "}";
+    return make_result(id, oss.str());
+  }
+
   if (*method == "get_tx_summaries") {
     const auto* txids_value = params ? params->get("txids") : nullptr;
     if (!txids_value || !txids_value->is_array()) return make_error(id, -32602, "missing txids");
@@ -3421,6 +3453,13 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     } else {
       oss << "null";
     }
+    oss << ",\"committee_bls_key_root\":";
+    if (checkpoint.has_value() && checkpoint->ordered_bls_keys.size() == checkpoint->ordered_members.size()) {
+      const auto root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
+      oss << "\"" << hex_encode(Bytes(root.begin(), root.end())) << "\"";
+    } else {
+      oss << "null";
+    }
     oss
         << ",\"ticket_pow\":" << ticket_pow_status_json(ticket_pow)
         << ",\"members\":[";
@@ -3433,6 +3472,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       std::optional<std::uint64_t> final_weight;
       std::optional<Hash32> ticket_hash;
       std::optional<std::uint64_t> ticket_nonce;
+      std::optional<crypto::BlsPublicKey> bls_pubkey;
       if (checkpoint.has_value()) {
         if (i < checkpoint->ordered_operator_ids.size()) operator_id = checkpoint->ordered_operator_ids[i];
         if (i < checkpoint->ordered_base_weights.size()) base_weight = checkpoint->ordered_base_weights[i];
@@ -3440,6 +3480,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         if (i < checkpoint->ordered_final_weights.size()) final_weight = checkpoint->ordered_final_weights[i];
         if (i < checkpoint->ordered_ticket_hashes.size()) ticket_hash = checkpoint->ordered_ticket_hashes[i];
         if (i < checkpoint->ordered_ticket_nonces.size()) ticket_nonce = checkpoint->ordered_ticket_nonces[i];
+        if (i < checkpoint->ordered_bls_keys.size()) bls_pubkey = checkpoint->ordered_bls_keys[i];
       }
       if (!operator_id.has_value()) {
         auto it = validators.find(representative_pubkey);
@@ -3471,6 +3512,9 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       else oss << "null";
       oss << ",\"ticket_nonce\":";
       if (ticket_nonce.has_value()) oss << *ticket_nonce;
+      else oss << "null";
+      oss << ",\"bls_pubkey\":";
+      if (bls_pubkey.has_value()) oss << "\"" << hex_encode(Bytes(bls_pubkey->begin(), bls_pubkey->end())) << "\"";
       else oss << "null";
       oss << "}";
     }
@@ -3543,6 +3587,25 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
 
   // Light-client proofs (consensus/light_client.hpp): each handoff proves the next epoch's committee
   // from the previous one's, starting after `from_epoch_start`, so a client walks them in order.
+  // Public lightservers this node learned from the network, as signed announcements: clients verify
+  // each signature and that the server at the URL reports the announced endpoint_pubkey.
+  if (*method == "get_lightserver_endpoints") {
+    std::ostringstream oss;
+    oss << "{\"endpoints\":[";
+    std::size_t count = 0;
+    for (const auto& [_, bytes] : db_.scan_prefix(storage::key_lightserver_endpoint_prefix())) {
+      const auto a = p2p::de_endpoint_announcement(bytes);
+      if (!a || !p2p::valid_endpoint_url(a->url, true)) continue;
+      if (count++) oss << ",";
+      oss << "{\"pubkey\":\"" << hex_encode(Bytes(a->pubkey.begin(), a->pubkey.end())) << "\",\"url\":\"" << a->url
+          << "\",\"issued_unix\":" << a->issued_unix << ",\"signature\":\""
+          << hex_encode(Bytes(a->signature.begin(), a->signature.end())) << "\"}";
+      if (count >= p2p::kEndpointTableCapacity) break;
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
+  }
+
   if (*method == "get_committee_handoffs") {
     const auto from = field_u64(params, "from_epoch_start");
     if (!from || *from == 0) return make_error(id, -32602, "missing from_epoch_start");
@@ -3664,6 +3727,26 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     auto tx = parse_any_tx(*tx_bytes);
     if (!tx.has_value()) {
+      // A TxTimed: its admission needs the committee keys and the SWE proof check, which the node's
+      // timed intake (consensus::check_timed_inclusion) does; relay it and report the node's verdict.
+      if (const auto timed = TxTimed::parse(*tx_bytes); timed.has_value()) {
+        const std::string timed_txid_hex = hex_encode32(timed->txid());
+        if (view->get_tx_index(timed->txid()).has_value()) {
+          return make_result(id, broadcast_result_json(false, timed_txid_hex, "rejected", "", std::string("tx_duplicate"),
+                                                       std::string("This transaction is already finalized."), false,
+                                                       "none", false, std::nullopt));
+        }
+        const auto relay = relay_tx_to_peer(*tx_bytes);
+        if (relay.outcome != TxRelayResult::Outcome::Accepted) {
+          const std::string code = relay.outcome == TxRelayResult::Outcome::Unavailable ? std::string("relay_unavailable")
+                                                                                        : std::string("tx_invalid");
+          return make_result(id, broadcast_result_json(false, timed_txid_hex, "rejected", "", code, relay.detail,
+                                                       code == "relay_unavailable", retry_class_for_error_code(code),
+                                                       false, std::nullopt));
+        }
+        return make_result(id, broadcast_result_json(true, timed_txid_hex, "accepted_for_relay", "accepted_for_relay",
+                                                     std::nullopt, std::nullopt, false, "none", false, std::nullopt));
+      }
       return make_result(id, broadcast_result_json(false, "", "rejected", "", std::string("tx_invalid"),
                                                    std::string("tx parse failed"), false, "none", false, std::nullopt));
     }
@@ -3819,6 +3902,10 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto parsed = net::parse_ipv4_cidr_list(*v);
       if (!parsed.has_value()) return std::nullopt;
       cfg.trusted_proxies = std::move(*parsed);
+    } else if (a == "--client-ip-header") {
+      auto v = next();
+      if (!v || !net::is_http_header_name(*v)) return std::nullopt;
+      cfg.client_ip_header = *v;
     } else {
       return std::nullopt;
     }

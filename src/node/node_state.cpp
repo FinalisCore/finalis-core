@@ -336,6 +336,16 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
     state.protocol_reserve_balance_units = *reserve;
   }
   if (auto pool = db.get_confidential_pool_value(); pool.has_value()) state.confidential_pool_value = *pool;
+  if (auto base_fee = db.get_base_fee_per_kib(); base_fee.has_value()) state.base_fee_per_kib = *base_fee;
+  state.timed_escrows = load_timed_escrows(db);
+  state.timed_key_sets = load_timed_key_sets(db);
+  for (const auto& [key, tx] : state.timed_escrows) {
+    if (consensus::timed_is_long_lock(tx, cfg.network.committee_epoch_blocks) &&
+        !state.timed_key_sets.contains(tx.committee_root)) {
+      if (error) *error = "checkpoint-timed-key-set-missing unlock=" + std::to_string(key.unlock_height);
+      return false;
+    }
+  }
   if (auto persisted_randomness = db.get(kFinalizedRandomnessKey);
       persisted_randomness.has_value() && persisted_randomness->size() == 32) {
     std::copy(persisted_randomness->begin(), persisted_randomness->end(), state.finalized_randomness.begin());
@@ -464,6 +474,7 @@ bool Node::canonical_genesis_state_locked(consensus::CanonicalDerivedState* out,
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
+  genesis_state.initial_validator_bls_keys = genesis::bls_keys_for(*genesis_doc, genesis_state.initial_validators);
 
   std::string canonical_error;
   if (!consensus::build_genesis_canonical_state(canonical_derivation_config_locked(), genesis_state, out, &canonical_error)) {
@@ -536,8 +547,9 @@ bool Node::refresh_runtime_from_frontier_storage_locked(const char* reason, std:
 }
 
 bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
-                                             const std::set<Hash32>& accepted_txids, storage::DB::Batch& batch,
-                                             std::string* error) {
+                                             const std::set<Hash32>& accepted_txids,
+                                             const std::vector<consensus::TimedSettlementRecord>& timed_settlements,
+                                             storage::DB::Batch& batch, std::string* error) {
   auto fail = [&](const std::string& reason) {
     if (error) *error = reason;
     return false;
@@ -549,58 +561,86 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
     return fail("frontier-continuity-mismatch");
   }
 
-  std::uint64_t seq = record.transition.prev_frontier;
-  std::uint32_t tx_index = 0;
-  for (const auto& ordered_record : record.ordered_records) {
-    ++seq;
-    if (!batch.put_ingress_record(seq, ordered_record)) return fail("put-ingress-record-failed seq=" + std::to_string(seq));
-    auto tx = parse_any_tx(ordered_record);
-    if (!tx.has_value()) {
-      log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
-               std::to_string(record.transition.height));
-      return fail("ordered-record-tx-parse-failed seq=" + std::to_string(seq));
-    }
-    const Hash32 txid = txid_any(*tx);
-    // Only executed transactions are finalized transfers. A rejected one moved no funds: no tx index
-    // and no address history, or get_tx_status would report it finalized and credit-safe.
-    if (!accepted_txids.contains(txid)) {
-      batch.put_rejected_tx(txid, record.transition.height);
-      continue;
-    }
-    batch.put_tx_index(txid, record.transition.height, tx_index++, ordered_record);
-    // Address history covers the transparent side of both formats; confidential outputs and the
-    // inputs spending them are indexed under confidential_history_key(one_time_pubkey).
-    const auto add_spent = [&](const Hash32& prev_txid, std::uint32_t prev_index) {
-      const auto prev_it = prev_utxos.find(OutPoint{prev_txid, prev_index});
-      if (prev_it == prev_utxos.end()) return;
-      const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
-      if (!spent_out.has_value()) return;
-      batch.add_script_history(crypto::sha256(spent_out->script_pubkey), record.transition.height, txid);
-    };
-    if (const auto* legacy = std::get_if<Tx>(&*tx)) {
-      for (const auto& input : legacy->inputs) add_spent(input.prev_txid, input.prev_index);
+  const auto height = record.transition.height;
+  // Address history covers the transparent side of both formats; confidential outputs and the
+  // inputs spending them are indexed under confidential_history_key(one_time_pubkey).
+  const auto add_spent = [&](const Hash32& txid, const Hash32& prev_txid, std::uint32_t prev_index) {
+    const auto prev_it = prev_utxos.find(OutPoint{prev_txid, prev_index});
+    if (prev_it == prev_utxos.end()) return;
+    const auto spent_out = transparent_txout_from_utxo_entry(prev_it->second);
+    if (!spent_out.has_value()) return;
+    for (const auto& h : script_index_hashes(spent_out->script_pubkey)) batch.add_script_history(h, height, txid);
+  };
+  const auto add_history = [&](const Hash32& txid, const AnyTx& tx) {
+    if (const auto* legacy = std::get_if<Tx>(&tx)) {
+      for (const auto& input : legacy->inputs) add_spent(txid, input.prev_txid, input.prev_index);
       for (const auto& output : legacy->outputs) {
-        batch.add_script_history(crypto::sha256(output.script_pubkey), record.transition.height, txid);
+        for (const auto& h : script_index_hashes(output.script_pubkey)) batch.add_script_history(h, height, txid);
       }
-    } else if (const auto* v2 = std::get_if<TxV2>(&*tx)) {
+    } else if (const auto* v2 = std::get_if<TxV2>(&tx)) {
       for (const auto& input : v2->inputs) {
         if (input.kind == TxInputKind::Transparent) {
-          add_spent(input.prev_txid, input.prev_index);
+          add_spent(txid, input.prev_txid, input.prev_index);
         } else {
           const auto& witness = std::get<ConfidentialInputWitnessV2>(input.witness);
-          batch.add_script_history(confidential_history_key(witness.one_time_pubkey), record.transition.height, txid);
+          batch.add_script_history(confidential_history_key(witness.one_time_pubkey), height, txid);
         }
       }
       for (const auto& output : v2->outputs) {
         if (output.kind == TxOutputKind::Transparent) {
           const auto& out = std::get<TransparentTxOutV2>(output.body);
-          batch.add_script_history(crypto::sha256(out.script_pubkey), record.transition.height, txid);
+          for (const auto& h : script_index_hashes(out.script_pubkey)) batch.add_script_history(h, height, txid);
         } else {
           const auto& out = std::get<ConfidentialTxOutV2>(output.body);
-          batch.add_script_history(confidential_history_key(out.one_time_pubkey), record.transition.height, txid);
+          batch.add_script_history(confidential_history_key(out.one_time_pubkey), height, txid);
         }
       }
     }
+  };
+
+  std::uint32_t tx_index = 0;
+  // Timed settlements ran before this block's records: the bodies they applied are transfers of this
+  // block (indexed first, in settlement order), and the sender's refund script sees the outcome.
+  for (const auto& settlement : timed_settlements) {
+    if (settlement.applied_body.has_value()) {
+      const auto body_txid = txid_any(*settlement.applied_body);
+      batch.put_tx_index(body_txid, height, tx_index++, serialize_any_tx(*settlement.applied_body));
+      add_history(body_txid, *settlement.applied_body);
+    }
+    if (settlement.revealed_data.has_value()) {
+      batch.put_timed_reveal(settlement.timed_txid, height, *settlement.revealed_data);
+    }
+    batch.add_script_history(crypto::sha256(settlement.bond_refund_script), height, settlement.timed_txid);
+  }
+
+  std::uint64_t seq = record.transition.prev_frontier;
+  for (const auto& ordered_record : record.ordered_records) {
+    ++seq;
+    if (!batch.put_ingress_record(seq, ordered_record)) return fail("put-ingress-record-failed seq=" + std::to_string(seq));
+    const auto identity = consensus::ingress_record_identity(ordered_record);
+    if (!identity.has_value()) {
+      log_line("finalized-state-invariant-violation source=runtime-write-frontier-tx-parse height=" +
+               std::to_string(height));
+      return fail("ordered-record-tx-parse-failed seq=" + std::to_string(seq));
+    }
+    const Hash32 txid = identity->txid;
+    // Only executed transactions are finalized transfers. A rejected one moved no funds: no tx index
+    // and no address history, or get_tx_status would report it finalized and credit-safe.
+    if (!accepted_txids.contains(txid)) {
+      batch.put_rejected_tx(txid, height);
+      continue;
+    }
+    batch.put_tx_index(txid, height, tx_index++, ordered_record);
+    if (identity->timed) {
+      // An escrowed envelope: its fee input is spent here and its change created here.
+      const auto timed = TxTimed::parse(ordered_record);
+      add_spent(txid, timed->fee_input.prev_txid, timed->fee_input.prev_index);
+      if (timed->fee_change.has_value()) {
+        batch.add_script_history(crypto::sha256(timed->fee_change->script_pubkey), height, txid);
+      }
+      continue;
+    }
+    add_history(txid, *parse_any_tx(ordered_record));
   }
   // Settlement (reward payout) outputs have no transaction: index their synthetic txid and credit
   // each recipient's history so explorers and wallets can resolve and show them.
@@ -648,6 +688,7 @@ void Node::hydrate_runtime_from_canonical_state_locked(const consensus::Canonica
   hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState(state));
 }
 
+// Keep in sync with CanonicalRuntimeFields (take_ / restore_canonical_runtime_locked).
 void Node::hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDerivedState&& owned) {
   canonical_state_ = std::move(owned);
   const auto& state = *canonical_state_;
@@ -666,6 +707,47 @@ void Node::hydrate_runtime_from_canonical_state_locked(consensus::CanonicalDeriv
   validator_liveness_window_start_height_ = state.validator_liveness_window_start_height;
   last_participation_eligible_signers_ = state.last_participation_eligible_signers;
   availability_state_ = state.availability_state;
+}
+
+Node::CanonicalRuntimeFields Node::take_canonical_runtime_locked() {
+  CanonicalRuntimeFields f;
+  f.canonical_state = std::move(canonical_state_);
+  canonical_state_.reset();
+  f.finalized_height = finalized_height_;
+  f.finalized_identity = finalized_identity_;
+  f.utxos = std::move(utxos_);
+  f.validators = std::move(validators_);
+  f.validator_join_requests = std::move(validator_join_requests_);
+  f.finalized_randomness = finalized_randomness_;
+  f.committee_epoch_randomness_cache = std::move(committee_epoch_randomness_cache_);
+  f.protocol_reserve_balance_units = protocol_reserve_balance_units_;
+  f.epoch_reward_states = std::move(epoch_reward_states_);
+  f.finalized_committee_checkpoints = std::move(finalized_committee_checkpoints_);
+  f.validator_join_window_start_height = validator_join_window_start_height_;
+  f.validator_join_count_in_window = validator_join_count_in_window_;
+  f.validator_liveness_window_start_height = validator_liveness_window_start_height_;
+  f.last_participation_eligible_signers = last_participation_eligible_signers_;
+  f.availability_state = std::move(availability_state_);
+  return f;
+}
+
+void Node::restore_canonical_runtime_locked(CanonicalRuntimeFields&& f) {
+  canonical_state_ = std::move(f.canonical_state);
+  finalized_height_ = f.finalized_height;
+  finalized_identity_ = f.finalized_identity;
+  utxos_ = std::move(f.utxos);
+  validators_ = std::move(f.validators);
+  validator_join_requests_ = std::move(f.validator_join_requests);
+  finalized_randomness_ = f.finalized_randomness;
+  committee_epoch_randomness_cache_ = std::move(f.committee_epoch_randomness_cache);
+  protocol_reserve_balance_units_ = f.protocol_reserve_balance_units;
+  epoch_reward_states_ = std::move(f.epoch_reward_states);
+  finalized_committee_checkpoints_ = std::move(f.finalized_committee_checkpoints);
+  validator_join_window_start_height_ = f.validator_join_window_start_height;
+  validator_join_count_in_window_ = f.validator_join_count_in_window;
+  validator_liveness_window_start_height_ = f.validator_liveness_window_start_height;
+  last_participation_eligible_signers_ = f.last_participation_eligible_signers;
+  availability_state_ = std::move(f.availability_state);
 }
 
 bool Node::init_mainnet_genesis() {
@@ -757,29 +839,26 @@ bool Node::init_mainnet_genesis() {
     return false;
   }
 
-  for (const auto& pub : doc->initial_validators) {
+  const auto genesis_bls = genesis::bls_keys_for(*doc, doc->initial_validators);
+  auto genesis_validator_info = [&](std::size_t i) {
     consensus::ValidatorInfo vi;
     vi.status = consensus::ValidatorStatus::ACTIVE;
     vi.joined_height = 0;
     vi.bonded_amount = consensus::genesis_validator_bond_amount();
-    vi.operator_id = pub;
+    vi.operator_id = doc->initial_validators[i];
     vi.has_bond = true;
     vi.bond_outpoint = OutPoint{zero_hash(), 0};
     vi.unbond_height = 0;
-    if (!db_.put_validator(pub, vi)) return false;
+    if (!genesis_bls.empty()) vi.bls_pubkey = genesis_bls[i];
+    return vi;
+  };
+  for (std::size_t i = 0; i < doc->initial_validators.size(); ++i) {
+    if (!db_.put_validator(doc->initial_validators[i], genesis_validator_info(i))) return false;
   }
   {
     consensus::ValidatorRegistry vr;
-    for (const auto& pub : doc->initial_validators) {
-      consensus::ValidatorInfo vi;
-      vi.status = consensus::ValidatorStatus::ACTIVE;
-      vi.joined_height = 0;
-      vi.bonded_amount = consensus::genesis_validator_bond_amount();
-      vi.operator_id = pub;
-      vi.has_bond = true;
-      vi.bond_outpoint = OutPoint{zero_hash(), 0};
-      vi.unbond_height = 0;
-      vr.upsert(pub, vi);
+    for (std::size_t i = 0; i < doc->initial_validators.size(); ++i) {
+      vr.upsert(doc->initial_validators[i], genesis_validator_info(i));
     }
     const UtxoSetV2 empty_utxos;
     (void)persist_state_roots(db_, 0, empty_utxos, vr, kFixedValidationRulesVersion);
@@ -800,6 +879,7 @@ bool Node::init_mainnet_genesis() {
   consensus::CanonicalGenesisState genesis_state;
   genesis_state.genesis_artifact_id = gblock;
   genesis_state.initial_validators = doc->initial_validators;
+  genesis_state.initial_validator_bls_keys = genesis::bls_keys_for(*doc, doc->initial_validators);
   genesis_state.genesis_time_unix = doc->genesis_time_unix;
   consensus::CanonicalDerivedState canonical_genesis_state;
   std::string canonical_error;
@@ -865,6 +945,7 @@ bool Node::load_state() {
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {
     genesis_state.initial_validators = {*bootstrap_validator_pubkey_};
   }
+  genesis_state.initial_validator_bls_keys = genesis::bls_keys_for(*genesis_doc, genesis_state.initial_validators);
 
   const auto stored_replay_mode_bytes = db_.get(kStartupReplayModeKey);
   if (stored_replay_mode_bytes.has_value() && !replay_mode_is_frontier(*stored_replay_mode_bytes)) {
@@ -1184,6 +1265,7 @@ bool Node::load_state() {
         checkpoint.ordered_ticket_hashes.push_back(winner.work_hash);
         checkpoint.ordered_ticket_nonces.push_back(winner.nonce);
       }
+      consensus::assign_checkpoint_bls_keys(validators_, &checkpoint);
       if (!db_.put_finalized_committee_checkpoint(checkpoint)) {
         log_line("finalized-state-invariant-violation source=load-state-checkpoint-repair-failed epoch=" +
                  std::to_string(epoch_start));
@@ -1238,10 +1320,18 @@ bool Node::load_state() {
       if (!inner.has_value()) return false;
       return parse_consensus_safety_state(*inner, &lock_state, &valid_polka, &prevotes);
     };
-    const bool primary_ok = decode(primary_row, false);
-    const bool mirror_ok = !primary_ok && decode(mirror_row, true);
+    // G2: both copies are written in one atomic batch, so two readable copies that differ can only
+    // come from outside damage (e.g. an older row restored over one of them): neither is trusted.
+    const auto primary_inner = primary_row ? unseal_consensus_safety_row(*primary_row, false) : std::nullopt;
+    const auto mirror_inner = mirror_row ? unseal_consensus_safety_row(*mirror_row, true) : std::nullopt;
+    const bool copies_disagree = primary_inner.has_value() && mirror_inner.has_value() && *primary_inner != *mirror_inner;
+    if (copies_disagree) {
+      log_line("consensus-safety-copies-disagree height=" + std::to_string(height) + " treating both as unreadable");
+    }
+    const bool primary_ok = !copies_disagree && decode(primary_row, false);
+    const bool mirror_ok = !copies_disagree && !primary_ok && decode(mirror_row, true);
     if (!primary_ok && !mirror_ok) {
-      // Both copies unreadable: the lock and prevote record (if any) are lost.
+      // Both copies unreadable (or disagreeing): the lock and prevote record (if any) are lost.
       // A node outside a multi-member committee for this height cannot have voted here, so the
       // row could only have held an observed polka and is safe to drop. Committees of size < 2 use
       // per-round fallback members, so membership is not knowable for every round: quarantine.
@@ -1291,7 +1381,35 @@ bool Node::load_state() {
     // Rewrite both sealed copies when the primary was bad or the mirror is missing.
     const bool needs_rewrite = !polka_valid || mirror_ok || !mirror_row.has_value() ||
                                !unseal_consensus_safety_row(*mirror_row, true).has_value();
-    if (needs_rewrite && !persist_consensus_safety_state_locked(height)) return false;
+    // Memory holds what was just read from disk (less an unverifiable polka), so it is not ahead of disk.
+    if (needs_rewrite && !persist_consensus_safety_state_locked(height, consensus_safety_state_locked(height),
+                                                                "startup-rewrite")) {
+      return false;
+    }
+  }
+  // G1: a height below the highwater with no row at all lost both copies (a missing row reads as
+  // "never voted"): quarantine it like an unreadable one. Bounded: rows only exist just above the
+  // finalized height, so a larger span means a damaged key and quarantines the first heights only.
+  {
+    constexpr std::uint64_t kMaxMissingSafetySpan = 64;
+    const auto highwater = load_consensus_safety_highwater(db_);
+    for (std::uint64_t height = finalized_height_ + 1;
+         height <= highwater && height <= finalized_height_ + kMaxMissingSafetySpan; ++height) {
+      if (safety_heights.contains(height) || db_.get(key_consensus_safety_quarantine(height)).has_value()) continue;
+      if (height == finalized_height_ + 1) {
+        const auto committee = committee_for_height_round(height, 0);
+        if (committee.size() >= 2 &&
+            std::find(committee.begin(), committee.end(), local_key_.public_key) == committee.end()) {
+          continue;  // could not have voted here (see the unreadable-row case above)
+        }
+      }
+      log_line("Consensus safety state for height " + std::to_string(height) + " missing below highwater " +
+               std::to_string(highwater) + ", quarantining and abstaining from voting");
+      const std::string marker = kConsensusSafetyMissingMarker;
+      storage::DB::Batch quarantine(db_);
+      quarantine.put(key_consensus_safety_quarantine(height), Bytes(marker.begin(), marker.end()));
+      if (!db_.write_batch_durable(quarantine)) return false;
+    }
   }
   for (const auto& [key, value] : db_.scan_prefix(kConsensusSafetyQuarantinePrefix)) {
     const auto height = parse_height_key(key, kConsensusSafetyQuarantinePrefix);
@@ -1310,6 +1428,11 @@ bool Node::load_state() {
       storage::DB::Batch discard(db_);
       discard.erase(key_consensus_safety_quarantine(h));
       discard.erase(key_consensus_locked_proposal(h));
+      if (load_consensus_safety_highwater(db_) == h) {  // else the next start quarantines h again (G1)
+        codec::ByteWriter w;
+        w.u64le(h - 1);
+        discard.put(kConsensusSafetyHighwaterKey, w.data());
+      }
       if (!db_.write_batch_durable(discard)) return false;
       abstain_heights_.erase(h);
     } else {

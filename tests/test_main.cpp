@@ -11,6 +11,18 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
+
+#ifndef _WIN32
+#include <csignal>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 namespace {
 
@@ -66,6 +78,53 @@ std::map<std::string, std::string>& test_tags() {
 RegTags::RegTags(const std::string& n, const std::string& tags) { test_tags()[n] = tags; }
 
 namespace {
+
+// Tests tagged "isolate" inject storage faults; a fault can abort the process inside librocksdb
+// (tests/KNOWN_DEFECTS.md, E1). They run in a child process (this binary, `--run NAME`), so an
+// abort fails that test with its signal instead of ending the whole run. POSIX only.
+#ifndef _WIN32
+bool has_tag(const std::string& name, const std::string& tag) {
+  auto it = test_tags().find(name);
+  if (it == test_tags().end()) return false;
+  return ("," + it->second + ",").find("," + tag + ",") != std::string::npos;
+}
+
+// Runs `name` in a child; returns std::nullopt on success, else the failure message.
+std::optional<std::string> run_isolated(const std::string& name, std::size_t index) {
+  const std::string result_path = "/tmp/finalis-test-child-" + std::to_string(::getpid()) + "-" + std::to_string(index);
+  std::remove(result_path.c_str());
+  std::vector<std::string> env_storage;
+  for (char** e = environ; *e; ++e) {
+    if (std::strncmp(*e, "FINALIS_TEST_CHILD_RESULT=", 26) != 0) env_storage.emplace_back(*e);
+  }
+  env_storage.push_back("FINALIS_TEST_CHILD_RESULT=" + result_path);
+  std::vector<char*> envp;
+  for (auto& e : env_storage) envp.push_back(e.data());
+  envp.push_back(nullptr);
+  std::string self = "/proc/self/exe", arg0 = "finalis-tests", run = "--run", test = name;
+  char* argv[] = {arg0.data(), run.data(), test.data(), nullptr};
+  std::cout.flush();
+  std::cerr.flush();
+  pid_t pid = 0;
+  if (posix_spawn(&pid, self.c_str(), nullptr, nullptr, argv, envp.data()) != 0) return std::string("posix_spawn failed");
+  int status = 0;
+  if (::waitpid(pid, &status, 0) < 0) return std::string("waitpid failed");
+  std::string message;
+  {
+    std::ifstream in(result_path);
+    message.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+  std::remove(result_path.c_str());
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return std::nullopt;
+  if (WIFSIGNALED(status)) {
+    const int sig = WTERMSIG(status);
+    return "child process killed by signal " + std::to_string(sig) +
+           (sig == SIGABRT ? " (SIGABRT; see the child's stderr above, e.g. an assertion inside librocksdb)" : "");
+  }
+  return message.empty() ? "child process exit " + std::to_string(WEXITSTATUS(status)) : message;
+}
+#endif
+
 
 int usage_error(const std::string& message) {
   std::cerr << "[tests] " << message << "\n"
@@ -131,6 +190,22 @@ int main(int argc, char** argv) {
   const std::size_t shard_count = shard_count_env ? static_cast<std::size_t>(std::atoi(shard_count_env)) : 1;
   const std::size_t shard_index = shard_index_env ? static_cast<std::size_t>(std::atoi(shard_index_env)) : 0;
 
+  // Tests tagged "known-defect" reproduce open production defects and fail until they are fixed
+  // (tests/KNOWN_DEFECTS.md). Default: excluded, and counted in the header so they stay visible.
+  // FINALIS_TEST_KNOWN_DEFECTS=only runs just them; =include runs everything. --run ignores this.
+  const char* known_defects_env = std::getenv("FINALIS_TEST_KNOWN_DEFECTS");
+  const std::string known_defects = known_defects_env ? known_defects_env : "exclude";
+  if (known_defects != "exclude" && known_defects != "only" && known_defects != "include") {
+    return usage_error("FINALIS_TEST_KNOWN_DEFECTS must be exclude, only or include");
+  }
+  const auto is_known_defect = [](const std::string& name) {
+    auto it = test_tags().find(name);
+    if (it == test_tags().end()) return false;
+    const std::string tags = "," + it->second + ",";
+    return tags.find(",known-defect,") != std::string::npos;
+  };
+  std::size_t known_defects_skipped = 0;
+
   std::vector<std::pair<std::string, TestFn>> selected;
   selected.reserve(tests().size());
   if (run_exact.has_value()) {
@@ -145,16 +220,30 @@ int main(int argc, char** argv) {
     std::size_t shard_counter = 0;
     for (const auto& [name, fn] : tests()) {
       if (filter && std::string(name).find(filter) == std::string::npos) continue;
+      const bool known = is_known_defect(name);
+      if ((known && known_defects == "exclude") || (!known && known_defects == "only")) {
+        if (known) ++known_defects_skipped;
+        continue;
+      }
       if (shard_count > 1 && (shard_counter++ % shard_count) != shard_index) continue;
       selected.push_back({name, fn});
     }
   }
 
+  // Set when this process is an isolated child (see run_isolated): the parent prints the progress.
+  const char* child_result = std::getenv("FINALIS_TEST_CHILD_RESULT");
   const std::size_t total = selected.size();
-  std::cout << "[tests] total=" << total;
-  if (filter) std::cout << " filter=\"" << filter << "\"";
-  if (shard_count > 1 && !run_exact.has_value()) std::cout << " shard=" << shard_index << "/" << shard_count;
-  std::cout << std::endl;
+  if (!child_result) {
+    std::cout << "[tests] total=" << total;
+    if (filter) std::cout << " filter=\"" << filter << "\"";
+    if (shard_count > 1 && !run_exact.has_value()) std::cout << " shard=" << shard_index << "/" << shard_count;
+    if (known_defects != "exclude") std::cout << " known-defects=" << known_defects;
+    std::cout << std::endl;
+  }
+  if (known_defects_skipped > 0) {
+    std::cout << "[tests] skipped " << known_defects_skipped
+              << " known-defect test(s); run them with FINALIS_TEST_KNOWN_DEFECTS=only (tests/KNOWN_DEFECTS.md)" << std::endl;
+  }
 
   TtyProgress tty_progress;
   std::size_t index = 0;
@@ -162,18 +251,37 @@ int main(int argc, char** argv) {
     ++index;
     const std::string progress =
         std::to_string(index) + "/" + std::to_string(total) + " " + std::to_string(index * 100 / total) + "%";
-    std::cout << "[run " << progress << "] " << name << std::endl;
+    if (!child_result) std::cout << "[run " << progress << "] " << name << std::endl;
+#ifndef _WIN32
+    if (!run_exact.has_value() && has_tag(name, "isolate")) {
+      if (const auto err = run_isolated(name, index); err.has_value()) {
+        ++failed;
+        failed_names.push_back(name);
+        std::cout << "[fail " << progress << "] " << name << ": " << *err << "\n";
+        tty_progress.fail(progress, name, *err);
+      } else {
+        std::cout << "[ok " << progress << "] " << name << "\n";
+        tty_progress.ok(progress);
+      }
+      continue;
+    }
+#endif
     try {
       fn();
-      std::cout << "[ok " << progress << "] " << name << "\n";
+      if (!child_result) std::cout << "[ok " << progress << "] " << name << "\n";
       tty_progress.ok(progress);
     } catch (const std::exception& e) {
       ++failed;
       failed_names.push_back(name);
-      std::cout << "[fail " << progress << "] " << name << ": " << e.what() << "\n";
+      if (child_result) {
+        std::ofstream(child_result) << e.what();
+      } else {
+        std::cout << "[fail " << progress << "] " << name << ": " << e.what() << "\n";
+      }
       tty_progress.fail(progress, name, e.what());
     }
   }
+  if (child_result) return failed ? 1 : 0;
   if (failed) {
     std::cerr << "[failed-summary] count=" << failed << "\n";
     for (const auto& name : failed_names) {

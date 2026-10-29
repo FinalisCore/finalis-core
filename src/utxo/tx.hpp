@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/types.hpp"
+#include "crypto/bls12_381.hpp"
 #include "crypto/confidential.hpp"
 
 namespace finalis {
@@ -177,6 +178,30 @@ struct FrontierVector {
   std::uint64_t total_count() const;
 };
 
+// The parent height's time signature: the Lagrange-weighted aggregate (crypto::mcfly_aggregate) of
+// the BLS signatures of `signer_indices` (into the parent epoch checkpoint's ordered_bls_keys,
+// strictly ascending) on time_signature_message(chain domain, parent height). Validators sign only
+// heights they hold a finality certificate for, so the aggregate exists only once the parent is
+// final; it is the witness that opens a TxTimed locked to the parent height.
+struct TimeSignatureAggregate {
+  std::vector<std::uint32_t> signer_indices;
+  crypto::BlsSignature aggregate{};
+
+  bool operator==(const TimeSignatureAggregate&) const = default;
+};
+
+// A long time lock's opening (consensus/frontier_execution.hpp, "long locks"): the aggregate, by the
+// key set `committee_root` names (the committee of the lock's inclusion epoch), on
+// time_signature_message(chain domain, unlock_height), signer indices into that key set.
+struct LongTimeSignature {
+  std::uint64_t unlock_height{0};
+  Hash32 committee_root{};
+  TimeSignatureAggregate signature;
+
+  bool operator==(const LongTimeSignature&) const = default;
+};
+inline constexpr std::size_t kMaxLongTimeSignaturesPerBlock = 16;
+
 struct FrontierTransition {
   Hash32 prev_finalized_hash{};
   Hash32 prev_finality_link_hash{};
@@ -219,6 +244,12 @@ struct FrontierTransition {
   // height are evaluated from this set, not from the quorum-truncated
   // finality certificate.
   std::vector<FinalitySig> prev_finality_signers;
+  // Time signature of the parent height, at least the parent committee's quorum of signers. Empty
+  // (no signers, zero aggregate) only when the parent is genesis.
+  TimeSignatureAggregate prev_time_signature;
+  // Openings of long time locks this block settles, strictly ascending by (unlock_height,
+  // committee_root); at most kMaxLongTimeSignaturesPerBlock. Optional: a block never waits for them.
+  std::vector<LongTimeSignature> long_time_signatures;
   FrontierSettlement settlement;
   Hash32 settlement_commitment{};
 
@@ -351,10 +382,21 @@ Bytes serialize_utxo_entry_v2(const UtxoEntryV2& entry);
 std::optional<UtxoEntryV2> parse_utxo_entry_v2(const Bytes& b);
 std::optional<TxOut> transparent_txout_from_utxo_entry(const UtxoEntryV2& entry);
 
+// SCVALJRQ / SCONBREG scripts: prefix(8) | validator_pubkey(32) | payout_pubkey(32) | pop(64) |
+// bls_pubkey(48) | bls_pop(96) [| admission_pow_epoch(u64le) | admission_pow_nonce(u64le)]:
+// 280 bytes, or 296 with admission PoW. pop is the Ed25519 signature of the registration message,
+// which covers bls_pubkey (the validator vouches for its BLS key); bls_pop is the BLS proof of
+// possession of bls_pubkey (crypto::bls_pop_prove; rules out rogue-key aggregation).
+inline constexpr std::size_t kValidatorRegistrationScriptBytes = 8 + 32 + 32 + 64 + crypto::kBlsPublicKeyBytes +
+                                                                 crypto::kBlsSignatureBytes;
+inline constexpr std::size_t kValidatorRegistrationScriptPowBytes = kValidatorRegistrationScriptBytes + 16;
+
 struct ValidatorJoinRequestScriptData {
   PubKey32 validator_pubkey{};
   PubKey32 payout_pubkey{};
   Sig64 pop{};
+  crypto::BlsPublicKey bls_pubkey{};
+  crypto::BlsSignature bls_pop{};
   bool has_admission_pow{false};
   std::uint64_t admission_pow_epoch{0};
   std::uint64_t admission_pow_nonce{0};
@@ -364,10 +406,15 @@ struct OnboardingRegistrationScriptData {
   PubKey32 validator_pubkey{};
   PubKey32 payout_pubkey{};
   Sig64 pop{};
+  crypto::BlsPublicKey bls_pubkey{};
+  crypto::BlsSignature bls_pop{};
   bool has_admission_pow{false};
   std::uint64_t admission_pow_epoch{0};
   std::uint64_t admission_pow_nonce{0};
 };
+
+Bytes encode_validator_join_request_script(const ValidatorJoinRequestScriptData& data);
+Bytes encode_onboarding_registration_script(const OnboardingRegistrationScriptData& data);
 
 bool is_validator_register_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
 bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
@@ -396,7 +443,9 @@ struct ValidatorJoinRequest {
   std::uint64_t bond_amount{0};
   std::uint64_t requested_height{0};
   std::uint64_t approved_height{0};
+  // REQUESTED: finalized while the join window was full; admitted in order once it has room.
   ValidatorJoinRequestStatus status{ValidatorJoinRequestStatus::REQUESTED};
+  crypto::BlsPublicKey bls_pubkey{};  // from the join request script, registered on admission
 };
 
 }  // namespace finalis

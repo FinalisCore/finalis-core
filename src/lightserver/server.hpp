@@ -95,6 +95,8 @@ struct Config {
   // Peers whose X-Real-IP names the client (a same-host reverse proxy). A request forwarded this way
   // is limited by that client's address and never gets the loopback exemption.
   std::vector<net::Ipv4Cidr> trusted_proxies;
+  // Header in which a trusted proxy names the client (CF-Connecting-IP behind a Cloudflare tunnel).
+  std::string client_ip_header{net::kDefaultClientIpHeader};
 };
 
 class Server {

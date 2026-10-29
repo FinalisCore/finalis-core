@@ -68,10 +68,7 @@ std::optional<storage::FinalizedCommitteeCheckpoint> genesis_committee_checkpoin
                                                                                   const Hash32& genesis_bin_hash,
                                                                                   std::string* error) {
   const auto cfg = network_canonical_derivation_config(network, chain_id_for_genesis(network, genesis_bin_hash));
-  CanonicalGenesisState genesis_state;
-  genesis_state.genesis_artifact_id = genesis::block_id(doc);
-  genesis_state.initial_validators = doc.initial_validators;
-  genesis_state.genesis_time_unix = doc.genesis_time_unix;
+  const CanonicalGenesisState genesis_state = canonical_genesis_state_from_document(doc);
   CanonicalDerivedState state;
   if (!build_genesis_canonical_state(cfg, genesis_state, &state, error)) return std::nullopt;
   const auto it = state.finalized_committee_checkpoints.find(1);

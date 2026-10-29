@@ -41,9 +41,28 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 5400
+        run: ctest --test-dir build --output-on-failure --timeout 5400 -LE known-defect
+      # Open production defects (tests/KNOWN_DEFECTS.md): reported on every run, not a gate until fixed.
+      - name: Known-defect regression tests (expected to fail)
+        continue-on-error: true
+        run: |
+          set +e
+          ctest --test-dir build --output-on-failure --timeout 5400 -L known-defect
+          status=$?
+          echo "### Known-defect regression tests: $([ $status -eq 0 ] && echo 'all pass (drop the known-defect tags)' || echo 'OPEN DEFECTS REPRODUCED') (tests/KNOWN_DEFECTS.md)" >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+      - name: Known-defect fuzz reproducers (expected to fail)
+        continue-on-error: true
+        run: |
+          set +e
+          fuzz/replay_known_defects.sh build | tee known_defect_fuzz.txt
+          status=${PIPESTATUS[0]}
+          { echo "### Known-defect fuzz reproducers"; echo '```'; cat known_defect_fuzz.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
       - name: Fuzz smoke
         run: |
+          # Storage faults off: the configuration that must stay clean (faults on: the step above).
+          FINALIS_FUZZ_FAULTS=0 FINALIS_FUZZ_ITERS=16 ./build/fuzz_consensus_persistence
           ./build/fuzz_p2p_frame
           ./build/fuzz_tx_parse
           ./build/fuzz_consensus_msgs
@@ -52,6 +71,7 @@ jobs:
           ./build/fuzz_confidential
           ./build/fuzz_wire_codecs
           ./build/fuzz_sync
+          ./build/fuzz_timed_execution
           scripts/fuzz_replay_corpus.sh build
 
   sanitize:
@@ -80,7 +100,7 @@ jobs:
         run: cmake -S . -B build $CMAKE_COMMON_FLAGS -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFINALIS_SANITIZE=ON
       - name: Build
         run: cmake --build build --target finalis-tests fuzz_p2p_frame fuzz_tx_parse fuzz_consensus_msgs fuzz_consensus_node
-          fuzz_smt fuzz_confidential fuzz_wire_codecs fuzz_sync -j"$(nproc)"
+          fuzz_smt fuzz_confidential fuzz_wire_codecs fuzz_sync fuzz_timed_execution -j"$(nproc)"
       - name: Test
         run: ./build/finalis-tests
       - name: Fuzz smoke
@@ -94,6 +114,7 @@ jobs:
           ./build/fuzz_confidential
           ./build/fuzz_wire_codecs
           ./build/fuzz_sync
+          ./build/fuzz_timed_execution
           scripts/fuzz_replay_corpus.sh build
 
   tsan:

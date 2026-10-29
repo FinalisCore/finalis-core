@@ -18,16 +18,32 @@ Hash32 outpoint_anchor_hash(const TxIn& in) {
   return crypto::sha256d(w.take());
 }
 
+std::uint32_t lane_from_anchor(const Hash32& anchor) {
+  std::uint64_t x = 0;
+  for (std::size_t i = 0; i < 8; ++i) x |= static_cast<std::uint64_t>(anchor[i]) << (8 * i);
+  return static_cast<std::uint32_t>(x % INGRESS_LANE_COUNT);
+}
+
 }  // namespace
 
+std::optional<IngressRecordIdentity> ingress_record_identity(const Bytes& tx_bytes) {
+  if (const auto tx = parse_any_tx(tx_bytes); tx.has_value()) {
+    return IngressRecordIdentity{txid_any(*tx), assign_ingress_lane(*tx), false};
+  }
+  if (const auto timed = TxTimed::parse(tx_bytes); timed.has_value()) {
+    return IngressRecordIdentity{timed->txid(), lane_from_anchor(outpoint_anchor_hash(timed->fee_input)), true};
+  }
+  return std::nullopt;
+}
+
 bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_bytes, std::string* error) {
-  const auto tx = parse_any_tx(tx_bytes);
-  if (!tx.has_value()) {
+  const auto identity = ingress_record_identity(tx_bytes);
+  if (!identity.has_value()) {
     if (error) *error = "ingress-tx-parse-failed";
     return false;
   }
 
-  const auto expected_txid = txid_any(*tx);
+  const auto expected_txid = identity->txid;
   if (expected_txid != cert.txid) {
     if (error) *error = "ingress-txid-mismatch";
     return false;
@@ -39,7 +55,7 @@ bool validate_ingress_payload(const IngressCertificate& cert, const Bytes& tx_by
     return false;
   }
 
-  if (assign_ingress_lane(*tx) != cert.lane) {
+  if (identity->lane != cert.lane) {
     if (error) *error = "ingress-lane-mismatch";
     return false;
   }
@@ -253,7 +269,9 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
       }
       return false;
     }
-    if (*existing_cert == cert) return true;
+    // Already appended only if the lane tip covers it. A stored certificate above the tip is an
+    // orphan of an interrupted append: applying it again is the repair, or the lane stays wedged.
+    if (*existing_cert == cert && lane_state.has_value() && lane_state->max_seq >= cert.seq) return true;
   }
 
   if (lane_state.has_value()) {
@@ -279,22 +297,13 @@ bool append_validated_ingress_record(storage::DB& db, const IngressCertificate& 
     return false;
   }
 
-  if (!db.put_ingress_bytes(cert.txid, tx_bytes)) {
-    if (error) *error = "ingress-bytes-store-failed";
-    return false;
-  }
-  if (!db.put_ingress_certificate(cert.lane, cert.seq, cert.serialize())) {
-    if (error && error->empty()) *error = "ingress-certificate-store-failed";
-    return false;
-  }
-
   LaneState next_state;
   next_state.epoch = cert.epoch;
   next_state.lane = cert.lane;
   next_state.max_seq = cert.seq;
   next_state.lane_root = compute_lane_root_append(lane_state.has_value() ? lane_state->lane_root : zero_hash(), cert.tx_hash);
-  if (!db.put_lane_state(cert.lane, next_state)) {
-    if (error) *error = "lane-state-store-failed";
+  if (!db.append_ingress_record_atomic(cert.serialize(), tx_bytes, next_state)) {
+    if (error) *error = "ingress-append-store-failed";
     return false;
   }
   return true;

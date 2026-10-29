@@ -48,6 +48,8 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "PREVOTE";
     case p2p::MsgType::TIMEOUT_VOTE:
       return "TIMEOUT_VOTE";
+    case p2p::MsgType::TIME_SIGNATURE:
+      return "TIME_SIGNATURE";
     case p2p::MsgType::GET_TRANSITION:
       return "GET_TRANSITION";
     case p2p::MsgType::TRANSITION:
@@ -60,6 +62,10 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "TX_RESULT";
     case p2p::MsgType::GETADDR:
       return "GETADDR";
+    case p2p::MsgType::GET_ENDPOINTS:
+      return "GET_ENDPOINTS";
+    case p2p::MsgType::ENDPOINTS:
+      return "ENDPOINTS";
     case p2p::MsgType::ADDR:
       return "ADDR";
     case p2p::MsgType::PING:
@@ -503,7 +509,8 @@ bool same_join_request(const ValidatorJoinRequest& a, const ValidatorJoinRequest
   return a.request_txid == b.request_txid && a.validator_pubkey == b.validator_pubkey &&
          a.payout_pubkey == b.payout_pubkey && a.bond_outpoint.txid == b.bond_outpoint.txid &&
          a.bond_outpoint.index == b.bond_outpoint.index && a.bond_amount == b.bond_amount &&
-         a.requested_height == b.requested_height && a.approved_height == b.approved_height && a.status == b.status;
+         a.requested_height == b.requested_height && a.approved_height == b.approved_height && a.status == b.status &&
+         a.bls_pubkey == b.bls_pubkey;
 }
 
 bool same_join_request_maps(const std::map<Hash32, ValidatorJoinRequest>& a,
@@ -521,7 +528,7 @@ bool same_join_request_maps(const std::map<Hash32, ValidatorJoinRequest>& a,
 bool same_epoch_reward_state(const storage::EpochRewardSettlementState& a, const storage::EpochRewardSettlementState& b) {
   return a.epoch_start_height == b.epoch_start_height && a.total_reward_units == b.total_reward_units &&
          a.fee_pool_units == b.fee_pool_units && a.reserve_accrual_units == b.reserve_accrual_units &&
-         a.reserve_subsidy_units == b.reserve_subsidy_units &&
+         a.reserve_subsidy_units == b.reserve_subsidy_units && a.recycled_units == b.recycled_units &&
          a.settled == b.settled && a.reward_score_units == b.reward_score_units &&
          a.onboarding_score_units == b.onboarding_score_units &&
          a.expected_participation_units == b.expected_participation_units &&
@@ -554,7 +561,8 @@ bool same_finalized_checkpoint(const storage::FinalizedCommitteeCheckpoint& a,
          a.ordered_members == b.ordered_members &&
          a.ordered_operator_ids == b.ordered_operator_ids && a.ordered_base_weights == b.ordered_base_weights &&
          a.ordered_ticket_bonus_bps == b.ordered_ticket_bonus_bps && a.ordered_final_weights == b.ordered_final_weights &&
-         a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces;
+         a.ordered_ticket_hashes == b.ordered_ticket_hashes && a.ordered_ticket_nonces == b.ordered_ticket_nonces &&
+         a.ordered_bls_keys == b.ordered_bls_keys;
 }
 
 bool same_finalized_checkpoint_maps(const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& a,
@@ -611,6 +619,65 @@ void stage_canonical_scalars(storage::DB::Batch& batch, const consensus::Canonic
   batch.put(kValidatorLivenessWindowStartKey, w_liveness.take());
 }
 
+std::string timed_escrow_db_key(const consensus::TimedEscrowKey& key) {
+  codec::ByteWriter w;
+  w.u64le(key.unlock_height);
+  w.u64le(key.inclusion_height);
+  w.u32le(key.inclusion_index);
+  return "TE:" + hex_encode(w.data());
+}
+
+std::string timed_key_set_db_key(const Hash32& root) { return "TK:" + hex_encode(Bytes(root.begin(), root.end())); }
+
+Bytes encode_timed_key_set(const std::vector<crypto::BlsPublicKey>& keys) {
+  codec::ByteWriter w;
+  w.varint(keys.size());
+  for (const auto& key : keys) w.bytes_fixed(key);
+  return w.take();
+}
+
+consensus::TimedKeySets load_timed_key_sets(const storage::DB& db) {
+  consensus::TimedKeySets out;
+  for (const auto& [key, value] : db.scan_prefix("TK:")) {
+    std::vector<crypto::BlsPublicKey> keys;
+    const bool ok = codec::parse_exact(value, [&](codec::ByteReader& r) {
+      auto n = r.varint();
+      if (!n || *n == 0 || *n > MAX_COMMITTEE) return false;
+      for (std::uint64_t i = 0; i < *n; ++i) {
+        auto k = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+        if (!k) return false;
+        keys.push_back(*k);
+      }
+      return true;
+    });
+    if (!ok) continue;
+    const auto root = consensus::committee_bls_key_root(keys);
+    if (timed_key_set_db_key(root) != key) continue;
+    out[root] = std::move(keys);
+  }
+  return out;
+}
+
+consensus::TimedEscrowState load_timed_escrows(const storage::DB& db) {
+  consensus::TimedEscrowState out;
+  for (const auto& [key, value] : db.scan_prefix("TE:")) {
+    const auto raw = hex_decode(key.substr(3));
+    if (!raw.has_value()) continue;
+    consensus::TimedEscrowKey k;
+    const bool ok = codec::parse_exact(*raw, [&](codec::ByteReader& r) {
+      auto unlock = r.u64le();
+      auto inclusion = r.u64le();
+      auto index = r.u32le();
+      if (!unlock || !inclusion || !index) return false;
+      k = consensus::TimedEscrowKey{*unlock, *inclusion, *index};
+      return true;
+    });
+    auto tx = TxTimed::parse(value);
+    if (ok && tx.has_value()) out[k] = std::move(*tx);
+  }
+  return out;
+}
+
 bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, const consensus::CanonicalDerivedState& state) {
   const std::string utxo_prefix = storage::key_utxo_prefix();
   std::set<std::string> desired_utxos;
@@ -631,8 +698,9 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   for (const auto& [op, entry] : state.utxos) {
     const auto transparent = transparent_txout_from_utxo_entry(entry);
     if (!transparent.has_value()) continue;
-    const auto scripthash = crypto::sha256(transparent->script_pubkey);
-    desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
+    for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+      desired_script_utxos.insert(storage::key_script_utxo(scripthash, op));
+    }
   }
   std::vector<std::string> script_utxos_to_erase;
   std::set<std::string> existing_script_utxos;
@@ -648,9 +716,10 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   for (const auto& [op, entry] : state.utxos) {
     const auto transparent = transparent_txout_from_utxo_entry(entry);
     if (!transparent.has_value()) continue;
-    const auto scripthash = crypto::sha256(transparent->script_pubkey);
-    if (existing_script_utxos.contains(storage::key_script_utxo(scripthash, op))) continue;
-    batch.put_script_utxo(scripthash, op, *transparent, state.finalized_height);
+    for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+      if (existing_script_utxos.contains(storage::key_script_utxo(scripthash, op))) continue;
+      batch.put_script_utxo(scripthash, op, *transparent, state.finalized_height);
+    }
   }
 
   for (const auto& [pub, info] : state.validators.all()) batch.put_validator(pub, info);
@@ -661,6 +730,7 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   }
   batch.put_protocol_reserve_balance(state.protocol_reserve_balance_units);
   batch.put_confidential_pool_value(state.confidential_pool_value);
+  batch.put_base_fee_per_kib(state.base_fee_per_kib);
   std::set<std::uint64_t> desired_checkpoint_epochs;
   for (const auto& [epoch, _] : state.finalized_committee_checkpoints) {
     desired_checkpoint_epochs.insert(epoch);
@@ -686,6 +756,10 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
     (void)epoch;
     batch.put_finalized_committee_checkpoint(checkpoint);
   }
+  for (const auto& [key, _] : db.scan_prefix("TE:")) batch.erase(key);
+  for (const auto& [key, tx] : state.timed_escrows) batch.put(timed_escrow_db_key(key), tx.serialize());
+  for (const auto& [key, _] : db.scan_prefix("TK:")) batch.erase(key);
+  for (const auto& [root, keys] : state.timed_key_sets) batch.put(timed_key_set_db_key(root), encode_timed_key_set(keys));
   stage_canonical_scalars(batch, state);
   return true;
 }
@@ -700,7 +774,9 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
     batch.put(storage::key_smt_leaf(kSmtTreeUtxo, key), value);
     tree_changes.push_back({key, crypto::SparseMerkleTree::leaf_hash(key, value)});
     if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
-      batch.put_script_utxo(crypto::sha256(transparent->script_pubkey), op, *transparent, next.finalized_height);
+      for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+        batch.put_script_utxo(scripthash, op, *transparent, next.finalized_height);
+      }
     }
   };
   const auto stage_erase = [&](const OutPoint& op, const UtxoEntryV2& entry) {
@@ -708,7 +784,9 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
     batch.erase(storage::key_smt_leaf(kSmtTreeUtxo, consensus::utxo_commitment_key(op)));
     tree_changes.push_back({consensus::utxo_commitment_key(op), std::nullopt});
     if (const auto transparent = transparent_txout_from_utxo_entry(entry); transparent.has_value()) {
-      batch.erase(storage::key_script_utxo(crypto::sha256(transparent->script_pubkey), op));
+      for (const auto& scripthash : script_index_hashes(transparent->script_pubkey)) {
+        batch.erase(storage::key_script_utxo(scripthash, op));
+      }
     }
   };
   // Ordered merge of the two UTXO sets: only spent, created or changed outputs touch storage.
@@ -733,7 +811,9 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
 
   for (const auto& [pub, info] : next.validators.all()) batch.put_validator(pub, info);
   for (const auto& [txid, req] : next.validator_join_requests) {
-    if (!prev.validator_join_requests.contains(txid)) batch.put_validator_join_request(txid, req);
+    // New, or admitted from the queue (REQUESTED -> APPROVED).
+    const auto it = prev.validator_join_requests.find(txid);
+    if (it == prev.validator_join_requests.end() || !same_join_request(it->second, req)) batch.put_validator_join_request(txid, req);
   }
   // Both maps are bounded by prune_consensus_history; pruned entries keep their history rows.
   for (const auto& [epoch, reward_state] : next.epoch_reward_states) {
@@ -748,6 +828,19 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
   }
   batch.put_protocol_reserve_balance(next.protocol_reserve_balance_units);
   batch.put_confidential_pool_value(next.confidential_pool_value);
+  batch.put_base_fee_per_kib(next.base_fee_per_kib);
+  for (const auto& [key, _] : prev.timed_escrows) {
+    if (!next.timed_escrows.contains(key)) batch.erase(timed_escrow_db_key(key));
+  }
+  for (const auto& [key, tx] : next.timed_escrows) {
+    if (!prev.timed_escrows.contains(key)) batch.put(timed_escrow_db_key(key), tx.serialize());
+  }
+  for (const auto& [root, _] : prev.timed_key_sets) {
+    if (!next.timed_key_sets.contains(root)) batch.erase(timed_key_set_db_key(root));
+  }
+  for (const auto& [root, keys] : next.timed_key_sets) {
+    if (!prev.timed_key_sets.contains(root)) batch.put(timed_key_set_db_key(root), encode_timed_key_set(keys));
+  }
   stage_canonical_scalars(batch, next);
   batch.put(storage::key_smt_delta(kSmtTreeUtxo, next.finalized_height), crypto::encode_smt_delta(tree_changes));
   if (next.finalized_height > kRetainedSmtDeltaHeights) {
@@ -794,6 +887,14 @@ std::string key_consensus_safety_quarantine(std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
   return std::string(kConsensusSafetyQuarantinePrefix) + hex_encode(w.data());
+}
+
+std::uint64_t load_consensus_safety_highwater(const storage::DB& db) {
+  const auto row = db.get(kConsensusSafetyHighwaterKey);
+  if (!row.has_value() || row->size() != 8) return 0;
+  std::uint64_t height = 0;
+  for (std::size_t i = 0; i < 8; ++i) height |= static_cast<std::uint64_t>((*row)[i]) << (8 * i);
+  return height;
 }
 
 namespace {

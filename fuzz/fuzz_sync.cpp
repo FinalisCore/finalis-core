@@ -31,6 +31,8 @@
 #include <vector>
 
 #include "support/test_leader_vrf.hpp"
+#include "support/test_time_signature.hpp"
+#include "support/test_validator_bls.hpp"
 
 #include "common/address.hpp"
 #include "consensus/canonical_derivation.hpp"
@@ -140,6 +142,7 @@ Fixture build_fixture() {
   consensus::CanonicalGenesisState genesis;
   genesis.genesis_artifact_id = zero_hash();
   genesis.initial_validators.push_back(validator.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(validator));
   genesis.genesis_time_unix = 1735689600ULL;
   consensus::CanonicalDerivedState state;
   std::string err;
@@ -194,8 +197,10 @@ Fixture build_fixture() {
           validator.private_key);
       prev_signers.push_back(FinalitySig{validator.public_key, *sig});
     }
+    const auto time_signature = test::test_prev_time_signature(fx.cfg, parent, {validator});
+    if (!time_signature) throw std::runtime_error("time signature failed");
     if (!consensus::populate_frontier_transition_metadata(fx.cfg, parent, h, 0, *leader, parent_round, prev_signers,
-                                                          result.accepted_fee_units, result.next_utxos,
+                                                          *time_signature, result.accepted_fee_units, result.next_utxos,
                                                           &result.transition, &err)) {
       throw std::runtime_error("metadata failed: " + err);
     }

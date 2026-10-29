@@ -6,6 +6,7 @@
 
 #include <limits>
 #include <set>
+#include <tuple>
 #include <type_traits>
 
 #include "consensus/confidential_supply.hpp"
@@ -13,8 +14,12 @@
 #include "consensus/randomness.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/state_commitment.hpp"
+#include "consensus/validator_registry.hpp"
+#include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/smt.hpp"
+#include "crypto/swe.hpp"
+#include "crypto/swe_proofs.hpp"
 #include "utxo/confidential_tx.hpp"
 
 namespace finalis::consensus {
@@ -26,6 +31,121 @@ Hash32 record_id_for_raw_ingress_record(const Bytes& raw_record) { return crypto
 void apply_accepted_tx_to_utxos(const AnyTx& tx, UtxoSetV2* utxos) {
   if (!utxos) return;
   apply_any_tx_to_utxo(tx, *utxos);
+}
+
+bool is_p2pkh_entry(const UtxoEntryV2& entry) {
+  const auto out = transparent_txout_from_utxo_entry(entry);
+  return out.has_value() && is_p2pkh_script_pubkey(out->script_pubkey, nullptr);
+}
+
+// A time-locked body moves value only: P2PKH or confidential inputs and outputs (and data outputs),
+// no validator or burn scripts (validator lifecycle changes are never deferred into a sealed envelope).
+bool timed_body_is_plain(const AnyTx& body, const UtxoSetV2& utxos) {
+  return std::visit(
+      [&](const auto& tx) {
+        for (const auto& in : tx.inputs) {
+          const auto it = utxos.find(OutPoint{in.prev_txid, in.prev_index});
+          if (it == utxos.end()) continue;  // missing: validation rejects it
+          if (it->second.kind == UtxoOutputKind::Transparent && !is_p2pkh_entry(it->second)) return false;
+        }
+        for (const auto& out : tx.outputs) {
+          if constexpr (std::is_same_v<std::decay_t<decltype(tx)>, Tx>) {
+            if (!is_p2pkh_script_pubkey(out.script_pubkey, nullptr) && !is_data_output_script(out.script_pubkey)) {
+              return false;
+            }
+          } else {
+            if (out.kind != TxOutputKind::Transparent) continue;
+            const auto& script = std::get<TransparentTxOutV2>(out.body).script_pubkey;
+            if (!is_p2pkh_script_pubkey(script, nullptr) && !is_data_output_script(script)) return false;
+          }
+        }
+        return true;
+      },
+      body);
+}
+
+// The body of a due escrow, opened with an aggregate on its unlock height by `keys` (the key set it
+// was encrypted to): SWE-decrypt the body key with the signers the aggregate names, then open the
+// AEAD. Nullopt on any failure (the bond is forfeited).
+std::optional<TimedBody> open_due_timed_body(const TxTimed& tx, const TimedExecutionContext& timed,
+                                         const std::vector<crypto::BlsPublicKey>& keys,
+                                         const TimeSignatureAggregate& time_signature) {
+  if (keys.empty()) return std::nullopt;
+  const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys.size(), crypto::kSweKeyChunks);
+  if (!ct.has_value()) return std::nullopt;
+  std::vector<crypto::BlsPublicKey> signers;
+  for (const auto index : time_signature.signer_indices) {
+    if (index >= keys.size()) return std::nullopt;
+    signers.push_back(keys[index]);
+  }
+  const auto chunks = crypto::swe_decrypt(*ct, keys, signers, time_signature.aggregate,
+                                          time_signature_message(timed.chain_domain, tx.unlock_height),
+                                          crypto::kBlsTimeSignatureDst);
+  if (!chunks.has_value()) return std::nullopt;
+  const auto key = crypto::swe_key_from_chunks(*chunks);
+  if (!key.has_value()) return std::nullopt;
+  return open_timed_body(tx, *key);
+}
+
+// The long escrows of the parent state an opening settles: unlock height and key set as named.
+std::vector<TimedEscrowState::const_iterator> long_escrows_for(const TimedExecutionContext& timed,
+                                                              const LongTimeSignature& entry) {
+  std::vector<TimedEscrowState::const_iterator> out;
+  for (auto it = timed.escrows->lower_bound(TimedEscrowKey{entry.unlock_height, 0, 0});
+       it != timed.escrows->end() && it->first.unlock_height == entry.unlock_height; ++it) {
+    if (timed_is_long_lock(it->second, timed.committee_epoch_blocks) && it->second.committee_root == entry.committee_root) {
+      out.push_back(it);
+    }
+  }
+  return out;
+}
+
+// A block's long_time_signatures: strictly ascending (unlock, root), each for a final unlock height
+// within its grace period, naming a key set with at least one waiting long escrow, at least the
+// key set's quorum of strictly ascending signers, an aggregate that verifies, and at most
+// kMaxLongSettlementsPerBlock escrows settled in all.
+bool verify_long_time_signatures(const TimedExecutionContext& timed, std::string* error) {
+  const auto fail = [&](const char* why) {
+    if (error) *error = why;
+    return false;
+  };
+  if (timed.long_time_signatures == nullptr || timed.long_time_signatures->empty()) return true;
+  const auto& entries = *timed.long_time_signatures;
+  if (timed.escrows == nullptr || timed.key_sets == nullptr) return fail("frontier-long-time-signature-no-context");
+  if (entries.size() > kMaxLongTimeSignaturesPerBlock) return fail("frontier-long-time-signatures-too-many");
+  std::size_t settled = 0;
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+    if (i > 0 && std::tie(entries[i - 1].unlock_height, entries[i - 1].committee_root) >=
+                     std::tie(entry.unlock_height, entry.committee_root)) {
+      return fail("frontier-long-time-signatures-not-canonical");
+    }
+    if (entry.unlock_height >= timed.height || timed.height - entry.unlock_height > kTimedLongGraceBlocks) {
+      return fail("frontier-long-time-signature-height-out-of-window");
+    }
+    const auto keys = timed.key_sets->find(entry.committee_root);
+    if (keys == timed.key_sets->end()) return fail("frontier-long-time-signature-unknown-key-set");
+    const auto due = long_escrows_for(timed, entry);
+    if (due.empty()) return fail("frontier-long-time-signature-nothing-to-settle");
+    settled += due.size();
+    if (settled > kMaxLongSettlementsPerBlock) return fail("frontier-long-time-signatures-too-many-settlements");
+    std::vector<crypto::BlsPublicKey> signers;
+    for (std::size_t j = 0; j < entry.signature.signer_indices.size(); ++j) {
+      const auto index = entry.signature.signer_indices[j];
+      if (index >= keys->second.size() || (j > 0 && index <= entry.signature.signer_indices[j - 1])) {
+        return fail("frontier-long-time-signature-signers-not-canonical");
+      }
+      signers.push_back(keys->second[index]);
+    }
+    if (signers.size() < quorum_threshold(keys->second.size())) {
+      return fail("frontier-long-time-signature-below-threshold");
+    }
+    if (!crypto::mcfly_aggregate_verify(signers, time_signature_message(timed.chain_domain, entry.unlock_height),
+                                        crypto::kBlsTimeSignatureDst, entry.signature.aggregate)) {
+      return fail("frontier-long-time-signature-invalid");
+    }
+  }
+  return true;
 }
 
 bool validate_certified_lane_records(const FrontierVector& prev_vector, const FrontierVector& next_vector,
@@ -76,13 +196,13 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
                             " actual=" + std::to_string(record.certificate.seq);
         return false;
       }
-      const auto tx = parse_any_tx(record.tx_bytes);
-      if (!tx.has_value()) {
+      const auto identity = ingress_record_identity(record.tx_bytes);
+      if (!identity.has_value()) {
         if (error) *error = "frontier-certified-ingress-parse-failed lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
       }
-      if (txid_any(*tx) != record.certificate.txid) {
+      if (identity->txid != record.certificate.txid) {
         if (error) *error = "frontier-certified-ingress-txid-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
@@ -120,7 +240,7 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
           }
         }
       }
-      if (assign_ingress_lane(*tx) != lane) {
+      if (identity->lane != lane) {
         if (error) *error = "frontier-certified-ingress-lane-assignment-mismatch lane=" + std::to_string(lane) +
                             " seq=" + std::to_string(expected_seq);
         return false;
@@ -306,7 +426,8 @@ crypto::PersistentSmt utxo_tree_with(const crypto::PersistentSmt& base, const Ut
 bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_confidential_pool_value,
                             std::uint64_t prev_frontier, const std::vector<Bytes>& ordered_records,
                             const SpecialValidationContext* ctx, FrontierExecutionResult* out, std::string* error,
-                            bool compute_next_state_root, const crypto::PersistentSmt* parent_utxo_tree) {
+                            bool compute_next_state_root, const crypto::PersistentSmt* parent_utxo_tree,
+                            const TimedExecutionContext* timed) {
   if (!out) {
     if (error) *error = "missing-output";
     return false;
@@ -349,6 +470,190 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
   std::vector<OutPoint> touched;  // outpoints accepted transactions spent or created
   std::uint64_t accepted_fee_units = 0;
   std::uint64_t confidential_pool_value = parent_confidential_pool_value;
+  TimedEscrowState opened_escrows;
+  std::vector<TimedSettlementRecord> settlements;
+  TimedKeySets opened_key_sets;
+
+  // Applies one Tx / TxV2 as an accepted record (validated under `vctx`); on rejection nothing
+  // changes and `reason` says why.
+  const auto try_apply = [&](const AnyTx& tx, const SpecialValidationContext* vctx, FrontierRejectReason* reason,
+                             std::string* detail = nullptr) -> bool {
+    const auto domains = frontier_conflict_domains_for_tx(tx);
+    for (const auto& domain : domains) {
+      if (consumed_domains.find(domain) != consumed_domains.end()) {
+        *reason = FrontierRejectReason::CONFLICT_DOMAIN_USED;
+        return false;
+      }
+    }
+    if (!vctx && tx_uses_special_scripts(tx)) {
+      *reason = FrontierRejectReason::TX_INVALID;
+      return false;
+    }
+    const auto validation = validate_any_tx(tx, 1, work, vctx);
+    if (!validation.ok) {
+      *reason = FrontierRejectReason::TX_INVALID;
+      if (detail) *detail = validation.error;
+      return false;
+    }
+    // Consensus turnstile: value can only leave the confidential pool if it entered it. Rejecting the
+    // tx (not the slice) keeps a certified record from wedging its ingress lane; a transition that
+    // accepts such a tx still fails recomputation of its decisions and state root.
+    std::uint64_t next_pool_value = confidential_pool_value;
+    if (const auto* v2 = std::get_if<TxV2>(&tx)) {
+      wide::I128 delta;
+      const bool resolved = txv2_confidential_pool_delta(*v2, work, &delta);
+      const wide::I128 next = wide::add(wide::i128_from_u64(confidential_pool_value), delta);
+      if (!resolved || !wide::fits_u64(next)) {
+        *reason = FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE;
+        return false;
+      }
+      next_pool_value = wide::to_u64(next);
+    }
+    confidential_pool_value = next_pool_value;
+
+    for (const auto& domain : domains) consumed_domains.insert(domain);
+    apply_accepted_tx_to_utxos(tx, &work);
+    std::visit(
+        [&](const auto& value) {
+          for (const auto& in : value.inputs) touched.push_back(OutPoint{in.prev_txid, in.prev_index});
+          const Hash32 txid = value.txid();
+          for (std::uint32_t i = 0; i < value.outputs.size(); ++i) touched.push_back(OutPoint{txid, i});
+        },
+        tx);
+    accepted_txs.push_back(tx);
+    accepted_fee_units += validation.cost.fee;
+    return true;
+  };
+
+  // An opened body: a transfer applies as a whole if it is plain (signed under timed_body_chain_domain),
+  // a reveal publishes its data; either way the bond is refunded. Nothing opened (nullopt) leaves the
+  // record unapplied.
+  std::optional<SpecialValidationContext> body_ctx;
+  if (ctx) {
+    body_ctx = *ctx;
+    body_ctx->timed_body = true;
+  }
+  const auto run_body = [&](TimedSettlementRecord* record, const std::optional<TimedBody>& body) {
+    if (!body.has_value()) return;
+    if (const auto* reveal = std::get_if<TimedReveal>(&*body)) {
+      record->body_applied = true;
+      record->revealed_data = reveal->data;
+      return;
+    }
+    const auto& tx = std::get<AnyTx>(*body);
+    record->body_txid = txid_any(tx);
+    FrontierRejectReason reason = FrontierRejectReason::NONE;
+    if (!timed_body_is_plain(tx, work)) {
+      record->body_reject_reason = "not-plain";
+      return;
+    }
+    std::string detail;
+    record->body_applied = try_apply(tx, body_ctx ? &*body_ctx : nullptr, &reason, &detail);
+    if (record->body_applied) {
+      record->applied_body = tx;
+    } else {
+      record->body_reject_reason = detail.empty() ? "reject-reason-" + std::to_string(static_cast<int>(reason)) : detail;
+    }
+  };
+
+  // Settlement first: every short-lock escrow locked to the parent height, in inclusion order, then
+  // the long locks this block opens or expires, before any record of this block (so no record can
+  // front-run a revealed body to make it a double spend).
+  if (timed != nullptr && timed->escrows != nullptr && timed->height >= 2) {
+    const auto unlock = timed->height - 1;
+    for (auto it = timed->escrows->lower_bound(TimedEscrowKey{unlock, 0, 0});
+         it != timed->escrows->end() && it->first.unlock_height == unlock; ++it) {
+      const auto& envelope = it->second;
+      if (timed_is_long_lock(envelope, timed->committee_epoch_blocks)) continue;  // settled below
+      TimedSettlementRecord record{it->first, envelope.txid(), false, std::nullopt, std::nullopt,
+                                   envelope.bond_refund_script};
+      if (timed->parent_time_signature != nullptr) {
+        run_body(&record, open_due_timed_body(envelope, *timed, timed->parent_committee_keys,
+                                              *timed->parent_time_signature));
+      }
+      const auto settled = settle_timed_escrow(
+          TimedEscrow{OutPoint{envelope.fee_input.prev_txid, envelope.fee_input.prev_index}, envelope.forfeit_bond,
+                      envelope.bond_refund_script},
+          record.body_applied);
+      if (settled.refund.has_value()) {
+        work[timed_refund_outpoint(record.timed_txid)] = UtxoEntryV2{*settled.refund};
+        touched.push_back(timed_refund_outpoint(record.timed_txid));
+      }
+      accepted_fee_units += settled.forfeited_fee;
+      settlements.push_back(record);
+    }
+  }
+  if (timed != nullptr && timed->escrows != nullptr) {
+    if (!verify_long_time_signatures(*timed, error)) return false;
+    const auto settle = [&](const TimedEscrowKey& key, const TxTimed& envelope, const std::vector<crypto::BlsPublicKey>* keys,
+                            const TimeSignatureAggregate* time_signature) {
+      TimedSettlementRecord record{key, envelope.txid(), false, std::nullopt, std::nullopt, envelope.bond_refund_script};
+      if (keys == nullptr) {
+        record.expired = true;
+      } else {
+        run_body(&record, open_due_timed_body(envelope, *timed, *keys, *time_signature));
+      }
+      const auto settled = settle_timed_escrow(
+          TimedEscrow{OutPoint{envelope.fee_input.prev_txid, envelope.fee_input.prev_index}, envelope.forfeit_bond,
+                      envelope.bond_refund_script},
+          record.body_applied || record.expired);
+      if (settled.refund.has_value()) {
+        work[timed_refund_outpoint(record.timed_txid)] = UtxoEntryV2{*settled.refund};
+        touched.push_back(timed_refund_outpoint(record.timed_txid));
+      }
+      accepted_fee_units += settled.forfeited_fee;
+      settlements.push_back(record);
+    };
+    // Long locks opened by this block, in (unlock height, key set) then inclusion order.
+    if (timed->long_time_signatures != nullptr) {
+      for (const auto& entry : *timed->long_time_signatures) {
+        const auto& keys = timed->key_sets->at(entry.committee_root);
+        for (const auto& it : long_escrows_for(*timed, entry)) settle(it->first, it->second, &keys, &entry.signature);
+      }
+    }
+    // Long locks whose grace period ended at the parent: refunded, unopened.
+    if (timed->height > kTimedLongGraceBlocks + 1) {
+      const auto unlock = timed->height - kTimedLongGraceBlocks - 1;
+      for (auto it = timed->escrows->lower_bound(TimedEscrowKey{unlock, 0, 0});
+           it != timed->escrows->end() && it->first.unlock_height == unlock; ++it) {
+        if (timed_is_long_lock(it->second, timed->committee_epoch_blocks)) settle(it->first, it->second, nullptr, nullptr);
+      }
+    }
+  }
+
+  // Inclusion of one TxTimed: the envelope rules (check_timed_inclusion), then the block's caps and conflicts.
+  const auto try_include_timed = [&](const TxTimed& tx) -> bool {
+    if (timed == nullptr || timed->escrows == nullptr || !timed->committee_keys) return false;
+    if (opened_escrows.size() >= kMaxTimedTxPerBlock) return false;
+    std::size_t waiting = 0;
+    for (auto it = timed->escrows->lower_bound(TimedEscrowKey{tx.unlock_height, 0, 0});
+         it != timed->escrows->end() && it->first.unlock_height == tx.unlock_height; ++it) {
+      ++waiting;
+    }
+    for (const auto& [key, _] : opened_escrows) waiting += key.unlock_height == tx.unlock_height ? 1 : 0;
+    if (waiting >= kMaxTimedEscrowsPerUnlockHeight) return false;
+    const OutPoint fee_outpoint{tx.fee_input.prev_txid, tx.fee_input.prev_index};
+    if (consumed_domains.count(fee_outpoint) != 0) return false;
+    TimedInclusion inclusion_value;
+    if (!check_timed_inclusion(tx, *timed, work, &inclusion_value)) return false;
+    const auto inclusion = std::optional<TimedInclusion>(inclusion_value);
+    const auto height = timed->height;
+
+    const auto txid = tx.txid();
+    consumed_domains.insert(fee_outpoint);
+    work.erase(fee_outpoint);
+    touched.push_back(fee_outpoint);
+    if (inclusion->change.has_value()) {
+      work[timed_change_outpoint(txid)] = UtxoEntryV2{*inclusion->change};
+      touched.push_back(timed_change_outpoint(txid));
+    }
+    accepted_fee_units += inclusion->fee;
+    opened_escrows[TimedEscrowKey{tx.unlock_height, height, static_cast<std::uint32_t>(opened_escrows.size())}] = tx;
+    if (timed_is_long_lock(tx, timed->committee_epoch_blocks) && !opened_key_sets.contains(tx.committee_root)) {
+      opened_key_sets[tx.committee_root] = *timed->committee_keys(tx.committee_epoch);
+    }
+    return true;
+  };
 
   for (const auto& raw_record : ordered_records) {
     FrontierDecision decision;
@@ -356,72 +661,22 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
 
     auto tx = parse_any_tx(raw_record);
     if (!tx.has_value()) {
+      if (const auto timed_tx = TxTimed::parse(raw_record); timed_tx.has_value()) {
+        decision.record_id = timed_tx->txid();
+        decision.accepted = try_include_timed(*timed_tx);
+        decision.reject_reason = decision.accepted ? FrontierRejectReason::NONE : FrontierRejectReason::TX_INVALID;
+        decisions.push_back(decision);
+        continue;
+      }
       decision.accepted = false;
       decision.reject_reason = FrontierRejectReason::TX_PARSE_FAILED;
       decisions.push_back(decision);
       continue;
     }
-    const auto domains = frontier_conflict_domains_for_tx(*tx);
-    bool conflict = false;
-    for (const auto& domain : domains) {
-      if (consumed_domains.find(domain) != consumed_domains.end()) {
-        conflict = true;
-        break;
-      }
-    }
-    if (conflict) {
-      decision.record_id = txid_any(*tx);
-      decision.accepted = false;
-      decision.reject_reason = FrontierRejectReason::CONFLICT_DOMAIN_USED;
-      decisions.push_back(decision);
-      continue;
-    }
-
     decision.record_id = txid_any(*tx);
-    if (!ctx && tx_uses_special_scripts(*tx)) {
-      decision.accepted = false;
-      decision.reject_reason = FrontierRejectReason::TX_INVALID;
-      decisions.push_back(decision);
-      continue;
-    }
-    const auto validation = validate_any_tx(*tx, 1, work, ctx);
-    if (!validation.ok) {
-      decision.accepted = false;
-      decision.reject_reason = FrontierRejectReason::TX_INVALID;
-      decisions.push_back(decision);
-      continue;
-    }
-    // Consensus turnstile: value can only leave the confidential pool if it entered it. Rejecting the
-    // tx (not the slice) keeps a certified record from wedging its ingress lane; a transition that
-    // accepts such a tx still fails recomputation of its decisions and state root.
-    std::uint64_t next_pool_value = confidential_pool_value;
-    if (const auto* v2 = std::get_if<TxV2>(&*tx)) {
-      wide::I128 delta;
-      const bool resolved = txv2_confidential_pool_delta(*v2, work, &delta);
-      const wide::I128 next = wide::add(wide::i128_from_u64(confidential_pool_value), delta);
-      if (!resolved || !wide::fits_u64(next)) {
-        decision.accepted = false;
-        decision.reject_reason = FrontierRejectReason::CONFIDENTIAL_TURNSTILE_NEGATIVE;
-        decisions.push_back(decision);
-        continue;
-      }
-      next_pool_value = wide::to_u64(next);
-    }
-    confidential_pool_value = next_pool_value;
-
-    for (const auto& domain : domains) consumed_domains.insert(domain);
-    apply_accepted_tx_to_utxos(*tx, &work);
-    std::visit(
-        [&](const auto& value) {
-          for (const auto& in : value.inputs) touched.push_back(OutPoint{in.prev_txid, in.prev_index});
-          const Hash32 txid = value.txid();
-          for (std::uint32_t i = 0; i < value.outputs.size(); ++i) touched.push_back(OutPoint{txid, i});
-        },
-        *tx);
-    accepted_txs.push_back(*tx);
-    accepted_fee_units += validation.cost.fee;
-    decision.accepted = true;
-    decision.reject_reason = FrontierRejectReason::NONE;
+    FrontierRejectReason reason = FrontierRejectReason::NONE;
+    decision.accepted = try_apply(*tx, ctx, &reason);
+    decision.reject_reason = decision.accepted ? FrontierRejectReason::NONE : reason;
     decisions.push_back(decision);
   }
 
@@ -446,6 +701,12 @@ bool execute_frontier_slice(const UtxoSetV2& parent_utxos, std::uint64_t parent_
   result.next_utxos = std::move(work);
   result.accepted_fee_units = accepted_fee_units;
   result.next_confidential_pool_value = confidential_pool_value;
+  result.opened_escrows = std::move(opened_escrows);
+  result.settlements = std::move(settlements);
+  result.opened_key_sets = std::move(opened_key_sets);
+  if (timed != nullptr && timed->long_time_signatures != nullptr) {
+    result.transition.long_time_signatures = *timed->long_time_signatures;
+  }
   *out = std::move(result);
   return true;
 }
@@ -462,7 +723,7 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
                                   const CertifiedIngressLaneRecords& lane_records,
                                   const FrontierLaneRoots& prev_lane_roots, const SpecialValidationContext* ctx,
                                   FrontierExecutionResult* out, std::string* error, bool compute_next_state_root,
-                                  const crypto::PersistentSmt* parent_utxo_tree) {
+                                  const crypto::PersistentSmt* parent_utxo_tree, const TimedExecutionContext* timed) {
   FrontierLaneRoots recomputed_lane_roots{};
   std::vector<Bytes> ordered_records;
   if (!frontier_merge_certified_ingress(prev_vector, next_vector, lane_records, prev_lane_roots, &recomputed_lane_roots,
@@ -490,7 +751,7 @@ bool execute_frontier_lane_prefix(const UtxoSetV2& parent_utxos, std::uint64_t p
 
   FrontierExecutionResult result;
   if (!execute_frontier_slice(parent_utxos, parent_confidential_pool_value, prev_vector.total_count(), ordered_records, ctx,
-                              &result, error, compute_next_state_root, parent_utxo_tree)) {
+                              &result, error, compute_next_state_root, parent_utxo_tree, timed)) {
     return false;
   }
   result.transition.prev_vector = prev_vector;
@@ -509,6 +770,159 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
                                   FrontierExecutionResult* out, std::string* error) {
   return execute_frontier_lane_prefix(upgrade_utxo_set_v2(parent_utxos), 0, prev_vector, next_vector, lane_records,
                                       prev_lane_roots, ctx, out, error);
+}
+
+bool verify_timed_swe_proof(const TxTimed& tx, const std::vector<crypto::BlsPublicKey>& keys, const Hash32& chain_domain) {
+  const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys.size(), crypto::kSweKeyChunks);
+  const auto proof = crypto::SweWellFormednessProof::parse(tx.swe_proof);
+  return ct.has_value() && proof.has_value() &&
+         crypto::swe_verify_well_formed(*ct, keys, time_signature_message(chain_domain, tx.unlock_height),
+                                        crypto::kBlsTimeSignatureDst, *proof);
+}
+
+bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed, const UtxoSetV2& utxos,
+                           TimedInclusion* inclusion_out, std::string* reason, TimedInclusionCheck check) {
+  const auto fail = [&](const char* why) {
+    if (reason) *reason = why;
+    return false;
+  };
+  if (!timed.committee_keys) return fail("no-committee-context");
+  const auto height = timed.height;
+  const auto epoch_blocks = std::max<std::uint64_t>(1, timed.committee_epoch_blocks);
+  if (tx.unlock_height < height) return fail("unlock-height-passed");
+  // The committee named is always the inclusion epoch's: the keys known now (a short lock's unlock
+  // height lies in this epoch, a long lock's beyond it).
+  const auto epoch = committee_epoch_start(height, epoch_blocks);
+  if (tx.committee_epoch != epoch) return fail("committee-epoch-mismatch");
+  const bool long_lock = timed_is_long_lock(tx, epoch_blocks);
+  if (long_lock && tx.body_ciphertext.size() > kTxTimedMaxLongBodyCiphertextBytes) return fail("long-lock-body-too-large");
+  {
+    const auto size_fee = timed_min_prepaid_fee(tx.serialize().size());
+    const auto long_fee = timed_long_lock_min_fee(height, tx.unlock_height, epoch_blocks);
+    if (!long_fee.has_value() || *long_fee > std::numeric_limits<std::uint64_t>::max() - size_fee ||
+        tx.prepaid_fee < size_fee + *long_fee) {
+      return fail(long_lock ? "long-lock-fee-below-minimum" : "prepaid-fee-below-minimum");
+    }
+  }
+
+  const OutPoint fee_outpoint{tx.fee_input.prev_txid, tx.fee_input.prev_index};
+  const auto fee_it = utxos.find(fee_outpoint);
+  if (fee_it == utxos.end()) return fail("fee-input-missing");
+  const auto fee_out = transparent_txout_from_utxo_entry(fee_it->second);
+  std::array<std::uint8_t, 20> pkh{};
+  if (!fee_out.has_value() || !is_p2pkh_script_pubkey(fee_out->script_pubkey, &pkh)) return fail("fee-input-not-p2pkh");
+  Sig64 sig{};
+  PubKey32 pub{};
+  if (!is_p2pkh_script_sig(tx.fee_input.script_sig, &sig, &pub)) return fail("fee-script-sig-malformed");
+  const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
+  if (!std::equal(derived.begin(), derived.end(), pkh.begin())) return fail("fee-pubkey-hash-mismatch");
+  if (!crypto::ed25519_verify(signing_message_for_timed_fee_input(timed.chain_domain, tx), sig, pub)) {
+    return fail("fee-signature-invalid");
+  }
+  if (!is_p2pkh_script_pubkey(tx.bond_refund_script, nullptr)) return fail("refund-script-not-p2pkh");
+  if (tx.fee_change.has_value() && !is_p2pkh_script_pubkey(tx.fee_change->script_pubkey, nullptr)) {
+    return fail("change-script-not-p2pkh");
+  }
+  const auto inclusion = open_timed_escrow(fee_outpoint, fee_out->value, tx.prepaid_fee, tx.forfeit_bond,
+                                           tx.bond_refund_script, tx.fee_change, timed.min_bond);
+  if (!inclusion.has_value()) return fail("value-accounting-or-bond-below-minimum");
+
+  const auto keys = timed.committee_keys(epoch);
+  if (!keys.has_value()) return fail("committee-keys-unknown");
+  if (tx.committee_root != committee_bls_key_root(*keys)) return fail("committee-root-mismatch");
+  const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys->size(), crypto::kSweKeyChunks);
+  if (!ct.has_value() || ct->key_shares.size() != keys->size()) return fail("swe-ciphertext-invalid");
+  if (ct->threshold != quorum_threshold(keys->size())) return fail("swe-threshold-mismatch");
+  if (!crypto::SweWellFormednessProof::parse(tx.swe_proof).has_value()) return fail("swe-proof-invalid");
+  if (check == TimedInclusionCheck::Full && !verify_timed_swe_proof(tx, *keys, timed.chain_domain)) {
+    return fail("swe-proof-invalid");
+  }
+  if (inclusion_out) *inclusion_out = *inclusion;
+  return true;
+}
+
+bool timed_is_long_lock(const TxTimed& tx, std::uint64_t committee_epoch_blocks) {
+  return committee_epoch_start(tx.unlock_height, std::max<std::uint64_t>(1, committee_epoch_blocks)) != tx.committee_epoch;
+}
+
+std::optional<std::uint64_t> timed_long_lock_min_fee(std::uint64_t height, std::uint64_t unlock_height,
+                                                     std::uint64_t committee_epoch_blocks) {
+  const auto epoch_blocks = std::max<std::uint64_t>(1, committee_epoch_blocks);
+  const auto epoch_end = committee_epoch_start(height, epoch_blocks) + epoch_blocks - 1;
+  if (unlock_height <= epoch_end) return 0;
+  const auto beyond = unlock_height - epoch_end;
+  const auto epochs = beyond / epoch_blocks + (beyond % epoch_blocks != 0 ? 1 : 0);
+  if (epochs > std::numeric_limits<std::uint64_t>::max() / kTxTimedLongFeePerEpoch) return std::nullopt;
+  return epochs * kTxTimedLongFeePerEpoch;
+}
+
+std::uint64_t timed_min_prepaid_fee(std::size_t envelope_bytes) {
+  const std::uint64_t kib = (static_cast<std::uint64_t>(envelope_bytes) + 1023) / 1024;  // envelopes are < 128 KiB
+  return kTxTimedMinPrepaidFee + kib * kTxTimedPrepaidFeePerKiB;
+}
+
+std::optional<TimedLockTerms> timed_lock_terms(std::uint64_t next_height, std::uint64_t unlock,
+                                               std::uint64_t committee_epoch_blocks, std::size_t envelope_bytes,
+                                               std::string* err) {
+  const auto fail = [&](std::string why) -> std::optional<TimedLockTerms> {
+    if (err) *err = std::move(why);
+    return std::nullopt;
+  };
+  const auto epoch_blocks = std::max<std::uint64_t>(1, committee_epoch_blocks);
+  if (unlock < next_height) return fail("unlock height " + std::to_string(unlock) + " is before the next block");
+  TimedLockTerms out;
+  out.committee_epoch = committee_epoch_start(next_height, epoch_blocks);
+  const auto epoch_end = out.committee_epoch + epoch_blocks - 1;
+  out.long_lock = unlock > epoch_end;
+  out.last_inclusion_height = std::min(epoch_end, unlock);
+  const auto base_fee = timed_min_prepaid_fee(envelope_bytes);
+  const auto long_fee = timed_long_lock_min_fee(next_height, unlock, epoch_blocks);
+  if (!long_fee.has_value() || *long_fee > std::numeric_limits<std::uint64_t>::max() - base_fee) {
+    return fail("long lock fee overflows");
+  }
+  out.prepaid_fee = base_fee + *long_fee;
+  if (out.long_lock && epoch_end + 1 - next_height < kTimedLongInclusionMarginBlocks) {
+    return fail("the current committee epoch ends at block " + std::to_string(epoch_end) +
+                "; send a long lock from block " + std::to_string(epoch_end + 1) + " on");
+  }
+  out.beyond_lien = unlock - next_height > kTimedLongLienBlocks;
+  return out;
+}
+
+Hash32 committee_bls_key_root(const std::vector<crypto::BlsPublicKey>& ordered_bls_keys) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'F', 'I', 'N', 'A', 'L', 'I', 'S', '-', 'C', 'O', 'M', 'M', 'I', 'T', 'T', 'E', 'E', '-', 'B', 'L', 'S',
+                '-', 'V', '1'});
+  w.varint(ordered_bls_keys.size());
+  for (const auto& key : ordered_bls_keys) w.bytes_fixed(key);
+  return crypto::sha256d(w.data());
+}
+
+std::optional<TimedInclusion> open_timed_escrow(const OutPoint& fee_outpoint, std::uint64_t fee_input_value,
+                                                std::uint64_t prepaid_fee, std::uint64_t forfeit_bond,
+                                                const Bytes& bond_refund_script,
+                                                const std::optional<TxOut>& fee_change, std::uint64_t min_bond) {
+  if (forfeit_bond < min_bond) return std::nullopt;
+  const std::uint64_t change = fee_change ? fee_change->value : 0;
+  // value == prepaid + bond + change, each subtraction checked so nothing wraps.
+  if (prepaid_fee > fee_input_value) return std::nullopt;
+  const std::uint64_t after_fee = fee_input_value - prepaid_fee;
+  if (forfeit_bond > after_fee || after_fee - forfeit_bond != change) return std::nullopt;
+  TimedInclusion out;
+  out.fee = prepaid_fee;
+  if (fee_change && fee_change->value > 0) out.change = fee_change;
+  out.escrow = TimedEscrow{fee_outpoint, forfeit_bond, bond_refund_script};
+  return out;
+}
+
+TimedSettlement settle_timed_escrow(const TimedEscrow& escrow, bool body_applied) {
+  TimedSettlement out;
+  if (body_applied) {
+    if (escrow.forfeit_bond > 0) out.refund = TxOut{escrow.forfeit_bond, escrow.bond_refund_script};
+  } else {
+    out.forfeited_fee = escrow.forfeit_bond;
+  }
+  return out;
 }
 
 }  // namespace finalis::consensus

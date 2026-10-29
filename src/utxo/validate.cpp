@@ -99,6 +99,11 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
       return false;
     }
 
+    if (is_data_output_script(out.script_pubkey) && out.value != 0) {
+      if (error) *error = "SCDATA01 output must have zero value";
+      return false;
+    }
+
     OnboardingRegistrationScriptData onboarding_req{};
     if (parse_onboarding_registration_script(out.script_pubkey, &onboarding_req)) {
       if (out.value != 0) {
@@ -106,14 +111,23 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
         return false;
       }
       std::string budget_error;
-      if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
+      if (!consume_verify_budget(verify_budget_remaining, 1 + kBlsPopVerifyCost, &budget_error)) {
         if (error) *error = budget_error;
         return false;
       }
-      if (!crypto::ed25519_verify(
-              onboarding_registration_pop_message(onboarding_req.validator_pubkey, onboarding_req.payout_pubkey),
-              onboarding_req.pop, onboarding_req.validator_pubkey)) {
+      if (!crypto::ed25519_verify(onboarding_registration_pop_message(onboarding_req.validator_pubkey,
+                                                                      onboarding_req.payout_pubkey,
+                                                                      onboarding_req.bls_pubkey),
+                                  onboarding_req.pop, onboarding_req.validator_pubkey)) {
         if (error) *error = "onboarding registration proof invalid";
+        return false;
+      }
+      if (!crypto::bls_pop_verify(onboarding_req.bls_pubkey, onboarding_req.bls_pop)) {
+        if (error) *error = "onboarding registration bls proof invalid";
+        return false;
+      }
+      if (ctx && ctx->validators && ctx->validators->bls_key_owner(onboarding_req.bls_pubkey).has_value()) {
+        if (error) *error = "bls key already registered";
         return false;
       }
       if (ctx && ctx->validators) {
@@ -155,15 +169,26 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
         return false;
       }
       std::string budget_error;
-      if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
+      if (!consume_verify_budget(verify_budget_remaining, 1 + kBlsPopVerifyCost, &budget_error)) {
         if (error) *error = budget_error;
         return false;
       }
       if (!crypto::ed25519_verify(
-              validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey), join_req.pop,
-              join_req.validator_pubkey)) {
+              validator_join_request_pop_message(join_req.validator_pubkey, join_req.payout_pubkey, join_req.bls_pubkey),
+              join_req.pop, join_req.validator_pubkey)) {
         if (error) *error = "validator join request proof invalid";
         return false;
+      }
+      if (!crypto::bls_pop_verify(join_req.bls_pubkey, join_req.bls_pop)) {
+        if (error) *error = "validator join request bls proof invalid";
+        return false;
+      }
+      if (ctx && ctx->validators) {
+        const auto owner = ctx->validators->bls_key_owner(join_req.bls_pubkey);
+        if (owner.has_value() && *owner != join_req.validator_pubkey) {
+          if (error) *error = "bls key already registered";
+          return false;
+        }
       }
       if (ctx && ctx->network && validator_join_admission_pow_enabled(*ctx->network) && !join_req.has_admission_pow) {
         if (error) *error = "missing admission pow";
@@ -278,16 +303,125 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_
   return true;
 }
 
+namespace {
+constexpr char kHeightLockPrefix[] = "SCHLOCK1";
+constexpr char kInheritanceLockPrefix[] = "SCHLOCK2";
+constexpr char kDataOutputPrefix[] = "SCDATA01";
+
+bool has_prefix(const Bytes& script, const char* prefix) {
+  return script.size() >= 8 && std::equal(prefix, prefix + 8, script.begin());
+}
+
+std::uint64_t read_u64le(const Bytes& b, std::size_t off) {
+  std::uint64_t v = 0;
+  for (std::size_t i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(b[off + i]) << (8 * i);
+  return v;
+}
+
+void append_u64le(Bytes* b, std::uint64_t v) {
+  for (std::size_t i = 0; i < 8; ++i) b->push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+}
+}  // namespace
+
+std::optional<HeightLockScript> parse_height_lock_script(const Bytes& script_pubkey) {
+  HeightLockScript out;
+  if (script_pubkey.size() == kHeightLockScriptBytes && has_prefix(script_pubkey, kHeightLockPrefix)) {
+    out.unlock_height = read_u64le(script_pubkey, 8);
+    std::copy(script_pubkey.begin() + 16, script_pubkey.begin() + 36, out.beneficiary_pkh.begin());
+  } else if (script_pubkey.size() == kInheritanceLockScriptBytes && has_prefix(script_pubkey, kInheritanceLockPrefix)) {
+    out.unlock_height = read_u64le(script_pubkey, 8);
+    std::array<std::uint8_t, 20> owner{};
+    std::copy(script_pubkey.begin() + 16, script_pubkey.begin() + 36, owner.begin());
+    std::copy(script_pubkey.begin() + 36, script_pubkey.begin() + 56, out.beneficiary_pkh.begin());
+    out.owner_pkh = owner;
+  } else {
+    return std::nullopt;
+  }
+  if (out.unlock_height == 0) return std::nullopt;  // a lock to height 0 is just P2PKH
+  return out;
+}
+
+Bytes height_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& pkh) {
+  Bytes out(kHeightLockPrefix, kHeightLockPrefix + 8);
+  append_u64le(&out, unlock_height);
+  out.insert(out.end(), pkh.begin(), pkh.end());
+  return out;
+}
+
+Bytes inheritance_lock_script_pubkey(std::uint64_t unlock_height, const std::array<std::uint8_t, 20>& owner_pkh,
+                                     const std::array<std::uint8_t, 20>& heir_pkh) {
+  Bytes out(kInheritanceLockPrefix, kInheritanceLockPrefix + 8);
+  append_u64le(&out, unlock_height);
+  out.insert(out.end(), owner_pkh.begin(), owner_pkh.end());
+  out.insert(out.end(), heir_pkh.begin(), heir_pkh.end());
+  return out;
+}
+
+bool is_data_output_script(const Bytes& script_pubkey, Bytes* out_data) {
+  if (script_pubkey.size() <= 8 || script_pubkey.size() > 8 + kDataOutputMaxBytes) return false;
+  if (!has_prefix(script_pubkey, kDataOutputPrefix)) return false;
+  if (out_data) out_data->assign(script_pubkey.begin() + 8, script_pubkey.end());
+  return true;
+}
+
+std::optional<Bytes> data_output_script_pubkey(const Bytes& data) {
+  if (data.empty() || data.size() > kDataOutputMaxBytes) return std::nullopt;
+  Bytes out(kDataOutputPrefix, kDataOutputPrefix + 8);
+  out.insert(out.end(), data.begin(), data.end());
+  return out;
+}
+
+bool script_spendable_by(const Bytes& script_pubkey, const std::array<std::uint8_t, 20>& pkh, std::uint64_t height) {
+  std::array<std::uint8_t, 20> p2pkh{};
+  if (is_p2pkh_script_pubkey(script_pubkey, &p2pkh)) return p2pkh == pkh;
+  const auto lock = parse_height_lock_script(script_pubkey);
+  if (!lock.has_value()) return false;
+  if (lock->owner_pkh.has_value() && *lock->owner_pkh == pkh) return true;
+  return lock->beneficiary_pkh == pkh && height >= lock->unlock_height;
+}
+
+std::vector<Hash32> script_index_hashes(const Bytes& script_pubkey) {
+  std::vector<Hash32> out{crypto::sha256(script_pubkey)};
+  if (const auto lock = parse_height_lock_script(script_pubkey); lock.has_value()) {
+    out.push_back(crypto::sha256(address::p2pkh_script_pubkey(lock->beneficiary_pkh)));
+    if (lock->owner_pkh.has_value()) out.push_back(crypto::sha256(address::p2pkh_script_pubkey(*lock->owner_pkh)));
+  }
+  if (Bytes data; is_data_output_script(script_pubkey, &data) && data.size() > kDataOutputTopicBytes) {
+    data.resize(kDataOutputTopicBytes);
+    out.push_back(crypto::sha256(*data_output_script_pubkey(data)));
+  }
+  return out;
+}
+
+bool script_indexed_under(const Bytes& script_pubkey, const Hash32& scripthash) {
+  for (const auto& h : script_index_hashes(script_pubkey)) {
+    if (h == scripthash) return true;
+  }
+  return false;
+}
+
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
-  return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
+  return is_p2pkh_script_pubkey(script_pubkey, nullptr) || parse_height_lock_script(script_pubkey).has_value() || is_validator_register_script(script_pubkey, nullptr) ||
          is_validator_unbond_script(script_pubkey, nullptr) ||
          is_onboarding_registration_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
-         is_burn_script(script_pubkey, nullptr);
+         is_burn_script(script_pubkey, nullptr) || is_data_output_script(script_pubkey);
 }
 
-std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index) {
-  if (input_index >= tx.inputs.size()) return std::nullopt;
+Hash32 spent_outputs_hash(const std::vector<TxOut>& spent) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'P', 'E', 'N', 'T', '-', 'V', '1'});
+  w.varint(spent.size());
+  for (const auto& out : spent) {
+    w.u64le(out.value);
+    w.varbytes(out.script_pubkey);
+  }
+  return crypto::sha256d(w.data());
+}
+
+std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                               const std::vector<TxOut>& spent) {
+  if (input_index >= tx.inputs.size() || spent.size() != tx.inputs.size()) return std::nullopt;
   Tx signing = tx;
   for (auto& in : signing.inputs) {
     in.script_sig.clear();
@@ -295,16 +429,18 @@ std::optional<Bytes> signing_message_for_input(const Hash32& chain_domain, const
   const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '4'});
   w.bytes_fixed(chain_domain);
   w.u32le(input_index);
   w.bytes_fixed(txh);
+  w.bytes_fixed(spent_outputs_hash(spent));
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
 
-std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index) {
-  if (input_index >= tx.inputs.size()) return std::nullopt;
+std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const Tx& tx, std::uint32_t input_index,
+                                              const std::vector<TxOut>& spent) {
+  if (input_index >= tx.inputs.size() || spent.size() != tx.inputs.size()) return std::nullopt;
   Tx signing = tx;
   for (auto& in : signing.inputs) {
     in.script_sig.clear();
@@ -312,10 +448,11 @@ std::optional<Bytes> unbond_message_for_input(const Hash32& chain_domain, const 
   const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '2'});
   w.bytes_fixed(chain_domain);
   w.bytes_fixed(txh);
   w.u32le(input_index);
+  w.bytes_fixed(spent_outputs_hash(spent));
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
@@ -358,20 +495,24 @@ std::optional<Hash32> balance_proof_message_v2(const Hash32& chain_domain, const
   return crypto::sha256d(w.data());
 }
 
-Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                          const crypto::BlsPublicKey& bls_pubkey) {
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'O', 'N', 'B', 'O', 'A', 'R', 'D', '-', 'V', '2'});
   w.bytes_fixed(validator_pubkey);
   w.bytes_fixed(payout_pubkey);
+  w.bytes_fixed(bls_pubkey);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
 
-Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
+                                         const crypto::BlsPublicKey& bls_pubkey) {
   codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
+  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '2'});
   w.bytes_fixed(validator_pubkey);
   w.bytes_fixed(payout_pubkey);
+  w.bytes_fixed(bls_pubkey);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
@@ -570,7 +711,14 @@ std::optional<Hash32> chain_domain_from_hex(const std::string& network_id_hex, c
 
 std::optional<Hash32> tx_chain_domain(const SpecialValidationContext* ctx) {
   if (!ctx || !ctx->network || !ctx->chain_id) return std::nullopt;
-  return consensus_chain_domain(*ctx->network, *ctx->chain_id);
+  const auto domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
+  return ctx->timed_body ? timed_body_chain_domain(domain) : domain;
+}
+
+Hash32 timed_body_chain_domain(const Hash32& chain_domain) {
+  Bytes in{'F', 'I', 'N', 'A', 'L', 'I', 'S', '-', 'T', 'I', 'M', 'E', 'D', '-', 'B', 'O', 'D', 'Y', '-', 'V', '1'};
+  in.insert(in.end(), chain_domain.begin(), chain_domain.end());
+  return crypto::sha256d(in);
 }
 
 Bytes vote_signing_message(const Hash32& chain_domain, std::uint64_t height, std::uint32_t round,
@@ -607,6 +755,27 @@ Bytes propose_signing_message(const Hash32& chain_domain, std::uint64_t height, 
   w.bytes_fixed(transition_id);
   w.u8(pol_round.has_value() ? 1 : 0);
   w.u32le(pol_round.value_or(0));
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes time_signature_message(const Hash32& chain_domain, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
+  w.u64le(height);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes signing_message_for_timed_fee_input(const Hash32& chain_domain, const TxTimed& tx) {
+  TxTimed signing = tx;
+  signing.fee_input.script_sig.clear();
+  const Hash32 txh = crypto::sha256d(signing.serialize());
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'T', 'I', 'M', 'E', 'D', '-', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
+  w.bytes_fixed(txh);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
@@ -675,6 +844,66 @@ bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
   return true;
 }
 
+bool parse_early_time_signature_script_sig(const Bytes& script_sig, EarlyTimeSignatureEvidence* out) {
+  static const Bytes marker{'S', 'C', 'T', 'S', 'L', 'A', 'S', 'H'};
+  if (script_sig.size() < marker.size()) return false;
+  if (!std::equal(marker.begin(), marker.end(), script_sig.begin())) return false;
+  Bytes tail(script_sig.begin() + static_cast<long>(marker.size()), script_sig.end());
+  Bytes blob;
+  if (!codec::parse_exact(tail, [&](codec::ByteReader& r) {
+        auto b = r.varbytes();
+        if (!b) return false;
+        blob = *b;
+        return true;
+      })) {
+    return false;
+  }
+  EarlyTimeSignatureEvidence ev;
+  if (!codec::parse_exact(blob, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto sig = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+        if (!h || !sig) return false;
+        ev.height = *h;
+        ev.signature = *sig;
+        return true;
+      })) {
+    return false;
+  }
+  ev.raw_blob = std::move(blob);
+  if (out) *out = std::move(ev);
+  return true;
+}
+
+bool is_slash_script_sig(const Bytes& script_sig) {
+  return parse_slash_script_sig(script_sig, nullptr) || parse_early_time_signature_script_sig(script_sig, nullptr);
+}
+
+namespace {
+
+// The checks of an early-time-signature slash of the bond (or unbond output) of `owner`: a single
+// SCBURN output committing to the evidence, a height not yet final at ctx->current_height, and a
+// signature that verifies under the owner's registered BLS key. Empty on success, else the error.
+std::string check_early_time_signature_slash(const Tx& tx, const EarlyTimeSignatureEvidence& evidence,
+                                             const PubKey32& owner, const SpecialValidationContext& ctx,
+                                             const Hash32& chain_domain, std::size_t* verify_budget_remaining) {
+  if (tx.outputs.size() != 1) return "slash tx must have exactly one output";
+  Hash32 burn_hash{};
+  if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return "slash output must be SCBURN";
+  if (burn_hash != crypto::sha256d(evidence.raw_blob)) return "slash evidence hash mismatch";
+  if (evidence.height < ctx.current_height) return "time signature evidence height already final";
+  const auto info = ctx.validators->get(owner);
+  if (!info.has_value() || info->bls_pubkey == crypto::BlsPublicKey{}) return "time signature evidence key not registered";
+  std::string budget_error;
+  if (!consume_verify_budget(verify_budget_remaining, kBlsPopVerifyCost, &budget_error)) return budget_error;
+  if (!crypto::bls_verify(info->bls_pubkey, time_signature_message(chain_domain, evidence.height),
+                          crypto::kBlsTimeSignatureDst, evidence.signature)) {
+    return "invalid time signature evidence";
+  }
+  return "";
+}
+
+}  // namespace
+
 TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
                                const SpecialValidationContext* ctx) {
   const auto chain_domain = tx_chain_domain(ctx);
@@ -721,6 +950,22 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     out_sum += out.value;
   }
 
+  // Every signature covers all spent outputs; resolved once, at the first signature checked.
+  std::optional<std::vector<TxOut>> spent;
+  const auto spent_outputs = [&]() -> const std::vector<TxOut>* {
+    if (!spent.has_value()) {
+      std::vector<TxOut> all;
+      all.reserve(tx.inputs.size());
+      for (const auto& input : tx.inputs) {
+        const auto found = utxos.find(OutPoint{input.prev_txid, input.prev_index});
+        if (found == utxos.end()) return nullptr;
+        all.push_back(found->second.out);
+      }
+      spent = std::move(all);
+    }
+    return &*spent;
+  };
+
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
     const auto& in = tx.inputs[i];
     if (in.sequence != 0xFFFFFFFF) return {false, "sequence must be FFFFFFFF", 0};
@@ -741,7 +986,36 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         return {false, "pubkey hash mismatch", 0};
       }
 
-      const auto msg = signing_message_for_input(*chain_domain, tx, i);
+      const auto* all_spent = spent_outputs();
+      if (all_spent == nullptr) return {false, "missing utxo", 0};
+      const auto msg = signing_message_for_input(*chain_domain, tx, i, *all_spent);
+      if (!msg.has_value()) return {false, "sighash failed", 0};
+      std::string budget_error;
+      if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
+      if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
+      if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+        return {false, "input sum overflow", 0};
+      }
+      in_sum += prev_out.value;
+      continue;
+    }
+
+    if (const auto lock = parse_height_lock_script(prev_out.script_pubkey); lock.has_value()) {
+      // The spending block's height decides; without it (no context) the input cannot be judged.
+      if (!ctx) return {false, "height-locked input needs a block height", 0};
+      Sig64 sig{};
+      PubKey32 pub{};
+      if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad script_sig", 0};
+      const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
+      std::array<std::uint8_t, 20> spender{};
+      std::copy(derived.begin(), derived.end(), spender.begin());
+      if (!script_spendable_by(prev_out.script_pubkey, spender, ctx->current_height)) {
+        const bool is_beneficiary = spender == lock->beneficiary_pkh;
+        return {false, is_beneficiary ? "height lock not reached" : "pubkey hash mismatch", 0};
+      }
+      const auto* all_spent = spent_outputs();
+      if (all_spent == nullptr) return {false, "missing utxo", 0};
+      const auto msg = signing_message_for_input(*chain_domain, tx, i, *all_spent);
       if (!msg.has_value()) return {false, "sighash failed", 0};
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -758,7 +1032,14 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       if (!ctx || !ctx->validators) return {false, "bond spend requires validator context", 0};
 
       SlashEvidence evidence;
-      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+      EarlyTimeSignatureEvidence early;
+      if (parse_early_time_signature_script_sig(in.script_sig, &early)) {
+        const auto slash_error =
+            check_early_time_signature_slash(tx, early, bond_pub, *ctx, *chain_domain, &verify_budget_remaining);
+        if (!slash_error.empty()) return {false, slash_error, 0};
+        has_slash_input = true;
+        slashed_sum += prev_out.value;  // bounded by the guarded in_sum below
+      } else if (parse_slash_script_sig(in.script_sig, &evidence)) {
         if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
         Hash32 burn_hash{};
         if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return {false, "slash output must be SCBURN", 0};
@@ -808,7 +1089,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         PubKey32 pub{};
         if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond auth script_sig", 0};
         if (pub != bond_pub) return {false, "unbond auth pubkey mismatch", 0};
-        const auto msg = unbond_message_for_input(*chain_domain, tx, i);
+        const auto* all_spent = spent_outputs();
+        if (all_spent == nullptr) return {false, "missing utxo", 0};
+        const auto msg = unbond_message_for_input(*chain_domain, tx, i, *all_spent);
         if (!msg.has_value()) return {false, "unbond sighash failed", 0};
         std::string budget_error;
         if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -827,6 +1110,19 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       auto info = ctx->validators->get(unbond_pub);
       if (!info.has_value()) return {false, "unknown validator for unbond output", 0};
       SlashEvidence evidence;
+      EarlyTimeSignatureEvidence early;
+      if (parse_early_time_signature_script_sig(in.script_sig, &early)) {
+        const auto slash_error =
+            check_early_time_signature_slash(tx, early, unbond_pub, *ctx, *chain_domain, &verify_budget_remaining);
+        if (!slash_error.empty()) return {false, slash_error, 0};
+        has_slash_input = true;
+        slashed_sum += prev_out.value;  // bounded by the guarded in_sum below
+        if (in_sum > std::numeric_limits<std::uint64_t>::max() - prev_out.value) {
+          return {false, "input sum overflow", 0};
+        }
+        in_sum += prev_out.value;
+        continue;
+      }
       if (parse_slash_script_sig(in.script_sig, &evidence)) {
         if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
         Hash32 burn_hash{};
@@ -866,12 +1162,17 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       if (!ctx->validators->can_withdraw_bond(unbond_pub, ctx->current_height, ctx->unbond_delay_blocks)) {
         return {false, "unbond delay not reached", 0};
       }
+      if (ctx->timed_bond_lien && ctx->timed_bond_lien(unbond_pub, ctx->current_height)) {
+        return {false, "bond held by a pending long time lock", 0};
+      }
 
       Sig64 sig{};
       PubKey32 pub{};
       if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond-spend script_sig", 0};
       if (pub != unbond_pub) return {false, "unbond-spend pubkey mismatch", 0};
-      const auto msg = signing_message_for_input(*chain_domain, tx, i);
+      const auto* all_spent = spent_outputs();
+      if (all_spent == nullptr) return {false, "missing utxo", 0};
+      const auto msg = signing_message_for_input(*chain_domain, tx, i, *all_spent);
       if (!msg.has_value()) return {false, "unbond-spend sighash failed", 0};
       std::string budget_error;
       if (!consume_verify_budget(&verify_budget_remaining, 1, &budget_error)) return {false, budget_error, 0};
@@ -1243,8 +1544,41 @@ std::uint64_t any_tx_confidential_verify_weight(const AnyTx& tx) {
   return 0;
 }
 
+namespace {
+bool tx_has_burn_output(const AnyTx& tx) {
+  if (const auto* v1 = std::get_if<Tx>(&tx)) {
+    for (const auto& out : v1->outputs) {
+      if (is_burn_script(out.script_pubkey, nullptr)) return true;
+    }
+    return false;
+  }
+  for (const auto& out : std::get<TxV2>(tx).outputs) {
+    if (out.kind == TxOutputKind::Transparent &&
+        is_burn_script(std::get<TransparentTxOutV2>(out.body).script_pubkey, nullptr)) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
 AnyTxValidationResult validate_any_tx(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
                                       const SpecialValidationContext* ctx) {
+  auto result = validate_any_tx_without_base_fee(tx, tx_index_in_block, utxos, ctx);
+  // Exempt: a timed body (its fee was prepaid) and a slash (its burn output must carry the whole
+  // slashed bond, so it cannot pay a fee, and congestion must not stop punishment).
+  if (result.ok && ctx && ctx->base_fee_per_kib > 0 && !ctx->timed_body && !tx_has_burn_output(tx)) {
+    const auto required = consensus::required_base_fee_units(ctx->base_fee_per_kib, result.cost.serialized_size);
+    if (result.cost.fee < required) {
+      result.ok = false;
+      result.error = "fee below base fee (needs " + std::to_string(required) + ")";
+    }
+  }
+  return result;
+}
+
+AnyTxValidationResult validate_any_tx_without_base_fee(const AnyTx& tx, size_t tx_index_in_block, const UtxoSetV2& utxos,
+                                                       const SpecialValidationContext* ctx) {
   return std::visit(
       [&](const auto& value) -> AnyTxValidationResult {
         using T = std::decay_t<decltype(value)>;
@@ -1272,6 +1606,11 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
           }
           const Hash32 txid = value.txid();
           for (std::uint32_t out_i = 0; out_i < value.outputs.size(); ++out_i) {
+            // Data and burn outputs are never spendable; burned value goes to the reserve instead.
+            if (is_data_output_script(value.outputs[out_i].script_pubkey) ||
+                is_burn_script(value.outputs[out_i].script_pubkey, nullptr)) {
+              continue;
+            }
             utxos[OutPoint{txid, out_i}] = UtxoEntryV2{value.outputs[out_i]};
           }
         } else {
@@ -1283,6 +1622,9 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
             const auto& out = value.outputs[out_i];
             if (out.kind == TxOutputKind::Transparent) {
               const auto& transparent = std::get<TransparentTxOutV2>(out.body);
+              if (is_data_output_script(transparent.script_pubkey) || is_burn_script(transparent.script_pubkey, nullptr)) {
+                continue;  // never spendable
+              }
               utxos[OutPoint{txid, out_i}] = UtxoEntryV2{TxOut{transparent.value, transparent.script_pubkey}};
             } else {
               const auto& confidential = std::get<ConfidentialTxOutV2>(out.body);

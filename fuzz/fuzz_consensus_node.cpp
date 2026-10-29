@@ -32,6 +32,7 @@
 #include "genesis/genesis.hpp"
 #include "node/node.hpp"
 #include "p2p/messages.hpp"
+#include "utxo/signing.hpp"
 #include "utxo/validate.hpp"
 
 using namespace finalis;
@@ -64,7 +65,7 @@ struct Fixture {
 
 bool write_genesis(const std::string& path, const std::vector<crypto::KeyPair>& keys) {
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -78,7 +79,12 @@ bool write_genesis(const std::string& path, const std::vector<crypto::KeyPair>& 
   d.initial_committee_params.c = 2;
   d.monetary_params_ref = "README.md#monetary-policy-7m-hard-cap";
   d.note = "fuzz-consensus-node";
-  for (std::size_t i = 0; i < kValidators; ++i) d.initial_validators.push_back(keys[i].public_key);
+  for (std::size_t i = 0; i < kValidators; ++i) {
+    d.initial_validators.push_back(keys[i].public_key);
+    const auto reg = validator_bls_registration(keys[i].private_key);
+    if (!reg) return false;
+    d.initial_validator_bls.push_back(genesis::ValidatorBls{reg->pubkey, reg->pop});
+  }
   std::ofstream out(path, std::ios::trunc);
   out << genesis::to_json(d);
   return out.good();

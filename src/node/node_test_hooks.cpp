@@ -23,6 +23,8 @@ bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, fal
 
 bool Node::inject_timeout_vote_for_test(const TimeoutVote& vote) { return handle_timeout_vote(vote, false, 0); }
 
+bool Node::inject_time_signature_for_test(const p2p::TimeSignatureMsg& msg) { return handle_time_signature(msg, true, 1); }
+
 std::string Node::inject_network_vote_result_for_test(const Vote& vote) {
   switch (handle_vote_result(vote, true, 1)) {
     case VoteHandlingResult::Accepted:
@@ -189,6 +191,14 @@ bool Node::inject_frontier_block_for_test(const FrontierProposal& proposal, cons
   return false;
 }
 
+bool Node::inject_record_for_test(const Bytes& raw, std::string* reason) {
+  return handle_record_bytes(raw, false, 0, reason);
+}
+
+bool Node::inject_network_record_for_test(const Bytes& raw, int peer_id, std::string* reason) {
+  return handle_record_bytes(raw, true, peer_id, reason);
+}
+
 bool Node::inject_tx_for_test(const AnyTx& tx, bool relay) {
   if (relay) return handle_tx(tx, false);
   std::lock_guard<std::mutex> lk(mu_);
@@ -326,6 +336,57 @@ std::optional<std::pair<Hash32, std::uint32_t>> Node::local_vote_lock_for_test(s
 std::vector<Vote> Node::precommits_for_rebroadcast_for_test(std::uint64_t height) const {
   std::lock_guard<std::mutex> lk(mu_);
   return local_votes_for_rebroadcast_locked(height).precommits;
+}
+
+std::array<std::size_t, 3> Node::rebroadcast_sizes_for_test(std::uint64_t height) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto out = local_votes_for_rebroadcast_locked(height);
+  return {out.timeouts.size(), out.prevotes.size(), out.precommits.size()};
+}
+
+bool Node::vote_recorded_by_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id,
+                                     const PubKey32& signer) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& sig : votes_.signatures_for(height, round, transition_id)) {
+    if (sig.validator_pubkey == signer) return true;
+  }
+  return false;
+}
+
+void Node::reseed_local_votes_for_test(std::uint64_t height) {
+  std::lock_guard<std::mutex> lk(mu_);
+  reseed_local_votes_locked(height);
+}
+
+std::uint64_t Node::consensus_signature_count_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return consensus_signatures_;
+}
+
+std::uint64_t Node::signatures_after_fail_stop_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  // The formal fail-stop entry (where the snapshot is taken), not just a fenced DB.
+  return safety_storage_failed_.load() ? consensus_signatures_ - consensus_signatures_at_fail_stop_ : 0;
+}
+
+bool Node::finalize_if_quorum_for_test(const Hash32& block_id, std::uint64_t height, std::uint32_t round) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return finalize_if_quorum(block_id, height, round);
+}
+
+bool Node::finalized_broadcast_queued_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return last_broadcast_finality_certificate_.has_value();
+}
+
+void Node::enter_safety_fail_stop_for_test(const std::string& reason) {
+  std::lock_guard<std::mutex> lk(mu_);
+  enter_safety_fail_stop_locked("test-hook", reason);
+}
+
+std::string Node::safety_storage_failure_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return safety_storage_failure_;
 }
 
 bool Node::local_vote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const {

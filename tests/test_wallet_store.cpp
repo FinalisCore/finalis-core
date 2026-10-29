@@ -19,6 +19,8 @@
 using namespace finalis::wallet;
 using finalis::Hash32;
 using finalis::OutPoint;
+using finalis::Bytes;
+using finalis::TxOut;
 
 namespace {
 std::string unique_test_dir(const char* prefix) {
@@ -421,4 +423,47 @@ TEST(test_wallet_store_refuses_confidential_secret_persistence_without_passphras
       .blinding_factor_hex = "b10b",
       .spent = false,
   }));
+}
+
+// A time-locked send's record survives reopening, including the sealed transfer's inputs (needed to
+// cancel it, since the chain holds the transfer encrypted until it opens).
+TEST(test_wallet_store_persists_timed_sends) {
+  const std::string base = unique_test_dir("/tmp/finalis_wallet_store_timed");
+  const std::string wallet_file = base + "/wallet.json";
+  WalletStore::TimedSendRecord record;
+  record.timed_txid_hex = std::string(64, 'a');
+  record.body_txid_hex = std::string(64, 'b');
+  record.unlock_height = 77;
+  record.forfeit_bond = 1'000'000;
+  record.amount = 42;
+  record.recipient = "tsc1example";
+  Hash32 t{};
+  t.fill(0x51);
+  record.fee_coin = {OutPoint{t, 2}, TxOut{1'500'000, Bytes{0x76, 0xa9}}};
+  t.fill(0x52);
+  record.body_inputs = {{OutPoint{t, 0}, TxOut{900, Bytes{0x01}}}, {OutPoint{t, 1}, TxOut{800, Bytes{0x02}}}};
+  {
+    WalletStore store;
+    ASSERT_TRUE(store.open(wallet_file));
+    ASSERT_TRUE(store.upsert_timed_send(record));
+    record.cancel_txid_hex = std::string(64, 'c');
+    ASSERT_TRUE(store.upsert_timed_send(record));  // replaces
+  }
+  WalletStore reload;
+  ASSERT_TRUE(reload.open(wallet_file));
+  WalletStore::State state;
+  ASSERT_TRUE(reload.load(&state));
+  ASSERT_EQ(state.timed_sends.size(), 1u);
+  const auto& got = state.timed_sends[0];
+  ASSERT_EQ(got.timed_txid_hex, record.timed_txid_hex);
+  ASSERT_EQ(got.body_txid_hex, record.body_txid_hex);
+  ASSERT_EQ(got.unlock_height, 77u);
+  ASSERT_EQ(got.forfeit_bond, 1'000'000u);
+  ASSERT_EQ(got.recipient, record.recipient);
+  ASSERT_TRUE(got.fee_coin.first.txid == record.fee_coin.first.txid && got.fee_coin.first.index == 2u);
+  ASSERT_EQ(got.fee_coin.second.value, 1'500'000u);
+  ASSERT_EQ(got.body_inputs.size(), 2u);
+  ASSERT_EQ(got.body_inputs[1].second.value, 800u);
+  ASSERT_TRUE(got.body_inputs[1].second.script_pubkey == Bytes{0x02});
+  ASSERT_EQ(got.cancel_txid_hex, record.cancel_txid_hex);
 }

@@ -32,7 +32,8 @@ std::string wallet_settings_key(const std::string& network, const std::string& k
 
 std::vector<std::string> default_lightserver_endpoints(const std::string& network) {
   // Mirrors testnet/SEEDS.json lightservers_rpc. Mainnet publishes none before launch: use a local node.
-  if (wallet_network_is_testnet(network)) return {"http://130.61.126.39:19544/rpc"};
+  // The public non-validator node first; the bootstrap validator's own lightserver is the fallback.
+  if (wallet_network_is_testnet(network)) return {"https://159.200.236.114/rpc", "http://130.61.126.39:19544/rpc"};
   return {default_local_rpc_url(network)};
 }
 

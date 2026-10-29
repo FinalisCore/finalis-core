@@ -799,6 +799,7 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
     peer_finalized_tip_seen_ms_.erase(peer_id);
     peer_ingress_tips_.erase(peer_id);
     getaddr_requested_peers_.erase(peer_id);
+    endpoints_requested_peers_.erase(peer_id);
     msg_rate_buckets_.erase(peer_id);
     sync_request_out_buckets_.erase(peer_id);
     vote_verify_buckets_.erase(peer_id);
@@ -947,6 +948,12 @@ void Node::send_version(int peer_id) {
   if (bootstrap_validator_pubkey_.has_value()) {
     v.node_software_version +=
         ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
+    // Its time-signature key and proof: followers that adopt it need the same genesis state.
+    if (const auto bls = bootstrap_validator_bls_locked()) {
+      Bytes kp(bls->pubkey.begin(), bls->pubkey.end());
+      kp.insert(kp.end(), bls->pop.begin(), bls->pop.end());
+      v.node_software_version += ";bootstrap_validator_bls=" + hex_encode(kp);
+    }
   }
   if (auto advertised = current_advertised_endpoint(); advertised.has_value()) {
     v.node_software_version += ";external_endpoint=" + advertised->key();
@@ -1100,6 +1107,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       return on_prevote(peer_id, payload, payload_id);
     case p2p::MsgType::TIMEOUT_VOTE:
       return on_timeout_vote(peer_id, payload, payload_id);
+    case p2p::MsgType::TIME_SIGNATURE:
+      return on_time_signature(peer_id, payload, payload_id);
     case p2p::MsgType::TX:
       return on_tx(peer_id, payload, payload_id);
     case p2p::MsgType::SUBMIT_TX:
@@ -1110,6 +1119,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       return on_getaddr(peer_id, payload);
     case p2p::MsgType::ADDR:
       return on_addr(peer_id, payload);
+    case p2p::MsgType::GET_ENDPOINTS:
+      return on_get_endpoints(peer_id, payload);
+    case p2p::MsgType::ENDPOINTS:
+      return on_endpoints(peer_id, payload);
     case p2p::MsgType::PING:
       return on_ping(peer_id, payload);
     case p2p::MsgType::PONG:
@@ -1217,8 +1230,18 @@ void Node::on_version(int peer_id, const Bytes& payload) {
     if (b && b->size() == 32) {
       PubKey32 pub{};
       std::copy(b->begin(), b->end(), pub.begin());
+      std::optional<genesis::ValidatorBls> bls;
+      if (const auto tag = software_fingerprint_value(v->node_software_version, "bootstrap_validator_bls")) {
+        const auto kb = hex_decode(*tag);
+        if (kb && kb->size() == crypto::kBlsPublicKeyBytes + crypto::kBlsSignatureBytes) {
+          genesis::ValidatorBls parsed;
+          std::copy(kb->begin(), kb->begin() + crypto::kBlsPublicKeyBytes, parsed.pubkey.begin());
+          std::copy(kb->begin() + crypto::kBlsPublicKeyBytes, kb->end(), parsed.pop.begin());
+          bls = parsed;  // checked when binding
+        }
+      }
       std::lock_guard<std::mutex> lk(mu_);
-      (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap");
+      (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap", bls);
     }
   }
   if (peer_validator.has_value()) {
@@ -1289,6 +1312,7 @@ void Node::on_verack(int peer_id, const Bytes& /*payload*/) {
   log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
   p2p_.mark_handshake_rx(peer_id, false, true);
   maybe_request_getaddr(peer_id);
+  maybe_request_endpoints(peer_id);
   send_finalized_tip(peer_id);
   request_finalized_tip(peer_id);
   send_ingress_tips(peer_id);
@@ -1463,6 +1487,7 @@ void Node::on_pong(int peer_id, const Bytes& payload) {
 }
 
 void Node::broadcast_propose(const p2p::ProposeMsg& p) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) { spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); }); });
   } else {
@@ -1481,6 +1506,7 @@ void Node::broadcast_epoch_ticket(const consensus::EpochTicket& ticket) {
 }
 
 void Node::broadcast_vote(const Vote& vote) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   p2p::VoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
@@ -1493,6 +1519,7 @@ void Node::broadcast_vote(const Vote& vote) {
 }
 
 void Node::broadcast_prevote(const Vote& vote) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   p2p::PrevoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
@@ -1505,6 +1532,7 @@ void Node::broadcast_prevote(const Vote& vote) {
 }
 
 void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
   p2p::TimeoutVoteMsg vm;
   vm.vote = vote;
   if (cfg_.disable_p2p) {
@@ -1513,6 +1541,17 @@ void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
     });
   } else {
     p2p_.broadcast(p2p::MsgType::TIMEOUT_VOTE, p2p::ser_timeout_vote(vm));
+  }
+}
+
+void Node::broadcast_time_signature(const p2p::TimeSignatureMsg& msg) {
+  if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
+  if (cfg_.disable_p2p) {
+    for_each_local_bus_peer([&](Node* peer) {
+      spawn_local_bus_task([peer, msg]() { (void)peer->handle_time_signature(msg, true, 0); });
+    });
+  } else {
+    p2p_.broadcast(p2p::MsgType::TIME_SIGNATURE, p2p::ser_time_signature(msg));
   }
 }
 
@@ -1527,6 +1566,9 @@ void Node::flush_pending_finalized_broadcasts() {
     if (pending_finalized_tip_broadcast_) tip = p2p::FinalizedTipMsg{finalized_height_, finalized_identity_.id};
     pending_finalized_tip_broadcast_ = false;
   }
+  // Fail-stop: precommits queued before the failure were backed by a durable lock, but none is
+  // sent once the node has halted.
+  if (safety_storage_failed()) precommits.clear();
   for (const auto& vote : precommits) {
     broadcast_vote(vote);
     (void)handle_vote(vote, false, 0);
@@ -1584,6 +1626,26 @@ void Node::broadcast_finalized_frontier(const FrontierProposal& proposal, const 
       if (!p2p_.get_peer_info(peer_id).established()) continue;
       (void)p2p_.send_to(peer_id, p2p::MsgType::TRANSITION, payload);
     }
+  }
+}
+
+void Node::broadcast_record_bytes(const Bytes& tx_bytes, int skip_peer_id) {
+  if (cfg_.disable_p2p) {
+    for_each_local_bus_peer(
+        [&](Node* peer) { spawn_local_bus_task([peer, tx_bytes]() { (void)peer->handle_record_bytes(tx_bytes, true); }); });
+    return;
+  }
+  const auto payload = p2p::ser_tx(p2p::TxMsg{tx_bytes});
+  const std::uint64_t now = now_ms();
+  for (int id : p2p_.peer_ids()) {
+    if (id == skip_peer_id) continue;
+    if (should_mute_peer(id)) continue;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = peer_tx_relay_backoff_until_ms_.find(id);
+      if (it != peer_tx_relay_backoff_until_ms_.end() && now < it->second) continue;
+    }
+    (void)p2p_.send_to(id, p2p::MsgType::TX, payload, true);
   }
 }
 
@@ -2708,6 +2770,8 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
       return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
     case p2p::MsgType::TIMEOUT_VOTE:
       return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::TIME_SIGNATURE:
+      return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
     case p2p::MsgType::TRANSITION:
       return get(msg_type, cfg_.block_rate_capacity, cfg_.block_rate_refill).consume(1.0, nms);
     case p2p::MsgType::GET_TRANSITION:
@@ -2725,6 +2789,10 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
     case p2p::MsgType::GETADDR:
       return get(msg_type, 4.0, 1.0).consume(1.0, nms);
     case p2p::MsgType::ADDR:
+      return get(msg_type, 8.0, 2.0).consume(1.0, nms);
+    case p2p::MsgType::GET_ENDPOINTS:
+      return get(msg_type, 4.0, 1.0).consume(1.0, nms);
+    case p2p::MsgType::ENDPOINTS:
       return get(msg_type, 8.0, 2.0).consume(1.0, nms);
     case p2p::MsgType::PING:
       return get(msg_type, 20.0, 10.0).consume(1.0, nms);

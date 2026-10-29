@@ -293,6 +293,59 @@ TEST(test_append_validated_ingress_record_succeeds_with_valid_cert_bytes_and_lan
   ASSERT_EQ(state->lane_root, consensus::compute_lane_root_append(zero_hash(), cert.tx_hash));
 }
 
+// A crash between the certificate write and the lane-tip write used to leave a certificate above the
+// tip. Every later append of that record saw "identical certificate stored, done" and never advanced
+// the tip, so the lane was wedged for good (chaos byz-2, 2026-10-28). Appends are now one atomic write,
+// and such an orphan is applied again instead of skipped.
+TEST(test_append_validated_ingress_record_repairs_certificate_orphaned_above_lane_tip) {
+  const std::string path = unique_test_base("/tmp/finalis_test_ingress_orphan_repair");
+  std::filesystem::remove_all(path);
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+
+  const auto from = key_from_byte(1);
+  const auto to = key_from_byte(2);
+  const std::vector<crypto::KeyPair> signers{key_from_byte(21), key_from_byte(22)};
+  const std::vector<PubKey32> committee{signers[0].public_key, signers[1].public_key};
+  // Three spends that land in one lane.
+  std::vector<Bytes> txs;
+  std::optional<std::uint32_t> lane;
+  for (std::uint8_t b = 0x40; txs.size() < 3 && b < 0xF0; ++b) {
+    OutPoint op{};
+    op.txid.fill(b);
+    const auto bytes = signed_spend_tx_bytes(op, p2pkh_out_for_pub(from.public_key, 10'000), from, to.public_key, 9'800);
+    const auto l = consensus::assign_ingress_lane(*parse_any_tx(bytes));
+    if (!lane) lane = l;
+    if (l == *lane) txs.push_back(bytes);
+  }
+  ASSERT_EQ(txs.size(), 3u);
+
+  std::string err;
+  const auto c1 = signed_ingress_certificate(txs[0], 9, 1, zero_hash(), signers);
+  ASSERT_TRUE(consensus::append_validated_ingress_record(db, c1, txs[0], committee, &err));
+  const auto root1 = db.get_lane_state(*lane)->lane_root;
+  const auto c2 = signed_ingress_certificate(txs[1], 9, 2, root1, signers);
+  // The interrupted append: payload and certificate stored, lane tip still at 1.
+  ASSERT_TRUE(db.put_ingress_bytes(c2.txid, txs[1]));
+  ASSERT_TRUE(db.put_ingress_certificate(c2.lane, c2.seq, c2.serialize()));
+  ASSERT_EQ(db.get_lane_state(*lane)->max_seq, 1u);
+
+  ASSERT_TRUE(consensus::append_validated_ingress_record(db, c2, txs[1], committee, &err));
+  ASSERT_EQ(db.get_lane_state(*lane)->max_seq, 2u);
+  ASSERT_EQ(db.get_lane_state(*lane)->lane_root, consensus::compute_lane_root_append(root1, c2.tx_hash));
+  // A second time it is a no-op, and the lane moves on.
+  ASSERT_TRUE(consensus::append_validated_ingress_record(db, c2, txs[1], committee, &err));
+  const auto c3 = signed_ingress_certificate(txs[2], 9, 3, db.get_lane_state(*lane)->lane_root, signers);
+  ASSERT_TRUE(consensus::append_validated_ingress_record(db, c3, txs[2], committee, &err));
+  ASSERT_EQ(db.get_lane_state(*lane)->max_seq, 3u);
+
+  // The atomic writer refuses what the separate ones refused: a gap and a conflicting rewrite.
+  ASSERT_TRUE(!db.append_ingress_record_atomic(c3.serialize(), txs[2], LaneState{9, *lane, 3, zero_hash()}));
+  auto forged = c1;
+  forged.tx_hash[0] ^= 1;
+  ASSERT_TRUE(!db.append_ingress_record_atomic(forged.serialize(), txs[0], LaneState{9, *lane, 1, zero_hash()}));
+}
+
 TEST(test_append_validated_ingress_record_rejects_tx_parse_mismatch) {
   storage::DB db;
   ASSERT_TRUE(db.open(unique_test_base("/tmp/finalis_test_ingress_parse_fail")));

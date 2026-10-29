@@ -2,8 +2,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -89,6 +91,9 @@ struct FinalizedCommitteeCheckpoint {
   std::vector<std::uint64_t> ordered_final_weights;
   std::vector<Hash32> ordered_ticket_hashes;
   std::vector<std::uint64_t> ordered_ticket_nonces;
+  // Each member's BLS time-signature key (ValidatorInfo::bls_pubkey), parallel to ordered_members:
+  // the key set V that time signatures of this epoch aggregate over and TxTimed encrypts to.
+  std::vector<crypto::BlsPublicKey> ordered_bls_keys;
 };
 
 struct EpochRewardSettlementState {
@@ -97,6 +102,7 @@ struct EpochRewardSettlementState {
   std::uint64_t fee_pool_units{0};
   std::uint64_t reserve_accrual_units{0};
   std::uint64_t reserve_subsidy_units{0};
+  std::uint64_t recycled_units{0};  // burned in this epoch's blocks; returns to the reserve at settlement
   bool settled{false};
   std::map<PubKey32, std::uint64_t> reward_score_units;
   std::map<PubKey32, std::uint64_t> expected_participation_units;
@@ -290,6 +296,8 @@ class DB {
     void put_rejected_tx(const Hash32& txid, std::uint64_t height);
     // Height of the transition whose settlement (reward payout) outputs live under this synthetic txid.
     void put_settlement_txid(const Hash32& txid, std::uint64_t height);
+    // A reveal body's data, published when the TxTimed `timed_txid` settled at `height`.
+    void put_timed_reveal(const Hash32& timed_txid, std::uint64_t height, const Bytes& data);
     void add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
     void stage_finalized_ingress_tip(std::uint64_t seq);
     void set_tip(const TipState& tip);
@@ -300,6 +308,7 @@ class DB {
     void put_epoch_reward_settlement(const EpochRewardSettlementState& state);
     void put_protocol_reserve_balance(std::uint64_t balance_units);
     void put_confidential_pool_value(std::uint64_t value_units);
+    void put_base_fee_per_kib(std::uint64_t units);
     void put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint);
     void put_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& snapshot);
     void put_consensus_state_commitment_cache(const ConsensusStateCommitmentCache& cache);
@@ -321,7 +330,20 @@ class DB {
   // Same as write_batch(), but fsyncs the WAL before returning. Use for state
   // that must survive power loss before a dependent message leaves the process
   // (e.g. a validator's vote lock, which must be durable before the vote is sent).
-  bool write_batch_durable(Batch& batch);
+  // On failure, `error` (if non-null) gets the rocksdb::Status message.
+  bool write_batch_durable(Batch& batch, std::string* error = nullptr);
+
+  // Write fence: every later write and flush returns false without reaching the storage engine.
+  // Set by fence_writes (node fail-stop) and by the DB itself on the first failed write or flush of
+  // any kind: RocksDB 8.9 does not stop writes after an ENOSPC WAL failure (it auto-recovers), and
+  // a later write can reach the failed WAL writer, which aborts an assertion-enabled build
+  // (KNOWN_DEFECTS.md E1) and returns an error otherwise. So after one failure nothing more is
+  // written in this process, whatever the error and whatever the caller. Never lifted; reopening is
+  // a restart. Safe from any thread.
+  void fence_writes(const std::string& reason = "fenced-by-caller");
+  bool writes_fenced() const { return write_fence_->fenced.load(std::memory_order_acquire); }
+  // The first failure (or fence_writes reason), "" while not fenced.
+  std::string write_fence_reason() const;
 
   // On failure, if `error` is non-null it's populated with the underlying
   // rocksdb::Status's message (lock held by another process, IO error, disk
@@ -386,6 +408,7 @@ class DB {
   bool put_protocol_reserve_balance(std::uint64_t balance_units);
   std::optional<std::uint64_t> get_protocol_reserve_balance() const;
   std::optional<std::uint64_t> get_confidential_pool_value() const;
+  std::optional<std::uint64_t> get_base_fee_per_kib() const;
   bool put_epoch_ticket(const consensus::EpochTicket& ticket);
   std::vector<consensus::EpochTicket> load_epoch_tickets(std::uint64_t epoch) const;
   std::vector<std::uint64_t> load_epoch_ticket_epochs() const;
@@ -423,6 +446,12 @@ class DB {
   std::optional<std::uint64_t> get_rejected_tx_height(const Hash32& txid) const;
   // Height of the transition that paid settlement outputs under `txid`, if any.
   std::optional<std::uint64_t> get_settlement_height(const Hash32& txid) const;
+  struct TimedRevealLocation {
+    std::uint64_t height{0};
+    Bytes data;
+  };
+  // The data a TxTimed's reveal body published, and the height it settled at, if any.
+  std::optional<TimedRevealLocation> get_timed_reveal(const Hash32& timed_txid) const;
 
   bool put_ingress_record(std::uint64_t seq, const Bytes& record_bytes);
   std::optional<Bytes> get_ingress_record(std::uint64_t seq) const;
@@ -432,6 +461,10 @@ class DB {
   bool force_set_finalized_ingress_tip(std::uint64_t seq);
   std::optional<std::uint64_t> get_finalized_ingress_tip() const;
   bool put_ingress_certificate(std::uint32_t lane, std::uint64_t seq, const Bytes& cert_bytes);
+  // One appended ingress record: its payload, certificate and the lane's new tip in a single atomic
+  // write. Written separately, a crash between them leaves a certificate above the lane tip. The
+  // certificate may already be stored (such an orphan, being repaired); it must then be identical.
+  bool append_ingress_record_atomic(const Bytes& cert_bytes, const Bytes& tx_bytes, const LaneState& next_state);
   std::optional<Bytes> get_ingress_certificate(std::uint32_t lane, std::uint64_t seq) const;
   bool put_ingress_bytes(const Hash32& txid, const Bytes& tx_bytes);
   std::optional<Bytes> get_ingress_bytes(const Hash32& txid) const;
@@ -471,6 +504,15 @@ class DB {
   std::string path_;
   bool readonly_{false};
   bool secondary_{false};
+  // Heap-held so DB stays movable.
+  struct WriteFence {
+    std::atomic<bool> fenced{false};
+    mutable std::mutex mu;
+    std::string reason;  // under mu
+  };
+  std::unique_ptr<WriteFence> write_fence_ = std::make_unique<WriteFence>();
+  // Fences writes with `reason` (if not fenced yet) and returns false, for `return fail_write(...)`.
+  bool fail_write(const std::string& reason);
 
 #ifdef SC_HAS_ROCKSDB
   class RocksImpl;
@@ -495,6 +537,11 @@ std::string key_finality_certificate_height_prefix();
 // consensus::CommitteeHandoff proving the checkpoint of the epoch starting at `next_epoch_start`.
 std::string key_committee_handoff(std::uint64_t next_epoch_start);
 std::string key_committee_handoff_prefix();
+// Public lightserver endpoints the node learned (p2p/endpoints.hpp), and its own announcement; written
+// by the node for its lightserver to serve. Not consensus state.
+std::string key_lightserver_endpoint(const PubKey32& pubkey);
+std::string key_lightserver_endpoint_prefix();
+std::string key_own_lightserver_endpoint();
 std::string key_ingress_record_prefix();
 std::string key_finalized_ingress_tip();
 std::string key_ingress_certificate_prefix();
@@ -520,6 +567,7 @@ std::string key_utxo(const OutPoint& op);
 std::string key_validator_prefix();
 std::string key_validator(const PubKey32& pub);
 std::string key_txidx_prefix();
+std::string key_timed_reveal_prefix();
 std::string key_lane_state_prefix();
 std::string key_ingress_equivocation_prefix();
 std::string key_node_runtime_status_snapshot();
@@ -527,6 +575,7 @@ std::string key_availability_persistent_state();
 std::string key_consensus_state_commitment_cache();
 std::string key_protocol_reserve_balance();
 std::string key_confidential_pool_value();
+std::string key_base_fee_per_kib();
 std::string key_adaptive_epoch_telemetry_prefix();
 std::string key_validator_onboarding(const PubKey32& pub);
 AdaptiveTelemetrySummary summarize_adaptive_epoch_telemetry(

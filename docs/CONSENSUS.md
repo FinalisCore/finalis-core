@@ -222,6 +222,136 @@ Finalized execution remains validator-signature-driven even when confidential
 transactions are present; `TxV2` does not change the validator-key consensus
 model.
 
+## Time Signatures
+
+Once a node holds the finality certificate for `H`, if it is a member of `H`'s epoch committee it
+signs `time_signature_message(D, H)` with its BLS key (derived from its validator seed, registered in
+genesis or in its registration, copied into the checkpoint's `ordered_bls_keys`) and sends
+`TIME_SIGNATURE {H, validator, signature}`. Receivers verify the signature against the checkpoint key
+and relay it once; they keep the tip and one height either side. A node never signs a height it has
+not finalized, and signs nothing in fail-stop. BLS signatures are deterministic, so signing again
+cannot equivocate; the own signature is re-sent every round timeout until `H + 1` finalizes.
+
+`H + 1` carries `prev_time_signature`: strictly ascending indices into `H`'s checkpoint keys and
+their Lagrange-weighted aggregate (`crypto::mcfly_aggregate`). Before applying `H + 1`, nodes require
+(`consensus::verify_prev_time_signature`):
+
+- no signers and a zero aggregate if and only if the parent is genesis
+- at least `time_signature_threshold(n) = quorum(n)` signers, each index `< n`
+- the aggregate verifies for those keys on `time_signature_message(D, H)`
+
+A leader proposes only once it holds the threshold for the parent (`proposal-build-wait
+reason=time-signatures` otherwise). Safety: the at most `f < quorum` faulty members cannot produce
+the aggregate for a height that is not final, because the honest members sign only after finality.
+Liveness: the `n - f >= quorum` honest members all sign once they learn of finality. The aggregate
+of `H` is the witness that opens a short `TxTimed` locked to `H` (encrypted with the same threshold to
+the same keys, `consensus::committee_bls_key_root`); long locks are opened by the committee they name
+(see Timed Transactions).
+
+## Height-Locked Outputs
+
+Locking value needs no secret and no committee: a transparent output (Tx v1) whose script names a
+height. Every node checks it against the height of the block that spends it, so a lock holds for any
+horizon, whoever validates then, and nothing that leaks or colludes can open it early.
+
+- `SCHLOCK1` (locked): `"SCHLOCK1" | u64le unlock_height | pkh(20)`: spendable by `pkh` in a block at
+  height `>= unlock_height`.
+- `SCHLOCK2` (inheritance): `"SCHLOCK2" | u64le unlock_height | owner_pkh(20) | heir_pkh(20)`: the owner
+  spends at any height, the heir from `unlock_height`.
+
+The input carries the usual P2PKH `script_sig` over `signing_message_for_input`. An unlock height of 0
+is not a lock (invalid script). Without a block height (no validation context) such an input is
+invalid. The outputs are indexed under the script and under the P2PKH address of each key that may
+spend them (`script_index_hashes`), so the beneficiary's wallet finds them by its own address.
+`finalis-cli lock_send` and the wallet's height-locked send mode create them; ordinary sends spend
+them once spendable. Hidden transfers and secrets use `TxTimed` below (long locks for far heights).
+
+## Data Outputs
+
+`SCDATA01`: `"SCDATA01" | data` with 1..80 bytes of data, in a Tx v1 output or a TxV2 transparent
+output. Its value must be 0 and it is never spendable: it is not added to the UTXO set, only to
+address history, under its script and, when the data is longer than 32 bytes, under the data script
+of its first 32 bytes (a topic, such as an auction id, that lists every output starting with it).
+A sealed transfer body may carry one (a bid paid with the money itself, tagged with its auction).
+
+## Timed Transactions
+
+A `TxTimed` (`src/utxo/confidential_tx.hpp`) is an ordered record of its own (version 3; never an
+`AnyTx`), in the lane of its fee input's outpoint. Execution of block `h`
+(`consensus::execute_frontier_slice` with a `TimedExecutionContext`):
+
+1. **Settlement first.** Every escrow locked to `h - 1`, in inclusion order: SWE-decrypt the body key
+   with the block's `prev_time_signature` (the aggregate for `h - 1`), open the body, and apply it
+   like a record if it is a plain transfer (P2PKH / confidential inputs and outputs, and data
+   outputs). A reveal body (`"SCREVEAL" | data`, 1..1016 bytes, `TimedReveal`) moves nothing: its
+   data is published in the settlement record (`revealed_data`, node rows `TR:` by timed txid with
+   the settling height). Applied or revealed: the bond is refunded at `(timed txid, 1)`. Otherwise
+   the bond is a fee of block `h`. No record of `h` runs before, so none can front-run a revealed body.
+   A transfer body is signed under `timed_body_chain_domain(D)` = `sha256d("FINALIS-TIMED-BODY-V1" | D)`
+   in place of the chain domain `D` (`SpecialValidationContext::timed_body`): revealed, it is no valid
+   record on its own, so nobody who decrypted it (a long lock's aggregate can circulate before a block
+   carries it) can spend its inputs first and make the settlement forfeit the bond.
+2. **Records.** A `TxTimed` is accepted (escrowed) when `h <= unlock_height`,
+   `committee_epoch` and `committee_root` name `h`'s epoch checkpoint keys, the ciphertext has
+   threshold `quorum(n)` and its well-formedness proof verifies, the fee input is an unspent P2PKH
+   output signed over the envelope, and its value is exactly `prepaid_fee + forfeit_bond + change`
+   with `forfeit_bond >= kTxTimedMinForfeitBond` (0.1 FLS) and `prepaid_fee >=
+   timed_min_prepaid_fee(serialized size)`: 0.0001 FLS plus 0.0001 FLS per KiB, started or whole
+   (plus the long-lock fee below). The prepaid fee is a fee of `h`; change appears at
+   `(timed txid, 0)`.
+
+**Long locks.** A `TxTimed` whose unlock height lies beyond its inclusion epoch is a long lock: the
+committee named at inclusion signs `time_signature_message(D, unlock_height)` once that height is
+final, wherever its members are then (their BLS keys are seed-derived and permanent). Rules:
+
+- inclusion: a prepaid fee of the size fee plus `kTxTimedLongFeePerEpoch` (0.001 FLS) per epoch,
+  started or whole, past the inclusion epoch, and a body ciphertext of at most 1 KiB + tag (a reveal of up to
+  1016 bytes fits exactly: archiving a key or a sealed bid that needs no input held for years)
+- the named key set is kept in `CanonicalDerivedState::timed_key_sets` (rows `TK:`, by
+  `committee_root`, dropped once no escrow names it), since checkpoints are pruned
+- a block may carry `long_time_signatures`: `(unlock_height, committee_root, signer indices,
+  aggregate)`, strictly ascending by `(unlock_height, committee_root)`, at most 16, each for an unlock
+  height `u` with `u < h <= u + kTimedLongGraceBlocks` (480), a stored key set with at least one
+  waiting long escrow, at least `quorum(n)` signers of that set and a verifying aggregate, and at
+  most 16 escrows settled through them in all; otherwise the block is invalid. They are optional: a
+  block never waits for them
+- settlement, after the short locks and before any record: every long escrow an entry names, in
+  inclusion order, opened with the entry's aggregate and the stored keys, exactly like a short lock
+- expiry: a long escrow still waiting at `u + kTimedLongGraceBlocks + 1` is refunded (bond to the
+  refund script, `expired` in the settlement record, the body never runs)
+- bond lien: a validator whose BLS key a waiting long escrow names cannot withdraw its bond
+  (`consensus::timed_bond_lien`, "bond held by a pending long time lock") until that escrow settles
+  or `kTimedLongLienBlocks` (one year) after its inclusion
+- early signing is slashable: a validator's BLS signature on `time_signature_message(D, H)` carried
+  in a block at a height `<= H` (before `H` is final) is evidence. The slash tx spends its bond or
+  unbond output (also while the lien holds it) with script_sig `"SCTSLASH" | varbytes(u64le H |
+  signature(96))` into one `SCBURN` output of the whole value committing to `sha256d` of the blob; the
+  signature verifies under the owner's registered BLS key; the validator is banned. Honest
+  validators sign `H` only once they hold its finality certificate, so honest signatures are never
+  evidence. `finalis-cli create_time_slash_tx` builds it
+- node: once `u` is final, every node whose BLS key a waiting long escrow's key set holds (committee
+  member or retired) signs `time_signature_message(D, u)` and broadcasts it as `TIME_SIGNATURE`,
+  re-sent every round timeout while the opening is pending. Receivers accept a signature for a
+  pending `(u, root)` from the signer's registered BLS key if the set holds it, outside the committee
+  window too, and relay it. The leader puts every pending pair with a quorum of its set into
+  `long_time_signatures` (canonical order, within the caps); it never waits for one
+
+Intake: a `TxTimed` travels in `TX` / `SUBMIT_TX` like any record. The node admits it with the
+same `consensus::check_timed_inclusion` the block applies (against the next height), a prepaid fee at
+least the relay floor, and an unused fee input, into a timed pool next to the mempool; it is
+certified in its lane and relayed like other records, and dropped once its fee input is spent or its
+unlock height has passed. A proposer stops a lane before the per-block cap rather than let a record
+be rejected. `finalis-cli timed_send` builds one (`build_signed_timed_tx`) from the committee keys of
+`get_committee` (verbose) at the next height, with `consensus::timed_lock_terms`: an unlock past the
+current epoch is a long lock (fee per epoch added, included by the epoch's end, a warning past the
+lien); `--data-text` / `--data-hex` seal a reveal instead of a transfer. RPC `get_timed_reveal`
+(`finalis-cli get_timed_reveal --txid`) returns a settled reveal's data and height.
+
+Bounds: at most `kMaxTimedTxPerBlock` (8) accepted per block, at most
+`kMaxTimedEscrowsPerUnlockHeight` (16) waiting per unlock height. Escrows are consensus state:
+`CanonicalDerivedState::timed_escrows`, committed as `timed_escrow_commitment_root` at the end of the
+post-state preimage and stored as one `TE:` row each.
+
 ## Transition Timestamp
 
 `FrontierTransition.timestamp` is unix seconds and part of the transition id.

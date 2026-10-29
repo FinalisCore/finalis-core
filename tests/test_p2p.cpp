@@ -162,7 +162,7 @@ TEST(test_version_message_rejects_oversized_software_string) {
   w.u64le(0);
   w.u64le(0);
   w.u32le(0);
-  Bytes sw(600, 'x');
+  Bytes sw(1100, 'x');  // over the 1024-byte cap
   w.varbytes(sw);
   w.u64le(0);
   Hash32 zero{};

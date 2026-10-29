@@ -281,6 +281,7 @@ Bytes serialize_validator(const consensus::ValidatorInfo& info) {
   w.u64le(info.last_exit_height);
   w.u32le(info.penalty_strikes);
   w.u64le(info.bonded_amount);
+  w.bytes_fixed(info.bls_pubkey);
   return w.take();
 }
 
@@ -299,7 +300,8 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
           info.unbond_height = 0;
           return true;
         }
-        if (r.remaining() == 137) {
+        // 137 / 185: the current layouts with operator_id, without / with the BLS key.
+        if (r.remaining() == 137 || r.remaining() == 137 + crypto::kBlsPublicKeyBytes) {
           auto operator_id = r.bytes_fixed<32>();
           if (!operator_id) return false;
           info.operator_id = *operator_id;
@@ -330,8 +332,13 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         info.penalty_strikes = *strikes;
         if (!r.eof()) {
           auto bonded = r.u64le();
-          if (!bonded || !r.eof()) return false;
+          if (!bonded) return false;
           info.bonded_amount = *bonded;
+          if (!r.eof()) {
+            auto bls = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+            if (!bls || !r.eof()) return false;
+            info.bls_pubkey = *bls;
+          }
         } else {
           info.bonded_amount = BOND_AMOUNT;
         }
@@ -353,6 +360,7 @@ Bytes serialize_validator_join_request(const ValidatorJoinRequest& req) {
   w.u64le(req.requested_height);
   w.u64le(req.approved_height);
   w.u8(static_cast<std::uint8_t>(req.status));
+  w.bytes_fixed(req.bls_pubkey);
   return w.take();
 }
 
@@ -380,6 +388,11 @@ std::optional<ValidatorJoinRequest> parse_validator_join_request(const Bytes& b)
         req.requested_height = *requested_height;
         req.approved_height = *approved_height;
         req.status = static_cast<ValidatorJoinRequestStatus>(*status);
+        if (!r.eof()) {
+          auto bls = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+          if (!bls || !r.eof()) return false;
+          req.bls_pubkey = *bls;
+        }
         return true;
       })) {
     return std::nullopt;
@@ -508,6 +521,8 @@ Bytes serialize_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoin
   w.u64le(checkpoint.qualified_depth);
   w.u32le(checkpoint.target_expand_streak);
   w.u32le(checkpoint.target_contract_streak);
+  w.varint(checkpoint.ordered_bls_keys.size());
+  for (const auto& key : checkpoint.ordered_bls_keys) w.bytes_fixed(key);
   return w.take();
 }
 
@@ -624,10 +639,19 @@ std::optional<FinalizedCommitteeCheckpoint> parse_finalized_committee_checkpoint
         auto qualified_depth = r.u64le();
         auto expand_streak = r.u32le();
         auto contract_streak = r.u32le();
+        auto bls_count = r.varint();
         if (!adaptive_target || !adaptive_min_eligible || !adaptive_min_bond || !qualified_depth || !expand_streak ||
-            !contract_streak || !r.eof()) {
+            !contract_streak || !bls_count || *bls_count > r.remaining() / crypto::kBlsPublicKeyBytes) {
           return false;
         }
+        checkpoint.ordered_bls_keys.clear();
+        checkpoint.ordered_bls_keys.reserve(*bls_count);
+        for (std::uint64_t i = 0; i < *bls_count; ++i) {
+          auto key = r.bytes_fixed<crypto::kBlsPublicKeyBytes>();
+          if (!key) return false;
+          checkpoint.ordered_bls_keys.push_back(*key);
+        }
+        if (!r.eof()) return false;
         checkpoint.adaptive_target_committee_size = *adaptive_target;
         checkpoint.adaptive_min_eligible = *adaptive_min_eligible;
         checkpoint.adaptive_min_bond = *adaptive_min_bond;
@@ -669,6 +693,7 @@ Bytes serialize_epoch_reward_settlement(const EpochRewardSettlementState& state)
     w.bytes_fixed(pub);
     w.u64le(score);
   }
+  w.u64le(state.recycled_units);
   return w.take();
 }
 
@@ -735,7 +760,10 @@ std::optional<EpochRewardSettlementState> parse_epoch_reward_settlement(const By
           if (!pub || !score) return false;
           state.onboarding_score_units[*pub] = *score;
         }
-        if (!r.eof()) return false;
+        if (!r.remaining()) return true;
+        auto recycled = r.u64le();
+        if (!recycled || !r.eof()) return false;
+        state.recycled_units = *recycled;
         return true;
       })) {
     return std::nullopt;
@@ -1295,6 +1323,11 @@ std::string key_committee_handoff(std::uint64_t next_epoch_start) {
   return key_committee_handoff_prefix() + hex_encode(w.data());
 }
 std::string key_committee_handoff_prefix() { return "LCH:"; }
+std::string key_lightserver_endpoint(const PubKey32& pubkey) {
+  return key_lightserver_endpoint_prefix() + hex_encode(Bytes(pubkey.begin(), pubkey.end()));
+}
+std::string key_lightserver_endpoint_prefix() { return "LSEP:"; }
+std::string key_own_lightserver_endpoint() { return "LSEPSELF"; }
 std::string key_height(std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -1346,10 +1379,13 @@ std::string key_availability_persistent_state() { return "APS"; }
 std::string key_consensus_state_commitment_cache() { return "CSC:TIP"; }
 std::string key_protocol_reserve_balance() { return "PRB"; }
 std::string key_confidential_pool_value() { return "CPOOL"; }
+std::string key_base_fee_per_kib() { return "BASEFEE"; }
 std::string key_validator_onboarding(const PubKey32& pub) { return "VO:" + hex_encode(Bytes(pub.begin(), pub.end())); }
 std::string key_txidx_prefix() { return "X:"; }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_rejected_tx(const Hash32& txid) { return "XR:" + hex_encode(Bytes(txid.begin(), txid.end())); }
+std::string key_timed_reveal_prefix() { return "TR:"; }
+std::string key_timed_reveal(const Hash32& txid) { return "TR:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_settlement_txid(const Hash32& txid) { return "XS:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_ingress_record_prefix() { return "IR:"; }
 std::string key_ingress_record(std::uint64_t seq) { return "IR:" + hex_encode(u64be_bytes(seq)); }
@@ -1419,6 +1455,34 @@ class DB::RocksImpl {
 
 DB::DB() = default;
 DB::~DB() = default;
+
+void DB::fence_writes(const std::string& reason) {
+  std::lock_guard<std::mutex> lk(write_fence_->mu);
+  if (!write_fence_->fenced.load(std::memory_order_relaxed)) write_fence_->reason = reason;
+  write_fence_->fenced.store(true, std::memory_order_release);
+}
+
+std::string DB::write_fence_reason() const {
+  std::lock_guard<std::mutex> lk(write_fence_->mu);
+  return write_fence_->reason;
+}
+
+namespace {
+// The key's leading printable characters (its kind prefix), for a fence reason.
+std::string key_tag(const std::string& key) {
+  std::string out;
+  for (char ch : key) {
+    if (out.size() == 12 || ch < 0x21 || ch > 0x7e) break;
+    out += ch;
+  }
+  return "[" + out + "]";
+}
+}  // namespace
+
+bool DB::fail_write(const std::string& reason) {
+  fence_writes(reason);
+  return false;
+}
 
 // --- DB::Batch -------------------------------------------------------------
 //
@@ -1545,6 +1609,13 @@ void DB::Batch::put_rejected_tx(const Hash32& txid, std::uint64_t height) {
   put(key_rejected_tx(txid), w.take());
 }
 
+void DB::Batch::put_timed_reveal(const Hash32& timed_txid, std::uint64_t height, const Bytes& data) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  w.varbytes(data);
+  put(key_timed_reveal(timed_txid), w.take());
+}
+
 void DB::Batch::put_settlement_txid(const Hash32& txid, std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -1599,6 +1670,12 @@ void DB::Batch::put_confidential_pool_value(std::uint64_t value_units) {
   put(key_confidential_pool_value(), w.take());
 }
 
+void DB::Batch::put_base_fee_per_kib(std::uint64_t units) {
+  codec::ByteWriter w;
+  w.u64le(units);
+  put(key_base_fee_per_kib(), w.take());
+}
+
 void DB::Batch::put_finalized_committee_checkpoint(const FinalizedCommitteeCheckpoint& checkpoint) {
   put(key_finalized_committee_checkpoint(checkpoint.epoch_start_height), serialize_finalized_committee_checkpoint(checkpoint));
 }
@@ -1612,34 +1689,45 @@ void DB::Batch::put_consensus_state_commitment_cache(const ConsensusStateCommitm
 }
 
 bool DB::write_batch(Batch& batch, bool disable_wal) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
   if (batch.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   rocksdb::WriteOptions opts;
   opts.disableWAL = disable_wal;
-  return rocks_->db->Write(opts, &batch.impl_->wb).ok();
+  const auto s = rocks_->db->Write(opts, &batch.impl_->wb);
+  return s.ok() || fail_write("write_batch: " + s.ToString());
 #else
   for (auto& [k, v] : batch.impl_->ops) {
     if (v.has_value()) mem_[k] = *v; else mem_.erase(k);
   }
-  return flush_file();
+  return flush_file() || fail_write("write_batch: file-flush-failed");
 #endif
 }
 
-bool DB::write_batch_durable(Batch& batch) {
-  if (readonly_) return false;
+bool DB::write_batch_durable(Batch& batch, std::string* error) {
+  auto fail = [error](const std::string& why) {
+    if (error) *error = why;
+    return false;
+  };
+  if (readonly_) return fail("read-only");
+  if (writes_fenced()) return fail("writes-fenced");
   if (batch.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
-  if (!rocks_ || !rocks_->db) return false;  // closed or never opened
+  if (!rocks_ || !rocks_->db) return fail("db-closed");  // closed or never opened
   rocksdb::WriteOptions opts;
   opts.sync = true;
-  return rocks_->db->Write(opts, &batch.impl_->wb).ok();
+  const auto s = rocks_->db->Write(opts, &batch.impl_->wb);
+  if (s.ok()) return true;
+  fence_writes("write_batch_durable: " + s.ToString());
+  return fail(s.ToString());
 #else
   for (auto& [k, v] : batch.impl_->ops) {
     if (v.has_value()) mem_[k] = *v; else mem_.erase(k);
   }
-  return flush_file();
+  if (flush_file()) return true;
+  fence_writes("write_batch_durable: file-flush-failed");
+  return fail("file-flush-failed");
 #endif
 }
 // --- end DB::Batch ----------------------------------------------------------
@@ -1741,19 +1829,19 @@ bool DB::catch_up_with_primary() {
 }
 
 bool DB::put(const std::string& key, const Bytes& value) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Put(rocksdb::WriteOptions(), key, rocksdb::Slice(reinterpret_cast<const char*>(value.data()), value.size()));
-  return s.ok();
+  return s.ok() || fail_write("put" + key_tag(key) + ": " + s.ToString());
 #else
   mem_[key] = value;
-  return flush_file();
+  return flush_file() || fail_write("put" + key_tag(key) + ": file-flush-failed");
 #endif
 }
 
 bool DB::put_many(const std::vector<std::pair<std::string, Bytes>>& entries, bool disable_wal) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
   if (entries.empty()) return true;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
@@ -1766,10 +1854,10 @@ bool DB::put_many(const std::vector<std::pair<std::string, Bytes>>& entries, boo
   rocksdb::WriteOptions opts;
   opts.disableWAL = disable_wal;
   auto status = rocks_->db->Write(opts, &batch);
-  return status.ok();
+  return status.ok() || fail_write("put_many: " + status.ToString());
 #else
   for (const auto& [key, value] : entries) mem_[key] = value;
-  return flush_file();
+  return flush_file() || fail_write("put_many: file-flush-failed");
 #endif
 }
 
@@ -1872,14 +1960,14 @@ std::optional<Bytes> DB::get(const std::string& key) const {
 }
 
 bool DB::erase(const std::string& key) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key);
-  return s.ok();
+  return s.ok() || fail_write("erase: " + s.ToString());
 #else
   mem_.erase(key);
-  return flush_file();
+  return flush_file() || fail_write("erase: file-flush-failed");
 #endif
 }
 
@@ -1958,14 +2046,14 @@ std::optional<Hash32> DB::get_height_hash(std::uint64_t height) const {
 bool DB::put_utxo(const OutPoint& op, const TxOut& out) { return put(key_utxo(op), serialize_txout(out)); }
 bool DB::put_utxo_v2(const OutPoint& op, const UtxoEntryV2& entry) { return put(key_utxo(op), serialize_utxo_entry_v2(entry)); }
 bool DB::erase_utxo(const OutPoint& op) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_utxo(op));
-  return s.ok();
+  return s.ok() || fail_write("erase_utxo: " + s.ToString());
 #else
   mem_.erase(key_utxo(op));
-  return flush_file();
+  return flush_file() || fail_write("erase_utxo: file-flush-failed");
 #endif
 }
 
@@ -2169,6 +2257,21 @@ std::optional<std::uint64_t> DB::get_protocol_reserve_balance() const {
   return out;
 }
 
+std::optional<std::uint64_t> DB::get_base_fee_per_kib() const {
+  auto b = get(key_base_fee_per_kib());
+  if (!b.has_value()) return std::nullopt;
+  std::optional<std::uint64_t> out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto value = r.u64le();
+        if (!value || !r.eof()) return false;
+        out = *value;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
 std::optional<std::uint64_t> DB::get_confidential_pool_value() const {
   auto b = get(key_confidential_pool_value());
   if (!b.has_value()) return std::nullopt;
@@ -2235,7 +2338,7 @@ std::map<PubKey32, consensus::EpochBestTicket> DB::load_best_epoch_tickets(std::
 }
 
 bool DB::clear_best_epoch_tickets(std::uint64_t epoch) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
   const std::string prefix = "EB:" + key_epoch_prefix(epoch) + ":";
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
@@ -2243,12 +2346,12 @@ bool DB::clear_best_epoch_tickets(std::uint64_t epoch) {
   for (const auto& [k, _] : scan_prefix(prefix)) keys.push_back(k);
   for (const auto& k : keys) {
     auto s = rocks_->db->Delete(rocksdb::WriteOptions(), k);
-    if (!s.ok()) return false;
+    if (!s.ok()) return fail_write("clear_best_epoch_tickets: " + s.ToString());
   }
   return true;
 #else
   for (const auto& [k, _] : scan_prefix(prefix)) mem_.erase(k);
-  return flush_file();
+  return flush_file() || fail_write("clear_best_epoch_tickets: file-flush-failed");
 #endif
 }
 
@@ -2388,6 +2491,23 @@ std::optional<std::uint64_t> DB::get_rejected_tx_height(const Hash32& txid) cons
     return std::nullopt;
   }
   return height;
+}
+
+std::optional<DB::TimedRevealLocation> DB::get_timed_reveal(const Hash32& timed_txid) const {
+  auto b = get(key_timed_reveal(timed_txid));
+  if (!b.has_value()) return std::nullopt;
+  TimedRevealLocation out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto data = r.varbytes();
+        if (!h || !data) return false;
+        out.height = *h;
+        out.data = std::move(*data);
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
 }
 
 std::optional<std::uint64_t> DB::get_settlement_height(const Hash32& txid) const {
@@ -2572,6 +2692,35 @@ bool DB::put_ingress_bytes(const Hash32& txid, const Bytes& tx_bytes) {
 
 std::optional<Bytes> DB::get_ingress_bytes(const Hash32& txid) const { return get(key_ingress_bytes(txid)); }
 
+bool DB::append_ingress_record_atomic(const Bytes& cert_bytes, const Bytes& tx_bytes, const LaneState& next_state) {
+  const auto cert = IngressCertificate::parse(cert_bytes);
+  const auto fail = [&](const char* detail) {
+    std::cerr << "finalized-state-invariant-violation source=db-append-ingress-record lane=" << next_state.lane
+              << " seq=" << next_state.max_seq << " detail=" << detail << "\n";
+    return false;
+  };
+  if (!cert.has_value()) return fail("invalid-certificate");
+  if (next_state.lane != cert->lane || next_state.max_seq != cert->seq) return fail("state-mismatch");
+  if (auto existing = get_ingress_bytes(cert->txid); existing.has_value() && *existing != tx_bytes) {
+    return fail("conflicting-ingress-bytes");
+  }
+  if (auto existing = get(key_ingress_certificate(cert->lane, cert->seq)); existing.has_value() && *existing != cert_bytes) {
+    return fail("conflicting-rewrite");
+  }
+  const auto state = get_lane_state(cert->lane);
+  if (state.has_value()) {
+    if (cert->seq != state->max_seq + 1) return fail("gap");
+    if (cert->prev_lane_root != state->lane_root) return fail("prev-lane-root-mismatch");
+  } else if (cert->seq != 1) {
+    return fail("missing-lane-state");
+  }
+  Batch batch(*this);
+  batch.put(key_ingress_bytes(cert->txid), tx_bytes);
+  batch.put(key_ingress_certificate(cert->lane, cert->seq), cert_bytes);
+  batch.put(key_lane_state(cert->lane), next_state.serialize());
+  return write_batch(batch);
+}
+
 bool DB::put_lane_state(std::uint32_t lane, const LaneState& state) {
   if (state.lane != lane) {
     std::cerr << "finalized-state-invariant-violation source=db-write-lane-state lane=" << lane
@@ -2676,14 +2825,14 @@ bool DB::put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxO
 }
 
 bool DB::erase_script_utxo(const Hash32& scripthash, const OutPoint& op) {
-  if (readonly_) return false;
+  if (readonly_ || writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;  // closed or never opened
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_script_utxo(scripthash, op));
-  return s.ok();
+  return s.ok() || fail_write("erase_script_utxo: " + s.ToString());
 #else
   mem_.erase(key_script_utxo(scripthash, op));
-  return flush_file();
+  return flush_file() || fail_write("erase_script_utxo: file-flush-failed");
 #endif
 }
 
@@ -2725,14 +2874,15 @@ bool DB::add_script_history(const Hash32& scripthash, std::uint64_t height, cons
 }
 
 bool DB::flush() {
+  if (writes_fenced()) return false;
 #ifdef SC_HAS_ROCKSDB
   if (!rocks_ || !rocks_->db) return false;
   rocksdb::FlushOptions opts;
   opts.wait = true;
   auto s = rocks_->db->Flush(opts);
-  return s.ok();
+  return s.ok() || fail_write("flush: " + s.ToString());
 #else
-  return flush_file();
+  return flush_file() || fail_write("flush: file-flush-failed");
 #endif
 }
 

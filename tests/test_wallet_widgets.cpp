@@ -8,6 +8,8 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QCheckBox>
+#include <QSpinBox>
 #include <QSettings>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -22,6 +24,7 @@
 #include "apps/finalis-wallet/widgets/activity_page.hpp"
 #include "apps/finalis-wallet/wallet_network.hpp"
 #include "apps/finalis-wallet/widgets/advanced_page.hpp"
+#include "apps/finalis-wallet/widgets/send_page.hpp"
 
 #define private public
 #include "apps/finalis-wallet/wallet_window.hpp"
@@ -297,6 +300,43 @@ void test_wallet_window_onboarding_badge_states() {
   require(window.validator_state_label_->text().contains("DETACHED"), "wallet onboarding state missing detached badge");
 }
 
+// The time-locked mode: its own entry, and the "Opens after" field only while it is selected.
+void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
+  QSettings settings(kSettingsOrg, kSettingsApp);
+  settings.clear();
+  settings.sync();
+  finalis::wallet::WalletWindow window;
+  auto* combo = window.send_mode_combo_;
+  require(combo != nullptr && combo->count() == 7, "send mode count mismatch");
+  require(combo->itemText(4).toStdString() == "Transparent -> Transparent (time-locked)", "time-locked mode missing");
+  require(window.send_read_sealed_button_ != nullptr && window.send_read_sealed_button_->isEnabled(),
+          "read sealed data button missing");
+  require(window.send_unlock_delay_spin_ != nullptr && window.send_cancel_timed_button_ != nullptr,
+          "time-locked controls missing");
+  require(window.send_unlock_delay_spin_->isHidden(), "unlock delay visible outside time-locked mode");
+  combo->setCurrentIndex(4);
+  require(!window.send_unlock_delay_spin_->isHidden(), "unlock delay hidden in time-locked mode");
+  require(window.send_unlock_delay_spin_->value() == 2, "unlock delay default mismatch");
+  combo->setCurrentIndex(0);
+  require(window.send_unlock_delay_spin_->isHidden(), "unlock delay still visible after leaving time-locked mode");
+  // Height-locked mode: its block field and the inheritance option, only in that mode.
+  require(combo->itemText(5).toStdString() == "Transparent -> Height-locked (vesting / inheritance)", "height-locked mode missing");
+  require(window.send_lock_height_edit_->isHidden() && window.send_inheritance_check_->isHidden(),
+          "height-lock fields visible outside their mode");
+  combo->setCurrentIndex(5);
+  require(!window.send_lock_height_edit_->isHidden() && !window.send_inheritance_check_->isHidden(),
+          "height-lock fields hidden in height-locked mode");
+  require(window.send_unlock_delay_spin_->isHidden(), "time-lock field visible in height-locked mode");
+  // Sealed data: the unlock field, no amount; long delays are allowed (long locks).
+  require(combo->itemText(6).toStdString() == "Sealed data (published at a block)", "sealed data mode missing");
+  combo->setCurrentIndex(6);
+  require(!window.send_unlock_delay_spin_->isHidden(), "unlock delay hidden in sealed data mode");
+  require(!window.send_amount_edit_->isEnabled(), "amount enabled in sealed data mode");
+  require(window.send_unlock_delay_spin_->maximum() >= 1'000'000, "long lock delays not selectable");
+  combo->setCurrentIndex(4);
+  require(window.send_amount_edit_->isEnabled(), "amount disabled in time-locked mode");
+}
+
 void test_wallet_window_defaults_to_lightserver_rpc_port() {
   QSettings settings(kSettingsOrg, kSettingsApp);
   settings.clear();
@@ -427,6 +467,9 @@ int main(int argc, char** argv) {
     std::cout << "Starting test 7: test_wallet_window_onboarding_badge_states" << std::endl;
     test_wallet_window_onboarding_badge_states();
     std::cout << "Completed test 7" << std::endl;
+    std::cout << "Starting test 7b: test_wallet_window_time_locked_send_mode_shows_unlock_delay" << std::endl;
+    test_wallet_window_time_locked_send_mode_shows_unlock_delay();
+    std::cout << "Completed test 7b" << std::endl;
     std::cout << "Starting test 8: test_wallet_window_defaults_to_lightserver_rpc_port" << std::endl;
     test_wallet_window_defaults_to_lightserver_rpc_port();
     std::cout << "Completed test 8" << std::endl;

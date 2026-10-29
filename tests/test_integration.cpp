@@ -2,8 +2,11 @@
 
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
+#include "support/test_genesis.hpp"
+#include "support/test_validator_bls.hpp"
 #include "support/test_leader_vrf.hpp"
 #include "support/test_paths.hpp"
+#include "support/storage_fault_injection.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -341,10 +344,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
   if (!doc.has_value()) return false;
 
-  consensus::CanonicalGenesisState genesis_state;
-  genesis_state.genesis_artifact_id = genesis::block_id(*doc);
-  genesis_state.initial_validators = doc->initial_validators;
-  genesis_state.genesis_time_unix = doc->genesis_time_unix;
+  consensus::CanonicalGenesisState genesis_state = consensus::canonical_genesis_state_from_document(*doc);
 
   consensus::CanonicalDerivedState genesis_derived;
   std::string error;
@@ -382,7 +382,7 @@ bool persist_test_frontier_replay_records(const node::NodeConfig& cfg, storage::
   const auto leader = consensus::canonical_leader_for_height_round(derivation_cfg, genesis_derived, 1, 0);
   if (!leader.has_value()) return false;
   if (!consensus::populate_frontier_transition_metadata(derivation_cfg, genesis_derived, 1, 0, *leader, 0, {},
-                                                        exec_result.accepted_fee_units, exec_result.next_utxos,
+                                                        TimeSignatureAggregate{}, exec_result.accepted_fee_units, exec_result.next_utxos,
                                                         &exec_result.transition, &error)) {
     return false;
   }
@@ -502,10 +502,7 @@ bool persist_certified_ingress_fixture(const node::NodeConfig& cfg, storage::DB&
   auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
   if (!doc.has_value()) return false;
 
-  consensus::CanonicalGenesisState genesis_state;
-  genesis_state.genesis_artifact_id = genesis::block_id(*doc);
-  genesis_state.initial_validators = doc->initial_validators;
-  genesis_state.genesis_time_unix = doc->genesis_time_unix;
+  consensus::CanonicalGenesisState genesis_state = consensus::canonical_genesis_state_from_document(*doc);
 
   consensus::CanonicalDerivedState genesis_derived;
   std::string error;
@@ -588,10 +585,7 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
   if (!doc.has_value()) return false;
 
-  consensus::CanonicalGenesisState genesis_state;
-  genesis_state.genesis_artifact_id = genesis::block_id(*doc);
-  genesis_state.initial_validators = doc->initial_validators;
-  genesis_state.genesis_time_unix = doc->genesis_time_unix;
+  consensus::CanonicalGenesisState genesis_state = consensus::canonical_genesis_state_from_document(*doc);
 
   CertifiedIngressFixture fixture;
   std::string error;
@@ -609,7 +603,7 @@ bool build_frontier_proposal_from_records(const node::NodeConfig& cfg, storage::
   // fixture.parent is the genesis-derived state, so there is no parent
   // participation to record.
   if (!consensus::populate_frontier_transition_metadata(derivation_cfg, fixture.parent, height, round, *leader, 0, {},
-                                                        exec_result.accepted_fee_units, exec_result.next_utxos,
+                                                        TimeSignatureAggregate{}, exec_result.accepted_fee_units, exec_result.next_utxos,
                                                         &exec_result.transition, &error)) {
     return false;
   }
@@ -756,8 +750,10 @@ std::optional<Tx> create_bond_tx_from_validator0(node::Node& node0, const crypto
   }
   tx.outputs = outs;
 
+  std::vector<TxOut> spent;
+  for (const auto& [_, out] : selected) spent.push_back(out);
   for (std::size_t i = 0; i < selected.size(); ++i) {
-    auto msg = signing_message_for_input(node_chain_domain(node0), tx, static_cast<std::uint32_t>(i));
+    auto msg = signing_message_for_input(node_chain_domain(node0), tx, static_cast<std::uint32_t>(i), spent);
     if (!msg.has_value()) return std::nullopt;
     auto sig = crypto::ed25519_sign(*msg, validator0.private_key);
     if (!sig.has_value()) return std::nullopt;
@@ -789,16 +785,20 @@ std::optional<Tx> create_join_request_tx_from_validator0(node::Node& node0, cons
   if (in_sum < bond_amount + fee) return std::nullopt;
 
   auto pop = crypto::ed25519_sign(
-      validator_join_request_pop_message(new_validator.public_key, new_validator.public_key),
+      validator_join_request_pop_message(new_validator.public_key, new_validator.public_key, test::test_bls_pubkey(new_validator)),
       Bytes(new_validator.private_key.begin(), new_validator.private_key.end()));
   if (!pop.has_value()) return std::nullopt;
 
   Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
   reg_spk.insert(reg_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  Bytes req_spk{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  req_spk.insert(req_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  req_spk.insert(req_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  ValidatorJoinRequestScriptData req{};
+  req.validator_pubkey = new_validator.public_key;
+  req.payout_pubkey = new_validator.public_key;
+  req.pop = *pop;
+  const auto bls = test::test_bls_registration(new_validator);
+  req.bls_pubkey = bls.pubkey;
+  req.bls_pop = bls.pop;
+  const Bytes req_spk = encode_validator_join_request_script(req);
 
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
   const std::uint64_t change = in_sum - bond_amount - fee;
@@ -857,16 +857,20 @@ std::optional<Tx> create_join_request_tx_from_validator0_with_payout(node::Node&
   if (in_sum < bond_amount + fee) return std::nullopt;
 
   auto pop = crypto::ed25519_sign(
-      validator_join_request_pop_message(new_validator.public_key, payout_pubkey),
+      validator_join_request_pop_message(new_validator.public_key, payout_pubkey, test::test_bls_pubkey(new_validator)),
       Bytes(new_validator.private_key.begin(), new_validator.private_key.end()));
   if (!pop.has_value()) return std::nullopt;
 
   Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
   reg_spk.insert(reg_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  Bytes req_spk{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  req_spk.insert(req_spk.end(), new_validator.public_key.begin(), new_validator.public_key.end());
-  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
-  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+  ValidatorJoinRequestScriptData req{};
+  req.validator_pubkey = new_validator.public_key;
+  req.payout_pubkey = payout_pubkey;
+  req.pop = *pop;
+  const auto bls = test::test_bls_registration(new_validator);
+  req.bls_pubkey = bls.pubkey;
+  req.bls_pop = bls.pop;
+  const Bytes req_spk = encode_validator_join_request_script(req);
 
   std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
   const std::uint64_t change = in_sum - bond_amount - fee;
@@ -1917,6 +1921,20 @@ struct StoredFrontierArtifact {
   FinalityCertificate certificate;
 };
 
+// The bound bootstrap validator's BLS key || proof (hex) from a node's stored effective genesis, as
+// that node advertises it in VERSION.
+std::string bootstrap_validator_bls_hex_from_db(const std::string& db_path) {
+  storage::DB db;
+  if (!db.open_readonly(db_path) && !db.open(db_path)) return {};
+  const auto gj = db.get(storage::key_genesis_json());
+  if (!gj) return {};
+  const auto doc = genesis::parse_json(std::string(gj->begin(), gj->end()));
+  if (!doc || doc->initial_validator_bls.size() != 1) return {};
+  Bytes kp(doc->initial_validator_bls[0].pubkey.begin(), doc->initial_validator_bls[0].pubkey.end());
+  kp.insert(kp.end(), doc->initial_validator_bls[0].pop.begin(), doc->initial_validator_bls[0].pop.end());
+  return hex_encode(kp);
+}
+
 std::optional<StoredFrontierArtifact> load_frontier_artifact_at_height(const std::string& db_path, std::uint64_t height) {
   storage::DB db;
   if (!db.open_readonly(db_path) && !db.open(db_path)) return std::nullopt;
@@ -1967,6 +1985,7 @@ struct OutOfOrderBlockSyncServer {
   std::uint64_t tip_height{0};
   PubKey32 bootstrap_pub{};
   std::string consensus_rules_fingerprint;  // advertised as crh=; peers reject VERSION without it
+  std::string bootstrap_validator_bls_hex;  // advertised as bootstrap_validator_bls=; adoption needs it
   std::map<Hash32, p2p::TransitionMsg> transitions;
   mutable std::mutex mu;
   mutable std::mutex client_mu;
@@ -2084,6 +2103,9 @@ struct OutOfOrderBlockSyncServer {
                   hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end())) + ";validator_pubkey=" +
                   hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end()));
               if (!consensus_rules_fingerprint.empty()) reply.node_software_version += ";crh=" + consensus_rules_fingerprint;
+              if (!bootstrap_validator_bls_hex.empty()) {
+                reply.node_software_version += ";bootstrap_validator_bls=" + bootstrap_validator_bls_hex;
+              }
               (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(reply)}, net.magic,
                                         net.protocol_version);
               sent_version = true;
@@ -2171,7 +2193,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   if (keys.size() < n_validators) return false;
 
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -2192,13 +2214,14 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   std::filesystem::create_directories(std::filesystem::path(path).parent_path());
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
+  finalis::test::fill_test_genesis_bls(d);
   out << genesis::to_json(d);
   return out.good();
 }
 
 bool write_empty_mainnet_bootstrap_genesis_file(const std::string& path) {
   genesis::Document d;
-  d.version = 1;
+  d.version = genesis::kGenesisVersion;
   d.network_name = "mainnet";
   d.protocol_version = mainnet_network().protocol_version;
   d.network_id = mainnet_network().network_id;
@@ -2217,6 +2240,7 @@ bool write_empty_mainnet_bootstrap_genesis_file(const std::string& path) {
   std::filesystem::create_directories(std::filesystem::path(path).parent_path());
   std::ofstream out(path, std::ios::trunc);
   if (!out.good()) return false;
+  finalis::test::fill_test_genesis_bls(d);
   out << genesis::to_json(d);
   return out.good();
 }
@@ -3780,6 +3804,334 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
   }, std::chrono::seconds(120)));
 }
 
+// A time-locked transfer end to end on a live node: the envelope enters through the node's intake,
+// a block escrows it, the committee time-signs the unlock height, and block unlock + 1 opens and
+// applies the transfer first and refunds the bond. With `reveal`, the body is data only: block
+// unlock + 1 publishes it ("TR:" row) and refunds the bond.
+void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base, bool reveal = false) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(base, static_cast<int>(n_nodes), static_cast<int>(n_nodes), MAX_COMMITTEE);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 3, ci_timeout_seconds(40)));
+  const std::uint64_t bond = consensus::kTxTimedMinForfeitBond;
+  // Covers any envelope here: the largest committee and a body of up to 1 KiB.
+  const std::uint64_t prepaid = consensus::timed_min_prepaid_fee(timed_envelope_bytes_bound(MAX_COMMITTEE, 1024));
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, 2 * (bond + prepaid), 2);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+  auto coins = funded->utxos;
+  std::sort(coins.begin(), coins.end(), [](const auto& a, const auto& b) { return a.second.value > b.second.value; });
+  ASSERT_TRUE(coins[0].second.value >= bond + prepaid);
+  const auto& sender = keys[funded->key_index];
+  const Bytes sender_priv(sender.private_key.begin(), sender.private_key.end());
+  const auto sender_script = coins[0].second.script_pubkey;
+  const auto recipient = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x5d});
+  const auto recipient_pkh = crypto::h160(Bytes(recipient->public_key.begin(), recipient->public_key.end()));
+  const auto domain = node_chain_domain(n0);
+
+  const auto& epoch_blocks = cluster.configs[0].network.committee_epoch_blocks;
+  const auto body = build_signed_p2pkh_tx_single_input(
+      timed_body_chain_domain(domain), coins[1].first, coins[1].second, sender_priv,
+      {TxOut{coins[1].second.value - 500, address::p2pkh_script_pubkey(recipient_pkh)}});
+  ASSERT_TRUE(body.has_value());
+  const Bytes revealed{'s', 'e', 'a', 'l', 'e', 'd', ' ', 'b', 'i', 'd'};
+  // Picks an unlock height a few blocks past the current tip and builds the envelope for it. The
+  // envelope must be included at or below its unlock height, so it is rebuilt after slow steps.
+  std::uint64_t unlock = 0;
+  const auto build_envelope = [&]() -> std::optional<TxTimed> {
+    const auto tip = n0.status().height;
+    unlock = std::min(tip + 4, consensus::committee_epoch_start(tip + 1, epoch_blocks) + epoch_blocks - 1);
+    if (unlock < tip + 2) return std::nullopt;  // room for the envelope to be included first
+    std::optional<storage::FinalizedCommitteeCheckpoint> checkpoint;
+    {
+      storage::DB db;
+      if (!db.open_readonly(base + "/node0")) return std::nullopt;
+      checkpoint = db.get_finalized_committee_checkpoint(consensus::committee_epoch_start(unlock, epoch_blocks));
+    }
+    if (!checkpoint.has_value() || checkpoint->ordered_bls_keys.empty()) return std::nullopt;
+    TimedTxParams params;
+    params.fee_outpoint = coins[0].first;
+    params.fee_prev_out = coins[0].second;
+    params.prepaid_fee = prepaid;
+    params.forfeit_bond = bond;
+    params.bond_refund_script = sender_script;
+    if (coins[0].second.value > bond + prepaid) {
+      params.fee_change = TxOut{coins[0].second.value - bond - prepaid, sender_script};
+    }
+    params.unlock_height = unlock;
+    params.committee_epoch = consensus::committee_epoch_start(unlock, epoch_blocks);
+    params.committee_root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
+    params.committee_keys = checkpoint->ordered_bls_keys;
+    params.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(checkpoint->ordered_bls_keys.size()));
+    Hash32 seed{};
+    seed.fill(0x3c);
+    return reveal ? build_signed_timed_tx(domain, params, TimedReveal{revealed}, sender_priv, seed)
+                  : build_signed_timed_tx(domain, params, AnyTx{*body}, sender_priv, seed);
+  };
+  std::optional<TxTimed> timed;
+  ASSERT_TRUE(wait_for([&]() { return (timed = build_envelope()).has_value(); }, ci_timeout_seconds(60)));
+  std::string reason;
+  if (n_nodes == 1 && !reveal) {
+    // A well-signed envelope with a broken proof: rejected after the (unlocked) proof check, and from
+    // the network the proof checks of all peers share one node-wide budget.
+    auto bad = *timed;
+    bad.swe_proof[bad.swe_proof.size() / 2] ^= 0x01;
+    const auto sig = crypto::ed25519_sign(signing_message_for_timed_fee_input(domain, bad), sender_priv);
+    ASSERT_TRUE(sig.has_value());
+    bad.fee_input.script_sig.clear();
+    bad.fee_input.script_sig.push_back(0x40);
+    bad.fee_input.script_sig.insert(bad.fee_input.script_sig.end(), sig->begin(), sig->end());
+    bad.fee_input.script_sig.push_back(0x20);
+    bad.fee_input.script_sig.insert(bad.fee_input.script_sig.end(), sender.public_key.begin(), sender.public_key.end());
+    ASSERT_TRUE(!n0.inject_record_for_test(bad.serialize(), &reason));
+    ASSERT_EQ(reason, std::string("swe-proof-invalid"));
+    std::size_t proof_checked = 0;
+    bool budget_hit = false;
+    for (int peer = 100; peer < 140 && !budget_hit; ++peer) {
+      std::string why;
+      ASSERT_TRUE(!n0.inject_network_record_for_test(bad.serialize(), peer, &why));
+      if (why == "swe-proof-invalid") ++proof_checked;
+      budget_hit = why == "timed verify rate limited";
+    }
+    ASSERT_TRUE(budget_hit);
+    ASSERT_TRUE(proof_checked <= 20);  // capacity 16, refilled at 4 per second while the loop runs
+    // Submitted as wallets and finalis-cli timed_send do: lightserver broadcast_tx, relayed to the node
+    // over P2P (relay_tx_to_peer used to parse only Tx / TxV2 and refused every TxTimed).
+    lightserver::Config lcfg;
+    lcfg.network = cluster.configs[0].network;
+    lcfg.db_path = cluster.configs[0].db_path;
+    lcfg.tx_relay_port = cluster.configs[0].p2p_port;
+    lcfg.admin_socket_path.clear();
+    lightserver::Server ls(lcfg);
+    ASSERT_TRUE(ls.init());
+    // The burst above drained the node-wide budget: retry until it refills (4 per second). The burst
+    // and the lightserver start are slow under sanitizers, so a retry rebuilds the envelope once the
+    // tip nears its unlock height.
+    std::string relayed;
+    ASSERT_TRUE(wait_for([&]() {
+      if (n0.status().height + 2 > unlock && !(timed = build_envelope())) return false;
+      relayed = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":1,"method":"broadcast_tx","params":{"tx_hex":")") +
+                                       hex_encode(timed->serialize()) + R"("}})");
+      return relayed.find("\"accepted\":true") != std::string::npos;
+    }, ci_timeout_seconds(15)));
+  } else {
+    ASSERT_TRUE(n0.inject_record_for_test(timed->serialize(), &reason));
+  }
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  const auto refunded = [&]() {
+    for (const auto& [op, out] : n0.find_utxos_by_pubkey_hash_for_test(sender_pkh)) {
+      const auto refund_op = consensus::timed_refund_outpoint(timed->txid());
+      if (op.txid == refund_op.txid && op.index == refund_op.index && out.value == bond) return true;
+    }
+    return false;
+  };
+  if (reveal) {
+    std::optional<storage::DB::TimedRevealLocation> published;
+    ASSERT_TRUE(wait_for([&]() {
+      storage::DB db;
+      if (!db.open_readonly(base + "/node0")) return false;
+      published = db.get_timed_reveal(timed->txid());
+      return published.has_value();
+    }, ci_timeout_seconds(120)));
+    ASSERT_EQ(published->height, unlock + 1);
+    ASSERT_TRUE(published->data == revealed);
+    ASSERT_TRUE(refunded());
+    return;
+  }
+
+  std::optional<storage::DB::TxLocation> included;
+  std::optional<storage::DB::TxLocation> opened;
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    included = db.get_tx_index(timed->txid());
+    opened = db.get_tx_index(body->txid());
+    return included.has_value() && opened.has_value();
+  }, ci_timeout_seconds(120)));
+  ASSERT_TRUE(included->height <= unlock);
+  ASSERT_EQ(opened->height, unlock + 1);
+  const auto recipient_utxos = n0.find_utxos_by_pubkey_hash_for_test(recipient_pkh);
+  ASSERT_EQ(recipient_utxos.size(), 1u);
+  ASSERT_EQ(recipient_utxos[0].second.value, coins[1].second.value - 500);
+  ASSERT_TRUE(refunded());
+  // Every node settled it the same way.
+  for (std::size_t i = 1; i < n_nodes; ++i) {
+    ASSERT_TRUE(wait_for([&]() { return cluster.nodes[i]->find_utxos_by_pubkey_hash_for_test(recipient_pkh).size() == 1; },
+                         ci_timeout_seconds(60)));
+  }
+}
+
+TEST(test_timed_transfer_opens_after_its_unlock_height_on_a_live_node) {
+  run_timed_transfer_on_cluster(1, unique_test_base("/tmp/finalis_it_timed_transfer"));
+}
+
+TEST(test_timed_reveal_is_published_after_its_unlock_height_on_a_live_node) {
+  run_timed_transfer_on_cluster(1, unique_test_base("/tmp/finalis_it_timed_reveal"), true);
+}
+
+// Four validators: the envelope reaches its lane's certifier from another node, and the unlock
+// height's time signature is aggregated from several validators' signatures.
+TEST(test_timed_transfer_on_a_four_validator_cluster) {
+  run_timed_transfer_on_cluster(4, unique_test_base("/tmp/finalis_it_timed_transfer4"));
+}
+
+// A long time lock end to end on four validators: encrypted to the inclusion epoch's committee and
+// unlocking past that epoch; once the unlock height is final every named validator signs it, the
+// signatures are relayed and accepted from the key set, and a leader carries the aggregate in
+// long_time_signatures, which opens and applies the transfer and refunds the bond.
+TEST(test_long_time_lock_opens_on_a_four_validator_cluster) {
+  const auto base = unique_test_base("/tmp/finalis_it_long_lock");
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(base, 4, 4, MAX_COMMITTEE);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 3, ci_timeout_seconds(40)));
+  const std::uint64_t bond = consensus::kTxTimedMinForfeitBond;
+  const auto& epoch_blocks = cluster.configs[0].network.committee_epoch_blocks;
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, 2 * (bond + 1'000'000 + 10 * consensus::kTxTimedLongFeePerEpoch), 2);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+  // Early in an epoch, so the envelope is included in the epoch it names.
+  ASSERT_TRUE(wait_for([&]() {
+    const auto next = n0.status().height + 1;
+    return consensus::committee_epoch_start(next, epoch_blocks) == consensus::committee_epoch_start(next + 10, epoch_blocks);
+  }, ci_timeout_seconds(120)));
+  const auto next = n0.status().height + 1;
+  const auto epoch = consensus::committee_epoch_start(next, epoch_blocks);
+  const auto unlock = epoch + epoch_blocks + 2;
+  const auto prepaid = consensus::timed_min_prepaid_fee(timed_envelope_bytes_bound(MAX_COMMITTEE, 1024)) +
+                       *consensus::timed_long_lock_min_fee(next, unlock, epoch_blocks);
+
+  auto coins = funded->utxos;
+  std::sort(coins.begin(), coins.end(), [](const auto& a, const auto& b) { return a.second.value > b.second.value; });
+  ASSERT_TRUE(coins[0].second.value >= bond + prepaid);
+  const auto& sender = keys[funded->key_index];
+  const Bytes sender_priv(sender.private_key.begin(), sender.private_key.end());
+  const auto sender_script = coins[0].second.script_pubkey;
+  const auto recipient = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x5e});
+  const auto recipient_pkh = crypto::h160(Bytes(recipient->public_key.begin(), recipient->public_key.end()));
+  const auto domain = node_chain_domain(n0);
+  std::optional<storage::FinalizedCommitteeCheckpoint> checkpoint;
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open_readonly(base + "/node0"));
+    checkpoint = db.get_finalized_committee_checkpoint(epoch);
+  }
+  ASSERT_TRUE(checkpoint.has_value() && checkpoint->ordered_bls_keys.size() == 4);
+
+  const auto body = build_signed_p2pkh_tx_single_input(
+      timed_body_chain_domain(domain), coins[1].first, coins[1].second, sender_priv,
+      {TxOut{coins[1].second.value - 500, address::p2pkh_script_pubkey(recipient_pkh)}});
+  ASSERT_TRUE(body.has_value());
+  TimedTxParams params;
+  params.fee_outpoint = coins[0].first;
+  params.fee_prev_out = coins[0].second;
+  params.prepaid_fee = prepaid;
+  params.forfeit_bond = bond;
+  params.bond_refund_script = sender_script;
+  if (coins[0].second.value > bond + prepaid) {
+    params.fee_change = TxOut{coins[0].second.value - bond - prepaid, sender_script};
+  }
+  params.unlock_height = unlock;
+  params.committee_epoch = epoch;
+  params.committee_root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
+  params.committee_keys = checkpoint->ordered_bls_keys;
+  params.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(checkpoint->ordered_bls_keys.size()));
+  Hash32 seed{};
+  seed.fill(0x3d);
+  const auto timed = build_signed_timed_tx(domain, params, AnyTx{*body}, sender_priv, seed);
+  ASSERT_TRUE(timed.has_value());
+  std::string reason;
+  ASSERT_TRUE(n0.inject_record_for_test(timed->serialize(), &reason));
+
+  std::optional<storage::DB::TxLocation> included;
+  std::optional<storage::DB::TxLocation> opened;
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    included = db.get_tx_index(timed->txid());
+    opened = db.get_tx_index(body->txid());
+    return included.has_value() && opened.has_value();
+  }, ci_timeout_seconds(240)));
+  ASSERT_TRUE(included->height < epoch + epoch_blocks);
+  ASSERT_TRUE(opened->height > unlock && opened->height <= unlock + consensus::kTimedLongGraceBlocks);
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  bool refunded = false;
+  for (const auto& [op, out] : n0.find_utxos_by_pubkey_hash_for_test(sender_pkh)) {
+    const auto refund_op = consensus::timed_refund_outpoint(timed->txid());
+    if (op.txid == refund_op.txid && op.index == refund_op.index && out.value == bond) refunded = true;
+  }
+  ASSERT_TRUE(refunded);
+  for (std::size_t i = 1; i < cluster.nodes.size(); ++i) {
+    ASSERT_TRUE(wait_for([&]() { return cluster.nodes[i]->find_utxos_by_pubkey_hash_for_test(recipient_pkh).size() == 1; },
+                         ci_timeout_seconds(60)));
+  }
+}
+
+// A height-locked payment on a live node: admitted and finalized, found under the recipient's own
+// address, refused before its height (mempool and block), and spent from it.
+TEST(test_height_locked_payment_on_a_live_node) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto base = unique_test_base("/tmp/finalis_it_height_lock");
+  auto cluster = make_cluster(base, 1, 1, 1);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 3, ci_timeout_seconds(40)));
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, 2'000'000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+  const auto& sender = keys[funded->key_index];
+  const auto recipient = crypto::keypair_from_seed32(std::array<std::uint8_t, 32>{0x6e});
+  const auto recipient_h = crypto::h160(Bytes(recipient->public_key.begin(), recipient->public_key.end()));
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  std::copy(recipient_h.begin(), recipient_h.end(), recipient_pkh.begin());
+  const auto domain = node_chain_domain(n0);
+
+  const auto unlock = n0.status().height + 6;
+  auto coin = funded->utxos.front();
+  for (const auto& c : funded->utxos) if (c.second.value > coin.second.value) coin = c;
+  const auto lock_tx = build_signed_p2pkh_tx_single_input(
+      domain, coin.first, coin.second, Bytes(sender.private_key.begin(), sender.private_key.end()),
+      {TxOut{1'000'000, height_lock_script_pubkey(unlock, recipient_pkh)},
+       TxOut{coin.second.value - 1'000'000 - 1'000, coin.second.script_pubkey}});
+  ASSERT_TRUE(lock_tx.has_value());
+  ASSERT_TRUE(n0.inject_tx_for_test(AnyTx{*lock_tx}, true));
+
+  // Indexed under the recipient's plain address (what its wallet queries).
+  const auto recipient_scripthash = crypto::sha256(address::p2pkh_script_pubkey(recipient_h));
+  std::vector<std::pair<OutPoint, TxOut>> found;
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    found.clear();
+    for (const auto& e : db.get_script_utxos(recipient_scripthash)) found.push_back({e.outpoint, TxOut{e.value, e.script_pubkey}});
+    return found.size() == 1;
+  }, ci_timeout_seconds(60)));
+  ASSERT_TRUE(found[0].first.txid == lock_tx->txid());
+  ASSERT_TRUE(n0.status().height + 1 < unlock);
+
+  const auto spend = build_signed_p2pkh_tx_single_input(
+      domain, found[0].first, found[0].second, Bytes(recipient->private_key.begin(), recipient->private_key.end()),
+      {TxOut{1'000'000 - 1'000, address::p2pkh_script_pubkey(recipient_h)}});
+  ASSERT_TRUE(spend.has_value());
+  ASSERT_TRUE(!n0.inject_tx_for_test(AnyTx{*spend}, true));  // too early: refused
+
+  ASSERT_TRUE(wait_for_tip(n0, unlock - 1, ci_timeout_seconds(90)));  // the next block is at the unlock height
+  ASSERT_TRUE(n0.inject_tx_for_test(AnyTx{*spend}, true));
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    const auto loc = db.get_tx_index(spend->txid());
+    return loc.has_value() && loc->height >= unlock;
+  }, ci_timeout_seconds(60)));
+}
+
 TEST(test_onboarding_registration_tx_finalization_inserts_onboarding_validator) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_registration_tx");
@@ -4142,6 +4494,45 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
       }, ci_timeout_seconds(300))) {
     throw std::runtime_error("slash validator did not converge to banned/no-bond state:" +
                              summarize_validator_fixture_nodes(nodes, slash_pub, slash_txid, &cluster.configs));
+  }
+}
+
+// A validator's time signature on a height not yet final, carried as evidence, burns its bond and
+// bans it on a live node.
+TEST(test_early_time_signature_slash_bans_validator) {
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_time_slash"), 1, 1, 1);
+  auto& nodes = cluster.nodes;
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 6; }, ci_timeout_seconds(60)));
+
+  const auto slash_pub = keys[0].public_key;
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(*nodes[0], cluster.configs[0]);
+  Hash32 bond_txid{};
+  bond_txid.fill(0xA6);
+  const OutPoint bond_op{bond_txid, 0};
+  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(60)));
+  const auto info0 = nodes[0]->validator_info_for_test(slash_pub);
+  ASSERT_TRUE(info0.has_value() && info0->has_bond);
+
+  // Far enough ahead that the evidence is included before that height is final.
+  const auto early = nodes[0]->status().height + 1'000;
+  const auto sk = crypto::bls_key_from_validator_seed(Bytes(keys[0].private_key.begin(), keys[0].private_key.end()));
+  ASSERT_TRUE(sk.has_value());
+  const auto sig = crypto::bls_sign(*sk, time_signature_message(nodes[0]->consensus_domain_for_test(), early),
+                                    crypto::kBlsTimeSignatureDst);
+  ASSERT_TRUE(sig.has_value());
+  const auto slash_tx = build_early_time_signature_slash_tx(bond_op, info0->bonded_amount, early, *sig);
+  append_live_certified_tx_or_throw(cluster, slash_tx, "append time slash tx failed");
+  for (auto& n : nodes) n->pause_proposals_for_test(false);
+
+  if (!wait_for([&]() {
+        const auto info = nodes[0]->validator_info_for_test(slash_pub);
+        return info.has_value() && info->status == consensus::ValidatorStatus::BANNED && !info->has_bond;
+      }, ci_timeout_seconds(300))) {
+    throw std::runtime_error("time slash did not ban:" +
+                             summarize_validator_fixture_nodes(nodes, slash_pub, slash_tx.txid(), &cluster.configs));
   }
 }
 
@@ -9102,6 +9493,7 @@ TEST(test_sync_peer_rejects_tampered_finalized_block_body) {
                       p2p::TransitionMsg{a2->proposal.serialize(), a2->certificate});
   transitions.emplace(frontier_proposal_id(a3->proposal),
                       p2p::TransitionMsg{tampered_proposal.serialize(), a3->certificate});
+  server.bootstrap_validator_bls_hex = bootstrap_validator_bls_hex_from_db(bootstrap_cfg.db_path);
   ASSERT_TRUE(server.start_transitions(bootstrap_cfg.network, bootstrap_status.genesis_hash, *bootstrap_pub, tampered_height,
                                        frontier_proposal_id(a3->proposal), std::move(transitions)));
 
@@ -9817,6 +10209,7 @@ TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descenda
                       p2p::TransitionMsg{a2->proposal.serialize(), a2->certificate});
   transitions.emplace(frontier_proposal_id(a3->proposal),
                       p2p::TransitionMsg{a3->proposal.serialize(), a3->certificate});
+  server.bootstrap_validator_bls_hex = bootstrap_validator_bls_hex_from_db(bootstrap_cfg.db_path);
   ASSERT_TRUE(server.start_transitions(bootstrap_cfg.network, bootstrap_status.genesis_hash, *bootstrap_pub, 3,
                                        frontier_proposal_id(a3->proposal), std::move(transitions)));
 
@@ -9905,6 +10298,7 @@ TEST(test_out_of_order_block_sync_recovers_after_disconnect_and_retries_parents)
                       p2p::TransitionMsg{a2->proposal.serialize(), a2->certificate});
   transitions.emplace(frontier_proposal_id(a3->proposal),
                       p2p::TransitionMsg{a3->proposal.serialize(), a3->certificate});
+  server.bootstrap_validator_bls_hex = bootstrap_validator_bls_hex_from_db(bootstrap_cfg.db_path);
   ASSERT_TRUE(server.start_transitions(bootstrap_cfg.network, bootstrap_status.genesis_hash, *bootstrap_pub, 3,
                                        frontier_proposal_id(a3->proposal), std::move(transitions), 2));
 
@@ -10688,6 +11082,17 @@ TEST(test_light_client_follows_committees_from_genesis_and_rejects_tampering) {
   ASSERT_TRUE(consensus::checkpoint_commitment_value(*genesis_checkpoint) ==
               consensus::checkpoint_commitment_value(node_checkpoints.at(1)));
   ASSERT_EQ(genesis_checkpoint->ordered_members.size(), 4u);
+  // Every committee carries each member's genesis BLS key, in member order.
+  std::map<PubKey32, crypto::BlsPublicKey> genesis_bls;
+  for (std::size_t i = 0; i < doc->initial_validators.size(); ++i) {
+    genesis_bls[doc->initial_validators[i]] = doc->initial_validator_bls[i].pubkey;
+  }
+  for (const auto& [epoch, checkpoint] : node_checkpoints) {
+    ASSERT_EQ(checkpoint.ordered_bls_keys.size(), checkpoint.ordered_members.size());
+    for (std::size_t i = 0; i < checkpoint.ordered_members.size(); ++i) {
+      ASSERT_TRUE(checkpoint.ordered_bls_keys[i] == genesis_bls.at(checkpoint.ordered_members[i]));
+    }
+  }
 
   const auto params = consensus::light_client_params(cfg.network, consensus::chain_id_for_genesis(cfg.network, genesis_hash));
   storage::FinalizedCommitteeCheckpoint current = *genesis_checkpoint;
@@ -10702,6 +11107,24 @@ TEST(test_light_client_follows_committees_from_genesis_and_rejects_tampering) {
     current = *verified;
   }
   ASSERT_EQ(current.epoch_start_height, consensus::committee_epoch_start(tip, 2));
+  // Every block after the first carries its parent's time signature: a threshold of the parent
+  // committee's BLS keys, verifying on time_signature_message(parent height).
+  {
+    storage::DB tdb;
+    ASSERT_TRUE(tdb.open_readonly(cfg.db_path));
+    const auto domain = consensus_chain_domain(cfg.network, consensus::chain_id_for_genesis(cfg.network, genesis_hash));
+    for (std::uint64_t h = 2; h <= tip; ++h) {
+      const auto t = FrontierTransition::parse(*tdb.get_frontier_transition(*tdb.get_frontier_transition_by_height(h)));
+      ASSERT_TRUE(t.has_value());
+      const auto& checkpoint = node_checkpoints.at(consensus::committee_epoch_start(h - 1, 2));
+      ASSERT_TRUE(t->prev_time_signature.signer_indices.size() >=
+                  consensus::time_signature_threshold(checkpoint.ordered_bls_keys.size()));
+      std::vector<crypto::BlsPublicKey> signers;
+      for (const auto i : t->prev_time_signature.signer_indices) signers.push_back(checkpoint.ordered_bls_keys.at(i));
+      ASSERT_TRUE(crypto::mcfly_aggregate_verify(signers, time_signature_message(domain, h - 1),
+                                                 crypto::kBlsTimeSignatureDst, t->prev_time_signature.aggregate));
+    }
+  }
   ASSERT_TRUE(consensus::verify_light_finality(params, current, *tip_transition, *tip_cert));
 
   // Tampering with any link is caught.
@@ -12061,3 +12484,1795 @@ TEST(test_known_equivocator_votes_still_count_toward_polka) {
   ASSERT_EQ(polka->round, 1u);
   ASSERT_TRUE(wait_for_local_precommit(target, f->height, 1, b1_id));
 }
+
+
+#ifdef FINALIS_STORAGE_FAULTS
+// ======================================================================================
+// Consensus persistence-failure tests (red-team round 2). Faults are injected only into the
+// target validator's RocksDB WAL (tests/support/storage_fault_injection.cpp); src/ is unchanged.
+//
+// Facts these rely on (test_storage_faults.cpp): a failed durable write is invisible, every later
+// write fails until the DB is reopened, a failed WAL write() loses the batch, and a failed WAL
+// sync replays the batch on reopen.
+//
+// Tests named test_pf_*_must_* / *_does_not_* assert the spec invariant (TWO_PHASE_FINALITY.md
+// §3.2: safety state is durable before the vote leaves the process). Those that fail on the
+// current code are the regression tests for the defects in the audit; they are failing on purpose.
+// ======================================================================================
+namespace {
+namespace faults = finalis::test::storage_faults;
+
+constexpr std::array<faults::Mode, 4> kPfWalFaults = {faults::Mode::FailWalWrite, faults::Mode::FailWalWriteNoSpace,
+                                                      faults::Mode::FailWalSync, faults::Mode::SyncThenFailWal};
+// Gating tests: every mode. ENOSPC was left out until P5 because the system librocksdb aborted on the
+// write after an auto-resume (E1, tests/KNOWN_DEFECTS.md); the storage::DB write fence closes that.
+constexpr std::array<faults::Mode, 4> kPfGateFaults = kPfWalFaults;
+
+// The disk stays failed for the whole armed window: a background write by the node's event loop may
+// take the first fault, and the write under test must fail as well.
+constexpr int kPfFaultCount = -1;
+
+std::string pf_fault_name(faults::Mode m) {
+  switch (m) {
+    case faults::Mode::FailWalWrite:
+      return "wal-write-eio";
+    case faults::Mode::FailWalWriteNoSpace:
+      return "wal-write-enospc";
+    case faults::Mode::FailWalSync:
+      return "wal-sync-eio";
+    case faults::Mode::SyncThenFailWal:
+      return "sync-then-eio";
+    case faults::Mode::Off:
+      break;
+  }
+  return "off";
+}
+
+void pf_require(bool ok, const std::string& what) {
+  if (!ok) throw std::runtime_error("assert failed: " + what);
+}
+
+std::string pf_join(const std::vector<std::string>& items) {
+  std::string out;
+  for (const auto& item : items) out += (out.empty() ? "" : " | ") + item;
+  return out;
+}
+
+// The three committee members other than the target, in committee order, with their cluster index.
+struct PfOthers {
+  std::vector<PubKey32> pubs;
+  std::vector<std::size_t> nodes;
+};
+
+PfOthers pf_others(TwoPhaseFixture& f) {
+  PfOthers out;
+  const auto me = f.target().local_validator_pubkey_for_test();
+  for (const auto& pub : f.committee) {
+    if (pub == me) continue;
+    std::size_t idx = f.cluster.nodes.size();
+    for (std::size_t k = 0; k < f.cluster.nodes.size(); ++k) {
+      if (f.cluster.nodes[k] && f.cluster.nodes[k]->local_validator_pubkey_for_test() == pub) idx = k;
+    }
+    out.pubs.push_back(pub);
+    out.nodes.push_back(idx);
+  }
+  if (out.pubs.size() < 3) throw std::runtime_error("need three other committee members");
+  return out;
+}
+
+const std::string& pf_db(const TwoPhaseFixture& f) { return f.cluster.configs[f.ti].db_path; }
+const Hash32& pf_domain(TwoPhaseFixture& f) { return f.target().consensus_domain_for_test(); }
+
+std::string pf_prevote(TwoPhaseFixture& f, std::uint32_t round, const Hash32& id, const PubKey32& signer) {
+  return f.target().inject_network_prevote_result_for_test(make_test_prevote(pf_domain(f), f.keys, f.height, round, id, signer));
+}
+
+// Target at round 0 receives A and prevotes it (storage healthy).
+void pf_prevote_a0(TwoPhaseFixture& f) {
+  auto& t = f.target();
+  pf_require(advance_test_frontier_round(t, f.height, 0), "advance to round 0");
+  pf_require(t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(f), *f.a0)) == "accepted",
+             "A0 proposal accepted");
+  pf_require(t.local_prevote_recorded_for_test(f.height, 0, frontier_proposal_id(*f.a0)), "own prevote A0 recorded");
+}
+
+// Two more A0 prevotes complete the polka (own + 2 = quorum 3). Called with a fault armed, the
+// first failing write is the valid-polka batch; the lock batch then fails on RocksDB's background
+// error, which is what a real failing disk does.
+void pf_complete_polka_a0(TwoPhaseFixture& f, const PfOthers& o) {
+  const auto a_id = frontier_proposal_id(*f.a0);
+  pf_require(pf_prevote(f, 0, a_id, o.pubs[0]) == "accepted", "prevote A0 from other[0]");
+  pf_require(pf_prevote(f, 0, a_id, o.pubs[1]) == "accepted", "prevote A0 from other[1]");
+}
+
+// "Must not happen" checks: a queued vote is flushed by whichever thread runs next, so give it a
+// bounded window instead of checking once.
+bool pf_within(const std::function<bool()>& cond, int ms = 1500) { return wait_for(cond, std::chrono::milliseconds(ms)); }
+
+bool pf_own_precommit_in_rebroadcast(const node::Node& n, std::uint64_t h, std::uint32_t r, const Hash32& id) {
+  const auto me = n.local_validator_pubkey_for_test();
+  for (const auto& v : n.precommits_for_rebroadcast_for_test(h)) {
+    if (v.validator_pubkey == me && v.round == r && v.frontier_transition_id == id) return true;
+  }
+  return false;
+}
+
+// Crash/restart of the target: a new process over the same DB directory, isolated from p2p so a
+// reconnect reset cannot race the test (as test_restart_between_prevote_and_precommit does).
+void pf_restart_target_isolated(TwoPhaseFixture& f) {
+  f.cluster.nodes[f.ti]->stop();
+  f.cluster.nodes[f.ti].reset();
+  f.cluster.configs[f.ti].disable_p2p = true;
+  f.cluster.configs[f.ti].listen = false;
+  f.cluster.configs[f.ti].p2p_port = 0;
+  f.cluster.nodes[f.ti] = std::make_unique<node::Node>(f.cluster.configs[f.ti]);
+  pf_require(f.target().init(), "target re-init after restart");
+  pf_require(f.target().pause_proposals_for_test(true), "pause target");
+  f.target().start();
+}
+
+// Deterministic setup for the in-process paths: the target leaves p2p for the in-process local bus
+// before the scenario. The other cluster validators are live (paused only from proposing): over
+// p2p they would echo the relayed proposal and send their own prevotes, re-entering the target's
+// polka handling at arbitrary times.
+void pf_isolate_target(TwoPhaseFixture& f) { pf_restart_target_isolated(f); }
+
+// A live validator moved onto the local bus next to the isolated target: it receives exactly what
+// the target broadcasts (and nothing the test injects without relay).
+node::Node& pf_bus_spy(TwoPhaseFixture& f, std::size_t idx) {
+  f.cluster.nodes[idx]->stop();
+  f.cluster.nodes[idx].reset();
+  f.cluster.configs[idx].disable_p2p = true;
+  f.cluster.configs[idx].listen = false;
+  f.cluster.configs[idx].p2p_port = 0;
+  f.cluster.nodes[idx] = std::make_unique<node::Node>(f.cluster.configs[idx]);
+  pf_require(f.cluster.nodes[idx]->init(), "spy init");
+  pf_require(f.cluster.nodes[idx]->pause_proposals_for_test(true), "pause spy");
+  f.cluster.nodes[idx]->start();
+  return *f.cluster.nodes[idx];
+}
+
+TimeoutCertificate pf_tc(TwoPhaseFixture& f, std::uint32_t round, const std::vector<PubKey32>& signers) {
+  TimeoutCertificate tc;
+  tc.height = f.height;
+  tc.round = round;
+  const auto msg = timeout_vote_signing_message(pf_domain(f), f.height, round);
+  for (const auto& pub : signers) {
+    const int id = node_for_pub(f.keys, pub);
+    if (id < 0) throw std::runtime_error("unknown tc signer");
+    auto sig = crypto::ed25519_sign(msg, f.keys[static_cast<std::size_t>(id)].private_key);
+    if (!sig.has_value()) throw std::runtime_error("tc sign failed");
+    tc.signatures.push_back(FinalitySig{pub, *sig});
+  }
+  return tc;
+}
+
+// Has peer `n` already received this exact vote? ed25519 is deterministic, so the test rebuilds
+// the byte-identical vote; a peer that already holds it reports a duplicate. (Consumes the probe:
+// a peer that did not have it accepts it now.)
+bool pf_peer_had_precommit(node::Node& n, const Vote& v) {
+  return n.inject_network_vote_diagnostic_for_test(v) == "soft-reject:duplicate";
+}
+
+}  // namespace
+
+// ---------- B. Lock persistence ----------
+
+// Invariant: when the lock write fails, the precommit that needed it is not emitted (first call).
+TEST_TAGS(test_pf_lock_write_failure_first_polka_does_not_precommit, "isolate,persistence-failure");
+TEST(test_pf_lock_write_failure_first_polka_does_not_precommit) {
+  for (const auto mode : kPfGateFaults) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_first_" + pf_fault_name(mode), 0xA0);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    pf_prevote_a0(*f);
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      pf_complete_polka_a0(*f, o);
+      pf_require(faults::injected() >= 1, pf_fault_name(mode) + ": fault injected");
+    }
+    auto& t = f->target();
+    pf_require(!pf_within([&] { return t.local_vote_recorded_for_test(f->height, 0, a_id); }),
+               pf_fault_name(mode) + ": no precommit A0 after failed lock write");
+    // State left behind (documented, not a requirement): the lock stays in memory.
+    const auto lock = t.local_vote_lock_for_test(f->height);
+    std::cerr << "[pf] mode=" << pf_fault_name(mode) << " in-memory-lock-after-failure=" << (lock ? "yes" : "no") << "\n";
+  }
+}
+
+// Invariant P1: a new prevote for the same polka after the failed lock write must not emit the
+// precommit while the lock is not durable. Defect D1: lock_on_polka_locked's early return.
+TEST_TAGS(test_pf_lock_write_failure_new_prevote_must_not_emit_precommit, "isolate,persistence-failure,D1");
+TEST(test_pf_lock_write_failure_new_prevote_must_not_emit_precommit) {
+  std::vector<std::string> failures;  // every mode runs; all failures are reported together
+  for (const auto mode : kPfWalFaults) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_reentry_" + pf_fault_name(mode), 0xA1);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    pf_prevote_a0(*f);
+    faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+    pf_complete_polka_a0(*f, o);
+    pf_require(faults::injected() >= 1, "fault injected");
+    auto& t = f->target();
+    pf_require(!pf_within([&] { return t.local_vote_recorded_for_test(f->height, 0, a_id); }), "no precommit before re-entry");
+    pf_require(pf_prevote(*f, 0, a_id, o.pubs[2]) == "accepted", "4th prevote accepted");
+    if (pf_within([&] { return t.local_vote_recorded_for_test(f->height, 0, a_id); })) {
+      failures.push_back(pf_fault_name(mode) + ": precommit A0 emitted after re-entry although its lock write failed (D1)");
+    }
+  }
+  pf_require(failures.empty(), pf_join(failures));
+}
+
+// Control for the duplicate path: a re-delivered prevote is rejected before on_prevotes_changed.
+TEST_TAGS(test_pf_lock_write_failure_duplicate_prevote_does_not_emit_precommit, "isolate,persistence-failure");
+TEST(test_pf_lock_write_failure_duplicate_prevote_does_not_emit_precommit) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_dup", 0xA2);
+  pf_isolate_target(*f);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  pf_require(pf_prevote(*f, 0, a_id, o.pubs[1]) == "soft-reject", "duplicate prevote is a soft reject");
+  pf_require(!pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); }),
+             "no precommit after duplicate prevote");
+}
+
+// Invariant P6: re-delivering the proposal body (on_candidate_body_locked) after the failed lock
+// write must not emit the precommit.
+TEST_TAGS(test_pf_lock_write_failure_proposal_redelivery_must_not_emit_precommit, "isolate,persistence-failure,D1");
+TEST(test_pf_lock_write_failure_proposal_redelivery_must_not_emit_precommit) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_body", 0xA3);
+  pf_isolate_target(*f);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  const auto r = f->target().inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0));
+  std::cerr << "[pf] proposal-redelivery result=" << r << "\n";
+  pf_require(!pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); }),
+             "precommit A0 emitted after proposal re-delivery although its lock write failed");
+}
+
+// Invariant P6: the stall rebroadcast must not sign a precommit for a lock that is not durable.
+// Defect D2: local_votes_for_rebroadcast_locked signs one from the in-memory lock.
+TEST_TAGS(test_pf_lock_write_failure_rebroadcast_must_not_sign_precommit, "isolate,persistence-failure,D2");
+TEST(test_pf_lock_write_failure_rebroadcast_must_not_sign_precommit) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_rebroadcast", 0xA4);
+  pf_isolate_target(*f);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  pf_require(!pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); }), "no direct precommit");
+  pf_require(!pf_own_precommit_in_rebroadcast(f->target(), f->height, 0, a_id),
+             "stall rebroadcast set contains a precommit A0 whose lock write failed (D2)");
+}
+
+// Invariant P6 for the peer-loss round reset: reseed_local_votes_locked must not record a precommit
+// for a lock that is not durable. Defect D3. The reset needs real p2p, but live validators would
+// re-enter the polka path (D1) first, so the cluster is stopped and the target's only peer is a
+// silent raw socket: it completes the handshake and never sends anything. Closing it is the peer
+// loss. Positive control: another validator's precommit, which the reset clears from votes_.
+TEST_TAGS(test_pf_lock_write_failure_peer_loss_reseed_must_not_record_precommit, "isolate,persistence-failure,D3");
+TEST(test_pf_lock_write_failure_peer_loss_reseed_must_not_record_precommit) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_reseed", 0xA5);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  auto& t = f->target();
+  for (std::size_t k = 0; k < f->cluster.nodes.size(); ++k) {
+    if (k != f->ti) f->cluster.nodes[k]->stop();
+  }
+  pf_require(wait_for([&] { return t.status().established_peers == 0; }, ci_timeout_seconds(30)), "cluster peers gone");
+  const auto& net = f->cluster.configs[f->ti].network;
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(net.protocol_version);
+  v.network_id = net.network_id;
+  v.feature_flags = net.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 0x5157u;
+  v.node_software_version = "pf-silent-peer/1;crh=" + t.consensus_rules_fingerprint_for_test();
+  auto fd = connect_bootstrap_joiner_without_sync("127.0.0.1", t.p2p_port_for_test(), v, net);
+  pf_require(finalis::net::valid_socket(fd), "silent peer connected");
+  pf_require(wait_for([&] { return t.status().established_peers >= 1; }, ci_timeout_seconds(10)), "silent peer established");
+
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  pf_require(!pf_within([&] { return t.local_vote_recorded_for_test(f->height, 0, a_id); }),
+             "no precommit before the reset (nothing re-enters the polka path)");
+  const auto marker = make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, o.pubs[0]);
+  pf_require(t.inject_vote_for_test(marker), "marker precommit accepted");
+  // Probe the vote tracker directly: the stall rebroadcast set is empty once the node fail-stopped.
+  const auto marker_present = [&] { return t.vote_recorded_by_for_test(f->height, 0, a_id, o.pubs[0]); };
+  pf_require(marker_present(), "marker visible before reset");
+
+  finalis::net::shutdown_socket(fd);
+  finalis::net::close_socket(fd);
+  pf_require(wait_for([&] { return !marker_present(); }, ci_timeout_seconds(30)), "control: peer-loss reset happened");
+  pf_require(!t.local_vote_recorded_for_test(f->height, 0, a_id),
+             "peer-loss reset reseeded a precommit A0 whose lock write failed (D3)");
+}
+
+// Invariant P1 on a live cluster, with no test-driven re-entry: after the failed lock write the
+// precommit must not be emitted. Live peers echo the relayed proposal and send their own prevotes,
+// which re-enter the polka path within milliseconds (D1 without any test help).
+TEST_TAGS(test_pf_lock_write_failure_on_live_cluster_must_not_emit_precommit, "isolate,persistence-failure,D1");
+TEST(test_pf_lock_write_failure_on_live_cluster_must_not_emit_precommit) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_live", 0xAC);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWriteNoSpace, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  pf_require(!pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); }, 3000),
+             "live cluster: precommit A0 emitted although its lock write failed (D1 via peer echo)");
+}
+
+// Invariant P1 at the network level: no peer receives the precommit whose lock write failed.
+TEST_TAGS(test_pf_lock_write_failure_precommit_must_not_reach_peer, "isolate,persistence-failure,D1");
+TEST(test_pf_lock_write_failure_precommit_must_not_reach_peer) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_peer", 0xA6);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto me = f->target().local_validator_pubkey_for_test();
+  pf_prevote_a0(*f);
+  {
+    faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+    pf_complete_polka_a0(*f, o);
+    pf_require(faults::injected() >= 1, "fault injected");
+    (void)pf_prevote(*f, 0, a_id, o.pubs[2]);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  const auto own = make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, me);
+  pf_require(!pf_peer_had_precommit(*f->cluster.nodes[o.nodes[2]], own),
+             "peer received precommit A0 whose lock write failed (D1 over p2p)");
+}
+
+// Control for the probe above: with healthy storage the same precommit does reach the peer.
+TEST_TAGS(test_pf_control_healthy_precommit_reaches_peer, "isolate,persistence-failure");
+TEST(test_pf_control_healthy_precommit_reaches_peer) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_peer_control", 0xA7);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto me = f->target().local_validator_pubkey_for_test();
+  pf_prevote_a0(*f);
+  pf_complete_polka_a0(*f, o);
+  pf_require(wait_for_local_precommit(f->target(), f->height, 0, a_id), "healthy precommit");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  const auto own = make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, me);
+  pf_require(pf_peer_had_precommit(*f->cluster.nodes[o.nodes[2]], own), "peer received healthy precommit");
+}
+
+// While the process keeps running, the in-memory lock still blocks conflicting votes.
+TEST_TAGS(test_pf_lock_write_failure_running_node_refuses_conflicts, "isolate,persistence-failure");
+TEST(test_pf_lock_write_failure_running_node_refuses_conflicts) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_running", 0xA8);
+  pf_isolate_target(*f);
+  const auto o = pf_others(*f);
+  const auto b0_id = frontier_proposal_id(*f->b0);
+  const auto b1_id = frontier_proposal_id(*f->b1);
+  auto& t = f->target();
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b0));
+  pf_require(!t.local_prevote_recorded_for_test(f->height, 0, b0_id), "no prevote B0 in the same round");
+  pf_require(advance_test_frontier_round(t, f->height, 1), "advance to round 1");
+  const auto tc0 = pf_tc(*f, 0, {o.pubs[0], o.pubs[1], o.pubs[2]});
+  (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b1, std::nullopt, tc0));
+  pf_require(!t.local_prevote_recorded_for_test(f->height, 1, b1_id), "no prevote B1 without POL while locked in memory");
+}
+
+// Invariant P3: a precommit that left the process is remembered after a restart (its lock is
+// restored), for every write-failure outcome. Defect D4 (consequence of D1).
+TEST_TAGS(test_pf_emitted_precommit_lock_must_survive_restart, "isolate,persistence-failure,D4");
+TEST(test_pf_emitted_precommit_lock_must_survive_restart) {
+  std::vector<std::string> failures;  // every mode runs; all failures are reported together
+  for (const auto mode : kPfWalFaults) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_restart_" + pf_fault_name(mode), 0xA9);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    pf_prevote_a0(*f);
+    bool emitted = false;
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      pf_complete_polka_a0(*f, o);
+      pf_require(faults::injected() >= 1, "fault injected");
+      (void)pf_prevote(*f, 0, a_id, o.pubs[2]);
+      emitted = pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); });
+    }
+    pf_restart_target_isolated(*f);
+    const auto lock = f->target().local_vote_lock_for_test(f->height);
+    std::cerr << "[pf] mode=" << pf_fault_name(mode) << " precommit-emitted=" << emitted
+              << " lock-after-restart=" << (lock ? "yes" : "no") << "\n";
+    if (emitted && !(lock.has_value() && lock->first == a_id && lock->second == 0)) {
+      failures.push_back(pf_fault_name(mode) + ": precommit A0 was emitted but its lock is gone after restart (D4)");
+    }
+  }
+  pf_require(failures.empty(), pf_join(failures));
+}
+
+// Ambiguous outcome of the lock batch itself: the valid polka is made durable first (recorded while
+// the target is at round 1), so the fault hits exactly the lock write. Invariant: whatever the disk
+// outcome, nothing was emitted, and after restart the node either has the lock or has not voted.
+TEST_TAGS(test_pf_isolated_lock_write_fault_outcomes_after_restart, "isolate,persistence-failure");
+TEST(test_pf_isolated_lock_write_fault_outcomes_after_restart) {
+  for (const auto mode : kPfGateFaults) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_isolated_" + pf_fault_name(mode), 0xAA);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    auto& t = f->target();
+    pf_prevote_a0(*f);
+    pf_require(advance_test_frontier_round(t, f->height, 1), "advance to round 1");
+    pf_complete_polka_a0(*f, o);  // valid polka recorded durably; no lock (not the current round)
+    pf_require(t.valid_polka_for_height_for_test(f->height).has_value(), "valid polka recorded");
+    pf_require(!t.local_vote_lock_for_test(f->height).has_value(), "no lock yet");
+    pf_require(advance_test_frontier_round(t, f->height, 0), "back to round 0");
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      pf_require(pf_prevote(*f, 0, a_id, o.pubs[2]) == "accepted", "4th prevote accepted");
+      pf_require(faults::injected() >= 1, "fault hit the lock write");
+    }
+    const bool emitted = pf_within([&] { return t.local_vote_recorded_for_test(f->height, 0, a_id); });
+    pf_restart_target_isolated(*f);
+    const auto lock = f->target().local_vote_lock_for_test(f->height);
+    std::cerr << "[pf] isolated mode=" << pf_fault_name(mode) << " emitted=" << emitted
+              << " lock-after-restart=" << (lock ? "yes" : "no") << "\n";
+    pf_require(!emitted, pf_fault_name(mode) + ": no precommit after the failed lock write");
+    // After restart: the lock reappears exactly when the WAL bytes reached the file.
+    const bool expect_lock = mode == faults::Mode::FailWalSync || mode == faults::Mode::SyncThenFailWal;
+    pf_require(lock.has_value() == expect_lock, pf_fault_name(mode) + ": lock presence after restart");
+  }
+}
+
+// End-to-end safety trace. 4 validators, quorum 3: T (target, honest, lock write fails), H2 and H3
+// honest (simulated by their signed votes), B (Byzantine, signs both sides). Delivery is
+// asynchronous; every step is legal for its actor. Invariant (Agreement): two different transitions
+// must not both gather a valid quorum certificate at the same height. Defect D5.
+//
+//  r0: A proposed. T, H2, B prevote A (T's prevote durable). T's lock write fails (disk error).
+//      H3 prevotes A late, which re-enters T's polka handling. Before P1, T precommitted A@0 here
+//      (D1) and {T, H2, B} formed a quorum for A@0. T must not precommit A@0 now.
+//  T crashes and restarts: its durable state has the r0 prevote but no lock.
+//  r1: B proposes B1 (no POL, justified by the round-0 TC from H2, H3, B). T (no lock) and H3
+//      prevote B1, B prevotes B1 -> polka; T, H3, B precommit B1@1 -> quorum for B1@1.
+//  Two observer nodes (H2's and H3's) are each handed the certificate that the signatures actually
+//  produced allow: A@0 holds T's precommit only if T emitted it.
+// ENOSPC included since P5 (kPfGateFaults): the storage::DB write fence closed the E1 abort here.
+TEST_TAGS(test_pf_lock_write_failure_crash_must_not_allow_conflicting_finality, "isolate,persistence-failure,D5");
+TEST(test_pf_lock_write_failure_crash_must_not_allow_conflicting_finality) {
+  std::vector<std::string> failures;  // every mode runs; all failures are reported together
+  for (const auto mode : kPfGateFaults) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_split_" + pf_fault_name(mode), 0xAB);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    const PubKey32 h2 = o.pubs[0], byz = o.pubs[1], h3 = o.pubs[2];
+    const std::size_t h2_node = o.nodes[0], h3_node = o.nodes[2];
+    const auto a_id = frontier_proposal_id(*f->a0);
+    const auto b1_id = frontier_proposal_id(*f->b1);
+    const auto me = f->target().local_validator_pubkey_for_test();
+    const std::string m = pf_fault_name(mode);
+    pf_require(f->quorum == 3 && f->committee.size() == 4, "committee 4, quorum 3");
+
+    // r0
+    pf_prevote_a0(*f);
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      pf_require(pf_prevote(*f, 0, a_id, h2) == "accepted", "H2 prevote A0");
+      pf_require(pf_prevote(*f, 0, a_id, byz) == "accepted", "B prevote A0 (polka)");
+      pf_require(faults::injected() >= 1, "fault injected");
+      pf_require(pf_prevote(*f, 0, a_id, h3) == "accepted", "H3 late prevote A0 (re-entry)");
+    }
+    // Assertion 1: the failed lock write does not lead to a precommit for A@0, on any path.
+    const bool t_precommitted_a0 =
+        pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); }, 3000) ||
+        pf_own_precommit_in_rebroadcast(f->target(), f->height, 0, a_id);
+    std::cerr << "[pf-trace] mode=" << m << " T precommit A@0 emitted=" << t_precommitted_a0 << "\n";
+    if (t_precommitted_a0) failures.push_back(m + ": T precommitted A@0 after its lock write failed (D1)");
+
+    // crash + restart
+    pf_restart_target_isolated(*f);
+    auto& t = f->target();
+    std::cerr << "[pf-trace] mode=" << m << " T lock after restart=" << (t.local_vote_lock_for_test(f->height) ? "yes" : "no") << "\n";
+
+    // r1
+    pf_require(advance_test_frontier_round(t, f->height, 1), "T to round 1");
+    const auto tc0 = pf_tc(*f, 0, {h2, h3, byz});
+    pf_require(t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b1, std::nullopt, tc0)) ==
+                   "accepted",
+               "B1 proposal accepted");
+    const bool t_prevoted_b1 = t.local_prevote_recorded_for_test(f->height, 1, b1_id);
+    bool t_precommitted_b1 = false;
+    if (t_prevoted_b1) {
+      pf_require(pf_prevote(*f, 1, b1_id, h3) == "accepted", "H3 prevote B1");
+      pf_require(pf_prevote(*f, 1, b1_id, byz) == "accepted", "B prevote B1 (polka)");
+      t_precommitted_b1 = wait_for_local_precommit(t, f->height, 1, b1_id);
+    }
+    std::cerr << "[pf-trace] mode=" << m << " T prevote B1@1=" << t_prevoted_b1 << " precommit B1@1=" << t_precommitted_b1 << "\n";
+
+    // Certificates from the signatures that exist: T's only where T emitted the precommit (its
+    // signature is deterministic, so the byte-identical copy stands for the one it sent).
+    const auto sig_of = [](const Vote& v) { return FinalitySig{v.validator_pubkey, v.signature}; };
+    std::vector<FinalitySig> cert_a = {sig_of(make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, h2)),
+                                       sig_of(make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, byz))};
+    if (t_precommitted_a0) cert_a.push_back(sig_of(make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, me)));
+    std::vector<FinalitySig> cert_b = {sig_of(make_test_vote(pf_domain(*f), f->keys, f->height, 1, b1_id, h3)),
+                                       sig_of(make_test_vote(pf_domain(*f), f->keys, f->height, 1, b1_id, byz))};
+    if (t_precommitted_b1) cert_b.push_back(sig_of(make_test_vote(pf_domain(*f), f->keys, f->height, 1, b1_id, me)));
+    const bool a_final = inject_test_frontier_block(*f->cluster.nodes[h2_node], *f->a0, cert_a);
+    const bool b_final = inject_test_frontier_block(*f->cluster.nodes[h3_node], *f->b1, cert_b);
+    std::cerr << "[pf-trace] mode=" << m << " A@0 signatures=" << cert_a.size() << " finalized=" << a_final
+              << " | B1@1 signatures=" << cert_b.size() << " finalized=" << b_final << "\n";
+    // Assertion 3: no conflicting finality.
+    if (a_final && b_final) failures.push_back(m + ": two transitions finalized at one height (A@0 and B1@1)");
+    if (t_precommitted_a0 && t_precommitted_b1) {
+      failures.push_back(m + ": T precommitted A@0 and, after restart, B1@1 without a POL (lock rule broken)");
+    }
+  }
+  pf_require(failures.empty(), pf_join(failures));
+}
+
+// ---------- C. Prevote persistence ----------
+
+// Invariant: a prevote whose write failed is not emitted on the direct path. Proxy: with
+// quorum - 1 other prevotes no polka forms at the target, so its own prevote was never handled
+// (broadcast_prevote and handle_prevote are called together, node_consensus.cpp handle_propose_result).
+TEST_TAGS(test_pf_prevote_write_failure_prevote_not_emitted, "isolate,persistence-failure");
+TEST(test_pf_prevote_write_failure_prevote_not_emitted) {
+  for (const auto mode : kPfGateFaults) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_prevote_" + pf_fault_name(mode), 0xB0);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    auto& t = f->target();
+    pf_require(advance_test_frontier_round(t, f->height, 0), "round 0");
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      // Accepted, or (P5) soft-rejected because an earlier failed write already halted signing.
+      const auto r = t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0));
+      pf_require(r == "accepted" || (r == "soft-reject" && t.safety_storage_failed()), "A0 proposal accepted (got " + r + ")");
+      pf_require(faults::injected() >= 1, "fault injected");
+    }
+    std::cerr << "[pf] prevote mode=" << pf_fault_name(mode)
+              << " in-memory-prevote-record=" << t.local_prevote_recorded_for_test(f->height, 0, a_id) << "\n";
+    pf_complete_polka_a0(*f, o);
+    pf_require(!t.valid_polka_for_height_for_test(f->height).has_value(), "own prevote not counted locally");
+  }
+}
+
+// After a failed prevote write the node does not prevote again in that round, for A or B.
+TEST_TAGS(test_pf_prevote_write_failure_blocks_same_round_retry_and_conflict, "isolate,persistence-failure");
+TEST(test_pf_prevote_write_failure_blocks_same_round_retry_and_conflict) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_prevote_retry", 0xB1);
+  pf_isolate_target(*f);
+  const auto b0_id = frontier_proposal_id(*f->b0);
+  auto& t = f->target();
+  pf_require(advance_test_frontier_round(t, f->height, 0), "round 0");
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  // Accepted, or (P5) soft-rejected because an earlier failed write already halted signing.
+  const auto r = t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0));
+  pf_require(r == "accepted" || (r == "soft-reject" && t.safety_storage_failed()), "A0 accepted (got " + r + ")");
+  (void)pf_within([&] { return faults::injected() >= 1; }, 1000);
+  pf_require(faults::injected() >= 1, "fault injected");
+  (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b0));
+  pf_require(!t.local_prevote_recorded_for_test(f->height, 0, b0_id), "no prevote B0 in the same round");
+}
+
+// Invariant P6: the stall rebroadcast must not send a prevote whose write failed. Defect D6.
+// Asserted twice: no in-memory prevote record survives the failed write (the rebroadcast re-sends
+// that map), and the spy never received the prevote.
+// Target and a spy validator share the local bus; the proposal reaches the target without relay.
+// Positive control: a precommit by a validator outside the bus, held only by the target, reaches
+// the spy, which proves the target's stall rebroadcast fired.
+TEST_TAGS(test_pf_prevote_write_failure_rebroadcast_must_not_send_prevote, "isolate,persistence-failure,D6");
+TEST(test_pf_prevote_write_failure_rebroadcast_must_not_send_prevote) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_prevote_rebroadcast", 0xB2);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto me = f->target().local_validator_pubkey_for_test();
+  pf_isolate_target(*f);
+  auto& spy = pf_bus_spy(*f, o.nodes[2]);
+  auto& t = f->target();
+  pf_require(advance_test_frontier_round(t, f->height, 0), "round 0");
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_require(t.inject_propose_msg_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0)), "A0 delivered");
+  pf_require(faults::injected() >= 1, "fault injected");
+  pf_require(!t.local_prevote_recorded_for_test(f->height, 0, a_id),
+             "failed prevote write left a published in-memory prevote record (stall rebroadcast would send it)");
+  const auto marker = make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, o.pubs[0]);
+  pf_require(t.inject_vote_for_test(marker), "marker precommit held by the target only");
+  // Control, read-only on the spy (an injecting probe would itself store the marker it looks for).
+  // A fail-stopped target (P2) runs no stall rebroadcast: then the control is that it has nothing
+  // to rebroadcast.
+  if (t.safety_storage_failed()) {
+    pf_require(t.rebroadcast_sizes_for_test(f->height) == std::array<std::size_t, 3>{0, 0, 0},
+               "control: fail-stopped target has nothing to rebroadcast");
+  } else {
+    pf_require(wait_for([&] { return spy.vote_recorded_by_for_test(f->height, 0, a_id, o.pubs[0]); }, ci_timeout_seconds(30)),
+               "control: target's stall rebroadcast reached the spy");
+  }
+  // Bus deliveries run on separate threads, so the prevote of the same rebroadcast may still be in
+  // flight; let several more rebroadcast cycles (one per round timeout) pass.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  const auto own = make_test_prevote(pf_domain(*f), f->keys, f->height, 0, a_id, me);
+  pf_require(spy.inject_network_prevote_result_for_test(own) == "accepted",
+             "spy received prevote A0 whose write failed, via stall rebroadcast (D6)");
+}
+
+namespace {
+// Passive wire observer: a raw p2p peer that completes the handshake and records every PREVOTE and
+// VOTE frame the node sends it (direct broadcasts and stall rebroadcasts alike). It answers PING
+// with PONG to stay connected and sends nothing else: it never injects, accepts or relays a vote,
+// so it cannot create the evidence it observes. Votes are kept only if their signature verifies.
+class PfWireObserver {
+ public:
+  PfWireObserver(node::Node& n, const NetworkConfig& net, std::uint64_t nonce) : net_(net), domain_(n.consensus_domain_for_test()) {
+    p2p::VersionMsg v;
+    v.proto_version = static_cast<std::uint32_t>(net.protocol_version);
+    v.network_id = net.network_id;
+    v.feature_flags = net.feature_flags;
+    v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+    v.nonce = nonce;
+    v.node_software_version = "pf-wire-observer/1;crh=" + n.consensus_rules_fingerprint_for_test();
+    fd_ = connect_bootstrap_joiner_without_sync("127.0.0.1", n.p2p_port_for_test(), v, net);
+    if (!finalis::net::valid_socket(fd_)) throw std::runtime_error("observer connect failed");
+    reader_ = std::thread([this] { read_loop(); });
+  }
+  ~PfWireObserver() {
+    stop_.store(true);
+    finalis::net::shutdown_socket(fd_);
+    if (reader_.joinable()) reader_.join();
+    finalis::net::close_socket(fd_);
+  }
+  PfWireObserver(const PfWireObserver&) = delete;
+  PfWireObserver& operator=(const PfWireObserver&) = delete;
+
+  // Did the node send a validly signed prevote / precommit for (h, r, id) by `signer`?
+  bool saw_prevote(std::uint64_t h, std::uint32_t r, const Hash32& id, const PubKey32& signer) const {
+    return saw(prevotes_, h, r, id, signer);
+  }
+  bool saw_precommit(std::uint64_t h, std::uint32_t r, const Hash32& id, const PubKey32& signer) const {
+    return saw(precommits_, h, r, id, signer);
+  }
+  bool connected() const { return !closed_.load(); }
+  // PREVOTE, VOTE, TIMEOUT_VOTE and PROPOSE frames received so far, verified or not.
+  int consensus_frames() const { return consensus_frames_.load(); }
+  // Asks for the node's finalized tip (GET_FINALIZED_TIP); the FINALIZED_TIP replies, and any the node
+  // broadcasts unasked, are collected in tips().
+  bool request_tip() {
+    std::lock_guard<std::mutex> wl(write_mu_);
+    return p2p::write_frame_fd(fd_, p2p::Frame{p2p::MsgType::GET_FINALIZED_TIP, Bytes{}}, net_.magic, net_.protocol_version);
+  }
+  std::vector<std::uint64_t> tips() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return tips_;
+  }
+  // TRANSITION frames (finalized frontier + certificate broadcasts) received so far.
+  int transitions() const { return transitions_.load(); }
+
+ private:
+  bool saw(const std::vector<Vote>& votes, std::uint64_t h, std::uint32_t r, const Hash32& id, const PubKey32& signer) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return std::any_of(votes.begin(), votes.end(), [&](const Vote& v) {
+      return v.height == h && v.round == r && v.frontier_transition_id == id && v.validator_pubkey == signer;
+    });
+  }
+
+  void read_loop() {
+    while (!stop_.load()) {
+      p2p::FrameReadError err = p2p::FrameReadError::NONE;
+      auto frame = p2p::read_frame_fd_timed(fd_, net_.max_payload_len, net_.magic, net_.protocol_version, 200, 2000, &err);
+      if (!frame.has_value()) {
+        if (err == p2p::FrameReadError::TIMEOUT_HEADER || err == p2p::FrameReadError::TIMEOUT_BODY) continue;
+        break;
+      }
+      if (frame->msg_type == p2p::MsgType::PING) {
+        if (auto ping = p2p::de_ping(frame->payload); ping.has_value()) {
+          std::lock_guard<std::mutex> wl(write_mu_);
+          (void)p2p::write_frame_fd(fd_, p2p::Frame{p2p::MsgType::PONG, p2p::ser_ping(*ping)}, net_.magic, net_.protocol_version);
+        }
+      } else if (frame->msg_type == p2p::MsgType::FINALIZED_TIP) {
+        if (auto tip = p2p::de_finalized_tip(frame->payload); tip.has_value()) {
+          std::lock_guard<std::mutex> lk(mu_);
+          tips_.push_back(tip->height);
+        }
+      } else if (frame->msg_type == p2p::MsgType::TRANSITION) {
+        transitions_.fetch_add(1);
+      } else if (frame->msg_type == p2p::MsgType::PREVOTE) {
+        if (auto m = p2p::de_prevote(frame->payload); m.has_value() && verified(*m, false)) record(prevotes_, m->vote);
+      } else if (frame->msg_type == p2p::MsgType::VOTE) {
+        if (auto m = p2p::de_vote(frame->payload); m.has_value() && verified(*m, true)) record(precommits_, m->vote);
+      }
+      if (frame->msg_type == p2p::MsgType::PREVOTE || frame->msg_type == p2p::MsgType::VOTE ||
+          frame->msg_type == p2p::MsgType::TIMEOUT_VOTE || frame->msg_type == p2p::MsgType::PROPOSE) {
+        consensus_frames_.fetch_add(1);
+      }
+    }
+    closed_.store(true);
+  }
+
+  template <typename Msg>
+  bool verified(const Msg& m, bool precommit) const {
+    const auto& v = m.vote;
+    const Bytes msg = precommit ? vote_signing_message(domain_, v.height, v.round, v.frontier_transition_id)
+                                : prevote_signing_message(domain_, v.height, v.round, v.frontier_transition_id);
+    return crypto::ed25519_verify(msg, v.signature, v.validator_pubkey);
+  }
+
+  void record(std::vector<Vote>& into, const Vote& v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    into.push_back(v);
+  }
+
+  NetworkConfig net_;
+  Hash32 domain_;
+  finalis::net::SocketHandle fd_{finalis::net::kInvalidSocket};
+  std::thread reader_;
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> closed_{false};
+  std::atomic<int> consensus_frames_{0};
+  std::atomic<int> transitions_{0};
+  std::mutex write_mu_;
+  std::vector<std::uint64_t> tips_;
+  mutable std::mutex mu_;
+  std::vector<Vote> prevotes_;
+  std::vector<Vote> precommits_;
+};
+
+// Crash/restart of the target onto real p2p at its original port (its cluster peers are stopped).
+void pf_restart_target_p2p_only(TwoPhaseFixture& f) {
+  f.cluster.nodes[f.ti]->stop();
+  f.cluster.nodes[f.ti].reset();
+  f.cluster.configs[f.ti].disable_p2p = false;
+  f.cluster.configs[f.ti].listen = true;
+  f.cluster.configs[f.ti].p2p_port = f.cluster.ports[f.ti];
+  f.cluster.nodes[f.ti] = std::make_unique<node::Node>(f.cluster.configs[f.ti]);
+  pf_require(f.target().init(), "target re-init on p2p");
+  pf_require(f.target().pause_proposals_for_test(true), "pause target");
+  f.target().start();
+}
+}  // namespace
+
+// Invariant P3 for prevotes: a prevote that reached a peer is remembered after restart, so the node
+// cannot prevote a different transition in that round (on-chain slashable PREVOTE_EQUIVOCATION).
+//
+// Observation is passive: the target's cluster peers are stopped and its only peer is a
+// PfWireObserver, which records the signed PREVOTE / VOTE frames the target actually sends and never
+// injects or relays anything. One observer per target process (the connection ends with the process).
+//  - Control 1: a precommit signed by another member, held only by the target, appears on the wire:
+//    the target's stall rebroadcast ran (the path that re-sends in-memory prevote records).
+//  - A0 emitted: the target sent a signed A0 prevote, before or after the restart.
+//  - Control 2: when the restarted target records a B0 prevote, the signed B0 appears on the wire
+//    before the absence of an A0/B0 pair is taken to mean anything.
+// Violation: the target sent signed prevotes for both A0 and B0 at (h, 0).
+// ENOSPC included since P5 (kPfGateFaults): the storage::DB write fence closed the E1 abort here.
+TEST_TAGS(test_pf_rebroadcast_prevote_must_be_remembered_after_restart, "isolate,persistence-failure,D6");
+TEST(test_pf_rebroadcast_prevote_must_be_remembered_after_restart) {
+  std::vector<std::string> failures;  // every mode runs; all failures are reported together
+  for (const auto mode : kPfGateFaults) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_prevote_restart_" + pf_fault_name(mode), 0xB3);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    const auto b0_id = frontier_proposal_id(*f->b0);
+    const auto me = f->target().local_validator_pubkey_for_test();
+    const std::string m = pf_fault_name(mode);
+    const auto& net = f->cluster.configs[f->ti].network;
+    for (std::size_t k = 0; k < f->cluster.nodes.size(); ++k) {
+      if (k != f->ti) f->cluster.nodes[k]->stop();
+    }
+    pf_require(wait_for([&] { return f->target().status().established_peers == 0; }, ci_timeout_seconds(30)), "cluster peers gone");
+
+    bool a0_before = false;
+    {
+      PfWireObserver wire(f->target(), net, 0xD6B1);
+      pf_require(wait_for([&] { return f->target().status().established_peers >= 1; }, ci_timeout_seconds(10)), "observer established");
+      pf_require(advance_test_frontier_round(f->target(), f->height, 0), "round 0");
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      pf_require(f->target().inject_propose_msg_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0)), "A0 delivered");
+      pf_require(faults::injected() >= 1, "fault injected");
+      const auto marker = make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, o.pubs[0]);
+      pf_require(f->target().inject_vote_for_test(marker), "marker precommit held by the target only");
+      // After P2 the failed write fail-stops the node: the stall rebroadcast (the path that would
+      // re-send an in-memory prevote record) is closed instead of shown to run.
+      if (f->target().safety_storage_failed()) {
+        pf_require(f->target().rebroadcast_sizes_for_test(f->height) == std::array<std::size_t, 3>{0, 0, 0},
+                   "control 1: fail-stopped target has nothing to rebroadcast");
+      } else {
+        pf_require(wait_for([&] { return wire.saw_precommit(f->height, 0, a_id, o.pubs[0]); }, ci_timeout_seconds(30)),
+                   "control 1: the target's stall rebroadcast reached the observer");
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // several more rebroadcast cycles
+      a0_before = wire.saw_prevote(f->height, 0, a_id, me);
+      pf_require(wire.connected(), "observer stayed connected");
+    }
+    pf_restart_target_p2p_only(*f);
+    auto& t = f->target();
+    bool a0_after = false, b0_seen = false;
+    bool prevoted_b0 = false;
+    {
+      PfWireObserver wire(t, net, 0xD6B2);
+      pf_require(wait_for([&] { return t.status().established_peers >= 1; }, ci_timeout_seconds(10)), "observer established after restart");
+      pf_require(advance_test_frontier_round(t, f->height, 0), "round 0 after restart");
+      (void)t.inject_propose_msg_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b0));
+      prevoted_b0 = t.local_prevote_recorded_for_test(f->height, 0, b0_id);
+      if (prevoted_b0) {
+        b0_seen = wait_for([&] { return wire.saw_prevote(f->height, 0, b0_id, me); }, ci_timeout_seconds(10));
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(3000));  // stall rebroadcasts of any restored prevote
+      a0_after = wire.saw_prevote(f->height, 0, a_id, me);
+      b0_seen = b0_seen || wire.saw_prevote(f->height, 0, b0_id, me);
+      pf_require(wire.connected(), "observer stayed connected after restart");
+    }
+    const bool a0_sent = a0_before || a0_after;
+    std::cerr << "[pf] prevote-restart mode=" << m << " wire-A0-before-restart=" << a0_before << " wire-A0-after-restart=" << a0_after
+              << " recorded-B0-after-restart=" << prevoted_b0 << " wire-B0=" << b0_seen << "\n";
+    if (prevoted_b0 && !b0_seen) {
+      failures.push_back(m + ": harness: the target recorded B0 but no B0 reached the observer, so the check is inconclusive");
+    }
+    if (a0_sent && b0_seen) {
+      failures.push_back(m + ": honest node sent signed prevotes for A0 and B0 in the same round (PREVOTE_EQUIVOCATION)");
+    }
+  }
+  pf_require(failures.empty(), pf_join(failures));
+}
+
+// ---------- Restart recovery matrix (safety rows edited between runs) ----------
+
+namespace {
+// Healthy run: lock + precommit on A0, then the target is stopped. Returns the target's db path.
+std::string pf_locked_then_stopped(TwoPhaseFixture& f) {
+  const auto o = pf_others(f);
+  const auto a_id = frontier_proposal_id(*f.a0);
+  pf_prevote_a0(f);
+  pf_complete_polka_a0(f, o);
+  pf_require(wait_for_local_precommit(f.target(), f.height, 0, a_id), "healthy precommit A0");
+  f.cluster.nodes[f.ti]->stop();
+  return pf_db(f);
+}
+}  // namespace
+
+TEST_TAGS(test_pf_recovery_corrupt_mirror_valid_primary_keeps_lock, "isolate,persistence-failure");
+TEST(test_pf_recovery_corrupt_mirror_valid_primary_keeps_lock) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_rec_mirror", 0xC0);
+  const auto db_path = pf_locked_then_stopped(*f);
+  {
+    storage::DB db;
+    pf_require(db.open(db_path), "open");
+    pf_require(db.put(csafe_mirror_db_key(f->height), Bytes{0x43, 0x53, 0x46, 0x32, 0xFF}), "corrupt mirror");
+    pf_require(db.flush(), "flush");
+  }
+  pf_restart_target_isolated(*f);
+  const auto lock = f->target().local_vote_lock_for_test(f->height);
+  pf_require(lock.has_value() && lock->first == frontier_proposal_id(*f->a0), "lock kept from primary");
+  pf_require(f->target().abstain_heights_for_test().empty(), "no abstention");
+  f->target().stop();
+  storage::DB db;
+  pf_require(db.open_readonly(db_path), "reopen");
+  const auto mirror = db.get(csafe_mirror_db_key(f->height));
+  pf_require(mirror.has_value() && *mirror != (Bytes{0x43, 0x53, 0x46, 0x32, 0xFF}), "mirror rewritten");
+}
+
+TEST_TAGS(test_pf_recovery_both_rows_corrupt_abstains_across_restarts, "isolate,persistence-failure");
+TEST(test_pf_recovery_both_rows_corrupt_abstains_across_restarts) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_rec_both_corrupt", 0xC1);
+  const auto db_path = pf_locked_then_stopped(*f);
+  {
+    storage::DB db;
+    pf_require(db.open(db_path), "open");
+    pf_require(db.put(csafe_db_key(f->height), Bytes{0x01}), "corrupt primary");
+    pf_require(db.put(csafe_mirror_db_key(f->height), Bytes{0x02}), "corrupt mirror");
+    pf_require(db.flush(), "flush");
+  }
+  for (int i = 0; i < 3; ++i) {
+    pf_restart_target_isolated(*f);
+    pf_require(f->target().abstain_heights_for_test().count(f->height) == 1, "abstains on restart " + std::to_string(i));
+    pf_require(advance_test_frontier_round(f->target(), f->height, 1), "round 1");
+    const auto tc0 = make_test_timeout_certificate(pf_domain(*f), f->keys, f->committee, f->height, 0, f->quorum);
+    (void)f->target().inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b1, std::nullopt, tc0));
+    pf_require(!f->target().local_prevote_recorded_for_test(f->height, 1, frontier_proposal_id(*f->b1)), "no vote while abstaining");
+  }
+}
+
+// Invariant P5 (as the audit brief states it): with the vote history unavailable, the node must not
+// silently resume unrestricted voting. Both rows deleted after a precommit: without more, the node
+// cannot tell this from "never voted" (G1). Fixed by P6: CSAFE_HIGHWATER records the highest height
+// that had a row, and a height below it with no row is quarantined (the node abstains there).
+TEST_TAGS(test_pf_recovery_both_rows_missing_after_precommit_must_not_vote_freely, "isolate,persistence-failure,G1");
+TEST(test_pf_recovery_both_rows_missing_after_precommit_must_not_vote_freely) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_rec_missing", 0xC2);
+  const auto db_path = pf_locked_then_stopped(*f);
+  {
+    storage::DB db;
+    pf_require(db.open(db_path), "open");
+    pf_require(db.erase(csafe_db_key(f->height)), "erase primary");
+    pf_require(db.erase(csafe_mirror_db_key(f->height)), "erase mirror");
+    pf_require(db.flush(), "flush");
+  }
+  pf_restart_target_isolated(*f);
+  auto& t = f->target();
+  std::cerr << "[pf] rows-missing lock=" << (t.local_vote_lock_for_test(f->height) ? "yes" : "no")
+            << " abstain=" << t.abstain_heights_for_test().count(f->height) << "\n";
+  pf_require(advance_test_frontier_round(t, f->height, 1), "round 1");
+  const auto tc0 = make_test_timeout_certificate(pf_domain(*f), f->keys, f->committee, f->height, 0, f->quorum);
+  (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b1, std::nullopt, tc0));
+  pf_require(!t.local_prevote_recorded_for_test(f->height, 1, frontier_proposal_id(*f->b1)),
+             "rows missing after a precommit: node prevoted B1 without a POL (P5 gap)");
+  pf_require(t.abstain_heights_for_test().count(f->height) == 1, "abstains at the height with missing rows");
+}
+
+// Primary and mirror both valid but different (an older primary restored over a newer one): load
+// preferred the primary without comparing, so the newer lock was lost (G2). Fixed by P6: the two
+// copies are written in one batch, so a difference is outside damage and neither is trusted: the
+// height is quarantined and the node abstains there (it never votes as if unlocked).
+TEST_TAGS(test_pf_recovery_stale_primary_newer_mirror_must_keep_lock, "isolate,persistence-failure,G2");
+TEST(test_pf_recovery_stale_primary_newer_mirror_must_keep_lock) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_rec_stale_primary", 0xC3);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_prevote_a0(*f);
+  std::optional<Bytes> old_primary;
+  {
+    // Snapshot the prevote-only row from a read-only handle while the node runs.
+    storage::DB ro;
+    pf_require(ro.open_readonly(pf_db(*f)), "open ro");
+    old_primary = ro.get(csafe_db_key(f->height));
+  }
+  pf_require(old_primary.has_value(), "prevote-only primary row exists");
+  pf_complete_polka_a0(*f, o);
+  pf_require(wait_for_local_precommit(f->target(), f->height, 0, a_id), "precommit A0");
+  f->cluster.nodes[f->ti]->stop();
+  {
+    storage::DB db;
+    pf_require(db.open(pf_db(*f)), "open");
+    pf_require(db.put(csafe_db_key(f->height), *old_primary), "restore old primary");
+    pf_require(db.flush(), "flush");
+  }
+  pf_restart_target_isolated(*f);
+  auto& t = f->target();
+  pf_require(t.abstain_heights_for_test().count(f->height) == 1, "stale-but-valid primary hid the newer mirror's lock");
+  pf_require(advance_test_frontier_round(t, f->height, 1), "round 1");
+  const auto tc0 = make_test_timeout_certificate(pf_domain(*f), f->keys, f->committee, f->height, 0, f->quorum);
+  (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b1, std::nullopt, tc0));
+  pf_require(!t.local_prevote_recorded_for_test(f->height, 1, frontier_proposal_id(*f->b1)), "no vote while abstaining");
+}
+
+// ---------- Round 3: recovery, controls and remaining vote paths ----------
+
+namespace {
+// Crash/restart of the target back onto real p2p (its original port), so it rejoins the cluster.
+void pf_restart_target_on_p2p(TwoPhaseFixture& f) {
+  f.cluster.nodes[f.ti]->stop();
+  f.cluster.nodes[f.ti].reset();
+  f.cluster.configs[f.ti].disable_p2p = false;
+  f.cluster.configs[f.ti].listen = true;
+  f.cluster.configs[f.ti].p2p_port = f.cluster.ports[f.ti];
+  f.cluster.nodes[f.ti] = std::make_unique<node::Node>(f.cluster.configs[f.ti]);
+  pf_require(f.target().init(), "target re-init on p2p");
+  f.target().start();
+}
+
+bool pf_holds_precommit_from(const node::Node& n, std::uint64_t h, std::uint32_t r, const Hash32& id, const PubKey32& signer) {
+  for (const auto& v : n.precommits_for_rebroadcast_for_test(h)) {
+    if (v.validator_pubkey == signer && v.round == r && v.frontier_transition_id == id) return true;
+  }
+  return false;
+}
+}  // namespace
+
+// Liveness control (P7): after a failed lock write that emitted nothing, a restart on a healthy disk
+// lets the node rejoin and the cluster finalize the height, with one transition everywhere.
+// Guards against "safe" results that only come from a node abstaining forever.
+TEST_TAGS(test_pf_recovery_failed_lock_write_then_restart_cluster_finalizes, "isolate,persistence-failure");
+TEST(test_pf_recovery_failed_lock_write_then_restart_cluster_finalizes) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_recovery_live", 0xD0);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_isolate_target(*f);
+  pf_prevote_a0(*f);
+  {
+    faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+    pf_complete_polka_a0(*f, o);
+    pf_require(faults::injected() >= 1, "fault injected");
+    pf_require(!pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); }), "nothing emitted");
+  }
+  pf_restart_target_on_p2p(*f);
+  for (auto& n : f->cluster.nodes) pf_require(n->pause_proposals_for_test(false), "unpause");
+  pf_require(wait_for([&] {
+               for (const auto& n : f->cluster.nodes) {
+                 if (n->status().height < f->height) return false;
+               }
+               return true;
+             }, ci_timeout_seconds(120)),
+             "every node finalized the height after the target's recovery");
+  const auto tip = f->cluster.nodes[0]->status();
+  for (const auto& n : f->cluster.nodes) {
+    pf_require(n->status().height >= f->height, "height reached");
+  }
+  pf_require(wait_for_same_tip(f->cluster.nodes, ci_timeout_seconds(30)), "one tip everywhere");
+  (void)tip;
+}
+
+// Harness control at node level: a fault armed for another node's DB leaves the target's lock path
+// healthy (precommit emitted, lock durable across restart).
+TEST_TAGS(test_pf_control_fault_on_other_node_leaves_target_healthy, "isolate,persistence-failure");
+TEST(test_pf_control_fault_on_other_node_leaves_target_healthy) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_other_node_fault", 0xD1);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_isolate_target(*f);
+  pf_prevote_a0(*f);
+  {
+    faults::Scoped fault(f->cluster.configs[o.nodes[0]].db_path, faults::Mode::FailWalWrite, kPfFaultCount);
+    pf_complete_polka_a0(*f, o);
+    pf_require(wait_for_local_precommit(f->target(), f->height, 0, a_id), "target precommits normally");
+  }
+  pf_restart_target_isolated(*f);
+  const auto lock = f->target().local_vote_lock_for_test(f->height);
+  pf_require(lock.has_value() && lock->first == a_id && lock->second == 0, "target lock durable");
+}
+
+// Precommits from other validators are not a re-entry path: after a failed lock write, their
+// arrival (2 of 3, below quorum) must not make the node precommit.
+TEST_TAGS(test_pf_lock_write_failure_peer_precommits_do_not_emit_precommit, "isolate,persistence-failure");
+TEST(test_pf_lock_write_failure_peer_precommits_do_not_emit_precommit) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_peer_precommits", 0xD2);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_isolate_target(*f);
+  auto& t = f->target();  // after the isolating restart: it replaces the node
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  for (std::size_t i = 0; i < 2; ++i) {
+    pf_require(t.inject_network_vote_result_for_test(make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, o.pubs[i])) ==
+                   "accepted",
+               "peer precommit accepted");
+  }
+  pf_require(!pf_within([&] { return t.local_vote_recorded_for_test(f->height, 0, a_id); }),
+             "peer precommits re-entered the polka path");
+}
+
+namespace {
+// The node's own answer to GET_FINALIZED_TIP, via the passive observer.
+std::optional<std::uint64_t> pf_tip_reply(PfWireObserver& wire) {
+  const auto before = wire.tips().size();
+  if (!wire.request_tip()) return std::nullopt;
+  if (!wait_for([&] { return wire.tips().size() > before; }, std::chrono::milliseconds(5000))) return std::nullopt;
+  return wire.tips().back();
+}
+
+// Target on real p2p with its cluster peers stopped and one PfWireObserver connected; it has
+// prevoted A0, locked on the A0 polka and precommitted A0, all durably (storage healthy).
+void pf_locked_on_a0_with_observer(TwoPhaseFixture& f, const PfOthers& o, std::unique_ptr<PfWireObserver>* wire,
+                                   std::uint64_t nonce) {
+  auto& t = f.target();
+  for (std::size_t k = 0; k < f.cluster.nodes.size(); ++k) {
+    if (k != f.ti) f.cluster.nodes[k]->stop();
+  }
+  pf_require(wait_for([&] { return t.status().established_peers == 0; }, ci_timeout_seconds(30)), "cluster peers gone");
+  *wire = std::make_unique<PfWireObserver>(t, f.cluster.configs[f.ti].network, nonce);
+  pf_require(wait_for([&] { return t.status().established_peers >= 1; }, ci_timeout_seconds(10)), "observer established");
+  pf_prevote_a0(f);
+  pf_complete_polka_a0(f, o);
+  pf_require(wait_for_local_precommit(t, f.height, 0, frontier_proposal_id(*f.a0)), "healthy precommit A0");
+}
+}  // namespace
+
+// Invariant (D7): a finalized height is reported (status, GET_FINALIZED_TIP replies, TRANSITION /
+// FINALIZED_TIP broadcasts) only once its batch is durable; a failed finalization write leaves the
+// previous finalized state live, enters fail-stop, and a restart never rolls back a reported height.
+// The finalization batch is the first failing write: lock and precommit were written while healthy.
+TEST_TAGS(test_pf_failed_disk_finalization_is_not_reported_unless_persisted, "isolate,persistence-failure,D7");
+TEST(test_pf_failed_disk_finalization_is_not_reported_unless_persisted) {
+  std::vector<std::string> failures;
+  for (const auto mode : kPfGateFaults) {
+    const std::string m = pf_fault_name(mode);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_finalize_failed_disk_" + m, 0xD3);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    auto& t = f->target();
+    std::unique_ptr<PfWireObserver> wire;
+    pf_locked_on_a0_with_observer(*f, o, &wire, 0xD701);
+    const auto h0 = t.status().height;
+    pf_require(h0 + 1 == f->height, m + ": open height is the next one");
+    const auto tip0 = pf_tip_reply(*wire);
+    pf_require(tip0.has_value() && *tip0 == h0, m + ": control: tip reply is the finalized height before the fault");
+    const int transitions0 = wire->transitions();
+    std::uint64_t max_reported = h0;
+    bool halted = false;
+    std::string failure;
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      for (std::size_t i = 0; i < 2; ++i) {  // own precommit + 2 = quorum 3: finalization runs now
+        (void)t.inject_network_vote_result_for_test(make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, o.pubs[i]));
+      }
+      pf_require(faults::injected() >= 1, m + ": fault injected");
+      (void)pf_within([&] {
+        max_reported = std::max(max_reported, t.status().height);
+        return false;
+      }, 1500);
+      halted = t.safety_storage_failed();
+      failure = t.safety_storage_failure_for_test();
+      if (const auto tip = pf_tip_reply(*wire); tip.has_value()) max_reported = std::max(max_reported, *tip);
+      else failures.push_back(m + ": no tip reply after the failed write");
+      for (const auto h : wire->tips()) max_reported = std::max(max_reported, h);
+    }
+    if (!halted || failure.rfind("finalization height=" + std::to_string(f->height), 0) != 0) {
+      failures.push_back(m + ": failed finalization write did not enter fail-stop as finalization (got \"" + failure + "\")");
+    }
+    if (max_reported != h0) {
+      failures.push_back(m + ": height " + std::to_string(max_reported) + " reported although its write failed");
+    }
+    if (wire->transitions() != transitions0) failures.push_back(m + ": finalized frontier broadcast after a failed write");
+    wire.reset();
+    pf_restart_target_isolated(*f);
+    const auto after = f->target().status().height;
+    std::cerr << "[pf] failed-disk finalization mode=" << m << " h0=" << h0 << " max-reported=" << max_reported
+              << " after-restart=" << after << " halted=" << halted << " failure=\"" << failure << "\"\n";
+    // A sync-then-EIO write is durable although it failed: the restart may find the new height (disk
+    // ahead of what was reported), never a lower one.
+    if (after < max_reported) failures.push_back(m + ": restart rolled back reported height " + std::to_string(max_reported));
+  }
+  pf_require(failures.empty(), pf_join(failures));
+}
+
+// Same through the delivered path (a certified block from a peer: handle_frontier_block_locked).
+TEST_TAGS(test_pf_failed_disk_delivered_finalization_is_not_reported, "isolate,persistence-failure,D7");
+TEST(test_pf_failed_disk_delivered_finalization_is_not_reported) {
+  for (const auto mode : kPfGateFaults) {
+    const std::string m = pf_fault_name(mode);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_delivered_failed_disk_" + m, 0xD5);
+    pf_isolate_target(*f);
+    auto& t = f->target();
+    const auto h0 = t.status().height;
+    const auto quorum = consensus::quorum_threshold(f->committee.size());
+    auto qc = make_test_frontier_qc(pf_domain(*f), f->keys, f->committee, *f->a0, quorum);
+    FinalityCertificate cert;
+    cert.height = f->height;
+    cert.round = 0;
+    cert.frontier_transition_id = frontier_proposal_id(*f->a0);
+    cert.quorum_threshold = static_cast<std::uint32_t>(quorum);
+    cert.committee_members = f->committee;
+    cert.signatures = qc.signatures;
+    bool accepted = false;
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      accepted = t.inject_frontier_transition_for_test(*f->a0, cert);
+      pf_require(faults::injected() >= 1, m + ": fault injected");
+    }
+    pf_require(!accepted, m + ": delivery whose write failed is not accepted");
+    pf_require(t.status().height == h0, m + ": status keeps the previous finalized height");
+    pf_require(t.safety_storage_failed() &&
+                   t.safety_storage_failure_for_test().rfind("finalization height=" + std::to_string(f->height), 0) == 0,
+               m + ": fail-stop as finalization (got \"" + t.safety_storage_failure_for_test() + "\")");
+    pf_restart_target_isolated(*f);
+    pf_require(f->target().status().height >= h0, m + ": no rollback below the previous height");
+  }
+}
+
+// Control for the above: with storage healthy the same finalization is reported at once (status, tip
+// reply), and a restart finds exactly that height and transition.
+TEST_TAGS(test_pf_successful_finalization_is_durable_across_restart, "isolate,persistence-failure");
+TEST(test_pf_successful_finalization_is_durable_across_restart) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_finalize_durable", 0xD6);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  auto& t = f->target();
+  std::unique_ptr<PfWireObserver> wire;
+  pf_locked_on_a0_with_observer(*f, o, &wire, 0xD702);
+  for (std::size_t i = 0; i < 2; ++i) {
+    (void)t.inject_network_vote_result_for_test(make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, o.pubs[i]));
+  }
+  pf_require(wait_for([&] { return t.status().height == f->height; }, ci_timeout_seconds(10)), "finalized A0");
+  pf_require(t.status().transition_hash == a_id, "finalized transition is A0");
+  const auto tip = pf_tip_reply(*wire);
+  pf_require(tip.has_value() && *tip == f->height, "tip reply reports the new height");
+  pf_require(!t.safety_storage_failed(), "healthy node not halted");
+  wire.reset();
+  pf_restart_target_isolated(*f);
+  pf_require(f->target().status().height == f->height, "restart finds the finalized height");
+  pf_require(f->target().status().transition_hash == a_id, "restart finds the finalized transition");
+}
+
+// Round advancement after a failed lock write: once the node is in round 1, a late round-0 prevote no
+// longer reaches the precommit path (current-round check), but the in-memory round-0 lock is still
+// in the stall rebroadcast set (D2, asserted in its own test).
+TEST_TAGS(test_pf_lock_write_failure_round_advance_closes_direct_path, "isolate,persistence-failure");
+TEST(test_pf_lock_write_failure_round_advance_closes_direct_path) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_round_advance", 0xD4);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  pf_isolate_target(*f);
+  auto& t = f->target();  // after the isolating restart: it replaces the node
+  pf_prevote_a0(*f);
+  faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+  pf_complete_polka_a0(*f, o);
+  pf_require(faults::injected() >= 1, "fault injected");
+  pf_require(advance_test_frontier_round(t, f->height, 1), "round 1");
+  pf_require(pf_prevote(*f, 0, a_id, o.pubs[2]) == "accepted", "late round-0 prevote accepted");
+  pf_require(!pf_within([&] { return t.local_vote_recorded_for_test(f->height, 0, a_id); }), "no round-0 precommit from round 1");
+}
+
+// Crash between a durable precommit and its receipt: the precommit left for an empty bus, the node
+// restarts, and its restored lock makes the stall rebroadcast deliver the precommit to a peer that
+// joins afterwards (observed without consuming: the peer's own rebroadcast set holds it).
+TEST_TAGS(test_pf_crash_after_durable_precommit_before_receipt_is_redelivered, "isolate,persistence-failure");
+TEST(test_pf_crash_after_durable_precommit_before_receipt_is_redelivered) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_crash_before_receipt", 0xD5);
+  const auto o = pf_others(*f);
+  const auto a_id = frontier_proposal_id(*f->a0);
+  const auto me = f->target().local_validator_pubkey_for_test();
+  pf_isolate_target(*f);
+  pf_prevote_a0(*f);
+  pf_complete_polka_a0(*f, o);
+  pf_require(wait_for_local_precommit(f->target(), f->height, 0, a_id), "durable precommit A0 (no one listening)");
+  pf_restart_target_isolated(*f);
+  pf_require(f->target().local_vote_lock_for_test(f->height).has_value(), "lock restored");
+  auto& spy = pf_bus_spy(*f, o.nodes[2]);
+  pf_require(wait_for([&] { return pf_holds_precommit_from(spy, f->height, 0, a_id, me); }, ci_timeout_seconds(30)),
+             "restarted node re-delivered its precommit to a peer");
+}
+
+// Restart consistency: every finalized state a node accepted live must load again after a restart.
+// The startup derivation (verify_frontier_finality_certificate) rejects a certificate from a round
+// below the transition's own round ("certificate-round-mismatch"). The live path accepted such a
+// quorum of precommits, so the node could not start again (R1). Producing one needs more than f
+// signers (honest validators never vote for a transition below its round), so it is outside the BFT
+// fault model; the divergence between the two checks was the defect. Fixed by P4: the live polka,
+// lock and finalization paths share consensus::vote_round_covers_transition with the derivation.
+// Found by fuzz_consensus_persistence (faults disabled).
+TEST_TAGS(test_pf_finalized_state_must_reload_after_restart, "isolate,beyond-fault-model,R1");
+TEST(test_pf_finalized_state_must_reload_after_restart) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_reload_finalized", 0xD6);
+  const auto o = pf_others(*f);
+  const auto b1_id = frontier_proposal_id(*f->b1);
+  pf_isolate_target(*f);
+  auto& t = f->target();  // after the isolating restart: it replaces the node
+  pf_require(advance_test_frontier_round(t, f->height, 1), "round 1");
+  const auto tc0 = make_test_timeout_certificate(pf_domain(*f), f->keys, f->committee, f->height, 0, f->quorum);
+  pf_require(t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b1, std::nullopt, tc0)) ==
+                 "accepted",
+             "B1 (transition round 1) body held");
+  for (std::size_t i = 0; i < 3; ++i) {
+    (void)t.inject_network_vote_result_for_test(make_test_vote(pf_domain(*f), f->keys, f->height, 0, b1_id, o.pubs[i]));
+  }
+  const bool finalized_live = wait_for([&] { return t.status().height >= f->height; }, std::chrono::milliseconds(3000));
+  std::cerr << "[pf] round-0 certificate for a round-1 transition finalized live=" << finalized_live << "\n";
+  pf_require(!finalized_live, "the live path ignores a precommit quorum below the transition's round");
+  t.stop();
+  f->cluster.nodes[f->ti].reset();
+  f->cluster.nodes[f->ti] = std::make_unique<node::Node>(f->cluster.configs[f->ti]);
+  pf_require(f->target().init(), "node restarts from its own database (R1)");
+}
+
+// Control for R1: the same transition finalizes live from a precommit quorum of its own round, and the
+// node restarts at that height.
+TEST_TAGS(test_pf_finalized_state_from_transition_round_reloads, "isolate,R1");
+TEST(test_pf_finalized_state_from_transition_round_reloads) {
+  auto f = make_two_phase_fixture("/tmp/finalis_pf_reload_finalized_ok", 0xD8);
+  const auto o = pf_others(*f);
+  const auto b1_id = frontier_proposal_id(*f->b1);
+  pf_isolate_target(*f);
+  auto& t = f->target();  // after the isolating restart: it replaces the node
+  pf_require(advance_test_frontier_round(t, f->height, 1), "round 1");
+  const auto tc0 = make_test_timeout_certificate(pf_domain(*f), f->keys, f->committee, f->height, 0, f->quorum);
+  pf_require(t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->b1, std::nullopt, tc0)) ==
+                 "accepted",
+             "B1 (transition round 1) body held");
+  for (std::size_t i = 0; i < 3; ++i) {
+    (void)t.inject_network_vote_result_for_test(make_test_vote(pf_domain(*f), f->keys, f->height, 1, b1_id, o.pubs[i]));
+  }
+  pf_require(wait_for([&] { return t.status().height >= f->height; }, std::chrono::milliseconds(5000)),
+             "round-1 certificate finalizes B1 live");
+  t.stop();
+  f->cluster.nodes[f->ti].reset();
+  f->cluster.nodes[f->ti] = std::make_unique<node::Node>(f->cluster.configs[f->ti]);
+  pf_require(f->target().init(), "node restarts at the finalized height");
+  pf_require(f->target().status().height >= f->height, "finalized height survives the restart");
+}
+
+// E1: an ENOSPC WAL failure on the lock path (the valid-polka write, then the lock write in the same
+// on_prevotes_changed_locked call) can abort the process inside the system librocksdb
+// (WritableFileWriter::Append assertion `sync_without_flush_called_`, stack:
+// lock_on_polka_locked -> DB::write_batch_durable -> DBImpl::Write) instead of returning an error. The
+// invariant asserted is the minimal one: a disk-full error must not kill the validator, and no
+// precommit may follow the failed lock write. Intermittent (seen 4/4 times under ENOSPC only), so the
+// scenario is repeated; the child-process isolation turns an abort into this test's failure.
+// Mechanism (P5, test_storage_raw_rocksdb_enospc_reuses_failed_wal_writer): RocksDB auto-resumes
+// after the ENOSPC and a later write reaches the failed WAL writer; the DB write fence stops that.
+TEST_TAGS(test_pf_enospc_wal_failure_must_not_abort_node, "isolate,persistence-failure,E1");
+TEST(test_pf_enospc_wal_failure_must_not_abort_node) {
+  for (int i = 0; i < 8; ++i) {
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_enospc_abort_" + std::to_string(i), 0xD7);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    pf_isolate_target(*f);
+    pf_prevote_a0(*f);
+    {
+      faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWriteNoSpace, kPfFaultCount);
+      pf_complete_polka_a0(*f, o);
+      pf_require(faults::injected() >= 1, "fault injected");
+      pf_require(!pf_within([&] { return f->target().local_vote_recorded_for_test(f->height, 0, a_id); }),
+                 "no precommit after the failed lock write");
+    }
+    pf_restart_target_isolated(*f);
+  }
+}
+
+// ---------- P2. Fail-stop after a failed safety-critical write ----------
+//
+// Oracle shared by these tests: consensus_signature_count_for_test counts every validator-key
+// signature (sign_consensus_locked / vrf_prove_consensus_locked, under mu_), and fail-stop entry
+// snapshots it under mu_. signatures_after_fail_stop_for_test is the difference, so any signing path
+// that ran after the failure was published, from any thread, shows up as a non-zero value.
+namespace {
+// The node fail-stopped, named for the path under test, or (P5) for an earlier failed write of the
+// event loop's: the fault stays armed for every write, as a failing disk does, and whichever write
+// comes first fences the DB and halts the node before the path under test signs. Either is reported.
+void pf_require_halted(node::Node& t, const std::string& what, const std::string& operation_prefixes) {
+  pf_require(t.safety_storage_failed(), what + ": node entered fail-stop");
+  // A fence from a non-safety write is entered formally by the event loop on its next tick.
+  (void)wait_for([&] { return !t.safety_storage_failure_for_test().empty(); }, std::chrono::milliseconds(3000));
+  const auto failure = t.safety_storage_failure_for_test();
+  bool known = false;
+  std::istringstream ops(operation_prefixes);
+  for (std::string op; std::getline(ops, op, ',');) known = known || failure.rfind(op, 0) == 0;
+  const bool earlier_write = failure.rfind("storage-write: ", 0) == 0;
+  std::cerr << "[pf] halted " << what << " on=" << (known ? "path-under-test" : earlier_write ? "earlier-write" : "unknown")
+            << " failure=\"" << failure.substr(0, 120) << "\"\n";
+  pf_require(known || earlier_write, what + ": failure names the operation (got \"" + failure + "\")");
+  pf_require(failure.find(": ") != std::string::npos && failure.size() > failure.find(": ") + 2,
+             what + ": failure carries the storage error (got \"" + failure + "\")");
+}
+
+void pf_require_no_signature_after_fail_stop(node::Node& t, const std::string& what) {
+  const auto n = t.signatures_after_fail_stop_for_test();
+  pf_require(n == 0, what + ": " + std::to_string(n) + " validator-key signature(s) made after fail-stop");
+}
+
+// Every in-process signing path a halted node could still be driven into, at round 0 and round 1.
+void pf_drive_signing_paths_after_halt(TwoPhaseFixture& f, const PfOthers& o, const std::string& m) {
+  auto& t = f.target();
+  const auto a_id = frontier_proposal_id(*f.a0);
+  (void)pf_prevote(f, 0, a_id, o.pubs[2]);  // re-entry (D1 path)
+  (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(f), *f.a0));  // body re-delivery
+  pf_require(t.rebroadcast_sizes_for_test(f.height) == std::array<std::size_t, 3>{0, 0, 0}, m + ": stall rebroadcast empty");
+  t.reseed_local_votes_for_test(f.height);
+  pf_require(!t.local_vote_recorded_for_test(f.height, 0, a_id), m + ": reseed recorded no own precommit");
+  // A new round and a new value: the node would prevote B1 if it were healthy (no lock was published).
+  pf_require(advance_test_frontier_round(t, f.height, 1), m + ": advance to round 1");
+  (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(f), *f.b1));
+  pf_require(!t.local_prevote_recorded_for_test(f.height, 1, frontier_proposal_id(*f.b1)), m + ": no prevote B1 after fail-stop");
+  pf_require(!t.local_vote_recorded_for_test(f.height, 1, frontier_proposal_id(*f.b1)), m + ": no precommit B1 after fail-stop");
+  pf_require(!pf_own_precommit_in_rebroadcast(t, f.height, 0, a_id), m + ": no precommit A0 in rebroadcast");
+}
+}  // namespace
+
+// A failed lock / valid-polka write fail-stops the node before mu_ is released; afterwards no path
+// (re-entry, body re-delivery, stall rebroadcast, reseed, a later round) signs anything.
+TEST_TAGS(test_pf_failstop_lock_write_failure_halts_all_signing, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_lock_write_failure_halts_all_signing) {
+  for (const auto mode : kPfGateFaults) {
+    const std::string m = pf_fault_name(mode);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_lock_" + m, 0xE0);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    auto& t = f->target();
+    pf_prevote_a0(*f);
+    pf_require(!t.safety_storage_failed(), m + ": healthy before the fault");
+    pf_require(t.consensus_signature_count_for_test() > 0, m + ": control: the A0 prevote was signed through the guard");
+    faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+    pf_complete_polka_a0(*f, o);
+    pf_require(faults::injected() >= 1, m + ": fault injected");
+    // The polka's first durable write is the valid-polka batch; the lock write fails right after it.
+    pf_require_halted(t, m, "valid-polka height=,vote-lock height=");
+    pf_require_no_signature_after_fail_stop(t, m + " (at fail-stop)");
+    pf_drive_signing_paths_after_halt(*f, o, m);
+    pf_require_no_signature_after_fail_stop(t, m + " (after driving every path)");
+  }
+}
+
+// Same for a failed prevote-record write.
+TEST_TAGS(test_pf_failstop_prevote_write_failure_halts_all_signing, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_prevote_write_failure_halts_all_signing) {
+  for (const auto mode : kPfGateFaults) {
+    const std::string m = pf_fault_name(mode);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_prevote_" + m, 0xE1);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    auto& t = f->target();
+    const auto a_id = frontier_proposal_id(*f->a0);
+    pf_require(advance_test_frontier_round(t, f->height, 0), m + ": round 0");
+    faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+    (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0));
+    pf_require(faults::injected() >= 1, m + ": fault injected");
+    pf_require(!t.local_prevote_recorded_for_test(f->height, 0, a_id), m + ": failed prevote not recorded");
+    pf_require_halted(t, m, "prevote-record height=");
+    // The prevote was signed just before its write failed (sign, then persist); that one is not
+    // counted as after fail-stop and was never sent.
+    pf_require_no_signature_after_fail_stop(t, m + " (at fail-stop)");
+    pf_drive_signing_paths_after_halt(*f, o, m);
+    pf_require_no_signature_after_fail_stop(t, m + " (after driving every path)");
+  }
+}
+
+// Timeout votes: with proposals unpaused, a healthy target times out of its round and signs a
+// timeout vote (control); a fail-stopped one signs none.
+TEST_TAGS(test_pf_failstop_halted_node_signs_no_timeout_vote, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_halted_node_signs_no_timeout_vote) {
+  for (const bool inject : {false, true}) {
+    const std::string m = inject ? "halted" : "control";
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_timeout_" + m, 0xE2);
+    pf_isolate_target(*f);
+    auto& t = f->target();
+    pf_require(advance_test_frontier_round(t, f->height, 0), m + ": round 0");
+    std::optional<faults::Scoped> fault;
+    if (inject) {
+      fault.emplace(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+      (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0));
+      pf_require_halted(t, m, "prevote-record height=");
+    }
+    pf_require(t.pause_proposals_for_test(false), m + ": unpause");
+    const bool timed_out = wait_for([&] { return t.local_timeout_vote_reserved_for_test(f->height, 0) ||
+                                                 t.local_timeout_vote_reserved_for_test(f->height, 1); },
+                                    inject ? std::chrono::milliseconds(3000) : std::chrono::milliseconds(ci_timeout_seconds(30)));
+    if (inject) {
+      pf_require(!timed_out, m + ": no timeout vote after fail-stop");
+      pf_require_no_signature_after_fail_stop(t, m);
+    } else {
+      pf_require(timed_out, m + ": healthy target signs a timeout vote (the path is reachable)");
+    }
+  }
+}
+
+// Wire level: once fail-stopped, the target sends no PREVOTE, VOTE, TIMEOUT_VOTE or PROPOSE frame,
+// although a stall rebroadcast ran before the fault (control). Passive observer (PfWireObserver).
+TEST_TAGS(test_pf_failstop_halted_node_sends_no_consensus_frame, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_halted_node_sends_no_consensus_frame) {
+  for (const auto mode : kPfGateFaults) {
+    const std::string m = pf_fault_name(mode);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_wire_" + m, 0xE3);
+    const auto o = pf_others(*f);
+    const auto a_id = frontier_proposal_id(*f->a0);
+    auto& t = f->target();
+    const auto& net = f->cluster.configs[f->ti].network;
+    for (std::size_t k = 0; k < f->cluster.nodes.size(); ++k) {
+      if (k != f->ti) f->cluster.nodes[k]->stop();
+    }
+    pf_require(wait_for([&] { return t.status().established_peers == 0; }, ci_timeout_seconds(30)), m + ": cluster peers gone");
+    PfWireObserver wire(t, net, 0xFA11);
+    pf_require(wait_for([&] { return t.status().established_peers >= 1; }, ci_timeout_seconds(10)), m + ": observer established");
+    pf_require(advance_test_frontier_round(t, f->height, 0), m + ": round 0");
+    const auto marker = make_test_vote(pf_domain(*f), f->keys, f->height, 0, a_id, o.pubs[0]);
+    pf_require(t.inject_vote_for_test(marker), m + ": marker precommit held by the target only");
+    pf_require(wait_for([&] { return wire.saw_precommit(f->height, 0, a_id, o.pubs[0]); }, ci_timeout_seconds(30)),
+               m + ": control: the healthy target's stall rebroadcast reaches the observer");
+    faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+    (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0));
+    pf_require_halted(t, m, "prevote-record height=");
+    // Frames queued before the flag was set may still be on the socket.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const int before = wire.consensus_frames();
+    pf_drive_signing_paths_after_halt(*f, o, m);
+    (void)t.pause_proposals_for_test(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));  // 15 round timeouts, several rebroadcast cycles
+    const int after = wire.consensus_frames();
+    std::cerr << "[pf] failstop-wire mode=" << m << " frames-at-halt=" << before << " frames-after=" << after << "\n";
+    pf_require(after == before, m + ": " + std::to_string(after - before) + " consensus frame(s) sent after fail-stop");
+    pf_require(!wire.saw_prevote(f->height, 0, a_id, t.local_validator_pubkey_for_test()), m + ": failed prevote A0 never sent");
+    pf_require(wire.connected(), m + ": observer stayed connected (silence is not a dropped link)");
+    pf_require_no_signature_after_fail_stop(t, m);
+  }
+}
+
+// Quorum-1 self-vote (finalize_if_quorum): a single-validator node signs its own precommit there,
+// without the lock path, as soon as the proposal body arrives. Control: a healthy node signs it and
+// finalizes. Halted: fail-stop is entered through the test hook, since no safety-row write precedes
+// this path (the self-vote comes before the prevote write; see KNOWN_DEFECTS.md H1, P7).
+TEST_TAGS(test_pf_failstop_quorum1_self_vote_refused, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_quorum1_self_vote_refused) {
+  for (const bool halted : {false, true}) {
+    const std::string m = halted ? "halted" : "control";
+    const std::string base = unique_test_base("/tmp/finalis_pf_failstop_q1_" + m);
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(base);
+    const std::string gpath = base + "/genesis.json";
+    pf_require(write_empty_mainnet_bootstrap_genesis_file(gpath), "genesis");
+    node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;
+    cfg.node_id = 0;
+    cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();
+    cfg.db_path = base + "/node0";
+    cfg.p2p_port = reserve_test_port();
+    pf_require(cfg.p2p_port != 0, "port");
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
+    pf_require(create_test_validator_keystore(cfg, 0), "keystore");
+    Tx tx = make_fixture_ingress_tx(1, 0xE4);
+    std::unique_ptr<node::Node> n;
+    // Not started (no event loop): the test drives the node.
+    pf_require(restart_single_node_with_seeded_certified_ingress(cfg, {tx.serialize()}, &n, nullptr, false) && n, "single node");
+    pf_require(n->committee_for_height_round_for_test(1, 0).size() == 1, "single-member committee");
+    auto proposal = build_test_frontier_proposal(*n, 1, 0);
+    pf_require(proposal.has_value(), m + ": proposal built");
+    const auto id = frontier_proposal_id(*proposal);
+    const auto msg = make_test_frontier_propose_msg(n->consensus_domain_for_test(), *proposal);
+    if (halted) {
+      n->enter_safety_fail_stop_for_test("simulated");
+      pf_require(n->safety_storage_failed(), m + ": halted");
+    }
+    const auto sigs_before = n->consensus_signature_count_for_test();
+    (void)n->inject_propose_msg_for_test(msg);  // body arrives: finalize_if_quorum runs
+    (void)n->finalize_if_quorum_for_test(id, 1, 0);  // and once more, directly
+    if (halted) {
+      pf_require(n->consensus_signature_count_for_test() == sigs_before, m + ": no signature on proposal delivery or finalize");
+      pf_require(!n->local_vote_recorded_for_test(1, 0, id), m + ": no quorum-1 self-vote");
+      pf_require(n->status().height == 0, m + ": nothing finalized without the self-vote");
+      pf_require_no_signature_after_fail_stop(*n, m);
+    } else {
+      pf_require(n->consensus_signature_count_for_test() > sigs_before, m + ": healthy quorum-1 path signs its self-vote");
+      pf_require(n->status().height == 1, m + ": healthy single validator finalizes height 1 by the self-vote");
+    }
+    n->stop();
+  }
+}
+
+// H1 (P7): the quorum-1 self-vote is signed without a lock row. It leaves the process only inside
+// the finality certificate, which is queued after the durable finalization write, so a failed write
+// (fail-stop, P3) or a crash before it publishes nothing: the restarted node is free to self-vote
+// again at that height, since nobody saw the first one. Every WAL fault mode: the node halts as
+// "finalization", reports and broadcasts nothing, restarts over its own database and finalizes
+// height 1 (a sync-then-EIO write already did: durable although it failed).
+TEST_TAGS(test_pf_quorum1_self_vote_failed_finalization_publishes_nothing, "isolate,persistence-failure,H1");
+TEST(test_pf_quorum1_self_vote_failed_finalization_publishes_nothing) {
+  std::vector<std::string> failures;
+  for (const auto mode : kPfGateFaults) {
+    const std::string m = pf_fault_name(mode);
+    const std::string base = unique_test_base("/tmp/finalis_pf_q1_failed_finalize_" + m);
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(base);
+    const std::string gpath = base + "/genesis.json";
+    pf_require(write_empty_mainnet_bootstrap_genesis_file(gpath), "genesis");
+    node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;
+    cfg.node_id = 0;
+    cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();
+    cfg.db_path = base + "/node0";
+    cfg.p2p_port = reserve_test_port();
+    pf_require(cfg.p2p_port != 0, "port");
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
+    pf_require(create_test_validator_keystore(cfg, 0), "keystore");
+    Tx tx = make_fixture_ingress_tx(1, 0xE5);
+    std::unique_ptr<node::Node> n;
+    pf_require(restart_single_node_with_seeded_certified_ingress(cfg, {tx.serialize()}, &n, nullptr, false) && n, "single node");
+    auto proposal = build_test_frontier_proposal(*n, 1, 0);
+    pf_require(proposal.has_value(), m + ": proposal built");
+    const auto id = frontier_proposal_id(*proposal);
+    const auto msg = make_test_frontier_propose_msg(n->consensus_domain_for_test(), *proposal);
+    {
+      faults::Scoped fault(cfg.db_path, mode, kPfFaultCount);
+      (void)n->inject_propose_msg_for_test(msg);
+      (void)n->finalize_if_quorum_for_test(id, 1, 0);
+      if (faults::injected() < 1) failures.push_back(m + ": no fault injected");
+    }
+    const auto failure = n->safety_storage_failure_for_test();
+    if (!n->safety_storage_failed()) failures.push_back(m + ": failed finalization write did not halt the node");
+    if (failure.rfind("finalization", 0) != 0 && failure.rfind("storage-write: ", 0) != 0) {
+      failures.push_back(m + ": halted on \"" + failure + "\"");
+    }
+    if (n->status().height != 0) failures.push_back(m + ": height reported although its write failed");
+    if (n->finalized_broadcast_queued_for_test()) failures.push_back(m + ": certificate queued for broadcast");
+    n->stop();
+    n.reset();
+    n = std::make_unique<node::Node>(cfg);
+    if (!n->init()) {
+      failures.push_back(m + ": restart failed");
+      continue;
+    }
+    if (n->status().height == 0) {
+      auto again = build_test_frontier_proposal(*n, 1, 0);
+      if (!again.has_value()) {
+        failures.push_back(m + ": no proposal after restart");
+      } else {
+        const auto again_id = frontier_proposal_id(*again);
+        (void)n->inject_propose_msg_for_test(make_test_frontier_propose_msg(n->consensus_domain_for_test(), *again));
+        (void)n->finalize_if_quorum_for_test(again_id, 1, 0);
+      }
+    }
+    std::cerr << "[pf] quorum-1 failed finalization mode=" << m << " failure=\"" << failure.substr(0, 80)
+              << "\" after-restart height=" << n->status().height << "\n";
+    if (n->status().height != 1) failures.push_back(m + ": restarted single validator did not finalize height 1");
+    n->stop();
+  }
+  pf_require(failures.empty(), pf_join(failures));
+}
+
+// Concurrency: signing paths hammered from several threads while the failing write happens on
+// another. Every signature is either counted before the fail-stop snapshot or refused.
+TEST_TAGS(test_pf_failstop_concurrent_failure_and_signing, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_concurrent_failure_and_signing) {
+  for (int iter = 0; iter < 3; ++iter) {
+    const std::string m = "iter" + std::to_string(iter);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_race_" + std::to_string(iter), 0xE5);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    auto& t = f->target();
+    const auto a_id = frontier_proposal_id(*f->a0);
+    pf_prevote_a0(*f);  // a prevote record: the rebroadcast and the reseed re-sign it
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> calls{0};
+    std::vector<std::thread> hammers;
+    for (int k = 0; k < 4; ++k) {
+      hammers.emplace_back([&, k] {
+        while (!stop.load()) {
+          switch (k) {
+            case 0: (void)t.rebroadcast_sizes_for_test(f->height); break;
+            case 1: t.reseed_local_votes_for_test(f->height); break;
+            case 2: (void)t.inject_network_propose_result_for_test(make_test_frontier_propose_msg(pf_domain(*f), *f->a0)); break;
+            default: (void)t.precommits_for_rebroadcast_for_test(f->height); break;
+          }
+          calls.fetch_add(1);
+        }
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto sigs_before_fault = t.consensus_signature_count_for_test();
+    {
+      faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWrite, kPfFaultCount);
+      // Third prevote completes the polka: valid-polka / lock write fails while the hammers run.
+      pf_require(pf_prevote(*f, 0, a_id, o.pubs[0]) == "accepted", m + ": prevote other[0]");
+      (void)pf_prevote(*f, 0, a_id, o.pubs[1]);
+      pf_require(faults::injected() >= 1, m + ": fault injected");
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    stop.store(true);
+    for (auto& th : hammers) th.join();
+    pf_require_halted(t, m, "valid-polka height=,vote-lock height=");
+    std::cerr << "[pf] failstop-race " << m << " hammer-calls=" << calls.load() << " sigs-before-fault=" << sigs_before_fault
+              << " sigs-total=" << t.consensus_signature_count_for_test()
+              << " sigs-after-fail-stop=" << t.signatures_after_fail_stop_for_test() << "\n";
+    pf_require(sigs_before_fault > 0, m + ": control: the hammers were signing before the fault");
+    pf_require_no_signature_after_fail_stop(t, m);
+    pf_require(!t.local_vote_recorded_for_test(f->height, 0, a_id), m + ": no precommit A0");
+  }
+}
+
+// Shutdown after fail-stop: stop() returns within an explicit bound for every fault mode, ENOSPC
+// included, while the disk is still failing; it rewrites neither peers.dat nor addrman.dat; the
+// node restarts from disk healthy. A stop() that does not return is reported and ends this child
+// process, since the blocked thread cannot be joined: bounded shutdown is then unproven.
+TEST_TAGS(test_pf_failstop_shutdown_is_bounded, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_shutdown_is_bounded) {
+  constexpr auto kBound = std::chrono::seconds(20);
+  for (const auto mode : kPfWalFaults) {
+    const std::string m = pf_fault_name(mode);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_stop_" + m, 0xE6);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    auto& t = f->target();
+    pf_prevote_a0(*f);
+    const auto dir = std::filesystem::path(pf_db(*f));
+    const auto stamp = [&](const char* name) {
+      std::error_code ec;
+      const auto when = std::filesystem::last_write_time(dir / name, ec);
+      return ec ? std::string("missing") : std::to_string(when.time_since_epoch().count());
+    };
+    {
+      faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+      pf_complete_polka_a0(*f, o);
+      pf_require(faults::injected() >= 1, m + ": fault injected");
+      pf_require_halted(t, m, "valid-polka height=,vote-lock height=");
+      const auto peers_before = stamp("peers.dat"), addrman_before = stamp("addrman.dat");
+      std::atomic<bool> done{false};
+      const auto start = std::chrono::steady_clock::now();
+      std::thread stopper([&] {
+        t.stop();
+        done.store(true);
+      });
+      if (!wait_for([&] { return done.load(); }, kBound)) {
+        std::cerr << "[pf] BOUNDED-SHUTDOWN-UNPROVEN mode=" << m << ": Node::stop() still blocked after " << kBound.count()
+                  << "s after fail-stop\n";
+        std::cerr.flush();
+        std::_Exit(3);
+      }
+      stopper.join();
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+      std::cerr << "[pf] failstop-shutdown mode=" << m << " stop_ms=" << ms << "\n";
+      pf_require(stamp("peers.dat") == peers_before, m + ": peers.dat not rewritten after fail-stop");
+      pf_require(stamp("addrman.dat") == addrman_before, m + ": addrman.dat not rewritten after fail-stop");
+    }
+    f->cluster.nodes[f->ti].reset();
+    f->cluster.nodes[f->ti] = std::make_unique<node::Node>(f->cluster.configs[f->ti]);
+    pf_require(f->target().init(), m + ": restart from disk after fail-stop");
+    pf_require(!f->target().safety_storage_failed(), m + ": restarted node is not halted");
+  }
+}
+
+// ENOSPC: after the first failed WAL write, nothing reaches the WAL again in this process (the
+// observed E1 abort followed a second write). With an every-call fault, injected() counts every WAL
+// write() attempt, so it must not grow after fail-stop while every path, and stop(), runs.
+TEST_TAGS(test_pf_failstop_enospc_no_second_wal_write, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_enospc_no_second_wal_write) {
+  for (int iter = 0; iter < 3; ++iter) {
+    const std::string m = "enospc-iter" + std::to_string(iter);
+    auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_enospc_" + std::to_string(iter), 0xE7);
+    pf_isolate_target(*f);
+    const auto o = pf_others(*f);
+    auto& t = f->target();
+    pf_prevote_a0(*f);
+    faults::Scoped fault(pf_db(*f), faults::Mode::FailWalWriteNoSpace, kPfFaultCount);
+    pf_complete_polka_a0(*f, o);
+    pf_require_halted(t, m, "valid-polka height=,vote-lock height=");
+    const int at_halt = faults::injected();
+    pf_require(at_halt >= 1, m + ": fault injected");
+    pf_drive_signing_paths_after_halt(*f, o, m);
+    t.stop();
+    std::cerr << "[pf] failstop-enospc " << m << " wal-writes-at-halt=" << at_halt << " after-stop=" << faults::injected() << "\n";
+    pf_require(faults::injected() == at_halt, m + ": " + std::to_string(faults::injected() - at_halt) +
+                                                  " WAL write attempt(s) after fail-stop");
+  }
+}
+
+// P5: a failed write that is not consensus safety state (here the slashing record a prevote
+// equivocation stores, a plain DB::put) fences the DB; the node signs nothing more, the event loop
+// enters fail-stop as "storage-write", and no later write reaches the WAL. Before P5 this was the
+// first failure of most campaign aborts (E1): the node kept writing after it. Write faults only: a
+// non-sync put never fsyncs, so the sync modes cannot fail it.
+TEST_TAGS(test_pf_failstop_non_safety_write_failure_halts_node, "isolate,persistence-failure,fail-stop");
+TEST(test_pf_failstop_non_safety_write_failure_halts_node) {
+  for (const auto mode : {faults::Mode::FailWalWrite, faults::Mode::FailWalWriteNoSpace}) {
+    for (int iter = 0; iter < (mode == faults::Mode::FailWalWriteNoSpace ? 3 : 1); ++iter) {
+      const std::string m = pf_fault_name(mode) + "#" + std::to_string(iter);
+      auto f = make_two_phase_fixture("/tmp/finalis_pf_failstop_slash_" + pf_fault_name(mode), 0xE8);
+      pf_isolate_target(*f);
+      const auto o = pf_others(*f);
+      auto& t = f->target();
+      pf_prevote_a0(*f);
+      pf_require(pf_prevote(*f, 0, frontier_proposal_id(*f->a0), o.pubs[0]) == "accepted", m + ": prevote A0 from other[0]");
+      int at_fence = 0;
+      {
+        faults::Scoped fault(pf_db(*f), mode, kPfFaultCount);
+        // other[0] prevotes B0 in the same round: equivocation evidence, stored by put_slashing_record.
+        (void)pf_prevote(*f, 0, frontier_proposal_id(*f->b0), o.pubs[0]);
+        pf_require(faults::injected() >= 1, m + ": fault injected");
+        pf_require(t.safety_storage_failed(), m + ": failed slashing-record write halts signing at once");
+        pf_require(wait_for([&] { return !t.safety_storage_failure_for_test().empty(); }, std::chrono::milliseconds(3000)),
+                   m + ": event loop entered fail-stop");
+        const auto failure = t.safety_storage_failure_for_test();
+        pf_require(failure.rfind("storage-write: put[SL:", 0) == 0, m + ": fail-stop names the failed write (got \"" + failure + "\")");
+        at_fence = faults::injected();
+        pf_drive_signing_paths_after_halt(*f, o, m);
+        pf_require_no_signature_after_fail_stop(t, m);
+        t.stop();
+        pf_require(faults::injected() == at_fence, m + ": " + std::to_string(faults::injected() - at_fence) +
+                                                       " WAL write attempt(s) after the fence");
+      }
+      std::cerr << "[pf] non-safety-write mode=" << m << " wal-writes=" << at_fence << " failure=\""
+                << t.safety_storage_failure_for_test() << "\"\n";
+      pf_restart_target_isolated(*f);
+      pf_require(!f->target().safety_storage_failed(), m + ": restart from disk is healthy");
+    }
+  }
+}
+#endif

@@ -182,10 +182,13 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   add_exact_key(db, &kvs, key_finalized_ingress_tip());
   add_exact_key(db, &kvs, key_protocol_reserve_balance());
   add_exact_key(db, &kvs, key_confidential_pool_value());
+  add_exact_key(db, &kvs, key_base_fee_per_kib());
   add_exact_key(db, &kvs, key_availability_persistent_state());
   add_exact_key(db, &kvs, key_consensus_state_commitment_cache());
   add_prefix(db, &kvs, "H:");
   add_prefix(db, &kvs, "ER:");
+  add_prefix(db, &kvs, "TE:");
+  add_prefix(db, &kvs, "TK:");
   add_prefix(db, &kvs, key_frontier_height_prefix());
   add_prefix(db, &kvs, key_frontier_transition_prefix());
   add_prefix(db, &kvs, key_finality_certificate_height_prefix());
@@ -198,6 +201,7 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   add_prefix(db, &kvs, key_utxo_prefix());
   add_prefix(db, &kvs, key_validator_prefix());
   add_prefix(db, &kvs, key_txidx_prefix());
+  add_prefix(db, &kvs, key_timed_reveal_prefix());
   add_prefix(db, &kvs, key_script_utxo_prefix(Hash32{}).substr(0, 3));
   add_prefix(db, &kvs, key_script_history_prefix(Hash32{}).substr(0, 3));
   add_prefix(db, &kvs, key_root_index_prefix());

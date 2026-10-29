@@ -16,6 +16,7 @@
 #include "consensus/confidential_supply.hpp"
 #include "consensus/frontier_execution.hpp"
 #include "consensus/validator_registry.hpp"
+#include "genesis/genesis.hpp"
 #include "storage/db.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
@@ -52,9 +53,16 @@ struct CanonicalDerivationConfig {
 struct CanonicalGenesisState {
   Hash32 genesis_artifact_id{};
   std::vector<PubKey32> initial_validators;
+  // Time-signature keys, parallel to initial_validators (genesis::Document::initial_validator_bls,
+  // proofs checked by genesis::validate_document); empty leaves the validators without one.
+  std::vector<crypto::BlsPublicKey> initial_validator_bls_keys;
   // Parent timestamp of height 1 (unix seconds).
   std::uint64_t genesis_time_unix{0};
 };
+
+// The canonical genesis state of a genesis document: artifact id, validators with their BLS keys,
+// genesis time. Every builder (node, light client, tools, tests) uses this one.
+CanonicalGenesisState canonical_genesis_state_from_document(const genesis::Document& doc);
 
 struct CanonicalFrontierRecord {
   FrontierTransition transition;
@@ -117,6 +125,15 @@ struct CanonicalDerivedState {
   // Confidential turnstile P: value held in confidential (TxV2) outputs, accounted from public boundary
   // flows only. Committed; a TxV2 that would make it negative is invalid (confidential-turnstile-negative).
   std::uint64_t confidential_pool_value{0};
+  // Base fee for the next block (consensus::next_base_fee_per_kib), units per started KiB.
+  std::uint64_t base_fee_per_kib{BASE_FEE_MIN_PER_KIB};
+  // TxTimed escrows waiting for their unlock height (consensus/frontier_execution.hpp). Committed.
+  TimedEscrowState timed_escrows;
+  // Key sets the waiting escrows name (long locks), by committee_root. Not committed separately: each
+  // is fixed by its root, which the committed escrows carry. Kept because checkpoints are pruned.
+  TimedKeySets timed_key_sets;
+  // Settlements of the last applied transition (derived, not committed): what the node indexes.
+  std::vector<TimedSettlementRecord> last_timed_settlements;
   std::map<std::uint64_t, storage::EpochRewardSettlementState> epoch_reward_states;
   std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> finalized_committee_checkpoints;
   std::map<std::uint64_t, CanonicalFinalizedMetadata> finalized_block_metadata;
@@ -184,6 +201,41 @@ bool canonicalize_and_verify_prev_finality_signers(const CanonicalDerivationConf
 // participation for the parent height (parent_committee vs the signer pubkeys
 // in transition.prev_finality_signers). Shared by canonical derivation and the
 // node's frozen-epoch rebuild so the two cannot drift.
+// The timed context for executing block `height` on `prev`, settling with `parent_time_signature`
+// (the block's own prev_time_signature). Holds pointers into `prev` and `parent_time_signature`.
+// `long_time_signatures`: the block's openings of long locks (also held by pointer).
+TimedExecutionContext timed_execution_context_for(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                                  std::uint64_t height,
+                                                  const TimeSignatureAggregate& parent_time_signature,
+                                                  const std::vector<LongTimeSignature>* long_time_signatures = nullptr);
+// Escrows after a block: those it settled removed, the opened ones added; key sets added for the
+// opened long escrows and dropped once no escrow names them.
+void apply_timed_escrows(const FrontierExecutionResult& result, TimedEscrowState* escrows, TimedKeySets* key_sets);
+// True if `validator`'s BLS key is named by a long escrow of `state` included less than
+// kTimedLongLienBlocks before `height`: its bond cannot be withdrawn yet.
+bool timed_bond_lien(const CanonicalDerivedState& state, const PubKey32& validator, std::uint64_t height,
+                     std::uint64_t committee_epoch_blocks);
+// Root of the escrow set as committed in the post-state (one leaf per escrow: key -> envelope txid).
+Hash32 timed_escrow_commitment_root(const TimedEscrowState& escrows);
+// Time signatures (TimeSignatureAggregate). The key set of a height is its epoch checkpoint's
+// ordered_bls_keys; a valid aggregate needs time_signature_threshold(n) of them, the same quorum
+// that finalizes the height, so the f validators an adversary may hold can never produce one (and
+// never open a TxTimed early), while the honest quorum always can once the height is final.
+std::size_t time_signature_threshold(std::size_t committee_size);
+// The epoch checkpoint keys for `height`, nullopt if the checkpoint is missing or a key is unset.
+std::optional<std::vector<crypto::BlsPublicKey>> time_signature_committee_keys(const CanonicalDerivationConfig& cfg,
+                                                                               const CanonicalDerivedState& state,
+                                                                               std::uint64_t height);
+// Requires: no signers and a zero aggregate iff the parent (prev.finalized_height) is genesis;
+// otherwise strictly ascending indices into the parent's committee keys, at least the threshold,
+// and an aggregate that verifies for them on time_signature_message(chain domain, parent height).
+bool verify_prev_time_signature(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
+                                const TimeSignatureAggregate& time_signature, std::string* error);
+// Aggregates the lowest-index `threshold` signatures of `sigs` (index -> signature, each already
+// verified); nullopt if there are fewer.
+std::optional<TimeSignatureAggregate> aggregate_time_signatures(const std::vector<crypto::BlsPublicKey>& committee_keys,
+                                                                const std::map<std::uint32_t, crypto::BlsSignature>& sigs,
+                                                                std::size_t threshold);
 void accrue_frontier_epoch_reward(const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators,
                                   std::map<std::uint64_t, storage::EpochRewardSettlementState>* reward_states,
                                   const FrontierTransition& transition,
@@ -192,6 +244,7 @@ bool populate_frontier_transition_metadata(const CanonicalDerivationConfig& cfg,
                                            std::uint64_t height, std::uint32_t round, const PubKey32& leader_pubkey,
                                            std::uint32_t prev_finality_round,
                                            const std::vector<FinalitySig>& prev_finality_signers,
+                                           const TimeSignatureAggregate& prev_time_signature,
                                            std::uint64_t accepted_fee_units, const UtxoSetV2& post_execution_utxos,
                                            FrontierTransition* transition,
                                            std::string* error,
@@ -208,6 +261,13 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
 bool apply_frontier_record(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& prev,
                            const CanonicalFrontierRecord& record, CanonicalDerivedState* out, std::string* error,
                            std::set<Hash32>* accepted_txids = nullptr);
+// Votes of round `vote_round` can certify a transition of round `transition_round` only from its own
+// round on (a re-proposed valid value is precommitted in later rounds, never earlier). The derivation
+// rejects a certificate below it, so the live path must ignore polkas, locks and precommit quorums
+// below it too: a node that finalized from one could not restart from its own database.
+inline bool vote_round_covers_transition(std::uint32_t vote_round, std::uint32_t transition_round) {
+  return vote_round >= transition_round;
+}
 // Checks `cert` finalizes `transition` with a quorum of valid precommits from the committee that
 // `state`'s checkpoints give for (transition.height, cert.round).
 bool verify_frontier_finality_certificate(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
@@ -241,6 +301,12 @@ inline constexpr std::uint64_t kRetainedMetadataEpochs = 8;
 std::uint64_t retained_checkpoint_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
 std::uint64_t retained_metadata_floor(const CanonicalDerivationConfig& cfg, std::uint64_t finalized_height);
 void prune_consensus_history(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state);
+// The validator registry effects of a finalized block's transactions from `input_start_index` on:
+// joins (queued while the join window is full, then admitted oldest first), unbonds, slashes and
+// liveness exits.
+void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state,
+                                            const std::vector<AnyTx>& txs, std::size_t input_start_index,
+                                            const UtxoSetV2& pre_utxos, std::uint64_t height);
 // The ticket difficulty checkpoint derivation uses for `epoch_start_height`, from finalized state (the
 // same rule and inputs the next checkpoint will be derived with).
 std::uint8_t ticket_difficulty_bits_for_epoch_from_state(const CanonicalDerivationConfig& cfg,
@@ -262,6 +328,9 @@ inline constexpr std::size_t kPostStatePreimageHeightOffset = 16;
 inline constexpr std::size_t kPostStatePreimageUtxoRootOffset = 32;
 inline constexpr std::size_t kPostStatePreimageCheckpointRootOffset = 168;
 // A committee checkpoint as a leaf of the post-state commitment's checkpoint tree.
+// Joins waiting for room in the join window (REQUESTED), keyed by finalization order; part of the
+// post-state commitment, since they decide who registers next.
+Hash32 queued_join_commitment_root(const std::map<Hash32, ValidatorJoinRequest>& requests);
 Hash32 checkpoint_commitment_key(std::uint64_t epoch_start_height);
 Bytes checkpoint_commitment_value(const storage::FinalizedCommitteeCheckpoint& checkpoint);
 std::optional<storage::FinalizedCommitteeCheckpoint> parse_checkpoint_commitment_value(const Bytes& bytes);
@@ -304,6 +373,9 @@ std::vector<PubKey32> emergency_fallback_committee_members(
     const ValidatorRegistry& validators,
     const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
     std::uint64_t committee_epoch_blocks);
+// Sets checkpoint->ordered_bls_keys to each member's registered BLS key, in member order (a zero
+// key for a member without one; every registration and genesis entry carries one).
+void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::FinalizedCommitteeCheckpoint* checkpoint);
 // Fills `checkpoint` (whose ordered_members is empty) with the emergency committee. Returns false
 // when there is no prior committee member to recover from.
 bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,

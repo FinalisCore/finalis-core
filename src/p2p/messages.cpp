@@ -9,7 +9,7 @@ namespace {
 
 // The VERSION fingerprint currently carries chain-id plus bootstrap/runtime
 // metadata, so the cap must comfortably exceed the minimal local fingerprint.
-constexpr std::size_t kMaxSoftwareVersionBytes = 512;
+constexpr std::size_t kMaxSoftwareVersionBytes = 1024;  // room for the bootstrap validator BLS key + proof
 constexpr std::size_t kMaxProposalBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxBlockMessageBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxTxMessageBytes = 256 * 1024;
@@ -31,6 +31,7 @@ bool is_known_message_type(std::uint16_t msg_type) {
     case MsgType::VOTE:
     case MsgType::PREVOTE:
     case MsgType::TIMEOUT_VOTE:
+    case MsgType::TIME_SIGNATURE:
     case MsgType::GET_TRANSITION:
     case MsgType::TRANSITION:
     case MsgType::TX:
@@ -38,6 +39,8 @@ bool is_known_message_type(std::uint16_t msg_type) {
     case MsgType::TX_RESULT:
     case MsgType::GETADDR:
     case MsgType::ADDR:
+    case MsgType::GET_ENDPOINTS:
+    case MsgType::ENDPOINTS:
     case MsgType::PING:
     case MsgType::PONG:
     case MsgType::GET_TRANSITION_BY_HEIGHT:
@@ -280,6 +283,29 @@ std::optional<TimeoutVoteMsg> de_timeout_vote(const Bytes& b) {
         m.vote.round = *round;
         m.vote.validator_pubkey = *pub;
         m.vote.signature = *sig;
+        return true;
+      })) return std::nullopt;
+  return m;
+}
+
+Bytes ser_time_signature(const TimeSignatureMsg& m) {
+  codec::ByteWriter w;
+  w.u64le(m.height);
+  w.bytes_fixed(m.validator_pubkey);
+  w.bytes_fixed(m.signature);
+  return w.take();
+}
+
+std::optional<TimeSignatureMsg> de_time_signature(const Bytes& b) {
+  TimeSignatureMsg m;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto pub = r.bytes_fixed<32>();
+        auto sig = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+        if (!h || !pub || !sig) return false;
+        m.height = *h;
+        m.validator_pubkey = *pub;
+        m.signature = *sig;
         return true;
       })) return std::nullopt;
   return m;

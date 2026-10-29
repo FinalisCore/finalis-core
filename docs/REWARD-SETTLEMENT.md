@@ -28,7 +28,7 @@ Fees and issuance are separated.
 - before the cap:
   - current-block fees remain immediate on the frontier transition path
   - issuance accrues during the epoch
-  - `10%` of gross issuance is diverted into protocol reserve accrual
+  - `30%` of gross issuance is diverted into protocol reserve accrual
   - `90%` of gross issuance accrues into validator settlement rewards
 - after the cap:
   - new issuance is zero
@@ -158,23 +158,25 @@ If `onboarding_score_units` is empty:
 This keeps total payout exact while avoiding payment to nonexistent onboarding
 recipients.
 
-## Post-Cap Subsidy
+## Fees, recycling and the reserve payout
 
-After `EMISSION_BLOCKS`, the closed epoch payout pool is:
+At every height the closed epoch payout pool is:
 
-- `settled_epoch_fees + reserve_subsidy_units`
+- `settlement_rewards + settled_epoch_fees + reserve_subsidy_units`
 
-Reserve subsidy is deterministic:
+with
 
-- `target_support = eligible_validator_count * POST_CAP_SUPPORT_UNITS_PER_ELIGIBLE_VALIDATOR_PER_EPOCH`
-- `support_gap = max(0, target_support - settled_epoch_fees)`
-- `spendable_reserve = max(0, reserve_balance - POST_CAP_RESERVE_FLOOR_UNITS)`
-- `runway_cap = reserve_balance / POST_CAP_MIN_RESERVE_RUNWAY_EPOCHS`
-- `reserve_subsidy = min(support_gap, spendable_reserve, runway_cap)`
+- `settled_epoch_fees = fee_pool - fee_reserve_share(fee_pool)`: validators get half of the epoch's
+  fees (from block 1, not only after the cap); `fee_reserve_share = fee_pool * FEE_RESERVE_BPS / 10,000`
+- `reserve_subsidy_units = reserve_payout_units(height, reserve_balance + reserve_accrual)`: zero
+  before `EMISSION_BLOCKS`, then `balance * RESERVE_PAYOUT_BPS_PER_YEAR / (10,000 * EPOCHS_PER_YEAR_365)`
 
-Eligibility is derived from the adjusted reward-score map:
+At settlement the reserve becomes:
 
-- validators with post-penalty score `> 0` are eligible
+- `reserve + reserve_accrual + fee_reserve_share(fee_pool) + recycled_units - reserve_subsidy_units`
+
+where `recycled_units` is the value of the epoch's burn (SCBURN) outputs, which do not stay in the
+coin set. A fixed fraction never empties the reserve, and the supply never exceeds 7,000,000 FLS.
 
 Distribution uses the same adjusted reward scores already used for normal epoch
 settlement. There is no equal split and no validator-controlled treasury key.

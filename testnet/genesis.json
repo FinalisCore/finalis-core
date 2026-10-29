@@ -1,13 +1,19 @@
 {
-  "version": 1,
+  "version": 2,
   "network_name": "testnet",
   "protocol_version": 1,
   "network_id_hex": "a6ffe3b32f81d1ad7df761693dc87dd8",
   "magic": 1414742833,
-  "genesis_time_unix": 1792861200,
+  "genesis_time_unix": 1793253600,
   "initial_height": 0,
   "initial_validators": [
     "150cf9f36fe2077090b562bfd80f66c3ad13d6412695096b0058f14c21fcfc24"
+  ],
+  "initial_validator_bls_pubkeys": [
+    "a4b6b0cbd2e93798edf8a2ae3d733f0c1a64f8e52ac572886f4f493196ca097522603051ef3defd5957fc9b0c6ccf71b"
+  ],
+  "initial_validator_bls_pops": [
+    "9466b439f64683e15a1d08d0c37586b42f190ba551af18a33f94decd52544bc17849eff1313bb7906db74b09f4928eed0186603cd2c2dac6d66ecae2633f4b3bfd2401526c7e7e0296c925a9c6be2176b14678fede061b57942ae04547dd3de0"
   ],
   "initial_active_set_size": 1,
   "initial_committee_params": {
@@ -18,5 +24,5 @@
   },
   "monetary_params_ref": "monetary-policy-7m-hard-cap",
   "seeds": [],
-  "note": "Finalis testnet-2 (RFC 9381 VRF): bootstrap validator 150cf9f36fe2077090b562bfd80f66c3ad13d6412695096b0058f14c21fcfc24"
+  "note": "Finalis testnet-3 (BLS time-signature keys): bootstrap validator 150cf9f36fe2077090b562bfd80f66c3ad13d6412695096b0058f14c21fcfc24"
 }

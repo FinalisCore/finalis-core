@@ -184,6 +184,17 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       auto v = next(a);
       if (!v || !net::parse_ipv4_cidr_list(*v).has_value()) return std::nullopt;
       cfg.lightserver_trusted_proxy = *v;
+    } else if (a == "--public-lightserver-url") {
+      auto v = next(a);
+      // Validated against the network in Node::init (mainnet refuses private hosts).
+      if (!v || !p2p::valid_endpoint_url(*v, true)) return std::nullopt;
+      cfg.public_lightserver_url = *v;
+    } else if (a == "--announce-endpoint-as-validator") {
+      cfg.announce_endpoint_as_validator = true;
+    } else if (a == "--lightserver-client-ip-header") {
+      auto v = next(a);
+      if (!v || !net::is_http_header_name(*v)) return std::nullopt;
+      cfg.lightserver_client_ip_header = *v;
     } else if (a == "--bind") {
       auto v = next(a);
       if (!v) return std::nullopt;

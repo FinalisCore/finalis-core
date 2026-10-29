@@ -170,13 +170,13 @@ std::vector<FinalizedCommitteeCandidate> aggregate_operator_committee_candidates
   const auto ticket_bonus_cap_bps = economics.ticket_bonus_cap_bps;
   for (const auto& [_, agg] : by_operator) {
     if (!agg.has_representative) continue;
-    const auto capped_bond = capped_effective_bond_units(economics, active_operator_count, agg.total_bonded_amount);
+    const auto capped_bond = capped_effective_bond_units(economics, height, active_operator_count, agg.total_bonded_amount);
     out.push_back(FinalizedCommitteeCandidate{
         .pubkey = agg.representative_pub,
         .selection_id = _,
         .bonded_amount = agg.total_bonded_amount,
         .capped_bonded_amount = capped_bond,
-        .effective_weight = effective_weight(economics, active_operator_count, agg.total_bonded_amount),
+        .effective_weight = effective_weight(economics, height, active_operator_count, agg.total_bonded_amount),
         .ticket_work_hash = agg.best_ticket_work_hash,
         .ticket_nonce = agg.best_ticket_nonce,
         .ticket_bonus_bps = std::min<std::uint32_t>(agg.best_ticket_bonus_bps, ticket_bonus_cap_bps),

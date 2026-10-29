@@ -30,9 +30,31 @@ LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-${DEFAULT_LIGHTSERVER_PORT}}"
 # X-Real-IP (TRUSTED_PROXY); the firewall opens 80/443 instead of the lightserver port.
 BEHIND_PROXY="${BEHIND_PROXY:-0}"
 TRUSTED_PROXY="${TRUSTED_PROXY:-127.0.0.1/32}"
+# CLIENT_IP_HEADER=CF-Connecting-IP behind a Cloudflare tunnel: cloudflared passes client headers through,
+# so a client-sent X-Real-IP would be trusted; the edge overwrites CF-Connecting-IP.
+CLIENT_IP_HEADER="${CLIENT_IP_HEADER:-X-Real-IP}"
+# PUBLIC_HTTPS=1: nginx on 80/443 with a Let's Encrypt certificate (scripts/setup_https.sh, lego,
+# renewed by a systemd timer) in front of the lightserver at https://<HTTPS_HOST>/rpc and, with
+# HTTPS_EXPLORER=1, the explorer at /. HTTPS_HOST defaults to the public IPv4 (an IP-address
+# certificate, 160 h, renewed every ~3 days); a DNS name pointing here works too. Port 80 must be
+# reachable from the internet. ACME_EMAIL (optional contact), ACME_STAGING=1 (rehearsal CA).
+PUBLIC_HTTPS="${PUBLIC_HTTPS:-0}"
+HTTPS_HOST="${HTTPS_HOST:-}"
+HTTPS_EXPLORER="${HTTPS_EXPLORER:-1}"
+ACME_EMAIL="${ACME_EMAIL:-}"
+ACME_STAGING="${ACME_STAGING:-0}"
+if [[ "${PUBLIC_HTTPS}" == "1" ]]; then BEHIND_PROXY=1; fi
 if [[ "${BEHIND_PROXY}" == "1" ]]; then DEFAULT_PUBLIC_BIND=127.0.0.1; else DEFAULT_PUBLIC_BIND=0.0.0.0; fi
 LIGHTSERVER_BIND="${LIGHTSERVER_BIND:-${DEFAULT_PUBLIC_BIND}}"
 WITH_LIGHTSERVER="${WITH_LIGHTSERVER:-1}"
+# Public lightserver discovery: the node announces this URL to the network so wallets and apps find
+# it (it checks first that the URL reaches its own lightserver; a registered validator never announces
+# unless ANNOUNCE_AS_VALIDATOR=1). PUBLIC_LIGHTSERVER=auto derives http://<public IPv4>:<port>/rpc when
+# the lightserver listens publicly; set PUBLIC_LIGHTSERVER_URL (e.g. an https:// name) to choose it,
+# or PUBLIC_LIGHTSERVER=0 to announce nothing.
+PUBLIC_LIGHTSERVER="${PUBLIC_LIGHTSERVER:-auto}"
+PUBLIC_LIGHTSERVER_URL="${PUBLIC_LIGHTSERVER_URL:-}"
+ANNOUNCE_AS_VALIDATOR="${ANNOUNCE_AS_VALIDATOR:-0}"
 WITH_EXPLORER="${WITH_EXPLORER:-1}"
 EXPLORER_PORT="${EXPLORER_PORT:-18080}"
 EXPLORER_BIND="${EXPLORER_BIND:-${DEFAULT_PUBLIC_BIND}}"
@@ -308,24 +330,100 @@ systemd_available() {
   have systemctl && [[ -d /run/systemd/system ]]
 }
 
+# Public IPv4 of this host as the internet sees it (behind 1:1 NAT the interfaces only show a private
+# address); empty if it cannot be learned or is not a public address.
+detect_public_ipv4() {
+  have curl || return 0
+  local ip svc
+  for svc in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip="$(curl -fsS -4 --max-time 5 "${svc}" 2>/dev/null | tr -d '[:space:]')" || continue
+    [[ "${ip}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || continue
+    local a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+    (( a == 10 || a == 127 || a == 0 || a >= 224 )) && continue
+    (( a == 172 && b >= 16 && b <= 31 )) && continue
+    (( a == 192 && b == 168 )) && continue
+    (( a == 169 && b == 254 )) && continue
+    (( a == 100 && b >= 64 && b <= 127 )) && continue
+    echo "${ip}"
+    return 0
+  done
+}
+
+resolve_public_lightserver_url() {
+  if [[ "${PUBLIC_LIGHTSERVER}" == "0" || "${WITH_LIGHTSERVER}" != "1" ]]; then
+    PUBLIC_LIGHTSERVER_URL=""
+    return 0
+  fi
+  if [[ "${PUBLIC_HTTPS}" == "1" ]]; then
+    [[ -n "${HTTPS_HOST}" ]] || HTTPS_HOST="$(detect_public_ipv4)"
+    if [[ -z "${HTTPS_HOST}" ]]; then
+      log "PUBLIC_HTTPS=1 but no public IPv4 found: set HTTPS_HOST. Continuing without HTTPS."
+      PUBLIC_HTTPS=0
+    elif [[ -z "${PUBLIC_LIGHTSERVER_URL}" ]]; then
+      if [[ "${HTTPS_HOST}" == *:* ]]; then
+        PUBLIC_LIGHTSERVER_URL="https://[${HTTPS_HOST}]/rpc"
+      else
+        PUBLIC_LIGHTSERVER_URL="https://${HTTPS_HOST}/rpc"
+      fi
+    fi
+  fi
+  if [[ -n "${PUBLIC_LIGHTSERVER_URL}" ]]; then
+    log "Public lightserver URL: ${PUBLIC_LIGHTSERVER_URL} (announced once reachable)."
+    return 0
+  fi
+  # Behind a proxy the public name is the operator's (PUBLIC_LIGHTSERVER_URL=https://...); a loopback
+  # listener is not reachable from outside.
+  if [[ "${BEHIND_PROXY}" == "1" || "${LIGHTSERVER_BIND}" == 127.* || "${LIGHTSERVER_BIND}" == "localhost" ]]; then
+    log "Not announcing the lightserver (local-only; set PUBLIC_LIGHTSERVER_URL to announce a public name)."
+    return 0
+  fi
+  local ip
+  ip="$(detect_public_ipv4)"
+  if [[ -z "${ip}" ]]; then
+    log "Not announcing the lightserver (no public IPv4 found; set PUBLIC_LIGHTSERVER_URL to announce one)."
+    return 0
+  fi
+  PUBLIC_LIGHTSERVER_URL="http://${ip}:${LIGHTSERVER_PORT}/rpc"
+  log "Public lightserver URL: ${PUBLIC_LIGHTSERVER_URL} (announced once the node sees it reach its own lightserver)."
+}
+
+setup_public_https() {
+  [[ "${PUBLIC_HTTPS}" == "1" ]] || return 0
+  local s; s="$(need_sudo)"
+  local explorer_port=""
+  if [[ "${WITH_EXPLORER}" == "1" && "${HTTPS_EXPLORER}" == "1" ]]; then explorer_port="${EXPLORER_PORT}"; fi
+  log "Setting up public HTTPS for ${HTTPS_HOST} (nginx + Let's Encrypt)..."
+  if ! ${s} env HTTPS_HOST="${HTTPS_HOST}" LIGHTSERVER_PORT="${LIGHTSERVER_PORT}" EXPLORER_PORT="${explorer_port}" \
+      ACME_EMAIL="${ACME_EMAIL}" ACME_STAGING="${ACME_STAGING}" bash "${ROOT_DIR}/scripts/setup_https.sh"; then
+    log "WARNING: HTTPS setup failed; the node runs, but ${PUBLIC_LIGHTSERVER_URL} is not announced until it works (re-run start.sh)."
+  fi
+}
+
 open_firewall_ports() {
   local mode="$1"
   if [[ "${OPEN_FIREWALL_PORTS}" != "1" ]]; then
     log "Skipping firewall changes (OPEN_FIREWALL_PORTS=0)."
     return 0
   fi
-  if [[ "${mode}" != "bootstrap" ]]; then
+  local -a ports=()
+  if [[ "${mode}" == "bootstrap" ]]; then
+    ports+=("${P2P_PORT}")
+    if [[ "${BEHIND_PROXY}" == "1" ]]; then
+      ports+=(80 443)
+    else
+      ports+=("${LIGHTSERVER_PORT}")
+    fi
+  elif [[ "${PUBLIC_HTTPS}" == "1" ]]; then
+    ports+=(80 443)
+  elif [[ -n "${PUBLIC_LIGHTSERVER_URL}" && "${BEHIND_PROXY}" != "1" ]]; then
+    # A joiner serving the public: only its lightserver port.
+    ports+=("${LIGHTSERVER_PORT}")
+  else
     log "Skipping firewall changes for joiner mode."
     return 0
   fi
 
   local s; s="$(need_sudo)"
-  local -a ports=("${P2P_PORT}")
-  if [[ "${BEHIND_PROXY}" == "1" ]]; then
-    ports+=(80 443)
-  else
-    ports+=("${LIGHTSERVER_PORT}")
-  fi
   local port
   if have ufw; then
     log "Opening firewall ports with ufw: ${ports[*]} (tcp)."
@@ -404,7 +502,7 @@ install_deps() {
         install_pacman
       else
         log "Unsupported Linux package manager. Install manually:"
-        log "  C++20 compiler, cmake>=3.22, git, pkg-config, OpenSSL dev, nlohmann-json, libsodium dev, RocksDB dev (optional)"
+        log "  C++20 compiler, cmake>=3.22, git, pkg-config, OpenSSL dev, nlohmann-json, libsodium dev, RocksDB dev (required)"
         exit 1
       fi
       ;;
@@ -866,7 +964,13 @@ build_node_command() {
       "--lightserver-port" "${LIGHTSERVER_PORT}"
     )
     if [[ "${BEHIND_PROXY}" == "1" ]]; then
-      args+=("--lightserver-trusted-proxy" "${TRUSTED_PROXY}")
+      args+=("--lightserver-trusted-proxy" "${TRUSTED_PROXY}" "--lightserver-client-ip-header" "${CLIENT_IP_HEADER}")
+    fi
+    if [[ -n "${PUBLIC_LIGHTSERVER_URL}" ]]; then
+      args+=("--public-lightserver-url" "${PUBLIC_LIGHTSERVER_URL}")
+      if [[ "${ANNOUNCE_AS_VALIDATOR}" == "1" ]]; then
+        args+=("--announce-endpoint-as-validator")
+      fi
     fi
   fi
 
@@ -912,7 +1016,7 @@ build_explorer_command() {
     "--rpc-url" "${EXPLORER_RPC_URL}"
   )
   if [[ "${BEHIND_PROXY}" == "1" ]]; then
-    args+=("--trusted-proxy" "${TRUSTED_PROXY}")
+    args+=("--trusted-proxy" "${TRUSTED_PROXY}" "--client-ip-header" "${CLIENT_IP_HEADER}")
   fi
   printf '%q ' "${args[@]}"
 }
@@ -1201,6 +1305,7 @@ main() {
   mkdir -p "${DB_DIR}"
   local genesis_path
   genesis_path="$(resolve_genesis_source)"
+  resolve_public_lightserver_url
   local command_line
   command_line="$(build_node_command "${genesis_path}" "${mode}")"
   local explorer_command_line=""
@@ -1210,6 +1315,7 @@ main() {
 
   print_summary "${mode}" "${genesis_path}" "${command_line}"
   open_firewall_ports "${mode}"
+  setup_public_https
   if install_and_restart_service "${command_line}"; then
     if [[ -n "${explorer_command_line}" ]]; then
       install_and_restart_explorer_service "${explorer_command_line}" || true

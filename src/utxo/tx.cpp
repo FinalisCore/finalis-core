@@ -539,6 +539,17 @@ Bytes FrontierTransition::serialize() const {
     w.bytes_fixed(sig.validator_pubkey);
     w.bytes_fixed(sig.signature);
   }
+  w.varint(prev_time_signature.signer_indices.size());
+  for (const auto index : prev_time_signature.signer_indices) w.varint(index);
+  w.bytes_fixed(prev_time_signature.aggregate);
+  w.varint(long_time_signatures.size());
+  for (const auto& entry : long_time_signatures) {
+    w.u64le(entry.unlock_height);
+    w.bytes_fixed(entry.committee_root);
+    w.varint(entry.signature.signer_indices.size());
+    for (const auto index : entry.signature.signer_indices) w.varint(index);
+    w.bytes_fixed(entry.signature.aggregate);
+  }
   w.varbytes(settlement.serialize());
   w.bytes_fixed(settlement_commitment);
   return w.take();
@@ -602,6 +613,39 @@ std::optional<FrontierTransition> FrontierTransition::parse(const Bytes& b) {
           auto sig = r.bytes_fixed<64>();
           if (!pub || !sig) return false;
           out.prev_finality_signers.push_back(FinalitySig{*pub, *sig});
+        }
+        auto time_signer_count = r.varint();
+        if (!time_signer_count || *time_signer_count > MAX_COMMITTEE) return false;
+        out.prev_time_signature.signer_indices.clear();
+        out.prev_time_signature.signer_indices.reserve(static_cast<std::size_t>(*time_signer_count));
+        for (std::uint64_t i = 0; i < *time_signer_count; ++i) {
+          auto index = r.varint();
+          if (!index || *index >= MAX_COMMITTEE) return false;
+          out.prev_time_signature.signer_indices.push_back(static_cast<std::uint32_t>(*index));
+        }
+        auto time_aggregate = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+        if (!time_aggregate) return false;
+        out.prev_time_signature.aggregate = *time_aggregate;
+        auto long_count = r.varint();
+        if (!long_count || *long_count > kMaxLongTimeSignaturesPerBlock) return false;
+        out.long_time_signatures.clear();
+        for (std::uint64_t i = 0; i < *long_count; ++i) {
+          LongTimeSignature entry;
+          auto unlock = r.u64le();
+          auto root = r.bytes_fixed<32>();
+          auto count = r.varint();
+          if (!unlock || !root || !count || *count > MAX_COMMITTEE) return false;
+          entry.unlock_height = *unlock;
+          entry.committee_root = *root;
+          for (std::uint64_t j = 0; j < *count; ++j) {
+            auto index = r.varint();
+            if (!index || *index >= MAX_COMMITTEE) return false;
+            entry.signature.signer_indices.push_back(static_cast<std::uint32_t>(*index));
+          }
+          auto aggregate = r.bytes_fixed<crypto::kBlsSignatureBytes>();
+          if (!aggregate) return false;
+          entry.signature.aggregate = *aggregate;
+          out.long_time_signatures.push_back(std::move(entry));
         }
         auto settlement_bytes = r.varbytes();
         auto settlement_commitment = r.bytes_fixed<32>();
@@ -764,28 +808,73 @@ bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey) {
   return true;
 }
 
-bool parse_onboarding_registration_script(const Bytes& script, OnboardingRegistrationScriptData* out) {
-  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
-  if (script.size() != 136 && script.size() != 152) return false;
-  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
-  if (out) {
-    std::copy(script.begin() + 8, script.begin() + 40, out->validator_pubkey.begin());
-    std::copy(script.begin() + 40, script.begin() + 72, out->payout_pubkey.begin());
-    std::copy(script.begin() + 72, script.begin() + 136, out->pop.begin());
-    out->has_admission_pow = (script.size() == 152);
-    out->admission_pow_epoch = 0;
-    out->admission_pow_nonce = 0;
-    if (out->has_admission_pow) {
-      Bytes suffix(script.begin() + 136, script.end());
-      codec::ByteReader r(suffix);
-      auto epoch = r.u64le();
-      auto nonce = r.u64le();
-      if (!epoch || !nonce || !r.eof()) return false;
-      out->admission_pow_epoch = *epoch;
-      out->admission_pow_nonce = *nonce;
-    }
+namespace {
+
+constexpr std::array<std::uint8_t, 8> kJoinRequestPrefix = {'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
+constexpr std::array<std::uint8_t, 8> kOnboardingPrefix = {'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
+
+// Both registration scripts share one layout (tx.hpp); only the prefix differs.
+template <typename Data>
+bool parse_registration_script(const Bytes& script, const std::array<std::uint8_t, 8>& prefix, Data* out) {
+  if (script.size() != kValidatorRegistrationScriptBytes && script.size() != kValidatorRegistrationScriptPowBytes) {
+    return false;
   }
+  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
+  Data d;
+  auto it = script.begin() + 8;
+  auto take = [&](auto& dst) {
+    std::copy(it, it + static_cast<std::ptrdiff_t>(dst.size()), dst.begin());
+    it += static_cast<std::ptrdiff_t>(dst.size());
+  };
+  take(d.validator_pubkey);
+  take(d.payout_pubkey);
+  take(d.pop);
+  take(d.bls_pubkey);
+  take(d.bls_pop);
+  d.has_admission_pow = script.size() == kValidatorRegistrationScriptPowBytes;
+  if (d.has_admission_pow) {
+    Bytes suffix(it, script.end());
+    codec::ByteReader r(suffix);
+    auto epoch = r.u64le();
+    auto nonce = r.u64le();
+    if (!epoch || !nonce || !r.eof()) return false;
+    d.admission_pow_epoch = *epoch;
+    d.admission_pow_nonce = *nonce;
+  }
+  if (out) *out = d;
   return true;
+}
+
+template <typename Data>
+Bytes encode_registration_script(const std::array<std::uint8_t, 8>& prefix, const Data& d) {
+  Bytes s(prefix.begin(), prefix.end());
+  s.insert(s.end(), d.validator_pubkey.begin(), d.validator_pubkey.end());
+  s.insert(s.end(), d.payout_pubkey.begin(), d.payout_pubkey.end());
+  s.insert(s.end(), d.pop.begin(), d.pop.end());
+  s.insert(s.end(), d.bls_pubkey.begin(), d.bls_pubkey.end());
+  s.insert(s.end(), d.bls_pop.begin(), d.bls_pop.end());
+  if (d.has_admission_pow) {
+    codec::ByteWriter w;
+    w.u64le(d.admission_pow_epoch);
+    w.u64le(d.admission_pow_nonce);
+    const auto suffix = w.take();
+    s.insert(s.end(), suffix.begin(), suffix.end());
+  }
+  return s;
+}
+
+}  // namespace
+
+Bytes encode_validator_join_request_script(const ValidatorJoinRequestScriptData& data) {
+  return encode_registration_script(kJoinRequestPrefix, data);
+}
+
+Bytes encode_onboarding_registration_script(const OnboardingRegistrationScriptData& data) {
+  return encode_registration_script(kOnboardingPrefix, data);
+}
+
+bool parse_onboarding_registration_script(const Bytes& script, OnboardingRegistrationScriptData* out) {
+  return parse_registration_script(script, kOnboardingPrefix, out);
 }
 
 bool is_onboarding_registration_script(const Bytes& script, PubKey32* out_validator_pubkey,
@@ -803,27 +892,7 @@ bool is_onboarding_registration_script(const Bytes& script, PubKey32* out_valida
 }
 
 bool parse_validator_join_request_script(const Bytes& script, ValidatorJoinRequestScriptData* out) {
-  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
-  if (script.size() != 136 && script.size() != 152) return false;
-  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
-  if (out) {
-    std::copy(script.begin() + 8, script.begin() + 40, out->validator_pubkey.begin());
-    std::copy(script.begin() + 40, script.begin() + 72, out->payout_pubkey.begin());
-    std::copy(script.begin() + 72, script.begin() + 136, out->pop.begin());
-    out->has_admission_pow = (script.size() == 152);
-    out->admission_pow_epoch = 0;
-    out->admission_pow_nonce = 0;
-    if (out->has_admission_pow) {
-      Bytes suffix(script.begin() + 136, script.end());
-      codec::ByteReader r(suffix);
-      auto epoch = r.u64le();
-      auto nonce = r.u64le();
-      if (!epoch || !nonce || !r.eof()) return false;
-      out->admission_pow_epoch = *epoch;
-      out->admission_pow_nonce = *nonce;
-    }
-  }
-  return true;
+  return parse_registration_script(script, kJoinRequestPrefix, out);
 }
 
 bool is_validator_join_request_script(const Bytes& script, PubKey32* out_validator_pubkey,
