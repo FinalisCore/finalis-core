@@ -2510,6 +2510,61 @@ TEST(test_lightserver_validator_onboarding_rpc_start_and_status_support_live_reg
   ASSERT_TRUE(get_status_resp.find("\"onboarding_reward_score_units\":7") != std::string::npos);
 }
 
+// The node creates an unencrypted validator key on testnet, so `finalis-cli --testnet
+// validator-register` against the running node must accept it there. Mainnet still requires an
+// encrypted key and its passphrase.
+TEST(test_lightserver_onboarding_rpc_accepts_unencrypted_keystore_only_off_mainnet) {
+  const std::string base = unique_test_base("/tmp/finalis_light_onboarding_plain_key");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  const std::string plain_key = base + "/keystore/validator.json";
+  const std::string sealed_key = base + "/keystore/sealed.json";
+  keystore::ValidatorKey vk;
+  std::string key_err;
+  ASSERT_TRUE(keystore::create_validator_keystore(plain_key, "", "testnet", "tsc", deterministic_seed_for_node_id(21),
+                                                  &vk, &key_err));
+  ASSERT_TRUE(keystore::create_validator_keystore(sealed_key, "pw", "testnet", "tsc", deterministic_seed_for_node_id(22),
+                                                  &vk, &key_err));
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open(base));
+    Hash32 tip_hash{};
+    tip_hash[31] = 0x21;
+    ASSERT_TRUE(db.set_tip(storage::TipState{1, tip_hash}));
+    ASSERT_TRUE(db.flush());
+    db.close();
+  }
+
+  const auto status_body = [](const std::string& key_file, const std::string& pass) {
+    return std::string(R"({"jsonrpc":"2.0","id":1,"method":"validator_onboarding_status","params":{"key_file":")") +
+           key_file + R"(","passphrase":")" + pass + R"("}})";
+  };
+  const std::string refused = "rpc requires a passphrase-encrypted keystore";
+
+  {
+    lightserver::Config cfg;
+    cfg.db_path = base;
+    cfg.network = testnet_network();
+    lightserver::Server ls(cfg);
+    ASSERT_TRUE(ls.init());
+    const auto plain = ls.handle_admin_rpc_for_test(status_body(plain_key, ""));
+    ASSERT_TRUE(plain.find(refused) == std::string::npos);
+    ASSERT_TRUE(plain.find("\"state\"") != std::string::npos);
+    // An encrypted key still needs its passphrase.
+    ASSERT_TRUE(ls.handle_admin_rpc_for_test(status_body(sealed_key, "")).find("\"state\":\"failed\"") != std::string::npos);
+    ASSERT_TRUE(ls.handle_admin_rpc_for_test(status_body(sealed_key, "pw")).find(refused) == std::string::npos);
+  }
+  {
+    lightserver::Config cfg;
+    cfg.db_path = base;
+    cfg.network = mainnet_network();
+    lightserver::Server ls(cfg);
+    ASSERT_TRUE(ls.init());
+    ASSERT_TRUE(ls.handle_admin_rpc_for_test(status_body(plain_key, "")).find(refused) != std::string::npos);
+  }
+}
+
 TEST(test_lightserver_survives_overflowing_content_length) {
   const std::string base = unique_test_base("/tmp/finalis_light_overflow_cl");
   std::filesystem::remove_all(base);
