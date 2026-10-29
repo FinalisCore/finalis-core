@@ -406,7 +406,7 @@ std::optional<UtxoView> parse_utxo_entry(const minijson::Value& entry) {
   if (!txid_hex || !vout || !value || !height || !spk_hex) return std::nullopt;
   auto txid = parse_hex32_field(*txid_hex);
   auto spk = hex_decode(*spk_hex);
-  if (!txid || !spk || *vout > std::numeric_limits<std::uint32_t>::max()) return std::nullopt;
+  if (!txid || !spk || *vout > (std::numeric_limits<std::uint32_t>::max)()) return std::nullopt;
   return UtxoView{*txid, static_cast<std::uint32_t>(*vout), *value, *height, *spk};
 }
 
@@ -436,7 +436,7 @@ std::optional<UtxoPageView> parse_utxo_page_result(const minijson::Value* result
   auto next_height = object_u64(next, "height");
   auto next_txid_hex = object_string(next, "txid");
   auto next_vout = object_u64(next, "vout");
-  if (!next_height || !next_txid_hex || !next_vout || *next_vout > std::numeric_limits<std::uint32_t>::max()) {
+  if (!next_height || !next_txid_hex || !next_vout || *next_vout > (std::numeric_limits<std::uint32_t>::max)()) {
     if (err) *err = "malformed utxo page cursor";
     return std::nullopt;
   }
@@ -703,7 +703,7 @@ std::optional<UtxoProofsView> rpc_get_utxo_proofs(const std::string& rpc_url, co
     const auto vout = object_u64(&item, "vout");
     const auto proof = hex_decode(object_string(&item, "proof_hex").value_or(""));
     const auto* value = item.get("value_hex");
-    if (!txid || txid->size() != 32 || !vout || *vout > std::numeric_limits<std::uint32_t>::max() || !proof || !value) {
+    if (!txid || txid->size() != 32 || !vout || *vout > (std::numeric_limits<std::uint32_t>::max)() || !proof || !value) {
       if (err) *err = "invalid utxo proof";
       return std::nullopt;
     }
