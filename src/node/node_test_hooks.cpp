@@ -450,6 +450,11 @@ PubKey32 Node::local_validator_pubkey_for_test() const {
   return local_key_.public_key;
 }
 
+bool Node::is_validator_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return is_validator_;
+}
+
 std::string Node::consensus_rules_fingerprint_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   return ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion));
