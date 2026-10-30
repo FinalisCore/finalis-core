@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -16,7 +17,6 @@
 #ifndef _WIN32
 #include <csignal>
 #include <cstring>
-#include <fstream>
 #include <iterator>
 #include <spawn.h>
 #include <sys/wait.h>
