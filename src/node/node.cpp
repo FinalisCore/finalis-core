@@ -1174,6 +1174,9 @@ void Node::event_loop() {
       std::lock_guard<std::mutex> lk(mu_);
       const std::uint64_t h = finalized_height_ + 1;
       validators_.advance_height(h);
+      // Activation and exit happen at runtime: a validator that joins while running certifies ingress
+      // from its activation height, without a restart.
+      is_validator_ = validators_.is_active_for_height(local_key_.public_key, h);
       const std::uint32_t cv = kFixedValidationRulesVersion;
       mempool_.set_validation_context(special_validation_context_locked(h));
       const std::uint64_t now_ms = this->now_ms();

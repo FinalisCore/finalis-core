@@ -342,6 +342,7 @@ class Node {
   std::uint64_t round_age_ms_for_test() const;
   Hash32 epoch_ticket_challenge_anchor_for_test(std::uint64_t height) const;
   PubKey32 local_validator_pubkey_for_test() const;
+  bool is_validator_for_test() const;
   // The `crh` value a peer's VERSION must carry to pass the handshake gate.
   std::string consensus_rules_fingerprint_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;

@@ -4339,6 +4339,74 @@ TEST(test_onboarding_live_path_transitions_to_pending_then_active_after_bonded_j
   }, ci_timeout_seconds(30)));
 }
 
+// A node that was already running when it registered: is_validator_ was only set at startup, so it
+// voted but refused to certify ingress for its lanes (local-not-validator) until it was restarted.
+TEST(test_validator_activated_while_running_certifies_ingress_without_restart) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const auto base = unique_test_base("/tmp/finalis_it_activated_while_running");
+  const auto configure = [](node::NodeConfig& cfg) {
+    apply_test_bond_floor(cfg);
+    cfg.network.validator_join_admission_pow_difficulty_bits = 0;
+    cfg.validator_warmup_blocks_override = 1;
+  };
+  auto cluster = make_cluster(base, 1, 1, 3, configure);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 5, ci_timeout_seconds(40)));
+
+  node::NodeConfig joiner_cfg = cluster.configs[0];
+  const auto joiner_ports = reserve_test_ports(1);
+  joiner_cfg.node_id = 1;
+  joiner_cfg.p2p_port = joiner_ports[0];
+  joiner_cfg.db_path = base + "/node1";
+  joiner_cfg.validator_key_file = joiner_cfg.db_path + "/keystore/validator.json";
+  joiner_cfg.peers = {"127.0.0.1:" + std::to_string(cluster.ports[0])};
+  keystore::ValidatorKey joiner_key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(joiner_cfg.validator_key_file, joiner_cfg.validator_passphrase,
+                                                  "mainnet", "sc", deterministic_seed_for_node_id(7), &joiner_key,
+                                                  &kerr));
+  auto joiner_node = std::make_unique<node::Node>(joiner_cfg);
+  ASSERT_TRUE(joiner_node->init());
+  cluster.configs.push_back(joiner_cfg);
+  cluster.nodes.push_back(std::move(joiner_node));
+  auto& n1 = *cluster.nodes[1];
+  n1.start();
+  ASSERT_TRUE(wait_for([&]() { return n1.status().height >= 5; }, ci_timeout_seconds(40)));
+  ASSERT_TRUE(!n1.is_validator_for_test());
+
+  const std::uint64_t bond_amount = live_registration_bond_amount_for_test(n0, cluster.configs[0]);
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, bond_amount + 1000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(300)));
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly(base + "/node0"));
+  const auto chain_id = ChainId::from_config_and_db(cluster.configs[0].network, db, std::nullopt, "test", std::nullopt);
+  ValidatorJoinAdmissionPowBuildContext pow_ctx{
+      .network = &cluster.configs[0].network,
+      .chain_id = &chain_id,
+      .current_height = n0.status().height + 1,
+      .finalized_hash_at_height = [&](std::uint64_t height) { return db.get_height_hash(height); },
+  };
+  auto join_tx = build_validator_join_request_tx(
+      node_chain_domain(n0), funded->utxos, Bytes(sender.private_key.begin(), sender.private_key.end()),
+      joiner_key.pubkey, Bytes(joiner_key.privkey.begin(), joiner_key.privkey.end()), joiner_key.pubkey, bond_amount,
+      1000, address::p2pkh_script_pubkey(sender_pkh), nullptr, &pow_ctx);
+  db.close();
+  ASSERT_TRUE(join_tx.has_value());
+  ASSERT_TRUE(n0.inject_tx_for_test(*join_tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto active = n0.active_validators_for_next_height_for_test();
+    return std::find(active.begin(), active.end(), joiner_key.pubkey) != active.end();
+  }, ci_timeout_seconds(120)));
+  ASSERT_TRUE(wait_for([&]() { return n1.is_validator_for_test(); }, ci_timeout_seconds(30)));
+}
+
 TEST(test_unbond_finalization_moves_validator_to_exiting) {
   // auto fixture = make_bonded_joined_validator_fixture(unique_test_base("/tmp/finalis_it_unbond_exit"), 66);
   #ifdef _WIN32
