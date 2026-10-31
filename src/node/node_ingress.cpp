@@ -669,30 +669,41 @@ bool Node::store_finalized_lane_certificates_locked(const FrontierProposal& prop
 }
 
 void Node::reforward_uncertified_mempool_txs_locked() {
-  constexpr std::size_t kMaxPerPass = 256;
-  std::size_t count = 0;
-  for (const auto& entry : mempool_.entries(kMaxPerPass)) {
+  constexpr std::size_t kMaxScanned = 4096;
+  // Each item can go to every validator peer, so one pass stays well under a receiver's TX bucket
+  // (200 burst, 100/s in check_rate_limit_locked). The rest wait for the next pass.
+  constexpr std::size_t kMaxPerPass = 128;
+  std::vector<mempool::MempoolEntry> uncertified;
+  for (auto& entry : mempool_.entries(kMaxScanned)) {
     if (db_.get_ingress_bytes(entry.txid).has_value()) continue;  // certified; waits for a slice
+    uncertified.push_back(std::move(entry));
+  }
+  std::vector<const TxTimed*> uncertified_timed;
+  for (const auto& [txid, timed] : timed_pool_) {
+    if (!db_.get_ingress_bytes(txid).has_value()) uncertified_timed.push_back(&timed);
+  }
+  const auto window =
+      next_reforward_window(uncertified.size() + uncertified_timed.size(), kMaxPerPass, &tx_reforward_cursor_);
+  for (const std::size_t index : window) {
     std::string error;
-    if (maybe_certify_locally_accepted_tx_locked(entry.tx, &error)) {
-      ++count;
+    if (index < uncertified.size()) {
+      const auto& tx = uncertified[index].tx;
+      if (!maybe_certify_locally_accepted_tx_locked(tx, &error)) {
+        maybe_forward_tx_to_designated_certifier_locked(tx, 0);
+      }
       continue;
     }
-    maybe_forward_tx_to_designated_certifier_locked(entry.tx, 0);
-    ++count;
-  }
-  for (const auto& [txid, timed] : timed_pool_) {
-    if (db_.get_ingress_bytes(txid).has_value()) continue;
-    const auto raw = timed.serialize();
+    const auto raw = uncertified_timed[index - uncertified.size()]->serialize();
     const auto identity = consensus::ingress_record_identity(raw);
     if (!identity.has_value()) continue;
-    std::string error;
     if (!maybe_certify_record_locked(raw, *identity, &error)) {
       maybe_forward_record_to_designated_certifier_locked(raw, identity->lane, 0);
     }
-    ++count;
   }
-  if (count > 0) log_line("tx-reforward-uncertified count=" + std::to_string(count));
+  if (!window.empty()) {
+    log_line("tx-reforward-uncertified count=" + std::to_string(window.size()) +
+             " pending=" + std::to_string(uncertified.size() + uncertified_timed.size()));
+  }
 }
 
 void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id) {

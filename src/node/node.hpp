@@ -1096,6 +1096,7 @@ class Node {
   std::uint64_t last_finalized_progress_ms_{0};
   std::uint64_t last_consensus_rebroadcast_ms_{0};
   std::uint64_t last_tx_reforward_ms_{0};
+  std::size_t tx_reforward_cursor_{0};
 #ifdef FINALIS_CHAOS_BYZANTINE
   // CHAOS TEST BUILDS ONLY (scripts/chaos_devnet.py --byzantine): this validator prevotes and
   // precommits every proposal it sees, ignoring every safety rule, and equivocates as leader.

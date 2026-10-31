@@ -1034,14 +1034,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   if (rate_limited) {
     log_line("sync-recv-drop peer_id=" + std::to_string(peer_id) + " type=" + std::string(msg_type_name(msg_type)) +
              " reason=rate-limited payload_size=" + std::to_string(payload.size()));
-    // Excess sync requests go unanswered and the requester retries; excess replies are a symptom of
-    // our own request rate. Scoring either banned honest nodes catching up from far behind (older
-    // nodes have no outbound budget), so both are dropped unscored.
-    const bool unscored = msg_type == p2p::MsgType::GET_TRANSITION_BY_HEIGHT ||
-                          msg_type == p2p::MsgType::GET_TRANSITION || msg_type == p2p::MsgType::GET_INGRESS_TIPS ||
-                          msg_type == p2p::MsgType::INGRESS_TIPS ||
-                          msg_type == p2p::MsgType::INGRESS_RANGE || msg_type == p2p::MsgType::EPOCH_TICKETS;
-    if (!unscored) score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");
+    if (rate_limit_drop_is_scored(msg_type)) score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");
     return;
   }
 

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <ctime>
 #include <filesystem>
+#include <set>
 #include <string>
 
 #ifndef _WIN32
@@ -18,6 +19,7 @@
 #endif
 
 #include "node/node.hpp"
+#include "node/node_internal.hpp"
 
 using namespace finalis;
 
@@ -79,6 +81,49 @@ TEST(test_node_rate_limit_still_scores_non_bootstrap_peer) {
   ASSERT_TRUE(st.banned);
 
   n.stop();
+}
+
+TEST(test_rate_limit_drop_scores_only_what_a_peer_produces_itself) {
+  using node::detail::rate_limit_drop_is_scored;
+  // Relayed for others: a burst from anyone reaches an honest peer's neighbours through it.
+  for (const std::uint16_t type :
+       {p2p::MsgType::TX, p2p::MsgType::SUBMIT_TX, p2p::MsgType::INGRESS_RECORD, p2p::MsgType::VOTE,
+        p2p::MsgType::PREVOTE, p2p::MsgType::TIMEOUT_VOTE, p2p::MsgType::TIME_SIGNATURE, p2p::MsgType::PROPOSE,
+        p2p::MsgType::TRANSITION, p2p::MsgType::EPOCH_TICKET}) {
+    ASSERT_TRUE(!rate_limit_drop_is_scored(type));
+  }
+  // Sync traffic stays unscored: requests are retried, replies follow our own request rate.
+  for (const std::uint16_t type :
+       {p2p::MsgType::GET_TRANSITION_BY_HEIGHT, p2p::MsgType::GET_TRANSITION, p2p::MsgType::GET_INGRESS_TIPS,
+        p2p::MsgType::INGRESS_TIPS, p2p::MsgType::INGRESS_RANGE, p2p::MsgType::EPOCH_TICKETS}) {
+    ASSERT_TRUE(!rate_limit_drop_is_scored(type));
+  }
+  for (const std::uint16_t type : {p2p::MsgType::PING, p2p::MsgType::PONG, p2p::MsgType::GETADDR, p2p::MsgType::ADDR,
+                                   p2p::MsgType::GET_FINALIZED_TIP, p2p::MsgType::GET_ENDPOINTS}) {
+    ASSERT_TRUE(rate_limit_drop_is_scored(type));
+  }
+}
+
+TEST(test_reforward_window_is_bounded_and_reaches_every_item) {
+  using node::detail::next_reforward_window;
+  std::size_t cursor = 0;
+  ASSERT_TRUE(next_reforward_window(0, 128, &cursor).empty());
+  ASSERT_EQ(cursor, 0U);
+
+  // The 259 stuck transactions of the live incident: no pass exceeds the cap, all get their turn.
+  std::set<std::size_t> seen;
+  for (int pass = 0; pass < 3; ++pass) {
+    const auto window = next_reforward_window(259, 128, &cursor);
+    ASSERT_TRUE(window.size() <= 128);
+    seen.insert(window.begin(), window.end());
+  }
+  ASSERT_EQ(seen.size(), 259U);
+
+  // The set shrinking under the cursor neither skips a pass nor reads out of range.
+  cursor = 200;
+  const auto after_shrink = next_reforward_window(10, 128, &cursor);
+  ASSERT_EQ(after_shrink.size(), 10U);
+  for (const auto index : after_shrink) ASSERT_TRUE(index < 10);
 }
 
 TEST(test_node_peer_discipline_decay_hook_reduces_score) {

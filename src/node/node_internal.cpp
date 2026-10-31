@@ -1069,4 +1069,36 @@ StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const Utxo
   return roots;
 }
 
+bool rate_limit_drop_is_scored(std::uint16_t msg_type) {
+  switch (msg_type) {
+    case p2p::MsgType::TX_RESULT:
+    case p2p::MsgType::GET_FINALIZED_TIP:
+    case p2p::MsgType::GET_INGRESS_RANGE:
+    case p2p::MsgType::GET_EPOCH_TICKETS:
+    case p2p::MsgType::GETADDR:
+    case p2p::MsgType::ADDR:
+    case p2p::MsgType::GET_ENDPOINTS:
+    case p2p::MsgType::ENDPOINTS:
+    case p2p::MsgType::PING:
+    case p2p::MsgType::PONG:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::vector<std::size_t> next_reforward_window(std::size_t total, std::size_t max_items, std::size_t* cursor) {
+  std::vector<std::size_t> window;
+  if (total == 0) {
+    *cursor = 0;
+    return window;
+  }
+  const std::size_t start = *cursor % total;
+  const std::size_t count = std::min(total, max_items);
+  window.reserve(count);
+  for (std::size_t i = 0; i < count; ++i) window.push_back((start + i) % total);
+  *cursor = (start + count) % total;
+  return window;
+}
+
 }  // namespace finalis::node::detail
