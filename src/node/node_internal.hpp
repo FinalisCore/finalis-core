@@ -178,4 +178,15 @@ StateRoots persist_state_roots(storage::DB& db, storage::DB::Batch& batch, std::
 StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const UtxoSetV2& utxos,
                                const consensus::ValidatorRegistry& validators, std::uint32_t validation_rules_version);
 
+// Whether a rate-limit drop of this message type scores the sending peer. Only messages a peer
+// produces itself are scored: anything it may be relaying for others says nothing about the peer,
+// and the bucket already makes the drop cheap. Scoring relays banned honest validators during a
+// transaction burst, and banned validators cannot reach quorum.
+bool rate_limit_drop_is_scored(std::uint16_t msg_type);
+
+// The re-forward pass over `total` pending items: indices to handle now, starting at `*cursor` and
+// wrapping, at most `max_items`. `*cursor` advances past them so the next pass starts where this
+// one stopped. No item starves however many stay pending.
+std::vector<std::size_t> next_reforward_window(std::size_t total, std::size_t max_items, std::size_t* cursor);
+
 }  // namespace finalis::node::detail
