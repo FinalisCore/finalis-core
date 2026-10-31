@@ -2,8 +2,8 @@ name: partner-api-governance
 
 on:
   push:
-    branches-ignore:
-      - "windows-installer-test"
+    branches:
+      - "main"
   pull_request:
     branches-ignore:
       - "windows-installer-test"

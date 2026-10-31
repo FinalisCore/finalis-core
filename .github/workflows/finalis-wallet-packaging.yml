@@ -2,8 +2,8 @@ name: finalis-wallet-packaging
 
 on:
   push:
-    branches-ignore:
-      - "windows-installer-test"
+    branches:
+      - "main"
     paths:
       - "apps/finalis-wallet/**"
       - "packaging/linux/**"

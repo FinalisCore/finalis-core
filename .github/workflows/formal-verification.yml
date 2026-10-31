@@ -2,8 +2,8 @@ name: formal-verification
 
 on:
   push:
-    branches-ignore:
-      - "windows-installer-test"
+    branches:
+      - "main"
     paths:
       - "formal/**"
       - "scripts/run_tlc.sh"

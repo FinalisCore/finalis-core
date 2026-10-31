@@ -2,8 +2,8 @@ name: simulator-conformance
 
 on:
   push:
-    branches-ignore:
-      - "windows-installer-test"
+    branches:
+      - "main"
     paths:
       - "src/consensus/finalized_committee.cpp"
       - "src/consensus/finalized_committee.hpp"

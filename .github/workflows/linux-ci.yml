@@ -2,11 +2,17 @@ name: linux-ci
 
 on:
   push:
-    branches-ignore:
-      - 'windows-installer-test'
+    branches:
+      - 'main'
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
   pull_request:
     branches-ignore:
       - 'windows-installer-test'
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
   workflow_dispatch:
 
 concurrency:
