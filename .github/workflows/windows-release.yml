@@ -12,6 +12,9 @@ on:
       - main
     tags:
       - "v*"
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
 
 permissions:
   contents: read
