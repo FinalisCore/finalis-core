@@ -1491,7 +1491,13 @@ void Node::broadcast_propose(const p2p::ProposeMsg& p) {
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) { spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); }); });
   } else {
-    p2p_.broadcast(p2p::MsgType::PROPOSE, p2p::ser_propose(p));
+    auto payload = p2p::ser_propose(p);
+    {
+      // Echoes of what this node already sent need no second validation or relay.
+      std::lock_guard<std::mutex> lk(mu_);
+      accepted_propose_payloads_.insert(message_payload_id(payload));
+    }
+    p2p_.broadcast(p2p::MsgType::PROPOSE, payload);
   }
 }
 

@@ -1755,8 +1755,14 @@ void Node::on_propose(int peer_id, const Bytes& payload, const Hash32& payload_i
     invalid_message_payloads_.insert(payload_id);
     score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PROPOSE, "invalid-propose");
   } else if (propose_result == ProposeHandlingResult::Accepted) {
-    std::lock_guard<std::mutex> lk(mu_);
-    accepted_propose_payloads_.insert(payload_id);
+    bool relay = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      accepted_propose_payloads_.insert(payload_id);
+      relay = !should_mute_peer_locked(peer_id);
+    }
+    // A leader behind NAT reaches only the peers it dialed; the rest of the committee hears it from them.
+    if (relay) broadcast_propose(*p);
   }
   return;
 }
@@ -1915,32 +1921,6 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
                                 msg.proposer_signature, *round_leader)) {
       log_propose_hard_reject("invalid-proposer-signature");
       return ProposeHandlingResult::HardReject;
-    }
-    if (from_network && from_peer_id > 0 && is_validator_) {
-      auto peer_validator_it = peer_validator_pubkeys_.find(from_peer_id);
-      if (peer_validator_it == peer_validator_pubkeys_.end()) {
-        bool allow_fallback = false;
-        std::string fallback_detail = " detail=missing-validator-pubkey";
-        const auto info = p2p_.get_peer_info(from_peer_id);
-        if (info.established() && validators_.is_active_for_height(*round_leader, msg.height)) {
-          allow_fallback = true;
-          fallback_detail = " detail=established-session-leader-fallback validator=" + short_hash_hex(*round_leader);
-        }
-        if (!allow_fallback) {
-          log_propose_hard_reject("peer-not-active-validator",
-                                  " peer_id=" + std::to_string(from_peer_id) + fallback_detail);
-          return ProposeHandlingResult::HardReject;
-        }
-        log_line("propose-peer-validator-fallback peer_id=" + std::to_string(from_peer_id) +
-                 " height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) + fallback_detail);
-      }
-      if (peer_validator_it != peer_validator_pubkeys_.end() &&
-          !validators_.is_active_for_height(peer_validator_it->second, msg.height)) {
-        log_propose_hard_reject("peer-not-active-validator",
-                                " peer_id=" + std::to_string(from_peer_id) + " validator=" +
-                                    short_hash_hex(peer_validator_it->second) + " height=" + std::to_string(msg.height));
-        return ProposeHandlingResult::HardReject;
-      }
     }
     const bool local_cached_proposal =
         !from_network && *round_leader == local_key_.public_key &&
@@ -2897,7 +2877,7 @@ void Node::retry_deferred_certified_votes() {
   for (const auto& [msg, peer_id] : ready) {
     log_line("proposal-certified-ingress-retry height=" + std::to_string(msg.height) +
              " round=" + std::to_string(msg.round) + " peer_id=" + std::to_string(peer_id));
-    (void)handle_propose_result(msg, false, peer_id, nullptr);
+    if (handle_propose_result(msg, false, peer_id, nullptr) == ProposeHandlingResult::Accepted) broadcast_propose(msg);
   }
 }
 

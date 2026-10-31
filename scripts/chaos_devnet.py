@@ -20,6 +20,9 @@ rule, and send two different proposals to different peers when they lead. Honest
 stay safe and live with K <= f. Byzantine nodes are never crashed; crashes take at most
 max(1, f - K) honest nodes.
 
+--topology star models validators behind NAT: only --hubs honest validators accept connections and
+every other validator dials just them, so proposals and votes reach the committee by relay alone.
+
 --tx-interval S sends a payment every S seconds (after the first reward settlement funds the
 validators) through a random running node's lightserver and tracks it to finality.
 
@@ -80,8 +83,9 @@ class LinkState:
 class Network:
     """Directed proxies i -> j; faults are set per unordered pair."""
 
-    def __init__(self, n: int):
+    def __init__(self, n: int, hubs: list[int] | None = None):
         self.n = n
+        self.hubs = hubs  # star topology: only these accept connections, as validators behind NAT do not
         self.state = {frozenset((i, j)): LinkState() for i in range(n) for j in range(n) if i < j}
         self.proxy_port: dict[tuple[int, int], int] = {}
         self.node_port: dict[int, int] = {}
@@ -110,7 +114,11 @@ class Network:
         return f"127.0.0.{10 + i}"
 
     def peers_for(self, i: int) -> str:
-        return ",".join(f"{self.ip(j)}:{self.proxy_port[(i, j)]}" for j in range(self.n) if j != i)
+        targets = range(self.n) if self.hubs is None else self.hubs
+        return ",".join(f"{self.ip(j)}:{self.proxy_port[(i, j)]}" for j in targets if j != i)
+
+    def accepts_inbound(self, i: int) -> bool:
+        return self.hubs is None or i in self.hubs
 
     async def _accept(self, i: int, j: int, reader, writer) -> None:
         key = frozenset((i, j))
@@ -181,7 +189,8 @@ class Nodes:
             "--node-id", str(i + 1),
             "--validator-key-file", str(self.genesis_dir / "keys" / f"validator-{i + 1}.json"),
             "--validator-passphrase-env", "FINALIS_VALIDATOR_PASSPHRASE",
-            "--listen", "--bind", "127.0.0.1", "--port", str(self.net.node_port[i]),
+            *(["--listen"] if self.net.accepts_inbound(i) else []),
+            "--bind", "127.0.0.1", "--port", str(self.net.node_port[i]),
             "--no-dns-seeds", "--peers", peers, "--seeds", peers,
             "--min-block-interval-ms", str(a.block_ms),
             "--round-timeout-ms", str(a.round_timeout_ms),
@@ -690,7 +699,12 @@ async def amain(args) -> int:
     genesis_dir = Path(args.genesis_dir).resolve() if args.genesis_dir else make_genesis(args, workdir)
     log(f"workdir={workdir} genesis={genesis_dir} nodes={args.nodes} seed={args.seed}")
 
-    net = Network(args.nodes)
+    hubs = None
+    if args.topology == "star":
+        if args.byzantine + args.hubs > args.nodes:
+            raise SystemExit("--topology star needs --hubs honest validators")
+        hubs = list(range(args.byzantine, args.byzantine + args.hubs))
+    net = Network(args.nodes, hubs)
     await net.start()
     nodes = Nodes(args, genesis_dir, net, workdir)
     mon = Monitor(args.nodes, workdir)
@@ -773,6 +787,9 @@ def main() -> int:
     ap.add_argument("--workdir")
     ap.add_argument("--genesis-dir", help="reuse a generate_fresh_genesis.sh output with --nodes validators")
     ap.add_argument("--build-dir", type=Path, default=ROOT / "build")
+    ap.add_argument("--topology", choices=["mesh", "star"], default="mesh",
+                    help="star: only --hubs validators accept connections, the rest dial just them")
+    ap.add_argument("--hubs", type=int, default=2, help="honest hub validators in a star topology")
     ap.add_argument("--block-ms", type=int, default=1000)
     ap.add_argument("--round-timeout-ms", type=int, default=2000)
     ap.add_argument("--max-round-timeout-ms", type=int, default=10000)
