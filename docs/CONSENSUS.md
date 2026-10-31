@@ -373,7 +373,10 @@ re-forwarded to the current certifier every 5 s.
 
 ## `PROPOSE` And Finalized Transition Delivery
 
-`PROPOSE` is the live current-round proposal path.
+`PROPOSE` is the live current-round proposal path. Each node relays a proposal once after accepting
+it, so a leader with few direct peers (behind NAT) still reaches the committee. The leader's signature
+authenticates a proposal, whichever peer delivered it. A leader builds once it has direct sessions to
+`quorum - 1` validators or a quorum of relayed time signatures for the parent.
 
 Finalized artifact delivery on the live path is frontier-transition based.
 

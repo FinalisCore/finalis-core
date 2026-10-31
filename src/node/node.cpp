@@ -1449,7 +1449,13 @@ void Node::event_loop() {
       }
       const std::size_t established_active_validators = established_active_validator_pubkeys.size();
       const std::size_t required_active_validators = quorum > 0 ? quorum - 1 : 0;
-      const bool quorum_validator_connectivity_ready = established_active_validators >= required_active_validators;
+      // A proposal carries the parent's time signature (consensus::verify_prev_time_signature).
+      const auto [time_signatures_known, time_signature_threshold] = time_signature_progress_for_next_height_locked();
+      const bool time_signature_ready = time_signatures_known >= time_signature_threshold;
+      // Time signatures are relayed, so a quorum of them proves a quorum is reachable without a direct
+      // session to each validator: a validator behind NAT dials only a few peers.
+      const bool quorum_validator_connectivity_ready = established_active_validators >= required_active_validators ||
+                                                       (time_signature_threshold > 0 && time_signature_ready);
       const bool ticket_pow_fallback_round = current_round_ > 0 && committee.size() == 1;
       const bool tc_driven_round = highest_tc.has_value() && highest_tc->round < current_round_;
       const bool round_justification_ready =
@@ -1545,9 +1551,6 @@ void Node::event_loop() {
         force_validator_redial = true;
       }
       const bool proposal_block_interval_ready = block_interval_elapsed || tc_driven_round;
-      // A proposal carries the parent's time signature (consensus::verify_prev_time_signature).
-      const auto [time_signatures_known, time_signature_threshold] = time_signature_progress_for_next_height_locked();
-      const bool time_signature_ready = time_signatures_known >= time_signature_threshold;
       if (!time_signature_ready && can_propose && proposal_block_interval_ready && proposal_clock_ready &&
           now_ms >= last_time_signature_wait_log_ms_ + 5000) {
         log_line("proposal-build-wait height=" + std::to_string(h) + " round=" + std::to_string(current_round_) +

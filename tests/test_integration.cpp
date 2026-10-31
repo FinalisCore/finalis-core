@@ -2855,6 +2855,52 @@ TEST(test_primary_timeout_falls_back_to_backup_proposer) {
   }
 }
 
+TEST(test_star_topology_leaf_validators_lead_through_hubs) {
+  if (!can_open_loopback_listener_for_test()) return;
+  // Validators behind NAT: nodes 2..5 take no inbound and dial only the two public hubs, so each sees
+  // 2 of the 5 other validators directly, and committee 6 has quorum 5. Their proposals must still
+  // reach a quorum through the hubs.
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_star_topology"), 6, 6, 6, [](node::NodeConfig& cfg) {
+    if (cfg.node_id < 2) return;
+    cfg.listen = false;
+    cfg.peers.resize(2);
+  });
+  auto& nodes = cluster.nodes;
+
+  constexpr std::uint64_t kHeights = 24;
+  const bool reached = wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < kHeights) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(120));
+  if (!reached) {
+    std::ostringstream oss;
+    oss << "star cluster failed to reach height " << kHeights << ":";
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      const auto st = nodes[i]->status();
+      oss << " node" << i << "{h=" << st.height << ",r=" << st.round << ",peers=" << st.peers << "}";
+    }
+    throw std::runtime_error(oss.str());
+  }
+
+  std::set<PubKey32> leaves;
+  for (std::size_t i = 2; i < nodes.size(); ++i) leaves.insert(nodes[i]->local_validator_pubkey_for_test());
+  std::uint64_t leaf_led = 0;
+  for (std::uint64_t h = 1; h <= kHeights; ++h) {
+    const auto msg = nodes[0]->finalized_transition_msg_for_test(h);
+    ASSERT_TRUE(msg.has_value());
+    const auto proposal = FrontierProposal::parse(msg->frontier_proposal_bytes);
+    ASSERT_TRUE(proposal.has_value());
+    if (leaves.contains(proposal->transition.leader_pubkey)) ++leaf_led;
+  }
+  // Leaders are drawn evenly, so about two thirds of these heights belong to the four leaves.
+  if (leaf_led < 4) {
+    throw std::runtime_error("leaf validators led " + std::to_string(leaf_led) + " of " + std::to_string(kHeights) +
+                             " heights");
+  }
+}
+
 TEST(test_tx_finalized_and_visible_on_all_nodes) {
   const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 4u);
