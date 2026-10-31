@@ -365,6 +365,7 @@ class Node {
   bool overwrite_runtime_frontier_cursor_for_test(std::uint64_t finalized_frontier);
   void set_peer_ip_for_test(int peer_id, const std::string& ip);
   void score_peer_for_test(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
+  void queue_overflow_while_locked_for_test(int peer_id);
   p2p::PeerScoreStatus peer_score_status_for_test(const std::string& ip,
                                                   std::optional<std::uint64_t> now_unix = std::nullopt) const;
   void decay_peer_discipline_for_test(std::uint64_t now_unix);

@@ -906,7 +906,9 @@ void Node::on_peer_event(int peer_id, p2p::PeerManager::PeerEventType type, cons
       score_peer(peer_id, p2p::MisbehaviorReason::HANDSHAKE_TIMEOUT, "handshake-timeout");
     }
   } else if (type == p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW) {
-    score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
+    // A full outbound queue is a slow link, not misbehaviour. Broadcasts send while holding mu_ and
+    // send_to raises this event on the same thread, so nothing on this path may take mu_: scoring
+    // here froze the validator for good during a transaction burst.
   } else if (type == p2p::PeerManager::PeerEventType::MESSAGE_RX) {
     log_line("peer-message-rx peer_id=" + std::to_string(peer_id) + " " + detail);
   }
