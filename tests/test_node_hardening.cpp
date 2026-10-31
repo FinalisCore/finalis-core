@@ -7,9 +7,12 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <set>
 #include <string>
+#include <thread>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -79,6 +82,34 @@ TEST(test_node_rate_limit_still_scores_non_bootstrap_peer) {
   ASSERT_EQ(st.score, 100);
   ASSERT_TRUE(st.soft_muted);
   ASSERT_TRUE(st.banned);
+
+  n.stop();
+}
+
+// Broadcasts send while holding the node lock, and PeerManager::send_to raises this event on the
+// same thread. Scoring the peer here took that lock again and froze the validator for good.
+TEST(test_node_queue_overflow_while_locked_neither_deadlocks_nor_scores) {
+  auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_queue_overflow_locked"));
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+
+  const std::string ip = "203.0.113.56";
+  n.set_peer_ip_for_test(11, ip);
+  std::atomic<bool> done{false};
+  std::thread sender([&]() {
+    for (int i = 0; i < 25; ++i) n.queue_overflow_while_locked_for_test(11);
+    done.store(true);
+  });
+  for (int i = 0; i < 500 && !done.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  if (!done.load()) {
+    // The sender holds the lock n.stop() needs, so a clean failure is impossible.
+    std::cerr << "deadlock: queue overflow event blocked on the node lock\n";
+    std::_Exit(1);
+  }
+  sender.join();
+  const auto st = n.peer_score_status_for_test(ip);
+  ASSERT_EQ(st.score, 0);
+  ASSERT_TRUE(!st.banned);
 
   n.stop();
 }

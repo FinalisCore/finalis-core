@@ -625,6 +625,11 @@ void Node::score_peer_for_test(int peer_id, p2p::MisbehaviorReason reason, const
   score_peer_locked(peer_id, reason, note);
 }
 
+void Node::queue_overflow_while_locked_for_test(int peer_id) {
+  std::lock_guard<std::mutex> lk(mu_);
+  on_peer_event(peer_id, p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW, "drop-low-priority");
+}
+
 p2p::PeerScoreStatus Node::peer_score_status_for_test(const std::string& ip,
                                                       std::optional<std::uint64_t> now_unix_opt) const {
   std::lock_guard<std::mutex> lk(mu_);
