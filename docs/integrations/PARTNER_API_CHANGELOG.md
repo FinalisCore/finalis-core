@@ -9,6 +9,24 @@ Entry format:
 - heading: `## YYYY-MM-DD - vX.Y.Z [NON-BREAKING|BREAKING]`
 - include changed endpoints/schemas and operational impact
 
+## 2026-11-01 - v1.4.0 [NON-BREAKING]
+
+- `GET /api/v1/tx/{txid}` serves timed envelopes:
+  - `flow.kind` is `timed-envelope`, and the new optional `timed` object
+    gives `unlock_height`, `forfeit_bond`, `settled`, `settlement_height`,
+    `outcome` and `body_txid`.
+- `TxOutput.unlock_height` and `TxOutput.owner_address` (nullable) describe
+  height and inheritance locks. `decoded_kind` is `height_lock` for both.
+- `flow.kind` / `flow_kind` can also be `shield`, `unshield` and `confidential`.
+- `TransitionSummary.hidden_tx_count` is new. `TransitionSummary.finalized_out`
+  and the `summary.finalized_out` of `GET /api/v1/recent-tx` now leave out
+  shield, confidential and timed-envelope transactions, whose public outputs
+  are only the sender's change. Types are unchanged.
+- Transitions list timed envelopes and the transfers they opened.
+- Crediting: an output with `unlock_height` or `owner_address` is not a normal
+  deposit, and a timed envelope is not a deposit. See
+  [EXCHANGE_INTEGRATION.md](EXCHANGE_INTEGRATION.md).
+
 ## 2026-10-10 - v1.3.0 [NON-BREAKING]
 
 - `GET /api/v1/tx/{txid}` now serves `TxV2` transactions (previously an

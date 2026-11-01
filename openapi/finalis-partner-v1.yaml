@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Finalis Partner API
-  version: 1.3.0
+  version: 1.4.0
   summary: Exchange-facing finalized-state partner API.
 servers:
   - url: https://partner.finalis.example
@@ -234,7 +234,9 @@ components:
         txid: {type: string}
         height: {type: [integer, 'null']}
         timestamp: {type: [integer, 'null']}
-        finalized_out: {type: [integer, 'null']}
+        finalized_out:
+          type: [integer, 'null']
+          description: Sum of this transaction's public outputs. For flow_kind shield and timed-envelope that is the sender's change, not an amount sent.
         total_out: {type: [integer, 'null']}
         fee: {type: [integer, 'null']}
         status_label: {type: [string, 'null']}
@@ -294,6 +296,28 @@ components:
         has_admission_pow: {type: boolean}
         admission_pow_epoch: {type: [integer, 'null']}
         admission_pow_nonce: {type: [integer, 'null']}
+        unlock_height:
+          type: [integer, 'null']
+          description: Set for decoded_kind "height_lock", the height from which the beneficiary named in address can spend.
+        owner_address:
+          type: [string, 'null']
+          description: Set for an inheritance lock, whose owner can spend at any height. Do not credit such an output as a deposit.
+
+    TimedEnvelope:
+      type: object
+      required: [unlock_height, forfeit_bond, settled, settlement_height, outcome, body_txid]
+      properties:
+        unlock_height: {type: integer}
+        forfeit_bond: {type: integer}
+        settled: {type: boolean}
+        settlement_height: {type: [integer, 'null']}
+        outcome:
+          type: string
+          enum: [sealed, forfeited, applied, revealed, expired, unrecorded]
+          description: sealed until settled. unrecorded if it settled before this node kept settlement records.
+        body_txid:
+          type: [string, 'null']
+          description: The opened transfer, once applied.
 
     TxResponse:
       type: object
@@ -351,6 +375,9 @@ components:
         primary_recipient: {type: [string, 'null']}
         recipient_count: {type: integer}
         participant_count: {type: [integer, 'null']}
+        timed:
+          $ref: '#/components/schemas/TimedEnvelope'
+          description: Present only for a timed envelope.
         finalized_only: {type: boolean}
         api_version:
           type: string
@@ -360,7 +387,12 @@ components:
       type: object
       properties:
         tx_count: {type: integer}
-        finalized_out: {type: integer}
+        finalized_out:
+          type: integer
+          description: Public outputs of the transactions whose amounts are public.
+        hidden_tx_count:
+          type: integer
+          description: Shield, confidential and timed-envelope transactions, left out of finalized_out.
         distinct_recipient_count: {type: integer}
         flow_mix:
           type: object
