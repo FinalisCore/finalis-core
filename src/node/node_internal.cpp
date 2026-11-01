@@ -764,6 +764,21 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
   return true;
 }
 
+storage::TimedSettlementRow timed_settlement_row(const consensus::TimedSettlementRecord& record) {
+  storage::TimedSettlementRow row;
+  row.timed_txid = record.timed_txid;
+  if (record.expired) {
+    row.outcome = storage::TimedSettlementOutcome::Expired;
+  } else if (record.revealed_data.has_value()) {
+    row.outcome = storage::TimedSettlementOutcome::Revealed;
+  } else if (record.body_applied) {
+    row.outcome = storage::TimedSettlementOutcome::Applied;
+  }
+  // A forfeited body's txid names a transfer that never happened: readers must not list it.
+  if (record.applied_body.has_value()) row.body_txid = txid_any(*record.applied_body);
+  return row;
+}
+
 bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::CanonicalDerivedState& prev,
                                    const consensus::CanonicalDerivedState& next, const Hash32& next_utxo_root) {
   std::vector<crypto::SmtChange> tree_changes;  // published per height for readers' in-memory trees

@@ -1385,6 +1385,14 @@ std::string key_txidx_prefix() { return "X:"; }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_rejected_tx(const Hash32& txid) { return "XR:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_timed_reveal_prefix() { return "TR:"; }
+std::string key_timed_settlements(std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return "TSH:" + hex_encode(w.data());
+}
+std::string key_timed_settlement_height(const Hash32& timed_txid) {
+  return "TSX:" + hex_encode(Bytes(timed_txid.begin(), timed_txid.end()));
+}
 std::string key_timed_reveal(const Hash32& txid) { return "TR:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_settlement_txid(const Hash32& txid) { return "XS:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_ingress_record_prefix() { return "IR:"; }
@@ -1614,6 +1622,22 @@ void DB::Batch::put_timed_reveal(const Hash32& timed_txid, std::uint64_t height,
   w.u64le(height);
   w.varbytes(data);
   put(key_timed_reveal(timed_txid), w.take());
+}
+
+void DB::Batch::put_timed_settlements(std::uint64_t height, const std::vector<TimedSettlementRow>& rows) {
+  if (rows.empty()) return;
+  codec::ByteWriter w;
+  w.varint(rows.size());
+  for (const auto& row : rows) {
+    w.bytes_fixed(row.timed_txid);
+    w.u8(static_cast<std::uint8_t>(row.outcome));
+    w.u8(row.body_txid.has_value() ? 1 : 0);
+    if (row.body_txid.has_value()) w.bytes_fixed(*row.body_txid);
+    codec::ByteWriter height_row;
+    height_row.u64le(height);
+    put(key_timed_settlement_height(row.timed_txid), height_row.take());
+  }
+  put(key_timed_settlements(height), w.take());
 }
 
 void DB::Batch::put_settlement_txid(const Hash32& txid, std::uint64_t height) {
@@ -2480,6 +2504,50 @@ bool DB::put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx
 
 std::optional<std::uint64_t> DB::get_rejected_tx_height(const Hash32& txid) const {
   auto b = get(key_rejected_tx(txid));
+  if (!b.has_value()) return std::nullopt;
+  std::uint64_t height = 0;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        if (!h) return false;
+        height = *h;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return height;
+}
+
+std::vector<TimedSettlementRow> DB::get_timed_settlements(std::uint64_t height) const {
+  std::vector<TimedSettlementRow> out;
+  auto b = get(key_timed_settlements(height));
+  if (!b.has_value()) return out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto count = r.varint();
+        if (!count) return false;
+        for (std::uint64_t i = 0; i < *count; ++i) {
+          TimedSettlementRow row;
+          auto txid = r.bytes_fixed<32>();
+          auto outcome = r.u8();
+          auto has_body = r.u8();
+          if (!txid || !outcome || !has_body || *outcome > 3 || *has_body > 1) return false;
+          row.timed_txid = *txid;
+          row.outcome = static_cast<TimedSettlementOutcome>(*outcome);
+          if (*has_body == 1) {
+            auto body = r.bytes_fixed<32>();
+            if (!body) return false;
+            row.body_txid = *body;
+          }
+          out.push_back(row);
+        }
+        return true;
+      })) {
+    return {};
+  }
+  return out;
+}
+
+std::optional<std::uint64_t> DB::get_timed_settlement_height(const Hash32& timed_txid) const {
+  auto b = get(key_timed_settlement_height(timed_txid));
   if (!b.has_value()) return std::nullopt;
   std::uint64_t height = 0;
   if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {

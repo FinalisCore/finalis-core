@@ -38,7 +38,9 @@
 #include "common/trusted_proxy.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/client.hpp"
+#include "utxo/confidential_tx.hpp"
 #include "utxo/tx.hpp"
+#include "utxo/validate.hpp"
 
 namespace {
 
@@ -300,6 +302,17 @@ struct TxOutputResult {
   bool has_admission_pow{false};
   std::optional<std::uint64_t> admission_pow_epoch;
   std::optional<std::uint64_t> admission_pow_nonce;
+  std::optional<std::uint64_t> unlock_height;  // decoded_kind "height_lock"
+};
+
+// The sealed part of a timed envelope, as far as the finalized chain has settled it.
+struct TimedResult {
+  std::uint64_t unlock_height{0};
+  std::uint64_t forfeit_bond{0};
+  bool settled{false};
+  std::optional<std::uint64_t> settlement_height;
+  std::string outcome{"sealed"};  // sealed, applied, revealed, forfeited, expired, unrecorded
+  std::optional<std::string> body_txid;
 };
 
 bool is_confidential_output(const TxOutputResult& out) {
@@ -328,6 +341,7 @@ struct TxResult {
   std::string data_source{"rpc_live_finalized"};
   std::optional<std::uint64_t> data_refreshed_unix_ms;
   bool finalized_only{true};
+  std::optional<TimedResult> timed;
 };
 
 struct TransitionResult {
@@ -436,6 +450,8 @@ constexpr auto kSlowRpcThreshold = std::chrono::milliseconds(200);
 constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
 constexpr std::size_t kPersistedTxIndexLimit = 128;
+// Bump when a cached finalized view would render differently: older entries are then rebuilt.
+constexpr std::uint64_t kPersistedViewVersion = 2;
 constexpr std::size_t kPersistedTransitionIndexLimit = 128;
 constexpr std::uint64_t kHomeLatestTransitions = 10;
 // The lightserver scans its local DB (and clamps to 4096); the per-height RPC fallback stays shallow.
@@ -962,6 +978,9 @@ std::string render_summary_metric_card_html(const std::string& label, const std:
   return oss.str();
 }
 
+// The transparent outputs of these flows are only change, so they say nothing about the amount sent.
+bool flow_amount_hidden(const std::string& flow_kind) { return flow_kind == "shield" || flow_kind == "confidential"; }
+
 std::string render_summary_metric_card(const std::string& label, const std::string& value, const std::string& sub = {}) {
   std::ostringstream oss;
   oss << "<div class=\"metric-card\"><span class=\"label\">" << html_escape(label) << "</span><span class=\"value\">"
@@ -1167,6 +1186,9 @@ std::string hrp_for_network_name(const std::string& network_name) {
 }
 
 std::optional<std::string> script_to_address(const Bytes& script_pubkey, const std::string& hrp) {
+  if (const auto lock = finalis::parse_height_lock_script(script_pubkey); lock.has_value()) {
+    return finalis::address::encode_p2pkh(hrp, lock->beneficiary_pkh);
+  }
   if (script_pubkey.size() != 25) return std::nullopt;
   if (script_pubkey[0] != 0x76 || script_pubkey[1] != 0xA9 || script_pubkey[2] != 0x14 || script_pubkey[23] != 0x88 ||
       script_pubkey[24] != 0xAC) {
@@ -1365,7 +1387,19 @@ FlowClassification classify_tx_flow(const std::vector<TxInputResult>& inputs, co
       std::any_of(output_addresses.begin(), output_addresses.end(),
                   [&](const std::string& address) { return input_addresses.count(address) != 0; });
 
-  if (inputs.empty()) {
+  const bool hidden_in = std::any_of(inputs.begin(), inputs.end(), [](const auto& in) { return in.confidential; });
+  const bool hidden_out = std::any_of(outputs.begin(), outputs.end(), [](const auto& out) { return is_confidential_output(out); });
+  if (hidden_in && hidden_out) {
+    flow.kind = "confidential";
+    flow.summary = "Amounts and recipients hidden";
+  } else if (hidden_out) {
+    flow.kind = "shield";
+    flow.summary = "Transparent coins moved into a hidden amount";
+    flow.primary_recipient.reset();  // the only visible output is the sender's change
+  } else if (hidden_in) {
+    flow.kind = "unshield";
+    flow.summary = "Hidden coins moved into transparent outputs";
+  } else if (inputs.empty()) {
     flow.kind = "issuance";
     flow.summary = outputs.size() <= 1 ? "Protocol or settlement issuance" : "Protocol or settlement issuance fanout";
   } else if (same_party) {
@@ -2330,15 +2364,28 @@ finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
     json_put(item, "has_admission_pow", out.has_admission_pow);
     json_put(item, "admission_pow_epoch", out.admission_pow_epoch);
     json_put(item, "admission_pow_nonce", out.admission_pow_nonce);
+    json_put(item, "unlock_height", out.unlock_height);
     outputs.array_value.push_back(std::move(item));
   }
   obj.object_value["inputs"] = std::move(inputs);
   obj.object_value["outputs"] = std::move(outputs);
+  json_put(obj, "view_version", kPersistedViewVersion);
+  if (result.timed.has_value()) {
+    auto timed = json_object_value();
+    json_put(timed, "unlock_height", result.timed->unlock_height);
+    json_put(timed, "forfeit_bond", result.timed->forfeit_bond);
+    json_put(timed, "settled", result.timed->settled);
+    json_put(timed, "settlement_height", result.timed->settlement_height);
+    json_put(timed, "outcome", result.timed->outcome);
+    json_put(timed, "body_txid", result.timed->body_txid);
+    obj.object_value["timed"] = std::move(timed);
+  }
   return obj;
 }
 
 std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& obj) {
   if (!obj.is_object()) return std::nullopt;
+  if (object_u64(&obj, "view_version") != kPersistedViewVersion) return std::nullopt;
   auto txid = object_string(&obj, "txid");
   if (!txid.has_value()) return std::nullopt;
   TxResult result;
@@ -2389,14 +2436,26 @@ std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& o
           object_bool(&output, "has_admission_pow").value_or(false),
           object_u64(&output, "admission_pow_epoch"),
           object_u64(&output, "admission_pow_nonce"),
+          object_u64(&output, "unlock_height"),
       });
     }
+  }
+  if (const auto* timed = obj.get("timed"); timed && timed->is_object()) {
+    result.timed = TimedResult{
+        object_u64(timed, "unlock_height").value_or(0),
+        object_u64(timed, "forfeit_bond").value_or(0),
+        object_bool(timed, "settled").value_or(false),
+        object_u64(timed, "settlement_height"),
+        object_string(timed, "outcome").value_or("sealed"),
+        object_string(timed, "body_txid"),
+    };
   }
   return result;
 }
 
 finalis::minijson::Value serialize_transition_result_object(const TransitionResult& result) {
   auto obj = json_object_value();
+  json_put(obj, "view_version", kPersistedViewVersion);
   json_put(obj, "found", result.found);
   json_put(obj, "finalized", result.finalized);
   json_put(obj, "height", result.height);
@@ -2423,6 +2482,7 @@ finalis::minijson::Value serialize_transition_result_object(const TransitionResu
 
 std::optional<TransitionResult> parse_transition_result_object(const finalis::minijson::Value& obj) {
   if (!obj.is_object()) return std::nullopt;
+  if (object_u64(&obj, "view_version") != kPersistedViewVersion) return std::nullopt;
   auto hash = object_string(&obj, "hash");
   if (!hash.has_value()) return std::nullopt;
   TransitionResult result;
@@ -2966,7 +3026,8 @@ std::string render_root(const Config& cfg) {
         body << "<span class=\"muted\">unknown</span>";
       }
       body << "</td><td class=\"num\">"
-           << (item.total_out.has_value() ? html_escape(format_amount(*item.total_out)) : std::string("<span class=\"muted\">n/a</span>"))
+           << (flow_amount_hidden(item.flow_kind.value_or("")) ? std::string("<span class=\"muted\">hidden</span>")
+               : item.total_out.has_value() ? html_escape(format_amount(*item.total_out)) : std::string("<span class=\"muted\">n/a</span>"))
            << "</td></tr>";
     }
     body << "</tbody></table></div>";
@@ -3174,6 +3235,17 @@ std::vector<std::string> fetch_transition_txids(const Config& cfg, const finalis
   std::vector<std::string> txids;
   if (transition.next_frontier < transition.prev_frontier) return txids;
   txids.reserve(static_cast<std::size_t>(transition.next_frontier - transition.prev_frontier));
+  // Timed settlement runs before the block's records, so the transfers it applied come first.
+  auto settled = rpc_call(cfg.rpc_url, "get_timed_settlements",
+                          std::string("{\"height\":") + std::to_string(transition.height) + "}");
+  if (settled.result.has_value() && settled.result->is_object()) {
+    if (const auto* items = settled.result->get("items"); items && items->is_array()) {
+      for (const auto& item : items->array_value) {
+        auto body_txid = object_string(&item, "body_txid");
+        if (body_txid.has_value() && is_hex64(*body_txid)) txids.push_back(*body_txid);
+      }
+    }
+  }
   for (std::uint64_t seq = transition.prev_frontier + 1; seq <= transition.next_frontier; ++seq) {
     auto rpc = rpc_call(cfg.rpc_url, "get_ingress_record", std::string("{\"seq\":") + std::to_string(seq) + "}");
     if (!rpc.result.has_value() || !rpc.result->is_object()) continue;
@@ -3319,6 +3391,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
                             ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                             : 0;
       result.txids = fetch_transition_txids(cfg, *blk);
+      result.tx_count = std::max(result.tx_count, result.txids.size());
       const auto summary = compute_transition_summary(cfg, result);
       result.summary_cached = true;
       result.cached_summary_finalized_out = summary.finalized_out;
@@ -3360,6 +3433,7 @@ LookupResult<TransitionResult> fetch_transition_result(const Config& cfg, const 
                           ? static_cast<std::size_t>(blk->next_frontier - blk->prev_frontier)
                           : 0;
     result.txids = fetch_transition_txids(cfg, *blk);
+    result.tx_count = std::max(result.tx_count, result.txids.size());
     const auto summary = compute_transition_summary(cfg, result);
     result.summary_cached = true;
     result.cached_summary_finalized_out = summary.finalized_out;
@@ -3473,8 +3547,9 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     return out;
   }
   auto tx_bytes = finalis::hex_decode(*tx_hex);
-  auto tx = tx_bytes ? finalis::parse_any_tx(*tx_bytes) : std::nullopt;
-  if (!tx.has_value()) {
+  const auto timed = tx_bytes ? finalis::TxTimed::parse(*tx_bytes) : std::nullopt;
+  auto tx = tx_bytes && !timed.has_value() ? finalis::parse_any_tx(*tx_bytes) : std::nullopt;
+  if (!tx.has_value() && !timed.has_value()) {
     out.error = upstream_error("tx parse failed");
     return out;
   }
@@ -3526,13 +3601,22 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
     auto prev_hex = object_string(&*prev_call.result, "tx_hex");
     if (!prev_hex) return nullptr;
     auto prev_bytes = finalis::hex_decode(*prev_hex);
+    if (const auto prev_timed = prev_bytes ? finalis::TxTimed::parse(*prev_bytes) : std::nullopt; prev_timed.has_value()) {
+      // An envelope's coins: its change, then the refunded bond (consensus::timed_refund_outpoint).
+      OutputsView view{prev_timed->fee_change, finalis::TxOut{prev_timed->forfeit_bond, prev_timed->bond_refund_script}};
+      return &prev_tx_cache.emplace(prev_txid_hex, std::move(view)).first->second;
+    }
     auto prev_tx = prev_bytes ? finalis::parse_any_tx(*prev_bytes) : std::nullopt;
     if (!prev_tx.has_value()) return nullptr;
     return &prev_tx_cache.emplace(prev_txid_hex, outputs_view(*prev_tx)).first->second;
   };
 
   std::string network_name = "mainnet";
-  if (auto st = fetch_status_result(cfg); st.value.has_value()) network_name = st.value->network;
+  std::optional<std::uint64_t> finalized_tip;
+  if (auto st = fetch_status_result(cfg); st.value.has_value()) {
+    network_name = st.value->network;
+    finalized_tip = st.value->finalized_height;
+  }
   const std::string hrp = hrp_for_network_name(network_name);
 
   std::uint64_t total_in = 0;
@@ -3555,27 +3639,48 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   const auto add_output = [&](const std::optional<finalis::TxOut>& tx_out) {
     if (!tx_out.has_value()) {
       result.outputs.push_back(TxOutputResult{0, std::nullopt, "", std::string("confidential"), std::nullopt, std::nullopt,
-                                              false, std::nullopt, std::nullopt});
+                                              false, std::nullopt, std::nullopt, std::nullopt});
       return;
     }
     result.total_out += tx_out->value;
+    const auto lock = finalis::parse_height_lock_script(tx_out->script_pubkey);
     result.outputs.push_back(TxOutputResult{
         tx_out->value,
         script_to_address(tx_out->script_pubkey, hrp),
         finalis::hex_encode(tx_out->script_pubkey),
-        std::nullopt,
+        lock.has_value() ? std::optional<std::string>{"height_lock"} : std::nullopt,
         std::nullopt,
         std::nullopt,
         false,
         std::nullopt,
         std::nullopt,
+        lock.has_value() ? std::optional<std::uint64_t>{lock->unlock_height} : std::nullopt,
     });
   };
 
-  if (const auto* tx_v1 = std::get_if<finalis::Tx>(&*tx)) {
+  const auto* tx_v1 = tx.has_value() ? std::get_if<finalis::Tx>(&*tx) : nullptr;
+  const auto* tx_v2 = tx.has_value() ? std::get_if<finalis::TxV2>(&*tx) : nullptr;
+  if (timed.has_value()) {
+    add_transparent_input(timed->fee_input.prev_txid, timed->fee_input.prev_index);
+    if (timed->fee_change.has_value()) add_output(*timed->fee_change);
+    TimedResult view;
+    view.unlock_height = timed->unlock_height;
+    view.forfeit_bond = timed->forfeit_bond;
+    const auto* settlement = tx_call.result->get("timed");
+    if (object_bool(settlement, "settled").value_or(false)) {
+      view.settled = true;
+      view.settlement_height = object_u64(settlement, "settlement_height");
+      view.outcome = object_string(settlement, "outcome").value_or("unrecorded");
+      view.body_txid = object_string(settlement, "body_txid");
+    } else if (finalized_tip.value_or(0) > timed->unlock_height + 1) {
+      // Settled before nodes recorded outcomes, or a long lock still waiting for its signatures.
+      view.outcome = "unrecorded";
+    }
+    result.timed = std::move(view);
+  } else if (tx_v1) {
     for (const auto& in : tx_v1->inputs) add_transparent_input(in.prev_txid, in.prev_index);
   } else {
-    for (const auto& in : std::get<finalis::TxV2>(*tx).inputs) {
+    for (const auto& in : tx_v2->inputs) {
       if (in.kind == finalis::TxInputKind::Transparent) {
         add_transparent_input(in.prev_txid, in.prev_index);
       } else {
@@ -3584,13 +3689,15 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
       }
     }
   }
-  for (const auto& tx_out : outputs_view(*tx)) add_output(tx_out);
+  if (tx.has_value()) {
+    for (const auto& tx_out : outputs_view(*tx)) add_output(tx_out);
+  }
   if (const auto* decoded_outputs = tx_call.result->get("decoded_outputs"); decoded_outputs && decoded_outputs->is_array()) {
     const auto limit = std::min(decoded_outputs->array_value.size(), result.outputs.size());
     for (std::size_t i = 0; i < limit; ++i) {
       const auto& item = decoded_outputs->array_value[i];
       if (!item.is_object() || is_confidential_output(result.outputs[i])) continue;
-      result.outputs[i].decoded_kind = object_string(&item, "decoded_kind");
+      if (auto kind = object_string(&item, "decoded_kind"); kind.has_value()) result.outputs[i].decoded_kind = kind;
       result.outputs[i].validator_pubkey_hex = object_string(&item, "validator_pubkey_hex");
       result.outputs[i].payout_pubkey_hex = object_string(&item, "payout_pubkey_hex");
       result.outputs[i].has_admission_pow = object_bool(&item, "has_admission_pow").value_or(false);
@@ -3599,19 +3706,23 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
       if (auto addr = object_string(&item, "address"); addr.has_value()) result.outputs[i].address = *addr;
     }
   }
-  if (const auto* tx_v2 = std::get_if<finalis::TxV2>(&*tx)) {
+  if (timed.has_value()) {
+    result.fee = timed->prepaid_fee;  // the input also funds the escrowed bond
+  } else if (tx_v2) {
     result.fee = tx_v2->fee;  // explicit in TxV2; confidential amounts make it uncomputable from the parts
   } else if (fee_known && total_in >= result.total_out) {
     result.fee = total_in - result.total_out;
   }
   const auto flow = classify_tx_flow(result.inputs, result.outputs);
-  result.flow_kind = flow.kind;
-  result.flow_summary = flow.summary;
+  result.flow_kind = timed.has_value() ? "timed-envelope" : flow.kind;
+  result.flow_summary = timed.has_value() ? "Sealed transfer or data, opened at its unlock height" : flow.summary;
   result.primary_sender = flow.primary_sender;
-  result.primary_recipient = flow.primary_recipient;
+  // An envelope's only visible output is the sender's change: its recipient is sealed.
+  if (!timed.has_value()) result.primary_recipient = flow.primary_recipient;
   result.participant_count = flow.participant_count;
   result.data_source = "rpc_live_finalized";
-  upsert_persisted_tx_result(cfg, result);
+  // A sealed envelope's outcome is still to come, so its view is not final yet.
+  if (!result.timed.has_value() || result.timed->settled) upsert_persisted_tx_result(cfg, result);
   out.value = std::move(result);
   return out;
 }
@@ -4134,6 +4245,7 @@ std::string render_tx_json(const TxResult& result) {
         << ",\"has_admission_pow\":" << json_bool(result.outputs[i].has_admission_pow)
         << ",\"admission_pow_epoch\":" << json_u64_or_null(result.outputs[i].admission_pow_epoch)
         << ",\"admission_pow_nonce\":" << json_u64_or_null(result.outputs[i].admission_pow_nonce)
+        << ",\"unlock_height\":" << json_u64_or_null(result.outputs[i].unlock_height)
         << "}";
   }
   std::size_t decoded_output_count = 0;
@@ -4144,7 +4256,16 @@ std::string render_tx_json(const TxResult& result) {
       decoded_recipients.insert(*output.address);
     }
   }
-  oss << "],\"finalized_out\":" << result.total_out << ",\"total_out\":" << result.total_out << ",\"fee\":"
+  oss << "]";
+  if (result.timed.has_value()) {
+    oss << ",\"timed\":{\"unlock_height\":" << result.timed->unlock_height
+        << ",\"forfeit_bond\":" << result.timed->forfeit_bond
+        << ",\"settled\":" << json_bool(result.timed->settled)
+        << ",\"settlement_height\":" << json_u64_or_null(result.timed->settlement_height)
+        << ",\"outcome\":\"" << finalis::minijson::escape(result.timed->outcome)
+        << "\",\"body_txid\":" << json_string_or_null(result.timed->body_txid) << "}";
+  }
+  oss << ",\"finalized_out\":" << result.total_out << ",\"total_out\":" << result.total_out << ",\"fee\":"
       << (result.fee.has_value() ? std::to_string(*result.fee) : "null") << ","
       << "\"input_count\":" << result.inputs.size() << ",\"output_count\":" << result.outputs.size()
       << ",\"decoded_output_count\":" << decoded_output_count
@@ -4329,6 +4450,21 @@ std::string render_health_json(bool ok, const std::optional<ApiError>& err = std
   return oss.str();
 }
 
+// What the page leads with: the amount sent, so a sender's change does not read as payment.
+std::string tx_headline_amount(const TxResult& tx) {
+  if (flow_amount_hidden(tx.flow_kind)) return "hidden";
+  if (tx.timed.has_value()) return "sealed";
+  std::set<std::string> senders;
+  for (const auto& in : tx.inputs) {
+    if (in.address.has_value()) senders.insert(*in.address);
+  }
+  std::uint64_t sent = 0;
+  for (const auto& out : tx.outputs) {
+    if (out.address.has_value() && senders.count(*out.address) == 0) sent += out.amount;
+  }
+  return format_amount(sent != 0 ? sent : tx.total_out);
+}
+
 std::string render_tx(const Config& cfg, const std::string& txid_hex) {
   std::ostringstream body;
   body << "<h1>Transaction</h1>";
@@ -4370,9 +4506,28 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
        << render_summary_metric_card("Flow", tx.flow_kind, tx.flow_summary)
        << render_summary_metric_card_html("From", payer, "inferred from inputs")
        << render_summary_metric_card_html("To", payee, "inferred from outputs, change excluded")
-       << render_summary_metric_card("Amount", format_amount(tx.total_out),
+       << render_summary_metric_card("Amount", tx_headline_amount(tx),
                                      tx.fee.has_value() ? ("fee " + format_amount(*tx.fee)) : "fee unknown")
        << "</div></div>";
+
+  if (tx.timed.has_value()) {
+    const auto& timed = *tx.timed;
+    std::string outcome = "Sealed until block " + std::to_string(timed.unlock_height);
+    if (timed.outcome == "applied") outcome = "Opened: transfer applied, bond refunded";
+    if (timed.outcome == "revealed") outcome = "Opened: data published, bond refunded";
+    if (timed.outcome == "forfeited") outcome = "Opened: transfer failed. Bond forfeited";
+    if (timed.outcome == "expired") outcome = "Expired unopened, bond refunded";
+    if (timed.outcome == "unrecorded") outcome = "Past its unlock height; outcome not recorded by this node";
+    body << "<div class=\"card\"><h2>Time-locked envelope</h2><div class=\"grid\">"
+         << "<div>Status</div><div>" << html_escape(outcome) << "</div>"
+         << "<div>Unlock height</div><div>" << link_transition_height(timed.unlock_height) << "</div>"
+         << "<div>Bond</div><div>" << html_escape(format_amount(timed.forfeit_bond)) << "</div>";
+    if (timed.settlement_height.has_value()) {
+      body << "<div>Settled in</div><div>" << link_transition_height(*timed.settlement_height) << "</div>";
+    }
+    if (timed.body_txid.has_value()) body << "<div>Opened transfer</div><div>" << link_tx(*timed.body_txid) << "</div>";
+    body << "</div></div>";
+  }
 
   body << "<div class=\"card\"><div class=\"status-hero\">"
        << "<div>" << mono_value(tx.txid) << "</div><div>" << finalized_badge(tx.finalized) << " "
@@ -4449,6 +4604,8 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
     body << "</td><td>";
     if (out.decoded_kind == std::optional<std::string>{"onboarding_registration"}) {
       body << "SCONBREG onboarding registration";
+    } else if (out.unlock_height.has_value()) {
+      body << "Height-locked until block " << *out.unlock_height;
     } else {
       body << (out.address.has_value() ? "P2PKH address" : "Raw script only");
     }

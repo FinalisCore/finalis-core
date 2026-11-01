@@ -164,13 +164,23 @@ std::optional<Tx> settlement_projection(const storage::DB& db, const Hash32& txi
 }
 
 // The transparent view of a finalized transaction, or of a settlement when `txid` names one.
+// What an envelope moves at inclusion. The bond and the sealed transfer are settled later.
+Tx timed_projection(const TxTimed& timed) {
+  Tx out;
+  out.version = timed.version;
+  out.inputs.push_back(TxIn{timed.fee_input.prev_txid, timed.fee_input.prev_index, {}, 0xFFFFFFFF});
+  if (timed.fee_change.has_value()) out.outputs.push_back(*timed.fee_change);
+  return out;
+}
+
 std::optional<Tx> load_finalized_tx(const storage::DB& db, const Hash32& txid, std::uint64_t* height = nullptr,
                                     bool* is_settlement = nullptr) {
   if (is_settlement) *is_settlement = false;
   if (auto loc = db.get_tx_index(txid); loc.has_value()) {
+    if (height) *height = loc->height;
+    if (const auto timed = TxTimed::parse(loc->tx_bytes); timed.has_value()) return timed_projection(*timed);
     auto tx = parse_any_tx(loc->tx_bytes);
     if (!tx.has_value()) return std::nullopt;
-    if (height) *height = loc->height;
     return transparent_projection(*tx);
   }
   auto settlement = settlement_projection(db, txid, height);
@@ -179,7 +189,9 @@ std::optional<Tx> load_finalized_tx(const storage::DB& db, const Hash32& txid, s
 }
 
 // TxV2 carries its fee explicitly; inputs minus outputs of its projection would count hidden value.
-std::optional<std::uint64_t> explicit_txv2_fee(const Bytes& tx_bytes) {
+// An envelope's fee is prepaid, and the rest of its input is the escrowed bond.
+std::optional<std::uint64_t> explicit_tx_fee(const Bytes& tx_bytes) {
+  if (const auto timed = TxTimed::parse(tx_bytes); timed.has_value()) return timed->prepaid_fee;
   const auto tx = parse_any_tx(tx_bytes);
   if (!tx.has_value() || !std::holds_alternative<TxV2>(*tx)) return std::nullopt;
   return std::get<TxV2>(*tx).fee;
@@ -384,14 +396,26 @@ std::vector<Hash32> canonical_transition_txids(const storage::DB& db, std::uint6
   std::vector<Hash32> txids;
   if (transition->next_frontier < transition->prev_frontier) return txids;
   txids.reserve(static_cast<std::size_t>(transition->next_frontier - transition->prev_frontier));
+  // Settlement ran before the block's records, so the transfers it applied come first.
+  for (const auto& row : db.get_timed_settlements(height)) {
+    if (row.body_txid.has_value()) txids.push_back(*row.body_txid);
+  }
   for (std::uint64_t seq = transition->prev_frontier + 1; seq <= transition->next_frontier; ++seq) {
     auto tx_bytes = db.get_ingress_record(seq);
     if (!tx_bytes.has_value()) continue;
-    auto tx = parse_any_tx(*tx_bytes);
-    if (!tx.has_value()) continue;
-    txids.push_back(txid_any(*tx));
+    if (const auto identity = consensus::ingress_record_identity(*tx_bytes); identity.has_value()) {
+      txids.push_back(identity->txid);
+    }
   }
   return txids;
+}
+
+// The address a coin pays: a height lock names its beneficiary rather than a P2PKH script.
+std::optional<std::string> payee_address(const Bytes& script_pubkey, const std::string& hrp) {
+  if (const auto lock = parse_height_lock_script(script_pubkey); lock.has_value()) {
+    return address::encode_p2pkh(hrp, lock->beneficiary_pkh);
+  }
+  return p2pkh_script_to_address(script_pubkey, hrp);
 }
 
 std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const NetworkConfig& network,
@@ -437,21 +461,21 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
       }
       const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
       total_in += prev_out.value;
-      if (auto addr = p2pkh_script_to_address(prev_out.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
+      if (auto addr = payee_address(prev_out.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
         if (input_addresses.insert(*addr).second) input_order.push_back(*addr);
       }
     }
 
     for (const auto& output : tx->outputs) {
       row.total_out += output.value;
-      if (auto addr = p2pkh_script_to_address(output.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
+      if (auto addr = payee_address(output.script_pubkey, hrp); addr.has_value() && !addr->empty()) {
         if (output_addresses.insert(*addr).second) output_order.push_back(*addr);
         row.recipients.push_back(*addr);
       }
     }
     if (is_settlement) {
       row.fee = 0;
-    } else if (auto v2_fee = explicit_txv2_fee(db.get_tx_index(txid)->tx_bytes); v2_fee.has_value()) {
+    } else if (auto v2_fee = explicit_tx_fee(db.get_tx_index(txid)->tx_bytes); v2_fee.has_value()) {
       row.fee = *v2_fee;
     } else if (fee_known && total_in >= row.total_out) {
       row.fee = total_in - row.total_out;
@@ -476,9 +500,33 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
         std::any_of(output_addresses.begin(), output_addresses.end(),
                     [&](const std::string& address) { return input_addresses.count(address) != 0; });
 
+    const auto tx_loc = is_settlement ? std::nullopt : db.get_tx_index(txid);
+    const auto any_tx = tx_loc.has_value() ? parse_any_tx(tx_loc->tx_bytes) : std::nullopt;
+    const auto* tx_v2 = any_tx.has_value() ? std::get_if<TxV2>(&*any_tx) : nullptr;
+    const bool hidden_in = tx_v2 && std::any_of(tx_v2->inputs.begin(), tx_v2->inputs.end(), [](const auto& in) {
+      return in.kind != TxInputKind::Transparent;
+    });
+    const bool hidden_out = tx_v2 && std::any_of(tx_v2->outputs.begin(), tx_v2->outputs.end(), [](const auto& out) {
+      return out.kind != TxOutputKind::Transparent;
+    });
+
     if (is_settlement) {
       row.flow_kind = "reward";
       row.flow_summary = "Protocol reward payout";
+    } else if (tx_loc.has_value() && TxTimed::parse(tx_loc->tx_bytes).has_value()) {
+      row.flow_kind = "timed-envelope";
+      row.flow_summary = "Sealed transfer or data, opened at its unlock height";
+      row.primary_recipient.reset();  // its only visible output is the sender's change
+    } else if (hidden_in && hidden_out) {
+      row.flow_kind = "confidential";
+      row.flow_summary = "Amounts and recipients hidden";
+    } else if (hidden_out) {
+      row.flow_kind = "shield";
+      row.flow_summary = "Transparent coins moved into a hidden amount";
+      row.primary_recipient.reset();  // its only visible output is the sender's change
+    } else if (hidden_in) {
+      row.flow_kind = "unshield";
+      row.flow_summary = "Hidden coins moved into transparent outputs";
     } else if (tx->inputs.empty()) {
       row.flow_kind = "issuance";
       row.flow_summary = tx->outputs.size() <= 1 ? "Protocol or settlement issuance" : "Protocol or settlement issuance fanout";
@@ -826,6 +874,26 @@ std::string ticket_pow_status_json(const TicketPowStatusView& status) {
   return oss.str();
 }
 
+std::optional<storage::TimedSettlementRow> timed_settlement_row_for(const storage::DB& db, const Hash32& timed_txid) {
+  const auto height = db.get_timed_settlement_height(timed_txid);
+  if (!height.has_value()) return std::nullopt;
+  for (const auto& row : db.get_timed_settlements(*height)) {
+    if (row.timed_txid == timed_txid) return row;
+  }
+  return std::nullopt;
+}
+
+std::string timed_settlement_fields_json(const storage::TimedSettlementRow& row, std::uint64_t height) {
+  const char* outcome = "forfeited";
+  if (row.outcome == storage::TimedSettlementOutcome::Applied) outcome = "applied";
+  if (row.outcome == storage::TimedSettlementOutcome::Revealed) outcome = "revealed";
+  if (row.outcome == storage::TimedSettlementOutcome::Expired) outcome = "expired";
+  std::ostringstream oss;
+  oss << "\"settlement_height\":" << height << ",\"outcome\":\"" << outcome << "\",\"body_txid\":";
+  if (row.body_txid.has_value()) oss << "\"" << hex_encode32(*row.body_txid) << "\""; else oss << "null";
+  return oss.str();
+}
+
 std::string decoded_tx_output_json(const TxOut& out, const NetworkConfig& network) {
   std::ostringstream oss;
   oss << "{\"amount\":" << out.value
@@ -930,9 +998,11 @@ std::string ingress_record_json(std::uint64_t seq, const std::optional<Bytes>& r
   }
   const auto record_hash = crypto::sha256d(*record);
   oss << ",\"hash\":\"" << hex_encode32(record_hash) << "\"";
-  if (auto tx = parse_any_tx(*record); tx.has_value()) {
-    oss << ",\"txid\":\"" << hex_encode32(txid_any(*tx)) << "\"";
-    if (std::holds_alternative<TxV2>(*tx)) {
+  if (const auto identity = consensus::ingress_record_identity(*record); identity.has_value()) {
+    oss << ",\"txid\":\"" << hex_encode32(identity->txid) << "\"";
+    if (identity->timed) {
+      oss << ",\"tx_version\":3";
+    } else if (const auto tx = parse_any_tx(*record); tx.has_value() && std::holds_alternative<TxV2>(*tx)) {
       oss << ",\"tx_version\":2";
     } else {
       oss << ",\"tx_version\":1";
@@ -2871,6 +2941,18 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     if (!loc.has_value()) return make_error(id, -32001, "not found");
     std::ostringstream oss;
     oss << "{\"height\":" << loc->height << ",\"tx_hex\":\"" << hex_encode(loc->tx_bytes) << "\"";
+    if (const auto timed = TxTimed::parse(loc->tx_bytes); timed.has_value()) {
+      oss << ",\"tx_version\":3,\"fee\":" << timed->prepaid_fee << ",\"decoded_outputs\":[";
+      if (timed->fee_change.has_value()) oss << decoded_tx_output_json(*timed->fee_change, cfg_.network);
+      oss << "],\"timed\":{\"unlock_height\":" << timed->unlock_height << ",\"forfeit_bond\":" << timed->forfeit_bond;
+      if (const auto row = timed_settlement_row_for(*view, *txid); row.has_value()) {
+        oss << ",\"settled\":true," << timed_settlement_fields_json(*row, *view->get_timed_settlement_height(*txid));
+      } else {
+        oss << ",\"settled\":false";
+      }
+      oss << "}}";
+      return make_result(id, oss.str());
+    }
     const auto parsed = parse_any_tx(loc->tx_bytes);
     if (parsed.has_value() && std::holds_alternative<Tx>(*parsed)) {
       const auto& tx = std::get<Tx>(*parsed);
@@ -2908,6 +2990,22 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     auto tip = view->get_tip();
     auto loc = view->get_tx_index(*txid);
     return make_result(id, tx_status_json(*txid, loc, tip, *view));
+  }
+
+  // How the block's timed envelopes settled (DB "TSH:" rows), written from this version on.
+  if (*method == "get_timed_settlements") {
+    auto height = field_u64(params, "height");
+    if (!height) return make_error(id, -32602, "missing height");
+    std::ostringstream oss;
+    oss << "{\"height\":" << *height << ",\"items\":[";
+    bool first = true;
+    for (const auto& row : view->get_timed_settlements(*height)) {
+      if (!first) oss << ",";
+      first = false;
+      oss << "{\"txid\":\"" << hex_encode32(row.timed_txid) << "\"," << timed_settlement_fields_json(row, *height) << "}";
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
   }
 
   // The data a TxTimed's reveal body published when it settled (DB "TR:" rows); revealed=false while

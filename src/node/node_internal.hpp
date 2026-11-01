@@ -183,6 +183,7 @@ StateRoots persist_state_roots(storage::DB& db, std::uint64_t height, const Utxo
 // and the bucket already makes the drop cheap. Scoring relays banned honest validators during a
 // transaction burst, and banned validators cannot reach quorum.
 bool rate_limit_drop_is_scored(std::uint16_t msg_type);
+storage::TimedSettlementRow timed_settlement_row(const consensus::TimedSettlementRecord& record);
 
 // The re-forward pass over `total` pending items: indices to handle now, starting at `*cursor` and
 // wrapping, at most `max_items`. `*cursor` advances past them so the next pass starts where this
