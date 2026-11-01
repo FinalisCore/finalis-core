@@ -2058,9 +2058,9 @@ bool DB::erase_utxo(const OutPoint& op) {
 }
 
 std::optional<TxOut> DB::get_utxo(const OutPoint& op) const {
-  auto raw = get(key_utxo(op));
-  if (!raw.has_value()) return std::nullopt;
-  return parse_txout(*raw);
+  const auto entry = get_utxo_v2(op);
+  if (!entry.has_value()) return std::nullopt;
+  return transparent_txout_from_utxo_entry(*entry);
 }
 
 std::optional<UtxoEntryV2> DB::get_utxo_v2(const OutPoint& op) const {

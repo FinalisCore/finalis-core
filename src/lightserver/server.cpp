@@ -207,97 +207,24 @@ std::vector<storage::DB::ScriptUtxoEntry> reconciled_script_utxos(const storage:
   }
   if (!needs_canonical_fallback) return verified;
 
-  if (history.empty()) {
-    const auto canonical_utxos = db.load_transparent_utxos();
-    std::map<OutPoint, TxOut> canonical_matches;
-    for (const auto& [op, entry] : canonical_utxos) {
-      if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
-      canonical_matches.emplace(op, entry.out);
-    }
-    std::vector<storage::DB::ScriptUtxoEntry> out;
-    out.reserve(std::max(indexed_entries.size(), canonical_matches.size()));
-    std::set<OutPoint> seen;
-    for (const auto& entry : indexed_entries) {
-      const auto canonical_it = canonical_matches.find(entry.outpoint);
-      if (canonical_it == canonical_matches.end()) continue;
-      if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
-      storage::DB::ScriptUtxoEntry merged = entry;
-      if (auto loc = db.get_tx_index(entry.outpoint.txid); loc.has_value()) merged.height = loc->height;
-      out.push_back(std::move(merged));
-      seen.insert(entry.outpoint);
-    }
-    for (const auto& [op, prevout] : canonical_matches) {
-      if (seen.find(op) != seen.end()) continue;
-      storage::DB::ScriptUtxoEntry merged;
-      merged.outpoint = op;
-      merged.value = prevout.value;
-      merged.script_pubkey = prevout.script_pubkey;
-      if (auto loc = db.get_tx_index(op.txid); loc.has_value()) merged.height = loc->height;
-      out.push_back(std::move(merged));
-    }
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
-      if (a.height != b.height) return a.height < b.height;
-      return std::tie(a.outpoint.txid, a.outpoint.index) < std::tie(b.outpoint.txid, b.outpoint.index);
-    });
-    return out;
-  }
-  std::map<Hash32, std::optional<Tx>> tx_cache;
-  const auto load_tx = [&](const Hash32& txid) -> std::optional<Tx> {
-    auto it = tx_cache.find(txid);
-    if (it != tx_cache.end()) return it->second;
-    std::optional<Tx> parsed = load_finalized_tx(db, txid);
-    tx_cache.emplace(txid, parsed);
-    return parsed;
-  };
-
-  std::map<OutPoint, storage::DB::ScriptUtxoEntry> canonical_matches;
-  for (const auto& item : history) {
-    const auto tx = load_tx(item.txid);
-    if (!tx.has_value()) continue;
-    for (std::size_t i = 0; i < tx->outputs.size(); ++i) {
-      const auto& out = tx->outputs[i];
-      if (!script_indexed_under(out.script_pubkey, scripthash) || is_data_output_script(out.script_pubkey)) continue;
-      const OutPoint op{item.txid, static_cast<std::uint32_t>(i)};
-      canonical_matches[op] = storage::DB::ScriptUtxoEntry{op, out.value, out.script_pubkey, item.height};
-    }
-    for (const auto& input : tx->inputs) {
-      const auto prev_tx = load_tx(input.prev_txid);
-      if (!prev_tx.has_value()) continue;
-      if (static_cast<std::size_t>(input.prev_index) >= prev_tx->outputs.size()) continue;
-      const auto& prev_out = prev_tx->outputs[static_cast<std::size_t>(input.prev_index)];
-      if (!script_indexed_under(prev_out.script_pubkey, scripthash)) continue;
-      canonical_matches.erase(OutPoint{input.prev_txid, input.prev_index});
-    }
-  }
-  // History does not include frontier settlement credits. Merge canonical UTXOs
-  // so settlement outputs remain visible even when history is non-empty.
-  const auto canonical_utxos = db.load_transparent_utxos();
-  for (const auto& [op, entry] : canonical_utxos) {
+  // The coin set alone decides what exists: replaying history would miss spends it cannot parse,
+  // such as a timed envelope's fee input.
+  std::map<OutPoint, std::uint64_t> indexed_heights;
+  for (const auto& entry : indexed_entries) indexed_heights.emplace(entry.outpoint, entry.height);
+  std::vector<storage::DB::ScriptUtxoEntry> out;
+  for (const auto& [op, entry] : db.load_transparent_utxos()) {
     if (!script_indexed_under(entry.out.script_pubkey, scripthash)) continue;
-    if (canonical_matches.find(op) != canonical_matches.end()) continue;
     storage::DB::ScriptUtxoEntry merged;
     merged.outpoint = op;
     merged.value = entry.out.value;
     merged.script_pubkey = entry.out.script_pubkey;
-    if (auto loc = db.get_tx_index(op.txid); loc.has_value()) merged.height = loc->height;
-    canonical_matches.emplace(op, std::move(merged));
-  }
-  std::vector<storage::DB::ScriptUtxoEntry> out;
-  out.reserve(std::max(indexed_entries.size(), canonical_matches.size()));
-  std::set<OutPoint> seen;
-  for (const auto& entry : indexed_entries) {
-    const auto canonical_it = canonical_matches.find(entry.outpoint);
-    if (canonical_it == canonical_matches.end()) continue;
-    if (canonical_it->second.value != entry.value || canonical_it->second.script_pubkey != entry.script_pubkey) continue;
-    storage::DB::ScriptUtxoEntry merged = canonical_it->second;
-    // Settlement credits have no tx index, so only the script-utxo index knows their finalization height.
-    if (merged.height == 0) merged.height = entry.height;
+    if (auto loc = db.get_tx_index(op.txid); loc.has_value()) {
+      merged.height = loc->height;
+    } else if (auto it = indexed_heights.find(op); it != indexed_heights.end()) {
+      // Settlement credits have no tx index, so only the script-utxo index knows their finalization height.
+      merged.height = it->second;
+    }
     out.push_back(std::move(merged));
-    seen.insert(entry.outpoint);
-  }
-  for (const auto& [op, prevout] : canonical_matches) {
-    if (seen.find(op) != seen.end()) continue;
-    out.push_back(prevout);
   }
   std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
     if (a.height != b.height) return a.height < b.height;
