@@ -22,7 +22,7 @@
 <p align="center">
   <a href="testnet/JOIN.md"><b>Run a node</b></a> ·
   <a href="https://finalis.self-link.com"><b>Live explorer</b></a> ·
-  <a href="docs/REVIEWING.md"><b>Break our claims</b></a> ·
+  <a href="docs/REVIEWING.md"><b>Break these claims</b></a> ·
   <a href="docs/whitepaper/WHITEPAPER.md"><b>Whitepaper</b></a> ·
   <a href="https://discord.gg/8rKfKc7QR9"><b>Discord</b></a>
 </p>
@@ -48,7 +48,8 @@
   checkpoints and rewards are all derived from finalized state, so every honest
   node computes the same result with no off-chain coordination.
 - **Fixed supply.** 7,000,000 FLS hard cap, emitted over 12 years with 20%
-  annual decay, then fees only ([ECONOMICS.md](docs/ECONOMICS.md)).
+  annual decay, then validators are paid from fees and a protocol reserve
+  ([ECONOMICS.md](docs/ECONOMICS.md)).
 
 ## Built To Be Checked
 
@@ -59,15 +60,14 @@
 - **Nightly chaos runs** with crashing and Byzantine validators, plus an
   [adversarial protocol simulator](docs/PROTOCOL_ATTACK_SIMULATOR.md).
 - **Explicit claims.** [docs/REVIEWING.md](docs/REVIEWING.md) lists the safety,
-  liveness and privacy claims we want broken, with the spec section and code
+  liveness and privacy claims I want broken, with the spec section and code
   for each.
 
 ## Get Involved
 
-**Run a node or become a validator.** testnet-3 starts on 2026-10-29 at
-06:00 UTC (10:00 UTC+4) and runs mainnet's rules. Its coins have no value, and validator
-bonds are free from the team. Four independent validators is the first size
-that survives one going down, and ten is the next goal.
+**Run a node or become a validator.** testnet-3 has been running since 2026-10-29,
+06:00 UTC, on mainnet's rules. Its coins have no value, and validator bonds are free
+from the faucet. Every independent validator makes the chain harder to stop.
 Mainnet will start the same way: one bootstrap validator, and everyone else
 joins by bonding coins from the faucet, with no reserved slots
 ([mainnet/MAINNET_PLAN.md](mainnet/MAINNET_PLAN.md#launch-model)).
@@ -202,6 +202,15 @@ Confidential transactions use `TxV2`. The wallet supports:
 - transparent -> confidential (shield)
 - confidential -> confidential (amounts hidden; only the fee is public)
 - confidential -> transparent (unshield)
+
+It also supports transparent sends that are time-locked or locked by height:
+
+- time-locked: recipient and amount stay encrypted on-chain until a chosen height, then the payment
+  opens by itself. The sender's bond comes back if it applies and is forfeited if the sender cancels
+  by spending the coin it depends on
+- sealed data: the same, for data instead of a payment
+- height lock: visible at once, but the recipient cannot spend it before a chosen height
+- inheritance lock: the owner can spend at any height, the heir from a chosen height
 
 Amounts are private only in confidential -> confidential transfers: shield and
 unshield amounts can be computed from their public parts, and the transaction

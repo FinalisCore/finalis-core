@@ -10,6 +10,6 @@
   ],
   "notes": [
     "Public testnet. Coins have no value; addresses start with tsc1.",
-    "Seeds are plain nodes, not validators."
+    "The seeds also run validators."
   ]
 }

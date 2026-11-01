@@ -200,6 +200,18 @@ exactly like a `Tx`: it appears in `get_history_page`, `get_utxos` and
 `"decoded_kind": "confidential"` with null amount and address. Validate the
 transparent output that pays your script, exactly as for a `Tx`.
 
+### Locked outputs are not deposits
+
+A height-locked or inheritance-locked output naming your address appears in
+your address history, `get_utxos` and balance, but it is not spendable like a
+normal coin. You cannot spend a height lock before its unlock height, and the
+owner of an inheritance lock can spend it away from you at any height. Compare
+the output's full script with your exact P2PKH script before crediting, and do
+not credit from a history entry or balance change alone.
+
+A timed envelope is not a deposit either: credit only its opened transfer, once
+that transfer itself is finalized and `credit_safe`.
+
 ## 6. Withdrawal model
 
 Recommended withdrawal flow:

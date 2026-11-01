@@ -2,19 +2,20 @@
 
 Finalis is a blockchain where every block is final the moment validators sign it: no waiting for
 confirmations and no reorgs, with confidential (amount-hiding) transactions built in from genesis.
-**testnet-3** starts on 29 October 2026 at 06:00 UTC (10:00 UTC+4). It uses mainnet's rules with its own identity,
-and its coins (FLS) **have no value**. (It replaces testnet-2; if you ran a testnet-2 node, see
+**testnet-3** has been running since 29 October 2026, 06:00 UTC. It uses mainnet's rules with its own identity,
+and its coins (FLS) **have no value**. (It replaced testnet-2; if you ran a testnet-2 node, see
 [README.md](README.md#genesis-testnet-3).)
 
-We are looking for people to run nodes and, if they want, to become validators. Today the testnet
-has **one** validator, so every block depends on a single machine. Four independent validators is
-the first size that survives one going down. You can help get there.
+I am looking for people to run nodes and, if they want, to become validators. On 1 November 2026
+the signing committee had **9** validators, 2 of them mine, and a block needs more than two-thirds
+of their signatures. Every independent validator makes the chain harder to stop. The
+[live explorer](https://finalis.self-link.com) shows the current committee.
 
 Running a node takes about 5 minutes with the prebuilt package or Docker.
 
 - **Run a node** (steps 1–3): syncs and relays the chain. No coins or keys needed.
-- **Become a validator** (step 4): your node signs blocks. You need a bond in testnet FLS, which we
-  send you for free.
+- **Become a validator** (step 4): your node signs blocks. You need a bond in testnet FLS, which the
+  faucet sends you for free.
 
 
 Questions at any point: **[Discord](https://discord.gg/8rKfKc7QR9)**.
@@ -192,7 +193,7 @@ sudo systemctl restart finalis-testnet
 
 (Docker: `docker ps`, `docker logs -f finalis`, `docker restart finalis`.)
 
-**Updating:** when we announce a new release on Discord:
+**Updating:** when I announce a new release on Discord:
 
 - **A. prebuilt:** run the `curl … install.sh | bash` line again.
 - **B. Docker:** `docker pull ghcr.io/finaliscore/finalis-core:latest`, then `docker rm -f finalis` and
@@ -202,9 +203,25 @@ sudo systemctl restart finalis-testnet
 Your chain data and key are kept. After an update that adds features, the
 first start can take a little longer while the node prepares data for them.
 
+Keep updating the way you installed. The prebuilt package bundles its own RocksDB, so a data folder
+written by a source build with a newer RocksDB can make it crash-loop at start.
+
 **Stopping for good:** `sudo systemctl disable --now finalis-testnet` (C: also
 `finalis-testnet-explorer`; Docker: `docker rm -f finalis`). If you
-were a validator, tell us on Discord so we know to expect it.
+were a validator, tell me on Discord so I know to expect it.
+
+## Use a wallet without a node
+
+You do not need a node to send and receive. The Qt wallet connects to the public lightservers and
+checks your balance against the validators' signatures itself.
+
+1. Install it: the [Windows installer](https://github.com/FinalisCore/finalis-core/releases), or on
+   Linux build from source with Qt5 (the prebuilt Linux package has no wallet).
+2. Choose testnet. The wallet then uses the public lightservers.
+3. **Import Wallet**: pick where to save the wallet file, paste your 32-byte private key in hex and
+   set a passphrase.
+
+Using your validator key in the wallet is fine, but never run a second node with it (see step 4.1).
 
 ## Something not working?
 
