@@ -496,6 +496,8 @@ void Node::stop() {
     }
   }
   if (freeze_watchdog_thread_.joinable()) freeze_watchdog_thread_.join();
+  outbound_dial_stop_.store(true);
+  if (outbound_dial_thread_.joinable()) outbound_dial_thread_.join();
   if (restart_debug_) log_line("restart-debug event-loop-joined");
   if (endpoint_self_check_thread_.joinable()) endpoint_self_check_thread_.join();
   if (restart_debug_) log_line("restart-debug round-timer-cancelled");
@@ -1823,7 +1825,7 @@ void Node::event_loop() {
     }
     for (int peer_id : finalized_tip_poll_peers) request_finalized_tip(peer_id);
     if (!cfg_.disable_p2p && force_validator_redial) {
-      try_connect_bootstrap_peers();
+      request_outbound_dial();
       last_seed_attempt_ms_ = now_ms();
     }
     if (should_persist_validators_addrman) {
@@ -1850,7 +1852,7 @@ void Node::event_loop() {
       maybe_refresh_nat_pmp_external_endpoint(now_ms);
       maybe_refresh_stun_external_endpoint(now_ms);
       if (outbound_peer_count() < cfg_.outbound_target && now_ms > last_seed_attempt_ms_ + 3000) {
-        try_connect_bootstrap_peers();
+        request_outbound_dial();
         last_seed_attempt_ms_ = now_ms;
       }
       if (now_ms > last_addrman_save_ms_ + 10'000) {

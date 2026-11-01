@@ -367,6 +367,7 @@ class Node {
   // Replaces the process exit, and holds the node lock as a freeze would.
   void set_freeze_handler_for_test(std::function<void(const std::string&)> handler);
   void hold_node_lock_for_test(std::uint32_t ms);
+  std::uint64_t event_loop_ticks_for_test() const;
   std::optional<p2p::GetIngressRangeMsg> requested_ingress_range_for_test(int peer_id, std::uint32_t lane) const;
   // The node's live ingress lane tip, read through its own DB handle.
   std::optional<LaneState> lane_state_for_test(std::uint32_t lane) const;
@@ -777,6 +778,8 @@ class Node {
   bool endpoint_matches_local_listener(const std::string& host, std::uint16_t port,
                                        std::vector<std::string>* resolved_endpoints = nullptr) const;
   void try_connect_bootstrap_peers();
+  // A dial can block for the whole handshake timeout, so the event loop must not make it.
+  void request_outbound_dial();
   std::vector<std::string> resolve_dns_seeds_once() const;
   void maybe_request_getaddr(int peer_id);
   void request_ingress_tips(int peer_id);
@@ -1086,6 +1089,9 @@ class Node {
   std::uint64_t consensus_signatures_at_fail_stop_{0};
   std::thread loop_thread_;
   std::thread freeze_watchdog_thread_;
+  std::thread outbound_dial_thread_;
+  std::atomic<bool> outbound_dial_active_{false};
+  std::atomic<bool> outbound_dial_stop_{false};
   std::atomic<std::uint64_t> event_loop_ticks_{0};
   std::function<void(const std::string&)> freeze_handler_;
   void freeze_watchdog_loop();
@@ -1166,7 +1172,6 @@ class Node {
   std::uint32_t upnp_igd_consecutive_failures_{0};
   std::vector<std::string> bootstrap_peers_;
   std::vector<std::string> validators_bootstrap_peers_;
-  bool prefer_validators_addrman_{false};
   std::vector<std::string> dns_seed_peers_;
   std::set<std::string> preflight_checked_seeds_;
   std::set<std::string> self_peer_endpoints_;
