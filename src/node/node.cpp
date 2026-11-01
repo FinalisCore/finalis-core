@@ -454,6 +454,7 @@ void Node::start() {
     g_local_bus_nodes.push_back(this);
   }
   loop_thread_ = std::thread([this]() { event_loop(); });
+  if (cfg_.freeze_exit_seconds != 0) freeze_watchdog_thread_ = std::thread([this]() { freeze_watchdog_loop(); });
   if (!start_lightserver_child()) {
     log_line("lightserver not running mode=" + lightserver_mode_name() + " reason=start-failed");
   }
@@ -494,6 +495,7 @@ void Node::stop() {
       log_line(std::string("shutdown-join-exception source=event-loop error=\"") + e.what() + "\"");
     }
   }
+  if (freeze_watchdog_thread_.joinable()) freeze_watchdog_thread_.join();
   if (restart_debug_) log_line("restart-debug event-loop-joined");
   if (endpoint_self_check_thread_.joinable()) endpoint_self_check_thread_.join();
   if (restart_debug_) log_line("restart-debug round-timer-cancelled");
@@ -1143,8 +1145,46 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
   return snapshot;
 }
 
+// A frozen node keeps its process and its lightserver, so nothing outside can tell: RPC answers and
+// the service stays active. Progress here means the lock was free once and the event loop turned.
+void Node::freeze_watchdog_loop() {
+  using clock = std::chrono::steady_clock;
+  const auto limit = std::chrono::seconds(cfg_.freeze_exit_seconds);
+  auto last_lock = clock::now();
+  auto last_tick = last_lock;
+  std::uint64_t ticks = event_loop_ticks_.load();
+  bool reported = false;
+  while (running_) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto now = clock::now();
+    if (mu_.try_lock()) {
+      mu_.unlock();
+      last_lock = now;
+    }
+    if (const auto t = event_loop_ticks_.load(); t != ticks) {
+      ticks = t;
+      last_tick = now;
+    }
+    if (now - last_lock < limit && now - last_tick < limit) continue;
+    if (reported) continue;
+    reported = true;
+    const auto seconds = [&](clock::time_point since) {
+      return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now - since).count());
+    };
+    const std::string detail = "lock_idle_s=" + seconds(last_lock) + " loop_idle_s=" + seconds(last_tick);
+    log_line("node-frozen " + detail + " action=exit code=" + std::to_string(kFreezeExitCode));
+    if (freeze_handler_) {
+      freeze_handler_(detail);
+    } else {
+      std::cerr.flush();
+      std::_Exit(kFreezeExitCode);
+    }
+  }
+}
+
 void Node::event_loop() {
   while (running_) {
+    event_loop_ticks_.fetch_add(1);
     // Fail-stop: no proposals, timeout votes, rebroadcasts or background writes; stop() and the
     // process supervisor take it from here.
     if (safety_storage_failed()) {

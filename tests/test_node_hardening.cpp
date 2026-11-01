@@ -4,6 +4,12 @@
 #include "support/test_genesis.hpp"
 #include "support/test_paths.hpp"
 
+#ifdef __linux__
+#include <csignal>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <atomic>
 #include <chrono>
 #include <ctime>
@@ -119,6 +125,89 @@ TEST(test_node_rate_limit_still_scores_non_bootstrap_peer) {
 
 // Broadcasts send while holding the node lock, and PeerManager::send_to raises this event on the
 // same thread. Scoring the peer here took that lock again and froze the validator for good.
+TEST(test_node_freeze_watchdog_exits_when_the_lock_never_frees) {
+  auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_freeze_watchdog"));
+  cfg.freeze_exit_seconds = 1;
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  std::atomic<int> reports{0};
+  std::mutex detail_mu;
+  std::string detail;
+  n.set_freeze_handler_for_test([&](const std::string& d) {
+    std::lock_guard<std::mutex> lk(detail_mu);
+    detail = d;
+    ++reports;
+  });
+  n.start();
+
+  // A healthy node takes no action, however long it runs past the limit.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1'500));
+  ASSERT_EQ(reports.load(), 0);
+  // A hold shorter than the limit is not a freeze.
+  n.hold_node_lock_for_test(500);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  ASSERT_EQ(reports.load(), 0);
+
+  n.hold_node_lock_for_test(1'500);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  n.stop();
+  ASSERT_EQ(reports.load(), 1);
+  std::lock_guard<std::mutex> lk(detail_mu);
+  ASSERT_TRUE(detail.find("lock_idle_s=1") != std::string::npos);
+}
+
+#ifdef __linux__
+// The real exit needs a process of its own, and a fresh one: fork() here could copy a held lock.
+TEST(test_node_freeze_watchdog_child) {
+  const char* base = std::getenv("FINALIS_FREEZE_CHILD_BASE");
+  if (base == nullptr) return;
+  auto cfg = make_cfg(base);
+  cfg.freeze_exit_seconds = 1;
+  node::Node n(cfg);
+  if (!n.init()) std::_Exit(1);
+  n.start();
+  n.hold_node_lock_for_test(30'000);
+  std::_Exit(2);
+}
+
+TEST(test_node_freeze_watchdog_ends_the_process_with_the_restartable_code) {
+  std::string base_env = "FINALIS_FREEZE_CHILD_BASE=" + unique_test_base("/tmp/finalis_test_node_freeze_exit");
+  std::vector<std::string> env_storage{base_env, "FINALIS_TEST_QUIET_LOGS=1"};
+  std::vector<char*> envp;
+  for (auto& e : env_storage) envp.push_back(e.data());
+  envp.push_back(nullptr);
+  std::string self = "/proc/self/exe", arg0 = "finalis-tests", run = "--run", test = "test_node_freeze_watchdog_child";
+  char* argv[] = {arg0.data(), run.data(), test.data(), nullptr};
+  pid_t child = 0;
+  ASSERT_TRUE(posix_spawn(&child, self.c_str(), nullptr, nullptr, argv, envp.data()) == 0);
+  int status = 0;
+  bool exited = false;
+  for (int i = 0; i < 2'000 && !exited; ++i) {
+    exited = waitpid(child, &status, WNOHANG) == child;
+    if (!exited) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!exited) {
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+  }
+  ASSERT_TRUE(exited);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), node::kFreezeExitCode);
+}
+#endif
+
+TEST(test_node_freeze_exit_is_restartable_and_on_by_default) {
+  // 78 and SIGABRT are in the units' RestartPreventExitStatus: they keep a node down on purpose.
+  ASSERT_TRUE(node::kFreezeExitCode != 0 && node::kFreezeExitCode != 78);
+  std::vector<std::string> args{"finalis-node"};
+  std::vector<char*> argv;
+  for (auto& a : args) argv.push_back(a.data());
+  const auto cfg = node::parse_args(static_cast<int>(argv.size()), argv.data());
+  ASSERT_TRUE(cfg.has_value());
+  ASSERT_EQ(cfg->freeze_exit_seconds, 300U);
+  ASSERT_EQ(node::NodeConfig{}.freeze_exit_seconds, 0U);
+}
+
 TEST(test_node_queue_overflow_while_locked_neither_deadlocks_nor_scores) {
   auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_queue_overflow_locked"));
   node::Node n(cfg);

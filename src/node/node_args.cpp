@@ -30,6 +30,7 @@ static std::uint16_t parse_port_arg(const std::string& s) {
 // parse_args() catches them and reports the offending flag.
 static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std::string* current_flag) {
   NodeConfig cfg;
+  cfg.freeze_exit_seconds = 300;
   cfg.listen = false;  // safe CLI default: outbound-only unless --listen is set
   // --testnet picks the network before anything defaults from it (ports, data directory).
   const bool testnet = std::any_of(argv + 1, argv + argc, [](const char* a) { return std::string_view(a) == "--testnet"; });
@@ -292,6 +293,10 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.handshake_timeout_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--freeze-exit-seconds") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.freeze_exit_seconds = static_cast<std::uint32_t>(std::stoul(*v));
     } else if (a == "--frame-timeout-ms") {
       auto v = next(a);
       if (!v) return std::nullopt;

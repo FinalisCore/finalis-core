@@ -174,6 +174,11 @@ restart is the recovery, so that exit code is restarted.
 | RocksDB reports corruption on a read or prefix scan | `finalized-state-invariant-violation source=db-read-corruption` (or `db-scan-corruption`) | `SIGABRT` | systemd `RestartPreventExitStatus=SIGABRT` |
 | A durable write of consensus safety state (vote lock, prevote record, valid polka) failed (disk full, I/O error) | `CRITICAL safety-storage-failure operation=... reason=...`; the node signs nothing further and stops | `75` | restarts (reloads the safety state from disk); with the disk still failing it fails again and systemd stops after `StartLimitBurst` |
 
+A frozen node is restarted on purpose. If the node lock stays held or the event loop stops turning
+for `--freeze-exit-seconds` (default 300, 0 = off), the node logs `node-frozen lock_idle_s=...
+loop_idle_s=...` and exits with code 75, which systemd restarts. Without this a frozen node stays
+`active` and its RPC keeps answering. Treat any `node-frozen` line as a bug to report.
+
 Other failures restart after 5 s. systemd stops trying after 5 failed starts in 300 s
 (`StartLimitBurst=5`, `StartLimitIntervalSec=300`); clear it with `systemctl reset-failed finalis-node`.
 docker-compose uses `restart: on-failure:5`. Docker cannot exclude particular exit codes from restarts.

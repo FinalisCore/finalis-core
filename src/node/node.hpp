@@ -47,6 +47,9 @@ enum class LightserverLaunchMode {
   Explicit,
 };
 
+// Restartable, unlike 78 and SIGABRT, which RestartPreventExitStatus keeps down for an operator.
+inline constexpr int kFreezeExitCode = 75;
+
 struct NodeConfig {
   NetworkConfig network{mainnet_network()};
   bool allow_unsafe_genesis_override{false};
@@ -110,6 +113,9 @@ struct NodeConfig {
   std::uint32_t handshake_timeout_ms{10'000};
   std::uint32_t frame_timeout_ms{3'000};
   std::uint32_t idle_timeout_ms{600'000};
+  // Exit with kFreezeExitCode once the node lock or the event loop makes no progress for this long,
+  // so the supervisor restarts it. 0 = off; --freeze-exit-seconds defaults to 300.
+  std::uint32_t freeze_exit_seconds{0};
   std::size_t peer_queue_max_bytes{8 * 1024 * 1024};
   std::size_t peer_queue_max_msgs{2'000};
   std::uint64_t ban_seconds{600};
@@ -358,6 +364,9 @@ class Node {
   bool self_endpoint_suppressed_for_test(const std::string& host, std::uint16_t port) const;
   std::optional<FrontierProposal> build_frontier_proposal_for_test(std::uint64_t height, std::uint32_t round);
   std::string last_test_hook_error_for_test() const;
+  // Replaces the process exit, and holds the node lock as a freeze would.
+  void set_freeze_handler_for_test(std::function<void(const std::string&)> handler);
+  void hold_node_lock_for_test(std::uint32_t ms);
   std::optional<p2p::GetIngressRangeMsg> requested_ingress_range_for_test(int peer_id, std::uint32_t lane) const;
   // The node's live ingress lane tip, read through its own DB handle.
   std::optional<LaneState> lane_state_for_test(std::uint32_t lane) const;
@@ -1076,6 +1085,10 @@ class Node {
   mutable std::uint64_t consensus_signatures_{0};
   std::uint64_t consensus_signatures_at_fail_stop_{0};
   std::thread loop_thread_;
+  std::thread freeze_watchdog_thread_;
+  std::atomic<std::uint64_t> event_loop_ticks_{0};
+  std::function<void(const std::string&)> freeze_handler_;
+  void freeze_watchdog_loop();
   mutable std::mutex local_bus_tasks_mu_;
   std::vector<std::thread> local_bus_tasks_;
   p2p::PeerManager p2p_;

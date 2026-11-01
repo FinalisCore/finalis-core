@@ -658,6 +658,9 @@ std::unordered_map<std::string, std::size_t> g_active_by_ip;
 // The whole request must arrive within this. A per-recv timeout alone lets a client that trickles
 // bytes keep a slot forever (slowloris).
 constexpr std::uint32_t kHttpRequestReadDeadlineMs = 10'000;
+constexpr std::uint32_t kAcceptPollMs = 250;
+// Longer than a request's read deadline, shorter than the 60 s systemd allows a stop.
+constexpr std::uint32_t kStopDrainMs = 20'000;
 thread_local std::string g_current_request_path;
 
 // A trusted proxy is exempt from the per-IP cap: all of its clients share its address, and it
@@ -682,6 +685,26 @@ void release_client(const std::string& peer_ip) {
 }
 
 void on_signal(int) { g_stop = 1; }
+
+// A blocked accept() resumes after a signal, so it would see a stop only at the next connection.
+finalis::net::SocketHandle accept_until_stop(finalis::net::SocketHandle listen_fd, sockaddr_in* client, socklen_t* len) {
+  while (!g_stop) {
+    if (!finalis::net::wait_readable(listen_fd, kAcceptPollMs)) continue;
+    const auto fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(client), len);
+    if (finalis::net::valid_socket(fd)) return fd;
+  }
+  return finalis::net::kInvalidSocket;
+}
+
+// Sessions run detached: main must not return under them, static destruction would pull their state away.
+bool drain_client_sessions(std::uint32_t timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (g_active_clients.load() != 0) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return true;
+}
 
 std::string html_escape(const std::string& in) {
   std::string out;
@@ -6524,11 +6547,8 @@ int main(int argc, char** argv) {
   while (!g_stop) {
     sockaddr_in client{};
     socklen_t len = sizeof(client);
-    const auto fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&client), &len);
-    if (!finalis::net::valid_socket(fd)) {
-      if (g_stop) break;
-      continue;
-    }
+    const auto fd = accept_until_stop(listen_fd, &client, &len);
+    if (!finalis::net::valid_socket(fd)) break;
     char ipbuf[INET_ADDRSTRLEN] = {0};
     std::string client_ip = "0.0.0.0";
     if (::inet_ntop(AF_INET, &client.sin_addr, ipbuf, sizeof(ipbuf))) client_ip = ipbuf;
@@ -6547,5 +6567,9 @@ int main(int argc, char** argv) {
   g_partner_webhook_cv.notify_all();
   if (g_partner_webhook_thread.joinable()) g_partner_webhook_thread.join();
   finalis::net::close_socket(listen_fd);
+  if (!drain_client_sessions(kStopDrainMs)) {
+    std::cout.flush();
+    std::_Exit(0);  // a session outlived the drain: skip the static destructors it still uses
+  }
   return 0;
 }
