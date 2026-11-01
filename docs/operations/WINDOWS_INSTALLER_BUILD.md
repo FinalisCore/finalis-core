@@ -1,4 +1,4 @@
-# Windows Installer Build Guide (v1.0.2)
+# Windows Installer Build Guide
 
 This guide walks you through rebuilding the Finalis Core Windows installer from current main branch on Windows 10/11.
 
@@ -149,12 +149,12 @@ Once tested:
 1. **Rename for release:**
    ```powershell
    Copy-Item C:\path\to\dist\installer\finalis-core_installer.exe `
-     -Destination C:\path\to\dist\installer\finalis-core-v1.0.2-windows-installer.exe
+     -Destination C:\path\to\dist\installer\finalis-core-windows-installer.exe
    ```
 
 2. **Generate checksum:**
    ```powershell
-   $file = "C:\path\to\dist\installer\finalis-core-v1.0.2-windows-installer.exe"
+   $file = "C:\path\to\dist\installer\finalis-core-windows-installer.exe"
    (Get-FileHash $file -Algorithm SHA256).Hash + " " + (Split-Path $file -Leaf) | Out-File checksum.txt
    ```
 

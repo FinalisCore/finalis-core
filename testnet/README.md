@@ -26,10 +26,10 @@ launch (see "Join as a validator" below), funded with testnet FLS from the boots
 block rewards. Mainnet launches the same way
 ([../mainnet/MAINNET_PLAN.md](../mainnet/MAINNET_PLAN.md#launch-model)).
 
-Until more validators are active the chain has no fault tolerance: the bootstrap validator alone
-finalizes every block, and the chain stops while it is down. Quorum with 2 validators is 2 (either
-one stopping halts it); 4 is the first size that survives a failure, so grow from 1 straight to 4,
-each on its own machine.
+At launch the chain has no fault tolerance: the bootstrap validator alone finalizes every block, and
+the chain stops while it is down. Quorum with 2 validators is 2 (either one stopping halts it); 4 is
+the first size that survives a failure, so grow from 1 straight to 4, each on its own machine.
+testnet-3 is past this stage: its committee had 9 validators on 1 November 2026.
 
 ### 1. Keys: on each validator machine, never copied elsewhere
 

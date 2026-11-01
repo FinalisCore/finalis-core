@@ -273,9 +273,9 @@ Emission is finite and deterministic in current implementation:
 - total primary emission: `7,000,000 FLS`
 - emission horizon: `2,102,400` blocks (12 years at a 180-second block target)
 - annual issuance declines by 20% year over year; yearly budgets sum exactly to the cap
-- reserve accrual during emission: `10%` of gross issuance; of the remaining 90%, `3%` is carved into onboarding rewards when eligible onboarding recipients exist
+- reserve accrual during emission: `30%` of gross issuance; of the remaining 70%, `3%` is carved into onboarding rewards when eligible onboarding recipients exist
 
-Before the cap, transaction fees are paid on the finalized transition. After the cap, new issuance is zero; fees are pooled per epoch and settled at the next epoch boundary, topped up by a deterministic reserve subsidy bounded by a reserve floor and a minimum runway.
+From block 1, every finalized fee is pooled into its epoch: half is paid to the epoch's validators at settlement and half returns to the reserve, as does the value of slashed bonds. After the cap, new issuance is zero, and each epoch pays out a fixed fraction of the reserve's balance, 5% a year, so the reserve never empties.
 
 ## 9. Ticket PoW Boundary
 
