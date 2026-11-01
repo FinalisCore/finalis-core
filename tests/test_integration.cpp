@@ -3985,6 +3985,12 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base,
     ASSERT_EQ(published->height, unlock + 1);
     ASSERT_TRUE(published->data == revealed);
     ASSERT_TRUE(refunded());
+    storage::DB db;
+    ASSERT_TRUE(db.open_readonly(base + "/node0"));
+    ASSERT_EQ(db.get_timed_settlement_height(timed->txid()), std::optional<std::uint64_t>(unlock + 1));
+    const auto rows = db.get_timed_settlements(unlock + 1);
+    ASSERT_EQ(rows.size(), 1u);
+    ASSERT_TRUE(rows[0].outcome == storage::TimedSettlementOutcome::Revealed);
     return;
   }
 
@@ -4003,6 +4009,15 @@ void run_timed_transfer_on_cluster(std::size_t n_nodes, const std::string& base,
   ASSERT_EQ(recipient_utxos.size(), 1u);
   ASSERT_EQ(recipient_utxos[0].second.value, coins[1].second.value - 500);
   ASSERT_TRUE(refunded());
+  {
+    storage::DB db;
+    ASSERT_TRUE(wait_for([&]() { return db.open_readonly(base + "/node0"); }, ci_timeout_seconds(30)));
+    const auto rows = db.get_timed_settlements(unlock + 1);
+    ASSERT_EQ(rows.size(), 1u);
+    ASSERT_TRUE(rows[0].timed_txid == timed->txid());
+    ASSERT_TRUE(rows[0].outcome == storage::TimedSettlementOutcome::Applied);
+    ASSERT_EQ(rows[0].body_txid, std::optional<Hash32>(body->txid()));
+  }
   // Every node settled it the same way.
   for (std::size_t i = 1; i < n_nodes; ++i) {
     ASSERT_TRUE(wait_for([&]() { return cluster.nodes[i]->find_utxos_by_pubkey_hash_for_test(recipient_pkh).size() == 1; },

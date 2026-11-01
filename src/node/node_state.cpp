@@ -599,6 +599,7 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
   };
 
   std::uint32_t tx_index = 0;
+  std::vector<storage::TimedSettlementRow> settlement_rows;
   // Timed settlements ran before this block's records: the bodies they applied are transfers of this
   // block (indexed first, in settlement order), and the sender's refund script sees the outcome.
   for (const auto& settlement : timed_settlements) {
@@ -611,7 +612,9 @@ bool Node::persist_finalized_frontier_record(const consensus::CanonicalFrontierR
       batch.put_timed_reveal(settlement.timed_txid, height, *settlement.revealed_data);
     }
     batch.add_script_history(crypto::sha256(settlement.bond_refund_script), height, settlement.timed_txid);
+    settlement_rows.push_back(detail::timed_settlement_row(settlement));
   }
+  batch.put_timed_settlements(height, settlement_rows);
 
   std::uint64_t seq = record.transition.prev_frontier;
   for (const auto& ordered_record : record.ordered_records) {

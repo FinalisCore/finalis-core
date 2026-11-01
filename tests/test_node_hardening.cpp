@@ -44,6 +44,37 @@ node::NodeConfig make_cfg(const std::string& db_path) {
 
 }  // namespace
 
+TEST(test_timed_settlement_row_keeps_outcome_and_only_a_real_body) {
+  consensus::TimedSettlementRecord record;
+  record.timed_txid.fill(0x11);
+
+  // Forfeited: the opened body has a txid, but it moved nothing.
+  Hash32 failed_body{};
+  failed_body.fill(0x22);
+  record.body_txid = failed_body;
+  auto row = node::detail::timed_settlement_row(record);
+  ASSERT_TRUE(row.timed_txid == record.timed_txid);
+  ASSERT_TRUE(row.outcome == storage::TimedSettlementOutcome::Forfeited);
+  ASSERT_TRUE(!row.body_txid.has_value());
+
+  Tx body;
+  body.outputs.push_back(TxOut{1, Bytes{0x51}});
+  record.body_applied = true;
+  record.applied_body = AnyTx{body};
+  row = node::detail::timed_settlement_row(record);
+  ASSERT_TRUE(row.outcome == storage::TimedSettlementOutcome::Applied);
+  ASSERT_EQ(row.body_txid, std::optional<Hash32>(body.txid()));
+
+  record.applied_body.reset();
+  record.revealed_data = Bytes{0x01};
+  ASSERT_TRUE(node::detail::timed_settlement_row(record).outcome == storage::TimedSettlementOutcome::Revealed);
+
+  record.revealed_data.reset();
+  record.body_applied = false;
+  record.expired = true;
+  ASSERT_TRUE(node::detail::timed_settlement_row(record).outcome == storage::TimedSettlementOutcome::Expired);
+}
+
 TEST(test_node_rate_limit_does_not_score_single_bootstrap_peer_during_sync) {
   auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_rate_limit_bootstrap_guard"));
   cfg.seeds = {"192.0.2.30:19440"};

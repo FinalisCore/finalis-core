@@ -1114,6 +1114,182 @@ TEST(test_wallet_spendable_utxos_omit_coin_spent_by_timed_envelope) {
   ASSERT_EQ(spendable[0].outpoint.txid, f.live.txid);
 }
 
+namespace {
+
+TxTimed timed_envelope_for_listing(const Bytes& refund_script, std::uint8_t tag) {
+  TxTimed tx;
+  tx.fee_input.prev_txid.fill(tag);
+  tx.fee_input.script_sig = Bytes(96, 0x22);
+  tx.prepaid_fee = 110'000;
+  tx.forfeit_bond = 10'000'000;
+  tx.bond_refund_script = refund_script;
+  tx.fee_change = TxOut{39'689'000, refund_script};
+  tx.unlock_height = 1390;
+  tx.committee_epoch = 1377;
+  tx.committee_root.fill(0x55);
+  tx.swe_ciphertext = Bytes(500, 0x66);
+  tx.swe_proof = Bytes(kTxTimedSweProofBytes, 0x77);
+  tx.body_nonce.fill(0x88);
+  tx.body_ciphertext = Bytes(200, 0x99);
+  return tx;
+}
+
+Bytes listing_test_script() {
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  return address::p2pkh_script_pubkey(crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end())));
+}
+
+// One block: `record` is its only frontier record, and the tip.
+bool put_block_with_record(storage::DB& db, std::uint64_t height, const Bytes& record) {
+  FrontierTransition transition;
+  transition.height = height;
+  transition.prev_frontier = 0;
+  transition.next_frontier = 1;
+  transition.leader_pubkey = node::Node::deterministic_test_keypairs()[0].public_key;
+  const auto transition_hash = transition.transition_id();
+  return db.set_tip(storage::TipState{height, transition_hash}) && db.set_height_hash(height, transition_hash) &&
+         db.put_frontier_transition(transition_hash, transition.serialize()) &&
+         db.map_height_to_frontier_transition(height, transition_hash) && db.put_ingress_record(1, record);
+}
+
+std::string rpc_for_test(lightserver::Server& ls, const std::string& method, const std::string& params) {
+  return ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":106,"method":")") + method + R"(","params":)" + params +
+                                "}");
+}
+
+}  // namespace
+
+TEST(test_lightserver_recent_tx_lists_timed_envelope_and_opened_body) {
+  const std::string base = unique_test_base("/tmp/finalis_light_recent_timed");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(put_utxo_listing_test_genesis(db));
+
+  const auto script = listing_test_script();
+  const auto envelope = timed_envelope_for_listing(script, 0xA1);
+  ASSERT_TRUE(put_block_with_record(db, 3, envelope.serialize()));
+  ASSERT_TRUE(db.put_tx_index(envelope.txid(), 3, 1, envelope.serialize()));
+
+  // Another envelope settled in this block: its opened transfer is a transaction of the block.
+  Tx body;
+  body.inputs.push_back(TxIn{zero_hash(), 0, Bytes{}, 0xFFFFFFFF});
+  body.outputs.push_back(TxOut{100'000'000, script});
+  ASSERT_TRUE(db.put_tx_index(body.txid(), 3, 0, body.serialize()));
+  Hash32 settled_envelope{};
+  settled_envelope[31] = 0xA2;
+  {
+    storage::DB::Batch batch(db);
+    batch.put_timed_settlements(3, {storage::TimedSettlementRow{settled_envelope, storage::TimedSettlementOutcome::Applied,
+                                                                body.txid()}});
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto recent = rpc_for_test(ls, "get_recent_tx_summaries", R"({"limit":8,"depth_window":8})");
+  ASSERT_TRUE(recent.find(hex_encode32(envelope.txid())) != std::string::npos);
+  ASSERT_TRUE(recent.find(hex_encode32(body.txid())) != std::string::npos);
+  ASSERT_TRUE(recent.find("\"flow_kind\":\"timed-envelope\"") != std::string::npos);
+  ASSERT_TRUE(recent.find("\"primary_recipient\":null") != std::string::npos);
+  ASSERT_TRUE(recent.find("\"fee\":110000") != std::string::npos);
+
+  const auto record = rpc_for_test(ls, "get_ingress_record", R"({"seq":1})");
+  ASSERT_TRUE(record.find("\"txid\":\"" + hex_encode32(envelope.txid()) + "\"") != std::string::npos);
+
+  const auto settlements = rpc_for_test(ls, "get_timed_settlements", R"({"height":3})");
+  ASSERT_TRUE(settlements.find("\"outcome\":\"applied\"") != std::string::npos);
+  ASSERT_TRUE(settlements.find("\"body_txid\":\"" + hex_encode32(body.txid()) + "\"") != std::string::npos);
+}
+
+TEST(test_lightserver_get_tx_reports_timed_settlement) {
+  const std::string base = unique_test_base("/tmp/finalis_light_get_tx_timed");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(put_utxo_listing_test_genesis(db));
+  const auto envelope = timed_envelope_for_listing(listing_test_script(), 0xA3);
+  ASSERT_TRUE(put_block_with_record(db, 3, envelope.serialize()));
+  ASSERT_TRUE(db.put_tx_index(envelope.txid(), 3, 1, envelope.serialize()));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  const std::string params = std::string(R"({"txid":")") + hex_encode32(envelope.txid()) + R"("})";
+  {
+    lightserver::Config lcfg;
+    lcfg.db_path = base;
+    lightserver::Server ls(lcfg);
+    ASSERT_TRUE(ls.init());
+    const auto pending = rpc_for_test(ls, "get_tx", params);
+    ASSERT_TRUE(pending.find("\"tx_version\":3") != std::string::npos);
+    ASSERT_TRUE(pending.find("\"fee\":110000") != std::string::npos);
+    ASSERT_TRUE(pending.find("\"unlock_height\":1390") != std::string::npos);
+    ASSERT_TRUE(pending.find("\"settled\":false") != std::string::npos);
+  }
+
+  storage::DB reopened;
+  ASSERT_TRUE(reopened.open(base));
+  {
+    storage::DB::Batch batch(reopened);
+    batch.put_timed_settlements(1391, {storage::TimedSettlementRow{envelope.txid(), storage::TimedSettlementOutcome::Forfeited,
+                                                                   std::nullopt}});
+    ASSERT_TRUE(reopened.write_batch(batch));
+  }
+  ASSERT_TRUE(reopened.flush());
+  reopened.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto settled = rpc_for_test(ls, "get_tx", params);
+  ASSERT_TRUE(settled.find("\"settled\":true") != std::string::npos);
+  ASSERT_TRUE(settled.find("\"settlement_height\":1391") != std::string::npos);
+  ASSERT_TRUE(settled.find("\"outcome\":\"forfeited\"") != std::string::npos);
+}
+
+TEST(test_lightserver_summary_names_the_recipient_of_a_height_lock) {
+  const std::string base = unique_test_base("/tmp/finalis_light_summary_height_lock");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(put_utxo_listing_test_genesis(db));
+
+  const auto sender_script = listing_test_script();
+  Tx parent;
+  parent.inputs.push_back(TxIn{zero_hash(), 0, Bytes{}, 0xFFFFFFFF});
+  parent.outputs.push_back(TxOut{700'000'000, sender_script});
+  ASSERT_TRUE(db.put_tx_index(parent.txid(), 2, 0, parent.serialize()));
+
+  std::array<std::uint8_t, 20> heir{};
+  heir.fill(0x6F);
+  Tx lock;
+  lock.inputs.push_back(TxIn{parent.txid(), 0, Bytes{}, 0xFFFFFFFF});
+  lock.outputs.push_back(TxOut{100'000'000, height_lock_script_pubkey(1373, heir)});
+  lock.outputs.push_back(TxOut{599'999'000, sender_script});
+  ASSERT_TRUE(put_block_with_record(db, 3, lock.serialize()));
+  ASSERT_TRUE(db.put_tx_index(lock.txid(), 3, 0, lock.serialize()));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto recent = rpc_for_test(ls, "get_recent_tx_summaries", R"({"limit":8,"depth_window":8})");
+  const auto recipient = address::encode_p2pkh("sc", heir);
+  ASSERT_TRUE(recipient.has_value());
+  ASSERT_TRUE(recent.find("\"primary_recipient\":\"" + *recipient + "\"") != std::string::npos);
+  ASSERT_TRUE(recent.find("\"flow_kind\":\"self-transfer\"") == std::string::npos);
+}
+
 TEST(test_lightserver_get_transition_by_height_direct) {
   const std::string base = unique_test_base("/tmp/finalis_light_block_by_height");
   std::filesystem::remove_all(base);

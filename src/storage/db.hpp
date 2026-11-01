@@ -243,6 +243,14 @@ struct ConsensusStateCommitmentCache {
   Hash32 commitment{};
 };
 
+// How a timed envelope settled. body_txid is set when an opened transfer applied.
+enum class TimedSettlementOutcome : std::uint8_t { Forfeited = 0, Applied = 1, Revealed = 2, Expired = 3 };
+struct TimedSettlementRow {
+  Hash32 timed_txid{};
+  TimedSettlementOutcome outcome{TimedSettlementOutcome::Forfeited};
+  std::optional<Hash32> body_txid;
+};
+
 class DB {
  public:
   DB();
@@ -298,6 +306,7 @@ class DB {
     void put_settlement_txid(const Hash32& txid, std::uint64_t height);
     // A reveal body's data, published when the TxTimed `timed_txid` settled at `height`.
     void put_timed_reveal(const Hash32& timed_txid, std::uint64_t height, const Bytes& data);
+    void put_timed_settlements(std::uint64_t height, const std::vector<TimedSettlementRow>& rows);
     void add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
     void stage_finalized_ingress_tip(std::uint64_t seq);
     void set_tip(const TipState& tip);
@@ -452,6 +461,9 @@ class DB {
   };
   // The data a TxTimed's reveal body published, and the height it settled at, if any.
   std::optional<TimedRevealLocation> get_timed_reveal(const Hash32& timed_txid) const;
+  // A block's timed settlements, for readers only: not committed, not read by execution.
+  std::vector<TimedSettlementRow> get_timed_settlements(std::uint64_t height) const;
+  std::optional<std::uint64_t> get_timed_settlement_height(const Hash32& timed_txid) const;
 
   bool put_ingress_record(std::uint64_t seq, const Bytes& record_bytes);
   std::optional<Bytes> get_ingress_record(std::uint64_t seq) const;
@@ -568,6 +580,8 @@ std::string key_validator_prefix();
 std::string key_validator(const PubKey32& pub);
 std::string key_txidx_prefix();
 std::string key_timed_reveal_prefix();
+std::string key_timed_settlements(std::uint64_t height);
+std::string key_timed_settlement_height(const Hash32& timed_txid);
 std::string key_lane_state_prefix();
 std::string key_ingress_equivocation_prefix();
 std::string key_node_runtime_status_snapshot();

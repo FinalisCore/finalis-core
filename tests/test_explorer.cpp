@@ -2550,4 +2550,156 @@ TEST(test_explorer_renders_txv2_with_hidden_confidential_parts) {
   const auto unshield_page = handle_request(cfg, make_http_get("/tx/" + unshield_txid));
   ASSERT_EQ(unshield_page.status, 200);
   ASSERT_TRUE(unshield_page.body.find("confidential output (no address)") != std::string::npos);
+
+  // A hidden amount is shown as hidden, never as the transparent remainder or as zero.
+  ASSERT_TRUE(shield_api.body.find("\"flow\":{\"kind\":\"shield\"") != std::string::npos);
+  ASSERT_TRUE(shield_api.body.find("\"primary_recipient\":null") != std::string::npos);
+  ASSERT_TRUE(unshield_api.body.find("\"flow\":{\"kind\":\"unshield\"") != std::string::npos);
+  ASSERT_TRUE(shield_page.body.find("<span class=\"label\">Amount</span><span class=\"value\">hidden") != std::string::npos);
+}
+
+namespace {
+
+TxTimed explorer_timed_envelope(const ExplorerFixture& fx, const Bytes& refund_script) {
+  TxTimed tx;
+  tx.fee_input.prev_txid = fx.tx.txid();
+  tx.fee_input.script_sig = Bytes(96, 0x22);
+  tx.prepaid_fee = 110'000;
+  tx.forfeit_bond = 10'000'000;
+  tx.bond_refund_script = refund_script;
+  tx.fee_change = TxOut{fx.tx.outputs[0].value - 10'110'000, refund_script};
+  tx.unlock_height = 1390;
+  tx.committee_epoch = 1377;
+  tx.committee_root.fill(0x55);
+  tx.swe_ciphertext = Bytes(500, 0x66);
+  tx.swe_proof = Bytes(kTxTimedSweProofBytes, 0x77);
+  tx.body_nonce.fill(0x88);
+  tx.body_ciphertext = Bytes(200, 0x99);
+  return tx;
+}
+
+std::string finalized_status_json(const ExplorerFixture& fx, std::uint64_t height) {
+  return std::string("{\"status\":\"finalized\",\"finalized\":true,\"height\":") + std::to_string(height) +
+         ",\"finalized_depth\":3,\"credit_safe\":true,\"transition_hash\":\"" + fx.transition_hash + "\"}";
+}
+
+}  // namespace
+
+TEST(test_explorer_shows_timed_envelope_and_its_outcome) {
+  ExplorerFixture fx;
+  const auto known = address::decode(fx.known_address);
+  ASSERT_TRUE(known.has_value());
+  const auto envelope = explorer_timed_envelope(fx, address::p2pkh_script_pubkey(known->pubkey_hash));
+  const std::string txid = hex_encode32(envelope.txid());
+  std::string settlement = "\"settled\":false";
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find(txid) != std::string::npos) {
+      if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) return rpc_result(finalized_status_json(fx, 8));
+      if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+        return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(envelope.serialize()) +
+                          "\",\"tx_version\":3,\"fee\":110000,\"timed\":{\"unlock_height\":1390,\"forfeit_bond\":10000000," +
+                          settlement + "}}");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+
+  const auto pending = handle_request(cfg, make_http_get("/api/tx/" + txid));
+  ASSERT_EQ(pending.status, 200);
+  ASSERT_TRUE(pending.body.find("\"flow\":{\"kind\":\"timed-envelope\"") != std::string::npos);
+  ASSERT_TRUE(pending.body.find("\"fee\":110000") != std::string::npos);
+  ASSERT_TRUE(pending.body.find("\"primary_recipient\":null") != std::string::npos);
+  ASSERT_TRUE(pending.body.find("\"unlock_height\":1390") != std::string::npos);
+  ASSERT_TRUE(pending.body.find("\"outcome\":\"sealed\"") != std::string::npos);
+  const auto pending_page = handle_request(cfg, make_http_get("/tx/" + txid));
+  ASSERT_EQ(pending_page.status, 200);
+  ASSERT_TRUE(pending_page.body.find("Time-locked envelope") != std::string::npos);
+  ASSERT_TRUE(pending_page.body.find("Sealed until block 1390") != std::string::npos);
+
+  // A sealed envelope's outcome is still to come: it must not be served from the snapshot once settled.
+  settlement = "\"settled\":true,\"settlement_height\":1391,\"outcome\":\"forfeited\"";
+  const auto forfeited = handle_request(cfg, make_http_get("/api/tx/" + txid));
+  ASSERT_EQ(forfeited.status, 200);
+  ASSERT_TRUE(forfeited.body.find("\"outcome\":\"forfeited\"") != std::string::npos);
+  ASSERT_TRUE(forfeited.body.find("\"settlement_height\":1391") != std::string::npos);
+  const auto forfeited_page = handle_request(cfg, make_http_get("/tx/" + txid));
+  ASSERT_TRUE(forfeited_page.body.find("Bond forfeited") != std::string::npos);
+}
+
+TEST(test_explorer_decodes_height_locked_output) {
+  ExplorerFixture fx;
+  const auto known = address::decode(fx.known_address);
+  const auto recipient = address::decode(fx.empty_address);
+  ASSERT_TRUE(known.has_value() && recipient.has_value());
+  Tx lock;
+  lock.inputs.push_back(TxIn{fx.tx.txid(), 0, Bytes{}, 0xFFFFFFFF});
+  lock.outputs.push_back(TxOut{100'000'000, height_lock_script_pubkey(1373, recipient->pubkey_hash)});
+  lock.outputs.push_back(TxOut{23'446'789, address::p2pkh_script_pubkey(known->pubkey_hash)});
+  const std::string txid = hex_encode32(lock.txid());
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find(txid) != std::string::npos) {
+      if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) return rpc_result(finalized_status_json(fx, 8));
+      if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+        return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(lock.serialize()) +
+                          "\",\"decoded_outputs\":[{\"amount\":100000000,\"address\":null,\"decoded_kind\":null},"
+                          "{\"amount\":23446789,\"address\":\"" + fx.known_address + "\",\"decoded_kind\":null}]}");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+  const auto api = handle_request(cfg, make_http_get("/api/tx/" + txid));
+  ASSERT_EQ(api.status, 200);
+  ASSERT_TRUE(api.body.find("\"decoded_kind\":\"height_lock\"") != std::string::npos);
+  ASSERT_TRUE(api.body.find("\"unlock_height\":1373") != std::string::npos);
+  ASSERT_TRUE(api.body.find("\"flow\":{\"kind\":\"transfer-with-change\"") != std::string::npos);
+  ASSERT_TRUE(api.body.find("\"primary_recipient\":\"" + fx.empty_address + "\"") != std::string::npos);
+  const auto page = handle_request(cfg, make_http_get("/tx/" + txid));
+  ASSERT_TRUE(page.body.find("Height-locked until block 1373") != std::string::npos);
+  // The headline amount is what was sent, not the sender's change.
+  ASSERT_TRUE(page.body.find("<span class=\"label\">Amount</span><span class=\"value\">" + format_amount(100'000'000)) != std::string::npos);
+}
+
+TEST(test_explorer_transition_lists_timed_envelope_and_opened_body) {
+  ExplorerFixture fx;
+  FrontierTransition transition = make_test_transition(7);
+  transition.prev_frontier = 0;
+  transition.next_frontier = 1;
+  const std::string transition_hash = hex_encode32(transition.transition_id());
+  const std::string envelope_txid(64, 'c');
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_transition_by_height\"") != std::string::npos ||
+        body.find("\"method\":\"get_transition\"") != std::string::npos) {
+      return rpc_result(std::string("{\"height\":7,\"hash\":\"") + transition_hash + "\",\"transition_hash\":\"" +
+                        transition_hash + "\",\"transition_hex\":\"" + hex_encode(transition.serialize()) + "\"}");
+    }
+    if (body.find("\"method\":\"get_ingress_record\"") != std::string::npos) {
+      return rpc_result(std::string("{\"seq\":1,\"present\":true,\"txid\":\"") + envelope_txid + "\"}");
+    }
+    if (body.find("\"method\":\"get_timed_settlements\"") != std::string::npos) {
+      return rpc_result(std::string("{\"height\":7,\"items\":[{\"txid\":\"") + std::string(64, 'd') +
+                        "\",\"outcome\":\"applied\",\"body_txid\":\"" + fx.txid + "\"}]}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+  const auto api = handle_request(cfg, make_http_get("/api/transition/7"));
+  ASSERT_EQ(api.status, 200);
+  ASSERT_TRUE(api.body.find(envelope_txid) != std::string::npos);
+  ASSERT_TRUE(api.body.find(fx.txid) != std::string::npos);
+  ASSERT_TRUE(api.body.find("\"tx_count\":2") != std::string::npos);
+}
+
+TEST(test_explorer_ignores_results_cached_by_an_older_version) {
+  ExplorerFixture fx;
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+  ASSERT_EQ(handle_request(cfg, make_http_get("/api/tx/" + fx.txid)).status, 200);
+  {
+    std::lock_guard<std::mutex> guard(g_persisted_snapshot_mu);
+    ASSERT_TRUE(!g_persisted_snapshot.tx_index.empty());
+    g_persisted_snapshot.tx_index.front().object_value.erase("view_version");
+  }
+  ASSERT_TRUE(!find_persisted_tx_result(fx.txid).has_value());
 }
