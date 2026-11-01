@@ -1107,7 +1107,7 @@ WalletWindow::~WalletWindow() {
 }
 
 std::uint64_t WalletWindow::send_fee_units(std::size_t estimated_bytes) const {
-  return std::max(send_fee_units(kSendSizeEstimateBytes),
+  return std::max(finalis::DEFAULT_WALLET_SEND_FEE_UNITS,
                   consensus::required_base_fee_units(2 * base_fee_per_kib_, estimated_bytes));
 }
 

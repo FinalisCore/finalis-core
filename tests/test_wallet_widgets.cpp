@@ -25,6 +25,8 @@
 #include "apps/finalis-wallet/wallet_network.hpp"
 #include "apps/finalis-wallet/widgets/advanced_page.hpp"
 #include "apps/finalis-wallet/widgets/send_page.hpp"
+#include "consensus/monetary.hpp"
+#include "utxo/signing.hpp"
 
 #define private public
 #include "apps/finalis-wallet/wallet_window.hpp"
@@ -337,6 +339,19 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   require(window.send_amount_edit_->isEnabled(), "amount disabled in time-locked mode");
 }
 
+void test_wallet_window_send_fee_keeps_floor_and_follows_base_fee() {
+  QSettings settings(kSettingsOrg, kSettingsApp);
+  settings.clear();
+  settings.sync();
+  finalis::wallet::WalletWindow window;
+  constexpr std::size_t kBytes = 16 * 1024;
+  window.base_fee_per_kib_ = 1;
+  require(window.send_fee_units(kBytes) == finalis::DEFAULT_WALLET_SEND_FEE_UNITS, "send fee lost its floor");
+  window.base_fee_per_kib_ = 1'000;
+  require(window.send_fee_units(kBytes) == finalis::consensus::required_base_fee_units(2'000, kBytes),
+          "send fee does not follow the base fee");
+}
+
 void test_wallet_window_defaults_to_lightserver_rpc_port() {
   QSettings settings(kSettingsOrg, kSettingsApp);
   settings.clear();
@@ -470,6 +485,9 @@ int main(int argc, char** argv) {
     std::cout << "Starting test 7b: test_wallet_window_time_locked_send_mode_shows_unlock_delay" << std::endl;
     test_wallet_window_time_locked_send_mode_shows_unlock_delay();
     std::cout << "Completed test 7b" << std::endl;
+    std::cout << "Starting test 7c: test_wallet_window_send_fee_keeps_floor_and_follows_base_fee" << std::endl;
+    test_wallet_window_send_fee_keeps_floor_and_follows_base_fee();
+    std::cout << "Completed test 7c" << std::endl;
     std::cout << "Starting test 8: test_wallet_window_defaults_to_lightserver_rpc_port" << std::endl;
     test_wallet_window_defaults_to_lightserver_rpc_port();
     std::cout << "Completed test 8" << std::endl;
