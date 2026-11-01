@@ -606,6 +606,15 @@ std::string tx_summaries_json(const std::vector<TxSummaryRow>& rows) {
   return oss.str();
 }
 
+std::optional<storage::TimedSettlementRow> timed_settlement_row_for(const storage::DB& db, const Hash32& timed_txid) {
+  const auto height = db.get_timed_settlement_height(timed_txid);
+  if (!height.has_value()) return std::nullopt;
+  for (const auto& row : db.get_timed_settlements(*height)) {
+    if (row.timed_txid == timed_txid) return row;
+  }
+  return std::nullopt;
+}
+
 std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, const Hash32& scripthash,
                                                       const std::vector<storage::DB::ScriptHistoryEntry>& page_items) {
   std::vector<DetailedHistoryRow> out;
@@ -624,6 +633,26 @@ std::vector<DetailedHistoryRow> detailed_history_rows(const storage::DB& db, con
     DetailedHistoryRow row;
     row.txid = item.txid;
     row.height = item.height;
+
+    // An envelope's second entry is its settlement: only the bond can move then.
+    if (const auto loc = db.get_tx_index(item.txid); loc.has_value() && loc->height != item.height) {
+      if (const auto timed = TxTimed::parse(loc->tx_bytes); timed.has_value()) {
+        const auto settlement = timed_settlement_row_for(db, item.txid);
+        if (!settlement.has_value()) {
+          row.direction = "related";
+          row.detail = "Time-lock settled, outcome not recorded by this node";
+        } else if (settlement->outcome == storage::TimedSettlementOutcome::Forfeited) {
+          row.direction = "related";
+          row.detail = "Time-lock bond forfeited";
+        } else {
+          row.direction = "received";
+          row.net_amount = static_cast<std::int64_t>(timed->forfeit_bond);
+          row.detail = "Time-lock bond returned";
+        }
+        out.push_back(std::move(row));
+        continue;
+      }
+    }
 
     const auto tx = load_tx(item.txid);
     if (!tx.has_value()) {
@@ -872,15 +901,6 @@ std::string ticket_pow_status_json(const TicketPowStatusView& status) {
       << ",\"bonus_cap_bps\":" << status.bonus_cap_bps
       << "}";
   return oss.str();
-}
-
-std::optional<storage::TimedSettlementRow> timed_settlement_row_for(const storage::DB& db, const Hash32& timed_txid) {
-  const auto height = db.get_timed_settlement_height(timed_txid);
-  if (!height.has_value()) return std::nullopt;
-  for (const auto& row : db.get_timed_settlements(*height)) {
-    if (row.timed_txid == timed_txid) return row;
-  }
-  return std::nullopt;
 }
 
 std::string timed_settlement_fields_json(const storage::TimedSettlementRow& row, std::uint64_t height) {

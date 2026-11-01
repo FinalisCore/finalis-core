@@ -1254,6 +1254,66 @@ TEST(test_lightserver_get_tx_reports_timed_settlement) {
   ASSERT_TRUE(settled.find("\"outcome\":\"forfeited\"") != std::string::npos);
 }
 
+TEST(test_lightserver_history_shows_what_a_timed_settlement_moved) {
+  const std::string base = unique_test_base("/tmp/finalis_light_history_timed");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(put_utxo_listing_test_genesis(db));
+
+  const auto script = listing_test_script();
+  const auto sh = crypto::sha256(script);
+  const auto applied = timed_envelope_for_listing(script, 0xB1);
+  const auto forfeited = timed_envelope_for_listing(script, 0xB2);
+  const auto unrecorded = timed_envelope_for_listing(script, 0xB3);
+  std::uint32_t index = 0;
+  for (const auto* envelope : {&applied, &forfeited, &unrecorded}) {
+    ASSERT_TRUE(db.put_tx_index(envelope->txid(), 3, index++, envelope->serialize()));
+    ASSERT_TRUE(db.add_script_history(sh, 3, envelope->txid()));
+    ASSERT_TRUE(db.add_script_history(sh, 1391, envelope->txid()));
+  }
+  {
+    storage::DB::Batch batch(db);
+    batch.put_timed_settlements(1391, {storage::TimedSettlementRow{applied.txid(), storage::TimedSettlementOutcome::Applied,
+                                                                   std::nullopt},
+                                       storage::TimedSettlementRow{forfeited.txid(), storage::TimedSettlementOutcome::Forfeited,
+                                                                   std::nullopt}});
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto resp = rpc_for_test(ls, "get_history_page_detailed",
+                                 std::string(R"({"scripthash_hex":")") + hex_encode32(sh) + R"(","limit":10})");
+  const auto row_of = [&](const Hash32& txid, std::uint64_t height) {
+    const auto at = resp.find("\"txid\":\"" + hex_encode32(txid) + "\",\"height\":" + std::to_string(height));
+    ASSERT_TRUE(at != std::string::npos);
+    return resp.substr(at, resp.find('}', at) - at);
+  };
+  // Inclusion still moves only the prepaid fee, the bond and the change.
+  ASSERT_TRUE(row_of(applied.txid(), 3).find("\"net_amount\":39689000") != std::string::npos);
+
+  const auto bond_back = row_of(applied.txid(), 1391);
+  ASSERT_TRUE(bond_back.find("\"direction\":\"received\"") != std::string::npos);
+  ASSERT_TRUE(bond_back.find("\"net_amount\":10000000") != std::string::npos);
+  ASSERT_TRUE(bond_back.find("\"detail\":\"Time-lock bond returned\"") != std::string::npos);
+
+  const auto bond_lost = row_of(forfeited.txid(), 1391);
+  ASSERT_TRUE(bond_lost.find("\"direction\":\"related\"") != std::string::npos);
+  ASSERT_TRUE(bond_lost.find("\"net_amount\":0") != std::string::npos);
+  ASSERT_TRUE(bond_lost.find("\"detail\":\"Time-lock bond forfeited\"") != std::string::npos);
+
+  const auto unknown = row_of(unrecorded.txid(), 1391);
+  ASSERT_TRUE(unknown.find("\"direction\":\"related\"") != std::string::npos);
+  ASSERT_TRUE(unknown.find("\"net_amount\":0") != std::string::npos);
+  ASSERT_TRUE(unknown.find("outcome not recorded by this node") != std::string::npos);
+}
+
 TEST(test_lightserver_summary_names_the_recipient_of_a_height_lock) {
   const std::string base = unique_test_base("/tmp/finalis_light_summary_height_lock");
   std::filesystem::remove_all(base);

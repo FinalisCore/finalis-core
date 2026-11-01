@@ -303,6 +303,7 @@ struct TxOutputResult {
   std::optional<std::uint64_t> admission_pow_epoch;
   std::optional<std::uint64_t> admission_pow_nonce;
   std::optional<std::uint64_t> unlock_height;  // decoded_kind "height_lock"
+  std::optional<std::string> owner_address;    // inheritance form: spends at any height
 };
 
 // The sealed part of a timed envelope, as far as the finalized chain has settled it.
@@ -451,7 +452,7 @@ constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
 constexpr std::size_t kPersistedTxIndexLimit = 128;
 // Bump when a cached finalized view would render differently: older entries are then rebuilt.
-constexpr std::uint64_t kPersistedViewVersion = 2;
+constexpr std::uint64_t kPersistedViewVersion = 3;
 constexpr std::size_t kPersistedTransitionIndexLimit = 128;
 constexpr std::uint64_t kHomeLatestTransitions = 10;
 // The lightserver scans its local DB (and clamps to 4096); the per-height RPC fallback stays shallow.
@@ -979,7 +980,14 @@ std::string render_summary_metric_card_html(const std::string& label, const std:
 }
 
 // The transparent outputs of these flows are only change, so they say nothing about the amount sent.
-bool flow_amount_hidden(const std::string& flow_kind) { return flow_kind == "shield" || flow_kind == "confidential"; }
+// These transactions' visible outputs are the sender's change, not an amount anyone sent.
+bool flow_amount_hidden(const std::string& flow_kind) {
+  return flow_kind == "shield" || flow_kind == "confidential" || flow_kind == "timed-envelope";
+}
+
+std::string hidden_amount_label(const std::string& flow_kind) {
+  return flow_kind == "timed-envelope" ? "sealed" : "hidden";
+}
 
 std::string render_summary_metric_card(const std::string& label, const std::string& value, const std::string& sub = {}) {
   std::ostringstream oss;
@@ -1009,7 +1017,9 @@ TransitionSummary compute_transition_summary(const Config& cfg, const Transition
   for (const auto& txid : transition.txids) {
     auto it = summaries.find(txid);
     if (it != summaries.end()) {
-      if (it->second.total_out.has_value()) summary.finalized_out += *it->second.total_out;
+      if (it->second.total_out.has_value() && !flow_amount_hidden(it->second.flow_kind.value_or(""))) {
+        summary.finalized_out += *it->second.total_out;
+      }
       if (it->second.flow_kind.has_value()) ++summary.flow_mix[*it->second.flow_kind];
       for (const auto& recipient : it->second.recipients) {
         if (!recipient.empty()) distinct_recipients.insert(recipient);
@@ -1018,7 +1028,7 @@ TransitionSummary compute_transition_summary(const Config& cfg, const Transition
     }
     auto tx_lookup = fetch_tx_result(cfg, txid);
     if (!tx_lookup.value.has_value()) continue;
-    summary.finalized_out += tx_lookup.value->total_out;
+    if (!flow_amount_hidden(tx_lookup.value->flow_kind)) summary.finalized_out += tx_lookup.value->total_out;
     ++summary.flow_mix[tx_lookup.value->flow_kind];
     for (const auto& out : tx_lookup.value->outputs) {
       if (out.address.has_value() && !out.address->empty()) distinct_recipients.insert(*out.address);
@@ -1026,6 +1036,14 @@ TransitionSummary compute_transition_summary(const Config& cfg, const Transition
   }
   summary.distinct_recipient_count = distinct_recipients.size();
   return summary;
+}
+
+std::size_t transition_hidden_tx_count(const TransitionSummary& summary) {
+  std::size_t hidden = 0;
+  for (const auto& [kind, count] : summary.flow_mix) {
+    if (flow_amount_hidden(kind)) hidden += count;
+  }
+  return hidden;
 }
 
 std::string summarize_flow_mix(const std::map<std::string, std::size_t>& flow_mix) {
@@ -2365,6 +2383,7 @@ finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
     json_put(item, "admission_pow_epoch", out.admission_pow_epoch);
     json_put(item, "admission_pow_nonce", out.admission_pow_nonce);
     json_put(item, "unlock_height", out.unlock_height);
+    json_put(item, "owner_address", out.owner_address);
     outputs.array_value.push_back(std::move(item));
   }
   obj.object_value["inputs"] = std::move(inputs);
@@ -2437,6 +2456,7 @@ std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& o
           object_u64(&output, "admission_pow_epoch"),
           object_u64(&output, "admission_pow_nonce"),
           object_u64(&output, "unlock_height"),
+          object_string(&output, "owner_address"),
       });
     }
   }
@@ -3026,7 +3046,8 @@ std::string render_root(const Config& cfg) {
         body << "<span class=\"muted\">unknown</span>";
       }
       body << "</td><td class=\"num\">"
-           << (flow_amount_hidden(item.flow_kind.value_or("")) ? std::string("<span class=\"muted\">hidden</span>")
+           << (flow_amount_hidden(item.flow_kind.value_or(""))
+                   ? "<span class=\"muted\">" + hidden_amount_label(*item.flow_kind) + "</span>"
                : item.total_out.has_value() ? html_escape(format_amount(*item.total_out)) : std::string("<span class=\"muted\">n/a</span>"))
            << "</td></tr>";
     }
@@ -3639,7 +3660,7 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   const auto add_output = [&](const std::optional<finalis::TxOut>& tx_out) {
     if (!tx_out.has_value()) {
       result.outputs.push_back(TxOutputResult{0, std::nullopt, "", std::string("confidential"), std::nullopt, std::nullopt,
-                                              false, std::nullopt, std::nullopt, std::nullopt});
+                                              false, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
       return;
     }
     result.total_out += tx_out->value;
@@ -3655,6 +3676,9 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
         std::nullopt,
         std::nullopt,
         lock.has_value() ? std::optional<std::uint64_t>{lock->unlock_height} : std::nullopt,
+        lock.has_value() && lock->owner_pkh.has_value()
+            ? std::optional<std::string>{finalis::address::encode_p2pkh(hrp, *lock->owner_pkh)}
+            : std::nullopt,
     });
   };
 
@@ -4246,6 +4270,7 @@ std::string render_tx_json(const TxResult& result) {
         << ",\"admission_pow_epoch\":" << json_u64_or_null(result.outputs[i].admission_pow_epoch)
         << ",\"admission_pow_nonce\":" << json_u64_or_null(result.outputs[i].admission_pow_nonce)
         << ",\"unlock_height\":" << json_u64_or_null(result.outputs[i].unlock_height)
+        << ",\"owner_address\":" << json_string_or_null(result.outputs[i].owner_address)
         << "}";
   }
   std::size_t decoded_output_count = 0;
@@ -4297,6 +4322,7 @@ std::string render_transition_json(const Config& cfg, const TransitionResult& re
   }
   oss << "],\"summary\":{\"tx_count\":" << result.tx_count
       << ",\"finalized_out\":" << summary.finalized_out
+      << ",\"hidden_tx_count\":" << transition_hidden_tx_count(summary)
       << ",\"distinct_recipient_count\":" << summary.distinct_recipient_count
       << ",\"flow_mix\":{";
   bool first_flow = true;
@@ -4408,7 +4434,7 @@ std::string render_recent_tx_json(const std::vector<RecentTxResult>& items, std:
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (i) oss << ",";
     const auto& item = items[i];
-    if (item.total_out.has_value()) finalized_out_total += *item.total_out;
+    if (item.total_out.has_value() && !flow_amount_hidden(item.flow_kind.value_or(""))) finalized_out_total += *item.total_out;
     oss << "{\"txid\":\"" << finalis::minijson::escape(item.txid) << "\""
         << ",\"height\":" << json_u64_or_null(item.height)
         << ",\"timestamp\":" << json_u64_or_null(item.timestamp)
@@ -4452,7 +4478,7 @@ std::string render_health_json(bool ok, const std::optional<ApiError>& err = std
 
 // What the page leads with: the amount sent, so a sender's change does not read as payment.
 std::string tx_headline_amount(const TxResult& tx) {
-  if (flow_amount_hidden(tx.flow_kind)) return "hidden";
+  if (flow_amount_hidden(tx.flow_kind)) return hidden_amount_label(tx.flow_kind);
   if (tx.timed.has_value()) return "sealed";
   std::set<std::string> senders;
   for (const auto& in : tx.inputs) {
@@ -4604,6 +4630,9 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
     body << "</td><td>";
     if (out.decoded_kind == std::optional<std::string>{"onboarding_registration"}) {
       body << "SCONBREG onboarding registration";
+    } else if (out.owner_address.has_value() && out.unlock_height.has_value()) {
+      body << "Inheritance lock. Owner " << html_escape(*out.owner_address)
+           << " can spend at any height, heir from block " << *out.unlock_height;
     } else if (out.unlock_height.has_value()) {
       body << "Height-locked until block " << *out.unlock_height;
     } else {
@@ -4660,9 +4689,14 @@ std::string render_transition(const Config& cfg, const std::string& ident) {
   }
   body << "</div>";
 
+  const std::size_t hidden_txs = transition_hidden_tx_count(summary);
+  const bool all_hidden = hidden_txs != 0 && hidden_txs == transition.txids.size();
   body << "<div class=\"card\"><div class=\"hero-metrics\">"
        << render_summary_metric_card("Transactions", std::to_string(transition.txids.size()))
-       << render_summary_metric_card("Amount", format_amount(summary.finalized_out), "sum of outputs")
+       << render_summary_metric_card("Amount", all_hidden ? std::string("hidden") : format_amount(summary.finalized_out),
+                                     hidden_txs == 0 ? std::string("sum of outputs")
+                                     : all_hidden    ? std::string("not public")
+                                                     : "public outputs, " + std::to_string(hidden_txs) + " hidden")
        << render_summary_metric_card("Recipients", std::to_string(summary.distinct_recipient_count), "distinct addresses")
        << render_summary_metric_card("Types", flow_mix_text, "transaction flow types")
        << "</div></div>";
