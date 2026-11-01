@@ -972,6 +972,148 @@ TEST(test_wallet_spendable_utxos_history_fallback_filters_noncanonical_outputs) 
   ASSERT_EQ(spendable[0].prevout.value, 222222222u);
 }
 
+namespace {
+
+bool put_utxo_listing_test_genesis(storage::DB& db) {
+  genesis::Document d;
+  d.version = genesis::kGenesisVersion;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-utxo-listing";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  finalis::test::fill_test_genesis_bls(d);
+  const auto genesis_json = genesis::to_json(d);
+  return db.put(storage::key_genesis_json(), Bytes(genesis_json.begin(), genesis_json.end()));
+}
+
+// The coin rows a finalized block leaves behind: a parent output spent by a timed envelope, whose
+// bytes are not an AnyTx, and one live output stored as the node stores it (V2 row + script index).
+struct UtxoListingFixture {
+  Bytes script_pubkey;
+  Hash32 scripthash{};
+  Hash32 spent_txid{};
+  OutPoint live{};
+};
+
+bool put_timed_spend_rows(storage::DB& db, UtxoListingFixture* f) {
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  f->script_pubkey = address::p2pkh_script_pubkey(crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end())));
+  f->scripthash = crypto::sha256(f->script_pubkey);
+
+  Tx parent;
+  parent.inputs.push_back(TxIn{zero_hash(), 0, Bytes{}, 0xFFFFFFFF});
+  parent.outputs.push_back(TxOut{111111111, f->script_pubkey});
+  f->spent_txid = parent.txid();
+  Hash32 envelope_txid{};
+  envelope_txid[31] = 0x92;
+  f->live.txid[31] = 0x93;
+  return db.put_tx_index(f->spent_txid, 10, 0, parent.serialize()) && db.add_script_history(f->scripthash, 10, f->spent_txid) &&
+         db.put_tx_index(envelope_txid, 11, 0, Bytes{0x03, 0x00, 0x00, 0x00}) &&
+         db.add_script_history(f->scripthash, 11, envelope_txid) &&
+         db.put_utxo_v2(f->live, UtxoEntryV2{TxOut{222222222, f->script_pubkey}}) &&
+         db.put_script_utxo(f->scripthash, f->live, TxOut{222222222, f->script_pubkey}, 11);
+}
+
+std::string get_utxos_for_test(lightserver::Server& ls, const Hash32& scripthash) {
+  return ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":105,"method":"get_utxos","params":{"scripthash_hex":")") +
+                                hex_encode32(scripthash) + R"("}})");
+}
+
+}  // namespace
+
+TEST(test_db_get_utxo_reads_node_written_rows) {
+  const std::string base = unique_test_base("/tmp/finalis_db_get_utxo_v2_rows");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  OutPoint op{};
+  op.txid[31] = 0x94;
+  ASSERT_TRUE(db.put_utxo_v2(op, UtxoEntryV2{TxOut{333333333, Bytes{0x51}}}));
+  const auto out = db.get_utxo(op);
+  ASSERT_TRUE(out.has_value());
+  ASSERT_EQ(out->value, 333333333u);
+}
+
+TEST(test_lightserver_get_utxos_omits_coin_spent_by_timed_envelope) {
+  const std::string base = unique_test_base("/tmp/finalis_light_utxos_timed_spend");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(put_utxo_listing_test_genesis(db));
+  UtxoListingFixture f;
+  ASSERT_TRUE(put_timed_spend_rows(db, &f));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto resp = get_utxos_for_test(ls, f.scripthash);
+  ASSERT_TRUE(resp.find(hex_encode32(f.live.txid)) != std::string::npos);
+  ASSERT_TRUE(resp.find(hex_encode32(f.spent_txid)) == std::string::npos);
+}
+
+TEST(test_lightserver_get_utxos_fallback_lists_only_live_coins) {
+  const std::string base = unique_test_base("/tmp/finalis_light_utxos_fallback_live_only");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(put_utxo_listing_test_genesis(db));
+  UtxoListingFixture f;
+  ASSERT_TRUE(put_timed_spend_rows(db, &f));
+  // A script-index row without a coin behind it sends the listing to its fallback.
+  OutPoint stale{};
+  stale.txid[31] = 0x95;
+  ASSERT_TRUE(db.put_script_utxo(f.scripthash, stale, TxOut{444444444, f.script_pubkey}, 12));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto resp = get_utxos_for_test(ls, f.scripthash);
+  ASSERT_TRUE(resp.find(hex_encode32(f.live.txid)) != std::string::npos);
+  ASSERT_TRUE(resp.find(hex_encode32(f.spent_txid)) == std::string::npos);
+  ASSERT_TRUE(resp.find(hex_encode32(stale.txid)) == std::string::npos);
+}
+
+TEST(test_wallet_spendable_utxos_omit_coin_spent_by_timed_envelope) {
+  const std::string base = unique_test_base("/tmp/finalis_wallet_spendable_timed_spend");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  UtxoListingFixture f;
+  ASSERT_TRUE(put_timed_spend_rows(db, &f));
+  OutPoint stale{};
+  stale.txid[31] = 0x95;
+  ASSERT_TRUE(db.put_script_utxo(f.scripthash, stale, TxOut{444444444, f.script_pubkey}, 12));
+  ASSERT_TRUE(db.flush());
+
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const auto spendable = wallet::spendable_p2pkh_utxos_for_pubkey_hash(db, pkh, nullptr);
+  ASSERT_EQ(spendable.size(), 1u);
+  ASSERT_EQ(spendable[0].outpoint.txid, f.live.txid);
+}
+
 TEST(test_lightserver_get_transition_by_height_direct) {
   const std::string base = unique_test_base("/tmp/finalis_light_block_by_height");
   std::filesystem::remove_all(base);
