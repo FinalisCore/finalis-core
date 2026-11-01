@@ -2819,6 +2819,55 @@ TEST(test_explorer_explains_an_inheritance_lock) {
   ASSERT_TRUE(cached.body.find("\"owner_address\":\"" + fx.known_address + "\"") != std::string::npos);
 }
 
+TEST(test_explorer_stop_wakes_a_blocked_accept) {
+  ASSERT_TRUE(finalis::net::ensure_sockets());
+  const auto listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_TRUE(finalis::net::valid_socket(listen_fd));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_TRUE(::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+  ASSERT_TRUE(::listen(listen_fd, 4) == 0);
+
+  g_stop = 0;
+  std::atomic<bool> returned{false};
+  std::atomic<bool> accepted{false};
+  std::thread accepting([&] {
+    sockaddr_in client{};
+    socklen_t len = sizeof(client);
+    accepted = finalis::net::valid_socket(accept_until_stop(listen_fd, &client, &len));
+    returned = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_TRUE(!returned.load());
+  on_signal(SIGTERM);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5 * kAcceptPollMs);
+  while (!returned.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const bool stopped = returned.load();
+  if (!stopped) g_stop = 1;
+  accepting.join();
+  g_stop = 0;
+  finalis::net::close_socket(listen_fd);
+  ASSERT_TRUE(stopped);
+  ASSERT_TRUE(!accepted.load());
+}
+
+TEST(test_explorer_stop_waits_for_client_sessions) {
+  ASSERT_TRUE(drain_client_sessions(0));
+  const Config cfg = test_config();
+  ASSERT_TRUE(try_admit_client(cfg, "203.0.113.9"));
+  ASSERT_TRUE(!drain_client_sessions(30));
+  std::thread session([] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    release_client("203.0.113.9");
+  });
+  const bool drained = drain_client_sessions(5'000);
+  session.join();
+  ASSERT_TRUE(drained);
+}
+
 TEST(test_explorer_ignores_results_cached_by_an_older_version) {
   ExplorerFixture fx;
   ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });

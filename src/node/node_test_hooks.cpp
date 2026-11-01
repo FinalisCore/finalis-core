@@ -19,6 +19,15 @@ std::vector<crypto::KeyPair> Node::deterministic_test_keypairs() {
   return out;
 }
 
+void Node::set_freeze_handler_for_test(std::function<void(const std::string&)> handler) {
+  freeze_handler_ = std::move(handler);
+}
+
+void Node::hold_node_lock_for_test(std::uint32_t ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
 bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false, 0); }
 
 bool Node::inject_timeout_vote_for_test(const TimeoutVote& vote) { return handle_timeout_vote(vote, false, 0); }
