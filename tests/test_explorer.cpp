@@ -2691,6 +2691,134 @@ TEST(test_explorer_transition_lists_timed_envelope_and_opened_body) {
   ASSERT_TRUE(api.body.find("\"tx_count\":2") != std::string::npos);
 }
 
+namespace {
+
+std::string summary_item_json(const std::string& txid, std::uint64_t height, const std::string& flow_kind,
+                              std::uint64_t finalized_out) {
+  return std::string("{\"txid\":\"") + txid + "\",\"height\":" + std::to_string(height) +
+         ",\"status_label\":\"FINALIZED (CREDIT SAFE)\",\"credit_safe\":true,\"finalized_depth\":4,\"finalized_out\":" +
+         std::to_string(finalized_out) + ",\"total_out\":" + std::to_string(finalized_out) +
+         ",\"fee\":1000,\"input_count\":1,\"output_count\":1,\"primary_sender\":null,\"primary_recipient\":null,"
+         "\"recipient_count\":0,\"recipients\":[],\"flow_kind\":\"" + flow_kind + "\",\"flow_summary\":\"test\"}";
+}
+
+std::string transition_with_records_json(const FrontierTransition& transition, std::uint64_t height) {
+  const std::string hash = hex_encode32(transition.transition_id());
+  return std::string("{\"height\":") + std::to_string(height) + ",\"hash\":\"" + hash + "\",\"transition_hash\":\"" + hash +
+         "\",\"transition_hex\":\"" + hex_encode(transition.serialize()) + "\"}";
+}
+
+}  // namespace
+
+TEST(test_explorer_home_list_keeps_sealed_and_hidden_amounts_out) {
+  ExplorerFixture fx;
+  const std::string envelope(64, 'a');
+  const std::string shield(64, 'b');
+  const std::string confidential(64, 'c');
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_recent_tx_summaries\"") != std::string::npos) {
+      return rpc_result(std::string("{\"items\":[") + summary_item_json(envelope, 9, "timed-envelope", 79'678'000) + "," +
+                        summary_item_json(shield, 8, "shield", 49'799'000) + "," +
+                        summary_item_json(confidential, 7, "confidential", 0) + "]}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+  const auto page = handle_request(cfg, make_http_get("/"));
+  ASSERT_EQ(page.status, 200);
+  // Both numbers are the sender's change, not an amount anyone sent.
+  ASSERT_TRUE(page.body.find(format_amount(79'678'000)) == std::string::npos);
+  ASSERT_TRUE(page.body.find(format_amount(49'799'000)) == std::string::npos);
+  ASSERT_TRUE(page.body.find("<span class=\"muted\">sealed</span>") != std::string::npos);
+  ASSERT_TRUE(page.body.find("<span class=\"muted\">hidden</span>") != std::string::npos);
+}
+
+TEST(test_explorer_transition_amount_counts_public_transfers_only) {
+  ExplorerFixture fx;
+  const std::string envelope(64, 'c');
+  const std::string confidential(64, 'e');
+  const std::string transparent(64, 'd');
+
+  FrontierTransition mixed = make_test_transition(31);
+  mixed.prev_frontier = 0;
+  mixed.next_frontier = 1;
+  FrontierTransition all_hidden = make_test_transition(32);
+  all_hidden.prev_frontier = 1;
+  all_hidden.next_frontier = 2;
+
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find("\"method\":\"get_transition_by_height\"") != std::string::npos ||
+        body.find("\"method\":\"get_transition\"") != std::string::npos) {
+      const bool is_mixed = body.find("31") != std::string::npos || body.find(hex_encode32(mixed.transition_id())) != std::string::npos;
+      return rpc_result(is_mixed ? transition_with_records_json(mixed, 31) : transition_with_records_json(all_hidden, 32));
+    }
+    if (body.find("\"method\":\"get_ingress_record\"") != std::string::npos) {
+      const bool first = body.find("\"seq\":1") != std::string::npos;
+      return rpc_result(std::string("{\"present\":true,\"txid\":\"") + (first ? envelope : confidential) + "\"}");
+    }
+    if (body.find("\"method\":\"get_timed_settlements\"") != std::string::npos) {
+      if (body.find("31") == std::string::npos) return rpc_result("{\"height\":32,\"items\":[]}");
+      return rpc_result(std::string("{\"height\":31,\"items\":[{\"txid\":\"") + std::string(64, 'f') +
+                        "\",\"outcome\":\"applied\",\"body_txid\":\"" + transparent + "\"}]}");
+    }
+    if (body.find("\"method\":\"get_tx_summaries\"") != std::string::npos) {
+      return rpc_result(std::string("{\"items\":[") + summary_item_json(envelope, 31, "timed-envelope", 79'678'000) + "," +
+                        summary_item_json(confidential, 32, "confidential", 0) + "," +
+                        summary_item_json(transparent, 31, "direct-transfer", 50'000'000) + "]}");
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+
+  const auto mixed_page = handle_request(cfg, make_http_get("/transition/31"));
+  ASSERT_EQ(mixed_page.status, 200);
+  ASSERT_TRUE(mixed_page.body.find("<span class=\"label\">Amount</span><span class=\"value\">" + format_amount(50'000'000)) !=
+              std::string::npos);
+  ASSERT_TRUE(mixed_page.body.find("public outputs, 1 hidden") != std::string::npos);
+  const auto mixed_api = handle_request(cfg, make_http_get("/api/transition/31"));
+  ASSERT_TRUE(mixed_api.body.find("\"finalized_out\":50000000") != std::string::npos);
+  ASSERT_TRUE(mixed_api.body.find("\"hidden_tx_count\":1") != std::string::npos);
+
+  const auto hidden_page = handle_request(cfg, make_http_get("/transition/32"));
+  ASSERT_EQ(hidden_page.status, 200);
+  ASSERT_TRUE(hidden_page.body.find("<span class=\"label\">Amount</span><span class=\"value\">hidden") != std::string::npos);
+  ASSERT_TRUE(hidden_page.body.find(format_amount(0)) == std::string::npos);
+}
+
+TEST(test_explorer_explains_an_inheritance_lock) {
+  ExplorerFixture fx;
+  const auto owner = address::decode(fx.known_address);
+  const auto heir = address::decode(fx.empty_address);
+  ASSERT_TRUE(owner.has_value() && heir.has_value());
+  Tx lock;
+  lock.inputs.push_back(TxIn{fx.tx.txid(), 0, Bytes{}, 0xFFFFFFFF});
+  lock.outputs.push_back(TxOut{70'000'000, inheritance_lock_script_pubkey(1541, owner->pubkey_hash, heir->pubkey_hash)});
+  const std::string txid = hex_encode32(lock.txid());
+  ScopedRpcHook hook([&](const std::string& body) {
+    if (body.find(txid) != std::string::npos) {
+      if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) return rpc_result(finalized_status_json(fx, 8));
+      if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+        return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(lock.serialize()) + "\"}");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+  const auto api = handle_request(cfg, make_http_get("/api/tx/" + txid));
+  ASSERT_EQ(api.status, 200);
+  ASSERT_TRUE(api.body.find("\"owner_address\":\"" + fx.known_address + "\"") != std::string::npos);
+  ASSERT_TRUE(api.body.find("\"unlock_height\":1541") != std::string::npos);
+  const auto page = handle_request(cfg, make_http_get("/tx/" + txid));
+  ASSERT_TRUE(page.body.find("Inheritance lock") != std::string::npos);
+  ASSERT_TRUE(page.body.find("Owner " + fx.known_address + " can spend at any height") != std::string::npos);
+  ASSERT_TRUE(page.body.find("heir from block 1541") != std::string::npos);
+  ASSERT_TRUE(page.body.find("Height-locked until block") == std::string::npos);
+
+  // A cached result keeps the owner.
+  const auto cached = handle_request(cfg, make_http_get("/api/tx/" + txid));
+  ASSERT_TRUE(cached.body.find("\"owner_address\":\"" + fx.known_address + "\"") != std::string::npos);
+}
+
 TEST(test_explorer_ignores_results_cached_by_an_older_version) {
   ExplorerFixture fx;
   ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
