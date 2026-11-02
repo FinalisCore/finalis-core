@@ -1735,7 +1735,13 @@ void Node::load_addrman() {
 
 void Node::persist_addrman() const {
   const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "addrman.dat";
-  (void)addrman_.save(p.string());
+  // The dial thread updates addrman_ under mu_; copy under it and write the file outside it.
+  p2p::AddrMan snapshot;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    snapshot = addrman_;
+  }
+  (void)snapshot.save(p.string());
 }
 
 void Node::load_validators_addrman() {
@@ -1782,8 +1788,11 @@ void Node::persist_validators_addrman(const std::vector<p2p::PeerInfo>& peers) c
   const auto now = now_unix();
   const std::uint64_t ttl_cutoff = now > kValidatorsAddrmanEntryTtlSeconds ? now - kValidatorsAddrmanEntryTtlSeconds : 0;
   std::map<std::string, std::uint64_t> addrman_last_seen;
-  for (const auto& entry : addrman_.all()) {
-    addrman_last_seen[entry.addr.key()] = entry.last_seen;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& entry : addrman_.all()) {
+      addrman_last_seen[entry.addr.key()] = entry.last_seen;
+    }
   }
 
   std::ifstream in(p);
