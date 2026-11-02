@@ -49,8 +49,7 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   configure_page_layout(layout);
 
   auto* intro = new QLabel(
-      "Review the transaction inline before sending. The wallet signs locally and only observes finalized state through lightserver. "
-      "Confidential TxV2 support is currently limited to transparent -> confidential and exact confidential -> transparent sends.",
+      "Review the transaction inline before sending. The wallet signs locally and only observes finalized state through lightserver.",
       this);
   intro->setWordWrap(true);
   intro->setProperty("role", QVariant(QStringLiteral("muted")));
@@ -100,7 +99,8 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
       "epoch it is a long lock: the current committee opens it, for a fee per epoch of lock (about 0.001 FLS "
       "per 96 minutes).");
   unlock_delay_label_ = new QLabel("Opens after", form_box);
-  form->addRow("Recipient address", address_edit_);
+  address_label_ = new QLabel("Recipient address", form_box);
+  form->addRow(address_label_, address_edit_);
   form->addRow("Send mode", mode_combo_);
   form->addRow("Amount (FLS)", amount_edit_);
   form->addRow("Fixed fee (FLS)", fee_edit_);

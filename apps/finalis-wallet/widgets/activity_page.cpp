@@ -34,7 +34,7 @@ void configure_table(QTableWidget* table, const QStringList& headers) {
   table->setSortingEnabled(true);
   table->verticalHeader()->setVisible(false);
   table->horizontalHeader()->setStretchLastSection(true);
-  table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+  table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   table->horizontalHeader()->setMinimumSectionSize(90);
 }
 

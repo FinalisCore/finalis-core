@@ -94,7 +94,7 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   finalized_note_label_->setProperty("role", QVariant(QStringLiteral("muted")));
   box_layout->addWidget(finalized_note_label_);
 
-  layout->addWidget(box, 0, Qt::AlignLeft | Qt::AlignTop);
+  layout->addWidget(box);
 
   auto* confidential_box = new QGroupBox("Confidential Receive", this);
   auto* confidential_layout = new QVBoxLayout(confidential_box);
@@ -185,7 +185,7 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   confidential_note_label_->setWordWrap(true);
   confidential_note_label_->setProperty("role", QVariant(QStringLiteral("muted")));
   confidential_layout->addWidget(confidential_note_label_);
-  layout->addWidget(confidential_box, 0, Qt::AlignLeft | Qt::AlignTop);
+  layout->addWidget(confidential_box);
 
   auto* help_box = new QGroupBox("What This Screen Covers", this);
   auto* help_layout = new QVBoxLayout(help_box);
@@ -197,7 +197,7 @@ ReceivePage::ReceivePage(QWidget* parent) : QWidget(parent) {
   help->setWordWrap(true);
   help->setProperty("role", QVariant(QStringLiteral("muted")));
   help_layout->addWidget(help);
-  layout->addWidget(help_box, 0, Qt::AlignLeft | Qt::AlignTop);
+  layout->addWidget(help_box);
   layout->addStretch(1);
 
   scroll->setWidget(content);

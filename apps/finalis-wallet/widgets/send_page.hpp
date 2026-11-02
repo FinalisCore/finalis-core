@@ -18,6 +18,7 @@ class SendPage final : public QWidget {
   explicit SendPage(QWidget* parent = nullptr);
 
   QLineEdit* address_edit() const { return address_edit_; }
+  QLabel* address_label() const { return address_label_; }
   QComboBox* mode_combo() const { return mode_combo_; }
   QLineEdit* amount_edit() const { return amount_edit_; }
   QLineEdit* fee_edit() const { return fee_edit_; }
@@ -47,6 +48,7 @@ class SendPage final : public QWidget {
 
  private:
   QLineEdit* address_edit_{nullptr};
+  QLabel* address_label_{nullptr};
   QComboBox* mode_combo_{nullptr};
   QLineEdit* amount_edit_{nullptr};
   QLineEdit* fee_edit_{nullptr};
