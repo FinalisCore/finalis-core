@@ -647,7 +647,10 @@ LookupResult<StatusResult> parse_status_result_object(const finalis::minijson::V
 LookupResult<CommitteeResult> parse_committee_result_object(const finalis::minijson::Value& committee_obj,
                                                             std::uint64_t requested_height);
 
-volatile std::sig_atomic_t g_stop = 0;
+// Atomic, not volatile sig_atomic_t: the signal may land on a session thread while main reads it.
+// A lock-free atomic is also safe to write from a signal handler.
+std::atomic<int> g_stop{0};
+static_assert(std::atomic<int>::is_always_lock_free);
 std::atomic<std::size_t> g_active_clients{0};
 constexpr std::size_t kMaxConcurrentClients = 64;
 // One address may not take every slot: without this a single client holding 64 slow connections
