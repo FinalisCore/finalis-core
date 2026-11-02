@@ -196,6 +196,33 @@ TEST(test_node_freeze_watchdog_ends_the_process_with_the_restartable_code) {
 }
 #endif
 
+TEST(test_node_dialing_a_dead_address_does_not_block_the_event_loop) {
+  auto cfg = make_cfg(unique_test_base("/tmp/finalis_test_node_dial_off_loop"));
+  cfg.disable_p2p = false;
+  cfg.listen = false;
+  cfg.outbound_target = 8;
+  cfg.handshake_timeout_ms = 2'500;
+  cfg.peers = {"192.0.2.71:19440", "192.0.2.72:19440"};  // TEST-NET-1: nothing answers
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  n.start();
+  const auto started = std::chrono::steady_clock::now();
+  auto ticks = n.event_loop_ticks_for_test();
+  auto last_tick = started;
+  std::chrono::milliseconds longest{0};
+  while (std::chrono::steady_clock::now() - started < std::chrono::milliseconds(7'000)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto t = n.event_loop_ticks_for_test(); t != ticks) {
+      ticks = t;
+      last_tick = now;
+    }
+    longest = std::max(longest, std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tick));
+  }
+  n.stop();
+  ASSERT_TRUE(longest < std::chrono::milliseconds(1'500));
+}
+
 TEST(test_node_freeze_exit_is_restartable_and_on_by_default) {
   // 78 and SIGABRT are in the units' RestartPreventExitStatus: they keep a node down on purpose.
   ASSERT_TRUE(node::kFreezeExitCode != 0 && node::kFreezeExitCode != 78);

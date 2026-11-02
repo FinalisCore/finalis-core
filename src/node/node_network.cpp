@@ -1735,7 +1735,13 @@ void Node::load_addrman() {
 
 void Node::persist_addrman() const {
   const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "addrman.dat";
-  (void)addrman_.save(p.string());
+  // The dial thread updates addrman_ under mu_; copy under it and write the file outside it.
+  p2p::AddrMan snapshot;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    snapshot = addrman_;
+  }
+  (void)snapshot.save(p.string());
 }
 
 void Node::load_validators_addrman() {
@@ -1770,11 +1776,9 @@ void Node::load_validators_addrman() {
   {
     std::lock_guard<std::mutex> lk(mu_);
     validators_bootstrap_peers_.assign(seen.begin(), seen.end());
-    prefer_validators_addrman_ = !validators_bootstrap_peers_.empty();
   }
   if (added > 0) {
     log_line("validators-addrman-load status=ok file=" + p.string() + " loaded=" + std::to_string(added));
-    log_line("validators-addrman-overlay mode=enabled endpoints=" + std::to_string(added));
   }
 }
 
@@ -1784,8 +1788,11 @@ void Node::persist_validators_addrman(const std::vector<p2p::PeerInfo>& peers) c
   const auto now = now_unix();
   const std::uint64_t ttl_cutoff = now > kValidatorsAddrmanEntryTtlSeconds ? now - kValidatorsAddrmanEntryTtlSeconds : 0;
   std::map<std::string, std::uint64_t> addrman_last_seen;
-  for (const auto& entry : addrman_.all()) {
-    addrman_last_seen[entry.addr.key()] = entry.last_seen;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& entry : addrman_.all()) {
+      addrman_last_seen[entry.addr.key()] = entry.last_seen;
+    }
   }
 
   std::ifstream in(p);
@@ -2266,7 +2273,6 @@ void Node::try_connect_bootstrap_peers() {
   std::vector<Candidate> addrman_candidates;
   std::set<std::string> seen;
   bool sync_bootstrap_mode = false;
-  bool validator_overlay_mode = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     std::size_t healthy_established_peers = 0;
@@ -2280,18 +2286,14 @@ void Node::try_connect_bootstrap_peers() {
     const std::uint64_t finalized_lag = best_peer_height > finalized_height_ ? (best_peer_height - finalized_height_) : 0;
     sync_bootstrap_mode =
         finalized_lag > kSyncBootstrapLagThreshold || healthy_established_peers < kSyncBootstrapHealthyPeerThreshold;
-    validator_overlay_mode = prefer_validators_addrman_ && !validators_bootstrap_peers_.empty();
-
     for (const auto& p : validators_bootstrap_peers_) {
       if (seen.insert(p).second) validator_candidates.push_back({p, "validators-addrman"});
     }
-    if (!validator_overlay_mode) {
-      for (const auto& p : bootstrap_peers_) {
-        if (seen.insert(p).second) static_candidates.push_back({p, "seeds"});
-      }
-      for (const auto& p : dns_seed_peers_) {
-        if (seen.insert(p).second) static_candidates.push_back({p, "dns"});
-      }
+    for (const auto& p : bootstrap_peers_) {
+      if (seen.insert(p).second) static_candidates.push_back({p, "seeds"});
+    }
+    for (const auto& p : dns_seed_peers_) {
+      if (seen.insert(p).second) static_candidates.push_back({p, "dns"});
     }
     if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) {
       for (const auto& a : addrman_.select_candidates(cfg_.outbound_target * 2, now_unix())) {
@@ -2302,6 +2304,7 @@ void Node::try_connect_bootstrap_peers() {
 
   auto attempt_candidates = [&](const std::vector<Candidate>& candidates) {
     for (const auto& candidate : candidates) {
+      if (outbound_dial_stop_.load()) return;
       const auto& peer = candidate.peer;
       const auto pos = peer.find(':');
       if (pos == std::string::npos) continue;
@@ -2341,6 +2344,8 @@ void Node::try_connect_bootstrap_peers() {
       }
       if (!p2p_.connect_to(host, port)) {
         log_line("peer-connect-failed endpoint=" + peer + " source=" + candidate.source + " reason=tcp-connect-failed");
+        std::lock_guard<std::mutex> lk(mu_);
+        addrman_.mark_fail(p2p::NetAddress{host, port}, now_unix(), "tcp-connect-failed");
         continue;
       }
       {
@@ -2369,14 +2374,22 @@ void Node::try_connect_bootstrap_peers() {
   if (sync_bootstrap_mode && outbound_peer_count() >= cfg_.outbound_target) return;
   if (sync_bootstrap_mode && outbound_peer_count() > 0 && established_active_validator_peers() > 0) return;
 
-  // In validator overlay mode, never fan out into generic addrman; keep
-  // consensus connectivity pinned to validator-advertised endpoints.
-  if (validator_overlay_mode) return;
-
-  // In normal mode we blend in addrman for broader discovery.
-  // In sync bootstrap mode we spill to addrman only when static/dns could not
-  // establish any outbound path.
+  // Validators and seeds come first. The rest of the outbound target goes to addrman: the validator
+  // list only ever gains peers this node dialed itself, so without this a node stays on the seeds
+  // that let it in. In sync bootstrap mode addrman is used only when static/dns could not establish
+  // any outbound path.
+  if (outbound_peer_count() >= cfg_.outbound_target) return;
+  addrman_candidates.resize(std::min(addrman_candidates.size(), cfg_.outbound_target - outbound_peer_count()));
   attempt_candidates(addrman_candidates);
+}
+
+void Node::request_outbound_dial() {
+  if (outbound_dial_active_.exchange(true)) return;
+  if (outbound_dial_thread_.joinable()) outbound_dial_thread_.join();
+  outbound_dial_thread_ = std::thread([this]() {
+    try_connect_bootstrap_peers();
+    outbound_dial_active_.store(false);
+  });
 }
 
 std::optional<p2p::NetAddress> Node::advertised_endpoint_locked() const {

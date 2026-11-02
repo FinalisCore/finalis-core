@@ -23,6 +23,8 @@ void Node::set_freeze_handler_for_test(std::function<void(const std::string&)> h
   freeze_handler_ = std::move(handler);
 }
 
+std::uint64_t Node::event_loop_ticks_for_test() const { return event_loop_ticks_.load(); }
+
 void Node::hold_node_lock_for_test(std::uint32_t ms) {
   std::lock_guard<std::mutex> lk(mu_);
   std::this_thread::sleep_for(std::chrono::milliseconds(ms));

@@ -4136,6 +4136,36 @@ TEST(test_long_time_lock_opens_on_a_four_validator_cluster) {
 
 // A height-locked payment on a live node: admitted and finalized, found under the recipient's own
 // address, refused before its height (mempool and block), and spent from it.
+// A node's dial list holds only validators it dialed itself. If that list also stopped it dialing
+// anything else, a validator would stay on the seeds that first let it in, and the network would
+// stay a star around them.
+TEST(test_validator_dial_list_does_not_seal_a_node_off_from_other_peers) {
+  const std::string base = unique_test_base("/tmp/finalis_test_dial_list_not_sealed");
+  auto cluster = make_cluster(base, 3, 3, 3, [](node::NodeConfig& cfg) {
+    cfg.handshake_timeout_ms = 2'000;
+    if (cfg.node_id != 2) return;
+    std::ofstream(std::filesystem::path(cfg.db_path) / "validators-addrman.dat")
+        << "# finalis validators-addrman v1\n" << cfg.peers.at(0) << "\n";
+    cfg.seeds = {cfg.peers.at(1)};
+    cfg.peers.clear();
+  });
+  const std::string known = "127.0.0.1:" + std::to_string(cluster.ports[1]);
+  const auto dial_list = std::filesystem::path(cluster.configs[2].db_path) / "validators-addrman.dat";
+
+  bool connected = false;
+  for (int i = 0; i < 300 && !connected; ++i) {
+    connected = cluster.nodes[2]->status().established_peers >= 2;
+    if (!connected) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  ASSERT_TRUE(connected);
+  cluster.nodes[2]->stop();
+
+  // The validator it found this way joins its dial list, so the list can grow.
+  std::ifstream in(dial_list);
+  const std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  ASSERT_TRUE(contents.find(known) != std::string::npos);
+}
+
 TEST(test_height_locked_payment_on_a_live_node) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto base = unique_test_base("/tmp/finalis_it_height_lock");
