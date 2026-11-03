@@ -50,6 +50,10 @@ namespace finalis::wallet {
 
 QString onboarding_error_display_text(const QString& error_code, const QString& fallback_message);
 QString onboarding_badge_html(const QString& badge);
+// Whether the funds cover a validator registration's bond and fee. The onboarding record's balance and
+// amount win when one exists; without one (no local node yet) the wallet's finalized spendable balance counts.
+bool onboarding_funds_sufficient(const std::optional<onboarding::ValidatorOnboardingRecord>& record,
+                                 std::uint64_t wallet_spendable_units, std::uint64_t required_total_units);
 
 struct HistoryFlowClassification {
   QString kind;
@@ -484,6 +488,8 @@ class WalletWindow final : public QMainWindow {
   QTextEdit* activity_detail_view_{nullptr};
 
   QLineEdit* send_address_edit_{nullptr};
+  QLabel* send_address_label_{nullptr};
+  QLabel* send_amount_label_{nullptr};
   QComboBox* send_mode_combo_{nullptr};
   QLineEdit* send_amount_edit_{nullptr};
   QLineEdit* send_fee_edit_{nullptr};

@@ -18,8 +18,10 @@ class SendPage final : public QWidget {
   explicit SendPage(QWidget* parent = nullptr);
 
   QLineEdit* address_edit() const { return address_edit_; }
+  QLabel* address_label() const { return address_label_; }
   QComboBox* mode_combo() const { return mode_combo_; }
   QLineEdit* amount_edit() const { return amount_edit_; }
+  QLabel* amount_label() const { return amount_label_; }
   QLineEdit* fee_edit() const { return fee_edit_; }
   QPushButton* max_button() const { return max_button_; }
   // Time-locked mode: the transfer opens this many blocks after the next one (within the epoch).
@@ -47,8 +49,10 @@ class SendPage final : public QWidget {
 
  private:
   QLineEdit* address_edit_{nullptr};
+  QLabel* address_label_{nullptr};
   QComboBox* mode_combo_{nullptr};
   QLineEdit* amount_edit_{nullptr};
+  QLabel* amount_label_{nullptr};
   QLineEdit* fee_edit_{nullptr};
   QPushButton* max_button_{nullptr};
   QSpinBox* unlock_delay_spin_{nullptr};

@@ -4,6 +4,8 @@
 #include <QByteArray>
 #include <QComboBox>
 #include <QDir>
+#include <QFontMetrics>
+#include <QFormLayout>
 #include <QDateTime>
 #include <QLabel>
 #include <QLineEdit>
@@ -18,12 +20,14 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 
 #include "apps/finalis-wallet/widgets/activity_page.hpp"
 #include "apps/finalis-wallet/wallet_network.hpp"
 #include "apps/finalis-wallet/widgets/advanced_page.hpp"
+#include "apps/finalis-wallet/widgets/receive_page.hpp"
 #include "apps/finalis-wallet/widgets/send_page.hpp"
 #include "consensus/monetary.hpp"
 #include "utxo/signing.hpp"
@@ -174,6 +178,7 @@ void test_wallet_window_local_filter_preserves_rendered_ordering() {
   window.chain_records_.push_back(finalis::wallet::WalletWindow::ChainRecord{
       "FINALIZED", "SENT", "5 FLS", "chain-ref", "12", "txid-chain", "chain details",
   });
+  window.local_sent_txids_ = {"pending-ref-1"};  // still tracked, so still pending
   window.local_history_lines_.push_back("[pending] relay accepted (pending-ref-1)");
   window.local_history_lines_.push_back("[finalized] pending send finalized (final-ref-2)");
   window.local_history_lines_.push_back("[info] pending send released (released-ref-3)");
@@ -194,6 +199,118 @@ void test_wallet_window_local_filter_preserves_rendered_ordering() {
   require(table->item(3, 0)->text().toStdString() == "Local Event (local)", "local release row type mismatch");
   require(table->item(3, 1)->text().toStdString() == "Info", "local release row status mismatch");
   require(window.activity_local_count_label_->text().toStdString() == "Local: 4", "local count chip mismatch");
+}
+
+void test_wallet_window_local_send_stops_pending_once_resolved() {
+  finalis::wallet::WalletWindow window;
+  window.chain_records_.clear();
+  window.local_history_lines_.clear();
+  window.history_row_refs_.clear();
+
+  // Lines carry the txid elided as elide_middle(txid, 12).
+  const auto ref = [](char c) { return QString(12, QChar(c)) + "..." + QString(12, QChar(c)); };
+  window.local_sent_txids_ = {std::string(64, 'c')};
+  window.local_history_lines_.push_back("[pending] sent 1 FLS -> x (" + ref('a') + ")");
+  window.local_history_lines_.push_back("[finalized] pending send finalized " + ref('a'));
+  window.local_history_lines_.push_back("[pending] sent 2 FLS -> y (" + ref('b') + ")");
+  window.local_history_lines_.push_back("[info] pending send released " + ref('b'));
+  window.local_history_lines_.push_back("[pending] sent 3 FLS -> z (" + ref('c') + ")");
+  window.local_history_lines_.push_back("[pending] cancelled time-locked send t (" + ref('d') + ")");
+
+  window.history_filter_combo_->setCurrentText("Local");
+  window.refresh_history_table();
+
+  auto* table = window.history_view_;
+  require(table->rowCount() == 6, "local send row count mismatch");
+  std::map<std::string, std::string> status_by_state;
+  int pending_rows = 0;
+  for (int r = 0; r < table->rowCount(); ++r) {
+    const std::string status = table->item(r, 1)->text().toStdString();
+    if (status == "Pending (local)") ++pending_rows;
+    if (table->item(r, 0)->text().startsWith("Local Send")) {
+      status_by_state[table->item(r, 4)->text().toStdString()] = status;
+    }
+  }
+  require(pending_rows == 1, "only the still-tracked send may show as pending, got " + std::to_string(pending_rows));
+  require(status_by_state["submitted, not final"] == "Pending (local)", "tracked send not pending");
+  require(status_by_state["finalized on chain"] == "Finalized", "finalized send not shown as finalized");
+  require(status_by_state["released, not finalized"] == "Info", "released send not shown as released");
+  require(status_by_state["no longer pending"] == "Info", "untracked send not shown as resolved");
+  require(window.activity_pending_count_label_->text().toStdString() == "Pending: 1", "pending chip counts resolved sends");
+}
+
+void test_wallet_window_activity_columns_fit_their_contents() {
+  finalis::wallet::WalletWindow window;
+  window.chain_records_.clear();
+  window.local_history_lines_.clear();
+  window.local_sent_txids_ = {"pending-ref-1"};
+  window.local_history_lines_.push_back("[pending] sent 1 FLS -> x (pending-ref-1)");
+  window.history_filter_combo_->setCurrentText("All");
+  window.resize(1900, 1000);
+  window.show();
+  window.refresh_history_table();
+  QApplication::processEvents();
+  auto* table = window.history_view_;
+  const QFontMetrics metrics(table->font());
+  for (int r = 0; r < table->rowCount(); ++r) {
+    for (int c = 0; c < 4; ++c) {
+      const auto* item = table->item(r, c);
+      if (item == nullptr) continue;
+      const int needed = metrics.horizontalAdvance(item->text());
+      require(table->columnWidth(c) >= needed, "activity column " + std::to_string(c) + " cuts \"" +
+                                                   item->text().toStdString() + "\": " +
+                                                   std::to_string(table->columnWidth(c)) + " < " + std::to_string(needed));
+    }
+  }
+}
+
+void test_wallet_window_recipient_label_follows_send_mode() {
+  finalis::wallet::WalletWindow window;
+  auto* combo = window.send_mode_combo_;
+  auto* form = qobject_cast<QFormLayout*>(window.send_address_edit_->parentWidget()->layout());
+  require(form != nullptr, "send form layout missing");
+  const char* expected[] = {"Recipient address",  "Recipient descriptor", "Recipient address", "Recipient request",
+                            "Recipient address",  "Recipient (or heir) address", "Data"};
+  require(combo->count() == 7, "send mode count mismatch");
+  for (int i = 0; i < 7; ++i) {
+    combo->setCurrentIndex(i);
+    auto* label = qobject_cast<QLabel*>(form->labelForField(window.send_address_edit_));
+    require(label != nullptr, "recipient label missing");
+    require(label->text().toStdString() == expected[i],
+            "recipient label for mode " + std::to_string(i) + " is \"" + label->text().toStdString() + "\"");
+  }
+}
+
+void test_onboarding_funds_without_a_record_use_the_wallet_balance() {
+  constexpr std::uint64_t kRequired = 15'000'010'000ULL;  // 150 FLS bond + 0.0001 FLS fee
+  require(finalis::wallet::onboarding_funds_sufficient(std::nullopt, 151'393'699'347ULL, kRequired),
+          "wallet balance above bond + fee reported as insufficient");
+  require(!finalis::wallet::onboarding_funds_sufficient(std::nullopt, kRequired - 1, kRequired),
+          "wallet balance below bond + fee reported as sufficient");
+  finalis::onboarding::ValidatorOnboardingRecord record;
+  record.last_spendable_balance = 1;
+  record.required_amount = kRequired;
+  require(!finalis::wallet::onboarding_funds_sufficient(record, 151'393'699'347ULL, kRequired),
+          "an onboarding record's own balance must win over the wallet balance");
+}
+
+void test_receive_page_text_is_not_clipped() {
+  finalis::wallet::ReceivePage page;
+  page.address_label()->setText("tsc1aagyktetjxxmheyhl73etiizijzsxi4krnu7pebx");
+  page.resize(1880, 720);
+  page.show();
+  QApplication::processEvents();
+  for (auto* label : page.findChildren<QLabel*>()) {
+    if (!label->isVisible() || !label->wordWrap() || label->text().isEmpty()) continue;
+    require(label->height() >= label->heightForWidth(label->width()),
+            "clipped label: \"" + label->text().left(40).toStdString() + "\" height " + std::to_string(label->height()) +
+                " < " + std::to_string(label->heightForWidth(label->width())));
+  }
+  for (auto* button : page.findChildren<QPushButton*>()) {
+    if (!button->isVisible()) continue;
+    require(button->height() >= button->sizeHint().height(),
+            "clipped button: " + button->text().toStdString());
+  }
 }
 
 void test_advanced_page_onboarding_defaults() {
@@ -333,10 +450,12 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   require(combo->itemText(6).toStdString() == "Sealed data (published at a block)", "sealed data mode missing");
   combo->setCurrentIndex(6);
   require(!window.send_unlock_delay_spin_->isHidden(), "unlock delay hidden in sealed data mode");
-  require(!window.send_amount_edit_->isEnabled(), "amount enabled in sealed data mode");
+  require(window.send_amount_edit_->isHidden() && window.send_page_->amount_label()->isHidden(),
+          "amount row shown in sealed data mode");
   require(window.send_unlock_delay_spin_->maximum() >= 1'000'000, "long lock delays not selectable");
   combo->setCurrentIndex(4);
-  require(window.send_amount_edit_->isEnabled(), "amount disabled in time-locked mode");
+  require(!window.send_amount_edit_->isHidden() && !window.send_page_->amount_label()->isHidden(),
+          "amount row hidden in time-locked mode");
 }
 
 void test_wallet_window_send_fee_keeps_floor_and_follows_base_fee() {
@@ -472,6 +591,11 @@ int main(int argc, char** argv) {
     std::cout << "Completed test 3" << std::endl;
     std::cout << "Starting test 4: test_wallet_window_local_filter_preserves_rendered_ordering" << std::endl;
     test_wallet_window_local_filter_preserves_rendered_ordering();
+    test_wallet_window_local_send_stops_pending_once_resolved();
+    test_wallet_window_recipient_label_follows_send_mode();
+    test_onboarding_funds_without_a_record_use_the_wallet_balance();
+    test_receive_page_text_is_not_clipped();
+    test_wallet_window_activity_columns_fit_their_contents();
     std::cout << "Completed test 4" << std::endl;
     std::cout << "Starting test 5: test_advanced_page_onboarding_defaults" << std::endl;
     test_advanced_page_onboarding_defaults();

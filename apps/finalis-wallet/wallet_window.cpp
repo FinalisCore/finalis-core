@@ -713,6 +713,12 @@ QString send_reservation_note(std::size_t pending_reserved, std::size_t onboardi
 
 }  // namespace
 
+bool onboarding_funds_sufficient(const std::optional<onboarding::ValidatorOnboardingRecord>& record,
+                                 std::uint64_t wallet_spendable_units, std::uint64_t required_total_units) {
+  if (record.has_value()) return record->last_spendable_balance >= record->required_amount;
+  return wallet_spendable_units >= required_total_units;
+}
+
 QString onboarding_error_display_text(const QString& error_code, const QString& fallback_message) {
   const QString code = error_code.trimmed().toLower();
   if (code == "node_not_ready") {
@@ -832,8 +838,16 @@ QString extract_amount_prefix(const QString& text) {
   return text.left(pos + ticker_suffix.size()).trimmed();
 }
 
-QString local_history_status(const QString& line) {
-  if (line.startsWith("[pending]")) return "PENDING";
+// "[pending]" lines are written once, when a send is made, and never rewritten. Refresh drops the txid
+// from local_sent_txids_ once the send finalizes or is released, and logs a "[finalized]" or
+// "[info] ... released" line carrying the same elided txid.
+enum class LocalPendingState { NotPending, Pending, Finalized, Released, NoLongerTracked };
+
+QString local_history_status(const QString& line, LocalPendingState pending) {
+  if (line.startsWith("[pending]")) {
+    if (pending == LocalPendingState::Pending) return "PENDING";
+    return pending == LocalPendingState::Finalized ? "FINALIZED" : "INFO";
+  }
   if (line.startsWith("[finalized]")) return "FINALIZED";
   if (line.startsWith("[onboarding]")) return "INFO";
   return "INFO";
@@ -855,8 +869,32 @@ QString local_history_reference(const QString& line) {
   return {};
 }
 
-QString local_history_state(const QString& line) {
-  if (line.startsWith("[pending]")) return "submitted, not final";
+LocalPendingState local_pending_state(const QString& line, const QStringList& lines,
+                                      const std::vector<std::string>& tracked_sent_txids) {
+  if (!line.startsWith("[pending]")) return LocalPendingState::NotPending;
+  const QString ref = local_history_reference(line);
+  if (ref.isEmpty()) return LocalPendingState::Pending;
+  for (const auto& txid : tracked_sent_txids) {
+    if (elide_middle(QString::fromStdString(txid), 12) == ref) return LocalPendingState::Pending;
+  }
+  if (lines.contains("[finalized] pending send finalized " + ref)) return LocalPendingState::Finalized;
+  if (lines.contains("[info] pending send released " + ref)) return LocalPendingState::Released;
+  return LocalPendingState::NoLongerTracked;
+}
+
+QString local_history_state(const QString& line, LocalPendingState pending) {
+  if (line.startsWith("[pending]")) {
+    switch (pending) {
+      case LocalPendingState::Finalized:
+        return "finalized on chain";
+      case LocalPendingState::Released:
+        return "released, not finalized";
+      case LocalPendingState::NoLongerTracked:
+        return "no longer pending";
+      default:
+        return "submitted, not final";
+    }
+  }
   if (line.startsWith("[finalized]")) return "local note";
   if (line.startsWith("[onboarding]")) return "local tracking";
   return "local event";
@@ -1295,6 +1333,8 @@ void WalletWindow::build_ui() {
   overview_open_explorer_button_ = overview_page_->open_explorer_button();
 
   send_address_edit_ = send_page_->address_edit();
+  send_address_label_ = send_page_->address_label();
+  send_amount_label_ = send_page_->amount_label();
   send_mode_combo_ = send_page_->mode_combo();
   send_amount_edit_ = send_page_->amount_edit();
   send_fee_edit_ = send_page_->fee_edit();
@@ -1572,8 +1612,11 @@ void WalletWindow::build_ui() {
   const auto update_send_mode_ui = [this]() {
     const auto mode = wallet_send_mode_from_combo(send_mode_combo_);
     if (send_address_edit_) send_address_edit_->setPlaceholderText(wallet_send_mode_default_placeholder(mode));
+    if (send_address_label_) send_address_label_->setText(wallet_send_mode_recipient_label(mode));
     const bool timed = mode == WalletSendMode::TimeLocked || mode == WalletSendMode::TimedReveal;
-    if (send_amount_edit_) send_amount_edit_->setEnabled(mode != WalletSendMode::TimedReveal);
+    // Sealed data moves no coins: its body only publishes data, so the amount row is hidden.
+    if (send_amount_edit_) send_amount_edit_->setVisible(mode != WalletSendMode::TimedReveal);
+    if (send_amount_label_) send_amount_label_->setVisible(mode != WalletSendMode::TimedReveal);
     if (send_unlock_delay_spin_) send_unlock_delay_spin_->setVisible(timed);
     if (send_unlock_delay_label_) send_unlock_delay_label_->setVisible(timed);
     const bool locked = mode == WalletSendMode::HeightLocked;
@@ -2557,13 +2600,13 @@ void WalletWindow::refresh_validator_readiness_panel(bool interactive) {
           const std::uint64_t available_finalized_units =
               result.record.has_value() ? result.record->last_spendable_balance : request.wallet_finalized_spendable_units;
 
-          bool enough_balance = false;
+          bool enough_balance =
+              onboarding_funds_sufficient(result.record, request.wallet_finalized_spendable_units, required_total_units);
           QString funding_text = "Balance not checked yet";
           QString registration_status = request.detached_local ? "Detached locally" : "Not started";
           qulonglong tracked_checked_height = request.persisted_checked_height;
           bool tracked_checked_height_ok = request.tracked_checked_height_ok;
           if (result.record.has_value()) {
-            enough_balance = result.record->last_spendable_balance >= result.record->required_amount;
             if (enough_balance) {
               funding_text = QString("%1 available, %2 required to register (bond %3 + fee %4)")
                                  .arg(format_coin_amount(result.record->last_spendable_balance))
@@ -6921,15 +6964,16 @@ void WalletWindow::update_selected_history_detail() {
   if (ref.source == HistoryRowRef::Source::Local) {
     if (static_cast<std::size_t>(ref.index) >= local_history_lines_.size()) return;
     const auto& line = local_history_lines_[static_cast<std::size_t>(ref.index)];
+    const auto pending = local_pending_state(line, local_history_lines_, local_sent_txids_);
     activity_detail_title_label_->setText(QString("%1 · %2")
-                                              .arg(title_case_status(local_history_status(line)),
+                                              .arg(title_case_status(local_history_status(line, pending)),
                                                    local_history_kind(line)));
     activity_detail_view_->setPlainText(
         QString("Status: %1\nCategory: %2\nReference: %3\nState: %4\n\n%5")
-            .arg(title_case_status(local_history_status(line)),
+            .arg(title_case_status(local_history_status(line, pending)),
                  local_history_kind(line),
                  local_history_reference(line).isEmpty() ? "-" : local_history_reference(line),
-                 local_history_state(line),
+                 local_history_state(line, pending),
                  line));
     return;
   }
@@ -7049,12 +7093,13 @@ void WalletWindow::refresh_history_table() {
   }
   for (std::size_t i = 0; i < local_history_lines_.size(); ++i) {
     const auto& line = local_history_lines_[i];
-    const QString status = local_history_status(line);
+    const auto pending = local_pending_state(line, local_history_lines_, local_sent_txids_);
+    const QString status = local_history_status(line, pending);
     const QString upper = status.trimmed().toUpper();
     const int bucket = upper == "PENDING" ? 0 : (upper == "FINALIZED" ? 2 : 4);
     push_row(local_history_kind(line), status, "-",
              elide_middle(local_history_reference(line), 10),
-             local_history_state(line),
+             local_history_state(line, pending),
              HistoryRowRef::Source::Local, static_cast<int>(i), bucket);
   }
   for (std::size_t i = 0; i < confidential_coin_views_.size(); ++i) {
