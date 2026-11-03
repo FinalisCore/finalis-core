@@ -2627,6 +2627,54 @@ TEST(test_explorer_shows_timed_envelope_and_its_outcome) {
   ASSERT_TRUE(forfeited_page.body.find("Bond forfeited") != std::string::npos);
 }
 
+TEST(test_explorer_shows_the_data_a_sealed_envelope_published) {
+  ExplorerFixture fx;
+  const auto known = address::decode(fx.known_address);
+  ASSERT_TRUE(known.has_value());
+  const auto text_envelope = explorer_timed_envelope(fx, address::p2pkh_script_pubkey(known->pubkey_hash));
+  auto binary_envelope = text_envelope;
+  binary_envelope.unlock_height = 1391;
+  const std::string text_txid = hex_encode32(text_envelope.txid());
+  const std::string binary_txid = hex_encode32(binary_envelope.txid());
+  const std::string text = "bid <b>500</b> & more";
+  const std::string text_hex = hex_encode(Bytes(text.begin(), text.end()));
+  const std::string binary_hex = "00ff10";
+  ScopedRpcHook hook([&](const std::string& body) {
+    for (const TxTimed* e : {&text_envelope, static_cast<const TxTimed*>(&binary_envelope)}) {
+      const std::string txid = hex_encode32(e->txid());
+      if (body.find(txid) == std::string::npos) continue;
+      const std::string data_hex = e == &text_envelope ? text_hex : binary_hex;
+      if (body.find("\"method\":\"get_tx_status\"") != std::string::npos) return rpc_result(finalized_status_json(fx, 8));
+      if (body.find("\"method\":\"get_timed_reveal\"") != std::string::npos) {
+        return rpc_result("{\"txid\":\"" + txid + "\",\"revealed\":true,\"height\":1392,\"data_hex\":\"" + data_hex + "\"}");
+      }
+      if (body.find("\"method\":\"get_tx\"") != std::string::npos) {
+        return rpc_result(std::string("{\"tx_hex\":\"") + hex_encode(e->serialize()) +
+                          "\",\"tx_version\":3,\"fee\":110000,\"timed\":{\"unlock_height\":" +
+                          std::to_string(e->unlock_height) +
+                          ",\"forfeit_bond\":10000000,\"settled\":true,\"settlement_height\":1392,\"outcome\":\"revealed\"}}");
+      }
+    }
+    return default_rpc_handler(fx, body);
+  });
+  const Config cfg = test_config();
+
+  const auto api = handle_request(cfg, make_http_get("/api/tx/" + text_txid));
+  ASSERT_EQ(api.status, 200);
+  ASSERT_TRUE(api.body.find("\"revealed_data_hex\":\"" + text_hex + "\"") != std::string::npos);
+  const auto page = handle_request(cfg, make_http_get("/tx/" + text_txid));
+  ASSERT_EQ(page.status, 200);
+  ASSERT_TRUE(page.body.find("Opened: data published, bond refunded") != std::string::npos);
+  ASSERT_TRUE(page.body.find("Published data") != std::string::npos);
+  ASSERT_TRUE(page.body.find("bid &lt;b&gt;500&lt;/b&gt; &amp; more") != std::string::npos);
+  ASSERT_TRUE(page.body.find("<b>500</b>") == std::string::npos);
+
+  const auto binary_page = handle_request(cfg, make_http_get("/tx/" + binary_txid));
+  ASSERT_EQ(binary_page.status, 200);
+  ASSERT_TRUE(binary_page.body.find("Published data (hex)") != std::string::npos);
+  ASSERT_TRUE(binary_page.body.find(binary_hex) != std::string::npos);
+}
+
 TEST(test_explorer_decodes_height_locked_output) {
   ExplorerFixture fx;
   const auto known = address::decode(fx.known_address);
