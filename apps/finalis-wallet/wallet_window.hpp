@@ -489,6 +489,7 @@ class WalletWindow final : public QMainWindow {
 
   QLineEdit* send_address_edit_{nullptr};
   QLabel* send_address_label_{nullptr};
+  QLabel* send_amount_label_{nullptr};
   QComboBox* send_mode_combo_{nullptr};
   QLineEdit* send_amount_edit_{nullptr};
   QLineEdit* send_fee_edit_{nullptr};

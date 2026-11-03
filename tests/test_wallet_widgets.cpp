@@ -450,10 +450,12 @@ void test_wallet_window_time_locked_send_mode_shows_unlock_delay() {
   require(combo->itemText(6).toStdString() == "Sealed data (published at a block)", "sealed data mode missing");
   combo->setCurrentIndex(6);
   require(!window.send_unlock_delay_spin_->isHidden(), "unlock delay hidden in sealed data mode");
-  require(!window.send_amount_edit_->isEnabled(), "amount enabled in sealed data mode");
+  require(window.send_amount_edit_->isHidden() && window.send_page_->amount_label()->isHidden(),
+          "amount row shown in sealed data mode");
   require(window.send_unlock_delay_spin_->maximum() >= 1'000'000, "long lock delays not selectable");
   combo->setCurrentIndex(4);
-  require(window.send_amount_edit_->isEnabled(), "amount disabled in time-locked mode");
+  require(!window.send_amount_edit_->isHidden() && !window.send_page_->amount_label()->isHidden(),
+          "amount row hidden in time-locked mode");
 }
 
 void test_wallet_window_send_fee_keeps_floor_and_follows_base_fee() {

@@ -1334,6 +1334,7 @@ void WalletWindow::build_ui() {
 
   send_address_edit_ = send_page_->address_edit();
   send_address_label_ = send_page_->address_label();
+  send_amount_label_ = send_page_->amount_label();
   send_mode_combo_ = send_page_->mode_combo();
   send_amount_edit_ = send_page_->amount_edit();
   send_fee_edit_ = send_page_->fee_edit();
@@ -1613,7 +1614,9 @@ void WalletWindow::build_ui() {
     if (send_address_edit_) send_address_edit_->setPlaceholderText(wallet_send_mode_default_placeholder(mode));
     if (send_address_label_) send_address_label_->setText(wallet_send_mode_recipient_label(mode));
     const bool timed = mode == WalletSendMode::TimeLocked || mode == WalletSendMode::TimedReveal;
-    if (send_amount_edit_) send_amount_edit_->setEnabled(mode != WalletSendMode::TimedReveal);
+    // Sealed data moves no coins: its body only publishes data, so the amount row is hidden.
+    if (send_amount_edit_) send_amount_edit_->setVisible(mode != WalletSendMode::TimedReveal);
+    if (send_amount_label_) send_amount_label_->setVisible(mode != WalletSendMode::TimedReveal);
     if (send_unlock_delay_spin_) send_unlock_delay_spin_->setVisible(timed);
     if (send_unlock_delay_label_) send_unlock_delay_label_->setVisible(timed);
     const bool locked = mode == WalletSendMode::HeightLocked;

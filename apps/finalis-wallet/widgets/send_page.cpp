@@ -102,7 +102,8 @@ SendPage::SendPage(QWidget* parent) : QWidget(parent) {
   address_label_ = new QLabel("Recipient address", form_box);
   form->addRow(address_label_, address_edit_);
   form->addRow("Send mode", mode_combo_);
-  form->addRow("Amount (FLS)", amount_edit_);
+  amount_label_ = new QLabel("Amount (FLS)", form_box);
+  form->addRow(amount_label_, amount_edit_);
   form->addRow("Fixed fee (FLS)", fee_edit_);
   form->addRow(unlock_delay_label_, unlock_delay_spin_);
   unlock_delay_label_->hide();
