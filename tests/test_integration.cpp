@@ -12052,6 +12052,9 @@ TEST(test_frontier_mode_proposer_build_is_identical_across_nodes_with_same_certi
   auto proposal_b = build_test_frontier_proposal(node_b, 1, 0);
   ASSERT_TRUE(proposal_a.has_value());
   ASSERT_TRUE(proposal_b.has_value());
+  // The timestamp is the proposer's wall-clock second, and the two builds can straddle one (often
+  // under sanitizers). Everything else must come out identical.
+  proposal_b->transition.timestamp = proposal_a->transition.timestamp;
   ASSERT_EQ(proposal_a->serialize(), proposal_b->serialize());
   ASSERT_EQ(proposal_a->transition.transition_id(), proposal_b->transition.transition_id());
 }
@@ -12084,6 +12087,7 @@ TEST(test_frontier_mode_proposer_build_does_not_depend_on_mempool_state) {
 
   auto proposal_after = build_test_frontier_proposal(target, 1, 0);
   ASSERT_TRUE(proposal_after.has_value());
+  proposal_after->transition.timestamp = proposal_before->transition.timestamp;  // wall-clock second, see above
   ASSERT_EQ(proposal_before->serialize(), proposal_after->serialize());
   ASSERT_EQ(proposal_after->ordered_records, fixture.merged_records);
 }
