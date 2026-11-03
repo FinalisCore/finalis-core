@@ -314,6 +314,7 @@ struct TimedResult {
   std::optional<std::uint64_t> settlement_height;
   std::string outcome{"sealed"};  // sealed, applied, revealed, forfeited, expired, unrecorded
   std::optional<std::string> body_txid;
+  std::optional<std::string> revealed_data_hex;  // what a "revealed" envelope published
 };
 
 bool is_confidential_output(const TxOutputResult& out) {
@@ -452,7 +453,7 @@ constexpr auto kSlowRequestThreshold = std::chrono::milliseconds(500);
 constexpr std::size_t kPersistedRecentLimit = 8;
 constexpr std::size_t kPersistedTxIndexLimit = 128;
 // Bump when a cached finalized view would render differently: older entries are then rebuilt.
-constexpr std::uint64_t kPersistedViewVersion = 3;
+constexpr std::uint64_t kPersistedViewVersion = 4;
 constexpr std::size_t kPersistedTransitionIndexLimit = 128;
 constexpr std::uint64_t kHomeLatestTransitions = 10;
 // The lightserver scans its local DB (and clamps to 4096); the per-height RPC fallback stays shallow.
@@ -2423,6 +2424,7 @@ finalis::minijson::Value serialize_tx_result_object(const TxResult& result) {
     json_put(timed, "settlement_height", result.timed->settlement_height);
     json_put(timed, "outcome", result.timed->outcome);
     json_put(timed, "body_txid", result.timed->body_txid);
+    json_put(timed, "revealed_data_hex", result.timed->revealed_data_hex);
     obj.object_value["timed"] = std::move(timed);
   }
   return obj;
@@ -2494,6 +2496,7 @@ std::optional<TxResult> parse_tx_result_object(const finalis::minijson::Value& o
         object_u64(timed, "settlement_height"),
         object_string(timed, "outcome").value_or("sealed"),
         object_string(timed, "body_txid"),
+        object_string(timed, "revealed_data_hex"),
     };
   }
   return result;
@@ -2984,6 +2987,44 @@ std::map<std::string, std::string> parse_query_params(std::string_view query) {
 
 std::string link_tx(const std::string& txid) {
   return "<a href=\"/tx/" + txid + "\"><code>" + html_escape(short_hex(txid)) + "</code></a>";
+}
+
+// UTF-8 text without control characters other than tab and newline: safe to show as text.
+bool is_printable_utf8(const finalis::Bytes& data) {
+  std::size_t i = 0;
+  while (i < data.size()) {
+    const std::uint8_t c = data[i];
+    std::size_t len = 0;
+    std::uint32_t cp = 0;
+    if (c < 0x80) {
+      if ((c < 0x20 && c != '\n' && c != '\t') || c == 0x7f) return false;
+      ++i;
+      continue;
+    }
+    if ((c & 0xe0) == 0xc0) { len = 2; cp = c & 0x1f; }
+    else if ((c & 0xf0) == 0xe0) { len = 3; cp = c & 0x0f; }
+    else if ((c & 0xf8) == 0xf0) { len = 4; cp = c & 0x07; }
+    else return false;
+    if (i + len > data.size()) return false;
+    for (std::size_t k = 1; k < len; ++k) {
+      if ((data[i + k] & 0xc0) != 0x80) return false;
+      cp = (cp << 6) | (data[i + k] & 0x3f);
+    }
+    const std::uint32_t min_cp = len == 2 ? 0x80 : (len == 3 ? 0x800 : 0x10000);
+    if (cp < min_cp || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) || (cp >= 0x80 && cp < 0xa0)) return false;
+    i += len;
+  }
+  return true;
+}
+
+// The data a sealed envelope published when it opened: as text when it is printable, else as hex.
+std::string revealed_data_rows(const std::string& data_hex) {
+  const auto data = finalis::hex_decode(data_hex);
+  if (data.has_value() && !data->empty() && is_printable_utf8(*data)) {
+    const std::string text(data->begin(), data->end());
+    return "<div>Published data</div><div>" + mono_value(text) + "</div>";
+  }
+  return "<div>Published data (hex)</div><div>" + mono_value(data_hex) + "</div>";
 }
 
 std::string link_transition_height(std::uint64_t height) {
@@ -3722,6 +3763,12 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
       view.settlement_height = object_u64(settlement, "settlement_height");
       view.outcome = object_string(settlement, "outcome").value_or("unrecorded");
       view.body_txid = object_string(settlement, "body_txid");
+      if (view.outcome == "revealed") {
+        auto reveal = rpc_call(cfg.rpc_url, "get_timed_reveal", std::string("{\"txid\":\"") + txid_hex + "\"}");
+        if (reveal.result.has_value() && object_bool(&*reveal.result, "revealed").value_or(false)) {
+          view.revealed_data_hex = object_string(&*reveal.result, "data_hex");
+        }
+      }
     } else if (finalized_tip.value_or(0) > timed->unlock_height + 1) {
       // Settled before nodes recorded outcomes, or a long lock still waiting for its signatures.
       view.outcome = "unrecorded";
@@ -4314,7 +4361,8 @@ std::string render_tx_json(const TxResult& result) {
         << ",\"settled\":" << json_bool(result.timed->settled)
         << ",\"settlement_height\":" << json_u64_or_null(result.timed->settlement_height)
         << ",\"outcome\":\"" << finalis::minijson::escape(result.timed->outcome)
-        << "\",\"body_txid\":" << json_string_or_null(result.timed->body_txid) << "}";
+        << "\",\"body_txid\":" << json_string_or_null(result.timed->body_txid)
+        << ",\"revealed_data_hex\":" << json_string_or_null(result.timed->revealed_data_hex) << "}";
   }
   oss << ",\"finalized_out\":" << result.total_out << ",\"total_out\":" << result.total_out << ",\"fee\":"
       << (result.fee.has_value() ? std::to_string(*result.fee) : "null") << ","
@@ -4578,6 +4626,7 @@ std::string render_tx(const Config& cfg, const std::string& txid_hex) {
       body << "<div>Settled in</div><div>" << link_transition_height(*timed.settlement_height) << "</div>";
     }
     if (timed.body_txid.has_value()) body << "<div>Opened transfer</div><div>" << link_tx(*timed.body_txid) << "</div>";
+    if (timed.revealed_data_hex.has_value()) body << revealed_data_rows(*timed.revealed_data_hex);
     body << "</div></div>";
   }
 
