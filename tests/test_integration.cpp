@@ -14546,3 +14546,224 @@ TEST(test_pf_failstop_non_safety_write_failure_halts_node) {
   }
 }
 #endif
+
+#ifndef _WIN32
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace {
+
+// A loopback TCP relay standing in for a home router in front of an outbound-only node. cut() is an
+// IP change: the home side gets a reset (its next packet leaves from the new address and matches no
+// connection), while the seed side stays open but silent, as the seed's half-open connection to the
+// old address does until it times out.
+class HomeRouterRelay {
+ public:
+  explicit HomeRouterRelay(std::uint16_t target_port) : target_port_(target_port) {}
+  ~HomeRouterRelay() { stop(); }
+
+  bool start() {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) return false;
+    int one = 1;
+    (void)::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(listen_fd_, 8) != 0) return false;
+    socklen_t len = sizeof(addr);
+    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+    port_ = ntohs(addr.sin_port);
+    running_ = true;
+    thread_ = std::thread([this]() { run(); });
+    return true;
+  }
+  std::uint16_t port() const { return port_; }
+  void cut() { cut_requested_ = true; }
+  std::size_t cuts_done() const { return cuts_done_.load(); }
+  std::size_t connections_accepted() const { return accepted_.load(); }
+  void stop() {
+    if (!running_.exchange(false)) return;
+    if (thread_.joinable()) thread_.join();
+    for (const auto& [home, seed] : pairs_) {
+      ::close(home);
+      ::close(seed);
+    }
+    for (int fd : stale_) ::close(fd);
+    pairs_.clear();
+    stale_.clear();
+    if (listen_fd_ >= 0) ::close(listen_fd_);
+    listen_fd_ = -1;
+  }
+
+ private:
+  static bool pump(int from, int to) {
+    char buf[16384];
+    const ssize_t n = ::recv(from, buf, sizeof(buf), 0);
+    if (n <= 0) return false;
+    for (ssize_t off = 0; off < n;) {
+      const ssize_t w = ::send(to, buf + off, static_cast<std::size_t>(n - off), MSG_NOSIGNAL);
+      if (w <= 0) return false;
+      off += w;
+    }
+    return true;
+  }
+
+  void run() {
+    while (running_) {
+      if (cut_requested_.exchange(false)) {
+        for (const auto& [home, seed] : pairs_) {
+          linger hard{1, 0};  // close with RST
+          (void)::setsockopt(home, SOL_SOCKET, SO_LINGER, &hard, sizeof(hard));
+          ::close(home);
+          stale_.push_back(seed);  // never read or closed again: the seed's side goes silent
+        }
+        pairs_.clear();
+        ++cuts_done_;
+      }
+      std::vector<pollfd> fds{{listen_fd_, POLLIN, 0}};
+      for (const auto& [home, seed] : pairs_) {
+        fds.push_back({home, POLLIN, 0});
+        fds.push_back({seed, POLLIN, 0});
+      }
+      if (::poll(fds.data(), fds.size(), 50) <= 0) continue;
+      if (fds[0].revents & POLLIN) {
+        const int home = ::accept(listen_fd_, nullptr, nullptr);
+        if (home >= 0) {
+          const int seed = ::socket(AF_INET, SOCK_STREAM, 0);
+          sockaddr_in to{};
+          to.sin_family = AF_INET;
+          to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+          to.sin_port = htons(target_port_);
+          if (seed >= 0 && ::connect(seed, reinterpret_cast<sockaddr*>(&to), sizeof(to)) == 0) {
+            pairs_.emplace_back(home, seed);
+            ++accepted_;
+          } else {
+            if (seed >= 0) ::close(seed);
+            ::close(home);
+          }
+        }
+      }
+      std::vector<std::pair<int, int>> keep;
+      for (std::size_t i = 0; i < pairs_.size(); ++i) {
+        const auto& home_ev = fds[1 + 2 * i];
+        const auto& seed_ev = fds[2 + 2 * i];
+        bool ok = true;
+        if (home_ev.revents & (POLLIN | POLLHUP | POLLERR)) ok = pump(pairs_[i].first, pairs_[i].second);
+        if (ok && (seed_ev.revents & (POLLIN | POLLHUP | POLLERR))) ok = pump(pairs_[i].second, pairs_[i].first);
+        if (ok) {
+          keep.push_back(pairs_[i]);
+        } else {
+          ::close(pairs_[i].first);
+          ::close(pairs_[i].second);
+        }
+      }
+      pairs_.swap(keep);
+    }
+  }
+
+  std::uint16_t target_port_;
+  std::uint16_t port_{0};
+  int listen_fd_{-1};
+  std::atomic<bool> running_{false};
+  std::atomic<bool> cut_requested_{false};
+  std::atomic<std::size_t> cuts_done_{0};
+  std::atomic<std::size_t> accepted_{0};
+  std::thread thread_;
+  std::vector<std::pair<int, int>> pairs_;  // (home side, seed side); touched by the relay thread only
+  std::vector<int> stale_;
+};
+
+}  // namespace
+
+// A home node (outbound-only: no --listen, behind a router whose public IP changes) must survive IP
+// changes: its connection to the seed dies with a reset while the seed keeps a silent half-open
+// connection to the old address. The node must dial the seed again on its own, be accepted next to
+// the stale connection, and keep following the chain, every time the IP changes.
+TEST(test_outbound_only_node_reconnects_after_home_ip_change) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const std::string base = unique_test_base("/tmp/finalis_it_home_ip_change");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 1));
+
+  const auto make_cfg = [&](int id) {
+    node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;
+    cfg.node_id = id;
+    cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();
+    cfg.db_path = base + "/node" + std::to_string(id);
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.network.min_block_interval_ms = 100;
+    cfg.network.round_timeout_ms = 200;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
+    keystore::ValidatorKey key;
+    std::string kerr;
+    if (!keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                             deterministic_seed_for_node_id(id), &key, &kerr)) {
+      throw std::runtime_error("keystore: " + kerr);
+    }
+    return cfg;
+  };
+
+  node::NodeConfig seed_cfg = make_cfg(0);  // the only validator, publicly reachable
+  seed_cfg.p2p_port = reserve_test_port();
+  if (seed_cfg.p2p_port == 0) return;
+  node::Node seed(seed_cfg);
+  if (!seed.init()) return;
+  seed.start();
+
+  HomeRouterRelay router(seed_cfg.p2p_port);
+  ASSERT_TRUE(router.start());
+
+  node::NodeConfig home_cfg = make_cfg(1);
+  home_cfg.listen = false;  // outbound-only, like PUBLIC_NODE=0 behind CGNAT
+  home_cfg.p2p_port = reserve_test_port();
+  home_cfg.peers.push_back("127.0.0.1:" + std::to_string(router.port()));
+  home_cfg.outbound_target = 1;
+  node::Node home(home_cfg);
+  if (!home.init()) {
+    seed.stop();
+    return;
+  }
+  home.start();
+
+  const auto in_step = [&](std::uint64_t min_height) {
+    const auto s0 = seed.status();
+    const auto s1 = home.status();
+    return s1.established_peers >= 1 && s1.height >= min_height && s0.height == s1.height &&
+           s0.transition_hash == s1.transition_hash;
+  };
+  ASSERT_TRUE(wait_for([&]() { return in_step(5); }, ci_timeout_seconds(60)));
+
+  for (int change = 1; change <= 2; ++change) {
+    const auto accepted_before = router.connections_accepted();
+    const auto cuts_before = router.cuts_done();
+    router.cut();
+    ASSERT_TRUE(wait_for([&]() { return router.cuts_done() > cuts_before; }, std::chrono::seconds(5)));
+    const auto cut_at = std::chrono::steady_clock::now();
+    const std::uint64_t height_at_cut = seed.status().height;
+
+    // The node dials again by itself and the seed lets it in next to the stale connection.
+    ASSERT_TRUE(wait_for([&]() { return router.connections_accepted() > accepted_before && home.status().established_peers >= 1; },
+                         ci_timeout_seconds(30)));
+    const auto reconnect_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cut_at).count();
+    std::cout << "home-ip-change " << change << " reconnect_ms=" << reconnect_ms << "\n";
+
+    // And it keeps following the chain.
+    ASSERT_TRUE(wait_for([&]() { return in_step(height_at_cut + 3); }, ci_timeout_seconds(60)));
+  }
+
+  home.stop();
+  router.stop();
+  seed.stop();
+}
+#endif
