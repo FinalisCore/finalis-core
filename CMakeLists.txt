@@ -416,6 +416,12 @@ target_link_libraries(finalis-bench-confidential PRIVATE finalis_core)
 # Time-lock (McFly SWE) cost per committee size and per worst-case block (not a test; Release build).
 add_executable(finalis-bench-swe tools/bench_swe.cpp)
 target_link_libraries(finalis-bench-swe PRIVATE finalis_core)
+if(FINALIS_SANITIZE)
+  foreach(bench_target finalis-bench-confidential finalis-bench-swe)
+    target_compile_options(${bench_target} PRIVATE ${SC_SAN_FLAGS})
+    target_link_options(${bench_target} PRIVATE -fsanitize=${SC_SAN_KINDS})
+  endforeach()
+endif()
 
 add_executable(finalis-explorer apps/finalis-explorer/main.cpp)
 target_link_libraries(finalis-explorer PRIVATE finalis_core)

@@ -31,6 +31,7 @@
 #include "genesis/genesis.hpp"
 #include "common/keystore.hpp"
 #include "common/minijson.hpp"
+#include "lightserver/client.hpp"
 #include "lightserver/server.hpp"
 #include "mempool/mempool.hpp"
 #include "node/node.hpp"
@@ -3256,3 +3257,20 @@ TEST(test_lightserver_broadcast_accepts_txv2_spending_confidential_output) {
   if (resp.find("\"accepted\":true") == std::string::npos) throw std::runtime_error("broadcast rejected: " + resp);
   ASSERT_TRUE(resp.find("\"status\":\"accepted_for_relay\"") != std::string::npos);
 }
+
+#ifndef _WIN32
+TEST(test_rpc_client_connect_error_names_target_and_reason) {
+  // A failed admin-socket connect used to print only "connect failed": no socket path, no reason,
+  // so an operator could not tell a wrong network/path from a stopped lightserver.
+  const std::string base = unique_test_base("/tmp/finalis_client_connect_error");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string sock = base + "/missing.sock";
+  std::string err;
+  ASSERT_TRUE(!lightserver::http_post_json_raw("unix://" + sock, "{}", &err).has_value());
+  ASSERT_TRUE(err.find("connect failed") != std::string::npos);
+  ASSERT_TRUE(err.find(sock) != std::string::npos);
+  ASSERT_TRUE(err.find(std::strerror(ENOENT)) != std::string::npos);
+  std::filesystem::remove_all(base);
+}
+#endif

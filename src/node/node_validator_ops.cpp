@@ -188,37 +188,37 @@ bool Node::maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32
   // configured bootstrap peer that advertises bootstrap_validator in VERSION.
   const bool explicit_bootstrap_advertisement = std::string(source) == "version-bootstrap";
   if (bootstrap_handoff_complete_locked()) {
-    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+    log_trace("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=handoff-complete height=" + std::to_string(finalized_height_));
     return false;
   }
   if (bootstrap_validator_pubkey_.has_value()) {
-    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+    log_trace("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=already-bound");
     return false;
   }
   if (finalized_height_ != 0) {
-    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+    log_trace("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=already-synced height=" + std::to_string(finalized_height_));
     return false;
   }
   if (!validators_.active_sorted(1).empty()) {
-    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+    log_trace("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=validators-present");
     return false;
   }
   if (!is_bootstrap_peer_ip(ip)) {
-    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+    log_trace("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=peer-not-bootstrap ip=" + ip);
     return false;
   }
   if (peer_height == 0 && !explicit_bootstrap_advertisement) {
-    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+    log_trace("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=peer-height-zero");
     return false;
   }
   if (!bootstrap_template_bind_validator(pub, pub == local_key_.public_key, bls)) {
-    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+    log_trace("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
              " reason=bind-failed");
     return false;
   }
@@ -1026,7 +1026,7 @@ bool Node::handle_epoch_ticket(const consensus::EpochTicket& ticket, bool from_n
       }
     }
     if (should_log) {
-      log_line("epoch-ticket-rejected peer_id=" + std::to_string(from_peer_id) + " epoch=" + std::to_string(ticket.epoch) +
+      log_trace("epoch-ticket-rejected peer_id=" + std::to_string(from_peer_id) + " epoch=" + std::to_string(ticket.epoch) +
                " participant=" + short_pub_hex(ticket.participant_pubkey) + " reason=" + reject_reason + suffix);
     }
   } else {
@@ -1056,7 +1056,7 @@ void Node::on_epoch_ticket(int peer_id, const Bytes& payload) {
       return;
     }
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " epoch=" + std::to_string(t->ticket.epoch) + " participant=" + short_pub_hex(t->ticket.participant_pubkey));
   (void)handle_epoch_ticket(t->ticket, true, peer_id);
   return;
@@ -1088,7 +1088,7 @@ void Node::on_get_epoch_tickets(int peer_id, const Bytes& payload) {
   tickets.resize(limit);
   const bool ok = p2p_.send_to(
       peer_id, p2p::MsgType::EPOCH_TICKETS, p2p::ser_epoch_tickets(p2p::EpochTicketsMsg{req->epoch, closed, tickets}));
-  log_line("epoch-reconcile-response peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(req->epoch) +
+  log_trace("epoch-reconcile-response peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(req->epoch) +
            " tickets=" + std::to_string(tickets.size()) + " closed=" + (closed ? "yes" : "no") +
            " status=" + (ok ? "ok" : "failed"));
   return;
@@ -1173,7 +1173,7 @@ void Node::on_epoch_tickets(int peer_id, const Bytes& payload) {
     }
   }
   if (should_log_reconcile) {
-    log_line("epoch-reconcile-recv peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(resp->epoch) +
+    log_trace("epoch-reconcile-recv peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(resp->epoch) +
              " tickets=" + std::to_string(resp->tickets.size()) + " accepted=" + std::to_string(accepted) +
              " rejected=" + std::to_string(rejected) + " closed=" + (resp->epoch_closed ? "yes" : "no") +
              reconcile_suffix);

@@ -980,14 +980,14 @@ void Node::maybe_send_verack(int peer_id) {
 void Node::send_ping(int peer_id) {
   const p2p::PingMsg ping{now_ms()};
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PING, p2p::ser_ping(ping), true);
-  log_line(std::string("send ") + msg_type_name(p2p::MsgType::PING) + " peer_id=" + std::to_string(peer_id) +
+  log_trace(std::string("send ") + msg_type_name(p2p::MsgType::PING) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(ping.nonce) + " status=" + (ok ? "ok" : "failed"));
 }
 
 void Node::request_epoch_tickets(int peer_id, std::uint64_t epoch, std::uint32_t max_tickets) {
   const bool ok =
       p2p_.send_to(peer_id, p2p::MsgType::GET_EPOCH_TICKETS, p2p::ser_get_epoch_tickets(p2p::GetEpochTicketsMsg{epoch, max_tickets}));
-  log_line("epoch-reconcile-request peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(epoch) +
+  log_trace("epoch-reconcile-request peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(epoch) +
            " max_tickets=" + std::to_string(max_tickets) + " status=" + (ok ? "ok" : "failed"));
 }
 
@@ -1341,7 +1341,7 @@ void Node::on_verack(int peer_id, const Bytes& /*payload*/) {
 
 void Node::on_get_finalized_tip(int peer_id, const Bytes& /*payload*/) {
   constexpr std::uint16_t msg_type = p2p::MsgType::GET_FINALIZED_TIP;
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
   send_finalized_tip(peer_id);
   return;
 }
@@ -1353,7 +1353,7 @@ void Node::on_finalized_tip(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-finalized-tip");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(tip->height) + " hash=" + short_hash_hex(tip->hash));
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1461,10 +1461,10 @@ void Node::on_ping(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-ping");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(ping->nonce));
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PONG, p2p::ser_ping(*ping), true);
-  log_line(std::string("send ") + msg_type_name(p2p::MsgType::PONG) + " peer_id=" + std::to_string(peer_id) +
+  log_trace(std::string("send ") + msg_type_name(p2p::MsgType::PONG) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(ping->nonce) + " status=" + (ok ? "ok" : "failed"));
   return;
 }
@@ -1476,7 +1476,7 @@ void Node::on_pong(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-pong");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(pong->nonce));
   return;
 }
@@ -1892,7 +1892,7 @@ void Node::request_ingress_tips(int peer_id) {
       it->second = tms;
     }
   }
-  log_line("request-ingress-tips peer_id=" + std::to_string(peer_id));
+  log_trace("request-ingress-tips peer_id=" + std::to_string(peer_id));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_INGRESS_TIPS, p2p::ser_get_ingress_tips(p2p::GetIngressTipsMsg{}), true);
 }
 
@@ -1909,7 +1909,7 @@ void Node::send_ingress_tips(int peer_id) {
     if (lane) oss << ",";
     oss << lane << ":" << msg.lane_tips[lane];
   }
-  log_line(oss.str());
+  log_trace(oss.str());
 }
 
 void Node::request_finalized_tip(int peer_id) {
@@ -1927,7 +1927,7 @@ void Node::request_finalized_tip(int peer_id) {
     local_height = finalized_height_;
     local_transition = finalized_identity_.id;
   }
-  log_line("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(local_height) +
+  log_trace("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(local_height) +
            " local_transition=" + short_hash_hex(local_transition));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP, Bytes{}, true);
 }
@@ -1942,7 +1942,7 @@ void Node::send_finalized_tip(int peer_id) {
     tip = p2p::FinalizedTipMsg{finalized_height_, finalized_identity_.id};
   }
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
-  log_line("send-finalized-tip peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(tip.height) +
+  log_trace("send-finalized-tip peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(tip.height) +
            " transition=" + short_hash_hex(tip.hash) + " status=" + (ok ? "ok" : "failed"));
 }
 

@@ -194,6 +194,9 @@ Behavior:
 - Confirm there are spendable finalized funds for registration fees/bond when using on-chain registration.
 - Confirm validator key can be decrypted with the provided passphrase.
 - Confirm the funding wallet address has received coins and that they are finalized, not just pending.
+- Node logs show events (connections, finalization, sync, errors, bans), not per-message traffic. To see
+  every received/sent message, vote soft-reject and tip exchange while debugging, start the node with
+  `FINALIS_LOG_TRACE=1` in its environment (several lines per second per peer; turn it off afterwards).
 
 ## 8) DB reset (wipe chain, keep identity and peers)
 

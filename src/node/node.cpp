@@ -109,6 +109,14 @@ bool log_timestamps_enabled() {
   return enabled;
 }
 
+bool trace_logs_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("FINALIS_LOG_TRACE");
+    return v && std::string_view(v) == "1";
+  }();
+  return enabled;
+}
+
 bool runtime_logs_enabled() {
   if (debug_economics_logs_enabled() || debug_finality_logs_enabled()) return true;
   const char* quiet = std::getenv("FINALIS_TEST_QUIET_LOGS");
@@ -1226,7 +1234,6 @@ void Node::event_loop() {
       // Activation and exit happen at runtime: a validator that joins while running certifies ingress
       // from its activation height, without a restart.
       is_validator_ = validators_.is_active_for_height(local_key_.public_key, h);
-      const std::uint32_t cv = kFixedValidationRulesVersion;
       mempool_.set_validation_context(special_validation_context_locked(h));
       const std::uint64_t now_ms = this->now_ms();
       const std::uint64_t now_unix_ms = now_unix() * 1000;
@@ -1456,7 +1463,7 @@ void Node::event_loop() {
           if (i) coss << ",";
           coss << short_pub_hex(committee[i]);
         }
-        log_line(coss.str());
+        log_trace(coss.str());
         if (cfg_.log_json) {
           std::ostringstream j;
           j << "{\"type\":\"status\",\"network\":\"" << cfg_.network.name << "\",\"height\":" << finalized_height_
@@ -1968,6 +1975,10 @@ std::uint64_t Node::now_unix() const {
 std::uint64_t Node::now_ms() const {
   using namespace std::chrono;
   return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void Node::log_trace(const std::string& s) const {
+  if (trace_logs_enabled()) log_line(s);
 }
 
 void Node::log_line(const std::string& s) const {

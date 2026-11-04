@@ -847,6 +847,9 @@ class Node {
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
   void log_line(const std::string& s) const;
+  // Per-message P2P/consensus chatter (recv/send, soft rejects, tip exchange): written only with
+  // FINALIS_LOG_TRACE=1, so default logs carry events, not traffic.
+  void log_trace(const std::string& s) const;
   // disable_p2p mode only: the other in-process nodes on the local bus (snapshot, excludes this).
   std::vector<Node*> local_bus_peers() const;
   // Calls fn(peer) for each local-bus peer; no-op unless running_. If fn returns bool,

@@ -29,10 +29,6 @@
 namespace finalis::consensus {
 namespace {
 
-bool bootstrap_validator_record(const ValidatorInfo& info) {
-  return info.joined_height == 0 && info.has_bond && info.bond_outpoint.txid == zero_hash() && info.bond_outpoint.index == 0;
-}
-
 constexpr std::uint64_t kAdaptiveMinBondFloor = 150ULL * BASE_UNITS_PER_COIN;
 // Committee eligibility never asks more than the lowest bond any registration ever required (the
 // registration minimum's 150 FLS floor), so no validator that joined legally is ever shut out later.
@@ -392,7 +388,6 @@ std::uint8_t ticket_difficulty_bits_for_epoch(const CanonicalDerivationConfig& c
                                               std::uint64_t epoch_start_height, std::size_t active_validator_count) {
   std::uint8_t previous_bits = DEFAULT_TICKET_DIFFICULTY_BITS;
   const auto epoch_blocks = std::max<std::uint64_t>(1, cfg.network.committee_epoch_blocks);
-  const auto& econ = active_economics_policy(cfg.network, epoch_start_height);
   if (epoch_start_height > 1) {
     const auto previous_epoch_start = epoch_start_height > epoch_blocks ? (epoch_start_height - epoch_blocks) : 1;
     if (auto checkpoint_it = state.finalized_committee_checkpoints.find(previous_epoch_start);
@@ -853,18 +848,6 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
   }
   state->validators.advance_height(height + 1);
 }
-
-namespace {
-
-void apply_validator_state_changes(const CanonicalDerivationConfig& cfg, CanonicalDerivedState* state, const Block& block,
-                                   const UtxoSetV2& pre_utxos, std::uint64_t height) {
-  std::vector<AnyTx> any_txs;
-  any_txs.reserve(block.txs.size());
-  for (const auto& tx : block.txs) any_txs.emplace_back(tx);
-  apply_validator_state_changes_from_txs(cfg, state, any_txs, 1, pre_utxos, height);
-}
-
-}  // namespace
 
 Hash32 frontier_settlement_txid(const FrontierTransition& transition) {
   codec::ByteWriter w;

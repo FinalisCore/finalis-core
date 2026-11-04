@@ -491,7 +491,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
     votes_.clear_height(finalized_height_ + 1);
     prevotes_.clear_height(finalized_height_ + 1);
     timeout_votes_.clear_height(finalized_height_ + 1);
-    log_line("round-state-reset height=" + std::to_string(finalized_height_ + 1) +
+    log_trace("round-state-reset height=" + std::to_string(finalized_height_ + 1) +
              " round=0 reason=finalized-advance previous_height=" + std::to_string(previous_finalized_height) +
              " new_height=" + std::to_string(finalized_height_));
   } else {
@@ -723,7 +723,7 @@ std::optional<Vote> Node::on_prevotes_changed_locked(const Hash32& transition_id
     std::string error;
     if (db_.write_batch_durable(batch, &error)) {
       valid_polka_by_height_[height] = polka;
-      log_line("polka-valid-value height=" + std::to_string(height) + " round=" + std::to_string(round) +
+      log_trace("polka-valid-value height=" + std::to_string(height) + " round=" + std::to_string(round) +
                " transition=" + short_hash_hex(transition_id));
     } else {
       log_line("polka-valid-value-persist-failed height=" + std::to_string(height) + " round=" + std::to_string(round) +
@@ -760,7 +760,7 @@ std::optional<Vote> Node::on_prevotes_changed_locked(const Hash32& transition_id
     return std::nullopt;
   }
   local_vote_reservations_.insert(key);
-  log_line("local-precommit-emit height=" + std::to_string(height) + " round=" + std::to_string(round) +
+  log_trace("local-precommit-emit height=" + std::to_string(height) + " round=" + std::to_string(round) +
            " transition=" + short_hash_hex(transition_id));
   return Vote{height, round, transition_id, local_key_.public_key, *sig};
 }
@@ -1403,7 +1403,7 @@ void Node::on_get_transition(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-transition");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " hash=" + short_hash_hex(gb->hash));
   auto transition_bytes = db_.get_frontier_transition(gb->hash);
   if (!transition_bytes.has_value()) return;
@@ -1481,7 +1481,7 @@ void Node::on_get_transition_by_height(int peer_id, const Bytes& payload) {
                                std::to_string(kGetTransitionByHeightPerPeerHeightMinIntervalMs));
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(gbh->height));
   {
     bool allow_historical_replay = false;
@@ -1604,7 +1604,7 @@ void Node::on_transition(int peer_id, const Bytes& payload, const Hash32& payloa
     score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-frontier-parse");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(proposal->transition.height) + " hash=" +
            short_hash_hex(proposal->transition.transition_id()) + " prev=" +
            short_hash_hex(proposal->transition.prev_finalized_hash));
@@ -1714,7 +1714,7 @@ void Node::on_propose(int peer_id, const Bytes& payload, const Hash32& payload_i
     score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-propose-msg");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round));
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1732,7 +1732,7 @@ void Node::on_propose(int peer_id, const Bytes& payload, const Hash32& payload_i
         block_id = proposal->transition.transition_id();
       }
       const std::string result_name = "duplicate";
-      log_line("proposal-duplicate-skip peer_id=" + std::to_string(peer_id) +
+      log_trace("proposal-duplicate-skip peer_id=" + std::to_string(peer_id) +
                " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round) +
                " transition=" + short_hash_hex(block_id) + " payload=" +
                hex_encode(Bytes(payload_id.begin(), payload_id.end())) + " result=" + result_name);
@@ -1747,7 +1747,7 @@ void Node::on_propose(int peer_id, const Bytes& payload, const Hash32& payload_i
   const char* result_name = propose_result == ProposeHandlingResult::Accepted
                                 ? "accepted"
                                 : (propose_result == ProposeHandlingResult::SoftReject ? "soft-reject" : "hard-reject");
-  log_line("proposal-dispatch-result peer_id=" + std::to_string(peer_id) +
+  log_trace("proposal-dispatch-result peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round) +
            " transition=" + short_hash_hex(block_id) + " result=" + result_name);
   if (propose_result == ProposeHandlingResult::HardReject) {
@@ -1776,7 +1776,7 @@ void Node::on_vote(int peer_id, const Bytes& payload, const Hash32& payload_id) 
     score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-vote-msg");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round) +
            " transition=" + short_hash_hex(v->vote.frontier_transition_id));
   {
@@ -1804,7 +1804,7 @@ void Node::on_prevote(int peer_id, const Bytes& payload, const Hash32& payload_i
     score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-prevote-msg");
     return;
   }
-  log_line("recv PREVOTE peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(v->vote.height) +
+  log_trace("recv PREVOTE peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(v->vote.height) +
            " round=" + std::to_string(v->vote.round) + " transition=" + short_hash_hex(v->vote.frontier_transition_id));
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1830,7 +1830,7 @@ void Node::on_timeout_vote(int peer_id, const Bytes& payload, const Hash32& payl
     score_peer_locked(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-timeout-vote-msg");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round));
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1946,7 +1946,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
       return ProposeHandlingResult::HardReject;
     }
     if (local_cached_proposal) {
-      log_line("proposal-local-validation-skip height=" + std::to_string(msg.height) +
+      log_trace("proposal-local-validation-skip height=" + std::to_string(msg.height) +
                " round=" + std::to_string(msg.round) + " transition=" + short_hash_hex(transition_id) +
                " reason=locally-built-cached-proposal");
     }
@@ -2086,7 +2086,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
                  std::to_string(msg.round) + " transition=" + short_hash_hex(transition_id) +
                  " reason=prevote-persist-failed");
       } else {
-        log_line("local-prevote-emit height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+        log_trace("local-prevote-emit height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
                  " transition=" + short_hash_hex(transition_id) + " pol_round=" +
                  (pol_round.has_value() ? std::to_string(*pol_round) : std::string("none")));
         maybe_vote = Vote{msg.height, msg.round, transition_id, local_key_.public_key, *sig};
@@ -2128,7 +2128,7 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto log_vote_soft_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
-      log_line("vote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
+      log_trace("vote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
                " reason=" + reason + extra);
     };
     auto log_vote_hard_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
@@ -2241,7 +2241,7 @@ Node::VoteHandlingResult Node::handle_vote_result(const Vote& vote, bool from_ne
     }
     finalize_ok = finalize_if_quorum(vote.frontier_transition_id, vote.height, vote.round);
     if (!finalize_ok) {
-      log_line("vote-accepted-waiting height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
+      log_trace("vote-accepted-waiting height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
                " transition=" + short_hash_hex(vote.frontier_transition_id) +
                " validator=" + short_pub_hex(vote.validator_pubkey));
     }
@@ -2271,7 +2271,7 @@ Node::VoteHandlingResult Node::handle_prevote_result(const Vote& vote, bool from
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto soft = [&](const std::string& reason, const std::string& extra = std::string()) {
-      log_line("prevote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
+      log_trace("prevote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
                " reason=" + reason + extra);
       if (reject_reason) *reject_reason = reason;
       return VoteHandlingResult::SoftReject;
@@ -2360,7 +2360,7 @@ Node::TimeoutVoteHandlingResult Node::handle_timeout_vote_result(const TimeoutVo
           if ((it->second % kTimeoutVoteDuplicateLogEvery) != 0) return;
         }
       }
-      log_line("timeout-vote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
+      log_trace("timeout-vote-soft-reject height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
                " reason=" + reason + extra);
     };
     auto log_timeout_hard_reject = [&](const std::string& reason, const std::string& extra = std::string()) {
@@ -2917,7 +2917,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   auto proposal_it = candidate_frontier_proposals_.find(block_id);
   if (proposal_it == candidate_frontier_proposals_.end()) {
     const bool in_flight = requested_sync_artifacts_.find(block_id) != requested_sync_artifacts_.end();
-    log_line(std::string(in_flight ? "finalize-wait" : "finalize-skip") + " height=" + std::to_string(height) +
+    log_trace(std::string(in_flight ? "finalize-wait" : "finalize-skip") + " height=" + std::to_string(height) +
              " round=" + std::to_string(round) + " transition=" + short_hash_hex(block_id) + " reason=" +
              (in_flight ? "candidate-pending" : "missing-candidate"));
     return false;
@@ -2925,7 +2925,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   // SAFETY (R1): a precommit quorum below the transition's own round finalizes nothing, as in the
   // derivation (verify_frontier_finality_certificate), which a restart replays.
   if (!consensus::vote_round_covers_transition(round, proposal_it->second.transition.round)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+    log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=round-below-transition-round transition_round=" +
              std::to_string(proposal_it->second.transition.round));
     return false;
@@ -2950,7 +2950,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
         if (members.contains(s.validator_pubkey)) counted.insert(s.validator_pubkey);
       }
       if (!self_vote_path && counted.size() < quorum) {
-        log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+        log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
                  " transition=" + short_hash_hex(block_id) + " reason=insufficient-votes votes=" +
                  std::to_string(counted.size()) + " quorum=" + std::to_string(quorum) +
                  " signers=" + signer_set_summary(sigs));
@@ -2964,14 +2964,14 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::string frontier_record_error;
   if (!consensus::load_certified_frontier_record_from_storage(db_, finalized_proposal.transition, &certified_record,
                                                               &frontier_record_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+    log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=" + frontier_record_error);
     return false;
   }
   certified_record.ordered_records = finalized_proposal.ordered_records;
 
   if (!canonical_state_.has_value()) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+    log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=missing-canonical-state");
     return false;
   }
@@ -2979,7 +2979,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::string validation_error;
   if (!consensus::verify_frontier_record_against_state(canonical_derivation_config_locked(), *canonical_state_,
                                                        certified_record, &recomputed, &validation_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+    log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=" + validation_error);
     return false;
   }
@@ -2987,7 +2987,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   const auto expected_committee = consensus::canonical_committee_for_height_round(
       canonical_derivation_config_locked(), *canonical_state_, height, round);
   if (expected_committee.empty()) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+    log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=empty-effective-committee");
     return false;
   }
@@ -3011,7 +3011,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
                  " round=" + std::to_string(round) + " transition=" + short_hash_hex(block_id));
       }
     } else {
-      log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+      log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
                " transition=" + short_hash_hex(block_id) + " reason=local-vote-sign-failed");
     }
   }
@@ -3042,7 +3042,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
     filtered.push_back(s);
   }
   if (filtered.size() < expected_quorum) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+    log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=insufficient-valid-signatures valid=" +
              std::to_string(filtered.size()) + " quorum=" + std::to_string(expected_quorum));
     return false;
@@ -3052,7 +3052,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::string apply_error;
   if (!apply_finalized_frontier_effects_locked(certified_record, round, canonical_sigs, false, &expected_committee,
                                                &apply_error)) {
-    log_line("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
+    log_trace("finalize-skip height=" + std::to_string(height) + " round=" + std::to_string(round) +
              " transition=" + short_hash_hex(block_id) + " reason=apply-failed" +
              (apply_error.empty() ? std::string() : " detail=" + apply_error));
     return false;
@@ -3249,7 +3249,7 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
       return std::nullopt;
     }
     if (height == finalized_height_ + 1) {
-      log_line("frontier-build-summary height=" + std::to_string(height) + " round=" + std::to_string(round) +
+      log_trace("frontier-build-summary height=" + std::to_string(height) + " round=" + std::to_string(round) +
                " transition=" + short_hash_hex(result.transition.transition_id()) +
                " settlement_commitment=" + short_hash_hex(result.transition.settlement_commitment) +
                " settlement_payload_hash=" + short_hash_hex(crypto::sha256(result.transition.settlement.serialize())) +
