@@ -1422,7 +1422,10 @@ FlowClassification classify_tx_flow(const std::vector<TxInputResult>& inputs, co
     }
   }
   if (!flow.primary_recipient.has_value() && !output_order.empty()) flow.primary_recipient = output_order.front();
-  flow.participant_count = input_addresses.size() + output_addresses.size();
+  // Distinct addresses on either side: change back to a sender is not a second participant.
+  std::set<std::string> participants = input_addresses;
+  participants.insert(output_addresses.begin(), output_addresses.end());
+  flow.participant_count = participants.size();
 
   const bool same_party = !input_addresses.empty() && !output_addresses.empty() && input_addresses == output_addresses;
   const bool single_sender = input_addresses.size() == 1;
@@ -3818,6 +3821,16 @@ LookupResult<TxResult> fetch_tx_result(const Config& cfg, const std::string& txi
   if (!timed.has_value()) result.primary_recipient = flow.primary_recipient;
   result.participant_count = flow.participant_count;
   result.data_source = "rpc_live_finalized";
+  // A transaction's time is its finalizing transition's timestamp (cached transition first).
+  if (result.finalized_height.has_value()) {
+    if (auto cached = find_persisted_transition_result_by_height(*result.finalized_height);
+        cached.has_value() && cached->timestamp.has_value()) {
+      result.timestamp = cached->timestamp;
+    } else if (auto blk = fetch_transition_by_height(cfg, *result.finalized_height, nullptr, nullptr);
+               blk.has_value() && blk->timestamp != 0) {
+      result.timestamp = blk->timestamp;
+    }
+  }
   // A sealed envelope's outcome is still to come, so its view is not final yet.
   if (!result.timed.has_value() || result.timed->settled) upsert_persisted_tx_result(cfg, result);
   out.value = std::move(result);

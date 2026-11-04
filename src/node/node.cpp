@@ -404,14 +404,21 @@ bool Node::init() {
     p2p_.set_on_event([this](int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
       on_peer_event(peer_id, type, detail);
     });
-    if (cfg_.listen) {
-      if (!p2p_.start_listener(cfg_.bind_ip, cfg_.p2p_port)) {
+    // An outbound-only node with a bundled lightserver still listens on loopback: the lightserver
+    // relays broadcast_tx over P2P to 127.0.0.1:p2p_port, and without a listener every send fails.
+    const bool loopback_relay_listener = !cfg_.listen && cfg_.lightserver_mode != LightserverLaunchMode::Disabled;
+    if (cfg_.listen || loopback_relay_listener) {
+      const std::string listen_ip = cfg_.listen ? cfg_.bind_ip : std::string("127.0.0.1");
+      if (!p2p_.start_listener(listen_ip, cfg_.p2p_port)) {
         const int err = errno;
-        std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << " errno=" << err
+        std::cerr << "listener start failed " << listen_ip << ":" << cfg_.p2p_port << " errno=" << err
                   << " err=\"" << std::strerror(err) << "\"\n";
         return false;
       }
       cfg_.p2p_port = p2p_.listener_port();
+      if (loopback_relay_listener) {
+        log_line("p2p listener loopback-only for lightserver relay " + listen_ip + ":" + std::to_string(cfg_.p2p_port));
+      }
     }
     try_connect_bootstrap_peers();
   }
@@ -650,8 +657,8 @@ bool Node::start_lightserver_child() {
     return false;
   }
   log_line("lightserver startup success mode=" + mode + " pid=" + std::to_string(pid));
-  if (!cfg_.listen || cfg_.disable_p2p) {
-    log_line("lightserver note: node listener is disabled; read RPC works, but tx relay to the node may fail");
+  if (cfg_.disable_p2p) {
+    log_line("lightserver note: p2p is disabled; read RPC works, but tx relay to the node will fail");
   }
   return true;
 #endif

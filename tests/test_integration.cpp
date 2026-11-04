@@ -5205,8 +5205,8 @@ TEST(test_epoch_reward_settlement_restart_is_deterministic) {
   }());
 }
 
-TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v1_boundary) {
-  const std::string base = unique_test_base("/tmp/finalis_it_restart_postfork_v1");
+TEST(test_restart_rebuild_preserves_checkpoint_and_settlement) {
+  const std::string base = unique_test_base("/tmp/finalis_it_restart_rebuild");
   {
     auto cluster = make_cluster(base, 1, 1, 1);
     const bool reached_225 =
@@ -5214,7 +5214,7 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
     if (!reached_225) {
       std::ostringstream oss;
       const auto st = cluster.nodes[0]->status();
-      oss << "postfork pre-restart node failed to reach height 225:"
+      oss << "pre-restart node failed to reach height 225:"
           << " node0{h=" << st.height << ",r=" << st.round
           << ",tip=" << hex_encode(Bytes(st.transition_hash.begin(), st.transition_hash.end())).substr(0, 8)
           << ",committee=" << st.committee_size << ",quorum=" << st.quorum_threshold
@@ -5228,7 +5228,7 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
           << ",state=" << st.consensus_state << "}";
       throw std::runtime_error(oss.str());
     }
-    std::cerr << "postfork-restart-test phase=reached-height-225\n";
+    std::cerr << "restart-rebuild-test phase=reached-height-225\n";
     for (auto& n : cluster.nodes) n->stop();
   }
 
@@ -5254,10 +5254,10 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
   cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
   cfg.validator_passphrase = "test-pass";
   {
-    std::cerr << "postfork-restart-test phase=restart-init-begin\n";
+    std::cerr << "restart-rebuild-test phase=restart-init-begin\n";
     node::Node restarted(cfg);
     ASSERT_TRUE(restarted.init());
-    std::cerr << "postfork-restart-test phase=restart-init-ok\n";
+    std::cerr << "restart-rebuild-test phase=restart-init-ok\n";
   }
 
   storage::DB after;
@@ -5907,6 +5907,76 @@ TEST(test_lightserver_relay_reports_node_mempool_verdict) {
 
   ASSERT_TRUE(node->pause_proposals_for_test(false));
   node->stop();
+}
+
+// L2 (fixed 2026-11-04, tests/KNOWN_DEFECTS.md): an outbound-only node (no --listen, the CLI default and
+// start.sh PUBLIC_NODE=0, which testnet/README.md advises behind carrier-grade NAT) with its bundled
+// lightserver (--with-lightserver, start.sh default) must accept sends: the lightserver relays every
+// broadcast_tx to 127.0.0.1:<p2p port>, so the node opens a loopback-only listener there.
+TEST(test_lightserver_relays_to_an_outbound_only_node) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const std::string base = unique_test_base("/tmp/finalis_it_relay_outbound_only");
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();
+  cfg.outbound_target = 0;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = reserve_test_port();
+  if (cfg.p2p_port == 0) return;
+  cfg.listen = false;
+  cfg.lightserver_mode = node::LightserverLaunchMode::Explicit;  // --with-lightserver
+  cfg.lightserver_port = reserve_test_port();
+  if (cfg.lightserver_port == 0) return;
+  cfg.lightserver_admin_socket.clear();
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  ASSERT_TRUE(wait_for([&]() {
+    return node->status().height >= 33 && !node->find_utxos_by_pubkey_hash_for_test(own_pkh).empty();
+  }, ci_timeout_seconds(120)));
+  ASSERT_TRUE(node->pause_proposals_for_test(true));
+  const auto prev = node->find_utxos_by_pubkey_hash_for_test(own_pkh).front();
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x63);
+  std::string err;
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second,
+                                               Bytes(key.privkey.begin(), key.privkey.end()),
+                                               {TxOut{prev.second.value - 10'000ULL, address::p2pkh_script_pubkey(recipient_pkh)}}, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  // What --with-lightserver starts: relay to 127.0.0.1:<the node's P2P port>.
+  lightserver::Config lcfg;
+  lcfg.network = cfg.network;
+  lcfg.db_path = cfg.db_path;
+  lcfg.tx_relay_host = "127.0.0.1";
+  lcfg.tx_relay_port = cfg.p2p_port;
+  lcfg.admin_socket_path.clear();
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto resp = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":1,"method":"broadcast_tx","params":{"tx_hex":")") +
+                                           hex_encode(tx->serialize()) + R"("}})");
+  ASSERT_TRUE(node->pause_proposals_for_test(false));
+  node->stop();
+  ASSERT_TRUE(resp.find("\"accepted\":true") != std::string::npos);
 }
 
 // Three disable_p2p nodes on the in-process local bus (no sockets): node0 is the only validator, node1 and
@@ -8439,6 +8509,43 @@ TEST(test_validator_refuses_vote_when_slice_differs_from_certified_ingress) {
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(target_height, 0, proposal_id));
   ASSERT_EQ(target.deferred_certified_vote_count_for_test(), 0u);
+}
+
+// INVARIANTS D6: no prevote for a transition stamped more than kMaxTransitionTimestampDriftS ahead of
+// the local clock. A member gets the same proposal stamped one hour ahead (re-signed by its leader)
+// and must not prevote; another member prevotes the correctly stamped one.
+TEST(test_validator_never_prevotes_a_transition_from_the_future) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_future_ts"), 4, 4, 4);
+  Tx tx = make_fixture_ingress_tx(1, 0x8F);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true));
+  const std::uint64_t target_height = cluster.nodes[0]->status().height + 1;
+  auto proposal = build_cluster_frontier_proposal_from_records(cluster, keys, {tx.serialize()}, target_height, 0,
+                                                               "/tmp/finalis_it_future_ts_p");
+  ASSERT_TRUE(proposal.has_value());
+  auto future = *proposal;
+  future.transition.timestamp = static_cast<std::uint64_t>(std::time(nullptr)) + 3600;
+  const auto future_id = frontier_proposal_id(future);
+  ASSERT_TRUE(future_id != frontier_proposal_id(*proposal));
+
+  std::vector<std::size_t> members;
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(target_height, 0)) members.push_back(k);
+  }
+  ASSERT_TRUE(members.size() >= 2u);
+  auto& target = *cluster.nodes[members[0]];
+  auto& control = *cluster.nodes[members[1]];
+  const auto domain = cluster.nodes[0]->consensus_domain_for_test();
+
+  ASSERT_TRUE(advance_test_frontier_round(target, target_height, 0));
+  (void)target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(domain, future));
+  ASSERT_TRUE(!target.local_prevote_recorded_for_test(target_height, 0, future_id));
+  ASSERT_TRUE(!target.local_vote_lock_for_test(target_height).has_value());
+
+  ASSERT_TRUE(advance_test_frontier_round(control, target_height, 0));
+  ASSERT_EQ(control.inject_network_propose_result_for_test(make_test_frontier_propose_msg(domain, *proposal)),
+            std::string("accepted"));
+  ASSERT_TRUE(control.local_prevote_recorded_for_test(target_height, 0, frontier_proposal_id(*proposal)));
 }
 
 // Regression for a captured fork: validators timed out of round 0, moved to round 1, then cast
