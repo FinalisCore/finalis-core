@@ -20,6 +20,7 @@
 </p>
 
 <p align="center">
+  <a href="docs/WHAT_IS_FINALIS.md"><b>What is Finalis?</b></a> ·
   <a href="testnet/JOIN.md"><b>Run a node</b></a> ·
   <a href="https://finalis.self-link.com"><b>Live explorer</b></a> ·
   <a href="docs/REVIEWING.md"><b>Break these claims</b></a> ·
@@ -83,6 +84,15 @@ finding can still change the protocol itself. Start with
 **Contribute code.** C++20 node, Qt wallet, explorer and a JavaScript SDK.
 See [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [codebase map](docs/CODEBASE_MAP.md).
+
+## Official Channels
+
+GitHub (this repo), [Discord](https://discord.gg/8rKfKc7QR9), the
+[explorer](https://finalis.self-link.com) and X (`<X_HANDLE>`). Nothing else is official.
+
+**There is no official Telegram, token sale, presale, airdrop, whitelist or "team wallet".** Nobody can
+sell you FLS before mainnet, and nobody from Finalis will ask for coins, keys or a seed phrase. If
+someone does, it's a scam: report it in Discord. Community-run groups are welcome but unofficial.
 
 > **Status: pre-launch.** Mainnet has not launched, so there are no user funds
 > and no legacy state. Mainnet genesis is not frozen yet
