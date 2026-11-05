@@ -439,7 +439,11 @@ class Node {
   void on_ping(int peer_id, const Bytes& payload);
   void on_pong(int peer_id, const Bytes& payload);
 
+  // send_version takes mu_ to read the bootstrap identity and endpoint, so callers must not hold it;
+  // a caller holding mu_ builds the tags with version_tags_locked() and calls send_version_with_tags.
   void send_version(int peer_id);
+  std::string version_tags_locked() const;
+  void send_version_with_tags(int peer_id, const std::string& tags);
   void maybe_send_verack(int peer_id);
   void send_ping(int peer_id);
   Hash32 epoch_ticket_challenge_anchor_locked(std::uint64_t height) const;

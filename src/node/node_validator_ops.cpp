@@ -243,7 +243,9 @@ void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
     if (!cfg_.disable_p2p) {
       // Safe: duplicate VERSION handling is idempotent and is used here to refresh
       // already-connected peers with the newly-bound bootstrap validator identity.
-      for (int peer_id : p2p_.peer_ids()) send_version(peer_id);
+      // mu_ is held here (event loop), so build the tags directly instead of send_version().
+      const std::string tags = version_tags_locked();
+      for (int peer_id : p2p_.peer_ids()) send_version_with_tags(peer_id, tags);
     }
   }
 }

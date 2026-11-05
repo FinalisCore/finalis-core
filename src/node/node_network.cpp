@@ -936,7 +936,34 @@ std::optional<std::string> Node::detect_possible_public_ip() const {
   return out;
 }
 
+std::string Node::version_tags_locked() const {
+  std::string tags;
+  if (bootstrap_validator_pubkey_.has_value()) {
+    tags += ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
+    // Its time-signature key and proof: followers that adopt it need the same genesis state.
+    if (const auto bls = bootstrap_validator_bls_locked()) {
+      Bytes kp(bls->pubkey.begin(), bls->pubkey.end());
+      kp.insert(kp.end(), bls->pop.begin(), bls->pop.end());
+      tags += ";bootstrap_validator_bls=" + hex_encode(kp);
+    }
+  }
+  if (auto advertised = advertised_endpoint_locked(); advertised.has_value()) {
+    tags += ";external_endpoint=" + advertised->key();
+  }
+  tags += ";validator_pubkey=" + hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
+  return tags;
+}
+
 void Node::send_version(int peer_id) {
+  std::string tags;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    tags = version_tags_locked();
+  }
+  send_version_with_tags(peer_id, tags);
+}
+
+void Node::send_version_with_tags(int peer_id, const std::string& tags) {
   auto tip = db_.get_tip();
   p2p::VersionMsg v;
   v.timestamp = now_unix();
@@ -946,22 +973,8 @@ void Node::send_version(int peer_id) {
   v.nonce = static_cast<std::uint32_t>(cfg_.node_id + 1000);
   v.start_height = tip ? tip->height : 0;
   v.start_hash = tip ? tip->hash : zero_hash();
-  v.node_software_version = local_software_version_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion);
-  if (bootstrap_validator_pubkey_.has_value()) {
-    v.node_software_version +=
-        ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
-    // Its time-signature key and proof: followers that adopt it need the same genesis state.
-    if (const auto bls = bootstrap_validator_bls_locked()) {
-      Bytes kp(bls->pubkey.begin(), bls->pubkey.end());
-      kp.insert(kp.end(), bls->pop.begin(), bls->pop.end());
-      v.node_software_version += ";bootstrap_validator_bls=" + hex_encode(kp);
-    }
-  }
-  if (auto advertised = current_advertised_endpoint(); advertised.has_value()) {
-    v.node_software_version += ";external_endpoint=" + advertised->key();
-  }
-  v.node_software_version +=
-      ";validator_pubkey=" + hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
+  v.node_software_version =
+      local_software_version_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion) + tags;
 
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
   log_line(std::string("send ") + msg_type_name(p2p::MsgType::VERSION) + " peer_id=" + std::to_string(peer_id) +
