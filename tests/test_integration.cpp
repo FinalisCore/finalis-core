@@ -4598,10 +4598,11 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   Hash32 bond_txid{};
   bond_txid.fill(0xA5);
   const OutPoint bond_op{bond_txid, 0};
-  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
-
+  // Seed only once proposals are paused and the tip is stable: the hook rewrites the live state
+  // root, so a next-height proposal built before it no longer validates and stalls a 1-node cluster.
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(60)));
+  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
 
   auto info0 = nodes[0]->validator_info_for_test(slash_pub);
   ASSERT_TRUE(info0.has_value());
@@ -4669,9 +4670,10 @@ TEST(test_early_time_signature_slash_bans_validator) {
   Hash32 bond_txid{};
   bond_txid.fill(0xA6);
   const OutPoint bond_op{bond_txid, 0};
-  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
+  // Seed after pausing; see test_slash_consumes_bond_and_bans_validator.
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(60)));
+  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
   const auto info0 = nodes[0]->validator_info_for_test(slash_pub);
   ASSERT_TRUE(info0.has_value() && info0->has_bond);
 
@@ -4715,10 +4717,10 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   Hash32 bond_txid{};
   bond_txid.fill(0xB6);
   const OutPoint bond_op{bond_txid, 0};
-  ASSERT_TRUE(n0.seed_bonded_validator_for_test(banned_pub, bond_op, bond_amount));
-
+  // Seed after pausing; see test_slash_consumes_bond_and_bans_validator.
   n0.pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, std::chrono::seconds(30)));
+  ASSERT_TRUE(n0.seed_bonded_validator_for_test(banned_pub, bond_op, bond_amount));
 
   auto info0 = n0.validator_info_for_test(banned_pub);
   ASSERT_TRUE(info0.has_value());
