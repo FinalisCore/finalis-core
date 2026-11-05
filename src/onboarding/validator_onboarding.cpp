@@ -191,16 +191,6 @@ bool open_db_readonly(const std::string& path, storage::DB* db, std::string* err
   return true;
 }
 
-std::optional<ValidatorStatus> validator_status_from_string(const std::string& status) {
-  if (status == "ONBOARDING") return ValidatorStatus::ONBOARDING;
-  if (status == "PENDING") return ValidatorStatus::PENDING;
-  if (status == "ACTIVE") return ValidatorStatus::ACTIVE;
-  if (status == "EXITING") return ValidatorStatus::EXITING;
-  if (status == "BANNED") return ValidatorStatus::BANNED;
-  if (status == "SUSPENDED") return ValidatorStatus::SUSPENDED;
-  return std::nullopt;
-}
-
 std::string validator_status_name(const std::optional<consensus::ValidatorInfo>& info) {
   if (!info.has_value()) return "NOT_REGISTERED";
   switch (info->status) {

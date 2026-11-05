@@ -24,8 +24,6 @@ Hash32 hash_tagged(const Bytes& tag, const Bytes& payload) {
   return crypto::sha256(in);
 }
 
-std::string hex_of_key(const Hash32& key) { return hex_encode(Bytes(key.begin(), key.end())); }
-
 std::vector<std::pair<Hash32, Bytes>> load_leaves(storage::DB& db, const std::string& prefix) {
   std::vector<std::pair<Hash32, Bytes>> out;
   for (const auto& [k, v] : db.scan_prefix(prefix)) {

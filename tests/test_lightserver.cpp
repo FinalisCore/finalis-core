@@ -31,6 +31,7 @@
 #include "genesis/genesis.hpp"
 #include "common/keystore.hpp"
 #include "common/minijson.hpp"
+#include "lightserver/client.hpp"
 #include "lightserver/server.hpp"
 #include "mempool/mempool.hpp"
 #include "node/node.hpp"
@@ -426,11 +427,13 @@ TEST(test_lightserver_exposes_finality_certificate_endpoint) {
   const std::string base = unique_test_base("/tmp/finalis_light_cert_rpc");
   auto cluster = make_cluster(base);
   ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 6; }, kClusterFinalizationTimeout));
-  const auto tip = cluster.nodes[0]->status();
 
   for (auto& n : cluster.nodes) {
     if (n) n->stop();
   }
+  // Read the tip only after every node has stopped: the cluster keeps finalizing
+  // until stop(), and the tip-default query below returns the DB tip.
+  const auto tip = cluster.nodes[0]->status();
   cluster.nodes.clear();
 
   lightserver::Config lcfg;
@@ -2021,6 +2024,54 @@ TEST(test_lightserver_broadcast_reports_node_mempool_rejection) {
   }
 }
 
+TEST(test_lightserver_broadcast_reports_transient_node_rejections_as_retryable) {
+  // L1 (fixed 2026-11-04, tests/KNOWN_DEFECTS.md): the node refuses a record for a moment, not for good:
+  // its node-wide time-locked proof budget is spent, its time-locked pool is full, or it has no
+  // canonical state yet. The lightserver must report these as retryable, like "verify rate limited",
+  // not tx_invalid / retry_class none, or a wallet drops a valid transaction (2026-11-03 load test:
+  // 15 "timed verify rate limited" rejects).
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_node_transient_reject");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  const auto keys = node::Node::deterministic_test_keypairs();
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x96;
+  ASSERT_TRUE(db.set_tip(storage::TipState{8, tip_hash}));
+
+  OutPoint op{};
+  op.txid.fill(0x59);
+  op.index = 0;
+  TxOut prev{10'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end())))};
+  ASSERT_TRUE(db.put_utxo(op, prev));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  auto tx = build_signed_p2pkh_tx_single_input(db_chain_domain(base), 
+      op, prev, keys[0].private_key,
+      std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}} );
+  ASSERT_TRUE(tx.has_value());
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":405,"method":"broadcast_tx","params":{"tx_hex":")") +
+                           hex_encode(tx->serialize()) + R"("}})";
+
+  for (const std::string reason : {"timed verify rate limited", "timed pool full", "no canonical state"}) {
+    lightserver::Config lcfg;
+    lcfg.db_path = base;
+    lcfg.tx_relay_override = [reason](const Bytes&) {
+      return lightserver::TxRelayResult{lightserver::TxRelayResult::Outcome::Rejected, reason};
+    };
+    lightserver::Server ls(lcfg);
+    ASSERT_TRUE(ls.init());
+    const auto resp = ls.handle_rpc_for_test(body);
+    ASSERT_TRUE(resp.find("\"accepted\":false") != std::string::npos);
+    ASSERT_TRUE(resp.find("\"error_code\":\"tx_invalid\"") == std::string::npos);
+    ASSERT_TRUE(resp.find("\"retryable\":true") != std::string::npos);
+    ASSERT_TRUE(resp.find("\"retry_class\":\"none\"") == std::string::npos);
+  }
+}
+
 TEST(test_lightserver_broadcast_returns_structured_success_when_relaying_to_live_node) {
   const std::string base = unique_test_base("/tmp/finalis_light_broadcast_success");
   std::filesystem::remove_all(base);
@@ -3208,3 +3259,20 @@ TEST(test_lightserver_broadcast_accepts_txv2_spending_confidential_output) {
   if (resp.find("\"accepted\":true") == std::string::npos) throw std::runtime_error("broadcast rejected: " + resp);
   ASSERT_TRUE(resp.find("\"status\":\"accepted_for_relay\"") != std::string::npos);
 }
+
+#ifndef _WIN32
+TEST(test_rpc_client_connect_error_names_target_and_reason) {
+  // A failed admin-socket connect used to print only "connect failed": no socket path, no reason,
+  // so an operator could not tell a wrong network/path from a stopped lightserver.
+  const std::string base = unique_test_base("/tmp/finalis_client_connect_error");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string sock = base + "/missing.sock";
+  std::string err;
+  ASSERT_TRUE(!lightserver::http_post_json_raw("unix://" + sock, "{}", &err).has_value());
+  ASSERT_TRUE(err.find("connect failed") != std::string::npos);
+  ASSERT_TRUE(err.find(sock) != std::string::npos);
+  ASSERT_TRUE(err.find(std::strerror(ENOENT)) != std::string::npos);
+  std::filesystem::remove_all(base);
+}
+#endif

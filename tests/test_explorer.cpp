@@ -2928,3 +2928,35 @@ TEST(test_explorer_ignores_results_cached_by_an_older_version) {
   }
   ASSERT_TRUE(!find_persisted_tx_result(fx.txid).has_value());
 }
+
+TEST(test_explorer_participant_count_counts_each_address_once) {
+  // X1 (fixed 2026-11-04, tests/KNOWN_DEFECTS.md): participant_count added the input and output address
+  // sets, so change back to the sender counts the sender twice (live: sealed envelope ad911c5a…,
+  // one address, participant_count 2).
+  TxInputResult in;
+  in.prev_txid = std::string(64, 'a');
+  in.address = "alice";
+  in.amount = 100;
+  TxOutputResult change;
+  change.amount = 40;
+  change.address = "alice";
+  TxOutputResult pay;
+  pay.amount = 50;
+  pay.address = "bob";
+  ASSERT_EQ(classify_tx_flow({in}, {change}).participant_count.value_or(0), 1u);
+  ASSERT_EQ(classify_tx_flow({in}, {pay, change}).participant_count.value_or(0), 2u);
+}
+
+TEST(test_explorer_tx_reports_its_transition_timestamp) {
+  // X2 (fixed 2026-11-04, tests/KNOWN_DEFECTS.md): /api/tx never set "timestamp" (only transitions did),
+  // so every live transaction reported null and the tx page has no Time row (live: h=2191, h=2466).
+  ExplorerFixture fx;
+  fx.transition.timestamp = 1793726271;
+  fx.transition_hash = hex_encode32(fx.transition.transition_id());
+  ScopedRpcHook hook([&](const std::string& body) { return default_rpc_handler(fx, body); });
+  const Config cfg = test_config();
+  const auto tx_ok = handle_request(cfg, make_http_get("/api/tx/" + fx.txid));
+  ASSERT_EQ(tx_ok.status, 200);
+  ASSERT_TRUE(tx_ok.body.find("\"height\":7") != std::string::npos);
+  ASSERT_TRUE(tx_ok.body.find("\"timestamp\":1793726271") != std::string::npos);
+}

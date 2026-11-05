@@ -439,7 +439,11 @@ class Node {
   void on_ping(int peer_id, const Bytes& payload);
   void on_pong(int peer_id, const Bytes& payload);
 
+  // send_version takes mu_ to read the bootstrap identity and endpoint, so callers must not hold it;
+  // a caller holding mu_ builds the tags with version_tags_locked() and calls send_version_with_tags.
   void send_version(int peer_id);
+  std::string version_tags_locked() const;
+  void send_version_with_tags(int peer_id, const std::string& tags);
   void maybe_send_verack(int peer_id);
   void send_ping(int peer_id);
   Hash32 epoch_ticket_challenge_anchor_locked(std::uint64_t height) const;
@@ -847,6 +851,9 @@ class Node {
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
   void log_line(const std::string& s) const;
+  // Per-message P2P/consensus chatter (recv/send, soft rejects, tip exchange): written only with
+  // FINALIS_LOG_TRACE=1, so default logs carry events, not traffic.
+  void log_trace(const std::string& s) const;
   // disable_p2p mode only: the other in-process nodes on the local bus (snapshot, excludes this).
   std::vector<Node*> local_bus_peers() const;
   // Calls fn(peer) for each local-bus peer; no-op unless running_. If fn returns bool,

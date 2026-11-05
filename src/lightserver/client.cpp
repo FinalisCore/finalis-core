@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
+#include <cstring>
 #include <limits>
 #include <sstream>
 
@@ -80,20 +82,30 @@ std::optional<std::string> parse_unix_socket_url(const std::string& url) {
   return path;
 }
 
-std::optional<net::SocketHandle> connect_unix(const std::string& path) {
+// On failure, *why (if set) says why: the errno text, or "path too long".
+std::optional<net::SocketHandle> connect_unix(const std::string& path, std::string* why) {
 #ifdef _WIN32
   (void)path;
+  if (why) *why = "unix sockets unsupported on Windows";
   return std::nullopt;
 #else
   sockaddr_un addr{};
-  if (path.size() >= sizeof(addr.sun_path)) return std::nullopt;
+  if (path.size() >= sizeof(addr.sun_path)) {
+    if (why) *why = "path too long";
+    return std::nullopt;
+  }
   const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) return std::nullopt;
+  if (fd < 0) {
+    if (why) *why = std::strerror(errno);
+    return std::nullopt;
+  }
   (void)net::set_socket_timeouts(fd, 15'000);
   addr.sun_family = AF_UNIX;
   std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    const int e = errno;
     ::close(fd);
+    if (why) *why = std::strerror(e);
     return std::nullopt;
   }
   return fd;
@@ -300,8 +312,11 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
   std::string path = "/rpc";
   std::string host_header = "localhost";
   std::optional<std::string> tls_host;
+  std::string connect_target;  // named in the error, so a failed connect says where and why
+  std::string connect_why;
   if (const auto socket_path = parse_unix_socket_url(url); socket_path.has_value()) {
-    fd_opt = connect_unix(*socket_path);
+    connect_target = *socket_path;
+    fd_opt = connect_unix(*socket_path, &connect_why);
   } else {
     auto parsed = parse_http_url(url);
     if (!parsed) {
@@ -309,13 +324,14 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
       return std::nullopt;
     }
     fd_opt = connect_tcp(parsed->host, parsed->port);
+    connect_target = parsed->host + ":" + std::to_string(parsed->port);
     path = parsed->path;
     const bool v6 = parsed->host.find(':') != std::string::npos;
     host_header = (v6 ? "[" + parsed->host + "]" : parsed->host) + ":" + std::to_string(parsed->port);
     tls_host = parsed->tls ? std::optional<std::string>(parsed->host) : std::nullopt;
   }
   if (!fd_opt) {
-    if (err) *err = "connect failed";
+    if (err) *err = "connect failed: " + connect_target + (connect_why.empty() ? "" : " (" + connect_why + ")");
     return std::nullopt;
   }
   const auto fd = *fd_opt;

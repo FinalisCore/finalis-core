@@ -22,7 +22,7 @@ an abort inside librocksdb (E1 below) fails that one test with its signal instea
 
 ## Status (2026-10-28)
 
-**No open defects.** Every row below is fixed and its tests are in the gating suite (tags
+No open defects. L1, L2, X1, X2 (2026-11-04, lightserver and explorer, none consensus) are fixed too. Every row below is fixed and its tests are in the gating suite (tags
 `known-defect` dropped; the `finalis-known-defects` ctest entry and `fuzz/replay_known_defects.sh` stay
 for the next finding). Fixes: D1-D6 P1, fail-stop P2, D7 P3, R1 P4, E1/E2 P5, G1/G2 P6, H1 P7
 (`docs/reports/CONSENSUS_PERSISTENCE_REMEDIATION_DESIGN.md`). The fuzz reproducers under
@@ -49,6 +49,15 @@ Byzantine majority), ~55k ops, ~950 injected WAL faults, no oracle violation or 
 --duration 600 --tx-interval 2 --timed-interval 5`: no fork, no stall, 97/100 time-locked transfers opened,
 the 3 others forfeited because the harness's own sender spent a body input first (a client race, by design).
 Nodes now log every settlement (`timed-settled ... outcome= reason=`).
+
+## Fixed 2026-11-04 (verification pass, none consensus)
+
+| Id | Defect | Fix and tests |
+|---|---|---|
+| L1 | The lightserver mapped a transient node refusal (`timed verify rate limited`, `timed pool full`, `no canonical state`) to `tx_invalid` / `retry_class` `none`, so a wallet dropped a valid transaction. Live: 15 rejects in the 2026-11-03 load test. | `node_reject_error_code` maps them to `relay_unavailable` (retryable, `transport`). `test_lightserver_broadcast_reports_transient_node_rejections_as_retryable` (`tests/test_lightserver.cpp`) |
+| L2 | An outbound-only node (no `--listen`: the CLI default, and `start.sh` `PUBLIC_NODE=0`, which `testnet/README.md` advises behind carrier-grade NAT) with its bundled lightserver (`--with-lightserver`, `start.sh` default) could not send anything: the lightserver relays `broadcast_tx` to `127.0.0.1:<p2p port>`, where nothing listened, so every send (wallet, CLI, `validator-register`) failed `connect relay peer failed`. Reproduced on a chaos devnet node. | With a bundled lightserver and no `--listen`, the node opens a loopback-only P2P listener (`Node::init`). `test_lightserver_relays_to_an_outbound_only_node` (`tests/test_integration.cpp`); control `test_lightserver_relay_reports_node_mempool_verdict` |
+| X1 | Explorer `participant_count` added the input and output address sets, so change back to the sender counted the sender twice. Live: ad911c5a… (one address) reported 2. | `classify_tx_flow` counts distinct addresses. `test_explorer_participant_count_counts_each_address_once` (`tests/test_explorer.cpp`) |
+| X2 | Explorer `/api/tx` never set `timestamp` (only transitions did), so every live tx reported `null` and the tx page had no Time row. Live: h=2191 and h=2466. | `fetch_tx_result` takes the finalizing transition's timestamp (cached transition first). `test_explorer_tx_reports_its_transition_timestamp` (`tests/test_explorer.cpp`) |
 
 ## Consensus persistence failures (red-team round 2, 2026-10-25, commit 9467c05)
 

@@ -1075,7 +1075,7 @@ print_summary() {
     log "  nc -vz <this-public-ip> ${P2P_PORT}"
   else
     log "Joiner verification:"
-    log "  rg 'peer-connected|recv VERSION|recv VERACK|request-finalized-tip|recv BLOCK|buffered-sync-applied'"
+    log "  rg 'peer-connected|recv VERSION|recv VERACK|buffered-sync-applied' (per-message lines need FINALIS_LOG_TRACE=1)"
   fi
   log "If logs show 'genesis-fingerprint-mismatch', stop the node and reset ${DB_DIR} before retrying."
 }

@@ -53,7 +53,7 @@ void Node::on_get_ingress_tips(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-ingress-tips");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
   // A peer asks on every FINALIZED_TIP we announce, which is once per block while we catch up.
   // Answer at most twice a second so our replies stay inside its INGRESS_TIPS bucket (20, 10/s).
   constexpr std::uint64_t kIngressTipsReplyMinIntervalMs = 500;
@@ -83,7 +83,7 @@ void Node::on_ingress_tips(int peer_id, const Bytes& payload) {
     if (lane) oss << ",";
     oss << lane << ":" << tips->lane_tips[lane];
   }
-  log_line(oss.str());
+  log_trace(oss.str());
   std::lock_guard<std::mutex> lk(mu_);
   (void)handle_ingress_tips_locked(peer_id, *tips);
   return;
@@ -103,7 +103,7 @@ void Node::on_get_ingress_range(int peer_id, const Bytes& payload) {
              std::to_string(req->to_seq) + "] limit=" + std::to_string(kMaxIngressRangeRequestRecords));
     req->to_seq = req->from_seq + static_cast<std::uint64_t>(kMaxIngressRangeRequestRecords) - 1;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " lane=" + std::to_string(req->lane) + " range=[" + std::to_string(req->from_seq) + "," +
            std::to_string(req->to_seq) + "]");
   p2p::IngressRangeMsg msg;
@@ -140,7 +140,7 @@ void Node::on_get_ingress_range(int peer_id, const Bytes& payload) {
   }
   msg.to_seq = msg.from_seq + msg.records.size() - 1;
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::INGRESS_RANGE, p2p::ser_ingress_range(msg), true);
-  log_line("send-ingress-range peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(req->lane) +
+  log_trace("send-ingress-range peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(req->lane) +
            " range=[" + std::to_string(msg.from_seq) + "," + std::to_string(msg.to_seq) +
            "] status=" + (ok ? "ok" : "failed"));
   return;
@@ -153,7 +153,7 @@ void Node::on_ingress_range(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-ingress-range");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " lane=" + std::to_string(range->lane) + " range=[" + std::to_string(range->from_seq) + "," +
            std::to_string(range->to_seq) + "] records=" + std::to_string(range->records.size()));
   {
@@ -178,7 +178,7 @@ void Node::on_ingress_record(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_INGRESS, "bad-ingress-record");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " lane=" + std::to_string(record->certificate.lane) +
            " seq=" + std::to_string(record->certificate.seq) +
            " txid=" + short_hash_hex(record->certificate.txid));
@@ -223,7 +223,7 @@ void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bo
   if (!tx.has_value()) {
     if (const auto timed = TxTimed::parse(m->tx_bytes); timed.has_value()) {
       const Hash32 timed_txid = timed->txid();
-      log_line("recv " + std::string(reply ? "SUBMIT_TX" : "TX") + " peer_id=" + std::to_string(peer_id) +
+      log_trace("recv " + std::string(reply ? "SUBMIT_TX" : "TX") + " peer_id=" + std::to_string(peer_id) +
                " txid=" + hex_encode32(timed_txid) + " kind=timed");
       std::string reason;
       if (handle_timed_tx(*timed, true, peer_id, &reason)) {
@@ -246,7 +246,7 @@ void Node::on_tx(int peer_id, const Bytes& payload, const Hash32& payload_id, bo
     return;
   }
   const Hash32 txid = txid_any(*tx);
-  log_line("recv " + std::string(reply ? "SUBMIT_TX" : "TX") + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(reply ? "SUBMIT_TX" : "TX") + " peer_id=" + std::to_string(peer_id) +
            " txid=" + hex_encode32(txid));
   std::string reason;
   if (!handle_tx(*tx, true, peer_id, &reason)) {
@@ -850,7 +850,7 @@ bool Node::handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& ms
     ++outstanding_for_peer;
   }
   if (!requested_any) {
-    log_line("ingress-tips-in-sync peer_id=" + std::to_string(peer_id));
+    log_trace("ingress-tips-in-sync peer_id=" + std::to_string(peer_id));
   }
   return true;
 }

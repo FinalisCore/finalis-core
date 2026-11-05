@@ -713,49 +713,6 @@ TEST(test_unbond_delay_enforced) {
   ASSERT_EQ(r3.error, std::string("bond held by a pending long time lock"));
 }
 
-TEST(test_existing_pre_fork_bond_can_unbond_after_economics_fork) {
-  const auto kp = key_from_byte(21);
-  OutPoint unb_op{};
-  unb_op.txid.fill(0xC0);
-  unb_op.index = 0;
-
-  UtxoSet view;
-  view[unb_op] = UtxoEntry{TxOut{BOND_AMOUNT - 1000, unb_script(kp.public_key)}};
-
-  consensus::ValidatorRegistry vr;
-  OutPoint bond_op{};
-  bond_op.txid.fill(0xC1);
-  bond_op.index = 0;
-  ASSERT_TRUE(vr.register_bond(kp.public_key, bond_op, 1, BOND_AMOUNT));
-  ASSERT_TRUE(vr.request_unbond(kp.public_key, 50));
-
-  Tx tx;
-  tx.version = 1;
-  tx.lock_time = 0;
-  tx.inputs.push_back(TxIn{unb_op.txid, unb_op.index, Bytes{}, 0xFFFFFFFF});
-  auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
-  tx.outputs.push_back(TxOut{BOND_AMOUNT - 2000, address::p2pkh_script_pubkey(pkh)});
-
-  auto msg = signing_message_for_input(finalis::test::test_chain_domain(), tx, 0, {view[unb_op].out});
-  ASSERT_TRUE(msg.has_value());
-  auto sig = crypto::ed25519_sign(*msg, kp.private_key);
-  ASSERT_TRUE(sig.has_value());
-  Bytes ss;
-  ss.push_back(0x40);
-  ss.insert(ss.end(), sig->begin(), sig->end());
-  ss.push_back(0x20);
-  ss.insert(ss.end(), kp.public_key.begin(), kp.public_key.end());
-  tx.inputs[0].script_sig = ss;
-
-  SpecialValidationContext post_fork = finalis::test::with_test_chain_identity(SpecialValidationContext{
-      .validators = &vr,
-      // CLEANSLATE: Validator economics are active at genesis.
-      .current_height = UNBOND_DELAY_BLOCKS + 50,
-  });
-  auto r = validate_tx(tx, 1, view, &post_fork);
-  ASSERT_TRUE(r.ok);
-}
-
 TEST(test_unbond_finalize_withdrawal_clears_live_bond_state) {
   const auto kp = key_from_byte(16);
   OutPoint bond_op{};

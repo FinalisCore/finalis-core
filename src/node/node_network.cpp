@@ -936,7 +936,34 @@ std::optional<std::string> Node::detect_possible_public_ip() const {
   return out;
 }
 
+std::string Node::version_tags_locked() const {
+  std::string tags;
+  if (bootstrap_validator_pubkey_.has_value()) {
+    tags += ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
+    // Its time-signature key and proof: followers that adopt it need the same genesis state.
+    if (const auto bls = bootstrap_validator_bls_locked()) {
+      Bytes kp(bls->pubkey.begin(), bls->pubkey.end());
+      kp.insert(kp.end(), bls->pop.begin(), bls->pop.end());
+      tags += ";bootstrap_validator_bls=" + hex_encode(kp);
+    }
+  }
+  if (auto advertised = advertised_endpoint_locked(); advertised.has_value()) {
+    tags += ";external_endpoint=" + advertised->key();
+  }
+  tags += ";validator_pubkey=" + hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
+  return tags;
+}
+
 void Node::send_version(int peer_id) {
+  std::string tags;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    tags = version_tags_locked();
+  }
+  send_version_with_tags(peer_id, tags);
+}
+
+void Node::send_version_with_tags(int peer_id, const std::string& tags) {
   auto tip = db_.get_tip();
   p2p::VersionMsg v;
   v.timestamp = now_unix();
@@ -946,22 +973,8 @@ void Node::send_version(int peer_id) {
   v.nonce = static_cast<std::uint32_t>(cfg_.node_id + 1000);
   v.start_height = tip ? tip->height : 0;
   v.start_hash = tip ? tip->hash : zero_hash();
-  v.node_software_version = local_software_version_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion);
-  if (bootstrap_validator_pubkey_.has_value()) {
-    v.node_software_version +=
-        ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
-    // Its time-signature key and proof: followers that adopt it need the same genesis state.
-    if (const auto bls = bootstrap_validator_bls_locked()) {
-      Bytes kp(bls->pubkey.begin(), bls->pubkey.end());
-      kp.insert(kp.end(), bls->pop.begin(), bls->pop.end());
-      v.node_software_version += ";bootstrap_validator_bls=" + hex_encode(kp);
-    }
-  }
-  if (auto advertised = current_advertised_endpoint(); advertised.has_value()) {
-    v.node_software_version += ";external_endpoint=" + advertised->key();
-  }
-  v.node_software_version +=
-      ";validator_pubkey=" + hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
+  v.node_software_version =
+      local_software_version_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion) + tags;
 
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
   log_line(std::string("send ") + msg_type_name(p2p::MsgType::VERSION) + " peer_id=" + std::to_string(peer_id) +
@@ -980,14 +993,14 @@ void Node::maybe_send_verack(int peer_id) {
 void Node::send_ping(int peer_id) {
   const p2p::PingMsg ping{now_ms()};
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PING, p2p::ser_ping(ping), true);
-  log_line(std::string("send ") + msg_type_name(p2p::MsgType::PING) + " peer_id=" + std::to_string(peer_id) +
+  log_trace(std::string("send ") + msg_type_name(p2p::MsgType::PING) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(ping.nonce) + " status=" + (ok ? "ok" : "failed"));
 }
 
 void Node::request_epoch_tickets(int peer_id, std::uint64_t epoch, std::uint32_t max_tickets) {
   const bool ok =
       p2p_.send_to(peer_id, p2p::MsgType::GET_EPOCH_TICKETS, p2p::ser_get_epoch_tickets(p2p::GetEpochTicketsMsg{epoch, max_tickets}));
-  log_line("epoch-reconcile-request peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(epoch) +
+  log_trace("epoch-reconcile-request peer_id=" + std::to_string(peer_id) + " epoch=" + std::to_string(epoch) +
            " max_tickets=" + std::to_string(max_tickets) + " status=" + (ok ? "ok" : "failed"));
 }
 
@@ -1341,7 +1354,7 @@ void Node::on_verack(int peer_id, const Bytes& /*payload*/) {
 
 void Node::on_get_finalized_tip(int peer_id, const Bytes& /*payload*/) {
   constexpr std::uint16_t msg_type = p2p::MsgType::GET_FINALIZED_TIP;
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
   send_finalized_tip(peer_id);
   return;
 }
@@ -1353,7 +1366,7 @@ void Node::on_finalized_tip(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-finalized-tip");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " height=" + std::to_string(tip->height) + " hash=" + short_hash_hex(tip->hash));
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1461,10 +1474,10 @@ void Node::on_ping(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-ping");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(ping->nonce));
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PONG, p2p::ser_ping(*ping), true);
-  log_line(std::string("send ") + msg_type_name(p2p::MsgType::PONG) + " peer_id=" + std::to_string(peer_id) +
+  log_trace(std::string("send ") + msg_type_name(p2p::MsgType::PONG) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(ping->nonce) + " status=" + (ok ? "ok" : "failed"));
   return;
 }
@@ -1476,7 +1489,7 @@ void Node::on_pong(int peer_id, const Bytes& payload) {
     score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-pong");
     return;
   }
-  log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+  log_trace("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
            " nonce=" + std::to_string(pong->nonce));
   return;
 }
@@ -1892,7 +1905,7 @@ void Node::request_ingress_tips(int peer_id) {
       it->second = tms;
     }
   }
-  log_line("request-ingress-tips peer_id=" + std::to_string(peer_id));
+  log_trace("request-ingress-tips peer_id=" + std::to_string(peer_id));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_INGRESS_TIPS, p2p::ser_get_ingress_tips(p2p::GetIngressTipsMsg{}), true);
 }
 
@@ -1909,7 +1922,7 @@ void Node::send_ingress_tips(int peer_id) {
     if (lane) oss << ",";
     oss << lane << ":" << msg.lane_tips[lane];
   }
-  log_line(oss.str());
+  log_trace(oss.str());
 }
 
 void Node::request_finalized_tip(int peer_id) {
@@ -1927,7 +1940,7 @@ void Node::request_finalized_tip(int peer_id) {
     local_height = finalized_height_;
     local_transition = finalized_identity_.id;
   }
-  log_line("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(local_height) +
+  log_trace("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(local_height) +
            " local_transition=" + short_hash_hex(local_transition));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP, Bytes{}, true);
 }
@@ -1942,7 +1955,7 @@ void Node::send_finalized_tip(int peer_id) {
     tip = p2p::FinalizedTipMsg{finalized_height_, finalized_identity_.id};
   }
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
-  log_line("send-finalized-tip peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(tip.height) +
+  log_trace("send-finalized-tip peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(tip.height) +
            " transition=" + short_hash_hex(tip.hash) + " status=" + (ok ? "ok" : "failed"));
 }
 

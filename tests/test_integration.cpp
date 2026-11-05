@@ -4598,10 +4598,11 @@ TEST(test_slash_consumes_bond_and_bans_validator) {
   Hash32 bond_txid{};
   bond_txid.fill(0xA5);
   const OutPoint bond_op{bond_txid, 0};
-  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
-
+  // Seed only once proposals are paused and the tip is stable: the hook rewrites the live state
+  // root, so a next-height proposal built before it no longer validates and stalls a 1-node cluster.
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(60)));
+  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
 
   auto info0 = nodes[0]->validator_info_for_test(slash_pub);
   ASSERT_TRUE(info0.has_value());
@@ -4669,9 +4670,10 @@ TEST(test_early_time_signature_slash_bans_validator) {
   Hash32 bond_txid{};
   bond_txid.fill(0xA6);
   const OutPoint bond_op{bond_txid, 0};
-  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
+  // Seed after pausing; see test_slash_consumes_bond_and_bans_validator.
   for (auto& n : nodes) n->pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(60)));
+  ASSERT_TRUE(nodes[0]->seed_bonded_validator_for_test(slash_pub, bond_op, bond_amount));
   const auto info0 = nodes[0]->validator_info_for_test(slash_pub);
   ASSERT_TRUE(info0.has_value() && info0->has_bond);
 
@@ -4715,10 +4717,10 @@ TEST(test_banned_validator_cannot_reenter_through_onboarding_registration_tx) {
   Hash32 bond_txid{};
   bond_txid.fill(0xB6);
   const OutPoint bond_op{bond_txid, 0};
-  ASSERT_TRUE(n0.seed_bonded_validator_for_test(banned_pub, bond_op, bond_amount));
-
+  // Seed after pausing; see test_slash_consumes_bond_and_bans_validator.
   n0.pause_proposals_for_test(true);
   ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, std::chrono::seconds(30)));
+  ASSERT_TRUE(n0.seed_bonded_validator_for_test(banned_pub, bond_op, bond_amount));
 
   auto info0 = n0.validator_info_for_test(banned_pub);
   ASSERT_TRUE(info0.has_value());
@@ -5205,8 +5207,8 @@ TEST(test_epoch_reward_settlement_restart_is_deterministic) {
   }());
 }
 
-TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v1_boundary) {
-  const std::string base = unique_test_base("/tmp/finalis_it_restart_postfork_v1");
+TEST(test_restart_rebuild_preserves_checkpoint_and_settlement) {
+  const std::string base = unique_test_base("/tmp/finalis_it_restart_rebuild");
   {
     auto cluster = make_cluster(base, 1, 1, 1);
     const bool reached_225 =
@@ -5214,7 +5216,7 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
     if (!reached_225) {
       std::ostringstream oss;
       const auto st = cluster.nodes[0]->status();
-      oss << "postfork pre-restart node failed to reach height 225:"
+      oss << "pre-restart node failed to reach height 225:"
           << " node0{h=" << st.height << ",r=" << st.round
           << ",tip=" << hex_encode(Bytes(st.transition_hash.begin(), st.transition_hash.end())).substr(0, 8)
           << ",committee=" << st.committee_size << ",quorum=" << st.quorum_threshold
@@ -5228,7 +5230,7 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
           << ",state=" << st.consensus_state << "}";
       throw std::runtime_error(oss.str());
     }
-    std::cerr << "postfork-restart-test phase=reached-height-225\n";
+    std::cerr << "restart-rebuild-test phase=reached-height-225\n";
     for (auto& n : cluster.nodes) n->stop();
   }
 
@@ -5254,10 +5256,10 @@ TEST(test_restart_rebuild_preserves_post_fork_checkpoint_and_settlement_across_v
   cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
   cfg.validator_passphrase = "test-pass";
   {
-    std::cerr << "postfork-restart-test phase=restart-init-begin\n";
+    std::cerr << "restart-rebuild-test phase=restart-init-begin\n";
     node::Node restarted(cfg);
     ASSERT_TRUE(restarted.init());
-    std::cerr << "postfork-restart-test phase=restart-init-ok\n";
+    std::cerr << "restart-rebuild-test phase=restart-init-ok\n";
   }
 
   storage::DB after;
@@ -5907,6 +5909,76 @@ TEST(test_lightserver_relay_reports_node_mempool_verdict) {
 
   ASSERT_TRUE(node->pause_proposals_for_test(false));
   node->stop();
+}
+
+// L2 (fixed 2026-11-04, tests/KNOWN_DEFECTS.md): an outbound-only node (no --listen, the CLI default and
+// start.sh PUBLIC_NODE=0, which testnet/README.md advises behind carrier-grade NAT) with its bundled
+// lightserver (--with-lightserver, start.sh default) must accept sends: the lightserver relays every
+// broadcast_tx to 127.0.0.1:<p2p port>, so the node opens a loopback-only listener there.
+TEST(test_lightserver_relays_to_an_outbound_only_node) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const std::string base = unique_test_base("/tmp/finalis_it_relay_outbound_only");
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;
+  cfg.node_id = 0;
+  cfg.max_committee = 1;
+  cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();
+  cfg.outbound_target = 0;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = reserve_test_port();
+  if (cfg.p2p_port == 0) return;
+  cfg.listen = false;
+  cfg.lightserver_mode = node::LightserverLaunchMode::Explicit;  // --with-lightserver
+  cfg.lightserver_port = reserve_test_port();
+  if (cfg.lightserver_port == 0) return;
+  cfg.lightserver_admin_socket.clear();
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  keystore::ValidatorKey key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &key, &kerr));
+
+  std::unique_ptr<node::Node> node;
+  ASSERT_TRUE(restart_single_node_with_seeded_certified_ingress(cfg, {}, &node));
+  const auto own_pkh = crypto::h160(Bytes(key.pubkey.begin(), key.pubkey.end()));
+  ASSERT_TRUE(wait_for([&]() {
+    return node->status().height >= 33 && !node->find_utxos_by_pubkey_hash_for_test(own_pkh).empty();
+  }, ci_timeout_seconds(120)));
+  ASSERT_TRUE(node->pause_proposals_for_test(true));
+  const auto prev = node->find_utxos_by_pubkey_hash_for_test(own_pkh).front();
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0x63);
+  std::string err;
+  auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(node), prev.first, prev.second,
+                                               Bytes(key.privkey.begin(), key.privkey.end()),
+                                               {TxOut{prev.second.value - 10'000ULL, address::p2pkh_script_pubkey(recipient_pkh)}}, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  // What --with-lightserver starts: relay to 127.0.0.1:<the node's P2P port>.
+  lightserver::Config lcfg;
+  lcfg.network = cfg.network;
+  lcfg.db_path = cfg.db_path;
+  lcfg.tx_relay_host = "127.0.0.1";
+  lcfg.tx_relay_port = cfg.p2p_port;
+  lcfg.admin_socket_path.clear();
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto resp = ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":1,"method":"broadcast_tx","params":{"tx_hex":")") +
+                                           hex_encode(tx->serialize()) + R"("}})");
+  ASSERT_TRUE(node->pause_proposals_for_test(false));
+  node->stop();
+  ASSERT_TRUE(resp.find("\"accepted\":true") != std::string::npos);
 }
 
 // Three disable_p2p nodes on the in-process local bus (no sockets): node0 is the only validator, node1 and
@@ -8439,6 +8511,43 @@ TEST(test_validator_refuses_vote_when_slice_differs_from_certified_ingress) {
             std::string("accepted"));
   ASSERT_TRUE(!target.local_prevote_recorded_for_test(target_height, 0, proposal_id));
   ASSERT_EQ(target.deferred_certified_vote_count_for_test(), 0u);
+}
+
+// INVARIANTS D6: no prevote for a transition stamped more than kMaxTransitionTimestampDriftS ahead of
+// the local clock. A member gets the same proposal stamped one hour ahead (re-signed by its leader)
+// and must not prevote; another member prevotes the correctly stamped one.
+TEST(test_validator_never_prevotes_a_transition_from_the_future) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_future_ts"), 4, 4, 4);
+  Tx tx = make_fixture_ingress_tx(1, 0x8F);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true));
+  const std::uint64_t target_height = cluster.nodes[0]->status().height + 1;
+  auto proposal = build_cluster_frontier_proposal_from_records(cluster, keys, {tx.serialize()}, target_height, 0,
+                                                               "/tmp/finalis_it_future_ts_p");
+  ASSERT_TRUE(proposal.has_value());
+  auto future = *proposal;
+  future.transition.timestamp = static_cast<std::uint64_t>(std::time(nullptr)) + 3600;
+  const auto future_id = frontier_proposal_id(future);
+  ASSERT_TRUE(future_id != frontier_proposal_id(*proposal));
+
+  std::vector<std::size_t> members;
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(target_height, 0)) members.push_back(k);
+  }
+  ASSERT_TRUE(members.size() >= 2u);
+  auto& target = *cluster.nodes[members[0]];
+  auto& control = *cluster.nodes[members[1]];
+  const auto domain = cluster.nodes[0]->consensus_domain_for_test();
+
+  ASSERT_TRUE(advance_test_frontier_round(target, target_height, 0));
+  (void)target.inject_network_propose_result_for_test(make_test_frontier_propose_msg(domain, future));
+  ASSERT_TRUE(!target.local_prevote_recorded_for_test(target_height, 0, future_id));
+  ASSERT_TRUE(!target.local_vote_lock_for_test(target_height).has_value());
+
+  ASSERT_TRUE(advance_test_frontier_round(control, target_height, 0));
+  ASSERT_EQ(control.inject_network_propose_result_for_test(make_test_frontier_propose_msg(domain, *proposal)),
+            std::string("accepted"));
+  ASSERT_TRUE(control.local_prevote_recorded_for_test(target_height, 0, frontier_proposal_id(*proposal)));
 }
 
 // Regression for a captured fork: validators timed out of round 0, moved to round 1, then cast
@@ -14437,5 +14546,228 @@ TEST(test_pf_failstop_non_safety_write_failure_halts_node) {
       pf_require(!f->target().safety_storage_failed(), m + ": restart from disk is healthy");
     }
   }
+}
+#endif
+
+#ifndef _WIN32
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace {
+
+// A loopback TCP relay standing in for a home router in front of an outbound-only node. cut() is an
+// IP change: the home side gets a reset (its next packet leaves from the new address and matches no
+// connection), while the seed side stays open but silent, as the seed's half-open connection to the
+// old address does until it times out.
+class HomeRouterRelay {
+ public:
+  explicit HomeRouterRelay(std::uint16_t target_port) : target_port_(target_port) {}
+  ~HomeRouterRelay() { stop(); }
+
+  bool start() {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) return false;
+    int one = 1;
+    (void)::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(listen_fd_, 8) != 0) return false;
+    socklen_t len = sizeof(addr);
+    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return false;
+    port_ = ntohs(addr.sin_port);
+    running_ = true;
+    thread_ = std::thread([this]() { run(); });
+    return true;
+  }
+  std::uint16_t port() const { return port_; }
+  void cut() { cut_requested_ = true; }
+  std::size_t cuts_done() const { return cuts_done_.load(); }
+  std::size_t connections_accepted() const { return accepted_.load(); }
+  void stop() {
+    if (!running_.exchange(false)) return;
+    if (thread_.joinable()) thread_.join();
+    for (const auto& [home, seed] : pairs_) {
+      ::close(home);
+      ::close(seed);
+    }
+    for (int fd : stale_) ::close(fd);
+    pairs_.clear();
+    stale_.clear();
+    if (listen_fd_ >= 0) ::close(listen_fd_);
+    listen_fd_ = -1;
+  }
+
+ private:
+  static bool pump(int from, int to) {
+    char buf[16384];
+    const ssize_t n = ::recv(from, buf, sizeof(buf), 0);
+    if (n <= 0) return false;
+    for (ssize_t off = 0; off < n;) {
+      const ssize_t w = ::send(to, buf + off, static_cast<std::size_t>(n - off), MSG_NOSIGNAL);
+      if (w <= 0) return false;
+      off += w;
+    }
+    return true;
+  }
+
+  void run() {
+    while (running_) {
+      if (cut_requested_.exchange(false)) {
+        for (const auto& [home, seed] : pairs_) {
+          linger hard{1, 0};  // close with RST
+          (void)::setsockopt(home, SOL_SOCKET, SO_LINGER, &hard, sizeof(hard));
+          ::close(home);
+          stale_.push_back(seed);  // never read or closed again: the seed's side goes silent
+        }
+        pairs_.clear();
+        ++cuts_done_;
+      }
+      std::vector<pollfd> fds{{listen_fd_, POLLIN, 0}};
+      for (const auto& [home, seed] : pairs_) {
+        fds.push_back({home, POLLIN, 0});
+        fds.push_back({seed, POLLIN, 0});
+      }
+      if (::poll(fds.data(), fds.size(), 50) <= 0) continue;
+      const std::size_t polled = (fds.size() - 1) / 2;  // pairs accepted below were not in this poll
+      if (fds[0].revents & POLLIN) {
+        const int home = ::accept(listen_fd_, nullptr, nullptr);
+        if (home >= 0) {
+          const int seed = ::socket(AF_INET, SOCK_STREAM, 0);
+          sockaddr_in to{};
+          to.sin_family = AF_INET;
+          to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+          to.sin_port = htons(target_port_);
+          if (seed >= 0 && ::connect(seed, reinterpret_cast<sockaddr*>(&to), sizeof(to)) == 0) {
+            pairs_.emplace_back(home, seed);
+            ++accepted_;
+          } else {
+            if (seed >= 0) ::close(seed);
+            ::close(home);
+          }
+        }
+      }
+      std::vector<std::pair<int, int>> keep;
+      for (std::size_t i = polled; i < pairs_.size(); ++i) keep.push_back(pairs_[i]);
+      for (std::size_t i = 0; i < polled; ++i) {
+        const auto& home_ev = fds[1 + 2 * i];
+        const auto& seed_ev = fds[2 + 2 * i];
+        bool ok = true;
+        if (home_ev.revents & (POLLIN | POLLHUP | POLLERR)) ok = pump(pairs_[i].first, pairs_[i].second);
+        if (ok && (seed_ev.revents & (POLLIN | POLLHUP | POLLERR))) ok = pump(pairs_[i].second, pairs_[i].first);
+        if (ok) {
+          keep.push_back(pairs_[i]);
+        } else {
+          ::close(pairs_[i].first);
+          ::close(pairs_[i].second);
+        }
+      }
+      pairs_.swap(keep);
+    }
+  }
+
+  std::uint16_t target_port_;
+  std::uint16_t port_{0};
+  int listen_fd_{-1};
+  std::atomic<bool> running_{false};
+  std::atomic<bool> cut_requested_{false};
+  std::atomic<std::size_t> cuts_done_{0};
+  std::atomic<std::size_t> accepted_{0};
+  std::thread thread_;
+  std::vector<std::pair<int, int>> pairs_;  // (home side, seed side); touched by the relay thread only
+  std::vector<int> stale_;
+};
+
+}  // namespace
+
+// A home node (outbound-only: no --listen, behind a router whose public IP changes) must survive IP
+// changes: its connection to the seed dies with a reset while the seed keeps a silent half-open
+// connection to the old address. The node must dial the seed again on its own, be accepted next to
+// the stale connection, and keep following the chain, every time the IP changes.
+TEST(test_outbound_only_node_reconnects_after_home_ip_change) {
+  if (!can_open_loopback_listener_for_test()) return;
+  const std::string base = unique_test_base("/tmp/finalis_it_home_ip_change");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 1));
+
+  const auto make_cfg = [&](int id) {
+    node::NodeConfig cfg;
+    cfg.allow_unencrypted_keystore = true;
+    cfg.node_id = id;
+    cfg.dns_seeds = false;
+    cfg.network.default_seeds.clear();
+    cfg.db_path = base + "/node" + std::to_string(id);
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.network.min_block_interval_ms = 100;
+    cfg.network.round_timeout_ms = 200;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
+    keystore::ValidatorKey key;
+    std::string kerr;
+    if (!keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                             deterministic_seed_for_node_id(id), &key, &kerr)) {
+      throw std::runtime_error("keystore: " + kerr);
+    }
+    return cfg;
+  };
+
+  node::NodeConfig seed_cfg = make_cfg(0);  // the only validator, publicly reachable
+  seed_cfg.p2p_port = reserve_test_port();
+  if (seed_cfg.p2p_port == 0) return;
+  node::Node seed(seed_cfg);
+  if (!seed.init()) return;
+  seed.start();
+
+  HomeRouterRelay router(seed_cfg.p2p_port);
+  ASSERT_TRUE(router.start());
+
+  node::NodeConfig home_cfg = make_cfg(1);
+  home_cfg.listen = false;  // outbound-only, like PUBLIC_NODE=0 behind CGNAT
+  home_cfg.p2p_port = reserve_test_port();
+  home_cfg.peers.push_back("127.0.0.1:" + std::to_string(router.port()));
+  home_cfg.outbound_target = 1;
+  node::Node home(home_cfg);
+  if (!home.init()) {
+    seed.stop();
+    return;
+  }
+  home.start();
+
+  const auto in_step = [&](std::uint64_t min_height) {
+    const auto s0 = seed.status();
+    const auto s1 = home.status();
+    return s1.established_peers >= 1 && s1.height >= min_height && s0.height == s1.height &&
+           s0.transition_hash == s1.transition_hash;
+  };
+  ASSERT_TRUE(wait_for([&]() { return in_step(5); }, ci_timeout_seconds(60)));
+
+  for (int change = 1; change <= 2; ++change) {
+    const auto accepted_before = router.connections_accepted();
+    const auto cuts_before = router.cuts_done();
+    router.cut();
+    ASSERT_TRUE(wait_for([&]() { return router.cuts_done() > cuts_before; }, std::chrono::seconds(5)));
+    const auto cut_at = std::chrono::steady_clock::now();
+    const std::uint64_t height_at_cut = seed.status().height;
+
+    // The node dials again by itself and the seed lets it in next to the stale connection.
+    ASSERT_TRUE(wait_for([&]() { return router.connections_accepted() > accepted_before && home.status().established_peers >= 1; },
+                         ci_timeout_seconds(30)));
+    const auto reconnect_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cut_at).count();
+    std::cout << "home-ip-change " << change << " reconnect_ms=" << reconnect_ms << "\n";
+
+    // And it keeps following the chain.
+    ASSERT_TRUE(wait_for([&]() { return in_step(height_at_cut + 3); }, ci_timeout_seconds(60)));
+  }
+
+  home.stop();
+  router.stop();
+  seed.stop();
 }
 #endif

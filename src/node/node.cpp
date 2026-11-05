@@ -109,6 +109,14 @@ bool log_timestamps_enabled() {
   return enabled;
 }
 
+bool trace_logs_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("FINALIS_LOG_TRACE");
+    return v && std::string_view(v) == "1";
+  }();
+  return enabled;
+}
+
 bool runtime_logs_enabled() {
   if (debug_economics_logs_enabled() || debug_finality_logs_enabled()) return true;
   const char* quiet = std::getenv("FINALIS_TEST_QUIET_LOGS");
@@ -404,14 +412,21 @@ bool Node::init() {
     p2p_.set_on_event([this](int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
       on_peer_event(peer_id, type, detail);
     });
-    if (cfg_.listen) {
-      if (!p2p_.start_listener(cfg_.bind_ip, cfg_.p2p_port)) {
+    // An outbound-only node with a bundled lightserver still listens on loopback: the lightserver
+    // relays broadcast_tx over P2P to 127.0.0.1:p2p_port, and without a listener every send fails.
+    const bool loopback_relay_listener = !cfg_.listen && cfg_.lightserver_mode != LightserverLaunchMode::Disabled;
+    if (cfg_.listen || loopback_relay_listener) {
+      const std::string listen_ip = cfg_.listen ? cfg_.bind_ip : std::string("127.0.0.1");
+      if (!p2p_.start_listener(listen_ip, cfg_.p2p_port)) {
         const int err = errno;
-        std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << " errno=" << err
+        std::cerr << "listener start failed " << listen_ip << ":" << cfg_.p2p_port << " errno=" << err
                   << " err=\"" << std::strerror(err) << "\"\n";
         return false;
       }
       cfg_.p2p_port = p2p_.listener_port();
+      if (loopback_relay_listener) {
+        log_line("p2p listener loopback-only for lightserver relay " + listen_ip + ":" + std::to_string(cfg_.p2p_port));
+      }
     }
     try_connect_bootstrap_peers();
   }
@@ -650,8 +665,8 @@ bool Node::start_lightserver_child() {
     return false;
   }
   log_line("lightserver startup success mode=" + mode + " pid=" + std::to_string(pid));
-  if (!cfg_.listen || cfg_.disable_p2p) {
-    log_line("lightserver note: node listener is disabled; read RPC works, but tx relay to the node may fail");
+  if (cfg_.disable_p2p) {
+    log_line("lightserver note: p2p is disabled; read RPC works, but tx relay to the node will fail");
   }
   return true;
 #endif
@@ -1219,7 +1234,6 @@ void Node::event_loop() {
       // Activation and exit happen at runtime: a validator that joins while running certifies ingress
       // from its activation height, without a restart.
       is_validator_ = validators_.is_active_for_height(local_key_.public_key, h);
-      const std::uint32_t cv = kFixedValidationRulesVersion;
       mempool_.set_validation_context(special_validation_context_locked(h));
       const std::uint64_t now_ms = this->now_ms();
       const std::uint64_t now_unix_ms = now_unix() * 1000;
@@ -1449,7 +1463,7 @@ void Node::event_loop() {
           if (i) coss << ",";
           coss << short_pub_hex(committee[i]);
         }
-        log_line(coss.str());
+        log_trace(coss.str());
         if (cfg_.log_json) {
           std::ostringstream j;
           j << "{\"type\":\"status\",\"network\":\"" << cfg_.network.name << "\",\"height\":" << finalized_height_
@@ -1961,6 +1975,10 @@ std::uint64_t Node::now_unix() const {
 std::uint64_t Node::now_ms() const {
   using namespace std::chrono;
   return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void Node::log_trace(const std::string& s) const {
+  if (trace_logs_enabled()) log_line(s);
 }
 
 void Node::log_line(const std::string& s) const {

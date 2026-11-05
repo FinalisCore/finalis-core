@@ -28,12 +28,6 @@ TEST(test_reward_schedule_boundaries) {
   ASSERT_EQ(reward_units(EMISSION_BLOCKS), 0ULL);
 }
 
-TEST(test_reward_after_emission_before_fork_preserves_zero_reward) {
-  using namespace finalis::consensus;
-  ASSERT_EQ(reward_units(EMISSION_BLOCKS), 0ULL);
-  ASSERT_EQ(reward_units(EMISSION_BLOCKS + 99), 0ULL);
-}
-
 TEST(test_reward_after_emission_remains_zero) {
   using namespace finalis::consensus;
   ASSERT_EQ(reward_units(EMISSION_BLOCKS), 0ULL);
@@ -269,22 +263,14 @@ TEST(test_validator_min_bond_follows_validators_and_supply) {
   ASSERT_TRUE(validator_min_bond_units(net, 6 * BLOCKS_PER_YEAR_365, 64) > validator_min_bond_units(net, h, 64));
 }
 
-TEST(test_payout_after_emission_before_fork_is_fees_only) {
-  using namespace finalis::consensus;
-  const std::uint64_t fees = 12345;
-  // CLEANSLATE: Payouts derive solely from the genesis-active monetary policy.
-  const auto p = compute_payout(EMISSION_BLOCKS, fees, pub(0x01), {pub(0x02), pub(0x03)});
-  ASSERT_EQ(p.total, fees);
-  std::uint64_t sum = p.leader;
-  for (const auto& it : p.signers) sum += it.second;
-  ASSERT_EQ(sum, fees);
-}
-
 TEST(test_payout_after_emission_is_fees_only) {
   using namespace finalis::consensus;
   const std::uint64_t fees = 12345;
   const auto p = compute_payout(EMISSION_BLOCKS, fees, pub(0x01), {pub(0x02), pub(0x03)});
   ASSERT_EQ(p.total, fees);
+  std::uint64_t sum = p.leader;
+  for (const auto& it : p.signers) sum += it.second;
+  ASSERT_EQ(sum, fees);
 }
 
 TEST(test_payout_collapses_leader_signer_share_into_leader_output) {

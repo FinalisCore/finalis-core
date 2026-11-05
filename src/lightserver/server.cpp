@@ -1255,7 +1255,11 @@ std::string validation_error_message(const std::string& err) {
 
 // The node's mempool reject reason (TX_RESULT) as a broadcast error code.
 std::string node_reject_error_code(const std::string& reason) {
-  if (reason == "verify rate limited" || reason == "node not running") return "relay_unavailable";
+  // Temporary node-side refusals: the tx itself may be valid, so the client retries later.
+  if (reason == "verify rate limited" || reason == "node not running" || reason == "timed verify rate limited" ||
+      reason == "timed pool full" || reason == "no canonical state") {
+    return "relay_unavailable";
+  }
   if (reason == "double spend in mempool") return "tx_conflict_in_mempool";
   if (reason == "fee below min relay fee") return "tx_fee_below_min_relay";
   if (reason == mempool::kMempoolFullNotGoodEnough) return "mempool_full_not_good_enough";
