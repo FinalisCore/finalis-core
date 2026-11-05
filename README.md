@@ -20,6 +20,7 @@
 </p>
 
 <p align="center">
+  <a href="https://www.finaliscore.org"><b>Website</b></a> ·
   <a href="docs/WHAT_IS_FINALIS.md"><b>What is Finalis?</b></a> ·
   <a href="testnet/JOIN.md"><b>Run a node</b></a> ·
   <a href="https://finalis.self-link.com"><b>Live explorer</b></a> ·
@@ -87,8 +88,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and the
 
 ## Official Channels
 
-GitHub (this repo), [Discord](https://discord.gg/8rKfKc7QR9), the
-[explorer](https://finalis.self-link.com) and X (`<X_HANDLE>`). Nothing else is official.
+The [website](https://www.finaliscore.org), GitHub (this repo), [Discord](https://discord.gg/8rKfKc7QR9), the
+[explorer](https://finalis.self-link.com) and [X](https://x.com/finalis_core). Nothing else is official.
 
 **There is no official Telegram, token sale, presale, airdrop, whitelist or "team wallet".** Nobody can
 sell you FLS before mainnet, and nobody from Finalis will ask for coins, keys or a seed phrase. If

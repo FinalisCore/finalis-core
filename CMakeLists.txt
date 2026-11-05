@@ -660,7 +660,7 @@ if(FINALIS_GENERATE_NGINX_CONFIG)
   set(FINALIS_NGINX_RPC_SERVER_NAME "rpc.example.com" CACHE STRING "Public hostname for lightserver HTTPS RPC endpoint.")
   set(FINALIS_NGINX_EXPLORER_UPSTREAM "127.0.0.1:18080" CACHE STRING "Explorer upstream host:port.")
   set(FINALIS_NGINX_RPC_UPSTREAM "127.0.0.1:19444" CACHE STRING "Lightserver RPC upstream host:port.")
-  set(FINALIS_NGINX_CORS_ORIGIN "https://finalis-core.github.io" CACHE STRING "Allowed CORS origin for explorer /api.")
+  set(FINALIS_NGINX_CORS_ORIGIN "https://www.finaliscore.org" CACHE STRING "Allowed CORS origin for explorer /api.")
   set(FINALIS_NGINX_RPC_ALLOWLIST "127.0.0.1" CACHE STRING "Semicolon-delimited allowlist IPs for /rpc.")
 
   string(REPLACE ";" "\n        allow " FINALIS_NGINX_RPC_ALLOW_RULES "${FINALIS_NGINX_RPC_ALLOWLIST}")

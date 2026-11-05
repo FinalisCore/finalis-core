@@ -79,6 +79,7 @@ Watch it live on the [explorer](https://finalis.self-link.com).
 
 Finalis is only these:
 
+- **Website:** https://www.finaliscore.org
 - **Code and releases:** https://github.com/FinalisCore/finalis-core
 - **Chat:** Discord, https://discord.gg/8rKfKc7QR9
 - **Explorer:** https://finalis.self-link.com
