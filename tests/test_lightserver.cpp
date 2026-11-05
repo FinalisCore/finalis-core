@@ -427,11 +427,13 @@ TEST(test_lightserver_exposes_finality_certificate_endpoint) {
   const std::string base = unique_test_base("/tmp/finalis_light_cert_rpc");
   auto cluster = make_cluster(base);
   ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 6; }, kClusterFinalizationTimeout));
-  const auto tip = cluster.nodes[0]->status();
 
   for (auto& n : cluster.nodes) {
     if (n) n->stop();
   }
+  // Read the tip only after every node has stopped: the cluster keeps finalizing
+  // until stop(), and the tip-default query below returns the DB tip.
+  const auto tip = cluster.nodes[0]->status();
   cluster.nodes.clear();
 
   lightserver::Config lcfg;
