@@ -14630,6 +14630,7 @@ class HomeRouterRelay {
         fds.push_back({seed, POLLIN, 0});
       }
       if (::poll(fds.data(), fds.size(), 50) <= 0) continue;
+      const std::size_t polled = (fds.size() - 1) / 2;  // pairs accepted below were not in this poll
       if (fds[0].revents & POLLIN) {
         const int home = ::accept(listen_fd_, nullptr, nullptr);
         if (home >= 0) {
@@ -14648,7 +14649,8 @@ class HomeRouterRelay {
         }
       }
       std::vector<std::pair<int, int>> keep;
-      for (std::size_t i = 0; i < pairs_.size(); ++i) {
+      for (std::size_t i = polled; i < pairs_.size(); ++i) keep.push_back(pairs_[i]);
+      for (std::size_t i = 0; i < polled; ++i) {
         const auto& home_ev = fds[1 + 2 * i];
         const auto& seed_ev = fds[2 + 2 * i];
         bool ok = true;
