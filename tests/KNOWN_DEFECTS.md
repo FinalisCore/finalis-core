@@ -20,9 +20,15 @@ the run summary ("OPEN DEFECTS REPRODUCED"), not a gate.
 Tests tagged `isolate` inject storage faults and run in a child process (`finalis-tests --run NAME`), so
 an abort inside librocksdb (E1 below) fails that one test with its signal instead of ending the run.
 
+## Open (2026-11-06)
+
+| Id | Defect | Tests (`tests/test_integration.cpp`) |
+|---|---|---|
+| C1 | A lane's designated ingress certifier (`consensus::designated_ingress_certifier`, one committee member per lane per epoch) that is offline or unreachable holds its lane for the rest of the epoch. Nobody else may certify it, so every transaction in that lane, of any type, waits in the mempools until the epoch ends (testnet: 32 blocks, ~1.6 h). A time lock must be included in its epoch, so it is dropped. The header treats one epoch as the bound for a censoring certifier; that is too long for an offline one. Live on testnet-3 2026-11-06 (epoch 3840-3871): validator 061ca02d (behind NAT, never proposes) held lanes 0 and 2; .114 logged ~6,950 `tx-forward-designated-unreachable lane=0\|2 designated=061ca02d` and `tx-reforward-uncertified pending=9`. 9 transactions (std, hlock, inherit, unshield, sweeps) became final only at h=3873, after the epoch change. 3 of 9 time locks from `finalis-nodetest` were lost. No coins were lost. Not fixed on purpose before the 13-validator `finalis-nodetest` window, which measures it. | `test_tx_final_within_epoch_when_designated_certifier_offline` (`known-defect`: 4 validators, certifier stopped, the other three keep finalizing, the transaction is not final within 10 blocks with 30+ left in the 64-block epoch). Control, gating: `test_tx_final_within_epoch_when_designated_certifier_online` |
+
 ## Status (2026-10-28)
 
-No open defects. L1, L2, X1, X2 (2026-11-04, lightserver and explorer, none consensus) are fixed too. Every row below is fixed and its tests are in the gating suite (tags
+No open defects other than C1 above. L1, L2, X1, X2 (2026-11-04, lightserver and explorer, none consensus) are fixed too. Every row below is fixed and its tests are in the gating suite (tags
 `known-defect` dropped; the `finalis-known-defects` ctest entry and `fuzz/replay_known_defects.sh` stay
 for the next finding). Fixes: D1-D6 P1, fail-stop P2, D7 P3, R1 P4, E1/E2 P5, G1/G2 P6, H1 P7
 (`docs/reports/CONSENSUS_PERSISTENCE_REMEDIATION_DESIGN.md`). The fuzz reproducers under

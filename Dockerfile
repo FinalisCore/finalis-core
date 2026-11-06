@@ -32,7 +32,7 @@ RUN cmake -S . -B build -G Ninja \
       -DFINALIS_BUILD_FUZZ=OFF \
       -DFINALIS_BUILD_NGINX=OFF \
       -DFINALIS_GENERATE_NGINX_CONFIG=OFF \
-    && cmake --build build --target finalis-node finalis-lightserver finalis-cli finalis-explorer -j"$(nproc)"
+    && cmake --build build --target finalis-node finalis-lightserver finalis-cli finalis-explorer finalis-nodetest -j"$(nproc)"
 
 # ---- Stage 2: portable Linux tarball payload ----------------------------------
 # Binaries plus every shared library they load except glibc, found through an
@@ -41,7 +41,7 @@ RUN cmake -S . -B build -G Ninja \
 # `docker buildx build --target dist --output type=local,dest=...`.
 FROM builder AS dist-stage
 RUN set -eu; d=/dist; mkdir -p "$d/bin" "$d/lib" "$d/testnet" "$d/packaging"; \
-    for b in finalis-node finalis-lightserver finalis-cli finalis-explorer; do \
+    for b in finalis-node finalis-lightserver finalis-cli finalis-explorer finalis-nodetest; do \
       cp "build/$b" "$d/bin/"; strip "$d/bin/$b"; \
       ldd "build/$b" | awk '/=> \//{print $3}'; \
     done | sort -u | grep -vE '/(libc|libm|libdl|libpthread|librt|libresolv|ld-linux[^/]*)\.so' \
@@ -75,6 +75,8 @@ COPY --from=builder /src/build/finalis-cli  /opt/finalis-core/bin/finalis-cli
 # --with-lightserver execs this as a sibling of finalis-node.
 COPY --from=builder /src/build/finalis-lightserver /opt/finalis-core/bin/finalis-lightserver
 COPY --from=builder /src/build/finalis-explorer /opt/finalis-core/bin/finalis-explorer
+# Testnet traffic tool (refuses mainnet); apps/finalis-nodetest/README.md.
+COPY --from=builder /src/build/finalis-nodetest /opt/finalis-core/bin/finalis-nodetest
 COPY --from=builder /src/mainnet/SEEDS.json  /opt/finalis-core/mainnet/SEEDS.json
 
 ENV PATH="/opt/finalis-core/bin:${PATH}" \

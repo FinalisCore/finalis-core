@@ -40,8 +40,10 @@ build_targets=(
   finalis-cli
   finalis-lightserver
   finalis-explorer
+  finalis-nodetest
   finalis-wallet
 )
+# cmake --install installs every target with an install() rule: each one must be in this list.
 cmake --build "$BUILD_DIR" --target "${build_targets[@]}" -j1
 cmake --install "$BUILD_DIR" --prefix "$STAGE_DIR"
 

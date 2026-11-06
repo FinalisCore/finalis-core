@@ -6104,6 +6104,103 @@ TEST(test_tx_forward_relays_via_validators_when_certifier_unreachable) {
                        ci_timeout_seconds(30)));
 }
 
+// KNOWN DEFECT C1 (tests/KNOWN_DEFECTS.md). 4 validators, real P2P; the lane's designated certifier
+// is offline (live: 061ca02d on testnet-3, unreachable behind NAT, 2026-11-06). The other three keep
+// finalizing blocks, but nobody else may certify that lane, so a transaction in it waits for the
+// epoch to end (a time lock, which must be included in its epoch, is lost). Required: it is final
+// within a few blocks while most of the epoch is left.
+// Runs the scenario; true if the transaction was final within kFinalWithinBlocks of its send.
+static bool certifier_scenario_tx_final_in_time(bool certifier_offline) {
+  constexpr std::uint64_t kEpochBlocks = 64;
+  constexpr std::uint64_t kFinalWithinBlocks = 10;
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_certifier_offline"), 4, 4, MAX_COMMITTEE,
+                              [](node::NodeConfig& cfg) { cfg.network.committee_epoch_blocks = kEpochBlocks; });
+  auto& nodes = cluster.nodes;
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 3) return false;
+    }
+    funded = find_funded_test_wallet(*nodes[0], keys, 1'000'000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+
+  // Start early in an epoch, so a fix cannot be mistaken for the epoch change.
+  std::uint64_t next_height = 0;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    for (auto& n : nodes) n->pause_proposals_for_test(true);
+    ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
+    next_height = nodes[0]->status().height + 1;
+    const std::uint64_t epoch_end = consensus::committee_epoch_start(next_height, kEpochBlocks) + kEpochBlocks - 1;
+    if (epoch_end - next_height >= 3 * kFinalWithinBlocks) break;
+    for (auto& n : nodes) n->pause_proposals_for_test(false);
+    ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height > epoch_end; }, ci_timeout_seconds(120)));
+    next_height = 0;
+  }
+  ASSERT_TRUE(next_height != 0);
+  funded = find_funded_test_wallet(*nodes[0], keys, 1'000'000, 1);
+  ASSERT_TRUE(funded.has_value());
+
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  std::array<std::uint8_t, 20> recipient_pkh{};
+  recipient_pkh.fill(0xC1);
+  const auto& prev = funded->utxos.front();
+  std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(recipient_pkh)},
+                             TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
+  std::string err;
+  const auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), prev.first, prev.second,
+                                                     Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
+  ASSERT_TRUE(tx.has_value());
+
+  const auto committee = nodes[0]->committee_for_height_round_for_test(next_height, 0);
+  const auto certifier_pub = consensus::designated_ingress_certifier(
+      committee, consensus::assign_ingress_lane(AnyTx{*tx}), consensus::committee_epoch_start(next_height, kEpochBlocks));
+  int certifier = -1;
+  for (int i = 0; i < 4; ++i) {
+    if (nodes[i]->local_validator_pubkey_for_test() == certifier_pub) certifier = i;
+  }
+  ASSERT_TRUE(certifier >= 0);
+  const int submitter = (certifier + 1) % 4;
+
+  // The certifier goes offline; the other three (a quorum of 4) resume and receive the transaction.
+  if (certifier_offline) {
+    nodes[certifier]->stop();
+    nodes[certifier].reset();
+  }
+  std::vector<node::Node*> live;
+  for (auto& n : nodes)
+    if (n) live.push_back(n.get());
+  for (auto* n : live) n->pause_proposals_for_test(false);
+  ASSERT_TRUE(nodes[submitter]->inject_tx_for_test(*tx, true));
+
+  // The chain keeps going without the certifier (liveness of blocks is not the defect).
+  ASSERT_TRUE(wait_for([&]() { return live[0]->status().height >= next_height + 2; }, ci_timeout_seconds(120)));
+
+  const std::uint64_t deadline = next_height + kFinalWithinBlocks;
+  bool final_in_time = false;
+  ASSERT_TRUE(wait_for([&]() {
+    if (!live[0]->find_utxos_by_pubkey_hash_for_test(recipient_pkh).empty()) {
+      final_in_time = live[0]->status().height <= deadline + 1;  // seen within a poll of the deadline
+      return true;
+    }
+    return live[0]->status().height > deadline;
+  }, ci_timeout_seconds(180)));
+  return final_in_time;
+}
+
+TEST(test_tx_final_within_epoch_when_designated_certifier_offline) {
+  ASSERT_TRUE(certifier_scenario_tx_final_in_time(true));
+}
+TEST_TAGS(test_tx_final_within_epoch_when_designated_certifier_offline, "known-defect");
+
+// Control for C1: the same scenario with the certifier online meets the same bound.
+TEST(test_tx_final_within_epoch_when_designated_certifier_online) {
+  ASSERT_TRUE(certifier_scenario_tx_final_in_time(false));
+}
+
 TEST(test_tx_status_reports_certified_ingress_before_finalization) {
   const std::string base = unique_test_base("/tmp/finalis_it_tx_status_certified_ingress");
 
