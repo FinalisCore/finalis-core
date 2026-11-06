@@ -423,6 +423,22 @@ if(FINALIS_SANITIZE)
   endforeach()
 endif()
 
+# Testnet traffic tool for validators (own throwaway wallet; refuses mainnet). apps/finalis-nodetest/README.md
+add_executable(finalis-nodetest
+  apps/finalis-nodetest/main.cpp
+  apps/finalis-nodetest/nodetest_core.cpp
+  apps/finalis-wallet/confidential_memo.cpp
+)
+target_include_directories(finalis-nodetest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(finalis-nodetest PRIVATE finalis_core)
+if(FINALIS_SANITIZE)
+  target_compile_options(finalis-nodetest PRIVATE ${SC_SAN_FLAGS})
+  target_link_options(finalis-nodetest PRIVATE -fsanitize=${SC_SAN_KINDS})
+endif()
+install(TARGETS finalis-nodetest
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
 add_executable(finalis-explorer apps/finalis-explorer/main.cpp)
 target_link_libraries(finalis-explorer PRIVATE finalis_core)
 if(FINALIS_SANITIZE)
@@ -534,6 +550,7 @@ if(WIN32 AND CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
 endif()
 
 add_executable(finalis-tests
+  apps/finalis-nodetest/nodetest_core.cpp
   apps/finalis-wallet/history_merge.cpp
   apps/finalis-wallet/refresh_gate.cpp
   apps/finalis-wallet/wallet_network.cpp
@@ -591,6 +608,7 @@ add_executable(finalis-tests
   tests/support/storage_fault_injection.cpp
   tests/test_lightserver.cpp
   tests/test_explorer.cpp
+  tests/test_nodetest.cpp
 )
 target_link_libraries(finalis-tests PRIVATE finalis_core)
 target_include_directories(finalis-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -5,7 +5,7 @@ This document helps contributors quickly identify where to read and where to add
 ## Top-Level Areas
 
 - `src/`: Core C++ implementation for consensus, node runtime, storage, mempool, crypto, wallet primitives, and supporting subsystems.
-- `apps/`: End-user applications and binaries (`finalis-node`, `finalis-lightserver`, `finalis-explorer`, `finalis-wallet`, `finalis-cli`).
+- `apps/`: End-user applications and binaries (`finalis-node`, `finalis-lightserver`, `finalis-explorer`, `finalis-wallet`, `finalis-cli`, `finalis-nodetest`: testnet traffic tool, see `apps/finalis-nodetest/README.md`).
 - `services/`: Service-oriented components and operational services.
 - `docs/`: Protocol and operational documentation.
 - `tests/`: Unit, integration, fixture, and conformance tests.
