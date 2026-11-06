@@ -134,6 +134,7 @@ $seedBinaries = @(
     (Join-Path $binDir "finalis-lightserver.exe"),
     (Join-Path $binDir "finalis-explorer.exe"),
     (Join-Path $binDir "finalis-cli.exe"),
+    (Join-Path $binDir "finalis-nodetest.exe"),
     (Join-Path $binDir "finalis-wallet.exe")
 ) | Where-Object { Test-Path $_ }
 
