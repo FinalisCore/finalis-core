@@ -281,6 +281,25 @@ class Runner {
         }
       }
     }
+    // Coins the file still calls unspent but the chain no longer has: spent by a transaction this
+    // wallet lost track of (e.g. a sweep finalized after its process ended).
+    std::vector<OutPoint> ask;
+    for (const auto& c : w_.conf)
+      if (c.origin_final && !c.spent && c.spend_txid == Hash32{}) ask.push_back(c.op);
+    for (std::size_t i = 0; i < ask.size(); i += 32) {
+      const std::vector<OutPoint> chunk(ask.begin() + i, ask.begin() + std::min(ask.size(), i + 32));
+      std::string err;
+      auto proofs = ls::rpc_get_utxo_proofs(opt_.rpc, chunk, &err);
+      if (!proofs) break;
+      for (const auto& p : proofs->proofs) {
+        if (p.value) continue;
+        for (auto& c : w_.conf)
+          if (same_op(c.op, p.outpoint) && !c.spent) {
+            c.spent = true;
+            changed = true;
+          }
+      }
+    }
     if (changed) save();
   }
 
