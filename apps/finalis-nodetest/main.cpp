@@ -52,6 +52,10 @@ constexpr std::uint64_t kMinFundingUnits = consensus::BASE_UNITS_PER_COIN;  // 1
 
 bool same_op(const OutPoint& a, const OutPoint& b) { return a.txid == b.txid && a.index == b.index; }
 
+std::int64_t unix_now() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -259,12 +263,21 @@ class Runner {
       }
       if (c.spend_txid != Hash32{}) {
         auto s = ls::rpc_get_tx_status(opt_.rpc, c.spend_txid, &err);
-        if (s) {
-          if (s->finalized) c.spent = true;
-          if (s->finalized || inflight_.count(c.spend_txid) == 0) {
-            c.spend_txid = Hash32{};
-            changed = true;
-          }
+        if (s && s->finalized) {
+          c.spent = true;
+          c.spend_txid = Hash32{};
+          changed = true;
+        } else if (inflight_.count(c.spend_txid) == 0) {
+          // Sent by an earlier process and maybe still in a mempool: track it like our own, so the coin
+          // is not spent twice; it comes free if the spend is not final within kExpireBlocks.
+          InFlight f;
+          f.txid = c.spend_txid;
+          f.type = "resumed";
+          f.sent_at = now_s();
+          f.sent_tip = tip_;
+          f.expire_after_height = tip_ + kExpireBlocks;
+          f.conf_spent = {c.op};
+          inflight_[c.spend_txid] = std::move(f);
         }
       }
     }
@@ -590,7 +603,8 @@ class Runner {
     b.key = k;
     b.bytes = tt->serialize();
     b.txid = tt->txid();
-    b.expire_after = std::min(terms->last_inclusion_height, tip_ + kExpireBlocks) + 2;
+    // Past its last inclusion height it can never be included: give it up then.
+    b.expire_after = std::min(terms->last_inclusion_height, tip_ + kExpireBlocks);
     b.inputs = {plan->fee_coin};
     for (const auto& c : plan->body.selected_prevs) b.body_inputs.push_back(c.first);
     b.body_release = unlock + 2;
@@ -727,7 +741,7 @@ class Runner {
         const double secs = now_s() - f.sent_at;
         log("final\t" + f.type + "\t" + hex_encode32(txid) + "\theight=" + std::to_string(s->height) +
             "\tseconds=" + std::to_string(static_cast<long long>(secs)));
-        if (f.type != "split" && f.type != "sweep") {
+        if (f.type != "split" && f.type != "sweep" && f.type != "resumed") {
           sum_.finals[f.type]++;
           sum_.finality_seconds.push_back(secs);
         }
@@ -746,7 +760,7 @@ class Runner {
         done.push_back(txid);
       } else if (tip_ > f.expire_after_height) {
         log("expired\t" + f.type + "\t" + hex_encode32(txid) + "\tnot final by height " + std::to_string(f.expire_after_height));
-        if (f.type != "split" && f.type != "sweep") sum_.expired[f.type]++;
+        if (f.type != "split" && f.type != "sweep" && f.type != "resumed") sum_.expired[f.type]++;
         for (const auto& op : f.inputs) reserved_.erase(op);
         for (auto& c : w_.conf)
           for (const auto& op : f.conf_spent)
@@ -818,10 +832,36 @@ class Runner {
                 << "coins to\n\n    " << w_.keys[0].address << "\n\nwait until the payment is final, then run again.\n";
       return 3;
     }
+    if (opt_.start_at_unix) {
+      switch (start_decision(unix_now(), *opt_.start_at_unix, opt_.allow_late)) {
+        case StartDecision::TooFar:
+          return fail("--start-at " + format_utc_time(*opt_.start_at_unix) + " is more than 14 days ahead; check the date");
+        case StartDecision::TooLate:
+          std::cerr << "finalis-nodetest: the shared test window started at " << format_utc_time(*opt_.start_at_unix)
+                    << ", more than 10 minutes ago. Not starting alone (--allow-late to start anyway).\n";
+          return 4;
+        case StartDecision::Wait:
+        case StartDecision::Start:
+          break;
+      }
+    }
     std::cout << "finalis-nodetest on " << opt_.rpc << ": " << opt_.rate << " tx/s for " << opt_.duration_seconds
               << " s, " << opt_.types.size() << " types, " << peers_.size() << " peers, funds " << fls(funds)
               << " FLS. Ctrl-C or touch " << (std::filesystem::path(opt_.dir) / "STOP").string() << " to stop.\n";
+    // A fresh wallet holds one or two coins: split them and wait until the work coins are final, so the
+    // run does not start with empty slots.
     maybe_split();
+    const double setup_end = now_s() + 900;
+    if (split_in_flight_) std::cout << "waiting for the setup split to be final (one or two blocks)...\n";
+    while (split_in_flight_ && !stop_requested() && now_s() < setup_end) {
+      for (int i = 0; i < 50 && !stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      if (refresh_status()) poll_inflight();
+    }
+    if (opt_.start_at_unix && !wait_for_start_time()) {
+      std::cout << "Stopped before the start; no test transactions were sent.\n";
+      return 0;
+    }
+    refresh_coins();
     log("start\trate=" + std::to_string(opt_.rate) + "\tduration=" + std::to_string(opt_.duration_seconds) +
         "\tpeers=" + std::to_string(peers_.size()) + "\ttip=" + std::to_string(tip_));
     const double start = now_s();
@@ -869,6 +909,43 @@ class Runner {
     return finish(true);
   }
 
+  // --start-at: counts down to the shared start (plus a few random seconds), then waits until the node
+  // passes the preflight again. False if stopped first, or if the node is not ready within the late
+  // cut-off after the start.
+  bool wait_for_start_time() {
+    const std::int64_t start = *opt_.start_at_unix;
+    const std::int64_t go = start + std::uniform_int_distribution<std::int64_t>(0, kStartJitterSeconds)(rng_);
+    std::cout << "Shared start at " << format_utc_time(start) << " (this node starts at " << format_utc_time(go)
+              << "). Leave this running; Ctrl-C or STOP cancels.\n";
+    std::int64_t last_note = 0;
+    while (unix_now() < go) {
+      if (stop_requested()) return false;
+      const std::int64_t left = go - unix_now();
+      const std::int64_t every = left > 3600 ? 1800 : left > 600 ? 300 : 60;
+      if (unix_now() - last_note >= every) {
+        std::cout << "starting in " << left / 3600 << "h " << left % 3600 / 60 << "m " << left % 60 << "s\n" << std::flush;
+        last_note = unix_now();
+      }
+      // Keep the open setup transactions moving while waiting.
+      if (unix_now() % 15 == 0 && refresh_status()) poll_inflight();
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    while (true) {
+      if (stop_requested()) return false;
+      std::string err;
+      auto s = ls::rpc_get_status(opt_.rpc, &err);
+      std::string problem = s ? preflight_problem(*s, opt_.min_peers).value_or("") : "status: " + err;
+      if (s && refuse_network(*s)) throw std::runtime_error("the server changed chains");
+      if (problem.empty()) return true;
+      if (unix_now() - start > kLateStartSeconds && !opt_.allow_late) {
+        log("stop\tnode not ready by " + format_utc_time(start + kLateStartSeconds) + "\t" + problem);
+        return false;
+      }
+      log("wait\tnode not ready\t" + problem);
+      for (int i = 0; i < 75 && !stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
+
   // Waits for open transactions, returns every spendable coin to address #0, prints the summary.
   int finish(bool after_run) {
     if (!after_run) {
@@ -888,37 +965,48 @@ class Runner {
       }
       for (int i = 0; i < 50 && g_stop.load() == stops_at_start; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    refresh_status();
-    refresh_coins();
+    // Sweep rounds: coins of transactions that expire meanwhile come free and go in the next round.
     const Bytes target = w_.keys[0].script;
-    std::vector<ConfCoin> conf;
-    for (const auto i : usable_conf()) conf.push_back(w_.conf[i]);
-    std::uint64_t dust = 0;
-    std::string err;
-    auto sweep = build_sweep(domain_, w_, coins_, conf, target, base_fee_, &dust, &err);
-    if (!err.empty() && sweep.empty()) log("sweep\tbuild failed\t" + err);
-    std::uint64_t moved = 0, fees = 0;
-    for (auto& s : sweep) {
-      Built b;
-      b.type = "sweep";
-      b.txid = s.txid;
-      b.bytes = std::visit([](const auto& t) { return t.serialize(); }, s.tx);
-      b.conf_spent = s.conf_inputs;
-      b.expire_after = tip_ + kExpireBlocks;
-      if (send(b, false)) {
-        moved += s.output_units;
-        fees += s.fee;
-      }
-    }
-    // Wait (bounded) for the sweep itself so the final balance is real.
+    std::uint64_t moved = 0, fees = 0, dust = 0;
+    std::size_t sweep_txs = 0;
     const double sweep_end = now_s() + std::min<double>(static_cast<double>(opt_.drain_seconds), 900);
-    while (!inflight_.empty() && now_s() < sweep_end && g_stop.load() <= stops_at_start + 1) {
-      for (int i = 0; i < 50; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      if (refresh_status()) poll_inflight();
+    for (int round = 0; round < 3; ++round) {
+      refresh_status();
+      refresh_coins();
+      if (round > 0) {  // the previous rounds' outputs are already home: only newly freed coins move
+        auto& home = coins_[0];
+        home.erase(std::remove_if(home.begin(), home.end(), [&](const Coin& c) { return c.second.script_pubkey == target; }),
+                   home.end());
+      }
+      std::vector<ConfCoin> conf;
+      for (const auto i : usable_conf()) conf.push_back(w_.conf[i]);
+      std::string err;
+      auto sweep = build_sweep(domain_, w_, coins_, conf, target, base_fee_, &dust, &err);
+      if (!err.empty() && sweep.empty()) log("sweep\tbuild failed\t" + err);
+      if (sweep.empty()) break;
+      for (auto& s : sweep) {
+        Built b;
+        b.type = "sweep";
+        b.txid = s.txid;
+        b.bytes = std::visit([](const auto& t) { return t.serialize(); }, s.tx);
+        b.conf_spent = s.conf_inputs;
+        b.expire_after = tip_ + kExpireBlocks;
+        if (send(b, false)) {
+          ++sweep_txs;
+          moved += s.output_units;
+          fees += s.fee;
+        }
+      }
+      // Wait (bounded) for the sweep itself so the final balance is real.
+      while (!inflight_.empty() && now_s() < sweep_end && g_stop.load() <= stops_at_start + 1) {
+        for (int i = 0; i < 50; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (refresh_status()) poll_inflight();
+      }
+      if (!inflight_.empty() || now_s() >= sweep_end) break;
     }
     save();
     std::cout << "\n" << sum_.render();
-    std::cout << "sweep: " << sweep.size() << " txs, " << fls(moved) << " FLS to " << w_.keys[0].address << " (fees "
+    std::cout << "sweep: " << sweep_txs << " txs, " << fls(moved) << " FLS to " << w_.keys[0].address << " (fees "
               << fls(fees) << ", left as dust " << fls(dust) << ")\n";
     if (!holds_.empty() || !inflight_.empty()) {
       std::cout << "Some coins are still time-locked or unconfirmed; run `finalis-nodetest sweep` again later.\n";

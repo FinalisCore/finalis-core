@@ -299,3 +299,36 @@ TEST(test_nodetest_summary_percentiles) {
   ASSERT_TRUE(text.find("accepted 3  final 2  rejected 1") != std::string::npos);
   ASSERT_TRUE(text.find("p50 200") != std::string::npos);
 }
+
+// --start-at takes exactly one UTC form, so every participant reads the same instant.
+TEST(test_nodetest_start_at_parses_utc_only) {
+  ASSERT_TRUE(parse_utc_time("2026-11-14T08:00:00Z") == std::optional<std::int64_t>(1794643200));
+  ASSERT_TRUE(parse_utc_time("2028-02-29T23:59:59Z") == std::optional<std::int64_t>(1835481599));  // leap day
+  ASSERT_EQ(format_utc_time(1794643200), std::string("2026-11-14T08:00:00Z"));
+  ASSERT_EQ(format_utc_time(1835481599), std::string("2028-02-29T23:59:59Z"));
+  for (const char* bad : {"2026-11-14T08:00:00", "2026-11-14T08:00:00+02:00", "2026-11-14 08:00:00Z",
+                          "2026-11-14T08:00Z", "2026-02-29T08:00:00Z", "2026-13-01T08:00:00Z", "2026-11-31T08:00:00Z",
+                          "2026-11-14T24:00:00Z", "2026-11-14T08:60:00Z", "2026-11-14T08:00:00.5Z", "tomorrow", ""}) {
+    ASSERT_TRUE(!parse_utc_time(bad).has_value());
+  }
+  std::string err;
+  auto o = parse_options({"--start-at", "2026-11-14T08:00:00Z", "--allow-late"}, &err);
+  ASSERT_TRUE(o.has_value() && o->start_at_unix == std::optional<std::int64_t>(1794643200) && o->allow_late);
+  ASSERT_TRUE(!parse_options({"--start-at", "2026-11-14T08:00:00"}, &err).has_value());
+  ASSERT_TRUE(err.find("UTC") != std::string::npos);
+  ASSERT_TRUE(!parse_options({}, &err)->start_at_unix.has_value());
+}
+
+// Wait before the start, start within the late cut-off, refuse after it (unless --allow-late) and
+// refuse a start more than 14 days ahead.
+TEST(test_nodetest_start_at_decision) {
+  const std::int64_t t = 1794643200;
+  ASSERT_TRUE(start_decision(t - 3600, t, false) == StartDecision::Wait);
+  ASSERT_TRUE(start_decision(t - 1, t, false) == StartDecision::Wait);
+  ASSERT_TRUE(start_decision(t, t, false) == StartDecision::Start);
+  ASSERT_TRUE(start_decision(t + kLateStartSeconds, t, false) == StartDecision::Start);
+  ASSERT_TRUE(start_decision(t + kLateStartSeconds + 1, t, false) == StartDecision::TooLate);
+  ASSERT_TRUE(start_decision(t + kLateStartSeconds + 1, t, true) == StartDecision::Start);
+  ASSERT_TRUE(start_decision(t - kMaxStartAheadSeconds, t, false) == StartDecision::Wait);
+  ASSERT_TRUE(start_decision(t - kMaxStartAheadSeconds - 1, t, false) == StartDecision::TooFar);
+}

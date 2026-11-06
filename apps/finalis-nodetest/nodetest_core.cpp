@@ -166,6 +166,9 @@ std::string usage_text() {
        "                     transparent payments. YOUR COINS THEN END UP PARTLY WITH THEM (and theirs\n"
        "                     with you); the final sweep only returns what this wallet still holds.\n"
        "  --min-peers N      refuse to start with fewer established node peers (default 2)\n"
+       "  --start-at TIME    shared test window: wait, then start at TIME (UTC, e.g. 2026-11-14T08:00:00Z),\n"
+       "                     so every participant starts together; refused more than 10 min late\n"
+       "  --allow-late       start even when more than 10 min after --start-at\n"
        "\n"
        "Safety: testnet only (refuses mainnet and any other chain); uses only its own wallet, never\n"
        "validator keys; stops on Ctrl-C or when a file named STOP appears in --dir; backs off when the\n"
@@ -191,6 +194,10 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
     const std::string& a = args[i];
     if (a == "--help" || a == "-h") {
       o.command = "help";
+      continue;
+    }
+    if (a == "--allow-late") {
+      o.allow_late = true;
       continue;
     }
     if (i + 1 >= args.size()) {
@@ -241,6 +248,13 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
         return std::nullopt;
       }
       o.min_peers = n;
+    } else if (a == "--start-at") {
+      const auto t = parse_utc_time(v);
+      if (!t) {
+        *err = "--start-at must be a UTC time like 2026-11-14T08:00:00Z (got " + v + ")";
+        return std::nullopt;
+      }
+      o.start_at_unix = *t;
     } else if (a == "--types") {
       o.types.clear();
       std::stringstream ss(v);
@@ -262,6 +276,74 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
     }
   }
   return o;
+}
+
+namespace {
+
+// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's days_from_civil).
+std::int64_t days_from_civil(std::int64_t y, unsigned m, unsigned d) {
+  y -= m <= 2 ? 1 : 0;
+  const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const auto yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+
+bool leap(std::int64_t y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+
+}  // namespace
+
+std::optional<std::int64_t> parse_utc_time(const std::string& s) {
+  // YYYY-MM-DDTHH:MM:SSZ
+  if (s.size() != 20 || s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':' || s[19] != 'Z') {
+    return std::nullopt;
+  }
+  const auto num = [&](std::size_t pos, std::size_t len) -> std::optional<unsigned> {
+    unsigned v = 0;
+    for (std::size_t i = pos; i < pos + len; ++i) {
+      if (s[i] < '0' || s[i] > '9') return std::nullopt;
+      v = v * 10 + static_cast<unsigned>(s[i] - '0');
+    }
+    return v;
+  };
+  const auto y = num(0, 4), mo = num(5, 2), d = num(8, 2), h = num(11, 2), mi = num(14, 2), se = num(17, 2);
+  if (!y || !mo || !d || !h || !mi || !se) return std::nullopt;
+  if (*y < 2000 || *mo < 1 || *mo > 12 || *d < 1 || *h > 23 || *mi > 59 || *se > 59) return std::nullopt;
+  static constexpr unsigned kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  const unsigned max_day = kDays[*mo - 1] + (*mo == 2 && leap(*y) ? 1 : 0);
+  if (*d > max_day) return std::nullopt;
+  return days_from_civil(*y, *mo, *d) * 86400 + *h * 3600 + *mi * 60 + *se;
+}
+
+std::string format_utc_time(std::int64_t t) {
+  std::int64_t days = t / 86400;
+  std::int64_t rem = t % 86400;
+  if (rem < 0) {
+    rem += 86400;
+    --days;
+  }
+  // civil_from_days
+  days += 719468;
+  const std::int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+  const auto doe = static_cast<unsigned>(days - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  const unsigned d = doy - (153 * mp + 2) / 5 + 1;
+  const unsigned m = mp < 10 ? mp + 3 : mp - 9;
+  const std::int64_t y = static_cast<std::int64_t>(yoe) + era * 400 + (m <= 2 ? 1 : 0);
+  std::ostringstream o;
+  o << std::setfill('0') << std::setw(4) << y << '-' << std::setw(2) << m << '-' << std::setw(2) << d << 'T' << std::setw(2)
+    << rem / 3600 << ':' << std::setw(2) << rem % 3600 / 60 << ':' << std::setw(2) << rem % 60 << 'Z';
+  return o.str();
+}
+
+StartDecision start_decision(std::int64_t now, std::int64_t start, bool allow_late) {
+  if (start - now > kMaxStartAheadSeconds) return StartDecision::TooFar;
+  if (now < start) return StartDecision::Wait;
+  if (now - start > kLateStartSeconds && !allow_late) return StartDecision::TooLate;
+  return StartDecision::Start;
 }
 
 std::optional<std::string> refuse_network(const lightserver::RpcStatusView& s) {

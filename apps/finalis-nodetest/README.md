@@ -15,6 +15,27 @@ finalis-nodetest                  # 30 minutes at 0.1 tx/s, then waits, sweeps a
 It talks to the lightserver at `http://127.0.0.1:19544/rpc` (the testnet default). Pass `--rpc URL`
 to use another one.
 
+## Shared test window: `--start-at`
+
+To make every participant start at the same moment, whatever their time zone, everyone runs the same
+command with the start time in UTC:
+
+```bash
+finalis-nodetest --start-at 2026-11-14T08:00:00Z
+```
+
+Start it at least 15 minutes early:
+
+1. It checks the network and the node right away, prepares its coins (the setup split), and counts down.
+2. At the start time it checks the node again. Each node waits a further 0 to 30 random seconds, so
+   that not all of them send in the same second.
+3. Then it runs as usual.
+
+The time must be exactly `YYYY-MM-DDTHH:MM:SSZ` in UTC. A start more than 14 days ahead is refused as
+a likely typo. If you start the tool more than 10 minutes after the start time, it exits with code 4
+rather than run alone. `--allow-late` overrides that. Your machine's clock must be right, which a
+validator's clock already needs to be.
+
 ## What it does
 
 - **Its own wallet.** The first run creates a random seed and 8 addresses in `~/.finalis-nodetest/wallet.txt`

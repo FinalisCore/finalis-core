@@ -57,7 +57,22 @@ struct Options {
   std::string peers_file;
   std::vector<TxType> types{kAllTypes.begin(), kAllTypes.end()};
   std::uint64_t min_peers{2};
+  std::optional<std::int64_t> start_at_unix;  // --start-at: shared start time (UTC), unix seconds
+  bool allow_late{false};                      // --allow-late: start even after the late cut-off
 };
+
+// Shared test window: every participant passes the same --start-at, so all nodes start together
+// whatever their local time zone. Exactly "YYYY-MM-DDTHH:MM:SSZ" (UTC); nullopt otherwise.
+std::optional<std::int64_t> parse_utc_time(const std::string& s);
+std::string format_utc_time(std::int64_t unix_seconds);
+// Started this long after --start-at, the tool refuses (the shared window is under way without it).
+inline constexpr std::int64_t kLateStartSeconds = 10 * 60;
+// A start time further ahead than this is refused as a likely typo.
+inline constexpr std::int64_t kMaxStartAheadSeconds = 14 * 24 * 60 * 60;
+// Each node starts up to this many seconds after --start-at, at random, so not all send in one second.
+inline constexpr std::int64_t kStartJitterSeconds = 30;
+enum class StartDecision : std::uint8_t { Wait, Start, TooLate, TooFar };
+StartDecision start_decision(std::int64_t now_unix, std::int64_t start_unix, bool allow_late);
 // argv without the program name. Refuses values above the hard limits instead of clamping them.
 std::optional<Options> parse_options(const std::vector<std::string>& args, std::string* err);
 std::string usage_text();
