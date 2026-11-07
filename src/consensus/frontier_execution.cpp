@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 #include <atomic>
+#include <deque>
+#include <mutex>
 #include <cstdio>
 #include "consensus/frontier_execution.hpp"
 
@@ -64,12 +66,114 @@ bool timed_body_is_plain(const AnyTx& body, const UtxoSetV2& utxos) {
       body);
 }
 
+// The memo of timed_opening_jobs / verify_timed_swe_proof (frontier_execution.hpp). A leaf lock:
+// nothing is computed or called while it is held.
+class TimedMemo {
+ public:
+  static TimedMemo& instance() {
+    static TimedMemo memo;
+    return memo;
+  }
+  std::optional<std::optional<TimedBody>> opening(const Hash32& key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = openings_.find(key);
+    if (it == openings_.end()) return std::nullopt;
+    ++stats_.opening_hits;
+    return it->second;
+  }
+  bool has_opening(const Hash32& key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return openings_.contains(key);
+  }
+  void put_opening(const Hash32& key, const std::optional<TimedBody>& body) {
+    std::lock_guard<std::mutex> lk(mu_);
+    ++stats_.opening_computed;
+    if (!openings_.emplace(key, body).second) return;
+    opening_order_.push_back(key);
+    while (opening_order_.size() > kMaxOpenings) {
+      openings_.erase(opening_order_.front());
+      opening_order_.pop_front();
+    }
+  }
+  bool proof_passed(const Hash32& key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!proofs_.contains(key)) return false;
+    ++stats_.proof_hits;
+    return true;
+  }
+  void put_proof(const Hash32& key, bool passed) {
+    std::lock_guard<std::mutex> lk(mu_);
+    ++stats_.proof_computed;
+    if (!passed || !proofs_.insert(key).second) return;
+    proof_order_.push_back(key);
+    while (proof_order_.size() > kMaxProofs) {
+      proofs_.erase(proof_order_.front());
+      proof_order_.pop_front();
+    }
+  }
+  TimedMemoStats stats() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return stats_;
+  }
+  void clear() {
+    std::lock_guard<std::mutex> lk(mu_);
+    openings_.clear();
+    opening_order_.clear();
+    proofs_.clear();
+    proof_order_.clear();
+    stats_ = {};
+  }
+
+ private:
+  // A block settles at most kMaxTimedEscrowsPerUnlockHeight + kMaxLongSettlementsPerBlock; the pool
+  // holds at most a few hundred envelopes.
+  static constexpr std::size_t kMaxOpenings = 256;
+  static constexpr std::size_t kMaxProofs = 2048;
+  std::mutex mu_;
+  std::map<Hash32, std::optional<TimedBody>> openings_;
+  std::deque<Hash32> opening_order_;
+  std::set<Hash32> proofs_;
+  std::deque<Hash32> proof_order_;
+  TimedMemoStats stats_;
+};
+
+void write_bls_keys(codec::ByteWriter& w, const std::vector<crypto::BlsPublicKey>& keys) {
+  w.varint(keys.size());
+  for (const auto& key : keys) w.bytes_fixed(key);
+}
+
+// Every input of open_due_timed_body: the envelope (all of it), the key set, the signer indices and
+// aggregate, the chain domain (the message is derived from it and tx.unlock_height).
+Hash32 timed_opening_memo_key(const TxTimed& tx, const std::vector<crypto::BlsPublicKey>& keys,
+                              const TimeSignatureAggregate& time_signature, const Hash32& chain_domain) {
+  codec::ByteWriter w;
+  static constexpr char kTag[] = "FINALIS-TIMED-OPENING-MEMO-V1";
+  w.bytes(Bytes(kTag, kTag + sizeof(kTag) - 1));
+  w.varbytes(tx.serialize());
+  write_bls_keys(w, keys);
+  w.varint(time_signature.signer_indices.size());
+  for (const auto index : time_signature.signer_indices) w.u32le(index);
+  w.bytes_fixed(time_signature.aggregate);
+  w.bytes_fixed(chain_domain);
+  return crypto::sha256d(w.take());
+}
+
+Hash32 timed_proof_memo_key(const TxTimed& tx, const std::vector<crypto::BlsPublicKey>& keys, const Hash32& chain_domain) {
+  codec::ByteWriter w;
+  static constexpr char kTag[] = "FINALIS-TIMED-PROOF-MEMO-V1";
+  w.bytes(Bytes(kTag, kTag + sizeof(kTag) - 1));
+  w.varbytes(tx.serialize());
+  write_bls_keys(w, keys);
+  w.bytes_fixed(chain_domain);
+  return crypto::sha256d(w.take());
+}
+
 // The body of a due escrow, opened with an aggregate on its unlock height by `keys` (the key set it
 // was encrypted to): SWE-decrypt the body key with the signers the aggregate names, then open the
 // AEAD. Nullopt on any failure (the bond is forfeited).
-std::optional<TimedBody> open_due_timed_body(const TxTimed& tx, const TimedExecutionContext& timed,
-                                         const std::vector<crypto::BlsPublicKey>& keys,
-                                         const TimeSignatureAggregate& time_signature) {
+std::optional<TimedBody> compute_due_timed_body(const TxTimed& tx, const Hash32& chain_domain,
+                                                const std::vector<crypto::BlsPublicKey>& keys,
+                                                const TimeSignatureAggregate& time_signature) {
   if (keys.empty()) return std::nullopt;
   const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys.size(), crypto::kSweKeyChunks);
   if (!ct.has_value()) return std::nullopt;
@@ -79,12 +183,23 @@ std::optional<TimedBody> open_due_timed_body(const TxTimed& tx, const TimedExecu
     signers.push_back(keys[index]);
   }
   const auto chunks = crypto::swe_decrypt(*ct, keys, signers, time_signature.aggregate,
-                                          time_signature_message(timed.chain_domain, tx.unlock_height),
+                                          time_signature_message(chain_domain, tx.unlock_height),
                                           crypto::kBlsTimeSignatureDst);
   if (!chunks.has_value()) return std::nullopt;
   const auto key = crypto::swe_key_from_chunks(*chunks);
   if (!key.has_value()) return std::nullopt;
   return open_timed_body(tx, *key);
+}
+
+std::optional<TimedBody> open_due_timed_body(const TxTimed& tx, const TimedExecutionContext& timed,
+                                             const std::vector<crypto::BlsPublicKey>& keys,
+                                             const TimeSignatureAggregate& time_signature) {
+  auto& memo = TimedMemo::instance();
+  const auto key = timed_opening_memo_key(tx, keys, time_signature, timed.chain_domain);
+  if (auto hit = memo.opening(key); hit.has_value()) return std::move(*hit);
+  auto body = compute_due_timed_body(tx, timed.chain_domain, keys, time_signature);
+  memo.put_opening(key, body);
+  return body;
 }
 
 // The long escrows of the parent state an opening settles: unlock height and key set as named.
@@ -773,12 +888,54 @@ bool execute_frontier_lane_prefix(const UtxoSet& parent_utxos, const FrontierVec
 }
 
 bool verify_timed_swe_proof(const TxTimed& tx, const std::vector<crypto::BlsPublicKey>& keys, const Hash32& chain_domain) {
+  auto& memo = TimedMemo::instance();
+  const auto key = timed_proof_memo_key(tx, keys, chain_domain);
+  if (memo.proof_passed(key)) return true;
   const auto ct = crypto::SweCiphertext::parse(tx.swe_ciphertext, keys.size(), crypto::kSweKeyChunks);
   const auto proof = crypto::SweWellFormednessProof::parse(tx.swe_proof);
-  return ct.has_value() && proof.has_value() &&
-         crypto::swe_verify_well_formed(*ct, keys, time_signature_message(chain_domain, tx.unlock_height),
-                                        crypto::kBlsTimeSignatureDst, *proof);
+  const bool passed = ct.has_value() && proof.has_value() &&
+                      crypto::swe_verify_well_formed(*ct, keys, time_signature_message(chain_domain, tx.unlock_height),
+                                                     crypto::kBlsTimeSignatureDst, *proof);
+  memo.put_proof(key, passed);
+  return passed;
 }
+
+std::vector<TimedOpeningJob> timed_opening_jobs(const TimedExecutionContext& timed) {
+  std::vector<TimedOpeningJob> jobs;
+  if (timed.escrows == nullptr) return jobs;
+  // The short locks the settlement loop of execute_frontier_lane_prefix opens.
+  if (timed.height >= 2 && timed.parent_time_signature != nullptr) {
+    const auto unlock = timed.height - 1;
+    for (auto it = timed.escrows->lower_bound(TimedEscrowKey{unlock, 0, 0});
+         it != timed.escrows->end() && it->first.unlock_height == unlock; ++it) {
+      if (timed_is_long_lock(it->second, timed.committee_epoch_blocks)) continue;
+      jobs.push_back(TimedOpeningJob{it->second, timed.parent_committee_keys, *timed.parent_time_signature,
+                                     timed.chain_domain});
+    }
+  }
+  // And the long locks its long_time_signatures open.
+  if (timed.long_time_signatures != nullptr && timed.key_sets != nullptr) {
+    for (const auto& entry : *timed.long_time_signatures) {
+      const auto keys = timed.key_sets->find(entry.committee_root);
+      if (keys == timed.key_sets->end()) continue;
+      for (const auto& it : long_escrows_for(timed, entry)) {
+        jobs.push_back(TimedOpeningJob{it->second, keys->second, entry.signature, timed.chain_domain});
+      }
+    }
+  }
+  return jobs;
+}
+
+void run_timed_opening_job(const TimedOpeningJob& job) {
+  auto& memo = TimedMemo::instance();
+  const auto key = timed_opening_memo_key(job.tx, job.keys, job.signature, job.chain_domain);
+  if (memo.has_opening(key)) return;  // not counted as a hit: only execution's lookups are
+  memo.put_opening(key, compute_due_timed_body(job.tx, job.chain_domain, job.keys, job.signature));
+}
+
+TimedMemoStats timed_memo_stats() { return TimedMemo::instance().stats(); }
+
+void clear_timed_memo_for_test() { TimedMemo::instance().clear(); }
 
 bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed, const UtxoSetV2& utxos,
                            TimedInclusion* inclusion_out, std::string* reason, TimedInclusionCheck check) {

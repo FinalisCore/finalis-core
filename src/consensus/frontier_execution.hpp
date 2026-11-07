@@ -298,4 +298,35 @@ bool check_timed_inclusion(const TxTimed& tx, const TimedExecutionContext& timed
 // the ordered keys of the envelope's committee (`keys`, whose root check_timed_inclusion checked).
 bool verify_timed_swe_proof(const TxTimed& tx, const std::vector<crypto::BlsPublicKey>& keys, const Hash32& chain_domain);
 
+// --- SWE work outside the node lock ---
+//
+// LIVENESS: execution runs under the node mutex, and on a small host one settlement decryption costs
+// ~270 ms (a full block: seconds), during which the node answers no peer. The two costly SWE steps of
+// execution (settlement decryption, inclusion well-formedness proof) are memoized process-wide, keyed
+// by sha256d of every input (the whole envelope, the ordered key set, the signer indices and
+// aggregate, the chain domain). A hit returns what the computation returns, so results and replay
+// (D2) do not depend on the memo; a miss computes as before. The node fills it off-lock: openings
+// with prewarm jobs taken under the lock and run after it is released, proofs at mempool intake.
+// Bounded (oldest dropped first); only a passing proof is remembered.
+struct TimedOpeningJob {
+  TxTimed tx;
+  std::vector<crypto::BlsPublicKey> keys;
+  TimeSignatureAggregate signature;
+  Hash32 chain_domain{};
+};
+// The openings executing block timed.height would decrypt (short locks due at height - 1 with the
+// parent time signature, then the escrows of each long_time_signatures entry), copied so they can
+// run after the state they were read from is unlocked. Entries naming an unknown key set are skipped.
+std::vector<TimedOpeningJob> timed_opening_jobs(const TimedExecutionContext& timed);
+// Decrypts one job into the memo (no-op if it is there already).
+void run_timed_opening_job(const TimedOpeningJob& job);
+struct TimedMemoStats {
+  std::uint64_t opening_computed{0};
+  std::uint64_t opening_hits{0};
+  std::uint64_t proof_computed{0};
+  std::uint64_t proof_hits{0};
+};
+TimedMemoStats timed_memo_stats();
+void clear_timed_memo_for_test();
+
 }  // namespace finalis::consensus
