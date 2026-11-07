@@ -164,10 +164,10 @@ restarts the services. Chain data is kept.
 ### Windows
 
 The installer's `Start-Finalis.ps1` starts mainnet only. For testnet, run the node from the install
-folder (default `C:\Program Files\Finalis Core`) in PowerShell:
+folder's `app\bin` (default `C:\Program Files\Finalis Core\app\bin`) in PowerShell:
 
 ```powershell
-cd "C:\Program Files\Finalis Core"
+cd "C:\Program Files\Finalis Core\app\bin"
 .\finalis-node.exe --testnet --public --with-lightserver --lightserver-bind 127.0.0.1 `
     --db "$env:APPDATA\.finalis\testnet"
 ```

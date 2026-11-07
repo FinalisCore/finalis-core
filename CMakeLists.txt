@@ -2,7 +2,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 # The release version. Tags must match it (vX.Y.Z); the release workflows check this.
-project(finalis_core VERSION 2.2.11 LANGUAGES CXX)
+project(finalis_core VERSION 2.2.12 LANGUAGES CXX)
 add_compile_definitions(FINALIS_RELEASE_VERSION="${PROJECT_VERSION}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -612,6 +612,8 @@ add_executable(finalis-tests
 )
 target_link_libraries(finalis-tests PRIVATE finalis_core)
 target_include_directories(finalis-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Tests that check files shipped in the repo (e.g. testnet/NODETEST_SCHEDULE.json) find them here.
+target_compile_definitions(finalis-tests PRIVATE FINALIS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 if(FINALIS_SANITIZE)
   target_compile_options(finalis-tests PRIVATE ${SC_SAN_FLAGS})
   target_link_options(finalis-tests PRIVATE -fsanitize=${SC_SAN_KINDS})
