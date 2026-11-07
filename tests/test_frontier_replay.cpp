@@ -3613,6 +3613,106 @@ TEST(test_long_timed_lock_settles_with_its_named_committee) {
   ASSERT_TRUE(!consensus::timed_bond_lien(settled, validator, settled.finalized_height + 1, epoch_blocks));
 }
 
+// LIVENESS: settlement decryptions run before execution, outside the node lock, and execution then
+// finds them memoized. A hit must return exactly what the computation returns (D2): the post-state is
+// the same with a cold memo and a prewarmed one, a prewarmed block decrypts nothing itself, and any
+// changed input (here the aggregate) is a different entry.
+TEST(test_prewarmed_timed_openings_give_the_same_state_without_decrypting_again) {
+  auto fx = make_timed_fixture();
+  const auto body = timed_body_spend(fx, fx.body_op, fx.body_out);
+  const auto timed = build_timed(fx, fx.parent, 1, AnyTx{body});
+  ASSERT_TRUE(timed.has_value());
+  const auto s1 = apply_frontier_or_throw(fx.cfg, fx.parent, {timed->serialize()});
+  const auto record2 = make_frontier_record(s1, {}, fx.cfg);
+  std::string err;
+
+  consensus::clear_timed_memo_for_test();
+  consensus::CanonicalDerivedState cold;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &cold, &err));
+  ASSERT_EQ(consensus::timed_memo_stats().opening_computed, 1u);
+  ASSERT_EQ(consensus::timed_memo_stats().opening_hits, 0u);
+  ASSERT_EQ(cold.last_timed_settlements.size(), 1u);
+  ASSERT_TRUE(cold.last_timed_settlements[0].body_applied);
+
+  consensus::clear_timed_memo_for_test();
+  const auto ctx = consensus::timed_execution_context_for(fx.cfg, s1, 2, record2.transition.prev_time_signature,
+                                                          &record2.transition.long_time_signatures);
+  const auto jobs = consensus::timed_opening_jobs(ctx);
+  ASSERT_EQ(jobs.size(), 1u);
+  ASSERT_TRUE(jobs[0].tx.txid() == timed->txid());
+  for (const auto& job : jobs) consensus::run_timed_opening_job(job);
+  for (const auto& job : jobs) consensus::run_timed_opening_job(job);  // already there: nothing more
+  ASSERT_EQ(consensus::timed_memo_stats().opening_computed, 1u);
+  consensus::CanonicalDerivedState warm;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &warm, &err));
+  ASSERT_EQ(consensus::timed_memo_stats().opening_computed, 1u);  // execution decrypted nothing
+  ASSERT_EQ(consensus::timed_memo_stats().opening_hits, 1u);
+  ASSERT_TRUE(warm.state_commitment == cold.state_commitment);
+  ASSERT_TRUE(warm.last_timed_settlements[0].body_applied);
+  ASSERT_TRUE(warm.last_timed_settlements[0].body_txid == cold.last_timed_settlements[0].body_txid);
+
+  // Another aggregate is another entry: computed (and fails to open), never served for the real one.
+  auto other = jobs[0];
+  other.signature.aggregate[5] ^= 0x01;
+  consensus::run_timed_opening_job(other);
+  ASSERT_EQ(consensus::timed_memo_stats().opening_computed, 2u);
+  consensus::CanonicalDerivedState again;
+  ASSERT_TRUE(consensus::apply_frontier_record(fx.cfg, s1, record2, &again, &err));
+  ASSERT_TRUE(again.state_commitment == cold.state_commitment);
+  ASSERT_EQ(consensus::timed_memo_stats().opening_hits, 2u);
+}
+
+// The long locks a block's long_time_signatures open are jobs too, with the key set they name.
+TEST(test_timed_opening_jobs_include_long_locks_opened_by_the_block) {
+  auto f = make_long_lock_fixture();
+  auto state = advance_to(f.fx.cfg, f.included, f.unlock + 1);
+  const std::vector<LongTimeSignature> entries{long_opening(f, state)};
+  const auto record = make_frontier_record(state, {}, f.fx.cfg, 0, {}, nullptr, &entries);
+  const auto ctx = consensus::timed_execution_context_for(f.fx.cfg, state, state.finalized_height + 1,
+                                                          record.transition.prev_time_signature,
+                                                          &record.transition.long_time_signatures);
+  const auto jobs = consensus::timed_opening_jobs(ctx);
+  ASSERT_EQ(jobs.size(), 1u);
+  ASSERT_TRUE(jobs[0].tx.txid() == f.timed.txid());
+  ASSERT_TRUE(jobs[0].keys == state.timed_key_sets.at(f.timed.committee_root));
+  ASSERT_TRUE(jobs[0].signature == entries[0].signature);
+
+  consensus::clear_timed_memo_for_test();
+  for (const auto& job : jobs) consensus::run_timed_opening_job(job);
+  consensus::CanonicalDerivedState settled;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(f.fx.cfg, state, record, &settled, &err));
+  ASSERT_EQ(consensus::timed_memo_stats().opening_computed, 1u);
+  ASSERT_EQ(consensus::timed_memo_stats().opening_hits, 1u);
+  ASSERT_TRUE(settled.last_timed_settlements[0].body_applied);
+}
+
+// A passing well-formedness proof is checked once; a failing one is never remembered.
+TEST(test_timed_proof_memo_remembers_only_a_passing_proof) {
+  auto fx = make_timed_fixture();
+  const auto timed = build_timed(fx, fx.parent, 1, TimedReveal{Bytes{'x'}});
+  ASSERT_TRUE(timed.has_value());
+  const auto epoch = consensus::committee_epoch_start(1, fx.cfg.network.committee_epoch_blocks);
+  const auto keys = consensus::time_signature_committee_keys(fx.cfg, fx.parent, epoch);
+  ASSERT_TRUE(keys.has_value());
+  consensus::clear_timed_memo_for_test();
+  ASSERT_TRUE(consensus::verify_timed_swe_proof(*timed, *keys, replay_chain_domain()));
+  ASSERT_TRUE(consensus::verify_timed_swe_proof(*timed, *keys, replay_chain_domain()));
+  ASSERT_EQ(consensus::timed_memo_stats().proof_computed, 1u);
+  ASSERT_EQ(consensus::timed_memo_stats().proof_hits, 1u);
+  auto bad = *timed;
+  bad.swe_proof[bad.swe_proof.size() / 2] ^= 0x01;
+  ASSERT_TRUE(!consensus::verify_timed_swe_proof(bad, *keys, replay_chain_domain()));
+  ASSERT_TRUE(!consensus::verify_timed_swe_proof(bad, *keys, replay_chain_domain()));
+  ASSERT_EQ(consensus::timed_memo_stats().proof_computed, 3u);
+  ASSERT_EQ(consensus::timed_memo_stats().proof_hits, 1u);
+  // Another chain domain is another entry.
+  Hash32 other_domain = replay_chain_domain();
+  other_domain[0] ^= 0x01;
+  ASSERT_TRUE(!consensus::verify_timed_swe_proof(*timed, *keys, other_domain));
+  ASSERT_EQ(consensus::timed_memo_stats().proof_hits, 1u);
+}
+
 // An opening must be canonical, for a final unlock height, name a stored key set with a waiting
 // escrow, and carry a threshold aggregate that verifies; anything else makes the block invalid.
 TEST(test_long_time_signature_rules) {

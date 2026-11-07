@@ -619,6 +619,12 @@ class Node {
   // The tip's aggregate for the next proposal, nullopt while fewer than the threshold are known.
   // The genesis parent needs none (an empty aggregate).
   std::optional<TimeSignatureAggregate> prev_time_signature_for_next_height_locked() const;
+  // LIVENESS: the settlement decryptions of the next block, run without mu_ so execution under it
+  // finds them memoized (consensus::timed_opening_jobs). For a proposal from the network: only once
+  // its height, parent and leader signature check, once per transition. For this node's own build:
+  // with the parent time signature it is about to carry. Both take mu_ themselves.
+  void prewarm_proposal_timed_openings(const p2p::ProposeMsg& msg);
+  void prewarm_local_timed_openings();
   // Count-only form of the above for the event loop (no aggregation): {known, threshold}.
   std::pair<std::size_t, std::size_t> time_signature_progress_for_next_height_locked() const;
   // Long locks (LongTimeSignature): the (unlock height, key set root) pairs a block at the next height
@@ -993,6 +999,7 @@ class Node {
   // Transitions whose next_state_commitment this node recomputed and matched, with their height. A
   // transition names its parent, so a match stays valid; entries at finalized heights are dropped.
   mutable std::map<Hash32, std::uint64_t> post_state_verified_transitions_;
+  std::map<Hash32, std::uint64_t> prewarmed_timed_transitions_;  // transition id -> height
   // The state produced by the most recently verified transition, reused when that transition
   // finalizes on the same parent instead of executing it a second time.
   struct VerifiedNextState {

@@ -1091,6 +1091,58 @@ std::optional<TimeSignatureAggregate> Node::prev_time_signature_for_next_height_
   return consensus::aggregate_time_signatures(*keys, it->second, threshold);
 }
 
+void Node::prewarm_proposal_timed_openings(const p2p::ProposeMsg& msg) {
+  std::vector<consensus::TimedOpeningJob> jobs;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!canonical_state_.has_value() || msg.height != finalized_height_ + 1 ||
+        msg.prev_finalized_hash != finalized_identity_.id) {
+      return;
+    }
+    const auto proposal = FrontierProposal::parse(msg.frontier_proposal_bytes);
+    if (!proposal.has_value() || proposal->transition.height != msg.height) return;
+    const auto& transition = proposal->transition;
+    const auto transition_id = transition.transition_id();
+    if (post_state_verified_transitions_.contains(transition_id) ||
+        prewarmed_timed_transitions_.contains(transition_id)) {
+      return;
+    }
+    // The same check handle_propose_result makes first: nobody but the round's leader can make this
+    // node decrypt anything.
+    const std::optional<std::uint32_t> pol_round =
+        msg.pol.has_value() ? std::optional<std::uint32_t>(msg.pol->round) : std::nullopt;
+    const auto round_leader = leader_for_height_round(msg.height, msg.round);
+    if (!round_leader.has_value() ||
+        !crypto::ed25519_verify(propose_signing_message(consensus_domain_, msg.height, msg.round, transition_id, pol_round),
+                                msg.proposer_signature, *round_leader)) {
+      return;
+    }
+    std::erase_if(prewarmed_timed_transitions_, [&](const auto& entry) { return entry.second <= finalized_height_; });
+    prewarmed_timed_transitions_[transition_id] = transition.height;
+    const auto timed = consensus::timed_execution_context_for(canonical_derivation_config_locked(), *canonical_state_,
+                                                              transition.height, transition.prev_time_signature,
+                                                              &transition.long_time_signatures);
+    jobs = consensus::timed_opening_jobs(timed);
+  }
+  for (const auto& job : jobs) consensus::run_timed_opening_job(job);
+}
+
+void Node::prewarm_local_timed_openings() {
+  std::vector<consensus::TimedOpeningJob> jobs;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!canonical_state_.has_value()) return;
+    const auto prev_time_signature = prev_time_signature_for_next_height_locked();
+    if (!prev_time_signature.has_value()) return;
+    const auto long_time_signatures = long_time_signatures_for_next_height_locked();
+    const auto timed = consensus::timed_execution_context_for(canonical_derivation_config_locked(), *canonical_state_,
+                                                              finalized_height_ + 1, *prev_time_signature,
+                                                              &long_time_signatures);
+    jobs = consensus::timed_opening_jobs(timed);
+  }
+  for (const auto& job : jobs) consensus::run_timed_opening_job(job);
+}
+
 std::map<std::pair<std::uint64_t, Hash32>, std::size_t> Node::pending_long_openings_locked() const {
   std::map<std::pair<std::uint64_t, Hash32>, std::size_t> out;
   if (!canonical_state_.has_value()) return out;
@@ -1854,6 +1906,7 @@ Node::ProposeHandlingResult Node::handle_propose_result(const p2p::ProposeMsg& m
                                                         std::string* reject_reason) {
   const FinalizedBroadcastFlushGuard flush_guard{this};  // destroyed last, after any mu_ scope
   if (from_network && !running_) return ProposeHandlingResult::SoftReject;
+  if (from_network) prewarm_proposal_timed_openings(msg);
   std::optional<Vote> maybe_vote;  // this node's prevote
   {
     std::lock_guard<std::mutex> lk(mu_);

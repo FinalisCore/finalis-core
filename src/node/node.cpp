@@ -1709,6 +1709,7 @@ void Node::event_loop() {
     }
 
     if (should_build_proposal) {
+      prewarm_local_timed_openings();
       std::optional<FrontierProposal> built;
       std::optional<FrontierProposal> reproposal;
       std::optional<QuorumCertificate> reproposal_pol;
