@@ -49,7 +49,7 @@ bool is_timed_type(TxType t);
 
 struct Options {
   std::string command{"run"};  // run | sweep | status | address | help
-  std::string dir;             // wallet + logs; default from default_state_dir()
+  std::string dir;             // wallet + logs: absolute path after parse_options (default ~/.finalis-nodetest)
   std::string rpc;             // default: the local testnet lightserver
   double rate{kDefaultRate};
   std::uint64_t duration_seconds{kDefaultDurationSeconds};
@@ -76,7 +76,10 @@ StartDecision start_decision(std::int64_t now_unix, std::int64_t start_unix, boo
 // argv without the program name. Refuses values above the hard limits instead of clamping them.
 std::optional<Options> parse_options(const std::vector<std::string>& args, std::string* err);
 std::string usage_text();
-std::string default_state_dir();
+std::string default_state_dir();  // "~/.finalis-nodetest", unexpanded (help text shows no personal path)
+// Expands a leading ~/ (HOME, Windows profile, else the password database) and makes the path
+// absolute. Nullopt + *err when no home directory can be found or the path is ~user.
+std::optional<std::string> resolve_state_dir(const std::string& raw, std::string* err);
 std::string default_rpc_url();
 
 // Nullopt when the server is on testnet-3 (testnet network id and the embedded testnet genesis);

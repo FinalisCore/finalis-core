@@ -8,6 +8,11 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <system_error>
+#ifndef _WIN32
+#include <pwd.h>
+#include <unistd.h>
+#endif
 
 #include "common/address.hpp"
 #include "common/network.hpp"
@@ -139,7 +144,42 @@ bool is_timed_type(TxType t) {
   return t == TxType::Timed || t == TxType::TimedLong || t == TxType::Seal || t == TxType::SealLong;
 }
 
-std::string default_state_dir() { return expand_user_home("~/.finalis-nodetest"); }
+std::string default_state_dir() { return "~/.finalis-nodetest"; }
+
+std::optional<std::string> resolve_state_dir(const std::string& raw, std::string* err) {
+  std::string p = raw;
+  if (p.empty()) {
+    *err = "--dir must not be empty";
+    return std::nullopt;
+  }
+  if (p[0] == '~') {
+    if (p.size() > 1 && p[1] != '/' && p[1] != '\\') {
+      *err = "--dir: only ~/... is supported, not ~user: give a full path";
+      return std::nullopt;
+    }
+    std::string home = expand_user_home("~");
+    if (home == "~") home.clear();
+#ifndef _WIN32
+    // HOME unset (env -i, cron, some service units): the account's home from the password database.
+    if (home.empty()) {
+      if (const passwd* pw = ::getpwuid(::getuid()); pw && pw->pw_dir && pw->pw_dir[0] != '\0') home = pw->pw_dir;
+    }
+#endif
+    if (home.empty()) {
+      *err = "cannot find your home directory (HOME is not set): pass --dir with a full path";
+      return std::nullopt;
+    }
+    p = home + p.substr(1);
+  }
+  // Absolute, so the wallet does not depend on the directory the tool is started from.
+  std::error_code ec;
+  const auto abs = std::filesystem::absolute(std::filesystem::path(p), ec);
+  if (ec) {
+    *err = "--dir " + raw + ": " + ec.message();
+    return std::nullopt;
+  }
+  return abs.lexically_normal().string();
+}
 
 std::string default_rpc_url() {
   return "http://127.0.0.1:" + std::to_string(testnet_network().lightserver_default_port) + "/rpc";
@@ -209,7 +249,7 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
     if (a == "--rpc") {
       o.rpc = v;
     } else if (a == "--dir") {
-      o.dir = expand_user_home(v);
+      o.dir = v;
     } else if (a == "--peers") {
       o.peers_file = v;
     } else if (a == "--rate") {
@@ -274,6 +314,11 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
       *err = "unknown option: " + a;
       return std::nullopt;
     }
+  }
+  if (o.command != "help") {
+    auto dir = resolve_state_dir(o.dir, err);
+    if (!dir) return std::nullopt;
+    o.dir = std::move(*dir);
   }
   return o;
 }

@@ -109,6 +109,7 @@ class Runner {
 
   int main_command() {
     std::string err;
+    std::cerr << "Wallet: " << opt_.dir << "\n";  // stderr: stdout stays the address list / tx log
     auto w = load_wallet(opt_.dir, &err);
     if (!w && !err.empty()) return fail(err);
     if (!w) {

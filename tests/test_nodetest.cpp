@@ -4,6 +4,9 @@
 #include "support/test_chain_domain.hpp"
 #include "test_framework.hpp"
 
+#include <cstdlib>
+#include <filesystem>
+
 #include "apps/finalis-nodetest/nodetest_core.hpp"
 #include "common/address.hpp"
 #include "common/network.hpp"
@@ -331,4 +334,57 @@ TEST(test_nodetest_start_at_decision) {
   ASSERT_TRUE(start_decision(t + kLateStartSeconds + 1, t, true) == StartDecision::Start);
   ASSERT_TRUE(start_decision(t - kMaxStartAheadSeconds, t, false) == StartDecision::Wait);
   ASSERT_TRUE(start_decision(t - kMaxStartAheadSeconds - 1, t, false) == StartDecision::TooFar);
+}
+
+// The wallet directory must not depend on the machine's shell setup or the directory the tool is
+// started from: with HOME unset it used to land in "./~/.finalis-nodetest" (a new, empty wallet per
+// working directory). The help text shows "~/...", not the local user's home path.
+TEST(test_nodetest_state_dir_is_absolute_and_home_independent) {
+  namespace fs = std::filesystem;
+  std::string err;
+  const char* old_home_c = std::getenv("HOME");
+  const std::string old_home = old_home_c ? old_home_c : "";
+  const auto restore = [&]() {
+#ifdef _WIN32
+    _putenv_s("HOME", old_home.c_str());
+#else
+    if (old_home_c) ::setenv("HOME", old_home.c_str(), 1); else ::unsetenv("HOME");
+#endif
+  };
+
+  const fs::path fake_home = fs::temp_directory_path() / "finalis_nodetest_home";
+#ifdef _WIN32
+  _putenv_s("HOME", fake_home.string().c_str());
+#else
+  ::setenv("HOME", fake_home.string().c_str(), 1);
+#endif
+  auto d = resolve_state_dir("~/.finalis-nodetest", &err);
+  ASSERT_TRUE(d.has_value());
+  ASSERT_TRUE(fs::path(*d) == (fake_home / ".finalis-nodetest").lexically_normal());
+  auto parsed = parse_options({"address"}, &err);
+  ASSERT_TRUE(parsed.has_value());
+  ASSERT_TRUE(fs::path(parsed->dir) == (fake_home / ".finalis-nodetest").lexically_normal());
+  ASSERT_TRUE(usage_text().find("(default ~/.finalis-nodetest)") != std::string::npos);
+  ASSERT_TRUE(usage_text().find(fake_home.string()) == std::string::npos);
+
+#ifndef _WIN32
+  ::unsetenv("HOME");
+  auto nohome = resolve_state_dir("~/.finalis-nodetest", &err);
+  if (nohome) {  // the password database knows this account's home
+    ASSERT_TRUE(fs::path(*nohome).is_absolute());
+    ASSERT_TRUE(nohome->find('~') == std::string::npos);
+  } else {
+    ASSERT_TRUE(err.find("--dir") != std::string::npos);  // refused with a hint, never relative
+  }
+#endif
+  restore();
+
+  auto rel = resolve_state_dir("nodetest-rel/w", &err);
+  ASSERT_TRUE(rel.has_value());
+  ASSERT_TRUE(fs::path(*rel).is_absolute());
+  ASSERT_TRUE(fs::path(*rel) == (fs::current_path() / "nodetest-rel" / "w").lexically_normal());
+  ASSERT_TRUE(!resolve_state_dir("~bob/w", &err).has_value());
+  ASSERT_TRUE(!resolve_state_dir("", &err).has_value());
+  ASSERT_TRUE(!parse_options({"--dir", ""}, &err).has_value());
+  ASSERT_TRUE(parse_options({"--help"}, &err).has_value());  // help needs no directory
 }

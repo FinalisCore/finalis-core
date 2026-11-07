@@ -15,6 +15,21 @@ finalis-nodetest                  # 30 minutes at 0.1 tx/s, then waits, sweeps a
 It talks to the lightserver at `http://127.0.0.1:19544/rpc` (the testnet default). Pass `--rpc URL`
 to use another one.
 
+## Where the wallet lives
+
+Every command prints `Wallet: <path>` first. Keep using the same path: a different one is a new,
+empty wallet, and the coins stay in the old one.
+
+| setup | default wallet directory |
+|-------|--------------------------|
+| Linux / macOS | `~/.finalis-nodetest` (from `HOME`, else the account's home directory) |
+| Windows | `%APPDATA%\.finalis-nodetest` (or `%HOME%\.finalis-nodetest` when `HOME` is set, e.g. Git Bash) |
+| Docker | run it inside the node container, `docker exec -it <container> finalis-nodetest ...`: the wallet is then in the `/var/lib/finalis` volume. A `docker run --rm` without that volume loses the wallet when the container exits. |
+| `sudo` | the wallet of root, not yours: run it as your own user |
+
+`--dir DIR` picks another directory. A relative path is made absolute against the directory the tool
+is started from.
+
 ## Shared test window: `--start-at`
 
 To make every participant start at the same moment, whatever their time zone, everyone runs the same
