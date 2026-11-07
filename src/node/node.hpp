@@ -523,6 +523,8 @@ class Node {
                                    std::string* error = nullptr);
   // Drops envelopes whose fee input is gone (included or conflicted) or whose unlock height passed.
   void prune_timed_pool_locked();
+  // The designated certifier certifies pooled envelopes that waited for their lane's timed record.
+  void certify_waiting_timed_records_locked();
   bool handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended = nullptr,
                                     std::string* error = nullptr);
   bool finalize_if_quorum(const Hash32& transition_id, std::uint64_t height, std::uint32_t round);

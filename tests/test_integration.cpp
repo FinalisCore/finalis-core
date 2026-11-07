@@ -4139,6 +4139,132 @@ TEST(test_long_time_lock_opens_on_a_four_validator_cluster) {
 // A node's dial list holds only validators it dialed itself. If that list also stopped it dialing
 // anything else, a validator would stay on the seeds that first let it in, and the network would
 // stay a star around them.
+// LIVENESS (testnet-3 2026-11-07, h=4150-4159): a block takes at most kMaxTimedTxPerBlock timed records
+// and a lane is included in order, so a lane holding more pending timed records than that held the
+// ordinary sends behind them for blocks. The lane's certifier keeps one unfinalized timed record per
+// lane; the rest wait pooled and are certified one by one, so none is lost.
+TEST(test_ordinary_tx_is_not_held_behind_timed_records_in_its_lane) {
+  const std::string base = unique_test_base("/tmp/finalis_it_timed_lane_hol");
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(base, 1, 1, MAX_COMMITTEE);
+  auto& n0 = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for_tip(n0, 3, ci_timeout_seconds(40)));
+  const auto domain = node_chain_domain(n0);
+  const auto epoch_blocks = cluster.configs[0].network.committee_epoch_blocks;
+  const std::uint64_t bond = consensus::kTxTimedMinForfeitBond;
+  const std::uint64_t prepaid = consensus::timed_min_prepaid_fee(timed_envelope_bytes_bound(MAX_COMMITTEE, 1024));
+  const std::uint64_t coin_value = bond + prepaid;
+  constexpr std::size_t kTimed = consensus::kMaxTimedTxPerBlock + 1;
+  constexpr std::size_t kSplit = 80;  // ~10 per lane: enough for kTimed + 1 in the fullest one
+
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    funded = find_funded_test_wallet(n0, keys, kSplit * coin_value + DEFAULT_WALLET_SEND_FEE_UNITS);
+    if (!funded) return false;
+    for (const auto& [_, out] : funded->utxos) {
+      if (out.value >= kSplit * coin_value + DEFAULT_WALLET_SEND_FEE_UNITS) return true;
+    }
+    return false;
+  }, ci_timeout_seconds(300)));
+  const auto& sender = keys[funded->key_index];
+  const Bytes sender_priv(sender.private_key.begin(), sender.private_key.end());
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  const auto sender_script = address::p2pkh_script_pubkey(sender_pkh);
+  std::pair<OutPoint, TxOut> source;
+  for (const auto& u : funded->utxos) {
+    if (u.second.value >= kSplit * coin_value + DEFAULT_WALLET_SEND_FEE_UNITS) source = u;
+  }
+  std::vector<TxOut> split_outputs(kSplit, TxOut{coin_value, sender_script});
+  split_outputs.push_back(TxOut{source.second.value - kSplit * coin_value - DEFAULT_WALLET_SEND_FEE_UNITS, sender_script});
+  if (split_outputs.back().value == 0) split_outputs.pop_back();
+  const auto split = build_signed_p2pkh_tx_single_input(domain, source.first, source.second, sender.private_key, split_outputs);
+  ASSERT_TRUE(split.has_value());
+  std::string reason;
+  ASSERT_TRUE(n0.inject_record_for_test(split->serialize(), &reason));
+  ASSERT_TRUE(wait_for([&]() { return n0.has_utxo_for_test(OutPoint{split->txid(), 0}); }, ci_timeout_seconds(120)));
+
+  // The fullest lane among the split's coins (a single-input tx and a timed fee input share the lane).
+  std::array<std::vector<std::pair<OutPoint, TxOut>>, INGRESS_LANE_COUNT> by_lane;
+  for (std::uint32_t i = 0; i < kSplit; ++i) {
+    Tx probe;
+    probe.inputs.push_back(TxIn{split->txid(), i, {}, 0xFFFFFFFF});
+    by_lane[consensus::assign_ingress_lane(probe)].push_back({OutPoint{split->txid(), i}, split_outputs[i]});
+  }
+  std::size_t lane = 0;
+  for (std::size_t l = 1; l < INGRESS_LANE_COUNT; ++l) {
+    if (by_lane[l].size() > by_lane[lane].size()) lane = l;
+  }
+  ASSERT_TRUE(by_lane[lane].size() >= kTimed + 1);
+
+  // Room in this epoch for all of them to be included one per block before their unlock height.
+  std::uint64_t unlock = 0;
+  ASSERT_TRUE(wait_for([&]() {
+    const auto tip = n0.status().height;
+    unlock = consensus::committee_epoch_start(tip + 1, epoch_blocks) + epoch_blocks - 1;
+    return unlock >= tip + kTimed + 6;
+  }, ci_timeout_seconds(180)));
+  ASSERT_TRUE(n0.pause_proposals_for_test(true));
+  ASSERT_TRUE(wait_for_stable_same_tip(cluster.nodes, std::chrono::seconds(10)));
+  std::optional<storage::FinalizedCommitteeCheckpoint> checkpoint;
+  {
+    storage::DB db;
+    ASSERT_TRUE(db.open_readonly(base + "/node0"));
+    checkpoint = db.get_finalized_committee_checkpoint(consensus::committee_epoch_start(unlock, epoch_blocks));
+  }
+  ASSERT_TRUE(checkpoint.has_value() && !checkpoint->ordered_bls_keys.empty());
+
+  std::vector<Hash32> timed_ids;
+  for (std::size_t i = 0; i < kTimed; ++i) {
+    const auto& [fee_op, fee_out] = by_lane[lane][i];
+    TimedTxParams params;
+    params.fee_outpoint = fee_op;
+    params.fee_prev_out = fee_out;
+    params.prepaid_fee = prepaid;
+    params.forfeit_bond = bond;
+    params.bond_refund_script = sender_script;
+    params.unlock_height = unlock;
+    params.committee_epoch = consensus::committee_epoch_start(unlock, epoch_blocks);
+    params.committee_root = consensus::committee_bls_key_root(checkpoint->ordered_bls_keys);
+    params.committee_keys = checkpoint->ordered_bls_keys;
+    params.threshold = static_cast<std::uint32_t>(consensus::time_signature_threshold(checkpoint->ordered_bls_keys.size()));
+    Hash32 seed{};
+    seed.fill(static_cast<std::uint8_t>(0x40 + i));
+    const auto timed = build_signed_timed_tx(domain, params, TimedReveal{Bytes{'b', static_cast<std::uint8_t>(i)}},
+                                             sender_priv, seed);
+    ASSERT_TRUE(timed.has_value());
+    ASSERT_TRUE(n0.inject_record_for_test(timed->serialize(), &reason));
+    timed_ids.push_back(timed->txid());
+  }
+  // The ordinary send, queued in the same lane after all of them.
+  const auto& [plain_op, plain_out] = by_lane[lane][kTimed];
+  const auto plain = build_signed_p2pkh_tx_single_input(
+      domain, plain_op, plain_out, sender.private_key,
+      {TxOut{plain_out.value - DEFAULT_WALLET_SEND_FEE_UNITS, sender_script}});
+  ASSERT_TRUE(plain.has_value());
+  ASSERT_TRUE(n0.inject_record_for_test(plain->serialize(), &reason));
+
+  const auto paused_tip = n0.status().height;
+  ASSERT_TRUE(n0.pause_proposals_for_test(false));
+  std::optional<storage::DB::TxLocation> plain_at;
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    plain_at = db.get_tx_index(plain->txid());
+    return plain_at.has_value();
+  }, ci_timeout_seconds(120)));
+  ASSERT_EQ(plain_at->height, paused_tip + 1);
+  // None of the timed records is lost: each is included by its unlock height.
+  ASSERT_TRUE(wait_for([&]() {
+    storage::DB db;
+    if (!db.open_readonly(base + "/node0")) return false;
+    for (const auto& id : timed_ids) {
+      const auto at = db.get_tx_index(id);
+      if (!at.has_value() || at->height > unlock) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(180)));
+}
+
 TEST(test_validator_dial_list_does_not_seal_a_node_off_from_other_peers) {
   const std::string base = unique_test_base("/tmp/finalis_test_dial_list_not_sealed");
   auto cluster = make_cluster(base, 3, 3, 3, [](node::NodeConfig& cfg) {

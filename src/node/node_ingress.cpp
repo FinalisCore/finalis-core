@@ -11,6 +11,7 @@
 #include <sstream>
 
 #include "consensus/canonical_derivation.hpp"
+#include "consensus/frontier_execution.hpp"
 #include "consensus/randomness.hpp"
 #include "consensus/ingress.hpp"
 #include "consensus/validator_registry.hpp"
@@ -439,6 +440,25 @@ void Node::prune_timed_pool_locked() {
       ++it;
     }
   }
+  certify_waiting_timed_records_locked();
+}
+
+void Node::certify_waiting_timed_records_locked() {
+  // Earliest unlock first: a lane takes one at a time (maybe_certify_record_locked), and the one due
+  // soonest has the least time left to be included.
+  std::vector<const TxTimed*> waiting;
+  for (const auto& [txid, timed] : timed_pool_) {
+    if (!db_.get_ingress_bytes(txid).has_value()) waiting.push_back(&timed);
+  }
+  std::sort(waiting.begin(), waiting.end(), [](const TxTimed* a, const TxTimed* b) {
+    return a->unlock_height != b->unlock_height ? a->unlock_height < b->unlock_height : a->txid() < b->txid();
+  });
+  for (const auto* timed : waiting) {
+    const auto raw = timed->serialize();
+    if (const auto identity = consensus::ingress_record_identity(raw); identity.has_value()) {
+      (void)maybe_certify_record_locked(raw, *identity, nullptr);
+    }
+  }
 }
 
 bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg& msg, bool* appended, std::string* error) {
@@ -528,6 +548,28 @@ bool Node::maybe_certify_record_locked(const Bytes& tx_bytes, const consensus::I
   }
 
   const auto lane_state = db_.get_lane_state(lane);
+
+  // LIVENESS: a block takes at most kMaxTimedTxPerBlock timed records, and a lane is included in
+  // order, so a timed record past the cap holds every record behind it in its lane (testnet-3
+  // 2026-11-07: ordinary sends waited 4 blocks). One unfinalized timed record per lane keeps the
+  // eight lanes within the cap. The envelope stays pooled and the reforward pass certifies it once
+  // the lane's timed record is final. Policy only: blocks and their validation are unchanged.
+  static_assert(INGRESS_LANE_COUNT <= consensus::kMaxTimedTxPerBlock);
+  if (identity.timed && lane_state.has_value() && canonical_state_.has_value()) {
+    const std::uint64_t cursor = canonical_state_->finalized_frontier_vector.lane_max_seq[lane];
+    for (std::uint64_t seq = cursor + 1; seq <= lane_state->max_seq; ++seq) {
+      const auto cert_bytes = db_.get_ingress_certificate(lane, seq);
+      const auto pending = cert_bytes.has_value() ? IngressCertificate::parse(*cert_bytes) : std::nullopt;
+      if (!pending.has_value()) continue;
+      const auto pending_bytes = db_.get_ingress_bytes(pending->txid);
+      if (!pending_bytes.has_value()) continue;
+      const auto pending_identity = consensus::ingress_record_identity(*pending_bytes);
+      if (pending_identity.has_value() && pending_identity->timed) {
+        if (error) *error = "lane-timed-record-pending";
+        return false;
+      }
+    }
+  }
 
   IngressCertificate cert;
   cert.epoch = consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks);
