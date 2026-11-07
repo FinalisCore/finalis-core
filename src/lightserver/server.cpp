@@ -2097,8 +2097,11 @@ TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   } else {
     return TxRelayResult{TxRelayResult::Outcome::Rejected, "tx parse failed"};
   }
-  constexpr std::uint32_t kRelayHandshakeTimeoutMs = 2000;
-  constexpr std::uint32_t kRelayVerdictTimeoutMs = 5000;
+  // The node answers from its event loop, which can be busy for seconds while it applies a block (a
+  // 1-vCPU testnet validator answered the handshake 3 s late, 2026-11-07). Handshake, verdict and
+  // drain together stay under the 15 s a lightserver client waits for the whole request.
+  constexpr std::uint32_t kRelayHandshakeTimeoutMs = 6000;  // VERSION and VERACK together
+  constexpr std::uint32_t kRelayVerdictTimeoutMs = 7000;
   constexpr std::uint32_t kRelayDrainTimeoutMs = 1000;
   addrinfo hints{};
   hints.ai_family = AF_INET;
@@ -2138,11 +2141,19 @@ TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
 
   bool saw_version = false;
   bool saw_verack = false;
+  const auto handshake_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRelayHandshakeTimeoutMs);
   while (!saw_version || !saw_verack) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto left_ms =
+        now >= handshake_deadline
+            ? 1u
+            : static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(handshake_deadline - now).count()) + 1;
     p2p::FrameReadError read_err = p2p::FrameReadError::NONE;
-    auto frame = p2p::read_frame_fd_timed(fd, cfg_.network.max_payload_len, cfg_.network.magic,
-                                          cfg_.network.protocol_version, kRelayHandshakeTimeoutMs,
-                                          kRelayHandshakeTimeoutMs, &read_err);
+    auto frame = now >= handshake_deadline
+                     ? std::nullopt
+                     : p2p::read_frame_fd_timed(fd, cfg_.network.max_payload_len, cfg_.network.magic,
+                                                cfg_.network.protocol_version, left_ms, left_ms, &read_err);
+    if (!frame.has_value() && read_err == p2p::FrameReadError::NONE) read_err = p2p::FrameReadError::TIMEOUT_HEADER;
     if (!frame.has_value()) {
       net::close_socket(fd);
       return unavailable("relay handshake failed: " + p2p::frame_read_error_string(read_err));
