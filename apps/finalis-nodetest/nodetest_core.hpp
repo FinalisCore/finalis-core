@@ -48,7 +48,7 @@ std::uint32_t type_weight(TxType t);
 bool is_timed_type(TxType t);
 
 struct Options {
-  std::string command{"run"};  // run | sweep | status | address | help
+  std::string command{"run"};  // run | auto | sweep | status | address | help
   std::string dir;             // wallet + logs: absolute path after parse_options (default ~/.finalis-nodetest)
   std::string rpc;             // default: the local testnet lightserver
   double rate{kDefaultRate};
@@ -59,6 +59,10 @@ struct Options {
   std::uint64_t min_peers{2};
   std::optional<std::int64_t> start_at_unix;  // --start-at: shared start time (UTC), unix seconds
   bool allow_late{false};                      // --allow-late: start even after the late cut-off
+  bool rate_set{false};                        // --rate given: in auto mode a ceiling on each window's rate
+  bool duration_set{false};                    // --duration given: in auto mode a ceiling on each window's length
+  std::string schedule_url;                    // auto: where the shared test windows are published
+  std::string schedule_file;                   // auto: --schedule FILE instead of downloading
 };
 
 // Shared test window: every participant passes the same --start-at, so all nodes start together
@@ -73,6 +77,48 @@ inline constexpr std::int64_t kMaxStartAheadSeconds = 14 * 24 * 60 * 60;
 inline constexpr std::int64_t kStartJitterSeconds = 30;
 enum class StartDecision : std::uint8_t { Wait, Start, TooLate, TooFar };
 StartDecision start_decision(std::int64_t now_unix, std::int64_t start_unix, bool allow_late);
+// Test windows for `finalis-nodetest auto`. The schedule is a small JSON file published in the repo
+// (kDefaultScheduleUrl), downloaded read-only every kScheduleRefreshSeconds; nothing is uploaded.
+//   {"version": 1, "network": "testnet", "genesis_hash": "<testnet genesis hex>",
+//    "windows": [{"start": "2026-11-08T08:00:00Z", "duration_seconds": 1800, "rate": 0.1}]}
+// "rate" is optional (default kDefaultRate). The whole file is refused if any part is invalid, the
+// chain is not this build's testnet, a window breaks the hard limits, or windows overlap.
+inline constexpr const char* kDefaultScheduleUrl =
+    "https://raw.githubusercontent.com/FinalisCore/finalis-core/main/testnet/NODETEST_SCHEDULE.json";
+inline constexpr std::int64_t kScheduleRefreshSeconds = 60 * 60;
+inline constexpr std::size_t kMaxScheduleWindows = 64;
+inline constexpr std::size_t kMaxScheduleBytes = 64 * 1024;
+inline constexpr std::uint64_t kMinWindowSeconds = 60;
+struct ScheduleWindow {
+  std::int64_t start_unix{0};
+  std::uint64_t duration_seconds{kDefaultDurationSeconds};
+  double rate{kDefaultRate};
+};
+std::optional<std::vector<ScheduleWindow>> parse_schedule(const std::string& json, std::string* err);
+// The window to take part in next: the first one that has not passed its late cut-off
+// (start + kLateStartSeconds) and starts within kMaxStartAheadSeconds; windows that started at or
+// before `done_start` were already run. Nullopt if none.
+std::optional<ScheduleWindow> next_window(const std::vector<ScheduleWindow>& windows, std::int64_t now_unix,
+                                          std::int64_t done_start);
+// A window's rate and length after the participant's own --rate/--duration ceilings.
+ScheduleWindow apply_ceilings(ScheduleWindow w, const Options& o);
+
+// Unlock heights. A block includes at most 8 time locks and at most 16 may open at one height
+// (consensus::kMaxTimedTxPerBlock, kMaxTimedEscrowsPerUnlockHeight): a fixed choice piles every lock
+// sent late in an epoch onto its last block (run 1, 2026-11-07: 20 locks expired at height 4160).
+// A short lock unlocks at a random height from next + kShortLockMinLead to next + kShortLockMaxLead,
+// capped at the epoch's last block; nullopt (send another type) when fewer than kShortLockMinLead
+// blocks of the epoch are left. A long lock unlocks at a random height in the first half of the
+// next epoch, at least kLongLockMinLead after the epoch end. `r` is a random number.
+inline constexpr std::uint64_t kShortLockMinLead = 3;
+inline constexpr std::uint64_t kShortLockMaxLead = 10;
+inline constexpr std::uint64_t kLongLockMinLead = 4;
+// Each participant sends at most one time lock per this many blocks, so 13 participants stay under
+// the 8-per-block cap.
+inline constexpr std::uint64_t kTimedEveryBlocks = 2;
+std::optional<std::uint64_t> short_lock_unlock(std::uint64_t next, std::uint64_t epoch_end, std::uint64_t r);
+std::uint64_t long_lock_unlock(std::uint64_t epoch_end, std::uint64_t epoch_blocks, std::uint64_t r);
+
 // argv without the program name. Refuses values above the hard limits instead of clamping them.
 std::optional<Options> parse_options(const std::vector<std::string>& args, std::string* err);
 std::string usage_text();

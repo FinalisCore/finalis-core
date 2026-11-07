@@ -220,5 +220,10 @@ std::optional<std::string> http_post_json_raw(const std::string& url, const std:
 std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body,
                                               const std::vector<std::pair<std::string, std::string>>& headers,
                                               std::string* err);
+// Plain HTTP(S) GET of a small file (TLS checked as for RPC). Only a 200 response counts; redirects are
+// not followed; a chunked body is decoded; a body above max_body_bytes is refused.
+std::optional<std::string> http_get(const std::string& url, std::size_t max_body_bytes, std::string* err);
+// The body of a raw HTTP/1.x response to a GET (the part of http_get that needs no network).
+std::optional<std::string> http_get_body(const std::string& raw, std::size_t max_body_bytes, std::string* err);
 
 }  // namespace finalis::lightserver

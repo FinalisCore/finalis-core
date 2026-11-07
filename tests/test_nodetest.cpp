@@ -6,6 +6,9 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <set>
+#include <sstream>
 
 #include "apps/finalis-nodetest/nodetest_core.hpp"
 #include "common/address.hpp"
@@ -387,4 +390,130 @@ TEST(test_nodetest_state_dir_is_absolute_and_home_independent) {
   ASSERT_TRUE(!resolve_state_dir("", &err).has_value());
   ASSERT_TRUE(!parse_options({"--dir", ""}, &err).has_value());
   ASSERT_TRUE(parse_options({"--help"}, &err).has_value());  // help needs no directory
+}
+
+namespace {
+std::string schedule_json(const std::string& windows, const std::string& genesis = "") {
+  return std::string("{\"version\":1,\"network\":\"testnet\",\"genesis_hash\":\"") +
+         (genesis.empty() ? hex_encode32(genesis::TESTNET_GENESIS_HASH) : genesis) + "\",\"windows\":[" + windows + "]}";
+}
+}  // namespace
+
+// `auto` reads its test windows from a published file; anything off about it refuses the whole file.
+TEST(test_nodetest_schedule_parse_and_refusals) {
+  std::string err;
+  auto ok = parse_schedule(schedule_json(R"({"start":"2026-11-09T08:00:00Z"},)"
+                                         R"({"start":"2026-11-08T08:00:00Z","duration_seconds":600,"rate":0.25})"),
+                           &err);
+  ASSERT_TRUE(ok.has_value());
+  ASSERT_EQ(ok->size(), 2u);
+  ASSERT_EQ((*ok)[0].start_unix, *parse_utc_time("2026-11-08T08:00:00Z"));  // sorted
+  ASSERT_EQ((*ok)[0].duration_seconds, 600u);
+  ASSERT_TRUE((*ok)[0].rate == 0.25);
+  ASSERT_TRUE((*ok)[1].rate == kDefaultRate && (*ok)[1].duration_seconds == kDefaultDurationSeconds);
+  ASSERT_TRUE(parse_schedule(schedule_json(""), &err).has_value());  // no windows yet is fine
+
+  const auto refused = [&](const std::string& json) { return !parse_schedule(json, &err).has_value(); };
+  ASSERT_TRUE(refused("not json"));
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z"})", std::string(64, 'a'))));  // other chain
+  ASSERT_TRUE(err.find("genesis_hash") != std::string::npos);
+  ASSERT_TRUE(refused(R"({"version":2,"network":"testnet","windows":[]})"));
+  ASSERT_TRUE(refused(std::string(R"({"version":1,"network":"mainnet","genesis_hash":")") +
+                      hex_encode32(genesis::TESTNET_GENESIS_HASH) + R"(","windows":[]})"));
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08 08:00"})")));
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z","rate":1.5})")));      // above the hard limit
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z","rate":0})")));
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z","rate":"0.1"})")));
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z","duration_seconds":14401})")));
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z","duration_seconds":30})")));
+  // Overlap: the next window starts before the previous one's run + drain + sweep is over.
+  ASSERT_TRUE(refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z"},{"start":"2026-11-08T08:40:00Z"})")));
+  ASSERT_TRUE(err.find("overlap") != std::string::npos);
+  ASSERT_TRUE(!refused(schedule_json(R"({"start":"2026-11-08T08:00:00Z"},{"start":"2026-11-08T09:00:00Z"})")));
+  std::string many;
+  for (int i = 0; i <= static_cast<int>(kMaxScheduleWindows); ++i)
+    many += std::string(i ? "," : "") + "{\"start\":\"" + format_utc_time(1'800'000'000 + i * 86400) + "\"}";
+  ASSERT_TRUE(refused(schedule_json(many)));
+
+  // The file the release ships with must parse in this build.
+  std::ifstream f(std::string(FINALIS_SOURCE_DIR) + "/testnet/NODETEST_SCHEDULE.json", std::ios::binary);
+  ASSERT_TRUE(static_cast<bool>(f));
+  std::stringstream ss;
+  ss << f.rdbuf();
+  auto repo = parse_schedule(ss.str(), &err);
+  if (!repo) throw std::runtime_error(err);
+  ASSERT_TRUE(!repo->empty());
+}
+
+TEST(test_nodetest_next_window_and_ceilings) {
+  const std::int64_t t0 = *parse_utc_time("2026-11-08T08:00:00Z");
+  const std::vector<ScheduleWindow> ws{{t0, 1800, 0.1}, {t0 + 86400, 1800, 0.5}};
+  ASSERT_EQ(next_window(ws, t0 - 3600, 0)->start_unix, t0);
+  ASSERT_EQ(next_window(ws, t0 + kLateStartSeconds, 0)->start_unix, t0);           // still joinable
+  ASSERT_EQ(next_window(ws, t0 + kLateStartSeconds + 1, 0)->start_unix, t0 + 86400);  // too late: the next one
+  ASSERT_EQ(next_window(ws, t0 - 3600, t0)->start_unix, t0 + 86400);                // already run
+  ASSERT_TRUE(!next_window(ws, t0 + 86400 + kLateStartSeconds + 1, 0).has_value());
+  ASSERT_TRUE(!next_window(ws, t0 - kMaxStartAheadSeconds - 1, 0).has_value());     // too far ahead
+
+  std::string err;
+  auto o = parse_options({"auto", "--rate", "0.2", "--duration", "600"}, &err);
+  ASSERT_TRUE(o.has_value() && o->rate_set && o->duration_set);
+  const auto w = apply_ceilings(ws[1], *o);
+  ASSERT_TRUE(w.rate == 0.2 && w.duration_seconds == 600u);
+  auto plain = parse_options({"auto"}, &err);
+  ASSERT_TRUE(plain.has_value() && plain->schedule_url == std::string(kDefaultScheduleUrl));
+  const auto same = apply_ceilings(ws[1], *plain);
+  ASSERT_TRUE(same.rate == 0.5 && same.duration_seconds == 1800u);
+  ASSERT_TRUE(!parse_options({"auto", "--start-at", "2026-11-08T08:00:00Z"}, &err).has_value());
+  ASSERT_TRUE(!parse_options({"auto", "--schedule-url", "ftp://x/y"}, &err).has_value());
+  auto file = parse_options({"auto", "--schedule", "/tmp/s.json"}, &err);
+  ASSERT_TRUE(file.has_value() && file->schedule_file == "/tmp/s.json");
+}
+
+// Run 1 (2026-11-07): every lock sent late in the epoch unlocked at its last block, 16 settled there
+// (kMaxTimedEscrowsPerUnlockHeight) and 20 expired. Unlocks now spread, and none is chosen too close
+// to the epoch end.
+TEST(test_nodetest_lock_unlock_heights_spread) {
+  const std::uint64_t epoch_end = 4160;
+  std::set<std::uint64_t> seen;
+  for (std::uint64_t r = 0; r < 1000; ++r) {
+    const std::uint64_t next = 4140 + r % 15;
+    auto u = short_lock_unlock(next, epoch_end, r * 2654435761u);
+    ASSERT_TRUE(u.has_value());
+    ASSERT_TRUE(*u >= next + kShortLockMinLead && *u <= std::min(epoch_end, next + kShortLockMaxLead));
+    seen.insert(*u);
+  }
+  ASSERT_TRUE(seen.size() >= 15);
+  // Close to the end: still spread over what is left, then no short lock at all.
+  std::set<std::uint64_t> late;
+  for (std::uint64_t r = 0; r < 100; ++r) late.insert(*short_lock_unlock(4152, epoch_end, r));
+  ASSERT_EQ(late.size(), 6u);  // 4155..4160
+  ASSERT_TRUE(short_lock_unlock(epoch_end - kShortLockMinLead, epoch_end, 7).has_value());
+  ASSERT_TRUE(!short_lock_unlock(epoch_end - kShortLockMinLead + 1, epoch_end, 7).has_value());
+  // Long locks: in the first half of the next epoch, not all at one height.
+  std::set<std::uint64_t> longs;
+  for (std::uint64_t r = 0; r < 200; ++r) {
+    const auto u = long_lock_unlock(epoch_end, 32, r);
+    ASSERT_TRUE(u >= epoch_end + kLongLockMinLead && u < epoch_end + kLongLockMinLead + 16);
+    longs.insert(u);
+  }
+  ASSERT_EQ(longs.size(), 16u);
+}
+
+// The schedule download: only a 200 with the file itself counts.
+TEST(test_http_get_body_status_and_chunked) {
+  std::string err;
+  auto plain = lightserver::http_get_body("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", 1024, &err);
+  ASSERT_TRUE(plain.has_value() && *plain == "{}");
+  auto chunked = lightserver::http_get_body(
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n", 1024, &err);
+  ASSERT_TRUE(chunked.has_value() && *chunked == "{\"a\":1}");
+  ASSERT_TRUE(!lightserver::http_get_body("HTTP/1.1 404 Not Found\r\n\r\nnope", 1024, &err).has_value());
+  ASSERT_TRUE(err.find("404") != std::string::npos);
+  ASSERT_TRUE(!lightserver::http_get_body("HTTP/1.1 301 Moved\r\nLocation: http://x/\r\n\r\n", 1024, &err).has_value());
+  ASSERT_TRUE(!lightserver::http_get_body("HTTP/1.1 200 OK\r\n\r\n" + std::string(2000, 'x'), 1024, &err).has_value());
+  ASSERT_TRUE(!lightserver::http_get_body(
+                   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nshort", 1024, &err)
+                   .has_value());
+  ASSERT_TRUE(!lightserver::http_get_body("garbage", 1024, &err).has_value());
 }

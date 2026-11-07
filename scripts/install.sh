@@ -115,7 +115,7 @@ ${SUDO} rm -rf "${OPT_DIR}.old"
 [[ -d "${OPT_DIR}" ]] && ${SUDO} mv "${OPT_DIR}" "${OPT_DIR}.old"
 ${SUDO} mv "${OPT_DIR}.new" "${OPT_DIR}"
 ${SUDO} rm -rf "${OPT_DIR}.old"
-for b in finalis-node finalis-lightserver finalis-cli finalis-explorer; do
+for b in finalis-node finalis-lightserver finalis-cli finalis-explorer finalis-nodetest; do
   ${SUDO} ln -sf "${OPT_DIR}/bin/${b}" "/usr/local/bin/${b}"
 done
 

@@ -15,6 +15,7 @@
 #endif
 
 #include "common/address.hpp"
+#include "common/minijson.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
 #include "consensus/monetary.hpp"
@@ -189,8 +190,10 @@ std::string usage_text() {
   std::ostringstream o;
   o << "finalis-nodetest: random test transactions on the Finalis TESTNET from a throwaway wallet.\n"
        "\n"
-       "Usage: finalis-nodetest [run|sweep|status|address] [options]\n"
+       "Usage: finalis-nodetest [run|auto|sweep|status|address] [options]\n"
        "  run      (default) send random transactions, then return the coins to address #0\n"
+       "  auto     keep running: wait for funds, join every shared test window of the published\n"
+       "           schedule, return the coins to address #0 after each one (also coins that unlock later)\n"
        "  sweep    only return every spendable coin to address #0\n"
        "  status   show the wallet's coins\n"
        "  address  print the wallet's addresses (give #0 to others for their --peers file)\n"
@@ -209,10 +212,13 @@ std::string usage_text() {
        "  --start-at TIME    shared test window: wait, then start at TIME (UTC, e.g. 2026-11-14T08:00:00Z),\n"
        "                     so every participant starts together; refused more than 10 min late\n"
        "  --allow-late       start even when more than 10 min after --start-at\n"
+       "  --schedule-url URL auto: where the test windows are published (default: the file in the repo)\n"
+       "  --schedule FILE    auto: read the test windows from FILE instead of downloading them\n"
+       "                     (in auto, --rate and --duration are ceilings on each window)\n"
        "\n"
        "Safety: testnet only (refuses mainnet and any other chain); uses only its own wallet, never\n"
        "validator keys; stops on Ctrl-C or when a file named STOP appears in --dir; backs off when the\n"
-       "node is busy; uploads nothing. Fund it by sending testnet coins (5 FLS is plenty) to address #0.\n";
+       "node is busy; uploads nothing. Fund it by sending testnet coins (5-10 FLS) to address #0.\n";
   return o.str();
 }
 
@@ -220,11 +226,12 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
   Options o;
   o.dir = default_state_dir();
   o.rpc = default_rpc_url();
+  o.schedule_url = kDefaultScheduleUrl;
   std::size_t i = 0;
   if (!args.empty() && args[0].rfind("--", 0) != 0) {
     o.command = args[0];
     i = 1;
-    if (o.command != "run" && o.command != "sweep" && o.command != "status" && o.command != "address" &&
+    if (o.command != "run" && o.command != "auto" && o.command != "sweep" && o.command != "status" && o.command != "address" &&
         o.command != "help") {
       *err = "unknown command: " + o.command;
       return std::nullopt;
@@ -266,6 +273,7 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
         return std::nullopt;
       }
       o.rate = r;
+      o.rate_set = true;
     } else if (a == "--duration") {
       if (!parse_u64(v, &n) || n == 0) {
         *err = "--duration must be a positive number of seconds";
@@ -276,6 +284,7 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
         return std::nullopt;
       }
       o.duration_seconds = n;
+      o.duration_set = true;
     } else if (a == "--drain") {
       if (!parse_u64(v, &n) || n > kMaxDurationSeconds) {
         *err = "--drain must be 0.." + std::to_string(kMaxDurationSeconds) + " seconds";
@@ -295,6 +304,14 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
         return std::nullopt;
       }
       o.start_at_unix = *t;
+    } else if (a == "--schedule-url") {
+      if (v.rfind("https://", 0) != 0 && v.rfind("http://", 0) != 0) {
+        *err = "--schedule-url must be an http:// or https:// URL";
+        return std::nullopt;
+      }
+      o.schedule_url = v;
+    } else if (a == "--schedule") {
+      o.schedule_file = v;
     } else if (a == "--types") {
       o.types.clear();
       std::stringstream ss(v);
@@ -314,6 +331,10 @@ std::optional<Options> parse_options(const std::vector<std::string>& args, std::
       *err = "unknown option: " + a;
       return std::nullopt;
     }
+  }
+  if (o.command == "auto" && o.start_at_unix) {
+    *err = "auto takes its start times from the schedule; --start-at is for run";
+    return std::nullopt;
   }
   if (o.command != "help") {
     auto dir = resolve_state_dir(o.dir, err);
@@ -389,6 +410,97 @@ StartDecision start_decision(std::int64_t now, std::int64_t start, bool allow_la
   if (now < start) return StartDecision::Wait;
   if (now - start > kLateStartSeconds && !allow_late) return StartDecision::TooLate;
   return StartDecision::Start;
+}
+
+std::optional<std::vector<ScheduleWindow>> parse_schedule(const std::string& json, std::string* err) {
+  const auto fail = [&](const std::string& m) -> std::optional<std::vector<ScheduleWindow>> {
+    *err = "schedule: " + m;
+    return std::nullopt;
+  };
+  if (json.size() > kMaxScheduleBytes) return fail("file too large");
+  const auto root = minijson::parse(json);
+  if (!root || !root->is_object()) return fail("not a JSON object");
+  const auto* version = root->get("version");
+  if (!version || version->as_u64() != std::optional<std::uint64_t>(1)) return fail("version must be 1");
+  const auto* network = root->get("network");
+  if (!network || network->as_string() != std::optional<std::string>("testnet")) return fail("network must be \"testnet\"");
+  const auto* genesis = root->get("genesis_hash");
+  if (!genesis || genesis->as_string() != std::optional<std::string>(hex_encode32(genesis::TESTNET_GENESIS_HASH))) {
+    return fail("genesis_hash is not this build's testnet (update finalis-nodetest)");
+  }
+  const auto* windows = root->get("windows");
+  if (!windows || !windows->is_array()) return fail("windows must be an array");
+  if (windows->array_value.size() > kMaxScheduleWindows) return fail("more than " + std::to_string(kMaxScheduleWindows) + " windows");
+  std::vector<ScheduleWindow> out;
+  for (std::size_t i = 0; i < windows->array_value.size(); ++i) {
+    const auto& w = windows->array_value[i];
+    const std::string at = "window " + std::to_string(i + 1) + ": ";
+    if (!w.is_object()) return fail(at + "not an object");
+    ScheduleWindow sw;
+    const auto* start = w.get("start");
+    const auto t = start ? start->as_string() : std::nullopt;
+    const auto ts = t ? parse_utc_time(*t) : std::nullopt;
+    if (!ts) return fail(at + "start must be a UTC time like 2026-11-08T08:00:00Z");
+    sw.start_unix = *ts;
+    if (const auto* d = w.get("duration_seconds")) {
+      const auto n = d->as_u64();
+      if (!n || *n < kMinWindowSeconds || *n > kMaxDurationSeconds) {
+        return fail(at + "duration_seconds must be " + std::to_string(kMinWindowSeconds) + ".." +
+                    std::to_string(kMaxDurationSeconds));
+      }
+      sw.duration_seconds = *n;
+    }
+    if (const auto* r = w.get("rate")) {
+      if (!r->is_number()) return fail(at + "rate must be a number");
+      char* end = nullptr;
+      const double v = std::strtod(r->string_value.c_str(), &end);
+      if (end == r->string_value.c_str() || *end != '\0' || !std::isfinite(v) || v <= 0 || v > kMaxRate) {
+        std::ostringstream m;
+        m << at << "rate must be above 0 and at most " << kMaxRate;
+        return fail(m.str());
+      }
+      sw.rate = v;
+    }
+    out.push_back(sw);
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.start_unix < b.start_unix; });
+  for (std::size_t i = 1; i < out.size(); ++i) {
+    // A window includes its drain and sweep: the next one may not start before those are over.
+    const std::int64_t busy_until =
+        out[i - 1].start_unix + static_cast<std::int64_t>(out[i - 1].duration_seconds + kDefaultDrainSeconds) + 15 * 60;
+    if (out[i].start_unix < busy_until) return fail("windows at " + format_utc_time(out[i - 1].start_unix) + " and " +
+                                                    format_utc_time(out[i].start_unix) + " overlap");
+  }
+  return out;
+}
+
+std::optional<ScheduleWindow> next_window(const std::vector<ScheduleWindow>& windows, std::int64_t now,
+                                          std::int64_t done_start) {
+  for (const auto& w : windows) {
+    if (w.start_unix <= done_start) continue;
+    if (now - w.start_unix > kLateStartSeconds) continue;  // under way for too long: not joining alone
+    if (w.start_unix - now > kMaxStartAheadSeconds) return std::nullopt;
+    return w;
+  }
+  return std::nullopt;
+}
+
+ScheduleWindow apply_ceilings(ScheduleWindow w, const Options& o) {
+  if (o.rate_set) w.rate = std::min(w.rate, o.rate);
+  if (o.duration_set) w.duration_seconds = std::min(w.duration_seconds, o.duration_seconds);
+  return w;
+}
+
+std::optional<std::uint64_t> short_lock_unlock(std::uint64_t next, std::uint64_t epoch_end, std::uint64_t r) {
+  const std::uint64_t lo = next + kShortLockMinLead;
+  if (epoch_end < lo) return std::nullopt;
+  const std::uint64_t hi = std::min(epoch_end, next + kShortLockMaxLead);
+  return lo + r % (hi - lo + 1);
+}
+
+std::uint64_t long_lock_unlock(std::uint64_t epoch_end, std::uint64_t epoch_blocks, std::uint64_t r) {
+  const std::uint64_t span = std::max<std::uint64_t>(1, epoch_blocks / 2);
+  return epoch_end + kLongLockMinLead + r % span;
 }
 
 std::optional<std::string> refuse_network(const lightserver::RpcStatusView& s) {
