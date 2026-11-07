@@ -7085,6 +7085,10 @@ TEST(test_future_height_vote_soft_rejects_without_penalizing_honest_ahead_peer) 
     }
     return true;
   }, std::chrono::seconds(60)));
+  // Pin the tip: one block finalizing before the inject turns height+2 into the next height,
+  // which is then a valid vote (accepted), not a future one.
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(10)));
 
   const auto live = nodes[0]->status();
   Vote future_vote;

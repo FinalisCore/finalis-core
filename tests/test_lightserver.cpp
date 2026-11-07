@@ -36,6 +36,7 @@
 #include "mempool/mempool.hpp"
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
+#include "p2p/messages.hpp"
 #include "storage/db.hpp"
 #include "storage/snapshot.hpp"
 #include "crypto/smt.hpp"
@@ -3276,3 +3277,122 @@ TEST(test_rpc_client_connect_error_names_target_and_reason) {
   std::filesystem::remove_all(base);
 }
 #endif
+
+namespace {
+
+// A stand-in node for broadcast_tx's relay: answers the handshake only after `handshake_delay_ms`
+// (testnet 2026-11-07: the 1-vCPU .39 node sent VERACK 3.07 s after connect while it applied block
+// 4158), then accepts the submitted transaction. answer=false: never answers at all.
+struct SlowRelayNode {
+  net::SocketHandle listen_fd{net::kInvalidSocket};
+  std::uint16_t port{0};
+  std::thread th;
+  std::atomic<bool> got_submit{false};
+
+  SlowRelayNode(const NetworkConfig& net, std::uint32_t handshake_delay_ms, bool answer) {
+    if (!net::ensure_sockets()) throw std::runtime_error("sockets");
+    listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    (void)net::set_reuseaddr(listen_fd);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || ::listen(listen_fd, 4) != 0) {
+      throw std::runtime_error("listen");
+    }
+    sockaddr_in bound{};
+    socklen_t len = sizeof(bound);
+    ::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&bound), &len);
+    port = ntohs(bound.sin_port);
+    th = std::thread([this, net, handshake_delay_ms, answer]() {
+      const auto fd = ::accept(listen_fd, nullptr, nullptr);
+      if (!net::valid_socket(fd)) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(handshake_delay_ms));
+      if (answer) {
+        p2p::VersionMsg v;
+        v.proto_version = static_cast<std::uint32_t>(net.protocol_version);
+        v.network_id = net.network_id;
+        v.feature_flags = net.feature_flags;
+        v.node_software_version = "slow-relay-node";
+        (void)p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, net.magic, net.protocol_version);
+        (void)p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}}, net.magic, net.protocol_version);
+      }
+      for (int i = 0; i < 8; ++i) {
+        p2p::FrameReadError e = p2p::FrameReadError::NONE;
+        auto f = p2p::read_frame_fd_timed(fd, net.max_payload_len, net.magic, net.protocol_version, 20'000, 20'000, &e);
+        if (!f) break;
+        if (f->msg_type != p2p::MsgType::SUBMIT_TX) continue;
+        got_submit = true;
+        auto tx = p2p::de_tx(f->payload);
+        p2p::TxResultMsg r;
+        if (tx) {
+          if (auto any = parse_any_tx(tx->tx_bytes)) r.txid = txid_any(*any);
+        }
+        r.accepted = true;
+        (void)p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::TX_RESULT, p2p::ser_tx_result(r)}, net.magic,
+                                  net.protocol_version);
+      }
+      net::close_socket(fd);
+    });
+  }
+  ~SlowRelayNode() {
+    net::shutdown_socket(listen_fd);
+    net::close_socket(listen_fd);
+    if (th.joinable()) th.join();
+  }
+};
+
+// A signed transfer the lightserver accepts for relay, and a server pointed at `relay_port`.
+std::pair<std::unique_ptr<lightserver::Server>, std::string> relay_test_server(const std::string& base, std::uint16_t relay_port) {
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const auto keys = node::Node::deterministic_test_keypairs();
+  storage::DB db;
+  if (!db.open(base)) throw std::runtime_error("db");
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x96;
+  (void)db.set_tip(storage::TipState{8, tip_hash});
+  OutPoint op{};
+  op.txid.fill(0x59);
+  TxOut prev{10'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end())))};
+  (void)db.put_utxo(op, prev);
+  (void)db.flush();
+  db.close();
+  auto tx = build_signed_p2pkh_tx_single_input(
+      db_chain_domain(base), op, prev, keys[0].private_key,
+      std::vector<TxOut>{TxOut{9'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(keys[1].public_key.begin(), keys[1].public_key.end())))}});
+  if (!tx) throw std::runtime_error("tx");
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lcfg.tx_relay_host = "127.0.0.1";
+  lcfg.tx_relay_port = relay_port;
+  auto ls = std::make_unique<lightserver::Server>(lcfg);
+  if (!ls->init()) throw std::runtime_error("init");
+  return {std::move(ls), std::string(R"({"jsonrpc":"2.0","id":7,"method":"broadcast_tx","params":{"tx_hex":")") +
+                             hex_encode(tx->serialize()) + R"("}})"};
+}
+
+}  // namespace
+
+// A node busy applying a block answers the relay handshake seconds late: the transaction must still
+// be relayed, not refused as relay_unavailable (TIMEOUT_HEADER) as on testnet run 1.
+TEST(test_lightserver_relay_waits_for_a_node_busy_for_seconds) {
+  SlowRelayNode slow(mainnet_network(), 3000, true);
+  auto [ls, body] = relay_test_server(unique_test_base("/tmp/finalis_light_relay_slow"), slow.port);
+  const auto resp = ls->handle_rpc_for_test(body);
+  ASSERT_TRUE(slow.got_submit.load());
+  if (resp.find("\"accepted\":true") == std::string::npos) throw std::runtime_error("relay refused: " + resp);
+}
+
+// A node that never answers: the relay gives up in time for the client to get the verdict
+// (lightserver::client waits 15 s per request), as a retryable relay_unavailable.
+TEST(test_lightserver_relay_gives_up_before_the_client_does) {
+  SlowRelayNode dead(mainnet_network(), 0, false);
+  auto [ls, body] = relay_test_server(unique_test_base("/tmp/finalis_light_relay_dead"), dead.port);
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto resp = ls->handle_rpc_for_test(body);
+  const auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  ASSERT_TRUE(resp.find("\"error_code\":\"relay_unavailable\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"retryable\":true") != std::string::npos);
+  if (secs >= 14.0) throw std::runtime_error("relay took " + std::to_string(secs) + " s");
+}

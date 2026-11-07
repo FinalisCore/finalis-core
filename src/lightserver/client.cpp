@@ -1343,4 +1343,90 @@ std::optional<std::string> http_post_json_raw(const std::string& url, const std:
   return http_post_json(url, body, headers, err);
 }
 
+std::optional<std::string> http_get_body(const std::string& raw, std::size_t max_body_bytes, std::string* err) {
+  const auto fail = [&](const std::string& m) -> std::optional<std::string> {
+    if (err) *err = m;
+    return std::nullopt;
+  };
+  const auto head_end = raw.find("\r\n\r\n");
+  if (head_end == std::string::npos) return fail("invalid http response");
+  const std::string head = raw.substr(0, head_end);
+  // Status line: "HTTP/1.x 200 ...". Redirects are not followed: the URL must name the file itself.
+  const auto sp = head.find(' ');
+  if (head.rfind("HTTP/1.", 0) != 0 || sp == std::string::npos || head.size() < sp + 4) return fail("invalid http status line");
+  const std::string code = head.substr(sp + 1, 3);
+  if (code != "200") return fail("http status " + code);
+  std::string lower = head;
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  const bool chunked = lower.find("\r\ntransfer-encoding: chunked") != std::string::npos;
+  std::string body = raw.substr(head_end + 4);
+  if (chunked) {
+    std::string out;
+    std::size_t pos = 0;
+    while (true) {
+      const auto eol = body.find("\r\n", pos);
+      if (eol == std::string::npos) return fail("truncated chunked body");
+      const std::string size_hex = body.substr(pos, body.find_first_of(";\r", pos) - pos);
+      if (size_hex.empty() || size_hex.size() > 8 ||
+          size_hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+        return fail("bad chunk size");
+      }
+      const std::size_t n = std::stoul(size_hex, nullptr, 16);
+      pos = eol + 2;
+      if (n == 0) break;
+      if (body.size() < pos + n + 2) return fail("truncated chunked body");
+      out.append(body, pos, n);
+      if (out.size() > max_body_bytes) return fail("response too large");
+      pos += n + 2;
+    }
+    body = std::move(out);
+  }
+  if (body.size() > max_body_bytes) return fail("response too large");
+  return body;
+}
+
+std::optional<std::string> http_get(const std::string& url, std::size_t max_body_bytes, std::string* err) {
+  auto parsed = parse_http_url(url);
+  if (!parsed) {
+    if (err) *err = "invalid http url";
+    return std::nullopt;
+  }
+  auto fd_opt = connect_tcp(parsed->host, parsed->port);
+  if (!fd_opt) {
+    if (err) *err = "connect failed: " + parsed->host + ":" + std::to_string(parsed->port);
+    return std::nullopt;
+  }
+  const auto fd = *fd_opt;
+  const bool v6 = parsed->host.find(':') != std::string::npos;
+  const bool default_port = parsed->port == (parsed->tls ? 443 : 80);
+  const std::string host = (v6 ? "[" + parsed->host + "]" : parsed->host) +
+                           (default_port ? "" : ":" + std::to_string(parsed->port));
+  std::ostringstream req;
+  req << "GET " << parsed->path << " HTTP/1.1\r\n"
+      << "Host: " << host << "\r\n"
+      << "User-Agent: finalis-core\r\n"
+      << "Accept: */*\r\n"
+      << "Connection: close\r\n\r\n";
+  std::optional<std::string> resp;
+  if (parsed->tls) {
+    std::string tls_err;
+    auto tls = TlsSession::open(fd, parsed->host, &tls_err);
+    if (!tls) {
+      net::close_socket(fd);
+      if (err) *err = tls_err;
+      return std::nullopt;
+    }
+    if (tls->write_all(req.str())) resp = tls->read_all(max_body_bytes + 64 * 1024);
+    tls.reset();
+  } else {
+    if (write_all(fd, req.str())) resp = read_all(fd);
+  }
+  net::close_socket(fd);
+  if (!resp) {
+    if (err) *err = "read failed";
+    return std::nullopt;
+  }
+  return http_get_body(*resp, max_body_bytes, err);
+}
+
 }  // namespace finalis::lightserver

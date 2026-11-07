@@ -39,8 +39,9 @@ namespace {
 std::atomic<int> g_stop{0};
 extern "C" void on_signal(int) { g_stop.fetch_add(1); }
 
-// Coin sizes. Work coins can fund any type, a time lock included (0.1 FLS bond + prepaid fee).
-constexpr std::uint64_t kWorkCoinUnits = 24'000'000;
+// Coin sizes. Work coins can fund any type, a time lock included (0.1 FLS bond + 0.02 fee and change),
+// and are small so that 5 FLS makes the 40 a run needs (run 1 with 0.24 FLS coins: 84 empty slots).
+constexpr std::uint64_t kWorkCoinUnits = 12'500'000;
 constexpr std::size_t kTargetWorkCoins = 40;
 constexpr std::uint64_t kMinSpendUnits = 200'000;
 constexpr std::uint64_t kTimedAmountUnits = 1'000'000;
@@ -49,6 +50,10 @@ constexpr std::size_t kMaxInFlight = 400;
 // A transaction not final this many blocks after sending is given up (its coins are reused).
 constexpr std::uint64_t kExpireBlocks = 20;
 constexpr std::uint64_t kMinFundingUnits = consensus::BASE_UNITS_PER_COIN;  // 1 FLS
+// auto: the setup split starts this long before a window; notes while idle come this often.
+constexpr std::int64_t kSetupLeadSeconds = 20 * 60;
+constexpr std::int64_t kIdleNoteSeconds = 30 * 60;
+constexpr std::int64_t kLaterSweepSeconds = 30 * 60;
 
 bool same_op(const OutPoint& a, const OutPoint& b) { return a.txid == b.txid && a.index == b.index; }
 
@@ -109,6 +114,7 @@ class Runner {
 
   int main_command() {
     std::string err;
+    std::cerr << "Wallet: " << opt_.dir << "\n";  // stderr: stdout stays the address list / tx log
     auto w = load_wallet(opt_.dir, &err);
     if (!w && !err.empty()) return fail(err);
     if (!w) {
@@ -124,6 +130,7 @@ class Runner {
     if (!connect()) return 1;
     if (opt_.command == "status") return status_command();
     if (opt_.command == "sweep") return finish(false);
+    if (opt_.command == "auto") return auto_command();
     return run_command();
   }
 
@@ -143,6 +150,8 @@ class Runner {
   std::ofstream log_;
   std::uint64_t consecutive_rejects_{0};
   bool split_in_flight_{false};
+  std::uint64_t last_timed_tip_{0};  // tip when the last time lock was sent (kTimedEveryBlocks apart)
+  std::string summary_label_;        // auto: the window a summary belongs to
 
   int fail(const std::string& m) {
     std::cerr << "finalis-nodetest: " << m << "\n";
@@ -524,10 +533,18 @@ class Runner {
     if (timed_open >= kMaxTimedInFlight) return std::nullopt;
     const bool reveal = type == TxType::Seal || type == TxType::SealLong;
     const bool lng = type == TxType::TimedLong || type == TxType::SealLong;
+    if (last_timed_tip_ != 0 && tip_ < last_timed_tip_ + kTimedEveryBlocks) return std::nullopt;
     const std::uint64_t next = tip_ + 1;
     const std::uint64_t epoch_blocks = std::max<std::uint64_t>(1, testnet_network().committee_epoch_blocks);
     const std::uint64_t horizon = consensus::committee_epoch_start(next, epoch_blocks) + epoch_blocks - 1;
-    const std::uint64_t unlock = lng ? horizon + 4 : std::min(horizon, next + 6);
+    std::uint64_t unlock = 0;
+    if (lng) {
+      unlock = long_lock_unlock(horizon, epoch_blocks, rng_());
+    } else {
+      auto u = short_lock_unlock(next, horizon, rng_());
+      if (!u) return std::nullopt;  // the epoch ends too soon: another type this time
+      unlock = *u;
+    }
     const std::uint64_t bond = consensus::kTxTimedMinForfeitBond;
     std::string e;
     // Plain coins of one key: the fee coin plus (for a transfer) coins for the sealed body.
@@ -619,6 +636,7 @@ class Runner {
     Built b;
     b.type = type_name(type);
     b.timed = true;
+    last_timed_tip_ = tip_;
     b.key = k;
     b.bytes = tt->serialize();
     b.txid = tt->txid();
@@ -824,31 +842,62 @@ class Runner {
     return 0;
   }
 
-  int run_command() {
+  // Peers file, crypto, log file, confidential records: what every sending command needs first.
+  bool prepare() {
     std::string err;
     if (!opt_.peers_file.empty()) {
       std::ifstream pf(opt_.peers_file);
-      if (!pf) return fail("cannot read " + opt_.peers_file);
+      if (!pf) {
+        fail("cannot read " + opt_.peers_file);
+        return false;
+      }
       std::stringstream ss;
       ss << pf.rdbuf();
       auto p = parse_peers(ss.str(), w_.addresses(), &err);
-      if (!p) return fail(err);
+      if (!p) {
+        fail(err);
+        return false;
+      }
       peers_ = std::move(*p);
     }
+    if (!crypto::confidential_crypto_init()) {
+      fail("confidential crypto init failed");
+      return false;
+    }
+    std::filesystem::remove(std::filesystem::path(opt_.dir) / "STOP");
+    log_.open(std::filesystem::path(opt_.dir) / "txlog.tsv", std::ios::app);
+    recheck_conf();
+    return true;
+  }
+
+  // A fresh wallet holds one or two coins: split them and wait until the work coins are final, so the
+  // run does not start with empty slots. False if stopped meanwhile.
+  bool setup_split() {
+    refresh_coins();
+    maybe_split();
+    const double setup_end = now_s() + 900;
+    if (split_in_flight_) std::cout << "waiting for the setup split to be final (one or two blocks)...\n" << std::flush;
+    while (split_in_flight_ && !stop_requested() && now_s() < setup_end) {
+      for (int i = 0; i < 50 && !stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      if (refresh_status()) poll_inflight();
+    }
+    return !stop_requested();
+  }
+
+  int run_command() {
+    std::string err;
     {
       auto s = ls::rpc_get_status(opt_.rpc, &err);
       if (!s) return fail("status: " + err);
       if (auto problem = preflight_problem(*s, opt_.min_peers)) return fail("not starting: " + *problem);
     }
-    if (!crypto::confidential_crypto_init()) return fail("confidential crypto init failed");
-    std::filesystem::remove(std::filesystem::path(opt_.dir) / "STOP");
-    log_.open(std::filesystem::path(opt_.dir) / "txlog.tsv", std::ios::app);
-    recheck_conf();
+    if (!prepare()) return 1;
     refresh_coins();
     const std::uint64_t funds = transparent_units() + conf_units();
     if (funds < kMinFundingUnits) {
-      std::cout << "This wallet holds " << fls(funds) << " FLS. Send at least 1 FLS (5 FLS is plenty) of testnet\n"
-                << "coins to\n\n    " << w_.keys[0].address << "\n\nwait until the payment is final, then run again.\n";
+      std::cout << "This wallet holds " << fls(funds) << " FLS. Send at least 1 FLS (5-10 FLS is plenty) of testnet\n"
+                << "coins to\n\n    " << w_.keys[0].address << "\n\nwait until the payment is final, then run again.\n"
+                << "(Or start `finalis-nodetest auto`: it waits for the payment itself.)\n";
       return 3;
     }
     if (opt_.start_at_unix) {
@@ -864,29 +913,32 @@ class Runner {
           break;
       }
     }
-    std::cout << "finalis-nodetest on " << opt_.rpc << ": " << opt_.rate << " tx/s for " << opt_.duration_seconds
-              << " s, " << opt_.types.size() << " types, " << peers_.size() << " peers, funds " << fls(funds)
-              << " FLS. Ctrl-C or touch " << (std::filesystem::path(opt_.dir) / "STOP").string() << " to stop.\n";
-    // A fresh wallet holds one or two coins: split them and wait until the work coins are final, so the
-    // run does not start with empty slots.
-    maybe_split();
-    const double setup_end = now_s() + 900;
-    if (split_in_flight_) std::cout << "waiting for the setup split to be final (one or two blocks)...\n";
-    while (split_in_flight_ && !stop_requested() && now_s() < setup_end) {
-      for (int i = 0; i < 50 && !stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      if (refresh_status()) poll_inflight();
-    }
-    if (opt_.start_at_unix && !wait_for_start_time()) {
+    banner(opt_.rate, opt_.duration_seconds, funds);
+    if (!setup_split() || (opt_.start_at_unix && !wait_until_start(*opt_.start_at_unix, opt_.allow_late))) {
       std::cout << "Stopped before the start; no test transactions were sent.\n";
       return 0;
     }
+    send_loop(opt_.rate, opt_.duration_seconds);
+    return finish(true);
+  }
+
+  void banner(double rate, std::uint64_t duration, std::uint64_t funds) {
+    std::cout << "finalis-nodetest on " << opt_.rpc << ": " << rate << " tx/s for " << duration << " s, "
+              << opt_.types.size() << " types, " << peers_.size() << " peers, funds " << fls(funds)
+              << " FLS. Ctrl-C or touch " << (std::filesystem::path(opt_.dir) / "STOP").string() << " to stop.\n"
+              << std::flush;
+  }
+
+  // Sends at `rate` for `duration` seconds (or until stopped / too many rejects in a row).
+  void send_loop(double rate, std::uint64_t duration) {
     refresh_coins();
-    log("start\trate=" + std::to_string(opt_.rate) + "\tduration=" + std::to_string(opt_.duration_seconds) +
+    log("start\trate=" + std::to_string(rate) + "\tduration=" + std::to_string(duration) +
         "\tpeers=" + std::to_string(peers_.size()) + "\ttip=" + std::to_string(tip_));
     const double start = now_s();
-    const double end = start + static_cast<double>(opt_.duration_seconds);
-    Pacer pacer(opt_.rate, start);
+    const double end = start + static_cast<double>(duration);
+    Pacer pacer(rate, start);
     double next_refresh = start + 15;
+    consecutive_rejects_ = 0;
     while (!stop_requested() && now_s() < end) {
       const double now = now_s();
       if (now >= next_refresh) {
@@ -925,17 +977,14 @@ class Runner {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     log(std::string("stop\t") + (stop_requested() ? "requested" : "duration reached or rejects"));
-    return finish(true);
   }
 
-  // --start-at: counts down to the shared start (plus a few random seconds), then waits until the node
-  // passes the preflight again. False if stopped first, or if the node is not ready within the late
-  // cut-off after the start.
-  bool wait_for_start_time() {
-    const std::int64_t start = *opt_.start_at_unix;
+  // Counts down to the shared `start` (plus a few random seconds), then waits until the node passes
+  // the preflight again. False if stopped first, or if the node is not ready within the late cut-off.
+  bool wait_until_start(std::int64_t start, bool allow_late) {
     const std::int64_t go = start + std::uniform_int_distribution<std::int64_t>(0, kStartJitterSeconds)(rng_);
     std::cout << "Shared start at " << format_utc_time(start) << " (this node starts at " << format_utc_time(go)
-              << "). Leave this running; Ctrl-C or STOP cancels.\n";
+              << "). Leave this running; Ctrl-C or STOP cancels.\n" << std::flush;
     std::int64_t last_note = 0;
     while (unix_now() < go) {
       if (stop_requested()) return false;
@@ -956,13 +1005,220 @@ class Runner {
       std::string problem = s ? preflight_problem(*s, opt_.min_peers).value_or("") : "status: " + err;
       if (s && refuse_network(*s)) throw std::runtime_error("the server changed chains");
       if (problem.empty()) return true;
-      if (unix_now() - start > kLateStartSeconds && !opt_.allow_late) {
+      if (unix_now() - start > kLateStartSeconds && !allow_late) {
         log("stop\tnode not ready by " + format_utc_time(start + kLateStartSeconds) + "\t" + problem);
         return false;
       }
       log("wait\tnode not ready\t" + problem);
       for (int i = 0; i < 75 && !stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+  }
+
+  // --- auto ---
+
+  std::filesystem::path state_path(const char* name) const { return std::filesystem::path(opt_.dir) / name; }
+
+  // Reads the schedule (download or --schedule FILE). On success the copy is kept in the wallet
+  // directory, so a failed download later falls back to the last good one.
+  void update_schedule(std::vector<ScheduleWindow>* windows, bool* have) {
+    std::string err;
+    std::optional<std::string> text;
+    std::string source = opt_.schedule_file.empty() ? opt_.schedule_url : opt_.schedule_file;
+    if (!opt_.schedule_file.empty()) {
+      std::ifstream f(opt_.schedule_file, std::ios::binary);
+      if (f) {
+        std::stringstream ss;
+        ss << f.rdbuf();
+        text = ss.str();
+      } else {
+        err = "cannot read " + opt_.schedule_file;
+      }
+    } else {
+      text = ls::http_get(opt_.schedule_url, kMaxScheduleBytes, &err);
+    }
+    std::optional<std::vector<ScheduleWindow>> parsed;
+    if (text) parsed = parse_schedule(*text, &err);
+    if (!parsed) {
+      log("schedule\tnot updated\t" + source + "\t" + err.substr(0, 200));
+      if (!*have) {  // first time: the copy from the last run, if any
+        std::ifstream f(state_path("schedule.json"), std::ios::binary);
+        std::stringstream ss;
+        if (f) ss << f.rdbuf();
+        std::string cerr_;
+        if (auto cached = f ? parse_schedule(ss.str(), &cerr_) : std::nullopt) {
+          *windows = std::move(*cached);
+          *have = true;
+          log("schedule\tusing the saved copy\t" + std::to_string(windows->size()) + " windows");
+        }
+      }
+      return;
+    }
+    if (!*have || parsed->size() != windows->size() ||
+        !std::equal(parsed->begin(), parsed->end(), windows->begin(), [](const auto& a, const auto& b) {
+          return a.start_unix == b.start_unix && a.duration_seconds == b.duration_seconds && a.rate == b.rate;
+        })) {
+      log("schedule\tupdated\t" + std::to_string(parsed->size()) + " windows\t" + source);
+    }
+    *windows = std::move(*parsed);
+    *have = true;
+    if (opt_.schedule_file.empty()) {
+      std::ofstream out(state_path("schedule.json"), std::ios::binary | std::ios::trunc);
+      out << *text;
+    }
+  }
+
+  std::int64_t load_done_window() const {
+    std::ifstream f(state_path("auto-last-window"));
+    std::int64_t v = 0;
+    if (f) f >> v;
+    return v;
+  }
+
+  void save_done_window(std::int64_t start) const {
+    std::ofstream f(state_path("auto-last-window"), std::ios::trunc);
+    f << start << "\n";
+  }
+
+  // True if some spendable coin is not yet a plain output at address #0.
+  bool coins_away_from_home() const {
+    const Bytes& home = w_.keys[0].script;
+    for (const auto& [k, cs] : coins_)
+      for (const auto& c : cs)
+        if (c.second.script_pubkey != home) return true;
+    return !usable_conf().empty();
+  }
+
+  void sleep_checking_stop(int seconds) {
+    for (int i = 0; i < seconds * 5 && !stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+
+  // Runs forever: waits for funds and for the next window of the schedule, takes part in it, returns
+  // the coins to address #0, and later also the coins that unlock after a window (height locks,
+  // time-lock bodies and bonds). This process remembers which coins pending time locks will spend,
+  // so it never spends them early (a separate `sweep` process cannot know).
+  int auto_command() {
+    if (!prepare()) return 1;
+    std::cout << "finalis-nodetest auto: test windows from "
+              << (opt_.schedule_file.empty() ? opt_.schedule_url : opt_.schedule_file) << "\n"
+              << "Wallet address #0: " << w_.keys[0].address << "\n"
+              << "Leave it running. Ctrl-C or touch " << state_path("STOP").string() << " to stop.\n" << std::flush;
+    std::vector<ScheduleWindow> windows;
+    bool have_schedule = false;
+    std::int64_t next_fetch = 0, last_note = 0, next_later_sweep = 0;
+    std::int64_t done = load_done_window();
+    while (!stop_requested()) {
+      const std::int64_t now = unix_now();
+      if (now >= next_fetch) {
+        update_schedule(&windows, &have_schedule);
+        next_fetch = now + (have_schedule ? kScheduleRefreshSeconds : 300);  // no schedule yet: retry soon
+      }
+      if (!refresh_status()) {
+        if (now - last_note >= 300) {
+          log("wait\tlightserver unreachable\t" + opt_.rpc + "\tretrying");
+          last_note = now;
+        }
+        sleep_checking_stop(30);
+        continue;
+      }
+      poll_inflight();
+      refresh_coins();
+      const std::uint64_t funds = transparent_units() + conf_units();
+      auto w = next_window(windows, now, done);
+      if (w && w->start_unix - now <= kSetupLeadSeconds) {
+        const ScheduleWindow win = apply_ceilings(*w, opt_);
+        if (funds < kMinFundingUnits) {
+          if (now - last_note >= 600) {
+            std::cout << utc_now() << "  window at " << format_utc_time(win.start_unix) << ", but this wallet holds "
+                      << fls(funds) << " FLS: send 5-10 testnet FLS to " << w_.keys[0].address << "\n" << std::flush;
+            last_note = now;
+          }
+          if (now > win.start_unix + kLateStartSeconds) done = win.start_unix;  // too late now
+          sleep_checking_stop(30);
+          continue;
+        }
+        banner(win.rate, win.duration_seconds, funds);
+        const bool go = setup_split() && wait_until_start(win.start_unix, false);
+        done = win.start_unix;
+        save_done_window(done);
+        if (!go) {
+          if (stop_requested()) break;
+          continue;  // node not ready in time: skip this window
+        }
+        sum_ = Summary{};
+        summary_label_ = format_utc_time(win.start_unix);
+        send_loop(win.rate, win.duration_seconds);
+        finish(true);
+        next_later_sweep = unix_now() + kLaterSweepSeconds;
+        last_note = 0;
+        continue;
+      }
+      // Idle: bring home the coins that came free since the last window.
+      if (now >= next_later_sweep && inflight_.empty()) {
+        next_later_sweep = now + kLaterSweepSeconds;
+        if (coins_away_from_home()) {
+          const auto r = sweep_home(g_stop.load(), now_s() + 600);
+          if (r.txs > 0) log("sweep\tlater\t" + std::to_string(r.txs) + " txs\t" + fls(r.moved) + " FLS to #0");
+        }
+      }
+      if (now - last_note >= kIdleNoteSeconds) {
+        std::cout << utc_now() << "  wallet " << fls(funds) << " FLS; "
+                  << (w ? "next window " + format_utc_time(w->start_unix)
+                        : std::string(have_schedule ? "no window scheduled yet" : "no schedule yet"))
+                  << "\n" << std::flush;
+        last_note = now;
+      }
+      sleep_checking_stop(60);
+    }
+    std::cout << "Stopped.\n";
+    return 0;
+  }
+
+  // --- sweep ---
+
+  struct SweepResult {
+    std::size_t txs{0};
+    std::uint64_t moved{0}, fees{0}, dust{0};
+  };
+
+  // Sends every spendable coin to address #0 in up to three rounds (coins of transactions that expire
+  // meanwhile come free and go in the next round) and waits, bounded, for the sweep itself.
+  SweepResult sweep_home(int stops_at_start, double sweep_end) {
+    SweepResult r;
+    const Bytes target = w_.keys[0].script;
+    for (int round = 0; round < 3; ++round) {
+      refresh_status();
+      refresh_coins();
+      // Outputs already home stay where they are: only the other coins move.
+      auto& home = coins_[0];
+      home.erase(std::remove_if(home.begin(), home.end(), [&](const Coin& c) { return c.second.script_pubkey == target; }),
+                 home.end());
+      std::vector<ConfCoin> conf;
+      for (const auto i : usable_conf()) conf.push_back(w_.conf[i]);
+      std::string err;
+      auto sweep = build_sweep(domain_, w_, coins_, conf, target, base_fee_, &r.dust, &err);
+      if (!err.empty() && sweep.empty()) log("sweep\tbuild failed\t" + err);
+      if (sweep.empty()) break;
+      for (auto& s : sweep) {
+        Built b;
+        b.type = "sweep";
+        b.txid = s.txid;
+        b.bytes = std::visit([](const auto& t) { return t.serialize(); }, s.tx);
+        b.conf_spent = s.conf_inputs;
+        b.expire_after = tip_ + kExpireBlocks;
+        if (send(b, false)) {
+          ++r.txs;
+          r.moved += s.output_units;
+          r.fees += s.fee;
+        }
+      }
+      while (!inflight_.empty() && now_s() < sweep_end && g_stop.load() <= stops_at_start + 1) {
+        for (int i = 0; i < 50; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (refresh_status()) poll_inflight();
+      }
+      if (!inflight_.empty() || now_s() >= sweep_end) break;
+    }
+    save();
+    return r;
   }
 
   // Waits for open transactions, returns every spendable coin to address #0, prints the summary.
@@ -979,59 +1235,32 @@ class Runner {
       if (refresh_status()) poll_inflight();
       if (inflight_.empty()) break;
       if (now_s() - last_note > 60) {
-        std::cout << "waiting for " << inflight_.size() << " open transactions (Ctrl-C to skip)...\n";
+        std::cout << "waiting for " << inflight_.size() << " open transactions (Ctrl-C to skip)...\n" << std::flush;
         last_note = now_s();
       }
       for (int i = 0; i < 50 && g_stop.load() == stops_at_start; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    // Sweep rounds: coins of transactions that expire meanwhile come free and go in the next round.
-    const Bytes target = w_.keys[0].script;
-    std::uint64_t moved = 0, fees = 0, dust = 0;
-    std::size_t sweep_txs = 0;
-    const double sweep_end = now_s() + std::min<double>(static_cast<double>(opt_.drain_seconds), 900);
-    for (int round = 0; round < 3; ++round) {
-      refresh_status();
-      refresh_coins();
-      if (round > 0) {  // the previous rounds' outputs are already home: only newly freed coins move
-        auto& home = coins_[0];
-        home.erase(std::remove_if(home.begin(), home.end(), [&](const Coin& c) { return c.second.script_pubkey == target; }),
-                   home.end());
-      }
-      std::vector<ConfCoin> conf;
-      for (const auto i : usable_conf()) conf.push_back(w_.conf[i]);
-      std::string err;
-      auto sweep = build_sweep(domain_, w_, coins_, conf, target, base_fee_, &dust, &err);
-      if (!err.empty() && sweep.empty()) log("sweep\tbuild failed\t" + err);
-      if (sweep.empty()) break;
-      for (auto& s : sweep) {
-        Built b;
-        b.type = "sweep";
-        b.txid = s.txid;
-        b.bytes = std::visit([](const auto& t) { return t.serialize(); }, s.tx);
-        b.conf_spent = s.conf_inputs;
-        b.expire_after = tip_ + kExpireBlocks;
-        if (send(b, false)) {
-          ++sweep_txs;
-          moved += s.output_units;
-          fees += s.fee;
-        }
-      }
-      // Wait (bounded) for the sweep itself so the final balance is real.
-      while (!inflight_.empty() && now_s() < sweep_end && g_stop.load() <= stops_at_start + 1) {
-        for (int i = 0; i < 50; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (refresh_status()) poll_inflight();
-      }
-      if (!inflight_.empty() || now_s() >= sweep_end) break;
-    }
-    save();
-    std::cout << "\n" << sum_.render();
-    std::cout << "sweep: " << sweep_txs << " txs, " << fls(moved) << " FLS to " << w_.keys[0].address << " (fees "
-              << fls(fees) << ", left as dust " << fls(dust) << ")\n";
+    const auto r = sweep_home(stops_at_start, now_s() + std::min<double>(static_cast<double>(opt_.drain_seconds), 900));
+    std::ostringstream out;
+    if (!summary_label_.empty()) out << "window " << summary_label_ << "\n";
+    out << sum_.render();
+    out << "sweep: " << r.txs << " txs, " << fls(r.moved) << " FLS to " << w_.keys[0].address << " (fees " << fls(r.fees)
+        << ", left as dust " << fls(r.dust) << ")\n";
+    std::cout << "\n" << out.str();
     if (!holds_.empty() || !inflight_.empty()) {
-      std::cout << "Some coins are still time-locked or unconfirmed; run `finalis-nodetest sweep` again later.\n";
+      std::cout << (opt_.command == "auto"
+                        ? "Some coins are still time-locked or unconfirmed; they are swept home once they unlock.\n"
+                        : "Some coins are still time-locked or unconfirmed; run `finalis-nodetest sweep` again later.\n");
+    }
+    if (!summary_label_.empty()) {
+      std::string name = "summary-" + summary_label_ + ".txt";
+      std::replace(name.begin(), name.end(), ':', '-');  // a valid file name on Windows too
+      std::ofstream f(state_path(name.c_str()), std::ios::trunc);
+      f << out.str();
+      std::cout << "Summary saved: " << state_path(name.c_str()).string() << "\n";
     }
     std::cout << "Log: " << (std::filesystem::path(opt_.dir) / "txlog.tsv").string()
-              << " (nothing was uploaded; paste the summary above if you want to share it)\n";
+              << " (nothing was uploaded; paste the summary above if you want to share it)\n" << std::flush;
     return 0;
   }
 };

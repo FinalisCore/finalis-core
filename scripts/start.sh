@@ -529,7 +529,7 @@ configure_and_build() {
   log "Configure command: cmake ${args[*]}"
   configure_cmake "${args[@]}"
 
-  local -a targets=(finalis-node finalis-lightserver finalis-explorer finalis-cli)
+  local -a targets=(finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-nodetest)
   if [[ "${RUN_TESTS}" == "1" ]]; then
     targets+=(finalis-tests)
   fi

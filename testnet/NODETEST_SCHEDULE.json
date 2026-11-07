@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "network": "testnet",
+  "genesis_hash": "f68c3097f1b5fce94ef79840418617719c75b57ee66b7bd51b6735a8a34193b6",
+  "windows": [
+    {"start": "2026-11-08T08:00:00Z", "duration_seconds": 1800, "rate": 0.1}
+  ]
+}
