@@ -7,6 +7,7 @@
 #include "codec/bytes.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "consensus/randomness.hpp"
 
 namespace finalis::consensus {
 namespace {
@@ -88,17 +89,28 @@ Hash32 ingress_lane_anchor(const AnyTx& tx) {
   return std::visit([](const auto& value) { return ingress_lane_anchor(value); }, tx);
 }
 
-PubKey32 designated_ingress_certifier(const std::vector<PubKey32>& committee, std::uint32_t lane,
-                                      std::uint64_t epoch_start) {
+std::uint64_t ingress_certifier_term_start(std::uint64_t height, std::uint64_t epoch_blocks, std::uint64_t term_blocks) {
+  const std::uint64_t epoch_start = committee_epoch_start(height, epoch_blocks);
+  if (height == 0 || term_blocks == 0 || epoch_blocks == 0 || epoch_blocks % term_blocks != 0) return epoch_start;
+  return epoch_start + ((height - epoch_start) / term_blocks) * term_blocks;
+}
+
+PubKey32 designated_ingress_certifier(const std::vector<PubKey32>& committee, const std::set<PubKey32>& live,
+                                      std::uint32_t lane, std::uint64_t term_start) {
+  std::vector<PubKey32> candidates;
+  for (const auto& member : committee) {
+    if (live.contains(member)) candidates.push_back(member);
+  }
+  const auto& pool = candidates.empty() ? committee : candidates;
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'I', 'N', 'G', 'R', 'E', 'S', 'S', '-', 'C', 'E', 'R', 'T', 'I', 'F', 'I', 'E', 'R',
-                '-', 'V', '1'});
-  w.u64le(epoch_start);
+                '-', 'V', '2'});
+  w.u64le(term_start);
   w.u32le(lane);
   const Hash32 h = crypto::sha256d(w.data());
   std::uint64_t x = 0;
   for (std::size_t i = 0; i < 8; ++i) x |= static_cast<std::uint64_t>(h[i]) << (8 * i);
-  return committee[static_cast<std::size_t>(x % committee.size())];
+  return pool[static_cast<std::size_t>(x % pool.size())];
 }
 
 std::uint32_t assign_ingress_lane(const Tx& tx) {

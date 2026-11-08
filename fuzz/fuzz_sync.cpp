@@ -111,7 +111,8 @@ consensus::CertifiedIngressLaneRecords lane_records_for(const Fixture& fx, const
   consensus::CertifiedIngressLaneRecords lanes;
   *next_vector = parent.finalized_frontier_vector;
   auto roots = parent.finalized_lane_roots;
-  const auto epoch = consensus::committee_epoch_start(parent.finalized_height + 1, fx.cfg.network.committee_epoch_blocks);
+  const auto epoch = consensus::ingress_certifier_term_start(parent.finalized_height + 1, fx.cfg.network.committee_epoch_blocks,
+                                                             fx.cfg.network.ingress_certifier_term_blocks);
   for (const auto& raw : raws) {
     auto tx = parse_any_tx(raw);
     if (!tx) throw std::runtime_error("bad fixture tx");

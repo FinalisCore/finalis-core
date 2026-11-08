@@ -62,6 +62,13 @@ Spec: `docs/spec/CONFIDENTIAL_UTXO_SPEC.md`.
 | D8 | Memoized SWE work (settlement decryption, inclusion proof) never changes a result: the memo key is sha256d of every input, a hit returns what the computation returns, and only a passing proof is remembered. | `TimedMemo` (`src/consensus/frontier_execution.cpp`) | `test_prewarmed_timed_openings_give_the_same_state_without_decrypting_again`, `test_timed_opening_jobs_include_long_locks_opened_by_the_block`, `test_timed_proof_memo_remembers_only_a_passing_proof` |
 | D9 | Only the round leader can make a node decrypt: a network proposal's settlement openings are prewarmed only after its proposer signature verifies against the round leader. | `Node::prewarm_proposal_timed_openings` (`src/node/node_consensus.cpp`) | `test_proposal_prewarm_requires_the_round_leaders_signature` |
 
+## Ingress certifiers (lanes)
+| # | Invariant | Enforced in | Test |
+|---|---|---|---|
+| I1 | An ingress certificate is valid only in its certifier term: its epoch field is the term's first height, and terms tile each committee epoch. | `consensus::ingress_certifier_term_start`, frontier lane prefix, `drop_stale_unfinalized_ingress_locked` | `test_frontier_lane_prefix_requires_the_certifier_term_of_the_block`, `test_ingress_certifier_terms_tile_each_epoch` |
+| I2 | Every node names the same certifier for a (term, lane), from finalized data only (committee and the last W `prev_finality_signers`); a node without that data does not certify. | `Node::designated_ingress_certifier_locked` | `test_ingress_certifiers_agree_across_nodes_and_skip_a_stopped_validator` |
+| I3 | A certifier that stops signing holds its lane for at most a liveness window plus a term. | `consensus::designated_ingress_certifier` (live members only) | `test_tx_final_within_epoch_when_designated_certifier_offline`, `test_designated_ingress_certifier_is_drawn_from_live_committee_members` |
+
 ## Monetary
 | # | Invariant | Enforced in | Test |
 |---|---|---|---|

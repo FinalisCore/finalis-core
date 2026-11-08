@@ -86,23 +86,7 @@ std::string network_id_hex(const NetworkConfig& cfg) {
 }
 
 std::string relay_consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
-  codec::ByteWriter w;
-  w.bytes_fixed(cfg.network_id);
-  w.u32le(cfg.protocol_version);
-  w.u64le(cfg.feature_flags);
-  w.u64le(cfg.magic);
-  w.u64le(cfg.committee_epoch_blocks);
-  w.u32le(cfg.max_committee);
-  w.u32le(cv);
-  const auto genesis = hex_decode(chain_id.genesis_hash_hex);
-  if (genesis.has_value() && genesis->size() == 32) {
-    Hash32 g{};
-    std::copy(genesis->begin(), genesis->end(), g.begin());
-    w.bytes_fixed(g);
-  } else {
-    w.bytes_fixed(zero_hash());
-  }
-  return hex_encode32(crypto::sha256d(w.data()));
+  return consensus_rules_fingerprint(cfg, chain_id, cv);
 }
 
 std::string relay_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {

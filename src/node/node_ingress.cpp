@@ -495,7 +495,7 @@ bool Node::handle_ingress_record_locked(int peer_id, const p2p::IngressRecordMsg
     }
   }
 
-  const auto expected_ingress_epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  const auto expected_ingress_epoch = ingress_term_start(finalized_height_ + 1);
   auto committee = ingress_committee_locked(expected_ingress_epoch);
   std::string append_error;
   if (!consensus::append_validated_ingress_record(db_, msg.certificate, msg.tx_bytes, committee,
@@ -534,9 +534,12 @@ bool Node::maybe_certify_record_locked(const Bytes& tx_bytes, const consensus::I
   }
 
   const std::uint32_t lane = identity.lane;
-  const PubKey32 designated_certifier = consensus::designated_ingress_certifier(
-      committee, lane, consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks));
-  if (designated_certifier != local_key_.public_key) {
+  const auto designated_certifier = designated_ingress_certifier_locked(lane, next_height);
+  if (!designated_certifier.has_value()) {
+    if (error) *error = "ingress-certifier-unknown";
+    return false;
+  }
+  if (*designated_certifier != local_key_.public_key) {
     if (error) *error = "local-not-designated-ingress-certifier";
     return false;
   }
@@ -572,7 +575,7 @@ bool Node::maybe_certify_record_locked(const Bytes& tx_bytes, const consensus::I
   }
 
   IngressCertificate cert;
-  cert.epoch = consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks);
+  cert.epoch = ingress_term_start(next_height);
   cert.lane = lane;
   cert.seq = lane_state.has_value() ? (lane_state->max_seq + 1) : 1;
   cert.txid = txid;
@@ -603,15 +606,15 @@ bool Node::maybe_certify_record_locked(const Bytes& tx_bytes, const consensus::I
 
 void Node::drop_stale_unfinalized_ingress_locked() {
   if (!canonical_state_.has_value()) return;
-  const std::uint64_t epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  const std::uint64_t epoch = ingress_term_start(finalized_height_ + 1);
   for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
     const std::uint64_t cursor = canonical_state_->finalized_frontier_vector.lane_max_seq[lane];
     const auto state = db_.get_lane_state(lane);
     if (!state.has_value() || state->max_seq <= cursor) continue;
     const auto cert_bytes = db_.get_ingress_certificate(lane, cursor + 1);
     const auto cert = cert_bytes.has_value() ? IngressCertificate::parse(*cert_bytes) : std::nullopt;
-    // Only a present record from an earlier epoch is stale. A missing record is fetched from peers,
-    // never dropped. Epochs never decrease along a lane, so a current-epoch first record means
+    // Only a present record from an earlier term is stale. A missing record is fetched from peers,
+    // never dropped. Terms never decrease along a lane, so a current-term first record means
     // nothing above it is stale either.
     if (!cert.has_value() || cert->epoch >= epoch) continue;
     LaneState restored;
@@ -669,7 +672,7 @@ bool Node::store_finalized_lane_certificates_locked(const FrontierProposal& prop
       tx_bytes_by_id.emplace(identity->txid, &raw);
     }
   }
-  const std::uint64_t epoch = consensus::committee_epoch_start(transition.height, cfg_.network.committee_epoch_blocks);
+  const std::uint64_t epoch = ingress_term_start(transition.height);
   const auto committee = ingress_committee_locked(epoch);
   for (std::uint32_t lane = 0; lane < INGRESS_LANE_COUNT; ++lane) {
     const std::uint64_t from_seq = transition.prev_vector.lane_max_seq[lane] + 1;
@@ -731,7 +734,7 @@ void Node::reforward_uncertified_mempool_txs_locked() {
     if (index < uncertified.size()) {
       const auto& tx = uncertified[index].tx;
       if (!maybe_certify_locally_accepted_tx_locked(tx, &error)) {
-        maybe_forward_tx_to_designated_certifier_locked(tx, 0);
+        maybe_forward_tx_to_designated_certifier_locked(tx, 0, false);
       }
       continue;
     }
@@ -739,7 +742,7 @@ void Node::reforward_uncertified_mempool_txs_locked() {
     const auto identity = consensus::ingress_record_identity(raw);
     if (!identity.has_value()) continue;
     if (!maybe_certify_record_locked(raw, *identity, &error)) {
-      maybe_forward_record_to_designated_certifier_locked(raw, identity->lane, 0);
+      maybe_forward_record_to_designated_certifier_locked(raw, identity->lane, 0, false);
     }
   }
   if (!window.empty()) {
@@ -748,20 +751,20 @@ void Node::reforward_uncertified_mempool_txs_locked() {
   }
 }
 
-void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id) {
-  maybe_forward_record_to_designated_certifier_locked(serialize_any_tx(tx), consensus::assign_ingress_lane(tx), skip_peer_id);
+void Node::maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id, bool relay_if_unreachable) {
+  maybe_forward_record_to_designated_certifier_locked(serialize_any_tx(tx), consensus::assign_ingress_lane(tx), skip_peer_id,
+                                                      relay_if_unreachable);
 }
 
-void Node::maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_bytes, std::uint32_t lane, int skip_peer_id) {
+void Node::maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_bytes, std::uint32_t lane, int skip_peer_id,
+                                                              bool relay_if_unreachable) {
   const std::uint64_t next_height = finalized_height_ + 1;
-  auto committee = ingress_committee_locked(next_height);
-  if (committee.empty()) return;
-
-  const PubKey32 designated_certifier = consensus::designated_ingress_certifier(
-      committee, lane, consensus::committee_epoch_start(next_height, cfg_.network.committee_epoch_blocks));
-  if (designated_certifier == local_key_.public_key) return;
+  const auto designated = designated_ingress_certifier_locked(lane, next_height);
+  if (designated.has_value() && *designated == local_key_.public_key) return;
 
   if (cfg_.disable_p2p) {
+    if (!designated.has_value()) return;
+    const PubKey32 designated_certifier = *designated;
     for_each_local_bus_peer([&](Node* peer) {
       // local_key_ is fixed after init(); taking the peer's mu_ here (while holding ours) inverts lock order.
       if (peer->local_key_.public_key != designated_certifier) return false;
@@ -773,35 +776,83 @@ void Node::maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_b
     return;
   }
 
-  if (skip_peer_id != 0) {
+  if (designated.has_value() && skip_peer_id != 0) {
     auto it = peer_validator_pubkeys_.find(skip_peer_id);
-    if (it != peer_validator_pubkeys_.end() && it->second == designated_certifier) return;
+    if (it != peer_validator_pubkeys_.end() && it->second == *designated) return;
   }
 
   const auto payload = p2p::ser_tx(p2p::TxMsg{tx_bytes});
-  for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
-    if (peer_id == skip_peer_id) continue;
-    if (peer_pub != designated_certifier) continue;
-    const auto info = p2p_.get_peer_info(peer_id);
-    if (!info.established()) continue;
-    const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TX, payload, true);
-    log_line("tx-forward-designated peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(lane) +
-             " designated=" + short_pub_hex(designated_certifier) + " status=" + (ok ? "ok" : "failed"));
-    if (ok) return;
-    break;
+  if (designated.has_value()) {
+    for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
+      if (peer_id == skip_peer_id) continue;
+      if (peer_pub != *designated) continue;
+      const auto info = p2p_.get_peer_info(peer_id);
+      if (!info.established()) continue;
+      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::TX, payload, true);
+      log_line("tx-forward-designated peer_id=" + std::to_string(peer_id) + " lane=" + std::to_string(lane) +
+               " designated=" + short_pub_hex(*designated) + " status=" + (ok ? "ok" : "failed"));
+      if (ok) return;
+      break;
+    }
   }
 
-  // The certifier is not reachable from here: relay through the other validators, which forward
-  // to it themselves (and re-forward every few seconds while the tx stays uncertified).
+  // The certifier is not reachable from here (or not known yet): relay through the other validators,
+  // which forward to it themselves. Once per record and term: re-sending every reforward pass to every
+  // validator multiplied traffic by the validator count while a lane waited (testnet-3 run 2,
+  // 2026-11-08: ~47,000 relays per host in 50 minutes). A new term may have a new certifier, so it
+  // relays again then.
+  const auto identity = consensus::ingress_record_identity(tx_bytes);
+  const std::uint64_t term = ingress_term_start(next_height);
+  if (!relay_if_unreachable && identity.has_value()) {
+    const auto it = ingress_relayed_all_term_.find(identity->txid);
+    if (it != ingress_relayed_all_term_.end() && it->second == term) return;
+  }
   // One session per validator: inbound and outbound connections to the same one both appear here.
   std::set<PubKey32> relayed;
   for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
-    if (peer_id == skip_peer_id || peer_pub == designated_certifier || relayed.contains(peer_pub)) continue;
+    if (peer_id == skip_peer_id || (designated.has_value() && peer_pub == *designated) || relayed.contains(peer_pub)) continue;
     if (!p2p_.get_peer_info(peer_id).established()) continue;
     if (p2p_.send_to(peer_id, p2p::MsgType::TX, payload, true)) relayed.insert(peer_pub);
   }
-  log_line("tx-forward-designated-unreachable lane=" + std::to_string(lane) +
-           " designated=" + short_pub_hex(designated_certifier) + " relayed_via=" + std::to_string(relayed.size()));
+  if (!relayed.empty()) ++ingress_relay_all_count_;
+  if (identity.has_value() && !relayed.empty()) {
+    std::erase_if(ingress_relayed_all_term_, [&](const auto& entry) { return entry.second < term; });
+    ingress_relayed_all_term_[identity->txid] = term;
+  }
+  log_line("tx-forward-designated-unreachable lane=" + std::to_string(lane) + " designated=" +
+           (designated.has_value() ? short_pub_hex(*designated) : std::string("unknown")) +
+           " relayed_via=" + std::to_string(relayed.size()));
+}
+
+std::uint64_t Node::ingress_term_start(std::uint64_t height) const {
+  return consensus::ingress_certifier_term_start(height, cfg_.network.committee_epoch_blocks,
+                                                 cfg_.network.ingress_certifier_term_blocks);
+}
+
+std::optional<PubKey32> Node::designated_ingress_certifier_locked(std::uint32_t lane, std::uint64_t height) {
+  const std::uint64_t term = ingress_term_start(height);
+  if (term == 0) return std::nullopt;
+  if (!ingress_certifier_term_.has_value() || ingress_certifier_term_->term_start != term) {
+    // Only finalized data, so every node with the same finalized chain picks the same certifier:
+    // the parents' signer sets recorded in the last W finalized transitions before the term.
+    if (finalized_height_ + 1 < term) return std::nullopt;
+    IngressCertifierTerm fresh;
+    fresh.term_start = term;
+    fresh.committee = ingress_committee_locked(term);
+    if (fresh.committee.empty()) return std::nullopt;
+    const std::uint64_t window = cfg_.network.ingress_certifier_liveness_blocks;
+    const std::uint64_t first = term > window ? term - window : 1;
+    for (std::uint64_t h = first; h < term; ++h) {
+      const auto id = db_.get_frontier_transition_by_height(h);
+      const auto bytes = id.has_value() ? db_.get_frontier_transition(*id) : std::nullopt;
+      const auto transition = bytes.has_value() ? FrontierTransition::parse(*bytes) : std::nullopt;
+      if (!transition.has_value() || transition->height != h) return std::nullopt;
+      for (const auto& sig : transition->prev_finality_signers) fresh.live.insert(sig.validator_pubkey);
+    }
+    ingress_certifier_term_ = std::move(fresh);
+  }
+  return consensus::designated_ingress_certifier(ingress_certifier_term_->committee, ingress_certifier_term_->live, lane,
+                                                 ingress_certifier_term_->term_start);
 }
 
 std::uint64_t Node::effective_min_relay_fee_for_height(std::uint64_t height) const {
@@ -831,15 +882,13 @@ std::array<std::uint64_t, INGRESS_LANE_COUNT> Node::local_ingress_lane_tips_lock
 
 bool Node::handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& msg) {
   peer_ingress_tips_[peer_id] = msg;
-  // Do not request ingress from a peer that is in a different committee epoch.
+  // Do not request ingress from a peer that is in a different certifier term.
   // Their certificates carry an epoch we cannot validate against our local
   // finalized state, which would cause spurious ingress-epoch-mismatch errors
   // and incorrectly ban the peer before chain sync completes.
-  const auto local_epoch =
-      consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  const auto local_epoch = ingress_term_start(finalized_height_ + 1);
   if (const auto tip_it = peer_finalized_tips_.find(peer_id); tip_it != peer_finalized_tips_.end()) {
-    const auto peer_epoch = consensus::committee_epoch_start(tip_it->second.height + 1,
-                                                             cfg_.network.committee_epoch_blocks);
+    const auto peer_epoch = ingress_term_start(tip_it->second.height + 1);
     if (peer_epoch != local_epoch) {
       log_line("ingress-tips-epoch-skipped peer_id=" + std::to_string(peer_id) +
                " local_epoch=" + std::to_string(local_epoch) +
@@ -937,7 +986,7 @@ bool Node::handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& 
     return false;
   }
 
-  const auto expected_ingress_epoch = consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.committee_epoch_blocks);
+  const auto expected_ingress_epoch = ingress_term_start(finalized_height_ + 1);
   auto simulated_state = db_.get_lane_state(msg.lane);
   std::string validation_error;
   std::size_t prevalidation_bytes = 0;

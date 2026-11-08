@@ -1549,8 +1549,10 @@ bool append_live_certified_ingress_to_nodes_once(const std::string& db_path, con
   }
   const auto tip = db.get_tip();
   const std::uint64_t tip_height = tip.has_value() ? tip->height : 0;
+  // A certificate carries its certifier term's first height (C1).
   const std::uint64_t expected_ingress_epoch =
-      consensus::committee_epoch_start(tip_height + 1, node::NodeConfig{}.network.committee_epoch_blocks);
+      consensus::ingress_certifier_term_start(tip_height + 1, node::NodeConfig{}.network.committee_epoch_blocks,
+                                              node::NodeConfig{}.network.ingress_certifier_term_blocks);
 
   for (const auto& raw : raw_records) {
     auto parsed = Tx::parse(raw);
@@ -6213,9 +6215,10 @@ TEST(test_tx_forward_relays_via_validators_when_certifier_unreachable) {
 
   const std::uint64_t next_height = nodes[0]->status().height + 1;
   const auto committee = nodes[0]->committee_for_height_round_for_test(next_height, 0);
-  const auto certifier_pub = consensus::designated_ingress_certifier(
-      committee, consensus::assign_ingress_lane(AnyTx{*tx}),
-      consensus::committee_epoch_start(next_height, cluster.configs[0].network.committee_epoch_blocks));
+  (void)committee;
+  const auto certifier_opt = nodes[0]->designated_ingress_certifier_for_test(consensus::assign_ingress_lane(AnyTx{*tx}), next_height);
+  ASSERT_TRUE(certifier_opt.has_value());
+  const auto certifier_pub = *certifier_opt;
   int certifier = -1;
   for (int i = 0; i < 4; ++i) {
     if (nodes[i]->local_validator_pubkey_for_test() == certifier_pub) certifier = i;
@@ -6230,11 +6233,11 @@ TEST(test_tx_forward_relays_via_validators_when_certifier_unreachable) {
                        ci_timeout_seconds(30)));
 }
 
-// KNOWN DEFECT C1 (tests/KNOWN_DEFECTS.md). 4 validators, real P2P; the lane's designated certifier
-// is offline (live: 061ca02d on testnet-3, unreachable behind NAT, 2026-11-06). The other three keep
-// finalizing blocks, but nobody else may certify that lane, so a transaction in it waits for the
-// epoch to end (a time lock, which must be included in its epoch, is lost). Required: it is final
-// within a few blocks while most of the epoch is left.
+// C1 (fixed 2026-11-08, tests/KNOWN_DEFECTS.md). 4 validators, real P2P; the lane's designated certifier
+// goes offline (live: 061ca02d on testnet-3 2026-11-06, 915bc9c1 in nodetest run 2 2026-11-08). The other
+// three keep finalizing; the next certifier term hands the lane to a live validator, so the transaction is
+// final within a few blocks while most of the epoch is left (before the fix it waited for the epoch to end,
+// and a time lock was lost).
 // Runs the scenario; true if the transaction was final within kFinalWithinBlocks of its send.
 static bool certifier_scenario_tx_final_in_time(bool certifier_offline) {
   constexpr std::uint64_t kEpochBlocks = 64;
@@ -6282,8 +6285,10 @@ static bool certifier_scenario_tx_final_in_time(bool certifier_offline) {
   ASSERT_TRUE(tx.has_value());
 
   const auto committee = nodes[0]->committee_for_height_round_for_test(next_height, 0);
-  const auto certifier_pub = consensus::designated_ingress_certifier(
-      committee, consensus::assign_ingress_lane(AnyTx{*tx}), consensus::committee_epoch_start(next_height, kEpochBlocks));
+  (void)committee;
+  const auto certifier_opt = nodes[0]->designated_ingress_certifier_for_test(consensus::assign_ingress_lane(AnyTx{*tx}), next_height);
+  ASSERT_TRUE(certifier_opt.has_value());
+  const auto certifier_pub = *certifier_opt;
   int certifier = -1;
   for (int i = 0; i < 4; ++i) {
     if (nodes[i]->local_validator_pubkey_for_test() == certifier_pub) certifier = i;
@@ -6320,7 +6325,130 @@ static bool certifier_scenario_tx_final_in_time(bool certifier_offline) {
 TEST(test_tx_final_within_epoch_when_designated_certifier_offline) {
   ASSERT_TRUE(certifier_scenario_tx_final_in_time(true));
 }
-TEST_TAGS(test_tx_final_within_epoch_when_designated_certifier_offline, "known-defect");
+
+// C1: every node names the same certifier for every lane (two would both certify it, and penalize each
+// other as equivocators), and a validator that stops signing holds no lane once a liveness window
+// and a term have passed. A node asked about a term it cannot compute yet says so instead of guessing.
+TEST(test_ingress_certifiers_agree_across_nodes_and_skip_a_stopped_validator) {
+  constexpr std::uint64_t kEpochBlocks = 64;
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_certifier_agree"), 4, 4, MAX_COMMITTEE,
+                              [](node::NodeConfig& cfg) { cfg.network.committee_epoch_blocks = kEpochBlocks; });
+  auto& nodes = cluster.nodes;
+  const auto& net = cluster.configs[0].network;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes)
+      if (n->status().height < 6) return false;
+    return true;
+  }, ci_timeout_seconds(120)));
+
+  const auto designations_agree = [&](const std::vector<node::Node*>& live, std::uint64_t height,
+                                      std::array<PubKey32, consensus::INGRESS_LANE_COUNT>* out) {
+    for (std::uint32_t lane = 0; lane < consensus::INGRESS_LANE_COUNT; ++lane) {
+      std::optional<PubKey32> first;
+      for (auto* n : live) {
+        const auto d = n->designated_ingress_certifier_for_test(lane, height);
+        if (!d.has_value()) return false;
+        if (!first.has_value()) first = d;
+        if (*d != *first) throw std::runtime_error("nodes disagree on the certifier of lane " + std::to_string(lane));
+      }
+      (*out)[lane] = *first;
+    }
+    return true;
+  };
+
+  std::vector<node::Node*> all;
+  for (auto& n : nodes) all.push_back(n.get());
+  for (auto* n : all) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
+  const std::uint64_t next = nodes[0]->status().height + 1;
+  std::array<PubKey32, consensus::INGRESS_LANE_COUNT> picks{};
+  ASSERT_TRUE(designations_agree(all, next, &picks));
+  // Two terms ahead is not computable from finalized data yet.
+  const auto far = consensus::ingress_certifier_term_start(next, kEpochBlocks, net.ingress_certifier_term_blocks) +
+                   2 * net.ingress_certifier_term_blocks;
+  ASSERT_TRUE(!nodes[0]->designated_ingress_certifier_for_test(0, far).has_value());
+
+  // Stop a validator that certifies at least one lane now.
+  int stopped = -1;
+  for (int i = 0; i < 4 && stopped < 0; ++i) {
+    const auto pub = nodes[i]->local_validator_pubkey_for_test();
+    if (std::find(picks.begin(), picks.end(), pub) != picks.end()) stopped = i;
+  }
+  ASSERT_TRUE(stopped >= 0);
+  const auto stopped_pub = nodes[stopped]->local_validator_pubkey_for_test();
+  nodes[stopped]->stop();
+  nodes[stopped].reset();
+  std::vector<node::Node*> live;
+  for (auto& n : nodes)
+    if (n) live.push_back(n.get());
+  for (auto* n : live) n->pause_proposals_for_test(false);
+
+  // After a full liveness window plus a term, the stopped validator certifies no lane.
+  const std::uint64_t settle = next + net.ingress_certifier_liveness_blocks + 2 * net.ingress_certifier_term_blocks;
+  ASSERT_TRUE(wait_for([&]() { return live[0]->status().height >= settle; }, ci_timeout_seconds(240)));
+  for (auto* n : live) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto h = live[0]->status().height;
+    for (auto* n : live)
+      if (n->status().height != h) return false;
+    return true;
+  }, ci_timeout_seconds(30)));
+  const std::uint64_t later = live[0]->status().height + 1;
+  ASSERT_TRUE(later < consensus::committee_epoch_start(next, kEpochBlocks) + kEpochBlocks);  // same epoch, same committee
+  ASSERT_TRUE(designations_agree(live, later, &picks));
+  for (const auto& pick : picks) ASSERT_TRUE(pick != stopped_pub);
+}
+
+// While a record's certifier is unreachable, a node relays it to the other validators once per term,
+// not on every 5 s reforward pass (testnet-3 run 2, 2026-11-08: ~47,000 such relays per host in 50
+// minutes, each to every validator). Blocks are paused, so the term cannot change.
+TEST(test_unreachable_certifier_relay_happens_once_per_term) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_relay_once"), 4, 4, MAX_COMMITTEE,
+                              [](node::NodeConfig& cfg) { cfg.network.committee_epoch_blocks = 64; });
+  auto& nodes = cluster.nodes;
+  std::optional<FundedTestWallet> funded;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes)
+      if (n->status().height < 3) return false;
+    funded = find_funded_test_wallet(*nodes[0], keys, 1'000'000, 1);
+    return funded.has_value();
+  }, ci_timeout_seconds(120)));
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, ci_timeout_seconds(30)));
+  funded = find_funded_test_wallet(*nodes[0], keys, 1'000'000, 1);
+  ASSERT_TRUE(funded.has_value());
+
+  const auto& sender = keys[funded->key_index];
+  const auto sender_pkh = crypto::h160(Bytes(sender.public_key.begin(), sender.public_key.end()));
+  const auto& prev = funded->utxos.front();
+  std::vector<TxOut> outputs{TxOut{1'000, address::p2pkh_script_pubkey(sender_pkh)},
+                             TxOut{prev.second.value - 1'000 - 10'000, address::p2pkh_script_pubkey(sender_pkh)}};
+  std::string err;
+  const auto tx = build_signed_p2pkh_tx_single_input(node_chain_domain(nodes[0]), prev.first, prev.second,
+                                                     Bytes(sender.private_key.begin(), sender.private_key.end()), outputs, &err);
+  ASSERT_TRUE(tx.has_value());
+  const std::uint64_t next_height = nodes[0]->status().height + 1;
+  const auto certifier_pub =
+      nodes[0]->designated_ingress_certifier_for_test(consensus::assign_ingress_lane(AnyTx{*tx}), next_height);
+  ASSERT_TRUE(certifier_pub.has_value());
+  int certifier = -1;
+  for (int i = 0; i < 4; ++i)
+    if (nodes[i]->local_validator_pubkey_for_test() == *certifier_pub) certifier = i;
+  ASSERT_TRUE(certifier >= 0);
+  nodes[certifier]->stop();
+  nodes[certifier].reset();
+  const int submitter = (certifier + 1) % 4;
+
+  const auto before = nodes[submitter]->ingress_relay_all_count_for_test();
+  ASSERT_TRUE(nodes[submitter]->inject_tx_for_test(*tx, true));
+  ASSERT_EQ(nodes[submitter]->ingress_relay_all_count_for_test(), before + 1);
+  // Three reforward passes (every 5 s) in the same term: no more relays to everyone.
+  std::this_thread::sleep_for(std::chrono::milliseconds(16'000));
+  ASSERT_EQ(nodes[submitter]->status().height + 1, next_height);
+  ASSERT_TRUE(nodes[submitter]->mempool_contains_for_test(tx->txid()));
+  ASSERT_EQ(nodes[submitter]->ingress_relay_all_count_for_test(), before + 1);
+}
 
 // Control for C1: the same scenario with the certifier online meets the same bound.
 TEST(test_tx_final_within_epoch_when_designated_certifier_online) {

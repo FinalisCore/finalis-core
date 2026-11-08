@@ -39,4 +39,9 @@ struct ChainIdMismatch {
 
 ChainIdMismatch compare_chain_identity(const ChainId& a, const ChainId& b);
 
+// Fingerprint of the rules two peers must share (advertised as crh= in VERSION; a mismatch is
+// disconnected). One implementation for the node and the lightserver relay, so they cannot drift.
+// `cv` is the validation rules version.
+std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv);
+
 }  // namespace finalis
