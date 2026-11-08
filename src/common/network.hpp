@@ -36,6 +36,14 @@ struct NetworkConfig {
   // Finalized-state metadata persists committee snapshots in deterministic
   // epochs for historical replay and inspection.
   std::uint64_t committee_epoch_blocks{32};
+  // Ingress certifier terms (C1): each lane has one certifier per term of this many blocks, and an
+  // IngressCertificate's epoch field is its term's first height. Must divide committee_epoch_blocks;
+  // otherwise a term is the whole epoch (consensus::ingress_certifier_term_start). Consensus-critical.
+  std::uint64_t ingress_certifier_term_blocks{2};
+  // A term's certifier is drawn from the committee members that signed at least one of the last this
+  // many finalized parents (prev_finality_signers), so an offline validator stops holding lanes.
+  // Routing only, but every node must use the same value (it is in the handshake fingerprint).
+  std::uint64_t ingress_certifier_liveness_blocks{2};
   // Round pacing (local, not consensus-critical): round r times out after
   // min(round_timeout_ms * (num/den)^r, max_round_timeout_ms). The growing
   // timeout lets rounds outlast any bounded message delay (partial synchrony).

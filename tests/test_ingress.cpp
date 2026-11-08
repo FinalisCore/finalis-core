@@ -4,6 +4,7 @@
 #include "test_framework.hpp"
 #include "support/test_paths.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <filesystem>
@@ -11,6 +12,7 @@
 
 #include "common/address.hpp"
 #include "consensus/ingress.hpp"
+#include "consensus/randomness.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "p2p/messages.hpp"
@@ -627,3 +629,60 @@ TEST(test_truncate_ingress_lane_drops_unfinalized_tail_and_reopens_lane) {
   ASSERT_TRUE(db.truncate_ingress_lane(fresh.lane, 0, restored, nullptr));
   ASSERT_TRUE(db.get_ingress_bytes(fresh.txid).has_value());
 }
+
+// C1: certifier terms tile each committee epoch; a term size that does not divide the epoch means
+// one term per epoch (the pre-C1 rule), never a term that straddles two epochs.
+TEST(test_ingress_certifier_terms_tile_each_epoch) {
+  ASSERT_EQ(consensus::ingress_certifier_term_start(1, 32, 4), 1u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(4, 32, 4), 1u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(5, 32, 4), 5u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(32, 32, 4), 29u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(33, 32, 4), 33u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(4641, 32, 4), 4641u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(4650, 32, 4), 4649u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(30, 32, 5), 1u);   // 5 does not divide 32
+  ASSERT_EQ(consensus::ingress_certifier_term_start(30, 32, 0), 1u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(30, 32, 32), 1u);
+  ASSERT_EQ(consensus::ingress_certifier_term_start(0, 32, 4), 0u);
+  for (std::uint64_t h = 1; h <= 200; ++h) {
+    const auto term = consensus::ingress_certifier_term_start(h, 32, 4);
+    ASSERT_TRUE(term <= h && h - term < 4);
+    ASSERT_EQ(consensus::committee_epoch_start(term, 32), consensus::committee_epoch_start(h, 32));
+  }
+}
+
+// C1: a term's certifier is a committee member seen signing recently; a member that stopped signing
+// (offline) is never chosen while others are live; with nobody live it falls back to the committee.
+TEST(test_designated_ingress_certifier_is_drawn_from_live_committee_members) {
+  std::vector<PubKey32> committee;
+  for (std::uint8_t i = 1; i <= 4; ++i) {
+    PubKey32 pub{};
+    pub.fill(i);
+    committee.push_back(pub);
+  }
+  const PubKey32 offline = committee[3];
+  const std::set<PubKey32> live{committee[0], committee[1], committee[2]};
+  std::set<PubKey32> chosen_when_all_live;
+  bool offline_ever_chosen_by_committee = false;
+  for (std::uint64_t term = 1; term < 400; term += 4) {
+    for (std::uint32_t lane = 0; lane < consensus::INGRESS_LANE_COUNT; ++lane) {
+      const auto pick = consensus::designated_ingress_certifier(committee, live, lane, term);
+      ASSERT_TRUE(pick != offline);
+      ASSERT_TRUE(live.contains(pick));
+      const auto all = consensus::designated_ingress_certifier(committee, {}, lane, term);
+      ASSERT_TRUE(std::find(committee.begin(), committee.end(), all) != committee.end());
+      chosen_when_all_live.insert(all);
+      if (all == offline) offline_ever_chosen_by_committee = true;
+      // Live keys outside the committee are ignored, not chosen.
+      PubKey32 outsider{};
+      outsider.fill(0xEE);
+      const auto with_outsider = consensus::designated_ingress_certifier(committee, {outsider}, lane, term);
+      ASSERT_TRUE(with_outsider == all);
+      // Deterministic.
+      ASSERT_TRUE(consensus::designated_ingress_certifier(committee, live, lane, term) == pick);
+    }
+  }
+  ASSERT_EQ(chosen_when_all_live.size(), committee.size());  // rotation reaches every member
+  ASSERT_TRUE(offline_ever_chosen_by_committee);
+}
+

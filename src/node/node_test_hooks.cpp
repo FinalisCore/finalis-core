@@ -419,6 +419,16 @@ bool Node::has_candidate_frontier_proposal_for_test(const Hash32& transition_id)
   return candidate_frontier_proposals_.find(transition_id) != candidate_frontier_proposals_.end();
 }
 
+std::uint64_t Node::ingress_relay_all_count_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return ingress_relay_all_count_;
+}
+
+std::optional<PubKey32> Node::designated_ingress_certifier_for_test(std::uint32_t lane, std::uint64_t height) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return designated_ingress_certifier_locked(lane, height);
+}
+
 bool Node::timed_openings_prewarmed_for_test(const Hash32& transition_id) const {
   std::lock_guard<std::mutex> lk(mu_);
   return prewarmed_timed_transitions_.contains(transition_id);

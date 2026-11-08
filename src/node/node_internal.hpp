@@ -90,7 +90,7 @@ std::string endpoint_to_ip(std::string endpoint);
 std::string token_value(const std::string& s, const std::string& key);
 std::string ascii_lower(std::string s);
 std::string network_id_hex(const NetworkConfig& cfg);
-std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv);
+using finalis::consensus_rules_fingerprint;  // common/chain_id.hpp
 bool debug_economics_logs_enabled();
 bool debug_finality_logs_enabled();
 bool debug_liveness_logs_enabled();

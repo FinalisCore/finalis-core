@@ -316,25 +316,6 @@ std::string network_id_hex(const NetworkConfig& cfg) {
   return hex_encode(Bytes(cfg.network_id.begin(), cfg.network_id.end()));
 }
 
-std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
-  codec::ByteWriter w;
-  w.bytes_fixed(cfg.network_id);
-  w.u32le(cfg.protocol_version);
-  w.u64le(cfg.feature_flags);
-  w.u64le(cfg.magic);
-  w.u64le(cfg.committee_epoch_blocks);
-  w.u32le(cfg.max_committee);
-  w.u32le(cv);
-  const auto genesis = hex_decode(chain_id.genesis_hash_hex);
-  if (genesis.has_value() && genesis->size() == 32) {
-    Hash32 g{};
-    std::copy(genesis->begin(), genesis->end(), g.begin());
-    w.bytes_fixed(g);
-  } else {
-    w.bytes_fixed(zero_hash());
-  }
-  return hex_encode32(crypto::sha256d(w.data()));
-}
 
 bool debug_economics_logs_enabled() {
   const char* enabled = std::getenv("FINALIS_DEBUG_ECONOMICS");

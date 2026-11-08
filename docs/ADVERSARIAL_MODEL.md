@@ -248,7 +248,7 @@ Capabilities:
 
 Protocol response:
 
-* ingress certificate epoch must match `committee_epoch_start(finalized_height + 1)`
+* ingress certificate epoch must match the certifier term start of `finalized_height + 1` (`ingress_certifier_term_start`)
 * lane assignment, sequence continuity, and `prev_lane_root` chaining are re-validated
 * signer validity and committee-membership checks are enforced in context
 * ingress equivocation is rejected and persisted as deterministic evidence

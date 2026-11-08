@@ -341,6 +341,10 @@ class Node {
   std::string inject_network_prevote_result_for_test(const Vote& vote);
   bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
   bool timed_openings_prewarmed_for_test(const Hash32& transition_id) const;
+  // The lane certifier this node routes to for a record at `height` (nullopt: it cannot tell yet).
+  std::optional<PubKey32> designated_ingress_certifier_for_test(std::uint32_t lane, std::uint64_t height);
+  // Times this node relayed a record to every validator because its certifier was unreachable.
+  std::uint64_t ingress_relay_all_count_for_test() const;
   std::set<std::uint64_t> abstain_heights_for_test() const;
   consensus::ConfidentialSupplyAuditResult confidential_supply_audit_for_test();
   std::size_t timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
@@ -687,14 +691,18 @@ class Node {
   // silently not at all if that peer is unreachable then. Re-forwards (or certifies, when this node
   // is now the certifier) mempool transactions that are still uncertified.
   void reforward_uncertified_mempool_txs_locked();
-  // LIVENESS: a record certified in epoch E but not finalized before E ends can never be finalized
-  // (certificates must match the current epoch), and every later record of its lane chains on it,
-  // so the lane is wedged and every proposal that reaches it fails. Truncates such lanes back to the
+  // LIVENESS: a record certified in certifier term E but not finalized before E ends can never be
+  // finalized (certificates must match the current term), and every later record of its lane chains on
+  // it, so the lane is wedged and every proposal that reaches it fails. Truncates such lanes back to the
   // finalized cursor; the dropped transactions stay in mempools and are re-certified in the new
-  // epoch by reforward_uncertified_mempool_txs_locked.
+  // term by reforward_uncertified_mempool_txs_locked.
   void drop_stale_unfinalized_ingress_locked();
-  void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0);
-  void maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_bytes, std::uint32_t lane, int skip_peer_id = 0);
+  void maybe_forward_tx_to_designated_certifier_locked(const AnyTx& tx, int skip_peer_id = 0,
+                                                      bool relay_if_unreachable = true);
+  // relay_if_unreachable=false (reforward passes): if the certifier is not a direct peer, relay through the
+  // other validators only once per term and record, not on every pass.
+  void maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_bytes, std::uint32_t lane, int skip_peer_id = 0,
+                                                          bool relay_if_unreachable = true);
 
   bool persist_finalized_frontier_record(const consensus::CanonicalFrontierRecord& record, const UtxoSetV2& prev_utxos,
                                          const std::set<Hash32>& accepted_txids,
@@ -808,6 +816,12 @@ class Node {
   bool peer_is_fresh_for_epoch_reconcile_locked(int peer_id, std::uint64_t* peer_height = nullptr,
                                                 std::uint64_t* max_peer_height = nullptr) const;
   std::vector<PubKey32> ingress_committee_locked(std::uint64_t epoch) const;
+  // First height of the ingress certifier term holding `height` (consensus::ingress_certifier_term_start).
+  std::uint64_t ingress_term_start(std::uint64_t height) const;
+  // The certifier of `lane` for a record at `height` (normally finalized_height_ + 1): drawn from the term's
+  // committee members that signed one of the last ingress_certifier_liveness_blocks finalized parents.
+  // nullopt if this node lacks those finalized transitions: it then neither certifies nor guesses.
+  std::optional<PubKey32> designated_ingress_certifier_locked(std::uint32_t lane, std::uint64_t height);
   std::array<std::uint64_t, INGRESS_LANE_COUNT> local_ingress_lane_tips_locked() const;
   bool handle_ingress_tips_locked(int peer_id, const p2p::IngressTipsMsg& msg);
   bool handle_ingress_range_locked(int peer_id, const p2p::IngressRangeMsg& msg, std::string* error = nullptr);
@@ -1134,6 +1148,16 @@ class Node {
   std::uint64_t last_consensus_rebroadcast_ms_{0};
   std::uint64_t last_tx_reforward_ms_{0};
   std::size_t tx_reforward_cursor_{0};
+  // Per-term certifier choice, computed once per term from finalized transitions.
+  struct IngressCertifierTerm {
+    std::uint64_t term_start{0};
+    std::vector<PubKey32> committee;
+    std::set<PubKey32> live;
+  };
+  std::optional<IngressCertifierTerm> ingress_certifier_term_;
+  // Records relayed to every validator because their certifier was unreachable: txid -> term start.
+  std::map<Hash32, std::uint64_t> ingress_relayed_all_term_;
+  std::uint64_t ingress_relay_all_count_{0};
 #ifdef FINALIS_CHAOS_BYZANTINE
   // CHAOS TEST BUILDS ONLY (scripts/chaos_devnet.py --byzantine): this validator prevotes and
   // precommits every proposal it sees, ignoring every safety rule, and equivocates as leader.

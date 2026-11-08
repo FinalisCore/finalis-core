@@ -275,9 +275,12 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
 
   FrontierLaneRoots lane_roots{};
   std::uint64_t max_delta = 0;
+  // Certificates are valid only in the certifier term of the block's height (C1); the term's
+  // committee is its epoch's, so membership is checked at the term start.
   const auto expected_ingress_epoch =
       (ctx && ctx->network && ctx->current_height != 0)
-          ? committee_epoch_start(ctx->current_height, ctx->network->committee_epoch_blocks)
+          ? ingress_certifier_term_start(ctx->current_height, ctx->network->committee_epoch_blocks,
+                                         ctx->network->ingress_certifier_term_blocks)
           : 0;
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     if (next_vector.lane_max_seq[lane] < prev_vector.lane_max_seq[lane]) {

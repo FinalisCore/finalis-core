@@ -3,6 +3,7 @@
 #pragma once
 
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -18,11 +19,18 @@ Hash32 ingress_lane_anchor(const Tx& tx);
 Hash32 ingress_lane_anchor(const TxV2& tx);
 Hash32 ingress_lane_anchor(const AnyTx& tx);
 std::uint32_t assign_ingress_lane(const Tx& tx);
-// The committee member that certifies `lane` during the epoch starting at `epoch_start`: a per-epoch
-// hash, so a censoring certifier holds a lane for one epoch at most and neighbours in the sorted
-// committee do not get consecutive epochs. Routing only: certificate validity does not depend on it.
-PubKey32 designated_ingress_certifier(const std::vector<PubKey32>& committee, std::uint32_t lane,
-                                      std::uint64_t epoch_start);
+// First height of the certifier term holding `height`. Terms of `term_blocks` tile each committee epoch
+// (epochs start at 1, epoch_blocks + 1, ...); if term_blocks is 0 or does not divide epoch_blocks, a
+// term is the whole epoch. An IngressCertificate's epoch field is this value: a certificate is valid
+// only in its own term, and a new term starts each lane from its finalized tip (C1).
+std::uint64_t ingress_certifier_term_start(std::uint64_t height, std::uint64_t epoch_blocks, std::uint64_t term_blocks);
+// The committee member that certifies `lane` during the term starting at `term_start`: a per-term hash
+// over the committee members in `live` (those seen signing recently), or over the whole committee if
+// none of them is live. A censoring or offline certifier holds a lane for one term at most.
+// Routing only: certificate validity does not depend on it, but two nodes that disagree would both
+// certify the lane, so `live` must come from finalized data only.
+PubKey32 designated_ingress_certifier(const std::vector<PubKey32>& committee, const std::set<PubKey32>& live,
+                                      std::uint32_t lane, std::uint64_t term_start);
 std::uint32_t assign_ingress_lane(const TxV2& tx);
 std::uint32_t assign_ingress_lane(const AnyTx& tx);
 Hash32 compute_lane_root_append(const Hash32& prev_root, const Hash32& tx_hash);

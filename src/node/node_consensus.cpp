@@ -537,6 +537,12 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   // on is durable.
   maybe_finalize_epoch_committees_locked();
   drop_stale_unfinalized_ingress_locked();
+  // A new certifier term starts with the next height: its certifier certifies what waits now, rather
+  // than at the next periodic pass (up to 5 s later), and the others route to it.
+  if (ingress_term_start(finalized_height_ + 1) != ingress_term_start(finalized_height_)) {
+    last_tx_reforward_ms_ = now_ms();
+    reforward_uncertified_mempool_txs_locked();
+  }
   // Stable, parseable record of every finalization (scripts/chaos_devnet.py compares these across
   // nodes to detect forks and measure rounds per height).
   log_line("finalized height=" + std::to_string(record.transition.height) + " transition=" +
@@ -3189,9 +3195,9 @@ std::optional<FrontierProposal> Node::build_frontier_transition_locked(std::uint
                    " reason=" + ingress_error);
           return std::nullopt;
         }
-        // A record certified in an earlier epoch can never be finalized: end the lane here rather
-        // than fail the whole build (drop_stale_unfinalized_ingress_locked clears it).
-        if (ingress.certificate.epoch != consensus::committee_epoch_start(height, cfg_.network.committee_epoch_blocks)) {
+        // A record certified in an earlier certifier term can never be finalized: end the lane here
+        // rather than fail the whole build (drop_stale_unfinalized_ingress_locked clears it).
+        if (ingress.certificate.epoch != ingress_term_start(height)) {
           log_line("frontier-build-lane-stale-epoch height=" + std::to_string(height) + " lane=" +
                    std::to_string(lane) + " seq=" + std::to_string(seq) +
                    " cert_epoch=" + std::to_string(ingress.certificate.epoch));

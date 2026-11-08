@@ -366,11 +366,23 @@ It feeds finalized-chain time: mempool hashcash stamp checks and explorer block 
 
 ## Ingress Certifier Per Lane
 
-Each lane has one designated certifier per epoch: committee member
-`sha256d("SC-INGRESS-CERTIFIER-V1" || epoch_start || lane) mod committee_size`. Routing only (any
-committee signature makes a valid certificate); it keeps one writer per lane and rotates every
-epoch, which bounds censorship by a certifier to one epoch. Uncertified mempool transactions are
-re-forwarded to the current certifier every 5 s.
+Each lane has one designated certifier per **certifier term** of `ingress_certifier_term_blocks` (2)
+heights; terms tile each committee epoch (a size that does not divide the epoch means one term per
+epoch). An ingress certificate's `epoch` field is its term's first height, and a block accepts only
+certificates of its own term, so at a term change every node drops the lane's unfinalized certificates
+of the old term and the new certifier continues from the finalized tip (no two writers in one term).
+
+The certifier of `(term, lane)` is `sha256d("SC-INGRESS-CERTIFIER-V2" || term_start || lane) mod n` over
+the committee members that appear in the `prev_finality_signers` of the last
+`ingress_certifier_liveness_blocks` (2) finalized transitions before the term (all of the committee if
+none does). Routing only (any committee signature makes a valid certificate), but it comes from finalized
+data, so every node names the same certifier; a node without that data does not certify. A validator
+that stops signing therefore holds a lane for at most about a liveness window plus a term, and a
+censoring one for a term.
+
+Uncertified mempool transactions are re-tried every 5 s and at each term change. While the certifier is
+not a direct peer, a transaction is relayed to the other validators once per term. Both parameters are
+part of the handshake's consensus-rules fingerprint.
 
 ## `PROPOSE` And Finalized Transition Delivery
 

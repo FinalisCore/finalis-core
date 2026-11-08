@@ -4,6 +4,9 @@
 
 #include <algorithm>
 
+#include "codec/bytes.hpp"
+#include "common/types.hpp"
+#include "crypto/hash.hpp"
 #include "genesis/embedded.hpp"
 
 namespace finalis {
@@ -75,6 +78,29 @@ ChainIdMismatch compare_chain_identity(const ChainId& a, const ChainId& b) {
   out.match =
       !(out.network_id_differs || out.genesis_hash_differs || out.protocol_version_differs || out.magic_differs);
   return out;
+}
+
+std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+  codec::ByteWriter w;
+  w.bytes_fixed(cfg.network_id);
+  w.u32le(cfg.protocol_version);
+  w.u64le(cfg.feature_flags);
+  w.u64le(cfg.magic);
+  w.u64le(cfg.committee_epoch_blocks);
+  w.u32le(cfg.max_committee);
+  w.u32le(cv);
+  const auto genesis = hex_decode(chain_id.genesis_hash_hex);
+  if (genesis.has_value() && genesis->size() == 32) {
+    Hash32 g{};
+    std::copy(genesis->begin(), genesis->end(), g.begin());
+    w.bytes_fixed(g);
+  } else {
+    w.bytes_fixed(zero_hash());
+  }
+  // Ingress certifier rules (C1): nodes that disagree on terms reject each other's certificates.
+  w.u64le(cfg.ingress_certifier_term_blocks);
+  w.u64le(cfg.ingress_certifier_liveness_blocks);
+  return hex_encode32(crypto::sha256d(w.data()));
 }
 
 }  // namespace finalis
