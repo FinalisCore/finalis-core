@@ -6364,9 +6364,9 @@ TEST(test_ingress_certifiers_agree_across_nodes_and_skip_a_stopped_validator) {
   std::array<PubKey32, consensus::INGRESS_LANE_COUNT> picks{};
   ASSERT_TRUE(designations_agree(all, next, &picks));
   // Two terms ahead is not computable from finalized data yet.
-  const auto far = consensus::ingress_certifier_term_start(next, kEpochBlocks, net.ingress_certifier_term_blocks) +
+  const auto two_terms_ahead = consensus::ingress_certifier_term_start(next, kEpochBlocks, net.ingress_certifier_term_blocks) +
                    2 * net.ingress_certifier_term_blocks;
-  ASSERT_TRUE(!nodes[0]->designated_ingress_certifier_for_test(0, far).has_value());
+  ASSERT_TRUE(!nodes[0]->designated_ingress_certifier_for_test(0, two_terms_ahead).has_value());
 
   // Stop a validator that certifies at least one lane now.
   int stopped = -1;
