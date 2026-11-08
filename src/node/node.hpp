@@ -297,6 +297,7 @@ class Node {
   // As received from peer `peer_id` (network rate limits apply).
   bool inject_network_record_for_test(const Bytes& raw, int peer_id, std::string* reason = nullptr);
   bool pause_proposals_for_test(bool pause);
+  bool proposals_paused_for_test() const { return pause_proposals_.load(); }
   bool advance_round_for_test(std::uint64_t expected_height, std::uint32_t target_round);
   bool mempool_contains_for_test(const Hash32& txid) const;
   std::optional<TxOut> find_utxo_by_pubkey_hash_for_test(const std::array<std::uint8_t, 20>& pkh,

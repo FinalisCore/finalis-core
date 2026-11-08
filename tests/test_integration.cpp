@@ -1530,7 +1530,8 @@ bool restart_single_node_with_seeded_certified_ingress(const node::NodeConfig& c
 // *injected_any is set once any node has accepted a range.
 bool append_live_certified_ingress_to_nodes_once(const std::string& db_path, const std::vector<node::Node*>& nodes,
                                                  const std::vector<Bytes>& raw_records, int peer_id, std::string* error,
-                                                 const crypto::KeyPair* signer_override, bool* injected_any) {
+                                                 const crypto::KeyPair* signer_override, bool* injected_any,
+                                                 std::uint64_t next_height) {
   if (nodes.empty()) return false;
   struct PendingRange {
     std::uint32_t lane{0};
@@ -1547,11 +1548,11 @@ bool append_live_certified_ingress_to_nodes_once(const std::string& db_path, con
     if (error) *error = "open-db-failed";
     return false;
   }
-  const auto tip = db.get_tip();
-  const std::uint64_t tip_height = tip.has_value() ? tip->height : 0;
-  // A certificate carries its certifier term's first height (C1).
+  // A certificate carries its certifier term's first height (C1), taken from the live nodes' next
+  // height: the read-only DB view can lag the writer by a block, which with 2-block terms is often
+  // the previous term.
   const std::uint64_t expected_ingress_epoch =
-      consensus::ingress_certifier_term_start(tip_height + 1, node::NodeConfig{}.network.committee_epoch_blocks,
+      consensus::ingress_certifier_term_start(next_height, node::NodeConfig{}.network.committee_epoch_blocks,
                                               node::NodeConfig{}.network.ingress_certifier_term_blocks);
 
   for (const auto& raw : raw_records) {
@@ -1625,13 +1626,46 @@ bool append_live_certified_ingress_to_nodes(const std::string& db_path, const st
                                             const std::vector<Bytes>& raw_records, int peer_id = 7,
                                             std::string* error = nullptr,
                                             const crypto::KeyPair* signer_override = nullptr) {
+  // Certifier terms are 2 blocks (C1): a record certified for one term and included a block too late
+  // is dropped as stale, and these records bypass the mempool, so nothing re-certifies them. Hold
+  // proposals (on the nodes not already held) while injecting, so the next block, which carries the
+  // record, is in the record's term. Each node's own pause state is restored on return.
+  std::vector<node::Node*> held;
+  for (auto* n : nodes) {
+    if (n && !n->proposals_paused_for_test() && n->pause_proposals_for_test(true)) held.push_back(n);
+  }
+  struct Release {
+    std::vector<node::Node*>& held;
+    ~Release() {
+      for (auto* n : held) (void)n->pause_proposals_for_test(false);
+    }
+  } release{held};
+  auto max_height = [&] {
+    std::uint64_t h = 0;
+    for (auto* n : nodes) {
+      if (n) h = std::max(h, n->status().height);
+    }
+    return h;
+  };
+  // A round already in flight may still finalize: wait until the height holds still.
+  std::uint64_t settled = max_height();
+  for (auto quiet_since = std::chrono::steady_clock::now(), deadline = quiet_since + std::chrono::seconds(10);
+       std::chrono::steady_clock::now() < deadline &&
+       std::chrono::steady_clock::now() - quiet_since < std::chrono::milliseconds(400);) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const auto h = max_height();
+    if (h != settled) {
+      settled = h;
+      quiet_since = std::chrono::steady_clock::now();
+    }
+  }
   constexpr int kMaxAttempts = 10;
   std::string attempt_error;
   for (int attempt = 1;; ++attempt) {
     attempt_error.clear();
     bool injected_any = false;
     if (append_live_certified_ingress_to_nodes_once(db_path, nodes, raw_records, peer_id, &attempt_error,
-                                                    signer_override, &injected_any)) {
+                                                    signer_override, &injected_any, max_height() + 1)) {
       return true;
     }
     const bool stale_seq_view = attempt_error.find("reason=ingress-seq-discontinuity") != std::string::npos ||
