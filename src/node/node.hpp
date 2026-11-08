@@ -340,6 +340,7 @@ class Node {
   bool local_prevote_recorded_for_test(std::uint64_t height, std::uint32_t round, const Hash32& transition_id) const;
   std::string inject_network_prevote_result_for_test(const Vote& vote);
   bool has_candidate_frontier_proposal_for_test(const Hash32& transition_id) const;
+  bool timed_openings_prewarmed_for_test(const Hash32& transition_id) const;
   std::set<std::uint64_t> abstain_heights_for_test() const;
   consensus::ConfidentialSupplyAuditResult confidential_supply_audit_for_test();
   std::size_t timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
