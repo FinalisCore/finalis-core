@@ -2073,6 +2073,52 @@ TEST(test_lightserver_broadcast_reports_transient_node_rejections_as_retryable) 
   }
 }
 
+TEST(test_lightserver_broadcast_reports_timed_record_node_rejections_by_reason) {
+  // A TxTimed takes broadcast_tx's own relay branch. That branch must map the node's reject reason
+  // like the ordinary branch does: testnet-3 max-load test 2026-11-07 saw 3 timed records refused
+  // with "timed verify rate limited" reported as tx_invalid / retry_class none, so wallets dropped them.
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_timed_node_reject");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  Hash32 tip_hash{};
+  tip_hash[31] = 0x96;
+  ASSERT_TRUE(db.set_tip(storage::TipState{8, tip_hash}));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  const auto timed = timed_envelope_for_listing(listing_test_script(), 0x31);
+  const Bytes timed_bytes = timed.serialize();
+  ASSERT_TRUE(TxTimed::parse(timed_bytes).has_value());
+  ASSERT_TRUE(!parse_any_tx(timed_bytes).has_value());
+  const std::string body = std::string(R"({"jsonrpc":"2.0","id":406,"method":"broadcast_tx","params":{"tx_hex":")") +
+                           hex_encode(timed_bytes) + R"("}})";
+
+  const std::vector<std::tuple<std::string, std::string, std::string>> cases = {
+      {"timed verify rate limited", "relay_unavailable", "transport"},
+      {"timed pool full", "relay_unavailable", "transport"},
+      {"no canonical state", "relay_unavailable", "transport"},
+      {"double spend in mempool", "tx_conflict_in_mempool", "none"},
+  };
+  for (const auto& [reason, code, retry_class] : cases) {
+    lightserver::Config lcfg;
+    lcfg.db_path = base;
+    lcfg.tx_relay_override = [reason = reason](const Bytes&) {
+      return lightserver::TxRelayResult{lightserver::TxRelayResult::Outcome::Rejected, reason};
+    };
+    lightserver::Server ls(lcfg);
+    ASSERT_TRUE(ls.init());
+    const auto resp = ls.handle_rpc_for_test(body);
+    if (resp.find("\"error_code\":\"" + code + "\"") == std::string::npos ||
+        resp.find("\"retry_class\":\"" + retry_class + "\"") == std::string::npos) {
+      throw std::runtime_error("reason '" + reason + "': " + resp);
+    }
+    ASSERT_TRUE(resp.find("\"accepted\":false") != std::string::npos);
+    ASSERT_TRUE(resp.find("\"retryable\":" + std::string(retry_class == "none" ? "false" : "true")) != std::string::npos);
+  }
+}
+
 TEST(test_lightserver_broadcast_returns_structured_success_when_relaying_to_live_node) {
   const std::string base = unique_test_base("/tmp/finalis_light_broadcast_success");
   std::filesystem::remove_all(base);

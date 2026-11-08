@@ -3802,11 +3802,12 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         }
         const auto relay = relay_tx_to_peer(*tx_bytes);
         if (relay.outcome != TxRelayResult::Outcome::Accepted) {
-          const std::string code = relay.outcome == TxRelayResult::Outcome::Unavailable ? std::string("relay_unavailable")
-                                                                                        : std::string("tx_invalid");
+          const std::string code = relay.outcome == TxRelayResult::Outcome::Unavailable
+                                       ? std::string("relay_unavailable")
+                                       : node_reject_error_code(relay.detail);
           return make_result(id, broadcast_result_json(false, timed_txid_hex, "rejected", "", code, relay.detail,
-                                                       code == "relay_unavailable", retry_class_for_error_code(code),
-                                                       false, std::nullopt));
+                                                       retry_class_for_error_code(code) != "none",
+                                                       retry_class_for_error_code(code), false, std::nullopt));
         }
         return make_result(id, broadcast_result_json(true, timed_txid_hex, "accepted_for_relay", "accepted_for_relay",
                                                      std::nullopt, std::nullopt, false, "none", false, std::nullopt));

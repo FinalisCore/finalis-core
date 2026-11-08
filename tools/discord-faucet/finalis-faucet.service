@@ -11,6 +11,10 @@ WorkingDirectory=/home/ubuntu/finalis-core/tools/discord-faucet
 ExecStart=/home/ubuntu/finalis-faucet/venv/bin/python faucet_bot.py
 Restart=on-failure
 RestartSec=30
+# Keep the bot resident on a small host: Discord drops a slash command not acked within 3 s
+# (error 10062), and a swapped-out bot misses that under node memory pressure.
+MemoryLow=96M
+CPUWeight=500
 
 [Install]
 WantedBy=multi-user.target
