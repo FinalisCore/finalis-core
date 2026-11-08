@@ -419,6 +419,11 @@ bool Node::has_candidate_frontier_proposal_for_test(const Hash32& transition_id)
   return candidate_frontier_proposals_.find(transition_id) != candidate_frontier_proposals_.end();
 }
 
+bool Node::timed_openings_prewarmed_for_test(const Hash32& transition_id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return prewarmed_timed_transitions_.contains(transition_id);
+}
+
 consensus::ConfidentialSupplyAuditResult Node::confidential_supply_audit_for_test() {
   std::lock_guard<std::mutex> lk(mu_);
   run_confidential_supply_audit_locked("test");

@@ -6997,6 +6997,54 @@ TEST(test_unreadable_safety_state_abstains_and_network_finalizes_without_it) {
   ASSERT_TRUE(cluster.nodes[victim]->abstain_heights_for_test().empty());
 }
 
+// LIVENESS/DoS (D8): a node prewarms a proposal's settlement decryptions off-lock, but only after the
+// round leader's signature checks out. A forged or non-leader proposal must not make it decrypt.
+TEST(test_proposal_prewarm_requires_the_round_leaders_signature) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  ASSERT_TRUE(keys.size() >= 4u);
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_prewarm_sig"), 4, 4, 4);
+  Tx tx = make_fixture_ingress_tx(1, 0x8D);
+  ASSERT_TRUE(restart_cluster_with_seeded_certified_ingress(&cluster, {tx.serialize()}, true, true, true));
+  const std::uint64_t h = cluster.nodes[0]->status().height + 1;
+  auto proposal = build_cluster_frontier_proposal_from_records(cluster, keys, {tx.serialize()}, h, 0,
+                                                               "/tmp/finalis_it_prewarm_sig_a0");
+  ASSERT_TRUE(proposal.has_value());
+  const Hash32 id = frontier_proposal_id(*proposal);
+  std::size_t ti = cluster.nodes.size();
+  for (std::size_t k = 0; k < cluster.nodes.size(); ++k) {
+    if (cluster.nodes[k]->local_is_committee_member_for_test(h, 0)) {
+      ti = k;
+      break;
+    }
+  }
+  ASSERT_TRUE(ti < cluster.nodes.size());
+  auto& node = *cluster.nodes[ti];
+  ASSERT_TRUE(advance_test_frontier_round(node, h, 0));
+  const auto domain = cluster.nodes[0]->consensus_domain_for_test();
+
+  auto forged = make_test_frontier_propose_msg(domain, *proposal);
+  forged.proposer_signature[7] ^= 0x01;
+  (void)node.inject_network_propose_result_for_test(forged);
+  ASSERT_TRUE(!node.timed_openings_prewarmed_for_test(id));
+
+  std::optional<PubKey32> other;
+  for (const auto& kp : keys) {
+    if (kp.public_key != proposal->transition.leader_pubkey) {
+      other = kp.public_key;
+      break;
+    }
+  }
+  ASSERT_TRUE(other.has_value());
+  const auto by_other = make_test_frontier_propose_msg(domain, *proposal, std::nullopt, std::nullopt, std::nullopt, other);
+  (void)node.inject_network_propose_result_for_test(by_other);
+  ASSERT_TRUE(!node.timed_openings_prewarmed_for_test(id));
+
+  // Control: the leader's own signature does prewarm (so the checks above are not vacuous).
+  ASSERT_EQ(node.inject_network_propose_result_for_test(make_test_frontier_propose_msg(domain, *proposal)),
+            std::string("accepted"));
+  ASSERT_TRUE(node.timed_openings_prewarmed_for_test(id));
+}
+
 // A corrupt primary row is recovered from its mirror: the lock survives and nothing is quarantined.
 TEST(test_safety_state_mirror_recovers_corrupted_primary) {
   const auto keys = node::Node::deterministic_test_keypairs();
