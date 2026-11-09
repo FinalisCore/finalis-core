@@ -189,6 +189,13 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   add_prefix(db, &kvs, "ER:");
   add_prefix(db, &kvs, "TE:");
   add_prefix(db, &kvs, "TK:");
+  // The rest of what fast start loads into the consensus state (node_state.cpp): committee
+  // checkpoints, join requests, finalized randomness and the validator window keys. Without them
+  // the tip's post-state commitment never matches and an imported node replays from genesis.
+  add_prefix(db, &kvs, "CE:");
+  add_prefix(db, &kvs, "VJR:");
+  add_prefix(db, &kvs, "PVAL:");
+  add_exact_key(db, &kvs, "PRAND:FINALIZED");
   add_prefix(db, &kvs, key_frontier_height_prefix());
   add_prefix(db, &kvs, key_frontier_transition_prefix());
   add_prefix(db, &kvs, key_finality_certificate_height_prefix());

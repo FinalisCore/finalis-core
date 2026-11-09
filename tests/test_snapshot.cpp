@@ -188,3 +188,40 @@ TEST(test_snapshot_import_rejects_genesis_mismatch_without_writing) {
   ASSERT_TRUE(err.find("snapshot genesis mismatch; reject import") != std::string::npos);
   ASSERT_TRUE(dst.scan_prefix("").empty());
 }
+
+// Everything fast start loads into the consensus state travels in the snapshot: without committee
+// checkpoints (CE:), join requests (VJR:), the validator window keys (PVAL:) and the finalized
+// randomness, an imported node's post-state commitment never matched the tip
+// (checkpoint-post-state-commitment-mismatch) and it replayed from genesis.
+TEST(test_snapshot_carries_every_row_fast_start_loads) {
+  Hash32 genesis_hash{};
+  genesis_hash.fill(0x05);
+  const std::string src_db_path = unique_snapshot_path("finalis_snapshot_fast_start_rows_src_db");
+  const std::string snapshot_path = unique_snapshot_path("finalis_snapshot_fast_start_rows.bin");
+  std::filesystem::remove_all(src_db_path);
+  std::filesystem::remove(snapshot_path);
+  const std::vector<std::pair<std::string, Bytes>> rows{
+      {"CE:00000000000000a1", Bytes{0xC1}},           {"VJR:abcd", Bytes{0xC2}},
+      {"PVAL:JOIN_WINDOW_START", Bytes{0xC3}},        {"PVAL:JOIN_WINDOW_COUNT", Bytes{0xC4}},
+      {"PVAL:LIVENESS_WINDOW_START", Bytes{0xC5}},    {"PRAND:FINALIZED", Bytes(32, 0xC6)},
+  };
+  {
+    storage::DB src;
+    ASSERT_TRUE(src.open(src_db_path));
+    populate_minimal_finalized_db(&src, genesis_hash);
+    for (const auto& [k, v] : rows) ASSERT_TRUE(src.put(k, v));
+    ASSERT_TRUE(src.flush());
+    std::string err;
+    ASSERT_TRUE(storage::export_snapshot_bundle(src, snapshot_path, nullptr, &err));
+  }
+  const std::string dst_db_path = unique_snapshot_path("finalis_snapshot_fast_start_rows_dst_db");
+  std::filesystem::remove_all(dst_db_path);
+  storage::DB dst;
+  ASSERT_TRUE(dst.open(dst_db_path));
+  std::string err;
+  ASSERT_TRUE(storage::import_snapshot_bundle(dst, snapshot_path, genesis_hash, nullptr, &err));
+  for (const auto& [k, v] : rows) {
+    const auto got = dst.get(k);
+    if (!got.has_value() || *got != v) throw std::runtime_error("snapshot dropped row " + k);
+  }
+}

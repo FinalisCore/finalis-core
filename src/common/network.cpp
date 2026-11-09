@@ -110,6 +110,8 @@ NetworkConfig make_testnet() {
   net.p2p_default_port = 19540;
   net.lightserver_default_port = 19544;
   net.default_seeds = {"130.61.126.39:19540", "159.200.236.114:19540"};
+  // testnet-3 ran one certifier term per epoch through h=4800; v2.2.13 (C1) took over at 4801.
+  net.ingress_certifier_terms_activation_height = 4801;
   return net;
 }
 
@@ -169,6 +171,11 @@ bool bootstrap_penalty_exit_protection_active_at_height(const NetworkConfig& net
 
 bool empty_active_set_epoch_escape_active_at_height(const NetworkConfig& network, std::uint64_t height) {
   return height >= network.empty_active_set_epoch_escape_activation_height;
+}
+
+std::uint64_t ingress_certifier_term_blocks_at(const NetworkConfig& network, std::uint64_t height) {
+  return height >= network.ingress_certifier_terms_activation_height ? network.ingress_certifier_term_blocks
+                                                                       : network.committee_epoch_blocks;
 }
 
 bool onboarding_admission_pow_enabled(const NetworkConfig& network) {

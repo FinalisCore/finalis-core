@@ -65,7 +65,7 @@ Spec: `docs/spec/CONFIDENTIAL_UTXO_SPEC.md`.
 ## Ingress certifiers (lanes)
 | # | Invariant | Enforced in | Test |
 |---|---|---|---|
-| I1 | An ingress certificate is valid only in its certifier term: its epoch field is the term's first height, and terms tile each committee epoch. | `consensus::ingress_certifier_term_start`, frontier lane prefix, `drop_stale_unfinalized_ingress_locked` | `test_frontier_lane_prefix_requires_the_certifier_term_of_the_block`, `test_ingress_certifier_terms_tile_each_epoch` |
+| I1 | An ingress certificate is valid only in its certifier term: its epoch field is the term's first height, and terms tile each committee epoch. Below `ingress_certifier_terms_activation_height` (testnet-3: 4801, else 0) a term is the whole epoch, so history from before C1 replays. | `consensus::ingress_certifier_term_start`, `ingress_certifier_term_blocks_at`, frontier lane prefix, `drop_stale_unfinalized_ingress_locked` | `test_frontier_lane_prefix_requires_the_certifier_term_of_the_block`, `test_ingress_certifier_terms_tile_each_epoch`, `test_frontier_lane_prefix_uses_whole_epoch_terms_below_the_terms_activation_height` |
 | I2 | Every node names the same certifier for a (term, lane), from finalized data only (committee and the last W `prev_finality_signers`); a node without that data does not certify. | `Node::designated_ingress_certifier_locked` | `test_ingress_certifiers_agree_across_nodes_and_skip_a_stopped_validator` |
 | I3 | A certifier that stops signing holds its lane for at most a liveness window plus a term. | `consensus::designated_ingress_certifier` (live members only) | `test_tx_final_within_epoch_when_designated_certifier_offline`, `test_designated_ingress_certifier_is_drawn_from_live_committee_members` |
 

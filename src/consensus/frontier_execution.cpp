@@ -280,7 +280,7 @@ bool validate_certified_lane_records(const FrontierVector& prev_vector, const Fr
   const auto expected_ingress_epoch =
       (ctx && ctx->network && ctx->current_height != 0)
           ? ingress_certifier_term_start(ctx->current_height, ctx->network->committee_epoch_blocks,
-                                         ctx->network->ingress_certifier_term_blocks)
+                                         ingress_certifier_term_blocks_at(*ctx->network, ctx->current_height))
           : 0;
   for (std::size_t lane = 0; lane < finalis::INGRESS_LANE_COUNT; ++lane) {
     if (next_vector.lane_max_seq[lane] < prev_vector.lane_max_seq[lane]) {
