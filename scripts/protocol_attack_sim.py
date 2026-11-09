@@ -115,6 +115,113 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return min(hi, max(lo, value))
 
 
+# --- Live rule mirrors (opt-in via ProtocolParameters; checked against C++ in
+# scripts/tests/test_protocol_attack_sim.py) ---
+# src/consensus/monetary.{hpp,cpp}
+TOTAL_SUPPLY_UNITS = 7_000_000 * BASE_UNITS_PER_COIN
+BLOCKS_PER_YEAR_365 = 175_200
+EMISSION_YEARS = 12
+EMISSION_BLOCKS = EMISSION_YEARS * BLOCKS_PER_YEAR_365
+EMISSION_DECAY_NUM = 4
+EMISSION_DECAY_DEN = 5
+MIN_BOND_SUPPLY_DIVISOR = 12_800
+MIN_BOND_VALIDATOR_COUNT_CAP = 512
+# src/common/network.cpp (mainnet and testnet economics)
+LIVE_TARGET_VALIDATORS = 16
+LIVE_BASE_MIN_BOND_UNITS = 150 * BASE_UNITS_PER_COIN
+LIVE_MIN_BOND_FLOOR_UNITS = 150 * BASE_UNITS_PER_COIN
+LIVE_MIN_BOND_CEILING_UNITS = 5_000 * BASE_UNITS_PER_COIN  # kValidatorBondMaxAmount = BOND_AMOUNT * 100
+LIVE_MIN_BOND_COINS = 150.0  # kAdaptiveMinBondFloor: the committee-eligibility bond
+# src/consensus/canonical_derivation.cpp derive_adaptive_committee_target (spec §5)
+ADAPTIVE_SMALL_TARGET = 16
+ADAPTIVE_LARGE_TARGET = 24
+ADAPTIVE_EXPAND_MIN_DEPTH = 30
+ADAPTIVE_EXPAND_EPOCHS = 4
+ADAPTIVE_CONTRACT_MAX_DEPTH = 22
+ADAPTIVE_CONTRACT_EPOCHS = 6
+
+
+def emission_year_budgets() -> list[int]:
+    weight = 1
+    for _ in range(1, EMISSION_YEARS):
+        weight *= EMISSION_DECAY_DEN
+    weights = []
+    for year in range(EMISSION_YEARS):
+        weights.append(weight)
+        if year + 1 < EMISSION_YEARS:
+            weight = (weight // EMISSION_DECAY_DEN) * EMISSION_DECAY_NUM
+    total_weight = sum(weights)
+    budgets = [TOTAL_SUPPLY_UNITS * weights[year] // total_weight for year in range(EMISSION_YEARS - 1)]
+    budgets.append(TOTAL_SUPPLY_UNITS - sum(budgets))
+    return budgets
+
+
+_EMISSION_YEAR_BUDGETS = emission_year_budgets()
+
+
+def emitted_supply_units(height: int) -> int:
+    """Mirror of consensus::emitted_supply_units: heights 1..height."""
+    if height == 0:
+        return 0
+    last = min(height, EMISSION_BLOCKS - 1)
+    total = 0
+    for year in range(EMISSION_YEARS):
+        lo = max(1, year * BLOCKS_PER_YEAR_365)
+        hi = min(last, (year + 1) * BLOCKS_PER_YEAR_365 - 1)
+        if lo > hi:
+            continue
+        budget = _EMISSION_YEAR_BUDGETS[year]
+        base, rem = divmod(budget, BLOCKS_PER_YEAR_365)
+        off_lo = lo - year * BLOCKS_PER_YEAR_365
+        off_hi = hi - year * BLOCKS_PER_YEAR_365
+        extra = (min(off_hi, rem - 1) - off_lo + 1) if off_lo < rem else 0
+        total += base * (off_hi - off_lo + 1) + extra
+    return total
+
+
+def live_validator_min_bond_units(height: int, active_operators: int) -> int:
+    """Mirror of consensus::validator_min_bond_units with the live economics policy."""
+    active = min(max(active_operators, 1), MIN_BOND_VALIDATOR_COUNT_CAP)
+    ratio = active * 100_000_000 // LIVE_TARGET_VALIDATORS
+    b_n = LIVE_BASE_MIN_BOND_UNITS * math.isqrt(ratio) // 10_000
+    b_s = emitted_supply_units(height) // MIN_BOND_SUPPLY_DIVISOR
+    mean = (b_n + 2 * b_s) // 3
+    return min(LIVE_MIN_BOND_CEILING_UNITS, max(LIVE_MIN_BOND_FLOOR_UNITS, mean))
+
+
+def live_adaptive_committee_target(
+    prior_target: int, qualified_depth: int, prior_expand: int, prior_contract: int
+) -> tuple[int, int, int]:
+    """Mirror of consensus::derive_adaptive_committee_target: (target, expand_streak, contract_streak)."""
+    target = prior_target if prior_target in (ADAPTIVE_SMALL_TARGET, ADAPTIVE_LARGE_TARGET) else ADAPTIVE_SMALL_TARGET
+    expand = 0
+    contract = 0
+    if target == ADAPTIVE_SMALL_TARGET and qualified_depth >= ADAPTIVE_EXPAND_MIN_DEPTH:
+        expand = min(ADAPTIVE_EXPAND_EPOCHS, prior_expand + 1)
+        if expand >= ADAPTIVE_EXPAND_EPOCHS:
+            target = ADAPTIVE_LARGE_TARGET
+    elif target == ADAPTIVE_LARGE_TARGET and qualified_depth <= ADAPTIVE_CONTRACT_MAX_DEPTH:
+        contract = min(ADAPTIVE_CONTRACT_EPOCHS, prior_contract + 1)
+        if contract >= ADAPTIVE_CONTRACT_EPOCHS:
+            target = ADAPTIVE_SMALL_TARGET
+    return target, expand, contract
+
+
+def quorum_threshold(committee_size: int) -> int:
+    """consensus::quorum_threshold: 2n/3 + 1."""
+    return (2 * committee_size) // 3 + 1
+
+
+def bft_risk_seats(committee_size: int) -> tuple[int, int]:
+    """(stall, safety) adversarial seat counts for a committee of n with quorum q.
+
+    Stall: n - q + 1 members can withhold every quorum. Safety: two quorums overlap in 2q - n
+    members, so that many equivocating members can finalize two conflicting blocks.
+    """
+    q = quorum_threshold(committee_size)
+    return committee_size - q + 1, 2 * q - committee_size
+
+
 @dataclass(frozen=True)
 class ProtocolParameters:
     epoch_size: int = DEFAULT_EPOCH_SIZE
@@ -128,6 +235,15 @@ class ProtocolParameters:
     ticket_bonus_cap_bps: int = DEFAULT_TICKET_BONUS_CAP_BPS
     ticket_difficulty_bits: int = DEFAULT_TICKET_DIFFICULTY_BITS
     ticket_nonce_limit: int = DEFAULT_NONCE_LIMIT
+    # Live rules, opt-in so existing scenarios and reports keep their numbers:
+    # adaptive_committee: committee size 16/24 from qualified depth and min_eligible = size + 3
+    #   (committee_size / min_eligible above are ignored).
+    # live_dynamic_min_bond: the effective-bond cap is consensus::validator_min_bond_units(height,
+    #   active operators) * max_effective_bond_multiple instead of dynamic_min_bond_coins * multiple.
+    # supply_height_offset: the chain height of epoch 1's start, for the supply term of that bond.
+    adaptive_committee: bool = False
+    live_dynamic_min_bond: bool = False
+    supply_height_offset: int = 0
 
     def validate(self) -> None:
         if self.epoch_size <= 0:
@@ -150,6 +266,8 @@ class ProtocolParameters:
             raise ValueError("ticket_difficulty_bits must be non-negative")
         if self.ticket_nonce_limit <= 0:
             raise ValueError("ticket_nonce_limit must be positive")
+        if self.supply_height_offset < 0:
+            raise ValueError("supply_height_offset must be non-negative")
 
     @property
     def dynamic_min_bond_units(self) -> int:
@@ -328,6 +446,11 @@ class EpochResult:
     operators: tuple[EpochOperatorResult, ...]
     join_activations: tuple[str, ...]
     exits_removed: tuple[str, ...]
+    committee_size: int = 0
+    effective_bond_cap_units: int = 0
+    coalition_seats: int = 0
+    stall_risk: bool = False
+    safety_risk: bool = False
 
 
 @dataclass(frozen=True)
@@ -371,6 +494,14 @@ class ScenarioSummary:
     warmup_blocking_rate: float
     cooldown_blocking_rate: float
     per_epoch: list[dict[str, Any]]
+    # BFT danger per epoch: the coalition holds >= n - q + 1 seats (can stall finality) or
+    # >= 2q - n seats (can finalize two conflicting blocks), q = 2n/3 + 1.
+    stall_risk_epochs: int = 0
+    stall_risk_rate: float = 0.0
+    safety_risk_epochs: int = 0
+    safety_risk_rate: float = 0.0
+    max_coalition_seats: int = 0
+    average_committee_size: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -553,10 +684,11 @@ def candidate_for_operator(
     epoch: int,
     params: ProtocolParameters,
     seed_label: str,
+    cap_units: int | None = None,
 ) -> RankedCandidate:
     rep = representative_validator(validators)
     total_bond_units = sum(coins_to_units(v.bond_coins) for v in validators)
-    capped_bond_units = min(total_bond_units, params.effective_bond_cap_units)
+    capped_bond_units = min(total_bond_units, params.effective_bond_cap_units if cap_units is None else cap_units)
     ticket_hash, ticket_nonce, bonus_bps = best_operator_ticket(operator_id, epoch, params, seed_label)
     actor = actor_map[rep.actor_id]
     return RankedCandidate(
@@ -735,8 +867,23 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
     warmup_total_checks = 0
     cooldown_blocked_checks = 0
     cooldown_total_checks = 0
+    adaptive_target = ADAPTIVE_SMALL_TARGET
+    adaptive_expand = 0
+    adaptive_contract = 0
 
     for epoch in range(1, scenario.epochs + 1):
+        active_operator_count = sum(
+            1
+            for operator_id in operator_map
+            if any(lifecycle_active_for_epoch(v, epoch, params) for v in validators_by_operator.get(operator_id, []))
+        )
+        if params.live_dynamic_min_bond:
+            cap_units = (
+                live_validator_min_bond_units(epoch_start_height(epoch, params) + params.supply_height_offset, active_operator_count)
+                * params.max_effective_bond_multiple
+            )
+        else:
+            cap_units = params.effective_bond_cap_units
         availability_eligible_ops: set[str] = set()
         candidate_pool: list[tuple[str, RankedCandidate]] = []
         operator_results: list[EpochOperatorResult] = []
@@ -791,8 +938,8 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
                     actor_id=spec.actor_id,
                     adversarial=actor_map[spec.actor_id].adversarial,
                     bonded_units=total_bond_units,
-                    capped_bonded_units=min(total_bond_units, params.effective_bond_cap_units),
-                    effective_weight=sqrt_effective_weight(min(total_bond_units, params.effective_bond_cap_units))
+                    capped_bonded_units=min(total_bond_units, cap_units),
+                    effective_weight=sqrt_effective_weight(min(total_bond_units, cap_units))
                     if total_bond_units > 0
                     else 0,
                     validator_count=len(validators_by_operator.get(operator_id, [])),
@@ -807,13 +954,24 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
             )
 
         eligible_count = len(sorted(availability_eligible_ops))
-        mode, reason = derive_mode_reason(previous_mode, eligible_count, params.min_eligible)
+        if params.adaptive_committee:
+            # The live target follows the previous checkpoint's and this epoch's qualified depth
+            # (availability-qualified operators), then min_eligible = target + 3 decides the mode.
+            adaptive_target, adaptive_expand, adaptive_contract = live_adaptive_committee_target(
+                adaptive_target, eligible_count, adaptive_expand, adaptive_contract
+            )
+            committee_size = adaptive_target
+            min_eligible = adaptive_target + 3
+        else:
+            committee_size = params.committee_size
+            min_eligible = params.min_eligible
+        mode, reason = derive_mode_reason(previous_mode, eligible_count, min_eligible)
         fallback_sticky = mode == MODE_FALLBACK and reason == REASON_STICKY
-        if eligible_count == params.min_eligible:
+        if eligible_count == min_eligible:
             epochs_at_exact_threshold += 1
-        if eligible_count < params.min_eligible:
+        if eligible_count < min_eligible:
             epochs_below_threshold += 1
-        if eligible_count == fallback_recovery_threshold(params.min_eligible):
+        if eligible_count == fallback_recovery_threshold(min_eligible):
             epochs_at_recovery_threshold += 1
         if fallback_sticky and not previous_sticky:
             sticky_fallback_entry_count += 1
@@ -851,12 +1009,16 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
             candidate_pool.append(
                 (
                     operator_id,
-                    candidate_for_operator(operator_id, base_eligible_validators, actor_map, epoch, params, scenario.seed_label),
+                    candidate_for_operator(
+                        operator_id, base_eligible_validators, actor_map, epoch, params, scenario.seed_label, cap_units
+                    ),
                 )
             )
 
         candidates = [candidate for _, candidate in sorted(candidate_pool, key=lambda item: item[0])]
-        committee = select_finalized_committee(candidates, epoch_seed(scenario.seed_label, epoch), params.committee_size)
+        committee = select_finalized_committee(candidates, epoch_seed(scenario.seed_label, epoch), committee_size)
+        coalition_seats = sum(1 for candidate in committee if candidate.adversarial)
+        stall_seats, safety_seats = bft_risk_seats(len(committee)) if committee else (1, 1)
         schedule = proposer_schedule(committee, epoch_seed(scenario.seed_label, epoch), epoch)
         proposer = schedule[0] if schedule else None
         candidate_actor: dict[bytes, str] = {}
@@ -915,7 +1077,7 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
                 fallback_reason=reason,
                 fallback_sticky=fallback_sticky,
                 eligible_operator_count=eligible_count,
-                min_eligible_operators=params.min_eligible,
+                min_eligible_operators=min_eligible,
                 committee_operator_ids=committee_operator_ids,
                 proposer_operator_id=proposer_op,
                 coalition_committee_share=coalition_committee_share,
@@ -926,6 +1088,11 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
                 operators=tuple(operator_results),
                 join_activations=tuple(sorted(join_activations)),
                 exits_removed=tuple(sorted(exits_removed)),
+                committee_size=len(committee),
+                effective_bond_cap_units=cap_units,
+                coalition_seats=coalition_seats,
+                stall_risk=bool(committee) and coalition_seats >= stall_seats,
+                safety_risk=bool(committee) and coalition_seats >= safety_seats,
             )
         )
         previous_mode = mode
@@ -999,6 +1166,12 @@ def run_scenario(scenario: SimulationScenario) -> ScenarioSummary:
         warmup_blocking_rate=warmup_blocked_checks / max(1, warmup_total_checks),
         cooldown_blocking_rate=cooldown_blocked_checks / max(1, cooldown_total_checks),
         per_epoch=[asdict(epoch) for epoch in committee_history],
+        stall_risk_epochs=sum(1 for epoch in committee_history if epoch.stall_risk),
+        stall_risk_rate=sum(1 for epoch in committee_history if epoch.stall_risk) / scenario.epochs,
+        safety_risk_epochs=sum(1 for epoch in committee_history if epoch.safety_risk),
+        safety_risk_rate=sum(1 for epoch in committee_history if epoch.safety_risk) / scenario.epochs,
+        max_coalition_seats=max((epoch.coalition_seats for epoch in committee_history), default=0),
+        average_committee_size=sum(epoch.committee_size for epoch in committee_history) / scenario.epochs,
     )
 
 
@@ -1018,6 +1191,10 @@ def compare_summaries(summaries: Sequence[ScenarioSummary]) -> dict[str, Any]:
                 "avg_hhi": round(summary.average_hhi, 6),
                 "avg_top1_pct": percent(summary.average_top1_share),
                 "avg_top3_pct": percent(summary.average_top3_share),
+                "avg_committee_size": round(summary.average_committee_size, 3),
+                "max_coalition_seats": summary.max_coalition_seats,
+                "stall_risk_pct": percent(summary.stall_risk_rate),
+                "safety_risk_pct": percent(summary.safety_risk_rate),
             }
         )
     baseline = summaries[0] if summaries else None
@@ -1044,15 +1221,17 @@ def render_markdown_report(summaries: Sequence[ScenarioSummary]) -> str:
     lines = [
         "# Finalis Protocol Attack Simulation",
         "",
-        "| scenario | strategy | bond share | committee share | proposer share | fallback rate | sticky rate | split amp | avg HHI |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| scenario | strategy | bond share | committee share | proposer share | fallback rate | sticky rate | split amp | avg HHI | avg size | max coalition seats | stall risk | safety risk |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for summary in summaries:
         lines.append(
             f"| {summary.scenario} | {summary.strategy_family} | {percent(summary.coalition_bond_share):.2f}% | "
             f"{percent(summary.average_coalition_committee_share):.2f}% | {percent(summary.proposer_share):.2f}% | "
             f"{percent(summary.fallback_rate):.2f}% | {percent(summary.sticky_fallback_rate):.2f}% | "
-            f"{summary.split_amplification_ratio:.3f} | {summary.average_hhi:.4f} |"
+            f"{summary.split_amplification_ratio:.3f} | {summary.average_hhi:.4f} | "
+            f"{summary.average_committee_size:.1f} | {summary.max_coalition_seats} | "
+            f"{percent(summary.stall_risk_rate):.2f}% | {percent(summary.safety_risk_rate):.2f}% |"
         )
     if len(summaries) >= 2:
         baseline = summaries[0]
@@ -1101,6 +1280,10 @@ def write_epoch_csv(path: Path, summaries: Sequence[ScenarioSummary]) -> None:
                 "committee_top3_share",
                 "committee_operator_ids",
                 "proposer_operator_id",
+                "committee_size",
+                "coalition_seats",
+                "stall_risk",
+                "safety_risk",
             ],
         )
         writer.writeheader()
@@ -1121,6 +1304,10 @@ def write_epoch_csv(path: Path, summaries: Sequence[ScenarioSummary]) -> None:
                         "committee_top3_share": f"{epoch['committee_top3_share']:.6f}",
                         "committee_operator_ids": ",".join(epoch["committee_operator_ids"]),
                         "proposer_operator_id": epoch["proposer_operator_id"] or "",
+                        "committee_size": epoch.get("committee_size", 0),
+                        "coalition_seats": epoch.get("coalition_seats", 0),
+                        "stall_risk": int(epoch.get("stall_risk", False)),
+                        "safety_risk": int(epoch.get("safety_risk", False)),
                     }
                 )
 
@@ -1386,8 +1573,8 @@ CURRENT_LIKE_PROFILE = CandidateProfile(
     name="current_like_baseline",
     committee_size=16,
     min_eligible=19,
-    dynamic_min_bond_coins=100.0,
-    availability_min_bond_coins=100.0,
+    dynamic_min_bond_coins=LIVE_MIN_BOND_COINS,
+    availability_min_bond_coins=LIVE_MIN_BOND_COINS,
     validator_warmup_blocks=100,
     validator_cooldown_blocks=100,
 )
@@ -2305,6 +2492,76 @@ def build_replay_expanded_honest_depth(
     )
 
 
+def build_scale_adversary(
+    total_operators: int = 500,
+    adversary_share: float = 0.2,
+    split: bool = True,
+    epochs: int = 64,
+    supply_height_offset: int = BLOCKS_PER_YEAR_365,
+    committee_size: int | None = None,
+) -> SimulationScenario:
+    """A large network under the live rules (adaptive 16/24 committee, dynamic min-bond cap).
+
+    Every honest operator bonds the live minimum (150 FLS). The adversary owns `adversary_share`
+    of all bond: split=True runs it as that share of the operators, each at the minimum;
+    split=False puts the same coins into one operator (sqrt weight, capped by the effective bond
+    cap). Reports how often the sampled committee gives it enough seats to stall or break safety.
+    committee_size fixes the committee (min_eligible = size + 3) instead of the live 16/24
+    adaptation, to evaluate larger committees.
+    """
+    if total_operators < 2:
+        raise ValueError("total_operators must be at least 2")
+    if not 0.0 < adversary_share < 1.0:
+        raise ValueError("adversary_share must be in (0, 1)")
+    protocol = ProtocolParameters(
+        dynamic_min_bond_coins=LIVE_MIN_BOND_COINS,
+        availability_min_bond_coins=LIVE_MIN_BOND_COINS,
+        adaptive_committee=committee_size is None,
+        live_dynamic_min_bond=True,
+        supply_height_offset=supply_height_offset,
+        committee_size=committee_size or DEFAULT_COMMITTEE_SIZE,
+        min_eligible=(committee_size + 3) if committee_size else DEFAULT_AVAILABILITY_MIN_ELIGIBLE,
+    )
+    adversary_ops = max(1, round(total_operators * adversary_share))
+    honest_ops = total_operators - adversary_ops
+    actors = [ActorSpec(actor_id="adversary", adversarial=True)] + [
+        ActorSpec(actor_id=f"honest-{idx}") for idx in range(honest_ops)
+    ]
+    operators: list[OperatorSpec] = []
+    validators: list[ValidatorSpec] = []
+    for idx in range(honest_ops):
+        operators.append(OperatorSpec(operator_id=f"op-h{idx}", actor_id=f"honest-{idx}"))
+        validators.append(
+            ValidatorSpec(validator_id=f"v-h{idx}", operator_id=f"op-h{idx}", actor_id=f"honest-{idx}", bond_coins=LIVE_MIN_BOND_COINS)
+        )
+    if split:
+        for idx in range(adversary_ops):
+            operators.append(OperatorSpec(operator_id=f"op-a{idx}", actor_id="adversary"))
+            validators.append(
+                ValidatorSpec(validator_id=f"v-a{idx}", operator_id=f"op-a{idx}", actor_id="adversary", bond_coins=LIVE_MIN_BOND_COINS)
+            )
+    else:
+        operators.append(OperatorSpec(operator_id="op-a0", actor_id="adversary"))
+        validators.append(
+            ValidatorSpec(
+                validator_id="v-a0", operator_id="op-a0", actor_id="adversary", bond_coins=LIVE_MIN_BOND_COINS * adversary_ops
+            )
+        )
+    mode = "split" if split else "unsplit"
+    size_tag = f"_k{committee_size}" if committee_size else ""
+    return SimulationScenario(
+        name=f"scale_{total_operators}{size_tag}_{mode}_p{round(adversary_share * 100)}",
+        description="Large network under live adaptive committee and dynamic min-bond rules.",
+        epochs=epochs,
+        protocol=protocol,
+        actors=tuple(actors),
+        operators=tuple(operators),
+        validators=tuple(validators),
+        seed_label=f"scale-{total_operators}{size_tag}-{mode}-{adversary_share}",
+        strategy_family="scale_sampling",
+    )
+
+
 BUILTIN_SCENARIOS: dict[str, Callable[[], SimulationScenario]] = {
     "honest_baseline": build_honest_baseline,
     "coalition_unsplit_baseline": build_unsplit_coalition_baseline,
@@ -2318,6 +2575,10 @@ BUILTIN_SCENARIOS: dict[str, Callable[[], SimulationScenario]] = {
     "boundary_activation_edge": build_boundary_activation_edge,
     "replay_calibrated_honest_depth": build_replay_calibrated_honest_depth,
     "replay_expanded_honest_depth": build_replay_expanded_honest_depth,
+    "scale_500_split_p10": lambda: build_scale_adversary(500, 0.10, True),
+    "scale_500_split_p20": lambda: build_scale_adversary(500, 0.20, True),
+    "scale_500_split_p33": lambda: build_scale_adversary(500, 0.33, True),
+    "scale_500_unsplit_p20": lambda: build_scale_adversary(500, 0.20, False),
 }
 
 

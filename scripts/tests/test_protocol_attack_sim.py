@@ -291,5 +291,78 @@ class ProtocolAttackSimulatorTests(unittest.TestCase):
         self.assertEqual(generate_replay_expanded_depth_report(), 0)
 
 
+class LiveRuleMirrorTests(unittest.TestCase):
+    # Values printed by consensus::emitted_supply_units / validator_min_bond_units (mainnet economics).
+    SUPPLY = {
+        0: 0, 1: 858051617, 5000: 4290258085000, 175199: 150329785081904, 175200: 150330471523197,
+        175201: 150331157964490, 1000000: 540215540940773, 2102399: 699999141948383, 2102400: 699999141948383,
+    }
+    MIN_BOND = {
+        (1, 1): 15000000000, (1, 500): 27950544690, (1, 1000): 28284044690,
+        (175200, 16): 15000000000, (175200, 100): 20329712058, (175200, 500): 35780212058,
+        (175200, 512): 36113712058, (1000000, 1): 29386226090, (1000000, 18): 33439226090,
+        (1000000, 500): 56086726090,
+    }
+
+    def test_supply_and_min_bond_match_cpp(self) -> None:
+        from scripts.protocol_attack_sim import emitted_supply_units, live_validator_min_bond_units
+
+        for height, units in self.SUPPLY.items():
+            self.assertEqual(emitted_supply_units(height), units, height)
+        for (height, active), units in self.MIN_BOND.items():
+            self.assertEqual(live_validator_min_bond_units(height, active), units, (height, active))
+
+    def test_adaptive_target_expands_after_four_deep_epochs_and_contracts_after_six_shallow(self) -> None:
+        from scripts.protocol_attack_sim import live_adaptive_committee_target
+
+        target, expand, contract = 16, 0, 0
+        for step in range(3):
+            target, expand, contract = live_adaptive_committee_target(target, 30, expand, contract)
+            self.assertEqual(target, 16, step)
+        target, expand, contract = live_adaptive_committee_target(target, 30, expand, contract)
+        self.assertEqual(target, 24)
+        # A non-qualifying epoch resets the streak.
+        target, expand, contract = live_adaptive_committee_target(24, 22, 0, 0)
+        target, expand, contract = live_adaptive_committee_target(target, 23, expand, contract)
+        self.assertEqual((target, contract), (24, 0))
+        for _ in range(5):
+            target, expand, contract = live_adaptive_committee_target(target, 22, expand, contract)
+            self.assertEqual(target, 24)
+        target, expand, contract = live_adaptive_committee_target(target, 22, expand, contract)
+        self.assertEqual(target, 16)
+
+    def test_bft_risk_seats(self) -> None:
+        from scripts.protocol_attack_sim import bft_risk_seats, quorum_threshold
+
+        self.assertEqual((quorum_threshold(16), bft_risk_seats(16)), (11, (6, 6)))
+        self.assertEqual((quorum_threshold(24), bft_risk_seats(24)), (17, (8, 10)))
+        self.assertEqual((quorum_threshold(4), bft_risk_seats(4)), (3, (2, 2)))
+
+    def test_scale_scenario_uses_adaptive_size_live_cap_and_reports_seat_risk(self) -> None:
+        from scripts.protocol_attack_sim import build_scale_adversary, live_validator_min_bond_units
+
+        summary = run_scenario(build_scale_adversary(total_operators=40, adversary_share=0.5, split=True, epochs=6))
+        sizes = [epoch["committee_size"] for epoch in summary.per_epoch]
+        # 40 qualified operators: 16 for three epochs, 24 from the fourth.
+        self.assertEqual(sizes, [16, 16, 16, 24, 24, 24])
+        self.assertEqual(summary.per_epoch[0]["min_eligible_operators"], 19)
+        self.assertEqual(summary.per_epoch[3]["min_eligible_operators"], 27)
+        self.assertEqual(
+            summary.per_epoch[0]["effective_bond_cap_units"], live_validator_min_bond_units(1 + 175200, 40) * 10
+        )
+        for epoch in summary.per_epoch:
+            stall = epoch["coalition_seats"] >= (6 if epoch["committee_size"] == 16 else 8)
+            self.assertEqual(epoch["stall_risk"], stall)
+        self.assertEqual(summary.stall_risk_epochs, sum(1 for epoch in summary.per_epoch if epoch["stall_risk"]))
+        self.assertGreater(summary.max_coalition_seats, 0)
+
+    def test_unsplit_adversary_holds_at_most_one_seat(self) -> None:
+        from scripts.protocol_attack_sim import build_scale_adversary
+
+        summary = run_scenario(build_scale_adversary(total_operators=40, adversary_share=0.5, split=False, epochs=3))
+        self.assertLessEqual(summary.max_coalition_seats, 1)
+        self.assertEqual(summary.safety_risk_epochs, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

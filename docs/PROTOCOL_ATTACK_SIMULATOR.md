@@ -29,11 +29,16 @@ The current live deployment context after the genesis reset is:
   - `NONE`
   - `INSUFFICIENT_ELIGIBLE_OPERATORS`
   - `HYSTERESIS_RECOVERY_PENDING`
-- adaptive checkpoint regime:
+- adaptive checkpoint regime (opt-in, `ProtocolParameters.adaptive_committee`; otherwise
+  `committee_size` / `min_eligible` stay fixed per scenario):
   - target set `{16, 24}`
-  - qualified-depth-driven expansion/contraction
+  - qualified-depth-driven expansion (`>= 30` for 4 epochs) and contraction (`<= 22` for 6)
   - `adaptive_min_eligible = target + 3`
-  - deterministic adaptive checkpoint minimum bond
+- live dynamic minimum bond (opt-in, `ProtocolParameters.live_dynamic_min_bond`): the effective
+  bond cap is `consensus::validator_min_bond_units(height, active operators) * 10`, with the
+  emission schedule mirrored for the supply term (`supply_height_offset` places epoch 1 on the
+  chain). The committee-eligibility bond stays the 150 FLS floor. Both mirrors are pinned to
+  values printed by the C++ code (`LiveRuleMirrorTests`)
 - live hysteresis:
   - `NORMAL -> FALLBACK` if eligible `< min`
   - `FALLBACK -> NORMAL` only if eligible `>= fallback_recovery_threshold(min)`: `min + 2`
@@ -123,6 +128,12 @@ Per run the simulator computes:
   - `bond_threshold_binding_rate`
   - `warmup_blocking_rate`
   - `cooldown_blocking_rate`
+- BFT seat risk per epoch, with `q = 2n/3 + 1`:
+  - `stall_risk_epochs` / `stall_risk_rate`: the coalition holds `>= n - q + 1` seats and can
+    withhold every quorum
+  - `safety_risk_epochs` / `safety_risk_rate`: the coalition holds `>= 2q - n` seats, the overlap
+    of two quorums, and can finalize two conflicting blocks
+  - `max_coalition_seats`, `average_committee_size`
 
 Report outputs:
 
@@ -160,6 +171,17 @@ python3 scripts/protocol_attack_sim.py run \
   --json-out /tmp/finalis_sim.json \
   --md-out /tmp/finalis_sim.md \
   --csv-out /tmp/finalis_sim.csv
+```
+
+Large-network sampling risk under the live rules (500 operators at the 150 FLS minimum, the
+adversary owning 10/20/33% of bond, split across operators or in one; 64 epochs each, slow:
+the ticket search is 4096 hashes per operator per epoch):
+
+```bash
+python3 scripts/protocol_attack_sim.py run \
+  --scenario scale_500_split_p10 --scenario scale_500_split_p20 \
+  --scenario scale_500_split_p33 --scenario scale_500_unsplit_p20 \
+  --md-out /tmp/finalis_scale.md
 ```
 
 Run a sensitivity sweep:
