@@ -6,7 +6,10 @@
 #include <iostream>
 
 #include "consensus/validator_registry.hpp"
+#include <blst.h>
+
 #include "crypto/bls12_381.hpp"
+#include "crypto/swe_internal.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/swe.hpp"
 
@@ -249,4 +252,105 @@ TEST(test_swe_full_committee_footprint_and_timing) {
   const auto ms = [](auto a, auto b) { return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };
   std::cerr << "[swe] n=" << MAX_COMMITTEE << " t=" << t << " ciphertext_bytes=" << ct->serialize().size()
             << " encrypt_ms=" << ms(t0, t1) << " decrypt_ms=" << ms(t2, t3) << "\n";
+}
+
+// Signature-free opening: every named validator j can compute its share point
+// Y_j = c_j - x_j * c = g1^{s_j} from its secret key at any time, without signing. A threshold
+// of those points interpolates g1^{r0}, and e(g1^{r0}, t_i) unmasks every chunk. A quorum that
+// colludes this way leaves no time signature behind, so SCTSLASH evidence never exists. The time
+// signature only gates honest holders; secrecy rests on fewer than t of the named keys colluding.
+namespace finalis::crypto::swe_internal {
+GtBytes gt_bytes(const blst_fp12& f);
+std::optional<blst_fp12> gt_decode(const GtBytes& b);
+}  // namespace finalis::crypto::swe_internal
+
+TEST(test_swe_named_quorum_opens_without_any_time_signature) {
+  namespace si = crypto::swe_internal;
+  const auto c = make_committee(7, 0x51);
+  const std::uint32_t t = static_cast<std::uint32_t>(consensus::quorum_threshold(c.pks.size()));
+  const auto msg = time_message(999'999);  // a height far in the future, never signed by anyone
+  Hash32 key{};
+  for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::uint8_t>(i * 11 + 5);
+  const auto ct = crypto::swe_encrypt(c.pks, t, msg, crypto::kBlsTimeSignatureDst, crypto::swe_key_to_chunks(key), seed_of(3));
+  ASSERT_TRUE(ct.has_value());
+
+  const std::vector<std::size_t> who{1, 2, 4, 5, 6};
+  ASSERT_EQ(who.size(), static_cast<std::size_t>(t));
+  const auto cpt = si::g1_decode(ct->c);
+  ASSERT_TRUE(cpt.has_value());
+  auto all_points = si::evaluation_points(c.pks);
+  ASSERT_TRUE(all_points.has_value());
+  std::vector<crypto::BlsScalar> pts;
+  for (const auto j : who) {
+    crypto::BlsScalar b{};
+    blst_scalar s = si::to_scalar((*all_points)[j]);
+    blst_bendian_from_scalar(b.data(), &s);
+    pts.push_back(b);
+  }
+  const auto lag = crypto::lagrange_coefficients_at_zero(pts);
+  ASSERT_TRUE(lag.has_value());
+
+  // Y0 = sum L_j * (c_j - x_j * c): only secret keys and public ciphertext data.
+  blst_p1 y0{};
+  bool first = true;
+  for (std::size_t k = 0; k < who.size(); ++k) {
+    const auto j = who[k];
+    blst_scalar x;
+    blst_scalar_from_bendian(&x, c.sks[j].bytes.data());
+    blst_p1 xc = si::g1_mul(si::g1_point(*cpt), x);
+    blst_p1_cneg(&xc, true);
+    const auto cj = si::g1_decode(ct->key_shares[j]);
+    ASSERT_TRUE(cj.has_value());
+    const blst_p1 yj = si::g1_add(si::g1_point(*cj), xc);  // g1^{s_j}
+    blst_scalar l;
+    blst_scalar_from_bendian(&l, (*lag)[k].data());
+    const blst_p1 term = si::g1_mul(yj, l);
+    y0 = first ? term : si::g1_add(y0, term);
+    first = false;
+  }
+  const blst_p1_affine y0a = si::g1_affine(y0);
+
+  std::vector<std::uint32_t> chunks;
+  for (const auto& ch : ct->chunks) {
+    const auto ti = si::g2_decode(ch.t);
+    ASSERT_TRUE(ti.has_value());
+    blst_fp12 ml, mask;
+    blst_miller_loop(&ml, &*ti, &y0a);
+    blst_final_exp(&mask, &ml);
+    blst_fp12 inv;
+    blst_fp12_inverse(&inv, &mask);
+    const auto cp = si::gt_decode(ch.c_prime);
+    ASSERT_TRUE(cp.has_value());
+    blst_fp12 z;
+    blst_fp12_mul(&z, &*cp, &inv);
+    const auto m = crypto::swe_gt_dlog(si::gt_bytes(z));
+    ASSERT_TRUE(m.has_value());
+    chunks.push_back(*m);
+  }
+  const auto got = crypto::swe_key_from_chunks(chunks);
+  ASSERT_TRUE(got.has_value());
+  ASSERT_TRUE(*got == key);
+}
+
+// A time signature for a far height can be made at any earlier height: the message is only
+// (chain domain, height), BLS signing is deterministic, so the signature made "at 4678" for 6777 is
+// byte-identical to the one made after 6777 is final, and it opens a lock to 6777 at once. There is
+// no way to make it "become usable later": it is usable the moment it exists.
+TEST(test_swe_time_signature_made_early_is_the_final_one_and_opens_at_once) {
+  const auto c = make_committee(7, 0x61);
+  const std::uint32_t t = static_cast<std::uint32_t>(consensus::quorum_threshold(c.pks.size()));
+  const auto msg = time_message(6777);
+  Hash32 key{};
+  key.fill(0x3c);
+  const auto ct = crypto::swe_encrypt(c.pks, t, msg, crypto::kBlsTimeSignatureDst, crypto::swe_key_to_chunks(key), seed_of(4));
+  ASSERT_TRUE(ct.has_value());
+  for (std::size_t j = 0; j < c.sks.size(); ++j) {
+    const auto early = crypto::bls_sign(c.sks[j], msg, crypto::kBlsTimeSignatureDst);  // "at 4678"
+    const auto late = crypto::bls_sign(c.sks[j], msg, crypto::kBlsTimeSignatureDst);   // "after 6777"
+    ASSERT_TRUE(early.has_value() && late.has_value());
+    ASSERT_TRUE(*early == *late);
+  }
+  const auto got = decrypt_key(*ct, c, {0, 1, 2, 3, 4}, msg);
+  ASSERT_TRUE(got.has_value());
+  ASSERT_TRUE(*got == key);
 }
