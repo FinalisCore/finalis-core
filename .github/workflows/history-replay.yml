@@ -1,0 +1,72 @@
+name: history-replay
+
+# Replays recorded testnet-3 history from genesis with the code under test (see
+# scripts/replay_history_check.sh). A consensus change that rejects old blocks fails here before
+# merge, instead of on the first fresh node after release (v2.2.13: block 37).
+#
+# The recorded chain is a snapshot published as a release asset and pinned by sha256. Extend it by
+# publishing a newer snapshot (finalis-cli snapshot_export from a synced node) and updating the
+# four HISTORY_* values together.
+
+on:
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'src/**'
+      - 'apps/finalis-node/**'
+      - 'apps/finalis-cli/**'
+      - 'CMakeLists.txt'
+      - 'scripts/replay_history_check.sh'
+      - '.github/workflows/history-replay.yml'
+  pull_request:
+    branches-ignore:
+      - 'windows-installer-test'
+    paths:
+      - 'src/**'
+      - 'apps/finalis-node/**'
+      - 'apps/finalis-cli/**'
+      - 'CMakeLists.txt'
+      - 'scripts/replay_history_check.sh'
+      - '.github/workflows/history-replay.yml'
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: history-replay-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HISTORY_URL: https://github.com/FinalisCore/finalis-core/releases/download/testnet3-history-5173/testnet3-history-5173.bin
+  HISTORY_SHA256: 043956095b0efc14ca81264f5f50efd892f62af5517b434ddf0c5fd2de3b1125
+  HISTORY_HEIGHT: '5173'
+  HISTORY_TIP: 14cd2aa5f391702c593aa09f1b23d609b470aa90fda5d74d2245406b76ed8992
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    name: replay testnet-3 from genesis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
+            libssl-dev libsodium-dev librocksdb-dev nlohmann-json3-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DFINALIS_BUILD_NGINX=OFF -DFINALIS_GENERATE_NGINX_CONFIG=OFF -DFINALIS_BUILD_FUZZ=OFF
+      - name: Build node and CLI
+        run: cmake --build build -j"$(nproc)" --target finalis-node finalis-cli
+      - name: Fetch recorded history
+        run: |
+          curl -fsSL --retry 5 -o history.bin "$HISTORY_URL"
+          echo "$HISTORY_SHA256  history.bin" | sha256sum -c -
+      - name: Replay from genesis
+        run: scripts/replay_history_check.sh build history.bin "$HISTORY_HEIGHT" "$HISTORY_TIP" 5400
