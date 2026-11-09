@@ -87,8 +87,9 @@ const NetworkConfig kMainnet{
             EconomicsConfig{
                 .activation_height = kEconomicsV2ActivationHeight,
                 .target_validators = kTargetValidators,
-                // CLEANSLATE: Adaptive min bond ranges 1,000-4,000 FLS; the ceiling
-                // is pinned to validator_bond_max_amount (see static_asserts above).
+                // Min bond (consensus::validator_min_bond_units): (150 FLS * sqrt(active/16) +
+                // 2 * supply / 12,800) / 3, clamped to 150 FLS .. validator_bond_max_amount
+                // (see static_asserts above).
                 .base_min_bond = kBaseMinBond,
                 .min_bond_floor = kMinBondFloor,
                 .min_bond_ceiling = kMinBondCeiling,

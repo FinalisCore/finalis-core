@@ -71,7 +71,7 @@ For each operator:
 Only one PoW contribution is kept:
 
 - the operator ticket is generated once from `operator_id`
-- the representative validator is chosen separately by a deterministic epoch-variant hash over the operator's active validator pubkeys
+- the representative validator is the operator's eligible validator with the smallest pubkey (`canonical_derivation.cpp` keeps one per operator before aggregation, so the epoch-variant `SC-REP-V1` hash in `aggregate_operator_committee_candidates` only ever sees that one key)
 - representative selection does not depend on ticket grinding
 
 The result is one committee candidate per operator.
@@ -125,7 +125,7 @@ Committee selection happens at the operator level, but the runtime still needs v
 
 The winning operator is mapped to one concrete validator deterministically:
 
-- the representative validator is the operator member with the best deterministic representative hash for that epoch
+- the representative validator is the operator's eligible validator with the smallest pubkey
 - that validator pubkey is stored in `ordered_members`
 
 The checkpoint also stores the selected ticket hashes and nonces used for proposer ordering.
@@ -165,7 +165,7 @@ The live protocol removes that remaining split edge:
 - validator splitting does not add search surface
 - the ticket search budget stays fixed at `4096` nonces
 - ticket bonus stays bounded by the active cap
-- representative selection is deterministic, epoch-variant, and ticket-independent
+- representative selection is deterministic and ticket-independent (smallest eligible pubkey)
 - committee ranking stays bond-primary through capped effective weight
 - Ticket PoW only modifies ordering inside that bond-primary model
 - Ticket PoW does not admit validators, set quorum, or define finality
