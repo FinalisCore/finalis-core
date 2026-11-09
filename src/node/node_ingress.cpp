@@ -826,7 +826,7 @@ void Node::maybe_forward_record_to_designated_certifier_locked(const Bytes& tx_b
 
 std::uint64_t Node::ingress_term_start(std::uint64_t height) const {
   return consensus::ingress_certifier_term_start(height, cfg_.network.committee_epoch_blocks,
-                                                 cfg_.network.ingress_certifier_term_blocks);
+                                                 ingress_certifier_term_blocks_at(cfg_.network, height));
 }
 
 std::optional<PubKey32> Node::designated_ingress_certifier_locked(std::uint32_t lane, std::uint64_t height) {

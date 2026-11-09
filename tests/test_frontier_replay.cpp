@@ -2006,6 +2006,62 @@ TEST(test_frontier_lane_prefix_requires_the_certifier_term_of_the_block) {
   if (!run(5, &err)) throw std::runtime_error("term-start certificate rejected: " + err);
 }
 
+// Replay of pre-C1 history (testnet-3 through h=4800): below ingress_certifier_terms_activation_height
+// a term is the whole epoch, so a block there carries epoch-start certificates; from the activation
+// height on, term-start ones. Without this, a node syncing from genesis rejected block 37.
+TEST(test_frontier_lane_prefix_uses_whole_epoch_terms_below_the_terms_activation_height) {
+  auto cfg = test_cfg();
+  cfg.network.committee_epoch_blocks = 8;
+  cfg.network.ingress_certifier_term_blocks = 4;
+  cfg.network.ingress_certifier_terms_activation_height = 9;  // epochs 1..8 old rule, 9.. terms
+
+  const auto from = key_from_byte(118);
+  const auto to = key_from_byte(119);
+  OutPoint op{};
+  op.txid.fill(0xA3);
+  op.index = 0;
+  const auto run = [&](std::uint64_t height, std::uint64_t cert_epoch, std::string* err) {
+    auto parent_state = build_parent_state_with_utxo(cfg, 0, op, p2pkh_out_for_pub(from.public_key, 10'000));
+    parent_state.finalized_height = height - 1;
+    const auto raw = raw_signed_spend(op, p2pkh_out_for_pub(from.public_key, 10'000), from, to.public_key, 9'800);
+    SpecialValidationContext ctx;
+    ctx.network = &cfg.network;
+    ctx.current_height = height;
+    FrontierVector next_vector;
+    auto lane_records = make_lane_records(parent_state, {raw}, &next_vector);
+    for (auto& records : lane_records) {
+      for (auto& record : records) {
+        record.certificate.epoch = cert_epoch;
+        const auto signing_hash = record.certificate.signing_hash();
+        const auto signer = key_from_byte(90);
+        record.certificate.sigs = {FinalitySig{
+            signer.public_key, *crypto::ed25519_sign(Bytes(signing_hash.begin(), signing_hash.end()), signer.private_key)}};
+      }
+    }
+    consensus::FrontierExecutionResult result;
+    return consensus::execute_frontier_lane_prefix(parent_state.utxos, parent_state.confidential_pool_value,
+                                                   parent_state.finalized_frontier_vector, next_vector, lane_records,
+                                                   parent_state.finalized_lane_roots, &ctx, &result, err);
+  };
+  ASSERT_EQ(ingress_certifier_term_blocks_at(cfg.network, 8), 8u);
+  ASSERT_EQ(ingress_certifier_term_blocks_at(cfg.network, 9), 4u);
+  std::string err;
+  // Height 6, before activation: the epoch start (1) is the term, the 4-block term start (5) is not.
+  if (!run(6, 1, &err)) throw std::runtime_error("pre-activation epoch-start certificate rejected: " + err);
+  err.clear();
+  ASSERT_TRUE(!run(6, 5, &err));
+  ASSERT_TRUE(err.find("frontier-certified-ingress-epoch-mismatch") != std::string::npos);
+  // Height 14, after activation: term 13..16, not the epoch start 9.
+  err.clear();
+  if (!run(14, 13, &err)) throw std::runtime_error("post-activation term-start certificate rejected: " + err);
+  err.clear();
+  ASSERT_TRUE(!run(14, 9, &err));
+  ASSERT_TRUE(err.find("frontier-certified-ingress-epoch-mismatch") != std::string::npos);
+  // Mainnet and fresh networks: terms from genesis; testnet-3 switched at its flag day.
+  ASSERT_EQ(mainnet_network().ingress_certifier_terms_activation_height, 0u);
+  ASSERT_EQ(testnet_network().ingress_certifier_terms_activation_height, 4801u);
+}
+
 TEST(test_verify_ingress_certificate_accepts_valid_signatures_when_committee_context_is_empty) {
   const auto signer = key_from_byte(115);
   const auto from = key_from_byte(116);

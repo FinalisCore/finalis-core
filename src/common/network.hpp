@@ -40,6 +40,10 @@ struct NetworkConfig {
   // IngressCertificate's epoch field is its term's first height. Must divide committee_epoch_blocks;
   // otherwise a term is the whole epoch (consensus::ingress_certifier_term_start). Consensus-critical.
   std::uint64_t ingress_certifier_term_blocks{2};
+  // First height certified under C1 terms; below it a term is the whole epoch (the rule before
+  // v2.2.13), so a node replaying testnet-3 from genesis accepts its pre-flag-day certificates.
+  // 0 everywhere except testnet-3 (flag day: last old block 4800). Consensus-critical.
+  std::uint64_t ingress_certifier_terms_activation_height{0};
   // A term's certifier is drawn from the committee members that signed at least one of the last this
   // many finalized parents (prev_finality_signers), so an offline validator stops holding lanes.
   // Routing only, but every node must use the same value (it is in the handshake fingerprint).
@@ -92,6 +96,9 @@ bool finality_binding_active_at_height(const NetworkConfig& network, std::uint64
 bool availability_recovery_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool bootstrap_penalty_exit_protection_active_at_height(const NetworkConfig& network, std::uint64_t height);
 bool empty_active_set_epoch_escape_active_at_height(const NetworkConfig& network, std::uint64_t height);
+// The ingress certifier term length in force at `height`: ingress_certifier_term_blocks from
+// ingress_certifier_terms_activation_height on, the whole epoch before it.
+std::uint64_t ingress_certifier_term_blocks_at(const NetworkConfig& network, std::uint64_t height);
 bool onboarding_admission_pow_enabled(const NetworkConfig& network);
 bool validator_join_admission_pow_enabled(const NetworkConfig& network);
 
