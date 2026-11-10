@@ -220,12 +220,21 @@ std::vector<SweepTx> build_sweep(const Hash32& chain_domain, const Wallet& w,
                                  const std::vector<ConfCoin>& conf, const Bytes& target_script,
                                  std::uint64_t base_fee_per_kib, std::uint64_t* dust_units, std::string* err);
 
+// Where the wallet's transparent coins were, in units. A no-coin slot records one.
+struct CoinPicture {
+  std::uint64_t spendable{0};
+  std::uint64_t in_flight{0};      // spent by a transaction not final yet
+  std::uint64_t timed_held{0};     // reserved by a timed send until its body is released
+  std::uint64_t height_locked{0};  // height-locked outputs not open yet
+};
+
 struct Summary {
   std::map<std::string, std::uint64_t> sent;      // accepted for relay, by type
   std::map<std::string, std::uint64_t> finals;    // final, by type
   std::map<std::string, std::uint64_t> rejected;  // by reason
   std::map<std::string, std::uint64_t> expired;   // never final, by type
   std::uint64_t starved{0};                       // slots with no coin to spend
+  std::vector<CoinPicture> starved_coins;         // the wallet's coins at each such slot
   std::vector<double> finality_seconds;
   std::string render() const;
 };

@@ -174,6 +174,12 @@ Each transaction gets one tab-separated line on stdout, also written to `~/.fina
 At the end it prints a summary with counts by type, rejects by reason, transactions that never became
 final, slots that had no coin to spend, and the time to finality (p50, p95, max).
 
+No-coin slots mean this wallet ran out of spendable coins, not that the network failed. For those
+slots the summary shows, on average, how many FLS were spendable, in flight (spent, not final yet),
+held by timed sends (`timed`, `timed-long`, `seal`, `seal-long`) and height-locked (`hlock`,
+`inherit`). Coins in the last three groups are still yours but cannot fund new sends until they
+return. Fund the wallet with more, or run without the locking types.
+
 ## Commands
 
 | command   | what it does                                                     |

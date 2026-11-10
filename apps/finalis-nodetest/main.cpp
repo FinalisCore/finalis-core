@@ -147,6 +147,7 @@ class Runner {
   std::set<OutPoint> reserved_;
   std::map<std::uint32_t, std::vector<Coin>> coins_;  // spendable now, not reserved
   Summary sum_;
+  CoinPicture coin_picture_;  // from the last refresh; spendable is recomputed at use
   std::ofstream log_;
   std::uint64_t consecutive_rejects_{0};
   bool split_in_flight_{false};
@@ -219,6 +220,9 @@ class Runner {
     }
     std::map<std::uint32_t, std::vector<Coin>> fresh;
     std::set<OutPoint> seen;
+    std::set<OutPoint> held;
+    for (const auto& hold : holds_) held.insert(hold.inputs.begin(), hold.inputs.end());
+    CoinPicture picture;
     for (std::uint32_t k = 0; k < w_.keys.size(); ++k) {
       std::string err;
       auto u = ls::rpc_get_utxos(opt_.rpc, w_.keys[k].scripthash, &err);
@@ -228,12 +232,20 @@ class Runner {
       }
       for (const auto& v : *u) {
         const OutPoint op{v.txid, v.vout};
-        if (v.value == 0 || reserved_.count(op) || !seen.insert(op).second) continue;
-        if (!script_spendable_by(v.script_pubkey, w_.keys[k].pkh, h)) continue;
+        if (v.value == 0 || !seen.insert(op).second) continue;
+        if (reserved_.count(op)) {
+          (held.count(op) ? picture.timed_held : picture.in_flight) += v.value;
+          continue;
+        }
+        if (!script_spendable_by(v.script_pubkey, w_.keys[k].pkh, h)) {
+          picture.height_locked += v.value;
+          continue;
+        }
         fresh[k].push_back({op, TxOut{v.value, v.script_pubkey}});
       }
     }
     coins_ = std::move(fresh);
+    coin_picture_ = picture;
   }
 
   std::uint64_t transparent_units() const {
@@ -967,7 +979,12 @@ class Runner {
             allowed.erase(std::find(allowed.begin(), allowed.end(), t));
           }
         }
-        if (!sent) ++sum_.starved;
+        if (!sent) {
+          ++sum_.starved;
+          auto picture = coin_picture_;
+          picture.spendable = transparent_units();
+          sum_.starved_coins.push_back(picture);
+        }
         if (pacer.due(now)) pacer.sent(now);
         if (consecutive_rejects_ >= kMaxConsecutiveRejects) {
           log("stop\t" + std::to_string(consecutive_rejects_) + " rejects in a row");

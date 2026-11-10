@@ -819,6 +819,36 @@ std::string Summary::render() const {
   }
   for (const auto& [reason, n] : rejected) o << "rejected " << n << "  " << reason << "\n";
   for (const auto& [t, n] : expired) o << "never final " << n << "  " << t << "\n";
+  if (starved != 0) {
+    // A funding limit of this wallet, not a network problem: say where the coins were.
+    CoinPicture avg;
+    if (!starved_coins.empty()) {
+      const auto n = static_cast<std::uint64_t>(starved_coins.size());
+      for (const auto& c : starved_coins) {
+        avg.spendable += c.spendable;
+        avg.in_flight += c.in_flight;
+        avg.timed_held += c.timed_held;
+        avg.height_locked += c.height_locked;
+      }
+      avg.spendable /= n;
+      avg.in_flight /= n;
+      avg.timed_held /= n;
+      avg.height_locked /= n;
+    }
+    const auto fls = [](std::uint64_t units) {
+      std::ostringstream f;
+      f << std::fixed << std::setprecision(2) << static_cast<double>(units) / static_cast<double>(consensus::BASE_UNITS_PER_COIN);
+      return f.str();
+    };
+    o << "no-coin slots " << starved << ": this wallet had no coin to spend (a funding limit, not a network problem)\n";
+    if (!starved_coins.empty()) {
+      o << "  transparent coins at those slots, average FLS: spendable " << fls(avg.spendable) << "  in flight "
+        << fls(avg.in_flight) << "  held by timed sends " << fls(avg.timed_held) << "  height-locked "
+        << fls(avg.height_locked) << "\n";
+    }
+    o << "  to fill them: fund the wallet with more FLS, or leave the locking types out of --types\n"
+      << "  (hlock, inherit: height-locked; timed, timed-long, seal, seal-long: held by timed sends)\n";
+  }
   if (!finality_seconds.empty()) {
     o << std::fixed << std::setprecision(0) << "time to final (s): p50 " << percentile(finality_seconds, 50) << "  p95 "
       << percentile(finality_seconds, 95) << "  max " << percentile(finality_seconds, 100) << "\n";
