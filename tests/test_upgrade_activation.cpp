@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: MIT
+
+#include "test_framework.hpp"
+
+#include <set>
+#include <vector>
+
+#include "consensus/upgrade_activation.hpp"
+
+using namespace finalis;
+using namespace finalis::consensus;
+
+namespace {
+
+constexpr std::uint64_t kB = 32;
+
+PubKey32 op(std::uint8_t i) {
+  PubKey32 p{};
+  p.fill(i);
+  return p;
+}
+
+std::set<PubKey32> ops(std::uint8_t n) {
+  std::set<PubKey32> out;
+  for (std::uint8_t i = 1; i <= n; ++i) out.insert(op(i));
+  return out;
+}
+
+UpgradeDef def() {
+  Hash32 fp{};
+  fp.fill(0xAB);
+  return UpgradeDef{upgrade_id("test-upgrade", fp), "test-upgrade", 33, 33 + 10 * kB};
+}
+
+// 9 active operators, committee(L+1) = operators 1..7 (quorum 5).
+UpgradeLockInInputs inputs() {
+  UpgradeLockInInputs in;
+  in.active_operators = ops(9);
+  for (std::uint8_t i = 1; i <= 7; ++i) in.next_committee_operators.push_back(op(i));
+  in.min_eligible_operators = 4;
+  return in;
+}
+
+void signal(UpgradeRecord* rec, std::initializer_list<std::uint8_t> ids) {
+  for (auto i : ids) rec->signalers.insert(op(i));
+}
+
+}  // namespace
+
+TEST(test_upgrade_id_binds_name_and_rules_fingerprint) {
+  Hash32 a{}, b{};
+  a.fill(1);
+  b.fill(2);
+  ASSERT_TRUE(upgrade_id("x", a) == upgrade_id("x", a));
+  ASSERT_TRUE(upgrade_id("x", a) != upgrade_id("y", a));
+  ASSERT_TRUE(upgrade_id("x", a) != upgrade_id("x", b));
+}
+
+TEST(test_upgrade_operator_threshold_is_ceil_two_thirds) {
+  ASSERT_EQ(upgrade_operator_threshold(0), 0u);
+  ASSERT_EQ(upgrade_operator_threshold(1), 1u);
+  ASSERT_EQ(upgrade_operator_threshold(3), 2u);
+  ASSERT_EQ(upgrade_operator_threshold(4), 3u);
+  ASSERT_EQ(upgrade_operator_threshold(9), 6u);
+  ASSERT_EQ(upgrade_operator_threshold(10), 7u);
+}
+
+TEST(test_upgrade_signal_admissibility) {
+  const auto d = def();
+  UpgradeRecord rec;
+  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, 32) == UpgradeSignalReject::BeforeWindow);
+  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, 33) == UpgradeSignalReject::None);
+  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), false, 40) == UpgradeSignalReject::NotActiveOperator);
+  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, d.signal_timeout) == UpgradeSignalReject::AfterTimeout);
+  signal(&rec, {1});
+  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, 40) == UpgradeSignalReject::Duplicate);
+  // After lock-in a late operator may still signal, with no deadline.
+  rec.state = UpgradeState::Active;
+  ASSERT_TRUE(check_upgrade_signal(d, rec, op(2), true, d.signal_timeout + 1000) == UpgradeSignalReject::None);
+  rec.state = UpgradeState::Failed;
+  ASSERT_TRUE(check_upgrade_signal(d, rec, op(2), true, 40) == UpgradeSignalReject::Failed);
+}
+
+TEST(test_upgrade_lock_in_needs_operator_and_committee_thresholds) {
+  auto in = inputs();
+  UpgradeRecord rec;
+  // 6 of 9 operators (= ceil 2/3) but only 4 of 7 committee seats (< quorum 5): no lock-in.
+  signal(&rec, {1, 2, 3, 4, 8, 9});
+  ASSERT_TRUE(!upgrade_lock_in_reached(rec, in));
+  // 5 of 7 seats, but now only 5 of 9 operators: no lock-in.
+  rec.signalers.clear();
+  signal(&rec, {1, 2, 3, 4, 5});
+  ASSERT_TRUE(!upgrade_lock_in_reached(rec, in));
+  // 6 of 9 operators and 5 of 7 seats: lock-in.
+  signal(&rec, {9});
+  ASSERT_TRUE(upgrade_lock_in_reached(rec, in));
+  // Signalers that are no longer active operators do not count.
+  rec.signalers.clear();
+  signal(&rec, {1, 2, 3, 4, 5, 42});
+  ASSERT_TRUE(!upgrade_lock_in_reached(rec, in));
+  // Signalers must also reach the minimum eligible operator count.
+  rec.signalers.clear();
+  signal(&rec, {1, 2, 3, 4, 5, 9});
+  in.min_eligible_operators = 7;
+  ASSERT_TRUE(!upgrade_lock_in_reached(rec, in));
+  // No operators or no committee: never.
+  ASSERT_TRUE(!upgrade_lock_in_reached(rec, UpgradeLockInInputs{}));
+}
+
+TEST(test_upgrade_lifecycle_locks_in_and_activates_two_epochs_later) {
+  const auto d = def();
+  const auto in = inputs();
+  UpgradeRecord rec;
+  advance_upgrade_at_epoch_end(d, &rec, 0, kB, in);  // genesis boundary, before the window
+  ASSERT_TRUE(rec.state == UpgradeState::Defined);
+  advance_upgrade_at_epoch_end(d, &rec, kB, kB, in);  // next height 33 = signal_start
+  ASSERT_TRUE(rec.state == UpgradeState::Signaling);
+
+  signal(&rec, {1, 2, 3, 4, 5, 9});
+  const std::uint64_t lock_end = 3 * kB;  // end of epoch L
+  advance_upgrade_at_epoch_end(d, &rec, lock_end, kB, in);
+  ASSERT_TRUE(rec.state == UpgradeState::LockedIn);
+  ASSERT_EQ(rec.lock_in_height, lock_end);
+  ASSERT_EQ(rec.activation_height, lock_end + 1 + kB);  // start of epoch L+2
+  ASSERT_TRUE(!upgrade_active(rec, lock_end + kB));
+  ASSERT_TRUE(upgrade_active(rec, lock_end + kB + 1));  // already true while LockedIn
+
+  advance_upgrade_at_epoch_end(d, &rec, lock_end + kB, kB, in);  // end of L+1
+  ASSERT_TRUE(rec.state == UpgradeState::Active);
+  const auto active = rec;
+  advance_upgrade_at_epoch_end(d, &rec, lock_end + 2 * kB, kB, UpgradeLockInInputs{});
+  ASSERT_TRUE(rec == active);  // terminal
+}
+
+TEST(test_upgrade_fails_at_timeout_and_lock_in_wins_on_the_same_boundary) {
+  const auto d = def();
+  const auto in = inputs();
+  UpgradeRecord rec;
+  rec.state = UpgradeState::Signaling;
+  signal(&rec, {1, 2, 3});
+  const std::uint64_t last_end = d.signal_timeout - 1;  // next height == signal_timeout
+  advance_upgrade_at_epoch_end(d, &rec, last_end - kB, kB, in);
+  ASSERT_TRUE(rec.state == UpgradeState::Signaling);
+  advance_upgrade_at_epoch_end(d, &rec, last_end, kB, in);
+  ASSERT_TRUE(rec.state == UpgradeState::Failed);
+  ASSERT_TRUE(!upgrade_active(rec, last_end + 10 * kB));
+
+  UpgradeRecord late;
+  late.state = UpgradeState::Signaling;
+  signal(&late, {1, 2, 3, 4, 5, 9});
+  advance_upgrade_at_epoch_end(d, &late, last_end, kB, in);
+  ASSERT_TRUE(late.state == UpgradeState::LockedIn);
+}
+
+TEST(test_upgrade_excludes_non_signalers_from_committees_from_activation_on) {
+  UpgradeRecord rec;
+  rec.state = UpgradeState::LockedIn;
+  rec.activation_height = 4 * kB + 1;
+  signal(&rec, {1, 2});
+  const std::vector<UpgradeRecord> records{rec};
+  // Before activation everyone stays eligible.
+  ASSERT_TRUE(operator_eligible_under_upgrades(records, op(3), 3 * kB + 1));
+  // From the activation epoch on, only signalers.
+  ASSERT_TRUE(operator_eligible_under_upgrades(records, op(1), 4 * kB + 1));
+  ASSERT_TRUE(!operator_eligible_under_upgrades(records, op(3), 4 * kB + 1));
+  // A late signal restores eligibility.
+  auto later = records;
+  later[0].signalers.insert(op(3));
+  ASSERT_TRUE(operator_eligible_under_upgrades(later, op(3), 5 * kB + 1));
+  // Failed upgrades never restrict anyone.
+  auto failed = records;
+  failed[0].state = UpgradeState::Failed;
+  ASSERT_TRUE(operator_eligible_under_upgrades(failed, op(3), 9 * kB + 1));
+}
