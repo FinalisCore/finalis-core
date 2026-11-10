@@ -233,6 +233,14 @@ Using your validator key in the wallet is fine, but never run a second node with
 | `peer-connect-failed ... reason=tcp-connect-failed` | the node cannot reach a seed; check outbound firewall rules |
 | `upnp-igd-refresh status=failed` | harmless on a VPS; at home, forward port 19540 by hand |
 | `genesis-fingerprint-mismatch` | the data folder belongs to another chain; see [README.md → Troubleshooting](README.md#troubleshooting) |
+| `state=FINALIZING` | normal: the node is following and finalizing blocks |
+| `state=SYNCING` | catching up, or no peers yet; it moves on by itself. Stuck with `peers=0`: check the network |
+| `state=WAITING_FOR_QUORUM` | not enough committee members are voting; the next `quorum-blocked` line says who is missing and why (see [LIGHTSERVER-OPERATIONS §4.0](../docs/operations/LIGHTSERVER-OPERATIONS.md)) |
+| `state=REPAIRING` | the node is fetching data it needs for the next block from peers; it logs `consensus-repair-exit` when done |
+| `cv=7` | the consensus rules version this binary runs; every node on the chain must show the same number |
+| `request-candidate-transition` | the node saw votes for a block it does not have yet and asked a peer for it; normal |
+| `abstaining_heights` / `consensus-abstain` | after a crash the node could not read its saved vote at that height, so it does not vote there (that prevents double voting). It votes again once the height is final (`consensus-abstain-end`). Nothing to do |
+| `error_code=...` from `finalis-cli` | the `hint=` line under it says what to do, for example `relay_unavailable`: temporary, safe to send again |
 | the build stops with a memory error | add 2 GB of swap and run `start.sh` again, or use the prebuilt package |
 | `install.sh`: glibc is older than 2.39 | your distro is too old for the package; use Docker |
 

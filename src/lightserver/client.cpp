@@ -1280,6 +1280,8 @@ BroadcastResult rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_byt
   if (auto message = object_string(result, "message"); message) out.message = *message;
   if (auto retryable = object_bool(result, "retryable"); retryable) out.retryable = *retryable;
   if (auto retry_class = object_string(result, "retry_class"); retry_class) out.retry_class = *retry_class;
+  if (auto hint = object_string(result, "hint"); hint) out.hint = *hint;
+  if (out.hint.empty()) out.hint = broadcast_error_hint(out.error_code);
   if (auto mempool_full = object_bool(result, "mempool_full"); mempool_full) out.mempool_full = *mempool_full;
   if (auto min_rate = object_u64(result, "min_fee_rate_to_enter_when_full"); min_rate) {
     out.min_fee_rate_to_enter_when_full = *min_rate;
@@ -1432,6 +1434,25 @@ std::optional<std::string> http_get(const std::string& url, std::size_t max_body
 std::string default_rpc_url(const char* env_finalis_rpc, std::uint16_t lightserver_default_port) {
   if (env_finalis_rpc != nullptr && *env_finalis_rpc != '\0') return env_finalis_rpc;
   return "http://127.0.0.1:" + std::to_string(lightserver_default_port) + "/rpc";
+}
+
+std::string broadcast_error_hint(const std::string& error_code) {
+  if (error_code == "relay_unavailable") {
+    return "temporary: the node is busy or still starting and accepted nothing; safe to send again in a minute";
+  }
+  if (error_code == "tx_missing_or_unconfirmed_input" || error_code == "missing_utxo") {
+    return "an input is already spent or not final yet; wait about one block for the earlier transaction, refresh, retry";
+  }
+  if (error_code == "tx_fee_below_min_relay") return "fee too low; raise --fee";
+  if (error_code == "mempool_full_not_good_enough") return "the mempool is full; retry later or with a higher fee";
+  if (error_code == "tx_conflict_in_mempool") {
+    return "another pending transaction spends the same coin; wait for it to finalize";
+  }
+  if (error_code == "tx_duplicate") return "already received or finalized; nothing to do";
+  if (error_code == "tx_invalid") return "the transaction is invalid and will never be accepted as is; see error_message";
+  if (error_code == "tx_rejected") return "the relay rejected it; see error_message";
+  if (error_code == "internal_error") return "server-side error; retry later and report it if it persists";
+  return {};
 }
 
 std::string explain_rpc_error(const std::string& rpc_url, const std::string& err) {

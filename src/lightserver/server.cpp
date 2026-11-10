@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "lightserver/server.hpp"
+#include "lightserver/client.hpp"
 
 #include "p2p/endpoints.hpp"
 
@@ -1203,7 +1204,12 @@ std::string broadcast_result_json(bool accepted, const std::string& txid_hex, co
       << "\",\"finalized\":false";
   if (!txid_hex.empty()) oss << ",\"txid\":\"" << minijson::escape(txid_hex) << "\"";
   if (!message.empty()) oss << ",\"message\":\"" << minijson::escape(message) << "\"";
-  if (error_code.has_value()) oss << ",\"error_code\":\"" << minijson::escape(*error_code) << "\"";
+  if (error_code.has_value()) {
+    oss << ",\"error_code\":\"" << minijson::escape(*error_code) << "\"";
+    if (const auto hint = broadcast_error_hint(*error_code); !hint.empty()) {
+      oss << ",\"hint\":\"" << minijson::escape(hint) << "\"";
+    }
+  }
   if (error_message.has_value()) {
     oss << ",\"error_message\":\"" << minijson::escape(*error_message) << "\"";
     oss << ",\"error\":\"" << minijson::escape(*error_message) << "\"";

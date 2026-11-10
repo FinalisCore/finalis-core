@@ -129,6 +129,17 @@ std::string default_rpc_url() {
   return finalis::lightserver::default_rpc_url(std::getenv("FINALIS_RPC"), cli_network().lightserver_default_port);
 }
 
+// A refused broadcast: machine fields first (scripts parse them), then advice for people.
+void print_broadcast_rejection(const finalis::lightserver::BroadcastResult& result) {
+  std::cout << "accepted=no\n";
+  if (!result.error_code.empty()) std::cout << "error_code=" << result.error_code << "\n";
+  if (!result.error_message.empty()) std::cout << "error_message=" << result.error_message << "\n";
+  else if (!result.error.empty()) std::cout << "error_message=" << result.error << "\n";
+  std::cout << "retryable=" << (result.retryable ? "yes" : "no") << "\n";
+  std::cout << "retry_class=" << result.retry_class << "\n";
+  if (!result.hint.empty()) std::cout << "hint=" << result.hint << "\n";
+}
+
 std::string short_pub_hex(const finalis::PubKey32& pub) {
   return finalis::hex_encode(finalis::Bytes(pub.begin(), pub.begin() + 4));
 }
@@ -509,6 +520,9 @@ void print_onboarding_record(const finalis::onboarding::ValidatorOnboardingRecor
   if (!status_source.empty()) std::cout << "status_source=" << status_source << "\n";
   std::cout << "last_error_code=" << record.last_error_code << "\n";
   std::cout << "last_error_message=" << record.last_error_message << "\n";
+  if (const auto hint = finalis::lightserver::broadcast_error_hint(record.last_error_code); !hint.empty()) {
+    std::cout << "last_error_hint=" << hint << "\n";
+  }
 }
 
 std::string local_tracked_onboarding_txid(const finalis::onboarding::ValidatorOnboardingOptions& options) {
@@ -3962,12 +3976,7 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
     if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
-      std::cout << "accepted=no\n";
-      if (!result.error_code.empty()) std::cout << "error_code=" << result.error_code << "\n";
-      if (!result.error_message.empty()) std::cout << "error_message=" << result.error_message << "\n";
-      else if (!result.error.empty()) std::cout << "error_message=" << result.error << "\n";
-      std::cout << "retryable=" << (result.retryable ? "yes" : "no") << "\n";
-      std::cout << "retry_class=" << result.retry_class << "\n";
+      print_broadcast_rejection(result);
       return 1;
     }
 
@@ -4098,8 +4107,7 @@ int run_cli(int argc, char** argv) {
     std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
     std::cout << "locked_output=" << finalis::hex_encode32(tx->txid()) << ":0\n";
     if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
-      std::cout << "accepted=no\n";
-      std::cout << "error_message=" << (!result.error_message.empty() ? result.error_message : result.error) << "\n";
+      print_broadcast_rejection(result);
       return 1;
     }
     std::cout << "accepted=yes\n";
@@ -4335,8 +4343,7 @@ int run_cli(int argc, char** argv) {
     }
     std::cout << "envelope_bytes=" << timed->serialize().size() << "\n";
     if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
-      std::cout << "accepted=no\n";
-      std::cout << "error_message=" << (!result.error_message.empty() ? result.error_message : result.error) << "\n";
+      print_broadcast_rejection(result);
       return 1;
     }
     std::cout << "accepted=yes\n";
@@ -4495,12 +4502,7 @@ int run_cli(int argc, char** argv) {
       return 1;
     }
     if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
-      std::cout << "accepted=no\n";
-      if (!result.error_code.empty()) std::cout << "error_code=" << result.error_code << "\n";
-      if (!result.error_message.empty()) std::cout << "error_message=" << result.error_message << "\n";
-      else if (!result.error.empty()) std::cout << "error_message=" << result.error << "\n";
-      std::cout << "retryable=" << (result.retryable ? "yes" : "no") << "\n";
-      std::cout << "retry_class=" << result.retry_class << "\n";
+      print_broadcast_rejection(result);
       return 1;
     }
 
@@ -4971,6 +4973,7 @@ int run_cli(int argc, char** argv) {
     else if (!result.error.empty()) std::cout << "error=" << result.error << "\n";
     std::cout << "retryable=" << (result.retryable ? "yes" : "no") << "\n";
     std::cout << "retry_class=" << result.retry_class << "\n";
+    if (!result.hint.empty()) std::cout << "hint=" << result.hint << "\n";
     if (result.min_fee_rate_to_enter_when_full.has_value()) {
       std::cout << "min_fee_rate_to_enter_when_full=" << *result.min_fee_rate_to_enter_when_full << "\n";
     }
