@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -111,6 +112,25 @@ Payout compute_payout(std::uint64_t height, std::uint64_t fees_units, const PubK
                       std::vector<PubKey32> signer_pubkeys);
 Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, const PubKey32& leader_pubkey,
                                std::vector<WeightedParticipant> participants);
+// Reading aid for operators (finalis-cli economics_explain); consensus uses the settlement code in
+// canonical_derivation.cpp, and tests pin that this matches it.
+// Participation in basis points: observed / expected, 100% when nothing was expected.
+std::uint32_t settlement_participation_bps(std::uint64_t expected_units, std::uint64_t observed_units);
+struct SettlementShareInputs {
+  std::uint64_t pool_units{0};  // validator emission (after onboarding) + validators' half of fees + subsidy
+  std::map<PubKey32, std::uint64_t> score_units;  // reward score before the participation adjustment
+  std::map<PubKey32, std::uint64_t> expected_participation_units;
+  std::map<PubKey32, std::uint64_t> observed_participation_units;
+  std::uint32_t participation_threshold_bps{0};
+};
+struct SettlementShareWhatIf {
+  std::uint64_t score_num{1}, score_den{1};           // scale `who`'s raw score (e.g. a different weight)
+  std::optional<std::uint32_t> participation_bps;     // replace `who`'s participation
+};
+// `who`'s share of the pool: pool * adjusted_score(who) / sum(adjusted scores), floor.
+std::uint64_t settlement_share_units(const SettlementShareInputs& in, const PubKey32& who,
+                                     const SettlementShareWhatIf& what_if = {});
+
 DeterministicCoinbasePayout compute_epoch_settlement_payout(
     std::uint64_t settlement_reward_units, std::uint64_t settled_epoch_fee_units, std::uint64_t reserve_subsidy_units,
     const PubKey32& current_leader_pubkey,

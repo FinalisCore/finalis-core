@@ -1862,6 +1862,7 @@ TEST(test_lightserver_broadcast_returns_structured_duplicate_code_for_finalized_
   const auto resp = ls.handle_rpc_for_test(body);
   ASSERT_TRUE(resp.find("\"accepted\":false") != std::string::npos);
   ASSERT_TRUE(resp.find("\"error_code\":\"tx_duplicate\"") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"hint\":\"already received or finalized; nothing to do\"") != std::string::npos);
   ASSERT_TRUE(resp.find("\"retryable\":false") != std::string::npos);
   ASSERT_TRUE(resp.find("\"retry_class\":\"none\"") != std::string::npos);
 }
@@ -1988,6 +1989,8 @@ TEST(test_lightserver_broadcast_returns_relay_unavailable_code_when_relay_path_f
   const auto resp = ls.handle_rpc_for_test(body);
   ASSERT_TRUE(resp.find("\"accepted\":false") != std::string::npos);
   ASSERT_TRUE(resp.find("\"error_code\":\"relay_unavailable\"") != std::string::npos);
+  // Feedback 2026-11-10: the code stays, a plain-language hint comes with it.
+  ASSERT_TRUE(resp.find("\"hint\":\"temporary: the node is busy") != std::string::npos);
   ASSERT_TRUE(resp.find("\"retryable\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"retry_class\":\"transport\"") != std::string::npos);
 }
@@ -3476,4 +3479,18 @@ TEST(test_cli_rpc_url_resolution_and_unreachable_lightserver_error) {
 
   // Errors that are not about reaching the server pass through unchanged.
   ASSERT_EQ(lightserver::explain_rpc_error(url, "address invalid"), std::string("address invalid"));
+}
+
+// Feedback 2026-11-10: every broadcast error code a server sends has advice in plain words.
+TEST(test_broadcast_error_codes_have_plain_language_hints) {
+  for (const char* code : {"relay_unavailable", "tx_missing_or_unconfirmed_input", "tx_fee_below_min_relay",
+                           "mempool_full_not_good_enough", "tx_conflict_in_mempool", "tx_duplicate", "tx_invalid",
+                           "tx_rejected", "internal_error"}) {
+    const auto hint = lightserver::broadcast_error_hint(code);
+    ASSERT_TRUE(!hint.empty());
+    ASSERT_TRUE(hint.find('"') == std::string::npos);
+  }
+  ASSERT_TRUE(lightserver::broadcast_error_hint("relay_unavailable").find("safe to send again") != std::string::npos);
+  ASSERT_TRUE(lightserver::broadcast_error_hint("no_such_code").empty());
+  ASSERT_TRUE(lightserver::broadcast_error_hint("").empty());
 }

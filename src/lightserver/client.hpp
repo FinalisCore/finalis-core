@@ -141,6 +141,7 @@ struct BroadcastResult {
   std::string message;
   bool retryable{false};
   std::string retry_class{"none"};
+  std::string hint;  // plain-language advice for error_code (server's, else broadcast_error_hint)
   bool mempool_full{false};
   std::optional<std::uint64_t> min_fee_rate_to_enter_when_full;
 };
@@ -229,6 +230,10 @@ std::optional<std::string> http_get_body(const std::string& raw, std::size_t max
 // Lightserver URL a client uses when no --rpc is given: $FINALIS_RPC if set and non-empty, else the
 // local lightserver on the network's default port.
 std::string default_rpc_url(const char* env_finalis_rpc, std::uint16_t lightserver_default_port);
+// What to do about a broadcast or onboarding error code, in plain words; empty for unknown codes.
+// The machine code stays the contract; the hint is for people.
+std::string broadcast_error_hint(const std::string& error_code);
+
 // An RPC error in operator words: a failed connect names the URL and says how to point the client at
 // the right lightserver. Other errors are returned unchanged.
 std::string explain_rpc_error(const std::string& rpc_url, const std::string& err);

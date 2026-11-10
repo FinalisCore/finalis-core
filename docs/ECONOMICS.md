@@ -238,6 +238,12 @@ Consensus boundary for economics-facing operators:
 
 ## 8. Operator visibility
 
+`finalis-cli economics_explain` prints the reward formula in words with one validator's numbers for
+the last settled epoch: weight from the bond, the epoch pool, score share, participation and its
+reduction, the onboarding slice, the expected payout next to the amount paid on chain, and what-ifs
+for a larger bond and other participation levels. `--validator <pubkey hex>` explains any validator
+without its key (rewards are public chain data).
+
 `finalis-cli economics_status` reports the active policy fields, including:
 
 - `economics_activation_height`

@@ -29,7 +29,7 @@ Fees and issuance are separated.
   - current-block fees remain immediate on the frontier transition path
   - issuance accrues during the epoch
   - `30%` of gross issuance is diverted into protocol reserve accrual
-  - `90%` of gross issuance accrues into validator settlement rewards
+  - the remaining `70%` of gross issuance accrues into validator settlement rewards
 - after the cap:
   - new issuance is zero
   - finalized epoch fees are pooled and settled at the first finalized height of
