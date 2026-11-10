@@ -1429,4 +1429,15 @@ std::optional<std::string> http_get(const std::string& url, std::size_t max_body
   return http_get_body(*resp, max_body_bytes, err);
 }
 
+std::string default_rpc_url(const char* env_finalis_rpc, std::uint16_t lightserver_default_port) {
+  if (env_finalis_rpc != nullptr && *env_finalis_rpc != '\0') return env_finalis_rpc;
+  return "http://127.0.0.1:" + std::to_string(lightserver_default_port) + "/rpc";
+}
+
+std::string explain_rpc_error(const std::string& rpc_url, const std::string& err) {
+  if (err.find("connect failed") == std::string::npos) return err;
+  return "lightserver not reachable at " + rpc_url + " (" + err +
+         "); is finalis-lightserver running there? Pass --rpc <url> or set FINALIS_RPC";
+}
+
 }  // namespace finalis::lightserver

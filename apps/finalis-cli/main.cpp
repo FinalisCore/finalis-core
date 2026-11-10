@@ -95,7 +95,10 @@ std::optional<finalis::Hash32> offline_chain_domain(const std::string& genesis_h
 // selected one.
 std::optional<finalis::Hash32> rpc_chain_domain(const std::string& rpc_url, std::string* err) {
   const auto status = finalis::lightserver::rpc_get_status(rpc_url, err);
-  if (!status.has_value()) return std::nullopt;
+  if (!status.has_value()) {
+    if (err) *err = finalis::lightserver::explain_rpc_error(rpc_url, *err);
+    return std::nullopt;
+  }
   const auto& net = cli_network();
   if (status->chain.network_id_hex != finalis::hex_encode(finalis::Bytes(net.network_id.begin(), net.network_id.end()))) {
     if (err) *err = "rpc endpoint serves network " + status->chain.network_name + ", not " + net.name;
@@ -121,8 +124,9 @@ std::optional<finalis::address::DecodedAddress> decode_network_address(const std
   return decoded;
 }
 
+// --rpc overrides this; FINALIS_RPC sets it once for every command.
 std::string default_rpc_url() {
-  return "http://127.0.0.1:" + std::to_string(cli_network().lightserver_default_port) + "/rpc";
+  return finalis::lightserver::default_rpc_url(std::getenv("FINALIS_RPC"), cli_network().lightserver_default_port);
 }
 
 std::string short_pub_hex(const finalis::PubKey32& pub) {
@@ -728,7 +732,10 @@ std::optional<std::vector<finalis::lightserver::UtxoView>> proven_rpc_utxos(cons
                                                                              const finalis::Hash32& scripthash,
                                                                              std::string* err) {
   auto listed = finalis::lightserver::rpc_get_utxos(rpc_url, scripthash, err);
-  if (!listed.has_value()) return std::nullopt;
+  if (!listed.has_value()) {
+    if (err) *err = finalis::lightserver::explain_rpc_error(rpc_url, *err);
+    return std::nullopt;
+  }
   std::string verr;
   auto verifier = finalis::wallet::LightVerifier::for_network(cli_network(), &verr);
   if (!verifier.has_value()) {
@@ -1456,11 +1463,12 @@ void print_user_cli_help(std::ostream& os) {
      << "    (--pass shows in ps and shell history; these do not)\n"
      << "  send, lock_send, timed_send and balance spend/count only coins proven against validator signatures;\n"
      << "    --allow-unverified trusts the lightserver when no proof can be had\n"
+     << "  --rpc <url> defaults to $FINALIS_RPC, else http://127.0.0.1:" << cli_network().lightserver_default_port << "/rpc\n"
      << "  finalis-cli --version\n"
      << "  finalis-cli getWallet [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli discover_endpoints [--rpc <url>] [--no-probe]  # public lightservers announced on the network; verified = signed and the server reports the announced key\n"
      << "  finalis-cli balance [--rpc <url>] [--address <addr> | --file <keystore> [--pass <pass>]] [--allow-unverified]  # proven against validator signatures\n"
-     << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli getBalance [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]  # local node DB, no lightserver\n"
      << "  finalis-cli getUTXO [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli lock_send --to <addr> (--amount <coins> | --amount-units <u64>) (--unlock-height <h> | --lock-blocks <n>) [--inheritance] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # spendable by <addr> only from <h>; --inheritance: you keep spending it, <addr> is the heir from <h>\n"
      << "  finalis-cli timed_send (--to <addr> (--amount <coins> | --amount-units <u64>) | --data-text <text> | --data-hex <hex>) [--unlock-height <h> | --delay <blocks>] [--bond <u64>] [--prepaid-fee <u64>] [--fee <u64>] [--rpc <url>] [--file <keystore>] [--pass <pass>]  # sealed until <h> is final; past the current epoch: a long lock\n"
@@ -3832,7 +3840,7 @@ int run_cli(int argc, char** argv) {
 
     auto validated = finalis::lightserver::rpc_validate_address(rpc_url, vk.address, &err);
     if (!validated.has_value()) {
-      std::cerr << "send failed to validate wallet address on rpc endpoint: " << err << "\n";
+      std::cerr << "send failed to validate wallet address: " << finalis::lightserver::explain_rpc_error(rpc_url, err) << "\n";
       return 1;
     }
     if (!validated->valid) {
@@ -4046,7 +4054,7 @@ int run_cli(int argc, char** argv) {
                                          : finalis::height_lock_script_pubkey(unlock, to_pkh);
     auto validated = finalis::lightserver::rpc_validate_address(rpc_url, vk.address, &err);
     if (!validated.has_value() || !validated->valid || !validated->has_scripthash) {
-      std::cerr << "lock_send failed to validate wallet address: " << err << "\n";
+      std::cerr << "lock_send failed to validate wallet address: " << finalis::lightserver::explain_rpc_error(rpc_url, err) << "\n";
       return 1;
     }
     auto rpc_utxos = proven_rpc_utxos(rpc_url, validated->scripthash, &err);
@@ -4221,7 +4229,7 @@ int run_cli(int argc, char** argv) {
 
     auto validated = finalis::lightserver::rpc_validate_address(rpc_url, vk.address, &err);
     if (!validated.has_value() || !validated->valid || !validated->has_scripthash) {
-      std::cerr << "timed_send failed to validate wallet address: " << err << "\n";
+      std::cerr << "timed_send failed to validate wallet address: " << finalis::lightserver::explain_rpc_error(rpc_url, err) << "\n";
       return 1;
     }
     auto rpc_utxos = proven_rpc_utxos(rpc_url, validated->scripthash, &err);
