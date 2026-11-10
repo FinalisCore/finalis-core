@@ -298,6 +298,8 @@ class Node {
   bool inject_network_record_for_test(const Bytes& raw, int peer_id, std::string* reason = nullptr);
   bool pause_proposals_for_test(bool pause);
   bool proposals_paused_for_test() const { return pause_proposals_.load(); }
+  // Drops every TIME_SIGNATURE this node would send (its own and relays) while set.
+  void drop_time_signature_broadcasts_for_test(bool drop) { drop_time_signature_broadcasts_.store(drop); }
   bool advance_round_for_test(std::uint64_t expected_height, std::uint32_t target_round);
   bool mempool_contains_for_test(const Hash32& txid) const;
   std::optional<TxOut> find_utxo_by_pubkey_hash_for_test(const std::array<std::uint8_t, 20>& pkh,
@@ -1132,6 +1134,7 @@ class Node {
   p2p::PeerManager p2p_;
 
   std::atomic<bool> pause_proposals_{false};
+  std::atomic<bool> drop_time_signature_broadcasts_{false};
   // Throttle for log_line's explicit flush (see its definition) -- mutable
   // since log_line is const, atomic since it's read/written from every
   // thread that logs, with no mu_ protection over just this timestamp.

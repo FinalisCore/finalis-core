@@ -1190,6 +1190,69 @@ TEST(test_sconbreg_rejects_foreign_unproven_or_taken_bls_key) {
   ASSERT_EQ(r.error, std::string("bls key already registered"));
 }
 
+// A committee member without a usable BLS key would leave its checkpoint's key set incomplete and
+// stop the chain (frontier-time-signature-missing-committee-keys). Both ways onto the registry from
+// a transaction reject an unset or undecodable key even when the Ed25519 proof covers it, so none
+// can be registered (genesis: test_genesis_requires_a_proven_unique_bls_key_per_validator).
+TEST(test_validator_without_a_usable_bls_key_cannot_register) {
+  const auto sponsor = key_from_byte(0x7b);
+  const auto validator = key_from_byte(0x7c);
+  const auto payout = key_from_byte(0x7d);
+  const OutPoint spend_op{Hash32{0x7b}, 0};
+  const TxOut prev_out{
+      BOND_AMOUNT + 1'000'000,
+      address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  UtxoSet utxos;
+  utxos.emplace(spend_op, UtxoEntry{prev_out});
+  const auto real = test::test_bls_registration(validator);
+  crypto::BlsPublicKey undecodable{};
+  undecodable.fill(0xff);
+  const auto validate_outputs = [&](std::vector<TxOut> outputs) {
+    std::uint64_t spent = 1000;
+    for (const auto& out : outputs) spent += out.value;
+    outputs.push_back(TxOut{prev_out.value - spent, prev_out.script_pubkey});
+    auto tx = build_signed_p2pkh_tx_single_input(finalis::test::test_chain_domain(), spend_op, prev_out, sponsor.private_key,
+                                                 outputs);
+    ASSERT_TRUE(tx.has_value());
+    return validate_tx(*tx, 1, utxos, finalis::test::test_validation_ctx());
+  };
+  const auto onboarding = [&](const crypto::BlsPublicKey& bls_pk, const crypto::BlsSignature& bls_pop) {
+    OnboardingRegistrationScriptData d{};
+    d.validator_pubkey = validator.public_key;
+    d.payout_pubkey = payout.public_key;
+    d.pop = *crypto::ed25519_sign(onboarding_registration_pop_message(validator.public_key, payout.public_key, bls_pk),
+                                  validator.private_key);
+    d.bls_pubkey = bls_pk;
+    d.bls_pop = bls_pop;
+    return validate_outputs({TxOut{0, encode_onboarding_registration_script(d)}});
+  };
+  const auto join = [&](const crypto::BlsPublicKey& bls_pk, const crypto::BlsSignature& bls_pop) {
+    ValidatorJoinRequestScriptData d{};
+    d.validator_pubkey = validator.public_key;
+    d.payout_pubkey = payout.public_key;
+    d.pop = *crypto::ed25519_sign(validator_join_request_pop_message(validator.public_key, payout.public_key, bls_pk),
+                                  validator.private_key);
+    d.bls_pubkey = bls_pk;
+    d.bls_pop = bls_pop;
+    return validate_outputs({TxOut{BOND_AMOUNT, reg_script(validator.public_key)},
+                             TxOut{0, encode_validator_join_request_script(d)}});
+  };
+  // The fixture is valid with the validator's real key.
+  ASSERT_TRUE(onboarding(real.pubkey, real.pop).ok);
+  ASSERT_TRUE(join(real.pubkey, real.pop).ok);
+  for (const auto& bad : {crypto::BlsPublicKey{}, undecodable}) {
+    for (const auto& pop : {crypto::BlsSignature{}, real.pop}) {
+      ASSERT_TRUE(!crypto::bls_pop_verify(bad, pop));
+      auto r = onboarding(bad, pop);
+      ASSERT_TRUE(!r.ok);
+      ASSERT_EQ(r.error, std::string("onboarding registration bls proof invalid"));
+      r = join(bad, pop);
+      ASSERT_TRUE(!r.ok);
+      ASSERT_EQ(r.error, std::string("validator join request bls proof invalid"));
+    }
+  }
+}
+
 TEST(test_registry_binds_a_bls_key_to_one_validator) {
   const auto a = key_from_byte(0x79);
   const auto b = key_from_byte(0x7a);

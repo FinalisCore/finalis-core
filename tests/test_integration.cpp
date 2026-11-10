@@ -2816,6 +2816,52 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   ASSERT_TRUE(!nodes[1]->inject_vote_for_test(vd));
 }
 
+// A block needs its parent's time signature (consensus::verify_prev_time_signature), so while no
+// TIME_SIGNATURE reaches anyone the chain stops; once they flow again it resumes on its own
+// (each validator re-sends its signature for the finalized tip every round timeout).
+TEST(test_chain_stalls_without_time_signatures_and_resumes_when_they_flow) {
+  if (!can_open_loopback_listener_for_test()) return;
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_time_sig_stall"), 4, 4, 4);
+  auto& nodes = cluster.nodes;
+  const auto heights = [&]() {
+    std::vector<std::uint64_t> out;
+    for (const auto& n : nodes) out.push_back(n->status().height);
+    return out;
+  };
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto h : heights()) {
+      if (h < 5) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(90)));
+
+  for (const auto& n : nodes) n->drop_time_signature_broadcasts_for_test(true);
+  const auto at_drop = heights();
+  const auto dropped_at = *std::max_element(at_drop.begin(), at_drop.end());
+  // Stalled: no height moves for 20 round timeouts (blocks come every ~100 ms when healthy).
+  std::vector<std::uint64_t> stalled;
+  ASSERT_TRUE(wait_for([&]() {
+    const auto before = heights();
+    std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+    if (heights() != before) return false;
+    stalled = before;
+    return true;
+  }, ci_timeout_seconds(60)));
+  const auto stalled_at = *std::max_element(stalled.begin(), stalled.end());
+  ASSERT_TRUE(stalled_at <= dropped_at + 2);
+
+  for (const auto& n : nodes) n->drop_time_signature_broadcasts_for_test(false);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = nodes[0]->status();
+    if (s0.height < stalled_at + 3) return false;
+    for (const auto& n : nodes) {
+      const auto s = n->status();
+      if (s.height != s0.height || s.transition_hash != s0.transition_hash) return false;
+    }
+    return true;
+  }, ci_timeout_seconds(60)));
+}
+
 TEST(test_primary_timeout_falls_back_to_backup_proposer) {
   if (!can_open_loopback_listener_for_test()) return;
   auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_backup_proposer"), 4, 4, 4);
