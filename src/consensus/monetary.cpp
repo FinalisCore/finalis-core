@@ -292,6 +292,36 @@ Payout compute_weighted_payout(std::uint64_t height, std::uint64_t fees_units, c
   return out;
 }
 
+std::uint32_t settlement_participation_bps(std::uint64_t expected_units, std::uint64_t observed_units) {
+  if (expected_units == 0) return 10'000U;
+  return static_cast<std::uint32_t>(
+      wide::mul_div_u64(std::min(observed_units, expected_units), 10'000ULL, expected_units));
+}
+
+std::uint64_t settlement_share_units(const SettlementShareInputs& in, const PubKey32& who,
+                                     const SettlementShareWhatIf& what_if) {
+  const auto lookup = [](const std::map<PubKey32, std::uint64_t>& m, const PubKey32& k) {
+    const auto it = m.find(k);
+    return it == m.end() ? 0ULL : it->second;
+  };
+  std::uint64_t total = 0;
+  std::uint64_t mine = 0;
+  for (const auto& [pub, raw] : in.score_units) {
+    std::uint64_t score = raw;
+    std::uint32_t bps = settlement_participation_bps(lookup(in.expected_participation_units, pub),
+                                                     lookup(in.observed_participation_units, pub));
+    if (pub == who) {
+      if (what_if.score_den != 0) score = wide::mul_div_u64(score, what_if.score_num, what_if.score_den);
+      if (what_if.participation_bps.has_value()) bps = *what_if.participation_bps;
+    }
+    score = apply_participation_penalty_bps(score, bps, in.participation_threshold_bps);
+    total += score;
+    if (pub == who) mine = score;
+  }
+  if (total == 0 || mine == 0) return 0;
+  return wide::mul_div_u64(in.pool_units, mine, total);
+}
+
 DeterministicCoinbasePayout compute_epoch_settlement_payout(
     std::uint64_t settlement_reward_units, std::uint64_t settled_epoch_fee_units, std::uint64_t reserve_subsidy_units,
     const PubKey32& current_leader_pubkey,

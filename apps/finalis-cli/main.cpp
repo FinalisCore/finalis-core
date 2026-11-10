@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
+#include <iomanip>
 #include <sstream>
 #include <optional>
 #include <set>
@@ -1490,6 +1491,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli validator_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
+     << "  finalis-cli economics_explain [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass> | --validator <pubkey hex>]  # the reward formula with your numbers\n"
      << "  finalis-cli economics_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
      << "  finalis-cli validator-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--fee <u64>] [--timeout-seconds <n>] [--json] [--no-watch] [--no-wait-for-sync] [--rpc-only]\n"
      << "  finalis-cli validator-register-status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--admin-rpc unix://<socket>] [--pass <pass>] [--json] [--rpc-only]\n"
@@ -3238,6 +3240,195 @@ int run_cli(int argc, char** argv) {
     std::cout << "address=" << vk.address << "\n";
     std::cout << "balance=" << spendable->total << "\n";
     std::cout << "spendable_utxos=" << spendable->count << "\n";
+    return 0;
+  }
+
+  if (cmd == "economics_explain") {
+    // The reward formula in words, with this validator's numbers, for the last settled epoch.
+    std::string db_path = default_db_path();
+    std::string validator_hex;
+    std::string file_path = default_validator_key_path();
+    std::string passphrase;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--validator" && i + 1 < argc) validator_hex = argv[++i];
+    }
+    db_path = expand_user(db_path);
+    file_path = expand_user(file_path);
+    finalis::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "economics_explain: failed to open db " << db_path << "\n";
+      return 1;
+    }
+    // Rewards are public chain data: any validator can be explained by pubkey, no key needed.
+    finalis::keystore::ValidatorKey vk;
+    std::string err;
+    if (!validator_hex.empty()) {
+      const auto pub = decode_hex32(validator_hex);
+      if (!pub.has_value()) {
+        std::cerr << "economics_explain: --validator must be a 32-byte hex pubkey\n";
+        return 1;
+      }
+      std::copy(pub->begin(), pub->end(), vk.pubkey.begin());
+      vk.address = "pubkey " + finalis::hex_encode(finalis::Bytes(vk.pubkey.begin(), vk.pubkey.begin() + 4));
+    } else if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
+      std::cerr << "economics_explain: failed to load validator key " << file_path << ": " << err
+                << " (or pass --validator <pubkey hex>)\n";
+      return 1;
+    }
+    namespace mc = finalis::consensus;
+    const auto fls = [](std::uint64_t units) {
+      std::ostringstream o;
+      o << units / mc::BASE_UNITS_PER_COIN << "." << std::setw(4) << std::setfill('0')
+        << (units % mc::BASE_UNITS_PER_COIN) / (mc::BASE_UNITS_PER_COIN / 10'000) << " FLS";
+      return o.str();
+    };
+    const auto pct = [](std::uint64_t num, std::uint64_t den) {
+      std::ostringstream o;
+      o << std::fixed << std::setprecision(2) << (den == 0 ? 0.0 : 100.0 * static_cast<double>(num) / static_cast<double>(den))
+        << "%";
+      return o.str();
+    };
+    const auto& net = cli_network();
+    const auto tip = db.get_tip();
+    const std::uint64_t finalized_height = tip ? tip->height : 0;
+    const std::uint64_t h = finalized_height + 1;
+    const auto validators = db.load_validators();
+    auto registry = build_registry_for_cli(net, validators, h);
+    const auto active_operators = active_operator_count_for_cli(registry, validators, h);
+    const auto& econ = finalis::active_economics_policy(net, h);
+    const auto me = validators.find(vk.pubkey);
+    if (me == validators.end()) {
+      std::cout << "Validator " << vk.address << " is not registered on this chain (height " << finalized_height
+                << "), so it earns nothing yet.\n";
+      return 0;
+    }
+    const auto bond = me->second.bonded_amount;
+    const auto max_eff = mc::validator_max_effective_bond_units(net, h, active_operators);
+    const auto capped = mc::capped_effective_bond_units(net, h, active_operators, bond);
+    const auto weight = mc::reward_weight(net, h, active_operators, bond);
+
+    std::cout << "Validator " << vk.address << " at height " << finalized_height << " (" << active_operators
+              << " active operators)\n\n";
+    std::cout << "1. Weight\n"
+              << "   weight = floor(sqrt(min(bond, max effective bond)))\n"
+              << "          = floor(sqrt(min(" << fls(bond) << ", " << fls(max_eff) << ")))  [in base units]\n"
+              << "          = " << weight << "\n";
+    if (capped < bond) {
+      std::cout << "   Your bond is above the cap: bond beyond " << fls(max_eff) << " adds no weight.\n";
+    }
+    std::cout << "   Each block your validator is in the committee adds `weight` to its score; proposing a block\n"
+              << "   adds `weight` once more. Weight grows with the square root of the bond: 4x the bond, 2x the weight.\n\n";
+
+    // The last epoch already paid out: it was settled at the start of the epoch holding the tip.
+    const auto settle_start =
+        settlement_epoch_start_for_height(net, finalis::consensus::committee_epoch_start(
+                                                   std::max<std::uint64_t>(1, finalized_height), net.committee_epoch_blocks));
+    std::optional<finalis::storage::EpochRewardSettlementState> state;
+    std::optional<finalis::FrontierTransition> settle_tx;
+    if (settle_start.has_value()) {
+      state = db.get_epoch_reward_settlement(*settle_start);
+      const auto settle_height = *settle_start + std::max<std::uint64_t>(1, net.committee_epoch_blocks);
+      if (settle_height <= finalized_height) {
+        if (auto id = db.get_frontier_transition_by_height(settle_height); id.has_value()) {
+          if (auto bytes = db.get_frontier_transition(*id); bytes.has_value()) settle_tx = finalis::FrontierTransition::parse(*bytes);
+        }
+      }
+    }
+    if (!state.has_value() || !settle_tx.has_value()) {
+      std::cout << "No settled epoch yet to explain: rewards are paid at the first block of the next epoch.\n";
+      return 0;
+    }
+    const auto& st = settle_tx->settlement;
+    const auto& es = *state;
+    // As settlement does (canonical_derivation.cpp checkpoint_onboarding_scores): the onboarding slice
+    // goes in equal parts to the committee checkpoint at the settlement boundary (else the epoch's own).
+    std::set<finalis::PubKey32> onboarding_members;
+    {
+      auto cp = db.get_finalized_committee_checkpoint(*settle_start + std::max<std::uint64_t>(1, net.committee_epoch_blocks));
+      if (!cp.has_value()) cp = db.get_finalized_committee_checkpoint(*settle_start);
+      if (cp.has_value()) onboarding_members.insert(cp->ordered_members.begin(), cp->ordered_members.end());
+    }
+    const auto onboarding = onboarding_members.empty() ? 0 : mc::onboarding_reward_units(st.settled_epoch_rewards);
+    std::uint64_t my_onboarding = 0;
+    if (onboarding_members.count(vk.pubkey) != 0) {
+      my_onboarding = onboarding / onboarding_members.size();
+      if (vk.pubkey == *onboarding_members.rbegin()) my_onboarding += onboarding % onboarding_members.size();
+    }
+    mc::SettlementShareInputs in;
+    in.pool_units = st.settled_epoch_rewards - onboarding + st.settled_epoch_fees + st.reserve_subsidy_units;
+    in.score_units = es.reward_score_units;
+    in.expected_participation_units = es.expected_participation_units;
+    in.observed_participation_units = es.observed_participation_units;
+    in.participation_threshold_bps = econ.participation_threshold_bps;
+    const auto get = [](const std::map<finalis::PubKey32, std::uint64_t>& m, const finalis::PubKey32& k) {
+      const auto it = m.find(k);
+      return it == m.end() ? 0ULL : it->second;
+    };
+    const auto my_score = get(es.reward_score_units, vk.pubkey);
+    std::uint64_t total_score = 0;
+    for (const auto& [_, sc] : es.reward_score_units) total_score += sc;
+    const auto expected = get(es.expected_participation_units, vk.pubkey);
+    const auto observed = get(es.observed_participation_units, vk.pubkey);
+    const auto part_bps = mc::settlement_participation_bps(expected, observed);
+    const auto threshold = econ.participation_threshold_bps;
+
+    std::cout << "2. Epoch " << *settle_start << " (paid at height " << settle_tx->height << ")\n"
+              << "   pool = validator emission " << fls(st.settled_epoch_rewards - onboarding);
+    if (onboarding != 0) std::cout << " (after " << fls(onboarding) << " for onboarding)";
+    std::cout << "\n        + validators' half of the fees " << fls(st.settled_epoch_fees) << "\n"
+              << "        + reserve subsidy " << fls(st.reserve_subsidy_units) << "\n"
+              << "        = " << fls(in.pool_units) << "\n"
+              << "   your score " << my_score << " of " << total_score << " (" << pct(my_score, total_score) << ")\n"
+              << "   participation: you signed " << observed << " of " << expected << " blocks you were expected to sign = "
+              << pct(part_bps, 10'000) << "\n";
+    if (part_bps >= threshold) {
+      std::cout << "   at or above " << pct(threshold, 10'000) << ": no reduction\n";
+    } else {
+      std::cout << "   below " << pct(threshold, 10'000) << ": score x " << pct(part_bps, 10'000) << " / "
+                << pct(threshold, 10'000) << " = x" << std::fixed << std::setprecision(3)
+                << static_cast<double>(part_bps) / static_cast<double>(threshold) << "\n";
+    }
+    const auto share = mc::settlement_share_units(in, vk.pubkey);
+    std::uint64_t paid = 0;
+    for (const auto& [pub, units] : st.outputs) {
+      if (pub == vk.pubkey) paid += units;
+    }
+    std::cout << "   your share = pool x your adjusted score / all adjusted scores = " << fls(share) << "\n";
+    if (onboarding != 0) {
+      std::cout << "   onboarding slice: " << fls(onboarding) << " in equal parts to the " << onboarding_members.size()
+                << " members of the next committee: " << (my_onboarding != 0 ? "you get " + fls(my_onboarding) : "you are not one")
+                << "\n";
+    }
+    std::cout << "   expected total " << fls(share + my_onboarding) << ", paid on chain " << fls(paid) << "\n";
+    if (paid != share + my_onboarding) {
+      // The settlement gives each pool's rounding remainder to the last scored key.
+      std::cout << "   (the difference is a rounding remainder)\n";
+    }
+
+    std::cout << "\n3. What if (same epoch, everyone else unchanged; your share, without the onboarding slice)\n";
+    const auto print_if = [&](const std::string& label, const mc::SettlementShareWhatIf& w) {
+      const auto v = mc::settlement_share_units(in, vk.pubkey, w);
+      std::cout << "   " << label << ": " << fls(v) << " (" << (v >= share ? "+" : "-") << fls(v >= share ? v - share : share - v)
+                << ")\n";
+    };
+    const auto scaled_weight = [&](std::uint64_t new_bond) {
+      return mc::reward_weight(net, h, active_operators, new_bond);
+    };
+    for (const auto& [label, nb] : std::vector<std::pair<std::string, std::uint64_t>>{
+             {"bond x2", bond * 2}, {"bond x4", bond * 4}, {"bond at the cap", std::max(bond, max_eff)}}) {
+      if (weight == 0) break;
+      print_if(label + " (weight " + std::to_string(scaled_weight(nb)) + ")",
+               mc::SettlementShareWhatIf{scaled_weight(nb), weight, std::nullopt});
+    }
+    for (const std::uint32_t bps : {10'000U, threshold, threshold / 2}) {
+      print_if("participation " + pct(bps, 10'000), mc::SettlementShareWhatIf{1, 1, bps});
+    }
+    std::cout << "\nPayouts follow the bond only as its square root, up to the cap; missing more than "
+              << pct(10'000 - threshold, 10'000) << " of your\nsigning duties scales your score down in proportion.\n";
     return 0;
   }
 

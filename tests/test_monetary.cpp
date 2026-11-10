@@ -282,3 +282,50 @@ TEST(test_payout_collapses_leader_signer_share_into_leader_output) {
   ASSERT_EQ(p.leader, R);
   ASSERT_TRUE(p.signers.empty());
 }
+
+// Feedback 2026-11-10 (economics_explain): the explanation's share must equal what settlement pays.
+TEST(test_settlement_share_matches_epoch_settlement_payout) {
+  const auto key = [](std::uint8_t b) {
+    PubKey32 p{};
+    p.fill(b);
+    return p;
+  };
+  consensus::SettlementShareInputs in;
+  in.pool_units = 186'437'400'00ULL;
+  in.participation_threshold_bps = 8'000;
+  in.score_units = {{key(1), 3'919'168}, {key(2), 122'474}, {key(3), 4'041'642}, {key(4), 3'796'694}};
+  in.expected_participation_units = {{key(1), 32}, {key(2), 1}, {key(3), 32}, {key(4), 32}};
+  in.observed_participation_units = {{key(1), 0}, {key(2), 1}, {key(3), 30}, {key(4), 20}};
+
+  ASSERT_EQ(consensus::settlement_participation_bps(0, 0), 10'000u);
+  ASSERT_EQ(consensus::settlement_participation_bps(32, 30), 9'375u);
+  ASSERT_EQ(consensus::settlement_participation_bps(32, 40), 10'000u);  // observed capped at expected
+
+  // Settlement pays from scores already adjusted for participation (canonical_derivation.cpp).
+  std::map<PubKey32, std::uint64_t> adjusted;
+  for (const auto& [pub, score] : in.score_units) {
+    adjusted[pub] = consensus::apply_participation_penalty_bps(
+        score, consensus::settlement_participation_bps(in.expected_participation_units.at(pub),
+                                                       in.observed_participation_units.at(pub)),
+        in.participation_threshold_bps);
+  }
+  const auto payout = consensus::compute_epoch_settlement_payout(in.pool_units, 0, 0, key(9), adjusted, {});
+  std::map<PubKey32, std::uint64_t> paid;
+  for (const auto& [pub, units] : payout.outputs) paid[pub] = units;
+  // key(4) is the last scored key and also gets the rounding remainder; the others match exactly.
+  for (std::uint8_t b : {1, 2, 3}) ASSERT_EQ(consensus::settlement_share_units(in, key(b)), paid[key(b)]);
+  ASSERT_TRUE(consensus::settlement_share_units(in, key(4)) <= paid[key(4)]);
+  ASSERT_EQ(consensus::settlement_share_units(in, key(1)), 0u);  // 0% participation: no validator share
+
+  // What-if: full participation for key(1) gives it a share; below the threshold scales linearly.
+  const auto full = consensus::settlement_share_units(in, key(1), {1, 1, 10'000});
+  const auto at_threshold = consensus::settlement_share_units(in, key(1), {1, 1, 8'000});
+  const auto half = consensus::settlement_share_units(in, key(1), {1, 1, 4'000});
+  ASSERT_TRUE(full > 0 && full == at_threshold);
+  ASSERT_TRUE(half > 0 && half < full);
+  // Doubling the score raises the share but less than 2x, since the total grows too.
+  const auto base3 = consensus::settlement_share_units(in, key(3));
+  const auto doubled3 = consensus::settlement_share_units(in, key(3), {2, 1, std::nullopt});
+  ASSERT_TRUE(doubled3 > base3 && doubled3 < 2 * base3);
+  ASSERT_EQ(consensus::settlement_share_units(in, key(7)), 0u);  // unknown key
+}
