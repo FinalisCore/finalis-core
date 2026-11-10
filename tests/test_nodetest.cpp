@@ -304,6 +304,22 @@ TEST(test_nodetest_summary_percentiles) {
   const auto text = s.render();
   ASSERT_TRUE(text.find("accepted 3  final 2  rejected 1") != std::string::npos);
   ASSERT_TRUE(text.find("p50 200") != std::string::npos);
+  ASSERT_TRUE(text.find("funding limit") == std::string::npos);  // no starved slots, no funding note
+}
+
+// Feedback 2026-11-10: no-coin slots looked like a network problem; the summary says where the coins were.
+TEST(test_nodetest_summary_explains_no_coin_slots) {
+  Summary s;
+  s.starved = 2;
+  s.starved_coins = {CoinPicture{10'000'000, 300'000'000, 100'000'000, 200'000'000},
+                     CoinPicture{30'000'000, 100'000'000, 100'000'000, 200'000'000}};
+  const auto text = s.render();
+  ASSERT_TRUE(text.find("never-final 0  no-coin slots 2\n") != std::string::npos);  // headline count kept
+  ASSERT_TRUE(text.find("a funding limit, not a network problem") != std::string::npos);
+  ASSERT_TRUE(text.find("spendable 0.20  in flight 2.00  held by timed sends 1.00  height-locked 2.00") !=
+              std::string::npos);
+  ASSERT_TRUE(text.find("leave the locking types out of --types") != std::string::npos);
+  ASSERT_TRUE(text.find("hlock, inherit: height-locked") != std::string::npos);
 }
 
 // --start-at takes exactly one UTC form, so every participant reads the same instant.
