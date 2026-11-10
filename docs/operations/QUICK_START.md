@@ -72,6 +72,16 @@ then on-chain registration will fail until coins are sent to that wallet address
 
 ## 5) CLI flow (install to validator registration)
 
+Commands that talk to a lightserver take `--rpc <url>`. Without it they use `$FINALIS_RPC`, and
+without that the local lightserver on the network's default port (mainnet 19444, testnet 19544). If you
+run the lightserver on another port, set it once:
+
+```bash
+export FINALIS_RPC=http://127.0.0.1:<port>/rpc
+```
+
+`getBalance` reads the local node database and needs no lightserver; `balance` and `send` need one.
+
 Step 1: Onboarding registration (SCONBREG)
 
 This step is only needed if you want on-chain onboarding registration. It is not required just to compete for the `3%` onboarding reward bucket through valid finalized epoch tickets.

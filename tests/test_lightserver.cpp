@@ -3458,3 +3458,22 @@ TEST(test_lightserver_relay_gives_up_before_the_client_does) {
   ASSERT_TRUE(resp.find("\"retryable\":true") != std::string::npos);
   if (secs >= 14.0) throw std::runtime_error("relay took " + std::to_string(secs) + " s");
 }
+
+// Feedback 2026-11-10: a wrong default port read like a wallet failure; FINALIS_RPC sets the URL once.
+TEST(test_cli_rpc_url_resolution_and_unreachable_lightserver_error) {
+  ASSERT_EQ(lightserver::default_rpc_url(nullptr, 19544), std::string("http://127.0.0.1:19544/rpc"));
+  ASSERT_EQ(lightserver::default_rpc_url("", 19544), std::string("http://127.0.0.1:19544/rpc"));
+  ASSERT_EQ(lightserver::default_rpc_url("http://10.0.0.5:20544/rpc", 19544), std::string("http://10.0.0.5:20544/rpc"));
+
+  // A real refused connect: nothing listens on port 1.
+  const std::string url = "http://127.0.0.1:1/rpc";
+  std::string err;
+  ASSERT_TRUE(!lightserver::rpc_get_status(url, &err).has_value());
+  const auto explained = lightserver::explain_rpc_error(url, err);
+  ASSERT_TRUE(explained.find("lightserver not reachable at " + url) == 0);
+  ASSERT_TRUE(explained.find(err) != std::string::npos);  // the machine detail is kept
+  ASSERT_TRUE(explained.find("--rpc") != std::string::npos && explained.find("FINALIS_RPC") != std::string::npos);
+
+  // Errors that are not about reaching the server pass through unchanged.
+  ASSERT_EQ(lightserver::explain_rpc_error(url, "address invalid"), std::string("address invalid"));
+}

@@ -226,4 +226,11 @@ std::optional<std::string> http_get(const std::string& url, std::size_t max_body
 // The body of a raw HTTP/1.x response to a GET (the part of http_get that needs no network).
 std::optional<std::string> http_get_body(const std::string& raw, std::size_t max_body_bytes, std::string* err);
 
+// Lightserver URL a client uses when no --rpc is given: $FINALIS_RPC if set and non-empty, else the
+// local lightserver on the network's default port.
+std::string default_rpc_url(const char* env_finalis_rpc, std::uint16_t lightserver_default_port);
+// An RPC error in operator words: a failed connect names the URL and says how to point the client at
+// the right lightserver. Other errors are returned unchanged.
+std::string explain_rpc_error(const std::string& rpc_url, const std::string& err);
+
 }  // namespace finalis::lightserver
