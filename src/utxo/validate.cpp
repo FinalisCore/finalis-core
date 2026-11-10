@@ -104,6 +104,38 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
       return false;
     }
 
+    UpgradeSignalScriptData upgrade_signal{};
+    if (parse_upgrade_signal_script(out.script_pubkey, &upgrade_signal)) {
+      if (out.value != 0) {
+        if (error) *error = "SCUPGSIG output must have zero value";
+        return false;
+      }
+      if (ctx && ctx->timed_body) {
+        if (error) *error = "SCUPGSIG not allowed in a timed body";
+        return false;
+      }
+      if (!ctx || !ctx->network || !ctx->chain_id) {
+        if (error) *error = "SCUPGSIG needs the chain domain";
+        return false;
+      }
+      if (ctx->current_height < ctx->network->upgrade_signal_activation_height) {
+        if (error) *error = "SCUPGSIG not active on this network yet";
+        return false;
+      }
+      std::string budget_error;
+      if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
+        if (error) *error = budget_error;
+        return false;
+      }
+      const auto domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
+      if (!crypto::ed25519_verify(upgrade_signal_message(domain, upgrade_signal.upgrade_id, upgrade_signal.validator_pubkey),
+                                  upgrade_signal.sig, upgrade_signal.validator_pubkey)) {
+        if (error) *error = "upgrade signal signature invalid";
+        return false;
+      }
+      continue;
+    }
+
     OnboardingRegistrationScriptData onboarding_req{};
     if (parse_onboarding_registration_script(out.script_pubkey, &onboarding_req)) {
       if (out.value != 0) {
@@ -220,6 +252,12 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
   }
   if (onboarding_outputs.size() > 1) {
     if (error) *error = "multiple SCONBREG outputs not allowed";
+    return false;
+  }
+  std::size_t upgrade_signal_outputs = 0;
+  for (const auto& out : outputs) upgrade_signal_outputs += parse_upgrade_signal_script(out.script_pubkey, nullptr) ? 1 : 0;
+  if (upgrade_signal_outputs > 1) {
+    if (error) *error = "multiple SCUPGSIG outputs not allowed";
     return false;
   }
   if (!onboarding_outputs.empty() && (!reg_outputs.empty() || !join_req_outputs.empty())) {
@@ -405,7 +443,8 @@ bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
          is_validator_unbond_script(script_pubkey, nullptr) ||
          is_onboarding_registration_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
-         is_burn_script(script_pubkey, nullptr) || is_data_output_script(script_pubkey);
+         is_burn_script(script_pubkey, nullptr) || is_data_output_script(script_pubkey) ||
+         parse_upgrade_signal_script(script_pubkey, nullptr);
 }
 
 Hash32 spent_outputs_hash(const std::vector<TxOut>& spent) {
@@ -502,6 +541,16 @@ Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, cons
   w.bytes_fixed(validator_pubkey);
   w.bytes_fixed(payout_pubkey);
   w.bytes_fixed(bls_pubkey);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes upgrade_signal_message(const Hash32& chain_domain, const Hash32& upgrade_id, const PubKey32& validator_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'U', 'P', 'G', 'R', 'A', 'D', 'E', '-', 'S', 'I', 'G', '-', 'V', '1'});
+  w.bytes_fixed(chain_domain);
+  w.bytes_fixed(upgrade_id);
+  w.bytes_fixed(validator_pubkey);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }

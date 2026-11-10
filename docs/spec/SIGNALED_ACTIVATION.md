@@ -55,9 +55,13 @@ activation heights. Only the source of the height changes, from a constant to ch
 
 ### 3.2 Readiness signal (on-chain)
 
-A new transaction kind `UpgradeSignal { operator, upgrade_id, sig }`:
+Carried as a zero-value `SCUPGSIG` output in an ordinary transaction, like `SCONBREG`: prefix(8) |
+validator_pubkey(32) | upgrade_id(32) | sig(64). No new transaction kind. It is accepted from the
+network's `upgrade_signal_activation_height` (mainnet 0; testnet-3 set at its flag day), so releases
+without the mechanism never see one in a block they validate. Rules (stateless ones in step 2a,
+stateful ones in 2b):
 
-- The operator's validator key signs it under the chain domain.
+- The validator key signs `upgrade_signal_message(chain_domain, upgrade_id, validator_pubkey)`; the operator is the validator's canonical operator id.
 - It is valid only if `operator` is an active operator, `upgrade_id` is defined, the height is in
   `[signal_start, signal_timeout)`, and this operator has no earlier signal for this id. One per
   operator per upgrade, so the total is bounded by the operator count.

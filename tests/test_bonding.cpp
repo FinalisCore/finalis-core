@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 #include "support/test_chain_domain.hpp"
+
+#include <limits>
 #include "test_framework.hpp"
 #include "support/test_validator_bls.hpp"
 
@@ -1273,4 +1275,96 @@ TEST(test_registry_binds_a_bls_key_to_one_validator) {
   ASSERT_TRUE(!vr.register_bond(b.public_key, OutPoint{Hash32{0x7a}, 0}, 2, BOND_AMOUNT, &err, std::nullopt, ka));
   ASSERT_EQ(err, std::string("bls key already registered"));
   ASSERT_TRUE(vr.register_bond(b.public_key, OutPoint{Hash32{0x7a}, 0}, 2, BOND_AMOUNT, &err, std::nullopt, kb));
+}
+
+// Signaled activation step 2a: an SCUPGSIG output carries a validator's chain-bound signal.
+TEST(test_upgrade_signal_script_roundtrip_and_layout) {
+  UpgradeSignalScriptData d{};
+  d.validator_pubkey.fill(0x11);
+  d.upgrade_id.fill(0x22);
+  d.sig.fill(0x33);
+  const auto s = encode_upgrade_signal_script(d);
+  ASSERT_EQ(s.size(), kUpgradeSignalScriptBytes);
+  UpgradeSignalScriptData back{};
+  ASSERT_TRUE(parse_upgrade_signal_script(s, &back));
+  ASSERT_TRUE(back.validator_pubkey == d.validator_pubkey && back.upgrade_id == d.upgrade_id && back.sig == d.sig);
+  ASSERT_TRUE(is_supported_base_layer_output_script(s));
+  auto shorter = s;
+  shorter.pop_back();
+  ASSERT_TRUE(!parse_upgrade_signal_script(shorter));
+  auto other_prefix = s;
+  other_prefix[7] = 'X';
+  ASSERT_TRUE(!parse_upgrade_signal_script(other_prefix));
+  ASSERT_TRUE(!parse_onboarding_registration_script(s));  // prefixes are not interchangeable
+}
+
+TEST(test_upgrade_signal_validation_checks_value_signature_chain_and_count) {
+  const auto sponsor = key_from_byte(0x85);
+  const auto validator = key_from_byte(0x86);
+  const OutPoint spend_op{Hash32{0x85}, 0};
+  const TxOut prev_out{
+      1'000'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+  UtxoSet utxos;
+  utxos.emplace(spend_op, UtxoEntry{prev_out});
+  Hash32 upgrade{};
+  upgrade.fill(0x5a);
+  const auto signal = [&](const Hash32& domain, std::uint64_t value = 0) {
+    UpgradeSignalScriptData d{};
+    d.validator_pubkey = validator.public_key;
+    d.upgrade_id = upgrade;
+    d.sig = *crypto::ed25519_sign(upgrade_signal_message(domain, upgrade, validator.public_key), validator.private_key);
+    return TxOut{value, encode_upgrade_signal_script(d)};
+  };
+  const auto validate_outputs = [&](std::vector<TxOut> outs, const SpecialValidationContext* ctx) {
+    outs.push_back(TxOut{prev_out.value - 1000, prev_out.script_pubkey});
+    auto tx = build_signed_p2pkh_tx_single_input(test::test_chain_domain(), spend_op, prev_out, sponsor.private_key, outs);
+    ASSERT_TRUE(tx.has_value());
+    return validate_tx(*tx, 1, utxos, ctx);
+  };
+  const auto domain = test::test_chain_domain();
+  ASSERT_TRUE(validate_outputs({signal(domain)}, test::test_validation_ctx()).ok);
+
+  auto r = validate_outputs({signal(domain, 1)}, test::test_validation_ctx());
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("SCUPGSIG output must have zero value"));
+
+  // Signed for another chain: not a signal here.
+  auto other_chain = domain;
+  other_chain[0] ^= 1;
+  r = validate_outputs({signal(other_chain)}, test::test_validation_ctx());
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("upgrade signal signature invalid"));
+
+  // Signed by someone else for this validator.
+  UpgradeSignalScriptData forged{};
+  forged.validator_pubkey = validator.public_key;
+  forged.upgrade_id = upgrade;
+  forged.sig = *crypto::ed25519_sign(upgrade_signal_message(domain, upgrade, validator.public_key), sponsor.private_key);
+  r = validate_outputs({TxOut{0, encode_upgrade_signal_script(forged)}}, test::test_validation_ctx());
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("upgrade signal signature invalid"));
+
+  r = validate_outputs({signal(domain), signal(domain)}, test::test_validation_ctx());
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("multiple SCUPGSIG outputs not allowed"));
+
+  // Below the network's activation height a signal is rejected, as an older release rejects it.
+  NetworkConfig late = test::test_network();
+  late.upgrade_signal_activation_height = 100;
+  SpecialValidationContext before = test::with_test_chain_identity();
+  before.network = &late;
+  before.current_height = 99;
+  r = validate_outputs({signal(domain)}, &before);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("SCUPGSIG not active on this network yet"));
+  before.current_height = 100;
+  ASSERT_TRUE(validate_outputs({signal(domain)}, &before).ok);
+  ASSERT_EQ(testnet_network().upgrade_signal_activation_height, std::numeric_limits<std::uint64_t>::max());
+  ASSERT_EQ(mainnet_network().upgrade_signal_activation_height, 0u);
+
+  SpecialValidationContext timed = test::with_test_chain_identity();
+  timed.timed_body = true;
+  r = validate_outputs({signal(domain)}, &timed);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("SCUPGSIG not allowed in a timed body"));
 }

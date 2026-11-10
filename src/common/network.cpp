@@ -113,6 +113,7 @@ NetworkConfig make_testnet() {
   net.default_seeds = {"130.61.126.39:19540", "159.200.236.114:19540"};
   // testnet-3 ran one certifier term per epoch through h=4800; v2.2.13 (C1) took over at 4801.
   net.ingress_certifier_terms_activation_height = 4801;
+  net.upgrade_signal_activation_height = std::numeric_limits<std::uint64_t>::max();  // set at the flag day
   return net;
 }
 

@@ -103,6 +103,9 @@ Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, cons
                                           const crypto::BlsPublicKey& bls_pubkey);
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
                                          const crypto::BlsPublicKey& bls_pubkey);
+// What an SCUPGSIG signature covers. The chain domain binds it to one chain: a testnet signal is no
+// signal on mainnet.
+Bytes upgrade_signal_message(const Hash32& chain_domain, const Hash32& upgrade_id, const PubKey32& validator_pubkey);
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id);
 Hash32 onboarding_registration_commitment(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs);

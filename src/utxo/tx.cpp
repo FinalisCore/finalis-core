@@ -812,6 +812,7 @@ namespace {
 
 constexpr std::array<std::uint8_t, 8> kJoinRequestPrefix = {'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
 constexpr std::array<std::uint8_t, 8> kOnboardingPrefix = {'S', 'C', 'O', 'N', 'B', 'R', 'E', 'G'};
+constexpr std::array<std::uint8_t, 8> kUpgradeSignalPrefix = {'S', 'C', 'U', 'P', 'G', 'S', 'I', 'G'};
 
 // Both registration scripts share one layout (tx.hpp); only the prefix differs.
 template <typename Data>
@@ -867,6 +868,28 @@ Bytes encode_registration_script(const std::array<std::uint8_t, 8>& prefix, cons
 
 Bytes encode_validator_join_request_script(const ValidatorJoinRequestScriptData& data) {
   return encode_registration_script(kJoinRequestPrefix, data);
+}
+
+Bytes encode_upgrade_signal_script(const UpgradeSignalScriptData& data) {
+  Bytes s(kUpgradeSignalPrefix.begin(), kUpgradeSignalPrefix.end());
+  s.insert(s.end(), data.validator_pubkey.begin(), data.validator_pubkey.end());
+  s.insert(s.end(), data.upgrade_id.begin(), data.upgrade_id.end());
+  s.insert(s.end(), data.sig.begin(), data.sig.end());
+  return s;
+}
+
+bool parse_upgrade_signal_script(const Bytes& script, UpgradeSignalScriptData* out) {
+  if (script.size() != kUpgradeSignalScriptBytes) return false;
+  if (!std::equal(kUpgradeSignalPrefix.begin(), kUpgradeSignalPrefix.end(), script.begin())) return false;
+  UpgradeSignalScriptData d;
+  auto it = script.begin() + 8;
+  std::copy(it, it + 32, d.validator_pubkey.begin());
+  it += 32;
+  std::copy(it, it + 32, d.upgrade_id.begin());
+  it += 32;
+  std::copy(it, it + 64, d.sig.begin());
+  if (out) *out = d;
+  return true;
 }
 
 Bytes encode_onboarding_registration_script(const OnboardingRegistrationScriptData& data) {

@@ -413,6 +413,20 @@ struct OnboardingRegistrationScriptData {
   std::uint64_t admission_pow_nonce{0};
 };
 
+// SCUPGSIG (signaled activation, docs/spec/SIGNALED_ACTIVATION.md): prefix(8) | validator_pubkey(32) |
+// upgrade_id(32) | sig(64) = 136 bytes, zero value. sig is the validator key's Ed25519 signature of
+// upgrade_signal_message (chain domain, upgrade id, validator key).
+inline constexpr std::size_t kUpgradeSignalScriptBytes = 8 + 32 + 32 + 64;
+
+struct UpgradeSignalScriptData {
+  PubKey32 validator_pubkey{};
+  Hash32 upgrade_id{};
+  Sig64 sig{};
+};
+
+Bytes encode_upgrade_signal_script(const UpgradeSignalScriptData& data);
+bool parse_upgrade_signal_script(const Bytes& script, UpgradeSignalScriptData* out = nullptr);
+
 Bytes encode_validator_join_request_script(const ValidatorJoinRequestScriptData& data);
 Bytes encode_onboarding_registration_script(const OnboardingRegistrationScriptData& data);
 

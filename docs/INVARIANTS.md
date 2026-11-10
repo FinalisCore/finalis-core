@@ -63,6 +63,11 @@ Spec: `docs/spec/CONFIDENTIAL_UTXO_SPEC.md`.
 | D9 | Only the round leader can make a node decrypt: a network proposal's settlement openings are prewarmed only after its proposer signature verifies against the round leader. | `Node::prewarm_proposal_timed_openings` (`src/node/node_consensus.cpp`) | `test_proposal_prewarm_requires_the_round_leaders_signature` |
 | D10 | Recorded history replays under the current code: a consensus rule change carries a per-network activation height, and heights below it validate under the old rule. v2.2.13 broke this (fresh nodes rejected testnet-3 block 37). | `NetworkConfig` activation heights (e.g. `ingress_certifier_terms_activation_height`) | CI `history-replay` (`scripts/replay_history_check.sh`: testnet-3 genesis → 5173 offline with `--no-fast-start`), `test_frontier_lane_prefix_uses_whole_epoch_terms_below_the_terms_activation_height` |
 
+## Upgrade signals (signaled activation)
+| # | Invariant | Enforced in | Test |
+|---|---|---|---|
+| U1 | An `SCUPGSIG` output is valid only from the network's `upgrade_signal_activation_height` (mainnet 0, testnet-3 not yet set), has zero value, appears at most once per transaction, is not part of a timed body, and carries the validator key's signature over the chain domain, the upgrade id and the key: a signal from another chain or another key is rejected. | `validate_special_script_semantics` (`src/utxo/validate.cpp`) | `test_upgrade_signal_validation_checks_value_signature_chain_and_count`, `test_upgrade_signal_script_roundtrip_and_layout` |
+
 ## Ingress certifiers (lanes)
 | # | Invariant | Enforced in | Test |
 |---|---|---|---|
