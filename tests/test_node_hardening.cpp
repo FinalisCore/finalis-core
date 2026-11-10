@@ -323,3 +323,38 @@ TEST(test_node_peer_discipline_decay_hook_reduces_score) {
 
   n.stop();
 }
+
+// Feedback 2026-11-10: a halted node must say who is missing and whether an upgrade is the cause.
+TEST(test_quorum_diagnosis_names_missing_signers_and_other_rules) {
+  std::vector<PubKey32> committee(4);
+  for (std::size_t i = 0; i < committee.size(); ++i) committee[i].fill(static_cast<std::uint8_t>(0x10 + i));
+  const std::set<PubKey32> present{committee[0], committee[1]};
+  const std::uint64_t now = 1'000'000'000;
+  std::map<PubKey32, std::uint64_t> other_rules{{committee[2], now - 1000}};
+  // Stale sighting (outside the window) must not count.
+  other_rules[committee[3]] = now - node::detail::kOtherRulesSeenWindowMs - 1;
+
+  auto d = node::detail::diagnose_quorum("WAITING_FOR_QUORUM", 3, committee, 3, present, other_rules, now);
+  ASSERT_EQ(d.observed, 2u);
+  ASSERT_EQ(d.quorum, 3u);
+  ASSERT_EQ(d.missing.size(), 2u);
+  ASSERT_EQ(d.missing_other_rules.size(), 1u);
+  ASSERT_TRUE(d.missing_other_rules[0] == committee[2]);
+  ASSERT_EQ(d.halt_reason, std::string("other_consensus_rules"));
+  const auto line = node::detail::quorum_blocked_log_line(42, d);
+  ASSERT_TRUE(line.find("quorum-blocked h=42 signers=2/3 committee=4 missing=2 other_rules=1") == 0);
+  ASSERT_TRUE(line.find("missing_ids=12121212,13131313") != std::string::npos);
+  ASSERT_TRUE(line.find("resumes once they upgrade") != std::string::npos);
+  ASSERT_TRUE(line.find('"') == std::string::npos);  // safe inside JSON logs
+
+  d = node::detail::diagnose_quorum("WAITING_FOR_QUORUM", 3, committee, 3, present, {}, now);
+  ASSERT_EQ(d.halt_reason, std::string("missing_signers"));
+
+  d = node::detail::diagnose_quorum("WAITING_FOR_QUORUM", 0, committee, 3, present, other_rules, now);
+  ASSERT_EQ(d.halt_reason, std::string("no_peers"));
+
+  d = node::detail::diagnose_quorum("FINALIZING", 3, committee, 3, present, other_rules, now);
+  ASSERT_TRUE(d.halt_reason.empty());
+  ASSERT_EQ(d.missing.size(), 2u);
+  ASSERT_TRUE(node::detail::quorum_blocked_log_line(42, d).empty());
+}

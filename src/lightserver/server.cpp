@@ -2578,8 +2578,29 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         << "}"
         << ",\"ticket_pow\":" << ticket_pow_status_json(ticket_pow)
         << ",\"latest_finality_committee_size\":" << latest_committee_size
-        << ",\"latest_finality_quorum_threshold\":" << latest_quorum_threshold
-        << ",\"sync\":{\"mode\":\"finalized_only\",\"snapshot_present\":"
+        << ",\"latest_finality_quorum_threshold\":" << latest_quorum_threshold;
+    // Why the next height is (not) finalizing. halt_reason null while finalizing.
+    oss << ",\"quorum\":";
+    if (!runtime.has_value()) {
+      oss << "null";
+    } else {
+      const auto pubs_json = [](const std::vector<PubKey32>& pubs) {
+        std::ostringstream o;
+        o << "[";
+        for (std::size_t i = 0; i < pubs.size(); ++i) o << (i ? "," : "") << "\"" << hex_encode32(pubs[i]) << "\"";
+        o << "]";
+        return o.str();
+      };
+      oss << "{\"consensus_state\":\"" << minijson::escape(runtime->consensus_state) << "\""
+          << ",\"committee_size\":" << runtime->committee_size << ",\"quorum_threshold\":" << runtime->quorum_threshold
+          << ",\"observed_signers\":" << runtime->observed_signers << ",\"halt_reason\":";
+      if (runtime->halt_reason.empty()) oss << "null";
+      else oss << "\"" << minijson::escape(runtime->halt_reason) << "\"";
+      oss << ",\"missing_signers\":" << pubs_json(runtime->missing_signers)
+          << ",\"missing_signers_other_rules\":" << pubs_json(runtime->missing_signers_other_rules)
+          << ",\"rejected_consensus_rules\":" << runtime->rejected_consensus_rules << "}";
+    }
+    oss << ",\"sync\":{\"mode\":\"finalized_only\",\"snapshot_present\":"
         << (runtime.has_value() ? "true" : "false")
         << ",\"local_finalized_height\":" << tip->height
         << ",\"observed_network_height_known\":";

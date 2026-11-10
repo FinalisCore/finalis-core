@@ -1686,6 +1686,16 @@ TEST(test_lightserver_get_status_exposes_runtime_sync_summary) {
   snapshot.availability_local_retained_prefix_count = 5;
   snapshot.availability_local_eligibility_score = 13;
   snapshot.availability_local_seat_budget = 1;
+  snapshot.consensus_state = "WAITING_FOR_QUORUM";
+  snapshot.committee_size = 9;
+  snapshot.quorum_threshold = 7;
+  snapshot.observed_signers = 5;
+  snapshot.halt_reason = "other_consensus_rules";
+  snapshot.missing_signers.resize(2);
+  snapshot.missing_signers[0].fill(0x41);
+  snapshot.missing_signers[1].fill(0x42);
+  snapshot.missing_signers_other_rules = {snapshot.missing_signers[1]};
+  snapshot.rejected_consensus_rules = 4;
   ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
   storage::AdaptiveEpochTelemetry telemetry;
   telemetry.epoch_start_height = 1;
@@ -1725,6 +1735,12 @@ TEST(test_lightserver_get_status_exposes_runtime_sync_summary) {
   ASSERT_TRUE(resp.find("\"snapshot_present\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"observed_network_finalized_height\":15") != std::string::npos);
   ASSERT_TRUE(resp.find("\"finalized_lag\":3") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"quorum\":{\"consensus_state\":\"WAITING_FOR_QUORUM\",\"committee_size\":9,"
+                        "\"quorum_threshold\":7,\"observed_signers\":5,\"halt_reason\":\"other_consensus_rules\","
+                        "\"missing_signers\":[\"" + hex_encode32(snapshot.missing_signers[0]) + "\",\"" +
+                        hex_encode32(snapshot.missing_signers[1]) + "\"],\"missing_signers_other_rules\":[\"" +
+                        hex_encode32(snapshot.missing_signers[1]) + "\"],\"rejected_consensus_rules\":4}") !=
+              std::string::npos);
   ASSERT_TRUE(resp.find("\"bootstrap_sync_incomplete\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"advertised_endpoint_present\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"advertised_endpoint_likely_public\":true") != std::string::npos);

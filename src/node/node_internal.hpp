@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,6 +20,16 @@
 #include "node.hpp"
 
 namespace finalis::node::detail {
+
+// A validator rejected for different consensus rules counts as "on other rules" for this long.
+inline constexpr std::uint64_t kOtherRulesSeenWindowMs = 10ULL * 60ULL * 1000ULL;
+
+// present: committee members whose vote for the next height/round was seen (self included).
+QuorumDiagnosis diagnose_quorum(const std::string& state, std::size_t peers, const std::vector<PubKey32>& committee,
+                                std::size_t quorum, const std::set<PubKey32>& present,
+                                const std::map<PubKey32, std::uint64_t>& other_rules_seen_ms, std::uint64_t now_ms);
+// One operator-readable line; empty when the chain is not blocked.
+std::string quorum_blocked_log_line(std::uint64_t height, const QuorumDiagnosis& d);
 
 // --- Constants ---
 inline constexpr std::uint32_t kFixedValidationRulesVersion = consensus::kValidationRulesVersion;

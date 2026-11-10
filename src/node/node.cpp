@@ -847,6 +847,13 @@ NodeStatus Node::status() const {
   s.inbound_connected = cfg_.disable_p2p ? 0 : p2p_.inbound_count();
   s.outbound_connected = cfg_.disable_p2p ? peer_count() : p2p_.outbound_count();
   s.consensus_state = consensus_state_locked(now_ms(), &s.observed_signers, &s.quorum_threshold);
+  {
+    auto diag = quorum_diagnosis_locked(now_ms());
+    s.halt_reason = std::move(diag.halt_reason);
+    s.missing_signers = std::move(diag.missing);
+    s.missing_signers_other_rules = std::move(diag.missing_other_rules);
+  }
+  s.rejected_consensus_rules = rejected_consensus_rules_;
   s.last_bootstrap_source = last_bootstrap_source_;
   s.rejected_network_id = rejected_network_id_;
   s.rejected_protocol_version = rejected_protocol_version_;
@@ -976,6 +983,17 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
     snapshot.stun_endpoint_candidate = stun_candidate_endpoint_->key();
   }
   snapshot.abstaining_heights.assign(abstain_heights_.begin(), abstain_heights_.end());
+  {
+    auto diag = quorum_diagnosis_locked(now_ms);
+    snapshot.consensus_state = std::move(diag.state);
+    snapshot.committee_size = diag.committee_size;
+    snapshot.quorum_threshold = diag.quorum;
+    snapshot.observed_signers = diag.observed;
+    snapshot.halt_reason = std::move(diag.halt_reason);
+    snapshot.missing_signers = std::move(diag.missing);
+    snapshot.missing_signers_other_rules = std::move(diag.missing_other_rules);
+  }
+  snapshot.rejected_consensus_rules = rejected_consensus_rules_;
 
   snapshot.next_height_committee_available = !committee_for_height_round(finalized_height_ + 1, current_round_).empty();
   snapshot.next_height_proposer_available = leader_for_height_round(finalized_height_ + 1, current_round_).has_value();
@@ -1328,7 +1346,7 @@ void Node::event_loop() {
                     << " outbound=" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count()) << "/"
                     << cfg_.outbound_target << " inbound=" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
                     << " established=" << established_peer_count() << " addrman=" << addrman_.size()
-                    << " cv=" << kFixedValidationRulesVersion << " state=" << state;
+                    << " cv=" << kFixedValidationRulesVersion << " state=" << state << " signers=" << observed << "/" << q;
           if (bootstrap_template_mode_) {
             std::cout << " bootstrap=template";
             if (bootstrap_validator_pubkey_.has_value()) {
@@ -1343,6 +1361,11 @@ void Node::event_loop() {
             }
           }
           std::cout << "\n";
+        }
+        if (runtime_logs_enabled()) {
+          if (const auto blocked = detail::quorum_blocked_log_line(h, quorum_diagnosis_locked(now_ms)); !blocked.empty()) {
+            log_line(blocked);
+          }
         }
         last_summary_log_ms_ = now_ms;
       }

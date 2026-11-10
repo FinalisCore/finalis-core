@@ -183,6 +183,29 @@ Other failures restart after 5 s. systemd stops trying after 5 failed starts in 
 (`StartLimitBurst=5`, `StartLimitIntervalSec=300`); clear it with `systemctl reset-failed finalis-node`.
 docker-compose uses `restart: on-failure:5`. Docker cannot exclude particular exit codes from restarts.
 
+### 4.0 Chain not finalizing (`WAITING_FOR_QUORUM`)
+
+This is not a fail-stop state: the node keeps running and resumes on its own once enough committee
+members vote. To see why it is waiting, check the log line printed every 30 s alongside the summary:
+
+```
+quorum-blocked h=4801 signers=5/7 committee=9 missing=4 other_rules=3 reason=other_consensus_rules missing_ids=1a2b3c4d,... -- 3 missing signer(s) run different consensus rules; the chain resumes once they upgrade
+```
+
+The same data is in the lightserver's `get_status` under `quorum`: `consensus_state`, `committee_size`,
+`quorum_threshold`, `observed_signers`, `halt_reason`, `missing_signers`, `missing_signers_other_rules`
+(full pubkeys) and `rejected_consensus_rules` (VERSION handshakes refused for different consensus
+rules since start). `halt_reason` is `null` while finalizing, otherwise:
+
+| `halt_reason` | Meaning | Action |
+|---|---|---|
+| `other_consensus_rules` | Some missing signers were refused in the last 10 min for a different consensus-rules fingerprint | They must upgrade (or you must, if you are the one behind: compare `crh` in the `reject-version` log lines) |
+| `missing_signers` | Missing signers are offline or unreachable | Wait, or contact the listed operators |
+| `no_peers` | No peer connections | Check network, firewall and peer settings |
+
+`missing_signers_other_rules` relies on the pubkey a peer claims in its handshake. It is a hint for
+operators, not evidence, and it never affects consensus.
+
 ### 4.1 Emergency fallback committee
 
 The emergency committee has at most 4 members. They come from the two previous committees and

@@ -144,6 +144,17 @@ struct NodeRuntimeStatusSnapshot {
   std::string stun_endpoint_candidate;
   // Heights at which the node abstains from signing because its consensus safety state was unreadable.
   std::vector<std::uint64_t> abstaining_heights;
+  // Quorum diagnosis for the next height. halt_reason is empty while the chain finalizes, otherwise
+  // "no_peers", "other_consensus_rules" (some missing signers run different consensus rules: upgrade
+  // needed) or "missing_signers". missing_signers_other_rules is a subset of missing_signers.
+  std::string consensus_state;
+  std::uint64_t committee_size{0};
+  std::uint64_t quorum_threshold{0};
+  std::uint64_t observed_signers{0};
+  std::string halt_reason;
+  std::vector<PubKey32> missing_signers;
+  std::vector<PubKey32> missing_signers_other_rules;
+  std::uint64_t rejected_consensus_rules{0};
   std::uint64_t finalized_lag{0};
   bool peer_height_disagreement{false};
   bool next_height_committee_available{false};

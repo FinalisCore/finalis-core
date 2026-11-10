@@ -1097,4 +1097,53 @@ std::vector<std::size_t> next_reforward_window(std::size_t total, std::size_t ma
   return window;
 }
 
+QuorumDiagnosis diagnose_quorum(const std::string& state, std::size_t peers, const std::vector<PubKey32>& committee,
+                                std::size_t quorum, const std::set<PubKey32>& present,
+                                const std::map<PubKey32, std::uint64_t>& other_rules_seen_ms, std::uint64_t now_ms) {
+  QuorumDiagnosis d;
+  d.state = state;
+  d.committee_size = committee.size();
+  d.quorum = quorum;
+  for (const auto& pub : committee) {
+    if (present.count(pub) != 0) {
+      ++d.observed;
+      continue;
+    }
+    d.missing.push_back(pub);
+    const auto it = other_rules_seen_ms.find(pub);
+    if (it != other_rules_seen_ms.end() && now_ms <= it->second + kOtherRulesSeenWindowMs) {
+      d.missing_other_rules.push_back(pub);
+    }
+  }
+  if (state != "WAITING_FOR_QUORUM") return d;
+  if (peers == 0 && d.committee_size > 1) d.halt_reason = "no_peers";
+  else if (!d.missing_other_rules.empty()) d.halt_reason = "other_consensus_rules";
+  else d.halt_reason = "missing_signers";
+  return d;
+}
+
+std::string quorum_blocked_log_line(std::uint64_t height, const QuorumDiagnosis& d) {
+  if (d.halt_reason.empty()) return {};
+  std::ostringstream oss;
+  oss << "quorum-blocked h=" << height << " signers=" << d.observed << "/" << d.quorum << " committee=" << d.committee_size
+      << " missing=" << d.missing.size() << " other_rules=" << d.missing_other_rules.size() << " reason=" << d.halt_reason;
+  if (!d.missing.empty()) {
+    oss << " missing_ids=";
+    for (std::size_t i = 0; i < d.missing.size(); ++i) {
+      if (i) oss << ",";
+      oss << hex_encode(Bytes(d.missing[i].begin(), d.missing[i].begin() + 4));
+    }
+  }
+  // Plain-language hint last; no quotes, log_line output may be JSON.
+  if (d.halt_reason == "no_peers") {
+    oss << " -- no peers connected, check the network and peer settings";
+  } else if (d.halt_reason == "other_consensus_rules") {
+    oss << " -- " << d.missing_other_rules.size()
+        << " missing signer(s) run different consensus rules; the chain resumes once they upgrade";
+  } else {
+    oss << " -- waiting for votes from offline or unreachable validators";
+  }
+  return oss.str();
+}
+
 }  // namespace finalis::node::detail

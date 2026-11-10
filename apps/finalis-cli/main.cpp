@@ -723,7 +723,7 @@ std::string light_verifier_state_path() {
 // unspent exactly as listed. Transparent signatures do not commit to input values, so a coin listed
 // with too small a value would otherwise silently become fee. Trust starts at the embedded genesis;
 // proven checkpoints are cached next to the node data so later calls do not walk from genesis.
-// Prints coins_verified=yes|no. nullopt: no list, or a proof failed and --allow-unverified is not set.
+// Prints coins_verified=yes|no|no_coins; coins_verified_height only after a proof was checked. nullopt: no list, or a proof failed and --allow-unverified is not set.
 std::optional<std::vector<finalis::lightserver::UtxoView>> proven_rpc_utxos(const std::string& rpc_url,
                                                                              const finalis::Hash32& scripthash,
                                                                              std::string* err) {
@@ -758,6 +758,11 @@ std::optional<std::vector<finalis::lightserver::UtxoView>> proven_rpc_utxos(cons
   }
   for (const auto& [endpoint, what] : balance.misbehaving) {
     std::cerr << "warning: " << endpoint << " failed verification: " << what << "\n";
+  }
+  if (balance.nothing_to_prove) {
+    // Nothing to spend and nothing to trust: no proof was requested, so no height is claimed.
+    std::cout << "coins_verified=no_coins\n";
+    return listed;
   }
   if (!balance.verified) {
     std::cout << "coins_verified=no\n";
