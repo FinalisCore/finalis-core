@@ -39,8 +39,9 @@
   `finalized_height + 1`.
 - **Confidential from genesis.** Amounts in confidential transfers are hidden
   with Pedersen commitments and Bulletproof range proofs (secp256k1-zkp), and
-  outputs go to unlinkable one-time keys. Privacy is part of the base layer,
-  not an add-on. What stays public is stated in
+  each payment goes to a one-time key from a fresh receive request. Privacy is
+  part of the base layer, not an add-on. The transaction graph stays public;
+  everything else that does is stated in
   [the spec](docs/spec/CONFIDENTIAL_UTXO_SPEC.md) (§3.3).
 - **Your wallet checks, not trusts.** The wallet starts from the genesis
   compiled into it, follows each committee handoff, and checks its balance
@@ -55,10 +56,12 @@
 
 ## Built To Be Checked
 
-- **TLA+ models** of two-phase finality and checkpoint availability, including
-  mutation configs that must fail ([formal/](formal/)), model-checked in CI.
-- **Continuous fuzzing** of consensus messages, P2P framing, sync, the sparse
-  Merkle tree and confidential transactions ([fuzz/](fuzz/)).
+- **TLA+ models** of two-phase finality, checkpoint availability and
+  time-locked release, including mutation configs that must fail
+  ([formal/](formal/)), model-checked in CI.
+- **Continuous fuzzing** of consensus messages and node state, P2P framing,
+  wire codecs, transaction parsing, sync, the sparse Merkle tree, confidential
+  transactions and time-locked settlement ([fuzz/](fuzz/)).
 - **Nightly chaos runs** with crashing and Byzantine validators, plus an
   [adversarial protocol simulator](docs/PROTOCOL_ATTACK_SIMULATOR.md).
 - **Explicit claims.** [docs/REVIEWING.md](docs/REVIEWING.md) lists the safety,
@@ -111,11 +114,12 @@ Mainnet (pre-launch):
 
 Testnet identity and parameters: [testnet/README.md](testnet/README.md).
 
-The codebase consists of:
+## What The Code Implements
 
 - a UTXO ledger
 - two transaction formats, both valid from genesis: `Tx` (transparent) and
-  `TxV2` (confidential-capable), parsed together as `AnyTx`
+  `TxV2` (confidential-capable), parsed together as `AnyTx`, plus `TxTimed`
+  (time-locked sends and sealed data, encrypted until their unlock height)
 - UTXO state (`UtxoSetV2`) holding transparent and confidential outputs
 - a validator committee
 - two-phase quorum finality
@@ -148,10 +152,14 @@ to mainnet; start from an empty data directory.
   - balances verified against validator signatures (see "Read Surfaces")
 - `finalis-cli`
   - command-line wallet, validator registration, genesis tooling and RPC queries
+- `finalis-nodetest`
+  - testnet traffic tool for validators, with its own throwaway wallet; refuses
+    mainnet ([apps/finalis-nodetest/README.md](apps/finalis-nodetest/README.md))
 
 This repository also contains:
 
-- formal TLA+ checkpoint / availability models under [formal/](formal/)
+- formal TLA+ models (two-phase finality, checkpoint availability, time-locked
+  release) under [formal/](formal/)
 - adversarial simulation under [scripts/protocol_attack_sim.py](scripts/protocol_attack_sim.py)
 - C++ fixture export and Python conformance tests under
   [tests/fixtures/](tests/fixtures)
@@ -165,7 +173,8 @@ This repository also contains:
 - prevotes and precommits are bound to `(height, round, transition_id)` in
   separate signing domains, and every signature commits to the chain
   (network id and genesis hash)
-- target block interval: 3 minutes
+- minimum block interval: 3 minutes (blocks never come faster; a stalled
+  round makes them slower)
 - the committee for a height comes from the finalized checkpoint for that
   height's epoch (32 blocks)
 - validator lifecycle changes come only from finalized history
@@ -217,8 +226,9 @@ Confidential transactions use `TxV2`. The wallet supports:
 It also supports transparent sends that are time-locked or locked by height:
 
 - time-locked: recipient and amount stay encrypted on-chain until a chosen height, then the payment
-  opens by itself. The sender's bond comes back if it applies and is forfeited if the sender cancels
-  by spending the coin it depends on
+  opens by itself. The sender's bond comes back if the payment applies, or if the network never
+  opens it (a long lock past its grace period); it is forfeited if the opened payment cannot apply,
+  for example because the sender spent the coin it depends on
 - sealed data: the same, for data instead of a payment
 - height lock: visible at once, but the recipient cannot spend it before a chosen height
 - inheritance lock: the owner can spend at any height, the heir from a chosen height
@@ -312,9 +322,10 @@ publicly over HTTPS behind Nginx, see [DEPLOYMENT.md](DEPLOYMENT.md).
 ### Windows
 
 Installers are published on the
-[releases page](https://github.com/FinalisCore/finalis-core/releases). The
-installer's `Start-Finalis.ps1` starts mainnet; for testnet, see
-[testnet/README.md](testnet/README.md#windows).
+[releases page](https://github.com/FinalisCore/finalis-core/releases). Mainnet
+has not launched, so run a testnet node as shown in
+[testnet/README.md](testnet/README.md#windows). The installer's
+`Start-Finalis.ps1` starts mainnet only and is for use after launch.
 
 ### Mainnet (at launch)
 
@@ -343,11 +354,14 @@ cmake -S . -B build -G Ninja && cmake --build build -j
 
 Dependency notes:
 
-- If `third_party/secp256k1-zkp` is missing, CMake fetches it (network required).
-- For offline builds, provide the vendored tree at the pinned commit and disable auto-fetch:
+- If `third_party/secp256k1-zkp` or `third_party/blst` is missing, CMake fetches it (network
+  required).
+- For offline builds, provide both vendored trees at their pinned commits and disable auto-fetch:
   ```bash
   git clone https://github.com/ElementsProject/secp256k1-zkp.git third_party/secp256k1-zkp
   git -C third_party/secp256k1-zkp checkout 08d1cd0c9c35a5a151ba80c226d49ea949e90374
+  git clone https://github.com/supranational/blst.git third_party/blst
+  git -C third_party/blst checkout 54e6e55674722fc2797ebb4bbb71b26d881eb4b8  # v0.3.17
   cmake -S . -B build -G Ninja -DFINALIS_AUTO_FETCH_DEPS=OFF -DFINALIS_BUILD_NGINX=OFF
   ```
 - On Linux the default build also downloads and compiles a local Nginx (reverse proxy for public
@@ -357,10 +371,11 @@ Dependency notes:
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure -LE known-defect
 ```
 
-Run a subset of the main suite with `FINALIS_TEST_FILTER=<substring> ./build/finalis-tests`.
+`-LE known-defect` skips the reproducers of open defects, which are expected to fail
+([tests/KNOWN_DEFECTS.md](tests/KNOWN_DEFECTS.md)). Run a subset of the main suite with `FINALIS_TEST_FILTER=<substring> ./build/finalis-tests`.
 
 ## Documentation
 

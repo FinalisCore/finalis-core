@@ -148,6 +148,10 @@ TEST(test_genesis_requires_a_proven_unique_bls_key_per_validator) {
   std::swap(bad_pop.initial_validator_bls[0].pop, bad_pop.initial_validator_bls[1].pop);
   ASSERT_TRUE(!genesis::validate_document(bad_pop, mainnet_network(), &err, 4));
   ASSERT_EQ(err, std::string("invalid initial validator bls proof"));
+  auto unset = *base;
+  unset.initial_validator_bls[1].pubkey = crypto::BlsPublicKey{};
+  ASSERT_TRUE(!genesis::validate_document(unset, mainnet_network(), &err, 4));
+  ASSERT_EQ(err, std::string("invalid initial validator bls proof"));
   auto dup = *base;
   dup.initial_validator_bls[3] = dup.initial_validator_bls[0];
   ASSERT_TRUE(!genesis::validate_document(dup, mainnet_network(), &err, 4));

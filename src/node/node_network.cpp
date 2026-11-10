@@ -1560,6 +1560,7 @@ void Node::broadcast_timeout_vote(const TimeoutVote& vote) {
 
 void Node::broadcast_time_signature(const p2p::TimeSignatureMsg& msg) {
   if (safety_storage_failed()) return;  // fail-stop: no consensus message leaves (see node.hpp)
+  if (drop_time_signature_broadcasts_.load()) return;
   if (cfg_.disable_p2p) {
     for_each_local_bus_peer([&](Node* peer) {
       spawn_local_bus_task([peer, msg]() { (void)peer->handle_time_signature(msg, true, 0); });
