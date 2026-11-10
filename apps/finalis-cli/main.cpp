@@ -1487,7 +1487,9 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli address_from_pubkey --hrp <sc> --pubkey <hex32>\n"
      << "  finalis-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>] [--genesis-hash <hex32>]\n"
      << "  finalis-cli build_p2pkh_multi_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> [--prev-txid ...] --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>] [--genesis-hash <hex32>]\n"
-     << "\nUse `finalis-cli help dev` for protocol/admin commands.\n";
+     << "\nStart a node from a snapshot instead of block 0: fast_sync / snapshot_export in `finalis-cli help dev`,\n"
+     << "  guide in docs/operations/FAST_SYNC.md\n"
+     << "Use `finalis-cli help dev` for protocol/admin commands.\n";
 }
 
 void print_dev_cli_help(std::ostream& os) {
@@ -1503,10 +1505,10 @@ void print_dev_cli_help(std::ostream& os) {
      << "  finalis-cli sync_doctor [--db <dir>] [--tail <n>] [--json]  # diagnose stalled sync and certificate gaps\n"
      << "  finalis-cli validator_doctor [--db <dir>] [--file <path>] [--pass <pass>] [--rpc <url>] [--json]\n"
      << "  finalis-cli operator_doctor [--db <dir>] [--file <path>] [--pass <pass>] [--rpc <url>] [--json]  # alias\n"
-     << "  finalis-cli fast_sync [--db <dir>] --snapshot <snapshot.bin> [--force] [--dry-run] [--expected-genesis-hash <hex32>]\n"
+     << "  finalis-cli fast_sync [--db <dir>] --snapshot <snapshot.bin> [--force] [--dry-run] [--expected-genesis-hash <hex32>]  # node stopped; keeps keystore/logs\n"
      << "  finalis-cli --print-logs [--db <dir>] [--service <name>] [--tail <n>]\n"
      << "  finalis-cli print_logs [--db <dir>] [--service <name>] [--tail <n>]\n"
-     << "  finalis-cli snapshot_export --db <dir> --out <snapshot.bin>\n"
+     << "  finalis-cli snapshot_export [--db <dir>] --out <snapshot.bin>  # read-only; the node may keep running\n"
      << "  finalis-cli snapshot_import --db <dir> --in <snapshot.bin> [--expected-genesis-hash <hex32>]  # default: " << net << " genesis\n"
      << "  finalis-cli create_keypair [--seed-hex <32b-hex>] [--hrp " << finalis::keystore::hrp_for_network(net) << "]\n"
      << "  finalis-cli confidential_supply_audit [--db <dir>]   (exit 0=ok 2=unavailable 3=FAILED)\n"

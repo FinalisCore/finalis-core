@@ -99,6 +99,9 @@ curl -s http://127.0.0.1:19544/rpc -d '{"jsonrpc":"2.0","id":1,"method":"get_sta
 Look for `"network_name":"testnet"`, `"chain_id_ok":true` and a `genesis_hash` starting with
 `f68c3097`.
 
+Syncing from block 0 takes a while. To start from a recent height instead, see
+[fast sync from a snapshot](../docs/operations/FAST_SYNC.md).
+
 ## 3. Let other nodes connect to you (recommended)
 
 Your node works without this: it connects out and syncs. Opening **TCP port 19540** lets other nodes

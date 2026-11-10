@@ -52,6 +52,7 @@ explain.
 - [MAINNET.md](MAINNET.md): mainnet access and operations reference
 - [operations/QUICK_START.md](operations/QUICK_START.md): install to validator registration
 - [operations/LIGHTSERVER-OPERATIONS.md](operations/LIGHTSERVER-OPERATIONS.md): lightserver RPC, limits, fail-stop states
+- [operations/FAST_SYNC.md](operations/FAST_SYNC.md): start a node from a snapshot, what it verifies, publishing snapshots
 - [operations/DEVNET-TESTING-GUIDE.md](operations/DEVNET-TESTING-GUIDE.md): local devnet testing
 - [operations/WINDOWS_INSTALLER_BUILD.md](operations/WINDOWS_INSTALLER_BUILD.md): building the Windows installer
 

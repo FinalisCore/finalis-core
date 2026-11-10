@@ -221,7 +221,8 @@ must still be bonded and not `BANNED`, `ONBOARDING` or `EXITING`. Before acknowl
 ### 4.2 Database corruption
 
 Do not restart the node on the same data directory. Keep a copy of it for analysis, then resync
-or restore from a snapshot (`finalis-cli snapshot_import --db <new-dir> --in <snapshot.bin>`). The node aborts on corruption on
+or restore from a snapshot into a new data directory (`finalis-cli fast_sync --db <new-dir> --snapshot <snapshot.bin>`, see
+[FAST_SYNC.md](FAST_SYNC.md)). The node aborts on corruption on
 purpose: if a corrupted record were read as missing, the node's derived state would silently
 diverge.
 
