@@ -7776,6 +7776,46 @@ TEST(test_reject_cross_network_version_handshake) {
   n.stop();
 }
 
+// Feedback 2026-11-10: a peer on other consensus rules is counted, so a halt can be attributed to it.
+TEST(test_reject_other_consensus_rules_is_counted_for_halt_diagnosis) {
+  const std::string base = unique_test_base("/tmp/finalis_it_reject_other_rules");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  cfg.p2p_port = 0;
+  cfg.network.default_seeds.clear();
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init() && "n.init() failed");
+  n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  if (port == 0) {
+    n.stop();
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
+  }
+  ASSERT_EQ(n.status().rejected_consensus_rules, 0u);
+
+  PubKey32 other{};
+  other.fill(0x77);
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+  v.network_id = cfg.network.network_id;
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 321;
+  v.node_software_version = "other-rules-test/0.7;crh=" + std::string(64, '0') +
+                            ";validator_pubkey=" + hex_encode(Bytes(other.begin(), other.end()));
+  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_consensus_rules >= 1; }, std::chrono::seconds(2)));
+  n.stop();
+}
+
 TEST(test_epoch_settlement_pays_onboarding_slice_to_onboarding_pubkey_from_finalized_ticket) {
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_settlement_slice");
   std::filesystem::remove_all(base);
@@ -11955,6 +11995,16 @@ TEST(test_light_verifier_checks_utxos_over_rpc_and_refuses_a_lying_server) {
 
   auto verifier = wallet::LightVerifier::from_genesis(cfg.network, *doc, genesis_hash);
   ASSERT_TRUE(verifier.has_value());
+  {
+    // Feedback 2026-11-10: with no coins listed no proof is checked, so it must not read "verified at height 0",
+    // even when the proof server is unreachable.
+    const auto empty =
+        wallet::verify_claimed_balance(&*verifier, {{"empty", tip, {}}}, {}, {"http://127.0.0.1:1/rpc"});
+    ASSERT_TRUE(!empty.verified);
+    ASSERT_TRUE(empty.nothing_to_prove);
+    ASSERT_EQ(empty.height, 0u);
+    ASSERT_TRUE(empty.misbehaving.empty());
+  }
   const auto& [real_op, real_entry] = *utxos.begin();
   OutPoint unknown_op{};
   unknown_op.txid.fill(0x5a);

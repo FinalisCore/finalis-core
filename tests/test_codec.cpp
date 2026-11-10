@@ -300,6 +300,16 @@ TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback
   snapshot.stun_endpoint_change_hits = 2;
   snapshot.stun_endpoint_change_required_hits = 3;
   snapshot.stun_endpoint_candidate = "198.51.100.9:19440";
+  snapshot.abstaining_heights = {7, 9};
+  snapshot.consensus_state = "WAITING_FOR_QUORUM";
+  snapshot.committee_size = 9;
+  snapshot.quorum_threshold = 7;
+  snapshot.observed_signers = 5;
+  snapshot.halt_reason = "other_consensus_rules";
+  snapshot.missing_signers.resize(4);
+  for (std::size_t i = 0; i < 4; ++i) snapshot.missing_signers[i].fill(static_cast<std::uint8_t>(0x30 + i));
+  snapshot.missing_signers_other_rules = {snapshot.missing_signers[1], snapshot.missing_signers[3]};
+  snapshot.rejected_consensus_rules = 11;
 
   ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
   const auto loaded = db.get_node_runtime_status_snapshot();
@@ -338,6 +348,15 @@ TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback
   ASSERT_EQ(loaded->stun_endpoint_change_hits, snapshot.stun_endpoint_change_hits);
   ASSERT_EQ(loaded->stun_endpoint_change_required_hits, snapshot.stun_endpoint_change_required_hits);
   ASSERT_EQ(loaded->stun_endpoint_candidate, snapshot.stun_endpoint_candidate);
+  ASSERT_TRUE(loaded->abstaining_heights == snapshot.abstaining_heights);
+  ASSERT_EQ(loaded->consensus_state, snapshot.consensus_state);
+  ASSERT_EQ(loaded->committee_size, snapshot.committee_size);
+  ASSERT_EQ(loaded->quorum_threshold, snapshot.quorum_threshold);
+  ASSERT_EQ(loaded->observed_signers, snapshot.observed_signers);
+  ASSERT_EQ(loaded->halt_reason, snapshot.halt_reason);
+  ASSERT_TRUE(loaded->missing_signers == snapshot.missing_signers);
+  ASSERT_TRUE(loaded->missing_signers_other_rules == snapshot.missing_signers_other_rules);
+  ASSERT_EQ(loaded->rejected_consensus_rules, snapshot.rejected_consensus_rules);
 }
 
 TEST(test_adaptive_epoch_telemetry_db_roundtrip_and_summary) {

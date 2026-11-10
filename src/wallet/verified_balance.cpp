@@ -41,6 +41,11 @@ VerifiedBalance verify_claimed_balance(LightVerifier* verifier, const std::vecto
   expected.reserve(distinct.size() + confidential.size());
   for (const auto& [key, claim] : distinct) expected.push_back(key);
   expected.insert(expected.end(), confidential.begin(), confidential.end());
+  if (expected.empty()) {
+    out.nothing_to_prove = true;
+    out.detail = "no coins listed, so nothing was proven";
+    return out;
+  }
 
   std::optional<VerifiedUtxos> proven;
   std::vector<std::string> unavailable;

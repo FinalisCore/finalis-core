@@ -32,6 +32,8 @@ struct VerifiedBalance {
   std::uint64_t height{0};      // finalized height the coins were proven at
   std::string proof_endpoint;   // server whose proofs were accepted
   std::string detail;           // why the balance is unverified
+  // No coin was listed or expected, so no proof was requested: an empty balance, not a verified one.
+  bool nothing_to_prove{false};
   // Verified: every claimed coin proven unspent. Unverified: the first server's list, as reported.
   std::vector<ClaimedUtxo> utxos;
   // Servers caught out: an invalid proof, a coin described wrongly, or a proven coin left out at the

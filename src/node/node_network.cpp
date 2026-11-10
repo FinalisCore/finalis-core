@@ -1197,6 +1197,19 @@ void Node::on_version(int peer_id, const Bytes& payload) {
     return;
   }
   if (ascii_lower(*peer_crh) != local_crh) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++rejected_consensus_rules_;
+      if (peer_validator.has_value()) {
+        if (auto b = hex_decode(*peer_validator); b && b->size() == 32) {
+          PubKey32 pub{};
+          std::copy(b->begin(), b->end(), pub.begin());
+          if (other_rules_validators_seen_ms_.size() < 4096 || other_rules_validators_seen_ms_.count(pub) != 0) {
+            other_rules_validators_seen_ms_[pub] = now_ms();
+          }
+        }
+      }
+    }
     log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=consensus-rules-fingerprint-mismatch peer_crh=" +
              ascii_lower(*peer_crh) + " local_crh=" + local_crh);
     p2p_.disconnect_peer(peer_id);

@@ -197,6 +197,16 @@ std::string Node::consensus_state_locked(std::uint64_t now_ms, std::size_t* obse
   return "FINALIZING";
 }
 
+QuorumDiagnosis Node::quorum_diagnosis_locked(std::uint64_t now_ms) const {
+  const std::uint64_t h = finalized_height_ + 1;
+  const auto committee = committee_for_height_round(h, current_round_);
+  std::set<PubKey32> present = votes_.participants_for(h, current_round_);
+  if (is_committee_member_for(local_key_.public_key, h, current_round_)) present.insert(local_key_.public_key);
+  return detail::diagnose_quorum(consensus_state_locked(now_ms), peer_count(), committee,
+                                 consensus::quorum_threshold(committee.size()), present, other_rules_validators_seen_ms_,
+                                 now_ms);
+}
+
 bool Node::next_height_requires_repair_locked(std::string* reason) const {
   const std::uint64_t height = finalized_height_ + 1;
   if (bootstrap_template_mode_ && finalized_height_ == 0 && bootstrap_validator_pubkey_.has_value()) {

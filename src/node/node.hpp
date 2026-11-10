@@ -161,6 +161,18 @@ struct NodeConfig {
   std::uint64_t availability_min_eligible_operators{1};
 };
 
+// Why the next height is (not) finalizing, for operators. Diagnostic only.
+struct QuorumDiagnosis {
+  std::string state;
+  std::size_t committee_size{0};
+  std::size_t quorum{0};
+  std::size_t observed{0};
+  // Empty while finalizing; else "no_peers", "other_consensus_rules" or "missing_signers".
+  std::string halt_reason;
+  std::vector<PubKey32> missing;              // committee members with no vote seen this round
+  std::vector<PubKey32> missing_other_rules;  // subset recently rejected for different consensus rules
+};
+
 struct NodeStatus {
   std::string network_name;
   std::uint32_t protocol_version{0};
@@ -186,6 +198,10 @@ struct NodeStatus {
   std::size_t outbound_connected{0};
   std::size_t observed_signers{0};
   std::string consensus_state;
+  std::string halt_reason;  // see storage::NodeRuntimeStatusSnapshot::halt_reason
+  std::vector<PubKey32> missing_signers;
+  std::vector<PubKey32> missing_signers_other_rules;
+  std::uint64_t rejected_consensus_rules{0};
   std::string last_bootstrap_source;
   std::uint64_t rejected_network_id{0};
   std::uint64_t rejected_protocol_version{0};
@@ -859,6 +875,7 @@ class Node {
   bool check_sync_transition_rate_limit_locked(int peer_id);
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
+  QuorumDiagnosis quorum_diagnosis_locked(std::uint64_t now_ms) const;
   std::size_t active_operator_count_for_height_locked(std::uint64_t height) const;
   std::uint64_t effective_validator_min_bond_for_height(std::uint64_t height) const;
   std::uint64_t effective_validator_bond_max_for_height(std::uint64_t height) const;
@@ -981,6 +998,10 @@ class Node {
   std::uint64_t rejected_network_id_{0};
   std::uint64_t rejected_protocol_version_{0};
   std::uint64_t rejected_pre_handshake_{0};
+  std::uint64_t rejected_consensus_rules_{0};
+  // Validator pubkeys (as claimed in VERSION) last rejected for a different consensus-rules fingerprint,
+  // with the time seen. Diagnostic only: feeds halt_reason, never consensus.
+  std::map<PubKey32, std::uint64_t> other_rules_validators_seen_ms_;
   std::uint64_t validator_min_bond_{BOND_AMOUNT};
   std::uint64_t validator_bond_min_amount_{BOND_AMOUNT};
   std::uint64_t validator_bond_max_amount_{BOND_AMOUNT};

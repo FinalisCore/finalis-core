@@ -1063,6 +1063,16 @@ Bytes serialize_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& sn
   w.varbytes(Bytes(snapshot.stun_endpoint_candidate.begin(), snapshot.stun_endpoint_candidate.end()));
   w.varint(snapshot.abstaining_heights.size());
   for (const auto h : snapshot.abstaining_heights) w.u64le(h);
+  w.varbytes(Bytes(snapshot.consensus_state.begin(), snapshot.consensus_state.end()));
+  w.u64le(snapshot.committee_size);
+  w.u64le(snapshot.quorum_threshold);
+  w.u64le(snapshot.observed_signers);
+  w.varbytes(Bytes(snapshot.halt_reason.begin(), snapshot.halt_reason.end()));
+  w.varint(snapshot.missing_signers.size());
+  for (const auto& pub : snapshot.missing_signers) w.bytes_fixed(pub);
+  w.varint(snapshot.missing_signers_other_rules.size());
+  for (const auto& pub : snapshot.missing_signers_other_rules) w.bytes_fixed(pub);
+  w.u64le(snapshot.rejected_consensus_rules);
   return w.take();
 }
 
@@ -1284,6 +1294,29 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
           if (!h) return false;
           snapshot.abstaining_heights.push_back(*h);
         }
+        auto state = r.varbytes();
+        auto committee_size = r.u64le();
+        auto quorum = r.u64le();
+        auto observed = r.u64le();
+        auto halt_reason = r.varbytes();
+        if (!state || !committee_size || !quorum || !observed || !halt_reason) return false;
+        snapshot.consensus_state = std::string(state->begin(), state->end());
+        snapshot.committee_size = *committee_size;
+        snapshot.quorum_threshold = *quorum;
+        snapshot.observed_signers = *observed;
+        snapshot.halt_reason = std::string(halt_reason->begin(), halt_reason->end());
+        for (auto* out : {&snapshot.missing_signers, &snapshot.missing_signers_other_rules}) {
+          auto count = r.varint();
+          if (!count || *count > 4096) return false;
+          for (std::uint64_t i = 0; i < *count; ++i) {
+            auto pub = r.bytes_fixed<32>();
+            if (!pub) return false;
+            out->push_back(*pub);
+          }
+        }
+        auto rejected = r.u64le();
+        if (!rejected) return false;
+        snapshot.rejected_consensus_rules = *rejected;
         return r.eof();
       })) {
     return std::nullopt;
