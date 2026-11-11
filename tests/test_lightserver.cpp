@@ -3494,3 +3494,49 @@ TEST(test_broadcast_error_codes_have_plain_language_hints) {
   ASSERT_TRUE(lightserver::broadcast_error_hint("no_such_code").empty());
   ASSERT_TRUE(lightserver::broadcast_error_hint("").empty());
 }
+
+// Signaled activation: get_upgrades lists the UPG: records with the lock-in inputs, counting only
+// signalers that are active operators now.
+TEST(test_lightserver_get_upgrades_lists_records_and_thresholds) {
+  const std::string base = unique_test_base("/tmp/finalis_light_get_upgrades");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(db.set_tip(storage::TipState{40, Hash32{}}));
+  std::vector<PubKey32> ops(4);
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    ops[i].fill(static_cast<std::uint8_t>(0x60 + i));
+    consensus::ValidatorInfo info;
+    info.status = consensus::ValidatorStatus::ACTIVE;
+    info.has_bond = true;
+    info.bonded_amount = 150;
+    ASSERT_TRUE(db.put_validator(ops[i], info));
+  }
+  Hash32 id{};
+  id.fill(0x5D);
+  consensus::UpgradeRecord rec;
+  rec.state = consensus::UpgradeState::Signaling;
+  rec.first_signal_height = 33;
+  PubKey32 gone{};
+  gone.fill(0x7F);  // signaled, no longer an operator: not counted
+  rec.signalers = {ops[0], ops[1], gone};
+  {
+    storage::DB::Batch batch(db);
+    batch.put_upgrade_record(id, rec);
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto resp = ls.handle_rpc_for_test(R"({"jsonrpc":"2.0","id":7,"method":"get_upgrades","params":{}})");
+  ASSERT_TRUE(resp.find("\"next_height\":41,\"active_operators\":4,\"operator_threshold\":3") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"max_open_signals_per_operator\":2") != std::string::npos);
+  ASSERT_TRUE(resp.find("{\"id\":\"" + hex_encode32(id) + "\",\"state\":\"signaling\",\"first_signal_height\":33,") !=
+              std::string::npos);
+  ASSERT_TRUE(resp.find("\"signalers\":2,\"known_by_server\":false}") != std::string::npos);
+}

@@ -3445,6 +3445,51 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     return make_result(id, paged_detailed_history_json(*view, *sh, history, limit, start_after));
   }
 
+  if (*method == "get_upgrades") {
+    // Signaled activation (SIGNALED_ACTIVATION §3.2-3.3): the UPG: records at the finalized tip.
+    const auto tip = view->get_tip();
+    const std::uint64_t next_height = tip ? tip->height + 1 : 1;
+    const auto records = view->load_upgrade_records();
+    const auto known = consensus::known_upgrades(cfg_.network);
+    // Same rule as lock-in (consensus::upgrade_lock_in_inputs), at the next height.
+    consensus::ValidatorRegistry registry;
+    for (const auto& [pub, info] : view->load_validators()) registry.upsert(pub, info);
+    std::set<PubKey32> active_operators;
+    for (const auto& [pub, info] : registry.all()) {
+      if (registry.is_active_for_height(pub, next_height)) active_operators.insert(consensus::canonical_operator_id(pub, info));
+    }
+    const auto state_name = [](consensus::UpgradeState s) {
+      switch (s) {
+        case consensus::UpgradeState::Defined: return "defined";
+        case consensus::UpgradeState::Signaling: return "signaling";
+        case consensus::UpgradeState::LockedIn: return "locked_in";
+        case consensus::UpgradeState::Active: return "active";
+        case consensus::UpgradeState::Failed: return "failed";
+      }
+      return "unknown";
+    };
+    std::ostringstream oss;
+    oss << "{\"next_height\":" << next_height << ",\"active_operators\":" << active_operators.size()
+        << ",\"operator_threshold\":" << consensus::upgrade_operator_threshold(active_operators.size())
+        << ",\"window_blocks\":" << cfg_.network.upgrade_signal_window_blocks
+        << ",\"max_open_signals_per_operator\":" << consensus::kMaxOpenUpgradeSignalsPerOperator << ",\"upgrades\":[";
+    bool first = true;
+    for (const auto& [uid, rec] : records) {
+      std::size_t signalers = 0;
+      for (const auto& op : rec.signalers) signalers += active_operators.count(op);
+      const bool is_known =
+          std::any_of(known.begin(), known.end(), [&](const consensus::UpgradeDef& d) { return d.id == uid; });
+      oss << (first ? "" : ",") << "{\"id\":\"" << hex_encode32(uid) << "\",\"state\":\"" << state_name(rec.state)
+          << "\",\"first_signal_height\":" << rec.first_signal_height
+          << ",\"window_end_height\":" << rec.first_signal_height + cfg_.network.upgrade_signal_window_blocks
+          << ",\"lock_in_height\":" << rec.lock_in_height << ",\"activation_height\":" << rec.activation_height
+          << ",\"signalers\":" << signalers << ",\"known_by_server\":" << (is_known ? "true" : "false") << "}";
+      first = false;
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
+  }
+
   if (*method == "get_committee") {
     auto h = field_u64(params, "height");
     if (!h) return make_error(id, -32602, "missing height");

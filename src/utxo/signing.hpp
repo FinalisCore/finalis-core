@@ -132,6 +132,12 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
                                                    std::uint64_t fee, const Bytes& change_script_pubkey,
                                                    std::string* err = nullptr,
                                                    const ValidatorJoinAdmissionPowBuildContext* pow_ctx = nullptr);
+// Signaled activation (SIGNALED_ACTIVATION §3.2): a zero-value SCUPGSIG output signed by the validator
+// key for `upgrade_id`, the fee and change paid by the funding wallet's inputs.
+std::optional<Tx> build_upgrade_signal_tx(const Hash32& chain_domain, const std::vector<std::pair<OutPoint, TxOut>>& prevs,
+                                          const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
+                                          const Bytes& validator_privkey_32, const Hash32& upgrade_id, std::uint64_t fee,
+                                          const Bytes& change_script_pubkey, std::string* err = nullptr);
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
                                  const Vote& vote_b, std::uint64_t fee = 0, std::string* err = nullptr,
                                  SlashVoteKind kind = SlashVoteKind::Precommit);

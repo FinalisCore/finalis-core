@@ -652,6 +652,46 @@ std::optional<CommitteeBlsKeysView> rpc_get_committee_bls_keys(const std::string
   return out;
 }
 
+std::optional<UpgradesView> rpc_get_upgrades(const std::string& rpc_url, std::string* err) {
+  auto body = http_post_json(rpc_url, R"({"jsonrpc":"2.0","id":1,"method":"get_upgrades","params":{}})", err);
+  if (!body) return std::nullopt;
+  auto root = minijson::parse(*body);
+  if (!root.has_value()) {
+    if (err) *err = "invalid rpc response";
+    return std::nullopt;
+  }
+  const auto* result = result_value(*root, err);
+  const auto* list = result ? result->get("upgrades") : nullptr;
+  const auto next = object_u64(result, "next_height");
+  if (!next || !list || !list->is_array()) {
+    if (err && err->empty()) *err = "invalid get_upgrades response";
+    return std::nullopt;
+  }
+  UpgradesView out;
+  out.next_height = *next;
+  out.active_operators = object_u64(result, "active_operators").value_or(0);
+  out.operator_threshold = object_u64(result, "operator_threshold").value_or(0);
+  out.window_blocks = object_u64(result, "window_blocks").value_or(0);
+  for (const auto& item : list->array_value) {
+    const auto id = hex_decode(object_string(&item, "id").value_or(""));
+    if (!id || id->size() != 32) {
+      if (err) *err = "invalid upgrade id";
+      return std::nullopt;
+    }
+    UpgradeView u;
+    std::copy(id->begin(), id->end(), u.id.begin());
+    u.state = object_string(&item, "state").value_or("");
+    u.first_signal_height = object_u64(&item, "first_signal_height").value_or(0);
+    u.window_end_height = object_u64(&item, "window_end_height").value_or(0);
+    u.lock_in_height = object_u64(&item, "lock_in_height").value_or(0);
+    u.activation_height = object_u64(&item, "activation_height").value_or(0);
+    u.signalers = object_u64(&item, "signalers").value_or(0);
+    u.known_by_server = object_bool(&item, "known_by_server").value_or(false);
+    out.upgrades.push_back(std::move(u));
+  }
+  return out;
+}
+
 std::optional<CommitteeHandoffsView> rpc_get_committee_handoffs(const std::string& rpc_url, std::uint64_t from_epoch_start,
                                                                 std::uint64_t limit, std::string* err) {
   std::ostringstream req;

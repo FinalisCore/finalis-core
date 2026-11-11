@@ -284,6 +284,9 @@ least 3 independent builders sign releases.
    gate). The lightserver relay handshake uses the same fingerprint. Testnet-3's
    `upgrade_signal_window_blocks` is not in the fingerprint: adding it would disconnect this branch's
    binaries from v2.2.14 before the flag day; it is set with the flag-day release.
-6. Node auto-signal, CLI `upgrade_status`.
+6. PARTLY DONE: lightserver `get_upgrades`, CLI `upgrade-status` and manual `upgrade-signal`
+   (funding wallet pays the fee, validator key signs, like `onboarding-register`). Node auto-signal is
+   open: the node holds only the validator key, so it needs a decision on which key pays the fee
+   (see the hand-over proposal).
 7. Integration and chaos tests, TLA+ model, INVARIANTS entry.
 8. Updater (notify mode) and release-manifest signing (§9); separate PRs, not consensus code.

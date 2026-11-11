@@ -1298,6 +1298,43 @@ TEST(test_upgrade_signal_script_roundtrip_and_layout) {
   ASSERT_TRUE(!parse_onboarding_registration_script(s));  // prefixes are not interchangeable
 }
 
+// The CLI's upgrade-signal transaction: a valid SCUPGSIG for the validator, fee and change from the
+// funding wallet; bound to its chain.
+TEST(test_build_upgrade_signal_tx_is_valid_and_chain_bound) {
+  const auto funding = key_from_byte(0x87);
+  const auto validator = key_from_byte(0x88);
+  const OutPoint op{Hash32{0x87}, 0};
+  const auto spk = address::p2pkh_script_pubkey(crypto::h160(Bytes(funding.public_key.begin(), funding.public_key.end())));
+  const TxOut prev{50'000, spk};
+  UtxoSet utxos;
+  utxos.emplace(op, UtxoEntry{prev});
+  Hash32 upgrade{};
+  upgrade.fill(0x6b);
+  std::string err;
+  const auto tx = build_upgrade_signal_tx(test::test_chain_domain(), {{op, prev}}, funding.private_key, validator.public_key,
+                                          validator.private_key, upgrade, 1'000, spk, &err);
+  ASSERT_TRUE(tx.has_value());
+  ASSERT_EQ(tx->outputs.size(), 2u);
+  ASSERT_EQ(tx->outputs[0].value, 0u);
+  UpgradeSignalScriptData parsed{};
+  ASSERT_TRUE(parse_upgrade_signal_script(tx->outputs[0].script_pubkey, &parsed));
+  ASSERT_TRUE(parsed.validator_pubkey == validator.public_key && parsed.upgrade_id == upgrade);
+  ASSERT_EQ(tx->outputs[1].value, 49'000u);
+  SpecialValidationContext admit = test::with_test_chain_identity();
+  admit.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string{}; };
+  ASSERT_TRUE(validate_tx(*tx, 1, utxos, &admit).ok);
+
+  Hash32 other_chain{};
+  other_chain.fill(0x01);
+  const auto foreign = build_upgrade_signal_tx(other_chain, {{op, prev}}, funding.private_key, validator.public_key,
+                                               validator.private_key, upgrade, 1'000, spk, &err);
+  ASSERT_TRUE(foreign.has_value());
+  ASSERT_TRUE(!validate_tx(*foreign, 1, utxos, &admit).ok);
+  ASSERT_TRUE(!build_upgrade_signal_tx(test::test_chain_domain(), {{op, prev}}, funding.private_key, validator.public_key,
+                                       validator.private_key, upgrade, 60'000, spk, &err)
+                   .has_value());
+}
+
 TEST(test_upgrade_signal_validation_checks_value_signature_chain_and_count) {
   const auto sponsor = key_from_byte(0x85);
   const auto validator = key_from_byte(0x86);
