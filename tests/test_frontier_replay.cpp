@@ -4117,3 +4117,102 @@ TEST(test_frontier_apply_records_upgrade_signal_and_commits_it) {
   ASSERT_TRUE(again.upgrade_records == with.upgrade_records);
   ASSERT_EQ(again.state_commitment, with.state_commitment);
 }
+
+// Signaled activation step 3: lock-in is evaluated at each epoch end against committee(L+1). One
+// genesis operator that signals in block 1 of epoch [1,4] locks the upgrade in at h=4 and it governs
+// from the start of epoch L+2 (h=9). Replay reproduces the schedule and its commitment.
+TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later) {
+  auto cfg = live_activation_cfg();  // 4-block epochs
+  const auto validator = key_from_byte(90);
+  const auto from = key_from_byte(91);
+  OutPoint op{};
+  op.txid.fill(0x9b);
+  const auto prev = p2pkh_out_for_pub(from.public_key, 100'000);
+
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(validator.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(validator));
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  state.utxos[op] = UtxoEntry{prev};
+  state.state_commitment = consensus::consensus_state_commitment(cfg, state);
+
+  Hash32 fp{};
+  fp.fill(0x32);
+  const consensus::UpgradeDef def{consensus::upgrade_id("lock-in-test", fp), "lock-in-test", 0, 1'000'000};
+  cfg.upgrade_defs = {def};
+
+  UpgradeSignalScriptData sig_data{};
+  sig_data.validator_pubkey = validator.public_key;
+  sig_data.upgrade_id = def.id;
+  sig_data.sig = *crypto::ed25519_sign(upgrade_signal_message(replay_chain_domain(), def.id, validator.public_key),
+                                       validator.private_key);
+  const auto signal_tx = build_signed_p2pkh_tx_single_input(
+      replay_chain_domain(), op, prev, from.private_key,
+      {TxOut{0, encode_upgrade_signal_script(sig_data)}, p2pkh_out_for_pub(from.public_key, 99'750)});
+  ASSERT_TRUE(signal_tx.has_value());
+
+  std::vector<consensus::CanonicalFrontierRecord> chain;
+  std::vector<consensus::CanonicalDerivedState> states{state};
+  OutPoint cur_op{signal_tx->txid(), 1};
+  TxOut cur_prev = signal_tx->outputs.at(1);
+  std::uint64_t value = cur_prev.value;
+  for (std::uint64_t h = 1; h <= 9; ++h) {
+    const auto& parent = states.back();
+    std::vector<Bytes> ordered;
+    if (h == 1) {
+      ordered.push_back(signal_tx->serialize());
+    } else {
+      value -= 250;
+      ordered.push_back(raw_signed_spend(cur_op, cur_prev, from, from.public_key, value));
+      const auto parsed = Tx::parse(ordered.front());
+      ASSERT_TRUE(parsed.has_value());
+      cur_op = OutPoint{parsed->txid(), 0};
+      cur_prev = parsed->outputs.at(0);
+    }
+    SpecialValidationContext vctx;
+    vctx.network = &cfg.network;
+    vctx.chain_id = &cfg.chain_id;
+    vctx.current_height = h;
+    vctx.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
+      return consensus::upgrade_signal_admission_error(cfg.upgrade_defs, parent.upgrade_records, parent.validators, h, v,
+                                                       id);
+    };
+    chain.push_back(make_frontier_record(parent, ordered, cfg, 0, {}, &vctx));
+    consensus::CanonicalDerivedState next;
+    if (!consensus::apply_frontier_record(cfg, parent, chain.back(), &next, &err)) {
+      throw std::runtime_error("apply h=" + std::to_string(h) + ": " + err);
+    }
+    states.push_back(std::move(next));
+  }
+
+  const auto rec_at = [&](std::uint64_t h) { return states.at(h).upgrade_records.at(def.id); };
+  // States move only at epoch ends: DEFINED until h=4, where it goes straight to LOCKED_IN.
+  ASSERT_TRUE(rec_at(1).state == consensus::UpgradeState::Defined);
+  ASSERT_TRUE(rec_at(3).state == consensus::UpgradeState::Defined);
+  ASSERT_TRUE(rec_at(4).state == consensus::UpgradeState::LockedIn);
+  ASSERT_EQ(rec_at(4).lock_in_height, 4u);
+  ASSERT_EQ(rec_at(4).activation_height, 9u);
+  ASSERT_TRUE(rec_at(7).state == consensus::UpgradeState::LockedIn);
+  ASSERT_TRUE(rec_at(8).state == consensus::UpgradeState::Active);
+  ASSERT_TRUE(rec_at(9) == rec_at(8));
+  ASSERT_TRUE(!consensus::canonical_upgrade_active(states.at(8), def.id, 8));
+  ASSERT_TRUE(consensus::canonical_upgrade_active(states.at(8), def.id, 9));
+  ASSERT_TRUE(consensus::canonical_upgrade_active(states.at(4), def.id, 9));
+  // The transition is committed: the h=4 state differs from the same state still SIGNALING.
+  auto signaling = states.at(4);
+  signaling.upgrade_records = states.at(3).upgrade_records;
+  ASSERT_TRUE(consensus::consensus_post_state_commitment(cfg, signaling) !=
+              consensus::consensus_post_state_commitment(cfg, states.at(4)));
+
+  consensus::CanonicalDerivedState replay = states.front();
+  for (const auto& record : chain) {
+    consensus::CanonicalDerivedState next;
+    ASSERT_TRUE(consensus::apply_frontier_record(cfg, replay, record, &next, &err));
+    replay = std::move(next);
+  }
+  ASSERT_TRUE(replay.upgrade_records == states.back().upgrade_records);
+  ASSERT_EQ(replay.state_commitment, states.back().state_commitment);
+}

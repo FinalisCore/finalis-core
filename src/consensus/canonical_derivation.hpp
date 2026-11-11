@@ -420,4 +420,18 @@ std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivat
                                                           const CanonicalDerivedState& state, std::uint64_t height,
                                                           std::uint32_t round);
 
+// Signaled activation (docs/spec/SIGNALED_ACTIVATION.md §3.3). Inputs of the lock-in check at the end
+// of the epoch before `next_checkpoint`: operators active at its start, its seats, and the minimum
+// eligible operator count when it derived NORMAL (0 in FALLBACK, which never requires availability).
+UpgradeLockInInputs upgrade_lock_in_inputs(const ValidatorRegistry& validators,
+                                           const storage::FinalizedCommitteeCheckpoint& next_checkpoint);
+// Advances every recorded upgrade the binary knows at the epoch end before `next_checkpoint`. Upgrades
+// without a record have no signalers: they cannot lock in, and signals after their timeout are
+// rejected at admission, so no record is created here and the commitment stays unchanged.
+void advance_upgrade_records_at_epoch_end(const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators,
+                                          const storage::FinalizedCommitteeCheckpoint& next_checkpoint,
+                                          UpgradeRecords* records);
+// Whether upgrade `id` governs `height` according to finalized state.
+bool canonical_upgrade_active(const CanonicalDerivedState& state, const Hash32& id, std::uint64_t height);
+
 }  // namespace finalis::consensus

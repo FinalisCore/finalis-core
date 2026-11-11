@@ -5,6 +5,7 @@
 #include <set>
 #include <vector>
 
+#include "consensus/canonical_derivation.hpp"
 #include "consensus/upgrade_activation.hpp"
 #include "consensus/validator_registry.hpp"
 
@@ -241,4 +242,66 @@ TEST(test_upgrade_record_codec_and_commitment_root) {
   b[id].signalers.insert(op(4));
   ASSERT_TRUE(upgrade_records_commitment_root(a) != upgrade_records_commitment_root(b));
   ASSERT_TRUE(known_upgrades(mainnet_network()).empty());  // nothing ships signaled yet
+}
+
+// Step 3: the epoch-end inputs come from the registry and the checkpoint just derived for L+1, and
+// only recorded upgrades the binary knows are advanced.
+TEST(test_upgrade_records_advance_at_epoch_end_from_checkpoint_inputs) {
+  CanonicalDerivationConfig cfg;
+  cfg.network.committee_epoch_blocks = kB;
+  const auto d = def();  // window [33, 353)
+  cfg.upgrade_defs = {d};
+  const auto vr = registry_with_active({op(1), op(2), op(3), op(4), op(5), op(6)}, op(9));
+  const auto id_of = [&](std::uint8_t i) { return canonical_operator_id(op(i), *vr.get(op(i))); };
+
+  storage::FinalizedCommitteeCheckpoint cp;
+  cp.epoch_start_height = 2 * kB + 1;  // judged at the end of epoch [33, 64]
+  for (std::uint8_t i = 1; i <= 4; ++i) cp.ordered_operator_ids.push_back(id_of(i));
+  cp.derivation_mode = storage::FinalizedCommitteeDerivationMode::NORMAL;
+  cp.availability_min_eligible_operators = 7;
+
+  const auto in = upgrade_lock_in_inputs(vr, cp);
+  ASSERT_EQ(in.active_operators.size(), 6u);  // the ONBOARDING validator is not an active operator
+  ASSERT_EQ(in.next_committee_operators.size(), 4u);
+  ASSERT_EQ(in.min_eligible_operators, 7u);
+  auto fallback_cp = cp;
+  fallback_cp.derivation_mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
+  ASSERT_EQ(upgrade_lock_in_inputs(vr, fallback_cp).min_eligible_operators, 0u);
+
+  UpgradeRecord four;
+  four.state = UpgradeState::Signaling;
+  for (std::uint8_t i = 1; i <= 4; ++i) four.signalers.insert(id_of(i));
+
+  // 4 of 6 operators and 4 of 4 seats, but NORMAL needs 7 eligible: not yet.
+  UpgradeRecords records{{d.id, four}};
+  advance_upgrade_records_at_epoch_end(cfg, vr, cp, &records);
+  ASSERT_TRUE(records.at(d.id).state == UpgradeState::Signaling);
+  // FALLBACK has no availability minimum: locks in at 64, active from 97.
+  advance_upgrade_records_at_epoch_end(cfg, vr, fallback_cp, &records);
+  ASSERT_TRUE(records.at(d.id).state == UpgradeState::LockedIn);
+  ASSERT_EQ(records.at(d.id).lock_in_height, 2 * kB);
+  ASSERT_EQ(records.at(d.id).activation_height, 3 * kB + 1);
+  ASSERT_TRUE(!upgrade_active(records.at(d.id), 3 * kB));
+  ASSERT_TRUE(upgrade_active(records.at(d.id), 3 * kB + 1));
+
+  // 3 of 6 operators is below ceil(2/3 * 6) = 4: stays SIGNALING, then FAILED at the timeout.
+  UpgradeRecord three = four;
+  three.signalers.erase(id_of(4));
+  UpgradeRecords short_records{{d.id, three}};
+  advance_upgrade_records_at_epoch_end(cfg, vr, fallback_cp, &short_records);
+  ASSERT_TRUE(short_records.at(d.id).state == UpgradeState::Signaling);
+  auto at_timeout = fallback_cp;
+  at_timeout.epoch_start_height = 11 * kB + 1;  // 353 >= signal_timeout
+  advance_upgrade_records_at_epoch_end(cfg, vr, at_timeout, &short_records);
+  ASSERT_TRUE(short_records.at(d.id).state == UpgradeState::Failed);
+
+  // A record for an upgrade this binary does not know is left as is; none is ever created.
+  auto unknown_cfg = cfg;
+  unknown_cfg.upgrade_defs.clear();
+  UpgradeRecords untouched{{d.id, four}};
+  advance_upgrade_records_at_epoch_end(unknown_cfg, vr, fallback_cp, &untouched);
+  ASSERT_TRUE(untouched.at(d.id) == four);
+  UpgradeRecords none;
+  advance_upgrade_records_at_epoch_end(cfg, vr, fallback_cp, &none);
+  ASSERT_TRUE(none.empty());
 }

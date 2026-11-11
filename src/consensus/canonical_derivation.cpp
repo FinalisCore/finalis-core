@@ -2041,7 +2041,9 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
       if (error && error->empty()) *error = "checkpoint-schedule-validation-failed";
       return false;
     }
-    next.finalized_committee_checkpoints[next_epoch_start] = checkpoint;
+    // Signaled activation §3.3: lock-in is judged against committee(L+1), derived just above.
+    advance_upgrade_records_at_epoch_end(cfg, next.validators, checkpoint, &next.upgrade_records);
+    next.finalized_committee_checkpoints[next_epoch_start] = std::move(checkpoint);
   }
   prune_consensus_history(cfg, &next);
   // verify_frontier_record_against_state checked next_state_root against the settled UTXO set,
@@ -3002,6 +3004,44 @@ std::vector<PubKey32> checkpoint_committee_for_round(const storage::FinalizedCom
     return {*fallback};
   }
   return {};
+}
+
+
+UpgradeLockInInputs upgrade_lock_in_inputs(const ValidatorRegistry& validators,
+                                           const storage::FinalizedCommitteeCheckpoint& next_checkpoint) {
+  UpgradeLockInInputs in;
+  for (const auto& [pub, info] : validators.all()) {
+    if (validators.is_active_for_height(pub, next_checkpoint.epoch_start_height)) {
+      in.active_operators.insert(canonical_operator_id(pub, info));
+    }
+  }
+  in.next_committee_operators = next_checkpoint.ordered_operator_ids;
+  // Excluding non-signalers must not drop a NORMAL derivation below its minimum. FALLBACK ignores
+  // availability already; there the operator threshold keeps the candidate set non-empty.
+  if (next_checkpoint.derivation_mode == storage::FinalizedCommitteeDerivationMode::NORMAL) {
+    in.min_eligible_operators = static_cast<std::size_t>(next_checkpoint.availability_min_eligible_operators);
+  }
+  return in;
+}
+
+void advance_upgrade_records_at_epoch_end(const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators,
+                                          const storage::FinalizedCommitteeCheckpoint& next_checkpoint,
+                                          UpgradeRecords* records) {
+  if (records == nullptr || records->empty() || next_checkpoint.epoch_start_height <= 1) return;
+  const auto epoch_blocks = std::max<std::uint64_t>(1, cfg.network.committee_epoch_blocks);
+  const auto epoch_end_height = next_checkpoint.epoch_start_height - 1;
+  std::optional<UpgradeLockInInputs> in;
+  for (const auto& def : cfg.upgrade_defs) {
+    const auto it = records->find(def.id);
+    if (it == records->end()) continue;
+    if (!in.has_value()) in = upgrade_lock_in_inputs(validators, next_checkpoint);
+    advance_upgrade_at_epoch_end(def, &it->second, epoch_end_height, epoch_blocks, *in);
+  }
+}
+
+bool canonical_upgrade_active(const CanonicalDerivedState& state, const Hash32& id, std::uint64_t height) {
+  const auto it = state.upgrade_records.find(id);
+  return it != state.upgrade_records.end() && upgrade_active(it->second, height);
 }
 
 }  // namespace finalis::consensus

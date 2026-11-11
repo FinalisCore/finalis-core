@@ -248,7 +248,11 @@ least 3 independent builders sign releases.
 2. DONE: `SCUPGSIG` output (2a: codec, stateless validation, activation height; 2b: stateful
    admission in derivation, mempool and lightserver, `upgrade_records` in state, commitment once
    non-empty, `UPG:` rows, snapshot). The known-upgrade table is empty, so nothing changes yet.
-3. Lock-in evaluation at epoch end in canonical derivation; `upgrade_active(id, h)`.
+3. DONE: lock-in evaluation at epoch end in canonical derivation, after committee(L+1) is derived
+   (`advance_upgrade_records_at_epoch_end`); `canonical_upgrade_active(state, id, h)`. States move only
+   at epoch ends, so a record created by the first signal stays `DEFINED` until the next one. The
+   minimum-eligible condition of §3.4.1 applies when committee(L+1) derived NORMAL; in FALLBACK the
+   operator threshold alone keeps the candidate set non-empty.
 4. Candidate filtering and emergency-recovery skip (§3.4.1); derivation spec update.
 5. Height-aware rules fingerprint, `upg=` handshake tag, old-binary `upgrade_required`, `get_status`.
 6. Node auto-signal, CLI `upgrade_status`.
