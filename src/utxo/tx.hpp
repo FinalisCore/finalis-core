@@ -414,13 +414,16 @@ struct OnboardingRegistrationScriptData {
 };
 
 // SCUPGSIG (signaled activation, docs/spec/SIGNALED_ACTIVATION.md): prefix(8) | validator_pubkey(32) |
-// upgrade_id(32) | sig(64) = 136 bytes, zero value. sig is the validator key's Ed25519 signature of
-// upgrade_signal_message (chain domain, upgrade id, validator key).
-inline constexpr std::size_t kUpgradeSignalScriptBytes = 8 + 32 + 32 + 64;
+// upgrade_id(32) | expiry_height(u64le) | sig(64) = 144 bytes, zero value. sig is the validator key's
+// Ed25519 signature of upgrade_signal_message (chain domain, upgrade id, validator key, expiry). The
+// only output of a transaction without inputs or fee; admissible at heights h with
+// h <= expiry_height <= h + committee_epoch_blocks, so an old signature cannot be replayed.
+inline constexpr std::size_t kUpgradeSignalScriptBytes = 8 + 32 + 32 + 8 + 64;
 
 struct UpgradeSignalScriptData {
   PubKey32 validator_pubkey{};
   Hash32 upgrade_id{};
+  std::uint64_t expiry_height{0};
   Sig64 sig{};
 };
 

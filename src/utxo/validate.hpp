@@ -107,8 +107,13 @@ Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, cons
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
                                          const crypto::BlsPublicKey& bls_pubkey);
 // What an SCUPGSIG signature covers. The chain domain binds it to one chain: a testnet signal is no
-// signal on mainnet.
-Bytes upgrade_signal_message(const Hash32& chain_domain, const Hash32& upgrade_id, const PubKey32& validator_pubkey);
+// signal on mainnet. The expiry height bounds where it is admissible, so it cannot be replayed later.
+Bytes upgrade_signal_message(const Hash32& chain_domain, const Hash32& upgrade_id, const PubKey32& validator_pubkey,
+                             std::uint64_t expiry_height);
+// True when tx has the shape of a fee-free upgrade signal: no inputs, one SCUPGSIG output (SIGNALED_ACTIVATION
+// §3.2). Shape only; validate_tx checks zero value, signature, expiry and admission.
+bool is_upgrade_signal_tx(const Tx& tx);
+bool is_upgrade_signal_tx(const AnyTx& tx);
 Hash32 admission_pow_chain_id_hash(const ChainId& chain_id);
 Hash32 onboarding_registration_commitment(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
 Hash32 join_request_input_commitment(const std::vector<OutPoint>& inputs);

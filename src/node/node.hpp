@@ -105,6 +105,9 @@ struct NodeConfig {
   // next_state_commitment; otherwise replay from genesis. --no-fast-start always replays.
   bool fast_start{true};
   bool reindex_on_start{true};
+  // Signaled activation (SIGNALED_ACTIVATION §3.2): sign and submit a fee-free upgrade signal for each
+  // upgrade this binary implements, from its signal_start on. --no-upgrade-signal turns it off.
+  bool auto_upgrade_signal{true};
   std::uint64_t startup_frontier_repair_max_rollback{10'000};
   std::uint32_t startup_frontier_repair_adaptive_percent{5};
   std::uint64_t startup_frontier_repair_absolute_max_rollback{50'000};
@@ -375,6 +378,7 @@ class Node {
   // Signaled activation: replaces the in-memory UPG: records and, if given, this binary's upgrade table.
   void set_upgrade_state_for_test(const consensus::UpgradeRecords& records,
                                   std::optional<std::vector<consensus::UpgradeDef>> known);
+  consensus::UpgradeRecords upgrade_records_for_test() const;
   bool abstaining_at_height_for_test(std::uint64_t height) const;
   QuorumDiagnosis quorum_diagnosis_for_test() const;
   consensus::ConfidentialSupplyAuditResult confidential_supply_audit_for_test();
@@ -505,6 +509,8 @@ class Node {
       const consensus::EpochCommitteeSnapshot& snapshot) const;
   void rebuild_epoch_committee_state_locked(std::uint64_t epoch, const char* reason, bool log_summary);
   void maybe_finalize_epoch_committees_locked();
+  // Submits this validator's fee-free upgrade signals to the mempool (cfg_.auto_upgrade_signal).
+  void maybe_auto_signal_upgrades_locked();
   void maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms);
   void request_epoch_tickets(int peer_id, std::uint64_t epoch, std::uint32_t max_tickets);
   std::optional<consensus::EpochTicket> mine_local_epoch_ticket_locked(std::uint64_t height) const;

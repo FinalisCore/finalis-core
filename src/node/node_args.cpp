@@ -241,6 +241,8 @@ static std::optional<NodeConfig> parse_args_unchecked(int argc, char** argv, std
       cfg.fast_start = true;
     } else if (a == "--no-fast-start") {
       cfg.fast_start = false;
+    } else if (a == "--no-upgrade-signal") {
+      cfg.auto_upgrade_signal = false;
     } else if (a == "--no-reindex") {
       cfg.reindex_on_start = false;
     } else if (a == "--seeds") {

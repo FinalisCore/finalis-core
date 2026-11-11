@@ -1491,7 +1491,7 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli upgrade-status [--rpc <url>]\n"
-     << "  finalis-cli upgrade-signal --upgrade-id <hex32> [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
+     << "  finalis-cli upgrade-signal --upgrade-id <hex32> [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--pass <pass>]   (fee-free; the node signals by itself unless --no-upgrade-signal)\n"
      << "  finalis-cli validator_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_explain [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass> | --validator <pubkey hex>]  # the reward formula with your numbers\n"
      << "  finalis-cli economics_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
@@ -4606,19 +4606,15 @@ int run_cli(int argc, char** argv) {
   if (cmd == "upgrade-signal") {
     std::string db_path = default_db_path();
     std::string file_path = default_validator_key_path();
-    std::string validator_file_path;
     std::string passphrase;
     std::string rpc_url = default_rpc_url();
     std::string upgrade_hex;
-    std::uint64_t fee = finalis::DEFAULT_WALLET_SEND_FEE_UNITS;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--db" && i + 1 < argc) db_path = argv[++i];
-      else if (a == "--file" && i + 1 < argc) file_path = argv[++i];
-      else if (a == "--validator-file" && i + 1 < argc) validator_file_path = argv[++i];
+      else if ((a == "--file" || a == "--validator-file") && i + 1 < argc) file_path = argv[++i];
       else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
       else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
-      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (a == "--upgrade-id" && i + 1 < argc) upgrade_hex = argv[++i];
     }
     const auto upgrade_bytes = decode_hex32(upgrade_hex);
@@ -4630,61 +4626,30 @@ int run_cli(int argc, char** argv) {
     std::copy(upgrade_bytes->begin(), upgrade_bytes->end(), upgrade_id.begin());
     db_path = expand_user(db_path);
     file_path = expand_user(file_path);
-    if (validator_file_path.empty()) validator_file_path = file_path;
-    validator_file_path = expand_user(validator_file_path);
 
     finalis::storage::DB db;
     if (!db.open_readonly(db_path) && !db.open(db_path)) {
       std::cerr << "failed to open db\n";
       return 1;
     }
-    finalis::keystore::ValidatorKey funding_key;
-    std::string err;
-    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &funding_key, &err)) {
-      std::cerr << "upgrade-signal failed to load funding key: " << err << "\n";
-      return 1;
-    }
     finalis::keystore::ValidatorKey validator_key;
-    if (!finalis::keystore::load_validator_keystore(validator_file_path, passphrase, &validator_key, &err)) {
+    std::string err;
+    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &validator_key, &err)) {
       std::cerr << "upgrade-signal failed to load validator key: " << err << "\n";
       return 1;
     }
-    if (funding_key.network_name != validator_key.network_name) {
-      std::cerr << "upgrade-signal failed: funding wallet targets " << funding_key.network_name
-                << " but validator key targets " << validator_key.network_name << "\n";
-      return 1;
-    }
-    const auto& network = finalis::network_by_name(funding_key.network_name);
+    const auto& network = finalis::network_by_name(validator_key.network_name);
     const auto chain_id = finalis::ChainId::from_config_and_db(network, db);
-
-    std::string utxo_err;
-    const auto available_prevs =
-        positive_value_utxos(spendable_utxos_for_wallet_address(db, funding_key.address, &utxo_err));
-    if (!utxo_err.empty()) {
-      std::cerr << "upgrade-signal failed to resolve funding wallet address: " << utxo_err << "\n";
+    const auto status = finalis::lightserver::rpc_get_status(rpc_url, &err);
+    if (!status.has_value()) {
+      std::cerr << "upgrade-signal failed to read the finalized height: " << err << "\n";
       return 1;
     }
-    std::vector<std::pair<finalis::OutPoint, finalis::TxOut>> selected_prevs;
-    std::uint64_t selected_units = 0;
-    for (const auto& prev : finalis::deterministic_largest_first_prevs(available_prevs)) {
-      selected_prevs.push_back(prev);
-      selected_units += prev.second.value;
-      if (selected_units >= fee) break;
-    }
-    if (selected_units < fee) {
-      std::cerr << "upgrade-signal failed: available finalized balance is too small to cover fee\n";
-      return 1;
-    }
-    auto own_decoded = finalis::address::decode(funding_key.address);
-    if (!own_decoded.has_value()) {
-      std::cerr << "upgrade-signal failed: invalid funding wallet address\n";
-      return 1;
-    }
-    auto tx = finalis::build_upgrade_signal_tx(
-        finalis::consensus_chain_domain(network, chain_id), selected_prevs,
-        finalis::Bytes(funding_key.privkey.begin(), funding_key.privkey.end()), validator_key.pubkey,
-        finalis::Bytes(validator_key.privkey.begin(), validator_key.privkey.end()), upgrade_id, fee,
-        finalis::address::p2pkh_script_pubkey(own_decoded->pubkey_hash), &err);
+    // Fee-free and input-less (SIGNALED_ACTIVATION §3.2); valid for about one epoch from the finalized tip.
+    const std::uint64_t expiry_height = status->tip_height + network.committee_epoch_blocks;
+    auto tx = finalis::build_upgrade_signal_tx(finalis::consensus_chain_domain(network, chain_id), validator_key.pubkey,
+                                               finalis::Bytes(validator_key.privkey.begin(), validator_key.privkey.end()),
+                                               upgrade_id, expiry_height, &err);
     if (!tx.has_value()) {
       std::cerr << "upgrade-signal build failed: " << err << "\n";
       return 1;
@@ -4692,8 +4657,7 @@ int run_cli(int argc, char** argv) {
     auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, tx->serialize(), &err);
     std::cout << "upgrade_id=" << finalis::hex_encode32(upgrade_id) << "\n";
     std::cout << "validator_address=" << validator_key.address << "\n";
-    std::cout << "funding_address=" << funding_key.address << "\n";
-    std::cout << "fee=" << fee << "\n";
+    std::cout << "expiry_height=" << expiry_height << "\n";
     std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
     if (!err.empty() && result.outcome == finalis::lightserver::BroadcastOutcome::Ambiguous) {
       std::cout << "accepted=unknown\n";

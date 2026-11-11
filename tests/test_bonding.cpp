@@ -1282,12 +1282,17 @@ TEST(test_upgrade_signal_script_roundtrip_and_layout) {
   UpgradeSignalScriptData d{};
   d.validator_pubkey.fill(0x11);
   d.upgrade_id.fill(0x22);
+  d.expiry_height = 0x0102030405060708ULL;
   d.sig.fill(0x33);
   const auto s = encode_upgrade_signal_script(d);
   ASSERT_EQ(s.size(), kUpgradeSignalScriptBytes);
+  ASSERT_EQ(kUpgradeSignalScriptBytes, 144u);
+  ASSERT_EQ(s[72], 0x08);  // expiry, little-endian, after prefix | validator | id
+  ASSERT_EQ(s[79], 0x01);
   UpgradeSignalScriptData back{};
   ASSERT_TRUE(parse_upgrade_signal_script(s, &back));
   ASSERT_TRUE(back.validator_pubkey == d.validator_pubkey && back.upgrade_id == d.upgrade_id && back.sig == d.sig);
+  ASSERT_EQ(back.expiry_height, d.expiry_height);
   ASSERT_TRUE(is_supported_base_layer_output_script(s));
   auto shorter = s;
   shorter.pop_back();
@@ -1298,105 +1303,146 @@ TEST(test_upgrade_signal_script_roundtrip_and_layout) {
   ASSERT_TRUE(!parse_onboarding_registration_script(s));  // prefixes are not interchangeable
 }
 
-// The CLI's upgrade-signal transaction: a valid SCUPGSIG for the validator, fee and change from the
-// funding wallet; bound to its chain.
+// The node's and the CLI's upgrade signal: a fee-free tx without inputs, one SCUPGSIG output signed by the
+// validator key, bound to its chain and to an expiry height; it creates no UTXO.
 TEST(test_build_upgrade_signal_tx_is_valid_and_chain_bound) {
-  const auto funding = key_from_byte(0x87);
   const auto validator = key_from_byte(0x88);
-  const OutPoint op{Hash32{0x87}, 0};
-  const auto spk = address::p2pkh_script_pubkey(crypto::h160(Bytes(funding.public_key.begin(), funding.public_key.end())));
-  const TxOut prev{50'000, spk};
-  UtxoSet utxos;
-  utxos.emplace(op, UtxoEntry{prev});
   Hash32 upgrade{};
   upgrade.fill(0x6b);
   std::string err;
-  const auto tx = build_upgrade_signal_tx(test::test_chain_domain(), {{op, prev}}, funding.private_key, validator.public_key,
-                                          validator.private_key, upgrade, 1'000, spk, &err);
+  const auto tx = build_upgrade_signal_tx(test::test_chain_domain(), validator.public_key, validator.private_key, upgrade,
+                                          40, &err);
   ASSERT_TRUE(tx.has_value());
-  ASSERT_EQ(tx->outputs.size(), 2u);
+  ASSERT_TRUE(tx->inputs.empty());
+  ASSERT_EQ(tx->outputs.size(), 1u);
   ASSERT_EQ(tx->outputs[0].value, 0u);
+  ASSERT_TRUE(is_upgrade_signal_tx(*tx));
   UpgradeSignalScriptData parsed{};
   ASSERT_TRUE(parse_upgrade_signal_script(tx->outputs[0].script_pubkey, &parsed));
   ASSERT_TRUE(parsed.validator_pubkey == validator.public_key && parsed.upgrade_id == upgrade);
-  ASSERT_EQ(tx->outputs[1].value, 49'000u);
+  ASSERT_EQ(parsed.expiry_height, 40u);
   SpecialValidationContext admit = test::with_test_chain_identity();
+  admit.current_height = 20;
   admit.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string{}; };
-  ASSERT_TRUE(validate_tx(*tx, 1, utxos, &admit).ok);
+  const UtxoSet empty;
+  const auto ok = validate_tx(*tx, 1, empty, &admit);
+  ASSERT_TRUE(ok.ok);
+  ASSERT_EQ(ok.fee, 0u);
+
+  UtxoSetV2 utxos;
+  apply_any_tx_to_utxo(AnyTx{*tx}, utxos);
+  ASSERT_TRUE(utxos.empty());  // never spendable, so never a UTXO
 
   Hash32 other_chain{};
   other_chain.fill(0x01);
-  const auto foreign = build_upgrade_signal_tx(other_chain, {{op, prev}}, funding.private_key, validator.public_key,
-                                               validator.private_key, upgrade, 1'000, spk, &err);
+  const auto foreign = build_upgrade_signal_tx(other_chain, validator.public_key, validator.private_key, upgrade, 40, &err);
   ASSERT_TRUE(foreign.has_value());
-  ASSERT_TRUE(!validate_tx(*foreign, 1, utxos, &admit).ok);
-  ASSERT_TRUE(!build_upgrade_signal_tx(test::test_chain_domain(), {{op, prev}}, funding.private_key, validator.public_key,
-                                       validator.private_key, upgrade, 60'000, spk, &err)
-                   .has_value());
+  ASSERT_TRUE(!validate_tx(*foreign, 1, empty, &admit).ok);
 }
 
-TEST(test_upgrade_signal_validation_checks_value_signature_chain_and_count) {
+TEST(test_upgrade_signal_validation_checks_value_signature_chain_expiry_and_shape) {
   const auto sponsor = key_from_byte(0x85);
   const auto validator = key_from_byte(0x86);
-  const OutPoint spend_op{Hash32{0x85}, 0};
-  const TxOut prev_out{
-      1'000'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
-  UtxoSet utxos;
-  utxos.emplace(spend_op, UtxoEntry{prev_out});
   Hash32 upgrade{};
   upgrade.fill(0x5a);
-  const auto signal = [&](const Hash32& domain, std::uint64_t value = 0) {
+  const std::uint64_t height = 100;
+  const std::uint64_t epoch = test::test_network().committee_epoch_blocks;
+  const auto signal_out = [&](const Hash32& domain, std::uint64_t expiry, std::uint64_t value = 0,
+                              const Bytes* signer = nullptr) {
     UpgradeSignalScriptData d{};
     d.validator_pubkey = validator.public_key;
     d.upgrade_id = upgrade;
-    d.sig = *crypto::ed25519_sign(upgrade_signal_message(domain, upgrade, validator.public_key), validator.private_key);
+    d.expiry_height = expiry;
+    d.sig = *crypto::ed25519_sign(upgrade_signal_message(domain, upgrade, validator.public_key, expiry),
+                                  signer ? *signer : validator.private_key);
     return TxOut{value, encode_upgrade_signal_script(d)};
   };
+  const UtxoSet empty;
   const auto validate_outputs = [&](std::vector<TxOut> outs, const SpecialValidationContext* ctx) {
-    outs.push_back(TxOut{prev_out.value - 1000, prev_out.script_pubkey});
-    auto tx = build_signed_p2pkh_tx_single_input(test::test_chain_domain(), spend_op, prev_out, sponsor.private_key, outs);
-    ASSERT_TRUE(tx.has_value());
-    return validate_tx(*tx, 1, utxos, ctx);
+    Tx tx;
+    tx.outputs = std::move(outs);
+    return validate_tx(tx, 1, empty, ctx);
   };
   const auto domain = test::test_chain_domain();
   // Stateful admission is the caller's (consensus::upgrade_signal_admission_error); here: always admissible.
   SpecialValidationContext admit = test::with_test_chain_identity();
+  admit.current_height = height;
   admit.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string{}; };
   {
-    auto none = validate_outputs({signal(domain)}, test::test_validation_ctx());
-    ASSERT_TRUE(!none.ok);
-    ASSERT_EQ(none.error, std::string("upgrade signals not accepted here"));
+    SpecialValidationContext none = admit;
+    none.upgrade_signal_admission = nullptr;
+    auto r = validate_outputs({signal_out(domain, height)}, &none);
+    ASSERT_TRUE(!r.ok);
+    ASSERT_EQ(r.error, std::string("upgrade signals not accepted here"));
     SpecialValidationContext refuse = admit;
     refuse.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string("duplicate-signal"); };
-    auto dup = validate_outputs({signal(domain)}, &refuse);
+    auto dup = validate_outputs({signal_out(domain, height)}, &refuse);
     ASSERT_TRUE(!dup.ok);
     ASSERT_EQ(dup.error, std::string("upgrade signal rejected: duplicate-signal"));
   }
-  ASSERT_TRUE(validate_outputs({signal(domain)}, &admit).ok);
+  ASSERT_TRUE(validate_outputs({signal_out(domain, height)}, &admit).ok);
+  ASSERT_TRUE(validate_outputs({signal_out(domain, height + epoch)}, &admit).ok);
 
-  auto r = validate_outputs({signal(domain, 1)}, &admit);
+  // Expiry: an old signature cannot be replayed, and none is valid for longer than an epoch.
+  auto r = validate_outputs({signal_out(domain, height - 1)}, &admit);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("upgrade signal expired"));
+  r = validate_outputs({signal_out(domain, height + epoch + 1)}, &admit);
+  ASSERT_TRUE(!r.ok);
+  ASSERT_EQ(r.error, std::string("upgrade signal expiry too far ahead"));
+  // The expiry is signed: changing it breaks the signature.
+  {
+    auto out = signal_out(domain, height + 1);
+    UpgradeSignalScriptData d{};
+    ASSERT_TRUE(parse_upgrade_signal_script(out.script_pubkey, &d));
+    d.expiry_height = height + 2;
+    r = validate_outputs({TxOut{0, encode_upgrade_signal_script(d)}}, &admit);
+    ASSERT_TRUE(!r.ok);
+    ASSERT_EQ(r.error, std::string("upgrade signal signature invalid"));
+  }
+
+  r = validate_outputs({signal_out(domain, height, 1)}, &admit);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("SCUPGSIG output must have zero value"));
 
   // Signed for another chain: not a signal here.
   auto other_chain = domain;
   other_chain[0] ^= 1;
-  r = validate_outputs({signal(other_chain)}, &admit);
+  r = validate_outputs({signal_out(other_chain, height)}, &admit);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("upgrade signal signature invalid"));
 
   // Signed by someone else for this validator.
-  UpgradeSignalScriptData forged{};
-  forged.validator_pubkey = validator.public_key;
-  forged.upgrade_id = upgrade;
-  forged.sig = *crypto::ed25519_sign(upgrade_signal_message(domain, upgrade, validator.public_key), sponsor.private_key);
-  r = validate_outputs({TxOut{0, encode_upgrade_signal_script(forged)}}, &admit);
+  r = validate_outputs({signal_out(domain, height, 0, &sponsor.private_key)}, &admit);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("upgrade signal signature invalid"));
 
-  r = validate_outputs({signal(domain), signal(domain)}, &admit);
+  // Only as the single output of a tx without inputs: not two, not next to other outputs, not funded.
+  r = validate_outputs({signal_out(domain, height), signal_out(domain, height)}, &admit);
   ASSERT_TRUE(!r.ok);
-  ASSERT_EQ(r.error, std::string("multiple SCUPGSIG outputs not allowed"));
+  ASSERT_EQ(r.error, std::string("tx inputs/outputs empty"));
+  {
+    const OutPoint spend_op{Hash32{0x85}, 0};
+    const TxOut prev_out{
+        1'000'000, address::p2pkh_script_pubkey(crypto::h160(Bytes(sponsor.public_key.begin(), sponsor.public_key.end())))};
+    UtxoSet utxos;
+    utxos.emplace(spend_op, UtxoEntry{prev_out});
+    auto funded = build_signed_p2pkh_tx_single_input(
+        test::test_chain_domain(), spend_op, prev_out, sponsor.private_key,
+        {signal_out(domain, height), TxOut{prev_out.value - 1000, prev_out.script_pubkey}});
+    ASSERT_TRUE(funded.has_value());
+    r = validate_tx(*funded, 1, utxos, &admit);
+    ASSERT_TRUE(!r.ok);
+    ASSERT_EQ(r.error, std::string("SCUPGSIG must be the only output of a tx without inputs"));
+  }
+  {
+    Tx stamped;
+    stamped.outputs = {signal_out(domain, height)};
+    stamped.hashcash = TxHashcashStamp{};
+    r = validate_tx(stamped, 1, empty, &admit);
+    ASSERT_TRUE(!r.ok);
+    ASSERT_EQ(r.error, std::string("upgrade signal tx carries a hashcash stamp"));
+  }
 
   // Below the network's activation height a signal is rejected, as an older release rejects it.
   NetworkConfig late = test::test_network();
@@ -1404,17 +1450,17 @@ TEST(test_upgrade_signal_validation_checks_value_signature_chain_and_count) {
   SpecialValidationContext before = admit;
   before.network = &late;
   before.current_height = 99;
-  r = validate_outputs({signal(domain)}, &before);
+  r = validate_outputs({signal_out(domain, 99)}, &before);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("SCUPGSIG not active on this network yet"));
   before.current_height = 100;
-  ASSERT_TRUE(validate_outputs({signal(domain)}, &before).ok);
+  ASSERT_TRUE(validate_outputs({signal_out(domain, 100)}, &before).ok);
   ASSERT_EQ(testnet_network().upgrade_signal_activation_height, std::numeric_limits<std::uint64_t>::max());
   ASSERT_EQ(mainnet_network().upgrade_signal_activation_height, 0u);
 
   SpecialValidationContext timed = admit;
   timed.timed_body = true;
-  r = validate_outputs({signal(domain)}, &timed);
+  r = validate_outputs({signal_out(domain, height)}, &timed);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("SCUPGSIG not allowed in a timed body"));
 }

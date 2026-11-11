@@ -324,7 +324,7 @@ bool Node::handle_tx(const AnyTx& tx, bool from_network, int from_peer_id, std::
       }
       return reject(err);
     }
-    if (fee < min_relay_fee) {
+    if (fee < min_relay_fee && !is_upgrade_signal_tx(tx)) {
       log_line("tx-reject txid=" + hex_encode32(txid_any(tx)) + " reason=fee-below-min-relay");
       return reject("fee below min relay fee");
     }

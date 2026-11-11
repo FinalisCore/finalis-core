@@ -7886,6 +7886,37 @@ TEST(test_node_upgrade_activation_changes_fingerprint_and_stops_signing_when_uni
   n.stop();
 }
 
+// Signaled activation §3.2: a validator node signals each upgrade its binary implements by itself, fee-free
+// (no inputs, nothing to fund), and the signal is finalized and recorded once. --no-upgrade-signal opts out.
+TEST(test_node_auto_signals_known_upgrade_fee_free_and_opt_out_holds) {
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_auto_upgrade_signal"), 2, 2, 2,
+                              [](node::NodeConfig& cfg) { cfg.auto_upgrade_signal = cfg.node_id != 1; });
+  auto& nodes = cluster.nodes;
+  Hash32 fp{};
+  fp.fill(0x4D);
+  const consensus::UpgradeDef def{consensus::upgrade_id("auto-signal-it", fp), "auto-signal-it", 0};
+  for (auto& n : nodes) n->set_upgrade_state_for_test({}, std::vector<consensus::UpgradeDef>{def});
+
+  const auto signalers_on = [&](std::size_t i) -> std::size_t {
+    const auto records = nodes[i]->upgrade_records_for_test();
+    const auto it = records.find(def.id);
+    return it == records.end() ? 0 : it->second.signalers.size();
+  };
+  const bool recorded = wait_for([&]() { return signalers_on(0) == 1 && signalers_on(1) == 1; }, ci_timeout_seconds(120));
+  if (!recorded) {
+    throw std::runtime_error("signal not recorded: node0 h=" + std::to_string(nodes[0]->status().height) +
+                             " signalers=" + std::to_string(signalers_on(0)) + " node1 h=" +
+                             std::to_string(nodes[1]->status().height) + " signalers=" + std::to_string(signalers_on(1)));
+  }
+  // Two operators, one opted out: exactly one signaler, still one after more blocks (recorded once), and
+  // the chain keeps finalizing.
+  const auto h = nodes[0]->status().height;
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= h + 4 && nodes[1]->status().height >= h + 4; },
+                       ci_timeout_seconds(60)));
+  ASSERT_EQ(signalers_on(0), 1u);
+  ASSERT_EQ(signalers_on(1), 1u);
+}
+
 TEST(test_epoch_settlement_pays_onboarding_slice_to_onboarding_pubkey_from_finalized_ticket) {
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_settlement_slice");
   std::filesystem::remove_all(base);

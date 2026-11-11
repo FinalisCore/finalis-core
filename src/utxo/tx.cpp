@@ -874,6 +874,7 @@ Bytes encode_upgrade_signal_script(const UpgradeSignalScriptData& data) {
   Bytes s(kUpgradeSignalPrefix.begin(), kUpgradeSignalPrefix.end());
   s.insert(s.end(), data.validator_pubkey.begin(), data.validator_pubkey.end());
   s.insert(s.end(), data.upgrade_id.begin(), data.upgrade_id.end());
+  for (int i = 0; i < 8; ++i) s.push_back(static_cast<std::uint8_t>(data.expiry_height >> (8 * i)));
   s.insert(s.end(), data.sig.begin(), data.sig.end());
   return s;
 }
@@ -887,6 +888,8 @@ bool parse_upgrade_signal_script(const Bytes& script, UpgradeSignalScriptData* o
   it += 32;
   std::copy(it, it + 32, d.upgrade_id.begin());
   it += 32;
+  for (int i = 0; i < 8; ++i) d.expiry_height |= static_cast<std::uint64_t>(*(it + i)) << (8 * i);
+  it += 8;
   std::copy(it, it + 64, d.sig.begin());
   if (out) *out = d;
   return true;

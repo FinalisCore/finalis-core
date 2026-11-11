@@ -553,6 +553,7 @@ bool Node::apply_finalized_frontier_effects_locked(const consensus::CanonicalFro
   // on is durable.
   maybe_finalize_epoch_committees_locked();
   drop_stale_unfinalized_ingress_locked();
+  maybe_auto_signal_upgrades_locked();
   // A new certifier term starts with the next height: its certifier certifies what waits now, rather
   // than at the next periodic pass (up to 5 s later), and the others route to it.
   if (ingress_term_start(finalized_height_ + 1) != ingress_term_start(finalized_height_)) {
@@ -867,6 +868,53 @@ bool Node::abstaining_at_height_locked(std::uint64_t height) const {
   // SIGNALED_ACTIVATION §3.6: never sign under rules this binary does not implement.
   const auto required = upgrade_required_from_height_locked();
   return required.has_value() && height >= *required;
+}
+
+void Node::maybe_auto_signal_upgrades_locked() {
+  if (!cfg_.auto_upgrade_signal || !canonical_state_.has_value()) return;
+  const std::uint64_t next_height = finalized_height_ + 1;
+  if (next_height < cfg_.network.upgrade_signal_activation_height) return;
+  bool context_set = false;
+  for (const auto& def : known_upgrades_locked()) {
+    if (next_height < def.signal_start) continue;
+    // Not admissible (not an active operator, already signaled, too many open): nothing to send.
+    if (!consensus::upgrade_signal_admission_error(canonical_state_->upgrade_records, canonical_state_->validators,
+                                                   next_height, local_key_.public_key, def.id)
+             .empty()) {
+      continue;
+    }
+    // Signed through the fail-stop guard like every other use of the validator key (none after a
+    // storage failure).
+    UpgradeSignalScriptData data{};
+    data.validator_pubkey = local_key_.public_key;
+    data.upgrade_id = def.id;
+    data.expiry_height = next_height + cfg_.network.committee_epoch_blocks;
+    const auto sig = sign_consensus_locked(
+        upgrade_signal_message(consensus_domain_, def.id, local_key_.public_key, data.expiry_height));
+    if (!sig.has_value()) return;
+    data.sig = *sig;
+    std::optional<Tx> tx = Tx{};
+    tx->outputs.push_back(TxOut{0, encode_upgrade_signal_script(data)});
+    std::string err;
+    if (!context_set) {
+      mempool_.set_validation_context(special_validation_context_locked(next_height));
+      context_set = true;
+    }
+    std::uint64_t fee = 0;
+    if (!mempool_.accept_tx(AnyTx{*tx}, utxos_, &err, 0, &fee)) {
+      if (err != "upgrade signal already pending") {
+        log_line("upgrade-signal-reject name=" + def.name + " id=" + hex_encode32(def.id) + " error=" + err);
+      }
+      continue;
+    }
+    log_line("upgrade-signal-submitted name=" + def.name + " id=" + hex_encode32(def.id) +
+             " txid=" + hex_encode32(tx->txid()) + " expiry_height=" +
+             std::to_string(next_height + cfg_.network.committee_epoch_blocks));
+    std::string ingress_error;
+    if (!maybe_certify_locally_accepted_tx_locked(AnyTx{*tx}, &ingress_error)) {
+      maybe_forward_tx_to_designated_certifier_locked(AnyTx{*tx}, 0, true);
+    }
+  }
 }
 
 std::vector<consensus::UpgradeDef> Node::known_upgrades_locked() const {

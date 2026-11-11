@@ -516,6 +516,9 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
     } else if (hidden_in) {
       row.flow_kind = "unshield";
       row.flow_summary = "Hidden coins moved into transparent outputs";
+    } else if (is_upgrade_signal_tx(*tx)) {
+      row.flow_kind = "upgrade-signal";
+      row.flow_summary = "Validator upgrade-readiness signal (no value moved)";
     } else if (tx->inputs.empty()) {
       row.flow_kind = "issuance";
       row.flow_summary = tx->outputs.size() <= 1 ? "Protocol or settlement issuance" : "Protocol or settlement issuance fanout";
@@ -3943,14 +3946,15 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
                                                    validation_error_message(vrx.error), retryable,
                                                    retry_class_for_error_code(code), false, std::nullopt));
     }
-    if (runtime.has_value() && runtime->min_relay_fee != 0 && vrx.cost.fee < runtime->min_relay_fee) {
+    const bool upgrade_signal = is_upgrade_signal_tx(*tx);  // fee-free by design (SIGNALED_ACTIVATION §3.2)
+    if (!upgrade_signal && runtime.has_value() && runtime->min_relay_fee != 0 && vrx.cost.fee < runtime->min_relay_fee) {
       return make_result(id, broadcast_result_json(false, txid_hex, "rejected", "",
                                                    std::string("tx_fee_below_min_relay"),
                                                    std::string("Transaction fee is below the current minimum relay fee."),
                                                    true, retry_class_for_error_code("tx_fee_below_min_relay"),
                                                    false, std::nullopt));
     }
-    if (runtime.has_value() && runtime->mempool_full &&
+    if (!upgrade_signal && runtime.has_value() && runtime->mempool_full &&
         runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte.has_value() &&
         fee_rate_below_threshold(vrx.cost.fee, tx_bytes->size(),
                                  *runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte)) {

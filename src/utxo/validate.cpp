@@ -122,13 +122,26 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
         if (error) *error = "SCUPGSIG not active on this network yet";
         return false;
       }
+      if (!inputs.empty() || outputs.size() != 1) {
+        if (error) *error = "SCUPGSIG must be the only output of a tx without inputs";
+        return false;
+      }
+      if (upgrade_signal.expiry_height < ctx->current_height) {
+        if (error) *error = "upgrade signal expired";
+        return false;
+      }
+      if (upgrade_signal.expiry_height - ctx->current_height > ctx->network->committee_epoch_blocks) {
+        if (error) *error = "upgrade signal expiry too far ahead";
+        return false;
+      }
       std::string budget_error;
       if (!consume_verify_budget(verify_budget_remaining, 1, &budget_error)) {
         if (error) *error = budget_error;
         return false;
       }
       const auto domain = consensus_chain_domain(*ctx->network, *ctx->chain_id);
-      if (!crypto::ed25519_verify(upgrade_signal_message(domain, upgrade_signal.upgrade_id, upgrade_signal.validator_pubkey),
+      if (!crypto::ed25519_verify(upgrade_signal_message(domain, upgrade_signal.upgrade_id, upgrade_signal.validator_pubkey,
+                                                         upgrade_signal.expiry_height),
                                   upgrade_signal.sig, upgrade_signal.validator_pubkey)) {
         if (error) *error = "upgrade signal signature invalid";
         return false;
@@ -554,14 +567,26 @@ Bytes onboarding_registration_pop_message(const PubKey32& validator_pubkey, cons
   return Bytes(msg.begin(), msg.end());
 }
 
-Bytes upgrade_signal_message(const Hash32& chain_domain, const Hash32& upgrade_id, const PubKey32& validator_pubkey) {
+Bytes upgrade_signal_message(const Hash32& chain_domain, const Hash32& upgrade_id, const PubKey32& validator_pubkey,
+                             std::uint64_t expiry_height) {
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'U', 'P', 'G', 'R', 'A', 'D', 'E', '-', 'S', 'I', 'G', '-', 'V', '1'});
   w.bytes_fixed(chain_domain);
   w.bytes_fixed(upgrade_id);
   w.bytes_fixed(validator_pubkey);
+  w.u64le(expiry_height);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
+}
+
+bool is_upgrade_signal_tx(const Tx& tx) {
+  return tx.version == 1 && tx.inputs.empty() && tx.outputs.size() == 1 &&
+         parse_upgrade_signal_script(tx.outputs[0].script_pubkey, nullptr);
+}
+
+bool is_upgrade_signal_tx(const AnyTx& tx) {
+  const auto* v1 = std::get_if<Tx>(&tx);
+  return v1 && is_upgrade_signal_tx(*v1);
 }
 
 Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey,
@@ -968,6 +993,18 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   if (!chain_domain) return {false, "tx validation requires chain identity", 0};
   if (tx.version != 1) return {false, "unsupported tx version", 0};
   if (tx.lock_time != 0) return {false, "lock_time must be 0 in v0", 0};
+  if (tx.inputs.empty() && tx_index_in_block != 0 && is_upgrade_signal_tx(tx)) {
+    // Fee-free upgrade signal (SIGNALED_ACTIVATION §3.2): nothing is spent, so only the SCUPGSIG checks apply.
+    if (tx.hashcash.has_value()) return {false, "upgrade signal tx carries a hashcash stamp", 0};
+    std::size_t budget = kMaxTxEd25519Verifies;
+    std::string script_error;
+    const std::vector<ScriptAnnotatedOutput> signal_outputs{
+        ScriptAnnotatedOutput{0, tx.outputs[0].value, tx.outputs[0].script_pubkey}};
+    if (!validate_special_script_semantics(signal_outputs, {}, ctx, &budget, &script_error)) {
+      return {false, script_error, 0};
+    }
+    return {true, "", 0};
+  }
   if (tx.inputs.empty() || tx.outputs.empty()) return {false, "tx inputs/outputs empty", 0};
   if (tx.inputs.size() > kMaxTxInputs) return {false, "tx has too many inputs", 0};
 
@@ -1664,9 +1701,10 @@ void apply_any_tx_to_utxo(const AnyTx& tx, UtxoSetV2& utxos) {
           }
           const Hash32 txid = value.txid();
           for (std::uint32_t out_i = 0; out_i < value.outputs.size(); ++out_i) {
-            // Data and burn outputs are never spendable; burned value goes to the reserve instead.
+            // Data, burn and upgrade-signal outputs are never spendable; burned value goes to the reserve.
             if (is_data_output_script(value.outputs[out_i].script_pubkey) ||
-                is_burn_script(value.outputs[out_i].script_pubkey, nullptr)) {
+                is_burn_script(value.outputs[out_i].script_pubkey, nullptr) ||
+                parse_upgrade_signal_script(value.outputs[out_i].script_pubkey, nullptr)) {
               continue;
             }
             utxos[OutPoint{txid, out_i}] = UtxoEntryV2{value.outputs[out_i]};

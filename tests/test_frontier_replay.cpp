@@ -4062,14 +4062,9 @@ TEST(test_frontier_apply_records_upgrade_signal_and_commits_it) {
   Hash32 fp{};
   fp.fill(0x31);
   const consensus::UpgradeDef def{consensus::upgrade_id("replay-test-upgrade", fp), "replay-test-upgrade", 0};
-  UpgradeSignalScriptData sig_data{};
-  sig_data.validator_pubkey = validator.public_key;
-  sig_data.upgrade_id = def.id;
-  sig_data.sig = *crypto::ed25519_sign(upgrade_signal_message(replay_chain_domain(), def.id, validator.public_key),
-                                       validator.private_key);
-  const std::vector<TxOut> outputs{TxOut{0, encode_upgrade_signal_script(sig_data)},
-                                   p2pkh_out_for_pub(from.public_key, 9'800)};
-  auto tx = build_signed_p2pkh_tx_single_input(replay_chain_domain(), op, prev, from.private_key, outputs);
+  // Fee-free, input-less (SIGNALED_ACTIVATION §3.2).
+  auto tx = build_upgrade_signal_tx(replay_chain_domain(), validator.public_key, validator.private_key, def.id,
+                                    parent.finalized_height + 1);
   ASSERT_TRUE(tx.has_value());
   const std::vector<Bytes> ordered{tx->serialize()};
   // The block builder decides with the same admission replay applies (canonical build_validation_context).
@@ -4136,20 +4131,14 @@ TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later)
   fp.fill(0x32);
   const consensus::UpgradeDef def{consensus::upgrade_id("lock-in-test", fp), "lock-in-test", 0};
 
-  UpgradeSignalScriptData sig_data{};
-  sig_data.validator_pubkey = validator.public_key;
-  sig_data.upgrade_id = def.id;
-  sig_data.sig = *crypto::ed25519_sign(upgrade_signal_message(replay_chain_domain(), def.id, validator.public_key),
-                                       validator.private_key);
-  const auto signal_tx = build_signed_p2pkh_tx_single_input(
-      replay_chain_domain(), op, prev, from.private_key,
-      {TxOut{0, encode_upgrade_signal_script(sig_data)}, p2pkh_out_for_pub(from.public_key, 99'750)});
+  const auto signal_tx =
+      build_upgrade_signal_tx(replay_chain_domain(), validator.public_key, validator.private_key, def.id, 1);
   ASSERT_TRUE(signal_tx.has_value());
 
   std::vector<consensus::CanonicalFrontierRecord> chain;
   std::vector<consensus::CanonicalDerivedState> states{state};
-  OutPoint cur_op{signal_tx->txid(), 1};
-  TxOut cur_prev = signal_tx->outputs.at(1);
+  OutPoint cur_op = op;
+  TxOut cur_prev = prev;
   std::uint64_t value = cur_prev.value;
   for (std::uint64_t h = 1; h <= 9; ++h) {
     const auto& parent = states.back();
@@ -4355,14 +4344,8 @@ TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_s
   Hash32 fp{};
   fp.fill(0x33);
   const consensus::UpgradeDef def{consensus::upgrade_id("cross-binary", fp), "cross-binary", 0};
-  UpgradeSignalScriptData sig_data{};
-  sig_data.validator_pubkey = validator.public_key;
-  sig_data.upgrade_id = def.id;
-  sig_data.sig = *crypto::ed25519_sign(upgrade_signal_message(replay_chain_domain(), def.id, validator.public_key),
-                                       validator.private_key);
-  auto tx = build_signed_p2pkh_tx_single_input(
-      replay_chain_domain(), op, prev, from.private_key,
-      {TxOut{0, encode_upgrade_signal_script(sig_data)}, p2pkh_out_for_pub(from.public_key, 9'800)});
+  auto tx = build_upgrade_signal_tx(replay_chain_domain(), validator.public_key, validator.private_key, def.id,
+                                    parent.finalized_height + 1);
   ASSERT_TRUE(tx.has_value());
   SpecialValidationContext vctx;
   vctx.network = &new_cfg.network;

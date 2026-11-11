@@ -60,25 +60,37 @@ activation heights. Only the source of the height changes, from a constant to ch
 
 ### 3.2 Readiness signal (on-chain)
 
-Carried as a zero-value `SCUPGSIG` output in an ordinary transaction, like `SCONBREG`: prefix(8) |
-validator_pubkey(32) | upgrade_id(32) | sig(64). No new transaction kind. It is accepted from the
-network's `upgrade_signal_activation_height` (mainnet 0; testnet-3 set at its flag day), so releases
-without the mechanism never see one in a block they validate. Rules (stateless ones in step 2a,
-stateful ones in 2b):
+A fee-free transaction with no inputs and exactly one zero-value `SCUPGSIG` output: prefix(8) |
+validator_pubkey(32) | upgrade_id(32) | expiry_height(u64le) | sig(64). Nothing is spent, so the node
+can send it with the validator key alone and the operator funds nothing (decision 7, §8). It is
+accepted from the network's `upgrade_signal_activation_height` (mainnet 0; testnet-3 set at its flag
+day), so releases without the mechanism never see one in a block they validate. Rules (stateless
+ones in step 2a, stateful ones in 2b):
 
-- The validator key signs `upgrade_signal_message(chain_domain, upgrade_id, validator_pubkey)`; the operator is the validator's canonical operator id.
+- The validator key signs `upgrade_signal_message(chain_domain, upgrade_id, validator_pubkey,
+  expiry_height)`; the operator is the validator's canonical operator id.
+- `SCUPGSIG` is valid only as the single output of a transaction without inputs, and only at heights
+  `h` with `h <= expiry_height <= h + committee_epoch_blocks`. A transaction without inputs can be
+  sent again by anyone, so the signed expiry is what stops a replay: after a window fails, an old
+  signature cannot reopen it for a validator that no longer runs the upgrade. It also gives each new
+  signal its own txid.
 - It is valid only if `operator` is an active operator and has no earlier signal for this id, and,
   unless the upgrade is already locked in, the operator holds fewer than
   `kMaxOpenUpgradeSignalsPerOperator` (2) signals on upgrades not yet locked in. Any id is
-  admissible. Open state is therefore bounded by 2 records per operator whatever ids are signaled;
-  each signal also pays a fee.
+  admissible. Open state is therefore bounded by 2 records per operator whatever ids are signaled.
 - The first signal for an id creates its record and opens its window: not locked in by
   `first_signal_height + upgrade_signal_window_blocks`, it fails and the record is removed at that
   epoch end, so a later signal opens a new window. A signal for a locked-in or active upgrade is
   always valid (late signal, §3.4).
-- The fee is paid like `onboarding-register`, from the operator's funding wallet.
-- A node whose binary knows the upgrade submits the signal automatically once it is synced (opt out
-  with `--no-upgrade-signal`). Upgrading the binary is the vote.
+- The output is never spendable and is not added to the UTXO set.
+- Relay: nodes and the lightserver exempt it from the minimum relay fee, the full-mempool fee rate
+  and hashcash; a stamped one is invalid. Spam stays bounded because only an active validator key can
+  make a valid one, the mempool holds at most one per (validator, upgrade), and drops it once it
+  expired or is no longer admissible.
+- A node whose binary implements the upgrade signals by itself, after each finalized height, from the
+  upgrade's `signal_start` on, while its signal is admissible (so it signals again after a failed
+  window), with an expiry one epoch ahead (opt out with `--no-upgrade-signal`). Upgrading the binary
+  is the vote. `finalis-cli upgrade-signal` sends the same transaction by hand.
 
 Stored in state as `UPG:<id> -> {state, first_signal_height, lock_in_height, activation_height, signalers}` and included
 in the state commitment, so light clients can prove the schedule.
@@ -215,6 +227,11 @@ unknown upgrade reach `LOCKED_IN`:
    the committee threshold becomes "⅔ of voting weight is ready" and the laggard rule becomes
    "excluded from the voter set". The mechanism stays the same, so the two designs can proceed
    independently.
+7. **Fee source — DECIDED 2026-11-11: no fee.** The signal is a transaction without inputs (§3.2), so
+   the node signals with its validator key and nobody funds anything. Rejected: a fee from the
+   validator key's address (operators must fund it), the funding keystore on the validator host (more
+   key material there), a signal inside block proposals (block format change; validators that never
+   propose could not signal).
 
 ## 9. Installing releases: updater and release signing
 
@@ -284,9 +301,9 @@ least 3 independent builders sign releases.
    gate). The lightserver relay handshake uses the same fingerprint. Testnet-3's
    `upgrade_signal_window_blocks` is not in the fingerprint: adding it would disconnect this branch's
    binaries from v2.2.14 before the flag day; it is set with the flag-day release.
-6. PARTLY DONE: lightserver `get_upgrades`, CLI `upgrade-status` and manual `upgrade-signal`
-   (funding wallet pays the fee, validator key signs, like `onboarding-register`). Node auto-signal is
-   open: the node holds only the validator key, so it needs a decision on which key pays the fee
-   (see the hand-over proposal).
+6. DONE: fee-free signal (§3.2, decision 7): no inputs, signed expiry at most one epoch ahead, no
+   UTXO; relay-fee and hashcash exemption with one pending signal per (validator, upgrade); node
+   auto-signal after each finalized height (`--no-upgrade-signal`); lightserver `get_upgrades`, CLI
+   `upgrade-status` and `upgrade-signal` (validator key only).
 7. Integration and chaos tests, TLA+ model, INVARIANTS entry.
 8. Updater (notify mode) and release-manifest signing (§9); separate PRs, not consensus code.
