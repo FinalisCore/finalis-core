@@ -358,3 +358,29 @@ TEST(test_quorum_diagnosis_names_missing_signers_and_other_rules) {
   ASSERT_EQ(d.missing.size(), 2u);
   ASSERT_TRUE(node::detail::quorum_blocked_log_line(42, d).empty());
 }
+
+// Signaled activation §3.6: a locked-in upgrade this binary lacks is reported before its activation
+// and is the halt reason from then on, whatever the quorum shows.
+TEST(test_quorum_diagnosis_reports_upgrade_required) {
+  std::vector<PubKey32> committee(3);
+  for (std::size_t i = 0; i < committee.size(); ++i) committee[i].fill(static_cast<std::uint8_t>(0x20 + i));
+  Hash32 id{};
+  id.fill(0xAB);
+  auto d = node::detail::diagnose_quorum("FINALIZING", 3, committee, 3, {}, {}, 1'000);
+  ASSERT_TRUE(node::detail::upgrade_required_log_line(50, d).empty());
+
+  node::detail::apply_upgrade_required(50, id, 64, &d);
+  ASSERT_TRUE(d.halt_reason.empty());  // not active yet: keep finalizing
+  const auto before = node::detail::upgrade_required_log_line(50, d);
+  ASSERT_TRUE(before.find("UPGRADE REQUIRED name=" + hex_encode32(id) + " activates_at=64") == 0);
+  ASSERT_TRUE(before.find("before height 64") != std::string::npos);
+
+  d = node::detail::diagnose_quorum("WAITING_FOR_QUORUM", 0, committee, 3, {}, {}, 1'000);
+  node::detail::apply_upgrade_required(64, id, 64, &d);
+  ASSERT_EQ(d.halt_reason, std::string("upgrade_required"));  // over no_peers
+  ASSERT_TRUE(node::detail::upgrade_required_log_line(64, d).find("active now") != std::string::npos);
+  const auto blocked = node::detail::quorum_blocked_log_line(64, d);
+  ASSERT_TRUE(blocked.find("reason=upgrade_required") != std::string::npos);
+  ASSERT_TRUE(blocked.find("install a release") != std::string::npos);
+  ASSERT_TRUE(blocked.find('"') == std::string::npos);
+}

@@ -610,6 +610,25 @@ std::optional<Tx> build_onboarding_registration_tx(const Hash32& chain_domain, c
   return build_signed_p2pkh_tx_multi_input(chain_domain, prevs, funding_privkey_32, outputs, err);
 }
 
+std::optional<Tx> build_upgrade_signal_tx(const Hash32& chain_domain, const PubKey32& validator_pubkey,
+                                          const Bytes& validator_privkey_32, const Hash32& upgrade_id,
+                                          std::uint64_t expiry_height, std::string* err) {
+  UpgradeSignalScriptData data{};
+  data.validator_pubkey = validator_pubkey;
+  data.upgrade_id = upgrade_id;
+  data.expiry_height = expiry_height;
+  const auto sig = crypto::ed25519_sign(upgrade_signal_message(chain_domain, upgrade_id, validator_pubkey, expiry_height),
+                                        validator_privkey_32);
+  if (!sig.has_value()) {
+    if (err) *err = "failed to sign upgrade signal";
+    return std::nullopt;
+  }
+  data.sig = *sig;
+  Tx tx;
+  tx.outputs.push_back(TxOut{0, encode_upgrade_signal_script(data)});
+  return tx;
+}
+
 Tx build_early_time_signature_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, std::uint64_t height,
                                        const crypto::BlsSignature& signature) {
   codec::ByteWriter ev;

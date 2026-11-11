@@ -13,6 +13,7 @@
 #include "consensus/availability_retention.hpp"
 #include "consensus/epoch_committee.hpp"
 #include "consensus/epoch_tickets.hpp"
+#include "consensus/upgrade_activation.hpp"
 #include "consensus/validator_registry.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
@@ -155,6 +156,9 @@ struct NodeRuntimeStatusSnapshot {
   std::vector<PubKey32> missing_signers;
   std::vector<PubKey32> missing_signers_other_rules;
   std::uint64_t rejected_consensus_rules{0};
+  // A locked-in signaled upgrade this binary does not implement (0: none), and its id.
+  std::uint64_t upgrade_required_height{0};
+  Hash32 upgrade_required_id{};
   std::uint64_t finalized_lag{0};
   bool peer_height_disagreement{false};
   bool next_height_committee_available{false};
@@ -325,6 +329,7 @@ class DB {
     void put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxOut& out, std::uint64_t height);
     void put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
     void put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req);
+    void put_upgrade_record(const Hash32& upgrade_id, const consensus::UpgradeRecord& record);
     void put_epoch_reward_settlement(const EpochRewardSettlementState& state);
     void put_protocol_reserve_balance(std::uint64_t balance_units);
     void put_confidential_pool_value(std::uint64_t value_units);
@@ -413,6 +418,8 @@ class DB {
   std::map<PubKey32, consensus::ValidatorInfo> load_validators() const;
   bool put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req);
   std::map<Hash32, ValidatorJoinRequest> load_validator_join_requests() const;
+  // UPG:<upgrade id hex> rows (signaled activation).
+  consensus::UpgradeRecords load_upgrade_records() const;
   bool put_slashing_record(const SlashingRecord& rec);
   std::map<Hash32, SlashingRecord> load_slashing_records() const;
   bool put_ingress_equivocation_evidence(const IngressEquivocationEvidence& rec);
@@ -550,6 +557,8 @@ class DB {
 std::string key_height(std::uint64_t height);
 std::string key_height_prefix();
 std::string key_tip();
+std::string key_upgrade_record(const Hash32& upgrade_id);
+std::string key_upgrade_record_prefix();
 std::string key_genesis_hash();
 std::string key_genesis_artifact();
 std::string key_genesis_json();

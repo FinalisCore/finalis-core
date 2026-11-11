@@ -737,6 +737,8 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
     (void)epoch;
     batch.put_finalized_committee_checkpoint(checkpoint);
   }
+  for (const auto& [key, _] : db.scan_prefix(storage::key_upgrade_record_prefix())) batch.erase(key);
+  for (const auto& [id, rec] : state.upgrade_records) batch.put_upgrade_record(id, rec);
   for (const auto& [key, _] : db.scan_prefix("TE:")) batch.erase(key);
   for (const auto& [key, tx] : state.timed_escrows) batch.put(timed_escrow_db_key(key), tx.serialize());
   for (const auto& [key, _] : db.scan_prefix("TK:")) batch.erase(key);
@@ -825,6 +827,13 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
   batch.put_protocol_reserve_balance(next.protocol_reserve_balance_units);
   batch.put_confidential_pool_value(next.confidential_pool_value);
   batch.put_base_fee_per_kib(next.base_fee_per_kib);
+  for (const auto& [id, _] : prev.upgrade_records) {
+    if (!next.upgrade_records.contains(id)) batch.erase(storage::key_upgrade_record(id));
+  }
+  for (const auto& [id, rec] : next.upgrade_records) {
+    const auto it = prev.upgrade_records.find(id);
+    if (it == prev.upgrade_records.end() || !(it->second == rec)) batch.put_upgrade_record(id, rec);
+  }
   for (const auto& [key, _] : prev.timed_escrows) {
     if (!next.timed_escrows.contains(key)) batch.erase(timed_escrow_db_key(key));
   }
@@ -1135,13 +1144,36 @@ std::string quorum_blocked_log_line(std::uint64_t height, const QuorumDiagnosis&
     }
   }
   // Plain-language hint last; no quotes, log_line output may be JSON.
-  if (d.halt_reason == "no_peers") {
+  if (d.halt_reason == "upgrade_required") {
+    oss << " -- this binary does not implement upgrade " << hex_encode32(d.upgrade_required_id)
+        << " active since " << d.upgrade_required_height << "; install a release that does";
+  } else if (d.halt_reason == "no_peers") {
     oss << " -- no peers connected, check the network and peer settings";
   } else if (d.halt_reason == "other_consensus_rules") {
     oss << " -- " << d.missing_other_rules.size()
         << " missing signer(s) run different consensus rules; the chain resumes once they upgrade";
   } else {
     oss << " -- waiting for votes from offline or unreachable validators";
+  }
+  return oss.str();
+}
+
+void apply_upgrade_required(std::uint64_t next_height, const Hash32& id, std::uint64_t activation_height,
+                            QuorumDiagnosis* d) {
+  d->upgrade_required_height = activation_height;
+  d->upgrade_required_id = id;
+  if (next_height >= activation_height) d->halt_reason = "upgrade_required";
+}
+
+std::string upgrade_required_log_line(std::uint64_t next_height, const QuorumDiagnosis& d) {
+  if (d.upgrade_required_height == 0) return {};
+  std::ostringstream oss;
+  oss << "UPGRADE REQUIRED name=" << hex_encode32(d.upgrade_required_id) << " activates_at=" << d.upgrade_required_height;
+  if (next_height >= d.upgrade_required_height) {
+    oss << " -- active now: this node no longer signs or follows the chain; install a release that implements it";
+  } else {
+    oss << " -- locked in by the validators; install a release that implements it before height "
+        << d.upgrade_required_height << ", after that this node stops signing";
   }
   return oss.str();
 }

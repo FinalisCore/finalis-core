@@ -27,6 +27,10 @@
   `get_committee_handoffs` (each epoch's committee, proven from the previous one) and
   `get_utxo_proofs` (UTXO membership proofs with the tip's transition and certificate), so clients
   can check answers against validator signatures instead of trusting this server.
+- Signaled activation ([docs/spec/SIGNALED_ACTIVATION.md](../../docs/spec/SIGNALED_ACTIVATION.md)):
+  `get_upgrades` lists the finalized `UPG:` records (state, window, lock-in and activation heights,
+  signalers that are active operators) with the operator threshold; `finalis-cli upgrade-status`
+  prints it and `finalis-cli upgrade-signal --upgrade-id <hex>` submits a signal by hand (fee-free, validator key only; nodes normally signal by themselves). `broadcast_tx` exempts such a signal from the relay-fee and full-mempool checks.
 - Responses read by the client library are capped at 16 MB (servers are untrusted).
 - Operator runbook: [docs/operations/LIGHTSERVER-OPERATIONS.md](../../docs/operations/LIGHTSERVER-OPERATIONS.md).
 

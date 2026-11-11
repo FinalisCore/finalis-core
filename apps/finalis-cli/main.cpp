@@ -1490,6 +1490,8 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli get_timed_reveal --txid <timed txid> [--rpc <url>]  # the data a reveal published\n"
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
+     << "  finalis-cli upgrade-status [--rpc <url>]\n"
+     << "  finalis-cli upgrade-signal --upgrade-id <hex32> [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--pass <pass>]   (fee-free; the node signals by itself unless --no-upgrade-signal)\n"
      << "  finalis-cli validator_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_explain [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass> | --validator <pubkey hex>]  # the reward formula with your numbers\n"
      << "  finalis-cli economics_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>] [--height <n>] [--settlement-epoch-start <n>] [--json]\n"
@@ -4566,6 +4568,109 @@ int run_cli(int argc, char** argv) {
       std::cout << "height=" << reveal->height << "\n";
       std::cout << "data_hex=" << finalis::hex_encode(reveal->data) << "\n";
     }
+    return 0;
+  }
+
+  // Signaled activation (docs/spec/SIGNALED_ACTIVATION.md): the UPG: records, and a manual readiness
+  // signal for an upgrade (the node's binary signals the upgrades it implements on its own once step 6 lands).
+  if (cmd == "upgrade-status") {
+    std::string rpc_url = default_rpc_url();
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+    }
+    std::string err;
+    const auto view = finalis::lightserver::rpc_get_upgrades(rpc_url, &err);
+    if (!view.has_value()) {
+      std::cerr << "upgrade-status failed: " << (err.empty() ? "rpc unavailable" : err) << "\n";
+      return 1;
+    }
+    std::cout << "next_height=" << view->next_height << "\n";
+    std::cout << "active_operators=" << view->active_operators << "\n";
+    std::cout << "operator_threshold=" << view->operator_threshold << "\n";
+    std::cout << "window_blocks=" << view->window_blocks << "\n";
+    std::cout << "upgrades=" << view->upgrades.size() << "\n";
+    for (const auto& u : view->upgrades) {
+      std::cout << "upgrade id=" << finalis::hex_encode32(u.id) << " state=" << u.state << " signalers=" << u.signalers
+                << "/" << view->operator_threshold << " first_signal=" << u.first_signal_height;
+      if (u.state == "locked_in" || u.state == "active") {
+        std::cout << " locked_in_at=" << u.lock_in_height << " activates_at=" << u.activation_height;
+      } else {
+        std::cout << " window_end=" << u.window_end_height;
+      }
+      std::cout << " known_by_server=" << (u.known_by_server ? "yes" : "no") << "\n";
+    }
+    return 0;
+  }
+
+  if (cmd == "upgrade-signal") {
+    std::string db_path = default_db_path();
+    std::string file_path = default_validator_key_path();
+    std::string passphrase;
+    std::string rpc_url = default_rpc_url();
+    std::string upgrade_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if ((a == "--file" || a == "--validator-file") && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--rpc" && i + 1 < argc) rpc_url = argv[++i];
+      else if (a == "--upgrade-id" && i + 1 < argc) upgrade_hex = argv[++i];
+    }
+    const auto upgrade_bytes = decode_hex32(upgrade_hex);
+    if (!upgrade_bytes) {
+      std::cerr << "upgrade-signal requires --upgrade-id <32-byte hex> (see upgrade-status)\n";
+      return 1;
+    }
+    finalis::Hash32 upgrade_id{};
+    std::copy(upgrade_bytes->begin(), upgrade_bytes->end(), upgrade_id.begin());
+    db_path = expand_user(db_path);
+    file_path = expand_user(file_path);
+
+    finalis::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+    finalis::keystore::ValidatorKey validator_key;
+    std::string err;
+    if (!finalis::keystore::load_validator_keystore(file_path, passphrase, &validator_key, &err)) {
+      std::cerr << "upgrade-signal failed to load validator key: " << err << "\n";
+      return 1;
+    }
+    const auto& network = finalis::network_by_name(validator_key.network_name);
+    const auto chain_id = finalis::ChainId::from_config_and_db(network, db);
+    const auto status = finalis::lightserver::rpc_get_status(rpc_url, &err);
+    if (!status.has_value()) {
+      std::cerr << "upgrade-signal failed to read the finalized height: " << err << "\n";
+      return 1;
+    }
+    // Fee-free and input-less (SIGNALED_ACTIVATION §3.2); valid for about one epoch from the finalized tip.
+    const std::uint64_t expiry_height = status->tip_height + network.committee_epoch_blocks;
+    auto tx = finalis::build_upgrade_signal_tx(finalis::consensus_chain_domain(network, chain_id), validator_key.pubkey,
+                                               finalis::Bytes(validator_key.privkey.begin(), validator_key.privkey.end()),
+                                               upgrade_id, expiry_height, &err);
+    if (!tx.has_value()) {
+      std::cerr << "upgrade-signal build failed: " << err << "\n";
+      return 1;
+    }
+    auto result = finalis::lightserver::rpc_broadcast_tx(rpc_url, tx->serialize(), &err);
+    std::cout << "upgrade_id=" << finalis::hex_encode32(upgrade_id) << "\n";
+    std::cout << "validator_address=" << validator_key.address << "\n";
+    std::cout << "expiry_height=" << expiry_height << "\n";
+    std::cout << "txid=" << finalis::hex_encode32(tx->txid()) << "\n";
+    if (!err.empty() && result.outcome == finalis::lightserver::BroadcastOutcome::Ambiguous) {
+      std::cout << "accepted=unknown\n";
+      std::cout << "error_message=" << err << "\n";
+      return 1;
+    }
+    if (result.outcome != finalis::lightserver::BroadcastOutcome::Sent) {
+      print_broadcast_rejection(result);
+      return 1;
+    }
+    std::cout << "accepted=yes\n";
+    std::cout << "status=accepted_for_relay\n";
+    print_submitted_not_final(tx->txid());
     return 0;
   }
 

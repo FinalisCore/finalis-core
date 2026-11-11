@@ -1163,6 +1163,34 @@ std::string rpc_for_test(lightserver::Server& ls, const std::string& method, con
 
 }  // namespace
 
+// A finalized upgrade signal has no inputs, like a settlement, but is listed as a signal, not issuance.
+TEST(test_lightserver_recent_tx_lists_upgrade_signal_as_signal_not_issuance) {
+  const std::string base = unique_test_base("/tmp/finalis_light_recent_upgrade_signal");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(put_utxo_listing_test_genesis(db));
+  const auto keys = node::Node::deterministic_test_keypairs();
+  Hash32 upgrade{};
+  upgrade.fill(0x6f);
+  const auto signal = build_upgrade_signal_tx(db_chain_domain(base), keys[0].public_key, keys[0].private_key, upgrade, 9);
+  ASSERT_TRUE(signal.has_value());
+  ASSERT_TRUE(put_block_with_record(db, 3, signal->serialize()));
+  ASSERT_TRUE(db.put_tx_index(signal->txid(), 3, 0, signal->serialize()));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto recent = rpc_for_test(ls, "get_recent_tx_summaries", R"({"limit":8,"depth_window":8})");
+  ASSERT_TRUE(recent.find(hex_encode32(signal->txid())) != std::string::npos);
+  ASSERT_TRUE(recent.find("\"flow_kind\":\"upgrade-signal\"") != std::string::npos);
+  ASSERT_TRUE(recent.find("\"flow_kind\":\"issuance\"") == std::string::npos);
+}
+
 TEST(test_lightserver_recent_tx_lists_timed_envelope_and_opened_body) {
   const std::string base = unique_test_base("/tmp/finalis_light_recent_timed");
   std::filesystem::remove_all(base);
@@ -1739,8 +1767,8 @@ TEST(test_lightserver_get_status_exposes_runtime_sync_summary) {
                         "\"quorum_threshold\":7,\"observed_signers\":5,\"halt_reason\":\"other_consensus_rules\","
                         "\"missing_signers\":[\"" + hex_encode32(snapshot.missing_signers[0]) + "\",\"" +
                         hex_encode32(snapshot.missing_signers[1]) + "\"],\"missing_signers_other_rules\":[\"" +
-                        hex_encode32(snapshot.missing_signers[1]) + "\"],\"rejected_consensus_rules\":4}") !=
-              std::string::npos);
+                        hex_encode32(snapshot.missing_signers[1]) + "\"],\"rejected_consensus_rules\":4,"
+                        "\"upgrade_required\":null}") != std::string::npos);
   ASSERT_TRUE(resp.find("\"bootstrap_sync_incomplete\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"advertised_endpoint_present\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"advertised_endpoint_likely_public\":true") != std::string::npos);
@@ -3493,4 +3521,97 @@ TEST(test_broadcast_error_codes_have_plain_language_hints) {
   ASSERT_TRUE(lightserver::broadcast_error_hint("relay_unavailable").find("safe to send again") != std::string::npos);
   ASSERT_TRUE(lightserver::broadcast_error_hint("no_such_code").empty());
   ASSERT_TRUE(lightserver::broadcast_error_hint("").empty());
+}
+
+// Signaled activation: get_upgrades lists the UPG: records with the lock-in inputs, counting only
+// signalers that are active operators now.
+// SIGNALED_ACTIVATION §3.2: broadcast_tx passes a fee-free upgrade signal past the relay-fee and
+// mempool-full checks (it fails only at the relay here, which has no node), and rejects an expired one.
+TEST(test_lightserver_broadcast_accepts_fee_free_upgrade_signal_and_rejects_expired) {
+  const std::string base = unique_test_base("/tmp/finalis_light_broadcast_upgrade_signal");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const auto keys = node::Node::deterministic_test_keypairs();
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(db.set_tip(storage::TipState{8, Hash32{}}));
+  consensus::ValidatorInfo info;
+  info.status = consensus::ValidatorStatus::ACTIVE;
+  info.has_bond = true;
+  info.bonded_amount = 150;
+  ASSERT_TRUE(db.put_validator(keys[0].public_key, info));
+  storage::NodeRuntimeStatusSnapshot snapshot;
+  snapshot.chain_id_ok = true;
+  snapshot.db_open = true;
+  snapshot.local_finalized_height = 8;
+  snapshot.mempool_tx_count = mempool::Mempool::kMaxTxCount;
+  snapshot.mempool_full = true;
+  snapshot.min_fee_rate_to_enter_when_full_milliunits_per_byte = 10000;
+  snapshot.min_relay_fee = 1000;
+  ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  Hash32 upgrade{};
+  upgrade.fill(0x6e);
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto broadcast = [&](std::uint64_t expiry) {
+    const auto tx = build_upgrade_signal_tx(db_chain_domain(base), keys[0].public_key, keys[0].private_key, upgrade, expiry);
+    ASSERT_TRUE(tx.has_value());
+    return ls.handle_rpc_for_test(std::string(R"({"jsonrpc":"2.0","id":9,"method":"broadcast_tx","params":{"tx_hex":")") +
+                                  hex_encode(tx->serialize()) + R"("}})");
+  };
+  const auto ok = broadcast(12);
+  ASSERT_TRUE(ok.find("\"error_code\":\"relay_unavailable\"") != std::string::npos);
+  const auto expired = broadcast(8);  // next height is 9
+  ASSERT_TRUE(expired.find("\"accepted\":false") != std::string::npos);
+  ASSERT_TRUE(expired.find("relay_unavailable") == std::string::npos);
+  ASSERT_TRUE(expired.find("\"error_code\":\"tx_invalid\"") != std::string::npos);
+}
+
+TEST(test_lightserver_get_upgrades_lists_records_and_thresholds) {
+  const std::string base = unique_test_base("/tmp/finalis_light_get_upgrades");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+  ASSERT_TRUE(db.set_tip(storage::TipState{40, Hash32{}}));
+  std::vector<PubKey32> ops(4);
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    ops[i].fill(static_cast<std::uint8_t>(0x60 + i));
+    consensus::ValidatorInfo info;
+    info.status = consensus::ValidatorStatus::ACTIVE;
+    info.has_bond = true;
+    info.bonded_amount = 150;
+    ASSERT_TRUE(db.put_validator(ops[i], info));
+  }
+  Hash32 id{};
+  id.fill(0x5D);
+  consensus::UpgradeRecord rec;
+  rec.state = consensus::UpgradeState::Signaling;
+  rec.first_signal_height = 33;
+  PubKey32 gone{};
+  gone.fill(0x7F);  // signaled, no longer an operator: not counted
+  rec.signalers = {ops[0], ops[1], gone};
+  {
+    storage::DB::Batch batch(db);
+    batch.put_upgrade_record(id, rec);
+    ASSERT_TRUE(db.write_batch(batch));
+  }
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+  const auto resp = ls.handle_rpc_for_test(R"({"jsonrpc":"2.0","id":7,"method":"get_upgrades","params":{}})");
+  ASSERT_TRUE(resp.find("\"next_height\":41,\"active_operators\":4,\"operator_threshold\":3") != std::string::npos);
+  ASSERT_TRUE(resp.find("\"max_open_signals_per_operator\":2") != std::string::npos);
+  ASSERT_TRUE(resp.find("{\"id\":\"" + hex_encode32(id) + "\",\"state\":\"signaling\",\"first_signal_height\":33,") !=
+              std::string::npos);
+  ASSERT_TRUE(resp.find("\"signalers\":2,\"known_by_server\":false}") != std::string::npos);
 }

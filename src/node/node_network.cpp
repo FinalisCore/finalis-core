@@ -726,11 +726,13 @@ std::set<std::string> local_ipv4_addresses() {
   return ips;
 }
 
-std::string local_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+// crh= is the height-aware rules fingerprint (Node::local_consensus_rules_fingerprint_locked).
+std::string local_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
+                                               const std::string& crh) {
   std::ostringstream oss;
   oss << finalis::node_software_version()
       << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv
-      << ";crh=" << consensus_rules_fingerprint(cfg, chain_id, cv);
+      << ";crh=" << crh;
   return oss.str();
 }
 
@@ -936,8 +938,26 @@ std::optional<std::string> Node::detect_possible_public_ip() const {
   return out;
 }
 
+std::string Node::local_consensus_rules_fingerprint_locked() const {
+  std::vector<Hash32> active;
+  if (canonical_state_.has_value()) {
+    active = consensus::implemented_active_upgrades(canonical_state_->upgrade_records,
+                                                    known_upgrades_locked(), finalized_height_ + 1);
+  }
+  return ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion, active));
+}
+
 std::string Node::version_tags_locked() const {
-  std::string tags;
+  // The fingerprint goes first (send_version_with_tags splits it off), then the upgrades this binary
+  // knows (diagnostics only: SIGNALED_ACTIVATION §3.5).
+  std::string tags = ";crh=" + local_consensus_rules_fingerprint_locked();
+  if (const auto known = known_upgrades_locked(); !known.empty()) {
+    tags += ";upg=";
+    for (std::size_t i = 0; i < known.size(); ++i) {
+      if (i) tags += ",";
+      tags += hex_encode(Bytes(known[i].id.begin(), known[i].id.end()));
+    }
+  }
   if (bootstrap_validator_pubkey_.has_value()) {
     tags += ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
     // Its time-signature key and proof: followers that adopt it need the same genesis state.
@@ -973,8 +993,12 @@ void Node::send_version_with_tags(int peer_id, const std::string& tags) {
   v.nonce = static_cast<std::uint32_t>(cfg_.node_id + 1000);
   v.start_height = tip ? tip->height : 0;
   v.start_hash = tip ? tip->hash : zero_hash();
+  // tags = ";crh=<fingerprint>" + the remaining tags (version_tags_locked).
+  const auto crh_end = tags.find(';', 1);
+  const std::string crh = tags.substr(5, crh_end == std::string::npos ? std::string::npos : crh_end - 5);
+  const std::string rest = crh_end == std::string::npos ? std::string{} : tags.substr(crh_end);
   v.node_software_version =
-      local_software_version_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion) + tags;
+      local_software_version_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion, crh) + rest;
 
   const bool ok = p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
   log_line(std::string("send ") + msg_type_name(p2p::MsgType::VERSION) + " peer_id=" + std::to_string(peer_id) +
@@ -1174,7 +1198,11 @@ void Node::on_version(int peer_id, const Bytes& payload) {
   }
   const std::string local_genesis = ascii_lower(chain_id_.genesis_hash_hex);
   const std::string local_nid = ascii_lower(network_id_hex(cfg_.network));
-  const std::string local_crh = ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion));
+  std::string local_crh;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    local_crh = local_consensus_rules_fingerprint_locked();
+  }
   const auto peer_genesis = software_fingerprint_value(v->node_software_version, "genesis");
   const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
   const auto peer_crh = software_fingerprint_value(v->node_software_version, "crh");

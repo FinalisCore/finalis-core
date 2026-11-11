@@ -20,9 +20,16 @@ the run summary ("OPEN DEFECTS REPRODUCED"), not a gate.
 Tests tagged `isolate` inject storage faults and run in a child process (`finalis-tests --run NAME`), so
 an abort inside librocksdb (E1 below) fails that one test with its signal instead of ending the run.
 
-## Open (2026-11-08)
+## Open (2026-11-11)
 
-None. C1 is fixed (below).
+None. A1 and A2 (2026-11-11) are fixed:
+
+| Id | Defect | Fix and tests |
+|---|---|---|
+| A2 | Signaled activation (unreleased). At an activation boundary where every signaler is suspended (not a candidate) and the signalers of the last 2 committees have exited, emergency recovery found only non-signalers and skipped them, so derivation failed closed (`empty-committee-no-emergency-fallback`) where the old rule recovers; no signal could be included afterwards. Found by `formal/signaled_activation.tla` (`NoExclusionHalt`). | `emergency_fallback_committee_members`: with no prior member left under an active upgrade, recover up to 4 signaler validators (lowest pubkeys) that hold a bond and are not BANNED/ONBOARDING/EXITING. `test_activation_boundary_recovers_suspended_signalers_instead_of_failing_closed`; model `signaled_activation_no_exclusion_halt.cfg` holds, `..._a2_prior_only_mutation.cfg` reproduces. Not covered: every signaler exits (the chain halts where the old rule would recover non-signalers). |
+| A1 | Signaled activation (unreleased: `upgrade_signal_activation_height` is max on testnet-3, mainnet not launched). Signal admission and `UPG:` state depended on the binary's `known_upgrades` table, so a binary that did not know an upgrade rejected the first block carrying a signal for it (`frontier-decisions-commitment-mismatch`): old and new binaries split at the first signal instead of at activation. | Admission, record creation, window and lock-in read finalized state only; `CanonicalDerivationConfig` has no upgrade table. Any id admissible, at most 2 open signals per operator, window from the first signal (`upgrade_signal_window_blocks`). `test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state` (reproduced the split before the fix), `test_upgrade_signal_admission_and_apply` |
+
+C1 is fixed (below).
 
 ## Status (2026-10-28)
 

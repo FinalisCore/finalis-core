@@ -194,11 +194,14 @@ quorum-blocked h=4801 signers=5/7 committee=9 missing=4 other_rules=3 reason=oth
 
 The same data is in the lightserver's `get_status` under `quorum`: `consensus_state`, `committee_size`,
 `quorum_threshold`, `observed_signers`, `halt_reason`, `missing_signers`, `missing_signers_other_rules`
-(full pubkeys) and `rejected_consensus_rules` (VERSION handshakes refused for different consensus
-rules since start). `halt_reason` is `null` while finalizing, otherwise:
+(full pubkeys), `rejected_consensus_rules` (VERSION handshakes refused for different consensus
+rules since start) and `upgrade_required` (`null`, or `{"id", "activation_height"}` of a signaled
+upgrade the validators locked in that this binary does not implement). `halt_reason` is `null` while
+finalizing, otherwise:
 
 | `halt_reason` | Meaning | Action |
 |---|---|---|
+| `upgrade_required` | A signaled upgrade this binary does not implement is active; the node no longer signs | Install a release that implements it. Before the activation height the node keeps working and logs `UPGRADE REQUIRED name=<id> activates_at=<h>` every summary |
 | `other_consensus_rules` | Some missing signers were refused in the last 10 min for a different consensus-rules fingerprint | They must upgrade (or you must, if you are the one behind: compare `crh` in the `reject-version` log lines) |
 | `missing_signers` | Missing signers are offline or unreachable | Wait, or contact the listed operators |
 | `no_peers` | No peer connections | Check network, firewall and peer settings |

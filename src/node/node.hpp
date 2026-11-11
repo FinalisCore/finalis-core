@@ -105,6 +105,9 @@ struct NodeConfig {
   // next_state_commitment; otherwise replay from genesis. --no-fast-start always replays.
   bool fast_start{true};
   bool reindex_on_start{true};
+  // Signaled activation (SIGNALED_ACTIVATION §3.2): sign and submit a fee-free upgrade signal for each
+  // upgrade this binary implements, from its signal_start on. --no-upgrade-signal turns it off.
+  bool auto_upgrade_signal{true};
   std::uint64_t startup_frontier_repair_max_rollback{10'000};
   std::uint32_t startup_frontier_repair_adaptive_percent{5};
   std::uint64_t startup_frontier_repair_absolute_max_rollback{50'000};
@@ -167,10 +170,15 @@ struct QuorumDiagnosis {
   std::size_t committee_size{0};
   std::size_t quorum{0};
   std::size_t observed{0};
-  // Empty while finalizing; else "no_peers", "other_consensus_rules" or "missing_signers".
+  // Empty while finalizing; else "upgrade_required", "no_peers", "other_consensus_rules" or
+  // "missing_signers".
   std::string halt_reason;
   std::vector<PubKey32> missing;              // committee members with no vote seen this round
   std::vector<PubKey32> missing_other_rules;  // subset recently rejected for different consensus rules
+  // The earliest locked-in upgrade this binary does not implement (SIGNALED_ACTIVATION §3.6); height 0
+  // when none. From its activation height on halt_reason is "upgrade_required".
+  std::uint64_t upgrade_required_height{0};
+  Hash32 upgrade_required_id{};
 };
 
 struct NodeStatus {
@@ -202,6 +210,8 @@ struct NodeStatus {
   std::vector<PubKey32> missing_signers;
   std::vector<PubKey32> missing_signers_other_rules;
   std::uint64_t rejected_consensus_rules{0};
+  std::uint64_t upgrade_required_height{0};  // see QuorumDiagnosis
+  Hash32 upgrade_required_id{};
   std::string last_bootstrap_source;
   std::uint64_t rejected_network_id{0};
   std::uint64_t rejected_protocol_version{0};
@@ -365,6 +375,12 @@ class Node {
   // Times this node relayed a record to every validator because its certifier was unreachable.
   std::uint64_t ingress_relay_all_count_for_test() const;
   std::set<std::uint64_t> abstain_heights_for_test() const;
+  // Signaled activation: replaces the in-memory UPG: records and, if given, this binary's upgrade table.
+  void set_upgrade_state_for_test(const consensus::UpgradeRecords& records,
+                                  std::optional<std::vector<consensus::UpgradeDef>> known);
+  consensus::UpgradeRecords upgrade_records_for_test() const;
+  bool abstaining_at_height_for_test(std::uint64_t height) const;
+  QuorumDiagnosis quorum_diagnosis_for_test() const;
   consensus::ConfidentialSupplyAuditResult confidential_supply_audit_for_test();
   std::size_t timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   bool local_timeout_vote_reserved_for_test(std::uint64_t height, std::uint32_t round) const;
@@ -467,6 +483,11 @@ class Node {
   // a caller holding mu_ builds the tags with version_tags_locked() and calls send_version_with_tags.
   void send_version(int peer_id);
   std::string version_tags_locked() const;
+  // consensus_rules_fingerprint over the signaled upgrades active at finalized_height_ + 1 that this
+  // binary implements (SIGNALED_ACTIVATION §3.5).
+  std::string local_consensus_rules_fingerprint_locked() const;
+  // First height this binary cannot validate: an upgrade it does not implement is locked in (§3.6).
+  std::optional<std::uint64_t> upgrade_required_from_height_locked() const;
   void send_version_with_tags(int peer_id, const std::string& tags);
   void maybe_send_verack(int peer_id);
   void send_ping(int peer_id);
@@ -488,6 +509,8 @@ class Node {
       const consensus::EpochCommitteeSnapshot& snapshot) const;
   void rebuild_epoch_committee_state_locked(std::uint64_t epoch, const char* reason, bool log_summary);
   void maybe_finalize_epoch_committees_locked();
+  // Submits this validator's fee-free upgrade signals to the mempool (cfg_.auto_upgrade_signal).
+  void maybe_auto_signal_upgrades_locked();
   void maybe_request_epoch_ticket_reconciliation_locked(std::uint64_t now_ms);
   void request_epoch_tickets(int peer_id, std::uint64_t epoch, std::uint32_t max_tickets);
   std::optional<consensus::EpochTicket> mine_local_epoch_ticket_locked(std::uint64_t height) const;
@@ -1062,6 +1085,9 @@ class Node {
   // Heights whose persisted safety state was unreadable at startup (see kConsensusSafetyQuarantinePrefix).
   // SAFETY: nothing is signed or proposed at these heights until they finalize.
   std::set<std::uint64_t> abstain_heights_;
+  // Test override of consensus::known_upgrades (set_upgrade_state_for_test).
+  std::optional<std::vector<consensus::UpgradeDef>> known_upgrades_for_test_;
+  std::vector<consensus::UpgradeDef> known_upgrades_locked() const;
   struct FinalizedTipVotes {
     std::uint64_t height{0};
     std::uint32_t round{0};

@@ -309,6 +309,7 @@ add_library(finalis_core
   src/consensus/validator_registry.cpp
   src/consensus/finalized_committee.cpp
   src/consensus/votes.cpp
+  src/consensus/upgrade_activation.cpp
   src/storage/db.cpp
   src/storage/snapshot.cpp
   src/p2p/framing.cpp
@@ -571,6 +572,7 @@ add_executable(finalis-tests
   tests/test_monetary.cpp
   tests/test_wide_arith.cpp
   tests/test_committee_schedule.cpp
+  tests/test_upgrade_activation.cpp
   tests/test_state_commitment.cpp
   tests/test_smt.cpp
   tests/test_bonding.cpp

@@ -42,6 +42,49 @@ TEST(test_mempool_rejects_nonexistent_utxo) {
   std::string err;
   ASSERT_TRUE(!mp.accept_tx(*tx_missing, view, &err));
 }
+// SIGNALED_ACTIVATION §3.2: a fee-free upgrade signal enters a pool with a relay fee, at most one per
+// (validator, upgrade) is pending, and it leaves the pool once expired.
+TEST(test_mempool_accepts_fee_free_upgrade_signal_once_and_drops_it_at_expiry) {
+  const auto validator = key_from_byte(0x71);
+  Hash32 upgrade{};
+  upgrade.fill(0x7a);
+  Hash32 other_upgrade{};
+  other_upgrade.fill(0x7b);
+  auto ctx = finalis::test::with_test_chain_identity();
+  ctx.current_height = 10;
+  ctx.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string{}; };
+  mempool::Mempool mp;
+  mp.set_validation_context(ctx);
+  const mempool::UtxoView view;
+  const auto signal = [&](const Hash32& id, std::uint64_t expiry) {
+    auto tx = build_upgrade_signal_tx(finalis::test::test_chain_domain(), validator.public_key, validator.private_key, id,
+                                      expiry);
+    ASSERT_TRUE(tx.has_value());
+    return *tx;
+  };
+  std::string err;
+  std::uint64_t fee = 1;
+  const auto first = signal(upgrade, 12);
+  ASSERT_TRUE(mp.accept_tx(first, view, &err, 1'000, &fee));
+  ASSERT_EQ(fee, 0u);
+  // Same validator and upgrade, another expiry (another txid): still one pending.
+  ASSERT_TRUE(!mp.accept_tx(signal(upgrade, 13), view, &err, 1'000));
+  ASSERT_EQ(err, std::string("upgrade signal already pending"));
+  ASSERT_TRUE(mp.accept_tx(signal(other_upgrade, 13), view, &err, 1'000));
+  ASSERT_EQ(mp.size(), 2u);
+
+  // Height 13: the first expired and is dropped, the second is still admissible.
+  ctx.current_height = 13;
+  mp.set_validation_context(ctx);
+  ASSERT_EQ(mp.size(), 1u);
+  ASSERT_TRUE(!mp.contains(first.txid()));
+  // No longer admissible (e.g. recorded in the meantime): dropped too.
+  ctx.current_height = 14;
+  ctx.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string("duplicate-signal"); };
+  mp.set_validation_context(ctx);
+  ASSERT_EQ(mp.size(), 0u);
+}
+
 TEST(test_mempool_rejects_invalid_fee_values) {
   mempool::Mempool mp;
   mp.set_validation_context(finalis::test::with_test_chain_identity());

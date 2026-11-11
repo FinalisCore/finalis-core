@@ -221,7 +221,23 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
     if (err) *err = "tx invalid: " + vr.error;
     return false;
   }
-  if (vr.cost.fee < min_fee) {
+  // A fee-free upgrade signal (SIGNALED_ACTIVATION §3.2) is exempt from the relay fee and hashcash: only an
+  // active validator key can make a valid one, at most one per (validator, upgrade) is pending, and it
+  // leaves the pool at its expiry.
+  const bool upgrade_signal = is_upgrade_signal_tx(tx);
+  if (upgrade_signal) {
+    UpgradeSignalScriptData incoming{};
+    (void)parse_upgrade_signal_script(std::get<Tx>(tx).outputs[0].script_pubkey, &incoming);
+    for (const auto& [other_txid, meta] : by_txid_) {
+      if (!is_upgrade_signal_tx(meta.entry.tx)) continue;
+      UpgradeSignalScriptData pending{};
+      (void)parse_upgrade_signal_script(std::get<Tx>(meta.entry.tx).outputs[0].script_pubkey, &pending);
+      if (pending.validator_pubkey == incoming.validator_pubkey && pending.upgrade_id == incoming.upgrade_id) {
+        if (err) *err = "upgrade signal already pending";
+        return false;
+      }
+    }
+  } else if (vr.cost.fee < min_fee) {
     if (err) *err = "fee below min relay fee";
     return false;
   }
@@ -238,7 +254,7 @@ bool Mempool::accept_tx(const AnyTx& tx, const UtxoView& view, std::string* err,
     pool_delta = delta;
   }
 
-  if (std::holds_alternative<Tx>(tx)) {
+  if (std::holds_alternative<Tx>(tx) && !upgrade_signal) {
     const auto& v1 = std::get<Tx>(tx);
     const auto required_bits = policy::required_hashcash_bits(hashcash_cfg_, v1, vr.cost.fee, by_txid_.size());
     if (required_bits != 0) {
@@ -365,7 +381,26 @@ std::size_t Mempool::set_confidential_pool_value(std::optional<std::uint64_t> po
 void Mempool::set_validation_context(SpecialValidationContext ctx) {
   const bool height_advanced = !ctx_.has_value() || ctx.current_height > ctx_->current_height;
   ctx_ = std::move(ctx);
-  if (height_advanced) (void)prune_expired_admission_pow();
+  if (height_advanced) {
+    (void)prune_expired_admission_pow();
+    (void)prune_stale_upgrade_signals();
+  }
+}
+
+std::size_t Mempool::prune_stale_upgrade_signals() {
+  if (!ctx_.has_value()) return 0;
+  std::size_t dropped = 0;
+  for (auto it = by_txid_.begin(); it != by_txid_.end();) {
+    // Expired, or no longer admissible (already recorded, operator no longer active): it can never be included.
+    if (!is_upgrade_signal_tx(it->second.entry.tx) || validate_any_tx(it->second.entry.tx, 1, UtxoView{}, &*ctx_).ok) {
+      ++it;
+      continue;
+    }
+    auto erase_it = it++;
+    erase_entry(erase_it);
+    ++dropped;
+  }
+  return dropped;
 }
 
 std::size_t Mempool::prune_expired_admission_pow() {

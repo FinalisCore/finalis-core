@@ -172,6 +172,25 @@ struct CommitteeBlsKeysView {
 };
 std::optional<CommitteeBlsKeysView> rpc_get_committee_bls_keys(const std::string& rpc_url, std::uint64_t height,
                                                                std::string* err);
+// Signaled upgrades (get_upgrades): UPG: records at the finalized tip and the lock-in inputs.
+struct UpgradeView {
+  Hash32 id{};
+  std::string state;  // defined | signaling | locked_in | active
+  std::uint64_t first_signal_height{0};
+  std::uint64_t window_end_height{0};
+  std::uint64_t lock_in_height{0};
+  std::uint64_t activation_height{0};
+  std::uint64_t signalers{0};         // signalers that are active operators now
+  bool known_by_server{false};        // in the lightserver binary's upgrade table
+};
+struct UpgradesView {
+  std::uint64_t next_height{0};
+  std::uint64_t active_operators{0};
+  std::uint64_t operator_threshold{0};
+  std::uint64_t window_blocks{0};
+  std::vector<UpgradeView> upgrades;
+};
+std::optional<UpgradesView> rpc_get_upgrades(const std::string& rpc_url, std::string* err);
 std::optional<CommitteeHandoffsView> rpc_get_committee_handoffs(const std::string& rpc_url, std::uint64_t from_epoch_start,
                                                                 std::uint64_t limit, std::string* err);
 std::optional<UtxoProofsView> rpc_get_utxo_proofs(const std::string& rpc_url, const std::vector<OutPoint>& outpoints,

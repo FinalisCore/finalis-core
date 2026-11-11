@@ -114,6 +114,7 @@ InputState(E):
     availability_state_at_H
     active_economics_policy_at_H
     previous_checkpoint                = CP[E]
+    upgrade_state_at_H                 = the UPG: records at H (SIGNALED_ACTIVATION.md)
 ```
 
 No local clocks, peer observations, mempool state, or wall-clock state may affect derivation.
@@ -379,6 +380,24 @@ committee_eligibility_at_checkpoint(v, a, econ, mode, checkpoint_height) =
 
 The function consumes `mode` as input. It must not recompute fallback mode internally.
 
+### 6.4 Upgrade Signal Eligibility
+
+```text
+upgrade_eligible(operator_id, epoch_start_height) =
+    for every record r in upgrade_state_at_H:
+        if r.state in {LOCKED_IN, ACTIVE} AND epoch_start_height >= r.activation_height
+           AND operator_id NOT IN r.signalers:
+            return false
+    return true
+```
+
+An operator that is not `upgrade_eligible` is skipped before every other check, in NORMAL and
+FALLBACK mode alike: it is not a candidate (§10), not counted in `qualified_depth` or
+`eligible_cnt` (§7), not recovered by §11.1 and not the empty-active-set escape member. It keeps
+its bond and is not slashed; a later signal makes it eligible again from the next derived
+checkpoint. Its availability state is not changed by the exclusion. With no records (every chain
+before its first signal) the predicate is always true and derivation is unchanged.
+
 ## 7. Eligible Operator Counting
 
 Let:
@@ -390,6 +409,8 @@ availability_eligible_operator_count(H) =
         availability_config_with_min_bond(live_availability_config, dynamic_min_bond_at_H)
     )
 ```
+
+Operators that are not `upgrade_eligible` (§6.4) are not counted.
 
 This count is computed from the canonical projected availability view at `H`,
 not from final committee membership and not by re-aggregating validator
@@ -544,9 +565,17 @@ for E' in [E, E-1] (the 2 prior epoch checkpoints, newest first):
         if len(members) == 4: stop
         if m already seen: skip
         if m has no bond, or m.status in {BANNED, ONBOARDING, EXITING}: skip
+        if NOT upgrade_eligible(m.operator_id, epoch_start_height(E+1)): skip   # §6.4
         members.append(m)
+if members is empty and an upgrade is active at epoch_start_height(E+1):   # A2
+    members := the first 4 validators by pubkey that hold a bond, are not BANNED, ONBOARDING
+               or EXITING, and are upgrade_eligible (suspended ones included)
 committee := sort_by_pubkey(members)   # weight = own bonded amount, no ticket
 ```
+
+The second step exists because the upgrade filter would otherwise turn a recovery the old rule
+completes into a permanent halt: once derivation fails closed, no late signal can be included
+(formal/signaled_activation.tla, `NoExclusionHalt`).
 
 `EXITING` members are skipped because they announced departure and may already be offline.
 `SUSPENDED` and `PENDING` members remain eligible: an emergency typically follows a mass liveness
@@ -651,6 +680,7 @@ function DeriveCheckpointForEpoch(next_epoch, S):
 
     qualified_depth :=
         count(distinct operator_id) such that:
+            upgrade_eligible (§6.4)
             lifecycle-active
             bond-qualified at prior_min_bond
             availability-eligible under availability_min_bond = prior_min_bond
@@ -688,6 +718,7 @@ function DeriveCheckpointForEpoch(next_epoch, S):
 
     raw_inputs := []
     for v in V:
+        if NOT upgrade_eligible(v.operator_id, epoch_start_height(next_epoch)): continue   # §6.4
         a := AIndex.get(v.operator_id, none)
         if committee_eligibility_at_checkpoint(v, a, econ, mode, H):
             raw_inputs.append(BuildOperatorCommitteeInput(v, a, econ, H))

@@ -357,6 +357,26 @@ TEST(test_node_runtime_status_snapshot_roundtrip_preserves_availability_fallback
   ASSERT_TRUE(loaded->missing_signers == snapshot.missing_signers);
   ASSERT_TRUE(loaded->missing_signers_other_rules == snapshot.missing_signers_other_rules);
   ASSERT_EQ(loaded->rejected_consensus_rules, snapshot.rejected_consensus_rules);
+  ASSERT_EQ(loaded->upgrade_required_height, 0u);
+
+  // Signaled activation §3.6: the required upgrade round-trips, and a snapshot written before the field
+  // existed (no trailing bytes) still parses with none.
+  snapshot.upgrade_required_height = 4097;
+  snapshot.upgrade_required_id.fill(0x77);
+  ASSERT_TRUE(db.put_node_runtime_status_snapshot(snapshot));
+  const auto with = db.get_node_runtime_status_snapshot();
+  ASSERT_TRUE(with.has_value());
+  ASSERT_EQ(with->upgrade_required_height, 4097u);
+  ASSERT_TRUE(with->upgrade_required_id == snapshot.upgrade_required_id);
+  const auto bytes = db.get(storage::key_node_runtime_status_snapshot());
+  ASSERT_TRUE(bytes.has_value());
+  ASSERT_TRUE(db.put(storage::key_node_runtime_status_snapshot(), Bytes(bytes->begin(), bytes->end() - 40)));
+  const auto old = db.get_node_runtime_status_snapshot();
+  ASSERT_TRUE(old.has_value());
+  ASSERT_EQ(old->upgrade_required_height, 0u);
+  ASSERT_EQ(old->rejected_consensus_rules, snapshot.rejected_consensus_rules);
+  ASSERT_TRUE(db.put(storage::key_node_runtime_status_snapshot(), Bytes(bytes->begin(), bytes->end() - 1)));
+  ASSERT_TRUE(!db.get_node_runtime_status_snapshot().has_value());
 }
 
 TEST(test_adaptive_epoch_telemetry_db_roundtrip_and_summary) {

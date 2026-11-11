@@ -15,10 +15,12 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <random>
 #include <vector>
 
 #include "consensus/availability_retention.hpp"
+#include "consensus/upgrade_activation.hpp"
 #include "p2p/messages.hpp"
 #include "storage/snapshot.hpp"
 #include "utxo/tx.hpp"
@@ -85,6 +87,16 @@ const std::vector<Codec>& codecs() {
       codec("getaddr", p2p::de_getaddr, p2p::ser_getaddr),
       codec("addr", p2p::de_addr, p2p::ser_addr),
       codec("ping", p2p::de_ping, p2p::ser_ping),
+      // Signaled activation: UPG: rows travel in snapshots; SCUPGSIG outputs in transactions.
+      codec("UpgradeRecord", consensus::parse_upgrade_record, consensus::serialize_upgrade_record),
+      codec(
+          "UpgradeSignalScript",
+          [](const Bytes& b) -> std::optional<UpgradeSignalScriptData> {
+            UpgradeSignalScriptData d{};
+            if (!parse_upgrade_signal_script(b, &d)) return std::nullopt;
+            return d;
+          },
+          [](const UpgradeSignalScriptData& d) { return encode_upgrade_signal_script(d); }),
   };
   return all;
 }

@@ -1073,6 +1073,8 @@ Bytes serialize_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& sn
   w.varint(snapshot.missing_signers_other_rules.size());
   for (const auto& pub : snapshot.missing_signers_other_rules) w.bytes_fixed(pub);
   w.u64le(snapshot.rejected_consensus_rules);
+  w.u64le(snapshot.upgrade_required_height);
+  w.bytes_fixed(snapshot.upgrade_required_id);
   return w.take();
 }
 
@@ -1317,6 +1319,12 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
         auto rejected = r.u64le();
         if (!rejected) return false;
         snapshot.rejected_consensus_rules = *rejected;
+        if (r.eof()) return true;
+        auto required_height = r.u64le();
+        auto required_id = r.bytes_fixed<32>();
+        if (!required_height || !required_id) return false;
+        snapshot.upgrade_required_height = *required_height;
+        snapshot.upgrade_required_id = *required_id;
         return r.eof();
       })) {
     return std::nullopt;
@@ -1373,6 +1381,10 @@ std::string key_validator_prefix() { return "V:"; }
 std::string key_validator(const PubKey32& pub) { return "V:" + hex_encode(Bytes(pub.begin(), pub.end())); }
 std::string key_validator_join_request(const Hash32& request_txid) {
   return "VJR:" + hex_encode(Bytes(request_txid.begin(), request_txid.end()));
+}
+std::string key_upgrade_record_prefix() { return "UPG:"; }
+std::string key_upgrade_record(const Hash32& upgrade_id) {
+  return key_upgrade_record_prefix() + hex_encode(Bytes(upgrade_id.begin(), upgrade_id.end()));
 }
 std::string key_slashing_record(const Hash32& record_id) {
   return "SL:" + hex_encode(Bytes(record_id.begin(), record_id.end()));
@@ -1709,6 +1721,10 @@ void DB::Batch::put_validator(const PubKey32& pub, const consensus::ValidatorInf
 
 void DB::Batch::put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req) {
   put(key_validator_join_request(request_txid), serialize_validator_join_request(req));
+}
+
+void DB::Batch::put_upgrade_record(const Hash32& upgrade_id, const consensus::UpgradeRecord& record) {
+  put(key_upgrade_record(upgrade_id), consensus::serialize_upgrade_record(record));
 }
 
 void DB::Batch::put_epoch_reward_settlement(const EpochRewardSettlementState& state) {
@@ -2203,6 +2219,20 @@ std::map<Hash32, ValidatorJoinRequest> DB::load_validator_join_requests() const 
     Hash32 request_txid{};
     std::copy(b->begin(), b->end(), request_txid.begin());
     out[request_txid] = *req;
+  }
+  return out;
+}
+
+consensus::UpgradeRecords DB::load_upgrade_records() const {
+  consensus::UpgradeRecords out;
+  const auto prefix = key_upgrade_record_prefix();
+  for (const auto& [k, v] : scan_prefix(prefix)) {
+    auto b = hex_decode(k.substr(prefix.size()));
+    auto rec = consensus::parse_upgrade_record(v);
+    if (!b.has_value() || b->size() != 32 || !rec.has_value()) continue;  // fast start then fails its commitment check
+    Hash32 id{};
+    std::copy(b->begin(), b->end(), id.begin());
+    out[id] = std::move(*rec);
   }
   return out;
 }

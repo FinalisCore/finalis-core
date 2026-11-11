@@ -445,6 +445,28 @@ std::set<std::uint64_t> Node::abstain_heights_for_test() const {
   return abstain_heights_;
 }
 
+void Node::set_upgrade_state_for_test(const consensus::UpgradeRecords& records,
+                                      std::optional<std::vector<consensus::UpgradeDef>> known) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (canonical_state_.has_value()) canonical_state_->upgrade_records = records;
+  known_upgrades_for_test_ = std::move(known);
+}
+
+consensus::UpgradeRecords Node::upgrade_records_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return canonical_state_.has_value() ? canonical_state_->upgrade_records : consensus::UpgradeRecords{};
+}
+
+bool Node::abstaining_at_height_for_test(std::uint64_t height) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return abstaining_at_height_locked(height);
+}
+
+QuorumDiagnosis Node::quorum_diagnosis_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return quorum_diagnosis_locked(now_ms());
+}
+
 std::size_t Node::timeout_vote_count_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const {
   std::lock_guard<std::mutex> lk(mu_);
   return timeout_votes_.signatures_for(height, round).size();
@@ -483,7 +505,7 @@ bool Node::is_validator_for_test() const {
 
 std::string Node::consensus_rules_fingerprint_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
-  return ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion));
+  return local_consensus_rules_fingerprint_locked();
 }
 
 std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubKey32& pub) const {

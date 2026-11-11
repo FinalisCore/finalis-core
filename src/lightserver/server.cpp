@@ -86,15 +86,19 @@ std::string network_id_hex(const NetworkConfig& cfg) {
   return hex_encode(Bytes(cfg.network_id.begin(), cfg.network_id.end()));
 }
 
-std::string relay_consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
-  return consensus_rules_fingerprint(cfg, chain_id, cv);
+// Height-aware like the node's (SIGNALED_ACTIVATION §3.5): the upgrades active at the next height that
+// this binary implements.
+std::string relay_consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
+                                              const std::vector<Hash32>& active_upgrades) {
+  return consensus_rules_fingerprint(cfg, chain_id, cv, active_upgrades);
 }
 
-std::string relay_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+std::string relay_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
+                                               const std::vector<Hash32>& active_upgrades) {
   std::ostringstream oss;
   oss << finalis::lightserver_software_version()
       << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv
-      << ";crh=" << relay_consensus_rules_fingerprint(cfg, chain_id, cv);
+      << ";crh=" << relay_consensus_rules_fingerprint(cfg, chain_id, cv, active_upgrades);
   return oss.str();
 }
 
@@ -512,6 +516,9 @@ std::vector<TxSummaryRow> build_tx_summary_rows(const storage::DB& db, const Net
     } else if (hidden_in) {
       row.flow_kind = "unshield";
       row.flow_summary = "Hidden coins moved into transparent outputs";
+    } else if (is_upgrade_signal_tx(*tx)) {
+      row.flow_kind = "upgrade-signal";
+      row.flow_summary = "Validator upgrade-readiness signal (no value moved)";
     } else if (tx->inputs.empty()) {
       row.flow_kind = "issuance";
       row.flow_summary = tx->outputs.size() <= 1 ? "Protocol or settlement issuance" : "Protocol or settlement issuance fanout";
@@ -2122,7 +2129,10 @@ TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   v.start_hash = tip ? tip->hash : zero_hash();
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 424242;
-  v.node_software_version = relay_software_version_fingerprint(cfg_.network, chain_id_, kRelayValidationRulesVersion);
+  const auto active_upgrades = consensus::implemented_active_upgrades(
+      db_.load_upgrade_records(), consensus::known_upgrades(cfg_.network), tip ? tip->height + 1 : 1);
+  v.node_software_version =
+      relay_software_version_fingerprint(cfg_.network, chain_id_, kRelayValidationRulesVersion, active_upgrades);
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
     net::close_socket(fd);
@@ -2604,7 +2614,14 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       else oss << "\"" << minijson::escape(runtime->halt_reason) << "\"";
       oss << ",\"missing_signers\":" << pubs_json(runtime->missing_signers)
           << ",\"missing_signers_other_rules\":" << pubs_json(runtime->missing_signers_other_rules)
-          << ",\"rejected_consensus_rules\":" << runtime->rejected_consensus_rules << "}";
+          << ",\"rejected_consensus_rules\":" << runtime->rejected_consensus_rules << ",\"upgrade_required\":";
+      if (runtime->upgrade_required_height == 0) {
+        oss << "null";
+      } else {
+        oss << "{\"id\":\"" << hex_encode32(runtime->upgrade_required_id)
+            << "\",\"activation_height\":" << runtime->upgrade_required_height << "}";
+      }
+      oss << "}";
     }
     oss << ",\"sync\":{\"mode\":\"finalized_only\",\"snapshot_present\":"
         << (runtime.has_value() ? "true" : "false")
@@ -3431,6 +3448,51 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     return make_result(id, paged_detailed_history_json(*view, *sh, history, limit, start_after));
   }
 
+  if (*method == "get_upgrades") {
+    // Signaled activation (SIGNALED_ACTIVATION §3.2-3.3): the UPG: records at the finalized tip.
+    const auto tip = view->get_tip();
+    const std::uint64_t next_height = tip ? tip->height + 1 : 1;
+    const auto records = view->load_upgrade_records();
+    const auto known = consensus::known_upgrades(cfg_.network);
+    // Same rule as lock-in (consensus::upgrade_lock_in_inputs), at the next height.
+    consensus::ValidatorRegistry registry;
+    for (const auto& [pub, info] : view->load_validators()) registry.upsert(pub, info);
+    std::set<PubKey32> active_operators;
+    for (const auto& [pub, info] : registry.all()) {
+      if (registry.is_active_for_height(pub, next_height)) active_operators.insert(consensus::canonical_operator_id(pub, info));
+    }
+    const auto state_name = [](consensus::UpgradeState s) {
+      switch (s) {
+        case consensus::UpgradeState::Defined: return "defined";
+        case consensus::UpgradeState::Signaling: return "signaling";
+        case consensus::UpgradeState::LockedIn: return "locked_in";
+        case consensus::UpgradeState::Active: return "active";
+        case consensus::UpgradeState::Failed: return "failed";
+      }
+      return "unknown";
+    };
+    std::ostringstream oss;
+    oss << "{\"next_height\":" << next_height << ",\"active_operators\":" << active_operators.size()
+        << ",\"operator_threshold\":" << consensus::upgrade_operator_threshold(active_operators.size())
+        << ",\"window_blocks\":" << cfg_.network.upgrade_signal_window_blocks
+        << ",\"max_open_signals_per_operator\":" << consensus::kMaxOpenUpgradeSignalsPerOperator << ",\"upgrades\":[";
+    bool first = true;
+    for (const auto& [uid, rec] : records) {
+      std::size_t signalers = 0;
+      for (const auto& op : rec.signalers) signalers += active_operators.count(op);
+      const bool is_known =
+          std::any_of(known.begin(), known.end(), [&](const consensus::UpgradeDef& d) { return d.id == uid; });
+      oss << (first ? "" : ",") << "{\"id\":\"" << hex_encode32(uid) << "\",\"state\":\"" << state_name(rec.state)
+          << "\",\"first_signal_height\":" << rec.first_signal_height
+          << ",\"window_end_height\":" << rec.first_signal_height + cfg_.network.upgrade_signal_window_blocks
+          << ",\"lock_in_height\":" << rec.lock_in_height << ",\"activation_height\":" << rec.activation_height
+          << ",\"signalers\":" << signalers << ",\"known_by_server\":" << (is_known ? "true" : "false") << "}";
+      first = false;
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
+  }
+
   if (*method == "get_committee") {
     auto h = field_u64(params, "height");
     if (!h) return make_error(id, -32602, "missing height");
@@ -3850,6 +3912,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     const std::uint64_t broadcast_max_bond =
         std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, broadcast_min_bond);
+    const auto upgrade_records = view->load_upgrade_records();
     ConfidentialPolicy confidential_policy{};
     SpecialValidationContext ctx{
         .network = &cfg_.network,
@@ -3870,6 +3933,10 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
           return view->get_height_hash(anchor_height);
         },
         .confidential_policy = &confidential_policy,
+        .upgrade_signal_admission =
+            [&, next_height](const PubKey32& validator, const Hash32& upgrade_id) {
+              return consensus::upgrade_signal_admission_error(upgrade_records, vr, next_height, validator, upgrade_id);
+            },
     };
     auto vrx = validate_any_tx(*tx, 1, utxos, &ctx);
     if (!vrx.ok) {
@@ -3879,14 +3946,15 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
                                                    validation_error_message(vrx.error), retryable,
                                                    retry_class_for_error_code(code), false, std::nullopt));
     }
-    if (runtime.has_value() && runtime->min_relay_fee != 0 && vrx.cost.fee < runtime->min_relay_fee) {
+    const bool upgrade_signal = is_upgrade_signal_tx(*tx);  // fee-free by design (SIGNALED_ACTIVATION §3.2)
+    if (!upgrade_signal && runtime.has_value() && runtime->min_relay_fee != 0 && vrx.cost.fee < runtime->min_relay_fee) {
       return make_result(id, broadcast_result_json(false, txid_hex, "rejected", "",
                                                    std::string("tx_fee_below_min_relay"),
                                                    std::string("Transaction fee is below the current minimum relay fee."),
                                                    true, retry_class_for_error_code("tx_fee_below_min_relay"),
                                                    false, std::nullopt));
     }
-    if (runtime.has_value() && runtime->mempool_full &&
+    if (!upgrade_signal && runtime.has_value() && runtime->mempool_full &&
         runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte.has_value() &&
         fee_rate_below_threshold(vrx.cost.fee, tx_bytes->size(),
                                  *runtime->min_fee_rate_to_enter_when_full_milliunits_per_byte)) {

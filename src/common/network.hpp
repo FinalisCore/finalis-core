@@ -44,6 +44,13 @@ struct NetworkConfig {
   // v2.2.13), so a node replaying testnet-3 from genesis accepts its pre-flag-day certificates.
   // 0 everywhere except testnet-3 (flag day: last old block 4800). Consensus-critical.
   std::uint64_t ingress_certifier_terms_activation_height{0};
+  // First height that accepts SCUPGSIG upgrade signals (docs/spec/SIGNALED_ACTIVATION.md). 0 on mainnet
+  // (from genesis); testnet-3 never until its flag day height is set. Below it an SCUPGSIG output is
+  // rejected, as releases without signaled activation reject it. Consensus-critical.
+  std::uint64_t upgrade_signal_activation_height{0};
+  // An upgrade not locked in this many blocks after its first signal fails (its record is removed).
+  // ~30 days at the 180 s minimum block interval; testnet ~3 days. Consensus-critical.
+  std::uint64_t upgrade_signal_window_blocks{14'400};
   // A term's certifier is drawn from the committee members that signed at least one of the last this
   // many finalized parents (prev_finality_signers), so an offline validator stops holding lanes.
   // Routing only, but every node must use the same value (it is in the handshake fingerprint).

@@ -57,6 +57,8 @@ class Mempool {
   // context, i.e. its epoch fell out of {current, previous}. Such txs can never be selected for a
   // block, and would otherwise hold their inputs until restart. Returns the number dropped.
   std::size_t prune_expired_admission_pow();
+  // Drops upgrade-signal txs that expired or are no longer admissible at the current context height.
+  std::size_t prune_stale_upgrade_signals();
   std::size_t size() const;
   std::size_t total_bytes() const;
   bool contains(const Hash32& txid) const;
