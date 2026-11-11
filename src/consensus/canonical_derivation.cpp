@@ -787,6 +787,12 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
     }
 
     for (const auto& out : outputs) {
+      UpgradeSignalScriptData upgrade_signal{};
+      if (parse_upgrade_signal_script(out.script_pubkey, &upgrade_signal)) {
+        (void)apply_upgrade_signal(cfg.upgrade_defs, state->validators, height, upgrade_signal.validator_pubkey,
+                                   upgrade_signal.upgrade_id, &state->upgrade_records);
+        continue;
+      }
       OnboardingRegistrationScriptData onboarding{};
       if (parse_onboarding_registration_script(out.script_pubkey, &onboarding)) {
         std::string err;
@@ -1535,6 +1541,11 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
         .timed_bond_lien =
             [&](const PubKey32& pub, std::uint64_t h) {
               return timed_bond_lien(prev, pub, h, cfg.network.committee_epoch_blocks);
+            },
+        .upgrade_signal_admission =
+            [&, height](const PubKey32& validator, const Hash32& upgrade_id) {
+              return upgrade_signal_admission_error(cfg.upgrade_defs, prev.upgrade_records, prev.validators, height,
+                                                    validator, upgrade_id);
             },
     };
   };
@@ -2462,6 +2473,9 @@ Bytes consensus_post_state_preimage(const CanonicalDerivationConfig& cfg, const 
   w.bytes_fixed(timed_escrow_commitment_root(state.timed_escrows));
   w.bytes_fixed(queued_join_commitment_root(state.validator_join_requests));
   w.u64le(state.base_fee_per_kib);
+  // Appended only once a signal exists, which no height below upgrade_signal_activation_height can
+  // hold: every earlier commitment, recorded history included, keeps its preimage (INVARIANTS D10).
+  if (!state.upgrade_records.empty()) w.bytes_fixed(upgrade_records_commitment_root(state.upgrade_records));
   return w.take();
 }
 

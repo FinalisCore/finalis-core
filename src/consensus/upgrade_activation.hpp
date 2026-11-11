@@ -7,11 +7,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "common/network.hpp"
 #include "common/types.hpp"
+#include "consensus/validator_registry.hpp"
 
 namespace finalis::consensus {
 
@@ -86,5 +90,25 @@ bool upgrade_active(const UpgradeRecord& rec, std::uint64_t height);
 // every upgrade active at that height.
 bool operator_eligible_under_upgrades(const std::vector<UpgradeRecord>& records, const PubKey32& operator_id,
                                       std::uint64_t epoch_start_height);
+
+using UpgradeRecords = std::map<Hash32, UpgradeRecord>;
+
+// Upgrades this binary knows for `network`. Empty until the first consensus change ships signaled.
+std::vector<UpgradeDef> known_upgrades(const NetworkConfig& network);
+
+// Empty when the SCUPGSIG of `validator_pubkey` for `upgrade_id` is admissible at `height`, else why
+// not: unknown upgrade, not an active validator, or a check_upgrade_signal reject. The signal counts
+// for the validator's canonical operator.
+std::string upgrade_signal_admission_error(const std::vector<UpgradeDef>& defs, const UpgradeRecords& records,
+                                           const ValidatorRegistry& validators, std::uint64_t height,
+                                           const PubKey32& validator_pubkey, const Hash32& upgrade_id);
+// Records an admissible signal; returns whether it changed `records`.
+bool apply_upgrade_signal(const std::vector<UpgradeDef>& defs, const ValidatorRegistry& validators, std::uint64_t height,
+                          const PubKey32& validator_pubkey, const Hash32& upgrade_id, UpgradeRecords* records);
+
+// Committed root over all records (sorted by id).
+Hash32 upgrade_records_commitment_root(const UpgradeRecords& records);
+Bytes serialize_upgrade_record(const UpgradeRecord& record);
+std::optional<UpgradeRecord> parse_upgrade_record(const Bytes& bytes);
 
 }  // namespace finalis::consensus

@@ -4046,3 +4046,74 @@ TEST(test_long_lock_key_sets_persist_and_reload) {
   ASSERT_TRUE(node::detail::persist_canonical_cache_rows(db, f.fx.parent));
   ASSERT_TRUE(node::detail::load_timed_key_sets(db).empty());
 }
+
+// Signaled activation step 2b: a finalized SCUPGSIG from an active validator is recorded per operator,
+// the state commitment covers the records, and replay reproduces them. Without the upgrade in the
+// binary's table the signal has no effect.
+TEST(test_frontier_apply_records_upgrade_signal_and_commits_it) {
+  auto cfg = test_cfg();
+  const auto validator = key_from_byte(90);  // the genesis validator of build_parent_state_with_utxo
+  const auto from = key_from_byte(91);
+  OutPoint op{};
+  op.txid.fill(0x9a);
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto parent = build_parent_state_with_utxo(cfg, 5, op, prev);
+  ASSERT_TRUE(parent.upgrade_records.empty());
+
+  Hash32 fp{};
+  fp.fill(0x31);
+  const consensus::UpgradeDef def{consensus::upgrade_id("replay-test-upgrade", fp), "replay-test-upgrade", 0, 1'000'000};
+  UpgradeSignalScriptData sig_data{};
+  sig_data.validator_pubkey = validator.public_key;
+  sig_data.upgrade_id = def.id;
+  sig_data.sig = *crypto::ed25519_sign(upgrade_signal_message(replay_chain_domain(), def.id, validator.public_key),
+                                       validator.private_key);
+  const std::vector<TxOut> outputs{TxOut{0, encode_upgrade_signal_script(sig_data)},
+                                   p2pkh_out_for_pub(from.public_key, 9'800)};
+  auto tx = build_signed_p2pkh_tx_single_input(replay_chain_domain(), op, prev, from.private_key, outputs);
+  ASSERT_TRUE(tx.has_value());
+  const std::vector<Bytes> ordered{tx->serialize()};
+  // The block builder decides with the same admission replay applies (canonical build_validation_context).
+  const auto apply_with = [&](const consensus::CanonicalDerivationConfig& c) {
+    SpecialValidationContext vctx;
+    vctx.network = &c.network;
+    vctx.chain_id = &c.chain_id;
+    vctx.current_height = parent.finalized_height + 1;
+    vctx.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
+      return consensus::upgrade_signal_admission_error(c.upgrade_defs, parent.upgrade_records, parent.validators,
+                                                       parent.finalized_height + 1, v, id);
+    };
+    const auto record = make_frontier_record(parent, ordered, c, 0, {}, &vctx);
+    consensus::CanonicalDerivedState out;
+    std::string err;
+    if (!consensus::apply_frontier_record(c, parent, record, &out, &err)) {
+      throw std::runtime_error("apply_frontier_record failed: " + err);
+    }
+    return out;
+  };
+
+  // Unknown to this binary: the block applies, the signal changes nothing.
+  const auto without = apply_with(cfg);
+  ASSERT_TRUE(without.upgrade_records.empty());
+
+  cfg.upgrade_defs = {def};
+  const auto with = apply_with(cfg);
+  ASSERT_EQ(with.upgrade_records.size(), 1u);
+  const auto& signalers = with.upgrade_records.at(def.id).signalers;
+  const auto info = with.validators.get(validator.public_key);
+  ASSERT_TRUE(info.has_value());
+  ASSERT_TRUE(signalers.count(consensus::canonical_operator_id(validator.public_key, *info)) == 1);
+
+  // The commitment covers the records; with none it is exactly what it was before this field existed.
+  auto cleared = with;
+  cleared.upgrade_records.clear();
+  ASSERT_TRUE(consensus::consensus_post_state_commitment(cfg, with) !=
+              consensus::consensus_post_state_commitment(cfg, cleared));
+  ASSERT_TRUE(consensus::consensus_post_state_commitment(cfg, without) ==
+              consensus::consensus_post_state_commitment(test_cfg(), without));
+
+  // Deterministic replay.
+  const auto again = apply_with(cfg);
+  ASSERT_TRUE(again.upgrade_records == with.upgrade_records);
+  ASSERT_EQ(again.state_commitment, with.state_commitment);
+}

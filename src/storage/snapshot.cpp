@@ -194,6 +194,7 @@ std::optional<SnapshotBundle> build_snapshot_bundle(const DB& db, std::string* e
   // the tip's post-state commitment never matches and an imported node replays from genesis.
   add_prefix(db, &kvs, "CE:");
   add_prefix(db, &kvs, "VJR:");
+  add_prefix(db, &kvs, key_upgrade_record_prefix());
   add_prefix(db, &kvs, "PVAL:");
   add_exact_key(db, &kvs, "PRAND:FINALIZED");
   add_prefix(db, &kvs, key_frontier_height_prefix());

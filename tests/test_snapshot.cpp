@@ -204,6 +204,7 @@ TEST(test_snapshot_carries_every_row_fast_start_loads) {
       {"CE:00000000000000a1", Bytes{0xC1}},           {"VJR:abcd", Bytes{0xC2}},
       {"PVAL:JOIN_WINDOW_START", Bytes{0xC3}},        {"PVAL:JOIN_WINDOW_COUNT", Bytes{0xC4}},
       {"PVAL:LIVENESS_WINDOW_START", Bytes{0xC5}},    {"PRAND:FINALIZED", Bytes(32, 0xC6)},
+      {storage::key_upgrade_record(Hash32{0x7a}), Bytes{0xC7}},  // signaled activation state
   };
   {
     storage::DB src;

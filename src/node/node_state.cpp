@@ -329,6 +329,7 @@ bool load_trusted_runtime_checkpoint_from_cache(const consensus::CanonicalDeriva
   state.utxos = db.load_utxos_v2();
   state.validators.mutable_all() = db.load_validators();
   state.validator_join_requests = db.load_validator_join_requests();
+  state.upgrade_records = db.load_upgrade_records();
   state.epoch_reward_states = db.load_epoch_reward_settlements();
   state.finalized_committee_checkpoints = db.load_finalized_committee_checkpoints();
 

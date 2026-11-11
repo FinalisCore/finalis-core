@@ -3850,6 +3850,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
     }
     const std::uint64_t broadcast_max_bond =
         std::max<std::uint64_t>(cfg_.network.validator_bond_max_amount, broadcast_min_bond);
+    const auto upgrade_records = view->load_upgrade_records();
     ConfidentialPolicy confidential_policy{};
     SpecialValidationContext ctx{
         .network = &cfg_.network,
@@ -3870,6 +3871,11 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
           return view->get_height_hash(anchor_height);
         },
         .confidential_policy = &confidential_policy,
+        .upgrade_signal_admission =
+            [&, next_height](const PubKey32& validator, const Hash32& upgrade_id) {
+              return consensus::upgrade_signal_admission_error(consensus::known_upgrades(cfg_.network),
+                                                               upgrade_records, vr, next_height, validator, upgrade_id);
+            },
     };
     auto vrx = validate_any_tx(*tx, 1, utxos, &ctx);
     if (!vrx.ok) {

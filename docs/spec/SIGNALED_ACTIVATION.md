@@ -243,9 +243,11 @@ least 3 independent builders sign releases.
 
 ## 10. Implementation steps
 
-1. `consensus/upgrade_activation`: definitions, state machine, threshold evaluation as pure
+1. DONE: `consensus/upgrade_activation`: definitions, state machine, threshold evaluation as pure
    functions plus unit tests. No wiring.
-2. `UpgradeSignal` tx kind: codec, validation, mempool rules, `UPG:` state rows, state commitment.
+2. DONE: `SCUPGSIG` output (2a: codec, stateless validation, activation height; 2b: stateful
+   admission in derivation, mempool and lightserver, `upgrade_records` in state, commitment once
+   non-empty, `UPG:` rows, snapshot). The known-upgrade table is empty, so nothing changes yet.
 3. Lock-in evaluation at epoch end in canonical derivation; `upgrade_active(id, h)`.
 4. Candidate filtering and emergency-recovery skip (§3.4.1); derivation spec update.
 5. Height-aware rules fingerprint, `upg=` handshake tag, old-binary `upgrade_required`, `get_status`.

@@ -12,6 +12,7 @@
 
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
+#include "consensus/upgrade_activation.hpp"
 #include "consensus/availability_retention.hpp"
 #include "consensus/confidential_supply.hpp"
 #include "consensus/frontier_execution.hpp"
@@ -48,6 +49,8 @@ struct CanonicalDerivationConfig {
   std::uint32_t validation_rules_version{6};
   ConfidentialPolicy confidential_policy{};
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
+  // Signaled upgrades this binary knows (consensus::known_upgrades); signals for others are invalid.
+  std::vector<UpgradeDef> upgrade_defs;
 };
 
 struct CanonicalGenesisState {
@@ -140,6 +143,8 @@ struct CanonicalDerivedState {
   std::uint64_t validator_join_window_start_height{0};
   std::uint32_t validator_join_count_in_window{0};
   std::uint64_t validator_liveness_window_start_height{0};
+  // Signaled activation state by upgrade id (SCUPGSIG signals). Committed once non-empty.
+  UpgradeRecords upgrade_records;
   std::size_t last_participation_eligible_signers{0};
   availability::AvailabilityPersistentState availability_state;
   // Derived supply-audit accumulators; deliberately not part of state_commitment.

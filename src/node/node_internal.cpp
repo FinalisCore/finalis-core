@@ -737,6 +737,8 @@ bool persist_canonical_cache_rows(storage::DB& db, storage::DB::Batch& batch, co
     (void)epoch;
     batch.put_finalized_committee_checkpoint(checkpoint);
   }
+  for (const auto& [key, _] : db.scan_prefix(storage::key_upgrade_record_prefix())) batch.erase(key);
+  for (const auto& [id, rec] : state.upgrade_records) batch.put_upgrade_record(id, rec);
   for (const auto& [key, _] : db.scan_prefix("TE:")) batch.erase(key);
   for (const auto& [key, tx] : state.timed_escrows) batch.put(timed_escrow_db_key(key), tx.serialize());
   for (const auto& [key, _] : db.scan_prefix("TK:")) batch.erase(key);
@@ -825,6 +827,13 @@ bool persist_canonical_cache_delta(storage::DB::Batch& batch, const consensus::C
   batch.put_protocol_reserve_balance(next.protocol_reserve_balance_units);
   batch.put_confidential_pool_value(next.confidential_pool_value);
   batch.put_base_fee_per_kib(next.base_fee_per_kib);
+  for (const auto& [id, _] : prev.upgrade_records) {
+    if (!next.upgrade_records.contains(id)) batch.erase(storage::key_upgrade_record(id));
+  }
+  for (const auto& [id, rec] : next.upgrade_records) {
+    const auto it = prev.upgrade_records.find(id);
+    if (it == prev.upgrade_records.end() || !(it->second == rec)) batch.put_upgrade_record(id, rec);
+  }
   for (const auto& [key, _] : prev.timed_escrows) {
     if (!next.timed_escrows.contains(key)) batch.erase(timed_escrow_db_key(key));
   }

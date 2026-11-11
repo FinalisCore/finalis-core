@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "consensus/upgrade_activation.hpp"
+#include "consensus/validator_registry.hpp"
 
 using namespace finalis;
 using namespace finalis::consensus;
@@ -171,4 +172,73 @@ TEST(test_upgrade_excludes_non_signalers_from_committees_from_activation_on) {
   auto failed = records;
   failed[0].state = UpgradeState::Failed;
   ASSERT_TRUE(operator_eligible_under_upgrades(failed, op(3), 9 * kB + 1));
+}
+
+namespace {
+consensus::ValidatorRegistry registry_with_active(const std::vector<PubKey32>& active, const PubKey32& pending) {
+  consensus::ValidatorRegistry vr;
+  for (const auto& pub : active) {
+    consensus::ValidatorInfo info;
+    info.status = consensus::ValidatorStatus::ACTIVE;
+    info.has_bond = true;
+    info.bonded_amount = 150;
+    vr.upsert(pub, info);
+  }
+  consensus::ValidatorInfo info;
+  info.status = consensus::ValidatorStatus::ONBOARDING;
+  vr.upsert(pending, info);
+  return vr;
+}
+}  // namespace
+
+// Step 2b: finalized signals are admitted against upgrade state and recorded per operator.
+TEST(test_upgrade_signal_admission_and_apply) {
+  const auto d = def();
+  const std::vector<UpgradeDef> defs{d};
+  const auto vr = registry_with_active({op(1), op(2)}, op(9));
+  UpgradeRecords records;
+  Hash32 unknown{};
+  unknown.fill(0xEE);
+  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 40, op(1), unknown), std::string("unknown-upgrade"));
+  ASSERT_EQ(upgrade_signal_admission_error({}, records, vr, 40, op(1), d.id), std::string("unknown-upgrade"));
+  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 40, op(9), d.id), std::string("not-active-operator"));
+  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 40, op(7), d.id), std::string("not-active-operator"));
+  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 10, op(1), d.id), std::string("before-signal-window"));
+  ASSERT_TRUE(upgrade_signal_admission_error(defs, records, vr, 40, op(1), d.id).empty());
+
+  ASSERT_TRUE(apply_upgrade_signal(defs, vr, 40, op(1), d.id, &records));
+  const auto operator1 = canonical_operator_id(op(1), *vr.get(op(1)));
+  ASSERT_TRUE(records.at(d.id).signalers.count(operator1) == 1);
+  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 41, op(1), d.id), std::string("duplicate-signal"));
+  ASSERT_TRUE(!apply_upgrade_signal(defs, vr, 41, op(1), d.id, &records));  // a duplicate changes nothing
+  ASSERT_TRUE(!apply_upgrade_signal(defs, vr, 41, op(9), d.id, &records));  // nor a non-operator
+  ASSERT_EQ(records.at(d.id).signalers.size(), 1u);
+}
+
+TEST(test_upgrade_record_codec_and_commitment_root) {
+  UpgradeRecord rec;
+  rec.state = UpgradeState::LockedIn;
+  rec.lock_in_height = 96;
+  rec.activation_height = 129;
+  rec.signalers = {op(3), op(1), op(2)};
+  const auto bytes = serialize_upgrade_record(rec);
+  const auto back = parse_upgrade_record(bytes);
+  ASSERT_TRUE(back.has_value() && *back == rec);
+  auto bad_state = bytes;
+  bad_state[0] = 9;
+  ASSERT_TRUE(!parse_upgrade_record(bad_state).has_value());
+  auto trailing = bytes;
+  trailing.push_back(0);
+  ASSERT_TRUE(!parse_upgrade_record(trailing).has_value());
+  auto unsorted = bytes;  // swap the first two signalers: not canonical
+  std::swap_ranges(unsorted.end() - 96, unsorted.end() - 64, unsorted.end() - 64);
+  ASSERT_TRUE(!parse_upgrade_record(unsorted).has_value());
+
+  const Hash32 id = def().id;
+  UpgradeRecords a{{id, rec}};
+  UpgradeRecords b = a;
+  ASSERT_TRUE(upgrade_records_commitment_root(a) == upgrade_records_commitment_root(b));
+  b[id].signalers.insert(op(4));
+  ASSERT_TRUE(upgrade_records_commitment_root(a) != upgrade_records_commitment_root(b));
+  ASSERT_TRUE(known_upgrades(mainnet_network()).empty());  // nothing ships signaled yet
 }

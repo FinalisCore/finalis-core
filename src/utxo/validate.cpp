@@ -133,6 +133,15 @@ bool validate_special_script_semantics(const std::vector<ScriptAnnotatedOutput>&
         if (error) *error = "upgrade signal signature invalid";
         return false;
       }
+      if (!ctx->upgrade_signal_admission) {
+        if (error) *error = "upgrade signals not accepted here";
+        return false;
+      }
+      if (const auto why = ctx->upgrade_signal_admission(upgrade_signal.validator_pubkey, upgrade_signal.upgrade_id);
+          !why.empty()) {
+        if (error) *error = "upgrade signal rejected: " + why;
+        return false;
+      }
       continue;
     }
 

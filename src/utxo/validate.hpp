@@ -45,6 +45,9 @@ struct SpecialValidationContext {
   std::function<bool(const PubKey32&, std::uint64_t)> timed_bond_lien;
   // Validating the sealed body of a settling TxTimed: its signatures cover timed_body_chain_domain.
   bool timed_body{false};
+  // Stateful check of an SCUPGSIG (validator, upgrade id) against finalized upgrade state: empty when
+  // admissible, else the reason (consensus::upgrade_signal_admission_error). Unset: signals rejected.
+  std::function<std::string(const PubKey32&, const Hash32&)> upgrade_signal_admission;
 };
 
 struct SlashEvidence {

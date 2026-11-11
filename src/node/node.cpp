@@ -1925,6 +1925,7 @@ consensus::CanonicalDerivationConfig Node::canonical_derivation_config_locked() 
     if (height == 0) return zero_hash();
     return db_.get_height_hash(height);
   };
+  cfg.upgrade_defs = consensus::known_upgrades(cfg_.network);
   return cfg;
 }
 
@@ -1988,6 +1989,12 @@ SpecialValidationContext Node::special_validation_context_locked(std::uint64_t h
       .timed_bond_lien = [this](const PubKey32& pub, std::uint64_t h) {
         return canonical_state_.has_value() &&
                consensus::timed_bond_lien(*canonical_state_, pub, h, cfg_.network.committee_epoch_blocks);
+      },
+      .upgrade_signal_admission = [this, height](const PubKey32& validator, const Hash32& upgrade_id) -> std::string {
+        if (!canonical_state_.has_value()) return "no-canonical-state";
+        return consensus::upgrade_signal_admission_error(consensus::known_upgrades(cfg_.network),
+                                                         canonical_state_->upgrade_records, canonical_state_->validators,
+                                                         height, validator, upgrade_id);
       }};
 }
 

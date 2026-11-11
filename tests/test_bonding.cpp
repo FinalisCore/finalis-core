@@ -1322,16 +1322,29 @@ TEST(test_upgrade_signal_validation_checks_value_signature_chain_and_count) {
     return validate_tx(*tx, 1, utxos, ctx);
   };
   const auto domain = test::test_chain_domain();
-  ASSERT_TRUE(validate_outputs({signal(domain)}, test::test_validation_ctx()).ok);
+  // Stateful admission is the caller's (consensus::upgrade_signal_admission_error); here: always admissible.
+  SpecialValidationContext admit = test::with_test_chain_identity();
+  admit.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string{}; };
+  {
+    auto none = validate_outputs({signal(domain)}, test::test_validation_ctx());
+    ASSERT_TRUE(!none.ok);
+    ASSERT_EQ(none.error, std::string("upgrade signals not accepted here"));
+    SpecialValidationContext refuse = admit;
+    refuse.upgrade_signal_admission = [](const PubKey32&, const Hash32&) { return std::string("duplicate-signal"); };
+    auto dup = validate_outputs({signal(domain)}, &refuse);
+    ASSERT_TRUE(!dup.ok);
+    ASSERT_EQ(dup.error, std::string("upgrade signal rejected: duplicate-signal"));
+  }
+  ASSERT_TRUE(validate_outputs({signal(domain)}, &admit).ok);
 
-  auto r = validate_outputs({signal(domain, 1)}, test::test_validation_ctx());
+  auto r = validate_outputs({signal(domain, 1)}, &admit);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("SCUPGSIG output must have zero value"));
 
   // Signed for another chain: not a signal here.
   auto other_chain = domain;
   other_chain[0] ^= 1;
-  r = validate_outputs({signal(other_chain)}, test::test_validation_ctx());
+  r = validate_outputs({signal(other_chain)}, &admit);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("upgrade signal signature invalid"));
 
@@ -1340,18 +1353,18 @@ TEST(test_upgrade_signal_validation_checks_value_signature_chain_and_count) {
   forged.validator_pubkey = validator.public_key;
   forged.upgrade_id = upgrade;
   forged.sig = *crypto::ed25519_sign(upgrade_signal_message(domain, upgrade, validator.public_key), sponsor.private_key);
-  r = validate_outputs({TxOut{0, encode_upgrade_signal_script(forged)}}, test::test_validation_ctx());
+  r = validate_outputs({TxOut{0, encode_upgrade_signal_script(forged)}}, &admit);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("upgrade signal signature invalid"));
 
-  r = validate_outputs({signal(domain), signal(domain)}, test::test_validation_ctx());
+  r = validate_outputs({signal(domain), signal(domain)}, &admit);
   ASSERT_TRUE(!r.ok);
   ASSERT_EQ(r.error, std::string("multiple SCUPGSIG outputs not allowed"));
 
   // Below the network's activation height a signal is rejected, as an older release rejects it.
   NetworkConfig late = test::test_network();
   late.upgrade_signal_activation_height = 100;
-  SpecialValidationContext before = test::with_test_chain_identity();
+  SpecialValidationContext before = admit;
   before.network = &late;
   before.current_height = 99;
   r = validate_outputs({signal(domain)}, &before);
@@ -1362,7 +1375,7 @@ TEST(test_upgrade_signal_validation_checks_value_signature_chain_and_count) {
   ASSERT_EQ(testnet_network().upgrade_signal_activation_height, std::numeric_limits<std::uint64_t>::max());
   ASSERT_EQ(mainnet_network().upgrade_signal_activation_height, 0u);
 
-  SpecialValidationContext timed = test::with_test_chain_identity();
+  SpecialValidationContext timed = admit;
   timed.timed_body = true;
   r = validate_outputs({signal(domain)}, &timed);
   ASSERT_TRUE(!r.ok);
