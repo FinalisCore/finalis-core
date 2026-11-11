@@ -34,6 +34,7 @@
 #include "common/minijson.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
+#include "common/release_manifest.hpp"
 #include "common/socket_compat.hpp"
 #include "common/wide_arith.hpp"
 #include "common/version.hpp"
@@ -1491,6 +1492,9 @@ void print_user_cli_help(std::ostream& os) {
      << "  finalis-cli send --to <addr> (--amount <coins> | --amount-units <u64> | --max) [--fee <u64>] [--rpc <url>] [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli onboarding-register [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--validator-file <path>] [--rpc <url>] [--pass <pass>] [--fee <u64>]\n"
      << "  finalis-cli upgrade-status [--rpc <url>]\n"
+     << "  finalis-cli release-keygen --out <file> --pass-prompt\n"
+     << "  finalis-cli release-manifest --version X.Y.Z --network <name> [--rules-fingerprint <fp>] [--upgrade-id <hex32>]... --out manifest.txt <artifact files...>\n"
+     << "  finalis-cli release-sign --manifest manifest.txt --key <release key file> [--sigs manifest.sig] --pass-prompt\n"
      << "  finalis-cli upgrade-signal --upgrade-id <hex32> [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--rpc <url>] [--pass <pass>]   (fee-free; the node signals by itself unless --no-upgrade-signal)\n"
      << "  finalis-cli validator_status [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass>]\n"
      << "  finalis-cli economics_explain [--db ~/.finalis/" << net << "] [--file ~/.finalis/" << net << "/keystore/validator.json] [--pass <pass> | --validator <pubkey hex>]  # the reward formula with your numbers\n"
@@ -1595,7 +1599,8 @@ std::optional<std::string> read_hidden_line(const std::string& prompt) {
 // line) and --pass-prompt (asked with echo off; twice for wallet_create/wallet_import) are rewritten
 // into --pass <value> here, so every command's own parser keeps handling --pass alone.
 bool resolve_passphrase_args(std::vector<std::string>& args) {
-  const bool creates = args.size() >= 2 && (args[1] == "wallet_create" || args[1] == "wallet_import");
+  const bool creates =
+      args.size() >= 2 && (args[1] == "wallet_create" || args[1] == "wallet_import" || args[1] == "release-keygen");
   for (std::size_t i = 1; i < args.size(); ++i) {
     const std::string a = args[i];
     if (a == "--pass") {
@@ -4600,6 +4605,144 @@ int run_cli(int argc, char** argv) {
       }
       std::cout << " known_by_server=" << (u.known_by_server ? "yes" : "no") << "\n";
     }
+    return 0;
+  }
+
+  // Release signing (docs/operations/UPDATER.md): the maintainer's Ed25519 release key, kept offline in
+  // an encrypted keystore; finalis-updater trusts a release signed by its policy's threshold of keys.
+  if (cmd == "release-keygen") {
+    std::string out_path, passphrase;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+    }
+    if (out_path.empty() || passphrase.empty()) {
+      std::cerr << "release-keygen requires --out <file> and a passphrase (--pass-prompt)\n";
+      return 1;
+    }
+    out_path = expand_user(out_path);
+    if (std::filesystem::exists(out_path)) {
+      std::cerr << "release-keygen: " << out_path << " exists; not overwriting\n";
+      return 1;
+    }
+    finalis::keystore::ValidatorKey key;
+    std::string err;
+    if (!finalis::keystore::create_validator_keystore(out_path, passphrase, "mainnet", "sc", std::nullopt, &key, &err)) {
+      std::cerr << "release-keygen failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "release_key_file=" << out_path << "\n";
+    std::cout << "release_pubkey=" << finalis::hex_encode32(key.pubkey) << "\n";
+    std::cout << "trust_policy_line=key " << finalis::hex_encode32(key.pubkey) << " <label>\n";
+    return 0;
+  }
+
+  if (cmd == "release-manifest") {
+    finalis::ReleaseManifest m;
+    std::string out_path;
+    std::vector<std::string> files;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--version" && i + 1 < argc) m.version = argv[++i];
+      else if (a == "--network" && i + 1 < argc) m.network = argv[++i];
+      else if (a == "--rules-fingerprint" && i + 1 < argc) m.rules_fingerprint = argv[++i];
+      else if (a == "--upgrade-id" && i + 1 < argc) {
+        const auto id = decode_hex32(argv[++i]);
+        if (!id) {
+          std::cerr << "release-manifest: --upgrade-id needs 32-byte hex\n";
+          return 1;
+        }
+        finalis::Hash32 h{};
+        std::copy(id->begin(), id->end(), h.begin());
+        m.upgrades.push_back(h);
+      } else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+      else files.push_back(a);
+    }
+    for (const auto& f : files) {
+      std::ifstream in(f, std::ios::binary);
+      if (!in) {
+        std::cerr << "release-manifest: cannot read " << f << "\n";
+        return 1;
+      }
+      finalis::Bytes data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      m.artifacts.push_back(
+          finalis::ReleaseArtifact{std::filesystem::path(f).filename().string(), finalis::crypto::sha256(data)});
+    }
+    std::string err;
+    if (out_path.empty() || !finalis::canonicalize_release_manifest(&m, &err)) {
+      std::cerr << "release-manifest: " << (out_path.empty() ? std::string("--out <file> required") : err)
+                << "\nusage: finalis-cli release-manifest --version X.Y.Z --network <name> [--rules-fingerprint <fp>]"
+                   " [--upgrade-id <hex32>]... --out manifest.txt <artifact files...>\n";
+      return 1;
+    }
+    std::ofstream out(expand_user(out_path), std::ios::binary | std::ios::trunc);
+    out << finalis::serialize_release_manifest(m);
+    if (!out) {
+      std::cerr << "release-manifest: cannot write " << out_path << "\n";
+      return 1;
+    }
+    std::cout << "manifest=" << out_path << "\nartifacts=" << m.artifacts.size() << "\n";
+    return 0;
+  }
+
+  if (cmd == "release-sign") {
+    std::string manifest_path, key_path, passphrase, sigs_path;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--manifest" && i + 1 < argc) manifest_path = argv[++i];
+      else if (a == "--key" && i + 1 < argc) key_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--sigs" && i + 1 < argc) sigs_path = argv[++i];
+    }
+    if (manifest_path.empty() || key_path.empty()) {
+      std::cerr << "usage: finalis-cli release-sign --manifest manifest.txt --key release-key.json [--sigs manifest.sig]"
+                   " --pass-prompt\n";
+      return 1;
+    }
+    if (sigs_path.empty()) sigs_path = manifest_path.substr(0, manifest_path.rfind('.')) + ".sig";
+    std::ifstream in(expand_user(manifest_path), std::ios::binary);
+    const std::string manifest_text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string err;
+    if (!finalis::parse_release_manifest(manifest_text, &err)) {
+      std::cerr << "release-sign: manifest invalid: " << err << "\n";
+      return 1;
+    }
+    finalis::keystore::ValidatorKey key;
+    if (!finalis::keystore::load_validator_keystore(expand_user(key_path), passphrase, &key, &err)) {
+      std::cerr << "release-sign: cannot load key: " << err << "\n";
+      return 1;
+    }
+    const auto sig = finalis::crypto::ed25519_sign(finalis::release_signing_message(manifest_text),
+                                                   finalis::Bytes(key.privkey.begin(), key.privkey.end()));
+    if (!sig) {
+      std::cerr << "release-sign: signing failed\n";
+      return 1;
+    }
+    // Append: co-signers add their lines to the same file; an earlier line of this key is replaced.
+    std::vector<finalis::ReleaseSignature> sigs;
+    if (std::ifstream prev(expand_user(sigs_path), std::ios::binary); prev) {
+      const std::string prev_text((std::istreambuf_iterator<char>(prev)), std::istreambuf_iterator<char>());
+      if (!prev_text.empty()) {
+        const auto parsed = finalis::parse_release_signatures(prev_text, &err);
+        if (!parsed) {
+          std::cerr << "release-sign: existing " << sigs_path << " invalid: " << err << "\n";
+          return 1;
+        }
+        for (const auto& s : *parsed) {
+          if (s.pubkey != key.pubkey) sigs.push_back(s);
+        }
+      }
+    }
+    sigs.push_back(finalis::ReleaseSignature{key.pubkey, *sig});
+    std::ofstream out(expand_user(sigs_path), std::ios::binary | std::ios::trunc);
+    out << finalis::serialize_release_signatures(sigs);
+    if (!out) {
+      std::cerr << "release-sign: cannot write " << sigs_path << "\n";
+      return 1;
+    }
+    std::cout << "signatures=" << sigs_path << "\nsigners=" << sigs.size() << "\nsigned_by="
+              << finalis::hex_encode32(key.pubkey) << "\n";
     return 0;
   }
 

@@ -151,10 +151,15 @@ to mainnet; start from an empty data directory.
     supported confidential subset
   - balances verified against validator signatures (see "Read Surfaces")
 - `finalis-cli`
-  - command-line wallet, validator registration, genesis tooling and RPC queries
+  - command-line wallet, validator registration, genesis tooling, RPC queries
+    and release signing (`release-keygen`, `release-manifest`, `release-sign`)
 - `finalis-nodetest`
   - testnet traffic tool for validators, with its own throwaway wallet; refuses
     mainnet ([apps/finalis-nodetest/README.md](apps/finalis-nodetest/README.md))
+- `finalis-updater`
+  - checks that a release is signed by the keys in the operator's trust policy
+    and reports newer trusted releases; installs nothing yet
+    ([docs/operations/UPDATER.md](docs/operations/UPDATER.md))
 
 This repository also contains:
 
