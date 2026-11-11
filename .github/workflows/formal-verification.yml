@@ -10,6 +10,7 @@ on:
       - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
       - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
       - "docs/spec/TWO_PHASE_FINALITY.md"
+      - "docs/spec/SIGNALED_ACTIVATION.md"
       - "docs/CONSENSUS.md"
       - "docs/LIVE_PROTOCOL.md"
       - "README.md"
@@ -23,6 +24,7 @@ on:
       - "docs/spec/CHECKPOINT_DERIVATION_SPEC.md"
       - "docs/spec/AVAILABILITY_STATE_COMPLETENESS.md"
       - "docs/spec/TWO_PHASE_FINALITY.md"
+      - "docs/spec/SIGNALED_ACTIVATION.md"
       - "docs/CONSENSUS.md"
       - "docs/LIVE_PROTOCOL.md"
       - "README.md"
@@ -89,6 +91,24 @@ jobs:
             --expect-violation NoBondLoss
           ./scripts/run_tlc.sh --spec "$spec" --config formal/timed_release_settle_last_mutation.cfg \
             --expect-violation NoBondLoss
+
+      # Signaled activation (formal/README.md, "Signaled Activation Model"): the invariants must hold
+      # exhaustively; the reachability configs and the four rule mutations must be violated.
+      - name: Run TLC signaled activation suite
+        run: |
+          spec=formal/signaled_activation.tla
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation.cfg
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_no_exclusion_halt.cfg
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_reach_active.cfg --expect-violation NeverActive
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_reach_failed.cfg --expect-violation NeverFailed
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_no_committee_check_mutation.cfg \
+            --expect-violation ParentCommitteeReady
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_no_exclusion_mutation.cfg \
+            --expect-violation ActiveCommitteeAllSignalers
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_no_emergency_skip_mutation.cfg \
+            --expect-violation ActiveCommitteeAllSignalers
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_a2_prior_only_mutation.cfg \
+            --expect-violation NoExclusionHalt
 
       - name: Upload TLC artifacts
         if: always()

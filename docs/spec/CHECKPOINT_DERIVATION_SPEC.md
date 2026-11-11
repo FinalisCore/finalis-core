@@ -567,8 +567,15 @@ for E' in [E, E-1] (the 2 prior epoch checkpoints, newest first):
         if m has no bond, or m.status in {BANNED, ONBOARDING, EXITING}: skip
         if NOT upgrade_eligible(m.operator_id, epoch_start_height(E+1)): skip   # §6.4
         members.append(m)
+if members is empty and an upgrade is active at epoch_start_height(E+1):   # A2
+    members := the first 4 validators by pubkey that hold a bond, are not BANNED, ONBOARDING
+               or EXITING, and are upgrade_eligible (suspended ones included)
 committee := sort_by_pubkey(members)   # weight = own bonded amount, no ticket
 ```
+
+The second step exists because the upgrade filter would otherwise turn a recovery the old rule
+completes into a permanent halt: once derivation fails closed, no late signal can be included
+(formal/signaled_activation.tla, `NoExclusionHalt`).
 
 `EXITING` members are skipped because they announced departure and may already be offline.
 `SUSPENDED` and `PENDING` members remain eligible: an emergency typically follows a mass liveness

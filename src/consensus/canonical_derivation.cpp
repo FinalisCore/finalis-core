@@ -2686,6 +2686,25 @@ std::vector<PubKey32> emergency_fallback_committee_members(
       out.push_back(pub);
     }
   }
+  // A2: the upgrade filter must not turn a recovery the old rule completes into a fail-closed halt,
+  // after which no signal could be included. Under an active upgrade with no prior member left,
+  // recover any signaler that did not leave (suspended or not), lowest pubkeys first.
+  const bool upgrade_governs =
+      upgrades != nullptr && std::any_of(upgrades->begin(), upgrades->end(), [&](const auto& entry) {
+        return upgrade_active(entry.second, epoch_start_height);
+      });
+  if (out.empty() && upgrade_governs) {
+    for (const auto& [pub, info] : validators.all()) {  // ordered by pubkey
+      if (out.size() >= kEmergencyFallbackMaxMembers) break;
+      if (!info.has_bond || info.bonded_amount == 0) continue;
+      if (info.status == ValidatorStatus::BANNED || info.status == ValidatorStatus::ONBOARDING ||
+          info.status == ValidatorStatus::EXITING) {
+        continue;
+      }
+      if (!operator_eligible_under_upgrades(upgrades, canonical_operator_id(pub, info), epoch_start_height)) continue;
+      out.push_back(pub);
+    }
+  }
   std::sort(out.begin(), out.end());
   return out;
 }

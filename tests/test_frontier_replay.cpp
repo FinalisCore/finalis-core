@@ -4383,7 +4383,7 @@ TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_s
   ASSERT_EQ(old_state.state_commitment, new_state.state_commitment);
 }
 
-// A2 (signaled activation, pre-release; formal/signaled_activation.tla NoExclusionHalt): at an
+// A2 (signaled activation, pre-release; fixed; formal/signaled_activation.tla NoExclusionHalt): at an
 // activation boundary where every signaler is suspended (not a candidate) and the signalers of the
 // last 2 committees have exited, emergency recovery finds only non-signalers and skips them, so the
 // derivation fails closed for good: no later signal can be included. The old rule would have recovered.
@@ -4442,4 +4442,3 @@ TEST(test_activation_boundary_recovers_suspended_signalers_instead_of_failing_cl
   storage::FinalizedCommitteeCheckpoint old_cp;
   ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, old_rules, 9, &old_cp, &err));
 }
-TEST_TAGS(test_activation_boundary_recovers_suspended_signalers_instead_of_failing_closed, "known-defect");

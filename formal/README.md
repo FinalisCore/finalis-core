@@ -236,9 +236,10 @@ reproduce the same defects in the node are listed in [tests/KNOWN_DEFECTS.md](..
 - Spec: [signaled_activation.tla](signaled_activation.tla) (docs/spec/SIGNALED_ACTIVATION.md,
   CHECKPOINT_DERIVATION_SPEC §6.4)
 - Configs: [signaled_activation.cfg](signaled_activation.cfg) (invariants hold, exhaustive: 4 operators,
-  committee 3, window 3 epochs, 7 epochs, 1 exit, any suspensions; 1,693,393 distinct states, ~1 min);
+  committee 3, window 3 epochs, 7 epochs, 1 exit, any suspensions; 1,692,305 distinct states, ~1 min) and
+  `signaled_activation_no_exclusion_halt.cfg`;
   reachability `signaled_activation_reach_{active,failed}.cfg`; mutations
-  `signaled_activation_{no_committee_check,no_exclusion,no_emergency_skip}_mutation.cfg` (the last with 5
+  `signaled_activation_{no_committee_check,no_exclusion,no_emergency_skip,a2_prior_only}_mutation.cfg` (`no_emergency_skip` with 5
   operators and committee 4, so committee(L+1) can hold a non-signaler).
 
 Abstracts finality (an epoch ends once final) and ticket order (any K-subset of the candidates). Models:
@@ -252,13 +253,12 @@ recovery from the 2 prior committees.
 | `ActiveCommitteeAllSignalers` | from activation on, every committee seat is a signaler | `no_exclusion`, `no_emergency_skip` |
 | `ActiveCommitteeUpgraded` | ... so every seat runs the new rules | |
 | `ParentCommitteeReady` | committee(A-1), the parent of the first new-rules block, has a quorum of signalers | `no_committee_check` |
+| `NoExclusionHalt` | the exclusion never makes derivation fail closed where the old rule completes | `a2_prior_only` |
 
-**Open defect A2** (tests/KNOWN_DEFECTS.md) (`signaled_activation_no_exclusion_halt.cfg`, `NoExclusionHalt` violated with the
-implemented rule, `Recovery = "current"`): the exclusion can turn a derivation the old rule completes
-into a fail-closed halt. At the activation boundary every signaler that is a candidate is suspended, and
-the signalers of the last 2 committees have exited, so emergency recovery finds only non-signalers and
-skips them. Once derivation fails closed no later signal can be included. The proposed rule
-(`Recovery = "signalers"`: with no recovery member, any signaler that did not exit, suspended or not)
-removes it for 1 exit (`signaled_activation_a2_signaler_recovery.cfg` holds, and
-`..._a2_signaler_recovery_safety.cfg` keeps every safety invariant). If every signaler exits, the halt
-remains unless a last resort recovers non-signalers, giving up `ActiveCommitteeAllSignalers` in that case.
+`signaled_activation_no_exclusion_halt.cfg` (`NoExclusionHalt` holds): the exclusion never turns a
+derivation the old rule completes into a fail-closed halt. With `Recovery = "prior_only"` (the rule
+before fix A2, tests/KNOWN_DEFECTS.md) it is violated: at an activation boundary where every signaler is
+suspended and the signalers of the last 2 committees have exited, emergency recovery found only
+non-signalers and failed closed for good. The fix recovers the signalers that did not exit. Not covered:
+every signaler exits (more than `MaxExits = 1`); the chain then halts where the old rule would recover
+non-signalers on old binaries.

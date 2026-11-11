@@ -105,8 +105,8 @@ EndEpoch ==
                                      /\ (UpgradeEligible(o, next) \/ Mutation = "no_emergency_skip")}
          base  == {o \in Ops : o \notin exited /\ o \notin suspended}
          emBase == {o \in committee \cup prevCommittee : o \notin exited}
-         \* Recovery = "signalers" (proposal A2): with no recovery member, any signaler that did not
-         \* exit, suspended or not; "current": the implemented rule (fail closed).
+         \* Recovery = "signalers" (the implemented rule, fix A2): with no recovery member, any signaler
+         \* that did not exit, suspended or not; "prior_only": the rule before A2 (fails closed).
          emSig == IF Recovery = "signalers" /\ ActiveAt(next) THEN {o \in signalers : o \notin exited} ELSE {}
      IN \E C \in (IF cands # {}
                   THEN {S \in SUBSET cands : Cardinality(S) = Min(K, Cardinality(cands))}

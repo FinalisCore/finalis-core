@@ -374,7 +374,8 @@ std::uint64_t effective_validator_min_bond_for_height(const NetworkConfig& netwo
 inline constexpr std::size_t kEmergencyFallbackMaxMembers = 4;
 inline constexpr std::uint64_t kEmergencyFallbackLookbackEpochs = 2;
 // From an upgrade's activation on, members whose operator has not signaled it are skipped
-// (SIGNALED_ACTIVATION §3.4.1).
+// (SIGNALED_ACTIVATION §3.4.1); if that leaves none, the first kEmergencyFallbackMaxMembers signaler
+// validators by pubkey that hold a bond and are not BANNED/ONBOARDING/EXITING (A2).
 std::vector<PubKey32> emergency_fallback_committee_members(
     const ValidatorRegistry& validators,
     const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
