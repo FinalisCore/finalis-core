@@ -132,13 +132,13 @@ std::optional<storage::FinalizedCommitteeCheckpoint> previous_checkpoint_for_epo
 
 AvailabilityCommitteeDecision decide_availability_committee_mode(
     const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state, std::uint64_t epoch_start_height,
-    const availability::AvailabilityPersistentState& availability_state) {
+    const availability::AvailabilityPersistentState& availability_state, const UpgradeRecords* upgrades) {
   AvailabilityCommitteeDecision decision;
   const auto previous_checkpoint = previous_checkpoint_for_epoch(cfg, state, epoch_start_height);
   const auto prior_adaptive = adaptive_checkpoint_parameters_from_metadata(previous_checkpoint);
   const auto qualified_cfg = availability_config_with_min_bond(cfg.availability, prior_adaptive.min_bond);
   decision.adaptive.qualified_depth = qualified_depth_at_checkpoint(state.validators, epoch_start_height, prior_adaptive.min_bond,
-                                                                    availability_state, qualified_cfg, &state.upgrade_records);
+                                                                    availability_state, qualified_cfg, upgrades);
   decision.adaptive = derive_adaptive_checkpoint_parameters(previous_checkpoint, decision.adaptive.qualified_depth);
   if (bootstrap_availability_grace_active(state.validators, epoch_start_height)) {
     decision.adaptive.target_committee_size = 1;
@@ -151,7 +151,7 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   decision.eligible_operator_count =
       count_eligible_operators_at_checkpoint(state.validators, epoch_start_height, availability_state,
                                              availability_config_with_min_bond(cfg.availability, decision.adaptive.min_bond),
-                                             &state.upgrade_records);
+                                             upgrades);
   decision.min_eligible_operators = decision.adaptive.min_eligible_operators;
   // Spec §11: committee = min(K, len(C)). FALLBACK must not shrink K to the
   // availability-eligible count; len(C) is applied by the callers' take.
@@ -491,7 +491,10 @@ std::vector<PubKey32> proposer_schedule_from_checkpoint(const CanonicalDerivatio
 
 std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_height(
     const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state, std::uint64_t height,
-    std::uint8_t ticket_difficulty_bits, AvailabilityCommitteeDecision* decision_out = nullptr) {
+    std::uint8_t ticket_difficulty_bits, AvailabilityCommitteeDecision* decision_out = nullptr,
+    bool apply_upgrade_filter = true) {
+  // The upgrade filter (§6.4); off only for the last-resort derivation (decision 8b).
+  const UpgradeRecords* upgrades = apply_upgrade_filter ? &state.upgrade_records : nullptr;
   std::vector<OperatorCommitteeInput> operator_inputs;
   const auto epoch_start = committee_epoch_start(height, cfg.network.committee_epoch_blocks);
   const auto epoch_seed = committee_epoch_seed(committee_epoch_randomness_for_height(cfg, state, height), epoch_start);
@@ -500,7 +503,7 @@ std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_heig
   for (const auto& operator_state : state.availability_state.operators) {
     availability_by_operator[operator_state.operator_pubkey] = &operator_state;
   }
-  auto decision = decide_availability_committee_mode(cfg, state, epoch_start, state.availability_state);
+  auto decision = decide_availability_committee_mode(cfg, state, epoch_start, state.availability_state, upgrades);
   const bool enforce_availability = decision.mode == storage::FinalizedCommitteeDerivationMode::NORMAL;
   if (decision_out) *decision_out = decision;
   auto adaptive_availability_cfg = availability_config_with_min_bond(cfg.availability, decision.adaptive.min_bond);
@@ -517,7 +520,7 @@ std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_heig
     const auto operator_id = canonical_operator_id(pub, info);
     // SIGNALED_ACTIVATION §3.4: from an upgrade's activation on, only its signalers are candidates
     // (NORMAL and FALLBACK alike).
-    if (!operator_eligible_under_upgrades(&state.upgrade_records, operator_id, epoch_start)) continue;
+    if (!operator_eligible_under_upgrades(upgrades, operator_id, epoch_start)) continue;
     const auto availability_it = availability_by_operator.find(operator_id);
     const auto eligibility = committee_eligibility_at_checkpoint(
         state.validators, pub, info, height, decision.adaptive.min_bond,
@@ -2038,6 +2041,9 @@ bool apply_frontier_record_impl(const CanonicalDerivationConfig& cfg, const Cano
   if (committee_epoch_start(next.finalized_height + 1, cfg.network.committee_epoch_blocks) == next.finalized_height + 1) {
     const auto next_epoch_start = next.finalized_height + 1;
     next.committee_epoch_randomness_cache[next_epoch_start] = next.finalized_randomness;
+    // decision 8a: an activation whose support fell below the operator threshold does not happen;
+    // decided before committee(next) is derived, so the old rules continue.
+    cancel_unsupported_upgrade_activations(next.validators, next_epoch_start, &next.upgrade_records);
     storage::FinalizedCommitteeCheckpoint checkpoint;
     if (!derive_next_epoch_checkpoint_from_state(cfg, next, next_epoch_start, &checkpoint, error)) return false;
     if (!validate_next_epoch_checkpoint_from_state(cfg, next, next_epoch_start, checkpoint, error)) return false;
@@ -2826,9 +2832,13 @@ std::optional<PubKey32> empty_active_set_escape_member(const ValidatorRegistry& 
   return out;
 }
 
-bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
-                                             std::uint64_t epoch_start_height,
-                                             storage::FinalizedCommitteeCheckpoint* out, std::string* error) {
+namespace {
+
+bool derive_checkpoint_with_upgrade_filter(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                           std::uint64_t epoch_start_height, bool apply_upgrade_filter,
+                                           storage::FinalizedCommitteeCheckpoint* out, std::string* error) {
+  const UpgradeRecords no_upgrades;
+  const UpgradeRecords& upgrades = apply_upgrade_filter ? state.upgrade_records : no_upgrades;
   // Normative implementation anchor:
   // docs/spec/CHECKPOINT_DERIVATION_SPEC.md §16 "DeriveCheckpointForEpoch"
   if (!out) {
@@ -2843,7 +2853,8 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
   const auto active_validator_count = state.validators.active_sorted(epoch_start_height).size();
   const auto difficulty_bits = ticket_difficulty_bits_for_epoch(cfg, state, epoch_start_height, active_validator_count);
   AvailabilityCommitteeDecision decision;
-  const auto active = finalized_committee_candidates_for_height(cfg, state, epoch_start_height, difficulty_bits, &decision);
+  const auto active = finalized_committee_candidates_for_height(cfg, state, epoch_start_height, difficulty_bits, &decision,
+                                                               apply_upgrade_filter);
   storage::FinalizedCommitteeCheckpoint checkpoint;
   checkpoint.epoch_start_height = epoch_start_height;
   checkpoint.epoch_seed = committee_epoch_seed(epoch_randomness, epoch_start_height);
@@ -2887,7 +2898,7 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
   }
   if (checkpoint.ordered_members.empty() && active_validator_count == 0 &&
       empty_active_set_epoch_escape_active_at_height(cfg.network, epoch_start_height)) {
-    if (auto fallback = empty_active_set_escape_member(state.validators, state.upgrade_records, epoch_start_height); fallback.has_value()) {
+    if (auto fallback = empty_active_set_escape_member(state.validators, upgrades, epoch_start_height); fallback.has_value()) {
       auto info = state.validators.get(*fallback);
       if (!info.has_value()) {
         if (error) *error = "escape-fallback-validator-missing-info";
@@ -2907,13 +2918,34 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
   // Never derive an empty committee: recover from recent prior committees, else fail closed.
   if (checkpoint.ordered_members.empty() &&
       !apply_emergency_fallback_committee(state.validators, state.finalized_committee_checkpoints,
-                                          cfg.network.committee_epoch_blocks, &checkpoint, &state.upgrade_records)) {
+                                          cfg.network.committee_epoch_blocks, &checkpoint,
+                                          apply_upgrade_filter ? &state.upgrade_records : nullptr)) {
     if (error) *error = "empty-committee-no-emergency-fallback";
     return false;
   }
   assign_checkpoint_bls_keys(state.validators, &checkpoint);
   *out = std::move(checkpoint);
   return true;
+}
+
+}  // namespace
+
+bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
+                                             std::uint64_t epoch_start_height,
+                                             storage::FinalizedCommitteeCheckpoint* out, std::string* error) {
+  std::string filtered_error;  // local: the retry must not depend on whether the caller wants the error
+  if (derive_checkpoint_with_upgrade_filter(cfg, state, epoch_start_height, true, out, &filtered_error)) return true;
+  // decision 8b (SIGNALED_ACTIVATION §3.4.2): with no signaler left to seat, even by emergency recovery,
+  // derive by the rule without the upgrade filter instead of failing closed. Liveness over "every
+  // seat is a signaler": no block could otherwise include a late signal. A seated non-signaler signs
+  // once it runs the new binary, which signals in its first block; from then on the filter seats it.
+  const bool upgrade_governs = std::any_of(state.upgrade_records.begin(), state.upgrade_records.end(),
+                                           [&](const auto& entry) { return upgrade_active(entry.second, epoch_start_height); });
+  if (!upgrade_governs || filtered_error != "empty-committee-no-emergency-fallback") {
+    if (error) *error = filtered_error;
+    return false;
+  }
+  return derive_checkpoint_with_upgrade_filter(cfg, state, epoch_start_height, false, out, error);
 }
 
 bool validate_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cfg, const CanonicalDerivedState& state,
@@ -3066,6 +3098,25 @@ void advance_upgrade_records_at_epoch_end(const CanonicalDerivationConfig& cfg, 
   for (auto it = records->begin(); it != records->end();) {
     advance_upgrade_at_epoch_end(&it->second, epoch_end_height, epoch_blocks, cfg.network.upgrade_signal_window_blocks, in);
     it = it->second.state == UpgradeState::Failed ? records->erase(it) : std::next(it);
+  }
+}
+
+void cancel_unsupported_upgrade_activations(const ValidatorRegistry& validators, std::uint64_t next_epoch_start,
+                                            UpgradeRecords* records) {
+  if (records == nullptr || records->empty()) return;
+  std::set<PubKey32> active_operators;
+  for (const auto& [pub, info] : validators.all()) {
+    if (validators.is_active_for_height(pub, next_epoch_start)) active_operators.insert(canonical_operator_id(pub, info));
+  }
+  for (auto it = records->begin(); it != records->end();) {
+    const auto& rec = it->second;
+    if (rec.state != UpgradeState::LockedIn || rec.activation_height != next_epoch_start) {
+      ++it;
+      continue;
+    }
+    std::size_t support = 0;
+    for (const auto& op : rec.signalers) support += active_operators.count(op);
+    it = support >= upgrade_operator_threshold(active_operators.size()) ? std::next(it) : records->erase(it);
   }
 }
 

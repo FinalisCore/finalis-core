@@ -99,6 +99,12 @@ jobs:
           spec=formal/signaled_activation.tla
           ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation.cfg
           ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_no_exclusion_halt.cfg
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_all_exit.cfg
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_no_exclusion_halt_all_exit.cfg
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_reach_cancelled.cfg --expect-violation NeverCancelled
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_reach_last_resort.cfg --expect-violation NeverLastResort
+          ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_a2_signalers_only_mutation.cfg \
+            --expect-violation NoExclusionHalt
           ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_reach_active.cfg --expect-violation NeverActive
           ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_reach_failed.cfg --expect-violation NeverFailed
           ./scripts/run_tlc.sh --spec "$spec" --config formal/signaled_activation_no_committee_check_mutation.cfg \

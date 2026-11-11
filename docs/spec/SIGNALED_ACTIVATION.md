@@ -112,6 +112,12 @@ Evaluated at each epoch end L, on finalized state:
 
 If both hold, the upgrade is `LOCKED_IN` at L and becomes active at the start of epoch A = L+2.
 
+**Re-check before activation (decision 8a).** At the end of L+1, before committee(A) is derived, the
+operator threshold is evaluated again over the operators active at A. If signalers have fallen below
+it (operators left or were removed), the record is removed: the upgrade does not activate, the old
+rules continue, nodes without the upgrade stop reporting `upgrade_required`, and a later signal opens
+a new window (`cancel_unsupported_upgrade_activations`).
+
 This gives activation the two things the 4800 flag day lacked:
 
 - The parent committee for the first new-rules block, committee(L+1), has a ready quorum, so time
@@ -144,6 +150,17 @@ evaluated at the end of L. Derivation consumes a closed input list, so:
   after activation could rebuild the committee from pre-activation members.
 - Lock-in also requires signalers ≥ the committee's minimum eligible operator count, so excluding
   non-signalers cannot leave derivation without enough candidates.
+
+### 3.4.2 No signaler left (decision 8b)
+
+After activation the record stays ACTIVE: blocks under the new rules exist, so there is no way back.
+If a derivation finds no signaler to seat, not as a candidate, not by emergency recovery and not by
+the A2 step (every signaler exited), it derives by the rule without the upgrade filter instead of
+failing closed. A halt there would be permanent, because no block could include a late signal. The
+seated non-signalers sign once they run the new binary, which signals in its first block; from the
+next derivation on the filter seats only signalers again. This is the one case where a committee
+seat may belong to a non-signaler (formal/signaled_activation.tla, `lastResort`). The checkpoint is
+the one the old rule derives, so nodes agree on it.
 
 ### 3.5 Handshake
 
@@ -232,6 +249,10 @@ unknown upgrade reach `LOCKED_IN`:
    validator key's address (operators must fund it), the funding keystore on the validator host (more
    key material there), a signal inside block proposals (block format change; validators that never
    propose could not signal).
+8. **Support lost, or no signaler left — DECIDED 2026-11-11: liveness and determinism first.**
+   a) Before activation: support is checked again at the last epoch end; without it the upgrade
+   does not proceed (§3.3). b) After activation: with no signaler left, the committee is derived
+   by the old rule rather than halting (§3.4.2).
 
 ## 9. Installing releases: updater and release signing
 
@@ -249,6 +270,10 @@ Rule: no node runs code that one person or one compromised account could produce
 
 Today there is one maintainer and one builder, so items 2 and 3 start at 1-of-1. That is why
 auto-install stays off (9.3).
+
+Implemented: the manifest (`src/common/release_manifest.hpp`, canonical text), signatures in
+`manifest.sig`, and the operator's trust policy `/etc/finalis/release-trust.txt` (`threshold` and
+`key` lines). The format is m-of-n from the start, so more maintainers only change the policy.
 
 ### 9.2 `finalis-updater`
 
@@ -306,4 +331,8 @@ least 3 independent builders sign releases.
    auto-signal after each finalized height (`--no-upgrade-signal`); lightserver `get_upgrades`, CLI
    `upgrade-status` and `upgrade-signal` (validator key only).
 7. Integration and chaos tests, TLA+ model, INVARIANTS entry.
-8. Updater (notify mode) and release-manifest signing (§9); separate PRs, not consensus code.
+8. PARTLY DONE (2026-11-11): release manifests signed with Ed25519 release keys, checked against an
+   operator trust policy (`threshold` plus keys; 1-of-1, the maintainer, for now; raising it is a
+   policy edit), `finalis-cli release-keygen|release-manifest|release-sign`, `finalis-updater
+   verify|check` (notify mode, nothing installed). [docs/operations/UPDATER.md](../operations/UPDATER.md).
+   Open: install mode (§9.2), the early-adopter gate (§9.3), reproducible builds (§9.1).

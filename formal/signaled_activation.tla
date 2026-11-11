@@ -16,8 +16,12 @@
 (* - from activation on only signalers are candidates; suspended operators  *)
 (*   are not candidates, but emergency recovery may take prior committee    *)
 (*   members of the 2 prior epochs that did not exit, suspended or not,     *)
-(*   also only signalers;                                                     *)
-(*   no candidate and no recovery member: derivation fails closed (halt).   *)
+(*   also only signalers; with none of those, any signaler that did not     *)
+(*   exit (A2); with no signaler left at all, the rule without the upgrade  *)
+(*   filter (last resort, decision 8b): liveness over "every seat signals"; *)
+(*   no member even then: derivation fails closed (halt), as the old rule;  *)
+(* - at the epoch end before activation, support is checked again: below    *)
+(*   ceil(2n/3) of active operators the record is removed (decision 8a).    *)
 (*                                                                          *)
 (* Mutations (each must break an invariant, see the *_mutation configs):    *)
 (*   "no_committee_check"  lock-in ignores committee(L+1)                   *)
@@ -26,7 +30,7 @@
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, TLC
 
-CONSTANTS Ops, K, Window, MaxEpoch, MaxExits, Mutation, Recovery
+CONSTANTS Ops, K, Window, MaxEpoch, MaxExits, Mutation, Recovery, Recheck
 
 Quorum(n)    == (2 * n) \div 3 + 1
 Threshold(n) == (2 * n + 2) \div 3
@@ -42,9 +46,12 @@ VARIABLES epoch,      \* current epoch
           suspended,  \* operators suspended for liveness (not candidates, recoverable)
           halted,     \* derivation failed closed
           everFailed, \* ghost: a record was removed at its window end
-          exclusionHalt \* ghost: derivation failed closed where it would not without the upgrade rule (A2)
+          exclusionHalt, \* ghost: derivation failed closed where it would not without the upgrade rule (A2)
+          lastResort, \* ghost: the current committee came from the last-resort rule (decision 8b)
+          everCancelled \* ghost: a locked-in record was removed at its activation boundary (decision 8a)
 
-vars == <<epoch, committee, prevCommittee, upgraded, signalers, rec, exited, suspended, halted, everFailed, exclusionHalt>>
+vars == <<epoch, committee, prevCommittee, upgraded, signalers, rec, exited, suspended, halted, everFailed, exclusionHalt,
+          lastResort, everCancelled>>
 
 States == {"none", "defined", "signaling", "locked", "active"}
 
@@ -58,6 +65,7 @@ TypeOK ==
   /\ rec.state \in States /\ rec.first \in 0..MaxEpoch /\ rec.act \in 0..(MaxEpoch + 2)
   /\ exited \subseteq Ops /\ suspended \subseteq Ops
   /\ halted \in BOOLEAN /\ everFailed \in BOOLEAN /\ exclusionHalt \in BOOLEAN
+  /\ lastResort \in BOOLEAN /\ everCancelled \in BOOLEAN
 
 Init ==
   /\ epoch = 1
@@ -71,71 +79,90 @@ Init ==
   /\ halted = FALSE
   /\ everFailed = FALSE
   /\ exclusionHalt = FALSE
+  /\ lastResort = FALSE
+  /\ everCancelled = FALSE
 
 Upgrade(o) ==
   /\ o \notin upgraded
   /\ upgraded' = upgraded \cup {o}
-  /\ UNCHANGED <<epoch, committee, prevCommittee, signalers, rec, exited, suspended, halted, everFailed, exclusionHalt>>
+  /\ UNCHANGED <<epoch, committee, prevCommittee, signalers, rec, exited, suspended, halted, everFailed, exclusionHalt, lastResort, everCancelled>>
 
 Signal(o) ==
   /\ ~halted
   /\ o \in upgraded /\ o \notin exited /\ o \notin signalers
   /\ signalers' = signalers \cup {o}
   /\ rec' = IF rec.state = "none" THEN [state |-> "defined", first |-> epoch, act |-> 0] ELSE rec
-  /\ UNCHANGED <<epoch, committee, prevCommittee, upgraded, exited, suspended, halted, everFailed, exclusionHalt>>
+  /\ UNCHANGED <<epoch, committee, prevCommittee, upgraded, exited, suspended, halted, everFailed, exclusionHalt, lastResort, everCancelled>>
 
 Exit(o) ==
   /\ o \notin exited /\ Cardinality(exited) < MaxExits
   /\ exited' = exited \cup {o}
-  /\ UNCHANGED <<epoch, committee, prevCommittee, upgraded, signalers, rec, suspended, halted, everFailed, exclusionHalt>>
+  /\ UNCHANGED <<epoch, committee, prevCommittee, upgraded, signalers, rec, suspended, halted, everFailed, exclusionHalt, lastResort, everCancelled>>
 
 ToggleSuspend(o) ==
   /\ suspended' = IF o \in suspended THEN suspended \ {o} ELSE suspended \cup {o}
-  /\ UNCHANGED <<epoch, committee, prevCommittee, upgraded, signalers, rec, exited, halted, everFailed, exclusionHalt>>
+  /\ UNCHANGED <<epoch, committee, prevCommittee, upgraded, signalers, rec, exited, halted, everFailed, exclusionHalt, lastResort, everCancelled>>
 
-\* Eligibility for the committee of epoch e (§6.4), before liveness filtering.
+\* Eligibility for the committee of epoch e (§6.4), before liveness filtering, under record r.
+ActiveUnder(r, e) == r.state \in {"locked", "active"} /\ e >= r.act
 UpgradeEligible(o, e) == ~ActiveAt(e) \/ o \in signalers
+
+NoRec == [state |-> "none", first |-> 0, act |-> 0]
 
 EndEpoch ==
   /\ ~halted /\ epoch < MaxEpoch
   /\ LET next  == epoch + 1
+         active   == Ops \ exited
+         support  == Cardinality(signalers \cap active) >= Threshold(Cardinality(active))
+         \* decision 8a: a locked-in record whose activation is the next epoch, with support below the
+         \* threshold, is removed before the next committee is derived; the old rules continue.
+         cancel == Recheck = "on" /\ rec.state = "locked" /\ next >= rec.act /\ ~support
+         r     == IF cancel THEN NoRec ELSE rec
+         sig   == IF cancel THEN {} ELSE signalers
+         elig(o) == ~ActiveUnder(r, next) \/ o \in sig
          cands == {o \in Ops : o \notin exited /\ o \notin suspended
-                               /\ (UpgradeEligible(o, next) \/ Mutation = "no_exclusion")}
+                               /\ (elig(o) \/ Mutation = "no_exclusion")}
          em    == {o \in committee \cup prevCommittee : o \notin exited
-                                     /\ (UpgradeEligible(o, next) \/ Mutation = "no_emergency_skip")}
+                                     /\ (elig(o) \/ Mutation = "no_emergency_skip")}
          base  == {o \in Ops : o \notin exited /\ o \notin suspended}
          emBase == {o \in committee \cup prevCommittee : o \notin exited}
-         \* Recovery = "signalers" (the implemented rule, fix A2): with no recovery member, any signaler
-         \* that did not exit, suspended or not; "prior_only": the rule before A2 (fails closed).
-         emSig == IF Recovery = "signalers" /\ ActiveAt(next) THEN {o \in signalers : o \notin exited} ELSE {}
-     IN \E C \in (IF cands # {}
-                  THEN {S \in SUBSET cands : Cardinality(S) = Min(K, Cardinality(cands))}
-                  ELSE IF em # {} THEN {em}
-                  ELSE IF emSig # {} THEN {emSig} ELSE {{}}) :
+         \* Recovery: "prior_only" = before A2 (fails closed); "signalers" = A2 (any signaler that did
+         \* not exit); "last_resort" = A2, then the rule without the upgrade filter (decision 8b).
+         emSig == IF Recovery \in {"signalers", "last_resort"} /\ ActiveUnder(r, next)
+                  THEN {o \in sig : o \notin exited} ELSE {}
+         useOld == Recovery = "last_resort" /\ cands = {} /\ em = {} /\ emSig = {}
+         options == IF cands # {}
+                    THEN {S \in SUBSET cands : Cardinality(S) = Min(K, Cardinality(cands))}
+                    ELSE IF em # {} THEN {em}
+                    ELSE IF emSig # {} THEN {emSig}
+                    ELSE IF useOld /\ base # {} THEN {S \in SUBSET base : Cardinality(S) = Min(K, Cardinality(base))}
+                    ELSE IF useOld /\ emBase # {} THEN {emBase}
+                    ELSE {{}}
+     IN \E C \in options :
           /\ halted' = (C = {})
           /\ exclusionHalt' = (C = {} /\ (base # {} \/ emBase # {}))
+          /\ lastResort' = (useOld /\ C # {})
+          /\ everCancelled' = (everCancelled \/ cancel)
           /\ committee' = C
           /\ prevCommittee' = committee
           /\ epoch' = next
-          /\ LET active   == Ops \ exited
-                 support  == Cardinality(signalers \cap active) >= Threshold(Cardinality(active))
-                 seats    == Mutation = "no_committee_check" \/ Cardinality(C \cap signalers) >= Quorum(Cardinality(C))
+          /\ LET seats    == Mutation = "no_committee_check" \/ Cardinality(C \cap sig) >= Quorum(Cardinality(C))
                  lock     == C # {} /\ support /\ seats
-             IN \/ /\ rec.state \in {"defined", "signaling"}
+             IN \/ /\ r.state \in {"defined", "signaling"}
                    /\ IF lock
-                      THEN /\ rec' = [rec EXCEPT !.state = "locked", !.act = epoch + 2]
-                           /\ UNCHANGED <<signalers, everFailed>>
-                      ELSE IF next >= rec.first + Window
-                           THEN /\ rec' = [state |-> "none", first |-> 0, act |-> 0]  \* failed: removed
+                      THEN /\ rec' = [r EXCEPT !.state = "locked", !.act = epoch + 2]
+                           /\ signalers' = sig /\ everFailed' = everFailed
+                      ELSE IF next >= r.first + Window
+                           THEN /\ rec' = NoRec  \* failed: removed
                                 /\ signalers' = {}
                                 /\ everFailed' = TRUE
-                           ELSE /\ rec' = [rec EXCEPT !.state = "signaling"]
-                                /\ UNCHANGED <<signalers, everFailed>>
-                \/ /\ rec.state = "locked"
-                   /\ rec' = IF next >= rec.act THEN [rec EXCEPT !.state = "active"] ELSE rec
-                   /\ UNCHANGED <<signalers, everFailed>>
-                \/ /\ rec.state \in {"none", "active"}
-                   /\ UNCHANGED <<rec, signalers, everFailed>>
+                           ELSE /\ rec' = [r EXCEPT !.state = "signaling"]
+                                /\ signalers' = sig /\ everFailed' = everFailed
+                \/ /\ r.state = "locked"
+                   /\ rec' = IF next >= r.act THEN [r EXCEPT !.state = "active"] ELSE r
+                   /\ signalers' = sig /\ everFailed' = everFailed
+                \/ /\ r.state \in {"none", "active"}
+                   /\ rec' = r /\ signalers' = sig /\ everFailed' = everFailed
   /\ UNCHANGED <<upgraded, exited, suspended>>
 
 Next ==
@@ -152,8 +179,9 @@ Symmetry == Permutations(Ops)
 
 \* From activation on, every committee seat belongs to a signaler, so the whole committee runs the
 \* new rules (no downgrade) and can sign new-rules blocks.
-ActiveCommitteeAllSignalers == ActiveAt(epoch) /\ ~halted => committee \subseteq signalers
-ActiveCommitteeUpgraded     == ActiveAt(epoch) /\ ~halted => committee \subseteq upgraded
+\* Except under the last-resort rule, which applies only once no signaler is left (decision 8b).
+ActiveCommitteeAllSignalers == ActiveAt(epoch) /\ ~halted /\ ~lastResort => committee \subseteq signalers
+ActiveCommitteeUpgraded     == ActiveAt(epoch) /\ ~halted /\ ~lastResort => committee \subseteq upgraded
 
 \* The parent committee of the first new-rules block (epoch act - 1, derived before lock-in) has a
 \* quorum of signalers, so its time signatures and votes are available at the switch.
@@ -166,4 +194,6 @@ NeverActive == rec.state # "active"
 NeverFailed == ~everFailed
 \* The upgrade rule never turns a derivation the old rule completes into a fail-closed halt.
 NoExclusionHalt == ~exclusionHalt
+NeverCancelled == ~everCancelled
+NeverLastResort == ~lastResort
 =============================================================================
