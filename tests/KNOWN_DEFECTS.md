@@ -20,9 +20,13 @@ the run summary ("OPEN DEFECTS REPRODUCED"), not a gate.
 Tests tagged `isolate` inject storage faults and run in a child process (`finalis-tests --run NAME`), so
 an abort inside librocksdb (E1 below) fails that one test with its signal instead of ending the run.
 
-## Open (2026-11-08)
+## Open (2026-11-11)
 
-None. C1 is fixed (below).
+| Id | Defect | Test |
+|---|---|---|
+| A1 | Signaled activation (unreleased: `upgrade_signal_activation_height` is max on testnet-3, mainnet not launched). Signal admission and `UPG:` state depend on the binary's `known_upgrades` table, so a binary that does not know an upgrade rejects the first block carrying a signal for it (`frontier-decisions-commitment-mismatch`). Old and new binaries split at the first signal instead of staying one network until activation (SIGNALED_ACTIVATION §3.5-3.6). Must be fixed before the mechanism is enabled anywhere. | `test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state` |
+
+C1 is fixed (below).
 
 ## Status (2026-10-28)
 

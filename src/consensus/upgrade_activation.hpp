@@ -92,6 +92,9 @@ bool operator_eligible_under_upgrades(const std::vector<UpgradeRecord>& records,
                                       std::uint64_t epoch_start_height);
 
 using UpgradeRecords = std::map<Hash32, UpgradeRecord>;
+// Same rule over the recorded state. Null means no upgrade state (always eligible).
+bool operator_eligible_under_upgrades(const UpgradeRecords* records, const PubKey32& operator_id,
+                                      std::uint64_t epoch_start_height);
 
 // Upgrades this binary knows for `network`. Empty until the first consensus change ships signaled.
 std::vector<UpgradeDef> known_upgrades(const NetworkConfig& network);

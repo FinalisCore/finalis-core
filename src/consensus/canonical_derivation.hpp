@@ -347,7 +347,8 @@ Hash32 consensus_state_commitment_from_post_state(const CanonicalDerivedState& s
 std::uint64_t qualified_depth_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,
                                             std::uint64_t effective_min_bond,
                                             const availability::AvailabilityPersistentState& availability_state,
-                                            const availability::AvailabilityConfig& availability_cfg);
+                                            const availability::AvailabilityConfig& availability_cfg,
+                                            const UpgradeRecords* upgrades = nullptr);
 std::uint64_t derive_adaptive_committee_target(const std::optional<storage::FinalizedCommitteeCheckpoint>& previous_checkpoint,
                                                std::uint64_t qualified_depth, std::uint32_t* expand_streak,
                                                std::uint32_t* contract_streak);
@@ -374,10 +375,12 @@ std::uint64_t effective_validator_min_bond_for_height(const NetworkConfig& netwo
 // order within an epoch) that still hold a bond and are not BANNED/ONBOARDING/EXITING, sorted by pubkey.
 inline constexpr std::size_t kEmergencyFallbackMaxMembers = 4;
 inline constexpr std::uint64_t kEmergencyFallbackLookbackEpochs = 2;
+// From an upgrade's activation on, members whose operator has not signaled it are skipped
+// (SIGNALED_ACTIVATION §3.4.1).
 std::vector<PubKey32> emergency_fallback_committee_members(
     const ValidatorRegistry& validators,
     const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
-    std::uint64_t committee_epoch_blocks);
+    std::uint64_t committee_epoch_blocks, const UpgradeRecords* upgrades = nullptr);
 // Sets checkpoint->ordered_bls_keys to each member's registered BLS key, in member order (a zero
 // key for a member without one; every registration and genesis entry carries one).
 void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::FinalizedCommitteeCheckpoint* checkpoint);
@@ -386,12 +389,15 @@ void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::Fi
 bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,
                                         const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
                                         std::uint64_t committee_epoch_blocks,
-                                        storage::FinalizedCommitteeCheckpoint* checkpoint);
+                                        storage::FinalizedCommitteeCheckpoint* checkpoint,
+                                        const UpgradeRecords* upgrades = nullptr);
 bool bootstrap_operator_grandfathered_for_availability(const ValidatorRegistry& validators, const PubKey32& operator_id,
                                                        std::uint64_t height);
+// Operators that have not signaled an upgrade active at `height` are not counted (`upgrades`).
 std::uint64_t count_eligible_operators_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,
                                                      const availability::AvailabilityPersistentState& availability_state,
-                                                     const availability::AvailabilityConfig& availability_cfg);
+                                                     const availability::AvailabilityConfig& availability_cfg,
+                                                     const UpgradeRecords* upgrades = nullptr);
 availability::AvailabilityConfig availability_config_with_min_bond(const availability::AvailabilityConfig& base,
                                                                    std::uint64_t min_bond);
 bool canonical_checkpoints_equal(const storage::FinalizedCommitteeCheckpoint& a,

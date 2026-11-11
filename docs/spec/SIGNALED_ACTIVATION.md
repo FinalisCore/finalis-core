@@ -253,7 +253,12 @@ least 3 independent builders sign releases.
    at epoch ends, so a record created by the first signal stays `DEFINED` until the next one. The
    minimum-eligible condition of §3.4.1 applies when committee(L+1) derived NORMAL; in FALLBACK the
    operator threshold alone keeps the candidate set non-empty.
-4. Candidate filtering and emergency-recovery skip (§3.4.1); derivation spec update.
+4. DONE: candidate filtering and emergency-recovery skip (§3.4.1); CHECKPOINT_DERIVATION_SPEC §6.4.
+   Excluded operators are also left out of `qualified_depth`, the eligible-operator count and the
+   empty-active-set escape, so they cannot steer mode or committee size. Availability state does
+   not depend on committees or upgrade records, so a late upgrader's score is affected only by the
+   time its old binary could not follow the chain; after its signal the next checkpoint is the one
+   an on-time signal gives (test above).
 5. Height-aware rules fingerprint, `upg=` handshake tag, old-binary `upgrade_required`, `get_status`.
 6. Node auto-signal, CLI `upgrade_status`.
 7. Integration and chaos tests, TLA+ model, INVARIANTS entry.

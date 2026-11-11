@@ -138,7 +138,7 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   const auto prior_adaptive = adaptive_checkpoint_parameters_from_metadata(previous_checkpoint);
   const auto qualified_cfg = availability_config_with_min_bond(cfg.availability, prior_adaptive.min_bond);
   decision.adaptive.qualified_depth = qualified_depth_at_checkpoint(state.validators, epoch_start_height, prior_adaptive.min_bond,
-                                                                    availability_state, qualified_cfg);
+                                                                    availability_state, qualified_cfg, &state.upgrade_records);
   decision.adaptive = derive_adaptive_checkpoint_parameters(previous_checkpoint, decision.adaptive.qualified_depth);
   if (bootstrap_availability_grace_active(state.validators, epoch_start_height)) {
     decision.adaptive.target_committee_size = 1;
@@ -150,7 +150,8 @@ AvailabilityCommitteeDecision decide_availability_committee_mode(
   }
   decision.eligible_operator_count =
       count_eligible_operators_at_checkpoint(state.validators, epoch_start_height, availability_state,
-                                             availability_config_with_min_bond(cfg.availability, decision.adaptive.min_bond));
+                                             availability_config_with_min_bond(cfg.availability, decision.adaptive.min_bond),
+                                             &state.upgrade_records);
   decision.min_eligible_operators = decision.adaptive.min_eligible_operators;
   // Spec §11: committee = min(K, len(C)). FALLBACK must not shrink K to the
   // availability-eligible count; len(C) is applied by the callers' take.
@@ -514,6 +515,9 @@ std::vector<FinalizedCommitteeCandidate> finalized_committee_candidates_for_heig
   std::map<PubKey32, OperatorSeed> by_operator;
   for (const auto& [pub, info] : state.validators.all()) {
     const auto operator_id = canonical_operator_id(pub, info);
+    // SIGNALED_ACTIVATION §3.4: from an upgrade's activation on, only its signalers are candidates
+    // (NORMAL and FALLBACK alike).
+    if (!operator_eligible_under_upgrades(&state.upgrade_records, operator_id, epoch_start)) continue;
     const auto availability_it = availability_by_operator.find(operator_id);
     const auto eligibility = committee_eligibility_at_checkpoint(
         state.validators, pub, info, height, decision.adaptive.min_bond,
@@ -2540,7 +2544,8 @@ Hash32 consensus_state_commitment_from_post_state(const CanonicalDerivedState& s
 std::uint64_t qualified_depth_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,
                                             std::uint64_t effective_min_bond,
                                             const availability::AvailabilityPersistentState& availability_state,
-                                            const availability::AvailabilityConfig& availability_cfg) {
+                                            const availability::AvailabilityConfig& availability_cfg,
+                                            const UpgradeRecords* upgrades) {
   std::set<PubKey32> qualified_operators;
   std::map<PubKey32, const availability::AvailabilityOperatorState*> availability_by_operator;
   for (const auto& operator_state : availability_state.operators) {
@@ -2548,6 +2553,7 @@ std::uint64_t qualified_depth_at_checkpoint(const ValidatorRegistry& validators,
   }
   for (const auto& [pub, info] : validators.all()) {
     const auto operator_id = canonical_operator_id(pub, info);
+    if (!operator_eligible_under_upgrades(upgrades, operator_id, height)) continue;
     const auto availability_it = availability_by_operator.find(operator_id);
     const auto eligibility = committee_eligibility_at_checkpoint(
         validators, pub, info, height, effective_min_bond,
@@ -2654,7 +2660,7 @@ bool bootstrap_availability_grace_active(const ValidatorRegistry& validators, st
 std::vector<PubKey32> emergency_fallback_committee_members(
     const ValidatorRegistry& validators,
     const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints, std::uint64_t epoch_start_height,
-    std::uint64_t committee_epoch_blocks) {
+    std::uint64_t committee_epoch_blocks, const UpgradeRecords* upgrades) {
   const auto epoch_blocks = std::max<std::uint64_t>(1, committee_epoch_blocks);
   std::vector<PubKey32> out;
   std::set<PubKey32> seen;
@@ -2675,6 +2681,8 @@ std::vector<PubKey32> emergency_fallback_committee_members(
           info->status == ValidatorStatus::EXITING) {
         continue;
       }
+      // Otherwise an emergency after an activation would rebuild the committee from pre-upgrade members.
+      if (!operator_eligible_under_upgrades(upgrades, canonical_operator_id(pub, *info), epoch_start_height)) continue;
       out.push_back(pub);
     }
   }
@@ -2694,9 +2702,10 @@ void assign_checkpoint_bls_keys(const ValidatorRegistry& validators, storage::Fi
 bool apply_emergency_fallback_committee(const ValidatorRegistry& validators,
                                         const std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint>& checkpoints,
                                         std::uint64_t committee_epoch_blocks,
-                                        storage::FinalizedCommitteeCheckpoint* checkpoint) {
-  const auto members =
-      emergency_fallback_committee_members(validators, checkpoints, checkpoint->epoch_start_height, committee_epoch_blocks);
+                                        storage::FinalizedCommitteeCheckpoint* checkpoint,
+                                        const UpgradeRecords* upgrades) {
+  const auto members = emergency_fallback_committee_members(validators, checkpoints, checkpoint->epoch_start_height,
+                                                            committee_epoch_blocks, upgrades);
   if (members.empty()) return false;
   checkpoint->derivation_mode = storage::FinalizedCommitteeDerivationMode::FALLBACK;
   checkpoint->fallback_reason = storage::FinalizedCommitteeFallbackReason::EMERGENCY_PRIOR_COMMITTEE;
@@ -2733,7 +2742,8 @@ bool bootstrap_operator_grandfathered_for_availability(const ValidatorRegistry& 
 
 std::uint64_t count_eligible_operators_at_checkpoint(const ValidatorRegistry& validators, std::uint64_t height,
                                                      const availability::AvailabilityPersistentState& availability_state,
-                                                     const availability::AvailabilityConfig& availability_cfg) {
+                                                     const availability::AvailabilityConfig& availability_cfg,
+                                                     const UpgradeRecords* upgrades) {
   std::map<PubKey32, const availability::AvailabilityOperatorState*> availability_by_operator;
   for (const auto& operator_state : availability_state.operators) {
     availability_by_operator[operator_state.operator_pubkey] = &operator_state;
@@ -2746,6 +2756,7 @@ std::uint64_t count_eligible_operators_at_checkpoint(const ValidatorRegistry& va
     if (!info.has_value()) continue;
     const auto operator_id = canonical_operator_id(validator_pubkey, *info);
     if (!counted.insert(operator_id).second) continue;
+    if (!operator_eligible_under_upgrades(upgrades, operator_id, height)) continue;
 
     if (bootstrap_operator_grandfathered_for_availability(validators, operator_id, height)) {
       ++out;
@@ -2784,11 +2795,13 @@ bool canonical_checkpoints_equal(const storage::FinalizedCommitteeCheckpoint& a,
          a.ordered_bls_keys == b.ordered_bls_keys;
 }
 
-std::optional<PubKey32> empty_active_set_escape_member(const ValidatorRegistry& validators) {
+std::optional<PubKey32> empty_active_set_escape_member(const ValidatorRegistry& validators, const UpgradeRecords& upgrades,
+                                                       std::uint64_t epoch_start_height) {
   std::optional<PubKey32> out;
   for (const auto& [pub, info] : validators.all()) {
     if (!info.has_bond || info.bonded_amount == 0) continue;
     if (info.status == ValidatorStatus::BANNED || info.status == ValidatorStatus::ONBOARDING) continue;
+    if (!operator_eligible_under_upgrades(&upgrades, canonical_operator_id(pub, info), epoch_start_height)) continue;
     if (!out.has_value() || pub < *out) out = pub;
   }
   return out;
@@ -2855,7 +2868,7 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
   }
   if (checkpoint.ordered_members.empty() && active_validator_count == 0 &&
       empty_active_set_epoch_escape_active_at_height(cfg.network, epoch_start_height)) {
-    if (auto fallback = empty_active_set_escape_member(state.validators); fallback.has_value()) {
+    if (auto fallback = empty_active_set_escape_member(state.validators, state.upgrade_records, epoch_start_height); fallback.has_value()) {
       auto info = state.validators.get(*fallback);
       if (!info.has_value()) {
         if (error) *error = "escape-fallback-validator-missing-info";
@@ -2875,7 +2888,7 @@ bool derive_next_epoch_checkpoint_from_state(const CanonicalDerivationConfig& cf
   // Never derive an empty committee: recover from recent prior committees, else fail closed.
   if (checkpoint.ordered_members.empty() &&
       !apply_emergency_fallback_committee(state.validators, state.finalized_committee_checkpoints,
-                                          cfg.network.committee_epoch_blocks, &checkpoint)) {
+                                          cfg.network.committee_epoch_blocks, &checkpoint, &state.upgrade_records)) {
     if (error) *error = "empty-committee-no-emergency-fallback";
     return false;
   }

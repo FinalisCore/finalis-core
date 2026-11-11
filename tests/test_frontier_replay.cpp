@@ -4216,3 +4216,178 @@ TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later)
   ASSERT_TRUE(replay.upgrade_records == states.back().upgrade_records);
   ASSERT_EQ(replay.state_commitment, states.back().state_commitment);
 }
+
+// Signaled activation step 4 (§3.4, §3.4.1): from an upgrade's activation on, operators that have not
+// signaled it are neither candidates nor counted as eligible. A late signal restores exactly the
+// checkpoint an on-time signal would have given: no lasting penalty beyond the epochs missed, and
+// availability state is untouched by the exclusion.
+TEST(test_checkpoint_excludes_non_signalers_from_activation_and_late_signal_restores_eligibility) {
+  const auto cfg = live_activation_cfg();
+  const auto bootstrap = key_from_byte(90);
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(bootstrap.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(bootstrap));
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  state.finalized_height = 4;
+  state.validators.set_rules(consensus::ValidatorRules{
+      .min_bond = live_adaptive_test_bond(), .warmup_blocks = 1, .cooldown_blocks = cfg.validator_cooldown_blocks});
+  const std::size_t late = 3;
+  const auto ops = add_active_operators(&state, 0xC0, live_normal_min_eligible() + 1 + late);
+  state.validators.advance_height(5);
+  state.committee_epoch_randomness_cache[5] = state.finalized_randomness;
+  const auto operator_of = [&](const PubKey32& pub) {
+    return consensus::canonical_operator_id(pub, *state.validators.get(pub));
+  };
+
+  const auto derive = [&](const consensus::CanonicalDerivedState& s) {
+    storage::FinalizedCommitteeCheckpoint cp;
+    std::string e;
+    if (!consensus::derive_next_epoch_checkpoint_from_state(cfg, s, 5, &cp, &e)) {
+      throw std::runtime_error("derive: " + e);
+    }
+    return cp;
+  };
+  const auto baseline = derive(state);
+  ASSERT_EQ(baseline.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
+
+  Hash32 id{};
+  id.fill(0x44);
+  consensus::UpgradeRecord rec;
+  rec.state = consensus::UpgradeState::Active;
+  rec.lock_in_height = 0;
+  rec.activation_height = 5;
+  rec.signalers.insert(operator_of(bootstrap.public_key));
+  std::set<PubKey32> laggards;
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    const auto op = operator_of(ops[i].public_key);
+    if (i < ops.size() - late) {
+      rec.signalers.insert(op);
+    } else {
+      laggards.insert(op);
+    }
+  }
+
+  auto excluded = state;
+  excluded.upgrade_records[id] = rec;
+  const auto cp = derive(excluded);
+  ASSERT_EQ(cp.derivation_mode, storage::FinalizedCommitteeDerivationMode::NORMAL);
+  ASSERT_EQ(cp.availability_eligible_operator_count, baseline.availability_eligible_operator_count - late);
+  ASSERT_TRUE(!cp.ordered_operator_ids.empty());
+  for (const auto& op : cp.ordered_operator_ids) ASSERT_TRUE(laggards.count(op) == 0);
+  ASSERT_TRUE(excluded.availability_state == state.availability_state);
+
+  // Locked in but not yet active at 5: nobody is excluded.
+  auto pending = excluded;
+  pending.upgrade_records[id].state = consensus::UpgradeState::LockedIn;
+  pending.upgrade_records[id].activation_height = 9;
+  ASSERT_TRUE(consensus::canonical_checkpoints_equal(derive(pending), baseline));
+  // A failed upgrade never restricts anyone.
+  auto failed = excluded;
+  failed.upgrade_records[id].state = consensus::UpgradeState::Failed;
+  ASSERT_TRUE(consensus::canonical_checkpoints_equal(derive(failed), baseline));
+
+  // The laggards upgrade and signal: the next derivation is the on-time one.
+  auto upgraded = excluded;
+  for (const auto& op : laggards) upgraded.upgrade_records[id].signalers.insert(op);
+  ASSERT_TRUE(consensus::canonical_checkpoints_equal(derive(upgraded), baseline));
+}
+
+// §3.4.1: emergency prior-committee recovery skips members whose operator has not signaled an active
+// upgrade, so an emergency after activation cannot rebuild the committee from pre-upgrade members.
+TEST(test_emergency_fallback_committee_skips_non_signalers_after_activation) {
+  consensus::ValidatorRegistry validators;
+  validators.set_rules(consensus::ValidatorRules{.min_bond = 1, .warmup_blocks = 0, .cooldown_blocks = 0});
+  std::vector<PubKey32> keys;
+  for (std::uint8_t seed = 0xD0; seed < 0xD4; ++seed) {
+    const auto kp = key_from_byte(seed);
+    OutPoint bond{};
+    bond.txid.fill(seed);
+    std::string err;
+    ASSERT_TRUE(validators.register_bond(kp.public_key, bond, 0, 100, &err, kp.public_key));
+    keys.push_back(kp.public_key);
+  }
+  std::map<std::uint64_t, storage::FinalizedCommitteeCheckpoint> checkpoints;
+  checkpoints[9].ordered_members = keys;
+
+  Hash32 id{};
+  id.fill(0x45);
+  consensus::UpgradeRecord rec;
+  rec.state = consensus::UpgradeState::Active;
+  rec.activation_height = 13;
+  for (std::size_t i = 0; i < 2; ++i) {
+    rec.signalers.insert(consensus::canonical_operator_id(keys[i], *validators.get(keys[i])));
+  }
+  const consensus::UpgradeRecords records{{id, rec}};
+
+  std::vector<PubKey32> signalers{keys[0], keys[1]};
+  std::sort(signalers.begin(), signalers.end());
+  auto all = keys;
+  std::sort(all.begin(), all.end());
+  ASSERT_EQ(consensus::emergency_fallback_committee_members(validators, checkpoints, 13, 4, &records), signalers);
+  ASSERT_EQ(consensus::emergency_fallback_committee_members(validators, checkpoints, 13, 4), all);
+  auto not_yet = records;
+  not_yet[id].state = consensus::UpgradeState::LockedIn;
+  not_yet[id].activation_height = 17;
+  ASSERT_EQ(consensus::emergency_fallback_committee_members(validators, checkpoints, 13, 4, &not_yet), all);
+
+  storage::FinalizedCommitteeCheckpoint checkpoint;
+  checkpoint.epoch_start_height = 13;
+  ASSERT_TRUE(consensus::apply_emergency_fallback_committee(validators, checkpoints, 4, &checkpoint, &records));
+  ASSERT_EQ(checkpoint.ordered_members, signalers);
+  // Nobody signaled: fail closed rather than recover pre-upgrade members.
+  auto none = records;
+  none[id].signalers.clear();
+  storage::FinalizedCommitteeCheckpoint empty;
+  empty.epoch_start_height = 13;
+  ASSERT_TRUE(!consensus::apply_emergency_fallback_committee(validators, checkpoints, 4, &empty, &none));
+}
+
+// A1 (signaled activation, pre-release): two binaries, one that knows an upgrade and one that does not,
+// must derive the same state from the same finalized block, or the first signal splits them long
+// before activation (SIGNALED_ACTIVATION §3.5-3.6). The block is built by the binary that knows the
+// upgrade and verified by one that does not.
+TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state) {
+  auto old_cfg = test_cfg();
+  auto new_cfg = test_cfg();
+  const auto validator = key_from_byte(90);
+  const auto from = key_from_byte(91);
+  OutPoint op{};
+  op.txid.fill(0x9c);
+  const auto prev = p2pkh_out_for_pub(from.public_key, 10'000);
+  const auto parent = build_parent_state_with_utxo(old_cfg, 5, op, prev);
+
+  Hash32 fp{};
+  fp.fill(0x33);
+  const consensus::UpgradeDef def{consensus::upgrade_id("cross-binary", fp), "cross-binary", 0, 1'000'000};
+  new_cfg.upgrade_defs = {def};
+  UpgradeSignalScriptData sig_data{};
+  sig_data.validator_pubkey = validator.public_key;
+  sig_data.upgrade_id = def.id;
+  sig_data.sig = *crypto::ed25519_sign(upgrade_signal_message(replay_chain_domain(), def.id, validator.public_key),
+                                       validator.private_key);
+  auto tx = build_signed_p2pkh_tx_single_input(
+      replay_chain_domain(), op, prev, from.private_key,
+      {TxOut{0, encode_upgrade_signal_script(sig_data)}, p2pkh_out_for_pub(from.public_key, 9'800)});
+  ASSERT_TRUE(tx.has_value());
+  SpecialValidationContext vctx;
+  vctx.network = &new_cfg.network;
+  vctx.chain_id = &new_cfg.chain_id;
+  vctx.current_height = parent.finalized_height + 1;
+  vctx.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
+    return consensus::upgrade_signal_admission_error(new_cfg.upgrade_defs, parent.upgrade_records, parent.validators,
+                                                     parent.finalized_height + 1, v, id);
+  };
+  const auto record = make_frontier_record(parent, {tx->serialize()}, new_cfg, 0, {}, &vctx);
+
+  consensus::CanonicalDerivedState new_state;
+  std::string err;
+  ASSERT_TRUE(consensus::apply_frontier_record(new_cfg, parent, record, &new_state, &err));
+  consensus::CanonicalDerivedState old_state;
+  const bool old_ok = consensus::apply_frontier_record(old_cfg, parent, record, &old_state, &err);
+  if (!old_ok) throw std::runtime_error("old binary rejects the block: " + err);
+  ASSERT_EQ(old_state.state_commitment, new_state.state_commitment);
+}
+TEST_TAGS(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state, "known-defect");

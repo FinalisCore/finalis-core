@@ -97,6 +97,15 @@ bool operator_eligible_under_upgrades(const std::vector<UpgradeRecord>& records,
   return true;
 }
 
+bool operator_eligible_under_upgrades(const UpgradeRecords* records, const PubKey32& operator_id,
+                                      std::uint64_t epoch_start_height) {
+  if (records == nullptr) return true;
+  for (const auto& [_, rec] : *records) {
+    if (upgrade_active(rec, epoch_start_height) && rec.signalers.count(operator_id) == 0) return false;
+  }
+  return true;
+}
+
 std::vector<UpgradeDef> known_upgrades(const NetworkConfig& network) {
   (void)network;
   return {};
