@@ -1144,13 +1144,36 @@ std::string quorum_blocked_log_line(std::uint64_t height, const QuorumDiagnosis&
     }
   }
   // Plain-language hint last; no quotes, log_line output may be JSON.
-  if (d.halt_reason == "no_peers") {
+  if (d.halt_reason == "upgrade_required") {
+    oss << " -- this binary does not implement upgrade " << hex_encode32(d.upgrade_required_id)
+        << " active since " << d.upgrade_required_height << "; install a release that does";
+  } else if (d.halt_reason == "no_peers") {
     oss << " -- no peers connected, check the network and peer settings";
   } else if (d.halt_reason == "other_consensus_rules") {
     oss << " -- " << d.missing_other_rules.size()
         << " missing signer(s) run different consensus rules; the chain resumes once they upgrade";
   } else {
     oss << " -- waiting for votes from offline or unreachable validators";
+  }
+  return oss.str();
+}
+
+void apply_upgrade_required(std::uint64_t next_height, const Hash32& id, std::uint64_t activation_height,
+                            QuorumDiagnosis* d) {
+  d->upgrade_required_height = activation_height;
+  d->upgrade_required_id = id;
+  if (next_height >= activation_height) d->halt_reason = "upgrade_required";
+}
+
+std::string upgrade_required_log_line(std::uint64_t next_height, const QuorumDiagnosis& d) {
+  if (d.upgrade_required_height == 0) return {};
+  std::ostringstream oss;
+  oss << "UPGRADE REQUIRED name=" << hex_encode32(d.upgrade_required_id) << " activates_at=" << d.upgrade_required_height;
+  if (next_height >= d.upgrade_required_height) {
+    oss << " -- active now: this node no longer signs or follows the chain; install a release that implements it";
+  } else {
+    oss << " -- locked in by the validators; install a release that implements it before height "
+        << d.upgrade_required_height << ", after that this node stops signing";
   }
   return oss.str();
 }

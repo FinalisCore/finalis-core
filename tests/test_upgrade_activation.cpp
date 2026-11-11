@@ -6,6 +6,7 @@
 #include <set>
 #include <vector>
 
+#include "common/chain_id.hpp"
 #include "consensus/canonical_derivation.hpp"
 #include "consensus/upgrade_activation.hpp"
 #include "consensus/validator_registry.hpp"
@@ -331,4 +332,55 @@ TEST(test_upgrade_records_advance_at_epoch_end_from_checkpoint_inputs) {
   UpgradeRecords none;
   advance_upgrade_records_at_epoch_end(cfg, vr, fallback_cp, &none);
   ASSERT_TRUE(none.empty());
+}
+
+// Step 5 (§3.5-3.6): what the handshake fingerprint covers, and what a binary must report as required.
+TEST(test_upgrade_handshake_and_required_helpers) {
+  Hash32 known_id{}, unknown_id{}, later_id{};
+  known_id.fill(0x01);
+  unknown_id.fill(0x02);
+  later_id.fill(0x03);
+  const std::vector<UpgradeDef> known{UpgradeDef{known_id, "known", 0}};
+  UpgradeRecord active;
+  active.state = UpgradeState::Active;
+  active.activation_height = 100;
+  UpgradeRecord locked;
+  locked.state = UpgradeState::LockedIn;
+  locked.activation_height = 200;
+  UpgradeRecord signaling;
+  signaling.state = UpgradeState::Signaling;
+  UpgradeRecords records{{known_id, active}, {later_id, locked}, {unknown_id, signaling}};
+
+  ASSERT_TRUE(implemented_active_upgrades(records, known, 99).empty());
+  ASSERT_TRUE(implemented_active_upgrades(records, known, 100) == std::vector<Hash32>{known_id});
+  ASSERT_TRUE(implemented_active_upgrades(records, {}, 100).empty());  // not implemented: not covered
+  // Only locked-in or active upgrades the binary lacks are required; a signaling one is not yet.
+  const auto required = unimplemented_locked_in_upgrades(records, known);
+  ASSERT_EQ(required.size(), 1u);
+  ASSERT_TRUE(required[0].id == later_id && required[0].activation_height == 200);
+  ASSERT_TRUE(upgrade_required_from_height(records, known) == std::optional<std::uint64_t>(200));
+  // Without any table both are required, earliest activation first.
+  const auto all = unimplemented_locked_in_upgrades(records, {});
+  ASSERT_EQ(all.size(), 2u);
+  ASSERT_TRUE(all[0].id == known_id && all[1].id == later_id);
+  ASSERT_TRUE(upgrade_required_from_height(records, {}) == std::optional<std::uint64_t>(100));
+  records.erase(later_id);
+  ASSERT_TRUE(!upgrade_required_from_height(records, known).has_value());
+}
+
+// §3.5: with no active upgrade the fingerprint is the one releases without signaled activation
+// advertise, so they keep connecting; an active upgrade changes it, in any order.
+TEST(test_rules_fingerprint_covers_active_upgrades_only_when_present) {
+  const auto& net = mainnet_network();
+  ChainId chain;
+  chain.genesis_hash_hex = std::string(64, 'a');
+  Hash32 a{}, b{};
+  a.fill(0x0A);
+  b.fill(0x0B);
+  const auto base = consensus_rules_fingerprint(net, chain, 7);
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, {}), base);
+  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, {a}) != base);
+  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, {a}) != consensus_rules_fingerprint(net, chain, 7, {b}));
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, {a, b}), consensus_rules_fingerprint(net, chain, 7, {b, a}));
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, {a, a}), consensus_rules_fingerprint(net, chain, 7, {a}));
 }

@@ -852,6 +852,8 @@ NodeStatus Node::status() const {
     s.halt_reason = std::move(diag.halt_reason);
     s.missing_signers = std::move(diag.missing);
     s.missing_signers_other_rules = std::move(diag.missing_other_rules);
+    s.upgrade_required_height = diag.upgrade_required_height;
+    s.upgrade_required_id = diag.upgrade_required_id;
   }
   s.rejected_consensus_rules = rejected_consensus_rules_;
   s.last_bootstrap_source = last_bootstrap_source_;
@@ -992,6 +994,8 @@ storage::NodeRuntimeStatusSnapshot Node::build_runtime_status_snapshot_locked(st
     snapshot.halt_reason = std::move(diag.halt_reason);
     snapshot.missing_signers = std::move(diag.missing);
     snapshot.missing_signers_other_rules = std::move(diag.missing_other_rules);
+    snapshot.upgrade_required_height = diag.upgrade_required_height;
+    snapshot.upgrade_required_id = diag.upgrade_required_id;
   }
   snapshot.rejected_consensus_rules = rejected_consensus_rules_;
 
@@ -1362,11 +1366,12 @@ void Node::event_loop() {
           }
           std::cout << "\n";
         }
+        const auto diag = quorum_diagnosis_locked(now_ms);
         if (runtime_logs_enabled()) {
-          if (const auto blocked = detail::quorum_blocked_log_line(h, quorum_diagnosis_locked(now_ms)); !blocked.empty()) {
-            log_line(blocked);
-          }
+          if (const auto blocked = detail::quorum_blocked_log_line(h, diag); !blocked.empty()) log_line(blocked);
         }
+        // Always, like the startup warnings: the operator must act before the activation height.
+        if (const auto required = detail::upgrade_required_log_line(h, diag); !required.empty()) log_line(required);
         last_summary_log_ms_ = now_ms;
       }
 

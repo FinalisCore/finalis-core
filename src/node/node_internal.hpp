@@ -30,6 +30,12 @@ QuorumDiagnosis diagnose_quorum(const std::string& state, std::size_t peers, con
                                 const std::map<PubKey32, std::uint64_t>& other_rules_seen_ms, std::uint64_t now_ms);
 // One operator-readable line; empty when the chain is not blocked.
 std::string quorum_blocked_log_line(std::uint64_t height, const QuorumDiagnosis& d);
+// Records a locked-in upgrade this binary does not implement; from its activation height on it is the
+// halt reason, whatever else the quorum shows (SIGNALED_ACTIVATION §3.6).
+void apply_upgrade_required(std::uint64_t next_height, const Hash32& id, std::uint64_t activation_height,
+                            QuorumDiagnosis* d);
+// "UPGRADE REQUIRED ..." while d records one, logged every summary; empty otherwise.
+std::string upgrade_required_log_line(std::uint64_t next_height, const QuorumDiagnosis& d);
 
 // --- Constants ---
 inline constexpr std::uint32_t kFixedValidationRulesVersion = consensus::kValidationRulesVersion;

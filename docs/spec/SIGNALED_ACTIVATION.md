@@ -275,7 +275,15 @@ least 3 independent builders sign releases.
    not depend on committees or upgrade records, so a late upgrader's score is affected only by the
    time its old binary could not follow the chain; after its signal the next checkpoint is the one
    an on-time signal gives (test above).
-5. Height-aware rules fingerprint, `upg=` handshake tag, old-binary `upgrade_required`, `get_status`.
+5. DONE: height-aware rules fingerprint (`consensus_rules_fingerprint` covers the upgrades active at
+   the next height that the binary implements; with none it is unchanged, so releases without the
+   mechanism keep connecting), `upg=` handshake tag (the binary's table, diagnostics), and for a
+   locked-in upgrade the binary does not implement: `UPGRADE REQUIRED name=<id> activates_at=<h>`
+   every summary, `halt_reason=upgrade_required` and `quorum.upgrade_required` in `get_status` from
+   the activation height, and no proposal, vote or timeout vote from that height (the node's abstain
+   gate). The lightserver relay handshake uses the same fingerprint. Testnet-3's
+   `upgrade_signal_window_blocks` is not in the fingerprint: adding it would disconnect this branch's
+   binaries from v2.2.14 before the flag day; it is set with the flag-day release.
 6. Node auto-signal, CLI `upgrade_status`.
 7. Integration and chaos tests, TLA+ model, INVARIANTS entry.
 8. Updater (notify mode) and release-manifest signing (§9); separate PRs, not consensus code.

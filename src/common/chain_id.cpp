@@ -80,7 +80,8 @@ ChainIdMismatch compare_chain_identity(const ChainId& a, const ChainId& b) {
   return out;
 }
 
-std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
+                                        std::vector<Hash32> active_upgrades) {
   codec::ByteWriter w;
   w.bytes_fixed(cfg.network_id);
   w.u32le(cfg.protocol_version);
@@ -100,6 +101,14 @@ std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId&
   // Ingress certifier rules (C1): nodes that disagree on terms reject each other's certificates.
   w.u64le(cfg.ingress_certifier_term_blocks);
   w.u64le(cfg.ingress_certifier_liveness_blocks);
+  if (!active_upgrades.empty()) {
+    std::sort(active_upgrades.begin(), active_upgrades.end());
+    active_upgrades.erase(std::unique(active_upgrades.begin(), active_upgrades.end()), active_upgrades.end());
+    const std::string tag = "upgrades";
+    w.varbytes(Bytes(tag.begin(), tag.end()));
+    w.varint(active_upgrades.size());
+    for (const auto& id : active_upgrades) w.bytes_fixed(id);
+  }
   return hex_encode32(crypto::sha256d(w.data()));
 }
 

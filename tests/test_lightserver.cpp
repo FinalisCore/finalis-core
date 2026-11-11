@@ -1739,8 +1739,8 @@ TEST(test_lightserver_get_status_exposes_runtime_sync_summary) {
                         "\"quorum_threshold\":7,\"observed_signers\":5,\"halt_reason\":\"other_consensus_rules\","
                         "\"missing_signers\":[\"" + hex_encode32(snapshot.missing_signers[0]) + "\",\"" +
                         hex_encode32(snapshot.missing_signers[1]) + "\"],\"missing_signers_other_rules\":[\"" +
-                        hex_encode32(snapshot.missing_signers[1]) + "\"],\"rejected_consensus_rules\":4}") !=
-              std::string::npos);
+                        hex_encode32(snapshot.missing_signers[1]) + "\"],\"rejected_consensus_rules\":4,"
+                        "\"upgrade_required\":null}") != std::string::npos);
   ASSERT_TRUE(resp.find("\"bootstrap_sync_incomplete\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"advertised_endpoint_present\":true") != std::string::npos);
   ASSERT_TRUE(resp.find("\"advertised_endpoint_likely_public\":true") != std::string::npos);

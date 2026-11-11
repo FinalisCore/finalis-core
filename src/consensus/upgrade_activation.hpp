@@ -104,6 +104,8 @@ bool operator_eligible_under_upgrades(const UpgradeRecords* records, const PubKe
                                       std::uint64_t epoch_start_height);
 
 // Upgrades this binary knows for `network`. Empty until the first consensus change ships signaled.
+// Append-only: an id stays here for good once released. A binary missing a locked-in id reports
+// upgrade_required and stops signing at its activation (unimplemented_locked_in_upgrades).
 std::vector<UpgradeDef> known_upgrades(const NetworkConfig& network);
 
 // Empty when the SCUPGSIG of `validator_pubkey` for `upgrade_id` is admissible at `height`, else the
@@ -116,6 +118,23 @@ std::string upgrade_signal_admission_error(const UpgradeRecords& records, const 
 // whether it changed `records`.
 bool apply_upgrade_signal(const ValidatorRegistry& validators, std::uint64_t height, const PubKey32& validator_pubkey,
                           const Hash32& upgrade_id, UpgradeRecords* records);
+
+// Ids of the upgrades active at `height` that `known` implements, sorted: what this binary's
+// handshake fingerprint covers (SIGNALED_ACTIVATION §3.5).
+std::vector<Hash32> implemented_active_upgrades(const UpgradeRecords& records, const std::vector<UpgradeDef>& known,
+                                                std::uint64_t height);
+
+// A locked-in or active upgrade this binary does not implement (§3.6).
+struct RequiredUpgrade {
+  Hash32 id{};
+  std::uint64_t activation_height{0};
+};
+// Earliest activation first; empty when the binary implements every locked-in upgrade.
+std::vector<RequiredUpgrade> unimplemented_locked_in_upgrades(const UpgradeRecords& records,
+                                                              const std::vector<UpgradeDef>& known);
+// First height this binary cannot validate, if any: the earliest activation it does not implement.
+std::optional<std::uint64_t> upgrade_required_from_height(const UpgradeRecords& records,
+                                                          const std::vector<UpgradeDef>& known);
 
 // Committed root over all records (sorted by id).
 Hash32 upgrade_records_commitment_root(const UpgradeRecords& records);

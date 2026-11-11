@@ -148,6 +148,40 @@ bool apply_upgrade_signal(const ValidatorRegistry& validators, std::uint64_t hei
   return it->second.signalers.insert(*op).second;
 }
 
+namespace {
+bool implements(const std::vector<UpgradeDef>& known, const Hash32& id) {
+  return std::any_of(known.begin(), known.end(), [&](const UpgradeDef& d) { return d.id == id; });
+}
+}  // namespace
+
+std::vector<Hash32> implemented_active_upgrades(const UpgradeRecords& records, const std::vector<UpgradeDef>& known,
+                                                std::uint64_t height) {
+  std::vector<Hash32> out;
+  for (const auto& [id, rec] : records) {
+    if (upgrade_active(rec, height) && implements(known, id)) out.push_back(id);
+  }
+  return out;  // map order: sorted by id
+}
+
+std::vector<RequiredUpgrade> unimplemented_locked_in_upgrades(const UpgradeRecords& records,
+                                                              const std::vector<UpgradeDef>& known) {
+  std::vector<RequiredUpgrade> out;
+  for (const auto& [id, rec] : records) {
+    if (locked_or_active(rec.state) && !implements(known, id)) out.push_back({id, rec.activation_height});
+  }
+  std::stable_sort(out.begin(), out.end(), [](const RequiredUpgrade& a, const RequiredUpgrade& b) {
+    return a.activation_height < b.activation_height;
+  });
+  return out;
+}
+
+std::optional<std::uint64_t> upgrade_required_from_height(const UpgradeRecords& records,
+                                                          const std::vector<UpgradeDef>& known) {
+  const auto required = unimplemented_locked_in_upgrades(records, known);
+  if (required.empty()) return std::nullopt;
+  return required.front().activation_height;
+}
+
 Bytes serialize_upgrade_record(const UpgradeRecord& record) {
   codec::ByteWriter w;
   w.u8(static_cast<std::uint8_t>(record.state));

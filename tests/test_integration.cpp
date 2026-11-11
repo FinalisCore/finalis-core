@@ -7816,6 +7816,76 @@ TEST(test_reject_other_consensus_rules_is_counted_for_halt_diagnosis) {
   n.stop();
 }
 
+// Signaled activation §3.5-3.6 at the node: an active upgrade the binary implements changes its handshake
+// fingerprint (a peer on the old rules is now disconnected), and one it does not implement makes it
+// report upgrade_required and sign nothing from the activation height on.
+TEST(test_node_upgrade_activation_changes_fingerprint_and_stops_signing_when_unimplemented) {
+  const std::string base = unique_test_base("/tmp/finalis_it_upgrade_required");
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = cfg.db_path + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  ASSERT_TRUE(write_mainnet_genesis_file(cfg.genesis_path, 1));
+  cfg.p2p_port = 0;
+  cfg.network.default_seeds.clear();
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init() && "n.init() failed");
+  n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  if (port == 0) {
+    n.stop();
+    ASSERT_TRUE(false && "p2p_port_for_test() returned 0");
+  }
+  const auto old_rules = n.consensus_rules_fingerprint_for_test();
+  ASSERT_TRUE(!n.abstaining_at_height_for_test(1));
+
+  Hash32 id{};
+  id.fill(0x5C);
+  consensus::UpgradeRecord rec;
+  rec.state = consensus::UpgradeState::Active;
+  rec.activation_height = 1;  // governs the next height
+  const consensus::UpgradeRecords records{{id, rec}};
+
+  // Implemented: new fingerprint, still signs, and a peer on the old rules is disconnected.
+  n.set_upgrade_state_for_test(records, std::vector<consensus::UpgradeDef>{consensus::UpgradeDef{id, "it", 0}});
+  const auto new_rules = n.consensus_rules_fingerprint_for_test();
+  ASSERT_TRUE(new_rules != old_rules);
+  ASSERT_TRUE(!n.abstaining_at_height_for_test(1));
+  ASSERT_EQ(n.quorum_diagnosis_for_test().upgrade_required_height, 0u);
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+  v.network_id = cfg.network.network_id;
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 322;
+  v.node_software_version = "old-release/0.7;crh=" + old_rules;
+  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_consensus_rules >= 1; }, std::chrono::seconds(2)));
+
+  // Not implemented (empty table): the fingerprint stays the old one, and from the activation height
+  // the node abstains and reports upgrade_required.
+  auto locked = rec;
+  locked.state = consensus::UpgradeState::LockedIn;
+  locked.activation_height = 5;
+  n.set_upgrade_state_for_test({{id, locked}}, std::vector<consensus::UpgradeDef>{});
+  ASSERT_EQ(n.consensus_rules_fingerprint_for_test(), old_rules);
+  ASSERT_TRUE(!n.abstaining_at_height_for_test(4));
+  ASSERT_TRUE(n.abstaining_at_height_for_test(5));
+  auto d = n.quorum_diagnosis_for_test();
+  ASSERT_EQ(d.upgrade_required_height, 5u);
+  ASSERT_TRUE(d.upgrade_required_id == id);
+  ASSERT_TRUE(d.halt_reason != "upgrade_required");  // next height 1 < 5
+  ASSERT_EQ(n.status().upgrade_required_height, 5u);
+  n.set_upgrade_state_for_test({{id, rec}}, std::vector<consensus::UpgradeDef>{});
+  ASSERT_TRUE(n.abstaining_at_height_for_test(1));
+  ASSERT_EQ(n.quorum_diagnosis_for_test().halt_reason, std::string("upgrade_required"));
+  n.stop();
+}
+
 TEST(test_epoch_settlement_pays_onboarding_slice_to_onboarding_pubkey_from_finalized_ticket) {
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_settlement_slice");
   std::filesystem::remove_all(base);

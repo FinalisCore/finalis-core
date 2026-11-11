@@ -156,6 +156,9 @@ struct NodeRuntimeStatusSnapshot {
   std::vector<PubKey32> missing_signers;
   std::vector<PubKey32> missing_signers_other_rules;
   std::uint64_t rejected_consensus_rules{0};
+  // A locked-in signaled upgrade this binary does not implement (0: none), and its id.
+  std::uint64_t upgrade_required_height{0};
+  Hash32 upgrade_required_id{};
   std::uint64_t finalized_lag{0};
   bool peer_height_disagreement{false};
   bool next_height_committee_available{false};

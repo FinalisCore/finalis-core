@@ -86,15 +86,19 @@ std::string network_id_hex(const NetworkConfig& cfg) {
   return hex_encode(Bytes(cfg.network_id.begin(), cfg.network_id.end()));
 }
 
-std::string relay_consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
-  return consensus_rules_fingerprint(cfg, chain_id, cv);
+// Height-aware like the node's (SIGNALED_ACTIVATION §3.5): the upgrades active at the next height that
+// this binary implements.
+std::string relay_consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
+                                              const std::vector<Hash32>& active_upgrades) {
+  return consensus_rules_fingerprint(cfg, chain_id, cv, active_upgrades);
 }
 
-std::string relay_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+std::string relay_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
+                                               const std::vector<Hash32>& active_upgrades) {
   std::ostringstream oss;
   oss << finalis::lightserver_software_version()
       << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv
-      << ";crh=" << relay_consensus_rules_fingerprint(cfg, chain_id, cv);
+      << ";crh=" << relay_consensus_rules_fingerprint(cfg, chain_id, cv, active_upgrades);
   return oss.str();
 }
 
@@ -2122,7 +2126,10 @@ TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   v.start_hash = tip ? tip->hash : zero_hash();
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 424242;
-  v.node_software_version = relay_software_version_fingerprint(cfg_.network, chain_id_, kRelayValidationRulesVersion);
+  const auto active_upgrades = consensus::implemented_active_upgrades(
+      db_.load_upgrade_records(), consensus::known_upgrades(cfg_.network), tip ? tip->height + 1 : 1);
+  v.node_software_version =
+      relay_software_version_fingerprint(cfg_.network, chain_id_, kRelayValidationRulesVersion, active_upgrades);
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
     net::close_socket(fd);
@@ -2604,7 +2611,14 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
       else oss << "\"" << minijson::escape(runtime->halt_reason) << "\"";
       oss << ",\"missing_signers\":" << pubs_json(runtime->missing_signers)
           << ",\"missing_signers_other_rules\":" << pubs_json(runtime->missing_signers_other_rules)
-          << ",\"rejected_consensus_rules\":" << runtime->rejected_consensus_rules << "}";
+          << ",\"rejected_consensus_rules\":" << runtime->rejected_consensus_rules << ",\"upgrade_required\":";
+      if (runtime->upgrade_required_height == 0) {
+        oss << "null";
+      } else {
+        oss << "{\"id\":\"" << hex_encode32(runtime->upgrade_required_id)
+            << "\",\"activation_height\":" << runtime->upgrade_required_height << "}";
+      }
+      oss << "}";
     }
     oss << ",\"sync\":{\"mode\":\"finalized_only\",\"snapshot_present\":"
         << (runtime.has_value() ? "true" : "false")

@@ -1073,6 +1073,8 @@ Bytes serialize_node_runtime_status_snapshot(const NodeRuntimeStatusSnapshot& sn
   w.varint(snapshot.missing_signers_other_rules.size());
   for (const auto& pub : snapshot.missing_signers_other_rules) w.bytes_fixed(pub);
   w.u64le(snapshot.rejected_consensus_rules);
+  w.u64le(snapshot.upgrade_required_height);
+  w.bytes_fixed(snapshot.upgrade_required_id);
   return w.take();
 }
 
@@ -1317,6 +1319,12 @@ std::optional<NodeRuntimeStatusSnapshot> parse_node_runtime_status_snapshot(cons
         auto rejected = r.u64le();
         if (!rejected) return false;
         snapshot.rejected_consensus_rules = *rejected;
+        if (r.eof()) return true;
+        auto required_height = r.u64le();
+        auto required_id = r.bytes_fixed<32>();
+        if (!required_height || !required_id) return false;
+        snapshot.upgrade_required_height = *required_height;
+        snapshot.upgrade_required_id = *required_id;
         return r.eof();
       })) {
     return std::nullopt;

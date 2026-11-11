@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "network.hpp"
 #include "common/types.hpp"
@@ -41,7 +42,11 @@ ChainIdMismatch compare_chain_identity(const ChainId& a, const ChainId& b);
 
 // Fingerprint of the rules two peers must share (advertised as crh= in VERSION; a mismatch is
 // disconnected). One implementation for the node and the lightserver relay, so they cannot drift.
-// `cv` is the validation rules version.
-std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv);
+// `cv` is the validation rules version. `active_upgrades` are the ids of the signaled upgrades
+// (SIGNALED_ACTIVATION §3.5) active at the local finalized tip that this binary implements, in any
+// order; with none the fingerprint is the one from before signaled activation existed, so old and
+// new binaries connect until an upgrade activates and disconnect from then on.
+std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
+                                        std::vector<Hash32> active_upgrades = {});
 
 }  // namespace finalis

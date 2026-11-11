@@ -202,9 +202,15 @@ QuorumDiagnosis Node::quorum_diagnosis_locked(std::uint64_t now_ms) const {
   const auto committee = committee_for_height_round(h, current_round_);
   std::set<PubKey32> present = votes_.participants_for(h, current_round_);
   if (is_committee_member_for(local_key_.public_key, h, current_round_)) present.insert(local_key_.public_key);
-  return detail::diagnose_quorum(consensus_state_locked(now_ms), peer_count(), committee,
-                                 consensus::quorum_threshold(committee.size()), present, other_rules_validators_seen_ms_,
-                                 now_ms);
+  auto d = detail::diagnose_quorum(consensus_state_locked(now_ms), peer_count(), committee,
+                                   consensus::quorum_threshold(committee.size()), present, other_rules_validators_seen_ms_,
+                                   now_ms);
+  if (canonical_state_.has_value() && !canonical_state_->upgrade_records.empty()) {
+    const auto required = consensus::unimplemented_locked_in_upgrades(canonical_state_->upgrade_records,
+                                                                      known_upgrades_locked());
+    if (!required.empty()) detail::apply_upgrade_required(h, required.front().id, required.front().activation_height, &d);
+  }
+  return d;
 }
 
 bool Node::next_height_requires_repair_locked(std::string* reason) const {
@@ -857,7 +863,19 @@ void Node::run_confidential_supply_audit_locked(const char* trigger) {
 }
 
 bool Node::abstaining_at_height_locked(std::uint64_t height) const {
-  return abstain_heights_.find(height) != abstain_heights_.end();
+  if (abstain_heights_.find(height) != abstain_heights_.end()) return true;
+  // SIGNALED_ACTIVATION §3.6: never sign under rules this binary does not implement.
+  const auto required = upgrade_required_from_height_locked();
+  return required.has_value() && height >= *required;
+}
+
+std::vector<consensus::UpgradeDef> Node::known_upgrades_locked() const {
+  return known_upgrades_for_test_.has_value() ? *known_upgrades_for_test_ : consensus::known_upgrades(cfg_.network);
+}
+
+std::optional<std::uint64_t> Node::upgrade_required_from_height_locked() const {
+  if (!canonical_state_.has_value() || canonical_state_->upgrade_records.empty()) return std::nullopt;
+  return consensus::upgrade_required_from_height(canonical_state_->upgrade_records, known_upgrades_locked());
 }
 
 bool Node::can_prevote_locked(std::uint64_t height, const Hash32& transition_id,
@@ -865,7 +883,9 @@ bool Node::can_prevote_locked(std::uint64_t height, const Hash32& transition_id,
   // SAFETY: this node's vote history at `height` was lost (unreadable safety state), so any
   // vote here could contradict one already broadcast. Checked before the lock rule.
   if (abstaining_at_height_locked(height)) {
-    if (reason) *reason = "abstain-corrupt-safety-state";
+    if (reason) {
+      *reason = abstain_heights_.count(height) != 0 ? "abstain-corrupt-safety-state" : "upgrade-required";
+    }
     return false;
   }
   auto it = local_vote_locks_.find(height);
