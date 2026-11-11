@@ -22,7 +22,11 @@ an abort inside librocksdb (E1 below) fails that one test with its signal instea
 
 ## Open (2026-11-11)
 
-None. A1 (2026-11-11) is fixed:
+| Id | Defect | Test |
+|---|---|---|
+| A2 | Signaled activation (unreleased). At an activation boundary where every signaler is suspended (so not a candidate) and the signalers of the last 2 committees have exited, emergency recovery finds only non-signalers and skips them, so derivation fails closed (`empty-committee-no-emergency-fallback`) where the old rule would have recovered. After that no signal can be included, so the halt is permanent. Found by `formal/signaled_activation.tla` (`NoExclusionHalt`). Proposed fix: with no recovery member under an active upgrade, recover the signalers that did not exit, suspended or not (model: `Recovery = "signalers"` holds). If every signaler exited, a last resort must decide between halting and recovering non-signalers. | `test_activation_boundary_recovers_suspended_signalers_instead_of_failing_closed` |
+
+A1 (2026-11-11) is fixed:
 
 | Id | Defect | Fix and tests |
 |---|---|---|

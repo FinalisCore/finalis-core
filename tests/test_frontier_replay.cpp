@@ -4382,3 +4382,64 @@ TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_s
   if (!old_ok) throw std::runtime_error("old binary rejects the block: " + err);
   ASSERT_EQ(old_state.state_commitment, new_state.state_commitment);
 }
+
+// A2 (signaled activation, pre-release; formal/signaled_activation.tla NoExclusionHalt): at an
+// activation boundary where every signaler is suspended (not a candidate) and the signalers of the
+// last 2 committees have exited, emergency recovery finds only non-signalers and skips them, so the
+// derivation fails closed for good: no later signal can be included. The old rule would have recovered.
+// Required: a committee of signalers that did not exit (suspended or not), not a fail-closed halt.
+TEST(test_activation_boundary_recovers_suspended_signalers_instead_of_failing_closed) {
+  const auto cfg = live_activation_cfg();  // 4-block epochs
+  const auto exiting = key_from_byte(90);  // genesis validator, a signaler that exits
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(exiting.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(exiting));
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  state.finalized_height = 8;
+  state.validators.set_rules(consensus::ValidatorRules{.min_bond = BOND_AMOUNT, .warmup_blocks = 0, .cooldown_blocks = 100});
+  const auto laggard = key_from_byte(0xD1);  // active, never signaled
+  const auto s1 = key_from_byte(0xD2);       // signalers, suspended
+  const auto s2 = key_from_byte(0xD3);
+  for (const auto* kp : {&laggard, &s1, &s2}) {
+    OutPoint bond{};
+    bond.txid.fill(kp->public_key[0]);
+    ASSERT_TRUE(state.validators.register_bond(kp->public_key, bond, 0, BOND_AMOUNT, &err, kp->public_key));
+  }
+  for (const auto* kp : {&s1, &s2}) {
+    auto info = *state.validators.get(kp->public_key);
+    info.status = consensus::ValidatorStatus::SUSPENDED;
+    state.validators.upsert(kp->public_key, info);
+  }
+  ASSERT_TRUE(state.validators.request_unbond(exiting.public_key, 8));
+  state.validators.advance_height(9);
+  ASSERT_TRUE(state.validators.is_active_for_height(laggard.public_key, 9));
+
+  // The last 2 committees: the exiting signaler and the laggard.
+  state.finalized_committee_checkpoints[5].epoch_start_height = 5;
+  state.finalized_committee_checkpoints[5].ordered_members = {exiting.public_key, laggard.public_key};
+  state.committee_epoch_randomness_cache[9] = state.finalized_randomness;
+
+  const auto op_of = [&](const PubKey32& pub) { return consensus::canonical_operator_id(pub, *state.validators.get(pub)); };
+  Hash32 id{};
+  id.fill(0x46);
+  consensus::UpgradeRecord rec;
+  rec.state = consensus::UpgradeState::Active;
+  rec.activation_height = 9;
+  rec.signalers = {op_of(exiting.public_key), op_of(s1.public_key), op_of(s2.public_key)};
+  state.upgrade_records[id] = rec;
+
+  storage::FinalizedCommitteeCheckpoint cp;
+  const bool ok = consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 9, &cp, &err);
+  if (!ok) throw std::runtime_error("derivation failed closed: " + err);
+  ASSERT_TRUE(!cp.ordered_members.empty());
+  for (const auto& m : cp.ordered_members) ASSERT_TRUE(rec.signalers.count(op_of(m)) == 1);
+  // Without the upgrade the laggard is recovered: the old rule completes this derivation.
+  auto old_rules = state;
+  old_rules.upgrade_records.clear();
+  storage::FinalizedCommitteeCheckpoint old_cp;
+  ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, old_rules, 9, &old_cp, &err));
+}
+TEST_TAGS(test_activation_boundary_recovers_suspended_signalers_instead_of_failing_closed, "known-defect");

@@ -230,3 +230,35 @@ C++ implementation of it is correct. Both halves are needed (the partial-fix row
 Run: `./scripts/run_tlc.sh --spec formal/two_phase_finality_persistence.tla --config <cfg>` (add
 `--expect-violation <invariant>` for the `_current*`, `_*fix_only*` and `_reach` configs). The tests that
 reproduce the same defects in the node are listed in [tests/KNOWN_DEFECTS.md](../tests/KNOWN_DEFECTS.md).
+
+## Signaled Activation Model
+
+- Spec: [signaled_activation.tla](signaled_activation.tla) (docs/spec/SIGNALED_ACTIVATION.md,
+  CHECKPOINT_DERIVATION_SPEC §6.4)
+- Configs: [signaled_activation.cfg](signaled_activation.cfg) (invariants hold, exhaustive: 4 operators,
+  committee 3, window 3 epochs, 7 epochs, 1 exit, any suspensions; 1,693,393 distinct states, ~1 min);
+  reachability `signaled_activation_reach_{active,failed}.cfg`; mutations
+  `signaled_activation_{no_committee_check,no_exclusion,no_emergency_skip}_mutation.cfg` (the last with 5
+  operators and committee 4, so committee(L+1) can hold a non-signaler).
+
+Abstracts finality (an epoch ends once final) and ticket order (any K-subset of the candidates). Models:
+old and new binaries (only new ones signal; no downgrade), the window from the first signal, lock-in at
+the epoch end after committee(L+1) is derived, activation at L+2, removal of a failed record, exclusion of
+non-signalers from candidates, suspension (not a candidate, but recoverable), exits, and emergency
+recovery from the 2 prior committees.
+
+| Invariant | Meaning | Mutation that breaks it |
+|---|---|---|
+| `ActiveCommitteeAllSignalers` | from activation on, every committee seat is a signaler | `no_exclusion`, `no_emergency_skip` |
+| `ActiveCommitteeUpgraded` | ... so every seat runs the new rules | |
+| `ParentCommitteeReady` | committee(A-1), the parent of the first new-rules block, has a quorum of signalers | `no_committee_check` |
+
+**Open defect A2** (tests/KNOWN_DEFECTS.md) (`signaled_activation_no_exclusion_halt.cfg`, `NoExclusionHalt` violated with the
+implemented rule, `Recovery = "current"`): the exclusion can turn a derivation the old rule completes
+into a fail-closed halt. At the activation boundary every signaler that is a candidate is suspended, and
+the signalers of the last 2 committees have exited, so emergency recovery finds only non-signalers and
+skips them. Once derivation fails closed no later signal can be included. The proposed rule
+(`Recovery = "signalers"`: with no recovery member, any signaler that did not exit, suspended or not)
+removes it for 1 exit (`signaled_activation_a2_signaler_recovery.cfg` holds, and
+`..._a2_signaler_recovery_safety.cfg` keeps every safety invariant). If every signaler exits, the halt
+remains unless a last resort recovers non-signalers, giving up `ActiveCommitteeAllSignalers` in that case.
