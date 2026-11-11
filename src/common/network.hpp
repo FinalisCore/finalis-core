@@ -48,6 +48,9 @@ struct NetworkConfig {
   // (from genesis); testnet-3 never until its flag day height is set. Below it an SCUPGSIG output is
   // rejected, as releases without signaled activation reject it. Consensus-critical.
   std::uint64_t upgrade_signal_activation_height{0};
+  // An upgrade not locked in this many blocks after its first signal fails (its record is removed).
+  // ~30 days at the 180 s minimum block interval; testnet ~3 days. Consensus-critical.
+  std::uint64_t upgrade_signal_window_blocks{14'400};
   // A term's certifier is drawn from the committee members that signed at least one of the last this
   // many finalized parents (prev_finality_signers), so an offline validator stops holding lanes.
   // Routing only, but every node must use the same value (it is in the handshake fingerprint).

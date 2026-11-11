@@ -49,8 +49,6 @@ struct CanonicalDerivationConfig {
   std::uint32_t validation_rules_version{6};
   ConfidentialPolicy confidential_policy{};
   std::function<std::optional<Hash32>(std::uint64_t)> finalized_hash_at_height;
-  // Signaled upgrades this binary knows (consensus::known_upgrades); signals for others are invalid.
-  std::vector<UpgradeDef> upgrade_defs;
 };
 
 struct CanonicalGenesisState {
@@ -431,9 +429,9 @@ std::optional<PubKey32> canonical_leader_for_height_round(const CanonicalDerivat
 // eligible operator count when it derived NORMAL (0 in FALLBACK, which never requires availability).
 UpgradeLockInInputs upgrade_lock_in_inputs(const ValidatorRegistry& validators,
                                            const storage::FinalizedCommitteeCheckpoint& next_checkpoint);
-// Advances every recorded upgrade the binary knows at the epoch end before `next_checkpoint`. Upgrades
-// without a record have no signalers: they cannot lock in, and signals after their timeout are
-// rejected at admission, so no record is created here and the commitment stays unchanged.
+// Advances every upgrade record at the epoch end before `next_checkpoint`, whether or not this binary
+// knows the upgrade, and removes the ones that fail. Records are created only by signals, so a chain
+// without signals keeps its commitments.
 void advance_upgrade_records_at_epoch_end(const CanonicalDerivationConfig& cfg, const ValidatorRegistry& validators,
                                           const storage::FinalizedCommitteeCheckpoint& next_checkpoint,
                                           UpgradeRecords* records);

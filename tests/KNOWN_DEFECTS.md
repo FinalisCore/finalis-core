@@ -22,9 +22,11 @@ an abort inside librocksdb (E1 below) fails that one test with its signal instea
 
 ## Open (2026-11-11)
 
-| Id | Defect | Test |
+None. A1 (2026-11-11) is fixed:
+
+| Id | Defect | Fix and tests |
 |---|---|---|
-| A1 | Signaled activation (unreleased: `upgrade_signal_activation_height` is max on testnet-3, mainnet not launched). Signal admission and `UPG:` state depend on the binary's `known_upgrades` table, so a binary that does not know an upgrade rejects the first block carrying a signal for it (`frontier-decisions-commitment-mismatch`). Old and new binaries split at the first signal instead of staying one network until activation (SIGNALED_ACTIVATION §3.5-3.6). Must be fixed before the mechanism is enabled anywhere. | `test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state` |
+| A1 | Signaled activation (unreleased: `upgrade_signal_activation_height` is max on testnet-3, mainnet not launched). Signal admission and `UPG:` state depended on the binary's `known_upgrades` table, so a binary that did not know an upgrade rejected the first block carrying a signal for it (`frontier-decisions-commitment-mismatch`): old and new binaries split at the first signal instead of at activation. | Admission, record creation, window and lock-in read finalized state only; `CanonicalDerivationConfig` has no upgrade table. Any id admissible, at most 2 open signals per operator, window from the first signal (`upgrade_signal_window_blocks`). `test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state` (reproduced the split before the fix), `test_upgrade_signal_admission_and_apply` |
 
 C1 is fixed (below).
 

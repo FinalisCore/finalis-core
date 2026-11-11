@@ -793,7 +793,7 @@ void apply_validator_state_changes_from_txs(const CanonicalDerivationConfig& cfg
     for (const auto& out : outputs) {
       UpgradeSignalScriptData upgrade_signal{};
       if (parse_upgrade_signal_script(out.script_pubkey, &upgrade_signal)) {
-        (void)apply_upgrade_signal(cfg.upgrade_defs, state->validators, height, upgrade_signal.validator_pubkey,
+        (void)apply_upgrade_signal(state->validators, height, upgrade_signal.validator_pubkey,
                                    upgrade_signal.upgrade_id, &state->upgrade_records);
         continue;
       }
@@ -1548,7 +1548,7 @@ bool verify_frontier_record_against_state(const CanonicalDerivationConfig& cfg, 
             },
         .upgrade_signal_admission =
             [&, height](const PubKey32& validator, const Hash32& upgrade_id) {
-              return upgrade_signal_admission_error(cfg.upgrade_defs, prev.upgrade_records, prev.validators, height,
+              return upgrade_signal_admission_error(prev.upgrade_records, prev.validators, height,
                                                     validator, upgrade_id);
             },
     };
@@ -3043,12 +3043,10 @@ void advance_upgrade_records_at_epoch_end(const CanonicalDerivationConfig& cfg, 
   if (records == nullptr || records->empty() || next_checkpoint.epoch_start_height <= 1) return;
   const auto epoch_blocks = std::max<std::uint64_t>(1, cfg.network.committee_epoch_blocks);
   const auto epoch_end_height = next_checkpoint.epoch_start_height - 1;
-  std::optional<UpgradeLockInInputs> in;
-  for (const auto& def : cfg.upgrade_defs) {
-    const auto it = records->find(def.id);
-    if (it == records->end()) continue;
-    if (!in.has_value()) in = upgrade_lock_in_inputs(validators, next_checkpoint);
-    advance_upgrade_at_epoch_end(def, &it->second, epoch_end_height, epoch_blocks, *in);
+  const auto in = upgrade_lock_in_inputs(validators, next_checkpoint);
+  for (auto it = records->begin(); it != records->end();) {
+    advance_upgrade_at_epoch_end(&it->second, epoch_end_height, epoch_blocks, cfg.network.upgrade_signal_window_blocks, in);
+    it = it->second.state == UpgradeState::Failed ? records->erase(it) : std::next(it);
   }
 }
 

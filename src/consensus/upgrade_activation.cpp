@@ -3,6 +3,7 @@
 #include "consensus/upgrade_activation.hpp"
 
 #include <algorithm>
+#include <limits>
 
 #include "codec/bytes.hpp"
 #include "consensus/validator_registry.hpp"
@@ -22,11 +23,9 @@ Hash32 upgrade_id(const std::string& name, const Hash32& new_rules_fingerprint) 
 const char* upgrade_signal_reject_name(UpgradeSignalReject r) {
   switch (r) {
     case UpgradeSignalReject::None: return "none";
-    case UpgradeSignalReject::Failed: return "upgrade-failed";
-    case UpgradeSignalReject::BeforeWindow: return "before-signal-window";
-    case UpgradeSignalReject::AfterTimeout: return "after-signal-timeout";
     case UpgradeSignalReject::NotActiveOperator: return "not-active-operator";
     case UpgradeSignalReject::Duplicate: return "duplicate-signal";
+    case UpgradeSignalReject::TooManyOpen: return "too-many-open-signals";
   }
   return "unknown";
 }
@@ -35,13 +34,12 @@ namespace {
 bool locked_or_active(UpgradeState s) { return s == UpgradeState::LockedIn || s == UpgradeState::Active; }
 }  // namespace
 
-UpgradeSignalReject check_upgrade_signal(const UpgradeDef& def, const UpgradeRecord& rec, const PubKey32& operator_id,
-                                         bool is_active_operator, std::uint64_t height) {
-  if (rec.state == UpgradeState::Failed) return UpgradeSignalReject::Failed;
-  if (height < def.signal_start) return UpgradeSignalReject::BeforeWindow;
-  if (!locked_or_active(rec.state) && height >= def.signal_timeout) return UpgradeSignalReject::AfterTimeout;
+UpgradeSignalReject check_upgrade_signal(const UpgradeRecord* rec, const PubKey32& operator_id, bool is_active_operator,
+                                         std::size_t open_signals) {
   if (!is_active_operator) return UpgradeSignalReject::NotActiveOperator;
-  if (rec.signalers.count(operator_id) != 0) return UpgradeSignalReject::Duplicate;
+  if (rec != nullptr && rec->signalers.count(operator_id) != 0) return UpgradeSignalReject::Duplicate;
+  const bool opens = rec == nullptr || !locked_or_active(rec->state);
+  if (opens && open_signals >= kMaxOpenUpgradeSignalsPerOperator) return UpgradeSignalReject::TooManyOpen;
   return UpgradeSignalReject::None;
 }
 
@@ -58,13 +56,15 @@ bool upgrade_lock_in_reached(const UpgradeRecord& rec, const UpgradeLockInInputs
   return ready_seats >= quorum_threshold(in.next_committee_operators.size());
 }
 
-void advance_upgrade_at_epoch_end(const UpgradeDef& def, UpgradeRecord* rec, std::uint64_t epoch_end_height,
-                                  std::uint64_t epoch_blocks, const UpgradeLockInInputs& in) {
+void advance_upgrade_at_epoch_end(UpgradeRecord* rec, std::uint64_t epoch_end_height, std::uint64_t epoch_blocks,
+                                  std::uint64_t window_blocks, const UpgradeLockInInputs& in) {
   if (rec == nullptr || epoch_blocks == 0) return;
   const std::uint64_t next_height = epoch_end_height + 1;
+  constexpr auto kMax = std::numeric_limits<std::uint64_t>::max();
+  const std::uint64_t window_end =
+      rec->first_signal_height > kMax - window_blocks ? kMax : rec->first_signal_height + window_blocks;
   switch (rec->state) {
     case UpgradeState::Defined:
-      if (next_height < def.signal_start) return;
       rec->state = UpgradeState::Signaling;
       [[fallthrough]];
     case UpgradeState::Signaling:
@@ -72,7 +72,7 @@ void advance_upgrade_at_epoch_end(const UpgradeDef& def, UpgradeRecord* rec, std
         rec->state = UpgradeState::LockedIn;
         rec->lock_in_height = epoch_end_height;
         rec->activation_height = next_height + (kUpgradeActivationDelayEpochs - 1) * epoch_blocks;
-      } else if (next_height >= def.signal_timeout) {
+      } else if (next_height >= window_end) {
         rec->state = UpgradeState::Failed;
       }
       return;
@@ -121,32 +121,37 @@ std::optional<PubKey32> active_operator_of(const ValidatorRegistry& validators, 
 }
 }  // namespace
 
-std::string upgrade_signal_admission_error(const std::vector<UpgradeDef>& defs, const UpgradeRecords& records,
-                                           const ValidatorRegistry& validators, std::uint64_t height,
-                                           const PubKey32& validator_pubkey, const Hash32& upgrade_id) {
-  const auto def = std::find_if(defs.begin(), defs.end(), [&](const UpgradeDef& d) { return d.id == upgrade_id; });
-  if (def == defs.end()) return "unknown-upgrade";
+std::string upgrade_signal_admission_error(const UpgradeRecords& records, const ValidatorRegistry& validators,
+                                           std::uint64_t height, const PubKey32& validator_pubkey,
+                                           const Hash32& upgrade_id) {
   const auto op = active_operator_of(validators, height, validator_pubkey);
   const auto rec_it = records.find(upgrade_id);
-  const UpgradeRecord empty;
-  const auto& rec = rec_it == records.end() ? empty : rec_it->second;
-  const auto reject = check_upgrade_signal(*def, rec, op.value_or(validator_pubkey), op.has_value(), height);
+  std::size_t open_signals = 0;
+  if (op.has_value()) {
+    for (const auto& [_, rec] : records) {
+      if (!locked_or_active(rec.state) && rec.signalers.count(*op) != 0) ++open_signals;
+    }
+  }
+  const auto reject = check_upgrade_signal(rec_it == records.end() ? nullptr : &rec_it->second,
+                                           op.value_or(validator_pubkey), op.has_value(), open_signals);
   return reject == UpgradeSignalReject::None ? std::string{} : std::string(upgrade_signal_reject_name(reject));
 }
 
-bool apply_upgrade_signal(const std::vector<UpgradeDef>& defs, const ValidatorRegistry& validators, std::uint64_t height,
-                          const PubKey32& validator_pubkey, const Hash32& upgrade_id, UpgradeRecords* records) {
+bool apply_upgrade_signal(const ValidatorRegistry& validators, std::uint64_t height, const PubKey32& validator_pubkey,
+                          const Hash32& upgrade_id, UpgradeRecords* records) {
   if (records == nullptr) return false;
-  if (!upgrade_signal_admission_error(defs, *records, validators, height, validator_pubkey, upgrade_id).empty()) {
-    return false;
-  }
+  if (!upgrade_signal_admission_error(*records, validators, height, validator_pubkey, upgrade_id).empty()) return false;
   const auto op = active_operator_of(validators, height, validator_pubkey);
-  return op.has_value() && (*records)[upgrade_id].signalers.insert(*op).second;
+  if (!op.has_value()) return false;
+  auto [it, created] = records->try_emplace(upgrade_id);
+  if (created) it->second.first_signal_height = height;
+  return it->second.signalers.insert(*op).second;
 }
 
 Bytes serialize_upgrade_record(const UpgradeRecord& record) {
   codec::ByteWriter w;
   w.u8(static_cast<std::uint8_t>(record.state));
+  w.u64le(record.first_signal_height);
   w.u64le(record.lock_in_height);
   w.u64le(record.activation_height);
   w.varint(record.signalers.size());
@@ -158,12 +163,15 @@ std::optional<UpgradeRecord> parse_upgrade_record(const Bytes& bytes) {
   UpgradeRecord rec;
   if (!codec::parse_exact(bytes, [&](codec::ByteReader& r) {
         auto state = r.u8();
+        auto first_signal = r.u64le();
         auto lock_in = r.u64le();
         auto activation = r.u64le();
         auto count = r.varint();
-        if (!state || !lock_in || !activation || !count) return false;
-        if (*state > static_cast<std::uint8_t>(UpgradeState::Failed) || *count > 1'000'000) return false;
+        if (!state || !first_signal || !lock_in || !activation || !count) return false;
+        // FAILED is never stored: the record is removed when it fails.
+        if (*state >= static_cast<std::uint8_t>(UpgradeState::Failed) || *count > 1'000'000) return false;
         rec.state = static_cast<UpgradeState>(*state);
+        rec.first_signal_height = *first_signal;
         rec.lock_in_height = *lock_in;
         rec.activation_height = *activation;
         std::optional<PubKey32> last;

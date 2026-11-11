@@ -2,6 +2,7 @@
 
 #include "test_framework.hpp"
 
+#include <limits>
 #include <set>
 #include <vector>
 
@@ -28,10 +29,12 @@ std::set<PubKey32> ops(std::uint8_t n) {
   return out;
 }
 
+constexpr std::uint64_t kWindow = 10 * kB;
+
 UpgradeDef def() {
   Hash32 fp{};
   fp.fill(0xAB);
-  return UpgradeDef{upgrade_id("test-upgrade", fp), "test-upgrade", 33, 33 + 10 * kB};
+  return UpgradeDef{upgrade_id("test-upgrade", fp), "test-upgrade", 33};
 }
 
 // 9 active operators, committee(L+1) = operators 1..7 (quorum 5).
@@ -68,19 +71,22 @@ TEST(test_upgrade_operator_threshold_is_ceil_two_thirds) {
 }
 
 TEST(test_upgrade_signal_admissibility) {
-  const auto d = def();
+  // No record yet: the first signal opens one.
+  ASSERT_TRUE(check_upgrade_signal(nullptr, op(1), true, 0) == UpgradeSignalReject::None);
+  ASSERT_TRUE(check_upgrade_signal(nullptr, op(1), false, 0) == UpgradeSignalReject::NotActiveOperator);
+  ASSERT_TRUE(check_upgrade_signal(nullptr, op(1), true, kMaxOpenUpgradeSignalsPerOperator) ==
+              UpgradeSignalReject::TooManyOpen);
   UpgradeRecord rec;
-  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, 32) == UpgradeSignalReject::BeforeWindow);
-  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, 33) == UpgradeSignalReject::None);
-  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), false, 40) == UpgradeSignalReject::NotActiveOperator);
-  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, d.signal_timeout) == UpgradeSignalReject::AfterTimeout);
+  rec.state = UpgradeState::Signaling;
   signal(&rec, {1});
-  ASSERT_TRUE(check_upgrade_signal(d, rec, op(1), true, 40) == UpgradeSignalReject::Duplicate);
-  // After lock-in a late operator may still signal, with no deadline.
+  ASSERT_TRUE(check_upgrade_signal(&rec, op(1), true, 1) == UpgradeSignalReject::Duplicate);
+  ASSERT_TRUE(check_upgrade_signal(&rec, op(2), true, kMaxOpenUpgradeSignalsPerOperator) ==
+              UpgradeSignalReject::TooManyOpen);
+  // After lock-in a late operator may always signal: it is how it regains committee eligibility.
+  rec.state = UpgradeState::LockedIn;
+  ASSERT_TRUE(check_upgrade_signal(&rec, op(2), true, kMaxOpenUpgradeSignalsPerOperator) == UpgradeSignalReject::None);
   rec.state = UpgradeState::Active;
-  ASSERT_TRUE(check_upgrade_signal(d, rec, op(2), true, d.signal_timeout + 1000) == UpgradeSignalReject::None);
-  rec.state = UpgradeState::Failed;
-  ASSERT_TRUE(check_upgrade_signal(d, rec, op(2), true, 40) == UpgradeSignalReject::Failed);
+  ASSERT_TRUE(check_upgrade_signal(&rec, op(2), true, kMaxOpenUpgradeSignalsPerOperator) == UpgradeSignalReject::None);
 }
 
 TEST(test_upgrade_lock_in_needs_operator_and_committee_thresholds) {
@@ -110,48 +116,54 @@ TEST(test_upgrade_lock_in_needs_operator_and_committee_thresholds) {
 }
 
 TEST(test_upgrade_lifecycle_locks_in_and_activates_two_epochs_later) {
-  const auto d = def();
   const auto in = inputs();
   UpgradeRecord rec;
-  advance_upgrade_at_epoch_end(d, &rec, 0, kB, in);  // genesis boundary, before the window
-  ASSERT_TRUE(rec.state == UpgradeState::Defined);
-  advance_upgrade_at_epoch_end(d, &rec, kB, kB, in);  // next height 33 = signal_start
+  rec.first_signal_height = kB - 3;
+  signal(&rec, {1});
+  advance_upgrade_at_epoch_end(&rec, kB, kB, kWindow, in);  // first epoch end after the first signal
   ASSERT_TRUE(rec.state == UpgradeState::Signaling);
 
-  signal(&rec, {1, 2, 3, 4, 5, 9});
+  signal(&rec, {2, 3, 4, 5, 9});
   const std::uint64_t lock_end = 3 * kB;  // end of epoch L
-  advance_upgrade_at_epoch_end(d, &rec, lock_end, kB, in);
+  advance_upgrade_at_epoch_end(&rec, lock_end, kB, kWindow, in);
   ASSERT_TRUE(rec.state == UpgradeState::LockedIn);
   ASSERT_EQ(rec.lock_in_height, lock_end);
   ASSERT_EQ(rec.activation_height, lock_end + 1 + kB);  // start of epoch L+2
   ASSERT_TRUE(!upgrade_active(rec, lock_end + kB));
   ASSERT_TRUE(upgrade_active(rec, lock_end + kB + 1));  // already true while LockedIn
 
-  advance_upgrade_at_epoch_end(d, &rec, lock_end + kB, kB, in);  // end of L+1
+  advance_upgrade_at_epoch_end(&rec, lock_end + kB, kB, kWindow, in);  // end of L+1
   ASSERT_TRUE(rec.state == UpgradeState::Active);
   const auto active = rec;
-  advance_upgrade_at_epoch_end(d, &rec, lock_end + 2 * kB, kB, UpgradeLockInInputs{});
+  advance_upgrade_at_epoch_end(&rec, lock_end + 2 * kB + 5 * kWindow, kB, kWindow, UpgradeLockInInputs{});
   ASSERT_TRUE(rec == active);  // terminal
 }
 
-TEST(test_upgrade_fails_at_timeout_and_lock_in_wins_on_the_same_boundary) {
-  const auto d = def();
+TEST(test_upgrade_fails_at_window_end_and_lock_in_wins_on_the_same_boundary) {
   const auto in = inputs();
   UpgradeRecord rec;
   rec.state = UpgradeState::Signaling;
+  rec.first_signal_height = kB + 1;
   signal(&rec, {1, 2, 3});
-  const std::uint64_t last_end = d.signal_timeout - 1;  // next height == signal_timeout
-  advance_upgrade_at_epoch_end(d, &rec, last_end - kB, kB, in);
+  const std::uint64_t last_end = rec.first_signal_height + kWindow - 1;  // next height == window end
+  advance_upgrade_at_epoch_end(&rec, last_end - kB, kB, kWindow, in);
   ASSERT_TRUE(rec.state == UpgradeState::Signaling);
-  advance_upgrade_at_epoch_end(d, &rec, last_end, kB, in);
+  advance_upgrade_at_epoch_end(&rec, last_end, kB, kWindow, in);
   ASSERT_TRUE(rec.state == UpgradeState::Failed);
   ASSERT_TRUE(!upgrade_active(rec, last_end + 10 * kB));
 
-  UpgradeRecord late;
+  UpgradeRecord late = rec;
   late.state = UpgradeState::Signaling;
-  signal(&late, {1, 2, 3, 4, 5, 9});
-  advance_upgrade_at_epoch_end(d, &late, last_end, kB, in);
+  signal(&late, {4, 5, 9});
+  advance_upgrade_at_epoch_end(&late, last_end, kB, kWindow, in);
   ASSERT_TRUE(late.state == UpgradeState::LockedIn);
+
+  // The window end never overflows.
+  UpgradeRecord far;
+  far.state = UpgradeState::Signaling;
+  far.first_signal_height = std::numeric_limits<std::uint64_t>::max() - 1;
+  advance_upgrade_at_epoch_end(&far, 5 * kB, kB, kWindow, in);
+  ASSERT_TRUE(far.state == UpgradeState::Signaling);
 }
 
 TEST(test_upgrade_excludes_non_signalers_from_committees_from_activation_on) {
@@ -192,33 +204,46 @@ consensus::ValidatorRegistry registry_with_active(const std::vector<PubKey32>& a
 }
 }  // namespace
 
-// Step 2b: finalized signals are admitted against upgrade state and recorded per operator.
+// Step 2b + A1: signals are admitted against finalized upgrade state only, whatever upgrades the
+// binary knows, and recorded per operator; the first one opens the record and its window.
 TEST(test_upgrade_signal_admission_and_apply) {
   const auto d = def();
-  const std::vector<UpgradeDef> defs{d};
   const auto vr = registry_with_active({op(1), op(2)}, op(9));
   UpgradeRecords records;
-  Hash32 unknown{};
-  unknown.fill(0xEE);
-  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 40, op(1), unknown), std::string("unknown-upgrade"));
-  ASSERT_EQ(upgrade_signal_admission_error({}, records, vr, 40, op(1), d.id), std::string("unknown-upgrade"));
-  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 40, op(9), d.id), std::string("not-active-operator"));
-  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 40, op(7), d.id), std::string("not-active-operator"));
-  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 10, op(1), d.id), std::string("before-signal-window"));
-  ASSERT_TRUE(upgrade_signal_admission_error(defs, records, vr, 40, op(1), d.id).empty());
+  ASSERT_EQ(upgrade_signal_admission_error(records, vr, 40, op(9), d.id), std::string("not-active-operator"));
+  ASSERT_EQ(upgrade_signal_admission_error(records, vr, 40, op(7), d.id), std::string("not-active-operator"));
+  ASSERT_TRUE(upgrade_signal_admission_error(records, vr, 10, op(1), d.id).empty());  // no binary-side window
 
-  ASSERT_TRUE(apply_upgrade_signal(defs, vr, 40, op(1), d.id, &records));
+  ASSERT_TRUE(apply_upgrade_signal(vr, 40, op(1), d.id, &records));
   const auto operator1 = canonical_operator_id(op(1), *vr.get(op(1)));
   ASSERT_TRUE(records.at(d.id).signalers.count(operator1) == 1);
-  ASSERT_EQ(upgrade_signal_admission_error(defs, records, vr, 41, op(1), d.id), std::string("duplicate-signal"));
-  ASSERT_TRUE(!apply_upgrade_signal(defs, vr, 41, op(1), d.id, &records));  // a duplicate changes nothing
-  ASSERT_TRUE(!apply_upgrade_signal(defs, vr, 41, op(9), d.id, &records));  // nor a non-operator
-  ASSERT_EQ(records.at(d.id).signalers.size(), 1u);
+  ASSERT_EQ(records.at(d.id).first_signal_height, 40u);
+  ASSERT_EQ(upgrade_signal_admission_error(records, vr, 41, op(1), d.id), std::string("duplicate-signal"));
+  ASSERT_TRUE(!apply_upgrade_signal(vr, 41, op(1), d.id, &records));  // a duplicate changes nothing
+  ASSERT_TRUE(!apply_upgrade_signal(vr, 41, op(9), d.id, &records));  // nor a non-operator
+  ASSERT_TRUE(apply_upgrade_signal(vr, 45, op(2), d.id, &records));
+  ASSERT_EQ(records.at(d.id).first_signal_height, 40u);  // a later signal keeps the window
+  ASSERT_EQ(records.at(d.id).signalers.size(), 2u);
+
+  // Any id is admissible, but an operator holds at most kMaxOpenUpgradeSignalsPerOperator open ones.
+  Hash32 other{};
+  other.fill(0xEE);
+  ASSERT_TRUE(apply_upgrade_signal(vr, 46, op(1), other, &records));
+  Hash32 third{};
+  third.fill(0xEF);
+  ASSERT_EQ(upgrade_signal_admission_error(records, vr, 47, op(1), third), std::string("too-many-open-signals"));
+  ASSERT_TRUE(!apply_upgrade_signal(vr, 47, op(1), third, &records));
+  ASSERT_TRUE(upgrade_signal_admission_error(records, vr, 47, op(2), third).empty());  // per operator
+  // Once one of them locks in, it no longer counts as open.
+  records.at(d.id).state = UpgradeState::LockedIn;
+  ASSERT_TRUE(upgrade_signal_admission_error(records, vr, 48, op(1), third).empty());
+  ASSERT_EQ(records.size(), 2u);
 }
 
 TEST(test_upgrade_record_codec_and_commitment_root) {
   UpgradeRecord rec;
   rec.state = UpgradeState::LockedIn;
+  rec.first_signal_height = 40;
   rec.lock_in_height = 96;
   rec.activation_height = 129;
   rec.signalers = {op(3), op(1), op(2)};
@@ -227,6 +252,8 @@ TEST(test_upgrade_record_codec_and_commitment_root) {
   ASSERT_TRUE(back.has_value() && *back == rec);
   auto bad_state = bytes;
   bad_state[0] = 9;
+  ASSERT_TRUE(!parse_upgrade_record(bad_state).has_value());
+  bad_state[0] = static_cast<std::uint8_t>(UpgradeState::Failed);  // never stored
   ASSERT_TRUE(!parse_upgrade_record(bad_state).has_value());
   auto trailing = bytes;
   trailing.push_back(0);
@@ -244,13 +271,13 @@ TEST(test_upgrade_record_codec_and_commitment_root) {
   ASSERT_TRUE(known_upgrades(mainnet_network()).empty());  // nothing ships signaled yet
 }
 
-// Step 3: the epoch-end inputs come from the registry and the checkpoint just derived for L+1, and
-// only recorded upgrades the binary knows are advanced.
+// Step 3: the epoch-end inputs come from the registry and the checkpoint just derived for L+1. Every
+// record advances (A1: no binary upgrade table is consulted); a failed one is removed.
 TEST(test_upgrade_records_advance_at_epoch_end_from_checkpoint_inputs) {
   CanonicalDerivationConfig cfg;
   cfg.network.committee_epoch_blocks = kB;
-  const auto d = def();  // window [33, 353)
-  cfg.upgrade_defs = {d};
+  cfg.network.upgrade_signal_window_blocks = kWindow;
+  const auto d = def();
   const auto vr = registry_with_active({op(1), op(2), op(3), op(4), op(5), op(6)}, op(9));
   const auto id_of = [&](std::uint8_t i) { return canonical_operator_id(op(i), *vr.get(op(i))); };
 
@@ -270,6 +297,7 @@ TEST(test_upgrade_records_advance_at_epoch_end_from_checkpoint_inputs) {
 
   UpgradeRecord four;
   four.state = UpgradeState::Signaling;
+  four.first_signal_height = 33;  // window ends at 353
   for (std::uint8_t i = 1; i <= 4; ++i) four.signalers.insert(id_of(i));
 
   // 4 of 6 operators and 4 of 4 seats, but NORMAL needs 7 eligible: not yet.
@@ -284,23 +312,22 @@ TEST(test_upgrade_records_advance_at_epoch_end_from_checkpoint_inputs) {
   ASSERT_TRUE(!upgrade_active(records.at(d.id), 3 * kB));
   ASSERT_TRUE(upgrade_active(records.at(d.id), 3 * kB + 1));
 
-  // 3 of 6 operators is below ceil(2/3 * 6) = 4: stays SIGNALING, then FAILED at the timeout.
+  // 3 of 6 operators is below ceil(2/3 * 6) = 4: stays SIGNALING, then fails at the window end and
+  // its record is removed, so a later signal opens a new window.
   UpgradeRecord three = four;
   three.signalers.erase(id_of(4));
   UpgradeRecords short_records{{d.id, three}};
   advance_upgrade_records_at_epoch_end(cfg, vr, fallback_cp, &short_records);
   ASSERT_TRUE(short_records.at(d.id).state == UpgradeState::Signaling);
   auto at_timeout = fallback_cp;
-  at_timeout.epoch_start_height = 11 * kB + 1;  // 353 >= signal_timeout
+  at_timeout.epoch_start_height = 10 * kB + 1;  // 321 < 353
   advance_upgrade_records_at_epoch_end(cfg, vr, at_timeout, &short_records);
-  ASSERT_TRUE(short_records.at(d.id).state == UpgradeState::Failed);
+  ASSERT_TRUE(short_records.at(d.id).state == UpgradeState::Signaling);
+  at_timeout.epoch_start_height = 11 * kB + 1;  // 353: window over
+  advance_upgrade_records_at_epoch_end(cfg, vr, at_timeout, &short_records);
+  ASSERT_TRUE(short_records.empty());
 
-  // A record for an upgrade this binary does not know is left as is; none is ever created.
-  auto unknown_cfg = cfg;
-  unknown_cfg.upgrade_defs.clear();
-  UpgradeRecords untouched{{d.id, four}};
-  advance_upgrade_records_at_epoch_end(unknown_cfg, vr, fallback_cp, &untouched);
-  ASSERT_TRUE(untouched.at(d.id) == four);
+  // No record is ever created at an epoch end.
   UpgradeRecords none;
   advance_upgrade_records_at_epoch_end(cfg, vr, fallback_cp, &none);
   ASSERT_TRUE(none.empty());

@@ -3873,8 +3873,7 @@ std::string Server::handle_rpc_body(const std::string& body, RpcSurface surface)
         .confidential_policy = &confidential_policy,
         .upgrade_signal_admission =
             [&, next_height](const PubKey32& validator, const Hash32& upgrade_id) {
-              return consensus::upgrade_signal_admission_error(consensus::known_upgrades(cfg_.network),
-                                                               upgrade_records, vr, next_height, validator, upgrade_id);
+              return consensus::upgrade_signal_admission_error(upgrade_records, vr, next_height, validator, upgrade_id);
             },
     };
     auto vrx = validate_any_tx(*tx, 1, utxos, &ctx);

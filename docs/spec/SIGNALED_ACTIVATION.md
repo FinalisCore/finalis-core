@@ -44,10 +44,15 @@ Each release that changes consensus carries a table of known upgrades:
 UpgradeDef {
   id            : Hash32   // H("FINALIS-UPGRADE-V1" || name || new_rules_fingerprint)
   name          : string   // e.g. "c2-certifier-terms"
-  signal_start  : height   // signals before this are invalid
-  signal_timeout: height   // not locked in by here -> FAILED, never activates
+  signal_start  : height   // the node auto-signals from here on (policy, not consensus)
 }
 ```
+
+The table is **not a consensus input** (A1, 2026-11-11). Signal admission, `UPG:` state, lock-in,
+window and exclusion are functions of finalized state only, so a binary that does not know an
+upgrade derives exactly the state of one that does. Otherwise the first signal would split old
+binaries off long before activation, which §3.5 must avoid. The table decides only which rules a
+binary implements, what it signals, and when it reports `upgrade_required` (§3.6).
 
 Rule code keeps both paths behind `upgrade_active(id, height)` instead of
 `height >= cfg.network.X_activation_height`. This is the pattern already used for the current
@@ -62,14 +67,20 @@ without the mechanism never see one in a block they validate. Rules (stateless o
 stateful ones in 2b):
 
 - The validator key signs `upgrade_signal_message(chain_domain, upgrade_id, validator_pubkey)`; the operator is the validator's canonical operator id.
-- It is valid only if `operator` is an active operator, `upgrade_id` is defined, the height is in
-  `[signal_start, signal_timeout)`, and this operator has no earlier signal for this id. One per
-  operator per upgrade, so the total is bounded by the operator count.
+- It is valid only if `operator` is an active operator and has no earlier signal for this id, and,
+  unless the upgrade is already locked in, the operator holds fewer than
+  `kMaxOpenUpgradeSignalsPerOperator` (2) signals on upgrades not yet locked in. Any id is
+  admissible. Open state is therefore bounded by 2 records per operator whatever ids are signaled;
+  each signal also pays a fee.
+- The first signal for an id creates its record and opens its window: not locked in by
+  `first_signal_height + upgrade_signal_window_blocks`, it fails and the record is removed at that
+  epoch end, so a later signal opens a new window. A signal for a locked-in or active upgrade is
+  always valid (late signal, §3.4).
 - The fee is paid like `onboarding-register`, from the operator's funding wallet.
 - A node whose binary knows the upgrade submits the signal automatically once it is synced (opt out
   with `--no-upgrade-signal`). Upgrading the binary is the vote.
 
-Stored in state as `UPG:<id> -> {state, signalers, lock_in_epoch, activation_height}` and included
+Stored in state as `UPG:<id> -> {state, first_signal_height, lock_in_height, activation_height, signalers}` and included
 in the state commitment, so light clients can prove the schedule.
 
 A validator's own state changes only through an on-chain transaction. That makes the signal
@@ -77,7 +88,8 @@ deterministic and auditable without changing the vote or certificate formats.
 
 ### 3.3 Lock-in and activation
 
-States: `DEFINED → SIGNALING → LOCKED_IN → ACTIVE`, or `FAILED` once `signal_timeout` passes.
+States: `DEFINED → SIGNALING → LOCKED_IN → ACTIVE`, or `FAILED` (record removed) once the window
+passes.
 
 Evaluated at each epoch end L, on finalized state:
 
@@ -150,7 +162,7 @@ unknown upgrade reach `LOCKED_IN`:
 - **Liveness.** It is guaranteed at the switch as long as the signalers stay online, since every
   committee seat at and after A belongs to a signaler. Signalers going offline later is the same
   risk as any offline validator today.
-- **The upgrade never gets enough support.** It ends `FAILED` at `signal_timeout` and the chain
+- **The upgrade never gets enough support.** It ends `FAILED` at its window's end and the chain
   never stopped. A new release can redefine it with new heights.
 - **Signal then downgrade.** That validator is offline for the new rules, the same as an offline
   validator.
@@ -162,7 +174,8 @@ unknown upgrade reach `LOCKED_IN`:
 | Operator threshold | ⌈⅔⌉ of active operators | same |
 | Committee threshold | quorum of committee(L+1) | same |
 | Activation delay | 2 epochs after lock-in | same |
-| Signal window (`signal_timeout − signal_start`) | ~30 days of blocks | ~3 days |
+| Signal window (`upgrade_signal_window_blocks`, from the first signal) | 14 400 blocks (~30 days at 180 s) | 1 440 (~3 days) |
+| Open signals per operator (`kMaxOpenUpgradeSignalsPerOperator`) | 2 | same |
 
 ## 6. Rollout
 
@@ -248,6 +261,9 @@ least 3 independent builders sign releases.
 2. DONE: `SCUPGSIG` output (2a: codec, stateless validation, activation height; 2b: stateful
    admission in derivation, mempool and lightserver, `upgrade_records` in state, commitment once
    non-empty, `UPG:` rows, snapshot). The known-upgrade table is empty, so nothing changes yet.
+   2c (A1 fix, 2026-11-11): admission and state no longer read the binary's table; any id is
+   admissible up to 2 open signals per operator, and the window runs from the first signal
+   (`upgrade_signal_window_blocks`).
 3. DONE: lock-in evaluation at epoch end in canonical derivation, after committee(L+1) is derived
    (`advance_upgrade_records_at_epoch_end`); `canonical_upgrade_active(state, id, h)`. States move only
    at epoch ends, so a record created by the first signal stays `DEFINED` until the next one. The

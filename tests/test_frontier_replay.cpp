@@ -4048,8 +4048,7 @@ TEST(test_long_lock_key_sets_persist_and_reload) {
 }
 
 // Signaled activation step 2b: a finalized SCUPGSIG from an active validator is recorded per operator,
-// the state commitment covers the records, and replay reproduces them. Without the upgrade in the
-// binary's table the signal has no effect.
+// the state commitment covers the records, and replay reproduces them.
 TEST(test_frontier_apply_records_upgrade_signal_and_commits_it) {
   auto cfg = test_cfg();
   const auto validator = key_from_byte(90);  // the genesis validator of build_parent_state_with_utxo
@@ -4062,7 +4061,7 @@ TEST(test_frontier_apply_records_upgrade_signal_and_commits_it) {
 
   Hash32 fp{};
   fp.fill(0x31);
-  const consensus::UpgradeDef def{consensus::upgrade_id("replay-test-upgrade", fp), "replay-test-upgrade", 0, 1'000'000};
+  const consensus::UpgradeDef def{consensus::upgrade_id("replay-test-upgrade", fp), "replay-test-upgrade", 0};
   UpgradeSignalScriptData sig_data{};
   sig_data.validator_pubkey = validator.public_key;
   sig_data.upgrade_id = def.id;
@@ -4080,7 +4079,7 @@ TEST(test_frontier_apply_records_upgrade_signal_and_commits_it) {
     vctx.chain_id = &c.chain_id;
     vctx.current_height = parent.finalized_height + 1;
     vctx.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
-      return consensus::upgrade_signal_admission_error(c.upgrade_defs, parent.upgrade_records, parent.validators,
+      return consensus::upgrade_signal_admission_error(parent.upgrade_records, parent.validators,
                                                        parent.finalized_height + 1, v, id);
     };
     const auto record = make_frontier_record(parent, ordered, c, 0, {}, &vctx);
@@ -4092,25 +4091,19 @@ TEST(test_frontier_apply_records_upgrade_signal_and_commits_it) {
     return out;
   };
 
-  // Unknown to this binary: the block applies, the signal changes nothing.
-  const auto without = apply_with(cfg);
-  ASSERT_TRUE(without.upgrade_records.empty());
-
-  cfg.upgrade_defs = {def};
   const auto with = apply_with(cfg);
   ASSERT_EQ(with.upgrade_records.size(), 1u);
+  ASSERT_EQ(with.upgrade_records.at(def.id).first_signal_height, parent.finalized_height + 1);
   const auto& signalers = with.upgrade_records.at(def.id).signalers;
   const auto info = with.validators.get(validator.public_key);
   ASSERT_TRUE(info.has_value());
   ASSERT_TRUE(signalers.count(consensus::canonical_operator_id(validator.public_key, *info)) == 1);
 
-  // The commitment covers the records; with none it is exactly what it was before this field existed.
+  // The commitment covers the records.
   auto cleared = with;
   cleared.upgrade_records.clear();
   ASSERT_TRUE(consensus::consensus_post_state_commitment(cfg, with) !=
               consensus::consensus_post_state_commitment(cfg, cleared));
-  ASSERT_TRUE(consensus::consensus_post_state_commitment(cfg, without) ==
-              consensus::consensus_post_state_commitment(test_cfg(), without));
 
   // Deterministic replay.
   const auto again = apply_with(cfg);
@@ -4141,8 +4134,7 @@ TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later)
 
   Hash32 fp{};
   fp.fill(0x32);
-  const consensus::UpgradeDef def{consensus::upgrade_id("lock-in-test", fp), "lock-in-test", 0, 1'000'000};
-  cfg.upgrade_defs = {def};
+  const consensus::UpgradeDef def{consensus::upgrade_id("lock-in-test", fp), "lock-in-test", 0};
 
   UpgradeSignalScriptData sig_data{};
   sig_data.validator_pubkey = validator.public_key;
@@ -4177,8 +4169,7 @@ TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later)
     vctx.chain_id = &cfg.chain_id;
     vctx.current_height = h;
     vctx.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
-      return consensus::upgrade_signal_admission_error(cfg.upgrade_defs, parent.upgrade_records, parent.validators, h, v,
-                                                       id);
+      return consensus::upgrade_signal_admission_error(parent.upgrade_records, parent.validators, h, v, id);
     };
     chain.push_back(make_frontier_record(parent, ordered, cfg, 0, {}, &vctx));
     consensus::CanonicalDerivedState next;
@@ -4350,8 +4341,10 @@ TEST(test_emergency_fallback_committee_skips_non_signalers_after_activation) {
 // before activation (SIGNALED_ACTIVATION §3.5-3.6). The block is built by the binary that knows the
 // upgrade and verified by one that does not.
 TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state) {
-  auto old_cfg = test_cfg();
-  auto new_cfg = test_cfg();
+  // Derivation config no longer carries an upgrade table; old and new binaries share it, and only the
+  // node-side policy differs (consensus::known_upgrades).
+  const auto old_cfg = test_cfg();
+  const auto new_cfg = test_cfg();
   const auto validator = key_from_byte(90);
   const auto from = key_from_byte(91);
   OutPoint op{};
@@ -4361,8 +4354,7 @@ TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_s
 
   Hash32 fp{};
   fp.fill(0x33);
-  const consensus::UpgradeDef def{consensus::upgrade_id("cross-binary", fp), "cross-binary", 0, 1'000'000};
-  new_cfg.upgrade_defs = {def};
+  const consensus::UpgradeDef def{consensus::upgrade_id("cross-binary", fp), "cross-binary", 0};
   UpgradeSignalScriptData sig_data{};
   sig_data.validator_pubkey = validator.public_key;
   sig_data.upgrade_id = def.id;
@@ -4377,7 +4369,7 @@ TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_s
   vctx.chain_id = &new_cfg.chain_id;
   vctx.current_height = parent.finalized_height + 1;
   vctx.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
-    return consensus::upgrade_signal_admission_error(new_cfg.upgrade_defs, parent.upgrade_records, parent.validators,
+    return consensus::upgrade_signal_admission_error(parent.upgrade_records, parent.validators,
                                                      parent.finalized_height + 1, v, id);
   };
   const auto record = make_frontier_record(parent, {tx->serialize()}, new_cfg, 0, {}, &vctx);
@@ -4390,4 +4382,3 @@ TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_s
   if (!old_ok) throw std::runtime_error("old binary rejects the block: " + err);
   ASSERT_EQ(old_state.state_commitment, new_state.state_commitment);
 }
-TEST_TAGS(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_state, "known-defect");
