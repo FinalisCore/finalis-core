@@ -378,6 +378,8 @@ class Node {
   // Signaled activation: replaces the in-memory UPG: records and, if given, this binary's upgrade table.
   void set_upgrade_state_for_test(const consensus::UpgradeRecords& records,
                                   std::optional<std::vector<consensus::UpgradeDef>> known);
+  // Replaces only this binary's upgrade table (an operator installing a release); finalized records stay.
+  void set_known_upgrades_for_test(std::vector<consensus::UpgradeDef> known);
   consensus::UpgradeRecords upgrade_records_for_test() const;
   bool abstaining_at_height_for_test(std::uint64_t height) const;
   QuorumDiagnosis quorum_diagnosis_for_test() const;
@@ -1214,6 +1216,9 @@ class Node {
   // precommits every proposal it sees, ignoring every safety rule, and equivocates as leader.
   bool chaos_byzantine_{false};
   std::uint64_t chaos_equivocation_nonce_{0};
+  // CHAOS TEST BUILDS ONLY (scripts/chaos_devnet.py --upgrade): FINALIS_CHAOS_KNOWN_UPGRADE=<name> gives
+  // this binary one upgrade, id upgrade_id(name, sha256(name)), as a release implementing it would.
+  std::optional<consensus::UpgradeDef> chaos_known_upgrade_;
 #endif
   std::uint64_t last_finalized_tip_poll_ms_{0};
   std::size_t finalized_tip_poll_cursor_{0};

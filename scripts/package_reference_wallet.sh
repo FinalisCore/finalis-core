@@ -41,6 +41,7 @@ build_targets=(
   finalis-lightserver
   finalis-explorer
   finalis-nodetest
+  finalis-updater
   finalis-wallet
 )
 # cmake --install installs every target with an install() rule: each one must be in this list.

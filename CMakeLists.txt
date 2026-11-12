@@ -282,6 +282,7 @@ add_library(finalis_core
   src/genesis/embedded_mainnet.cpp
   src/genesis/embedded_testnet.cpp
   src/common/merkle.cpp
+  src/common/release_manifest.cpp
   src/common/address.cpp
   src/consensus/availability_retention.cpp
   src/wallet/utxo_selection.cpp
@@ -391,6 +392,16 @@ if(FINALIS_SANITIZE)
   target_link_options(finalis-cli PRIVATE -fsanitize=${SC_SAN_KINDS})
 endif()
 install(TARGETS finalis-cli
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+add_executable(finalis-updater apps/finalis-updater/main.cpp)
+target_link_libraries(finalis-updater PRIVATE finalis_core)
+if(FINALIS_SANITIZE)
+  target_compile_options(finalis-updater PRIVATE ${SC_SAN_FLAGS})
+  target_link_options(finalis-updater PRIVATE -fsanitize=${SC_SAN_KINDS})
+endif()
+install(TARGETS finalis-updater
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
@@ -561,6 +572,7 @@ add_executable(finalis-tests
   apps/finalis-wallet/confidential_send.cpp
   tests/test_main.cpp
   tests/test_codec.cpp
+  tests/test_release_manifest.cpp
   tests/test_chain_id.cpp
   tests/test_crypto.cpp
   tests/test_confidential_tx.cpp

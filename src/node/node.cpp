@@ -360,6 +360,13 @@ bool Node::init() {
     chaos_byzantine_ = true;
     log_line("CHAOS-BYZANTINE enabled: this validator violates the consensus rules on purpose");
   }
+  if (const char* v = std::getenv("FINALIS_CHAOS_KNOWN_UPGRADE"); v && *v) {
+    const std::string name(v);
+    const auto fp = crypto::sha256(Bytes(name.begin(), name.end()));
+    std::lock_guard<std::mutex> lk(mu_);
+    chaos_known_upgrade_ = consensus::UpgradeDef{consensus::upgrade_id(name, fp), name, 0};
+    log_line("CHAOS-UPGRADE known name=" + name + " id=" + hex_encode32(chaos_known_upgrade_->id));
+  }
 #endif
   {
     std::lock_guard<std::mutex> lk(mu_);

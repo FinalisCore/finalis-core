@@ -918,6 +918,9 @@ void Node::maybe_auto_signal_upgrades_locked() {
 }
 
 std::vector<consensus::UpgradeDef> Node::known_upgrades_locked() const {
+#ifdef FINALIS_CHAOS_BYZANTINE
+  if (!known_upgrades_for_test_.has_value() && chaos_known_upgrade_.has_value()) return {*chaos_known_upgrade_};
+#endif
   return known_upgrades_for_test_.has_value() ? *known_upgrades_for_test_ : consensus::known_upgrades(cfg_.network);
 }
 

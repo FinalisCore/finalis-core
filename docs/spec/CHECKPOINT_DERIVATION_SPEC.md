@@ -582,7 +582,12 @@ completes into a permanent halt: once derivation fails closed, no late signal ca
 failure in which most prior members are suspended for miss rate, and excluding them would leave
 the recovery set empty.
 
-If `members` is empty, derivation fails closed (`empty-committee-no-emergency-fallback`).
+If `members` is empty while an upgrade is active at `epoch_start_height(E+1)` (no signaler is left),
+the whole derivation of `CP[E+1]` is repeated with the upgrade filter off (§6.4 skipped in candidate
+filtering, the eligible counts, `qualified_depth`, the escape and recovery): the checkpoint the old
+rule derives (SIGNALED_ACTIVATION §3.4.2, decision 8b).
+
+If `members` is still empty, derivation fails closed (`empty-committee-no-emergency-fallback`).
 Nodes log `CRITICAL` when deriving such a checkpoint and refuse to start on one without
 `--acknowledge-emergency-fallback`.
 

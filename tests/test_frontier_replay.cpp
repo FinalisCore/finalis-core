@@ -4135,6 +4135,7 @@ TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later)
       build_upgrade_signal_tx(replay_chain_domain(), validator.public_key, validator.private_key, def.id, 1);
   ASSERT_TRUE(signal_tx.has_value());
 
+  std::map<std::uint64_t, std::vector<Bytes>> ordered_at;
   std::vector<consensus::CanonicalFrontierRecord> chain;
   std::vector<consensus::CanonicalDerivedState> states{state};
   OutPoint cur_op = op;
@@ -4160,6 +4161,7 @@ TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later)
     vctx.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
       return consensus::upgrade_signal_admission_error(parent.upgrade_records, parent.validators, h, v, id);
     };
+    ordered_at[h] = ordered;
     chain.push_back(make_frontier_record(parent, ordered, cfg, 0, {}, &vctx));
     consensus::CanonicalDerivedState next;
     if (!consensus::apply_frontier_record(cfg, parent, chain.back(), &next, &err)) {
@@ -4195,6 +4197,29 @@ TEST(test_frontier_upgrade_locks_in_at_epoch_end_and_activates_two_epochs_later)
   }
   ASSERT_TRUE(replay.upgrade_records == states.back().upgrade_records);
   ASSERT_EQ(replay.state_commitment, states.back().state_commitment);
+
+  // decision 8a, end to end: the same h=8 block, applied where the locked-in record lost its support
+  // (its signaler is no longer an operator), removes the record at the boundary before activation;
+  // the upgrade never governs and the old rules continue.
+  auto unsupported = states.at(7);
+  PubKey32 gone{};
+  gone.fill(0x7E);
+  unsupported.upgrade_records.at(def.id).signalers = {gone};
+  unsupported.state_commitment = consensus::consensus_state_commitment(cfg, unsupported);
+  SpecialValidationContext vctx8;
+  vctx8.network = &cfg.network;
+  vctx8.chain_id = &cfg.chain_id;
+  vctx8.current_height = 8;
+  vctx8.upgrade_signal_admission = [&](const PubKey32& v, const Hash32& id) {
+    return consensus::upgrade_signal_admission_error(unsupported.upgrade_records, unsupported.validators, 8, v, id);
+  };
+  const auto record8 = make_frontier_record(unsupported, ordered_at.at(8), cfg, 0, {}, &vctx8);
+  consensus::CanonicalDerivedState cancelled;
+  if (!consensus::apply_frontier_record(cfg, unsupported, record8, &cancelled, &err)) {
+    throw std::runtime_error("apply cancelled h=8: " + err);
+  }
+  ASSERT_TRUE(cancelled.upgrade_records.count(def.id) == 0);
+  ASSERT_TRUE(!consensus::canonical_upgrade_active(cancelled, def.id, 9));
 }
 
 // Signaled activation step 4 (§3.4, §3.4.1): from an upgrade's activation on, operators that have not
@@ -4364,6 +4389,131 @@ TEST(test_upgrade_signal_for_unknown_upgrade_keeps_old_and_new_binaries_on_one_s
   const bool old_ok = consensus::apply_frontier_record(old_cfg, parent, record, &old_state, &err);
   if (!old_ok) throw std::runtime_error("old binary rejects the block: " + err);
   ASSERT_EQ(old_state.state_commitment, new_state.state_commitment);
+}
+
+// decision 8b (SIGNALED_ACTIVATION §3.4.2; formal/signaled_activation.tla NoExclusionHalt, all-exit
+// config): after activation every signaler exits. No signaler is left to seat, so the derivation uses the
+// rule without the upgrade filter, the same checkpoint the old rule derives, instead of failing closed
+// for good. Deterministic: the result does not depend on whether the caller asks for the error.
+TEST(test_activation_boundary_with_every_signaler_exited_derives_by_the_old_rule) {
+  const auto cfg = live_activation_cfg();  // 4-block epochs
+  const auto exiting = key_from_byte(90);  // genesis validator, a signaler that exits
+  consensus::CanonicalGenesisState genesis;
+  genesis.genesis_artifact_id = zero_hash();
+  genesis.initial_validators.push_back(exiting.public_key);
+  genesis.initial_validator_bls_keys.push_back(test::test_bls_pubkey(exiting));
+  consensus::CanonicalDerivedState state;
+  std::string err;
+  ASSERT_TRUE(consensus::build_genesis_canonical_state(cfg, genesis, &state, &err));
+  state.finalized_height = 8;
+  state.validators.set_rules(consensus::ValidatorRules{.min_bond = BOND_AMOUNT, .warmup_blocks = 0, .cooldown_blocks = 100});
+  const auto laggard = key_from_byte(0xD1);  // active, never signaled
+  const auto s1 = key_from_byte(0xD2);       // signalers that exit too
+  for (const auto* kp : {&laggard, &s1}) {
+    OutPoint bond{};
+    bond.txid.fill(kp->public_key[0]);
+    ASSERT_TRUE(state.validators.register_bond(kp->public_key, bond, 0, BOND_AMOUNT, &err, kp->public_key));
+  }
+  ASSERT_TRUE(state.validators.request_unbond(exiting.public_key, 8));
+  ASSERT_TRUE(state.validators.request_unbond(s1.public_key, 8));
+  state.validators.advance_height(9);
+  ASSERT_TRUE(state.validators.is_active_for_height(laggard.public_key, 9));
+  state.finalized_committee_checkpoints[5].epoch_start_height = 5;
+  state.finalized_committee_checkpoints[5].ordered_members = {exiting.public_key, s1.public_key};
+  state.committee_epoch_randomness_cache[9] = state.finalized_randomness;
+
+  const auto op_of = [&](const PubKey32& pub) { return consensus::canonical_operator_id(pub, *state.validators.get(pub)); };
+  Hash32 id{};
+  id.fill(0x47);
+  consensus::UpgradeRecord rec;
+  rec.state = consensus::UpgradeState::Active;
+  rec.activation_height = 5;
+  rec.signalers = {op_of(exiting.public_key), op_of(s1.public_key)};
+  state.upgrade_records[id] = rec;
+
+  storage::FinalizedCommitteeCheckpoint cp;
+  const bool ok = consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 9, &cp, &err);
+  if (!ok) throw std::runtime_error("derivation failed closed: " + err);
+  ASSERT_TRUE(std::find(cp.ordered_members.begin(), cp.ordered_members.end(), laggard.public_key) !=
+              cp.ordered_members.end());
+  auto old_rules = state;
+  old_rules.upgrade_records.clear();
+  storage::FinalizedCommitteeCheckpoint old_cp;
+  ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, old_rules, 9, &old_cp, &err));
+  ASSERT_TRUE(consensus::canonical_checkpoints_equal(cp, old_cp));
+  storage::FinalizedCommitteeCheckpoint no_error_cp;
+  ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 9, &no_error_cp, nullptr));
+  ASSERT_TRUE(consensus::canonical_checkpoints_equal(cp, no_error_cp));
+  ASSERT_TRUE(consensus::validate_next_epoch_checkpoint_from_state(cfg, state, 9, cp, &err));
+
+  // One signaler still bonded (suspended): a signaler is seated (the empty-active-set escape or A2), and
+  // the last resort is not used.
+  const auto s2 = key_from_byte(0xD3);
+  OutPoint bond{};
+  bond.txid.fill(s2.public_key[0]);
+  ASSERT_TRUE(state.validators.register_bond(s2.public_key, bond, 0, BOND_AMOUNT, &err, s2.public_key));
+  auto info = *state.validators.get(s2.public_key);
+  info.status = consensus::ValidatorStatus::SUSPENDED;
+  state.validators.upsert(s2.public_key, info);
+  auto laggard_info = *state.validators.get(laggard.public_key);
+  laggard_info.status = consensus::ValidatorStatus::SUSPENDED;
+  state.validators.upsert(laggard.public_key, laggard_info);
+  state.upgrade_records[id].signalers.insert(op_of(s2.public_key));
+  storage::FinalizedCommitteeCheckpoint a2_cp;
+  ASSERT_TRUE(consensus::derive_next_epoch_checkpoint_from_state(cfg, state, 9, &a2_cp, &err));
+  ASSERT_TRUE(!a2_cp.ordered_members.empty());
+  for (const auto& m : a2_cp.ordered_members) ASSERT_TRUE(state.upgrade_records[id].signalers.count(op_of(m)) == 1);
+}
+
+// decision 8a (SIGNALED_ACTIVATION §3.3): at the epoch end before an activation, a locked-in upgrade whose
+// signalers among the then-active operators fell below the operator threshold is removed, so it does not
+// activate and the old rules continue. Only records activating at that boundary are checked.
+TEST(test_locked_in_upgrade_without_support_at_its_activation_boundary_is_cancelled) {
+  consensus::ValidatorRegistry validators;
+  validators.set_rules(consensus::ValidatorRules{.min_bond = BOND_AMOUNT, .warmup_blocks = 0, .cooldown_blocks = 100});
+  std::vector<crypto::KeyPair> ops;
+  std::string err;
+  for (std::uint8_t b : {0xE1, 0xE2, 0xE3}) {
+    ops.push_back(key_from_byte(b));
+    OutPoint bond{};
+    bond.txid.fill(b);
+    ASSERT_TRUE(validators.register_bond(ops.back().public_key, bond, 0, BOND_AMOUNT, &err, ops.back().public_key));
+  }
+  validators.advance_height(9);
+  const auto op_of = [&](const crypto::KeyPair& kp) {
+    return consensus::canonical_operator_id(kp.public_key, *validators.get(kp.public_key));
+  };
+  const auto locked = [&](std::uint64_t activation, std::set<PubKey32> signalers) {
+    consensus::UpgradeRecord rec;
+    rec.state = consensus::UpgradeState::LockedIn;
+    rec.activation_height = activation;
+    rec.signalers = std::move(signalers);
+    return rec;
+  };
+  Hash32 kept{}, cancelled{}, later{}, active{};
+  kept.fill(1);
+  cancelled.fill(2);
+  later.fill(3);
+  active.fill(4);
+  consensus::UpgradeRecords records;
+  records[kept] = locked(9, {op_of(ops[0]), op_of(ops[1])});  // 2 of 3 = threshold
+  records[cancelled] = locked(9, {op_of(ops[0])});             // 1 of 3
+  records[later] = locked(13, {op_of(ops[0])});                // activates at a later boundary
+  records[active] = locked(5, {op_of(ops[0])});
+  records[active].state = consensus::UpgradeState::Active;
+  consensus::cancel_unsupported_upgrade_activations(validators, 9, &records);
+  ASSERT_TRUE(records.count(kept) == 1);
+  ASSERT_TRUE(records.count(cancelled) == 0);
+  ASSERT_TRUE(records.count(later) == 1);
+  ASSERT_TRUE(records.count(active) == 1);
+
+  // Support lost by exits: the signalers left, the active set shrank, and 1 of 2 is below the threshold.
+  ASSERT_TRUE(validators.request_unbond(ops[1].public_key, 9));
+  validators.advance_height(10);
+  consensus::UpgradeRecords lost{{kept, locked(13, {op_of(ops[0]), op_of(ops[1])})}};
+  consensus::cancel_unsupported_upgrade_activations(validators, 13, &lost);
+  ASSERT_EQ(consensus::upgrade_operator_threshold(2), 2u);
+  ASSERT_TRUE(lost.empty());
 }
 
 // A2 (signaled activation, pre-release; fixed; formal/signaled_activation.tla NoExclusionHalt): at an

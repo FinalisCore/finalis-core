@@ -437,6 +437,11 @@ void advance_upgrade_records_at_epoch_end(const CanonicalDerivationConfig& cfg, 
                                           const storage::FinalizedCommitteeCheckpoint& next_checkpoint,
                                           UpgradeRecords* records);
 // Whether upgrade `id` governs `height` according to finalized state.
+// decision 8a (SIGNALED_ACTIVATION §3.3): at the epoch end before an activation, removes each LOCKED_IN
+// record activating at next_epoch_start whose signalers among the operators active then are below
+// upgrade_operator_threshold. Called before committee(next) is derived.
+void cancel_unsupported_upgrade_activations(const ValidatorRegistry& validators, std::uint64_t next_epoch_start,
+                                            UpgradeRecords* records);
 bool canonical_upgrade_active(const CanonicalDerivedState& state, const Hash32& id, std::uint64_t height);
 
 }  // namespace finalis::consensus

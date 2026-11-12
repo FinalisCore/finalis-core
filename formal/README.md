@@ -236,11 +236,15 @@ reproduce the same defects in the node are listed in [tests/KNOWN_DEFECTS.md](..
 - Spec: [signaled_activation.tla](signaled_activation.tla) (docs/spec/SIGNALED_ACTIVATION.md,
   CHECKPOINT_DERIVATION_SPEC §6.4)
 - Configs: [signaled_activation.cfg](signaled_activation.cfg) (invariants hold, exhaustive: 4 operators,
-  committee 3, window 3 epochs, 7 epochs, 1 exit, any suspensions; 1,692,305 distinct states, ~1 min) and
-  `signaled_activation_no_exclusion_halt.cfg`;
-  reachability `signaled_activation_reach_{active,failed}.cfg`; mutations
-  `signaled_activation_{no_committee_check,no_exclusion,no_emergency_skip,a2_prior_only}_mutation.cfg` (`no_emergency_skip` with 5
-  operators and committee 4, so committee(L+1) can hold a non-signaler).
+  committee 3, window 3 epochs, 7 epochs, 1 exit, any suspensions; 1,692,305 distinct states, ~1 min),
+  `signaled_activation_all_exit.cfg` (the same with 3 exits, so every signaler can exit; 5,171,181
+  distinct states, ~3 min), `signaled_activation_no_exclusion_halt.cfg` and
+  `signaled_activation_no_exclusion_halt_all_exit.cfg`;
+  reachability `signaled_activation_reach_{active,failed,cancelled,last_resort}.cfg`; mutations
+  `signaled_activation_{no_committee_check,no_exclusion,no_emergency_skip,a2_prior_only,a2_signalers_only}_mutation.cfg`
+  (`no_emergency_skip` with 5 operators and committee 4, so committee(L+1) can hold a non-signaler).
+  `Recovery`: `prior_only` (before A2), `signalers` (A2), `last_resort` (A2 and decision 8b, the
+  implemented rule); `Recheck = "on"`: the support re-check before activation (decision 8a).
 
 Abstracts finality (an epoch ends once final) and ticket order (any K-subset of the candidates). Models:
 old and new binaries (only new ones signal; no downgrade), the window from the first signal, lock-in at
@@ -253,12 +257,14 @@ recovery from the 2 prior committees.
 | `ActiveCommitteeAllSignalers` | from activation on, every committee seat is a signaler | `no_exclusion`, `no_emergency_skip` |
 | `ActiveCommitteeUpgraded` | ... so every seat runs the new rules | |
 | `ParentCommitteeReady` | committee(A-1), the parent of the first new-rules block, has a quorum of signalers | `no_committee_check` |
-| `NoExclusionHalt` | the exclusion never makes derivation fail closed where the old rule completes | `a2_prior_only` |
+| `NoExclusionHalt` | the exclusion never makes derivation fail closed where the old rule completes | `a2_prior_only`, `a2_signalers_only` |
 
 `signaled_activation_no_exclusion_halt.cfg` (`NoExclusionHalt` holds): the exclusion never turns a
 derivation the old rule completes into a fail-closed halt. With `Recovery = "prior_only"` (the rule
 before fix A2, tests/KNOWN_DEFECTS.md) it is violated: at an activation boundary where every signaler is
 suspended and the signalers of the last 2 committees have exited, emergency recovery found only
-non-signalers and failed closed for good. The fix recovers the signalers that did not exit. Not covered:
-every signaler exits (more than `MaxExits = 1`); the chain then halts where the old rule would recover
-non-signalers on old binaries.
+non-signalers and failed closed for good. The fix recovers the signalers that did not exit. With every
+signaler exited (3 exits), A2 alone still halts (`a2_signalers_only` mutation); the last resort (decision
+8b) derives by the old rule, and `NoExclusionHalt` holds (`no_exclusion_halt_all_exit`). The safety
+invariants exempt only a committee seated by the last resort (`lastResort`), whose members become
+signalers once they upgrade.
