@@ -89,16 +89,16 @@ std::string network_id_hex(const NetworkConfig& cfg) {
 // Height-aware like the node's (SIGNALED_ACTIVATION §3.5): the upgrades active at the next height that
 // this binary implements.
 std::string relay_consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
-                                              const std::vector<Hash32>& active_upgrades) {
-  return consensus_rules_fingerprint(cfg, chain_id, cv, active_upgrades);
+                                              std::uint64_t next_height, const std::vector<Hash32>& active_upgrades) {
+  return consensus_rules_fingerprint(cfg, chain_id, cv, next_height, active_upgrades);
 }
 
 std::string relay_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
-                                               const std::vector<Hash32>& active_upgrades) {
+                                               std::uint64_t next_height, const std::vector<Hash32>& active_upgrades) {
   std::ostringstream oss;
   oss << finalis::lightserver_software_version()
       << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv
-      << ";crh=" << relay_consensus_rules_fingerprint(cfg, chain_id, cv, active_upgrades);
+      << ";crh=" << relay_consensus_rules_fingerprint(cfg, chain_id, cv, next_height, active_upgrades);
   return oss.str();
 }
 
@@ -2129,10 +2129,11 @@ TxRelayResult Server::relay_tx_to_peer(const Bytes& tx_bytes) {
   v.start_hash = tip ? tip->hash : zero_hash();
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 424242;
+  const std::uint64_t next_height = tip ? tip->height + 1 : 1;
   const auto active_upgrades = consensus::implemented_active_upgrades(
-      db_.load_upgrade_records(), consensus::known_upgrades(cfg_.network), tip ? tip->height + 1 : 1);
-  v.node_software_version =
-      relay_software_version_fingerprint(cfg_.network, chain_id_, kRelayValidationRulesVersion, active_upgrades);
+      db_.load_upgrade_records(), consensus::known_upgrades(cfg_.network), next_height);
+  v.node_software_version = relay_software_version_fingerprint(cfg_.network, chain_id_, kRelayValidationRulesVersion,
+                                                               next_height, active_upgrades);
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
     net::close_socket(fd);

@@ -81,7 +81,7 @@ ChainIdMismatch compare_chain_identity(const ChainId& a, const ChainId& b) {
 }
 
 std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv,
-                                        std::vector<Hash32> active_upgrades) {
+                                        std::uint64_t next_height, std::vector<Hash32> active_upgrades) {
   codec::ByteWriter w;
   w.bytes_fixed(cfg.network_id);
   w.u32le(cfg.protocol_version);
@@ -101,6 +101,12 @@ std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId&
   // Ingress certifier rules (C1): nodes that disagree on terms reject each other's certificates.
   w.u64le(cfg.ingress_certifier_term_blocks);
   w.u64le(cfg.ingress_certifier_liveness_blocks);
+  if (next_height >= cfg.upgrade_signal_activation_height) {
+    const std::string tag = "signals";
+    w.varbytes(Bytes(tag.begin(), tag.end()));
+    w.u64le(cfg.upgrade_signal_activation_height);
+    w.u64le(cfg.upgrade_signal_window_blocks);
+  }
   if (!active_upgrades.empty()) {
     std::sort(active_upgrades.begin(), active_upgrades.end());
     active_upgrades.erase(std::unique(active_upgrades.begin(), active_upgrades.end()), active_upgrades.end());
@@ -110,6 +116,46 @@ std::string consensus_rules_fingerprint(const NetworkConfig& cfg, const ChainId&
     for (const auto& id : active_upgrades) w.bytes_fixed(id);
   }
   return hex_encode32(crypto::sha256d(w.data()));
+}
+
+std::vector<std::string> reachable_consensus_rules_fingerprints(const NetworkConfig& cfg, const ChainId& chain_id,
+                                                                std::uint32_t cv, std::uint64_t next_height,
+                                                                const std::vector<Hash32>& active_upgrades,
+                                                                const std::vector<Hash32>& known_upgrades) {
+  std::vector<Hash32> pending;
+  for (const auto& id : known_upgrades) {
+    if (std::find(active_upgrades.begin(), active_upgrades.end(), id) == active_upgrades.end() &&
+        std::find(pending.begin(), pending.end(), id) == pending.end()) {
+      pending.push_back(id);
+    }
+  }
+  if (pending.size() > 8) pending.resize(8);
+  std::vector<std::uint64_t> heights{next_height};
+  if (cfg.upgrade_signal_activation_height > next_height) heights.push_back(cfg.upgrade_signal_activation_height);
+  std::vector<std::string> out;
+  for (const auto h : heights) {
+    for (std::size_t mask = 0; mask < (std::size_t{1} << pending.size()); ++mask) {
+      auto active = active_upgrades;
+      for (std::size_t i = 0; i < pending.size(); ++i) {
+        if (mask & (std::size_t{1} << i)) active.push_back(pending[i]);
+      }
+      out.push_back(consensus_rules_fingerprint(cfg, chain_id, cv, h, std::move(active)));
+    }
+  }
+  return out;
+}
+
+bool peer_consensus_rules_fingerprint_acceptable(const std::string& peer_crh, std::uint64_t peer_next_height,
+                                                 std::uint64_t local_next_height, const std::string& local_crh,
+                                                 const std::function<std::string(std::uint64_t)>& fingerprint_at,
+                                                 const std::function<std::vector<std::string>()>& reachable) {
+  if (peer_crh == local_crh) return true;
+  if (peer_next_height < local_next_height) return peer_crh == fingerprint_at(peer_next_height);
+  if (peer_next_height > local_next_height) {
+    const auto all = reachable();
+    return std::find(all.begin(), all.end(), peer_crh) != all.end();
+  }
+  return false;
 }
 
 }  // namespace finalis

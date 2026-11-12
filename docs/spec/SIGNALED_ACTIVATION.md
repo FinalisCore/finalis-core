@@ -171,6 +171,17 @@ tip**, plus the binary's known upgrade ids advertised separately (`upg=<id,...>`
   one network.
 - After activation, the fingerprints differ and peers disconnect, as today. The point-1 diagnostic
   (`halt_reason=other_consensus_rules`) already reports this.
+- The signal rules themselves are in the fingerprint from `upgrade_signal_activation_height` on
+  (that height and `upgrade_signal_window_blocks`), so the release that sets the height can be
+  installed early without splitting the network, and at the height releases without signals drop
+  out instead of receiving blocks they reject.
+- A peer is checked against the rules at **its own** tip (`start_height` in VERSION,
+  `peer_consensus_rules_fingerprint_acceptable`): a peer below the local tip must show exactly the
+  fingerprint the local history gives its height, a peer above it one this binary can reach (its
+  active upgrades, any of its known upgrades, signal rules on). Without this, a node below an
+  activation (syncing from genesis, back from downtime) is refused by every peer above it and never
+  syncs past it (found 2026-11-12, `test_cluster_fresh_node_syncs_past_an_active_upgrade`). The
+  fingerprint only filters peers; blocks are validated regardless.
 
 ### 3.6 Old binaries
 
@@ -323,9 +334,9 @@ least 3 independent builders sign releases.
    locked-in upgrade the binary does not implement: `UPGRADE REQUIRED name=<id> activates_at=<h>`
    every summary, `halt_reason=upgrade_required` and `quorum.upgrade_required` in `get_status` from
    the activation height, and no proposal, vote or timeout vote from that height (the node's abstain
-   gate). The lightserver relay handshake uses the same fingerprint. Testnet-3's
-   `upgrade_signal_window_blocks` is not in the fingerprint: adding it would disconnect this branch's
-   binaries from v2.2.14 before the flag day; it is set with the flag-day release.
+   gate). The lightserver relay handshake uses the same fingerprint. 2026-11-12: the signal rules
+   enter the fingerprint from `upgrade_signal_activation_height` on (below it the fingerprint is
+   v2.2.14's), and peers are checked at their own height (§3.5).
 6. DONE: fee-free signal (§3.2, decision 7): no inputs, signed expiry at most one epoch ahead, no
    UTXO; relay-fee and hashcash exemption with one pending signal per (validator, upgrade); node
    auto-signal after each finalized height (`--no-upgrade-signal`); lightserver `get_upgrades`, CLI

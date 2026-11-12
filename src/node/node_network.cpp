@@ -939,12 +939,17 @@ std::optional<std::string> Node::detect_possible_public_ip() const {
 }
 
 std::string Node::local_consensus_rules_fingerprint_locked() const {
+  return local_consensus_rules_fingerprint_at_locked(finalized_height_ + 1);
+}
+
+std::string Node::local_consensus_rules_fingerprint_at_locked(std::uint64_t next_height) const {
   std::vector<Hash32> active;
   if (canonical_state_.has_value()) {
-    active = consensus::implemented_active_upgrades(canonical_state_->upgrade_records,
-                                                    known_upgrades_locked(), finalized_height_ + 1);
+    active = consensus::implemented_active_upgrades(canonical_state_->upgrade_records, known_upgrades_locked(),
+                                                    next_height);
   }
-  return ascii_lower(consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion, active));
+  return ascii_lower(
+      consensus_rules_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion, next_height, active));
 }
 
 std::string Node::version_tags_locked() const {
@@ -1199,9 +1204,32 @@ void Node::on_version(int peer_id, const Bytes& payload) {
   const std::string local_genesis = ascii_lower(chain_id_.genesis_hash_hex);
   const std::string local_nid = ascii_lower(network_id_hex(cfg_.network));
   std::string local_crh;
+  bool crh_acceptable = false;
+  const auto peer_crh_raw = software_fingerprint_value(v->node_software_version, "crh");
   {
     std::lock_guard<std::mutex> lk(mu_);
     local_crh = local_consensus_rules_fingerprint_locked();
+    if (peer_crh_raw.has_value()) {
+      // SIGNALED_ACTIVATION §3.5: check the peer against the rules at its own tip, so a node below an
+      // activation (syncing, back from downtime) still connects and a node above it is not refused.
+      const std::uint64_t local_next = finalized_height_ + 1;
+      crh_acceptable = peer_consensus_rules_fingerprint_acceptable(
+          ascii_lower(*peer_crh_raw), v->start_height + 1, local_next, local_crh,
+          [&](std::uint64_t h) { return local_consensus_rules_fingerprint_at_locked(h); },
+          [&]() {
+            std::vector<Hash32> active;
+            if (canonical_state_.has_value()) {
+              active = consensus::implemented_active_upgrades(canonical_state_->upgrade_records,
+                                                              known_upgrades_locked(), local_next);
+            }
+            std::vector<Hash32> known;
+            for (const auto& d : known_upgrades_locked()) known.push_back(d.id);
+            auto all = reachable_consensus_rules_fingerprints(cfg_.network, chain_id_, kFixedValidationRulesVersion,
+                                                              local_next, active, known);
+            for (auto& f : all) f = ascii_lower(f);
+            return all;
+          });
+    }
   }
   const auto peer_genesis = software_fingerprint_value(v->node_software_version, "genesis");
   const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
@@ -1224,7 +1252,7 @@ void Node::on_version(int peer_id, const Bytes& payload) {
     p2p_.disconnect_peer(peer_id);
     return;
   }
-  if (ascii_lower(*peer_crh) != local_crh) {
+  if (!crh_acceptable) {
     {
       std::lock_guard<std::mutex> lk(mu_);
       ++rejected_consensus_rules_;

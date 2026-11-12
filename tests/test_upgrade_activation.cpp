@@ -377,10 +377,74 @@ TEST(test_rules_fingerprint_covers_active_upgrades_only_when_present) {
   Hash32 a{}, b{};
   a.fill(0x0A);
   b.fill(0x0B);
-  const auto base = consensus_rules_fingerprint(net, chain, 7);
-  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, {}), base);
-  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, {a}) != base);
-  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, {a}) != consensus_rules_fingerprint(net, chain, 7, {b}));
-  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, {a, b}), consensus_rules_fingerprint(net, chain, 7, {b, a}));
-  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, {a, a}), consensus_rules_fingerprint(net, chain, 7, {a}));
+  const auto base = consensus_rules_fingerprint(net, chain, 7, 1);
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, 1, {}), base);
+  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, 1, {a}) != base);
+  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, 1, {a}) != consensus_rules_fingerprint(net, chain, 7, 1, {b}));
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, 1, {a, b}), consensus_rules_fingerprint(net, chain, 7, 1, {b, a}));
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, 1, {a, a}), consensus_rules_fingerprint(net, chain, 7, 1, {a}));
+}
+
+// §3.5 at the signal flag day: below upgrade_signal_activation_height the fingerprint is the one releases
+// without signals advertise (installing the release early splits nothing); from that height on it
+// covers the signal rules, so a release without them disconnects instead of receiving blocks it rejects.
+TEST(test_rules_fingerprint_covers_signal_rules_from_their_activation_height) {
+  NetworkConfig net = testnet_network();
+  ChainId chain;
+  chain.genesis_hash_hex = std::string(64, 'b');
+  NetworkConfig old_release = net;  // no signal rules: the tag never appears
+  old_release.upgrade_signal_activation_height = std::numeric_limits<std::uint64_t>::max();
+  net.upgrade_signal_activation_height = 9000;
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, 8999), consensus_rules_fingerprint(old_release, chain, 7, 8999));
+  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, 9000) != consensus_rules_fingerprint(old_release, chain, 7, 9000));
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, 9000), consensus_rules_fingerprint(net, chain, 7, 20000));
+  NetworkConfig other_window = net;
+  other_window.upgrade_signal_window_blocks += 1;
+  ASSERT_EQ(consensus_rules_fingerprint(net, chain, 7, 8999), consensus_rules_fingerprint(other_window, chain, 7, 8999));
+  ASSERT_TRUE(consensus_rules_fingerprint(net, chain, 7, 9000) != consensus_rules_fingerprint(other_window, chain, 7, 9000));
+}
+
+// §3.5 handshake: a peer is checked against the rules at its own tip. Behind: exactly (the local node
+// knows the history). Ahead: any fingerprint this binary can reach. Another binary's rules: refused.
+TEST(test_peer_rules_fingerprint_is_checked_at_the_peers_height) {
+  NetworkConfig net = testnet_network();
+  net.upgrade_signal_activation_height = 100;
+  ChainId chain;
+  chain.genesis_hash_hex = std::string(64, 'c');
+  Hash32 up{}, foreign{};
+  up.fill(0x1A);
+  foreign.fill(0x2B);
+  // Local tip: next height 300, upgrade `up` active from 200.
+  const auto at = [&](std::uint64_t h) {
+    return consensus_rules_fingerprint(net, chain, 7, h, h >= 200 ? std::vector<Hash32>{up} : std::vector<Hash32>{});
+  };
+  const auto reachable_from = [&](std::uint64_t h) {
+    return [&, h]() {
+      return reachable_consensus_rules_fingerprints(net, chain, 7, h, h >= 200 ? std::vector<Hash32>{up} : std::vector<Hash32>{},
+                                                    {up});
+    };
+  };
+  const auto ok = [&](const std::string& peer, std::uint64_t peer_next, std::uint64_t local_next) {
+    return peer_consensus_rules_fingerprint_acceptable(peer, peer_next, local_next, at(local_next), at,
+                                                       reachable_from(local_next));
+  };
+  ASSERT_TRUE(ok(at(300), 300, 300));
+  // Behind: below the upgrade, below the signal rules, at genesis.
+  ASSERT_TRUE(ok(at(150), 150, 300));
+  ASSERT_TRUE(ok(at(50), 50, 300));
+  ASSERT_TRUE(ok(at(1), 1, 300));
+  ASSERT_TRUE(ok(at(300), 150, 300));   // the local rules are always accepted, whatever height is reported
+  ASSERT_TRUE(!ok(at(50), 120, 300));   // signal rules missing at a height that has them (from 100)
+  ASSERT_TRUE(!ok(at(150), 300, 300));  // same height, other rules
+  // Ahead, seen from a node at next height 50 (no signals, no upgrade yet): signals on, upgrade active.
+  ASSERT_TRUE(ok(at(150), 150, 50));
+  ASSERT_TRUE(ok(at(300), 300, 50));
+  // A binary with an upgrade this one does not know, or other signal parameters, is refused either way.
+  const auto other = consensus_rules_fingerprint(net, chain, 7, 300, {up, foreign});
+  ASSERT_TRUE(!ok(other, 300, 300));
+  ASSERT_TRUE(!ok(other, 400, 50));
+  ASSERT_TRUE(!ok(other, 150, 300));
+  NetworkConfig other_window = net;
+  other_window.upgrade_signal_window_blocks += 1;
+  ASSERT_TRUE(!ok(consensus_rules_fingerprint(other_window, chain, 7, 400, {up}), 400, 50));
 }
