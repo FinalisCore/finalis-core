@@ -121,12 +121,12 @@ jobs:
       - name: Build (with tests)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
         shell: pwsh
-        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-nodetest finalis-wallet finalis-tests checkpoint-fixture-export
+        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-nodetest finalis-updater finalis-wallet finalis-tests checkpoint-fixture-export
 
       - name: Build (without tests)
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.run_tests }}
         shell: pwsh
-        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-nodetest finalis-wallet checkpoint-fixture-export
+        run: cmake --build --preset $env:BUILD_PRESET --target finalis-node finalis-lightserver finalis-explorer finalis-cli finalis-nodetest finalis-updater finalis-wallet checkpoint-fixture-export
 
       # Determinism gate: committee derivation on MSVC must match the Linux-generated corpus byte
       # for byte. A mismatch means Windows and Linux validators would derive different committees.
@@ -175,6 +175,7 @@ jobs:
             "${{ github.workspace }}\build\windows-release\finalis-explorer.exe",
             "${{ github.workspace }}\build\windows-release\finalis-cli.exe",
             "${{ github.workspace }}\build\windows-release\finalis-nodetest.exe",
+            "${{ github.workspace }}\build\windows-release\finalis-updater.exe",
             "${{ github.workspace }}\build\windows-release\finalis-wallet.exe"
           )
           foreach ($file in $files) {
@@ -255,6 +256,7 @@ jobs:
             "app\bin\finalis-explorer.exe",
             "app\bin\finalis-cli.exe",
             "app\bin\finalis-nodetest.exe",
+            "app\bin\finalis-updater.exe",
             "app\bin\finalis-wallet.exe",
             "app\scripts\Start-Finalis.ps1",
             "app\WINDOWS-RUN.txt",
