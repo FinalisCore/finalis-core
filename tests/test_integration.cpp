@@ -8165,6 +8165,60 @@ TEST(test_cluster_laggards_holding_one_third_block_lock_in_until_one_more_upgrad
   ASSERT_TRUE(nodes[5]->quorum_diagnosis_for_test().upgrade_required_height == activation);
 }
 
+// Signaled activation §3.5: after an upgrade activates, a node that is still below the activation
+// height (a fresh node syncing from genesis, or one back from downtime) must still be able to
+// connect and sync past it.
+TEST(test_cluster_fresh_node_syncs_past_an_active_upgrade) {
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_activation_joiner"), 4, 4, 4);
+  auto& nodes = cluster.nodes;
+  Hash32 fp{};
+  fp.fill(0x6E);
+  const consensus::UpgradeDef def{consensus::upgrade_id("activation-joiner-it", fp), "activation-joiner-it", 0};
+  for (auto& n : nodes) n->set_known_upgrades_for_test({def});
+  std::uint64_t activation = 0;
+  const bool active = wait_for(
+      [&]() {
+        const auto rec = upgrade_record_on(*nodes[0], def.id);
+        if (!rec.has_value() || rec->state != consensus::UpgradeState::Active) return false;
+        activation = rec->activation_height;
+        return nodes[0]->status().height >= activation + 4;
+      },
+      ci_timeout_seconds(240));
+  if (!active) throw std::runtime_error("no activation:" + activation_cluster_state(nodes, def.id));
+
+  // A fresh follower with the release, dialing every validator.
+  node::NodeConfig cfg;
+  cfg.allow_unencrypted_keystore = true;  // test fixture: no passphrase
+  cfg.disable_p2p = false;
+  cfg.listen = false;
+  cfg.bind_ip = "127.0.0.1";
+  cfg.dns_seeds = false;
+  cfg.network.default_seeds.clear();
+  cfg.node_id = 9;
+  cfg.max_committee = 4;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.p2p_port = reserve_test_ports(1)[0];
+  cfg.db_path = cluster.base + "/joiner";
+  cfg.genesis_path = cluster.configs[0].genesis_path;
+  cfg.allow_unsafe_genesis_override = true;
+  for (const auto p : cluster.ports) cfg.peers.push_back("127.0.0.1:" + std::to_string(p));
+  node::Node joiner(cfg);
+  ASSERT_TRUE(joiner.init());
+  joiner.set_known_upgrades_for_test({def});
+  joiner.start();
+  const auto target = nodes[0]->status().height;
+  const bool synced = wait_for([&]() { return joiner.status().height >= target; }, ci_timeout_seconds(120));
+  const auto joiner_height = joiner.status().height;
+  const auto rejected = nodes[0]->status().rejected_consensus_rules;
+  joiner.stop();
+  if (!synced) {
+    throw std::runtime_error("joiner stuck at h=" + std::to_string(joiner_height) + " target=" + std::to_string(target) +
+                             " activation=" + std::to_string(activation) +
+                             " node0_rejected_consensus_rules=" + std::to_string(rejected));
+  }
+}
+
 TEST(test_epoch_settlement_pays_onboarding_slice_to_onboarding_pubkey_from_finalized_ticket) {
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_settlement_slice");
   std::filesystem::remove_all(base);

@@ -488,6 +488,8 @@ class Node {
   // consensus_rules_fingerprint over the signaled upgrades active at finalized_height_ + 1 that this
   // binary implements (SIGNALED_ACTIVATION §3.5).
   std::string local_consensus_rules_fingerprint_locked() const;
+  // The fingerprint this binary has at `next_height`, from the finalized upgrade records.
+  std::string local_consensus_rules_fingerprint_at_locked(std::uint64_t next_height) const;
   // First height this binary cannot validate: an upgrade it does not implement is locked in (§3.6).
   std::optional<std::uint64_t> upgrade_required_from_height_locked() const;
   void send_version_with_tags(int peer_id, const std::string& tags);
