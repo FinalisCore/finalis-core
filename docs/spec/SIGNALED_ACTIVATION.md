@@ -330,7 +330,13 @@ least 3 independent builders sign releases.
    UTXO; relay-fee and hashcash exemption with one pending signal per (validator, upgrade); node
    auto-signal after each finalized height (`--no-upgrade-signal`); lightserver `get_upgrades`, CLI
    `upgrade-status` and `upgrade-signal` (validator key only).
-7. Integration and chaos tests, TLA+ model, INVARIANTS entry.
+7. PARTLY DONE (2026-11-12): TLA+ model and INVARIANTS U1-U7 are in. 4-node cluster tests: 3 of 4
+   upgraded → auto-signal, lock-in, activation, laggard `upgrade_required`, abstaining and unseated
+   from A on, chain keeps finalizing, laggard seated again after it installs the release
+   (`test_cluster_three_of_four_upgrade_activates_excludes_laggard_and_readmits_it`); 2 of 4 → window
+   closes without lock-in, chain keeps finalizing, nobody reports `upgrade_required`
+   (`test_cluster_two_of_four_upgrade_window_fails_and_chain_continues`). Open: chaos scenario with a
+   laggard holding exactly ⅓ of a committee.
 8. PARTLY DONE (2026-11-11): release manifests signed with Ed25519 release keys, checked against an
    operator trust policy (`threshold` plus keys; 1-of-1, the maintainer, for now; raising it is a
    policy edit), `finalis-cli release-keygen|release-manifest|release-sign`, `finalis-updater

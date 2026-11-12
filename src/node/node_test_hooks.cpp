@@ -452,6 +452,11 @@ void Node::set_upgrade_state_for_test(const consensus::UpgradeRecords& records,
   known_upgrades_for_test_ = std::move(known);
 }
 
+void Node::set_known_upgrades_for_test(std::vector<consensus::UpgradeDef> known) {
+  std::lock_guard<std::mutex> lk(mu_);
+  known_upgrades_for_test_ = std::move(known);
+}
+
 consensus::UpgradeRecords Node::upgrade_records_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   return canonical_state_.has_value() ? canonical_state_->upgrade_records : consensus::UpgradeRecords{};

@@ -378,6 +378,8 @@ class Node {
   // Signaled activation: replaces the in-memory UPG: records and, if given, this binary's upgrade table.
   void set_upgrade_state_for_test(const consensus::UpgradeRecords& records,
                                   std::optional<std::vector<consensus::UpgradeDef>> known);
+  // Replaces only this binary's upgrade table (an operator installing a release); finalized records stay.
+  void set_known_upgrades_for_test(std::vector<consensus::UpgradeDef> known);
   consensus::UpgradeRecords upgrade_records_for_test() const;
   bool abstaining_at_height_for_test(std::uint64_t height) const;
   QuorumDiagnosis quorum_diagnosis_for_test() const;
