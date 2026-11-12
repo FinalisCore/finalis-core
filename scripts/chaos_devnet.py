@@ -31,11 +31,20 @@ every S seconds and tracks it until its sealed body opens. An envelope that fina
 never opened (its bond was forfeited) is a failure (exit 5): the time signature gate and the
 settle-first rule must open every honest lock whatever the faults.
 
+--upgrade NAME --laggards K (chaos build) runs signaled activation under the faults: every validator
+but the last K gets FINALIS_CHAOS_KNOWN_UPGRADE=NAME, as if it had installed a release with that
+upgrade, so its node signals by itself. The run records the upgrade's states, and from the activation
+height on checks every committee (get_committee) for a laggard: a laggard seated at or after A is a
+failure (exit 6), as is a result against --expect-activation. After the chaos phase the laggards
+"install" the release (restart with the upgrade); final convergence then needs them back on the tip
+and their signals recorded.
+
 Liveness: stalls (exit 2), recovery times, rounds per height, catch-up lag at the end.
 
 Usage:
   scripts/chaos_devnet.py --nodes 7 --duration 900 --seed 1
   scripts/chaos_devnet.py --nodes 7 --byzantine 2 --build-dir build-chaos --tx-interval 1
+  scripts/chaos_devnet.py --nodes 6 --build-dir build-chaos --upgrade it --laggards 1 --expect-activation yes
 Output: <workdir>/report.json, <workdir>/report.md, <workdir>/node<i>.log
 """
 
@@ -179,6 +188,16 @@ class Nodes:
         self.procs: dict[int, subprocess.Popen | None] = {i: None for i in range(net.n)}
         self.rpc_port = {i: free_port() for i in range(net.n)}
         self.hard_kills: list[tuple[int, float]] = []  # (node, time)
+        self.installed: set[int] = set()  # laggards that installed the upgrade release
+
+    def is_laggard(self, i: int) -> bool:
+        return bool(self.args.upgrade) and i >= self.net.n - self.args.laggards and i not in self.installed
+
+    def install_upgrade(self, i: int) -> None:
+        """A laggard installs the release with the upgrade: restart it with the upgrade known."""
+        self.installed.add(i)
+        self.stop(i, hard=False)
+        self.start(i)
 
     def cmd(self, i: int) -> list[str]:
         a = self.args
@@ -206,6 +225,9 @@ class Nodes:
         env = dict(os.environ, FINALIS_VALIDATOR_PASSPHRASE=PASSPHRASE, FINALIS_LOG_TIMESTAMPS="1")
         if i < self.args.byzantine:
             env["FINALIS_CHAOS_BYZANTINE"] = "1"
+        env.pop("FINALIS_CHAOS_KNOWN_UPGRADE", None)
+        if self.args.upgrade and not self.is_laggard(i):
+            env["FINALIS_CHAOS_KNOWN_UPGRADE"] = self.args.upgrade
         logf = open(self.workdir / f"node{i}.log", "ab")
         # Own process group: the lightserver child dies with the node, also on SIGKILL.
         self.procs[i] = subprocess.Popen(self.cmd(i), stdout=logf, stderr=subprocess.STDOUT, env=env,
@@ -386,6 +408,101 @@ class Chaos:
                     return
             calm = self.rng.uniform(self.args.calm_s / 2, self.args.calm_s)
             await asyncio.sleep(max(0.0, calm - (time.monotonic() - healed_at)))
+
+
+# --- signaled activation --------------------------------------------------------------------------
+
+async def rpc(url: str, method: str, params: dict) -> object | None:
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    proc = await asyncio.create_subprocess_exec(
+        "curl", "-s", "-m", "3", "-X", "POST", "-H", "Content-Type: application/json", "-d", body, url,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    try:
+        return json.loads(out).get("result")
+    except (ValueError, AttributeError):
+        return None
+
+
+class UpgradeWatch:
+    """Polls get_upgrades on an upgraded node; checks committees from the activation height on."""
+
+    def __init__(self, args, genesis_dir: Path, nodes: Nodes, mon: Monitor):
+        self.args, self.nodes, self.mon = args, nodes, mon
+        manifest = dict(line.split("=", 1) for line in (genesis_dir / "manifest.env").read_text().splitlines()
+                        if "=" in line and not line.startswith("#"))
+        n = args.nodes
+        self.laggard_nodes = list(range(n - args.laggards, n))
+        self.laggard_pubkeys = {manifest[f"VALIDATOR_{i + 1}_PUBKEY"].lower(): i for i in self.laggard_nodes}
+        self.transitions: list[dict] = []  # state changes as first seen
+        self.last: dict | None = None
+        self.activation_height: int | None = None
+        self.checked_epochs: set[int] = set()
+        self.seated_laggards: list[dict] = []  # laggard in a committee at or after A, before it installed
+        self.install_height: int | None = None
+        self.active_operators: int | None = None
+
+    def _source(self) -> int | None:
+        running = [i for i in self.nodes.running() if not self.nodes.is_laggard(i)]
+        return min(running, key=lambda i: -self.mon.node_height.get(i, 0)) if running else None
+
+    async def poll(self) -> None:
+        src = self._source()
+        if src is None:
+            return
+        res = await rpc(self.nodes.rpc_url(src), "get_upgrades", {})
+        if not isinstance(res, dict):
+            return
+        ups = res.get("upgrades") or []
+        self.active_operators = res.get("active_operators")
+        cur = ups[0] if ups else None
+        key = None if cur is None else (cur["state"], cur["signalers"], cur["activation_height"])
+        last_key = None if self.last is None else (self.last["state"], self.last["signalers"], self.last["activation_height"])
+        if key != last_key:
+            entry = {"t": round(time.monotonic(), 1), "height": self.mon.max_height(),
+                     "state": None if cur is None else cur["state"],
+                     "signalers": None if cur is None else cur["signalers"],
+                     "active_operators": res.get("active_operators"),
+                     "activation_height": None if cur is None else cur["activation_height"]}
+            self.transitions.append(entry)
+            log(f"upgrade: {entry}")
+        self.last = cur
+        if cur is not None and cur["state"] in ("locked_in", "active") and cur["activation_height"]:
+            self.activation_height = cur["activation_height"]
+        await self._check_committees(src)
+
+    async def _check_committees(self, src: int) -> None:
+        a = self.activation_height
+        if a is None:
+            return
+        epoch = 32  # committee_epoch_blocks of the mainnet parameters generate_fresh_genesis.sh copies
+        tip = self.mon.node_height.get(src, 0)
+        end = tip if self.install_height is None else min(tip, self.install_height)
+        start_epoch = (a - 1) // epoch
+        for e in range(start_epoch, (end - 1) // epoch + 1 if end >= a else start_epoch):
+            if e in self.checked_epochs:
+                continue
+            h = max(a, e * epoch + 1)
+            members = await rpc(self.nodes.rpc_url(src), "get_committee", {"height": h})
+            if not isinstance(members, list):
+                return
+            self.checked_epochs.add(e)
+            for pub in members:
+                if pub.lower() in self.laggard_pubkeys:
+                    hit = {"height": h, "node": self.laggard_pubkeys[pub.lower()]}
+                    self.seated_laggards.append(hit)
+                    log(f"UPGRADE FAILURE: laggard seated at or after activation: {hit}")
+
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            await self.poll()
+            await asyncio.sleep(2)
+
+    def summary(self) -> dict:
+        return {"upgrade": self.args.upgrade, "laggards": self.laggard_nodes,
+                "activation_height": self.activation_height, "install_height": self.install_height,
+                "final": self.last, "committee_epochs_checked": len(self.checked_epochs),
+                "seated_laggards": self.seated_laggards, "transitions": self.transitions}
 
 
 # --- transaction traffic -------------------------------------------------------------------------
@@ -650,7 +767,7 @@ def percentile(xs: list[float], p: float) -> float | None:
 
 
 def write_report(args, workdir: Path, mon: Monitor, chaos: Chaos, nodes: Nodes, final: dict,
-                 traffic: Traffic | None) -> dict:
+                 traffic: Traffic | None, upgrade: "UpgradeWatch | None" = None) -> dict:
     rec = [w["recovery_s"] for w in chaos.windows if w["recovery_s"] is not None]
     rounds = list(mon.commit_round.values())
     report = {
@@ -666,6 +783,7 @@ def write_report(args, workdir: Path, mon: Monitor, chaos: Chaos, nodes: Nodes, 
         "finalization_sources": mon.sources,
         "final": final,
         "transactions": traffic.summary() if traffic else None,
+        "upgrade": upgrade.summary() if upgrade else None,
         "unexpected_exits": nodes.exited_unexpectedly(),
         "windows": chaos.windows,
     }
@@ -683,6 +801,9 @@ def write_report(args, workdir: Path, mon: Monitor, chaos: Chaos, nodes: Nodes, 
         f"- commit rounds: {report['commit_round_histogram']}",
         f"- final: {final}",
         f"- transactions: {report['transactions']}",
+        *([f"- upgrade: activation_height {upgrade.activation_height}, install_height {upgrade.install_height}, "
+           f"final {upgrade.last}, committee epochs checked {len(upgrade.checked_epochs)}, "
+           f"laggards seated after A {upgrade.seated_laggards}"] if upgrade else []),
         "", "| fault | fault s | progress during | recovery s |", "|---|---|---|---|",
     ]
     for w in chaos.windows:
@@ -722,6 +843,10 @@ async def amain(args) -> int:
     traffic = Traffic(args, genesis_dir, nodes, workdir, rng) if args.tx_interval > 0 or args.timed_interval > 0 else None
     stop_traffic = asyncio.Event()
     traffic_tasks = []
+    upgrade = UpgradeWatch(args, genesis_dir, nodes, mon) if args.upgrade else None
+    upgrade_failed: list[str] = []
+    if upgrade:
+        traffic_tasks.append(asyncio.create_task(upgrade.run(stop_traffic)))
     if traffic:
         traffic_tasks = [asyncio.create_task(traffic.run(stop_traffic)), asyncio.create_task(traffic.run_timed(stop_traffic)),
                          asyncio.create_task(traffic.track(stop_traffic))]
@@ -738,6 +863,12 @@ async def amain(args) -> int:
 
         # Final convergence: all faults healed, every node must reach the same tip.
         net.heal()
+        if upgrade:
+            await upgrade.poll()
+            upgrade.install_height = mon.max_height()
+            log(f"laggards {upgrade.laggard_nodes} install the upgrade at height {upgrade.install_height}")
+            for i in upgrade.laggard_nodes:
+                nodes.install_upgrade(i)
         for i in range(args.nodes):
             if nodes.procs[i] is None or nodes.procs[i].poll() is not None:
                 nodes.start(i)
@@ -749,6 +880,28 @@ async def amain(args) -> int:
                 break
         final = {"target_height": target, "node_heights": {str(i): mon.node_height.get(i, 0) for i in range(args.nodes)},
                  "converged": all(mon.node_height.get(i, 0) >= target for i in range(args.nodes))}
+        if upgrade:
+            # Installed laggards signal by themselves: every active operator ends up a signaler.
+            end = time.monotonic() + args.recovery_deadline * 2
+            while time.monotonic() < end:
+                await upgrade.poll()
+                cur = upgrade.last
+                if cur is not None and cur["signalers"] == upgrade.active_operators:
+                    break
+                await asyncio.sleep(2)
+            activated = upgrade.activation_height is not None
+            if upgrade.seated_laggards:
+                upgrade_failed.append("laggard seated at or after activation")
+            if args.expect_activation == "yes" and not activated:
+                upgrade_failed.append("expected activation, none")
+            if args.expect_activation == "no" and activated:
+                upgrade_failed.append("expected no activation, activated")
+            cur = upgrade.last
+            if cur is None or cur["signalers"] != upgrade.active_operators:
+                upgrade_failed.append("installed laggards' signals not all recorded")
+            if upgrade_failed:
+                log(f"UPGRADE FAILURE: {upgrade_failed}")
+            final["upgrade_failures"] = upgrade_failed
         if traffic:
             stop_traffic.set()
             # Give in-flight payments time to finalize on the healed network.
@@ -766,7 +919,7 @@ async def amain(args) -> int:
         for i in range(args.nodes):
             nodes.stop(i, hard=False)
         mon_task.cancel()
-        report = write_report(args, workdir, mon, chaos, nodes, final, traffic)
+        report = write_report(args, workdir, mon, chaos, nodes, final, traffic, upgrade)
         log(f"report: {workdir / 'report.md'}")
         log(f"heights={report['heights_finalized']} forks={len(report['forks'])} stalls={len(report['stalls'])} "
             f"recovery_p95={report['recovery_s']['p95']}s final={final} tx={report['transactions']}")
@@ -776,6 +929,8 @@ async def amain(args) -> int:
         return 5
     if chaos.stalls or not final.get("converged", False):
         return 2
+    if upgrade_failed:
+        return 6
     return 0
 
 
@@ -806,11 +961,18 @@ def main() -> int:
     ap.add_argument("--fault-mix", choices=["default", "crash"], default="default",
                     help="fault weights; crash: mostly hard crash/restart")
     ap.add_argument("--tx-lost-s", type=float, default=120, help="an accepted payment not finalized by then is lost")
+    ap.add_argument("--upgrade", help="signaled activation: upgrade name the non-laggards know (chaos build)")
+    ap.add_argument("--laggards", type=int, default=0, help="with --upgrade: the last K validators lack the upgrade")
+    ap.add_argument("--expect-activation", choices=["any", "yes", "no"], default="any")
     args = ap.parse_args()
     if args.nodes < 4:
         ap.error("--nodes must be >= 4")
     if args.byzantine > (args.nodes - 1) // 3:
         ap.error("--byzantine must be <= f = (nodes - 1) // 3")
+    if args.upgrade and args.byzantine + args.laggards > args.nodes:
+        ap.error("--laggards must leave room for the --byzantine validators")
+    if args.upgrade and b"CHAOS-UPGRADE" not in (args.build_dir / "finalis-node").read_bytes():
+        ap.error(f"{args.build_dir}/finalis-node is not a -DFINALIS_CHAOS_BYZANTINE=ON build with CHAOS-UPGRADE")
     if args.byzantine and b"CHAOS-BYZANTINE" not in (args.build_dir / "finalis-node").read_bytes():
         ap.error(f"{args.build_dir}/finalis-node is not a -DFINALIS_CHAOS_BYZANTINE=ON build")
     return asyncio.run(amain(args))

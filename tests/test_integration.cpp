@@ -8084,6 +8084,87 @@ TEST(test_cluster_two_of_four_upgrade_window_fails_and_chain_continues) {
   }
 }
 
+// Signaled activation §3.3 at the ⅓ boundary, 6 nodes, committee 6 (quorum 5): laggards holding exactly
+// ⅓ of the seats leave 4 ready seats, below quorum, so the upgrade must not lock in (activating would
+// leave committee(L+1) without a ready quorum) and the chain keeps finalizing. One more operator
+// upgrades: 5 of 6 is a quorum, the upgrade activates and the last laggard loses its seat.
+TEST(test_cluster_laggards_holding_one_third_block_lock_in_until_one_more_upgrades) {
+  constexpr std::uint64_t kWindow = 1'000'000;  // the window must not close during the test
+  auto cluster = make_cluster(unique_test_base("/tmp/finalis_it_activation_third"), 6, 6, 6,
+                              [](node::NodeConfig& cfg) { cfg.network.upgrade_signal_window_blocks = kWindow; });
+  auto& nodes = cluster.nodes;
+  Hash32 fp{};
+  fp.fill(0x1C);
+  const consensus::UpgradeDef def{consensus::upgrade_id("activation-third-it", fp), "activation-third-it", 0};
+  for (std::size_t i = 0; i < 4; ++i) nodes[i]->set_known_upgrades_for_test({def});
+  nodes[4]->set_known_upgrades_for_test({});
+  nodes[5]->set_known_upgrades_for_test({});
+  const PubKey32 late = nodes[4]->local_validator_pubkey_for_test();
+  const PubKey32 laggard = nodes[5]->local_validator_pubkey_for_test();
+  const auto epoch = cluster.configs[0].network.committee_epoch_blocks;
+
+  const auto all_at_least = [&](std::uint64_t h, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) {
+      if (nodes[i]->status().height < h) return false;
+    }
+    return true;
+  };
+  const auto not_locked = [&]() {
+    const auto rec = upgrade_record_on(*nodes[0], def.id);
+    return !rec.has_value() ||
+           (rec->state != consensus::UpgradeState::LockedIn && rec->state != consensus::UpgradeState::Active);
+  };
+
+  // 4 signalers recorded, committee of 6 with both laggards seated.
+  const bool signaled = wait_for(
+      [&]() {
+        const auto rec = upgrade_record_on(*nodes[0], def.id);
+        return rec.has_value() && rec->signalers.size() == 4;
+      },
+      ci_timeout_seconds(180));
+  if (!signaled) throw std::runtime_error("signals not recorded:" + activation_cluster_state(nodes, def.id));
+  {
+    const auto committee = nodes[0]->committee_for_next_height_for_test();
+    ASSERT_EQ(committee.size(), 6u);
+    ASSERT_TRUE(committee_contains(committee, late) && committee_contains(committee, laggard));
+  }
+  // Three epoch ends pass with 4 of 6 ready: no lock-in, and the chain keeps finalizing.
+  const auto h0 = nodes[0]->status().height;
+  bool ever_locked = false;
+  const bool advanced = wait_for(
+      [&]() {
+        if (!not_locked()) ever_locked = true;
+        return ever_locked || all_at_least(h0 + 3 * epoch, nodes.size());
+      },
+      ci_timeout_seconds(240));
+  if (!advanced) throw std::runtime_error("chain stalled at 4 of 6:" + activation_cluster_state(nodes, def.id));
+  ASSERT_TRUE(!ever_locked);
+  for (const auto& n : nodes) ASSERT_EQ(n->quorum_diagnosis_for_test().upgrade_required_height, 0u);
+
+  // A fifth operator installs the release: 5 of 6 ready, lock-in, activation, the last laggard unseated.
+  nodes[4]->set_known_upgrades_for_test({def});
+  std::uint64_t activation = 0;
+  const bool locked = wait_for(
+      [&]() {
+        const auto rec = upgrade_record_on(*nodes[0], def.id);
+        if (not_locked()) return false;
+        activation = rec->activation_height;
+        return true;
+      },
+      ci_timeout_seconds(240));
+  if (!locked) throw std::runtime_error("no lock-in at 5 of 6:" + activation_cluster_state(nodes, def.id));
+  ASSERT_EQ(upgrade_record_on(*nodes[0], def.id)->signalers.size(), 5u);
+  const auto past = activation + 2 * epoch;
+  const bool after = wait_for([&]() { return all_at_least(past, 5); }, ci_timeout_seconds(240));
+  if (!after) throw std::runtime_error("chain stalled after activation:" + activation_cluster_state(nodes, def.id));
+  for (std::uint64_t h = activation; h <= past; ++h) {
+    const auto committee = nodes[0]->committee_for_height_round_for_test(h, 0);
+    ASSERT_TRUE(!committee_contains(committee, laggard));
+    ASSERT_TRUE(committee_contains(committee, late));
+  }
+  ASSERT_TRUE(nodes[5]->quorum_diagnosis_for_test().upgrade_required_height == activation);
+}
+
 TEST(test_epoch_settlement_pays_onboarding_slice_to_onboarding_pubkey_from_finalized_ticket) {
   const auto base = unique_test_base("/tmp/finalis_it_onboarding_settlement_slice");
   std::filesystem::remove_all(base);

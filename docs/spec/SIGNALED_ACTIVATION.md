@@ -335,8 +335,14 @@ least 3 independent builders sign releases.
    from A on, chain keeps finalizing, laggard seated again after it installs the release
    (`test_cluster_three_of_four_upgrade_activates_excludes_laggard_and_readmits_it`); 2 of 4 → window
    closes without lock-in, chain keeps finalizing, nobody reports `upgrade_required`
-   (`test_cluster_two_of_four_upgrade_window_fails_and_chain_continues`). Open: chaos scenario with a
-   laggard holding exactly ⅓ of a committee.
+   (`test_cluster_two_of_four_upgrade_window_fails_and_chain_continues`); laggards holding exactly ⅓
+   of a 6-seat committee (4 ready seats, quorum 5) → no lock-in, chain keeps finalizing; a fifth
+   upgrader → activation and the last laggard unseated
+   (`test_cluster_laggards_holding_one_third_block_lock_in_until_one_more_upgrades`). Chaos:
+   `scripts/chaos_devnet.py --upgrade NAME --laggards K [--expect-activation yes|no]` (chaos build,
+   `FINALIS_CHAOS_KNOWN_UPGRADE`) runs activation under crashes, partitions and latency, checks every
+   committee from A for a laggard, then installs the release on the laggards and needs them back on
+   the tip with their signals recorded.
 8. PARTLY DONE (2026-11-11): release manifests signed with Ed25519 release keys, checked against an
    operator trust policy (`threshold` plus keys; 1-of-1, the maintainer, for now; raising it is a
    policy edit), `finalis-cli release-keygen|release-manifest|release-sign`, `finalis-updater

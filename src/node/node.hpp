@@ -1216,6 +1216,9 @@ class Node {
   // precommits every proposal it sees, ignoring every safety rule, and equivocates as leader.
   bool chaos_byzantine_{false};
   std::uint64_t chaos_equivocation_nonce_{0};
+  // CHAOS TEST BUILDS ONLY (scripts/chaos_devnet.py --upgrade): FINALIS_CHAOS_KNOWN_UPGRADE=<name> gives
+  // this binary one upgrade, id upgrade_id(name, sha256(name)), as a release implementing it would.
+  std::optional<consensus::UpgradeDef> chaos_known_upgrade_;
 #endif
   std::uint64_t last_finalized_tip_poll_ms_{0};
   std::size_t finalized_tip_poll_cursor_{0};
